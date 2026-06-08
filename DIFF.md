@@ -1,29 +1,692 @@
-## 2026-06-07 — core/src/hle/kernel/k_client_session.rs, core/src/hle/kernel/k_server_session.rs, core/src/hle/kernel/k_thread.rs, and core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
+## 2026-06-08 — core/src/hle/kernel/k_session.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_session.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_session.h
+
+### Intentional differences
+- Rust stores `KSession::m_server` / `m_client` equivalents behind `Arc<Mutex<_>>` instead of upstream embedded endpoint members. This is the current Rust ownership adaptation for sharing session endpoints through handle tables while preserving the conceptual `KSession` owner.
+- `KSession::on_server_request_defer_scheduler_unlock(...)` is a Rust mutex-boundary helper for the same upstream `KSession::OnRequest(...) -> KServerSession::OnRequest(...)` edge. It releases the Rust `KServerSession` mutex before dropping the scheduler-lock guard produced by the server endpoint.
+- `KSession::finalize_with_process(...)` uses the owning `KProcess` object tables to resolve the stored parent client-port id and call `KClientPort::on_session_finalized()`. Upstream stores a direct `KClientPort* m_port`; Rust uses an optional object id because kernel objects are currently reached through process registries.
+- `KSession::finalize_with_process(...)` also releases a committed `SessionCountMax` reservation because Rust does not yet have upstream's slab `PostDestroy(uintptr_t owner)` callback boundary. The release is guarded by an explicit committed-resource flag so pre-commit failure cleanup still relies on `KScopedResourceReservation` drop, matching upstream failure ordering.
+- `ServiceManager` service-port entries store `Arc<Mutex<KPort>>` plus the stable client-port object id used for `KSession::Initialize(...)`. Upstream stores `KClientPort*` directly in `ServiceManager::service_ports`; this Rust shape preserves the same parent-port finalization edge without introducing unsafe parent pointers.
+
+### Unintentional differences (to fix)
+- `KSession::PostDestroy` is not represented as a real slab-object callback and the owner-process `Close()` edge is not modeled with upstream `KAutoObject` refcount ownership.
+
+### Missing items
+- Port upstream-shaped `PostDestroy(uintptr_t owner)` and owner-process `Close()` once the Rust kernel object lifecycle has matching `KAutoObject` owner hooks.
+
+### Binary layout verification
+- N/A: kernel object lifecycle and session endpoint ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `KSession::Initialize`, `Finalize`, `OnServerClosed`, `OnClientClosed`, and `PostDestroy`.
+- `cargo test -p core test_on_client_closed_only_transitions_from_normal -- --nocapture --test-threads=1`
+- `cargo test -p core test_on_server_closed_only_transitions_from_normal -- --nocapture --test-threads=1`
+- `cargo test -p core destroy_with_process_notifies_parent_server_session -- --nocapture --test-threads=1`
+- `cargo test -p core closing_last_client_session_handle_notifies_parent_server_session -- --nocapture --test-threads=1`
+- `cargo test -p core enqueue_helper_uses_resolved_parent_without_locking_client_session -- --nocapture --test-threads=1`
+- `cargo test -p core send_sync_request_with_process_enqueues_real_session_request -- --nocapture --test-threads=1`
+- `cargo test -p core normal_port_session_finalize_notifies_client_port -- --nocapture --test-threads=1`
+- `cargo test -p core service_port_identity_allows_session_finalize_notification -- --nocapture --test-threads=1`
+- `cargo test -p core connect_to_named_port_attaches_manager_to_server_session_for_hle_service -- --nocapture --test-threads=1`
+- `cargo test -p core connect_to_port_creates_client_session_and_enqueues_server_session -- --nocapture --test-threads=1`
+- `cargo test -p core create_session_allocates_and_registers_session_objects -- --nocapture --test-threads=1`
+- `cargo test -p core on_session_finalized_reopens_saturated_client_port -- --nocapture --test-threads=1`
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 75s isolated-XDG smoke (`/tmp/ruzu_mk8d_ipc_branch_smoke_1780919083.log`, no L+R input, `RUST_LOG=warn,core::hle::service::audio=info,core::hle::service::nvdrv=info,core::hle::service::nvnflinger=info`): reached `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, `BQP_QUEUE`, and one sampled `SF_COMPOSE ... COMPOSING`; no `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, panic, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, `0x068B0000`, or `0x0000D401` marker. The wrapper summary failed after the child process because zsh reserves `status`, so this is log-based runtime smoke evidence.
+- Manual MK8D 75s isolated-XDG smoke after parent client-port finalization wiring (`/tmp/ruzu_mk8d_session_finalize_retry_1780919584.log`, no L+R input, `RUST_LOG=warn,core::hle::service::audio=info,core::hle::service::nvdrv=info,core::hle::service::nvnflinger=info`): reached `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, `BQP_QUEUE`, and two sampled `SF_COMPOSE ... COMPOSING`; no `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, panic, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, `0x068B0000`, or `0x0000D401` marker.
+- Manual MK8D 75s isolated-XDG smoke after `SessionCountMax` release wiring (`/tmp/ruzu_mk8d_ipc_sessioncount_1780920901.log`, no L+R input, `RUST_LOG=warn,core::hle::service::audio=info,core::hle::service::nvdrv=info,core::hle::service::nvnflinger=info`): wrapper timed out as expected at 75s after reaching `NotifyRunning=1`, `OpenAudioRenderer=3`, `IAudioRenderer::Start=1`, `BQP_QUEUE=23`, and `SF_COMPOSE=169`; no `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, panic, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, `0x068B0000`, or `0x0000D401` marker.
+- Manual MK8D 75s isolated-XDG smoke after making `KClientPort` waitable and wiring `OnSessionFinalized()->NotifyAvailable` (`/tmp/ruzu_mk8d_client_port_waitable_1780921379.log`, no L+R input, `RUST_LOG=warn,core::hle::service::audio=info,core::hle::service::nvdrv=info,core::hle::service::nvnflinger=info`): wrapper timed out as expected at 75s after reaching `NotifyRunning=1`, `OpenAudioRenderer=3`, `IAudioRenderer::Start=1`, `BQP_QUEUE=23`, and `SF_COMPOSE=144`; no `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, panic, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, `0x068B0000`, or `0x0000D401` marker.
+
+## 2026-06-08 — core/src/hle/kernel/svc/svc_ipc.rs and core/src/hle/service/server_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.cpp
+
+### Intentional differences
+- `ServerManager::default_host_thread_service_matches_from_flags(...)` is the single Rust migration-policy hook for service-name based host-thread IPC selection, but it currently returns `false` for every service by default. Cold MK8D A/B showed that broad implicit promotions can regress boot before `NotifyRunning`, so service promotion is kept behind explicit validation gates until each service group is proven safe.
+- The broad host-thread sleep diagnostic is no longer enabled by `RUZU_SERVER_THREAD_IPC_SERVICE`. Service-name routing is the validation path for candidate default promotions, so adding a global inter-IPC sleep there changes timing outside the selected service and does not model the future default route. The sleep remains available for broader diagnostics such as host-thread-all, exact-handle routing, or explicit Binder routing.
+- `svc_ipc.rs` and `ServerManager::register_session(...)` resolve service names only when the explicit `RUZU_SERVER_THREAD_IPC_SERVICE` filter or SVC IPC progress trace needs them. Upstream resolves no service name on `KClientSession::SendSyncRequest`; this keeps the Rust migration hook from adding manager/handler locks to the normal inline path.
+- `ServerManager::register_session(...)` links `MultiWait` session holders only for sessions whose routing policy will consume requests on the host-thread path: host-thread-all, exact-handle routing, or service-filter routing. This avoids a double consumer for services that still use inline dispatch.
+- `server_manager.rs` module and `complete_sync_request(...)` comments describe the current split: explicit host-thread routes use the `ServerManager` event loop, while non-routed services still use the temporary inline fallback.
+- Explicit host-thread routing in `svc_ipc.rs` delegates synchronous request creation/enqueue to `KClientSession::send_sync_request_to_parent_with_process(...)`, so the upstream `KClientSession::SendSyncRequest` → `KSession::OnRequest` ownership is used for that path instead of manually constructing `KSessionRequest` inside the SVC wrapper.
+- `ServerManager::complete_sync_request(...)` and the shared host-thread session path treat unexpected `SendReplyHLE` / service-dispatch errors like upstream `R_ASSERT(res)` / `R_ASSERT(service_res)`: after the session-closed cases, Rust asserts success before relinking the session.
+- `ServerManager::on_session_event(...)` and the shared host-thread session path treat unexpected `ReceiveRequestHLE` errors like upstream `R_ASSERT(res)`: `SessionClosed` destroys the session, while any other receive error panics instead of being logged and ignored.
+- `ServerManager::process(...)` still resolves selected `MultiWaitHolder` pointers back through Rust `Vec<Session>` / `Vec<Port>` ownership instead of upstream intrusive-list `static_cast`, but invalid tags or unregistered holders now panic like upstream `UNREACHABLE()` / `R_ASSERT(Process(...))` instead of being ignored.
+
+### Unintentional differences (to fix)
+- Synchronous HLE IPC defaults to the Rust inline fallback unless an explicit host-thread routing gate selects the session, instead of upstream's `ServerManager::LoopProcess` path.
+- The Rust host-thread path still depends on a coarse `Mutex<ServerManager>` owner. Upstream resolves only the client session and uses internal `ServerManager` synchronization.
+
+### Missing items
+- Re-promote service groups from inline fallback to `ServerManager` consumption only after per-service validation through `RUZU_SERVER_THREAD_IPC_SERVICE`, then remove the inline fallback and routing knobs once host-thread IPC is globally safe.
+- Continue splitting the coarse `Mutex<ServerManager>` owner into upstream-shaped internal synchronization for structural parity, but do not treat it as the proven host-thread-all throughput blocker: current phase profiles after moving session dispatch outside the coarse lock localize dominant time to Binder / `BufferQueueProducer::DequeueBuffer` pacing or broader producer scheduling.
+
+### Binary layout verification
+- N/A: IPC lifecycle/routing policy only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `KClientSession::SendSyncRequest`, `KServerSession::OnRequest`, `ServerManager::WaitSignaled`, `ServerManager::OnSessionEvent`, and `ServerManager::CompleteSyncRequest`.
+- Re-read upstream `LM::LoopProcess`, `AOC::LoopProcess`, `PCTL::LoopProcess`, `PlayReport::LoopProcess`, and `Friend::LoopProcess`.
+- Re-read upstream `Glue::LoopProcess`, `PSC::LoopProcess`, and `PSC::Time::ServiceManager::SetupSAndP` before promoting the Time service names.
+- Re-read upstream and Rust `Mii::LoopProcess` before testing the Mii service names.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo test -p core service_name_resolution_is_only_for_explicit_service_filter -- --nocapture --test-threads=1`
+- `cargo test -p core host_thread_ipc_sleep_follows_all_routing_gates -- --nocapture --test-threads=1`
+- `cargo test -p core default_host_thread_services_are_not_promoted_implicitly -- --nocapture --test-threads=1`
+- `cargo test -p core default_host_thread_session_services_are_not_promoted_implicitly -- --nocapture --test-threads=1`
+- `cargo test -p core complete_sync_request_asserts_unexpected_service_error -- --nocapture --test-threads=1`
+- `cargo test -p core on_session_event_asserts_unexpected_receive_error -- --nocapture --test-threads=1`
+- `cargo test -p core shared_session_event_asserts_unexpected_receive_error -- --nocapture --test-threads=1`
+- `cargo test -p core shared_session_event_asserts_unexpected_service_error -- --nocapture --test-threads=1`
+- `cargo test -p core shared_session_event_asserts_unexpected_reply_error -- --nocapture --test-threads=1`
+- `cargo test -p core process_panics_on_unknown_wait_holder_tag -- --nocapture --test-threads=1`
+- `cargo test -p core process_panics_on_unregistered_session_holder -- --nocapture --test-threads=1`
+- `cargo test -p core enqueue_helper_uses_resolved_parent_without_locking_client_session -- --nocapture --test-threads=1`
+- `cargo test -p core send_sync_request_with_process_enqueues_real_session_request -- --nocapture --test-threads=1`
+- `cargo test -p core server_manager::tests:: -- --nocapture --test-threads=1`
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 75s isolated-XDG temporary Binder default experiment (`/tmp/ruzu_mk8d_binder_default_smoke.log`, `RUST_LOG=warn`): reached `NotifyRunning`; no `BreakLoopNullPc`, `svcBreak`, `SetTerminateResult`, `panic`, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, or `0x068B0000` marker. This is historical smoke evidence only; current policy does not route Binder implicitly.
+- Manual MK8D 45s isolated-XDG temporary Binder default experiment (`/tmp/ruzu_mk8d_binder_default_info_smoke.log`, `RUST_LOG=info`): reached `OpenAudioRenderer`, `IAudioRenderer::Start`, and `BQP_QUEUE` markers; no fatal IPC/kernel markers listed above. This is historical smoke evidence only; current policy does not route Binder implicitly.
+- Manual MK8D 45s isolated-XDG temporary default-promotion smoke for `IHOSBinderDriver` + `pl:u` (`/tmp/ruzu_mk8d_plu_default_info_smoke.log`, `RUST_LOG=info`, no `RUZU_SERVER_THREAD_IPC_*` routing env): reached `OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, `pl:u GetSharedMemoryAddressOffset`, `pl:u GetSize`, `BQP_QUEUE`, and `SF_COMPOSE ... COMPOSING`; no `BreakLoopNullPc`, `svcBreak`, `SetTerminateResult`, `panic`, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, or `0x068B0000` marker. This is historical smoke evidence only; current policy no longer promotes these services implicitly.
+- Manual MK8D 45s isolated-XDG temporary default-promotion smoke for `IHOSBinderDriver` + `pl:s` + `pl:u` (`/tmp/ruzu_mk8d_pls_default_info_smoke.log`, `RUST_LOG=info`, no `RUZU_SERVER_THREAD_IPC_*` routing env): reached `OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, `pl:u GetSharedMemoryAddressOffset`, `pl:u GetSize`, `BQP_QUEUE`, and `SF_COMPOSE ... COMPOSING`; no `BreakLoopNullPc`, `svcBreak`, `SetTerminateResult`, `panic`, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, or `0x068B0000` marker. This is historical smoke evidence only; current policy no longer promotes these services implicitly.
+- Manual MK8D 45s isolated-XDG service-gated smokes before promoting the audio renderer group: `RUZU_SERVER_THREAD_IPC_SERVICE=audren:u` (`/tmp/ruzu_mk8d_audren_service_info_smoke.log`), `RUZU_SERVER_THREAD_IPC_SERVICE=audren:u,IAudioRenderer` (`/tmp/ruzu_mk8d_audren_renderer_service_info_smoke.log`), and `RUZU_SERVER_THREAD_IPC_SERVICE=audren:u,IAudioRenderer,IAudioDevice` (`/tmp/ruzu_mk8d_audren_full_service_info_smoke.log`) all reached `OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, `BQP_QUEUE`, and `SF_COMPOSE` activity without `BreakLoopNullPc`, `svcBreak`, `SetTerminateResult`, `panic`, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, or `0x068B0000` markers. These are smoke-level routing validations only; they do not prove late audio/video correctness.
+- Manual MK8D 45s isolated-XDG temporary default-promotion smoke for the audio renderer group (`/tmp/ruzu_mk8d_audren_default_info_smoke.log`, `RUST_LOG=info`, no `RUZU_SERVER_THREAD_IPC_*` routing env): reached `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::QuerySystemEvent`, `IAudioRenderer::Start`, `NotifyRunning`, `BQP_QUEUE`, and `SF_COMPOSE ... COMPOSING`; no `BreakLoopNullPc`, `svcBreak`, `SetTerminateResult`, `panic`, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, or `0x068B0000` marker. This was historical smoke evidence only; current policy no longer promotes this group implicitly.
+- Manual MK8D 45s isolated-XDG service-gated smoke before promoting the VI group (`/tmp/ruzu_mk8d_vi_service_info_smoke.log`, `RUST_LOG=info`, `RUZU_SERVER_THREAD_IPC_SERVICE=vi:m,vi:s,vi:u,IApplicationDisplayService,vi::IManagerDisplayService,vi::ISystemDisplayService`): reached `GetService("vi:m")`, `GetService("vi:s")`, `GetService("vi:u")`, `IApplicationDisplayService::GetManagerDisplayService`, `IApplicationDisplayService::GetSystemDisplayService`, `IApplicationDisplayService::GetRelayService`, `OpenDisplay("Default")`, `OpenLayer`, `GetDisplayVsyncEvent`, `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, and `BQP_QUEUE`; no `BreakLoopNullPc`, `svcBreak`, `SetTerminateResult`, `panic`, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, or `0x068B0000` marker. This is smoke-level routing validation only.
+- Manual MK8D 45s isolated-XDG temporary default-promotion smoke for the VI group (`/tmp/ruzu_mk8d_vi_default_info_smoke.log`, `RUST_LOG=info`, no `RUZU_SERVER_THREAD_IPC_*` routing env): reached `GetService("vi:m")`, `GetService("vi:s")`, `GetService("vi:u")`, `IApplicationDisplayService::GetManagerDisplayService`, `IApplicationDisplayService::GetSystemDisplayService`, `IApplicationDisplayService::GetRelayService`, `OpenDisplay("Default")`, `OpenLayer`, `GetDisplayVsyncEvent`, `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, `BQP_QUEUE`, and `SF_COMPOSE ... COMPOSING`; no `BreakLoopNullPc`, `svcBreak`, `SetTerminateResult`, `panic`, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, or `0x068B0000` marker. This was historical smoke evidence only; current policy no longer promotes this group implicitly.
+- Manual MK8D 45s isolated-XDG service-gated smoke for `nvdrv,nvdrv:a,nvdrv:s,nvdrv:t` (`/tmp/ruzu_mk8d_nvdrv_service_info_smoke.log`, `RUST_LOG=info`, `RUZU_SERVER_THREAD_IPC_SERVICE=nvdrv,nvdrv:a,nvdrv:s,nvdrv:t`): reached `GetService("nvdrv")`, `NVDRV_OPEN`, `NVDRV_IOCTL`, `nvmap::IocAlloc`, `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, `BQP_QUEUE`, and `SF_COMPOSE ... COMPOSING`; no fatal IPC/kernel/NV markers. This proves the explicit route can process MK8D's early nvdrv traffic, not that it is safe as a default.
+- Manual MK8D 45s isolated-XDG default smokes with temporary `nvdrv*` default routing (`/tmp/ruzu_mk8d_nvdrv_default_info_smoke.log` and `/tmp/ruzu_mk8d_nvdrv_default2_info_smoke.log`, `RUST_LOG=info`, no `RUZU_SERVER_THREAD_IPC_*` routing env): both reached audio startup, `NotifyRunning`, and `BQP_QUEUE` with no fatal markers, but emitted no `SF_COMPOSE ... COMPOSING`. `nvdrv*` remains excluded from the default routing set until the presentation regression is understood.
+- Manual MK8D 45s isolated-XDG default smoke after removing service-filter-triggered global sleep (`/tmp/ruzu_mk8d_default_after_sleep_gate_info_smoke.log`, `RUST_LOG=info`, no `RUZU_SERVER_THREAD_IPC_*` routing env): reached `GetService("apm")`, `GetService("set")`, `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, `BQP_QUEUE`, and `SF_COMPOSE ... COMPOSING`; no fatal markers. This confirms the sleep-gate change did not regress the current default set.
+- Manual MK8D 45s isolated-XDG service-gated smoke for `apm,apm:am,apm:sys` after removing service-filter-triggered global sleep (`/tmp/ruzu_mk8d_apm_service_nosleep_info_smoke.log`, `RUST_LOG=info`, `RUZU_SERVER_THREAD_IPC_SERVICE=apm,apm:am,apm:sys`): reached `GetService("apm")`, `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, and `BQP_QUEUE` with no fatal markers. A follow-up dense SurfaceFlinger run (`/tmp/ruzu_mk8d_apm_dense_sf.log`, `RUZU_TRACE_SF_COMPOSE_DENSE=1`) showed repeated `display_id=0 layers=1` composition on the same `SurfaceFlinger` instance; the earlier absence of sampled `SF_COMPOSE ... COMPOSING` lines was not a proven presentation regression.
+- Manual MK8D 45s isolated-XDG service-gated smoke for `set,set:cal,set:fd,set:sys` after removing service-filter-triggered global sleep (`/tmp/ruzu_mk8d_set_service_nosleep_info_smoke.log`, `RUST_LOG=info`, `RUZU_SERVER_THREAD_IPC_SERVICE=set,set:cal,set:fd,set:sys`): reached `GetService("set")`, `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, and `BQP_QUEUE` with no fatal markers. The sampled `SF_COMPOSE ... COMPOSING` marker is insufficient as a verdict because display iteration order can make `display_id=0` miss the sparse log condition.
+- Manual MK8D 45s isolated-XDG temporary default-promotion smoke for APM and Set groups (`/tmp/ruzu_mk8d_apm_set_default_info_smoke.log`, `RUST_LOG=info`, no `RUZU_SERVER_THREAD_IPC_*` routing env): reached `GetService("apm")`, `GetService("set")`, `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, `BQP_QUEUE`, and `SF_COMPOSE` activity; no `BreakLoopNullPc`, `svcBreak`, `SetTerminateResult`, `panic`, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, `0x068B0000`, `NvServices is not initialized`, `Could not find DeviceFD`, or `Trying to open unknown device` marker. This was historical smoke evidence only; current policy no longer promotes these groups implicitly.
+- Manual MK8D 45s isolated-XDG service-gated smoke for `lm,aoc:u,pctl:a,prepo:a,friend:a` (`/tmp/ruzu_mk8d_simple_services_info_smoke.log`, `RUST_LOG=info`, `RUZU_SERVER_THREAD_IPC_SERVICE=lm,aoc:u,pctl:a,prepo:a,friend:a`): reached `GetService("lm")`, `GetService("aoc:u")`, `GetService("pctl:a")`, `GetService("prepo:a")`, `GetService("friend:a")`, `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, `BQP_QUEUE`, and `SF_COMPOSE ... COMPOSING`; no fatal IPC/kernel/NV marker. This validates the exercised MK8D entry points for the newly promoted service groups, not every command on the non-exercised sibling service names.
+- Manual MK8D 45s isolated-XDG temporary default-promotion smoke for LM, AOC, PCTL, PlayReport, and Friend groups (`/tmp/ruzu_mk8d_simple_default_info_smoke.log`, `RUST_LOG=info`, no `RUZU_SERVER_THREAD_IPC_*` routing env): reached `GetService("lm")`, `GetService("aoc:u")`, `GetService("pctl:a")`, `GetService("prepo:a")`, `GetService("friend:a")`, `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, `BQP_QUEUE=19`, and `SF_COMPOSE=40`; no `BreakLoopNullPc`, `svcBreak`, `SetTerminateResult`, `panic`, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, `0x068B0000`, `NvServices is not initialized`, `Could not find DeviceFD`, or `Trying to open unknown device` marker. This was historical smoke evidence only; current policy no longer promotes these groups implicitly.
+- Manual MK8D 45s isolated-XDG service-gated smoke for `time:u,time:a,time:s,time:su` (`/tmp/ruzu_mk8d_time_service_info_smoke.log`, `RUST_LOG=info`): reached `GetService("time:u")`, `SF_COMPOSE ... COMPOSING`, `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, and `BQP_QUEUE`; no fatal IPC/kernel/NV marker. This validates MK8D's exercised Time entry point only; sibling Time names are included because upstream and ruzu register them through `ServerManager` owners.
+- Manual MK8D 45s isolated-XDG temporary default-promotion smoke for Time services (`/tmp/ruzu_mk8d_time_default_info_smoke.log`, `RUST_LOG=info`, no `RUZU_SERVER_THREAD_IPC_*` routing env): reached `GetService("time:u")`, `SF_COMPOSE ... COMPOSING`, `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, and `BQP_QUEUE`; no `BreakLoopNullPc`, `svcBreak`, `SetTerminateResult`, `panic`, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, `0x068B0000`, `NvServices is not initialized`, `Could not find DeviceFD`, or `Trying to open unknown device` marker. This was historical smoke evidence only; current policy no longer promotes these services implicitly.
+- Manual MK8D 45s isolated-XDG service-gated smoke for `mii:e,mii:u,miiimg` (`/tmp/ruzu_mk8d_mii_service_info_smoke.log`, `RUST_LOG=info`): reached `GetService("mii:e")`, `SF_COMPOSE ... COMPOSING`, `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, and `BQP_QUEUE`; no fatal IPC/kernel/NV marker. This validates MK8D's exercised Mii entry point only; sibling Mii names are included because upstream and ruzu register them through the same Mii `ServerManager`.
+- Manual MK8D 45s isolated-XDG default smoke with temporary Mii default routing (`/tmp/ruzu_mk8d_mii_default_info_smoke.log`, `RUST_LOG=info`, no `RUZU_SERVER_THREAD_IPC_*` routing env): reached `GetService("mii:e")`, `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, and `BQP_QUEUE`, but emitted only sampled `SF_COMPOSE ... NO_LAYERS` lines and no `SF_COMPOSE ... COMPOSING`. `mii:*` remains excluded from the default routing set until the presentation regression is understood.
+- Manual MK8D cold-boot A/B after broader implicit default promotion (`/tmp/ruzu_mk8d_ipc_host_policy_20260608_125116.log` vs `/tmp/ruzu_mk8d_ipc_inline_ab_20260608_125314.log`): the promoted-default run stalled before `NotifyRunning` with 31 `QueryPointerBufferSize` markers and no fatal marker, while `RUZU_INLINE_IPC=1` reached `NotifyRunning`. This is why `ServerManager::default_host_thread_service_matches_from_flags(...)` now returns false for all services until they are revalidated individually.
+- Manual MK8D 45s isolated-XDG default smoke after removing implicit promotions (`/tmp/ruzu_mk8d_ipc_no_default_host_20260608_130009.log`, `RUST_LOG=warn,core::hle::service::audio=info`): reached `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, and `NotifyRunning`; no `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, panic, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, `0x068B0000`, or `0x0000D401` marker. The run timed out by wrapper at 45s and warn-level logging did not prove BQP/SF or late rendering.
+- Manual MK8D 45s isolated-XDG default smoke after gating service-name resolution to explicit service filters (`/tmp/ruzu_mk8d_ipc_service_resolution_20260608_130753.log`, `RUST_LOG=warn,core::hle::service::audio=info`): reached `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, and `NotifyRunning`; no `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, panic, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, `0x068B0000`, or `0x0000D401` marker. The run timed out by wrapper at 45s and warn-level logging did not prove BQP/SF or late rendering.
+
+## 2026-06-08 — core/src/hle/service/server_manager.rs, core/src/hle/kernel/kernel.rs, core/src/core.rs, and core/src/hle/service/sm/sm.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.h, and /home/vricosti/Dev/emulators/zuyu/src/core/core.cpp
+
+### Intentional differences
+- The legacy Rust by-value runtime path `ServerManager::run_server(ServerManager)` / `KernelCore::run_server(ServerManager)` / `System::run_server(ServerManager)` was removed after all `core/src/hle/service` loops were migrated to `ServerManager::new_shared(...)` and `run_server_shared(...)`. Upstream passes a `std::unique_ptr<ServerManager>` whose pointee is stable before registration; Rust now requires the equivalent final `Arc<Mutex<ServerManager>>` owner before service registration instead of supporting a second post-registration owner-publication path.
+- The low-level `ServerManager::new(...)` constructor is private to `server_manager.rs`; external call sites, including tests in other modules, must use `new_shared(...)`. This prevents runtime code from registering services before the final shared owner is bound, matching upstream's stable `std::unique_ptr<ServerManager>` pointee before registration.
+- `ServerManager::register_named_service(...)` and `manage_named_port(...)` now publish service ownership only from an already-bound `self_reference`. This matches the migrated runtime setup where `new_shared(...)` binds the final owner before registration.
+- `ServerManager::destroy_session(...)` removes Rust stable deferred-session ids at the same ownership boundary where upstream erases the intrusive `Session*` entry. Upstream does not signal `m_wakeup_event` from `DestroySession`; Rust now keeps wakeup signaling owned by `LinkToDeferredList(...)` like upstream.
+- `SM::setup_sm_for_test(...)` no longer calls a deferred ownership publication helper; the test setup uses `new_shared(...)`, so `manage_named_port("sm:", ...)` has a live owner immediately.
+
+### Unintentional differences (to fix)
+- Rust still stores the final owner as `Arc<Mutex<ServerManager>>`; upstream owns through `std::unique_ptr<ServerManager>` and uses internal synchronization rather than a coarse outer mutex.
+
+### Missing items
+- Continue splitting the coarse Rust `Mutex<ServerManager>` into upstream-shaped internal synchronization before enabling host-thread `OnSessionEvent` as the only HLE IPC consumer.
+
+### Binary layout verification
+- N/A: service-manager ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `ServerManager::RunServer`, `RegisterNamedService`, and `ManageNamedPort`.
+- Re-read Rust `KernelCore::run_server_shared`, `System::run_server_shared`, and `SM::setup_sm_for_test`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p core`
+- `cargo test -p core destroy_session_removes_matching_deferred_id -- --nocapture --test-threads=1`
+- `cargo test -p core server_manager::tests:: -- --nocapture --test-threads=1`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 45s isolated-XDG smoke from the earlier `DestroySession` cleanup pass (`/tmp/ruzu_mk8d_destroy_session_wakeup_retry_20260608_131705.log`, `RUST_LOG=warn,core::hle::service::audio=info`): reached `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, and `NotifyRunning`; no `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, panic, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, `0x068B0000`, or `0x0000D401` marker. A preceding 45s retry reached audio start but did not log `NotifyRunning`, so this remains historical smoke-level no-obvious-regression evidence, not a full progression verdict.
+- Manual MK8D isolated-XDG smoke after removing the by-value server-manager path (`/tmp/ruzu_mk8d_ipc_host_thread_smoke.log`): reached `NotifyRunning`; no `BreakLoopNullPc`, `svcBreak`, `SetTerminateResult`, `panic`, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, or `0x068B0000` marker. The shell wrapper used a reserved zsh variable after the child process, so this is log-based early IPC smoke evidence, not a full runtime progression result.
+
+## 2026-06-08 — core/src/hle/service/services.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/{jit,ldr,fatal,psc,lm,mig,mm,mnpp,ncm,ngc,nim,npns,omm,ssl}/*.cpp
+
+### Intentional differences
+- `services.rs` now delegates the audited service `LoopProcess` entries to their matching Rust service modules instead of owning their `RegisterNamedService(...)` calls directly. This matches upstream file ownership more closely while preserving the existing Rust bootstrap dispatcher.
+- Service modules that still expose generic placeholder services use the shared Rust `register_stub_services(...)` helper rather than duplicating placeholder factory code. Upstream has real service classes instead of this helper; the helper is a temporary Rust migration adapter, not final service behavior.
+- `PSC::loop_process(...)` receives raw `DeviceMemory` / `KMemoryManager` owner pointers from the existing Rust service bootstrap so the `time:m` factory can keep constructing the shared `TimeServiceManager`. Upstream constructs `Time::TimeManager` and `Time::ServiceManager` in `psc.cpp` with direct access to `server_manager.get()`.
+- `OMM::loop_process(...)` now registers concrete `IPolicyManagerSystem`, `IOperationModeManager`, and `IPowerStateInterface` services from their matching Rust module files, with the same service names and command tables as upstream `policy_manager_system.cpp`, `operation_mode_manager.cpp`, and `power_state_interface.cpp`.
+- `SSL::loop_process(...)` now registers a concrete `ISslService` instead of `GenericStubService("ssl")`. `ISslService` and `ISslContext` keep their upstream service names, command ids, handler ownership in `ssl.rs`, and `CreateContext` now returns an `ISslContext` IPC interface through `ResponseBuilder::push_ipc_interface(...)`, matching upstream `PushIpcInterface<ISslContext>`.
+
+### Unintentional differences (to fix)
+- Several service implementations still use generic stubs compared with upstream: PSC now registers the upstream service names, but `psc:c`, `psc:m`, `ovln:rcv`, `ovln:snd`, `time:su`, and `time:al` still do not all instantiate their upstream service classes. Other modules still using `register_stub_services(...)` need per-file handler audits against their upstream service classes.
+- `SSL::ISslContext::CreateConnection` and the full `ISslConnection` command table are not yet ported. Upstream creates an `SSLConnectionBackend`, returns `ISslConnection`, and implements socket/backend-backed `SetSocketDescriptor`, `SetHostName`, `DoHandshake`, `Read`, `Write`, `Pending`, and `SetOption`; ruzu still leaves `CreateConnection` unimplemented in the `ISslContext` handler table.
+- `SSL::ISslService::GetCertificates` and `GetCertificateBufSize` are still not wired to Rust `cert_store.rs`; upstream routes both through `CertStore`.
+
+### Missing items
+- Port the missing non-stub service registrations and handlers listed above against their upstream files.
+- Port `SSL::ISslConnection` and wire `SSL::ISslContext::CreateConnection`.
+- Wire `SSL::ISslService::GetCertificates` and `GetCertificateBufSize` through the Rust certificate store.
+
+### Binary layout verification
+- PASS: `SSL::CreateContextParameters` is `repr(C)` and size-checked at 0x10, matching upstream `ISslService::CreateContext::Parameters`; `SSL::ContextOptionParameters` is `repr(C)` and size-checked at 0x8, matching upstream `ISslContext::SetOption::Parameters`.
+
+### Tests
+- Re-read upstream `LoopProcess` implementations for JIT, LDR, Fatal, PSC, LM, MIG, MM, MNPP, NCM, NGC, NIM, NPNS, OMM, and SSL.
+- Re-read upstream `SSL::ISslService`, `SSL::ISslContext`, `SSL::ISslConnection`, `SslVersion`, `SslContextSharedData`, `CreateContext::Parameters`, and `SetOption::Parameters`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo test -p core "hle::service::ssl" -- --nocapture`
+- `cargo check -p core`
+
+## 2026-06-08 — core/src/hle/service/acc/acc.rs, core/src/hle/service/nifm/nifm.rs, and core/src/hle/service/sockets/sockets.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/acc/acc.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nifm/nifm.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/sockets/sockets.cpp
+
+### Intentional differences
+- `Account::loop_process(...)`, `NIFM::loop_process(...)`, and `Sockets::loop_process(...)` now construct `ServerManager` through `ServerManager::new_shared(...)` before named-service registration and enter the loop through `ServerManager::run_server_shared(...)`. This preserves the existing Rust factories/stubs while matching upstream's stable `std::unique_ptr<ServerManager>` before `RegisterNamedService(...)` ownership shape.
+- Registrations are performed under short `Mutex<ServerManager>` scopes because Rust stores the final manager in an `Arc<Mutex<_>>`; upstream has direct unique-pointer ownership and therefore no equivalent lock.
+- `Sockets::loop_process(...)` keeps the existing Rust-only `SERVICES_INIT_DONE` gate and `start_additional_host_threads("bsdsocket", 2)` hook in the same relative position after registrations and before entering the server loop. Upstream has no equivalent gate in `Sockets::LoopProcess`; this slice preserves current Rust runtime ordering while changing only final-manager ownership.
+
+### Unintentional differences (to fix)
+- This slice only changes manager ownership timing. Existing service implementation/stub gaps in Account, NIFM, and Sockets remain unchanged.
+- `Sockets::loop_process(...)` still carries Rust-only host-thread timing logic that upstream does not have.
+
+### Missing items
+- Audit the `Sockets::loop_process(...)` bsdsocket host-thread gate once the broader `ServerManager::StartAdditionalHostThreads` path is upstream-shaped enough to remove local ordering workarounds.
+
+### Binary layout verification
+- N/A: service-manager ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `Account::LoopProcess`, `NIFM::LoopProcess`, and `Sockets::LoopProcess`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p core`
+
+## 2026-06-08 — core/src/hle/service/ldn/ldn.rs, core/src/hle/service/ldn/monitor_service.rs, core/src/hle/service/ldn/sf_monitor_service.rs, core/src/hle/service/ldn/sf_service.rs, core/src/hle/service/ldn/sf_service_monitor.rs, core/src/hle/service/ldn/system_local_communication_service.rs, core/src/hle/service/ldn/user_local_communication_service.rs, and core/src/hle/service/ro/ro.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ldn/ldn.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ldn/monitor_service.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ldn/sf_monitor_service.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ldn/sf_service.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ldn/sf_service_monitor.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ldn/system_local_communication_service.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ldn/user_local_communication_service.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ro/ro.cpp
+
+### Intentional differences
+- `LDN::loop_process(...)` and `RO::loop_process(...)` now construct `ServerManager` through `ServerManager::new_shared(...)` before named-service registration and enter the loop through `ServerManager::run_server_shared(...)`. This preserves upstream's stable `std::unique_ptr<ServerManager>` before `RegisterNamedService(...)` ownership shape.
+- Registrations are performed under short `Mutex<ServerManager>` scopes because Rust stores the final manager in an `Arc<Mutex<_>>`; upstream has direct unique-pointer ownership and therefore no equivalent lock.
+- `LDN::loop_process(...)` now registers concrete Rust service creators for `ldn:m`, `ldn:s`, `ldn:u`, `lp2p:app`, `lp2p:sys`, and `lp2p:m` instead of generic placeholders. The creator command tables and returned child service types match upstream `ldn.cpp`.
+- `IMonitorService`, `ISystemLocalCommunicationService`, `ISfService`, `ISfMonitorService`, and `ISfServiceMonitor` now own their upstream command tables in their matching Rust files. Stubbed/null handlers intentionally remain stubbed/null where upstream also logs stubbed behavior or registers `nullptr`.
+- `IUserLocalCommunicationService` owns the upstream command ids and service name in `user_local_communication_service.rs`, but its current IPC table keeps command callbacks as `None` until the LAN discovery and event/copy-handle command bodies are wired through CMIF.
+
+### Unintentional differences (to fix)
+- `IUserLocalCommunicationService` still does not route its upstream command bodies through IPC. Upstream implements `GetState`, `GetNetworkInfo`, `GetIpv4Address`, state-change event attachment, scan, access-point/station lifecycle, network create/destroy, advertise/filter commands, and initialization/finalization against `LANDiscovery`, `RoomNetwork`, and `ServiceContext`.
+- Rust `IUserLocalCommunicationService` does not yet own upstream's `ServiceContext`, `RoomNetwork`, `state_change_event`, or packet callback lifecycle. It only keeps the reduced `LANDiscovery` owner already present in the Rust port.
+- RO is still only covered by the named-service registration ownership slice here; its service-internal parity is not audited in this entry.
+
+### Missing items
+- Port `IUserLocalCommunicationService` IPC handlers and lifecycle against upstream `user_local_communication_service.cpp`.
+- Audit RO service-internal command ownership and behavior in a dedicated RO entry before treating RO as complete.
+
+### Binary layout verification
+- N/A for the LDN creator/service-table slice. Child service payload structs such as `GroupInfo`, `NetworkInfo`, and `CreateNetworkConfig` are not newly changed by this entry.
+
+### Tests
+- Re-read upstream `LDN::LoopProcess` and `RO::LoopProcess`.
+- Re-read upstream LDN child service files: `monitor_service.cpp`, `system_local_communication_service.cpp`, `user_local_communication_service.cpp`, `sf_service.cpp`, `sf_monitor_service.cpp`, and `sf_service_monitor.cpp`.
+- `cargo test -p core "hle::service::ldn" -- --nocapture`
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p core`
+
+## 2026-06-08 — core/src/hle/service/nim/nim.rs, core/src/hle/service/btm/btm.rs, core/src/hle/service/fatal/fatal.rs, and core/src/hle/service/friend/friend_interface.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nim/nim.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/btm/btm.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/fatal/fatal.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/friend/friend.cpp
+
+### Intentional differences
+- `NIM::loop_process(...)`, `BTM::loop_process(...)`, `Fatal::loop_process(...)`, and `Friend::loop_process(...)` now construct `ServerManager` through `ServerManager::new_shared(...)` before named-service registration and enter the loop through `ServerManager::run_server_shared(...)`. This preserves the existing Rust factories/stubs while matching upstream's stable `std::unique_ptr<ServerManager>` before `RegisterNamedService(...)` ownership shape.
+- Registrations are performed under short `Mutex<ServerManager>` scopes because Rust stores the final manager in an `Arc<Mutex<_>>`; upstream has direct unique-pointer ownership and therefore no equivalent lock.
+
+### Unintentional differences (to fix)
+- This slice only changes manager ownership timing. Existing service implementation/stub gaps in NIM, BTM, Fatal, and Friend remain unchanged.
+
+### Missing items
+- None identified for the audited NIM named-service registration slice after re-reading upstream `NIM::LoopProcess`.
+
+### Binary layout verification
+- N/A: service-manager ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `NIM::LoopProcess`, `BTM::LoopProcess`, `Fatal::LoopProcess`, and `Friend::LoopProcess`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p core`
+
+## 2026-06-08 — core/src/hle/service/eupld/eupld.rs and core/src/hle/service/lbl/lbl.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/eupld/eupld.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/lbl/lbl.cpp
+
+### Intentional differences
+- `EUPLD::loop_process(...)` and `LBL::loop_process(...)` now construct `ServerManager` through `ServerManager::new_shared(...)` before named-service registration and enter the loop through `ServerManager::run_server_shared(...)`. This preserves the existing Rust factories/stubs while matching upstream's stable `std::unique_ptr<ServerManager>` before `RegisterNamedService(...)` ownership shape.
+- `ErrorUploadContext` and `ErrorUploadRequest` now instantiate concrete Rust `ServiceFramework` services with the same command ids, service names, and `None` handler callbacks as upstream `eupld.cpp`, instead of using `GenericStubService`.
+- Registrations are performed under short `Mutex<ServerManager>` scopes because Rust stores the final manager in an `Arc<Mutex<_>>`; upstream has direct unique-pointer ownership and therefore no equivalent lock.
+
+### Unintentional differences (to fix)
+- Existing service implementation/stub gaps in LBL remain unchanged.
+
+### Missing items
+
+### Binary layout verification
+- N/A: service-manager ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `EUPLD::LoopProcess` and `LBL::LoopProcess`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p core`
+
+## 2026-06-08 — core/src/hle/service/es/es.rs, core/src/hle/service/nfc/nfc.rs, core/src/hle/service/nfp/nfp.rs, and core/src/hle/service/caps/caps.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/es/es.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nfc/nfc.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nfp/nfp.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/caps/caps.cpp
+
+### Intentional differences
+- `ETicket::loop_process(...)`, `NFC::loop_process(...)`, `NFP::loop_process(...)`, and `Capture::loop_process(...)` now construct `ServerManager` through `ServerManager::new_shared(...)` before named-service registration and enter the loop through `ServerManager::run_server_shared(...)`. This preserves the existing Rust factories/stubs while matching upstream's stable `std::unique_ptr<ServerManager>` before `RegisterNamedService(...)` ownership shape.
+- Registrations are performed under short `Mutex<ServerManager>` scopes because Rust stores the final manager in an `Arc<Mutex<_>>`; upstream has direct unique-pointer ownership and therefore no equivalent lock.
+
+### Unintentional differences (to fix)
+- This slice only changes manager ownership timing. Existing service implementation/stub gaps in ES, NFC, NFP, and Capture remain unchanged.
+
+### Missing items
+
+### Binary layout verification
+- N/A: service-manager ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `ETicket::LoopProcess`, `NFC::LoopProcess`, `NFP::LoopProcess`, and `Capture::LoopProcess`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p core`
+
+## 2026-06-08 — core/src/hle/service/pcv/pcv.rs, core/src/hle/service/usb/usb.rs, core/src/hle/service/ngc/ngc.rs, and core/src/hle/service/btdrv/btdrv.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/pcv/pcv.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/usb/usb.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ngc/ngc.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/btdrv/btdrv.cpp
+
+### Intentional differences
+- `PCV::loop_process(...)`, `USB::loop_process(...)`, `NGC::loop_process(...)`, and `BtDrv::loop_process(...)` now construct `ServerManager` through `ServerManager::new_shared(...)` before named-service registration and enter the loop through `ServerManager::run_server_shared(...)`. This preserves the existing Rust factories/stubs while matching upstream's stable `std::unique_ptr<ServerManager>` before `RegisterNamedService(...)` ownership shape.
+- Registrations are performed under short `Mutex<ServerManager>` scopes because Rust stores the final manager in an `Arc<Mutex<_>>`; upstream has direct unique-pointer ownership and therefore no equivalent lock.
+- `IBluetoothDriver` and `IBluetoothUser` now instantiate concrete Rust `ServiceFramework` services with the same service names and command tables as upstream `btdrv.cpp`. `IBluetoothDriver::EnableRadio` returns success, and `IBluetoothUser::RegisterBleEvent` returns a copied readable-event handle through the Rust `Event::copy_handle(...)` path, matching upstream's `OutCopyHandle<KReadableEvent>` response shape.
+- `NgctServiceImpl` and `NgcServiceImpl` now instantiate concrete Rust `ServiceFramework` services with the same service names and command tables as upstream `ngc.cpp`. `Match`, `Filter`, `GetContentVersion`, `Check`, `Mask`, and `Reload` are routed through IPC handlers that preserve upstream's no-censoring stub behavior.
+- `PCV`, `CLKRST`, `IClkrstSession`, and `CLKRST_A` now instantiate concrete Rust `ServiceFramework` services with the same service names and command tables as upstream `pcv.cpp`. `CLKRST::OpenSession` returns an `IClkrstSession` IPC interface, and `IClkrstSession::SetClockRate` / `GetClockRate` preserve upstream's per-session stub clock-rate storage.
+- USB now instantiates concrete Rust `ServiceFramework` services for the same service classes and named-service registrations as upstream `usb.cpp`: `IDsRootSession`, `IClientRootSession`, `IPdManager`, `IPdCradleManager`, `IPmMainService`, plus the nested `IDsInterface`, `IClientEpSession`, `IClientIfSession`, `IPdSession`, and `IPdCradleSession` classes. `IPdManager::OpenSession` and `IPdCradleManager::OpenCradleSession` return IPC interfaces like upstream.
+- USB uses a local macro only for the repeated mechanical `SessionRequestHandler`/`ServiceFramework` trait implementations. Handler tables, service names, and class ownership remain in `usb.rs`, the upstream counterpart of `usb.cpp`.
+
+### Unintentional differences (to fix)
+- None identified for the audited PCV, USB, NGC, and BtDrv service implementation slices after re-reading their upstream files.
+
+### Missing items
+- None identified for the audited PCV, USB, NGC, and BtDrv service implementation slices after re-reading upstream `pcv.cpp`, `usb.cpp`, `ngc.cpp`, and `btdrv.cpp`.
+
+### Binary layout verification
+- PASS: `ProfanityFilterOption` remains 0x20 bytes and NGC `Check`/`Mask` parse the upstream `{ u32 flags; ProfanityFilterOption option; }` raw input shape.
+- PASS: `DeviceCode` values now mirror upstream `pcv.h`; `CLKRST::OpenSession` parses the upstream raw `{ u32 device_code; u32 unknown_input; }` shape.
+
+### Tests
+- Re-read upstream `PCV::LoopProcess`, `USB::LoopProcess`, `NGC::LoopProcess`, and `BtDrv::LoopProcess`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p core`
+
+## 2026-06-08 — core/src/hle/service/jit/jit.rs, core/src/hle/service/prepo/prepo.rs, and core/src/hle/service/npns/npns.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/jit/jit.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/prepo/prepo.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/npns/npns.cpp
+
+### Intentional differences
+- `JIT::loop_process(...)`, `PlayReport::loop_process(...)`, and `NPNS::loop_process(...)` now construct `ServerManager` through `ServerManager::new_shared(...)` before named-service registration and enter the loop through `ServerManager::run_server_shared(...)`. This preserves the existing Rust factories/stubs while matching upstream's stable `std::unique_ptr<ServerManager>` before `RegisterNamedService(...)` ownership shape.
+- `INpnsSystem` and `INpnsUser` now instantiate concrete Rust `ServiceFramework` services with the same named-service registrations, service names, and command tables as upstream `npns.cpp`. `INpnsSystem::ListenTo` returns success, and `INpnsSystem::GetReceiveEvent` returns the readable receive event through the Rust copy-handle path.
+- Registrations are performed under short `Mutex<ServerManager>` scopes because Rust stores the final manager in an `Arc<Mutex<_>>`; upstream has direct unique-pointer ownership and therefore no equivalent lock.
+
+### Unintentional differences (to fix)
+- This slice only changes manager ownership timing for JIT and PREPO. Existing service implementation/stub gaps in JIT and PREPO remain unchanged.
+
+### Missing items
+
+### Binary layout verification
+- N/A: service-manager ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `JIT::LoopProcess`, `PlayReport::LoopProcess`, and `NPNS::LoopProcess`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p core`
+
+## 2026-06-08 — core/src/hle/service/mig/mig.rs, core/src/hle/service/mnpp/mnpp_app.rs, and core/src/hle/service/ncm/ncm.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mig/mig.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mnpp/mnpp_app.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ncm/ncm.cpp
+
+### Intentional differences
+- `Migration::loop_process(...)`, `MNPP::loop_process(...)`, and `NCM::loop_process(...)` now construct `ServerManager` through `ServerManager::new_shared(...)` before named-service registration and enter the loop through `ServerManager::run_server_shared(...)`. This preserves the existing Rust factories/stubs while matching upstream's stable `std::unique_ptr<ServerManager>` before `RegisterNamedService(...)` ownership shape.
+- `MNPP_APP` now registers concrete `unknown0` and `unknown1` handlers that log and return `ResultSuccess`, matching upstream's stubbed handler behavior.
+- `MIG_USR` now instantiates a concrete Rust `ServiceFramework` service with the same named-service registration, service name, command ids, and `None` handlers as upstream `mig.cpp`.
+- `LR`, `NCM`, `ILocationResolver`, `IRegisteredLocationResolver`, and `IAddOnContentLocationResolver` now instantiate concrete Rust `ServiceFramework` services with the same service names and command tables as upstream `ncm.cpp`.
+- Registrations are performed under short `Mutex<ServerManager>` scopes because Rust stores the final manager in an `Arc<Mutex<_>>`; upstream has direct unique-pointer ownership and therefore no equivalent lock.
+
+### Unintentional differences (to fix)
+- None identified for the audited MIG, MNPP_APP, and NCM service implementation slices after re-reading upstream `mig.cpp`, `mnpp_app.cpp`, and `ncm.cpp`.
+
+### Missing items
+- None identified for the audited MIG, MNPP_APP, and NCM service implementation slices after re-reading upstream `mig.cpp`, `mnpp_app.cpp`, and `ncm.cpp`.
+
+### Binary layout verification
+- N/A: service-manager ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `Migration::LoopProcess`, `MNPP::LoopProcess`, and `NCM::LoopProcess`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p core`
+
+## 2026-06-08 — core/src/hle/service/bpc/bpc.rs, core/src/hle/service/grc/grc.rs, and core/src/hle/service/mm/mm_u.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/bpc/bpc.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/grc/grc.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mm/mm_u.cpp
+
+### Intentional differences
+- `BPC::loop_process(...)`, `GRC::loop_process(...)`, and `MM::loop_process(...)` now construct `ServerManager` through `ServerManager::new_shared(...)` before named-service registration and enter the loop through `ServerManager::run_server_shared(...)`. This preserves the existing Rust factories/stubs while matching upstream's stable `std::unique_ptr<ServerManager>` before `RegisterNamedService(...)` ownership shape.
+- `BPC` and `BPC_R` now instantiate concrete Rust `ServiceFramework` services with the same command ids, service names, and `None` handler callbacks as upstream `bpc.cpp`, instead of using `GenericStubService`.
+- Registrations are performed under short `Mutex<ServerManager>` scopes because Rust stores the final manager in an `Arc<Mutex<_>>`; upstream has direct unique-pointer ownership and therefore no equivalent lock.
+
+### Unintentional differences (to fix)
+- Existing service stub/functionality gaps in GRC and MM remain unchanged.
+
+### Missing items
+
+### Binary layout verification
+- N/A: service-manager ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `BPC::LoopProcess`, `GRC::LoopProcess`, and `MM::LoopProcess`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p core`
+
+## 2026-06-08 — core/src/hle/service/bcat/bcat.rs, core/src/hle/service/olsc/olsc.rs, core/src/hle/service/erpt/erpt.rs, core/src/hle/service/fgm/fgm.rs, core/src/hle/service/aoc/addon_content_manager.rs, and core/src/hle/service/pcie/pcie.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/bcat/bcat.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/olsc/olsc.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/erpt/erpt.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/fgm/fgm.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/aoc/addon_content_manager.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/pcie/pcie.cpp
+
+### Intentional differences
+- `BCAT::loop_process(...)`, `OLSC::loop_process(...)`, `ERPT::loop_process(...)`, `FGM::loop_process(...)`, `AOC::loop_process(...)`, and `PCIe::loop_process(...)` now construct `ServerManager` through `ServerManager::new_shared(...)` before named-service registration and enter the loop through `ServerManager::run_server_shared(...)`. This preserves the existing Rust factories/stubs while matching upstream's stable `std::unique_ptr<ServerManager>` before `RegisterNamedService(...)` ownership shape.
+- `ErrorReportContext` and `ErrorReportSession` now instantiate concrete Rust `ServiceFramework` services. `ErrorReportContext` wires the same success-returning stub handlers as upstream (`SubmitContext`, `CreateReportV0`, `CreateReportV1`, `CreateReport`) and keeps the remaining command entries as `None`, matching upstream `erpt.cpp`.
+- `FGM`, `FGM_DBG`, and child `IRequest` now instantiate concrete Rust `ServiceFramework` services. `FGM::Initialize` returns an `IRequest` IPC interface like upstream, while `IRequest` and `FGM_DBG` keep their upstream `None` command entries.
+- `PCIe` and child `ISession` now instantiate concrete Rust `ServiceFramework` services with the same service names and command tables as upstream `pcie.cpp`.
+- `OLSC::loop_process(...)` now registers concrete `IOlscServiceForApplication` and `IOlscServiceForSystemService` services instead of generic placeholders, matching upstream `olsc.cpp` ownership. `IOlscServiceForApplication` now owns its upstream command table and success-returning stub handlers in `olsc_service_for_application.rs`.
+- Registrations are performed under short `Mutex<ServerManager>` scopes because Rust stores the final manager in an `Arc<Mutex<_>>`; upstream has direct unique-pointer ownership and therefore no equivalent lock.
+
+### Unintentional differences (to fix)
+- Existing service stub/functionality gaps in BCAT and AOC remain unchanged.
+- OLSC still has intentionally stubbed command bodies where upstream is also stubbed or returns placeholder values, but Rust `IOlscServiceForSystemService::CloneService` creates a new service instance instead of returning `shared_from_this()` because current Rust service objects do not own an `Arc<Self>` self-reference.
+
+### Missing items
+
+### Binary layout verification
+- N/A: service-manager ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `BCAT::LoopProcess`, `OLSC::LoopProcess`, `ERPT::LoopProcess`, `FGM::LoopProcess`, `AOC::LoopProcess`, and `PCIe::LoopProcess`.
+- Re-read upstream `OLSC::IOlscServiceForApplication` and `OLSC::IOlscServiceForSystemService` command tables.
+- `cargo check -p core`
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo test -p core "hle::service::olsc" -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 45s isolated-XDG default smoke after migrating `BCAT::LoopProcess`, `OLSC::LoopProcess`, `ERPT::LoopProcess`, `FGM::LoopProcess`, `AOC::LoopProcess`, and `PCIe::LoopProcess` to `ServerManager::new_shared(...)` (`/tmp/ruzu_mk8d_bcat_olsc_erpt_fgm_aoc_pcie_shared_1780901226.log`, `RUST_LOG=warn,core::hle::service::audio=info`): timed out by wrapper (`rc=124`) after reaching `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, and `NotifyRunning`, with no `receive_request_hle failed`, `missing_server_manager_owner`, `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, `PrefetchAbort`, panic, `IocAlloc`, or `0x068B0000` marker.
+
+## 2026-06-08 — core/src/hle/service/apm/apm.rs, core/src/hle/service/ldr/ldr.rs, core/src/hle/service/spl/spl.rs, core/src/hle/service/pctl/pctl.rs, core/src/hle/service/ptm/ptm.rs, and core/src/hle/service/pm/pm.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/apm/apm.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ldr/ldr.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/spl/spl_module.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/pctl/pctl.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ptm/ptm.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/pm/pm.cpp
+
+### Intentional differences
+- `APM::loop_process(...)`, `LDR::loop_process(...)`, `SPL::loop_process(...)`, `PCTL::loop_process(...)`, `PTM::loop_process(...)`, and `PM::loop_process(...)` now construct `ServerManager` through `ServerManager::new_shared(...)` before named-service registration and enter the server loop through `ServerManager::run_server_shared(...)`. This matches upstream's stable `std::unique_ptr<ServerManager>` setup before `RegisterNamedService(...)` while preserving the current Rust service factories/stubs for modules not audited in more detail here.
+- `LDR::DebugMonitor`, `LDR::ProcessManager`, and `LDR::Shell` now instantiate concrete Rust `ServiceFramework` services with the same command ids, service names, and `None` handler callbacks as upstream `ldr.cpp`, instead of using `GenericStubService`.
+- `PTM::loop_process(...)` now registers concrete `PSM` and `TS` service objects from their matching Rust module files instead of generic placeholders, matching upstream `ptm.cpp` ownership.
+- `PM::loop_process(...)` now registers concrete `BootMode`, `DebugMonitor`, `Info`, and `Shell` service objects with upstream command ids and service names. `DebugMonitor`, `Info`, and `Shell` query a kernel-owned process-list snapshot via `KernelCore::get_process_list()`, matching upstream `kernel.GetProcessList()` ownership instead of using per-service empty snapshots at runtime.
+- `KernelCore` now owns a Rust `process_list: Mutex<Vec<Arc<ProcessLock>>>`, plus `register_process(...)` and `get_process_list()`, as the Rust owner-backed counterpart to upstream `KernelCore::Impl::process_list`. Application and service processes register into it when their stable `Arc<ProcessLock>` owner is created.
+- Registrations are performed under short `Mutex<ServerManager>` scopes. Upstream has no mutex around `ServerManager` because the unique pointer is directly owned by the service loop; the short Rust scope is the ownership adapter for the final shared manager owner.
+
+### Unintentional differences (to fix)
+- This slice does not audit or change existing service implementation/stub parity inside APM, SPL, or PCTL. Their service names, factory implementations, and stubbed command behavior remain as previously documented elsewhere.
+- `PM::DebugMonitor::AtmosphereGetProcessInfo` still cannot push the upstream `KProcess` copy object in the success response because ruzu's PM path snapshots only process ids/program ids into `ProcessInfo`. The raw `ProgramLocation` and `OverrideStatus` payloads match upstream layout, and the default not-found path remains upstream-shaped.
+
+### Missing items
+
+### Binary layout verification
+- PASS: `PM::ProgramLocation` is `repr(C)`, zero-padded, and size-checked at 0x10; `PM::OverrideStatus` is `repr(C)` and size-checked at 0x10. No other guest-visible raw payload layout changed in this slice.
+
+### Tests
+- Re-read upstream `APM::LoopProcess`, `LDR::LoopProcess`, `SPL::LoopProcess`, `PCTL::LoopProcess`, `PTM::LoopProcess`, and `PM::LoopProcess`.
+- Re-read upstream `PM::BootMode`, `PM::DebugMonitor`, `PM::Info`, `PM::Shell`, `SearchProcessList`, `GetApplicationPidGeneric`, `ProgramLocation`, and `OverrideStatus`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo test -p core "hle::service::pm" -- --nocapture`
+- `cargo test -p core "hle::kernel::kernel::tests::process_list_registration_is_idempotent_and_queryable" -- --nocapture`
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 45s isolated-XDG default smoke after migrating `APM::LoopProcess`, `LDR::LoopProcess`, `SPL::LoopProcess`, `PCTL::LoopProcess`, `PTM::LoopProcess`, and `PM::LoopProcess` to `ServerManager::new_shared(...)` (`/tmp/ruzu_mk8d_apm_ldr_spl_pctl_ptm_pm_shared_1780900937.log`, `RUST_LOG=warn,core::hle::service::audio=info`): timed out by wrapper (`rc=124`) after reaching `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, and `NotifyRunning`, with no `receive_request_hle failed`, `missing_server_manager_owner`, `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, `PrefetchAbort`, panic, `IocAlloc`, or `0x068B0000` marker.
+
+## 2026-06-08 — core/src/core.rs, core/src/hle/kernel/kernel.rs, core/src/hle/service/server_manager.rs, core/src/hle/service/nvnflinger/nvnflinger.rs, core/src/hle/service/audio/audio.rs, core/src/hle/service/vi/vi.rs, core/src/hle/service/nvdrv/mod.rs, core/src/hle/service/sm/sm.rs, core/src/hle/service/am/am.rs, core/src/hle/service/filesystem/filesystem.rs, core/src/hle/service/hid/hid.rs, core/src/hle/service/ns/ns.rs, core/src/hle/service/set/settings.rs, core/src/hle/service/mii/mii.rs, and core/src/hle/service/glue/glue.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/core.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/kernel.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvnflinger/nvnflinger.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/vi/vi.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/nvdrv.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/sm/sm.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/am.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/filesystem.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hid/hid.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ns/ns.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/set/settings.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/glue/glue.cpp
+
+### Intentional differences
+- `ServerManager::new_shared(...)`, `ServerManager::run_server_shared(...)`, `System::run_server_shared(...)`, and `KernelCore::run_server_shared(...)` provide a Rust path where the final `Arc<Mutex<ServerManager>>` owner exists before service registration. Upstream reaches the same stable-pointee property by constructing `std::unique_ptr<ServerManager>` before `RegisterNamedService(...)` and moving it through `ServerManager::RunServer(...) -> System::RunServer(...) -> KernelCore::RunServer(...)`.
+- `Nvnflinger::loop_process(...)` now uses the shared-owner path before registering `"dispdrv"`, so `IHOSBinderDriver` service ownership is live during `RegisterNamedService(...)` instead of relying on the legacy pending-service-owner publication bridge.
+- `Audio::loop_process(...)`, `VI::loop_process(...)`, and `Nvidia::loop_process(...)` now use the same shared-owner path before registering `aud*` / `hwopus`, `vi:*`, `nvdrv*`, and `nvmemp` services. This preserves their existing Rust factories while moving the manager ownership boundary closer to upstream `std::make_unique<ServerManager>(system)` before registration.
+- `SM::loop_process(...)` and `AM::loop_process(...)` now use the shared-owner path before `ManageNamedPort("sm:")` / `RegisterNamedService("applet*")`. The Rust-only `setup_sm_for_test(...)` fixture helper also uses `new_shared(...)`, so test-created `sm:` ownership no longer exercises the legacy pending-owner bridge.
+- `FileSystem::register_services(...)`, `HID::loop_process(...)`, `NS::loop_process(...)`, `Set::loop_process(...)`, `Mii::loop_process(...)`, and `Glue::loop_process(...)` now register their named services through an already-bound shared manager, matching the upstream `std::make_unique<ServerManager>(system)` before `RegisterNamedService(...)` pattern for these MK8D-critical service groups.
+
+### Unintentional differences (to fix)
+
+### Missing items
+
+### Binary layout verification
+- N/A: service-manager ownership and host-thread routing only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `Nvnflinger::LoopProcess`, `Audio::LoopProcess`, `VI::LoopProcess`, `Nvidia::LoopProcess`, `SM::LoopProcess`, `AM::LoopProcess`, `FileSystem::LoopProcess`, `HID::LoopProcess`, `NS::LoopProcess`, `Set::LoopProcess`, `Mii::LoopProcess`, `Glue::LoopProcess`, `ServerManager::RunServer`, `System::RunServer`, and `KernelCore::RunServer`.
+- `cargo test -p core new_shared_binds_service_owner_before_registration -- --nocapture --test-threads=1`
+- `cargo test -p core sm::sm::tests:: -- --nocapture --test-threads=1`
+- `cargo check -p core`
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 45s isolated-XDG default smoke after migrating `Nvnflinger::LoopProcess` to `ServerManager::new_shared(...)` (`/tmp/ruzu_mk8d_nvnflinger_shared_owner_1780899595.log`, `RUST_LOG=warn,core::hle::service::audio=info`): timed out by wrapper (`rc=124`) after reaching `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, and `NotifyRunning`, with no `receive_request_hle failed`, `missing_server_manager_owner`, `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, `PrefetchAbort`, panic, `IocAlloc`, or `0x068B0000` marker.
+- Manual MK8D 45s isolated-XDG default smoke after also migrating `Audio::LoopProcess`, `VI::LoopProcess`, and `Nvidia::LoopProcess` to `ServerManager::new_shared(...)` (`/tmp/ruzu_mk8d_core_services_shared_owner_1780899896.log`, `RUST_LOG=warn,core::hle::service::audio=info`): timed out by wrapper (`rc=124`) after reaching `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, and `NotifyRunning`, with no `receive_request_hle failed`, `missing_server_manager_owner`, `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, `PrefetchAbort`, panic, `IocAlloc`, or `0x068B0000` marker.
+- Manual MK8D 45s isolated-XDG default smoke after also migrating `SM::LoopProcess` and `AM::LoopProcess` to `ServerManager::new_shared(...)` (`/tmp/ruzu_mk8d_sm_am_shared_owner_1780900309.log`, `RUST_LOG=warn,core::hle::service::audio=info`): timed out by wrapper (`rc=124`) after reaching `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, and `NotifyRunning`, with no `receive_request_hle failed`, `missing_server_manager_owner`, `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, `PrefetchAbort`, panic, `IocAlloc`, or `0x068B0000` marker.
+- Manual MK8D 45s isolated-XDG default smoke after also migrating `FileSystem::register_services`, `HID::LoopProcess`, `NS::LoopProcess`, `Set::LoopProcess`, `Mii::LoopProcess`, and `Glue::LoopProcess` to `ServerManager::new_shared(...)` (`/tmp/ruzu_mk8d_more_shared_owner_1780900653.log`, `RUST_LOG=warn,core::hle::service::audio=info`): timed out by wrapper (`rc=124`) after reaching `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, and `NotifyRunning`, with no `receive_request_hle failed`, `missing_server_manager_owner`, `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, `PrefetchAbort`, panic, `IocAlloc`, or `0x068B0000` marker.
+
+## 2026-06-08 — core/src/hle/service/nvdrv/mod.rs and core/src/hle/service/nvdrv/nvmemp.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/nvdrv.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/nvmemp.cpp
+
+### Intentional differences
+- Rust `Nvmemp` uses the existing `ServiceFramework` command-table path with `None` handlers for commands `0: Open` and `1: GetAruid`. Upstream registers the same two commands and both bodies are `UNIMPLEMENTED()`, so the Rust table preserves command ownership without adding non-upstream behavior.
+- `Nvidia::loop_process(...)` registers `"nvmemp"` through a factory closure because Rust service registration stores constructors. Upstream registers `std::make_shared<NVMEMP>(system)` directly; both are manager-owned named-service registrations in `Nvidia::LoopProcess`.
+
+### Unintentional differences (to fix)
+- `nvdrv`, `nvdrv:a`, `nvdrv:s`, and `nvdrv:t` still use the inline HLE fallback by default unless selected with `RUZU_SERVER_THREAD_IPC_SERVICE` or host-thread-all routing. Upstream always serves them through `Nvidia::LoopProcess`'s `ServerManager`.
+
+### Missing items
+- Promote `nvdrv*` to default host-thread routing only after the default-routing presentation regression is understood; service-gated MK8D smoke reached `SF_COMPOSE ... COMPOSING`, but temporary default promotion did not.
+- Implement real `NVMEMP::Open` / `NVMEMP::GetAruid` behavior if upstream grows behavior beyond the current `UNIMPLEMENTED()` handlers or if a title requires non-stub responses.
+
+### Binary layout verification
+- N/A: service registration and IPC command table only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `Nvidia::LoopProcess`, `NVMEMP::NVMEMP`, `NVMEMP::Open`, and `NVMEMP::GetAruid`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo test -p core default_host_thread_services_include_validated_mk8d_services -- --nocapture --test-threads=1`
+- `cargo test -p core default_host_thread_session_services_include_validated_mk8d_services -- --nocapture --test-threads=1`
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 45s isolated-XDG default smoke after registering `nvmemp` and keeping `nvdrv*` out of the default routing set (`/tmp/ruzu_mk8d_nvmemp_default_info_smoke.log`, `RUST_LOG=info`, no `RUZU_SERVER_THREAD_IPC_*` routing env): reached `GetService("nvdrv")`, `NVDRV_OPEN`, `NVDRV_IOCTL`, `nvmap::IocAlloc`, `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, `BQP_QUEUE`, and `SF_COMPOSE ... COMPOSING`; no `BreakLoopNullPc`, `svcBreak`, `SetTerminateResult`, `panic`, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, `0x068B0000`, `NvServices is not initialized`, `Could not find DeviceFD`, or `Trying to open unknown device` marker. MK8D did not request `nvmemp` in this smoke.
+
+## 2026-06-08 — core/src/hle/service/hle_ipc.rs, core/src/hle/service/am/applet.rs, core/src/hle/service/am/lifecycle_manager.rs, core/src/hle/service/am/service/common_state_getter.rs, core/src/hle/service/am/service/self_controller.rs, core/src/hle/service/am/service/application_functions.rs, core/src/hle/service/am/service/lock_accessor.rs, core/src/hle/service/am/service/home_menu_functions.rs, core/src/hle/service/am/service/global_state_controller.rs, and core/src/hle/service/am/service/cradle_firmware_updater.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ipc_helpers.h, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/applet.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/applet.h, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/lifecycle_manager.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/lifecycle_manager.h, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/common_state_getter.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/self_controller.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/application_functions.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/lock_accessor.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/home_menu_functions.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/global_state_controller.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/cradle_firmware_updater.cpp
+
+### Intentional differences
+- `LifecycleManager::{ensure_system_event_object_id,ensure_operation_mode_changed_system_event_object_id}(...)` expose the service events' readable object ids for IPC response serialization. Upstream `LifecycleManager::{GetSystemEvent,GetOperationModeChangedSystemEvent}()` return `Event&`; `ICommonStateGetter::GetEventHandle` and `ICommonStateGetter::GetDefaultDisplayResolutionChangeEvent` assign those events' `GetHandle()` results into `OutCopyHandle<Kernel::KReadableEvent>`.
+- `ICommonStateGetter::get_event_handle_handler(...)` now emits the lifecycle system event with `ResponseBuilder::push_copy_object_id(...)`, deferring final copy-handle allocation to IPC write-back instead of pre-allocating a process handle.
+- `ICommonStateGetter::get_default_display_resolution_change_event_handler(...)` now emits the operation-mode-changed event with `ResponseBuilder::push_copy_object_id(...)`, matching upstream's object-owned `OutCopyHandle` path.
+- `HLERequestContext::create_readable_event_object(...)` creates and registers a `KReadableEvent` object without pre-allocating a process handle. `Applet::ensure_sleep_lock_event_object_id(...)` uses it for the persistent sleep-lock event, and `ICommonStateGetter::get_acquired_sleep_lock_event_handler(...)` now emits that object id through `push_copy_object_id(...)`, matching upstream `*out_event = m_applet->sleep_lock_event.GetHandle()`.
+- `ISelfController::{get_library_applet_launchable_event_handler,get_accumulated_suspended_tick_changed_event_handler}(...)` emit applet-owned event object ids through `ResponseBuilder::push_copy_object_id(...)`; `GetLibraryAppletLaunchableEvent` keeps the upstream signal-before-return ordering.
+- `IApplicationFunctions::{get_gpu_error_detected_system_event_handler,get_friend_invitation_storage_channel_event_handler,get_health_warning_disappeared_system_event_handler}(...)` emit applet-owned event object ids through `ResponseBuilder::push_copy_object_id(...)`, matching upstream `Event::GetHandle()` assignment into `OutCopyHandle`.
+- `ILockAccessor::{try_lock_handler,get_event_handler}(...)` emit the accessor-owned readable event object id through `ResponseBuilder::push_copy_object_id(...)`, matching upstream's persistent `m_event.GetHandle()` path instead of creating a fresh readable event per call.
+- `IHomeMenuFunctions::get_pop_from_general_channel_event_handler(...)`, `IGlobalStateController::get_hdcp_authentication_failed_event_handler(...)`, and `ICradleFirmwareUpdater::get_cradle_device_info_change_event_handler(...)` now fetch their service-context-owned `Event` and emit the readable object id through `ResponseBuilder::push_copy_object_id(...)`, matching upstream persistent `Event` members.
+
+### Unintentional differences (to fix)
+- Rust still keeps legacy handle-returning helpers (`copy_handle_for_readable_event`, `create_readable_event_handle`, and `Service::Event::copy_handle`) for non-migrated services and reduced fixtures. Upstream's `OutCopyHandle` path stores kernel objects and lets IPC write-back allocate final process handles.
+
+### Missing items
+- Replace the remaining non-AM pre-resolved event-handle response paths with object-owned `OutCopyHandle` serialization where upstream uses `KReadableEvent*`.
+- Port a fuller upstream-shaped `KernelHelpers::ServiceContext` lifecycle once the service owner graph can create/close real kernel `KEvent` objects without the current Rust service-layer event bridge.
+
+### Binary layout verification
+- N/A: IPC copy-object ownership only. No AM payload layout changed.
+
+### Tests
+- Re-read upstream `LifecycleManager::{GetSystemEvent,GetOperationModeChangedSystemEvent}`, `Applet` sleep-lock event ownership, `ICommonStateGetter::GetEventHandle`, `ICommonStateGetter::GetDefaultDisplayResolutionChangeEvent`, `ICommonStateGetter::GetAcquiredSleepLockEvent`, `ISelfController::{GetLibraryAppletLaunchableEvent,GetAccumulatedSuspendedTickChangedEvent}`, `IApplicationFunctions::{GetGpuErrorDetectedSystemEvent,GetFriendInvitationStorageChannelEvent,GetHealthWarningDisappearedSystemEvent}`, `ILockAccessor::{TryLock,GetEvent}`, `IHomeMenuFunctions::GetPopFromGeneralChannelEvent`, `IGlobalStateController::GetHdcpAuthenticationFailedEvent`, and `ICradleFirmwareUpdater::GetCradleDeviceInfoChangeEvent`.
+- `cargo test -p core push_copy_object_id_writes_copy_handle_into_response -- --nocapture`
+- `cargo check -p core`
+- `cargo fmt --all --check`
+- `git diff --check`
+
+## 2026-06-08 — core/src/hle/service/acc/acc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/acc/async_context.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/acc/async_context.h
+
+### Intentional differences
+- `EnsureTokenIdCacheAsyncInterface::get_system_event_handler(...)` now emits the completion readable event through `Event::copy_object_id(...)` and `ResponseBuilder::push_copy_object_id(...)`. Upstream `IAsyncContext::GetSystemEvent` writes `completion_event->GetReadableEvent()` with `IPC::ResponseBuilder::PushCopyObjects(...)`, deferring final handle allocation to IPC write-back.
+
+### Unintentional differences (to fix)
+- Rust's account async context is still a local `EnsureTokenIdCacheAsyncInterface` with a service-layer `Event` wrapper rather than an upstream-shaped `IAsyncContext` base class owning `KernelHelpers::ServiceContext` and `Kernel::KEvent* completion_event`.
+
+### Missing items
+- Port the broader account async-context class structure if more account async interfaces start sharing the same lifecycle and completion-event behavior.
+
+### Binary layout verification
+- N/A: IPC copy-object ownership only. No account payload layout changed.
+
+### Tests
+- Re-read upstream `IAsyncContext::{IAsyncContext,GetSystemEvent,MarkComplete}`.
+- `cargo check -p core`
+- `cargo fmt --all --check`
+- `git diff --check`
+
+## 2026-06-07 — core/src/hle/service/audio/audio_out.rs, core/src/hle/service/audio/audio_in.rs, core/src/hle/service/audio/audio_renderer.rs, core/src/hle/service/audio/audio_device.rs, core/src/hle/service/audio/audio_controller.rs, and core/src/hle/service/cmif_serialization.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_out.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_in.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_renderer.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_device.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_device.h, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_controller.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_controller.h, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/cmif_serialization.h
+
+### Intentional differences
+- `IAudioOut::register_buffer_event_handler(...)`, `IAudioIn::register_buffer_event_handler(...)`, and `IAudioRenderer::query_system_event_handler(...)` now push the readable event object id through `CmifResponse::push_copy_object_id(...)` instead of pre-allocating a process handle through `copy_handle_for_readable_event(...)`. Upstream writes `OutCopyHandle<Kernel::KReadableEvent>` by assigning `&impl->GetBufferEvent()` / `&impl->GetSystemEvent()` and defers final handle allocation to IPC serialization.
+- `IAudioDevice::{query_audio_device_system_event_handler,query_audio_device_input_event_handler,query_audio_device_output_event_handler}(...)` now push the service-owned readable event object id through `CmifResponse::push_copy_object_id(...)`, matching upstream `*out_event = &event->GetReadableEvent()` / `OutCopyHandle<Kernel::KReadableEvent>`.
+- `IAudioController::acquire_target_notification_handler(...)` now pushes the notification readable event object id through `CmifResponse::push_copy_object_id(...)`, matching upstream `*out_notification_event = &notification_event->GetReadableEvent()`.
+- `CmifResponse::push_copy_object_id(...)` is a Rust relay to `ResponseBuilder::push_copy_object_id(...)`, matching the upstream generated CMIF serializer's use of `ResponseBuilder::PushCopyObjects(KReadableEvent*)`.
+
+### Unintentional differences (to fix)
+- The audio service owners still create/register kernel event objects explicitly through Rust process/object-id tables instead of owning a literal upstream `ServiceContext` member that creates and closes `KEvent*` objects in the constructor/destructor.
+
+### Missing items
+- Continue auditing any future audio copy-handle response paths for the same pre-resolved-handle pattern.
+
+### Binary layout verification
+- N/A: IPC copy-object ownership only. No audio parameter, buffer, or renderer payload layout changed.
+
+### Tests
+- Re-read upstream `IAudioOut::RegisterBufferEvent`, `IAudioIn::RegisterBufferEvent`, `IAudioRenderer::QuerySystemEvent`, and CMIF `OutCopyHandle` / `ResponseBuilder::PushCopyObjects`.
+- Re-read upstream `IAudioDevice::{QueryAudioDeviceSystemEvent,QueryAudioDeviceInputEvent,QueryAudioDeviceOutputEvent}`.
+- Re-read upstream `IAudioController::AcquireTargetNotification`.
+- `cargo check -p core`
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 60s isolated-XDG default smoke after migrating audio event copy handles to object-owned response emission (`/tmp/ruzu_mk8d_audio_copy_object_smoke_1780869171.log`, `RUST_LOG=warn,core::hle::service::audio=info`): reached `NotifyRunning`; logged `OpenAudioRenderer`, `IAudioRenderer::QuerySystemEvent`, and `IAudioRenderer::Start`; no `receive_request_hle failed`, `missing_server_manager_owner`, `BreakLoopNullPc`, panic, `svcBreak`, or `SetTerminateResult` markers. Warn/info logging did not emit presentation markers in this short run.
+- Manual MK8D 45s isolated-XDG default smoke after the `IAudioDevice` copy-object migration (`/tmp/ruzu_mk8d_audio_device_copy_object_smoke_1780869488.log`, `RUST_LOG=warn,core::hle::service::audio=info`): reached `NotifyRunning`; logged `OpenAudioRenderer`, `IAudioRenderer::QuerySystemEvent`, and `IAudioRenderer::Start`; no `receive_request_hle failed`, `missing_server_manager_owner`, `BreakLoopNullPc`, panic, `svcBreak`, or `SetTerminateResult` markers. The `IAudioDevice::QueryAudioDevice*Event` handlers were not exercised in this short run, so this is no-obvious-regression evidence rather than direct runtime coverage of those three handlers.
+
+## 2026-06-07 — core/src/hle/service/os/event.rs, core/src/hle/service/vi/application_display_service.rs, and core/src/hle/service/vi/system_display_service.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/os/event.h, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/os/event.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/vi/application_display_service.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/vi/system_display_service.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/vi/system_display_service.h, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/vi/shared_buffer_manager.cpp
+
+### Intentional differences
+- `Service::Event::copy_object_id(...)` exposes the readable event object id without pre-allocating a process handle. Upstream `Service::Event::GetHandle()` returns `Kernel::KReadableEvent*`; Rust stores the object id in `ResponseBuilder::push_copy_object_id(...)` and lets IPC write-back allocate the final copy handle.
+- `IApplicationDisplayService::get_display_vsync_event(...)` now returns the vsync readable event through `push_copy_object_id(...)`, matching upstream `*out_vsync_event = it->second.GetHandle()` / `OutCopyHandle<Kernel::KReadableEvent>` ownership more closely than the older `copy_handle_for_readable_event(...)` + raw `push_copy_objects(handle)` path.
+- `ISystemDisplayService::get_shared_frame_buffer_acquirable_event(...)` now propagates `SharedBufferManager::get_shared_frame_buffer_acquirable_event(...)` errors and emits the returned `KReadableEvent` through `push_copy_object_id(...)`. Upstream forwards `OutCopyHandle<Kernel::KReadableEvent>` into `SharedBufferManager::GetSharedFrameBufferAcquirableEvent(...)`, which assigns `producer->GetNativeHandle({})`.
+
+### Unintentional differences (to fix)
+- Rust still lazily materializes the backing kernel `KEvent` / `KReadableEvent` pair from `Service::Event::create_kernel_bridge_from_context(...)`; upstream `Service::Event` creates its `KEvent` in the constructor through `KernelHelpers::ServiceContext::CreateEvent(...)`.
+
+### Missing items
+- Continue migrating other service event responses from pre-resolved handles to object-owned `push_copy_object_id(...)` where the service owns the readable event object.
+
+### Binary layout verification
+- N/A: IPC copy-object ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `Service::Event::{Event,GetHandle}` and `IApplicationDisplayService::GetDisplayVsyncEvent`.
+- Re-read upstream `ISystemDisplayService::GetSharedFrameBufferAcquirableEvent` and `SharedBufferManager::GetSharedFrameBufferAcquirableEvent`.
+- `cargo check -p core`
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 45s isolated-XDG default smoke after migrating `GetDisplayVsyncEvent` to object-owned copy handle emission (`/tmp/ruzu_mk8d_vi_vsync_object_id_smoke_1780868918.log`): reached `NotifyRunning`, no panic/`BreakLoopNullPc`, no `svcBreak`/`SetTerminateResult`, no `missing_server_manager_owner`, and no `receive_request_hle failed` warnings. Warn-level logging did not emit a `GetDisplayVsyncEvent` marker, so this is a no-obvious-early-regression smoke, not proof that the vsync event path was exercised.
+
+## 2026-06-07 — core/src/hle/service/hle_ipc.rs, core/src/hle/service/ipc_helpers.rs, core/src/hle/service/sm/sm.rs, and core/src/hle/kernel/svc/svc_port.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.h, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ipc_helpers.h, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/sm/sm.cpp
+
+### Intentional differences
+- `SessionRequestManager::from_parent_server_manager_endpoints(...)` centralizes the Rust adaptation for upstream's `SessionRequestManager(kernel, manager->GetServerManager())`. Rust preserves the pending-registration queue and wakeup event only when the corresponding `ServerManager` owner is also available; if the owner is not available, the child manager remains ownerless rather than carrying a queue-only state that upstream does not have.
+- `ResponseBuilder::push_ipc_interface`, `HLERequestContext::create_session_for_service`, `SM::GetService`, and `svc::ConnectToNamedPort` now use that shared construction rule so child sessions preserve the parent's registration path before the client endpoint is exposed, matching upstream's `RegisterSession(&session->GetServerSession(), next_manager)` ordering as closely as the Rust host-thread queue allows.
+- `ServerManager::register_named_service(...)` / `manage_named_port(...)` publish a live `ServerManager` weak owner immediately when `bind_self_reference(...)` has already run.
+- `ServerManager::new_shared(...)` / `run_server_shared(...)` now provide the upstream-shaped construction path where the final Rust owner exists before service registration. `Nvnflinger::LoopProcess` uses this path for `"dispdrv"` so `IHOSBinderDriver` ownership is live at `RegisterNamedService` time instead of being republished after `KernelCore::run_server(...)`.
+- `SessionRequestManager` stores the owning manager as `Weak<Mutex<ServerManager>>` instead of a strong `Arc`. Upstream stores `Service::ServerManager&`, which is non-owning; Rust upgrades the weak owner only at call sites that need the manager object. The pending-registration queue and wakeup event remain strong endpoint handles because they are the Rust host-thread registration bridge.
+
+### Unintentional differences (to fix)
+
+### Missing items
+
+### Binary layout verification
+- N/A: service-session ownership and registration routing only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `SessionRequestManager`, `HLERequestContext::AddMoveInterface`, `IPC::ResponseBuilder::PushIpcInterface`, `ServerManager::RegisterSession`, and `SM::GetServiceImpl`.
+- `cargo test -p core session_request_manager_drops_incomplete_server_manager_endpoints -- --nocapture --test-threads=1`
+- `cargo test -p core create_session_for_service_queues_server_manager_registration -- --nocapture --test-threads=1`
+- `cargo test -p core service_owner_weak_is_live_after_manager_is_bound -- --nocapture --test-threads=1`
+- `cargo test -p core new_shared_binds_service_owner_before_registration -- --nocapture --test-threads=1`
+- `cargo test -p core server_manager::tests:: -- --nocapture --test-threads=1`
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 45s isolated-XDG default smoke after publishing live service-owner weak refs for already-bound managers (`/tmp/ruzu_mk8d_service_owner_weak_smoke.log`): reached `NotifyRunning`, no panic/`BreakLoopNullPc`, no `svcBreak`/`SetTerminateResult`, no `missing_server_manager_owner`, and no `receive_request_hle failed` warnings.
+- Manual MK8D 45s isolated-XDG default smoke after switching `SessionRequestManager` to a weak `ServerManager` owner (`/tmp/ruzu_mk8d_ipc_weak_owner_smoke_1780868646.log`): reached `NotifyRunning`, no panic/`BreakLoopNullPc`, no `svcBreak`/`SetTerminateResult`, no `missing_server_manager_owner`, and no `receive_request_hle failed` warnings. Warn-level logging did not emit audio or presentation markers in this short run.
+- Manual MK8D 25s isolated-XDG host-thread-all smoke after switching `SessionRequestManager` to a weak `ServerManager` owner (`/tmp/ruzu_mk8d_ipc_weak_owner_host_all_smoke_1780868703.log`, `RUZU_SERVER_THREAD_IPC_ALL=1`): reached `NotifyRunning`, no panic/`BreakLoopNullPc`, no `svcBreak`/`SetTerminateResult`, no `missing_server_manager_owner`, and no `receive_request_hle failed` warnings. Warn-level logging did not emit audio or presentation markers in this short run.
+
+## 2026-06-07 — core/src/hle/kernel/k_client_session.rs, core/src/hle/kernel/k_session.rs, core/src/hle/kernel/k_server_session.rs, core/src/hle/kernel/k_thread.rs, core/src/hle/kernel/k_scheduler.rs, and core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
 
 ### Intentional differences
 - `KServerSession::on_request(...)` / `on_request_with_process(...)` now own the synchronous IPC wait transition: scheduler lock, session-closed check, termination check, request enqueue, notify-available, and `ThreadWaitReasonForDebugging::Ipc` + `begin_wait()` for requests without an async event. Rust uses the client thread captured in `KSessionRequest` instead of re-reading a raw `GetCurrentThread(m_kernel)` pointer because the request already stores the Rust-safe owner reference created by `KClientSession`.
-- The host-thread branch in `svc_ipc.rs` now routes request creation/enqueue through `KClientSession::send_sync_request_to_parent_with_process(...)` / `KSession::on_request_with_process(...)` instead of constructing the `KSessionRequest` and parking the client locally. The branch still remains env-gated; default inline HLE dispatch is unchanged until the remaining `ServerManager` lifecycle work is safe for MK8D.
+- The host-thread branch in `svc_ipc.rs` now initializes a real `KSessionRequest` under the caller `KProcess` lock, then drops the process lock before forwarding to the resolved parent server endpoint. Upstream `KClientSession::SendSyncRequest` forwards through `m_parent->OnRequest(request)` without Rust host mutexes; this split preserves the same request lifecycle while avoiding holding `KProcess` across the scheduler-unlock handoff.
+- `KSession::on_server_request_defer_scheduler_unlock(...)` lets the host-thread path clone `KSession::server` under a short parent-session mutex borrow, then drop the parent `KSession` mutex before `KServerSession::OnRequest` can switch fibers. Upstream has embedded objects and no `Mutex<KSession>`, so this is the Rust lock-order counterpart to upstream's direct `m_parent->OnRequest(request)` call.
+- `KClientSession::send_request_to_parent_with_process(...)` now uses the same short parent-session borrow: it creates the `KSessionRequest`, clones the parent server endpoint and trace name, drops the parent `KSession` mutex, then forwards to `KSession::on_server_request_defer_scheduler_unlock(...)`. Upstream `KClientSession::SendSyncRequest` calls `m_parent->OnRequest(request)` without an extra host mutex; this removes the Rust-only parent-session mutex from the scheduler-unlock handoff path.
+- `KServerSession::on_request_defer_scheduler_unlock(...)` returns the scheduler lock guard to `KSession`, allowing Rust to drop the `KServerSession` mutex before dropping `KScopedSchedulerLock`. Upstream drops the scheduler lock at the end of `KServerSession::OnRequest` without a host `Mutex<KServerSession>` being held.
+- The host-thread route now relies on the initial pending-registration wakeup plus `KServerSession::notify_available(...)`'s `manager_wakeup` signal for request availability. There is no longer a second post-`OnRequest` wakeup signal in `svc_ipc.rs`; upstream also has a single `NotifyAvailable()` edge when the request list transitions from empty to non-empty.
+- `KScheduler::enable_scheduling_with_scheduler(...)` now matches upstream `KScheduler::EnableScheduling(...)` ordering: after rescheduling other cores, it first checks whether `GetDisableDispatchCount() > 1` and only calls `RescheduleCurrentCore()` for the outermost dispatch-disable scope. This avoids a Rust-only early reschedule when a thread has already transitioned to `WAITING` inside a nested dispatch-disable scope.
+- Host-thread routing no longer has the Rust-only one-shot worker fallback. If routing is explicitly selected and the target session lacks `ServerManager` queue+wakeup ownership, `svc_ipc.rs` returns `ResultInvalidHandle` and emits the `missing_server_manager_owner` trace stage instead of masking the missing owner with a non-upstream dispatch path.
 - Removed the Rust-only `KThread` wait-wake guard fields/methods from the host-thread IPC path. Once `KServerSession::OnRequest` owns the scheduler-locked wait transition, `KThread::end_wait(...)` can return to upstream's no-op behavior when the target thread is not waiting.
+- The post-inline `KScheduler::yield_without_core_migration(...)` experiment remains gated behind `RUZU_YIELD_AFTER_IPC=1`. A default-yield trial was rejected because fresh MK8D boots became less stable than the no-yield inline fallback, so this remains diagnostic evidence rather than an upstream-parity fix.
+- `ServerManager::default_host_thread_service_matches_from_flags(...)` is the single Rust-only migration policy hook for service-name based host-thread IPC rollout. It currently returns false for all services after cold MK8D A/B rejected broad implicit promotion; `svc_ipc.rs` still delegates to the same helper so future request routing and `ServerManager` wait-holder linkage cannot drift. Upstream has no service-level selector because every `KClientSession::SendSyncRequest` goes through `KServerSession::OnRequest`.
+- `RUZU_SERVER_THREAD_IPC_SERVICE=<service[,service...]>` is a Rust-only migration gate that resolves the target session handler name and routes matching services through the host-thread path for validation before adding them to the default list.
+- The ruzu-only host-thread IPC OS-scheduler sleep now follows all explicit host-thread routing gates (`ALL`, `HANDLE`, `BINDER`, and `SERVICE`) and is disabled by `RUZU_INLINE_IPC`. Upstream has no post-IPC host sleep; this remains a non-default migration aid for validating the host-thread path without starving HLE service threads during back-to-back guest IPC.
 
 ### Unintentional differences (to fix)
-- Ruzu still defaults most synchronous HLE IPC to the legacy inline fallback, so normal service dispatch is not yet fully routed through `ServerManager::LoopProcess` like upstream.
+- Ruzu still defaults synchronous HLE IPC to the legacy inline fallback unless an explicit host-thread route is selected, so normal service dispatch is not yet fully routed through `ServerManager::LoopProcess` like upstream. Explicit service filters and host-thread-all routing remain behind env gates until cold-boot, long-run, and broader title validation are strong enough to remove the compatibility fallback.
 - `svc_ipc.rs` still resolves Rust object ids and manager queue/wakeup bridges before using the host-thread path. Upstream `svc_ipc.cpp` only resolves `KClientSession`, keeps the parent alive, and calls `KClientSession::SendSyncRequest(...)`.
 
 ### Missing items
-- Make the host-thread/server-manager path the default once the remaining boot-order/re-entrancy regressions are addressed.
-- Remove the remaining inline fallback and Rust-only host-thread routing diagnostics once all sessions are safely owned by `ServerManager`.
+- Re-promote service groups from the inline fallback to the shared `ServerManager::default_host_thread_service_matches_from_flags(...)` policy only after per-service MK8D/runtime validation no longer regresses cold boot.
+- Investigate the remaining common post-`NotifyRunning` progression stall before promoting host-thread-all to default. Current 30s and 120s Binder/BQP/PRESENT profiles do not prove late rendering/present stability.
+- After long-run validation is strong enough, remove the inline compatibility fallback and Rust-only host-thread routing diagnostics.
 
 ### Binary layout verification
 - N/A: IPC control-flow ownership only. No guest-visible raw payload layout changed.
 
 ### Tests
 - Re-read upstream `KClientSession::SendSyncRequest`, `KServerSession::OnRequest`, `svc_ipc.cpp::SendSyncRequestImpl`, and `ServerManager::{RegisterSession,LoopProcess}` before changing ownership.
+- Re-read upstream `KClientSession::SendSyncRequest` before removing the parent `KSession` mutex from `KClientSession::send_request_to_parent_with_process(...)`'s `OnRequest` handoff.
 - Re-read upstream `KThread::EndWait` ownership through `KServerSession::SendReply` before removing the Rust-only wait-wake guard.
+- Re-read upstream `svc_ipc.cpp::SendSyncRequestImpl`, `KClientSession::SendSyncRequest`, and `ServerManager::{RegisterSession,WaitSignaled,OnSessionEvent}` before adding the service-name migration gate.
+- Re-read upstream `KAbstractSchedulerLock::Unlock`, `KScheduler::EnableScheduling`, and `KScheduler::RescheduleCurrentCore` before changing scheduler unlock ordering.
+- Re-read upstream `svc_ipc.cpp::SendSyncRequestImpl` and `KClientSession::SendSyncRequest` before widening the ruzu-only host-thread sleep to service-gated routing modes.
+- Re-read upstream `svc_ipc.cpp::SendSyncRequestImpl` and `ServerManager::{RegisterSession,LoopProcess}` before making `ServerManager` the single Rust migration-policy owner for default host-thread service selection.
 - `cargo test -p core on_request_sync_parks_client_thread_for_ipc_wait -- --nocapture`
 - `cargo test -p core send_sync_request_with_process_enqueues_real_session_request -- --nocapture`
 - `cargo test -p core enqueue_helper_uses_resolved_parent_without_locking_client_session -- --nocapture`
+- `cargo test -p core host_thread_ipc_sleep_follows_all_routing_gates -- --nocapture --test-threads=1`
+- `cargo test -p core k_client_session::tests -- --nocapture`
 - `cargo check -p core`
-- `cargo fmt --check`
+- `cargo fmt --all`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D host-thread-all smoke (`/tmp/ruzu_mk8d_host_all_no_ksession_lock.log`, isolated XDG dirs, `RUST_LOG=warn`, `RUZU_SERVER_THREAD_IPC_ALL=1`, `RUZU_TRACE_HOST_THREAD_IPC=1`, 25s timeout): reached `NotifyRunning`, emitted 5554 `after_server_on_request` and 5554 `client_resumed` records, and emitted no `missing_server_manager_owner`, `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, or panic marker. Trace volume is high, so this validates the first-IPC/early-host-thread handoff but not late rendering/audio.
+- Manual MK8D host-thread-all smoke after keeping default routing inline (`/tmp/ruzu_mk8d_host_all_after_explicit_revert_25s.log`, isolated XDG dirs, `RUST_LOG=warn`, `RUZU_SERVER_THREAD_IPC_ALL=1`, 25s timeout): reached `NotifyRunning`, with no `missing_server_manager_owner`, `BreakLoopNullPc`, `SetTerminateResult`, panic marker, or `svcBreak`.
+- Manual MK8D default smoke (`/tmp/ruzu_mk8d_default_after_ksession_unlock.log`, isolated XDG dirs, `RUST_LOG=warn`, 45s timeout): reached `NotifyRunning`, with no `BreakLoopNullPc`, `SetTerminateResult`, panic marker, or `svcBreak`.
+- Manual MK8D default smoke after keeping host-thread routing explicit (`/tmp/ruzu_mk8d_default_after_host_auto_revert_75s.log`, isolated XDG dirs, `RUST_LOG=warn`, 75s timeout): reached `NotifyRunning`, with no `missing_server_manager_owner`, `BreakLoopNullPc`, `SetTerminateResult`, panic marker, or `svcBreak`.
+- Manual MK8D default smoke after the final scheduler/comment cleanup (`/tmp/ruzu_mk8d_ipc_host_thread_existing_xdg_75s.log`, existing `/tmp/ruzu-{data,cache,config}` XDG dirs, `RUST_LOG=warn`, 75s timeout): reached `NotifyRunning`, with no `missing_server_manager_owner`, `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, or panic marker. A fresh empty XDG smoke (`/tmp/ruzu_mk8d_ipc_host_thread_smoke_75s.log`) did not reach `NotifyRunning`, so cold-profile/cold-config boot remains a separate validation risk.
+- Manual MK8D cold A/B after testing default post-inline yield: with yield promoted to default, three fresh 35s isolated-XDG runs produced only one `NotifyRunning`/audio marker run (`/tmp/ruzu_mk8d_ipc_default_yield_loop_{1,2,3}.log`: early `QueryPointerBufferSize` stall, one pass, one `gpu_mm::read` unmapped warning). With `RUZU_DISABLE_INLINE_IPC_YIELD=1`, three matching fresh 35s runs reached the expected marker each time (`/tmp/ruzu_mk8d_ipc_disable_yield_loop_{1,2,3}.log`). The code therefore keeps `RUZU_YIELD_AFTER_IPC=1` opt-in instead of default.
+- Manual MK8D current-default cold validation after rebuilding release with `RUZU_YIELD_AFTER_IPC` opt-in again: two of three fresh 35s isolated-XDG runs reached the expected marker (`/tmp/ruzu_mk8d_ipc_current_default_loop_{1,2,3}.log`); one still stopped after `QueryPointerBufferSize`. This branch improves ownership shape but does not eliminate the remaining cold boot scheduling/lifecycle race.
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 45s isolated-XDG service-gated host-thread smoke with `RUZU_SERVER_THREAD_IPC_SERVICE=IHOSBinderDriver` after narrowing `ServerManager` session-holder linkage per session (`/tmp/ruzu_mk8d_ipc_service_IHOSBinderDriver_precise_1780871697.log`): reached `NotifyRunning`, logged `OpenAudioRenderer` and `IAudioRenderer::Start`, routed 252 `IHOSBinderDriver` requests through host-thread IPC with 252 `after_on_request` / 252 `client_resumed`, registered 1 host-thread session, and emitted no `receive_request_hle failed`, `missing_server_manager_owner`, `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, or panic marker.
+- Manual MK8D 45s isolated-XDG service-gated host-thread smoke with `RUZU_SERVER_THREAD_IPC_SERVICE=pl:u` after narrowing `ServerManager` session-holder linkage per session (`/tmp/ruzu_mk8d_ipc_service_pl_u_precise_1780871625.log`): reached `NotifyRunning`, logged `OpenAudioRenderer` and `IAudioRenderer::Start`, routed 21 `pl:u` requests through host-thread IPC with 21 `after_on_request` / 21 `client_resumed`, registered 7 host-thread sessions, and emitted no `receive_request_hle failed`, `missing_server_manager_owner`, `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, or panic marker.
+- Manual MK8D 45s isolated-XDG service-gated host-thread smoke after widening the host-thread IPC OS-scheduler sleep to `RUZU_SERVER_THREAD_IPC_SERVICE=IHOSBinderDriver` (`/tmp/ruzu_mk8d_ipc_service_binder_sleep_1780899036.log`): reached `NotifyRunning`, logged `OpenAudioRenderer` and `IAudioRenderer::Start`, and emitted no `receive_request_hle failed`, `missing_server_manager_owner`, `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, `PrefetchAbort`, or panic marker. The zsh wrapper lost the timeout exit code by writing to the read-only `status` variable after the run, so this is marker-based no-obvious-regression evidence rather than a clean wrapper-status record.
+- Manual MK8D cold-boot A/B validation, three 45s isolated-XDG runs per mode (`/tmp/ruzu_mk8d_ipc_ab_1780872081.summary`): default inline reached `NotifyRunning` and `IAudioRenderer::Start` in 3/3 runs with no IPC fatal markers; `RUZU_SERVER_THREAD_IPC_ALL=1` also reached `NotifyRunning` and `IAudioRenderer::Start` in 3/3 runs, routed 5569-5586 host-thread requests per run, registered 46 host-thread sessions, and emitted no `receive_request_hle failed`, `missing_server_manager_owner`, `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, or panic marker. This strengthens cold-boot IPC/audio confidence but still does not prove late rendering/present correctness.
+- Manual MK8D 120s present-throughput comparison with identical nvnflinger/present traces: default inline (`/tmp/ruzu_mk8d_default_present_120s_1780872624.log`) reached `BQP_QUEUE=1850`, `SF_COMPOSE=10549`, and `PRESENT_COMPOSITE=9248`; `RUZU_SERVER_THREAD_IPC_ALL=1` without verbose host-thread trace (`/tmp/ruzu_mk8d_hostall_present_notrace_120s_1780872766.log`) reached audio and emitted no IPC/fatal markers, but only `BQP_QUEUE=129`, `SF_COMPOSE=1852`, and `PRESENT_COMPOSITE=643`. A host-thread-all run with verbose IPC trace was slower still (`/tmp/ruzu_mk8d_hostall_present_120s_1780872482.log`: `BQP_QUEUE=2`, `PRESENT_COMPOSITE=8`). This makes host-thread-all functionally safer than before but still too slow to promote as default.
+- Manual MK8D 45s host-thread-all profile before removing the post-`OnRequest` wakeup (`/tmp/ruzu_mk8d_hostall_hostphase_1780873510.log`, `RUZU_PROFILE_IPC=1`, `RUZU_PROFILE_IPC_PHASES=1`, `RUZU_PROFILE_BQP_WAIT=1`, `RUZU_PROFILE_PRESENT=1`): reached `NotifyRunning`, produced `PRESENT_PROFILE count=130`, and localized host IPC cost to `host_05_on_request_begin_wait` (`5570` calls, `2332.93ms` total, `418.84us` avg).
+- Manual MK8D 45s host-thread-all profile after removing the post-`OnRequest` wakeup (`/tmp/ruzu_mk8d_hostall_no_belt_profile_1780873676.log`, same env): reached `NotifyRunning`, produced `PRESENT_PROFILE count=132`, no IPC/fatal markers, and still localized host IPC cost to `host_05_on_request_begin_wait` (`5582` calls, `2390.69ms` total, `428.29us` avg). The removed signal eliminates a non-upstream duplicate wakeup edge but does not resolve the throughput gap; the next target is the scheduler-lock / `KServerSession::OnRequest` cost and broader service-thread scheduling model.
+- Manual MK8D 45s host-thread-all profile with fine-grained `KSession` / `KServerSession::OnRequest` phases before the scheduler-order change (`/tmp/ruzu_mk8d_hostall_schedulerphase_1780874069.log`): reached `NotifyRunning`, produced `PRESENT_PROFILE count=130`, and showed the expensive client-side interval is `ksession_04_drop_scheduler_lock` (`5560` calls, `2325.09ms` total, `418.18us` avg). Internal `on_request_*` phases are microsecond-scale, so the cost is the intentional fiber suspension until the server replies, not request-list enqueue or `NotifyAvailable`.
+- Manual MK8D 45s host-thread-all profile after matching upstream `EnableScheduling` nested-count ordering (`/tmp/ruzu_mk8d_hostall_sched_order_profile_1780874246.log`): reached `NotifyRunning`, produced `PRESENT_PROFILE count=130`, no IPC/fatal markers, and kept the same bottleneck at `ksession_04_drop_scheduler_lock` (`5567` calls, `2328.38ms` total, `418.25us` avg). The scheduler-order change is retained for upstream parity but does not solve host-thread-all throughput; remaining work is service-thread scheduling / server dispatch throughput, not `KServerSession::OnRequest` micro-logic.
 
 ## 2026-06-07 — core/src/hle/kernel/k_dynamic_resource_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_memory_block_manager.h
 
@@ -57,7 +720,7 @@
 - Rust still keeps `copy_handle_for_readable_event(...)` and raw-handle `push_copy_objects(handle)` for older service paths. Upstream's `ResponseBuilder::PushCopyObjects` stores kernel objects, not pre-resolved client handles.
 
 ### Missing items
-- Audit the remaining service paths that call `copy_handle_for_readable_event(...)` and migrate them to object-owned `push_copy_object_id(...)` where the owner object is available.
+- Audit the remaining non-migrated service paths that call `copy_handle_for_readable_event(...)` and migrate them to object-owned `push_copy_object_id(...)` where the owner object is available.
 
 ### Binary layout verification
 - PASS: IPC handle ownership policy only; no raw NV ioctl payload layout changed.
@@ -316,7 +979,7 @@
 - Env-gated `GPU_VA_MAP` / `GPU_VA_UNMAP` trace-ring emission mirrors the existing Rust diagnostic system. It is disabled by default and does not change ioctl payloads or results.
 
 ### Unintentional differences (to fix)
-- None identified for the audited `FreeMappingLocked` / `UnmapBuffer` / `FreeSpace` size and operation-order slice. `FreeMappingLocked` now matches upstream's separate helper path: dynamic mappings free allocator pages using `AlignUp(mapping->size, page_size) >> page_size_bits`, unpin the NvMap handle, restore sparse or unmap GMMU state with raw `mapping->size`, then erase `mapping_map`. `UnmapBuffer` now matches upstream's separate ioctl path rather than delegating to `FreeMappingLocked`: non-fixed mappings free allocator pages with raw `mapping->size >> page_size_bits`, restore sparse or unmap GMMU state, unpin the NvMap handle, then erase `mapping_map`. `FreeSpace` keeps the `allocation_map` entry alive until after mappings, sparse unmap, and allocator free complete. Sparse `FreeSpace` restores fixed mappings to sparse GMMU state before unmapping the full sparse allocation, matching upstream ordering.
+- None identified for the audited `FreeMappingLocked` / `UnmapBuffer` / `FreeSpace` size and operation-order slice.
 
 ### Missing items
 - None identified for the audited `nvhost_as_gpu` address-space serialization, `FreeMappingLocked`, `UnmapBuffer`, and `FreeSpace` slice.
@@ -376,7 +1039,7 @@
 ## 2026-06-07 — core/src/core.rs, core/src/hle/kernel/kernel.rs, and core/src/hle/service/sm/sm.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/sm/sm.cpp
 
 ### Intentional differences
-- `System::new_for_test()` uses Rust-only `setup_sm_for_test(...)` to register `sm:`, publish the matching `ServiceOwnership`, and keep the returned `ServerManager` alive without entering upstream's blocking `ServerManager::RunServer(...)` loop. Runtime SM startup still uses `sm::loop_process(...)`, which keeps the upstream-shaped blocking server-manager lifecycle.
+- `System::new_for_test()` uses Rust-only `setup_sm_for_test(...)` to register `sm:`, publish the matching `ServiceOwnership`, and keep the returned `ServerManager` alive without entering upstream's blocking `ServerManager::RunServer(...)` loop. The helper now constructs the manager through `ServerManager::new_shared(...)`, matching runtime SM's stable-owner-before-registration setup while still skipping the blocking loop for tests.
 - `KernelCore::track_server_manager_for_test(...)` is a narrow Rust harness owner hook so the weak service-ownership reference created during non-blocking test setup remains upgradeable. Upstream has no equivalent because its test harness is not built around Rust `Weak<ServerManager>` ownership.
 
 ### Unintentional differences (to fix)
@@ -528,24 +1191,22 @@
 ## 2026-06-05 — core/src/hle/kernel/svc/svc_ipc.rs and core/src/arm/dynarmic/arm_dynarmic_32.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_32.cpp
 
 ### Intentional differences
-- `IHOSBinderDriver` host-thread IPC routing is no longer enabled by default. It remains available through `RUZU_SERVER_THREAD_IPC_BINDER=1`, `RUZU_SERVER_THREAD_IPC_HANDLE=...`, or `RUZU_SERVER_THREAD_IPC_ALL=1`, but normal MK8D boots return to the inline IPC path until the Rust host-thread `ServerManager` lifecycle is complete. Upstream routes service work through server managers; this is a temporary safety divergence because the current Rust Binder host-thread path can leave MK8D after the first `dequeue_return` with no `queue_commit`, no audio, and only `HWC status=2` acquisitions.
 - Added optional filters to the existing A32 unmapped-write diagnostic: `RUZU_TRACE_UNMAPPED_WRITE_ADDR=0x...` and `RUZU_TRACE_UNMAPPED_WRITE_LIMIT=N`. Upstream has no equivalent diagnostic hook; default behavior is unchanged unless `RUZU_TRACE_UNMAPPED_WRITE` is enabled.
 - The process-side client-session parent cache is the safe Rust equivalent of upstream `KClientSession::m_parent` and is documented in the dedicated `k_client_session` entry below; it is not treated as remaining IPC debt here.
 
 ### Unintentional differences (to fix)
-- The complete upstream-shaped `ServerManager`/host-thread IPC lifecycle is still not safe enough to be the default for Binder, despite being architecturally closer to upstream.
+- The complete upstream-shaped `ServerManager`/host-thread IPC lifecycle is still not the default for ordinary HLE service IPC, despite being architecturally closer to upstream. The current gap is default-routing validation and removal of the inline fallback for the remaining services.
 
 ### Missing items
-- Finish the host-thread IPC lifecycle audit so Binder can move back to the upstream-shaped ServerManager path without losing early MK8D buffer submission.
+- Finish the host-thread IPC lifecycle audit so the remaining services can use the upstream-shaped ServerManager path by default, then remove the inline fallback and service-specific routing knobs.
 
 ### Binary layout verification
 - N/A: IPC routing policy and JIT diagnostics only. No guest-visible raw payload layout changed.
 
 ### Tests
-- Manual MK8D comparison, same light trace set for 60s: default Binder host-thread routing stalled at `BQP dequeue_return seq=0`, `HWC status=2`, and no audio; `RUZU_INLINE_IPC=1` reached BQP frame ~2215, HWC frame ~2426, and non-zero audio.
 - `cargo check -p core`
 - `cargo build --release --bin ruzu-cmd`
-- Manual MK8D validation after reverting Binder host-thread default: default run without `RUZU_INLINE_IPC` reached BQP frame ~3177, HWC frame ~3508, and non-zero audio in 60s.
+- Manual MK8D validation from that historical slice reached BQP frame ~3177, HWC frame ~3508, and non-zero audio in 60s.
 
 ## 2026-06-06 — core/src/hle/kernel/k_process.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.cpp
 
@@ -624,17 +1285,33 @@
 - `cargo check -p video_core`
 - Filtered MK8D cbuf trace run pending.
 
-## 2026-06-05 — core/src/hle/kernel/k_process.rs and core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp
+## 2026-06-05 — core/src/hle/kernel/k_client_session.rs, core/src/hle/kernel/k_process.rs, and core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp
 
 ### Intentional differences
 - Upstream `KClientSession` stores a raw `KSession* m_parent` and `SendSyncRequest` forwards directly to `m_parent->OnRequest(request)` without taking a separate client-session mutex. Ruzu's `KClientSession::parent_id` is the safe object-id equivalent of that parent pointer. `KProcess::client_session_parent_ids` additionally caches the client-session-object-id -> parent-session-object-id relation at registration time so the hot `svc::SendSyncRequest` path can resolve the parent while it already holds the process table, avoiding a `KClientSession` mutex acquisition that can wedge MK8D under IPC fan-out.
 - `svc::SendSyncRequest` validates that the handle maps to a client-session object, but parent lookup and request enqueue now use the process-side parent cache plus an already-resolved parent `KSession`, matching upstream's lock-free `m_parent->OnRequest(request)` access pattern more closely.
+- `KClientSession::destroy_with_process(...)` is the owner-held Rust counterpart to upstream `KClientSession::Destroy`: it notifies the parent `KSession` through `on_client_closed_with_process(...)`, which routes to `KServerSession::OnClientClosed`. `KProcess::remove_handle(...)` invokes that path when the last handle to a client-session object id is closed, then removes the Rust client-session registry entry. Upstream's final `m_parent->Close()` is represented by the existing Rust handle/Arc registry cleanup rather than a literal intrusive refcount close.
+
+### Unintentional differences (to fix)
+- `KClientSession::Destroy` still uses Rust process/object-id lookup or the owner-held `destroy_with_process(...)` variant rather than upstream's direct `m_parent` pointer call, because the current port avoids unsafe parent pointers.
+- `KSession` / `KClientSession` lifecycle still lacks upstream's literal `Open()/Close()` slab-object refcount model; Rust uses process registries, handle-table membership, and `Arc` ownership.
+
+### Missing items
+- Audit server-session handle close and port-finalization paths against upstream `KSession::Finalize`, `KSession::PostDestroy`, and the process session-count release once the wider kernel object refcount model is ported.
 
 ### Binary layout verification
 - N/A: kernel object bookkeeping only. No guest-visible raw payload layout changed.
 
 ### Tests
 - `cargo check -p core`
+- Re-read upstream `KClientSession::Destroy`, `KSession::OnClientClosed`, and Rust `KProcess::remove_handle`.
+- `cargo test -p core destroy_with_process_notifies_parent_server_session -- --nocapture`
+- `cargo test -p core closing_last_client_session_handle_notifies_parent_server_session -- --nocapture`
+- `cargo test -p core client_session -- --nocapture --test-threads=1`
+- `svc_ipc.rs` test harness now installs a real current thread, a page-table-backed `Memory` bridge, and `Normal/UserReadWrite` page-table metadata for user IPC message buffers before constructing `HLERequestContext::new_with_thread(...)`, matching upstream's `GetCurrentThreadPointer`, current-process memory, and `LockForIpcUserBuffer` assumptions for these IPC fixtures.
+- `cargo test -p core send_sync_request_with_user_buffer_dispatches_on_message_buffer -- --nocapture --test-threads=1`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 90s isolated-XDG smoke after the client-session/user-buffer IPC fixture cleanup (`/tmp/ruzu_mk8d_ipc_host_thread_smoke.log`, `RUST_LOG=warn`, no L+R input): reached `NotifyRunning`; no `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, panic, `0x0000D401`, or `Invalid DeviceFD` marker was logged. The run used sparse warn-level logging and only proves no early boot regression, not late presentation/audio progress.
 
 ## 2026-06-05 — core/src/hle/service/hle_ipc.rs, core/src/hle/service/ipc_helpers.rs, and core/src/hle/service/sm/sm_controller.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.h, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ipc_helpers.h, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/sm/sm_controller.cpp
 
@@ -649,7 +1326,7 @@
 ### Tests
 - `cargo check -p core`
 - `cargo build --release --bin ruzu-cmd`
-- `cargo test -p core create_session_for_service_queues_server_manager_registration -- --nocapture` attempted; blocked by pre-existing core test compilation errors outside this slice.
+- `cargo test -p core create_session_for_service_queues_server_manager_registration -- --nocapture --test-threads=1`
 - Manual MK8D Mii check: `IDatabaseService::Get source_flag=0x1 count=0` and `source_flag=0x2 count=6`, matching the expected zuyu Mii count for the system source.
 
 ## 2026-06-05 — video_core/src/renderer_opengl/gl_device.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_device.h and gl_device.cpp
@@ -1182,16 +1859,13 @@
 - `CpuManager::multi_core_run_guest_thread` consumes the new `dispatch_supervisor_call` return and reschedules immediately when `ExitThread` does not continue. Upstream performs this by non-returning thread exit/fiber switch rather than an explicit boolean.
 - `KServerSession::receive_inline_request_hle` exists only for ruzu's legacy inline HLE IPC fallback. Upstream routes `KClientSession::SendSyncRequest` to the owning `ServerManager`; ruzu still keeps an inline fallback for service sessions that are not yet fully host-thread routed.
 - The inline fallback creates a `KSessionRequest`, pushes it without `NotifyAvailable`, and consumes it synchronously via `receive_inline_request_hle`. This avoids exposing the same request to both the real `ServerManager` and the inline dispatcher, which previously allowed stale reply data such as `SFCO` to be parsed as a fresh request.
-- `RUZU_LEGACY_INLINE_NOTIFY=1` keeps the previous inline path as a diagnostic comparator. It is disabled by default and is not an upstream behavior.
-- Reply wakeup filtering skips stale replies when the client has moved to a non-IPC wait state. Upstream's single server-thread path does not need this guard because the same stale inline/host double-dispatch race does not exist there.
 
 ### Unintentional differences (to fix)
 - Full upstream host-thread IPC is still not the default for every HLE service session. Until that is completed, ruzu still needs the non-upstream inline fallback path.
 - `KThread::exit()` still returns as a Rust function and logs if called directly; this slice only prevents post-`ExitThread` SVC dispatch from continuing the terminated guest thread. The deeper non-returning fiber lifecycle remains incomplete.
-- The reply wakeup guard is a protective divergence around ruzu's current mixed IPC model. Once host-thread IPC fully matches upstream, this guard should be re-audited against upstream unconditional reply completion semantics.
 
 ### Missing items
-- Finish upstream-style host-thread IPC routing for all service sessions so the inline fallback and `RUZU_LEGACY_INLINE_NOTIFY` can be removed.
+- Finish upstream-style host-thread IPC routing for all service sessions so the inline fallback can be removed.
 - Complete non-returning guest thread exit at the fiber/JIT boundary so `KThread::Exit()` itself cannot return after termination.
 
 ### Binary layout verification
@@ -1926,6 +2600,7 @@
 
 ### Intentional differences
 - Rust service registration uses closure-based `ServerManager::register_named_service` in place of upstream templated service registration: mechanical adaptation while preserving root service ownership.
+- `loop_process(system)` constructs the `ServerManager` through `ServerManager::new_shared(...)` before registering `vi:m`, `vi:s`, and `vi:u`, matching upstream's stable `std::unique_ptr<ServerManager>` before `RegisterNamedService(...)`.
 - Upstream uses a `std::stop_callback` to call `container->OnTerminate()` when the service loop is stopped. Rust runs the same cleanup through `Container::Drop`, which calls `on_terminate()` when the server-manager-owned root services release the shared `Arc<Container>`.
 
 ### Binary layout verification
@@ -2463,6 +3138,7 @@
 
 ### Intentional differences
 - Rust keeps the `Nvnflinger` helper owner struct and now adds `loop_process(system)` beside it, so the upstream owner file both constructs the shared binder stack and registers `"dispdrv"` through `ServerManager`.
+- `loop_process(system)` constructs the `ServerManager` through `ServerManager::new_shared(...)` before registering `"dispdrv"`. This is the Rust counterpart to upstream's `std::make_unique<ServerManager>(system)` existing before `RegisterNamedService(...)`, and avoids the legacy pending-service-owner publication path for the binder driver manager.
 
 ### Binary layout verification
 - PASS: service-registration/runtime file only; no raw-serialized structs are defined here.
@@ -5130,6 +5806,7 @@
 
 ### Intentional differences
 - `audctl` is registered as a real `IAudioController` service. Rust still constructs the service with the existing no-argument owner bridge because the full upstream `Core::System&` service-framework base and `KernelHelpers::ServiceContext` constructor path are not yet mirrored.
+- `loop_process(system)` constructs the `ServerManager` through `ServerManager::new_shared(...)` before registering the audio services, matching upstream's stable `std::unique_ptr<ServerManager>` before `RegisterNamedService(...)`.
 
 ### Missing items
 - Full system-owned constructors for the remaining audio service managers.
@@ -5929,7 +6606,7 @@
 - Rust still keeps the upstream single device mutex plus several inner `Mutex` fields (`vm`, `mapping_map`, `allocation_map`, `gmmu`) to satisfy borrow and aliasing rules. The outer owner mutex serializes the same AS entrypoints as upstream before touching the VM/allocation/mapping/GMMU state; the inner locks are not used to weaken the upstream operation ordering.
 
 ### Unintentional differences (to fix)
-- None identified for the audited `Allocation` / `mapping_map` ownership slice. Fixed mappings share one owner between `Allocation.mappings` and `mapping_map`, while dynamic mappings live only in `mapping_map`, matching upstream's structure.
+- None identified for the audited `Allocation` / `mapping_map` ownership slice.
 
 ### Binary layout verification
 - PASS: `IoctlAllocAsEx`, `IoctlAllocSpace`, `IoctlFreeSpace`, `IoctlRemapEntry`, `IoctlMapBufferEx`, `IoctlUnmapBuffer`, `IoctlBindChannel`, `IoctlGetVaRegions`, and `VaRegion` keep the upstream sizes in this owner file.
@@ -6555,10 +7232,10 @@
 ## 2026-04-09 — `core/src/hle/service/server_manager.rs` vs `src/core/hle/service/server_manager.cpp`
 
 ### Intentional differences
-- Rust now records upstream `StartAdditionalHostThreads(...)` requests and activates them after `KernelCore::run_server(...)` wraps the manager in `Arc<Mutex<...>>`. The additional host threads currently run a bounded park/wakeup loop instead of the full concurrent upstream `LoopProcessImpl()` on the shared manager. This divergence is temporary and documented here rather than hidden.
+- Rust records upstream `StartAdditionalHostThreads(...)` requests until `loop_process_shared(...)` has prepared wait-holder linkage on the final `Arc<Mutex<ServerManager>>` owner, then starts each additional host thread directly on the same `loop_process_impl_shared(...)` body used by the main server thread. This keeps the Rust owner-move adaptation explicit while matching upstream's `StartAdditionalHostThreads(... LoopProcessImpl ...)` responsibility.
 
 ### Missing items
-- Full upstream concurrency parity is still incomplete: additional host threads do not yet process the same `ServerManager` event loop concurrently via the true upstream `LoopProcessImpl()` model.
+- Full upstream concurrency parity is still incomplete: additional host threads execute the same event-loop body, but the broad Rust `Mutex<ServerManager>` still serializes more work than upstream's per-field synchronization plus `m_selection_mutex`.
 
 ### Binary layout verification
 - PASS: host-thread ownership only; no raw serialized struct layout changed.
@@ -6695,11 +7372,11 @@
 ## 2026-04-10 — `core/src/hle/service/server_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.h` and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.cpp`
 
 ### Intentional differences
-- Rust still uses a bounded fallback for `StartAdditionalHostThreads(...)`: the extra host threads exist with real dummy `KThread` owners, but they still do not execute the full upstream concurrent `LoopProcessImpl()` model on the shared `ServerManager`.
+- Rust activates `StartAdditionalHostThreads(...)` after `loop_process_shared(...)` prepares the final shared owner, then each extra host thread enters the shared `loop_process_impl_shared(...)` event-loop body. The remaining adaptation is the Rust owner/mutex shape, not a separate bounded park/wakeup worker.
 - Rust still gates the guest-kernel wait path on `KernelCore::is_current_thread_guest_core()` to avoid the current fiber hijack on host service threads. Upstream host service threads block directly in `WaitAny(...)`; this remains a temporary behavioral workaround, not parity.
 
 ### Missing items
-- Port the real concurrent `LoopProcessImpl()` model for additional host threads.
+- Split the broad `Mutex<ServerManager>` so the additional host threads can make real concurrent progress like upstream instead of serializing most of `wait_and_process_impl(...)`.
 - Remove the `is_current_thread_guest_core()` workaround once host service threads can safely participate in guest wait/schedule primitives without stealing guest fibers.
 
 ### Binary layout verification
@@ -6870,8 +7547,7 @@
 - Rust `WaitableObject` remains a Rust enum wrapper over per-process object-table lookups instead of upstream virtual `KSynchronizationObject*` pointers. This is still the project-wide adaptation for waitable resolution.
 
 ### Missing items
-- `KServerPort` is still not a real waitable object here, so the full upstream `ServerManager` `MultiWait` graph remains incomplete.
-- `MultiWait::WaitAny(kernel)` is still not wired to these waitables; `ServerManager` continues to use its hybrid fallback path until the remaining holder/port parity is ported.
+- `MultiWait::WaitAny(kernel)` is still not the only `ServerManager` wait path; `ServerManager` continues to use its hybrid fallback path until the remaining holder/session ownership parity is ported.
 
 ### Binary layout verification
 - PASS: waitable resolution only; no raw serialized struct layout changed.
@@ -6998,9 +7674,10 @@
 ### Intentional differences
 - Rust still omits the literal upstream `KPort* m_parent` back-pointer, so `CreateSession(...)` cannot enqueue directly on the parent port from inside `KClientPort`. The caller performs the final `KPort::EnqueueSession(...)` step immediately after `create_session(...)` returns.
 - Rust still returns object ids instead of raw `KClientSession*` / `KLightClientSession*` pointers because the kernel object model is still id-backed.
+- Rust stores `SynchronizationObjectState` directly in `KClientPort` and resolves it through the process client-port table. This is the Rust composition equivalent of upstream `KClientPort final : KSynchronizationObject`.
 
 ### Missing items
-- Port the upstream parent-pointer lifecycle (`IsLight()`, `IsServerClosed()`, `Destroy()`, `OnSessionFinalized()->NotifyAvailable()`) more literally once `KClientPort` regains a parent owner reference.
+- Port the upstream parent-pointer lifecycle (`IsLight()`, `IsServerClosed()`, `Destroy()`) more literally once `KClientPort` regains a parent owner reference.
 
 ### Binary layout verification
 - PASS: no raw serialized struct layout involved; only kernel object/session lifecycle changed.
@@ -7009,14 +7686,21 @@
 
 ### Intentional differences
 - Rust now creates a real `KSessionRequest` owner for sync requests, but it still approximates the upstream slab/auto-object lifecycle with `Arc<Mutex<KSessionRequest>>`.
-- `KClientSession` still carries an optional `request_manager` field for older direct HLE helper paths, even though the active SVC sync-request flow no longer relies on it.
 
 ### Missing items
 - Port the literal upstream `KSessionRequest` allocation/initialization flow for sync and async requests.
-- Remove the remaining client-side `request_manager` shortcut once all helper/session creation paths use the server-side owner chain.
 
 ### Binary layout verification
 - PASS: endpoint/runtime behavior only; no raw serialized struct layout changed.
+
+### Tests
+- Re-read upstream `KClientSession::Initialize`, `Destroy`, `SendSyncRequest`, and `SendAsyncRequest`.
+- `cargo test -p core send_sync_request_uses_server_session_manager -- --nocapture --test-threads=1`
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 75s isolated-XDG smoke after removing the client-side `request_manager` shortcut (`/tmp/ruzu_mk8d_no_client_request_manager_1780921709.log`, no L+R input, `RUST_LOG=warn,core::hle::service::audio=info,core::hle::service::nvdrv=info,core::hle::service::nvnflinger=info`): wrapper timed out as expected at 75s after reaching `NotifyRunning=1`, `OpenAudioRenderer=3`, `IAudioRenderer::Start=1`, `BQP_QUEUE=23`, and `SF_COMPOSE=299`; no `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, panic, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, `0x068B0000`, or `0x0000D401` marker.
 
 ## 2026-04-11 — `core/src/hle/kernel/svc/svc_port.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_port.cpp`
 
@@ -10660,7 +11344,6 @@
 
 ### Intentional differences
 - Rust still registers services through `ServerManager::register_named_service(...)` closures returning `Arc<dyn SessionRequestHandler>`, instead of C++ `std::make_shared<...>`. This is the expected mechanical ownership adaptation of the same upstream service graph.
-- The Rust file continues to use the existing `ServerManager::run_server(server_manager)` interface rather than the C++ move-only `RunServer(std::move(server_manager))`. This is a mechanical language adaptation only.
 
 ### Binary layout verification
 - PASS: service registration/control-flow change only; no guest-visible raw struct layout changed.
@@ -13485,7 +14168,7 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Intentional differences
 - The current host-thread IPC path is still a Rust bridge around upstream `KClientSession::SendSyncRequest` semantics: enqueue request, park client thread, let the owning `ServerManager` process the server session, then resume on reply. Upstream performs this inside kernel/session objects directly without a Rust diagnostic routing layer.
-- Host-thread IPC routing is kept opt-in via `RUZU_SERVER_THREAD_IPC_ALL=1` or `RUZU_SERVER_THREAD_IPC_HANDLE=...`; default execution remains the legacy inline path because global routing still trips a `KThread::EndWait` invariant (`WAITING` with no `wait_queue`) in MK8D.
+- Host-thread IPC routing is kept opt-in via `RUZU_SERVER_THREAD_IPC_ALL=1` or `RUZU_SERVER_THREAD_IPC_HANDLE=...`; default execution remains the legacy inline path because global routing still needs broader cold-boot, long-run, and multi-title validation before replacing the compatibility fallback.
 - `trace_host_thread_ipc` and the pl:u fresh-session diagnostic now emit through `common::trace` instead of `eprintln!` / `log::info!`, preserving the new non-blocking tracing model from `ad4e48844e5471439673b7065766cf900e772094`.
 - The host-thread routing path now performs request creation/enqueue through `KClientSession::send_sync_request_to_parent_with_process(...)`; the synchronous client wait transition is owned by `KServerSession::OnRequest`, matching upstream ownership more closely than the earlier `svc_ipc.rs`-local park.
 - The current diagnostic run with `RUZU_SERVER_THREAD_IPC_ALL=1` shows pl:u fresh-session requests land in the watched `KServerSession` before the client is parked (`is_signaled=true req_len=1 cur_req=false` for 46/46 samples).
@@ -13495,7 +14178,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - `PLU_IPC` currently samples request-list state only when `needs_setup` is true. If later evidence shows request loss can also occur after setup, this probe must be widened.
 
 ### Missing items
-- Default-enable validation for global host-thread IPC routing. The current opt-in path reaches MK8D `NotifyRunning` and the early render/present path without the previous `PrefetchAbort`/unmapped-write corruption, but broader title coverage and longer MK8D runs are still required before replacing the inline default.
+- Default-enable validation for global host-thread IPC routing. The current opt-in path reaches MK8D `NotifyRunning` and audio start reliably in cold-boot smokes without the previous `PrefetchAbort`/unmapped-write/`KThread::end_wait` corruption. Older 120s present-throughput comparisons showed host-thread-all producing fewer queued/presented frames than the inline path; after the latest `ServerManager` lock split, shorter Binder/BQP/PRESENT profiles no longer reproduce an early gap, so the remaining requirement is longer late-rendering/present coverage and broader title validation before replacing the inline default.
 
 ### Binary layout verification
 - N/A: IPC control flow and host diagnostics only. No guest-visible raw payload layout changed.
@@ -13509,6 +14192,9 @@ The following still panic because upstream either also throws NotImplementedExce
 - MK8D 18 s default inline run with `host_thread_ipc`/`plu_ipc` enabled in `trace.toml`: reaches `NotifyRunning`, emits no host-thread/PLU events, and shows no `KThread::end_wait` invariant errors.
 - MK8D 10 s `RUZU_SERVER_THREAD_IPC_ALL=1` diagnostic run: reaches `NotifyRunning`, emits 46 `PLU_IPC` samples, all with `is_signaled=true req_len=1 cur_req=false`, and shows no `PrefetchAbort` or `KThread::end_wait` invariant errors.
 - MK8D 25 s `RUZU_SERVER_THREAD_IPC_ALL=1` run: reaches `NotifyRunning`, `BQP_QUEUE=17`, `SF_COMPOSE=46`, with no `PrefetchAbort`, no unmapped access, no audio-glitch mute, and no `KThread::end_wait` invariant errors.
+- MK8D 90 s `RUZU_SERVER_THREAD_IPC_ALL=1` run after per-session `ServerManager` holder linkage (`/tmp/ruzu_mk8d_ipc_all_90s_1780871845.log`): reached `NotifyRunning`, logged `OpenAudioRenderer` and `IAudioRenderer::Start`, routed 5583 host-thread IPC requests with 5583 `after_on_request` / 5583 `client_resumed`, and emitted no `receive_request_hle failed`, `missing_server_manager_owner`, `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, panic marker, `PrefetchAbort`, or `KThread::end_wait` invariant marker. This validates the current global IPC routing smoke path but does not prove render/present correctness because presentation trace categories were not enabled in this run.
+- MK8D cold-boot A/B validation, three 45s isolated-XDG runs per mode (`/tmp/ruzu_mk8d_ipc_ab_1780872081.summary`): default inline reached `NotifyRunning` and `IAudioRenderer::Start` in 3/3 runs; `RUZU_SERVER_THREAD_IPC_ALL=1` reached the same markers in 3/3 runs, routed 5569-5586 host-thread requests per run, registered 46 host-thread sessions, and emitted no IPC/fatal markers. This is evidence that the remaining default-inline divergence is now promotion/coverage work, not a known cold-boot IPC/audio regression.
+- MK8D 120s present-throughput comparison with identical nvnflinger/present traces: default inline (`/tmp/ruzu_mk8d_default_present_120s_1780872624.log`) reached `BQP_QUEUE=1850`, `SF_COMPOSE=10549`, and `PRESENT_COMPOSITE=9248`; `RUZU_SERVER_THREAD_IPC_ALL=1` without verbose host-thread trace (`/tmp/ruzu_mk8d_hostall_present_notrace_120s_1780872766.log`) reached audio and emitted no IPC/fatal markers, but only `BQP_QUEUE=129`, `SF_COMPOSE=1852`, and `PRESENT_COMPOSITE=643`. The remaining default-inline divergence is therefore not only coverage risk; it includes a concrete host-thread-all throughput regression.
 
 ## 2026-05-30 — core/src/cpu_manager.rs and core/src/hle/kernel/kernel.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/cpu_manager.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/kernel.cpp
 
@@ -13817,20 +14503,17 @@ The following still panic because upstream either also throws NotImplementedExce
 ## 2026-05-27 — core/src/hle/service/server_manager.rs, core/src/hle/service/sm/sm.rs, core/src/hle/service/hle_ipc.rs, core/src/hle/kernel/svc/svc_ipc.rs, core/src/hle/kernel/k_scheduler.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.cpp, sm.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp
 
 ### Intentional differences
-- Ruzu keeps host-thread IPC routing behind a single env knob `RUZU_HOST_THREAD_IPC=1` instead of making it default. Upstream always routes through `ServerManager::LoopProcess`, but flipping the knob on by default exposes a pre-existing host-fiber boot-time readiness race (MK8D reaches `am::NotifyRunning` in ~33 % of runs vs ~80 % inline). Inline remains the default until that race is fixed.
+- Ruzu keeps host-thread IPC routing behind explicit env knobs (`RUZU_SERVER_THREAD_IPC_ALL=1`, `RUZU_SERVER_THREAD_IPC_HANDLE=...`, or service-specific gates) instead of making it default for every service. Upstream always routes through `ServerManager::LoopProcess`; inline remains the default until the remaining service-registration and host-fiber readiness races are fixed.
 - `ServerManager::register_session` mirrors the session into the host fiber's KProcess via `register_session_object` so that the kernel-backed `MultiWait::wait_any` can resolve its parent id. Sessions created via `HLERequestContext::create_session_with_manager_object_id` get synthetic object ids (counter starting at `0x1000_0000`) registered only in the guest process; without this mirror the wait fails systematically with `RESULT_INVALID_HANDLE`. Upstream `MultiWait::WaitAny` works on native `KSession*` pointers and is process-agnostic — this bridges the gap until the wait path itself goes process-agnostic.
 - `ServerManager::wait_and_process_impl` performs a local non-blocking signaled-holder scan before entering the kernel wait, and on guest-core fibers falls back to a bounded `wakeup_event.wait_timeout(100 ms)` when `wait_any` returns `None`. Without the bound, that path spins at ~200 K iter/sec and starves every other guest-service fiber sharing the same core.
-- `ServerManager::complete_sync_request` installs a `ClientThreadImpersonationGuard` (RAII) that swaps the host fiber's `CURRENT_THREAD` thread-local with the IPC's client thread for the lifetime of one handler dispatch. Handlers that read `system.current_thread()` (and chase `parent`/`scheduler`) then see the guest fiber that issued the request rather than the host fiber's dummy KThread.
-- `SessionRequestManager::new_with_registration_queue` is a Rust lifecycle adapter for the window where `register_named_service` has published a port but `KernelCore::run_server` has not yet republished the final `Weak<ServerManager>`. It preserves the queue+wakeup endpoint needed for host-thread IPC until full ownership is available.
+- `ServerManager::complete_sync_request` deliberately keeps the host service thread's own dummy `CURRENT_THREAD` during handler dispatch. The IPC client thread is available explicitly through `HLERequestContext::get_thread()`, and client process memory is wired into the context. Earlier impersonation was removed because swapping `CURRENT_THREAD` to the guest client violated scheduler dispatch-count invariants on the host service thread.
 - `KScheduler::{schedule_raw_if_needed,reschedule_current_core_impl}` disables dispatch on the thread captured before the fiber switch and only re-enables if the disable count is still positive. Upstream `GetCurrentThread().DisableDispatch(); Schedule(); GetCurrentThread().EnableDispatch();` assumes thread identity is stable across the call; ruzu's TLS/fiber handoff can otherwise re-read a different current thread.
 - Added env-gated diagnostics for `ServerManager` and host-thread IPC queue selection (`RUZU_TRACE_SERVER_MANAGER_IPC`, `RUZU_TRACE_SERVER_MANAGER_LOOP`, `RUZU_TRACE_HOST_THREAD_IPC`, `RUZU_TRACE_MULTI_WAIT`, `RUZU_TRACE_SM_OWNERSHIP`). All inactive by default and do not affect guest-visible payload layout.
 
 ### Unintentional differences (to fix)
-- Ruzu still uses the inline IPC path by default; upstream `ServerManager::OnSessionEvent` owns HLE request dispatch. The host-thread route (`RUZU_HOST_THREAD_IPC=1`) is functional end-to-end (reaches `am::NotifyRunning` + audio loop) but flaky at boot.
-- The Rust service-registration lifecycle still publishes service ports before the final `ServerManager` weak reference is available; queue-only ownership is a compatibility bridge, not full upstream structural parity.
+- Ruzu still uses the inline IPC path by default unless explicit host-thread routing is selected; upstream `ServerManager::OnSessionEvent` owns all HLE request dispatch. The remaining services still need default-routing validation before the inline fallback can be removed.
 
 ### Missing items
-- Remove the legacy spawn-based fallback (`host_thread_ipc_spawn_fallback`) once all sessions have reliable ServerManager ownership.
 - Replace the process-id based `MultiWait` resolution with an upstream-faithful wait model over stable kernel object references, so the per-process session mirror in `register_session` becomes unnecessary.
 
 ### Binary layout verification
@@ -13841,7 +14524,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - `cargo build --release --bin ruzu-cmd` clean (4 pre-existing warnings).
 - `git diff --check` clean.
 - Runtime MK8D default inline smoke (`RUZU_DISABLE_ASLR=1 RUZU_RNG_SEED=0`, 25 s timeout): 4/5 runs reach `am::NotifyRunning`.
-- Runtime MK8D opt-in smoke (`RUZU_HOST_THREAD_IPC=1`, 30 s timeout): 1/3 runs reach `am::NotifyRunning` + audio glitch-mute (game loop entry). Flakiness tracked as the host-fiber boot race.
+- Runtime MK8D opt-in smoke from this historical slice used the then-current host-thread routing knob and is superseded by the current `RUZU_SERVER_THREAD_IPC_ALL=1` / `RUZU_SERVER_THREAD_IPC_HANDLE=...` gates; host-thread routing remains opt-in because default safety is not proven.
 
 ## 2026-05-26 — core/src/hle/kernel/svc_dispatch.rs, core/src/hle/kernel/svc/svc_thread.rs, core/src/hle/kernel/k_scheduler.rs, and core/src/cpu_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_thread.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/cpu_manager.cpp
 
@@ -13868,15 +14551,15 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Intentional differences
 - Added env-gated `RUZU_YIELD_AFTER_IPC=1`, which calls `KScheduler::yield_without_core_migration(...)` after an inline HLE IPC reply. This is diagnostic-only and verifies that simple queue rotation can run same-priority workers after IPC, but it does not match upstream because the client thread is still runnable while the HLE handler runs inline.
-- Added env-gated `RUZU_SERVER_THREAD_IPC_HANDLE=0x...[,0x...]` with optional `RUZU_SERVER_THREAD_IPC_LIMIT=N`. For selected handles only, ruzu enqueues the request, marks the client thread as IPC-waiting, processes the request on a one-shot host worker, sends the reply, and resumes through `KServerSession::send_reply()`. This is an investigation bridge toward upstream's `KClientSession::SendSyncRequest` → `KServerSession::OnRequest` → `ServerManager::OnSessionEvent` lifecycle, not a final architecture.
-- Added `RUZU_TRACE_SERVER_THREAD_IPC=1`, targeted only at the selected one-shot IPC path, to identify whether the experiment blocks in enqueue, receive, dispatch, or reply.
+- Added env-gated `RUZU_SERVER_THREAD_IPC_HANDLE=0x...[,0x...]`. For selected handles, ruzu now routes through the pending-registration queue and owning `ServerManager` wakeup path when session ownership is available, then resumes through `KServerSession::send_reply_hle_unlocked(...)`. This remains an investigation bridge toward making upstream's `KClientSession::SendSyncRequest` → `KServerSession::OnRequest` → `ServerManager::OnSessionEvent` lifecycle the default.
+- Added `RUZU_TRACE_SERVER_THREAD_IPC=1`, targeted at the host-thread IPC routing path, to identify whether the experiment blocks in queue setup, request enqueue, manager wakeup, dispatch, or reply.
 
 ### Unintentional differences (to fix)
 - Ruzu still defaults to inline HLE IPC in `svc_ipc.rs`. Upstream never completes normal HLE service dispatch directly inside `Svc::SendSyncRequestImpl`; it enqueues a `KSessionRequest`, transitions the client through `BeginWait`, and the server manager receives/completes/replies on the service side.
-- The one-shot worker is deliberately less faithful than upstream `ServerManager`: it is per-request, host-thread spawned, and selected by guest handle. It proved the scheduler ordering issue but should be replaced by real server-manager session processing.
+- Explicit host-thread routing now fails with `ResultInvalidHandle` when a target lacks `ServerManager` queue+wakeup ownership. Upstream does not need this ownership check because `KClientSession` always calls its parent `KSession` directly and service dispatch is owned by registered server sessions.
 
 ### Missing items
-- Port the default synchronous HLE IPC lifecycle so `KClientSession::send_sync_request_with_process(...)`/`KServerSession::on_request_with_process(...)` put the client thread into IPC wait and return only after `KServerSession::send_reply()` ends that wait, matching upstream ownership.
+- Make the default synchronous HLE IPC lifecycle use `KClientSession::send_sync_request_with_process(...)` / `KServerSession::on_request_with_process(...)` for all service sessions, with `ServerManager` ownership available before the first request.
 - Wire all HLE sessions through `ServerManager::OnSessionEvent` instead of relying on `svc_ipc.rs` inline receive/complete/reply.
 
 ### Binary layout verification
@@ -15288,10 +15971,10 @@ The following still panic because upstream either also throws NotImplementedExce
 ## 2026-05-31 — core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
 
 ### Intentional differences
-- Ruzu keeps the experimental host-thread IPC routing behind explicit opt-in (`RUZU_SERVER_THREAD_IPC_ALL` or `RUZU_SERVER_THREAD_IPC_HANDLE=...`) and uses inline IPC by default: upstream routes service dispatch through server threads, but ruzu's current host-thread path still has boot-order/re-entrancy regressions in MK8D. This preserves the known-good default while keeping the upstream-parity path available for targeted investigation.
+- Ruzu keeps the experimental host-thread IPC routing behind explicit opt-in (`RUZU_SERVER_THREAD_IPC_ALL` or `RUZU_SERVER_THREAD_IPC_HANDLE=...`) and uses inline IPC by default. Upstream routes service dispatch through server threads; ruzu's current host-thread path now passes targeted MK8D IPC/audio smokes, but default promotion still requires broader validation and removal of Rust-only routing gates.
 
 ### Unintentional differences (to fix)
-- Full upstream server-thread IPC remains incomplete as the default path. The remaining gap is in session lifecycle/re-entrancy behavior, not in the basic queue/wakeup plumbing.
+- Full upstream server-thread IPC remains incomplete as the default path. The remaining gap is proving and then promoting the host-thread lifecycle as the sole consumer, not the basic queue/wakeup plumbing.
 
 ### Missing items
 - Finish the `ServerManager`/host-thread IPC audit so the upstream-shaped server-thread path can become default without regressing MK8D boot.
@@ -15665,7 +16348,7 @@ The following still panic because upstream either also throws NotImplementedExce
 ## 2026-06-03 — core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
 
 ### Intentional differences
-- Restricted the ruzu-only post-IPC host OS sleep to explicit host-thread IPC experiments (`RUZU_SERVER_THREAD_IPC_ALL` or `RUZU_SERVER_THREAD_IPC_HANDLE`). Upstream has no post-IPC sleep in `SendSyncRequest`; ruzu keeps it only as a mitigation for the non-default host-thread routing path.
+- Restricted the ruzu-only post-IPC host OS sleep to explicit host-thread IPC experiments (`RUZU_SERVER_THREAD_IPC_ALL`, `RUZU_SERVER_THREAD_IPC_HANDLE`, `RUZU_SERVER_THREAD_IPC_BINDER`, or `RUZU_SERVER_THREAD_IPC_SERVICE`). Upstream has no post-IPC sleep in `SendSyncRequest`; ruzu keeps it only as a mitigation for the non-default host-thread routing path.
 
 ### Binary layout verification
 - N/A: IPC scheduling/yield policy only. No guest-visible raw payload layout changed.
@@ -15839,7 +16522,7 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Intentional differences
 - `svc_dispatch.rs` now routes A32/A64 `QueryMemory` through `svc_query_memory::query_memory(...)`, and `svc_query_memory.rs` now serializes `KMemoryInfo::get_svc_memory_info()`. This matches upstream's `QueryMemory -> QueryProcessMemory -> KMemoryInfo::GetSvcMemoryInfo()` path and removes the older local partial `query_memory_info` conversion.
 - `KMemoryInfo::get_svc_memory_info()` masks memory attributes and permissions with the user masks, preserving ipc/device counts, matching upstream `KMemoryInfo::GetSvcMemoryInfo()`.
-- `svc_ipc.rs` keeps host-thread IPC routing env-gated. `IHOSBinderDriver` was temporarily routed through the owning `ServerManager` by default in this investigation, but the later 2026-06-05 IPC entry records why that default was reverted to opt-in.
+- `svc_ipc.rs` keeps host-thread IPC routing env-gated. `IHOSBinderDriver` is validated through `RUZU_SERVER_THREAD_IPC_SERVICE=IHOSBinderDriver` or broader explicit routing, not through an implicit default route.
 - Added env-gated diagnostics for MK8D investigation: `RUZU_TRACE_IOCALLOC_CTX=1` in `nvdrv_interface.rs` prints the nvmap alloc IPC buffer descriptors, `RUZU_TRACE_PHYS_MEMORY=1` in `svc_physical_memory.rs` prints Map/UnmapPhysicalMemory calls and results, and `RUZU_TRACE_INVALID_HANDLE_SVC=1` in `svc_dispatch.rs` logs only SVC returns whose result register is `ResultInvalidHandle`. These are inactive by default and do not change guest-visible behavior.
 
 ### Unintentional differences (to fix)
@@ -15856,7 +16539,7 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Tests
 - `cargo check -p core`
 - `cargo build --release --bin ruzu-cmd`
-- Manual MK8D run after rebuilding release with default Binder host-thread routing: the earlier Binder scheduler wedge is gone at the 8s SIGUSR1 snapshot (`pq_fronts=None`, all cores `needs=false`), and the run reaches the next blocker: `nvmap::IocAlloc(handle=0xACC, addr=0x068B0000, size=0x70000)` on `Free` memory followed by `BreakLoopNullPc tid=96`.
+- Historical MK8D run after rebuilding release during the temporary Binder host-thread routing experiment: the earlier Binder scheduler wedge was gone at the 8s SIGUSR1 snapshot (`pq_fronts=None`, all cores `needs=false`), and the run reached the next blocker: `nvmap::IocAlloc(handle=0xACC, addr=0x068B0000, size=0x70000)` on `Free` memory followed by `BreakLoopNullPc tid=96`.
 - Manual MK8D run with `RUZU_TRACE_IOCALLOC=1`: reproduced the late block at `IocAlloc` with guest input buffer already containing `address=0x068B0000`.
 - Manual MK8D run with `RUZU_TRACE_TID_SVC=96 RUZU_TRACE_TID_SVC_PC=1`: captured the following post-failure guest SVC sequence from `tid=96`: `SendSyncRequest pc=0x01D50474 lr=0x01D3C7C0`, then `FlushProcessDataCache pc=0x01D50750 lr=0x01D299C0` over `0x068B0000`.
 
@@ -16320,7 +17003,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - `KMemoryManager::InitializeOptimizedMemory` / `FinalizeOptimizedMemory` now enforce the upstream single optimized process per pool and process-id-matched finalization policy, but the per-`Impl` optimized allocation bitmap clear/track helpers remain simplified because ruzu does not yet expose upstream's management-region device-memory map.
 
 ### Unintentional differences (to fix)
-- None identified in the audited `KMemoryManager::{Open,OpenFirst,Close}` and `KPageGroup::{Open,OpenFirst,Close}` slice. The Rust public entry points now split ranges per physical `Impl`, take the pool lock per segment, and `KPageGroup::open_first()` routes to `KMemoryManager::open_first()`.
+- None identified in the audited `KMemoryManager::{Open,OpenFirst,Close}` and `KPageGroup::{Open,OpenFirst,Close}` slice.
 
 ### Missing items
 - Replace the `Vec<KBlockInfo>` storage with an upstream-shaped `KBlockInfoManager` owner if later page-table work needs exact block-node allocation/lifetime parity.
@@ -16338,3 +17021,147 @@ The following still panic because upstream either also throws NotImplementedExce
 - `cargo fmt --check`
 - `git diff --check`
 - `cargo test -p core open_first_open_close_split_across_impl_managers -- --nocapture`
+
+## 2026-06-07 — `core/src/hle/kernel/svc/svc_ipc.rs` and `core/src/hle/kernel/k_server_session.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp`
+
+### Intentional differences
+- Rust routes HLE replies from the inline/fallback SVC path through `KServerSession::send_reply_hle_unlocked(&Arc<Mutex<KServerSession>>)`. Upstream `KServerSession::SendReply(..., is_hle=true)` holds a light lock and then uses `KScopedSchedulerLock`; the Rust `Mutex<KServerSession>` previously covered too much state, so the helper mirrors upstream ordering by taking `m_current_request` under the session mutex and dropping that mutex before waking the client thread.
+- `ProcessSendMessageReceiveMapping` now copies receive/exchange payload bytes from the source process page table before writing them through the destination process page-table validation path. Upstream passes a direct source pointer into `dst_page_table.CopyMemoryFromUserToLinear(...)`; ruzu does not expose stable cross-process direct pointers here, so the Rust path materializes the source bytes first and then uses `copy_memory_from_kernel_to_linear(...)` for the destination write.
+
+### Unintentional differences (to fix)
+- The full raw `SendReply`/`SendMessage` translation path still uses local `Vec<u32>` mirrors and explicit final flushes instead of upstream's direct `dst_msg_ptr` / `src_msg_ptr` `MessageBuffer` views for every operation. Receive/exchange mapping direction is now covered, but the broader direct-pointer transport shape is still not fully upstream-identical.
+
+### Missing items
+- None identified in this HLE reply-routing slice. The broader non-HLE direct-pointer transport differences remain tracked in the existing `KServerSession` message-buffer entries above.
+
+### Binary layout verification
+- N/A: kernel scheduling/reply ordering only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `svc_ipc.cpp` `SendSyncRequest` reply path and `k_server_session.cpp` `KServerSession::SendReply`.
+- Re-read upstream `k_server_session.cpp` `SendMessage`, closed-request cleanup, and async/sync reply result selection.
+- `cargo test -p core send_reply_with_message -- --nocapture --test-threads=1`
+- `cargo check -p core`
+- Manual MK8D `PRESENT_COMPOSITE` smoke after the `SendMessage` receive/exchange mapping fix: 1677 `after_swap` presents in 55s, `NotifyRunning=1`, no panic, no `BreakLoopNullPc`, no real `ERROR`, and no nonzero `gl_error` in `/tmp/ruzu_mk8d_after_ipc_transport.*`.
+
+## 2026-06-07 — `core/src/hle/service/hle_ipc.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.h`
+
+### Intentional differences
+- `HLERequestContext::write_guest_memory(...)` now uses `Memory::write_block_no_rasterizer_checked(...)` for IPC out-buffer copies. Upstream `HLERequestContext::WriteBufferB/C` calls `memory.WriteBlock(...)`; in ruzu, the checked no-rasterizer path is the existing Rust adaptation for HLE IPC output buffers, avoiding rasterizer notification while the global `Memory` mutex is held.
+
+### Unintentional differences (to fix)
+- Rust still returns copied `Vec<u8>` data for `ReadBuffer*` instead of upstream's span-returning zero-copy `ReadBuffer*` methods because the memory bridge is behind `Arc<Mutex<Memory>>`.
+
+### Missing items
+- None identified in this HLE IPC buffer descriptor slice.
+
+### Binary layout verification
+- N/A: service IPC buffer copy policy only. No guest-visible raw payload struct layout changed.
+
+### Tests
+- Re-read upstream `HLERequestContext::WriteBuffer`, `WriteBufferB`, and `WriteBufferC`.
+- `cargo test -p core write_guest_memory_uses_memory_ipc_write_block -- --nocapture`
+- `cargo test -p core write_buffer_prefers_b_descriptor_and_clamps_like_upstream -- --nocapture`
+- `cargo test -p core write_buffer_returns_zero_when_selected_c_descriptor_is_missing -- --nocapture`
+- `cargo test -p core parse_tipc_command_buffer_keeps_c_receive_descriptor -- --nocapture`
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D `PRESENT_COMPOSITE` smoke: 1911 `after_swap` presents in 45s, `NotifyRunning=1`, no panic, no `BreakLoopNullPc`, no real `ERROR`, and no nonzero `gl_error` in `/tmp/ruzu_mk8d_ipc_smoke.*`.
+
+## 2026-06-07 — `common/src/trace.rs` SVC IPC diagnostic formatting vs local trace infrastructure
+
+### Intentional differences
+- `SVC_IPC_PROGRESS` text formatting now prints both the symbolic stage name and the numeric stage id (`stage=name(id)`). This is diagnostic-only and keeps unknown temporary stages attributable in ring-buffer dumps without changing trace payload emission.
+
+### Unintentional differences (to fix)
+- None identified; this only affects host-side human-readable trace formatting.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- N/A: host trace text formatting only.
+
+### Tests
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D `PRESENT_COMPOSITE` run: 1669 presents in 60s, `NotifyRunning=1`, no panic/ERROR in `/tmp/mk8d_final_present_check.log`.
+
+## 2026-06-07 — `core/src/hle/service/server_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.h`
+
+### Intentional differences
+- `ServerManager` stores an upstream-equivalent `selection_mutex` and `wait_signaled(...)` takes it before linking deferred holders and selecting a `MultiWaitHolder`, matching upstream `Mutex m_selection_mutex` around `WaitSignaled`. The field is an `Arc<Mutex<()>>` so Rust can take the guard without blocking later `&mut self` operations on the same owner.
+- `ServerManager::wait_signaled(...)` now consumes the wakeup holder inside the selection loop, clears `wakeup_event`, relinks the wakeup holder, and restarts selection, matching upstream `WaitSignaled`'s `if selected == m_wakeup_holder { Clear(); continue; }` behavior. Rust still keeps the existing 100 ms timeout fallback around host-thread waits because its `MultiWait` kernel-object bridge is not yet fully upstream-shaped.
+- `ServerManager::process(...)` now reads `MultiWaitHolder::get_user_data()` and dispatches on the upstream `UserDataTag` values before calling the Rust owner-specific event helpers. Rust still resolves the selected `Port` / `Session` by pointer lookup in the local vectors because it cannot safely `static_cast` the holder pointer back to an intrusive C++ owner object.
+- `ServerManager::register_session(...)` still records every session, but links a session holder into `MultiWait` only when that specific session is consumed by the host-thread path: `RUZU_SERVER_THREAD_IPC_ALL`, an already-prepared exact-handle route with `manager_wakeup`, or a handler name matched by `RUZU_SERVER_THREAD_IPC_SERVICE`. `rebuild_wait_holder_linkage_after_move(...)` applies the same per-session rule, so moving the manager into its final Rust owner does not silently link non-target sessions and reintroduce an inline double-consumer. Upstream always has `ServerManager` as the sole consumer; ruzu's default path still consumes HLE IPC inline in `svc_ipc.rs`, so linking non-target session holders creates a second consumer racing `receive_request_hle(...)`.
+- `ServerManager::register_named_service(...)` and `manage_named_port(...)` publish a live `ServiceOwnership.server_manager` weak reference immediately when `bind_self_reference(...)` has already run. Runtime service loops construct the final shared owner before registration through `ServerManager::new_shared(...)`, matching upstream's stable-pointee setup more closely.
+- `ServerManager::deferred_sessions` stores monotonic `Session::id` values as the Rust equivalent of upstream's stable `Session*` entries in `std::list<Session*> m_deferred_sessions`. Rust still stores sessions in a `Vec<Session>`, so retry resolves the id to the current index before calling `complete_sync_request(...)`.
+- `ServerManager::on_deferral_event(...)` owns the deferral-event clear before taking the deferred session list and relinking the deferral holder, matching upstream `OnDeferralEvent` method ownership.
+- `ServerManager::destroy_session(...)` owns session removal for the same callers as upstream `DestroySession(Session*)`: closed-session handling in `on_session_event(...)` and `complete_sync_request(...)`. Because Rust tracks deferred sessions by stable ids rather than raw `Session*`, destruction also removes matching deferred ids at the same ownership boundary so a later deferral retry cannot target a destroyed session.
+- `ServerManager::loop_process_shared(...)` prepares the final shared owner, activates pending `StartAdditionalHostThreads(...)` requests, then enters the shared `loop_process_impl_shared(...)` body. Additional host threads have no Rust-only pre-loop `park_timeout` gate; they rely on the same shared stop flag and event-loop body as the main server thread while preserving the owner-move preparation Rust needs before `MultiWaitHolder` backlinks are stable. The shared loop now selects a `Session` holder under `selection_mutex` / `Mutex<ServerManager>`, clones the session endpoint and request manager, then runs `ReceiveRequestHLE` / `CompleteSyncRequest` / `SendReplyHLE` outside the coarse manager mutex before relinking or destroying the session under the owner lock. This matches upstream's split more closely: `WaitSignaled` is serialized by `m_selection_mutex`, but `OnSessionEvent` work is not protected by one global manager mutex.
+- `RUZU_PROFILE_IPC_PHASES=1` now records disabled-by-default `server_*` phase timings around `ServerManager::WaitAndProcessImpl`, `OnSessionEvent`, and `CompleteSyncRequest`. Upstream has no equivalent profiler; this is host-side diagnostics only and was added to prove whether the remaining host-thread-all throughput gap is in selection, `ReceiveRequestHLE`, HLE dispatch, reply, or relink.
+
+### Unintentional differences (to fix)
+- The shared Rust `loop_process_shared(...)` path still uses `Mutex<ServerManager>` for holder selection, port events, deferral events, session relink/destroy, and owner-vector lookup. Session handler dispatch is no longer under the coarse owner lock, but additional host threads are still more serialized than upstream's intrusive-list/per-field locking model.
+- Ruzu still defaults HLE IPC to the inline consumer, while upstream always dispatches through `ServerManager::OnSessionEvent`. The default-mode session-holder unlink is therefore a temporary compatibility adaptation, not final upstream parity.
+
+### Missing items
+- Make `ServerManager::OnSessionEvent` the default and only HLE IPC consumer. Once that is safe, remove the env-gated session-holder linking and always link sessions like upstream.
+- Continue splitting the remaining monolithic `Mutex<ServerManager>` responsibilities into upstream-shaped per-field synchronization: port accept/register, deferral retry, session holder lookup/relink, and the Rust `Vec<Session>` / `Vec<Port>` owner storage still serialize more than upstream's intrusive lists plus `m_selection_mutex`.
+
+### Binary layout verification
+- N/A: host-side service event-loop synchronization only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `server_manager.h` for `m_selection_mutex`.
+- Re-read upstream `server_manager.cpp::StartAdditionalHostThreads`, `LoopProcess`, `LoopProcessImpl`, `WaitSignaled`, `Process`, `OnSessionEvent`, `CompleteSyncRequest`, `OnDeferralEvent`, and `DestroySession`.
+- Re-read upstream `server_manager.cpp::WaitAndProcessImpl`, `OnSessionEvent`, and `CompleteSyncRequest` before moving session dispatch outside the coarse Rust `Mutex<ServerManager>`.
+- `cargo check -p core`
+- `cargo test -p core deferred_session_ids_survive_session_vector_removal -- --nocapture --test-threads=1`
+- `cargo test -p core destroy_session_removes_matching_deferred_id -- --nocapture --test-threads=1`
+- `cargo test -p core start_additional_host_threads_records_pending_threads -- --nocapture --test-threads=1`
+- `cargo test -p core server_manager::tests:: -- --nocapture --test-threads=1`
+- `cargo test -p core wait_holder_rebuild_keeps_default_inline_session_holder_unlinked -- --nocapture --test-threads=1`
+- `cargo test -p core service_owner_weak_is_live_after_manager_is_bound -- --nocapture --test-threads=1`
+- `cargo test -p core server_manager_holders_use_upstream_process_tags -- --nocapture --test-threads=1`
+- `cargo fmt --all --check`
+- `cargo test -p core server_manager::tests:: -- --nocapture --test-threads=1`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 75s isolated-XDG default smoke after stable deferred-session ids and `OnDeferralEvent` ownership cleanup (`/tmp/ruzu_mk8d_ipc_smoke_1780876178.log`, `RUST_LOG=warn`): reached `NotifyRunning`; no `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, panic, `receive_request_hle failed`, `missing_server_manager_owner`, `KThread::end_wait`, `PrefetchAbort`, or `0x068B0000` marker. Warn-level logging did not emit audio/present markers, so this is early IPC no-obvious-regression evidence only.
+- Manual MK8D 75s isolated-XDG default smoke after moving additional host-thread activation into `loop_process_shared(...)` (`/tmp/ruzu_mk8d_server_threads_1780876743.log`, `RUST_LOG=warn`): reached `NotifyRunning`; no `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, panic, `receive_request_hle failed`, `missing_server_manager_owner`, `KThread::end_wait`, `PrefetchAbort`, or `0x068B0000` marker. The log stayed silent after `NotifyRunning` and did not emit audio/present markers at warn level, so this is no-obvious-regression evidence only.
+- Manual MK8D 45s isolated-XDG host-thread-all server phase profile (`/tmp/ruzu_mk8d_hostall_serverphase_1780874626.log`, `RUZU_SERVER_THREAD_IPC_ALL=1`, `RUZU_PROFILE_IPC_PHASES=1`): reached `NotifyRunning`, no IPC/fatal markers, `server_03_receive_request_hle` was microsecond-scale (`5570` calls, `11.12ms` total), `server_10_send_reply_hle` was small (`28.16ms` total), and time localized to `server_08_hle_complete_sync_request` / `IHOSBinderDriver cmd=0`.
+- Manual MK8D 45s isolated-XDG binder phase A/B: host-thread-all (`/tmp/ruzu_mk8d_hostall_binderphase_1780874709.log`) processed `134` `BufferQueueProducer::DequeueBuffer` transactions with `txn=3 binder_transact` averaging `14.8ms`; default inline (`/tmp/ruzu_mk8d_inline_binderphase_1780874789.log`) processed `1829` matching transactions with `txn=3 binder_transact` averaging `15.2ms`. The blocking dequeue itself is upstream-shaped BufferQueue pacing; the host-thread-all regression is the much lower volume of IPC/present work, not slower parcel copies or `SendReplyHLE`.
+- Manual MK8D 45s isolated-XDG default smoke after moving shared-loop session dispatch outside the coarse `Mutex<ServerManager>` (`/tmp/ruzu_mk8d_ipc_shared_session_smoke.log`, `RUST_LOG=info`): reached `IAudioRendererManager::OpenAudioRenderer`, `IAudioRenderer::Start`, `NotifyRunning`, `BQP_QUEUE`, and repeated `SF_COMPOSE ... COMPOSING`; no `BreakLoopNullPc`, `svcBreak`, `SetTerminateResult`, panic, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, `0x068B0000`, `NvServices is not initialized`, `Could not find DeviceFD`, or `Trying to open unknown device` marker. The zsh wrapper reused the read-only `status` variable after the run, so this is marker-based no-obvious-regression evidence rather than a clean wrapper-status record.
+- Manual MK8D 60s isolated-XDG A/B after moving shared-loop session dispatch outside the coarse `Mutex<ServerManager>` used identical `RUST_LOG=info` marker logging. Default routing (`/tmp/ruzu_mk8d_default_after_session_unlock_60s.log`) timed out by wrapper with last sampled `BQP_QUEUE #64`, `SF_COMPOSE #1729`, and `SF_COMPOSE ... COMPOSING #1680`. `RUZU_SERVER_THREAD_IPC_ALL=1` (`/tmp/ruzu_mk8d_hostall_after_session_unlock_60s.log`) timed out by wrapper with last sampled `BQP_QUEUE #128`, `SF_COMPOSE #17820`, and `SF_COMPOSE ... COMPOSING #17820`. Neither run emitted `BreakLoopNullPc`, `svcBreak`, `SetTerminateResult`, panic, `receive_request_hle failed`, `missing_server_manager_owner`, `PrefetchAbort`, `0x068B0000`, `NvServices is not initialized`, `Could not find DeviceFD`, or `Trying to open unknown device`. This rules out an obvious host-thread-all regression from the lock split under this verbose trace setup, but it is not directly comparable to the older 120s present-throughput profile because the trace categories and logging volume differ.
+- Manual MK8D 18s isolated-XDG SIGUSR2 phase/profile A/B after the same lock split (`/tmp/ruzu_mk8d_default_after_session_unlock_profile_sigusr2.log` and `/tmp/ruzu_mk8d_hostall_after_session_unlock_profile_sigusr2.log`, `RUZU_PROFILE_IPC=1`, `RUZU_PROFILE_IPC_PHASES=1`) shows the dominant time is `IHOSBinderDriver cmd=0` in both modes: default `245` calls / `1797.35ms` total / `7336.13us` avg; host-thread-all `273` calls / `1954.08ms` total / `7157.80us` avg. Server receive/relink phases remain microsecond-scale (`server_03_receive_request_hle`, `server_10_send_reply_hle`, `server_12_relink_session`). This narrows the remaining throughput investigation away from `ServerManager` selection/relink locking and toward Binder transaction / `BufferQueueProducer::DequeueBuffer` pacing or broader producer scheduling.
+- Manual MK8D 30s isolated-XDG SIGUSR2 Binder/BQP/PRESENT A/B after the same lock split (`/tmp/ruzu_prof_default_bqp.log` and `/tmp/ruzu_prof_hostall_bqp.log`, `RUZU_PROFILE_BINDER_TXN=1`, `RUZU_PROFILE_BQP_WAIT=1`, `RUZU_PROFILE_BQP_SLOTS=1`, `RUZU_PROFILE_PRESENT=1`) reached `NotifyRunning` in both modes with no fatal IPC/kernel markers. Default routed `117` `QueueBuffer` calls, `118` Binder `txn=3` dequeues averaging `15133us`, `BQP_WAIT total_us=1784727`, and `PRESENT_PROFILE count=116`. `RUZU_SERVER_THREAD_IPC_ALL=1` routed `128` `QueueBuffer` calls, `129` Binder `txn=3` dequeues averaging `14820us`, `BQP_WAIT total_us=1910779`, and `PRESENT_PROFILE count=127`. This short profile does not prove late-run parity, but it no longer supports treating the remaining default-vs-host-thread-all risk as a current early Binder/BQP throughput gap.
+- Manual MK8D 120s isolated-XDG SIGUSR2 Binder/BQP/PRESENT A/B after the same lock split used low-volume warn logging. The first default run (`/tmp/ruzu_long_default_present.log`) was rejected as an early `time:u` / `cv_key=0x69A545AC` boot stall: no `NotifyRunning`, only `1` `DequeueBuffer`, and `PRESENT_PROFILE count=0`. The retry default (`/tmp/ruzu_long_default2_present.log`) reached `NotifyRunning` with no fatal IPC/kernel markers, but only `119` `QueueBuffer` calls, `120` Binder `txn=3` dequeues averaging `14964us`, `BQP_WAIT total_us=1794764`, and `PRESENT_PROFILE count=118`. `RUZU_SERVER_THREAD_IPC_ALL=1` (`/tmp/ruzu_long_hostall_present.log`) reached `NotifyRunning` with no fatal IPC/kernel markers and produced `131` `QueueBuffer` calls, `132` Binder `txn=3` dequeues averaging `14717us`, `BQP_WAIT total_us=1941627`, and `PRESENT_PROFILE count=130`. This no longer shows a host-thread-all-specific early throughput regression, but both modes still appear to stop making meaningful present progress long before the requested 120s late-rendering window.
+- Manual MK8D 35s isolated-XDG smoke after adding `selection_mutex` (`/tmp/ruzu_mk8d_selection_mutex_smoke.log`): no panic/`BreakLoopNullPc`, but did not reach `NotifyRunning`; last marker remained `ServerManager(ns:am2): session 6 receive_request_hle failed (result=0xf601)`. This confirms the structural guard is not sufficient to fix the stale/signaled session holder race.
+- Manual MK8D 45s isolated-XDG default smoke after gating session-holder linking (`/tmp/ruzu_mk8d_session_unlink_smoke.log`): reached `NotifyRunning`/audio marker, no panic/`BreakLoopNullPc`, and no `receive_request_hle failed` warnings. This confirms the default inline path no longer has a competing `ServerManager` session consumer.
+- Manual MK8D 25s isolated-XDG host-thread-all smoke with `RUZU_SERVER_THREAD_IPC_ALL=1` (`/tmp/ruzu_mk8d_host_all_session_link_smoke.log`): reached `NotifyRunning`/audio marker, no panic/`BreakLoopNullPc`, no `missing_server_manager_owner`, and no `receive_request_hle failed` warnings. This confirms explicit host-thread routing still links session holders.
+- Manual MK8D 45s isolated-XDG default smoke after moving wakeup-holder consumption into `wait_signaled(...)` (`/tmp/ruzu_mk8d_server_waitsignaled_smoke.log`): reached `NotifyRunning`, no panic/`BreakLoopNullPc`, no `svcBreak`/`SetTerminateResult`, and no `receive_request_hle failed` warnings.
+- Manual MK8D 25s isolated-XDG host-thread-all smoke after moving wakeup-holder consumption into `wait_signaled(...)` (`/tmp/ruzu_mk8d_server_waitsignaled_host_all_smoke.log`, `RUZU_SERVER_THREAD_IPC_ALL=1`): reached `NotifyRunning`, no panic/`BreakLoopNullPc`, no `svcBreak`/`SetTerminateResult`, no `missing_server_manager_owner`, and no `receive_request_hle failed` warnings.
+
+## 2026-06-08 — `core/src/hle/kernel/k_server_session.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp`
+
+### Intentional differences
+- `RUZU_PROFILE_IPC_PHASES=1` records disabled-by-default reply counters around sync/async reply wake paths. Upstream has no equivalent profiler; the counters are host diagnostics only and do not alter reply behavior.
+- `KServerSession::send_reply_hle_unlocked(...)` remains a Rust mutex-boundary adaptation for host-thread `ServerManager` dispatch. It computes the reply under the session mutex, drops that mutex, then takes the scheduler lock and calls `KThread::end_wait(...)`, avoiding the Rust `Mutex<KServerSession>` vs scheduler-lock ABBA while preserving upstream's `SendReplyHLE -> EndWait` ordering at the kernel-state boundary.
+
+### Unintentional differences (to fix)
+- None identified for the audited sync reply wake decision: both `send_reply_with_message(...)` and `send_reply_hle_unlocked(...)` now call `KThread::end_wait(client_result)` for non-terminating sync clients without an extra wait-reason guard, matching upstream `KServerSession::SendReply(..., is_hle)` plus upstream `KThread::EndWait` no-op behavior when the target thread is not waiting.
+
+### Missing items
+- Continue reducing the split between `send_reply_with_message(...)` and `send_reply_hle_unlocked(...)` once `KServerSession` no longer needs a broad Rust mutex around state that upstream protects with lighter-weight kernel locks.
+
+### Binary layout verification
+- N/A: IPC reply wake control flow only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `KServerSession::SendReply` and `KThread::EndWait` before removing the Rust-only stale-wait guard.
+- `cargo test -p core send_reply_with_message_ends_sync_client_wait -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p core`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 45s isolated-XDG default smoke after removing the stale-wait guard (`/tmp/ruzu_mk8d_reply_endwait_default_1780875381.log`, `RUST_LOG=warn`, `RUZU_PROFILE_PRESENT=1`): no `BreakLoopNullPc`, `SetTerminateResult`, `svcBreak`, panic, `receive_request_hle failed`, `missing_server_manager_owner`, or `KThread::end_wait: wait_queue is None` marker, but `PRESENT_PROFILE count=0` and the nvnflinger history shows repeated `acquire_fail`; this run is inconclusive for rendering progress and only rules out an obvious IPC reply crash in this short window.

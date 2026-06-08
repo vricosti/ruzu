@@ -337,6 +337,10 @@ impl<'a> CmifResponse<'a> {
         self.builder.push_copy_objects(handle);
     }
 
+    pub fn push_copy_object_id(&mut self, object_id: u64) {
+        self.builder.push_copy_object_id(object_id);
+    }
+
     pub fn push_move_objects(&mut self, handle: u32) {
         self.builder.push_move_objects(handle);
     }

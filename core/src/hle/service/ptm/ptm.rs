@@ -13,21 +13,27 @@ pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
 
-    let mut server_manager = ServerManager::new(system);
+    use super::psm::PSM;
+    use super::ts::TS;
 
-    let stub_names = &["psm", "ts"];
-    for &name in stub_names {
-        let svc_name = name.to_string();
+    let server_manager = ServerManager::new_shared(system);
+
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        let psm_system = system.clone();
         server_manager.register_named_service(
-            name,
+            "psm",
             Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(
-                    &svc_name,
-                ))
+                std::sync::Arc::new(PSM::new(psm_system.clone()))
             }),
+            16,
+        );
+        server_manager.register_named_service(
+            "ts",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(TS::new()) }),
             16,
         );
     }
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }

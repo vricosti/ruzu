@@ -302,7 +302,7 @@ impl<'a> ResponseBuilder<'a> {
                 .map(|m| {
                     let guard = m.lock().unwrap();
                     (
-                        guard.get_server_manager().cloned(),
+                        guard.get_server_manager(),
                         guard.pending_registrations().cloned(),
                         guard.server_wakeup().cloned(),
                     )
@@ -312,21 +312,13 @@ impl<'a> ResponseBuilder<'a> {
             // Create child manager linked to same ServerManager. Propagate
             // the queue + wakeup so this child can register grandchild
             // sessions without locking `Mutex<ServerManager>`.
-            let child_manager = match (
-                parent_server_manager.clone(),
-                parent_queue.clone(),
-                parent_wakeup.clone(),
-            ) {
-                (Some(sm), Some(q), Some(w)) => std::sync::Arc::new(std::sync::Mutex::new(
-                    super::hle_ipc::SessionRequestManager::new_with_server_manager_full(sm, q, w),
-                )),
-                (Some(sm), _, _) => std::sync::Arc::new(std::sync::Mutex::new(
-                    super::hle_ipc::SessionRequestManager::new_with_server_manager(sm),
-                )),
-                _ => std::sync::Arc::new(std::sync::Mutex::new(
-                    super::hle_ipc::SessionRequestManager::new(),
-                )),
-            };
+            let child_manager = std::sync::Arc::new(std::sync::Mutex::new(
+                super::hle_ipc::SessionRequestManager::from_parent_server_manager_endpoints(
+                    parent_server_manager.clone(),
+                    parent_queue.clone(),
+                    parent_wakeup.clone(),
+                ),
+            ));
             child_manager.lock().unwrap().set_session_handler(iface);
 
             // Create session and keep the client-session object unresolved until
@@ -592,7 +584,58 @@ mod tests {
     use crate::hle::result::ResultCode;
     use crate::hle::service::hle_ipc::{SessionRequestHandler, SessionRequestManager};
     use crate::memory::memory::Memory;
+    use common::page_table::{PageTable, PageType};
     use std::sync::{Arc, Mutex};
+
+    struct MappedResponseMemory {
+        _device_memory: Box<DeviceMemory>,
+        _page_table: Box<PageTable>,
+        memory: Arc<Mutex<Memory>>,
+    }
+
+    impl MappedResponseMemory {
+        fn new(mapped_start: u64, mapped_size: usize) -> Self {
+            const PAGE_BITS: usize = 12;
+            const PAGE_SIZE: usize = 1 << PAGE_BITS;
+
+            let device_memory = Box::new(DeviceMemory::new());
+            let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
+            let memory = Arc::new(Mutex::new(unsafe {
+                Memory::new(
+                    SystemRef::null(),
+                    device_memory.as_ref() as *const _,
+                    buffer_ptr,
+                )
+            }));
+
+            let mut page_table = Box::new(PageTable::new());
+            page_table.resize(32, PAGE_BITS);
+            let base_page = (mapped_start as usize) / PAGE_SIZE;
+            let num_pages = mapped_size.div_ceil(PAGE_SIZE);
+            let host_base = device_memory.buffer.backing_base_pointer() as usize;
+            for page in base_page..base_page + num_pages {
+                let target = (page * PAGE_SIZE) as u64;
+                page_table.map_pages(
+                    page,
+                    1,
+                    target,
+                    PageType::Memory,
+                    host_base + target as usize,
+                );
+            }
+
+            memory
+                .lock()
+                .unwrap()
+                .set_current_page_table(page_table.as_mut() as *mut PageTable);
+
+            Self {
+                _device_memory: device_memory,
+                _page_table: page_table,
+                memory,
+            }
+        }
+    }
 
     struct TestHandler;
 
@@ -633,15 +676,8 @@ mod tests {
 
     #[test]
     fn push_ipc_interface_writes_move_handle_into_response() {
-        let device_memory = Box::new(DeviceMemory::new());
-        let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
-        let memory = Arc::new(Mutex::new(unsafe {
-            Memory::new(
-                SystemRef::null(),
-                device_memory.as_ref() as *const _,
-                buffer_ptr,
-            )
-        }));
+        let fixture = MappedResponseMemory::new(0x4000, 0x1000);
+        let memory = fixture.memory.clone();
 
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         {
@@ -695,29 +731,30 @@ mod tests {
 
     #[test]
     fn push_copy_object_id_writes_copy_handle_into_response() {
-        use std::sync::{Arc, Mutex};
-
-        use crate::hle::kernel::k_process::{KProcess, ProcessLock};
         use crate::hle::kernel::k_readable_event::KReadableEvent;
-        use crate::hle::kernel::k_thread::{KThread, KThreadLock};
         use crate::hle::kernel::k_typed_address::KProcessAddress;
 
-        let system = crate::core::System::new_for_test();
+        let fixture = MappedResponseMemory::new(0x4000, 0x1000);
+        let memory = fixture.memory.clone();
+
         let mut process = KProcess::new();
         process.process_id = 1;
-        process.initialize_handle_table();
-        process.create_memory(&system);
-        process.allocate_code_memory(0, 0x2000);
+        assert_eq!(
+            process.ensure_handle_table_initialized(),
+            RESULT_SUCCESS.get_inner_value()
+        );
+        process.page_table.set_memory(memory);
         let process = Arc::new(ProcessLock::from_value(process));
 
+        let tls_address = 0x4000;
         let thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut thread = thread.lock().unwrap();
-            thread.tls_address = KProcessAddress::new(0x100);
+            thread.tls_address = KProcessAddress::new(tls_address);
             thread.parent = Some(Arc::downgrade(&process));
         }
 
-        let mut ctx = HLERequestContext::new_with_thread(Arc::clone(&thread), 0x100);
+        let mut ctx = HLERequestContext::new_with_thread(Arc::clone(&thread), tls_address);
 
         let readable_event = Arc::new(Mutex::new(KReadableEvent::new()));
         readable_event.lock().unwrap().object_id = 0x2000_0001;
@@ -747,7 +784,7 @@ mod tests {
             .get_memory()
             .unwrap();
         let mem = mem.lock().unwrap();
-        let handle_word = mem.read_32(0x100 + 12);
+        let handle_word = mem.read_32(tls_address + 12);
         assert_ne!(handle_word, 0);
         assert_eq!(
             process.lock().unwrap().handle_table.get_object(handle_word),

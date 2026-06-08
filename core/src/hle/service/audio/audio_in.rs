@@ -257,22 +257,10 @@ impl IAudioIn {
     fn register_buffer_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         let _ = svc.buffer_event.lock().unwrap().is_initialized();
-        let Some(handle) =
-            ctx.copy_handle_for_readable_event(Arc::clone(&svc.buffer_readable_event))
-        else {
-            CmifResponse::result_only(
-                ctx,
-                ResultCode::from_module_description(
-                    crate::hle::result::ErrorModule::Audio,
-                    crate::hle::service::audio::errors::RESULT_OPERATION_FAILED.1,
-                ),
-            );
-            return;
-        };
 
         let mut response = CmifResponse::new(ctx, 2, 1, 0);
         response.push_result(RESULT_SUCCESS);
-        response.push_copy_objects(handle);
+        response.push_copy_object_id(svc.buffer_readable_event_object_id);
     }
 
     fn get_released_audio_in_buffers_handler(

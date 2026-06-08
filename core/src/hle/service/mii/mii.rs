@@ -1292,32 +1292,38 @@ pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
     let manager = Arc::new(Mutex::new(MiiManager::new()));
 
-    let mgr_e = Arc::clone(&manager);
-    server_manager.register_named_service(
-        "mii:e",
-        Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(IStaticService::new(system, Arc::clone(&mgr_e), true))
-        }),
-        64,
-    );
+    {
+        let mut server_manager = server_manager.lock().unwrap();
 
-    let mgr_u = Arc::clone(&manager);
-    server_manager.register_named_service(
-        "mii:u",
-        Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(IStaticService::new(system, Arc::clone(&mgr_u), false))
-        }),
-        64,
-    );
+        let mgr_e = Arc::clone(&manager);
+        server_manager.register_named_service(
+            "mii:e",
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(IStaticService::new(system, Arc::clone(&mgr_e), true))
+            }),
+            64,
+        );
 
-    server_manager.register_named_service(
-        "miiimg",
-        Box::new(move || -> SessionRequestHandlerPtr { Arc::new(IImageDatabaseService::new()) }),
-        64,
-    );
+        let mgr_u = Arc::clone(&manager);
+        server_manager.register_named_service(
+            "mii:u",
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(IStaticService::new(system, Arc::clone(&mgr_u), false))
+            }),
+            64,
+        );
 
-    ServerManager::run_server(server_manager);
+        server_manager.register_named_service(
+            "miiimg",
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(IImageDatabaseService::new())
+            }),
+            64,
+        );
+    }
+
+    ServerManager::run_server_shared(server_manager);
 }

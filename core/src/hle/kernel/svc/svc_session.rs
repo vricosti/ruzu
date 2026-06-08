@@ -156,6 +156,11 @@ pub fn create_session(
 
     *out_server = server_handle;
     *out_client = client_handle;
+    if !is_light {
+        if let Some(session) = process.get_session_by_object_id(server_object_id) {
+            session.lock().unwrap().mark_session_resource_committed();
+        }
+    }
     session_reservation.commit();
     RESULT_SUCCESS
 }

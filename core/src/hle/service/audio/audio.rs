@@ -18,69 +18,73 @@ use crate::hle::service::server_manager::ServerManager;
 /// server_manager->RegisterNamedService("hwopus", std::make_shared<IHardwareOpusDecoderManager>(system));
 /// ```
 pub fn loop_process(system: crate::core::SystemRef) {
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    server_manager.register_named_service(
-        "audctl",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(super::audio_controller::IAudioController::new())
-        }),
-        16,
-    );
+    {
+        let mut server_manager = server_manager.lock().unwrap();
 
-    server_manager.register_named_service(
-        "audin:u",
-        Box::new(move || -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(super::audio_in_manager::IAudioInManager::new(system))
-        }),
-        16,
-    );
+        server_manager.register_named_service(
+            "audctl",
+            Box::new(|| -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(super::audio_controller::IAudioController::new())
+            }),
+            16,
+        );
 
-    server_manager.register_named_service(
-        "audout:u",
-        Box::new(move || -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(super::audio_out_manager::IAudioOutManager::new(system))
-        }),
-        16,
-    );
+        server_manager.register_named_service(
+            "audin:u",
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(super::audio_in_manager::IAudioInManager::new(system))
+            }),
+            16,
+        );
 
-    server_manager.register_named_service(
-        "audrec:a",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(super::final_output_recorder_manager_for_applet::IFinalOutputRecorderManagerForApplet::new())
-        }),
-        16,
-    );
+        server_manager.register_named_service(
+            "audout:u",
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(super::audio_out_manager::IAudioOutManager::new(system))
+            }),
+            16,
+        );
 
-    server_manager.register_named_service(
-        "audrec:u",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(
-                super::final_output_recorder_manager::IFinalOutputRecorderManager::new(),
-            )
-        }),
-        16,
-    );
+        server_manager.register_named_service(
+            "audrec:a",
+            Box::new(|| -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(super::final_output_recorder_manager_for_applet::IFinalOutputRecorderManagerForApplet::new())
+            }),
+            16,
+        );
 
-    server_manager.register_named_service(
-        "audren:u",
-        Box::new(move || -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(super::audio_renderer_manager::IAudioRendererManager::new(
-                system,
-            ))
-        }),
-        16,
-    );
+        server_manager.register_named_service(
+            "audrec:u",
+            Box::new(|| -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(
+                    super::final_output_recorder_manager::IFinalOutputRecorderManager::new(),
+                )
+            }),
+            16,
+        );
 
-    server_manager.register_named_service(
-        "hwopus",
-        Box::new(move || -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(
-                super::hardware_opus_decoder_manager::IHardwareOpusDecoderManager::new(system),
-            )
-        }),
-        16,
-    );
+        server_manager.register_named_service(
+            "audren:u",
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(super::audio_renderer_manager::IAudioRendererManager::new(
+                    system,
+                ))
+            }),
+            16,
+        );
 
-    ServerManager::run_server(server_manager);
+        server_manager.register_named_service(
+            "hwopus",
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(
+                    super::hardware_opus_decoder_manager::IHardwareOpusDecoderManager::new(system),
+                )
+            }),
+            16,
+        );
+    }
+
+    ServerManager::run_server_shared(server_manager);
 }

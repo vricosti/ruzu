@@ -28,72 +28,74 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
     log::debug!("NS::LoopProcess called");
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    // ns:am2, ns:ec, ns:rid, ns:rt, ns:web, ns:ro -> IServiceGetterInterface
-    for &name in NS_SERVICE_GETTER_NAMES {
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+
+        // ns:am2, ns:ec, ns:rid, ns:rt, ns:web, ns:ro -> IServiceGetterInterface
+        for &name in NS_SERVICE_GETTER_NAMES {
+            server_manager.register_named_service(
+                name,
+                Box::new(move || -> SessionRequestHandlerPtr {
+                    Arc::new(
+                        super::service_getter_interface::IServiceGetterInterface::new(system, name),
+                    )
+                }),
+                64,
+            );
+        }
+
+        // ns:dev -> IDevelopInterface
         server_manager.register_named_service(
-            name,
-            Box::new(move || -> SessionRequestHandlerPtr {
+            "ns:dev",
+            Box::new(|| -> SessionRequestHandlerPtr {
+                Arc::new(super::develop_interface::IDevelopInterface::new())
+            }),
+            64,
+        );
+
+        // ns:su -> ISystemUpdateInterface
+        server_manager.register_named_service(
+            "ns:su",
+            Box::new(|| -> SessionRequestHandlerPtr {
+                Arc::new(super::system_update_interface::ISystemUpdateInterface::new())
+            }),
+            64,
+        );
+
+        // ns:vm -> IVulnerabilityManagerInterface
+        server_manager.register_named_service(
+            "ns:vm",
+            Box::new(|| -> SessionRequestHandlerPtr {
                 Arc::new(
-                    super::service_getter_interface::IServiceGetterInterface::new(system, name),
+                    super::vulnerability_manager_interface::IVulnerabilityManagerInterface::new(),
                 )
             }),
             64,
         );
-    }
 
-    // ns:dev -> IDevelopInterface
-    server_manager.register_named_service(
-        "ns:dev",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            Arc::new(super::develop_interface::IDevelopInterface::new())
-        }),
-        64,
-    );
+        // pdm:qry -> IQueryService
+        server_manager.register_named_service(
+            "pdm:qry",
+            Box::new(|| -> SessionRequestHandlerPtr {
+                Arc::new(super::query_service::IQueryService::new())
+            }),
+            64,
+        );
 
-    // ns:su -> ISystemUpdateInterface
-    server_manager.register_named_service(
-        "ns:su",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            Arc::new(super::system_update_interface::ISystemUpdateInterface::new())
-        }),
-        64,
-    );
-
-    // ns:vm -> IVulnerabilityManagerInterface
-    server_manager.register_named_service(
-        "ns:vm",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            Arc::new(super::vulnerability_manager_interface::IVulnerabilityManagerInterface::new())
-        }),
-        64,
-    );
-
-    // pdm:qry -> IQueryService
-    server_manager.register_named_service(
-        "pdm:qry",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            Arc::new(super::query_service::IQueryService::new())
-        }),
-        64,
-    );
-
-    // pl:s -> IPlatformServiceManager
-    {
+        // pl:s -> IPlatformServiceManager
         let pl_s: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
             Arc::new(super::platform_service_manager::IPlatformServiceManager::new(system, "pl:s"));
         let pl_s_clone = Arc::clone(&pl_s);
         server_manager.register_named_service("pl:s", Box::new(move || pl_s_clone.clone()), 64);
-    }
 
-    // pl:u -> IPlatformServiceManager
-    {
+        // pl:u -> IPlatformServiceManager
         let pl_u: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
             Arc::new(super::platform_service_manager::IPlatformServiceManager::new(system, "pl:u"));
         let pl_u_clone = Arc::clone(&pl_u);
         server_manager.register_named_service("pl:u", Box::new(move || pl_u_clone.clone()), 64);
     }
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }

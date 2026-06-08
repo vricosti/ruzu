@@ -5,6 +5,15 @@
 //!
 //! NgctServiceImpl ("ngct:u") and NgcServiceImpl ("ngc:u") services.
 
+use std::collections::BTreeMap;
+
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{
+    HLERequestContext, SessionRequestHandler, SessionRequestHandlerPtr,
+};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
 /// IPC command IDs for NgctServiceImpl ("ngct:u")
 pub mod ngct_commands {
     pub const MATCH: u32 = 0;
@@ -23,17 +32,48 @@ pub mod ngc_commands {
 pub const NGC_CONTENT_VERSION: u32 = 1;
 
 /// ProfanityFilterOption. Upstream: `ProfanityFilterOption` in `ngc.cpp`.
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct ProfanityFilterOption {
     pub _data: [u8; 0x20],
 }
 
+impl Default for ProfanityFilterOption {
+    fn default() -> Self {
+        Self { _data: [0; 0x20] }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct InputParameters {
+    flags: u32,
+    option: ProfanityFilterOption,
+}
+
 /// NgctServiceImpl ("ngct:u").
-pub struct NgctServiceImpl;
+pub struct NgctServiceImpl {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl NgctServiceImpl {
     pub fn new() -> Self {
-        Self
+        Self {
+            handlers: build_handler_map(&[
+                (
+                    ngct_commands::MATCH,
+                    Some(NgctServiceImpl::match_handler),
+                    "Match",
+                ),
+                (
+                    ngct_commands::FILTER,
+                    Some(NgctServiceImpl::filter_handler),
+                    "Filter",
+                ),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// Match (cmd 0) - returns false since we don't censor anything
@@ -47,14 +87,86 @@ impl NgctServiceImpl {
         log::warn!("(STUBBED) NgctServiceImpl::filter called");
         buffer.to_vec()
     }
+
+    fn match_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NgctServiceImpl) };
+        let buffer = ctx.read_buffer(0);
+        let text = fixed_zero_terminated_string(&buffer);
+        let matched = service.match_text(&text);
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(matched);
+    }
+
+    fn filter_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NgctServiceImpl) };
+        let buffer = ctx.read_buffer(0);
+        let filtered = service.filter(&buffer);
+        ctx.write_buffer(&filtered, 0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+impl SessionRequestHandler for NgctServiceImpl {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ngct:u"
+    }
+}
+
+impl ServiceFramework for NgctServiceImpl {
+    fn get_service_name(&self) -> &str {
+        "ngct:u"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 /// NgcServiceImpl ("ngc:u").
-pub struct NgcServiceImpl;
+pub struct NgcServiceImpl {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl NgcServiceImpl {
     pub fn new() -> Self {
-        Self
+        Self {
+            handlers: build_handler_map(&[
+                (
+                    ngc_commands::GET_CONTENT_VERSION,
+                    Some(NgcServiceImpl::get_content_version_handler),
+                    "GetContentVersion",
+                ),
+                (
+                    ngc_commands::CHECK,
+                    Some(NgcServiceImpl::check_handler),
+                    "Check",
+                ),
+                (
+                    ngc_commands::MASK,
+                    Some(NgcServiceImpl::mask_handler),
+                    "Mask",
+                ),
+                (
+                    ngc_commands::RELOAD,
+                    Some(NgcServiceImpl::reload_handler),
+                    "Reload",
+                ),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// GetContentVersion (cmd 0)
@@ -84,30 +196,122 @@ impl NgcServiceImpl {
     pub fn reload(&self) {
         log::info!("(STUBBED) NgcServiceImpl::reload called");
     }
+
+    fn get_content_version_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NgcServiceImpl) };
+        let version = service.get_content_version();
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(version);
+    }
+
+    fn check_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NgcServiceImpl) };
+        let mut rp = RequestParser::new(ctx);
+        let params: InputParameters = rp.pop_raw();
+        let input = ctx.read_buffer(0);
+        let out_flags = service.check(params.flags, &params.option, &input);
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(out_flags);
+    }
+
+    fn mask_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NgcServiceImpl) };
+        let mut rp = RequestParser::new(ctx);
+        let params: InputParameters = rp.pop_raw();
+        let input = ctx.read_buffer(0);
+        let (out_flags, output) = service.mask(params.flags, &params.option, &input);
+        ctx.write_buffer(&output, 0);
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(out_flags);
+    }
+
+    fn reload_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NgcServiceImpl) };
+        service.reload();
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
 }
 
-/// Registers "ngc:u" service.
+impl SessionRequestHandler for NgcServiceImpl {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ngc:u"
+    }
+}
+
+impl ServiceFramework for NgcServiceImpl {
+    fn get_service_name(&self) -> &str {
+        "ngc:u"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+fn fixed_zero_terminated_string(buffer: &[u8]) -> String {
+    let end = buffer
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf8_lossy(&buffer[..end]).into_owned()
+}
+
+/// Registers "ngct:u" and "ngc:u" services.
 ///
 /// Corresponds to `LoopProcess` in upstream `ngc.cpp`.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    let stub = |sm: &mut ServerManager, name: &str| {
-        let svc_name = name.to_string();
-        sm.register_named_service(
-            name,
-            Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(
-                    &svc_name,
-                ))
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        server_manager.register_named_service(
+            "ngct:u",
+            Box::new(|| -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(NgctServiceImpl::new())
             }),
             64,
         );
-    };
-    stub(&mut server_manager, "ngc:u");
+        server_manager.register_named_service(
+            "ngc:u",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(NgcServiceImpl::new()) }),
+            64,
+        );
+    }
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profanity_filter_option_matches_upstream_size() {
+        assert_eq!(core::mem::size_of::<ProfanityFilterOption>(), 0x20);
+        assert_eq!(core::mem::size_of::<InputParameters>(), 0x24);
+    }
+
+    #[test]
+    fn fixed_zero_terminated_string_stops_at_first_nul() {
+        assert_eq!(fixed_zero_terminated_string(b"abc\0def"), "abc");
+        assert_eq!(fixed_zero_terminated_string(b"abc"), "abc");
+    }
 }

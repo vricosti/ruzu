@@ -962,29 +962,34 @@ pub fn register_services(
     system: crate::core::SystemRef,
     fsc: Arc<Mutex<FileSystemController>>,
 ) {
-    let mut server_manager = crate::hle::service::server_manager::ServerManager::new(system);
+    let server_manager = crate::hle::service::server_manager::ServerManager::new_shared(system);
 
-    server_manager.register_named_service(
-        "fsp-ldr",
-        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(super::fsp::fsp_ldr::FspLdr::new()) }),
-        64,
-    );
-    server_manager.register_named_service(
-        "fsp:pr",
-        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(super::fsp::fsp_pr::FspPr::new()) }),
-        64,
-    );
-    let fsc_for_closure = fsc.clone();
-    server_manager.register_named_service(
-        "fsp-srv",
-        Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(super::fsp::fsp_srv::FspSrv::new_with_system(
-                system,
-                fsc_for_closure.clone(),
-            ))
-        }),
-        64,
-    );
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        server_manager.register_named_service(
+            "fsp-ldr",
+            Box::new(|| -> SessionRequestHandlerPtr {
+                Arc::new(super::fsp::fsp_ldr::FspLdr::new())
+            }),
+            64,
+        );
+        server_manager.register_named_service(
+            "fsp:pr",
+            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(super::fsp::fsp_pr::FspPr::new()) }),
+            64,
+        );
+        let fsc_for_closure = fsc.clone();
+        server_manager.register_named_service(
+            "fsp-srv",
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(super::fsp::fsp_srv::FspSrv::new_with_system(
+                    system,
+                    fsc_for_closure.clone(),
+                ))
+            }),
+            64,
+        );
+    }
 
-    crate::hle::service::server_manager::ServerManager::run_server(server_manager);
+    crate::hle::service::server_manager::ServerManager::run_server_shared(server_manager);
 }

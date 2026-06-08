@@ -122,7 +122,7 @@ pub struct SessionRequestManager {
     domain_handlers: Vec<Option<SessionRequestHandlerPtr>>,
     /// Reference to the owning ServerManager.
     /// Matches upstream: `Service::ServerManager& server_manager`.
-    server_manager: Option<Arc<Mutex<super::server_manager::ServerManager>>>,
+    server_manager: Option<Weak<Mutex<super::server_manager::ServerManager>>>,
     /// Cloned Arc to the ServerManager's pending-registration queue. Lets
     /// handlers register new sessions without locking `Mutex<ServerManager>`
     /// (which would deadlock — the host thread holds it for `loop_process`'s
@@ -175,7 +175,7 @@ impl SessionRequestManager {
             is_initialized_for_sm: false,
             session_handler: None,
             domain_handlers: Vec::new(),
-            server_manager: Some(server_manager),
+            server_manager: Some(Arc::downgrade(&server_manager)),
             pending_registrations: None,
             server_wakeup: None,
         }
@@ -197,32 +197,29 @@ impl SessionRequestManager {
             is_initialized_for_sm: false,
             session_handler: None,
             domain_handlers: Vec::new(),
-            server_manager: Some(server_manager),
+            server_manager: Some(Arc::downgrade(&server_manager)),
             pending_registrations: Some(pending_registrations),
             server_wakeup: Some(wakeup),
         }
     }
 
-    /// Create with only the owning ServerManager's registration endpoints.
+    /// Build the closest upstream-shaped manager from a parent manager's
+    /// already-extracted owner endpoints.
     ///
-    /// Used during the short window where a service port has been published
-    /// but `KernelCore::run_server` has not yet installed the final
-    /// ServerManager weak reference. The queue+wakeup pair is sufficient for
-    /// host-thread IPC routing and is overwritten with the full manager wiring
-    /// once ownership is republished.
-    pub fn new_with_registration_queue(
-        pending_registrations: PendingRegistrationQueue,
-        wakeup: Arc<super::os::event::Event>,
+    /// Upstream `SessionRequestManager` always stores `ServerManager&`, so
+    /// Rust only preserves the pending-registration queue and wakeup event when
+    /// the corresponding `ServerManager` owner is also available.
+    pub fn from_parent_server_manager_endpoints(
+        server_manager: Option<Arc<Mutex<super::server_manager::ServerManager>>>,
+        pending_registrations: Option<PendingRegistrationQueue>,
+        wakeup: Option<Arc<super::os::event::Event>>,
     ) -> Self {
-        Self {
-            convert_to_domain: false,
-            is_domain: false,
-            is_initialized_for_sm: false,
-            session_handler: None,
-            domain_handlers: Vec::new(),
-            server_manager: None,
-            pending_registrations: Some(pending_registrations),
-            server_wakeup: Some(wakeup),
+        match (server_manager, pending_registrations, wakeup) {
+            (Some(sm), Some(queue), Some(wakeup)) => {
+                Self::new_with_server_manager_full(sm, queue, wakeup)
+            }
+            (Some(sm), _, _) => Self::new_with_server_manager(sm),
+            _ => Self::new(),
         }
     }
 
@@ -240,8 +237,8 @@ impl SessionRequestManager {
     }
 
     /// Get the ServerManager reference. Matches upstream `GetServerManager()`.
-    pub fn get_server_manager(&self) -> Option<&Arc<Mutex<super::server_manager::ServerManager>>> {
-        self.server_manager.as_ref()
+    pub fn get_server_manager(&self) -> Option<Arc<Mutex<super::server_manager::ServerManager>>> {
+        self.server_manager.as_ref().and_then(Weak::upgrade)
     }
 
     pub fn is_domain(&self) -> bool {
@@ -1040,21 +1037,19 @@ impl HLERequestContext {
             .map(|m| {
                 let guard = m.lock().unwrap();
                 (
-                    guard.get_server_manager().cloned(),
+                    guard.get_server_manager(),
                     guard.pending_registrations().cloned(),
                     guard.server_wakeup().cloned(),
                 )
             })
             .unwrap_or((None, None, None));
-        let manager = match (parent_server_manager, parent_queue, parent_wakeup) {
-            (Some(sm), Some(q), Some(w)) => Arc::new(std::sync::Mutex::new(
-                SessionRequestManager::new_with_server_manager_full(sm, q, w),
-            )),
-            (Some(sm), _, _) => Arc::new(std::sync::Mutex::new(
-                SessionRequestManager::new_with_server_manager(sm),
-            )),
-            _ => Arc::new(std::sync::Mutex::new(SessionRequestManager::new())),
-        };
+        let manager = Arc::new(std::sync::Mutex::new(
+            SessionRequestManager::from_parent_server_manager_endpoints(
+                parent_server_manager,
+                parent_queue,
+                parent_wakeup,
+            ),
+        ));
         manager.lock().unwrap().set_session_handler(handler);
         let handle = self.create_session_with_manager(manager.clone())?;
         self.register_last_created_session_with_manager(manager);
@@ -1124,11 +1119,7 @@ impl HLERequestContext {
             let mut ksession = session.lock().unwrap();
             ksession.initialize(None, 0);
             ksession.server.lock().unwrap().initialize(object_id);
-            ksession
-                .client
-                .lock()
-                .unwrap()
-                .initialize_with_manager(object_id, manager.clone());
+            ksession.client.lock().unwrap().initialize(object_id);
         }
         log::info!(
             "HLERequestContext::create_session_with_manager_object_id: endpoints initialized object_id={:#x}",
@@ -1142,10 +1133,7 @@ impl HLERequestContext {
             "HLERequestContext::create_session_with_manager_object_id: registering session endpoints"
         );
         server_session.lock().unwrap().set_manager(manager.clone());
-        client_session
-            .lock()
-            .unwrap()
-            .initialize_with_manager(object_id, manager.clone());
+        client_session.lock().unwrap().initialize(object_id);
 
         self.last_created_server_session = Some(server_session.clone());
 
@@ -1189,15 +1177,15 @@ impl HLERequestContext {
         Some(handle)
     }
 
-    /// Creates a KReadableEvent and registers it in the current process handle table.
+    /// Creates a KReadableEvent and registers it in the current process object table.
     ///
-    /// Matches the ownership of upstream `ServiceContext::CreateEvent`, while returning both the
-    /// readable-end object and the process handle so service owners can keep persistent event
-    /// objects instead of manufacturing one-off handles per request.
-    pub fn create_readable_event(
+    /// Matches the ownership of upstream `ServiceContext::CreateEvent` without
+    /// pre-allocating an IPC copy handle. The final handle is allocated when
+    /// `ResponseBuilder::push_copy_object_id(...)` is written back.
+    pub fn create_readable_event_object(
         &self,
         signaled: bool,
-    ) -> Option<(Handle, Arc<Mutex<KReadableEvent>>)> {
+    ) -> Option<(u64, Arc<Mutex<KReadableEvent>>)> {
         let thread = self.thread.as_ref()?;
         let thread_guard = thread.lock().unwrap();
         let parent = thread_guard.parent.as_ref()?.upgrade()?;
@@ -1218,6 +1206,24 @@ impl HLERequestContext {
             }
         }
         process.register_readable_event_object(object_id, readable.clone());
+
+        Some((object_id, readable))
+    }
+
+    /// Creates a KReadableEvent and registers it in the current process handle table.
+    ///
+    /// Matches older Rust service paths that still pre-resolve process handles
+    /// before writing IPC responses. Prefer `create_readable_event_object(...)`
+    /// for upstream-shaped `OutCopyHandle<KReadableEvent>` serialization.
+    pub fn create_readable_event(
+        &self,
+        signaled: bool,
+    ) -> Option<(Handle, Arc<Mutex<KReadableEvent>>)> {
+        let (object_id, readable) = self.create_readable_event_object(signaled)?;
+        let thread = self.thread.as_ref()?;
+        let thread_guard = thread.lock().unwrap();
+        let parent = thread_guard.parent.as_ref()?.upgrade()?;
+        let mut process = parent.lock().unwrap();
 
         let handle = process.handle_table.add(object_id).ok()?;
         Some((handle, readable))
@@ -1455,8 +1461,28 @@ impl HLERequestContext {
         }
 
         if is_buffer_b {
+            if self.buffer_b_descriptors.len() <= buffer_index
+                || (self.buffer_b_descriptors[buffer_index].size() as usize) < size
+            {
+                log::error!(
+                    "BufferDescriptorB is invalid, index={}, size={}",
+                    buffer_index,
+                    size
+                );
+                return 0;
+            }
             self.write_buffer_b(&data[..size], buffer_index)
         } else {
+            if self.buffer_c_descriptors.len() <= buffer_index
+                || (self.buffer_c_descriptors[buffer_index].size() as usize) < size
+            {
+                log::error!(
+                    "BufferDescriptorC is invalid, index={}, size={}",
+                    buffer_index,
+                    size
+                );
+                return 0;
+            }
             self.write_buffer_c(&data[..size], buffer_index)
         }
     }
@@ -1540,7 +1566,10 @@ impl HLERequestContext {
             });
         }
         if let Some(ref memory) = self.memory {
-            let accessible = memory.lock().unwrap().write_block(address, data);
+            let accessible = memory
+                .lock()
+                .unwrap()
+                .write_block_no_rasterizer_checked(address, data);
             if accessible {
                 return;
             }
@@ -2209,7 +2238,7 @@ mod tests {
     }
 
     #[test]
-    fn write_guest_memory_uses_memory_write_block() {
+    fn write_guest_memory_uses_memory_ipc_write_block() {
         let fixture = MappedTestMemory::new(0x3000, 0x1000);
         let memory = fixture.memory.clone();
 
@@ -2232,6 +2261,52 @@ mod tests {
     }
 
     #[test]
+    fn write_buffer_prefers_b_descriptor_and_clamps_like_upstream() {
+        let fixture = MappedTestMemory::new(0x3000, 0x1000);
+        let memory = fixture.memory.clone();
+
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        process
+            .lock()
+            .unwrap()
+            .page_table
+            .set_memory(memory.clone());
+
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+
+        let mut ctx = HLERequestContext::new_with_thread(thread, 0x2000);
+        ctx.buffer_b_descriptors = vec![ipc::BufferDescriptorABW {
+            size_bits_0_31: 2,
+            address_bits_0_31: 0x3000,
+            raw_word2: 0,
+        }];
+        ctx.buffer_c_descriptors = vec![ipc::BufferDescriptorC {
+            address_bits_0_31: 0x3010,
+            raw_word1: 4 << 16,
+        }];
+
+        assert_eq!(ctx.write_buffer(&[0xaa, 0xbb, 0xcc, 0xdd], 0), 2);
+
+        let mut b_out = [0u8; 4];
+        memory.lock().unwrap().read_block(0x3000, &mut b_out);
+        assert_eq!(b_out, [0xaa, 0xbb, 0, 0]);
+
+        let mut c_out = [0u8; 4];
+        memory.lock().unwrap().read_block(0x3010, &mut c_out);
+        assert_eq!(c_out, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn write_buffer_returns_zero_when_selected_c_descriptor_is_missing() {
+        let mut ctx = HLERequestContext::new();
+        ctx.buffer_b_descriptors.clear();
+        ctx.buffer_c_descriptors.clear();
+
+        assert_eq!(ctx.write_buffer(&[0x55], 0), 0);
+    }
+
+    #[test]
     fn create_session_for_service_queues_server_manager_registration() {
         let mut process = KProcess::new();
         process.initialize_handle_table();
@@ -2239,16 +2314,15 @@ mod tests {
         let thread = Arc::new(KThreadLock::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
 
-        let server_manager = Arc::new(Mutex::new(
-            crate::hle::service::server_manager::ServerManager::new(SystemRef::null()),
-        ));
+        let server_manager =
+            crate::hle::service::server_manager::ServerManager::new_shared(SystemRef::null());
         let (queue, wakeup) = {
             let guard = server_manager.lock().unwrap();
             (guard.pending_registrations_arc(), guard.wakeup_event_arc())
         };
         let manager = Arc::new(Mutex::new(
             SessionRequestManager::new_with_server_manager_full(
-                server_manager,
+                server_manager.clone(),
                 queue.clone(),
                 wakeup,
             ),
@@ -2263,6 +2337,22 @@ mod tests {
 
         assert!(process.lock().unwrap().handle_table.is_valid_handle(handle));
         assert_eq!(queue.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn session_request_manager_drops_incomplete_server_manager_endpoints() {
+        let queue: PendingRegistrationQueue = Arc::new(Mutex::new(Vec::new()));
+        let wakeup = Arc::new(crate::hle::service::os::event::Event::new());
+
+        let manager = SessionRequestManager::from_parent_server_manager_endpoints(
+            None,
+            Some(queue),
+            Some(wakeup),
+        );
+
+        assert!(manager.get_server_manager().is_none());
+        assert!(manager.pending_registrations().is_none());
+        assert!(manager.server_wakeup().is_none());
     }
 
     #[test]
@@ -2332,6 +2422,25 @@ mod tests {
         assert_eq!(ctx.buffer_descriptor_c()[1].size(), 0x40);
         assert_eq!(ctx.buffer_descriptor_c()[2].address(), 0x0007_5555_6666);
         assert_eq!(ctx.buffer_descriptor_c()[2].size(), 0x50);
+    }
+
+    #[test]
+    fn parse_tipc_command_buffer_keeps_c_receive_descriptor() {
+        let mut ctx = HLERequestContext::new();
+        let mut cmd_buf = [0u32; ipc::COMMAND_BUFFER_LENGTH];
+
+        cmd_buf[0] = ipc::CommandType::TipcCommandRegion as u32;
+        cmd_buf[1] = (ipc::BufferDescriptorCFlag::OneDescriptor as u32) << 10;
+        cmd_buf[2] = 0x1111_2222;
+        cmd_buf[3] = (0x30u32 << 16) | 0x0003;
+
+        ctx.populate_from_incoming_command_buffer(&cmd_buf);
+
+        assert!(ctx.is_tipc());
+        assert_eq!(ctx.get_command(), 0);
+        assert_eq!(ctx.buffer_descriptor_c().len(), 1);
+        assert_eq!(ctx.buffer_descriptor_c()[0].address(), 0x0003_1111_2222);
+        assert_eq!(ctx.buffer_descriptor_c()[0].size(), 0x30);
     }
 
     struct DummyHandler;

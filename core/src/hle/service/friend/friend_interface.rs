@@ -146,18 +146,21 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
     let module = Arc::new(super::friend::Module);
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    for &name in &["friend:a", "friend:m", "friend:s", "friend:u", "friend:v"] {
-        let m = module.clone();
-        server_manager.register_named_service(
-            name,
-            Box::new(move || -> SessionRequestHandlerPtr {
-                Arc::new(Friend::new(system, m.clone(), name))
-            }),
-            64,
-        );
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        for &name in &["friend:a", "friend:m", "friend:s", "friend:u", "friend:v"] {
+            let m = module.clone();
+            server_manager.register_named_service(
+                name,
+                Box::new(move || -> SessionRequestHandlerPtr {
+                    Arc::new(Friend::new(system, m.clone(), name))
+                }),
+                64,
+            );
+        }
     }
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }

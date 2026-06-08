@@ -120,11 +120,22 @@ impl LifecycleManager {
         self.system_event.copy_handle(ctx)
     }
 
+    pub fn ensure_system_event_object_id(&mut self, ctx: &HLERequestContext) -> Option<u64> {
+        self.system_event.copy_object_id(ctx)
+    }
+
     pub fn ensure_operation_mode_changed_system_event(
         &mut self,
         ctx: &HLERequestContext,
     ) -> Option<Handle> {
         self.operation_mode_changed_system_event.copy_handle(ctx)
+    }
+
+    pub fn ensure_operation_mode_changed_system_event_object_id(
+        &mut self,
+        ctx: &HLERequestContext,
+    ) -> Option<u64> {
+        self.operation_mode_changed_system_event.copy_object_id(ctx)
     }
 
     pub fn is_application(&self) -> bool {

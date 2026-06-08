@@ -209,6 +209,20 @@ impl Applet {
         Some(new_handle)
     }
 
+    fn ensure_persistent_readable_event_object_id(
+        ctx: &HLERequestContext,
+        readable_event: &mut Option<Arc<Mutex<KReadableEvent>>>,
+        signaled: bool,
+    ) -> Option<u64> {
+        if let Some(existing) = readable_event.as_ref() {
+            return ctx.register_readable_event_object(Arc::clone(existing));
+        }
+
+        let (object_id, new_event) = ctx.create_readable_event_object(signaled)?;
+        *readable_event = Some(new_event);
+        Some(object_id)
+    }
+
     fn signal_persistent_readable_event(
         _process: &mut KProcess,
         readable_event: &Arc<Mutex<KReadableEvent>>,
@@ -225,6 +239,10 @@ impl Applet {
         )
     }
 
+    pub fn ensure_sleep_lock_event_object_id(&mut self, ctx: &HLERequestContext) -> Option<u64> {
+        Self::ensure_persistent_readable_event_object_id(ctx, &mut self.sleep_lock_event, false)
+    }
+
     pub fn signal_sleep_lock_event(&mut self, process: &mut KProcess) {
         if let Some(event) = self.sleep_lock_event.as_ref() {
             Self::signal_persistent_readable_event(process, event);
@@ -239,6 +257,17 @@ impl Applet {
             ctx,
             &mut self.library_applet_launchable_event,
             &mut self.library_applet_launchable_event_handle,
+            false,
+        )
+    }
+
+    pub fn ensure_library_applet_launchable_event_object_id(
+        &mut self,
+        ctx: &HLERequestContext,
+    ) -> Option<u64> {
+        Self::ensure_persistent_readable_event_object_id(
+            ctx,
+            &mut self.library_applet_launchable_event,
             false,
         )
     }
@@ -261,6 +290,17 @@ impl Applet {
         )
     }
 
+    pub fn ensure_accumulated_suspended_tick_changed_event_object_id(
+        &mut self,
+        ctx: &HLERequestContext,
+    ) -> Option<u64> {
+        Self::ensure_persistent_readable_event_object_id(
+            ctx,
+            &mut self.accumulated_suspended_tick_changed_event,
+            false,
+        )
+    }
+
     pub fn ensure_gpu_error_detected_system_event(
         &mut self,
         ctx: &HLERequestContext,
@@ -269,6 +309,17 @@ impl Applet {
             ctx,
             &mut self.gpu_error_detected_event,
             &mut self.gpu_error_detected_event_handle,
+            false,
+        )
+    }
+
+    pub fn ensure_gpu_error_detected_system_event_object_id(
+        &mut self,
+        ctx: &HLERequestContext,
+    ) -> Option<u64> {
+        Self::ensure_persistent_readable_event_object_id(
+            ctx,
+            &mut self.gpu_error_detected_event,
             false,
         )
     }
@@ -285,6 +336,17 @@ impl Applet {
         )
     }
 
+    pub fn ensure_friend_invitation_storage_channel_event_object_id(
+        &mut self,
+        ctx: &HLERequestContext,
+    ) -> Option<u64> {
+        Self::ensure_persistent_readable_event_object_id(
+            ctx,
+            &mut self.friend_invitation_storage_channel_event,
+            false,
+        )
+    }
+
     pub fn ensure_health_warning_disappeared_system_event(
         &mut self,
         ctx: &HLERequestContext,
@@ -293,6 +355,17 @@ impl Applet {
             ctx,
             &mut self.health_warning_disappeared_system_event,
             &mut self.health_warning_disappeared_system_event_handle,
+            false,
+        )
+    }
+
+    pub fn ensure_health_warning_disappeared_system_event_object_id(
+        &mut self,
+        ctx: &HLERequestContext,
+    ) -> Option<u64> {
+        Self::ensure_persistent_readable_event_object_id(
+            ctx,
+            &mut self.health_warning_disappeared_system_event,
             false,
         )
     }

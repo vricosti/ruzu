@@ -8,9 +8,13 @@
 //! This is the most complex LDN service, handling network scanning, access point
 //! management, station connections, and LAN discovery.
 
+use std::collections::BTreeMap;
+
 use super::lan_discovery::LANDiscovery;
 use super::ldn_types::{DisconnectReason, State};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IUserLocalCommunicationService.
 ///
@@ -48,6 +52,8 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 pub struct IUserLocalCommunicationService {
     is_initialized: bool,
     lan_discovery: LANDiscovery,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IUserLocalCommunicationService {
@@ -55,6 +61,38 @@ impl IUserLocalCommunicationService {
         Self {
             is_initialized: false,
             lan_discovery: LANDiscovery::new(),
+            handlers: build_handler_map(&[
+                (0, None, "GetState"),
+                (1, None, "GetNetworkInfo"),
+                (2, None, "GetIpv4Address"),
+                (3, None, "GetDisconnectReason"),
+                (4, None, "GetSecurityParameter"),
+                (5, None, "GetNetworkConfig"),
+                (100, None, "AttachStateChangeEvent"),
+                (101, None, "GetNetworkInfoLatestUpdate"),
+                (102, None, "Scan"),
+                (103, None, "ScanPrivate"),
+                (104, None, "SetWirelessControllerRestriction"),
+                (200, None, "OpenAccessPoint"),
+                (201, None, "CloseAccessPoint"),
+                (202, None, "CreateNetwork"),
+                (203, None, "CreateNetworkPrivate"),
+                (204, None, "DestroyNetwork"),
+                (205, None, "Reject"),
+                (206, None, "SetAdvertiseData"),
+                (207, None, "SetStationAcceptPolicy"),
+                (208, None, "AddAcceptFilterEntry"),
+                (209, None, "ClearAcceptFilter"),
+                (300, None, "OpenStation"),
+                (301, None, "CloseStation"),
+                (302, None, "Connect"),
+                (303, None, "ConnectPrivate"),
+                (304, None, "Disconnect"),
+                (400, None, "Initialize"),
+                (401, None, "Finalize"),
+                (402, None, "Initialize2"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -131,5 +169,29 @@ impl IUserLocalCommunicationService {
             process_id
         );
         self.initialize(process_id)
+    }
+}
+
+impl SessionRequestHandler for IUserLocalCommunicationService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "IUserLocalCommunicationService"
+    }
+}
+
+impl ServiceFramework for IUserLocalCommunicationService {
+    fn get_service_name(&self) -> &str {
+        "IUserLocalCommunicationService"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

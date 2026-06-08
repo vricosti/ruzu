@@ -529,8 +529,8 @@ impl IApplicationDisplayService {
             .unwrap()
             .insert(display_id, Arc::clone(&event));
 
-        let Some(handle) = event.copy_handle(ctx) else {
-            log::error!("GetDisplayVsyncEvent: failed to materialize readable event handle");
+        let Some(object_id) = event.copy_object_id(ctx) else {
+            log::error!("GetDisplayVsyncEvent: failed to materialize readable event object");
             svc.container.unlink_vsync_event(display_id, &event);
             svc.display_vsync_events.lock().unwrap().remove(&display_id);
             let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
@@ -540,14 +540,14 @@ impl IApplicationDisplayService {
         };
 
         log::info!(
-            "GetDisplayVsyncEvent: created vsync event handle={:#x} for display_id={}",
-            handle,
+            "GetDisplayVsyncEvent: created vsync event object_id={:#x} for display_id={}",
+            object_id,
             display_id
         );
 
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(handle);
+        rb.push_copy_object_id(object_id);
     }
 
     /// Generic stub that returns RESULT_SUCCESS with no extra data.

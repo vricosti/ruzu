@@ -668,13 +668,16 @@ pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::server_manager::ServerManager;
     use std::sync::Arc;
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    server_manager.register_named_service(
-        "lbl",
-        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(LBL::new()) }),
-        64,
-    );
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        server_manager.register_named_service(
+            "lbl",
+            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(LBL::new()) }),
+            64,
+        );
+    }
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }

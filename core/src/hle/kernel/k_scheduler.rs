@@ -940,19 +940,12 @@ impl KScheduler {
 
         // Upstream: GetCurrentThread(m_kernel).EnableDispatch();
         //
-        // Upstream asserts the count is exactly 1 here (every caller increments
-        // it once via DisableScheduling or DisableDispatch). The ruzu host-fiber
-        // path can enter this with count==0: a host service fiber dispatches
-        // an IPC under `ClientThreadImpersonationGuard` (which swaps
-        // `CURRENT_THREAD` to the parked guest fiber that issued the request),
-        // and the handler signals a `KEvent` whose `KReadableEvent::signal`
-        // takes `KScopedSchedulerLock`. The lock's `Lock()` increments
-        // `disable_count` on the impersonated thread; the drop's `Unlock()`
-        // calls back here to decrement. If anything in between (`send_reply` /
-        // `EndWait`) already balanced the count to 0, decrementing again
-        // panics in `enable_dispatch`. Guard the decrement so the function is
-        // safe under those host-fiber re-entries; the explicit
-        // `needs_scheduling` reschedule call below still runs.
+        // Upstream asserts the count is exactly 1 here (every caller
+        // increments it once via DisableScheduling or DisableDispatch). The
+        // Rust host-fiber path can re-enter scheduler-lock drop after a service
+        // reply has already balanced the dummy/current-thread dispatch count.
+        // Guard the decrement so those host-fiber re-entries do not underflow;
+        // the explicit `needs_scheduling` reschedule call below still runs.
         if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
             let mut t = cur_thread.lock().unwrap();
             if t.get_disable_dispatch_count() > 0 {
@@ -1040,23 +1033,12 @@ impl KScheduler {
             sched.reschedule_other_cores(cores_needing_scheduling);
         }
 
-        let current_state = super::kernel::with_current_thread_fast_mut(|t| t.get_raw_state())
-            .unwrap_or(ThreadState::INITIALIZED);
-
-        if current_state != ThreadState::RUNNABLE {
-            // Upstream: RescheduleCurrentCore when the thread became non-runnable.
-            // The fiber switch properly suspends the WAITING thread's fiber and
-            // switches to the next runnable thread (or idle). When EndWait or
-            // CancelWait transitions the thread back to RUNNABLE, the scheduler
-            // picks it up and resumes this fiber.
-            let sched_ptr = {
-                let guard = scheduler.lock().unwrap();
-                &*guard as *const KScheduler as *mut KScheduler
-            };
-            unsafe {
-                (*sched_ptr).reschedule_current_core();
-            }
-        } else if initial_disable_dispatch > 1 {
+        if initial_disable_dispatch > 1 {
+            // Upstream checks the nested disable count before attempting to
+            // reschedule. A thread may already be WAITING while still inside
+            // an outer dispatch-disable scope; in that case EnableScheduling
+            // only balances the nested disable and leaves the actual fiber
+            // switch to the outermost unlock.
             super::kernel::with_current_thread_fast_mut(|t| {
                 t.enable_dispatch();
             });

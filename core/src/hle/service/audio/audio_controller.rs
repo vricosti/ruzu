@@ -531,14 +531,14 @@ impl IAudioController {
     ) {
         let service = Self::as_self(this);
         log::warn!("IAudioController::AcquireTargetNotification (STUBBED)");
-        let handle = service
+        let object_id = service
             .service_context
             .get_event(service.notification_event_handle)
-            .and_then(|event| event.copy_handle(ctx))
+            .and_then(|event| event.copy_object_id(ctx))
             .unwrap_or(0);
         let mut response = CmifResponse::new(ctx, 2, 1, 0);
         response.push_result(RESULT_SUCCESS);
-        response.push_copy_objects(handle);
+        response.push_copy_object_id(object_id);
     }
 }
 

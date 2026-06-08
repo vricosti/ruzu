@@ -174,38 +174,41 @@ pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    server_manager.register_named_service(
-        "bsd:s",
-        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Bsd::new(true)) }),
-        16,
-    );
-    server_manager.register_named_service(
-        "bsd:u",
-        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Bsd::new(false)) }),
-        16,
-    );
-    server_manager.register_named_service(
-        "bsdcfg",
-        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BsdCfg::new()) }),
-        16,
-    );
-    server_manager.register_named_service(
-        "nsd:a",
-        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Nsd::new("nsd:a")) }),
-        16,
-    );
-    server_manager.register_named_service(
-        "nsd:u",
-        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Nsd::new("nsd:u")) }),
-        16,
-    );
-    server_manager.register_named_service(
-        "sfdnsres",
-        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Sfdnsres::new()) }),
-        16,
-    );
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        server_manager.register_named_service(
+            "bsd:s",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Bsd::new(true)) }),
+            16,
+        );
+        server_manager.register_named_service(
+            "bsd:u",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Bsd::new(false)) }),
+            16,
+        );
+        server_manager.register_named_service(
+            "bsdcfg",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BsdCfg::new()) }),
+            16,
+        );
+        server_manager.register_named_service(
+            "nsd:a",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Nsd::new("nsd:a")) }),
+            16,
+        );
+        server_manager.register_named_service(
+            "nsd:u",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Nsd::new("nsd:u")) }),
+            16,
+        );
+        server_manager.register_named_service(
+            "sfdnsres",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Sfdnsres::new()) }),
+            16,
+        );
+    }
 
     // Wait for the main thread to finish spawning all initial services before
     // calling start_additional_host_threads. Without this gate, ruzu's
@@ -218,7 +221,10 @@ pub fn loop_process(system: crate::core::SystemRef) {
         std::thread::yield_now();
     }
 
-    server_manager.start_additional_host_threads("bsdsocket", 2);
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        server_manager.start_additional_host_threads("bsdsocket", 2);
+    }
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }

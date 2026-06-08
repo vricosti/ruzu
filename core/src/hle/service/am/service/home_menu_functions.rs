@@ -144,15 +144,19 @@ impl IHomeMenuFunctions {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let _service =
+        let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IHomeMenuFunctions) };
         log::info!("IHomeMenuFunctions::GetPopFromGeneralChannelEvent called");
 
-        if let Some(handle) = ctx.create_readable_event_handle(false) {
-            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-            rb.push_result(RESULT_SUCCESS);
-            rb.push_copy_objects(handle);
-        }
+        let object_id = service
+            .service_context
+            .get_event(service.pop_from_general_channel_event_handle)
+            .and_then(|event| event.copy_object_id(ctx))
+            .unwrap_or(0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(object_id);
     }
 
     /// Port of IHomeMenuFunctions::IsRebootEnabled

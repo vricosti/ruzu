@@ -1542,6 +1542,9 @@ impl System {
                 .lock()
                 .unwrap()
                 .bind_self_reference(&process_arc);
+            if let Some(ref kernel) = self.kernel {
+                kernel.register_process(process_arc.clone());
+            }
 
             // Wire the global scheduler context and per-core scheduler so the
             // process can update priority queues when threads become runnable.
@@ -2178,16 +2181,14 @@ impl System {
         self.kernel.as_ref()
     }
 
-    /// Runs a service server until shutdown.
-    ///
-    /// Port of upstream `System::RunServer`.
-    pub fn run_server(&self, server_manager: ServerManager) {
+    /// Runs a service server that already lives in its final shared owner.
+    pub fn run_server_shared(&self, server_manager: Arc<StdMutex<ServerManager>>) {
         let Some(kernel) = self.kernel() else {
-            log::warn!("System::run_server called before kernel initialization");
+            log::warn!("System::run_server_shared called before kernel initialization");
             return;
         };
 
-        kernel.run_server(server_manager);
+        kernel.run_server_shared(server_manager);
     }
 
     /// Get a mutable reference to the kernel core.
@@ -2237,7 +2238,11 @@ impl System {
 
     /// Set the Arc-wrapped current process for SVC dispatch.
     pub fn set_current_process_arc(&mut self, p: Arc<ProcessLock>) {
-        self.current_process_arc = Some(p);
+        self.current_process_arc = Some(Arc::clone(&p));
+        if let Some(kernel) = &self.kernel {
+            kernel.register_process(Arc::clone(&p));
+            kernel.ensure_tracked_server_manager_port_registrations(p);
+        }
     }
 
     /// Set the cooperative scheduler for SVC dispatch.
@@ -2272,6 +2277,10 @@ impl System {
         self.current_process_arc
             .as_ref()
             .expect("current_process_arc not set; call set_current_process_arc() first")
+    }
+
+    pub fn current_process_arc_opt(&self) -> Option<Arc<ProcessLock>> {
+        self.current_process_arc.clone()
     }
 
     /// Get the scheduler Arc for the current core.
@@ -2353,6 +2362,7 @@ impl System {
             kernel.create_new_object_id();
             kernel.create_new_thread_id();
         }
+        kernel.ensure_object_name_global_data_for_test();
         system.kernel = Some(kernel);
         let service_manager = Arc::new(StdMutex::new(ServiceManager::new()));
         // Register "sm:" port so connect_to_named_port tests work without

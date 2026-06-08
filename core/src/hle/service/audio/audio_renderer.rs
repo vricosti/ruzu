@@ -386,8 +386,8 @@ impl IAudioRenderer {
     /// Port of upstream `IAudioRenderer::QuerySystemEvent`.
     ///
     /// Upstream returns `&rendered_event->GetReadableEvent()` as a copy handle.
-    /// We create the KReadableEvent lazily on first call and return its handle.
-    /// Upstream creates an unsignaled event owned by the service context.
+    /// Rust creates the KReadableEvent with the service and defers copy-handle
+    /// allocation to IPC write-back, matching upstream `OutCopyHandle`.
     fn query_system_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::info!("IAudioRenderer::QuerySystemEvent");
         let svc = Self::as_self(this);
@@ -403,26 +403,17 @@ impl IAudioRenderer {
         }
 
         let _ = svc.rendered_event.lock().unwrap().is_initialized();
-        let Some(handle) =
-            ctx.copy_handle_for_readable_event(Arc::clone(&svc.rendered_readable_event))
-        else {
-            log::error!("IAudioRenderer::QuerySystemEvent failed to copy handle");
-            let mut response = CmifResponse::new(ctx, 2, 0, 0);
-            response.push_result(RESULT_SUCCESS);
-            return;
-        };
 
         if std::env::var_os("RUZU_TRACE_AUDIO_EVENT").is_some() {
             log::info!(
-                "IAudioRenderer::QuerySystemEvent readable_event_object_id={} copy_handle=0x{:08X}",
-                svc.rendered_readable_event_object_id,
-                handle
+                "IAudioRenderer::QuerySystemEvent readable_event_object_id={} deferred_handle",
+                svc.rendered_readable_event_object_id
             );
         }
 
         let mut response = CmifResponse::new(ctx, 2, 1, 0);
         response.push_result(RESULT_SUCCESS);
-        response.push_copy_objects(handle);
+        response.push_copy_object_id(svc.rendered_readable_event_object_id);
     }
 
     fn set_rendering_time_limit_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

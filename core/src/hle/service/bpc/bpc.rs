@@ -6,6 +6,14 @@
 //! BPC service ("bpc") and BPC_R service ("bpc:r").
 //! All commands are stubs (nullptr in upstream).
 
+use std::collections::BTreeMap;
+
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{
+    HLERequestContext, SessionRequestHandler, SessionRequestHandlerPtr,
+};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
 /// IPC command IDs for BPC service
 pub mod bpc_commands {
     pub const SHUTDOWN_SYSTEM: u32 = 0;
@@ -36,20 +44,143 @@ pub mod bpc_r_commands {
 }
 
 /// BPC service. All commands are unimplemented stubs in upstream.
-pub struct BPC;
+pub struct BPC {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl BPC {
     pub fn new() -> Self {
-        Self
+        Self {
+            handlers: build_handler_map(&[
+                (bpc_commands::SHUTDOWN_SYSTEM, None, "ShutdownSystem"),
+                (bpc_commands::REBOOT_SYSTEM, None, "RebootSystem"),
+                (bpc_commands::GET_WAKEUP_REASON, None, "GetWakeupReason"),
+                (bpc_commands::GET_SHUTDOWN_REASON, None, "GetShutdownReason"),
+                (bpc_commands::GET_AC_OK, None, "GetAcOk"),
+                (
+                    bpc_commands::GET_BOARD_POWER_CONTROL_EVENT,
+                    None,
+                    "GetBoardPowerControlEvent",
+                ),
+                (
+                    bpc_commands::GET_SLEEP_BUTTON_STATE,
+                    None,
+                    "GetSleepButtonState",
+                ),
+                (bpc_commands::GET_POWER_EVENT, None, "GetPowerEvent"),
+                (bpc_commands::CREATE_WAKEUP_TIMER, None, "CreateWakeupTimer"),
+                (bpc_commands::CANCEL_WAKEUP_TIMER, None, "CancelWakeupTimer"),
+                (
+                    bpc_commands::ENABLE_WAKEUP_TIMER_ON_DEVICE,
+                    None,
+                    "EnableWakeupTimerOnDevice",
+                ),
+                (
+                    bpc_commands::CREATE_WAKEUP_TIMER_EX,
+                    None,
+                    "CreateWakeupTimerEx",
+                ),
+                (
+                    bpc_commands::GET_LAST_ENABLED_WAKEUP_TIMER_TYPE,
+                    None,
+                    "GetLastEnabledWakeupTimerType",
+                ),
+                (
+                    bpc_commands::CLEAN_ALL_WAKEUP_TIMERS,
+                    None,
+                    "CleanAllWakeupTimers",
+                ),
+                (bpc_commands::GET_POWER_BUTTON, None, "GetPowerButton"),
+                (
+                    bpc_commands::SET_ENABLE_WAKEUP_TIMER,
+                    None,
+                    "SetEnableWakeupTimer",
+                ),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for BPC {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "bpc"
+    }
+}
+
+impl ServiceFramework for BPC {
+    fn get_service_name(&self) -> &str {
+        "bpc"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }
 
 /// BPC_R service. All commands are unimplemented stubs in upstream.
-pub struct BpcR;
+pub struct BpcR {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl BpcR {
     pub fn new() -> Self {
-        Self
+        Self {
+            handlers: build_handler_map(&[
+                (bpc_r_commands::GET_RTC_TIME, None, "GetRtcTime"),
+                (bpc_r_commands::SET_RTC_TIME, None, "SetRtcTime"),
+                (
+                    bpc_r_commands::GET_RTC_RESET_DETECTED,
+                    None,
+                    "GetRtcResetDetected",
+                ),
+                (
+                    bpc_r_commands::CLEAR_RTC_RESET_DETECTED,
+                    None,
+                    "ClearRtcResetDetected",
+                ),
+                (
+                    bpc_r_commands::SET_UP_RTC_RESET_ON_SHUTDOWN,
+                    None,
+                    "SetUpRtcResetOnShutdown",
+                ),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for BpcR {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "bpc:r"
+    }
+}
+
+impl ServiceFramework for BpcR {
+    fn get_service_name(&self) -> &str {
+        "bpc:r"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }
 
@@ -60,11 +191,20 @@ impl BpcR {
 /// server_manager->RegisterNamedService("bpc", std::make_shared<BPC>(system));
 /// server_manager->RegisterNamedService("bpc:r", std::make_shared<BPC_R>(system));
 /// ```
-///
-/// Neither BPC nor BPC_R implement SessionRequestHandler yet (all commands are
-/// nullptr in upstream), so we use stub services.
 pub fn loop_process(system: crate::core::SystemRef) {
-    let mut server_manager = crate::hle::service::server_manager::ServerManager::new(system);
-    crate::hle::service::services::register_stub_services(&mut server_manager, &["bpc", "bpc:r"]);
-    crate::hle::service::server_manager::ServerManager::run_server(server_manager);
+    let server_manager = crate::hle::service::server_manager::ServerManager::new_shared(system);
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        server_manager.register_named_service(
+            "bpc",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BPC::new()) }),
+            64,
+        );
+        server_manager.register_named_service(
+            "bpc:r",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BpcR::new()) }),
+            64,
+        );
+    }
+    crate::hle::service::server_manager::ServerManager::run_server_shared(server_manager);
 }

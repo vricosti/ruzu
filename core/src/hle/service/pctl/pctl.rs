@@ -25,37 +25,40 @@ use crate::hle::service::server_manager::ServerManager;
 /// }
 /// ```
 pub fn loop_process(system: crate::core::SystemRef) {
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    register_named_service(
-        &mut server_manager,
-        system,
-        "pctl",
-        super::pctl_types::Capability::APPLICATION
-            | super::pctl_types::Capability::SNS_POST
-            | super::pctl_types::Capability::STATUS
-            | super::pctl_types::Capability::STEREO_VISION,
-    );
-    register_named_service(
-        &mut server_manager,
-        system,
-        "pctl:a",
-        super::pctl_types::Capability::NONE,
-    );
-    register_named_service(
-        &mut server_manager,
-        system,
-        "pctl:r",
-        super::pctl_types::Capability::NONE,
-    );
-    register_named_service(
-        &mut server_manager,
-        system,
-        "pctl:s",
-        super::pctl_types::Capability::NONE,
-    );
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        register_named_service(
+            &mut server_manager,
+            system,
+            "pctl",
+            super::pctl_types::Capability::APPLICATION
+                | super::pctl_types::Capability::SNS_POST
+                | super::pctl_types::Capability::STATUS
+                | super::pctl_types::Capability::STEREO_VISION,
+        );
+        register_named_service(
+            &mut server_manager,
+            system,
+            "pctl:a",
+            super::pctl_types::Capability::NONE,
+        );
+        register_named_service(
+            &mut server_manager,
+            system,
+            "pctl:r",
+            super::pctl_types::Capability::NONE,
+        );
+        register_named_service(
+            &mut server_manager,
+            system,
+            "pctl:s",
+            super::pctl_types::Capability::NONE,
+        );
+    }
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }
 
 fn register_named_service(

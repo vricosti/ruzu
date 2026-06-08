@@ -26,39 +26,43 @@ pub const VI_SERVICE_NAMES: &[&str] = &["vi:m", "vi:s", "vi:u"];
 pub fn loop_process(system: crate::core::SystemRef) {
     let container = Container::new(system);
 
-    let mut server_manager = crate::hle::service::server_manager::ServerManager::new(system);
+    let server_manager = crate::hle::service::server_manager::ServerManager::new_shared(system);
 
-    // vi:m — IManagerRootService (cmd 2 = GetDisplayService)
-    let container_m = Arc::clone(&container);
-    server_manager.register_named_service(
-        "vi:m",
-        Box::new(move || -> Arc<dyn SessionRequestHandler> {
-            Arc::new(IManagerRootService::new(Arc::clone(&container_m)))
-        }),
-        64,
-    );
+    {
+        let mut server_manager = server_manager.lock().unwrap();
 
-    // vi:s — ISystemRootService (cmd 1 = GetDisplayService)
-    let container_s = Arc::clone(&container);
-    server_manager.register_named_service(
-        "vi:s",
-        Box::new(move || -> Arc<dyn SessionRequestHandler> {
-            Arc::new(ISystemRootService::new(Arc::clone(&container_s)))
-        }),
-        64,
-    );
+        // vi:m — IManagerRootService (cmd 2 = GetDisplayService)
+        let container_m = Arc::clone(&container);
+        server_manager.register_named_service(
+            "vi:m",
+            Box::new(move || -> Arc<dyn SessionRequestHandler> {
+                Arc::new(IManagerRootService::new(Arc::clone(&container_m)))
+            }),
+            64,
+        );
 
-    // vi:u — IApplicationRootService (cmd 0 = GetDisplayService)
-    let container_u = Arc::clone(&container);
-    server_manager.register_named_service(
-        "vi:u",
-        Box::new(move || -> Arc<dyn SessionRequestHandler> {
-            Arc::new(IApplicationRootService::new(Arc::clone(&container_u)))
-        }),
-        64,
-    );
+        // vi:s — ISystemRootService (cmd 1 = GetDisplayService)
+        let container_s = Arc::clone(&container);
+        server_manager.register_named_service(
+            "vi:s",
+            Box::new(move || -> Arc<dyn SessionRequestHandler> {
+                Arc::new(ISystemRootService::new(Arc::clone(&container_s)))
+            }),
+            64,
+        );
 
-    crate::hle::service::server_manager::ServerManager::run_server(server_manager);
+        // vi:u — IApplicationRootService (cmd 0 = GetDisplayService)
+        let container_u = Arc::clone(&container);
+        server_manager.register_named_service(
+            "vi:u",
+            Box::new(move || -> Arc<dyn SessionRequestHandler> {
+                Arc::new(IApplicationRootService::new(Arc::clone(&container_u)))
+            }),
+            64,
+        );
+    }
+
+    crate::hle::service::server_manager::ServerManager::run_server_shared(server_manager);
 }
 
 /// Backward-compatible alias.

@@ -9,46 +9,26 @@ use std::sync::{Arc, Mutex};
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_session::KSession;
 use crate::hle::kernel::k_session_request::KSessionRequest;
-use crate::hle::service::hle_ipc::SessionRequestManager;
 
 /// The client session object.
 /// Matches upstream `KClientSession` class (k_client_session.h).
 pub struct KClientSession {
     /// Parent KSession ID.
     pub parent_id: Option<u64>,
-    pub request_manager: Option<Arc<Mutex<SessionRequestManager>>>,
 }
 
 impl KClientSession {
     pub fn new() -> Self {
-        Self {
-            parent_id: None,
-            request_manager: None,
-        }
+        Self { parent_id: None }
     }
 
     /// Initialize with a parent session.
     pub fn initialize(&mut self, parent_id: u64) {
         self.parent_id = Some(parent_id);
-        self.request_manager = None;
-    }
-
-    /// Initialize with a parent session and its request manager.
-    pub fn initialize_with_manager(
-        &mut self,
-        parent_id: u64,
-        request_manager: Arc<Mutex<SessionRequestManager>>,
-    ) {
-        self.parent_id = Some(parent_id);
-        self.request_manager = Some(request_manager);
     }
 
     pub fn get_parent_id(&self) -> Option<u64> {
         self.parent_id
-    }
-
-    pub fn request_manager(&self) -> Option<Arc<Mutex<SessionRequestManager>>> {
-        self.request_manager.clone()
     }
 
     /// Send a synchronous IPC request.
@@ -180,8 +160,18 @@ impl KClientSession {
             .lock()
             .unwrap()
             .initialize_with_process(process, event_id, address, size);
-        let session = parent_session.lock().unwrap();
-        session.on_request_with_process(process, request)
+        let (server_endpoint, trace_object_id) = {
+            let session = parent_session.lock().unwrap();
+            (
+                Arc::clone(session.get_server_session()),
+                session.name as u64,
+            )
+        };
+        KSession::on_server_request_defer_scheduler_unlock(
+            &server_endpoint,
+            trace_object_id,
+            request,
+        )
     }
 
     /// Called when the server side is closed.
@@ -194,10 +184,42 @@ impl KClientSession {
     /// Destroy the client session.
     /// Port of upstream `KClientSession::Destroy`.
     pub fn destroy(&mut self) {
-        // Upstream: m_parent->OnClientClosed(); m_parent->Close();
-        // Parent reference cleanup is handled by the object system.
+        let Some(parent_id) = self.parent_id else {
+            return;
+        };
+        let Some(kernel) = crate::hle::kernel::kernel::get_kernel_ref() else {
+            self.parent_id = None;
+            return;
+        };
+        let Some(owner_process_id) = kernel.get_session_owner_process_id(parent_id) else {
+            self.parent_id = None;
+            return;
+        };
+        let Some(process_arc) = kernel.get_process_by_id(owner_process_id) else {
+            self.parent_id = None;
+            return;
+        };
+        let mut process = process_arc.lock().unwrap();
+        self.destroy_with_process(&mut process);
+    }
+
+    /// Port of upstream `KClientSession::Destroy` when the owning process is
+    /// already held by the caller.
+    ///
+    /// Upstream calls `m_parent->OnClientClosed(); m_parent->Close();`. Rust
+    /// represents the `Close()` refcount through handle/Arc registry cleanup,
+    /// but the parent close notification must still run before the endpoint is
+    /// removed from `KProcess`.
+    pub fn destroy_with_process(&mut self, process: &mut KProcess) {
+        if let Some(parent_id) = self.parent_id {
+            if let Some(parent_session) = process.get_session_by_object_id(parent_id) {
+                parent_session
+                    .lock()
+                    .unwrap()
+                    .on_client_closed_with_process(process);
+            }
+        }
         self.parent_id = None;
-        self.request_manager = None;
     }
 }
 
@@ -215,6 +237,17 @@ mod tests {
     use crate::hle::kernel::k_thread::{KThread, KThreadLock, ThreadState};
     use std::sync::{Arc, Mutex};
 
+    fn install_test_current_thread(thread_id: u64) -> Arc<KThreadLock> {
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut thread = current_thread.lock().unwrap();
+            thread.thread_id = thread_id;
+            thread.set_state(ThreadState::RUNNABLE);
+        }
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&current_thread));
+        current_thread
+    }
+
     #[test]
     fn send_sync_request_with_process_enqueues_real_session_request() {
         let mut process = KProcess::new();
@@ -227,13 +260,7 @@ mod tests {
         }
         process.register_session_object(0x1000, Arc::clone(&session));
 
-        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
-        {
-            let mut thread = current_thread.lock().unwrap();
-            thread.thread_id = 1;
-            thread.set_state(ThreadState::RUNNABLE);
-        }
-        crate::hle::kernel::kernel::set_current_emu_thread(Some(&current_thread));
+        let _current_thread = install_test_current_thread(1);
 
         let client_session = session.lock().unwrap().get_client_session().clone();
         assert_eq!(
@@ -258,6 +285,56 @@ mod tests {
     }
 
     #[test]
+    fn destroy_with_process_notifies_parent_server_session() {
+        let mut process = KProcess::new();
+        let session = Arc::new(Mutex::new(KSession::new()));
+        {
+            let mut session_guard = session.lock().unwrap();
+            session_guard.initialize(None, 0);
+            session_guard.client.lock().unwrap().initialize(0x1000);
+            session_guard.server.lock().unwrap().initialize(0x1000);
+        }
+        let client_session = session.lock().unwrap().get_client_session().clone();
+        let server_session = session.lock().unwrap().get_server_session().clone();
+        process.register_session_object(0x1000, Arc::clone(&session));
+
+        client_session
+            .lock()
+            .unwrap()
+            .destroy_with_process(&mut process);
+
+        let server = server_session.lock().unwrap();
+        assert!(server.client_closed);
+        assert!(server.is_signaled());
+    }
+
+    #[test]
+    fn closing_last_client_session_handle_notifies_parent_server_session() {
+        let mut process = KProcess::new();
+        assert_eq!(process.initialize_handle_table(), 0);
+
+        let session = Arc::new(Mutex::new(KSession::new()));
+        {
+            let mut session_guard = session.lock().unwrap();
+            session_guard.initialize(None, 0);
+            session_guard.client.lock().unwrap().initialize(0x1000);
+            session_guard.server.lock().unwrap().initialize(0x1000);
+        }
+        let client_session = session.lock().unwrap().get_client_session().clone();
+        let server_session = session.lock().unwrap().get_server_session().clone();
+        process.register_session_object(0x1000, Arc::clone(&session));
+        process.register_client_session_object(0x2000, client_session, 0x1000);
+
+        let handle = process.handle_table.add(0x2000).unwrap();
+        assert!(process.remove_handle(handle));
+
+        assert!(process.get_client_session_by_object_id(0x2000).is_none());
+        let server = server_session.lock().unwrap();
+        assert!(server.client_closed);
+        assert!(server.is_signaled());
+    }
+
+    #[test]
     fn send_async_request_with_process_enqueues_request_with_event() {
         let mut process = KProcess::new();
         let session = Arc::new(Mutex::new(KSession::new()));
@@ -269,6 +346,7 @@ mod tests {
         }
         process.register_session_object(0x1000, Arc::clone(&session));
 
+        let _current_thread = install_test_current_thread(1);
         let client_session = session.lock().unwrap().get_client_session().clone();
         assert_eq!(
             client_session
@@ -288,6 +366,7 @@ mod tests {
         let current_request = current_request.lock().unwrap();
         assert_eq!(current_request.get_event_id(), Some(0x2222));
         assert_eq!(current_request.get_address(), 0x2395000);
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
     }
 
     #[test]

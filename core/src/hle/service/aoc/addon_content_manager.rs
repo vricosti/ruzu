@@ -370,12 +370,16 @@ impl IAddOnContentManager {
 /// }
 /// ```
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
-    let mut server_manager = crate::hle::service::server_manager::ServerManager::new(system);
-    let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
-        Arc::new(IAddOnContentManager::new(system))
-    });
-    server_manager.register_named_service("aoc:u", factory, 64);
-    crate::hle::service::server_manager::ServerManager::run_server(server_manager);
+    let server_manager = crate::hle::service::server_manager::ServerManager::new_shared(system);
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        let factory: SessionRequestHandlerFactory =
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(IAddOnContentManager::new(system))
+            });
+        server_manager.register_named_service("aoc:u", factory, 64);
+    }
+    crate::hle::service::server_manager::ServerManager::run_server_shared(server_manager);
 }
 
 impl SessionRequestHandler for IAddOnContentManager {

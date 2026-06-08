@@ -24,37 +24,43 @@ pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::server_manager::ServerManager;
     use std::sync::Arc;
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    // "set" -> ISettingsServer
-    server_manager.register_named_service(
-        "set",
-        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(ISettingsServer::new()) }),
-        64,
-    );
+    {
+        let mut server_manager = server_manager.lock().unwrap();
 
-    // "set:cal" -> IFactorySettingsServer
-    server_manager.register_named_service(
-        "set:cal",
-        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IFactorySettingsServer::new()) }),
-        64,
-    );
+        // "set" -> ISettingsServer
+        server_manager.register_named_service(
+            "set",
+            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(ISettingsServer::new()) }),
+            64,
+        );
 
-    // "set:fd" -> IFirmwareDebugSettingsServer
-    server_manager.register_named_service(
-        "set:fd",
-        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IFirmwareDebugSettingsServer::new()) }),
-        64,
-    );
+        // "set:cal" -> IFactorySettingsServer
+        server_manager.register_named_service(
+            "set:cal",
+            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IFactorySettingsServer::new()) }),
+            64,
+        );
 
-    // "set:sys" -> ISystemSettingsServer (via SystemSettingsService wrapper)
-    server_manager.register_named_service(
-        "set:sys",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            Arc::new(super::system_settings_server::SystemSettingsService::new())
-        }),
-        64,
-    );
+        // "set:fd" -> IFirmwareDebugSettingsServer
+        server_manager.register_named_service(
+            "set:fd",
+            Box::new(|| -> SessionRequestHandlerPtr {
+                Arc::new(IFirmwareDebugSettingsServer::new())
+            }),
+            64,
+        );
 
-    ServerManager::run_server(server_manager);
+        // "set:sys" -> ISystemSettingsServer (via SystemSettingsService wrapper)
+        server_manager.register_named_service(
+            "set:sys",
+            Box::new(|| -> SessionRequestHandlerPtr {
+                Arc::new(super::system_settings_server::SystemSettingsService::new())
+            }),
+            64,
+        );
+    }
+
+    ServerManager::run_server_shared(server_manager);
 }
