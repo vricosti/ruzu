@@ -2074,6 +2074,83 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
         }
     }
 
+    // RUZU_TRACE_SVC_ERRVAL=0xNNNN — eprintln (level-independent) every SVC
+    // whose returned r0 equals the given result code. Used to find which SVC
+    // returns ResultInvalidHandle (0xE401) right before MK8D's boot-time
+    // SetTerminateResult + svcBreak abort (task #123). Entry args are
+    // captured in `args` (the caller's copy is untouched by the handler;
+    // `dispatch_args` carries the post-call values).
+    {
+        fn svc_errval_target() -> Option<u64> {
+            use std::sync::OnceLock;
+            static CACHED: OnceLock<Option<u64>> = OnceLock::new();
+            *CACHED.get_or_init(|| {
+                std::env::var("RUZU_TRACE_SVC_ERRVAL").ok().and_then(|s| {
+                    let s = s.trim();
+                    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+                    u64::from_str_radix(s, 16).ok()
+                })
+            })
+        }
+        if let Some(target) = svc_errval_target() {
+            // Silent ring of handle-related SVCs (CloseHandle, SendSyncRequest,
+            // WaitSynchronization, ResetSignal, SignalEvent, ClearEvent). No
+            // I/O on the hot path — synchronous eprintln tracing makes the
+            // boot race vanish (heisenbug).
+            if matches!(imm, 0x16 | 0x21 | 0x18 | 0x12 | 0x11 | 0x13) && tid >= 0 {
+                super::handle_forensics::record_svc(
+                    tid as u64,
+                    imm,
+                    [args[0], args[1], args[2], args[3]],
+                    dispatch_args[0],
+                );
+            }
+            if dispatch_args[0] == target {
+                eprintln!(
+                    "[SVC_ERRVAL] tid={} core={} svc=0x{:02X} ret0=0x{:X} args_in=[0x{:X},0x{:X},0x{:X},0x{:X}] args_out=[0x{:X},0x{:X},0x{:X},0x{:X}]",
+                    tid, core_id, imm,
+                    dispatch_args[0],
+                    args[0], args[1], args[2], args[3],
+                    dispatch_args[1], dispatch_args[2],
+                    dispatch_args[3], dispatch_args[4]
+                );
+                super::handle_forensics::dump_for_handle(args[0]);
+            }
+        }
+    }
+
+    // RUZU_TRACE_SVC_IMM=0x16,0x21,... — eprintln (level-independent) entry
+    // args + return of every SVC whose number is in the list. Companion to
+    // RUZU_TRACE_SVC_ERRVAL: trace CloseHandle (0x16) to correlate which tid
+    // closed the session handle that a later SendSyncRequest fails on.
+    {
+        fn svc_imm_targets() -> &'static [u32] {
+            use std::sync::OnceLock;
+            static CACHED: OnceLock<Vec<u32>> = OnceLock::new();
+            CACHED.get_or_init(|| {
+                std::env::var("RUZU_TRACE_SVC_IMM")
+                    .map(|s| {
+                        s.split(',')
+                            .filter_map(|p| {
+                                let p = p.trim();
+                                let p = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")).unwrap_or(p);
+                                u32::from_str_radix(p, 16).ok()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+        }
+        if svc_imm_targets().contains(&imm) {
+            eprintln!(
+                "[SVC_IMM] tid={} core={} svc=0x{:02X} args_in=[0x{:X},0x{:X},0x{:X},0x{:X}] ret0=0x{:X}",
+                tid, core_id, imm,
+                args[0], args[1], args[2], args[3],
+                dispatch_args[0]
+            );
+        }
+    }
+
     // RUZU_TRACE_TID_SVC_RET=N (or comma list, or *) — log SVC RETURN values
     // (the dispatch_args after handler completion) for matching tid(s).
     // Pairs with RUZU_TRACE_TID_SVC (which logs ENTRY args). Diffing both

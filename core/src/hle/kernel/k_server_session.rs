@@ -994,6 +994,13 @@ impl KServerSession {
             let src_handle = src_message.get_handle(offset);
             let dst_handle = if src_handle != INVALID_HANDLE {
                 let Some(object_id) = src_process.handle_table.get_object(src_handle) else {
+                    if crate::hle::kernel::handle_forensics::enabled() {
+                        eprintln!(
+                            "[SPECIAL_DATA_FAIL] kind=copy src_handle=0x{:X} src_pid={} dst_pid={}",
+                            src_handle, src_process.process_id, dst_process.process_id
+                        );
+                        crate::hle::kernel::handle_forensics::dump_for_handle(src_handle as u64);
+                    }
                     return crate::hle::kernel::svc::svc_results::RESULT_INVALID_HANDLE
                         .get_inner_value();
                 };
@@ -1015,6 +1022,13 @@ impl KServerSession {
             let src_handle = src_message.get_handle(offset);
             let dst_handle = if src_handle != INVALID_HANDLE {
                 let Some(object_id) = src_process.handle_table.get_object(src_handle) else {
+                    if crate::hle::kernel::handle_forensics::enabled() {
+                        eprintln!(
+                            "[SPECIAL_DATA_FAIL] kind=move src_handle=0x{:X} src_pid={} dst_pid={}",
+                            src_handle, src_process.process_id, dst_process.process_id
+                        );
+                        crate::hle::kernel::handle_forensics::dump_for_handle(src_handle as u64);
+                    }
                     return crate::hle::kernel::svc::svc_results::RESULT_INVALID_HANDLE
                         .get_inner_value();
                 };

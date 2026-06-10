@@ -2006,6 +2006,15 @@ impl HLERequestContext {
 
     fn resolve_ipc_object_handle(&self, obj_ref: KAutoObjectRef) -> Option<u32> {
         if let Some(handle) = obj_ref.as_handle() {
+            // Silent provenance record for the InvalidHandle boot-abort
+            // forensics (task #123) — no I/O, see handle_forensics.rs.
+            if crate::hle::kernel::handle_forensics::enabled() {
+                let (svc, cmd, _ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
+                crate::hle::kernel::handle_forensics::record_handle_out(
+                    handle,
+                    format!("raw service={} cmd={}", svc, cmd),
+                );
+            }
             // RUZU_IPC_HANDLE_OUT=1 — log every raw-handle path that bypasses
             // handle_table.Add. The handle is written verbatim to the client
             // IPC buffer; if it's not actually present in the client's table,
@@ -2046,6 +2055,15 @@ impl HLERequestContext {
             return None;
         }
         let result = process.handle_table.add(object_id).ok();
+        if crate::hle::kernel::handle_forensics::enabled() {
+            if let Some(h) = result {
+                let (svc, cmd, _ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
+                crate::hle::kernel::handle_forensics::record_handle_out(
+                    h,
+                    format!("add service={} cmd={} object_id=0x{:X}", svc, cmd, object_id),
+                );
+            }
+        }
         if common::trace::is_enabled(common::trace::cat::IPC_HANDLE_OUT) {
             let (svc, cmd, _ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
             let svc_str = if svc.is_empty() { "?" } else { svc.as_str() };
