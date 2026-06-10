@@ -1889,6 +1889,20 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                         if let Some(ref dm) = self.device_memory {
                             let mut buf = vec![0u8; size as usize];
                             dm.read_block_unsafe(device_addr, &mut buf);
+                            // RUZU_TRACE_UBO_REFRESH=1 — also cover the fast
+                            // push path (small per-binding uploads).
+                            if std::env::var_os("RUZU_TRACE_UBO_REFRESH").is_some() {
+                                let all_zero = buf.iter().all(|&b| b == 0);
+                                if all_zero {
+                                    log::warn!(
+                                        "[UBO_FAST_ZERO] stage={} binding={} device_addr=0x{:X} size={}",
+                                        stage,
+                                        binding_index,
+                                        device_addr,
+                                        size,
+                                    );
+                                }
+                            }
                             rt.push_fast_uniform_buffer(stage, binding_index, &buf);
                             fast_buffer_bound = true;
                         }
@@ -1943,7 +1957,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         } else {
             false
         };
-        let needs_bind = needs_bind | has_fast_bound | binding_size_differs;
+        // RUZU_UBO_FORCE_REFRESH=1 — diagnostic: never skip the bind+refresh
+        // (tests whether stale/never-written UBO slices cause the MK8D
+        // zero-cbuf world draws).
+        let force_refresh = {
+            use std::sync::OnceLock;
+            static FORCE: OnceLock<bool> = OnceLock::new();
+            *FORCE.get_or_init(|| std::env::var_os("RUZU_UBO_FORCE_REFRESH").is_some())
+        };
+        let needs_bind = needs_bind | has_fast_bound | binding_size_differs | force_refresh;
         if !needs_bind {
             return;
         }
@@ -1960,6 +1982,21 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             if let Some(ref dm) = self.device_memory {
                 let mut bytes = vec![0u8; size as usize];
                 dm.read_block_unsafe(device_addr, &mut bytes);
+                // RUZU_TRACE_UBO_REFRESH=1 — log every refresh whose guest
+                // read came back all-zero (the MK8D zero-cbuf world draws).
+                if std::env::var_os("RUZU_TRACE_UBO_REFRESH").is_some() {
+                    let all_zero = bytes.iter().all(|&b| b == 0);
+                    if all_zero || std::env::var_os("RUZU_TRACE_UBO_REFRESH_ALL").is_some() {
+                        log::warn!(
+                            "[UBO_REFRESH] stage={} binding={} device_addr=0x{:X} size={} all_zero={}",
+                            stage,
+                            binding_index,
+                            device_addr,
+                            size,
+                            all_zero,
+                        );
+                    }
+                }
                 self.slot_buffers[binding.buffer_id].immediate_upload(offset as u64, &bytes);
             }
         }

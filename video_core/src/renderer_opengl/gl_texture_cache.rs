@@ -989,6 +989,49 @@ impl Image {
                 }
             }
             self.copy_buffer_to_image(copy, buffer_offset);
+            // RUZU_TRACE_GL_UPLOAD_ERR=1 — when a copy raises a GL error
+            // (e.g. "out of bounds PBO access"), log the full copy + PBO
+            // geometry so the offending texture/staging size mismatch can be
+            // identified. Gated: glGetError stalls the pipeline.
+            if std::env::var_os("RUZU_TRACE_GL_UPLOAD_ERR").is_some() {
+                let err = unsafe { gl::GetError() };
+                if err != gl::NO_ERROR {
+                    let mut pbo_size: i64 = -1;
+                    unsafe {
+                        gl::GetNamedBufferParameteri64v(
+                            buffer_handle,
+                            gl::BUFFER_SIZE,
+                            &mut pbo_size,
+                        );
+                    }
+                    log::warn!(
+                        "[GL_UPLOAD_ERR] err=0x{:X} tex={} type={:?} ifmt=0x{:X} fmt=0x{:X} ty=0x{:X} \
+                         level={} layer={}+{} off=({},{},{}) extent={}x{}x{} row_len={} img_h={} \
+                         buf_off=0x{:X}+0x{:X} buf_size=0x{:X} pbo_size=0x{:X}",
+                        err,
+                        self.texture,
+                        self.image_type,
+                        self.gl_internal_format,
+                        self.gl_format,
+                        self.gl_type,
+                        copy.image_subresource.base_level,
+                        copy.image_subresource.base_layer,
+                        copy.image_subresource.num_layers,
+                        copy.image_offset.x,
+                        copy.image_offset.y,
+                        copy.image_offset.z,
+                        copy.image_extent.width,
+                        copy.image_extent.height,
+                        copy.image_extent.depth,
+                        copy.buffer_row_length,
+                        copy.buffer_image_height,
+                        buffer_offset,
+                        copy.buffer_offset,
+                        copy.buffer_size,
+                        pbo_size,
+                    );
+                }
+            }
         }
         unsafe {
             gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, 0);
@@ -2458,11 +2501,17 @@ impl TextureCache {
             return;
         }
         let image = &mut self.base.slot_images[image_id];
-        if can_be_decoded_async(self.has_native_astc, &image.info) {
-            image.flags.insert(ImageFlagBits::ASYNCHRONOUS_DECODE);
-        } else if can_be_accelerated(self.has_native_astc, &image.info) {
-            image.flags.insert(ImageFlagBits::ACCELERATED_UPLOAD);
-        }
+        // Upstream sets ASYNCHRONOUS_DECODE / ACCELERATED_UPLOAD here, but
+        // ruzu has ported neither the async ASTC decoder thread nor the
+        // compute-shader accelerated upload. Setting the flags without the
+        // backend paths breaks `map_size_bytes` (ACCELERATED_UPLOAD makes it
+        // return the guest ASTC size while the CPU convert path produces
+        // RGBA8 output → staging PBO too small, GL_INVALID_OPERATION, empty
+        // textures on the MK8D splash/demo). Keep the flags off until those
+        // subsystems are ported — mirroring upstream's own "disable
+        // accelerated uploads we don't implement" pattern.
+        let _ = can_be_decoded_async(self.has_native_astc, &image.info);
+        let _ = can_be_accelerated(self.has_native_astc, &image.info);
         if is_converted_image(
             self.has_native_astc,
             image.info.format,
@@ -2608,13 +2657,39 @@ impl TextureCache {
             return;
         }
         let mut staging = vec![0u8; staging_size];
-        let copies = unswizzle_image(
-            &(),
-            base_image.gpu_addr,
-            &base_image.info,
-            &guest,
-            &mut staging,
-        );
+        // Upstream `UploadImageContents`: converted images (ASTC without
+        // native support, BC4/BC5 3D) are unswizzled into a scratch buffer
+        // first, then `ConvertImage` decodes into the staging map and
+        // rewrites the copies to the converted layout (RGBA8 offsets/sizes,
+        // tight row_length/image_height). Uploading the raw unswizzled bytes
+        // with unconverted copies leaves the GL_RGBA8 texture empty
+        // (GL_INVALID_OPERATION: out-of-bounds PBO access — MK8D splash text
+        // and demo assets).
+        let copies = if base_image.flags.contains(ImageFlagBits::CONVERTED) {
+            let mut unswizzled = vec![0u8; base_image.unswizzled_size_bytes as usize];
+            let mut copies = unswizzle_image(
+                &(),
+                base_image.gpu_addr,
+                &base_image.info,
+                &guest,
+                &mut unswizzled,
+            );
+            crate::texture_cache::util::convert_image(
+                &unswizzled,
+                &base_image.info,
+                &mut staging,
+                &mut copies,
+            );
+            copies
+        } else {
+            unswizzle_image(
+                &(),
+                base_image.gpu_addr,
+                &base_image.info,
+                &guest,
+                &mut staging,
+            )
+        };
         if copies.is_empty() {
             return;
         }
@@ -3069,6 +3144,25 @@ impl TextureCache {
                     0,
                 ],
             );
+        }
+        // RUZU_TRACE_UNMAP_VICTIMS=1 — name every image evicted by this unmap
+        // walk (correlates scene-RT evictions with composite draws).
+        if std::env::var_os("RUZU_TRACE_UNMAP_VICTIMS").is_some() {
+            for (image_id, _) in &deleted_images {
+                let image = &self.base.slot_images[*image_id];
+                log::warn!(
+                    "[UNMAP_VICTIM] unmap=0x{:X}+0x{:X} image_id={} gpu=0x{:X} cpu=0x{:X} size=0x{:X} {}x{} flags=0x{:X}",
+                    cpu_addr,
+                    size,
+                    image_id.index,
+                    image.gpu_addr,
+                    image.cpu_addr,
+                    image.guest_size_bytes,
+                    image.info.size.width,
+                    image.info.size.height,
+                    image.flags.bits(),
+                );
+            }
         }
         for (image_id, view_ids) in deleted_images {
             self.images.remove(&image_id);

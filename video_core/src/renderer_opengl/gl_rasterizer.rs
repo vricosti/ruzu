@@ -2474,6 +2474,198 @@ unsafe fn emit_rt_grid_phase(
             gl_error as u64,
         ],
     );
+    // RUZU_TRACE_RT_GRID_STATE=1 — also dump the GL pipeline state that gates
+    // fragment output for this draw (diagnoses "draw executes but writes
+    // nothing": color mask, blending, depth/stencil/scissor).
+    if std::env::var_os("RUZU_TRACE_RT_GRID_STATE").is_some() {
+        let mut color_mask = [0i32; 4];
+        gl::GetIntegeri_v(gl::COLOR_WRITEMASK, 0, color_mask.as_mut_ptr());
+        let blend = gl::IsEnabledi(gl::BLEND, 0);
+        let mut blend_src_rgb = 0i32;
+        let mut blend_dst_rgb = 0i32;
+        let mut blend_src_a = 0i32;
+        let mut blend_dst_a = 0i32;
+        gl::GetIntegeri_v(gl::BLEND_SRC_RGB, 0, &mut blend_src_rgb);
+        gl::GetIntegeri_v(gl::BLEND_DST_RGB, 0, &mut blend_dst_rgb);
+        gl::GetIntegeri_v(gl::BLEND_SRC_ALPHA, 0, &mut blend_src_a);
+        gl::GetIntegeri_v(gl::BLEND_DST_ALPHA, 0, &mut blend_dst_a);
+        let depth_test = gl::IsEnabled(gl::DEPTH_TEST);
+        let mut depth_func = 0i32;
+        gl::GetIntegerv(gl::DEPTH_FUNC, &mut depth_func);
+        let mut depth_mask = 0i32;
+        gl::GetIntegerv(gl::DEPTH_WRITEMASK, &mut depth_mask);
+        let stencil_test = gl::IsEnabled(gl::STENCIL_TEST);
+        let scissor_test = gl::IsEnabledi(gl::SCISSOR_TEST, 0);
+        let mut scissor_box = [0i32; 4];
+        gl::GetIntegeri_v(gl::SCISSOR_BOX, 0, scissor_box.as_mut_ptr());
+        let mut viewport = [0f32; 4];
+        gl::GetFloati_v(gl::VIEWPORT, 0, viewport.as_mut_ptr());
+        let raster_discard = gl::IsEnabled(gl::RASTERIZER_DISCARD);
+        let cull = gl::IsEnabled(gl::CULL_FACE);
+        let mut cull_mode = 0i32;
+        gl::GetIntegerv(gl::CULL_FACE_MODE, &mut cull_mode);
+        let mut front_face = 0i32;
+        gl::GetIntegerv(gl::FRONT_FACE, &mut front_face);
+        let mut polygon_mode = 0i32;
+        gl::GetIntegerv(gl::POLYGON_MODE, &mut polygon_mode);
+        let mut depth_clamp = 0u8;
+        depth_clamp = gl::IsEnabled(gl::DEPTH_CLAMP);
+        eprintln!(
+            "[RT_GRID_STATE2] raster_discard={} cull={} cull_mode={:#X} front_face={:#X} \
+             polygon_mode={:#X} depth_clamp={}",
+            raster_discard, cull, cull_mode, front_face, polygon_mode, depth_clamp
+        );
+        // RUZU_TRACE_RT_GRID_UBO=1 — dump the first 8 floats of every uniform
+        // buffer bound to indices 0-3 (what THIS draw's vertex shader reads —
+        // diagnoses degenerate transforms from bad cbuf uploads).
+        if std::env::var_os("RUZU_TRACE_RT_GRID_UBO").is_some() {
+            for binding in 0..4u32 {
+                let mut buf = 0i32;
+                gl::GetIntegeri_v(gl::UNIFORM_BUFFER_BINDING, binding, &mut buf);
+                if buf == 0 {
+                    continue;
+                }
+                let mut start = 0i64;
+                let mut size = 0i64;
+                gl::GetInteger64i_v(gl::UNIFORM_BUFFER_START, binding, &mut start);
+                gl::GetInteger64i_v(gl::UNIFORM_BUFFER_SIZE, binding, &mut size);
+                let mut floats = [0f32; 32];
+                let read = (size.max(0) as usize).min(128);
+                if read > 0 {
+                    gl::GetNamedBufferSubData(
+                        buf as u32,
+                        start as isize,
+                        read as isize,
+                        floats.as_mut_ptr() as *mut _,
+                    );
+                }
+                // Also read vec4 indices 33-34 (bytes 528..560) — the sprite
+                // rect transform the MK8D world quads read (vs_cbuf3[33/34]).
+                let mut hi = [0f32; 8];
+                if size >= 560 {
+                    gl::GetNamedBufferSubData(
+                        buf as u32,
+                        start as isize + 528,
+                        32,
+                        hi.as_mut_ptr() as *mut _,
+                    );
+                }
+                eprintln!(
+                    "[RT_GRID_UBO] phase={} draw_seq={} pipeline={} binding={} buf={} start={} size={} f[0..8]={:?} f[132..140]={:?} gl_error=0x{:X}",
+                    phase,
+                    draw_seq,
+                    pipeline,
+                    binding,
+                    buf,
+                    start,
+                    size,
+                    floats,
+                    hi,
+                    gl::GetError(),
+                );
+            }
+        }
+        // RUZU_TRACE_RT_GRID_UNITS=1 — read the center texel of every texture
+        // currently bound to units 0-7 (what THIS draw actually samples).
+        if std::env::var_os("RUZU_TRACE_RT_GRID_UNITS").is_some() {
+            for unit in 0..8u32 {
+                let mut tex = 0i32;
+                gl::GetIntegeri_v(gl::TEXTURE_BINDING_2D, unit, &mut tex);
+                if tex == 0 {
+                    continue;
+                }
+                let mut w = 0i32;
+                let mut h = 0i32;
+                gl::GetTextureLevelParameteriv(tex as u32, 0, gl::TEXTURE_WIDTH, &mut w);
+                gl::GetTextureLevelParameteriv(tex as u32, 0, gl::TEXTURE_HEIGHT, &mut h);
+                let mut px = [0u8; 4];
+                if w > 0 && h > 0 {
+                    gl::GetTextureSubImage(
+                        tex as u32,
+                        0,
+                        w / 2,
+                        h / 2,
+                        0,
+                        1,
+                        1,
+                        1,
+                        gl::RGBA,
+                        gl::UNSIGNED_BYTE,
+                        4,
+                        px.as_mut_ptr() as *mut _,
+                    );
+                }
+                eprintln!(
+                    "[RT_GRID_UNIT] phase={} draw_seq={} unit={} tex={} {}x{} center={:02X?} gl_error=0x{:X}",
+                    phase,
+                    draw_seq,
+                    unit,
+                    tex,
+                    w,
+                    h,
+                    px,
+                    gl::GetError(),
+                );
+            }
+        }
+        // RUZU_TRACE_RT_GRID_TEX=<gl texture id> — also read a few texels of
+        // that texture at probe time (diagnoses what a composite draw WOULD
+        // sample from the scene RT at this exact point in the GL stream).
+        if let Ok(spec) = std::env::var("RUZU_TRACE_RT_GRID_TEX") {
+            if let Ok(tex) = spec.trim().parse::<u32>() {
+                let mut px = [[0u8; 4]; 3];
+                let pts = [(960i32, 540i32), (300, 300), (1600, 800)];
+                for (i, (x, y)) in pts.iter().enumerate() {
+                    gl::GetTextureSubImage(
+                        tex,
+                        0,
+                        *x,
+                        *y,
+                        0,
+                        1,
+                        1,
+                        1,
+                        gl::RGBA,
+                        gl::UNSIGNED_BYTE,
+                        4,
+                        px[i].as_mut_ptr() as *mut _,
+                    );
+                }
+                eprintln!(
+                    "[RT_GRID_TEX] phase={} draw_seq={} tex={} px(960,540)={:02X?} px(300,300)={:02X?} px(1600,800)={:02X?} gl_error=0x{:X}",
+                    phase,
+                    draw_seq,
+                    tex,
+                    px[0],
+                    px[1],
+                    px[2],
+                    gl::GetError(),
+                );
+            }
+        }
+        eprintln!(
+            "[RT_GRID_STATE] phase={} draw_seq={} fbo={} rt0=0x{:X} color_mask={:?} blend={} \
+             blend_func=({:#X},{:#X},{:#X},{:#X}) depth_test={} depth_func={:#X} depth_mask={} \
+             stencil={} scissor={} scissor_box={:?} viewport={:?}",
+            phase,
+            draw_seq,
+            framebuffer,
+            rt_address,
+            color_mask,
+            blend,
+            blend_src_rgb,
+            blend_dst_rgb,
+            blend_src_a,
+            blend_dst_a,
+            depth_test,
+            depth_func,
+            depth_mask,
+            stencil_test,
+            scissor_test,
+            scissor_box,
+            viewport,
+        );
+    }
 }
 
 const GL_VERTEX_BINDING_OFFSET: u32 = 0x82D7;

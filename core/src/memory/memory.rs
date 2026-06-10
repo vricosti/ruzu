@@ -916,7 +916,7 @@ impl Memory {
         record_rasterizer_mark_cached_stage(7);
     }
 
-    fn current_physical_address(&self, vaddr: u64) -> Option<u64> {
+    pub fn current_physical_address(&self, vaddr: u64) -> Option<u64> {
         if self.current_page_table.is_null() {
             return None;
         }
