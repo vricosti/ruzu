@@ -415,11 +415,20 @@ fn trace_ipc_response_tls(system: &System, message_address: u64) {
     );
 }
 
+// Forensics for the boot-time InvalidHandle abort (task #123): names which
+// link of the host-thread owner-resolution chain returned None when
+// send_sync_request_impl fails with RESULT_INVALID_HANDLE. Thread-local so
+// concurrent guest cores don't clobber each other's diagnosis.
+thread_local! {
+    static OWNER_FAIL_STAGE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
 fn send_sync_request_impl(
     system: &System,
     session_handle: Handle,
     message_address: u64,
 ) -> ResultCode {
+    OWNER_FAIL_STAGE.with(|s| s.set(""));
     // `RUZU_PROFILE_IPC_PHASES=1` — time each phase of send_sync_request_impl
     // so we can see which Mutex acquisition or sub-step is the bottleneck.
     // Used in the MK8D wedge investigation to localize where 7ms/call goes
@@ -566,7 +575,13 @@ fn send_sync_request_impl(
                     Arc::as_ptr(&server_session) as u64,
                     0,
                 );
-                let manager = server_session.lock().unwrap().get_manager().cloned()?;
+                let manager = match server_session.lock().unwrap().get_manager().cloned() {
+                    Some(m) => m,
+                    None => {
+                        OWNER_FAIL_STAGE.with(|s| s.set("manager_none"));
+                        return None;
+                    }
+                };
                 trace_svc_ipc_progress(
                     16,
                     session_handle,
@@ -647,6 +662,11 @@ fn send_sync_request_impl(
                     g.server_wakeup().cloned(),
                 )
             };
+            if queue.is_none() {
+                OWNER_FAIL_STAGE.with(|s| s.set("queue_none"));
+            } else if wakeup.is_none() {
+                OWNER_FAIL_STAGE.with(|s| s.set("wakeup_none"));
+            }
             Some((
                 Arc::clone(server_session),
                 Arc::clone(manager),
@@ -662,6 +682,33 @@ fn send_sync_request_impl(
             // an ad-hoc worker or inline dispatch would hide missing
             // ownership and reintroduce a lifecycle upstream does not have.
             trace_host_thread_ipc("missing_server_manager_owner", session_handle);
+            // Forensics for the boot-time InvalidHandle abort (task #123):
+            // name the link of the owner-resolution chain that failed. Only
+            // prints on the bug path, so no heisenbug risk.
+            if crate::hle::kernel::handle_forensics::enabled() {
+                let stage = OWNER_FAIL_STAGE.with(|s| s.get());
+                let stage = if stage.is_empty() {
+                    if server_session_and_manager.is_none() {
+                        if needs_manager_resolution {
+                            "parent_session_none"
+                        } else {
+                            "manager_resolution_not_attempted"
+                        }
+                    } else {
+                        "unknown"
+                    }
+                } else {
+                    stage
+                };
+                eprintln!(
+                    "[OWNER_FAIL] handle=0x{:X} parent_id={} stage={} forced={} svc_name_routing={}",
+                    session_handle,
+                    parent_id,
+                    stage,
+                    forced_host_thread_routing,
+                    host_thread_service_routing
+                );
+            }
             trace_svc_ipc_progress(
                 21,
                 session_handle,
@@ -718,6 +765,12 @@ fn send_sync_request_impl(
             trace_host_thread_ipc("after_process_lock", session_handle);
             trace_host_thread_ipc("before_parent_lookup", session_handle);
             let Some(parent_session) = process.get_session_by_object_id(parent_id) else {
+                if crate::hle::kernel::handle_forensics::enabled() {
+                    eprintln!(
+                        "[OWNER_FAIL] handle=0x{:X} parent_id={} stage=relookup_parent_session_none",
+                        session_handle, parent_id
+                    );
+                }
                 return RESULT_INVALID_HANDLE;
             };
             trace_host_thread_ipc("after_parent_lookup", session_handle);
@@ -741,6 +794,12 @@ fn send_sync_request_impl(
         trace_host_thread_ipc("after_on_request", session_handle);
         trace_host_thread_ipc("after_send_sync_request_with_process", session_handle);
         if send_result != 0 {
+            if crate::hle::kernel::handle_forensics::enabled() {
+                eprintln!(
+                    "[OWNER_FAIL] handle=0x{:X} parent_id={} stage=on_request_err result=0x{:X}",
+                    session_handle, parent_id, send_result
+                );
+            }
             return ResultCode::new(send_result);
         }
         record_phase("host_05_on_request_begin_wait", &mut phase_last);
@@ -779,6 +838,16 @@ fn send_sync_request_impl(
             .current_thread()
             .map(|thread| ResultCode::new(thread.lock().unwrap().get_wait_result()))
             .unwrap_or(RESULT_INVALID_HANDLE);
+        if crate::hle::kernel::handle_forensics::enabled()
+            && result.get_inner_value() == RESULT_INVALID_HANDLE.get_inner_value()
+        {
+            eprintln!(
+                "[OWNER_FAIL] handle=0x{:X} parent_id={} stage=wait_result_invalid_handle current_thread={}",
+                session_handle,
+                parent_id,
+                system.current_thread().is_some()
+            );
+        }
         record_phase("host_08_wait_result", &mut phase_last);
         return result;
     }
@@ -820,6 +889,12 @@ fn send_sync_request_impl(
                         parent_id
                     );
                 }
+                if crate::hle::kernel::handle_forensics::enabled() {
+                    eprintln!(
+                        "[OWNER_FAIL] handle=0x{:X} parent_id={} stage=inline_parent_session_none",
+                        session_handle, parent_id
+                    );
+                }
                 return RESULT_INVALID_HANDLE;
             };
             let server_session = parent_session.lock().unwrap().get_server_session().clone();
@@ -830,6 +905,12 @@ fn send_sync_request_impl(
                         log::info!(
                             "svc::SendSyncRequest stage=missing_server_manager parent_id={:#x}",
                             parent_id
+                        );
+                    }
+                    if crate::hle::kernel::handle_forensics::enabled() {
+                        eprintln!(
+                            "[OWNER_FAIL] handle=0x{:X} parent_id={} stage=inline_manager_none",
+                            session_handle, parent_id
                         );
                     }
                     return RESULT_INVALID_HANDLE;
@@ -858,9 +939,44 @@ fn send_sync_request_impl(
             0,
             0,
         );
+        // Upstream `KClientSession::SendSyncRequest` enqueues the request and
+        // parks the client until the server consumes it; a session that is
+        // busy with another in-flight request is NEVER an error. The inline
+        // fallback consumes the request synchronously on the caller's thread,
+        // so a concurrent request from another guest thread on the same
+        // session (MK8D's nn::nv serializes ioctls per-fd, not per-session —
+        // several threads share the single nvdrv session) finds
+        // `current_request` occupied and `receive_inline_request_hle` fails
+        // with `ResultNotFound`. Mapping that to an error surfaced as a
+        // transient `ResultInvalidHandle` which nn::nv treats as fatal
+        // (SetTerminateResult(0xE401) + svcBreak) — MK8D's flaky boot abort.
+        // Wait for the in-flight request to complete instead, matching the
+        // upstream "client waits until the server is free" semantic. Handlers
+        // never defer on the inline path, so the wait is bounded by one
+        // handler execution on another host thread; no locks are held here.
         let receive_result = {
-            let mut server_session = server_session.lock().unwrap();
-            server_session.receive_inline_request_hle(request, Arc::clone(&manager))
+            let mut waited_us: u64 = 0;
+            loop {
+                let attempt = {
+                    let mut server_session = server_session.lock().unwrap();
+                    server_session
+                        .receive_inline_request_hle(Arc::clone(&request), Arc::clone(&manager))
+                };
+                match attempt {
+                    Err(code) if code == RESULT_NOT_FOUND.get_inner_value() => {
+                        if waited_us == 1_000_000 {
+                            log::error!(
+                                "svc::SendSyncRequest inline: session busy >1s (handle={:#x}); still waiting",
+                                session_handle
+                            );
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(5));
+                        waited_us += 5;
+                        continue;
+                    }
+                    other => break other,
+                }
+            }
         };
         record_phase("05_receive_request_hle", &mut phase_last);
         match receive_result {
@@ -879,7 +995,15 @@ fn send_sync_request_impl(
                 }
                 (manager, context, request_message_address)
             }
-            Err(_) => return RESULT_INVALID_HANDLE,
+            Err(code) => {
+                if crate::hle::kernel::handle_forensics::enabled() {
+                    eprintln!(
+                        "[OWNER_FAIL] handle=0x{:X} parent_id={} stage=inline_receive_err code=0x{:X}",
+                        session_handle, parent_id, code
+                    );
+                }
+                return RESULT_INVALID_HANDLE;
+            }
         }
     };
 

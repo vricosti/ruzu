@@ -128,6 +128,7 @@ pub mod physical_core;
 #[cfg(feature = "debug-logs")]
 pub mod physical_core_log;
 pub mod race_anchor;
+pub mod handle_forensics;
 pub mod sleep_timing;
 pub mod startthread_gap;
 pub mod sync_cell;
