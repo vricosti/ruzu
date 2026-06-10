@@ -1037,6 +1037,20 @@ impl TextureCacheBase {
                 .retain(|&other_overlap_id| other_overlap_id != image_id);
             other_image.check_bad_overlap_state();
         }
+        // Upstream `DeleteImage` purges every reference to the dying views
+        // BEFORE the slots are reused: `RemoveImageViewReferences` drops the
+        // per-channel descriptor→view caches, and the TIC tables are
+        // invalidated so the next visit re-resolves every slot. Without this,
+        // `find_image_view*` keeps serving the dead (or recycled!) view id —
+        // MK8D's scene-RT image is evicted/recreated constantly by nvmap heap
+        // unmaps, and the composite pass then samples a stale texture frozen
+        // on the clear color (red splash / black demo).
+        self.channel_state
+            .image_views
+            .retain(|_, id| !image_view_ids.contains(id));
+        self.channel_state.graphics_image_table.invalidate();
+        self.channel_state.compute_image_table.invalidate();
+
         for image_view_id in image_view_ids {
             if image_view_id != NULL_IMAGE_VIEW_ID && image_view_id.is_valid() {
                 self.slot_image_views.erase(image_view_id);

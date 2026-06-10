@@ -104,6 +104,26 @@ pub struct GpuMemoryManager {
     rasterizer: Option<RasterizerHandle>,
     /// Upstream stores `std::unique_ptr<VideoCommon::InvalidationAccumulator>`.
     accumulator: InvalidationAccumulator,
+    /// When `Some`, rasterizer notifications (`modify_gpu_memory`,
+    /// `unmap_memory`) are recorded here instead of being invoked inline, so
+    /// the caller can replay them AFTER releasing the memory-manager mutex.
+    /// Upstream `MemoryManager` has no mutex, so its inline rasterizer calls
+    /// never nest a cache lock under a memory-manager lock; in Rust the
+    /// nvdrv (CPU) path holds `Arc<Mutex<MemoryManager>>` while the GPU
+    /// thread holds the rasterizer lock during draws and then locks this
+    /// memory manager — invoking the rasterizer inline here deadlocks (ABBA,
+    /// observed in MK8D). `None` (the default) keeps the inline behavior for
+    /// GPU-thread-side callers.
+    deferred_rasterizer_ops: Option<Vec<DeferredRasterizerOp>>,
+}
+
+/// A rasterizer notification produced under the memory-manager lock and
+/// replayed by the caller after releasing it. See
+/// `GpuMemoryManager::deferred_rasterizer_ops`.
+#[derive(Debug, Clone, Copy)]
+pub enum DeferredRasterizerOp {
+    ModifyGpuMemory { id: usize, gpu_addr: u64, size: u64 },
+    UnmapMemory { device_addr: u64, size: u64 },
 }
 
 impl GpuMemoryManager {
@@ -195,6 +215,7 @@ impl GpuMemoryManager {
             device_memory,
             rasterizer: None,
             accumulator: InvalidationAccumulator::new(),
+            deferred_rasterizer_ops: None,
         }
     }
 
@@ -219,6 +240,37 @@ impl GpuMemoryManager {
     /// Upstream: `MemoryManager::BindRasterizer(rasterizer)`.
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
         self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
+    }
+
+    /// Start recording rasterizer notifications instead of invoking them
+    /// inline. See `deferred_rasterizer_ops` for the deadlock rationale.
+    pub fn begin_deferring_rasterizer_ops(&mut self) {
+        self.deferred_rasterizer_ops = Some(Vec::new());
+    }
+
+    /// Stop recording and return the pending notifications. The caller must
+    /// replay them through the rasterizer AFTER releasing the
+    /// memory-manager mutex.
+    pub fn take_deferred_rasterizer_ops(&mut self) -> Vec<DeferredRasterizerOp> {
+        self.deferred_rasterizer_ops.take().unwrap_or_default()
+    }
+
+    /// Copy of the bound rasterizer handle, for replaying deferred ops
+    /// outside the memory-manager mutex.
+    pub fn rasterizer_handle(&self) -> Option<RasterizerHandle> {
+        self.rasterizer
+    }
+
+    /// `rasterizer.modify_gpu_memory(...)`, inline or deferred depending on
+    /// `deferred_rasterizer_ops`.
+    fn notify_modify_gpu_memory(&mut self, gpu_addr: u64, size: u64) {
+        let id = self.unique_identifier;
+        if let Some(buf) = self.deferred_rasterizer_ops.as_mut() {
+            buf.push(DeferredRasterizerOp::ModifyGpuMemory { id, gpu_addr, size });
+        } else {
+            let _ = self
+                .with_rasterizer_mut(|rasterizer| rasterizer.modify_gpu_memory(id, gpu_addr, size));
+        }
     }
 
     // ── Entry access (bitpacked) ────────────────────────────────────────
@@ -340,10 +392,7 @@ impl GpuMemoryManager {
             let current_entry_type = self.get_entry_small(current_gpu_addr);
             self.set_entry_small(current_gpu_addr, entry_type);
             if current_entry_type != entry_type {
-                let unique_identifier = self.unique_identifier;
-                let _ = self.with_rasterizer_mut(|rasterizer| {
-                    rasterizer.modify_gpu_memory(unique_identifier, current_gpu_addr, page_size)
-                });
+                self.notify_modify_gpu_memory(current_gpu_addr, page_size);
             }
             if entry_type == EntryType::Mapped {
                 let current_dev_addr = dev_addr + offset;
@@ -377,10 +426,7 @@ impl GpuMemoryManager {
             let current_entry_type = self.get_entry_big(current_gpu_addr);
             self.set_entry_big(current_gpu_addr, entry_type);
             if current_entry_type != entry_type {
-                let unique_identifier = self.unique_identifier;
-                let _ = self.with_rasterizer_mut(|rasterizer| {
-                    rasterizer.modify_gpu_memory(unique_identifier, current_gpu_addr, big_page_size)
-                });
+                self.notify_modify_gpu_memory(current_gpu_addr, big_page_size);
             }
             if entry_type == EntryType::Mapped {
                 let current_dev_addr = dev_addr + offset;
@@ -458,11 +504,20 @@ impl GpuMemoryManager {
         }
         log::trace!("gpu_mm: unmap GPU {:#x}..{:#x}", gpu_addr, gpu_addr + size);
         let ranges = self.get_submapped_device_ranges(gpu_addr, size);
-        let _ = self.with_rasterizer_mut(|rasterizer| {
+        if let Some(buf) = self.deferred_rasterizer_ops.as_mut() {
             for (map_addr, map_size) in ranges {
-                rasterizer.unmap_memory(map_addr, map_size);
+                buf.push(DeferredRasterizerOp::UnmapMemory {
+                    device_addr: map_addr,
+                    size: map_size,
+                });
             }
-        });
+        } else {
+            let _ = self.with_rasterizer_mut(|rasterizer| {
+                for (map_addr, map_size) in ranges {
+                    rasterizer.unmap_memory(map_addr, map_size);
+                }
+            });
+        }
         self.big_page_table_op(EntryType::Free, gpu_addr, 0, size, PteKind::INVALID);
         self.page_table_op(EntryType::Free, gpu_addr, 0, size, PteKind::INVALID);
     }
@@ -1980,6 +2035,21 @@ impl MemoryManager {
     /// Upstream: `MemoryManager::Unmap(gpu_addr, size)`.
     pub fn unmap(&mut self, gpu_addr: u64, size: u64) {
         self.inner.unmap(gpu_addr, size);
+    }
+
+    /// See `GpuMemoryManager::begin_deferring_rasterizer_ops`.
+    pub fn begin_deferring_rasterizer_ops(&mut self) {
+        self.inner.begin_deferring_rasterizer_ops();
+    }
+
+    /// See `GpuMemoryManager::take_deferred_rasterizer_ops`.
+    pub fn take_deferred_rasterizer_ops(&mut self) -> Vec<DeferredRasterizerOp> {
+        self.inner.take_deferred_rasterizer_ops()
+    }
+
+    /// See `GpuMemoryManager::rasterizer_handle`.
+    pub fn rasterizer_handle(&self) -> Option<crate::rasterizer_interface::RasterizerHandle> {
+        self.inner.rasterizer_handle()
     }
 
     pub fn address_space_bits(&self) -> u64 {

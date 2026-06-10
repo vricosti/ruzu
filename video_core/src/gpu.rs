@@ -977,20 +977,72 @@ impl GpuMemoryManagerHandle for VideoGpuMemoryManagerHandle {
         self
     }
 
+    // The nvdrv (CPU-side) map/unmap entry points replay rasterizer
+    // notifications AFTER releasing the memory-manager mutex. The GPU thread
+    // takes the rasterizer lock during draws and then locks this memory
+    // manager for address translation, so invoking the rasterizer while the
+    // mutex is held deadlocks (ABBA, observed wedging MK8D). Upstream
+    // `Tegra::MemoryManager` has no mutex, so its inline rasterizer calls
+    // never nest a cache lock under a memory-manager lock.
     fn map(&self, gpu_addr: u64, device_addr: u64, size: u64, kind: u32, is_big_pages: bool) {
-        self.memory_manager
-            .lock()
-            .map(gpu_addr, device_addr, size, kind, is_big_pages);
+        let (handle, ops) = {
+            let mut mm = self.memory_manager.lock();
+            mm.begin_deferring_rasterizer_ops();
+            mm.map(gpu_addr, device_addr, size, kind, is_big_pages);
+            (mm.rasterizer_handle(), mm.take_deferred_rasterizer_ops())
+        };
+        replay_deferred_rasterizer_ops(handle, ops);
     }
 
     fn map_sparse(&self, gpu_addr: u64, size: u64, is_big_pages: bool) {
-        self.memory_manager
-            .lock()
-            .map_sparse(gpu_addr, size, is_big_pages);
+        let (handle, ops) = {
+            let mut mm = self.memory_manager.lock();
+            mm.begin_deferring_rasterizer_ops();
+            mm.map_sparse(gpu_addr, size, is_big_pages);
+            (mm.rasterizer_handle(), mm.take_deferred_rasterizer_ops())
+        };
+        replay_deferred_rasterizer_ops(handle, ops);
     }
 
     fn unmap(&self, gpu_addr: u64, size: u64) {
-        self.memory_manager.lock().unmap(gpu_addr, size);
+        let (handle, ops) = {
+            let mut mm = self.memory_manager.lock();
+            mm.begin_deferring_rasterizer_ops();
+            mm.unmap(gpu_addr, size);
+            (mm.rasterizer_handle(), mm.take_deferred_rasterizer_ops())
+        };
+        replay_deferred_rasterizer_ops(handle, ops);
+    }
+}
+
+/// Replay rasterizer notifications recorded under the memory-manager mutex.
+/// Must be called with the mutex RELEASED — see the comment on
+/// `VideoGpuMemoryManagerHandle::map`.
+fn replay_deferred_rasterizer_ops(
+    handle: Option<crate::rasterizer_interface::RasterizerHandle>,
+    ops: Vec<crate::memory_manager::DeferredRasterizerOp>,
+) {
+    use crate::memory_manager::DeferredRasterizerOp;
+    let Some(handle) = handle else { return };
+    if ops.is_empty() {
+        return;
+    }
+    // SAFETY: same contract as `GpuMemoryManager::with_rasterizer_mut` — the
+    // handle points at the rasterizer owned by the renderer, which outlives
+    // every memory manager bound to it.
+    unsafe {
+        handle.with_mut(|rasterizer| {
+            for op in ops {
+                match op {
+                    DeferredRasterizerOp::ModifyGpuMemory { id, gpu_addr, size } => {
+                        rasterizer.modify_gpu_memory(id, gpu_addr, size);
+                    }
+                    DeferredRasterizerOp::UnmapMemory { device_addr, size } => {
+                        rasterizer.unmap_memory(device_addr, size);
+                    }
+                }
+            }
+        });
     }
 }
 

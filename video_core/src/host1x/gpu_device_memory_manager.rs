@@ -242,7 +242,20 @@ fn smmu_physical_page_count_from_settings() -> usize {
 
 #[derive(Default)]
 struct SmmuRegisteredProcesses {
-    processes: Vec<Option<Arc<Mutex<Memory>>>>,
+    /// Each entry stores the process memory plus a raw pointer to the
+    /// `Memory` value inside the `Arc<Mutex<..>>` allocation (as usize),
+    /// captured once at registration. The pointee is heap-stable for the
+    /// Arc's lifetime, which the registry itself keeps alive.
+    ///
+    /// The raw pointer exists so `update_pages_cached_count` can call
+    /// `Memory::rasterizer_mark_region_cached` (atomic page-entry stores +
+    /// mprotect only) WITHOUT taking the Memory mutex. Upstream
+    /// `MarkRegionCaching` is lock-free; taking the mutex here deadlocks:
+    /// the GPU thread holds the shader-cache lock (draw →
+    /// `ShaderCache::register` → here) while a CPU core holds the Memory
+    /// mutex (guest write → `handle_rasterizer_write` →
+    /// `ShaderCache::invalidate_region`).
+    processes: Vec<Option<(Arc<Mutex<Memory>>, usize)>>,
     id_pool: VecDeque<usize>,
 }
 
@@ -463,11 +476,18 @@ impl SmmuReverseMappings {
 
 impl SmmuRegisteredProcesses {
     fn register(&mut self, memory: Option<Arc<Mutex<Memory>>>) -> u32 {
+        let entry = memory.map(|m| {
+            let raw = {
+                let guard = m.lock().unwrap();
+                &*guard as *const Memory as usize
+            };
+            (m, raw)
+        });
         if let Some(id) = self.id_pool.pop_front() {
-            self.processes[id] = memory;
+            self.processes[id] = entry;
             id as u32
         } else {
-            self.processes.push(memory);
+            self.processes.push(entry);
             (self.processes.len() - 1) as u32
         }
     }
@@ -483,7 +503,15 @@ impl SmmuRegisteredProcesses {
     fn get(&self, asid: u32) -> Option<Arc<Mutex<Memory>>> {
         self.processes
             .get(asid as usize)
-            .and_then(|memory| memory.as_ref().cloned())
+            .and_then(|memory| memory.as_ref().map(|(m, _)| m.clone()))
+    }
+
+    /// Raw pointer (as usize) to the registered process `Memory`. See the
+    /// `processes` field doc for the locking rationale and stability proof.
+    fn get_raw(&self, asid: u32) -> Option<usize> {
+        self.processes
+            .get(asid as usize)
+            .and_then(|memory| memory.as_ref().map(|(_, raw)| *raw))
     }
 }
 
@@ -853,6 +881,9 @@ impl MaxwellDeviceMemoryManager {
 
         let start_page = d_address >> SMMU_PAGE_BITS;
         let num_pages = smmu_num_pages_for_size(size) as usize;
+        // RUZU_SMMU_PHYS_OFF=1 reverts to pointer-only physical resolution
+        // (A/B aid while the alias-page fallback is being validated).
+        let phys_fallback_enabled = std::env::var_os("RUZU_SMMU_PHYS_OFF").is_none();
         for index in 0..num_pages {
             let page = start_page + index as u64;
             let current_vaddr = virtual_address.wrapping_add((index as u64) << SMMU_PAGE_BITS);
@@ -860,9 +891,41 @@ impl MaxwellDeviceMemoryManager {
                 let memory = memory.lock().unwrap();
                 memory.get_pointer_silent(current_vaddr)
             };
-            self.smmu_map_device_page(
+            if host_ptr.is_null() {
+                self.smmu_map_device_page(
+                    page,
+                    host_ptr,
+                    Some(CpuBacking {
+                        asid,
+                        virtual_address: current_vaddr,
+                    }),
+                );
+                continue;
+            }
+            // Upstream CPU page-table pointers always live inside the
+            // DeviceMemory backing window, so the physical page is derived
+            // from the pointer. In ruzu some regions are populated with
+            // virtual-alias pointers (outside the backing window); for those,
+            // derive the physical page from the page table's device address
+            // instead — it is the same value upstream would compute.
+            let mut compressed = self.smmu_compressed_physical_for_host_address(host_ptr as usize);
+            if compressed == 0 && phys_fallback_enabled {
+                let phys_addr = {
+                    let memory = memory.lock().unwrap();
+                    memory.current_physical_address(current_vaddr)
+                };
+                if let Some(daddr) = phys_addr {
+                    let offset =
+                        daddr.wrapping_sub(ruzu_core::device_memory::dram_memory_map::BASE);
+                    let phys_page = (offset >> SMMU_PAGE_BITS) as usize;
+                    if phys_page < self.smmu_physical_page_count {
+                        compressed = phys_page as u32 + 1;
+                    }
+                }
+            }
+            self.smmu_map_device_page_compressed(
                 page,
-                host_ptr,
+                compressed,
                 Some(CpuBacking {
                     asid,
                     virtual_address: current_vaddr,
@@ -1011,6 +1074,18 @@ impl MaxwellDeviceMemoryManager {
         }
 
         let new_compressed = self.smmu_compressed_physical_for_host_address(host_ptr as usize);
+        self.smmu_map_device_page_compressed(page, new_compressed, cpu_backing);
+    }
+
+    /// Same as `smmu_map_device_page` but with a precomputed compressed
+    /// physical page (used when the physical page is derived from the page
+    /// table's device address rather than the host pointer).
+    fn smmu_map_device_page_compressed(
+        &self,
+        page: u64,
+        new_compressed: u32,
+        cpu_backing: Option<CpuBacking>,
+    ) {
         {
             let mut compressed_physical = self.smmu_compressed_physical_ptr.lock().unwrap();
             let mut reverse = self.smmu_reverse_mappings.lock().unwrap();
@@ -1170,6 +1245,13 @@ impl MaxwellDeviceMemoryManager {
 
     fn smmu_registered_memory(&self, asid: u32) -> Option<Arc<Mutex<Memory>>> {
         self.smmu_registered_processes.lock().unwrap().get(asid)
+    }
+
+    /// Raw pointer (as usize) to the registered process `Memory`, for the
+    /// mutex-free `rasterizer_mark_region_cached` call in
+    /// `update_pages_cached_count`. See `SmmuRegisteredProcesses::processes`.
+    fn smmu_registered_memory_raw(&self, asid: u32) -> Option<usize> {
+        self.smmu_registered_processes.lock().unwrap().get_raw(asid)
     }
 
     /// Remove SMMU mappings for `[d_address, d_address + size)`.
@@ -1428,14 +1510,21 @@ impl MaxwellDeviceMemoryManager {
         let mut cache_begin: u64 = 0;
         let mut cache_bytes: u64 = 0;
 
-        let mut callbacks: Vec<(Option<Arc<Mutex<Memory>>>, u64, usize, bool)> = Vec::new();
+        // Callbacks carry a raw `*const Memory` (as usize, None for the test
+        // path) instead of the Arc<Mutex<Memory>> so the final loop can mark
+        // regions cached WITHOUT taking the Memory mutex — upstream
+        // MarkRegionCaching is lock-free, and locking here deadlocks against
+        // CPU cores that hold the Memory mutex during guest writes while
+        // invalidating the shader cache (this thread already holds the
+        // shader-cache lock via ShaderCache::register).
+        let mut callbacks: Vec<(Option<usize>, u64, usize, bool)> = Vec::new();
         record_update_cached_stage(2);
         let counter_guard = ScopedRangeLock::new(&self.cached_pages_guard, addr, size as u64);
         record_update_cached_stage(3);
 
         fn flush_callbacks(
-            callbacks: &mut Vec<(Option<Arc<Mutex<Memory>>>, u64, usize, bool)>,
-            memory: &Option<Arc<Mutex<Memory>>>,
+            callbacks: &mut Vec<(Option<usize>, u64, usize, bool)>,
+            memory: &Option<usize>,
             uncache_begin: &mut u64,
             uncache_bytes: &mut u64,
             cache_begin: &mut u64,
@@ -1464,7 +1553,7 @@ impl MaxwellDeviceMemoryManager {
         let first_backing = self.smmu_extract_cpu_backing(page_begin);
         let mut old_vpage: u64 = first_backing.virtual_page.wrapping_sub(1);
         let old_asid = first_backing.asid;
-        let mut current_memory = self.smmu_registered_memory(old_asid);
+        let mut current_memory = self.smmu_registered_memory_raw(old_asid);
 
         for page in page_begin..page_end {
             let backing = self.smmu_extract_cpu_backing(page);
@@ -1489,7 +1578,7 @@ impl MaxwellDeviceMemoryManager {
                     &mut cache_bytes,
                 );
                 if backing.asid != old_asid {
-                    current_memory = self.smmu_registered_memory(backing.asid);
+                    current_memory = self.smmu_registered_memory_raw(backing.asid);
                 }
             }
             old_vpage = backing.virtual_page;
@@ -1557,11 +1646,24 @@ impl MaxwellDeviceMemoryManager {
         record_update_cached_stage(6);
         record_update_cached_stage(7);
         for (memory, address, size, caching) in callbacks {
-            if let Some(memory) = memory {
-                memory
-                    .lock()
-                    .unwrap()
-                    .rasterizer_mark_region_cached(address, size as u64, caching);
+            if let Some(memory_raw) = memory {
+                // SAFETY: `memory_raw` points at the `Memory` value inside the
+                // `Arc<Mutex<Memory>>` held by the smmu process registry; the
+                // allocation is stable while the registration lives.
+                // `rasterizer_mark_region_cached` takes `&self` and only
+                // performs atomic page-entry stores plus fastmem mprotect, so
+                // calling it without the mutex matches upstream's lock-free
+                // `MarkRegionCaching`. Taking the mutex here deadlocked MK8D:
+                // GPU thread (shader-cache lock held) waited on the Memory
+                // mutex held by a CPU core whose guest write was waiting on
+                // the shader-cache lock via ShaderCache::invalidate_region.
+                unsafe {
+                    (*(memory_raw as *const Memory)).rasterizer_mark_region_cached(
+                        address,
+                        size as u64,
+                        caching,
+                    );
+                }
             } else {
                 #[cfg(test)]
                 {
