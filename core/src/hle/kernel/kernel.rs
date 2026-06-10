@@ -220,6 +220,83 @@ pub static GUEST_REGS: [[std::sync::atomic::AtomicU32; 12];
     [ROW, ROW, ROW, ROW]
 };
 
+/// RUZU_PC_SAMPLE=1 — background guest-PC/LR sampling profiler. Every
+/// `RUZU_PC_SAMPLE_INTERVAL_US` (default 200µs) it reads each core's last
+/// guest (PC,LR) and increments a histogram keyed by LR (the game code that
+/// called the nnSdk SVC stub — the real hot loop, vs the stub PC which drowns
+/// it out). Dumped on SIGUSR1 via `dump_pc_sample_hist`. Fills the missing
+/// "where is the wedge hot loop" tool: the candidate-PC hooks all turned out
+/// cold, so we need to discover the hot LR empirically.
+static PC_SAMPLE_HIST: std::sync::Mutex<Option<std::collections::HashMap<(u32, u64), u64>>> =
+    std::sync::Mutex::new(None);
+static PC_SAMPLE_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn maybe_spawn_pc_sampler() {
+    if std::env::var_os("RUZU_PC_SAMPLE").is_none() {
+        return;
+    }
+    if PC_SAMPLE_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let interval_us = std::env::var("RUZU_PC_SAMPLE_INTERVAL_US")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(200);
+    *PC_SAMPLE_HIST.lock().unwrap() = Some(std::collections::HashMap::new());
+    std::thread::Builder::new()
+        .name("ruzu-pc-sample".into())
+        .spawn(move || {
+            let dur = std::time::Duration::from_micros(interval_us.max(20));
+            loop {
+                {
+                    let mut guard = PC_SAMPLE_HIST.lock().unwrap();
+                    if let Some(hist) = guard.as_mut() {
+                        for core in 0..GUEST_LR.len() {
+                            let lr = GUEST_LR[core].load(Ordering::Acquire);
+                            let pc = GUEST_PC[core].load(Ordering::Acquire);
+                            if lr == 0 && pc == 0 {
+                                continue;
+                            }
+                            // tid running on this core = last SVC's tid (SVC_IN_PROGRESS
+                            // is set on every svc-enter and persists until the next svc
+                            // on this core ≈ the current thread). Lets us isolate one
+                            // thread's hot loop (e.g. tid=75 Main render thread).
+                            let tid = (SVC_IN_PROGRESS[core].load(Ordering::Acquire) >> 32) as u32;
+                            // Key by (tid, lr<<32 | pc&0xFFFFFFFF) so we keep the SVC
+                            // stub PC and the game caller LR distinguished, per thread.
+                            let key = (tid, (lr << 32) | (pc & 0xFFFF_FFFF));
+                            *hist.entry(key).or_insert(0) += 1;
+                        }
+                    }
+                }
+                std::thread::sleep(dur);
+            }
+        })
+        .ok();
+    eprintln!("[PC_SAMPLE] sampler started (interval {}µs); dump on SIGUSR1", interval_us);
+}
+
+pub fn dump_pc_sample_hist() {
+    let guard = PC_SAMPLE_HIST.lock().unwrap();
+    let Some(hist) = guard.as_ref() else {
+        return;
+    };
+    let total: u64 = hist.values().sum();
+    let mut v: Vec<((u32, u64), u64)> = hist.iter().map(|(k, c)| (*k, *c)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    eprintln!("[PC_SAMPLE] === top guest (tid,LR,PC) by sample count (total={}) ===", total);
+    for ((tid, lrpc), count) in v.iter().take(40) {
+        let lr = lrpc >> 32;
+        let pc = lrpc & 0xFFFF_FFFF;
+        let pct = if total > 0 { (*count as f64) * 100.0 / total as f64 } else { 0.0 };
+        eprintln!(
+            "[PC_SAMPLE] tid={} lr=0x{:08X} pc=0x{:08X} count={} ({:.1}%)",
+            tid, lr, pc, count, pct
+        );
+    }
+}
+
 #[inline]
 pub fn mark_svc_enter(core_id: usize, tid: u64, svc: u32) {
     if core_id >= SVC_IN_PROGRESS.len() {
@@ -340,6 +417,7 @@ fn install_sigusr1_handler() {
         "[SIGUSR1] handler installed for pid={}: send `kill -USR1 <pid>` to dump thread state",
         std::process::id(),
     );
+    maybe_spawn_pc_sampler();
 }
 
 /// Dump all per-core and per-thread state to stderr.
@@ -349,6 +427,7 @@ fn install_sigusr1_handler() {
 fn dump_thread_state(kernel: &KernelCore) {
     eprintln!("=========================================");
     eprintln!("[DUMP] === ruzu kernel thread dump ===");
+    dump_pc_sample_hist();
     crate::hle::kernel::svc_dispatch::dump_svc_ring_profile();
     crate::hle::kernel::svc_dispatch::dump_svc_summary_profile();
     crate::hle::kernel::svc::svc_memory_history::dump("sigusr1_thread_dump");
@@ -493,6 +572,34 @@ fn dump_thread_state(kernel: &KernelCore) {
         DUMP_REQUESTED.store(false, Ordering::Relaxed);
         return;
     };
+
+    // RUZU_DUMP_MEM=0xADDR:LEN[,0xADDR:LEN...] — dump guest memory words at the
+    // wedge instant (e.g. the barrier-object region to read the never-satisfied
+    // join predicate). LEN is in BYTES (decimal or 0xhex).
+    if let Ok(spec) = std::env::var("RUZU_DUMP_MEM") {
+        for part in spec.split(',') {
+            let mut it = part.split(':');
+            if let (Some(a), Some(l)) = (it.next(), it.next()) {
+                if let (Some(addr), Some(len)) = (parse_u64_auto(a), parse_u64_auto(l)) {
+                    let nwords = ((len as usize) / 4).min(64);
+                    // Read guest memory directly via the fastmem arena (host base
+                    // + guest vaddr) — no KProcess lock, which is held continuously
+                    // by the kernel CV-wait during a wedge.
+                    let fb = common::fastmem_registry::base();
+                    if fb == 0 {
+                        eprintln!("[DUMP] MEM 0x{:08X} <no-fastmem-base>", addr);
+                    } else {
+                        let mut w = vec![0u32; nwords];
+                        for (i, slot) in w.iter_mut().enumerate() {
+                            let host = (fb as u64 + addr + (i as u64) * 4) as *const u32;
+                            *slot = unsafe { std::ptr::read_volatile(host) };
+                        }
+                        eprintln!("[DUMP] MEM 0x{:08X} ({} words) = {:08X?}", addr, nwords, w);
+                    }
+                }
+            }
+        }
+    }
 
     let pq_fronts = kernel.global_scheduler_context().and_then(|gsc| {
         gsc.try_lock().ok().map(|gsc| {
@@ -1005,6 +1112,9 @@ fn dump_thread_state(kernel: &KernelCore) {
                     || comm.starts_with("HLE:")
                     || comm.starts_with("DSP_")
                     || comm == "CoreTiming"
+                    || comm == "GPU"
+                    || comm == "VSyncThread"
+                    || comm.starts_with("AudioRender")
                 {
                     let host_tid: i32 = tid_str.parse().unwrap_or(-1);
                     if host_tid > 0 {

@@ -859,6 +859,27 @@ fn main() {
         gpu.set_system_ref(system_ref);
         let gpu_ptr = gpu.as_ref() as *const video_core::gpu::Gpu as usize;
 
+        // One-time capture of a raw pointer to the process `Memory`, shared
+        // by the GPU-side memory callbacks below. They run on the GPU thread
+        // while it holds rasterizer cache locks; taking the global Memory
+        // mutex there deadlocks against CPU/DSP threads that hold the mutex
+        // during guest writes which re-enter the rasterizer (`on_cpu_write`)
+        // — the MK8D freeze. Upstream's equivalent accesses are raw-pointer
+        // and lock-free; every `Memory` method used below takes `&self`. The
+        // pointee lives inside the `Arc<Mutex<..>>` allocation, which the
+        // system keeps alive for the whole emulation session.
+        let memory_raw: std::sync::Arc<std::sync::OnceLock<usize>> =
+            std::sync::Arc::new(std::sync::OnceLock::new());
+        fn memory_raw_of(
+            cell: &std::sync::OnceLock<usize>,
+            memory: &std::sync::Arc<std::sync::Mutex<ruzu_core::memory::memory::Memory>>,
+        ) -> *const ruzu_core::memory::memory::Memory {
+            *cell.get_or_init(|| {
+                let guard = memory.lock().unwrap();
+                &*guard as *const ruzu_core::memory::memory::Memory as usize
+            }) as *const ruzu_core::memory::memory::Memory
+        }
+
         let renderer: Box<dyn video_core::renderer_base::RendererBase> =
             match renderer_backend_str.as_str() {
                 "opengl" => {
@@ -893,12 +914,15 @@ fn main() {
                     // the CPU side, and resolves GPU VAs through the bound
                     // channel's `MemoryManager` via `Gpu::read_gpu_memory`.
                     let system_ref_gpu = ruzu_core::core::SystemRef::from_ref(&system);
+                    let memory_raw_shader = memory_raw.clone();
                     renderer.rasterizer_mut().set_gpu_memory_reader(Arc::new(
                         move |gpu_va, dst: &mut [u8]| {
                             let cpu_reader = |addr: u64, out: &mut [u8]| {
                                 let sys = system_ref_gpu.get();
                                 if let Some(memory) = sys.memory_shared() {
-                                    let m = memory.lock().unwrap();
+                                    // Mutex-free read — see `memory_raw` above.
+                                    let m =
+                                        unsafe { &*memory_raw_of(&memory_raw_shader, &memory) };
                                     if m.read_block(addr, out) {
                                         return;
                                     }
@@ -940,6 +964,7 @@ fn main() {
                 )),
             };
         gpu.bind_renderer(renderer);
+        let memory_raw_reader = memory_raw.clone();
         gpu.set_guest_memory_reader(Arc::new(move |addr, output: &mut [u8]| {
             // The address handed to us is a *device address* coming from the
             // GPU's GMMU after walking GPU VA → device. Resolve in this order:
@@ -992,7 +1017,8 @@ fn main() {
                 }
             }
             if let Some(memory) = sys.memory_shared() {
-                let m = memory.lock().unwrap();
+                // Mutex-free read — see `memory_raw` above.
+                let m = unsafe { &*memory_raw_of(&memory_raw_reader, &memory) };
                 if !m.read_block(addr, output) {
                     let dm = sys.device_memory();
                     let base = ruzu_core::device_memory::dram_memory_map::BASE;
@@ -1025,6 +1051,7 @@ fn main() {
                     .and_then(|d| u64::from_str_radix(d, 16).ok())
                     .or_else(|| s.parse::<u64>().ok())
             });
+        let memory_raw_writer = memory_raw.clone();
         gpu.set_guest_memory_writer(Arc::new(move |addr, data: &[u8]| {
             if let Some(target) = trace_gpu_write_vaddr {
                 let end = addr.saturating_add(data.len() as u64);
@@ -1060,7 +1087,9 @@ fn main() {
                 }
             }
             if let Some(memory) = sys.memory_shared() {
-                let m = memory.lock().unwrap();
+                // Mutex-free write — see `memory_raw` above. `write_block`
+                // takes `&self` (interior atomics) like the read path.
+                let m = unsafe { &*memory_raw_of(&memory_raw_writer, &memory) };
                 if m.write_block(addr, data) {
                     return;
                 }

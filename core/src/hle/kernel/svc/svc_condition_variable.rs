@@ -45,7 +45,19 @@ pub fn wait_process_wide_key_atomic(
     // Convert timeout from nanoseconds to ticks.
     // Upstream: kernel.HardwareTimer().GetTick() + offset_tick + 2
     let timeout: i64 = if timeout_ns > 0 {
-        let offset_tick = timeout_ns;
+        // DEBUG EXPERIMENT (RUZU_CV_TIMEOUT_MULT=N): scale the timed-CV-wait
+        // timeout. Tests the hypothesis that ruzu's wakeup latency makes timed
+        // waits spuriously TIME OUT where they should be SIGNALED, breaking the
+        // MK8D tid=75/82/83 handshake. If MK8D progresses past the wedge with a
+        // large multiplier, the root is timing/latency (not a data divergence).
+        // Gated/reversible — no effect when unset.
+        let offset_tick = match std::env::var("RUZU_CV_TIMEOUT_MULT")
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+        {
+            Some(mult) if mult > 1 => timeout_ns.saturating_mul(mult),
+            _ => timeout_ns,
+        };
         if offset_tick > 0 {
             let hardware_tick = system
                 .kernel()
