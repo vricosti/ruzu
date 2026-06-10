@@ -106,6 +106,12 @@ impl HeapMapper {
         let d_address = self
             .m_daddress
             .wrapping_add(start.wrapping_sub(self.m_vaddress));
+        if std::env::var_os("RUZU_TRACE_NVMAP_PIN").is_some() {
+            eprintln!(
+                "[HEAP_UNMAP] vaddr=0x{:X} size=0x{:X} -> smmu_unmap d_address=0x{:X}",
+                start, size, d_address
+            );
+        }
         if let Some(host1x) = self.system.get().host1x_core() {
             host1x.smmu_unmap(d_address, size);
         }
