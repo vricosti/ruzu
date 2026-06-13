@@ -4164,23 +4164,9 @@ impl RasterizerInterface for RasterizerOpenGL {
                     image_ids.push(image_id);
                 }
             }
-            if let Some(mm) = cbuf_mm_guard.as_ref() {
-                for image_id in image_ids {
-                    self.texture_cache.prepare_image_with_gpu_reader(
-                        image_id,
-                        false,
-                        false,
-                        &mut |gpu_addr, out| {
-                            mm.read_block(gpu_addr, out);
-                            true
-                        },
-                    );
-                }
-            } else {
-                for image_id in image_ids {
-                    self.texture_cache
-                        .prepare_image_without_gpu_reader(image_id, false, false);
-                }
+            for image_id in image_ids {
+                self.texture_cache
+                    .prepare_image_without_gpu_reader(image_id, false, false);
             }
             record_gl_draw_stage(draw_seq, 18);
             trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_prepare_images", draw_seq);
@@ -4193,17 +4179,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             // GL wrapper lazily mirrors the slots into its HashMaps here.
             // Required before any future `glBindTextureUnit` step can resolve
             // a view-id to a real GL texture name.
-            if let Some(mm) = cbuf_mm_guard.as_ref() {
-                self.texture_cache.materialize_views_with_gpu_reader(
-                    &views,
-                    &mut |gpu_addr, out| {
-                        mm.read_block(gpu_addr, out);
-                        true
-                    },
-                );
-            } else {
-                self.texture_cache.materialize_views(&views);
-            }
+            self.texture_cache.materialize_views(&views);
             record_gl_draw_stage(draw_seq, 19);
             trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_materialize_views", draw_seq);
             // Slice 13: materialise the GL `Sampler` objects for the same
@@ -4234,10 +4210,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                     });
                 self.texture_cache.prepare_render_targets_from_snapshot(
                     &render_targets,
-                    Some(&mut |gpu_addr, out| {
-                        mm.read_block(gpu_addr, out);
-                        true
-                    }),
+                    None,
                     false,
                     None,
                 );
