@@ -329,49 +329,7 @@ impl TextureCacheBase {
         views: &mut [ImageViewInOut],
         has_blacklists: bool,
     ) {
-        if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
-            self.fill_graphics_image_views_with_gpu_reader(
-                views,
-                has_blacklists,
-                &mut |gpu_addr, out| gpu_memory.lock().read_block(gpu_addr, out),
-                &mut |gpu_addr, size| {
-                    let gpu_memory = gpu_memory.lock();
-                    gpu_memory
-                        .gpu_to_cpu_address(gpu_addr)
-                        .or_else(|| gpu_memory.gpu_to_cpu_address_range(gpu_addr, size))
-                },
-            );
-            return;
-        }
         self.fill_image_views(true, views, has_blacklists);
-    }
-
-    /// Same as `fill_graphics_image_views`, but reads TIC descriptors and
-    /// validates image addresses through a caller-provided channel GPU-VA
-    /// reader.
-    pub fn fill_graphics_image_views_with_gpu_reader(
-        &mut self,
-        views: &mut [ImageViewInOut],
-        has_blacklists: bool,
-        read_gpu: &mut dyn FnMut(GPUVAddr, &mut [u8]) -> bool,
-        gpu_to_cpu: &mut dyn FnMut(GPUVAddr, u64) -> Option<u64>,
-    ) {
-        let mut has_blacklisted;
-        loop {
-            self.has_deleted_images = false;
-            has_blacklisted = false;
-            for view in views.iter_mut() {
-                view.id = self
-                    .visit_graphics_image_view_with_gpu_reader(view.index, read_gpu, gpu_to_cpu);
-                if has_blacklists && view.blacklist && view.id != NULL_IMAGE_VIEW_ID {
-                    // TODO: ScaleDown(slot_images[image_view.image_id]).
-                    has_blacklisted = false;
-                }
-            }
-            if !self.has_deleted_images && !(has_blacklists && has_blacklisted) {
-                break;
-            }
-        }
     }
 
     /// Port of `TextureCache<P>::FillComputeImageViews`
@@ -418,7 +376,8 @@ impl TextureCacheBase {
     /// Reads the TIC descriptor at `index` from the channel's graphics or
     /// compute table; on a fresh read, looks up (or creates) an `ImageView`
     /// via `find_image_view`. Splits the borrow across `channel_state`
-    /// fields + `device_memory` so `find_image_view` can take `&mut self`.
+    /// fields + the appropriate GPU-memory owner so `find_image_view` can
+    /// take `&mut self`.
     fn visit_image_view(&mut self, graphics: bool, index: u32) -> ImageViewId {
         if std::env::var_os("RUZU_TRACE_VISIT_TIC").is_some() {
             let table = if graphics {
@@ -443,7 +402,6 @@ impl TextureCacheBase {
                 );
             }
         }
-        let gpu_memory = self.device_memory.clone();
         // Step 1: read the TIC descriptor with a local borrow on the table only.
         let (descriptor, is_new) = {
             let table = if graphics {
@@ -454,7 +412,19 @@ impl TextureCacheBase {
             if index > table.limit() {
                 return NULL_IMAGE_VIEW_ID;
             }
-            table.read(&*gpu_memory, index)
+            if graphics {
+                if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
+                    table.read_with(index, |gpu_addr, out| {
+                        gpu_memory.lock().read_block(gpu_addr, out)
+                    })
+                } else {
+                    let gpu_memory = self.device_memory.clone();
+                    table.read(&*gpu_memory, index)
+                }
+            } else {
+                let gpu_memory = self.device_memory.clone();
+                table.read(&*gpu_memory, index)
+            }
         };
         // Step 2: on first read for this index, resolve via find_image_view
         // (now &mut self).
@@ -476,47 +446,6 @@ impl TextureCacheBase {
         cached_ids[index as usize]
     }
 
-    fn visit_graphics_image_view_with_gpu_reader(
-        &mut self,
-        index: u32,
-        read_gpu: &mut dyn FnMut(GPUVAddr, &mut [u8]) -> bool,
-        gpu_to_cpu: &mut dyn FnMut(GPUVAddr, u64) -> Option<u64>,
-    ) -> ImageViewId {
-        let (descriptor, is_new) = {
-            let table = &mut self.channel_state.graphics_image_table;
-            if index > table.limit() {
-                return NULL_IMAGE_VIEW_ID;
-            }
-            table.read_with(index, |gpu_addr, out| read_gpu(gpu_addr, out))
-        };
-        if std::env::var_os("RUZU_TRACE_VISIT_TIC").is_some() {
-            log::warn!(
-                "[VISIT_TIC_GPU] index={} tic_gpu=0x{:X} fmt=0x{:X} width={} height={} is_new={}",
-                index,
-                descriptor.address(),
-                {
-                    let raw = descriptor.raw[0];
-                    raw as u32 & 0xFFFFFF // approximation of format bits
-                },
-                {
-                    // width is in word4 bits[16:0] for pitch, varies by layout
-                    let w = (descriptor.raw[2] >> 0) as u32 & 0xFFFF;
-                    w
-                },
-                {
-                    let h = (descriptor.raw[2] >> 16) as u32 & 0xFFFF;
-                    h
-                },
-                is_new,
-            );
-        }
-        if is_new {
-            let new_id = self.find_image_view_with_gpu_to_cpu(&descriptor, gpu_to_cpu);
-            self.channel_state.graphics_image_view_ids[index as usize] = new_id;
-        }
-        self.channel_state.graphics_image_view_ids[index as usize]
-    }
-
     /// Diagnostic helper for [TIC_LOOKUP]: resolve the PixelFormat of the
     /// image backing `view_id` (or a marker when null/imageless).
     fn tic_lookup_image_format(&self, view_id: ImageViewId) -> String {
@@ -535,6 +464,14 @@ impl TextureCacheBase {
     /// Guards on `IsValidEntry`, then does a HashMap try_emplace against the
     /// descriptor; on cache miss, calls `create_image_view`.
     fn find_image_view(&mut self, descriptor: &crate::textures::texture::TicEntry) -> ImageViewId {
+        if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
+            return self.find_image_view_with_gpu_to_cpu(descriptor, &mut |gpu_addr, size| {
+                let gpu_memory = gpu_memory.lock();
+                gpu_memory
+                    .gpu_to_cpu_address(gpu_addr)
+                    .or_else(|| gpu_memory.gpu_to_cpu_address_range(gpu_addr, size))
+            });
+        }
         let gpu_memory = self.device_memory.clone();
         if !super::util::is_valid_entry(&*gpu_memory, descriptor) {
             return NULL_IMAGE_VIEW_ID;
@@ -990,75 +927,6 @@ impl TextureCacheBase {
         let cached = self.channel_state.graphics_sampler_ids[index as usize];
         if !is_new && cached.is_valid() && cached != CORRUPT_ID {
             return cached;
-        }
-        let id = self.find_sampler(&descriptor);
-        self.channel_state.graphics_sampler_ids[index as usize] = id;
-        id
-    }
-
-    /// Resolve a graphics-stage sampler index using a caller-provided GPU-VA
-    /// reader for the TSC table.
-    ///
-    /// Same ownership as upstream `TextureCache<P>::GetGraphicsSamplerId`;
-    /// this Rust bridge exists because the current cache base stores the
-    /// Host1x SMMU device-memory manager, while graphics TSC table pointers
-    /// in MK8D are GPU virtual addresses that must go through the channel
-    /// `MemoryManager`.
-    pub fn get_graphics_sampler_id_with_gpu_reader(
-        &mut self,
-        index: u32,
-        table_addr: GPUVAddr,
-        table_limit: u32,
-        mut read_gpu: impl FnMut(GPUVAddr, &mut [u8]) -> bool,
-    ) -> SamplerId {
-        use crate::texture_cache::types::NULL_SAMPLER_ID;
-        if index > table_limit {
-            log::debug!(
-                "TextureCacheBase::get_graphics_sampler_id_with_gpu_reader: invalid index={}",
-                index
-            );
-            return NULL_SAMPLER_ID;
-        }
-        if index as usize >= self.channel_state.graphics_sampler_ids.len() {
-            self.channel_state
-                .graphics_sampler_ids
-                .resize(index as usize + 1, CORRUPT_ID);
-        }
-        let cached = self.channel_state.graphics_sampler_ids[index as usize];
-        if cached.is_valid() && cached != CORRUPT_ID {
-            return cached;
-        }
-
-        let descriptor_addr = table_addr
-            + index as u64 * std::mem::size_of::<crate::textures::texture::TscEntry>() as u64;
-        let mut buf = [0u8; std::mem::size_of::<crate::textures::texture::TscEntry>()];
-        if !read_gpu(descriptor_addr, &mut buf) {
-            if std::env::var_os("RUZU_TRACE_TSC_READ").is_some() {
-                log::warn!(
-                    "[TSC_READ] miss index={} table=0x{:X} limit={} addr=0x{:X}",
-                    index,
-                    table_addr,
-                    table_limit,
-                    descriptor_addr,
-                );
-            }
-            return NULL_SAMPLER_ID;
-        }
-        let descriptor = unsafe {
-            std::ptr::read_unaligned(buf.as_ptr() as *const crate::textures::texture::TscEntry)
-        };
-        if std::env::var_os("RUZU_TRACE_TSC_READ").is_some() {
-            log::warn!(
-                "[TSC_READ] index={} table=0x{:X} limit={} addr=0x{:X} raw={:016X} {:016X} {:016X} {:016X}",
-                index,
-                table_addr,
-                table_limit,
-                descriptor_addr,
-                descriptor.raw[0],
-                descriptor.raw[1],
-                descriptor.raw[2],
-                descriptor.raw[3],
-            );
         }
         let id = self.find_sampler(&descriptor);
         self.channel_state.graphics_sampler_ids[index as usize] = id;
