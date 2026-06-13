@@ -14,7 +14,8 @@ use crate::textures::texture::texture_pair;
 
 use super::gl_texture_cache::TextureCache;
 use shader_recompiler::shader_info::{
-    ImageBufferDescriptor, ImageDescriptor, Info, TextureBufferDescriptor, TextureDescriptor,
+    num_descriptors, ImageBufferDescriptor, ImageDescriptor, Info, TextureBufferDescriptor,
+    TextureDescriptor,
 };
 
 /// Maximum number of textures bound to a compute pipeline.
@@ -77,10 +78,22 @@ pub(crate) struct ComputeTextureHandles {
     pub num_image_buffers: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComputePipelineInfoState {
+    uniform_buffer_sizes: ComputeUniformBufferSizes,
+    num_texture_buffers: u32,
+    num_image_buffers: u32,
+    use_storage_buffers: bool,
+    writes_global_memory: bool,
+    uses_local_memory: bool,
+}
+
 /// OpenGL compute pipeline.
 ///
 /// Corresponds to `OpenGL::ComputePipeline`.
 pub struct ComputePipeline {
+    /// Shader resource metadata copied into the pipeline.
+    pub info: Info,
     /// Source program handle (GLSL or SPIR-V).
     pub source_program: u32,
     /// Assembly program handle (GLASM).
@@ -112,7 +125,22 @@ impl ComputePipeline {
     ///
     /// Corresponds to `ComputePipeline::ComputePipeline()`.
     pub fn new(
-        _device: &super::gl_device::Device,
+        device: &super::gl_device::Device,
+        code: &str,
+        code_v: &[u32],
+        force_context_flush: bool,
+    ) -> Self {
+        Self::new_with_info(device, Info::default(), code, code_v, force_context_flush)
+    }
+
+    /// Create a new compute pipeline with translated shader resource metadata.
+    ///
+    /// This is the Rust counterpart of upstream's constructor parameters
+    /// `const Shader::Info& info_`, `std::string code`, and
+    /// `std::vector<u32> code_v`.
+    pub fn new_with_info(
+        device: &super::gl_device::Device,
+        info: Info,
         _code: &str,
         _code_v: &[u32],
         _force_context_flush: bool,
@@ -120,18 +148,22 @@ impl ComputePipeline {
         // Full implementation would:
         // 1. Check device.get_shader_backend() (GLSL vs GLASM)
         // 2. Compile shader from source code
-        // 3. Copy uniform buffer sizes from shader info
-        // 4. Count texture/image buffer descriptors
-        // 5. Determine use_storage_buffers, writes_global_memory, uses_local_memory
+        let state = Self::info_state(
+            &info,
+            device.use_assembly_shaders(),
+            device.max_glasm_storage_buffer_blocks(),
+        );
+
         Self {
+            info,
             source_program: 0,
             assembly_program: 0,
-            uniform_buffer_sizes: [0; 8],
-            num_texture_buffers: 0,
-            num_image_buffers: 0,
-            use_storage_buffers: false,
-            writes_global_memory: false,
-            uses_local_memory: false,
+            uniform_buffer_sizes: state.uniform_buffer_sizes,
+            num_texture_buffers: state.num_texture_buffers,
+            num_image_buffers: state.num_image_buffers,
+            use_storage_buffers: state.use_storage_buffers,
+            writes_global_memory: state.writes_global_memory,
+            uses_local_memory: state.uses_local_memory,
             built_mutex: Mutex::new(false),
             built_condvar: Condvar::new(),
             built_fence: 0,
@@ -248,6 +280,50 @@ impl ComputePipeline {
         }
 
         result
+    }
+
+    fn info_state(
+        info: &Info,
+        is_glasm: bool,
+        max_glasm_storage_buffer_blocks: u32,
+    ) -> ComputePipelineInfoState {
+        let mut uniform_buffer_sizes = [0; 8];
+        uniform_buffer_sizes.copy_from_slice(&info.constant_buffer_used_sizes[..8]);
+
+        let num_texture_buffers = num_descriptors(&info.texture_buffer_descriptors);
+        let num_image_buffers = num_descriptors(&info.image_buffer_descriptors);
+        let num_textures = num_texture_buffers + num_descriptors(&info.texture_descriptors);
+        let num_images = num_image_buffers + num_descriptors(&info.image_descriptors);
+        assert!(
+            num_textures <= MAX_TEXTURES,
+            "compute texture descriptor count {} exceeds MAX_TEXTURES {}",
+            num_textures,
+            MAX_TEXTURES
+        );
+        assert!(
+            num_images <= MAX_IMAGES,
+            "compute image descriptor count {} exceeds MAX_IMAGES {}",
+            num_images,
+            MAX_IMAGES
+        );
+
+        let num_storage_buffers = num_descriptors(&info.storage_buffers_descriptors);
+        let use_storage_buffers =
+            !is_glasm || num_storage_buffers < max_glasm_storage_buffer_blocks;
+        let writes_global_memory = !use_storage_buffers
+            && info
+                .storage_buffers_descriptors
+                .iter()
+                .any(|desc| desc.is_written);
+
+        ComputePipelineInfoState {
+            uniform_buffer_sizes,
+            num_texture_buffers,
+            num_image_buffers,
+            use_storage_buffers,
+            writes_global_memory,
+            uses_local_memory: info.uses_local_memory,
+        }
     }
 
     pub(crate) fn descriptor_sync_regs(dispatch: &DispatchCall) -> ComputeDescriptorSyncRegs {
@@ -496,8 +572,8 @@ mod tests {
     use super::*;
     use crate::engines::kepler_compute::{DispatchCall, QmdConstBuffer, QueueMetaData};
     use shader_recompiler::shader_info::{
-        ImageBufferDescriptor, ImageDescriptor, ImageFormat, TextureBufferDescriptor,
-        TextureDescriptor, TextureType,
+        ImageBufferDescriptor, ImageDescriptor, ImageFormat, StorageBufferDescriptor,
+        TextureBufferDescriptor, TextureDescriptor, TextureType,
     };
 
     #[test]
@@ -549,6 +625,100 @@ mod tests {
         assert_eq!(regs.tic_limit, 6);
         assert_eq!(regs.tsc_addr, 0x3000);
         assert_eq!(regs.tsc_limit, 1);
+    }
+
+    #[test]
+    fn compute_pipeline_info_state_matches_upstream_constructor_metadata() {
+        let mut info = Info::default();
+        info.constant_buffer_used_sizes[0] = 0x10;
+        info.constant_buffer_used_sizes[7] = 0x80;
+        info.constant_buffer_used_sizes[8] = 0x90;
+        info.texture_buffer_descriptors
+            .push(TextureBufferDescriptor {
+                has_secondary: false,
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                shift_left: 0,
+                secondary_cbuf_index: 0,
+                secondary_cbuf_offset: 0,
+                secondary_shift_left: 0,
+                count: 2,
+                size_shift: 2,
+            });
+        info.texture_buffer_descriptors
+            .push(TextureBufferDescriptor {
+                has_secondary: false,
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                shift_left: 0,
+                secondary_cbuf_index: 0,
+                secondary_cbuf_offset: 0,
+                secondary_shift_left: 0,
+                count: 3,
+                size_shift: 2,
+            });
+        info.image_buffer_descriptors.push(ImageBufferDescriptor {
+            format: ImageFormat::R32Uint,
+            is_written: false,
+            is_read: true,
+            is_integer: true,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            count: 4,
+            size_shift: 2,
+        });
+        info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth: false,
+            is_multisample: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 6,
+            size_shift: 2,
+        });
+        info.image_descriptors.push(ImageDescriptor {
+            texture_type: TextureType::Color2D,
+            format: ImageFormat::R32Uint,
+            is_written: false,
+            is_read: true,
+            is_integer: true,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            count: 7,
+            size_shift: 2,
+        });
+        info.storage_buffers_descriptors
+            .push(StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0x20,
+                count: 2,
+                is_written: true,
+            });
+        info.uses_local_memory = true;
+
+        let glsl_state = ComputePipeline::info_state(&info, false, 0);
+        assert_eq!(
+            glsl_state.uniform_buffer_sizes,
+            [0x10, 0, 0, 0, 0, 0, 0, 0x80]
+        );
+        assert_eq!(glsl_state.num_texture_buffers, 5);
+        assert_eq!(glsl_state.num_image_buffers, 4);
+        assert!(glsl_state.use_storage_buffers);
+        assert!(!glsl_state.writes_global_memory);
+        assert!(glsl_state.uses_local_memory);
+
+        let glasm_state_without_capacity = ComputePipeline::info_state(&info, true, 2);
+        assert!(!glasm_state_without_capacity.use_storage_buffers);
+        assert!(glasm_state_without_capacity.writes_global_memory);
+
+        let glasm_state_with_capacity = ComputePipeline::info_state(&info, true, 3);
+        assert!(glasm_state_with_capacity.use_storage_buffers);
+        assert!(!glasm_state_with_capacity.writes_global_memory);
     }
 
     #[test]
