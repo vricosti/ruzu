@@ -1,3 +1,29 @@
+## 2026-06-13 — video_core/src/renderer_opengl/gl_compute_pipeline.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.h
+
+### Intentional differences
+- `ComputePipeline::collect_texture_handles(...)` now ports the handle-collection half of upstream `ComputePipeline::Configure`: it reads QMD constant-buffer handles, preserves upstream texture-buffer -> image-buffer -> sampled-texture -> storage-image view ordering, handles secondary texture descriptors, splits handles through `TexturePair`, records sampled-texture TSC indices, and marks written storage images as blacklisted.
+- `ComputePipeline::prepare_texture_bindings(...)` resolves compute sampler ids through `TextureCacheBase::get_compute_sampler_id(...)` and calls the OpenGL `TextureCache::fill_compute_image_views(...)` wrapper, matching upstream's `GetComputeSamplerId` / `FillComputeImageViews` ownership for this slice.
+- Rust passes an explicit `DispatchCall` snapshot and `read_u32` closure because `ComputePipeline` still does not store upstream's `kepler_compute` / `gpu_memory` pointers. This is the same temporary ownership adaptation tracked for descriptor synchronization.
+
+### Unintentional differences (to fix)
+- Full OpenGL `ComputePipeline::Configure` still does not own `BufferCache`, `TextureCache`, `ProgramManager`, `Shader::Info`, `kepler_compute`, and `gpu_memory` as upstream members, so the new collection/binding helper is not yet called by the real dispatch path.
+- Texture-buffer GL binding, sampled texture/sampler GL binding, image GL binding, rescaling uniforms, and buffer-cache update/bind ordering are still missing from the runtime compute configure path.
+
+### Missing items
+- Store shader `Info` and the upstream cache owners on `ComputePipeline`, then call `prepare_texture_bindings(...)` from the real `configure` path.
+- Port the post-`FillComputeImageViews` bind phase: `BindComputeTextureBuffer`, `UpdateComputeBuffers`, `SetImagePointers`, `BindHostComputeBuffers`, texture/sampler/image GL handle arrays, rescaling masks, and `glBindTextures` / `glBindSamplers` / `glBindImageTextures`.
+
+### Binary layout verification
+- PASS: no guest-visible payload changed. Handles remain raw u32 values read from QMD constant-buffer GPU addresses.
+
+### Tests
+- Re-read upstream OpenGL `ComputePipeline::Configure`, `ComputePipeline` members in `gl_compute_pipeline.h`, and `Tegra::Texture::TexturePair`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo test -p video_core collect_texture_handles_follows_upstream_compute_order_and_pairs -- --nocapture`
+- `cargo test -p video_core descriptor_sync_regs_come_from_dispatch_call -- --nocapture`
+- `cargo check -p video_core --quiet`
+
 ## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs and video_core/src/texture_cache/texture_cache_base.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
 
 ### Intentional differences
@@ -5,13 +31,14 @@
 - Rust passes `ComputeDescriptorSyncRegs` instead of reading `kepler_compute` directly because `TextureCacheBase` does not own a KeplerCompute pointer; this matches the existing graphics descriptor snapshot pattern.
 - `KeplerCompute::execute_pending(...)` now forwards the recorded `DispatchCall` to `RasterizerInterface::dispatch_compute_with_call(...)`, and OpenGL delegates descriptor synchronization to `ComputePipeline::synchronize_texture_descriptors(...)`. This moves ownership closer to upstream `ComputePipeline::Configure` without re-entering `KeplerCompute` mutably while it is already calling the rasterizer.
 - `OpenGL::TextureCache::fill_compute_image_views(...)` now owns the backend `ScaleDown(image)` blacklist loop for compute image views, matching upstream `TextureCache<P>::FillComputeImageViews -> FillImageViews<true>`.
+- `ComputePipeline::prepare_texture_bindings(...)` now owns the QMD/cbuf handle collection, compute sampler-id resolution, and call into `OpenGL::TextureCache::fill_compute_image_views(...)` for the future real configure path.
 
 ### Unintentional differences (to fix)
-- Full OpenGL `ComputePipeline::Configure` is still not ported: it does not yet iterate shader texture/sampler/image descriptors, read compute handles, fill views, materialize/bind GL textures, bind samplers, bind images, or bind texture buffers. The current rasterizer dispatch path only delegates the first descriptor-synchronization step to the compute-pipeline owner.
+- Full OpenGL `ComputePipeline::Configure` is still not ported: runtime dispatch still does not materialize/bind GL textures, bind samplers, bind images, or bind texture buffers. The current rasterizer dispatch path only delegates descriptor synchronization to the compute-pipeline owner because `ComputePipeline` still does not store upstream's cache/engine pointers.
 
 ### Missing items
 - Port OpenGL `ComputePipeline::Configure` texture/sampler/image binding so synchronized compute descriptors are consumed by dispatch.
-- Call `OpenGL::TextureCache::fill_compute_image_views(...)` from the full compute configure path after descriptor handle collection.
+- Call `ComputePipeline::prepare_texture_bindings(...)` from the real compute configure path after shader-info ownership is ported.
 
 ### Binary layout verification
 - PASS: no guest-visible payload changed; TIC/TSC descriptors remain raw 32-byte entries.
