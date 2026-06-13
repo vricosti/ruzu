@@ -1085,22 +1085,24 @@ pub fn swizzle_image(
             if pitch == 0 {
                 continue;
             }
-            let row_bytes = copy.image_extent.width.saturating_mul(bytes_per_block) as usize;
-            let input_stride = copy.buffer_row_length.saturating_mul(bytes_per_block) as usize;
-            for layer in 0..copy.image_subresource.num_layers.max(1) as u32 {
-                for y in 0..copy.image_extent.height {
-                    let src_offset = copy.buffer_offset
-                        + layer as usize * copy.buffer_image_height as usize * input_stride
-                        + y as usize * input_stride;
-                    let src_end = src_offset.saturating_add(row_bytes);
-                    if src_end > memory.len() {
-                        break;
-                    }
-                    let dst_offset = layer as u64 * info.layer_stride as u64
-                        + (copy.image_offset.y as u64 + y as u64) * pitch as u64
-                        + copy.image_offset.x as u64 * bytes_per_block as u64;
-                    guest_memory_writer(cpu_addr + dst_offset, &memory[src_offset..src_end]);
+            debug_assert_eq!(copy.image_offset.z, 0);
+            debug_assert_eq!(copy.image_extent.depth, 1);
+            debug_assert_eq!(copy.image_subresource.base_level, 0);
+            debug_assert_eq!(copy.image_subresource.base_layer, 0);
+            debug_assert_eq!(copy.image_subresource.num_layers, 1);
+
+            let row_length = copy.image_extent.width.saturating_mul(bytes_per_block) as usize;
+            let guest_offset_x = copy.image_offset.x.max(0) as u64 * bytes_per_block as u64;
+            for line in 0..copy.image_extent.height {
+                let host_offset = copy.buffer_offset + line as usize * pitch as usize;
+                let host_end = host_offset.saturating_add(row_length);
+                if host_end > memory.len() {
+                    break;
                 }
+                let guest_offset_y =
+                    (copy.image_offset.y.max(0) as u64 + line as u64) * pitch as u64;
+                let guest_offset = guest_offset_x + guest_offset_y;
+                guest_memory_writer(cpu_addr + guest_offset, &memory[host_offset..host_end]);
             }
             continue;
         }
@@ -1678,8 +1680,8 @@ mod tests {
         };
         let copy = BufferImageCopy {
             buffer_offset: 0,
-            buffer_size: 16,
-            buffer_row_length: 2,
+            buffer_size: 32,
+            buffer_row_length: 4,
             buffer_image_height: 2,
             image_subresource: SubresourceLayers {
                 base_level: 0,
@@ -1693,7 +1695,9 @@ mod tests {
                 depth: 1,
             },
         };
-        let memory: Vec<u8> = (0..16).collect();
+        let mut memory: Vec<u8> = (0..32).collect();
+        memory[8..16].fill(0xAA);
+        memory[24..32].fill(0xBB);
         let mut tmp = Vec::new();
 
         swizzle_image(&writer, 0x1000, &info, &[copy], &memory, &mut tmp);
@@ -1701,7 +1705,7 @@ mod tests {
         let writes = writes.lock().unwrap();
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0], (0x1000, vec![0, 1, 2, 3, 4, 5, 6, 7]));
-        assert_eq!(writes[1], (0x1010, vec![8, 9, 10, 11, 12, 13, 14, 15]));
+        assert_eq!(writes[1], (0x1010, vec![16, 17, 18, 19, 20, 21, 22, 23]));
     }
 
     #[test]
