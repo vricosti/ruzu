@@ -4110,6 +4110,16 @@ impl TextureCache {
         true
     }
 
+    fn refresh_contents_with_bound_gpu_reader(&mut self, image_id: ImageId) -> bool {
+        let Some(gpu_memory) = self.base.channel_gpu_memory.as_ref().cloned() else {
+            return false;
+        };
+        self.refresh_contents_with_gpu_reader(image_id, &mut |addr, out| {
+            gpu_memory.lock().read_block(addr, out)
+        });
+        true
+    }
+
     /// OpenGL-backed port of `TextureCache<P>::PrepareImage`.
     ///
     /// The common Rust base owns the upstream method name, but it cannot reach
@@ -4349,15 +4359,17 @@ impl TextureCache {
                     .flags
                     .contains(ImageFlagBits::CPU_MODIFIED) =>
                 {
-                    if trace_join {
-                        log::warn!(
-                            "[JOIN_IMAGES] defer new={} because RefreshContents needs a GPU reader",
-                            join.new_image_id.index
-                        );
+                    if !self.refresh_contents_with_bound_gpu_reader(join.new_image_id) {
+                        if trace_join {
+                            log::warn!(
+                                "[JOIN_IMAGES] defer new={} because RefreshContents needs a GPU reader",
+                                join.new_image_id.index
+                            );
+                        }
+                        deferred.push(join);
+                        blocked_on_reader = true;
+                        continue;
                     }
-                    deferred.push(join);
-                    blocked_on_reader = true;
-                    continue;
                 }
                 None => {}
             }
