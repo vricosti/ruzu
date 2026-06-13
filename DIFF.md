@@ -1,3 +1,32 @@
+## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs, video_core/src/texture_cache/texture_cache_base.rs, and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h
+
+### Intentional differences
+- `TextureCacheBase` now owns `LeastRecentlyUsedCache<ImageId, i64>` in the same conceptual slot as upstream `Common::LeastRecentlyUsedCache<LRUItemParams> lru_cache`; `RegisterImage` inserts into it, `UnregisterImage` frees it, and OpenGL `PrepareImage` paths call `touch_image(...)`, matching upstream `lru_cache.Touch(image.lru_index, frame_tick)`.
+- `TextureCacheBase::run_garbage_collector(...)` now ports upstream's two-pass memory-pressure policy: normal/high/aggressive mode selection, age thresholds `50/25/10`, iteration limits `10/20/40`, `IS_DECODING` and non-aggressive `COSTLY_LOAD` skips, safe-download gating, unregister, and delete ordering.
+- Rust uses the existing callback-backed `image_downloader` + `guest_memory_writer` for the `must_download` GC path. If those callbacks are absent or fail, Rust preserves the GPU-modified image instead of deleting dirty contents; this is a safety-preserving adaptation until every backend construction path provides the same runtime/GPU-memory availability as upstream.
+- `TextureCacheBase` now owns `sentenced_images` and `sentenced_image_view` as `DelayedDestructionRing<_, TICKS_TO_DESTROY>` counterparts. `DeleteImage(..., immediate_delete=false)` and OpenGL `InvalidateScale` move image/image-view base objects into those rings with `SlotVector::take(...)`, matching upstream's `sentenced_* .Push(std::move(...)); erase(...)` ownership pattern for the ported base resources.
+- OpenGL `TextureCache::tick_frame(...)` now runs the memory-pressure GC, ticks the delayed image/image-view destruction rings, then runs async decode/runtime/common frame ticking, matching upstream `TextureCache<P>::TickFrame` ordering for the ported parts.
+
+### Unintentional differences (to fix)
+- Rust still has no `sentenced_framebuffers` counterpart in `TextureCacheBase` because base framebuffer slot ownership (`slot_framebuffers`) is still represented as the `framebuffers: HashMap<RenderTargets, FramebufferId>` bridge plus backend OpenGL framebuffer cache.
+- The GC download path uses callback staging instead of exact `runtime.DownloadStagingBuffer(...)`, `image.DownloadMemory(...)`, `runtime.Finish()`, and channel `gpu_memory` ownership.
+
+### Missing items
+- Port common framebuffer slot ownership and `sentenced_framebuffers` so framebuffer destruction can be deferred like upstream.
+- Move the GC download path to exact backend runtime ownership once `TextureCacheBase` can call the same runtime/image hooks as upstream `TextureCache<P>`.
+
+### Binary layout verification
+- N/A: host texture-cache ownership and lifecycle only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::RunGarbageCollector`, `TextureCache<P>::TickFrame`, `TextureCache<P>::RegisterImage`, `TextureCache<P>::UnregisterImage`, `TextureCache<P>::DeleteImage`, and `TextureCache<P>::PrepareImage`.
+- Re-read upstream `TextureCache<P>::InvalidateScale`, `texture_cache_base.h` `sentenced_*` members, and `video_core/delayed_destruction_ring.h`.
+- `cargo fmt --all`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core run_garbage_collector -- --nocapture`
+- `cargo test -p video_core delete_image -- --nocapture`
+- `cargo test -p video_core update_render_targets_from_snapshot_registers_presentable_view -- --nocapture`
+
 ## 2026-06-13 — `video_core/src/renderer_opengl/gl_texture_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h`
 
 ### Intentional differences
@@ -18247,10 +18276,10 @@ The following still panic because upstream either also throws NotImplementedExce
 - `OpenGL::TextureCache::tick_frame(...)` now applies upstream's first `TickFrame` step: when the runtime can report memory usage, replace the cache estimate with `TextureCacheRuntime::get_device_memory_usage()` before async decode/runtime/common ticking.
 
 ### Unintentional differences (to fix)
-- Rust still does not run upstream `RunGarbageCollector()` from `TickFrame` because the common cache has no faithful LRU cache, delayed destruction rings, backend image download/delete hooks, or real `sentenced_*` rings yet. Calling the current stub every frame would only log without evicting.
+- Rust now runs the ported LRU/memory-pressure portion of upstream `RunGarbageCollector()` from OpenGL `tick_frame(...)`, but the backend delayed-destruction rings and exact runtime/image download hooks are still tracked in the newer 2026-06-13 GC parity entry.
 
 ### Missing items
-- Port the LRU/delayed-destruction owner graph needed for full `TextureCache<P>::RunGarbageCollector`, `sentenced_images.Tick()`, `sentenced_framebuffers.Tick()`, and `sentenced_image_view.Tick()` parity.
+- Port the delayed-destruction owner graph needed for `sentenced_images.Tick()`, `sentenced_framebuffers.Tick()`, and `sentenced_image_view.Tick()` parity.
 
 ### Binary layout verification
 - N/A: host memory-budget accounting and frame lifecycle only. No guest-visible raw payload layout changed.
@@ -18495,7 +18524,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - None known for the OpenGL runtime no-op hook and MSAA guard slice after re-reading upstream `TextureCache<P>::TickFrame`, `TextureCache<P>::RefreshContents`, and `TextureCacheRuntime::{TransitionImageLayout,TickFrame,BarrierFeedbackLoop}`.
 
 ### Missing items
-- Full common `TextureCache<P>::TickFrame` parity remains broader than this slice: Rust still lacks the upstream delayed-destruction rings and memory-pressure garbage-collector ordering in the common texture-cache layer.
+- Full common `TextureCache<P>::TickFrame` parity remains broader than this slice: Rust still lacks the upstream delayed-destruction rings in the common texture-cache layer.
 - Backend `Image&` ownership remains split, so `transition_image_layout` cannot yet take the exact upstream OpenGL `Image&` type.
 
 ### Binary layout verification

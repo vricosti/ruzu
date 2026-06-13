@@ -17,10 +17,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use common::lru_cache::LeastRecentlyUsedCache;
 use parking_lot::{Mutex as ParkingMutex, ReentrantMutex};
 
 use common::slot_vector::SlotVector;
 
+use crate::delayed_destruction_ring::DelayedDestructionRing;
 use crate::framebuffer_config::{BlendMode, FramebufferConfig};
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::RasterizerDownloadArea;
@@ -280,6 +282,12 @@ pub struct TextureCacheBase {
     pub minimum_memory: u64,
     pub expected_memory: u64,
     pub critical_memory: u64,
+    /// Upstream: `Common::LeastRecentlyUsedCache<LRUItemParams> lru_cache`.
+    pub lru_cache: LeastRecentlyUsedCache<ImageId, i64>,
+    /// Upstream: `DelayedDestructionRing<Image, TICKS_TO_DESTROY> sentenced_images`.
+    pub sentenced_images: DelayedDestructionRing<ImageBase, TICKS_TO_DESTROY>,
+    /// Upstream: `DelayedDestructionRing<ImageView, TICKS_TO_DESTROY> sentenced_image_view`.
+    pub sentenced_image_view: DelayedDestructionRing<ImageViewBase, TICKS_TO_DESTROY>,
     pub has_broken_texture_view_formats: bool,
     pub has_native_bgr: bool,
 
@@ -379,6 +387,9 @@ impl TextureCacheBase {
             minimum_memory: 0,
             expected_memory: DEFAULT_EXPECTED_MEMORY as u64 + 512 * 1024 * 1024,
             critical_memory: DEFAULT_CRITICAL_MEMORY as u64 + 1024 * 1024 * 1024,
+            lru_cache: LeastRecentlyUsedCache::new(),
+            sentenced_images: DelayedDestructionRing::new(),
+            sentenced_image_view: DelayedDestructionRing::new(),
             has_broken_texture_view_formats,
             has_native_bgr,
             uncommitted_downloads: Vec::new(),
@@ -475,8 +486,12 @@ impl TextureCacheBase {
     pub fn tick_frame(&mut self) {
         self.frame_tick += 1;
         self.has_deleted_images = false;
-        // In full implementation: delayed_destruction_ring.Tick()
         // In full implementation: check for resolution scaling changes
+    }
+
+    pub fn tick_delayed_destruction_rings(&mut self) {
+        self.sentenced_images.tick();
+        self.sentenced_image_view.tick();
     }
 
     /// Mark images in a range as modified from the CPU.

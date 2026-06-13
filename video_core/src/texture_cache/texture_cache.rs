@@ -99,15 +99,176 @@ impl TextureCacheBase {
     // ── Garbage collection ─────────────────────────────────────────────
 
     /// Port of `TextureCache<P>::RunGarbageCollector`.
-    ///
-    /// Upstream iterates the LRU cache and destroys images that have not been
-    /// used recently.  Requires `slot_images` typed as concrete `Image<P>` with
-    /// `ImageFlagBits` and the runtime `DownloadStagingBuffer` / `Finish` calls.
-    /// Not implementable without backend types; logs a warning and returns.
     pub fn run_garbage_collector(&mut self) {
-        log::warn!(
-            "TextureCacheBase::run_garbage_collector: backend types not yet available — GC skipped"
+        let mut high_priority_mode = false;
+        let mut aggressive_mode = false;
+        let mut ticks_to_destroy = 0u64;
+        let mut num_iterations = 0usize;
+
+        let configure = |cache: &Self,
+                         allow_aggressive: bool,
+                         high_priority_mode: &mut bool,
+                         aggressive_mode: &mut bool,
+                         ticks_to_destroy: &mut u64,
+                         num_iterations: &mut usize| {
+            *high_priority_mode = cache.total_used_memory >= cache.expected_memory;
+            *aggressive_mode = allow_aggressive && cache.total_used_memory >= cache.critical_memory;
+            *ticks_to_destroy = if *aggressive_mode {
+                10
+            } else if *high_priority_mode {
+                25
+            } else {
+                50
+            };
+            *num_iterations = if *aggressive_mode {
+                40
+            } else if *high_priority_mode {
+                20
+            } else {
+                10
+            };
+        };
+
+        configure(
+            self,
+            false,
+            &mut high_priority_mode,
+            &mut aggressive_mode,
+            &mut ticks_to_destroy,
+            &mut num_iterations,
         );
+        self.cleanup_lru_images(
+            self.frame_tick.saturating_sub(ticks_to_destroy),
+            &mut num_iterations,
+            &mut high_priority_mode,
+            &mut aggressive_mode,
+        );
+
+        if self.total_used_memory >= self.critical_memory {
+            configure(
+                self,
+                true,
+                &mut high_priority_mode,
+                &mut aggressive_mode,
+                &mut ticks_to_destroy,
+                &mut num_iterations,
+            );
+            self.cleanup_lru_images(
+                self.frame_tick.saturating_sub(ticks_to_destroy),
+                &mut num_iterations,
+                &mut high_priority_mode,
+                &mut aggressive_mode,
+            );
+        }
+    }
+
+    fn cleanup_lru_images(
+        &mut self,
+        tick_threshold: u64,
+        num_iterations: &mut usize,
+        high_priority_mode: &mut bool,
+        aggressive_mode: &mut bool,
+    ) {
+        let mut candidates = Vec::new();
+        self.lru_cache
+            .for_each_item_below(tick_threshold as i64, |image_id| {
+                candidates.push(image_id);
+                false
+            });
+
+        for image_id in candidates {
+            if *num_iterations == 0 {
+                break;
+            }
+            if !image_id.is_valid() || image_id == NULL_IMAGE_ID {
+                continue;
+            }
+
+            *num_iterations -= 1;
+            let image = &self.slot_images[image_id];
+            if image.flags.contains(ImageFlagBits::IS_DECODING) {
+                continue;
+            }
+            if !*aggressive_mode && image.flags.contains(ImageFlagBits::COSTLY_LOAD) {
+                continue;
+            }
+            let must_download =
+                image.is_safe_download() && !image.flags.contains(ImageFlagBits::BAD_OVERLAP);
+            if !*high_priority_mode && must_download {
+                continue;
+            }
+            if must_download && !self.download_image_for_gc(image_id) {
+                continue;
+            }
+            if self.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::TRACKED)
+            {
+                self.untrack_image(image_id);
+            }
+            self.unregister_image(image_id);
+            let immediate_delete = self.slot_images[image_id].scale_tick > self.frame_tick + 5;
+            self.delete_image(image_id, immediate_delete);
+
+            if self.total_used_memory < self.critical_memory {
+                if *aggressive_mode {
+                    *num_iterations >>= 2;
+                    *aggressive_mode = false;
+                    break;
+                }
+                if *high_priority_mode && self.total_used_memory < self.expected_memory {
+                    *num_iterations >>= 1;
+                    *high_priority_mode = false;
+                }
+            }
+        }
+    }
+
+    fn download_image_for_gc(&mut self, image_id: ImageId) -> bool {
+        let Some(downloader) = self.image_downloader.as_ref().cloned() else {
+            return false;
+        };
+        let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
+            return false;
+        };
+        let image = self.slot_images[image_id].clone();
+        let mut staging = vec![0u8; image.unswizzled_size_bytes as usize];
+        if !downloader(image_id, &image, &mut staging) {
+            return false;
+        }
+        let copies = super::util::full_download_copies(&image.info);
+        super::util::swizzle_image(
+            writer.as_ref(),
+            image.cpu_addr,
+            &image.info,
+            &copies,
+            &staging,
+            &mut self.swizzle_data_buffer,
+        );
+        self.slot_images[image_id]
+            .flags
+            .remove(ImageFlagBits::GPU_MODIFIED);
+        true
+    }
+
+    fn registered_image_memory_size(image: &ImageBase) -> u64 {
+        let mut tentative_size = u64::from(image.guest_size_bytes.max(image.unswizzled_size_bytes));
+        if (surface::is_pixel_format_astc(image.info.format)
+            && image.flags.contains(ImageFlagBits::ACCELERATED_UPLOAD))
+            || image.flags.contains(ImageFlagBits::CONVERTED)
+        {
+            tentative_size = surface::transcoded_astc_size(tentative_size, image.info.format);
+        }
+        common::alignment::align_up(tentative_size, 1024)
+    }
+
+    fn scaled_image_memory_size(image: &ImageBase) -> u64 {
+        let resolution = common::settings::values().resolution_info.clone();
+        let scale_up = (resolution.up_scale * resolution.up_scale) as u64;
+        let down_shift = (resolution.down_shift + resolution.down_shift) as u64;
+        let image_size_bytes = u64::from(image.guest_size_bytes.max(image.unswizzled_size_bytes));
+        let tentative_size = (image_size_bytes * scale_up) >> down_shift;
+        common::alignment::align_up(tentative_size, 1024)
     }
 
     // ── Image view resolution ──────────────────────────────────────────
@@ -1421,6 +1582,19 @@ impl TextureCacheBase {
     ///
     /// Inserts the image into page tables and marks it for CPU write-tracking.
     pub fn register_image(&mut self, image_id: ImageId) {
+        debug_assert!(
+            !self.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::REGISTERED),
+            "TextureCache::register_image: image already registered"
+        );
+        let memory_size = Self::registered_image_memory_size(&self.slot_images[image_id]);
+        self.total_used_memory = self.total_used_memory.saturating_add(memory_size);
+        let lru_index = self
+            .lru_cache
+            .insert(image_id, self.frame_tick.min(i64::MAX as u64) as i64);
+        self.slot_images[image_id].lru_index = lru_index;
+
         let (gpu_addr, guest_size_bytes, is_sparse) = {
             let image = &self.slot_images[image_id];
             (
@@ -1519,6 +1693,19 @@ impl TextureCacheBase {
             .insert(ImageFlagBits::REGISTERED);
     }
 
+    /// Port of `lru_cache.Touch(image.lru_index, frame_tick)` in
+    /// `TextureCache<P>::PrepareImage`.
+    pub fn touch_image(&mut self, image_id: ImageId) {
+        if !image_id.is_valid() || image_id == NULL_IMAGE_ID {
+            return;
+        }
+        let lru_index = self.slot_images[image_id].lru_index;
+        if lru_index != usize::MAX {
+            self.lru_cache
+                .touch(lru_index, self.frame_tick.min(i64::MAX as u64) as i64);
+        }
+    }
+
     /// Port of `TextureCache<P>::UnregisterImage`.
     ///
     /// Removes the image from CPU page tables and clears registration state.
@@ -1591,6 +1778,10 @@ impl TextureCacheBase {
         let image = &mut self.slot_images[image_id];
         image.flags.remove(ImageFlagBits::REGISTERED);
         image.flags.remove(ImageFlagBits::BAD_OVERLAP);
+        if image.lru_index != usize::MAX {
+            self.lru_cache.free(image.lru_index);
+            image.lru_index = usize::MAX;
+        }
     }
 
     /// Port of `TextureCache<P>::TrackImage` (texture_cache.h:2113).
@@ -1686,11 +1877,17 @@ impl TextureCacheBase {
     /// `immediate_delete` corresponds to the upstream `bool immediate` parameter
     /// that determines whether the image is placed in the delayed-destruction
     /// ring or freed immediately.
-    pub fn delete_image(&mut self, image_id: ImageId, _immediate_delete: bool) {
+    pub fn delete_image(&mut self, image_id: ImageId, immediate_delete: bool) {
         let image_view_ids = self.slot_images[image_id].image_view_ids.clone();
         let aliased_images = self.slot_images[image_id].aliased_images.clone();
         let overlapping_images = self.slot_images[image_id].overlapping_images.clone();
         let gpu_addr = self.slot_images[image_id].gpu_addr;
+        let registered_size = Self::registered_image_memory_size(&self.slot_images[image_id]);
+        let scaled_size = if self.slot_images[image_id].has_scaled {
+            Self::scaled_image_memory_size(&self.slot_images[image_id])
+        } else {
+            0
+        };
 
         debug_assert!(
             !self.slot_images[image_id]
@@ -1741,11 +1938,24 @@ impl TextureCacheBase {
 
         for image_view_id in image_view_ids {
             if image_view_id != NULL_IMAGE_VIEW_ID && image_view_id.is_valid() {
-                self.slot_image_views.erase(image_view_id);
+                if immediate_delete {
+                    self.slot_image_views.erase(image_view_id);
+                } else {
+                    let image_view = self.slot_image_views.take(image_view_id);
+                    self.sentenced_image_view.push(image_view);
+                }
             }
         }
 
-        self.slot_images.erase(image_id);
+        if immediate_delete {
+            self.slot_images.erase(image_id);
+        } else {
+            let image = self.slot_images.take(image_id);
+            self.sentenced_images.push(image);
+        }
+        self.total_used_memory = self
+            .total_used_memory
+            .saturating_sub(registered_size.saturating_add(scaled_size));
 
         if let Some(alloc_id) = self.image_allocs_table.get(&gpu_addr).copied() {
             let alloc_images = &mut self.slot_image_allocs[alloc_id].images;
@@ -1866,6 +2076,24 @@ mod tests {
                 word4 as u64 | ((word5 as u64) << 32),
                 0,
             ],
+        }
+    }
+
+    fn test_cache() -> TextureCacheBase {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+        TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()))
+    }
+
+    fn test_color_info(width: u32, height: u32) -> ImageInfo {
+        ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            size: crate::texture_cache::types::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
+            ..ImageInfo::default()
         }
     }
 
@@ -2096,6 +2324,50 @@ mod tests {
         let image = &cache.slot_images[image_id];
         assert!(image.flags.contains(ImageFlagBits::CPU_MODIFIED));
         assert!(!image.flags.contains(ImageFlagBits::TRACKED));
+    }
+
+    #[test]
+    fn run_garbage_collector_deletes_old_lru_images_only() {
+        let mut cache = test_cache();
+        let info = test_color_info(16, 16);
+        let old_id = cache.insert_image(&info, 0x4000);
+        let touched_id = cache.insert_image(&info, 0x8000);
+        let initial_memory = cache.total_used_memory;
+        assert!(initial_memory > 0);
+
+        cache.frame_tick = 100;
+        cache.touch_image(touched_id);
+        cache.run_garbage_collector();
+
+        assert!(cache
+            .collect_images_in_gpu_region(0x4000, 4, false)
+            .is_empty());
+        assert_eq!(
+            cache.collect_images_in_gpu_region(0x8000, 4, false),
+            vec![touched_id]
+        );
+        assert!(cache.total_used_memory < initial_memory);
+    }
+
+    #[test]
+    fn run_garbage_collector_preserves_gpu_modified_image_without_download_path() {
+        let mut cache = test_cache();
+        let info = test_color_info(16, 16);
+        let image_id = cache.insert_image(&info, 0x4000);
+        cache.mark_modification_by_id(image_id);
+        cache.frame_tick = 100;
+        cache.expected_memory = 0;
+        cache.critical_memory = u64::MAX;
+
+        cache.run_garbage_collector();
+
+        assert_eq!(
+            cache.collect_images_in_gpu_region(0x4000, 4, false),
+            vec![image_id]
+        );
+        assert!(cache.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::GPU_MODIFIED));
     }
 
     #[test]

@@ -3462,6 +3462,10 @@ impl TextureCache {
             }
             self.image_views.remove(view_id);
             self.remove_framebuffers_for_view(*view_id);
+            if *view_id != NULL_IMAGE_VIEW_ID && view_id.is_valid() {
+                let image_view = self.base.slot_image_views.take(*view_id);
+                self.base.sentenced_image_view.push(image_view);
+            }
         }
         self.base
             .channel_state
@@ -3918,6 +3922,7 @@ impl TextureCache {
         if is_modification {
             self.base.mark_modification_by_id(image_id);
         }
+        self.base.touch_image(image_id);
     }
 
     /// OpenGL-backed port of `TextureCache<P>::PrepareImage`.
@@ -3969,6 +3974,7 @@ impl TextureCache {
         if is_modification {
             self.base.mark_modification_by_id(image_id);
         }
+        self.base.touch_image(image_id);
     }
 
     /// OpenGL-backed port of `TextureCache<P>::RefreshContents`.
@@ -5383,6 +5389,10 @@ impl TextureCache {
             self.base
                 .update_total_used_memory_from_runtime(self.runtime.get_device_memory_usage());
         }
+        if self.base.total_used_memory > self.base.minimum_memory {
+            self.base.run_garbage_collector();
+        }
+        self.base.tick_delayed_destruction_rings();
         self.tick_async_decode();
         self.runtime.tick_frame();
         self.base.tick_frame();
