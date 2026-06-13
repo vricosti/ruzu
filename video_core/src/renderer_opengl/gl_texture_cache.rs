@@ -6,6 +6,7 @@
 //! OpenGL texture cache -- manages GPU texture and image objects, framebuffers, and samplers.
 
 use std::collections::HashMap;
+use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 
@@ -13,6 +14,7 @@ use common::settings;
 
 use super::gl_shader_manager::{ProgramManager, ProgramManagerHandle};
 use super::gl_staging_buffer_pool::{StagingBufferMap, StagingBufferPool};
+use super::gl_state_tracker::StateTracker;
 use super::util_shaders::UtilShaders;
 use crate::engines::draw_manager::Maxwell3DRenderTargets;
 use crate::engines::maxwell_3d::{RenderTargetInfo, ScissorInfo};
@@ -287,7 +289,7 @@ const NUM_TEXTURE_TYPES: usize = 9;
 /// Format properties for a given GL internal format.
 ///
 /// Corresponds to `OpenGL::FormatProperties`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct FormatProperties {
     pub compatibility_class: u32,
     pub compatibility_by_size: bool,
@@ -424,9 +426,16 @@ impl Drop for FormatConversionPass {
 pub struct TextureCacheRuntime {
     pub has_broken_texture_view_formats: bool,
     pub device_access_memory: u64,
+    can_report_memory_usage: bool,
+    has_native_astc: bool,
+    // Upstream stores `StateTracker& state_tracker`. `RasterizerOpenGL` owns
+    // the tracker allocation in Rust, and this non-null pointer has the same
+    // lifetime as the texture cache runtime field.
+    state_tracker: NonNull<StateTracker>,
     staging_buffer_pool: StagingBufferPool,
     util_shaders: UtilShaders,
     format_conversion_pass: FormatConversionPass,
+    format_properties: [HashMap<u32, FormatProperties>; 3],
     null_image_handles: [u32; 7],
     null_image_views: [u32; NUM_TEXTURE_TYPES],
     rescale_draw_fbos: [u32; 4],
@@ -440,7 +449,11 @@ impl TextureCacheRuntime {
     /// `TextureCacheRuntime::TextureCacheRuntime` budget: NVX total +
     /// 512 MiB when the extension is present, else a 2 GiB minimum. Kept
     /// in sync with the buffer-cache runtime (gl_buffer_cache.cpp:139).
-    pub fn new(device: &super::gl_device::Device, program_manager: ProgramManagerHandle) -> Self {
+    pub fn new(
+        device: &super::gl_device::Device,
+        program_manager: ProgramManagerHandle,
+        state_tracker: &mut StateTracker,
+    ) -> Self {
         const HALF_GIB: u64 = 512 * 1024 * 1024;
         let device_access_memory = if device.can_report_memory() {
             device.get_current_dedicated_video_memory() + HALF_GIB
@@ -450,25 +463,35 @@ impl TextureCacheRuntime {
         Self::new_with_caps(
             device.has_broken_texture_view_formats(),
             device_access_memory,
+            device.can_report_memory(),
+            device.has_astc(),
             device.has_debugging_tool_attached(),
             program_manager,
+            state_tracker,
         )
     }
 
     pub fn new_with_caps(
         has_broken_texture_view_formats: bool,
         device_access_memory: u64,
+        can_report_memory_usage: bool,
+        has_native_astc: bool,
         has_debugging_tool_attached: bool,
         program_manager: ProgramManagerHandle,
+        state_tracker: &mut StateTracker,
     ) -> Self {
         let (null_image_handles, null_image_views) =
             create_null_image_views(has_debugging_tool_attached);
         let mut runtime = Self {
             has_broken_texture_view_formats,
             device_access_memory,
+            can_report_memory_usage,
+            has_native_astc,
+            state_tracker: NonNull::from(state_tracker),
             staging_buffer_pool: StagingBufferPool::new(),
             util_shaders: UtilShaders::new(program_manager),
             format_conversion_pass: FormatConversionPass::new(),
+            format_properties: create_format_properties(),
             null_image_handles,
             null_image_views,
             rescale_draw_fbos: [0; 4],
@@ -504,7 +527,7 @@ impl TextureCacheRuntime {
     }
 
     pub fn blit_framebuffer(
-        &self,
+        &mut self,
         dst_framebuffer: u32,
         src_framebuffer: u32,
         dst_buffer_bits: u32,
@@ -514,6 +537,11 @@ impl TextureCacheRuntime {
         filter: crate::engines::fermi_2d::Filter,
         _operation: crate::engines::fermi_2d::Operation,
     ) {
+        let state_tracker = unsafe { self.state_tracker.as_mut() };
+        state_tracker.notify_scissor0();
+        state_tracker.notify_rasterize_enable();
+        state_tracker.notify_framebuffer_srgb();
+
         debug_assert_eq!(dst_buffer_bits, src_buffer_bits);
         let buffer_bits = dst_buffer_bits;
         let has_depth = (buffer_bits & !gl::COLOR_BUFFER_BIT) != 0;
@@ -538,6 +566,12 @@ impl TextureCacheRuntime {
                 gl_filter,
             );
         }
+    }
+
+    pub fn notify_rescale_blit_state_changed(&mut self) {
+        let state_tracker = unsafe { self.state_tracker.as_mut() };
+        state_tracker.notify_viewport0();
+        state_tracker.notify_scissor0();
     }
 
     pub fn can_image_be_copied(&self, dst: &ImageBase, src: &ImageBase) -> bool {
@@ -630,6 +664,9 @@ impl TextureCacheRuntime {
     /// the same constant upstream uses; subtraction stays non-negative
     /// because the ctor sized `device_access_memory` to `total + 512MiB`.
     pub fn get_device_memory_usage(&self) -> u64 {
+        if !self.can_report_memory_usage {
+            return 2 * 1024 * 1024 * 1024;
+        }
         const GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX: u32 = 0x9048;
         let mut total_kb: i32 = 0;
         unsafe {
@@ -643,12 +680,32 @@ impl TextureCacheRuntime {
         }
     }
 
+    pub fn can_report_memory_usage(&self) -> bool {
+        self.can_report_memory_usage
+    }
+
     pub fn should_reinterpret(&self) -> bool {
         true
     }
 
     pub fn can_upload_msaa(&self) -> bool {
         true
+    }
+
+    pub fn format_info(&self, image_type: ImageType, internal_format: u32) -> FormatProperties {
+        let table_index = match image_type {
+            ImageType::E1D => 0,
+            ImageType::E2D | ImageType::Linear => 1,
+            ImageType::E3D => 2,
+            _ => {
+                debug_assert!(false, "unsupported image type {:?}", image_type);
+                return FormatProperties::default();
+            }
+        };
+        self.format_properties[table_index]
+            .get(&internal_format)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn has_native_bgr(&self) -> bool {
@@ -660,28 +717,8 @@ impl TextureCacheRuntime {
     }
 
     /// Port of `TextureCacheRuntime::HasNativeASTC`.
-    /// Checks whether GL_KHR_texture_compression_astc_ldr is supported.
     pub fn has_native_astc(&self) -> bool {
-        // Check for ASTC LDR support via extension
-        let mut num_extensions: i32 = 0;
-        unsafe {
-            gl::GetIntegerv(gl::NUM_EXTENSIONS, &mut num_extensions);
-        }
-        for i in 0..num_extensions {
-            let ext = unsafe {
-                let ptr = gl::GetStringi(gl::EXTENSIONS, i as u32);
-                if ptr.is_null() {
-                    continue;
-                }
-                std::ffi::CStr::from_ptr(ptr as *const i8)
-                    .to_str()
-                    .unwrap_or("")
-            };
-            if ext == "GL_KHR_texture_compression_astc_ldr" {
-                return true;
-            }
-        }
-        false
+        self.has_native_astc
     }
 
     pub fn insert_upload_memory_barrier(&self) {
@@ -2664,6 +2701,7 @@ impl TextureCacheParams {
 pub struct TextureCache {
     pub base: CommonTextureCache,
     runtime: TextureCacheRuntime,
+    standalone_state_tracker: Option<Box<StateTracker>>,
     images: HashMap<ImageId, Image>,
     image_views: HashMap<ImageViewId, ImageView>,
     samplers: HashMap<crate::texture_cache::types::SamplerId, Sampler>,
@@ -2672,7 +2710,6 @@ pub struct TextureCache {
     has_native_astc: bool,
     has_broken_texture_view_formats: bool,
     has_native_bgr: bool,
-    rescale_touched_viewport_scissor: bool,
     texture_decode_worker: ThreadWorker,
 }
 
@@ -2763,6 +2800,58 @@ fn create_null_image_views(
     set_view(TextureType::ColorArrayCube, handles[1]);
     set_view(TextureType::Color2DRect, handles[4]);
     (handles, views)
+}
+
+fn create_format_properties() -> [HashMap<u32, FormatProperties>; 3] {
+    const GL_IMAGE_COMPATIBILITY_CLASS: u32 = 0x82A8;
+    const GL_IMAGE_FORMAT_COMPATIBILITY_TYPE: u32 = 0x90C7;
+    const GL_IMAGE_FORMAT_COMPATIBILITY_BY_SIZE: i32 = 0x90C8;
+    const GL_TEXTURE_COMPRESSED: u32 = 0x86A1;
+
+    let targets = [gl::TEXTURE_1D_ARRAY, gl::TEXTURE_2D_ARRAY, gl::TEXTURE_3D];
+    let mut format_properties: [HashMap<u32, FormatProperties>; 3] =
+        std::array::from_fn(|_| HashMap::new());
+    for (index, target) in targets.into_iter().enumerate() {
+        for tuple in super::maxwell_to_gl::FORMAT_TABLE {
+            let format = tuple.internal_format;
+            let mut compatibility_class = 0;
+            let mut compatibility_type = 0;
+            let mut is_compressed = 0;
+            unsafe {
+                gl::GetInternalformativ(
+                    target,
+                    format,
+                    GL_IMAGE_COMPATIBILITY_CLASS,
+                    1,
+                    &mut compatibility_class,
+                );
+                gl::GetInternalformativ(
+                    target,
+                    format,
+                    GL_IMAGE_FORMAT_COMPATIBILITY_TYPE,
+                    1,
+                    &mut compatibility_type,
+                );
+                gl::GetInternalformativ(
+                    target,
+                    format,
+                    GL_TEXTURE_COMPRESSED,
+                    1,
+                    &mut is_compressed,
+                );
+            }
+            format_properties[index].insert(
+                format,
+                FormatProperties {
+                    compatibility_class: compatibility_class as u32,
+                    compatibility_by_size: compatibility_type
+                        == GL_IMAGE_FORMAT_COMPATIBILITY_BY_SIZE,
+                    is_compressed: is_compressed == gl::TRUE as i32,
+                },
+            );
+        }
+    }
+    format_properties
 }
 
 unsafe fn trace_present_image_grid(
@@ -3178,13 +3267,14 @@ impl TextureCache {
         >,
         device: &super::gl_device::Device,
         program_manager: ProgramManagerHandle,
+        state_tracker: &mut StateTracker,
     ) -> Self {
         Self::new_with_runtime(
             device_memory,
             device.has_astc(),
             device.has_broken_texture_view_formats(),
             false,
-            TextureCacheRuntime::new(device, program_manager),
+            TextureCacheRuntime::new(device, program_manager, state_tracker),
         )
     }
 
@@ -3197,6 +3287,7 @@ impl TextureCache {
         has_native_bgr: bool,
         has_debugging_tool_attached: bool,
         program_manager: ProgramManagerHandle,
+        state_tracker: &mut StateTracker,
     ) -> Self {
         Self::new_with_runtime(
             device_memory,
@@ -3206,8 +3297,11 @@ impl TextureCache {
             TextureCacheRuntime::new_with_caps(
                 has_broken_texture_view_formats,
                 2 * 1024 * 1024 * 1024,
+                false,
+                has_native_astc,
                 has_debugging_tool_attached,
                 program_manager,
+                state_tracker,
             ),
         )
     }
@@ -3228,6 +3322,7 @@ impl TextureCache {
                 has_native_bgr,
             ),
             runtime,
+            standalone_state_tracker: None,
             images: HashMap::new(),
             image_views: HashMap::new(),
             samplers: HashMap::new(),
@@ -3236,7 +3331,6 @@ impl TextureCache {
             has_native_astc,
             has_broken_texture_view_formats,
             has_native_bgr,
-            rescale_touched_viewport_scissor: false,
             texture_decode_worker: ThreadWorker::new_named(1, "TextureDecoder"),
         }
     }
@@ -3244,10 +3338,6 @@ impl TextureCache {
     /// Port of `TextureCache<P>::IsRescaling`.
     pub fn is_rescaling_active(&self) -> bool {
         self.base.is_rescaling_active()
-    }
-
-    pub fn take_rescale_viewport_scissor_dirty(&mut self) -> bool {
-        std::mem::take(&mut self.rescale_touched_viewport_scissor)
     }
 
     fn ensure_backend_image(&mut self, image_id: ImageId) -> bool {
@@ -3313,7 +3403,7 @@ impl TextureCache {
             false,
         );
         if rescaled {
-            self.rescale_touched_viewport_scissor = true;
+            self.runtime.notify_rescale_blit_state_changed();
             if !has_copy {
                 let resolution = settings::values().resolution_info.clone();
                 let scale_up = (resolution.up_scale * resolution.up_scale) as u64;
@@ -3342,7 +3432,7 @@ impl TextureCache {
             false,
         );
         if rescaled {
-            self.rescale_touched_viewport_scissor = true;
+            self.runtime.notify_rescale_blit_state_changed();
             self.invalidate_scale(image_id);
         }
         rescaled
@@ -6742,7 +6832,8 @@ impl Default for TextureCache {
     /// construction goes through `RasterizerOpenGL::new`, which threads
     /// the shared `Arc` from `Host1x::memory_manager()`.
     fn default() -> Self {
-        Self::new_with_caps(
+        let mut state_tracker = Box::new(StateTracker::new());
+        let mut cache = Self::new_with_caps(
             std::sync::Arc::new(
                 crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
             ),
@@ -6751,7 +6842,10 @@ impl Default for TextureCache {
             false,
             false,
             ProgramManager::new_shared_with_caps(false, false),
-        )
+            state_tracker.as_mut(),
+        );
+        cache.standalone_state_tracker = Some(state_tracker);
+        cache
     }
 }
 
