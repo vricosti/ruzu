@@ -1,0 +1,6 @@
+[submodule "externals/rdynarmic"]
+	path = externals/rdynarmic
+	url = git@github.com:vricosti/rdynarmic.git
+[submodule "externals/rxbyak"]
+	path = externals/rxbyak
+	url = git@github.com:vricosti/rxbyak.git
