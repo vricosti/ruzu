@@ -128,6 +128,22 @@ pub struct DescriptorSyncRegs {
     pub tex_sampler_limit: u32,
 }
 
+/// Snapshot of the KeplerCompute registers consumed by
+/// `TextureCacheBase::synchronize_compute_descriptors`.
+///
+/// Mirrors upstream `TextureCache<P>::SynchronizeComputeDescriptors`:
+/// * `kepler_compute->launch_description.linked_tsc`
+/// * `kepler_compute->regs.tic.Address()` / `.limit`
+/// * `kepler_compute->regs.tsc.Address()` / `.limit`
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ComputeDescriptorSyncRegs {
+    pub linked_tsc: bool,
+    pub tic_addr: GPUVAddr,
+    pub tic_limit: u32,
+    pub tsc_addr: GPUVAddr,
+    pub tsc_limit: u32,
+}
+
 // ── TextureCacheChannelInfo ────────────────────────────────────────────
 
 /// Per-channel state for the texture cache.

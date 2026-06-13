@@ -1,3 +1,26 @@
+## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs and video_core/src/texture_cache/texture_cache_base.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `TextureCacheBase::synchronize_compute_descriptors(...)` now ports upstream `TextureCache<P>::SynchronizeComputeDescriptors`: it receives a KeplerCompute snapshot, chooses `tsc_limit = tic_limit` when `linked_tsc` is set, synchronizes compute TSC/TIC descriptor tables, and resizes `compute_sampler_ids` / `compute_image_view_ids` with `CORRUPT_ID`.
+- Rust passes `ComputeDescriptorSyncRegs` instead of reading `kepler_compute` directly because `TextureCacheBase` does not own a KeplerCompute pointer; this matches the existing graphics descriptor snapshot pattern.
+
+### Unintentional differences (to fix)
+- The OpenGL compute dispatch path still does not call this method because `RasterizerOpenGL::dispatch_compute` does not yet drain `KeplerCompute::DispatchCall` or configure an OpenGL `ComputePipeline`.
+
+### Missing items
+- Thread `ComputeDescriptorSyncRegs` from `KeplerCompute::DispatchCall` into OpenGL compute dispatch/configure, then call `synchronize_compute_descriptors(...)` at the upstream `ComputePipeline::Configure` point.
+- Port OpenGL `ComputePipeline::Configure` texture/sampler/image binding so synchronized compute descriptors are consumed by dispatch.
+- Apply backend blacklist `ScaleDown(image)` to `FillComputeImageViews` once the OpenGL compute configure path calls through the backend texture-cache wrapper.
+
+### Binary layout verification
+- PASS: no guest-visible payload changed; TIC/TSC descriptors remain raw 32-byte entries.
+
+### Tests
+- Re-read upstream `TextureCache<P>::SynchronizeComputeDescriptors` and OpenGL `ComputePipeline::Configure`.
+- `cargo fmt --all --check`
+- `cargo test -p video_core synchronize_compute_descriptors -- --nocapture`
+- `cargo check -p video_core --quiet`
+
 ## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs and video_core/src/texture_cache/texture_cache_base.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h
 
 ### Intentional differences
@@ -6,10 +29,9 @@
 - `TextureCacheChannelInfo` comments now describe the current descriptor-table ownership instead of the old pre-reader stub state.
 
 ### Unintentional differences (to fix)
-- `TextureCacheBase::synchronize_compute_descriptors(...)` is still a stub because ruzu has not yet passed the upstream `kepler_compute->regs` / `launch_description.linked_tsc` snapshot into the texture cache. Without that call, production compute descriptor tables are not synchronized by the OpenGL compute path.
+- None known for compute TIC/TSC descriptor-read ownership after this slice; compute descriptor synchronization is tracked in the newer 2026-06-13 entry above.
 
 ### Missing items
-- Port `TextureCache<P>::SynchronizeComputeDescriptors` with a Rust snapshot of KeplerCompute TIC/TSC address, limit, and linked-TSC state.
 - Port OpenGL `ComputePipeline::Configure` texture/sampler/image binding so the newly ported compute descriptor reads are consumed by dispatch.
 - Apply the backend blacklist `ScaleDown(image)` side effect to `FillComputeImageViews` once the OpenGL compute configure path calls through the backend texture-cache wrapper.
 
