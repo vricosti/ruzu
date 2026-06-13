@@ -68,7 +68,8 @@
 ## 2026-06-13 — `core/src/memory/memory.rs`, `video_core/src/texture_cache/texture_cache_base.rs`, `video_core/src/renderer_opengl/gl_texture_cache.rs`, and `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/memory.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`
 
 ### Intentional differences
-- `Memory::handle_rasterizer_download(...)` still resolves the current device address through ruzu's page-table `backing_addr` instead of upstream's `gpu_device_memory->ApplyOpOnPointer(...)` bridge, but now keeps the upstream-style per-host-core `rasterizer_read_areas` coverage cache before calling the core-facing `GpuCore::on_cpu_read(device_addr, size)` bridge. Rust wraps each per-core cached area in a `Mutex` because `Memory` cache/download methods take `&self`; the lock is released before entering the GPU bridge and reacquired to store the returned area, preserving the upstream coverage predicate without holding a memory-internal lock across backend code.
+- `Memory::handle_rasterizer_download(...)` now follows upstream's host-pointer path for production construction: it obtains `GetPointerImpl(vaddr)`, asks the Host1x device-memory bridge to apply the operation to every SMMU/device alias of that host pointer, and runs the upstream-style per-host-core `rasterizer_read_areas` coverage predicate before calling the core-facing `GpuCore::on_cpu_read(device_addr, size)` bridge. Rust wraps each per-core cached area in a `Mutex` because `Memory` cache/download methods take `&self`; the lock is released before entering the GPU bridge and reacquired to store the returned area, preserving the upstream coverage predicate without holding a memory-internal lock across backend code.
+- If `System` has no Host1x owner or the Host1x bridge finds no alias, `Memory::handle_rasterizer_download(...)` falls back to the page-table `backing_addr` device address. This keeps reduced unit-test construction usable; production Host1x construction uses the upstream-shaped alias fan-out path.
 - `TextureCacheBase::get_flush_area(...)` owns the backend-independent `TextureCache<P>::GetFlushArea(...)` logic: CPU-region image scan, GPU-modified filtering, area expansion over image CPU ranges, image-view `PREEMTIVE_DOWNLOAD` marking, and `ImageInfo::forced_flushed` update. `OpenGLTextureCache::get_flush_area(...)` is a thin wrapper because ruzu splits upstream's templated common/backend cache storage.
 - `RasterizerOpenGL::get_flush_area(...)` now consults texture cache first, then buffer cache, then returns the default preemptive aligned area, matching upstream `RasterizerOpenGL::GetFlushArea(...)` ordering.
 
@@ -76,7 +77,7 @@
 - The OpenGL wrapper for texture `get_flush_area(...)` exists only because ruzu stores backend-independent texture state in `TextureCacheBase` and backend GL objects in `OpenGLTextureCache`; upstream owns both under one `TextureCache<P>` template instance.
 
 ### Missing items
-- Replace the remaining `current_physical_address(...)` shortcut with an upstream-faithful GPU device-memory `ApplyOpOnPointer(...)` bridge when ruzu has a stable Host1x memory-manager owner in `core`.
+- Remove the reduced-construction `backing_addr` fallback in `Memory::handle_rasterizer_download(...)` if all tests and non-OpenGL construction grow a Host1x SMMU owner.
 
 ### Binary layout verification
 - N/A: CPU/GPU cache-coherency path only. No guest-visible raw payload layout changed.
@@ -84,7 +85,9 @@
 ### Tests
 - Re-read upstream `Memory::Impl::Read<T>`, `Memory::Impl::ReadBlockImpl`, `Memory::Impl::CopyBlock`, `Memory::Impl::InvalidateDataCache`, and `Memory::Impl::HandleRasterizerDownload`.
 - Re-read upstream `Memory::Impl::InvalidateDataCache` and `Memory::Impl::HandleRasterizerDownload` again for the per-host-core `rasterizer_read_areas` cache update.
+- Re-read upstream `Memory::Impl::HandleRasterizerDownload`, ruzu `Host1xCoreInterface::smmu_apply_op_on_host_pointer`, and video_core `MaxwellDeviceMemoryManager::smmu_apply_op_on_host_pointer` while replacing the production `current_physical_address(...)` shortcut with Host1x alias fan-out.
 - `cargo test -p core rasterizer_download_skips_reads_covered_by_current_core_area -- --nocapture`
+- `cargo test -p core rasterizer_download_ -- --nocapture`
 - Re-read upstream `RasterizerOpenGL::GetFlushArea`, `TextureCache<P>::GetFlushArea`, `BufferCache<P>::GetFlushArea`, and `GPU::Impl::OnCPURead`.
 - `cargo test -p video_core get_flush_area_marks_gpu_modified_image_views_preemptive -- --nocapture`
 - `cargo check -p core`

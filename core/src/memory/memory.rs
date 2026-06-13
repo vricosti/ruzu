@@ -1056,31 +1056,40 @@ impl Memory {
     }
 
     fn handle_rasterizer_download(&self, vaddr: u64, size: usize) {
-        let Some(device_addr) = self.current_physical_address(vaddr) else {
-            return;
-        };
-
         if self.system.is_null() {
             return;
         }
 
+        let host_ptr = self.get_pointer_impl(vaddr);
         let Some(gpu) = self.system.get().gpu_core() else {
             return;
         };
 
         let core = self.current_host_thread_cache_index();
-        let end_address = device_addr.wrapping_add(size as u64);
-
-        {
-            let current_area = self.rasterizer_read_areas[core].lock().unwrap();
-            if current_area.start_address <= device_addr && end_address <= current_area.end_address
+        let mut download = |device_addr: u64| {
+            let end_address = device_addr.wrapping_add(size as u64);
             {
+                let current_area = self.rasterizer_read_areas[core].lock().unwrap();
+                if current_area.start_address <= device_addr
+                    && end_address <= current_area.end_address
+                {
+                    return;
+                }
+            }
+
+            let new_area = gpu.on_cpu_read(device_addr, size as u64);
+            *self.rasterizer_read_areas[core].lock().unwrap() = new_area;
+        };
+
+        if let Some(host1x) = self.system.get().host1x_core() {
+            if host1x.smmu_apply_op_on_host_pointer(host_ptr as usize, &mut download) != 0 {
                 return;
             }
         }
 
-        let new_area = gpu.on_cpu_read(device_addr, size as u64);
-        *self.rasterizer_read_areas[core].lock().unwrap() = new_area;
+        if let Some(device_addr) = self.current_physical_address(vaddr) {
+            download(device_addr);
+        }
     }
 
     fn handle_rasterizer_download_for_read_range(&self, start_addr: u64, size: usize) {
@@ -2680,6 +2689,7 @@ mod rasterizer_download_tests {
         GpuMemoryManagerHandle, RasterizerDownloadArea,
     };
     use crate::hle::service::nvdrv::nvdata::NvFence;
+    use crate::host1x_core::{Host1xChannelType, Host1xCoreInterface};
 
     struct FakeGpuMemoryManagerHandle;
 
@@ -2761,6 +2771,123 @@ mod rasterizer_download_tests {
         fn flush_region(&self, _addr: u64, _size: u64) {}
     }
 
+    struct FakeHost1xCore {
+        applied_host_ptrs: Arc<Mutex<Vec<usize>>>,
+        aliases: Vec<u64>,
+    }
+
+    impl Host1xCoreInterface for FakeHost1xCore {
+        fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+            self
+        }
+
+        fn get_host_syncpoint_value(&self, _id: u32) -> u32 {
+            0
+        }
+
+        fn wait_host(&self, _id: u32, _expected_value: u32) {}
+
+        fn register_host_action(
+            &self,
+            _id: u32,
+            _expected_value: u32,
+            _action: Box<dyn FnOnce() + Send>,
+        ) -> Option<u64> {
+            None
+        }
+
+        fn deregister_host_action(&self, _id: u32, _handle: u64) {}
+
+        fn smmu_allocate(&self, _size: usize) -> u64 {
+            0
+        }
+
+        fn smmu_register_process(&self, _memory: Option<Arc<Mutex<Memory>>>) -> u32 {
+            0
+        }
+
+        fn smmu_unregister_process(&self, _asid: u32) {}
+
+        fn smmu_free(&self, _d_address: u64, _size: usize) {}
+
+        fn smmu_map(
+            &self,
+            _d_address: u64,
+            _virtual_address: u64,
+            _size: usize,
+            _asid: u32,
+            _track: bool,
+        ) {
+        }
+
+        fn smmu_track_continuity(&self, _d_address: u64, _size: usize) {}
+
+        fn smmu_unmap(&self, _d_address: u64, _size: usize) {}
+
+        fn smmu_lookup(&self, _d_address: u64) -> usize {
+            0
+        }
+
+        fn smmu_apply_op_on_host_pointer(
+            &self,
+            host_ptr: usize,
+            operation: &mut dyn FnMut(u64),
+        ) -> usize {
+            self.applied_host_ptrs.lock().unwrap().push(host_ptr);
+            for &alias in &self.aliases {
+                operation(alias);
+            }
+            self.aliases.len()
+        }
+
+        fn bind_device_memory_invalidator(&self, _callback: Box<dyn Fn(u64, usize) + Send + Sync>) {
+        }
+
+        fn bind_device_memory_flusher(&self, _callback: Box<dyn Fn(u64, usize) + Send + Sync>) {}
+
+        fn host1x_gmmu_map_low(&self, _d_address: u64, _size: usize) -> u32 {
+            0
+        }
+
+        fn host1x_gmmu_unmap_low(&self, _gpu_address: u32, _size: usize) {}
+
+        fn start_device(&self, _fd: i32, _channel_type: Host1xChannelType, _syncpt: u32) {}
+
+        fn stop_device(&self, _fd: i32, _channel_type: Host1xChannelType) {}
+
+        fn push_entries(&self, _fd: i32, _entries: Vec<u32>) {}
+    }
+
+    fn make_rasterizer_cached_memory(
+        system: &System,
+    ) -> (Box<DeviceMemory>, Box<PageTable>, Memory, u64, u64) {
+        let device_memory = Box::new(DeviceMemory::with_size(0x20_000));
+        let mut page_table = Box::new(PageTable::new());
+        page_table.resize(16, PAGE_BITS);
+        let vaddr = 0x4000u64;
+        let device_addr = dram_memory_map::BASE + 0x2000;
+        let host_ptr = (device_memory.buffer.backing_base_pointer() as usize)
+            .wrapping_add((device_addr - dram_memory_map::BASE) as usize);
+        page_table.map_pages(
+            (vaddr >> PAGE_BITS) as usize,
+            1,
+            device_addr,
+            PageType::RasterizerCachedMemory,
+            host_ptr,
+        );
+
+        let mut memory = unsafe {
+            Memory::new(
+                SystemRef::from_ref(system),
+                &*device_memory,
+                &device_memory.buffer,
+            )
+        };
+        memory.set_current_page_table(&mut *page_table);
+
+        (device_memory, page_table, memory, vaddr, device_addr)
+    }
+
     #[test]
     fn rasterizer_download_skips_reads_covered_by_current_core_area() {
         let reads = Arc::new(Mutex::new(Vec::new()));
@@ -2770,33 +2897,40 @@ mod rasterizer_download_tests {
             download_size: 0x100,
         }));
 
-        let device_memory = DeviceMemory::with_size(0x20_000);
-        let mut page_table = PageTable::new();
-        page_table.resize(16, PAGE_BITS);
-        let vaddr = 0x4000u64;
-        let device_addr = dram_memory_map::BASE + 0x2000;
-        page_table.map_pages(
-            (vaddr >> PAGE_BITS) as usize,
-            1,
-            device_addr,
-            PageType::RasterizerCachedMemory,
-            1,
-        );
-
-        let mut memory = unsafe {
-            Memory::new(
-                SystemRef::from_ref(&system),
-                &device_memory,
-                &device_memory.buffer,
-            )
-        };
-        memory.set_current_page_table(&mut page_table);
+        let (_device_memory, _page_table, memory, vaddr, device_addr) =
+            make_rasterizer_cached_memory(&system);
 
         memory.handle_rasterizer_download(vaddr + 0x20, 4);
         memory.handle_rasterizer_download(vaddr + 0x40, 4);
 
         let reads = reads.lock().unwrap();
         assert_eq!(&*reads, &[(device_addr + 0x20, 4)]);
+    }
+
+    #[test]
+    fn rasterizer_download_uses_host1x_pointer_alias_when_available() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let applied_host_ptrs = Arc::new(Mutex::new(Vec::new()));
+        let host1x_device_addr = 0x1234_5020;
+        let mut system = System::new_for_test();
+        system.set_gpu_core(Box::new(FakeGpuCore {
+            reads: reads.clone(),
+            download_size: 0x80,
+        }));
+        system.set_host1x_core(Box::new(FakeHost1xCore {
+            applied_host_ptrs: applied_host_ptrs.clone(),
+            aliases: vec![host1x_device_addr],
+        }));
+
+        let (_device_memory, _page_table, memory, vaddr, backing_device_addr) =
+            make_rasterizer_cached_memory(&system);
+
+        memory.handle_rasterizer_download(vaddr + 0x20, 4);
+
+        assert_eq!(applied_host_ptrs.lock().unwrap().len(), 1);
+        let reads = reads.lock().unwrap();
+        assert_eq!(&*reads, &[(host1x_device_addr, 4)]);
+        assert_ne!(reads[0].0, backing_device_addr + 0x20);
     }
 }
 
