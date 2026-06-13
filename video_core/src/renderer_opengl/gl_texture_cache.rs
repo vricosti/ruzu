@@ -727,6 +727,12 @@ impl TextureCacheRuntime {
         }
     }
 
+    pub fn transition_image_layout(&self, _image: &ImageBase) {}
+
+    pub fn tick_frame(&self) {}
+
+    pub fn barrier_feedback_loop(&self) {}
+
     pub fn accelerate_image_upload(
         &mut self,
         image_handle: u32,
@@ -3315,12 +3321,14 @@ impl TextureCache {
         has_native_bgr: bool,
         runtime: TextureCacheRuntime,
     ) -> Self {
+        let mut base = CommonTextureCache::new_with_caps(
+            device_memory,
+            has_broken_texture_view_formats,
+            has_native_bgr,
+        );
+        base.configure_device_memory_budget(runtime.get_device_local_memory());
         Self {
-            base: CommonTextureCache::new_with_caps(
-                device_memory,
-                has_broken_texture_view_formats,
-                has_native_bgr,
-            ),
+            base,
             runtime,
             standalone_state_tracker: None,
             images: HashMap::new(),
@@ -3900,9 +3908,12 @@ impl TextureCache {
         } else {
             // Upstream `PrepareImage` always runs `SynchronizeAliases` after
             // `RefreshContents`. The reader-less Rust path cannot refresh
-            // guest CPU writes, but alias synchronization is a backend-local
-            // copy and must still run before sampling or modifying the image.
-            self.synchronize_aliases(image_id);
+            // guest CPU writes; only run the backend-local alias copy when
+            // `RefreshContents` would be a no-op, otherwise we could propagate
+            // stale backend texture contents.
+            if self.can_synchronize_aliases_without_refresh(image_id) {
+                self.synchronize_aliases(image_id);
+            }
         }
         if is_modification {
             self.base.mark_modification_by_id(image_id);
@@ -4007,6 +4018,12 @@ impl TextureCache {
             self.base.track_image(image_id);
         }
 
+        if base_image.info.num_samples > 1 && !self.runtime.can_upload_msaa() {
+            log::warn!("MSAA image uploads are not implemented");
+            self.runtime.transition_image_layout(&base_image);
+            return;
+        }
+
         if base_image
             .flags
             .contains(ImageFlagBits::ASYNCHRONOUS_DECODE)
@@ -4033,6 +4050,13 @@ impl TextureCache {
             self.runtime.insert_upload_memory_barrier();
             return;
         }
+    }
+
+    fn can_synchronize_aliases_without_refresh(&self, image_id: ImageId) -> bool {
+        image_id.is_valid()
+            && !self.base.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::CPU_MODIFIED)
     }
 
     /// Port of upstream `TextureCache<P>::SynchronizeAliases`.
@@ -5355,7 +5379,12 @@ impl TextureCache {
     }
 
     pub fn tick_frame(&mut self) {
+        if self.runtime.can_report_memory_usage() {
+            self.base
+                .update_total_used_memory_from_runtime(self.runtime.get_device_memory_usage());
+        }
         self.tick_async_decode();
+        self.runtime.tick_frame();
         self.base.tick_frame();
     }
 
@@ -5440,10 +5469,12 @@ impl TextureCache {
                 } else {
                     // Upstream `PrepareImage(image_id, true, false)` always
                     // synchronizes aliases before marking the render target as
-                    // modified. The reader-less Rust path cannot refresh
-                    // CPU-modified contents, but alias synchronization is
-                    // backend-local and must still run.
-                    self.synchronize_aliases(image_id);
+                    // modified. The reader-less Rust path cannot refresh CPU
+                    // writes, so only run alias copies when RefreshContents
+                    // would be a no-op.
+                    if self.can_synchronize_aliases_without_refresh(image_id) {
+                        self.synchronize_aliases(image_id);
+                    }
                 }
                 self.base.mark_modification_by_id(image_id);
             }

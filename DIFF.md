@@ -1614,14 +1614,14 @@
 
 ### Intentional differences
 - `TextureCache::prepare_image_with_gpu_reader` now calls an OpenGL-owned `synchronize_aliases(image_id)` immediately after `refresh_contents_with_gpu_reader`, matching upstream `TextureCache<P>::PrepareImage` ordering (`RefreshContents` then `SynchronizeAliases`, before `MarkModification`).
-- `TextureCache::prepare_image_without_gpu_reader` preserves the backend-local part of upstream `PrepareImage` when the draw path lacks a guest-memory reader: it still runs `SynchronizeAliases` before sampled image views are materialized or bound. Rust still cannot perform `RefreshContents` in this fallback because the common cache does not own the OpenGL upload path.
+- `TextureCache::prepare_image_without_gpu_reader` preserves the backend-local part of upstream `PrepareImage` when the draw path lacks a guest-memory reader and `RefreshContents` would be a no-op: it runs `SynchronizeAliases` before sampled image views are materialized or bound only when the image is not still `CPU_MODIFIED`.
 - `TextureCache::prepare_render_targets_from_snapshot` also calls the OpenGL-owned `synchronize_aliases(image_id)` in the reader-less non-invalidate path before `mark_modification_by_id`, preserving upstream `PrepareImage(image_id, true, false)` ordering when render-target preparation has no guest-memory reader available.
 - Ported upstream `SynchronizeAliases` tick/flag propagation and modification-tick sorting for registered `aliased_images`. Rust clones the alias copy list before copying so the borrow model stays safe while preserving the upstream source/destination ordering.
 - Ported upstream OpenGL `MakeCopyOrigin`, `MakeCopyRegion`, and the direct `TextureCacheRuntime::CopyImage` path through `glCopyImageSubData` for ordinary same-format, same-sample-count texture aliases.
 - Added env-gated `RUZU_TRACE_ALIAS_SYNC=1` logging for alias-copy skips and GL copy errors. Upstream has no equivalent diagnostic hook; default execution is unchanged.
 
 ### Unintentional differences (to fix)
-- Upstream `PrepareImage` always performs `RefreshContents` before `SynchronizeAliases`. Ruzu's reader-less fallback can only perform alias synchronization; CPU-modified texture upload still requires the `prepare_image_with_gpu_reader` path.
+- Upstream `PrepareImage` always performs `RefreshContents` before `SynchronizeAliases`. Ruzu's reader-less fallback skips alias synchronization when the image is still `CPU_MODIFIED`, because CPU-modified texture upload still requires the `prepare_image_with_gpu_reader` path.
 - Upstream routes all copy policy through `TextureCacheRuntime`. Rust now covers direct copies, MSAA copies, BGR/format conversion via `FormatConversionPass`, BC4 3D emulated copies through `UtilShaders::copy_bc4`, and the S8D24 post-conversion component swap through `UtilShaders::convert_s8d24`.
 - Ruzu still depends on registered `aliased_images`; if the image insertion path failed to create aliases because `JoinImages` / `ResolveOverlap` parity is incomplete, this synchronization has no aliases to process.
 
@@ -18228,7 +18228,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - None known for the null-image ownership slice after re-reading upstream `TextureCacheRuntime::TextureCacheRuntime`, `TextureCacheRuntime::~TextureCacheRuntime`, `ImageView::ImageView(TextureCacheRuntime&, ...)`, and the runtime member declarations.
 
 ### Missing items
-- Broader runtime parity remains tracked separately: the exact `StateTracker&` ownership is still not fully shaped like upstream `TextureCacheRuntime`.
+- Broader runtime parity remains tracked separately: exact external `StagingBufferPool&`, `const Device&`, and backend `Image&` ownership still differ from upstream `TextureCacheRuntime`.
 
 ### Binary layout verification
 - N/A: OpenGL host texture handles and image-view default bindings only. No guest-visible raw payload layout changed.
@@ -18238,7 +18238,73 @@ The following still panic because upstream either also throws NotImplementedExce
 - `cargo fmt --all --check`
 - `git diff --check`
 - `cargo check -p video_core --quiet`
-- `cargo test -p video_core texture_cache::texture_cache::tests::update_render_targets_from_snapshot_registers_presentable_view -- --nocapture`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache_base.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- Rust now configures OpenGL texture-cache memory budgets with the upstream `HAS_DEVICE_MEMORY_INFO` constructor branch. `TextureCacheBase::configure_device_memory_budget(...)` mirrors upstream's `device_local_memory`, `min_spacing_expected`, `min_spacing_critical`, `mem_threshold`, `min_vacancy_expected`, `min_vacancy_critical`, `expected_memory`, `critical_memory`, and `minimum_memory` formula.
+- `OpenGL::TextureCache::new_with_runtime(...)` calls that budget helper with `TextureCacheRuntime::get_device_local_memory()`, matching OpenGL `TextureCacheParams::HAS_DEVICE_MEMORY_INFO = true`.
+- `OpenGL::TextureCache::tick_frame(...)` now applies upstream's first `TickFrame` step: when the runtime can report memory usage, replace the cache estimate with `TextureCacheRuntime::get_device_memory_usage()` before async decode/runtime/common ticking.
+
+### Unintentional differences (to fix)
+- Rust still does not run upstream `RunGarbageCollector()` from `TickFrame` because the common cache has no faithful LRU cache, delayed destruction rings, backend image download/delete hooks, or real `sentenced_*` rings yet. Calling the current stub every frame would only log without evicting.
+
+### Missing items
+- Port the LRU/delayed-destruction owner graph needed for full `TextureCache<P>::RunGarbageCollector`, `sentenced_images.Tick()`, `sentenced_framebuffers.Tick()`, and `sentenced_image_view.Tick()` parity.
+
+### Binary layout verification
+- N/A: host memory-budget accounting and frame lifecycle only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::TextureCache`, `TextureCache<P>::TickFrame`, `TextureCache<P>::RunGarbageCollector`, and OpenGL `TextureCacheParams::HAS_DEVICE_MEMORY_INFO`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core configure_device_memory_budget_matches_upstream_formula -- --nocapture`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust `TextureCacheBase::check_feedback_loop(...)` now ports the upstream `TextureCache<P>::CheckFeedbackLoop` scan over sampled `ImageViewInOut` entries, current color render-target image views, and the depth render target. It returns the backend-independent `requires_barrier` boolean instead of directly calling `runtime.BarrierFeedbackLoop()` because ruzu's common cache does not own the OpenGL runtime reference.
+- Null image-view ids are skipped explicitly (`NULL_IMAGE_VIEW_ID`) to preserve upstream's `if (!view.id) continue` / `if (ct_view_id)` semantics with Rust `SlotId(0)`.
+- No new OpenGL draw-path call was added in this slice: upstream `gl_graphics_pipeline.cpp::ConfigureImpl` in the compared tree calls `FillGraphicsImageViews` and `UpdateRenderTargets`, but does not call `CheckFeedbackLoop` there.
+
+### Unintentional differences (to fix)
+- If an upstream call site for `CheckFeedbackLoop` is restored or found in another backend path, ruzu still needs the wrapper-level call that maps `requires_barrier` to `TextureCacheRuntime::barrier_feedback_loop()`.
+
+### Missing items
+- None known for the backend-independent feedback-loop detection predicate after re-reading upstream `TextureCache<P>::CheckFeedbackLoop`.
+
+### Binary layout verification
+- N/A: texture-cache image-view comparison only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::CheckFeedbackLoop` and OpenGL `gl_graphics_pipeline.cpp::ConfigureImpl` ordering.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core check_feedback_loop -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Reader-less `OpenGL::TextureCache::{prepare_image_without_gpu_reader,prepare_render_targets_from_snapshot}` now call `SynchronizeAliases` only when `RefreshContents` would be a no-op (`CPU_MODIFIED` is not set). Upstream always executes `RefreshContents` before `SynchronizeAliases`; without a channel GPU reader, Rust cannot upload CPU-modified guest contents, so copying backend aliases in that state could propagate stale texture data.
+- This keeps reader-less alias synchronization for already-clean images, preserving the backend-local part of upstream `PrepareImage` when no upload is required.
+
+### Unintentional differences (to fix)
+- CPU-modified images in reader-less paths still cannot complete upstream `RefreshContents`; they wait for a later path with a GPU reader to upload contents before alias synchronization can safely run.
+
+### Missing items
+- Move `RefreshContents` / `UploadImageContents` ownership into a common/backend hook shape so every `PrepareImage` caller can execute the upstream refresh-before-alias order without requiring separate reader/non-reader wrappers.
+
+### Binary layout verification
+- N/A: OpenGL texture-cache ordering guard only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::PrepareImage` and `TextureCache<P>::RefreshContents`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
 
 ## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
 
@@ -18417,3 +18483,26 @@ The following still panic because upstream either also throws NotImplementedExce
 - `cargo check -p video_core --quiet`
 - `cargo test -p video_core astc_upload_flags_follow_upstream_policy -- --nocapture`
 - `cargo test -p video_core s8d24 -- --nocapture` (0 tests matched; compile-only evidence for this filter)
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- Rust now exposes OpenGL runtime counterparts for upstream `TextureCacheRuntime::{TransitionImageLayout,TickFrame,BarrierFeedbackLoop}`. They are no-ops like upstream's OpenGL backend; `transition_image_layout` receives `&ImageBase` instead of upstream `Image&` because ruzu's backend image table is still split from the common image owner.
+- `TextureCache::tick_frame` now calls `runtime.tick_frame()` between async decode ticking and the common frame tick. Upstream calls `runtime.TickFrame()` before incrementing `frame_tick`; Rust keeps the existing async-decode ordering from the current OpenGL wrapper split, then preserves the runtime/common tick relationship.
+- `refresh_contents_with_gpu_reader` now includes the upstream MSAA upload guard (`num_samples > 1 && !runtime.CanUploadMSAA()`), logs the same unsupported condition, calls the OpenGL no-op transition hook, and returns. Since OpenGL `can_upload_msaa()` is true, this is behavior-preserving today.
+
+### Unintentional differences (to fix)
+- None known for the OpenGL runtime no-op hook and MSAA guard slice after re-reading upstream `TextureCache<P>::TickFrame`, `TextureCache<P>::RefreshContents`, and `TextureCacheRuntime::{TransitionImageLayout,TickFrame,BarrierFeedbackLoop}`.
+
+### Missing items
+- Full common `TextureCache<P>::TickFrame` parity remains broader than this slice: Rust still lacks the upstream delayed-destruction rings and memory-pressure garbage-collector ordering in the common texture-cache layer.
+- Backend `Image&` ownership remains split, so `transition_image_layout` cannot yet take the exact upstream OpenGL `Image&` type.
+
+### Binary layout verification
+- N/A: OpenGL runtime no-op hooks and frame lifecycle only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::TickFrame`, `TextureCache<P>::RefreshContents`, and `TextureCacheRuntime::{TransitionImageLayout,TickFrame,BarrierFeedbackLoop}`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
