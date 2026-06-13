@@ -4061,6 +4061,9 @@ impl TextureCache {
         if !image_id.is_valid() {
             return;
         }
+        if self.prepare_image_with_bound_gpu_reader(image_id, is_modification, invalidate) {
+            return;
+        }
         self.ensure_backend_image_flags(image_id);
         if invalidate {
             let image = &mut self.base.slot_images[image_id];
@@ -4087,6 +4090,24 @@ impl TextureCache {
             self.base.mark_modification_by_id(image_id);
         }
         self.base.touch_image(image_id);
+    }
+
+    fn prepare_image_with_bound_gpu_reader(
+        &mut self,
+        image_id: ImageId,
+        is_modification: bool,
+        invalidate: bool,
+    ) -> bool {
+        let Some(gpu_memory) = self.base.channel_gpu_memory.as_ref().cloned() else {
+            return false;
+        };
+        self.prepare_image_with_gpu_reader(
+            image_id,
+            is_modification,
+            invalidate,
+            &mut |addr, out| gpu_memory.lock().read_block(addr, out),
+        );
+        true
     }
 
     /// OpenGL-backed port of `TextureCache<P>::PrepareImage`.
@@ -5661,6 +5682,9 @@ impl TextureCache {
             if let Some(reader) = read_gpu.as_deref_mut() {
                 self.prepare_image_with_gpu_reader(image_id, true, invalidate, reader);
             } else {
+                if self.prepare_image_with_bound_gpu_reader(image_id, true, invalidate) {
+                    continue;
+                }
                 if invalidate {
                     let image = &mut self.base.slot_images[image_id];
                     image
