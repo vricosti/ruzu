@@ -17,8 +17,8 @@ use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::psc::time::clocks::context_writers::ContextWriter;
 use crate::hle::service::psc::time::common::{
-    AlarmInfo, ClockSourceId, LocationName, OperationEvent, RuleVersion, StaticServiceSetupInfo,
-    SteadyClockTimePoint, SystemClockContext,
+    convert_to_time_span_ns, AlarmInfo, ClockSourceId, LocationName, OperationEvent, RuleVersion,
+    StaticServiceSetupInfo, SteadyClockTimePoint, SystemClockContext,
 };
 use crate::hle::service::psc::time::r#static::StaticService;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -53,7 +53,7 @@ impl TimeServiceManager {
             if system.is_null() {
                 0
             } else {
-                system.get().get_core_timing_ticks() as i64
+                convert_to_time_span_ns(system.get().get_core_timing_ticks() as i64)
             }
         });
 

@@ -696,6 +696,62 @@ impl IProfileCommon {
         unsafe { &*(this as *const dyn ServiceFramework as *const IProfileCommon) }
     }
 
+    fn trace_profile(
+        stage: u64,
+        result: ResultCode,
+        base: Option<&ProfileBase>,
+        data: Option<&UserData>,
+    ) {
+        if !common::trace::is_enabled(common::trace::cat::ACC_PROFILE) {
+            return;
+        }
+        let (user_lo, user_hi, timestamp, name0, name1) = if let Some(base) = base {
+            let user_lo = u64::from_le_bytes(base.user_uuid[0..8].try_into().unwrap());
+            let user_hi = u64::from_le_bytes(base.user_uuid[8..16].try_into().unwrap());
+            let mut name0 = [0u8; 8];
+            let mut name1 = [0u8; 8];
+            name0.copy_from_slice(&base.username[0..8]);
+            name1.copy_from_slice(&base.username[8..16]);
+            (
+                user_lo,
+                user_hi,
+                base.timestamp,
+                u64::from_le_bytes(name0),
+                u64::from_le_bytes(name1),
+            )
+        } else {
+            (0, 0, 0, 0, 0)
+        };
+        let (data0, data1) = if let Some(data) = data {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    data as *const UserData as *const u8,
+                    std::mem::size_of::<UserData>(),
+                )
+            };
+            (
+                u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+                u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            )
+        } else {
+            (0, 0)
+        };
+        common::trace::emit_raw(
+            common::trace::cat::ACC_PROFILE,
+            &[
+                stage,
+                result.get_inner_value() as u64,
+                user_lo,
+                user_hi,
+                timestamp,
+                name0,
+                name1,
+                data0,
+                data1,
+            ],
+        );
+    }
+
     /// Upstream: IProfileCommon::Get (cmd 0)
     fn get_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
@@ -704,6 +760,7 @@ impl IProfileCommon {
 
         let index = pm.get_user_index(svc.user_id);
         if let Some((base, data)) = pm.get_profile_base_and_data(index) {
+            Self::trace_profile(1, RESULT_SUCCESS, Some(&base), Some(&data));
             // Write UserData to output buffer
             let data_bytes = unsafe {
                 std::slice::from_raw_parts(
@@ -717,6 +774,7 @@ impl IProfileCommon {
             rb.push_result(RESULT_SUCCESS);
             rb.push_raw(&base);
         } else {
+            Self::trace_profile(1, ResultCode::new(1), None, None);
             log::error!(
                 "IProfileCommon::Get: Failed to get profile base and data for user=0x{:032x}",
                 svc.user_id
@@ -736,10 +794,12 @@ impl IProfileCommon {
         );
 
         if let Some(base) = pm.get_profile_base_by_uuid(svc.user_id) {
+            Self::trace_profile(2, RESULT_SUCCESS, Some(&base), None);
             let mut rb = ResponseBuilder::new(ctx, 16, 0, 0);
             rb.push_result(RESULT_SUCCESS);
             rb.push_raw(&base);
         } else {
+            Self::trace_profile(2, ResultCode::new(1), None, None);
             log::error!(
                 "IProfileCommon::GetBase: Failed to get profile base for user=0x{:032x}",
                 svc.user_id

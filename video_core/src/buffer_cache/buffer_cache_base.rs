@@ -530,6 +530,14 @@ pub trait BufferCacheRuntime {
     /// to each stage-local storage binding index.
     fn set_base_storage_bindings(&mut self, _bindings: &[u32; NUM_STAGES as usize]) {}
 
+    /// Set the output arrays used by OpenGL texture/image-buffer binding.
+    ///
+    /// Upstream: `BufferCacheRuntime::SetImagePointers(GLuint*, GLuint*)`.
+    /// `BindHostStageBuffers` writes TBO/image-buffer texture names through
+    /// these pointers before the pipeline bulk-calls `glBindTextures` /
+    /// `glBindImageTextures`.
+    fn set_image_pointers(&mut self, _texture_handles: *mut u32, _image_handles: *mut u32) {}
+
     /// Select GL SSBO binding mode for graphics/compute storage buffers.
     ///
     /// Upstream OpenGL uses real `GL_SHADER_STORAGE_BUFFER` bindings for GLSL
@@ -558,12 +566,26 @@ pub trait BufferCacheRuntime {
     /// Bind a texture buffer view.
     ///
     /// Upstream: `Runtime::BindTextureBuffer(buffer, offset, size, format)`
-    fn bind_texture_buffer(&mut self, buffer: BufferId, offset: u32, size: u32, format: u32);
+    fn bind_texture_buffer(
+        &mut self,
+        buffer: BufferId,
+        gpu_handle: u32,
+        offset: u32,
+        size: u32,
+        format: u32,
+    );
 
     /// Bind an image buffer view (separate from texture on some backends).
     ///
     /// Upstream: `Runtime::BindImageBuffer(buffer, offset, size, format)`
-    fn bind_image_buffer(&mut self, buffer: BufferId, offset: u32, size: u32, format: u32);
+    fn bind_image_buffer(
+        &mut self,
+        buffer: BufferId,
+        gpu_handle: u32,
+        offset: u32,
+        size: u32,
+        format: u32,
+    );
 
     // -- Transform feedback --
 

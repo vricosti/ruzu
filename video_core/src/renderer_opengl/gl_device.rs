@@ -157,12 +157,28 @@ impl Device {
             && has_ext("GL_NV_compute_program5")
             && has_ext("GL_NV_transform_feedback")
             && has_ext("GL_NV_transform_feedback2");
-        let use_asynchronous_shaders = has_ext("GL_ARB_parallel_shader_compile");
         let use_driver_cache = is_nvidia;
 
         let can_report_memory = has_ext("GL_NVX_gpu_memory_info");
         let must_emulate_bgr565 = is_intel;
         let strict_context_required = false; // Set by window code if on Wayland
+        let blacklist_async_shaders =
+            (is_intel && !cfg!(target_os = "linux")) || strict_context_required;
+        let requested_async_shaders = *common::settings::values()
+            .use_asynchronous_shaders
+            .get_value();
+        let mut use_asynchronous_shaders = requested_async_shaders && !blacklist_async_shaders;
+        if use_asynchronous_shaders {
+            // Upstream backs this mode with OpenGL ShaderWorker compilation.
+            // Ruzu does not port that worker yet; enabling async here makes
+            // ShaderCache::built_pipeline skip non-small/depth draws forever.
+            warn!(
+                "Asynchronous shader compilation enabled but OpenGL ShaderWorker is not ported; using synchronous compilation"
+            );
+            use_asynchronous_shaders = false;
+        } else if requested_async_shaders && !use_asynchronous_shaders {
+            warn!("Asynchronous shader compilation enabled but not supported");
+        }
         let supports_conditional_barriers = !is_intel;
         let has_lmem_perf_bug = is_nvidia;
 

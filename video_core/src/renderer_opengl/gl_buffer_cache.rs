@@ -6,6 +6,8 @@
 //! OpenGL buffer cache -- manages GPU buffer objects for vertex, index, uniform, and storage
 //! buffer access.
 
+use std::collections::HashMap;
+
 /// NV program stage LUT for assembly shader parameter buffer bindings.
 ///
 /// Corresponds to `BufferCacheRuntime::PABO_LUT` in gl_buffer_cache.h.
@@ -223,6 +225,17 @@ pub struct BufferCacheRuntime {
 
     pub index_buffer_offset: u32,
     pub device_access_memory: u64,
+    texture_handles: *mut u32,
+    image_handles: *mut u32,
+    buffer_views: HashMap<BufferViewKey, u32>,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct BufferViewKey {
+    buffer_handle: u32,
+    offset: u32,
+    size: u32,
+    format: u32,
 }
 
 impl BufferCacheRuntime {
@@ -258,6 +271,9 @@ impl BufferCacheRuntime {
             graphics_base_storage_bindings: [0; NUM_STAGES],
             index_buffer_offset: 0,
             device_access_memory,
+            texture_handles: std::ptr::null_mut(),
+            image_handles: std::ptr::null_mut(),
+            buffer_views: HashMap::new(),
         }
     }
 
@@ -274,6 +290,59 @@ impl BufferCacheRuntime {
     /// Set whether to use storage buffers.
     pub fn set_enable_storage_buffers(&mut self, enable: bool) {
         self.use_storage_buffers = enable;
+    }
+
+    /// Set output arrays for texture/image-buffer handles.
+    ///
+    /// Port of upstream `BufferCacheRuntime::SetImagePointers`.
+    pub fn set_image_pointers(&mut self, texture_handles: *mut u32, image_handles: *mut u32) {
+        self.texture_handles = texture_handles;
+        self.image_handles = image_handles;
+    }
+
+    fn texture_buffer_format(gl_format: u32) -> u32 {
+        match gl_format {
+            gl::RGBA8_SNORM => gl::RGBA8I,
+            gl::R8_SNORM => gl::R8I,
+            gl::RGBA16_SNORM => gl::RGBA16I,
+            gl::R16_SNORM => gl::R16I,
+            gl::RG16_SNORM => gl::RG16I,
+            gl::RG8_SNORM => gl::RG8I,
+            _ => gl_format,
+        }
+    }
+
+    fn buffer_view(&mut self, gpu_handle: u32, offset: u32, size: u32, format: u32) -> u32 {
+        if gpu_handle == 0 || size == 0 {
+            return 0;
+        }
+        let key = BufferViewKey {
+            buffer_handle: gpu_handle,
+            offset,
+            size,
+            format,
+        };
+        if let Some(&texture) = self.buffer_views.get(&key) {
+            return texture;
+        }
+        let internal_format =
+            super::maxwell_to_gl::get_format_tuple(format as usize).internal_format;
+        let texture_format = Self::texture_buffer_format(internal_format);
+        let mut texture = 0;
+        unsafe {
+            gl::CreateTextures(gl::TEXTURE_BUFFER, 1, &mut texture);
+            if texture != 0 {
+                gl::TextureBufferRange(
+                    texture,
+                    texture_format,
+                    gpu_handle,
+                    offset as isize,
+                    size as isize,
+                );
+            }
+        }
+        self.buffer_views.insert(key, texture);
+        texture
     }
 
     /// Pre-copy memory barrier.
@@ -340,6 +409,22 @@ impl BufferCacheRuntime {
     /// Index offset for element array draws.
     pub fn index_offset(&self) -> usize {
         self.index_buffer_offset as usize
+    }
+}
+
+impl Drop for BufferCacheRuntime {
+    fn drop(&mut self) {
+        let textures: Vec<u32> = self
+            .buffer_views
+            .values()
+            .copied()
+            .filter(|&texture| texture != 0)
+            .collect();
+        if !textures.is_empty() {
+            unsafe {
+                gl::DeleteTextures(textures.len() as i32, textures.as_ptr());
+            }
+        }
     }
 }
 
@@ -544,6 +629,10 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         BufferCacheRuntime::set_enable_storage_buffers(self, enable);
     }
 
+    fn set_image_pointers(&mut self, texture_handles: *mut u32, image_handles: *mut u32) {
+        BufferCacheRuntime::set_image_pointers(self, texture_handles, image_handles);
+    }
+
     fn bind_storage_buffer(
         &mut self,
         stage: usize,
@@ -628,8 +717,39 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         }
     }
 
-    fn bind_texture_buffer(&mut self, _buffer: BufferId, _offset: u32, _size: u32, _format: u32) {}
-    fn bind_image_buffer(&mut self, _buffer: BufferId, _offset: u32, _size: u32, _format: u32) {}
+    fn bind_texture_buffer(
+        &mut self,
+        _buffer: BufferId,
+        gpu_handle: u32,
+        offset: u32,
+        size: u32,
+        format: u32,
+    ) {
+        let texture = self.buffer_view(gpu_handle, offset, size, format);
+        if !self.texture_handles.is_null() {
+            unsafe {
+                *self.texture_handles = texture;
+                self.texture_handles = self.texture_handles.add(1);
+            }
+        }
+    }
+
+    fn bind_image_buffer(
+        &mut self,
+        _buffer: BufferId,
+        gpu_handle: u32,
+        offset: u32,
+        size: u32,
+        format: u32,
+    ) {
+        let texture = self.buffer_view(gpu_handle, offset, size, format);
+        if !self.image_handles.is_null() {
+            unsafe {
+                *self.image_handles = texture;
+                self.image_handles = self.image_handles.add(1);
+            }
+        }
+    }
     fn bind_transform_feedback_buffers(&mut self, _bindings: &HostBindings) {}
 
     fn bind_compute_uniform_buffer(

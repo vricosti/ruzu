@@ -282,6 +282,14 @@ pub mod cat {
     /// [seq, kind, fd, handle, size, address, flags, align, heap_mask]
     /// kind: 1=IocCreate, 2=IocAlloc.
     pub const NVMAP_ALLOC: u16 = 50;
+    /// Account profile response attribution. args =
+    /// [stage, result, user_lo, user_hi, timestamp, name0_7, name8_15,
+    ///  user_data0, user_data1]
+    /// stage: 1=IProfileCommon::Get, 2=IProfileCommon::GetBase.
+    pub const ACC_PROFILE: u16 = 51;
+    /// HID NPad service command attribution. args =
+    /// [cmd, result, aruid, arg0, arg1, out0, out1, out2]
+    pub const HID_NPAD: u16 = 52;
 }
 
 fn service_registry() -> &'static Mutex<Vec<String>> {
@@ -479,6 +487,8 @@ pub struct Config {
     pub rt_zeta_bind_trace: bool,
     pub submit_gpfifo_trace: bool,
     pub mii_service_trace: bool,
+    pub acc_profile_trace: bool,
+    pub hid_npad_trace: bool,
     /// Sink target: "stderr" or "file".
     pub output_target: String,
     /// File path when target == "file".
@@ -542,6 +552,8 @@ impl Default for Config {
             rt_zeta_bind_trace: false,
             submit_gpfifo_trace: false,
             mii_service_trace: false,
+            acc_profile_trace: false,
+            hid_npad_trace: false,
             output_target: "stderr".to_string(),
             output_file: String::new(),
             ring_capacity: 16384,
@@ -599,6 +611,8 @@ impl Config {
             || self.rt_zeta_bind_trace
             || self.submit_gpfifo_trace
             || self.mii_service_trace
+            || self.acc_profile_trace
+            || self.hid_npad_trace
     }
 }
 
@@ -802,6 +816,8 @@ fn build_config() -> Config {
             false,
         ),
         mii_service_trace: get_bool("mii", "service", "RUZU_TRACE_MII_SERVICE", false),
+        acc_profile_trace: get_bool("account", "profile", "RUZU_TRACE_ACC_PROFILE", false),
+        hid_npad_trace: get_bool("hid", "npad", "RUZU_TRACE_HID_NPAD", false),
         output_target: get_str("output", "target", "RUZU_TRACE_TARGET", "stderr"),
         output_file: file
             .as_ref()
@@ -884,6 +900,8 @@ pub fn is_enabled(category: u16) -> bool {
         cat::RT_ZETA_BIND => c.rt_zeta_bind_trace,
         cat::SUBMIT_GPFIFO => c.submit_gpfifo_trace,
         cat::MII_SERVICE => c.mii_service_trace,
+        cat::ACC_PROFILE => c.acc_profile_trace,
+        cat::HID_NPAD => c.hid_npad_trace,
         _ => false,
     }
 }
@@ -2267,6 +2285,40 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 rec.args[8],
             );
         }
+        cat::ACC_PROFILE => {
+            let stage = match rec.args[0] {
+                1 => "get",
+                2 => "get_base",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                out,
+                "[ACC_PROFILE] stage={} result=0x{:08X} user_id={:016X}{:016X} timestamp=0x{:X} name_words=[{:016X},{:016X}] data_words=[{:016X},{:016X}]",
+                stage,
+                rec.args[1] as u32,
+                rec.args[3],
+                rec.args[2],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+            );
+        }
+        cat::HID_NPAD => {
+            let _ = writeln!(
+                out,
+                "[HID_NPAD] cmd={} result=0x{:08X} aruid=0x{:X} arg0=0x{:X} arg1=0x{:X} out0=0x{:X} out1=0x{:X} out2=0x{:X}",
+                rec.args[0],
+                rec.args[1] as u32,
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+            );
+        }
         cat::PRESENT_IMAGE_SELECT => {
             let image_id = if rec.args[2] == u64::MAX {
                 "missing".to_string()
@@ -2587,6 +2639,10 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 9 => "convert_core_to_char",
                 10 => "convert_v3",
                 11 => "convert_char_to_core",
+                12 => "is_updated",
+                13 => "get_count",
+                14 => "set_interface_version",
+                15 => "is_full_database",
                 _ => "unknown",
             };
             let _ = writeln!(

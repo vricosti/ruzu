@@ -5,6 +5,27 @@
 
 pub type ClockSourceId = [u8; 16]; // Common::UUID
 
+/// Port of upstream `ConvertToTimeSpan`.
+///
+/// Converts CoreTiming CNTPCT ticks (19.2 MHz) into nanoseconds while preserving
+/// the upstream saturation behavior for extreme signed values.
+pub fn convert_to_time_span_ns(ticks: i64) -> i64 {
+    const ONE_SECOND_NS: i64 = 1_000_000_000;
+    const CNTFRQ: i64 = common::wall_clock::CNTFRQ as i64;
+    const MAX: i64 = CNTFRQ * (i64::MAX / ONE_SECOND_NS);
+
+    if ticks > MAX {
+        return i64::MAX;
+    }
+    if ticks < -MAX {
+        return i64::MIN;
+    }
+
+    let a = ticks / CNTFRQ * ONE_SECOND_NS;
+    let b = ((ticks % CNTFRQ) * ONE_SECOND_NS) / CNTFRQ;
+    a + b
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TimeType {
@@ -186,4 +207,22 @@ pub fn get_span_between_time_points(
         return None; // overflow
     }
     Some(b.time_point - a.time_point)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::convert_to_time_span_ns;
+
+    #[test]
+    fn convert_to_time_span_matches_cntpct_frequency() {
+        assert_eq!(convert_to_time_span_ns(0), 0);
+        assert_eq!(
+            convert_to_time_span_ns(common::wall_clock::CNTFRQ as i64),
+            1_000_000_000
+        );
+        assert_eq!(
+            convert_to_time_span_ns(-(common::wall_clock::CNTFRQ as i64)),
+            -1_000_000_000
+        );
+    }
 }

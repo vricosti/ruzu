@@ -939,28 +939,26 @@ fn send_sync_request_impl(
             0,
             0,
         );
-        // Upstream `KClientSession::SendSyncRequest` enqueues the request and
-        // parks the client until the server consumes it; a session that is
-        // busy with another in-flight request is NEVER an error. The inline
-        // fallback consumes the request synchronously on the caller's thread,
-        // so a concurrent request from another guest thread on the same
-        // session (MK8D's nn::nv serializes ioctls per-fd, not per-session —
-        // several threads share the single nvdrv session) finds
-        // `current_request` occupied and `receive_inline_request_hle` fails
-        // with `ResultNotFound`. Mapping that to an error surfaced as a
-        // transient `ResultInvalidHandle` which nn::nv treats as fatal
-        // (SetTerminateResult(0xE401) + svcBreak) — MK8D's flaky boot abort.
-        // Wait for the in-flight request to complete instead, matching the
-        // upstream "client waits until the server is free" semantic. Handlers
-        // never defer on the inline path, so the wait is bounded by one
-        // handler execution on another host thread; no locks are held here.
+        // Upstream `KClientSession::SendSyncRequest` enqueues the request
+        // before the client waits, even when another request is currently
+        // being handled. Preserve that FIFO property in the inline fallback:
+        // enqueue exactly once, then wait until this same request reaches the
+        // front and `current_request` is free. Retrying by enqueueing only
+        // after the session becomes idle lets host lock timing reorder guest
+        // threads that share one service session.
         let receive_result = {
+            let enqueue_result = {
+                let mut server_session = server_session.lock().unwrap();
+                server_session.enqueue_inline_request_hle(Arc::clone(&request))
+            };
+            if let Err(code) = enqueue_result {
+                return RESULT_INVALID_HANDLE;
+            }
             let mut waited_us: u64 = 0;
             loop {
                 let attempt = {
                     let mut server_session = server_session.lock().unwrap();
-                    server_session
-                        .receive_inline_request_hle(Arc::clone(&request), Arc::clone(&manager))
+                    server_session.receive_queued_inline_request_hle(&request, &manager)
                 };
                 match attempt {
                     Err(code) if code == RESULT_NOT_FOUND.get_inner_value() => {

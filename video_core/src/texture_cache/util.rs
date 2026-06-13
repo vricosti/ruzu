@@ -1274,7 +1274,7 @@ fn resolve_overlap_right_address_3d(
     if !is_block_linear_size_compatible(new_info, info, base.level as u32, 0, strict_size) {
         return None;
     }
-    let mip_depth = 1u32.max(new_info.size.depth >> base.level as u32);
+    let mip_depth = 1u32.max(new_info.size.depth << base.level as u32);
     if mip_depth < info.size.depth + base.layer as u32 {
         return None;
     }
@@ -1474,7 +1474,7 @@ pub fn find_subresource(
         return None;
     }
     if existing.image_type == ImageType::E3D {
-        let mip_depth = 1u32.max(existing.size.depth >> base.level as u32);
+        let mip_depth = 1u32.max(existing.size.depth << base.level as u32);
         if mip_depth < candidate.size.depth + base.layer as u32 {
             return None;
         }

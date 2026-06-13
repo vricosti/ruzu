@@ -492,24 +492,26 @@ impl NvMapDevice {
             (lock_result, start_info, end_info)
         };
         if lock_result != 0 {
-            crate::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_history(
-                "nvmap_lock_for_map_device_address_space_failed",
-            );
-            crate::hle::kernel::svc::svc_memory_history::dump(
-                "nvmap_lock_for_map_device_address_space_failed",
-            );
-            crate::hle::service::nvnflinger::diagnostics::dump(
-                "nvmap_lock_for_map_device_address_space_failed",
-            );
-            log::error!(
-                "nvmap::IocAlloc failed to lock CPU range for device mapping: handle=0x{:X} addr=0x{:X} size=0x{:X} result=0x{:08X}",
+            if std::env::var_os("RUZU_DUMP_NVMAP_LOCK_FAILURE").is_some() {
+                crate::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_history(
+                    "nvmap_lock_for_map_device_address_space_failed",
+                );
+                crate::hle::kernel::svc::svc_memory_history::dump(
+                    "nvmap_lock_for_map_device_address_space_failed",
+                );
+                crate::hle::service::nvnflinger::diagnostics::dump(
+                    "nvmap_lock_for_map_device_address_space_failed",
+                );
+            }
+            log::debug!(
+                "nvmap::IocAlloc LockForMapDeviceAddressSpace assert would fail: handle=0x{:X} addr=0x{:X} size=0x{:X} result=0x{:08X}",
                 params.handle,
                 handle_address,
                 handle_size,
                 lock_result
             );
             if let Some(info) = lock_start_info {
-                log::error!(
+                log::debug!(
                     "nvmap::IocAlloc lock start state: base=0x{:X} size=0x{:X} state={:?} perm={:?} attr={:?} orig_perm={:?} ipc_locks={} device_use={}",
                     info.m_address,
                     info.m_size,
@@ -521,10 +523,10 @@ impl NvMapDevice {
                     info.m_device_use_count
                 );
             } else {
-                log::error!("nvmap::IocAlloc lock start state: <missing>");
+                log::debug!("nvmap::IocAlloc lock start state: <missing>");
             }
             if let Some(info) = lock_end_info {
-                log::error!(
+                log::debug!(
                     "nvmap::IocAlloc lock end state: base=0x{:X} size=0x{:X} state={:?} perm={:?} attr={:?} orig_perm={:?} ipc_locks={} device_use={}",
                     info.m_address,
                     info.m_size,
@@ -536,7 +538,7 @@ impl NvMapDevice {
                     info.m_device_use_count
                 );
             } else {
-                log::error!("nvmap::IocAlloc lock end state: <missing>");
+                log::debug!("nvmap::IocAlloc lock end state: <missing>");
             }
             // Upstream uses ASSERT(...IsSuccess()) here and still returns the
             // original nvmap result to the guest if asserts are ignored. Do

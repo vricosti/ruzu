@@ -22,6 +22,7 @@ use parking_lot::ReentrantMutex;
 use common::slot_vector::SlotVector;
 
 use crate::framebuffer_config::{BlendMode, FramebufferConfig};
+use crate::rasterizer_interface::RasterizerDownloadArea;
 use crate::renderer_base::GuestMemoryWriter;
 
 use super::descriptor_table::DescriptorTable;
@@ -29,7 +30,7 @@ use super::format_lookup_table::PixelFormat;
 use super::image_base::{
     GPUVAddr, ImageAllocBase, ImageBase, ImageFlagBits, ImageMapView, NullImageParams,
 };
-use super::image_view_base::{ImageViewBase, NullImageViewParams};
+use super::image_view_base::{ImageViewBase, ImageViewFlagBits, NullImageViewParams};
 use super::image_view_info::{ImageViewInfo, SwizzleSource};
 use super::render_targets::RenderTargets;
 use super::types::*;
@@ -199,6 +200,19 @@ pub struct PendingDownload {
 pub struct JoinCopy {
     pub is_alias: bool,
     pub id: ImageId,
+    /// Rust backend-split adaptation: upstream consumes `join_copies_to_do`
+    /// synchronously inside `JoinImages`, so it reads `GpuModified` directly
+    /// from the overlap before any deferred refresh/delete boundary can mutate
+    /// flags. Ruzu queues the backend copy tail, therefore the decision must be
+    /// snapshotted at join time.
+    pub gpu_modified_at_join: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingJoinCopies {
+    pub new_image_id: ImageId,
+    pub copies: Vec<JoinCopy>,
+    pub alias_indices: HashMap<ImageId, usize>,
 }
 
 // ── TextureCache<P> ────────────────────────────────────────────────────
@@ -235,7 +249,8 @@ pub struct TextureCacheBase {
 
     // Render state
     pub render_targets: RenderTargets,
-    pub framebuffers: HashMap<u64, FramebufferId>, // keyed by RenderTargets hash
+    /// Upstream keys cached framebuffers by the full `RenderTargets` object.
+    pub framebuffers: HashMap<RenderTargets, FramebufferId>,
 
     // Page tables
     pub page_table: HashMap<u64, Vec<ImageMapId>>,
@@ -248,6 +263,8 @@ pub struct TextureCacheBase {
     pub minimum_memory: u64,
     pub expected_memory: u64,
     pub critical_memory: u64,
+    pub has_broken_texture_view_formats: bool,
+    pub has_native_bgr: bool,
 
     // Download tracking
     pub uncommitted_downloads: Vec<PendingDownload>,
@@ -269,6 +286,7 @@ pub struct TextureCacheBase {
     pub join_bad_overlap_ids: Vec<ImageId>,
     pub join_copies_to_do: Vec<JoinCopy>,
     pub join_alias_indices: HashMap<ImageId, usize>,
+    pub pending_join_copies: Vec<PendingJoinCopies>,
 
     // Image alloc table
     pub image_allocs_table: HashMap<GPUVAddr, ImageAllocId>,
@@ -312,6 +330,16 @@ impl TextureCacheBase {
             crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
         >,
     ) -> Self {
+        Self::new_with_caps(device_memory, false, false)
+    }
+
+    pub fn new_with_caps(
+        device_memory: std::sync::Arc<
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
+        >,
+        has_broken_texture_view_formats: bool,
+        has_native_bgr: bool,
+    ) -> Self {
         let mut cache = Self {
             slot_images: SlotVector::new(),
             slot_map_views: SlotVector::new(),
@@ -328,6 +356,8 @@ impl TextureCacheBase {
             minimum_memory: 0,
             expected_memory: DEFAULT_EXPECTED_MEMORY as u64 + 512 * 1024 * 1024,
             critical_memory: DEFAULT_CRITICAL_MEMORY as u64 + 1024 * 1024 * 1024,
+            has_broken_texture_view_formats,
+            has_native_bgr,
             uncommitted_downloads: Vec::new(),
             committed_downloads: VecDeque::new(),
             modification_tick: 0,
@@ -341,6 +371,7 @@ impl TextureCacheBase {
             join_bad_overlap_ids: Vec::new(),
             join_copies_to_do: Vec::new(),
             join_alias_indices: HashMap::new(),
+            pending_join_copies: Vec::new(),
             image_allocs_table: HashMap::new(),
             swizzle_data_buffer: vec![0u8; 8 * 1024 * 1024], // 8 MiB
             unswizzle_data_buffer: vec![0u8; 1 * 1024 * 1024], // 1 MiB
@@ -612,6 +643,38 @@ impl TextureCacheBase {
             }
         });
         image_ids
+    }
+
+    /// Return the CPU/device-memory range that must be downloaded before the
+    /// CPU reads a rasterizer-cached region.
+    ///
+    /// Port of `TextureCache<P>::GetFlushArea`.
+    pub fn get_flush_area(&mut self, cpu_addr: u64, size: usize) -> Option<RasterizerDownloadArea> {
+        let mut area: Option<RasterizerDownloadArea> = None;
+        for image_id in self.collect_images_in_region(cpu_addr, size) {
+            if !self.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::GPU_MODIFIED)
+            {
+                continue;
+            }
+            let image = &mut self.slot_images[image_id];
+            let current = area.get_or_insert(RasterizerDownloadArea {
+                start_address: cpu_addr,
+                end_address: cpu_addr + size as u64,
+                preemptive: true,
+            });
+            current.start_address = current.start_address.min(image.cpu_addr);
+            current.end_address = current.end_address.max(image.cpu_addr_end);
+            for &image_view_id in &image.image_view_ids {
+                self.slot_image_views[image_view_id]
+                    .flags
+                    .insert(ImageViewFlagBits::PREEMTIVE_DOWNLOAD);
+            }
+            current.preemptive &= image.info.forced_flushed;
+            image.info.forced_flushed = true;
+        }
+        area
     }
 
     /// Remove images in a region.

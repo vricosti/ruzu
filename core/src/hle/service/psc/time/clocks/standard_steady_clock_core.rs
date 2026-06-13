@@ -21,7 +21,7 @@ pub struct StandardSteadyClockCore {
     internal_offset: i64,
     clock_source_id: ClockSourceId,
     rtc_offset: i64,
-    cached_time_point: i64,
+    cached_time_point: Mutex<i64>,
     continuous_adjustment_time_point: ContinuousAdjustmentTimePoint,
     /// Callback to get clock ticks in nanoseconds from CoreTiming.
     get_ticks_ns: Box<dyn Fn() -> i64 + Send + Sync>,
@@ -36,7 +36,7 @@ impl StandardSteadyClockCore {
             internal_offset: 0,
             clock_source_id: [0u8; 16],
             rtc_offset: 0,
-            cached_time_point: 0,
+            cached_time_point: Mutex::new(0),
             continuous_adjustment_time_point: ContinuousAdjustmentTimePoint::default(),
             get_ticks_ns,
         }
@@ -116,6 +116,12 @@ impl StandardSteadyClockCore {
         };
         self.continuous_adjustment_time_point.lower = expected_time;
     }
+
+    /// Rust helper for upstream `CoreTiming::GetClockTicks()` followed by
+    /// `ConvertToTimeSpan(...)` in `StaticService`.
+    pub fn get_current_uptime_ns(&self) -> i64 {
+        (self.get_ticks_ns)()
+    }
 }
 
 impl SteadyClockCoreImpl for StandardSteadyClockCore {
@@ -133,11 +139,10 @@ impl SteadyClockCoreImpl for StandardSteadyClockCore {
         let _lock = self.mutex.lock().unwrap();
         let ticks_ns = (self.get_ticks_ns)();
         let current_time_ns = self.rtc_offset + ticks_ns;
-        // Note: upstream caches and returns max of current vs cached.
-        // We can't mutate through &self with the Mutex<()> pattern,
-        // so we just return the computed value. For full parity,
-        // cached_time_point tracking would need interior mutability.
-        current_time_ns.max(self.cached_time_point)
+        let mut cached_time_point = self.cached_time_point.lock().unwrap();
+        let time_point = current_time_ns.max(*cached_time_point);
+        *cached_time_point = time_point;
+        time_point
     }
 
     fn get_test_offset_impl(&self) -> i64 {

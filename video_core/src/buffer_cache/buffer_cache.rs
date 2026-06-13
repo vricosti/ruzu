@@ -221,6 +221,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         self.runtime = Some(runtime);
     }
 
+    /// Set OpenGL texture/image-buffer output arrays.
+    ///
+    /// Upstream: `BufferCacheRuntime::SetImagePointers`.
+    pub fn set_image_pointers(&mut self, texture_handles: *mut u32, image_handles: *mut u32) {
+        if let Some(ref mut rt) = self.runtime {
+            rt.set_image_pointers(texture_handles, image_handles);
+        }
+    }
+
     pub fn index_offset(&self) -> usize {
         self.runtime
             .as_ref()
@@ -789,7 +798,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let binding = if let Some(ref es) = self.engine_state {
             let cbuf_info = es.get_const_buffer(stage, cbuf_index);
             let ssbo_addr = cbuf_info.address.wrapping_add(cbuf_offset as u64);
-            if std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some() {
+            if {
+                static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *F.get_or_init(|| std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some())
+            } {
                 log::info!(
                     "[SSBO_DESC] stage={} index={} cbuf={} cbuf_addr=0x{:X} cbuf_size=0x{:X} enabled={} desc_offset=0x{:X} ssbo_addr=0x{:X} written={}",
                     stage,
@@ -805,7 +817,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             }
             self.storage_buffer_binding(ssbo_addr, cbuf_index, is_written)
         } else {
-            if std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some() {
+            if {
+                static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *F.get_or_init(|| std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some())
+            } {
                 log::warn!(
                     "[SSBO_DESC] stage={} index={} cbuf={} desc_offset=0x{:X} missing_engine_state",
                     stage,
@@ -1861,7 +1876,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         drop(cs);
 
         let device_addr = binding.device_addr;
-        let size = if std::env::var_os("RUZU_FORCE_FULL_UBO_RANGE").is_some() {
+        let size = if {
+            static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *F.get_or_init(|| std::env::var_os("RUZU_FORCE_FULL_UBO_RANGE").is_some())
+        } {
             binding.size
         } else if let Some(ref sizes) = ub_sizes {
             binding.size.min(sizes[stage][index as usize])
@@ -1878,6 +1896,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 .memory_tracker
                 .is_region_gpu_modified(device_addr, size as u64);
 
+
         if use_fast_buffer {
             // Upstream fast path: either BindMappedUniformBuffer or PushFastUniformBuffer.
             let mut fast_buffer_bound = false;
@@ -1891,7 +1910,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                             dm.read_block_unsafe(device_addr, &mut buf);
                             // RUZU_TRACE_UBO_REFRESH=1 — also cover the fast
                             // push path (small per-binding uploads).
-                            if std::env::var_os("RUZU_TRACE_UBO_REFRESH").is_some() {
+                            if {
+                                static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                                *F.get_or_init(|| {
+                                    std::env::var_os("RUZU_TRACE_UBO_REFRESH").is_some()
+                                })
+                            } {
                                 let all_zero = buf.iter().all(|&b| b == 0);
                                 if all_zero {
                                     log::warn!(
@@ -1984,7 +2008,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 dm.read_block_unsafe(device_addr, &mut bytes);
                 // RUZU_TRACE_UBO_REFRESH=1 — log every refresh whose guest
                 // read came back all-zero (the MK8D zero-cbuf world draws).
-                if std::env::var_os("RUZU_TRACE_UBO_REFRESH").is_some() {
+                if {
+                    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    *F.get_or_init(|| std::env::var_os("RUZU_TRACE_UBO_REFRESH").is_some())
+                } {
                     let all_zero = bytes.iter().all(|&b| b == 0);
                     if all_zero || std::env::var_os("RUZU_TRACE_UBO_REFRESH_ALL").is_some() {
                         log::warn!(
@@ -2133,11 +2160,24 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             let is_image = P::SEPARATE_IMAGE_BUFFER_BINDINGS && ((image_mask >> idx) & 1) != 0;
 
             let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
+            let gpu_handle = self.slot_buffers[binding.buffer_id].gpu_handle;
             if let Some(ref mut rt) = self.runtime {
                 if is_image {
-                    rt.bind_image_buffer(binding.buffer_id, offset, binding.size, binding.format);
+                    rt.bind_image_buffer(
+                        binding.buffer_id,
+                        gpu_handle,
+                        offset,
+                        binding.size,
+                        binding.format,
+                    );
                 } else {
-                    rt.bind_texture_buffer(binding.buffer_id, offset, binding.size, binding.format);
+                    rt.bind_texture_buffer(
+                        binding.buffer_id,
+                        gpu_handle,
+                        offset,
+                        binding.size,
+                        binding.format,
+                    );
                 }
             }
 
@@ -2318,11 +2358,24 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             let is_image = P::SEPARATE_IMAGE_BUFFER_BINDINGS && ((image_mask >> idx) & 1) != 0;
 
             let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
+            let gpu_handle = self.slot_buffers[binding.buffer_id].gpu_handle;
             if let Some(ref mut rt) = self.runtime {
                 if is_image {
-                    rt.bind_image_buffer(binding.buffer_id, offset, binding.size, binding.format);
+                    rt.bind_image_buffer(
+                        binding.buffer_id,
+                        gpu_handle,
+                        offset,
+                        binding.size,
+                        binding.format,
+                    );
                 } else {
-                    rt.bind_texture_buffer(binding.buffer_id, offset, binding.size, binding.format);
+                    rt.bind_texture_buffer(
+                        binding.buffer_id,
+                        gpu_handle,
+                        offset,
+                        binding.size,
+                        binding.format,
+                    );
                 }
             }
 
@@ -3755,7 +3808,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let gpu_addr = match read_block(ssbo_addr, &mut gpu_addr_bytes) {
             true => u64::from_le_bytes(gpu_addr_bytes),
             false => {
-                if std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some() {
+                if {
+                    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    *F.get_or_init(|| std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some())
+                } {
                     log::warn!(
                         "[SSBO_BINDING_FAIL] cbuf={} ssbo_addr=0x{:X} reason=read_u64_failed",
                         cbuf_index,
@@ -3765,7 +3821,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 return NULL_BINDING;
             }
         };
-        if std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some() {
+        if {
+            static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *F.get_or_init(|| std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some())
+        } {
             log::info!(
                 "[SSBO_BINDING_SRC] cbuf={} ssbo_addr=0x{:X} gpu_addr=0x{:X} written={}",
                 cbuf_index,

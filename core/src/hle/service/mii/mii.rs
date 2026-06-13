@@ -239,6 +239,28 @@ impl IDatabaseService {
         );
     }
 
+    fn trace_scalar(stage: u64, cmd: u32, result: ResultCode, aux0: u64, aux1: u64) {
+        if !common::trace::is_enabled(common::trace::cat::MII_SERVICE) {
+            return;
+        }
+        common::trace::emit_raw(
+            common::trace::cat::MII_SERVICE,
+            &[
+                stage,
+                cmd as u64,
+                result.get_inner_value() as u64,
+                aux0,
+                aux1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+    }
+
     fn is_db_test_mode_enabled(&self) -> bool {
         Self::query_db_test_mode_enabled(&self.set_sys)
     }
@@ -259,6 +281,13 @@ impl IDatabaseService {
                 .unwrap()
                 .is_updated(&mut metadata, source_flag_raw)
         };
+        Self::trace_scalar(
+            12,
+            0,
+            RESULT_SUCCESS,
+            source_flag_raw as u64,
+            is_updated as u64,
+        );
         let mut response = CmifResponse::new(ctx, 3, 0, 0);
         response.push_result(RESULT_SUCCESS);
         response.push_bool(is_updated);
@@ -268,6 +297,7 @@ impl IDatabaseService {
         let service = Self::as_self(this);
         log::debug!("IDatabaseService::IsFullDatabase called");
         let is_full = service.manager.lock().unwrap().is_full_database();
+        Self::trace_scalar(15, 1, RESULT_SUCCESS, 0, is_full as u64);
         let mut response = CmifResponse::new(ctx, 3, 0, 0);
         response.push_result(RESULT_SUCCESS);
         response.push_bool(is_full);
@@ -290,6 +320,7 @@ impl IDatabaseService {
             source_flag_raw,
             count
         );
+        Self::trace_scalar(13, 2, RESULT_SUCCESS, source_flag_raw as u64, count as u64);
         let mut response = CmifResponse::new(ctx, 3, 0, 0);
         response.push_result(RESULT_SUCCESS);
         response.push_raw(&count);
@@ -736,6 +767,7 @@ impl IDatabaseService {
             .lock()
             .unwrap()
             .set_interface_version(&mut metadata, version);
+        Self::trace_scalar(14, 22, RESULT_SUCCESS, version as u64, 0);
 
         let mut response = CmifResponse::new(ctx, 2, 0, 0);
         response.push_result(RESULT_SUCCESS);

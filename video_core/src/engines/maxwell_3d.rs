@@ -4681,7 +4681,10 @@ impl Maxwell3D {
         let entry = ((method - MACRO_REGISTERS_START) >> 1) % 128;
         let params = self.macro_params.clone();
         let macro_method = self.macro_positions[entry as usize];
-        if std::env::var_os("RUZU_TRACE_MACRO_CALL").is_some() {
+        if {
+            static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *F.get_or_init(|| std::env::var_os("RUZU_TRACE_MACRO_CALL").is_some())
+        } {
             eprintln!(
                 "[MACRO_CALL] trigger=0x{:X} entry={} macro_start=0x{:X} param_count={} params={:08X?} addrs={:X?} segments={:X?} dirty={}",
                 method,
@@ -4724,7 +4727,10 @@ impl Maxwell3D {
         // method+value pair the macro interpreter emits via `call_method`.
         // Used to diagnose missing shader-pipeline configuration writes for
         // MK8D — see project_mk8d_shader_uninitialized_2026_05_14.md.
-        let trace_macro_writes = std::env::var_os("RUZU_TRACE_MACRO_WRITE").is_some();
+        let trace_macro_writes = {
+            static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *F.get_or_init(|| std::env::var_os("RUZU_TRACE_MACRO_WRITE").is_some())
+        };
         let macro_start_for_trace = macro_method;
         let compile =
             move |code: &[u32]| -> Box<dyn crate::macro_engine::macro_engine::CachedMacro> {

@@ -34,6 +34,25 @@ pub struct IHidServer {
 }
 
 impl IHidServer {
+    fn trace_npad(cmd: u32, result: ResultCode, aruid: u64, arg0: u64, arg1: u64, out0: u64) {
+        if !common::trace::is_enabled(common::trace::cat::HID_NPAD) {
+            return;
+        }
+        common::trace::emit_raw(
+            common::trace::cat::HID_NPAD,
+            &[
+                cmd as u64,
+                result.get_inner_value() as u64,
+                aruid,
+                arg0,
+                arg1,
+                out0,
+                0,
+                0,
+            ],
+        );
+    }
+
     pub fn new(
         system: SystemRef,
         resource_manager: Arc<parking_lot::Mutex<ResourceManager>>,
@@ -1449,21 +1468,40 @@ impl IHidServer {
 
     // cmd 89: ResetIsSixAxisSensorDeviceNewlyAssigned
     fn reset_is_six_axis_sensor_device_newly_assigned(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let server = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
-        let _sixaxis_handle: SixAxisSensorHandle = rp.pop_raw();
+        let sixaxis_handle: SixAxisSensorHandle = rp.pop_raw();
         let _padding = rp.pop_u32();
         let aruid = rp.pop_u64();
         log::warn!(
-            "(STUBBED) IHidServer::ResetIsSixAxisSensorDeviceNewlyAssigned called, aruid={}",
+            "IHidServer::ResetIsSixAxisSensorDeviceNewlyAssigned called, npad_type={:?}, npad_id={}, device_index={:?}, aruid={}",
+            sixaxis_handle.npad_type,
+            sixaxis_handle.npad_id,
+            sixaxis_handle.device_index,
             aruid
         );
-        // Upstream delegates to npad->ResetIsSixAxisSensorDeviceNewlyAssigned which is not
-        // yet ported. Return success.
+        let rm = server.resource_manager.lock();
+        let result = if let Some(ref npad) = rm.get_npad() {
+            to_ipc_result(
+                npad.lock()
+                    .reset_is_six_axis_sensor_device_newly_assigned(aruid, &sixaxis_handle),
+            )
+        } else {
+            RESULT_SUCCESS
+        };
+        Self::trace_npad(
+            89,
+            result,
+            aruid,
+            sixaxis_handle.npad_type as u64,
+            sixaxis_handle.npad_id as u64,
+            sixaxis_handle.device_index as u64,
+        );
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     // cmd 91: ActivateGesture
@@ -1540,6 +1578,7 @@ impl IHidServer {
         if result.is_success() {
             server.signal_npad_style_set_events(aruid);
         }
+        Self::trace_npad(100, result, aruid, supported_style_set_raw as u64, 0, 0);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
@@ -1564,6 +1603,7 @@ impl IHidServer {
         } else {
             (RESULT_SUCCESS, NpadStyleSet::NONE)
         };
+        Self::trace_npad(101, result, aruid, 0, 0, style_set.bits() as u64);
 
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(result);
@@ -1609,6 +1649,7 @@ impl IHidServer {
         } else {
             RESULT_SUCCESS
         };
+        Self::trace_npad(102, result, aruid, npad_count as u64, 0, 0);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
@@ -1648,6 +1689,14 @@ impl IHidServer {
         if result.is_success() {
             server.signal_npad_style_set_events(aruid);
         }
+        Self::trace_npad(
+            103,
+            result,
+            aruid,
+            register_result.0 as u64,
+            create_result.0 as u64,
+            0,
+        );
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
@@ -1688,6 +1737,14 @@ impl IHidServer {
         // Upstream signals the event immediately after handing it out.
         event.signal();
         let handle = event.copy_handle(ctx).unwrap_or(0);
+        Self::trace_npad(
+            106,
+            RESULT_SUCCESS,
+            aruid,
+            npad_id_raw as u64,
+            unknown,
+            handle as u64,
+        );
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_objects(handle);
@@ -1778,6 +1835,14 @@ impl IHidServer {
         if result.is_success() {
             server.signal_npad_style_set_events(aruid);
         }
+        Self::trace_npad(
+            109,
+            result,
+            aruid,
+            revision_raw as u64,
+            register_result.0 as u64,
+            create_result.0 as u64,
+        );
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
@@ -1806,6 +1871,7 @@ impl IHidServer {
         } else {
             RESULT_SUCCESS
         };
+        Self::trace_npad(120, result, aruid, hold_type_raw, 0, 0);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
@@ -1827,6 +1893,7 @@ impl IHidServer {
         } else {
             (RESULT_SUCCESS, NpadJoyHoldType::Vertical)
         };
+        Self::trace_npad(121, result, aruid, 0, 0, hold_type as u64);
 
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(result);
@@ -1989,6 +2056,7 @@ impl IHidServer {
         } else {
             RESULT_SUCCESS
         };
+        Self::trace_npad(128, result, aruid, activation_mode_raw, 0, 0);
 
         log::info!(
             "IHidServer::SetNpadHandheldActivationMode aruid={} activation_mode={:?} result=0x{:X}",
@@ -2020,6 +2088,7 @@ impl IHidServer {
         } else {
             (RESULT_SUCCESS, NpadHandheldActivationMode::Dual)
         };
+        Self::trace_npad(129, result, aruid, 0, 0, mode as u64);
 
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(result);
@@ -2717,6 +2786,7 @@ impl IHidServer {
         ctx: &mut HLERequestContext,
     ) {
         log::warn!("(STUBBED) IHidServer::IsUsbFullKeyControllerEnabled called");
+        Self::trace_npad(400, RESULT_SUCCESS, 0, 0, 0, 0);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_bool(false);
@@ -3101,6 +3171,7 @@ impl IHidServer {
             communication_mode
         );
         // This function has been stubbed since 2.0.0+
+        Self::trace_npad(1000, RESULT_SUCCESS, aruid, communication_mode, 0, 0);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -3115,6 +3186,14 @@ impl IHidServer {
         );
         // This function has been stubbed since 2.0.0+
         // Return NpadCommunicationMode::Default (0)
+        Self::trace_npad(
+            1001,
+            RESULT_SUCCESS,
+            aruid,
+            0,
+            0,
+            NpadCommunicationMode::Default as u64,
+        );
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u64(NpadCommunicationMode::Default as u64);

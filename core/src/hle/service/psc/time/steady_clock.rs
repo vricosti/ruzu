@@ -7,10 +7,12 @@
 //! ISteadyClock: provides steady clock time point queries.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use super::clocks::steady_clock_core::{self, SteadyClockCoreImpl};
 use super::common::SteadyClockTimePoint;
 use super::errors::{RESULT_CLOCK_UNINITIALIZED, RESULT_NOT_IMPLEMENTED, RESULT_PERMISSION_DENIED};
+use super::manager::TimeManager;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -28,12 +30,104 @@ pub mod commands {
     pub const GET_INTERNAL_OFFSET: u32 = 200;
 }
 
+/// Live backing object for `SteadyClock`.
+///
+/// Upstream `SteadyClock` stores a reference to `TimeManager::m_standard_steady_clock`.
+/// Keep the same lifetime shape here so every IPC observes the current clock core
+/// instead of a snapshot captured when the sub-service was created.
+pub trait SteadyClockBackend: Send + Sync {
+    fn is_initialized(&self) -> bool;
+    fn get_current_time_point(&self) -> Result<SteadyClockTimePoint, ResultCode>;
+    fn get_test_offset(&self) -> i64;
+    fn set_test_offset(&self, offset: i64);
+    fn get_rtc_value(&self) -> Result<i64, ResultCode>;
+    fn is_rtc_reset_detected(&self) -> bool;
+    fn get_setup_result_value(&self) -> ResultCode;
+    fn get_internal_offset(&self) -> i64;
+}
+
+pub struct TimeManagerSteadyClockBackend {
+    time_manager: Arc<Mutex<TimeManager>>,
+}
+
+impl TimeManagerSteadyClockBackend {
+    pub fn new(time_manager: Arc<Mutex<TimeManager>>) -> Self {
+        Self { time_manager }
+    }
+}
+
+impl SteadyClockBackend for TimeManagerSteadyClockBackend {
+    fn is_initialized(&self) -> bool {
+        self.time_manager
+            .lock()
+            .unwrap()
+            .standard_steady_clock
+            .state
+            .is_initialized()
+    }
+
+    fn get_current_time_point(&self) -> Result<SteadyClockTimePoint, ResultCode> {
+        let time = self.time_manager.lock().unwrap();
+        steady_clock_core::get_current_time_point(&time.standard_steady_clock)
+    }
+
+    fn get_test_offset(&self) -> i64 {
+        self.time_manager
+            .lock()
+            .unwrap()
+            .standard_steady_clock
+            .get_test_offset_impl()
+    }
+
+    fn set_test_offset(&self, offset: i64) {
+        self.time_manager
+            .lock()
+            .unwrap()
+            .standard_steady_clock
+            .set_test_offset_impl(offset);
+    }
+
+    fn get_rtc_value(&self) -> Result<i64, ResultCode> {
+        self.time_manager
+            .lock()
+            .unwrap()
+            .standard_steady_clock
+            .get_rtc_value_impl()
+    }
+
+    fn is_rtc_reset_detected(&self) -> bool {
+        self.time_manager
+            .lock()
+            .unwrap()
+            .standard_steady_clock
+            .state
+            .is_reset_detected()
+    }
+
+    fn get_setup_result_value(&self) -> ResultCode {
+        self.time_manager
+            .lock()
+            .unwrap()
+            .standard_steady_clock
+            .get_setup_result_value_impl()
+    }
+
+    fn get_internal_offset(&self) -> i64 {
+        self.time_manager
+            .lock()
+            .unwrap()
+            .standard_steady_clock
+            .get_internal_offset_impl()
+    }
+}
+
 /// SteadyClock service interface.
 ///
 /// Corresponds to `SteadyClock` in upstream steady_clock.h.
 pub struct SteadyClock {
     can_write_steady_clock: bool,
     can_write_uninitialized_clock: bool,
+    backend: Option<Arc<dyn SteadyClockBackend>>,
     // State for the clock core
     initialized: bool,
     test_offset: Mutex<i64>,
@@ -57,6 +151,16 @@ impl SteadyClock {
             RESULT_SUCCESS,
             false,
         )
+    }
+
+    pub fn with_backend(
+        can_write_steady_clock: bool,
+        can_write_uninitialized_clock: bool,
+        backend: Arc<dyn SteadyClockBackend>,
+    ) -> Self {
+        let mut this = Self::new(can_write_steady_clock, can_write_uninitialized_clock);
+        this.backend = Some(backend);
+        this
     }
 
     pub fn with_state(
@@ -109,6 +213,7 @@ impl SteadyClock {
         Self {
             can_write_steady_clock,
             can_write_uninitialized_clock,
+            backend: None,
             initialized,
             test_offset: Mutex::new(test_offset),
             internal_offset,
@@ -125,8 +230,15 @@ impl SteadyClock {
         self.initialized = initialized;
     }
 
+    fn is_backend_initialized(&self) -> bool {
+        match &self.backend {
+            Some(backend) => backend.is_initialized(),
+            None => self.initialized,
+        }
+    }
+
     fn check_initialized(&self) -> ResultCode {
-        if !self.can_write_uninitialized_clock && !self.initialized {
+        if !self.can_write_uninitialized_clock && !self.is_backend_initialized() {
             return RESULT_CLOCK_UNINITIALIZED;
         }
         RESULT_SUCCESS
@@ -140,11 +252,15 @@ impl SteadyClock {
         if check.is_error() {
             return Err(check);
         }
+        let time_point = match &self.backend {
+            Some(backend) => backend.get_current_time_point(),
+            None => Ok(self.current_time_point),
+        }?;
         log::debug!(
             "SteadyClock::GetCurrentTimePoint: time_point={}",
-            self.current_time_point.time_point
+            time_point.time_point
         );
-        Ok(self.current_time_point)
+        Ok(time_point)
     }
 
     /// GetTestOffset (cmd 2).
@@ -155,11 +271,12 @@ impl SteadyClock {
         if check.is_error() {
             return Err(check);
         }
-        log::debug!(
-            "SteadyClock::GetTestOffset: test_offset={}",
-            *self.test_offset.lock().unwrap()
-        );
-        Ok(*self.test_offset.lock().unwrap())
+        let offset = match &self.backend {
+            Some(backend) => backend.get_test_offset(),
+            None => *self.test_offset.lock().unwrap(),
+        };
+        log::debug!("SteadyClock::GetTestOffset: test_offset={}", offset);
+        Ok(offset)
     }
 
     /// SetTestOffset (cmd 3).
@@ -174,7 +291,10 @@ impl SteadyClock {
         if check.is_error() {
             return check;
         }
-        *self.test_offset.lock().unwrap() = test_offset;
+        match &self.backend {
+            Some(backend) => backend.set_test_offset(test_offset),
+            None => *self.test_offset.lock().unwrap() = test_offset,
+        }
         RESULT_SUCCESS
     }
 
@@ -186,12 +306,13 @@ impl SteadyClock {
         if check.is_error() {
             return Err(check);
         }
-        // In upstream this calls m_clock_core.GetRtcValue()
-        // For now, return current system time in seconds
-        let time_s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let time_s = match &self.backend {
+            Some(backend) => backend.get_rtc_value()?,
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+        };
         log::debug!("SteadyClock::GetRtcValue: rtc_value={}", time_s);
         Ok(time_s)
     }
@@ -206,9 +327,15 @@ impl SteadyClock {
         }
         log::debug!(
             "SteadyClock::IsRtcResetDetected: is_detected={}",
-            self.rtc_reset_detected
+            match &self.backend {
+                Some(backend) => backend.is_rtc_reset_detected(),
+                None => self.rtc_reset_detected,
+            }
         );
-        Ok(self.rtc_reset_detected)
+        Ok(match &self.backend {
+            Some(backend) => backend.is_rtc_reset_detected(),
+            None => self.rtc_reset_detected,
+        })
     }
 
     /// GetSetupResultValue (cmd 102).
@@ -221,9 +348,16 @@ impl SteadyClock {
         }
         log::debug!(
             "SteadyClock::GetSetupResultValue: result={:08X}",
-            self.setup_result.get_inner_value()
+            match &self.backend {
+                Some(backend) => backend.get_setup_result_value(),
+                None => self.setup_result,
+            }
+            .get_inner_value()
         );
-        Ok(self.setup_result)
+        Ok(match &self.backend {
+            Some(backend) => backend.get_setup_result_value(),
+            None => self.setup_result,
+        })
     }
 
     /// GetInternalOffset (cmd 200).
@@ -236,9 +370,15 @@ impl SteadyClock {
         }
         log::debug!(
             "SteadyClock::GetInternalOffset: internal_offset={}",
-            self.internal_offset
+            match &self.backend {
+                Some(backend) => backend.get_internal_offset(),
+                None => self.internal_offset,
+            }
         );
-        Ok(self.internal_offset)
+        Ok(match &self.backend {
+            Some(backend) => backend.get_internal_offset(),
+            None => self.internal_offset,
+        })
     }
 
     fn get_current_time_point_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

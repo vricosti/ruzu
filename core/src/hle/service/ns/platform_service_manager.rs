@@ -55,6 +55,24 @@ pub const SHARED_FONT_MEM_SIZE: u64 = 0x1100000;
 const EMPTY_REGION: FontRegion = FontRegion { offset: 0, size: 0 };
 const MAX_ELEMENT_COUNT: usize = 6;
 
+fn shared_font_priority_count(
+    font_codes_size: usize,
+    font_offsets_size: usize,
+    font_sizes_size: usize,
+    region_count: usize,
+) -> usize {
+    [
+        MAX_ELEMENT_COUNT,
+        font_codes_size / std::mem::size_of::<u32>(),
+        font_offsets_size / std::mem::size_of::<u32>(),
+        font_sizes_size / std::mem::size_of::<u32>(),
+        region_count,
+    ]
+    .into_iter()
+    .min()
+    .unwrap_or(0)
+}
+
 const SHARED_FONTS: [(FontArchives, &[u8]); 7] = [
     (FontArchives::Standard, &font_standard::FONT_STANDARD),
     (
@@ -528,11 +546,12 @@ impl IPlatformServiceManager {
         RESULT_SUCCESS
     }
 
-    /// Resolve or create the font shared-memory object, register it with the
-    /// caller's process, and return a fresh handle. Returns 0 on failure.
-    fn get_shared_memory_native_handle(&self, ctx: &mut HLERequestContext) -> u32 {
+    /// Resolve or create the font shared-memory object and register it with the
+    /// caller's process. The IPC layer creates the copy handle from the returned
+    /// object id, matching upstream `OutCopyHandle<KSharedMemory>`.
+    fn get_shared_memory_native_handle(&self, ctx: &mut HLERequestContext) -> Option<u64> {
         log::info!("pl:u GetSharedMemoryNativeHandle begin");
-        let handle = (|| -> Option<u32> {
+        let object_id = (|| -> Option<u64> {
             let thread = ctx.get_thread()?;
             let parent = thread.lock().unwrap().parent.as_ref()?.upgrade()?;
 
@@ -552,18 +571,13 @@ impl IPlatformServiceManager {
 
             let mut process = parent.lock().unwrap();
             process.register_shared_memory_object(object_id, shared_memory);
-            let h = process.handle_table.add(object_id).ok();
-            if h.is_none() {
-                log::error!(
-                    "pl:u GetSharedMemoryNativeHandle handle_table.add failed for object_id=0x{:x}",
-                    object_id
-                );
-            }
-            h
-        })()
-        .unwrap_or(0);
-        log::info!("pl:u GetSharedMemoryNativeHandle -> handle=0x{:x}", handle);
-        handle
+            Some(object_id)
+        })();
+        log::info!(
+            "pl:u GetSharedMemoryNativeHandle -> object_id=0x{:x}",
+            object_id.unwrap_or(0)
+        );
+        object_id
     }
 
     fn get_shared_font_in_order_of_priority(
@@ -577,7 +591,12 @@ impl IPlatformServiceManager {
             "pl:u GetSharedFontInOrderOfPriority language_code=0x{:x}",
             language_code
         );
-        let max_size = self.shared_font_regions.len().min(MAX_ELEMENT_COUNT);
+        let max_size = shared_font_priority_count(
+            ctx.get_write_buffer_size(0),
+            ctx.get_write_buffer_size(1),
+            ctx.get_write_buffer_size(2),
+            self.shared_font_regions.len(),
+        );
         let mut font_codes = vec![0u8; max_size * 4];
         let mut font_offsets = vec![0u8; max_size * 4];
         let mut font_sizes = vec![0u8; max_size * 4];
@@ -647,10 +666,14 @@ impl IPlatformServiceManager {
         ctx: &mut HLERequestContext,
     ) {
         let service = Self::as_self(this);
-        let handle = service.get_shared_memory_native_handle(ctx);
+        let object_id = service.get_shared_memory_native_handle(ctx);
         let mut response = CmifResponse::new(ctx, 2, 1, 0);
         response.push_result(RESULT_SUCCESS);
-        response.push_copy_objects(handle);
+        if let Some(object_id) = object_id {
+            response.push_copy_object_id(object_id);
+        } else {
+            response.push_copy_objects(0);
+        }
     }
 
     fn get_shared_font_in_order_of_priority_handler(
@@ -716,6 +739,15 @@ mod tests {
         for pair in regions.windows(2) {
             assert!(pair[0].offset < pair[1].offset);
         }
+    }
+
+    #[test]
+    fn shared_font_priority_count_is_limited_by_guest_buffers() {
+        assert_eq!(shared_font_priority_count(24, 24, 24, 7), 6);
+        assert_eq!(shared_font_priority_count(8, 24, 24, 7), 2);
+        assert_eq!(shared_font_priority_count(24, 12, 24, 7), 3);
+        assert_eq!(shared_font_priority_count(24, 24, 4, 7), 1);
+        assert_eq!(shared_font_priority_count(24, 24, 24, 4), 4);
     }
 
     #[test]

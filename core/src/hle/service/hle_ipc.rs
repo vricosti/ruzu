@@ -1566,10 +1566,11 @@ impl HLERequestContext {
             });
         }
         if let Some(ref memory) = self.memory {
-            let accessible = memory
-                .lock()
-                .unwrap()
-                .write_block_no_rasterizer_checked(address, data);
+            // Upstream HLE writes call Core::Memory::Memory::WriteBlock, not
+            // a rasterizer-bypassing path. Use the checked variant so
+            // protected host pages report EFAULT instead of SIGSEGV while
+            // preserving WriteBlock's rasterizer-write side effect.
+            let accessible = memory.lock().unwrap().write_block_checked(address, data);
             if accessible {
                 return;
             }
@@ -2060,7 +2061,10 @@ impl HLERequestContext {
                 let (svc, cmd, _ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
                 crate::hle::kernel::handle_forensics::record_handle_out(
                     h,
-                    format!("add service={} cmd={} object_id=0x{:X}", svc, cmd, object_id),
+                    format!(
+                        "add service={} cmd={} object_id=0x{:X}",
+                        svc, cmd, object_id
+                    ),
                 );
             }
         }

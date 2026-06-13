@@ -2843,7 +2843,7 @@ impl KProcess {
         // that MK8D's freeze polls (339 + 388, plus a padding range to catch
         // siblings). Uses `#[track_caller]` so the log shows the caller file:
         // line, which identifies which HLE service owns the event.
-        if matches!(object_id, 330..=400) {
+        if matches!(object_id, 330..=400 | 600..=700) {
             let loc = std::panic::Location::caller();
             log::info!(
                 "[EVENT_REG] readable_event object_id={} registered by {}:{}",

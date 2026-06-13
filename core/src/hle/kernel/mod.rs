@@ -105,6 +105,7 @@ pub mod init;
 // Kernel top-level modules.
 pub mod code_set;
 pub mod global_scheduler_context;
+pub mod handle_forensics;
 pub mod initial_process;
 pub mod k_address_arbiter;
 pub mod k_auto_object_container;
@@ -128,7 +129,6 @@ pub mod physical_core;
 #[cfg(feature = "debug-logs")]
 pub mod physical_core_log;
 pub mod race_anchor;
-pub mod handle_forensics;
 pub mod sleep_timing;
 pub mod startthread_gap;
 pub mod sync_cell;

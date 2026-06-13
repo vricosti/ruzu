@@ -110,9 +110,25 @@ fn patch_fragment_debug_by_source_hash(stage: ShaderStage, source: String) -> St
         std::env::var("RUZU_FRAGMENT_DEBUG_HASH_MODE").unwrap_or_else(|_| "green".to_string());
     let replacement = match mode.as_str() {
         "tex0_center" => "void main(){\nfrag_color0=texture(tex0,vec2(0.5,0.5));\nreturn;\n}\n",
+        "tex0_attr0" => "void main(){\nfrag_color0=texture(tex0,in_attr0.xy);\nreturn;\n}\n",
+        "cbuf3" => {
+            "void main(){\nfrag_color0=vec4(abs(fs_cbuf3[0].x),abs(fs_cbuf3[0].y),abs(fs_cbuf3[1].z),abs(fs_cbuf3[1].w));\nreturn;\n}\n"
+        }
+        "cbuf3b" => {
+            "void main(){\nfrag_color0=vec4(abs(fs_cbuf3[0].z),abs(fs_cbuf3[0].w),abs(fs_cbuf3[1].w),1.0);\nreturn;\n}\n"
+        }
         "tex0_attr1" => "void main(){\nfrag_color0=texture(tex0,in_attr1.xy);\nreturn;\n}\n",
         "uv" => {
             "void main(){\nvec2 ruzu_uv=in_attr1.xy;\nfrag_color0=vec4(fract(ruzu_uv),0.0,1.0);\nreturn;\n}\n"
+        }
+        "attr0" => "void main(){\nfrag_color0=abs(in_attr0);\nreturn;\n}\n",
+        "tex1_attr0" => "void main(){\nfrag_color0=texture(tex1,in_attr0.xy);\nreturn;\n}\n",
+        "tex2_attr0" => "void main(){\nfrag_color0=texture(tex2,in_attr0.xy);\nreturn;\n}\n",
+        "tex2_lod0_attr0" => {
+            "void main(){\nfrag_color0=textureLod(tex2,in_attr0.xy,0.0);\nreturn;\n}\n"
+        }
+        "tex2_lod1_attr0" => {
+            "void main(){\nfrag_color0=textureLod(tex2,in_attr0.xy,1.0);\nreturn;\n}\n"
         }
         "alpha_one" => {
             "void main(){\nvec4 c=texture(tex0,in_attr1.xy);\nfrag_color0=vec4(c.rgb,1.0);\nreturn;\n}\n"
@@ -126,6 +142,21 @@ fn patch_fragment_debug_by_source_hash(stage: ShaderStage, source: String) -> St
         mode
     );
     format!("{}{}", &source[..main_index], replacement)
+}
+
+fn trace_fragment_source_hash(key: &GraphicsPipelineKey, stage: ShaderStage, source: &str) {
+    if stage != ShaderStage::Fragment
+        || std::env::var_os("RUZU_TRACE_FRAGMENT_SOURCE_HASH").is_none()
+    {
+        return;
+    }
+    log::warn!(
+        "[FRAGMENT_SOURCE_HASH] key_hash=0x{:016X} unique_hash=0x{:016X} source_hash=0x{:016X} len={}",
+        key.hash_key(),
+        key.unique_hashes[5],
+        city_hash64(source.as_bytes()),
+        source.len()
+    );
 }
 
 use super::gl_compute_pipeline::{ComputePipeline, ComputePipelineKey};
@@ -820,6 +851,7 @@ impl ShaderCache {
                     slot as u64,
                     compiled.source.len() as u64,
                 );
+                trace_fragment_source_hash(&self.graphics_key, actual_stage, &compiled.source);
                 previous_info = compiled.info.clone();
                 if previous_info.requires_layer_emulation {
                     layer_source_info = Some(previous_info.clone());
@@ -1013,6 +1045,7 @@ impl ShaderCache {
                 slot as u64,
                 compiled.source.len() as u64,
             );
+            trace_fragment_source_hash(&self.graphics_key, actual_stage, &compiled.source);
             previous_info = Some(compiled.info.clone());
             if compiled.info.requires_layer_emulation {
                 layer_source_info = Some(compiled.info.clone());

@@ -1977,6 +1977,7 @@ impl ArmDynarmic64 {
                 Some(unsafe { (*exclusive_monitor).get_monitor() as *mut _ })
             },
             fastmem_pointer,
+            page_table_pointer: None,
             define_unpredictable_behaviour: true,
             processor_id: core_index as usize,
             wall_clock_cntpct: uses_wall_clock,

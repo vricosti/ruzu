@@ -93,6 +93,12 @@ fn structure_region(
                             // Forward branch → If/Then
                             let merge = true_target as u32;
                             syntax.push(SyntaxNode::Block(block_idx));
+                            // Upstream applies `!cond` inside the full
+                            // `GotoPass::EliminateAsConditional` tree
+                            // transform. This simplified flat-CFG structurer
+                            // does not yet model that tree, so carrying the
+                            // raw branch condition is the behavior that
+                            // matches the generated block order here.
                             syntax.push(SyntaxNode::If {
                                 cond: Value::ImmU1(true),
                                 body: (i + 1) as u32,

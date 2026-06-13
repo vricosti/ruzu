@@ -2715,14 +2715,52 @@ impl KServerSession {
         request: Arc<Mutex<KSessionRequest>>,
         manager: Arc<Mutex<SessionRequestManager>>,
     ) -> Result<(HLERequestContext, Arc<Mutex<SessionRequestManager>>, u64), u32> {
+        self.enqueue_inline_request_hle(Arc::clone(&request))?;
+        self.receive_queued_inline_request_hle(&request, &manager)
+    }
+
+    /// Queue an inline-dispatched request without notifying the owning
+    /// ServerManager.
+    ///
+    /// Upstream `OnRequest` appends to `m_request_list` before the client
+    /// waits, even when another request is currently being handled. The legacy
+    /// inline path still must preserve that FIFO property; otherwise two guest
+    /// threads sharing one service session can be reordered by host lock timing.
+    pub fn enqueue_inline_request_hle(
+        &mut self,
+        request: Arc<Mutex<KSessionRequest>>,
+    ) -> Result<(), u32> {
         if self.client_closed {
             return Err(RESULT_SESSION_CLOSED.get_inner_value());
         }
-        if self.current_request.is_some() {
+        self.request_list.push_back(request);
+        Ok(())
+    }
+
+    /// Receive the next inline-dispatched request only when it is ready.
+    ///
+    /// Returns `ResultNotFound` while the session is busy or while an earlier
+    /// queued request is still ahead of the caller. The caller can wait/retry
+    /// without enqueueing duplicates.
+    pub fn receive_queued_inline_request_hle(
+        &mut self,
+        request: &Arc<Mutex<KSessionRequest>>,
+        manager: &Arc<Mutex<SessionRequestManager>>,
+    ) -> Result<(HLERequestContext, Arc<Mutex<SessionRequestManager>>, u64), u32> {
+        if self.client_closed {
+            return Err(RESULT_SESSION_CLOSED.get_inner_value());
+        }
+        if self.current_request.is_some() || self.request_list.is_empty() {
             return Err(RESULT_NOT_FOUND.get_inner_value());
         }
-        self.request_list.push_back(request);
-        self.receive_request_hle(manager)
+        if !self
+            .request_list
+            .front()
+            .is_some_and(|front| Arc::ptr_eq(front, request))
+        {
+            return Err(RESULT_NOT_FOUND.get_inner_value());
+        }
+        self.receive_request_hle(Arc::clone(manager))
     }
 
     /// HLE convenience wrapper matching upstream `ReceiveRequestHLE()`.
@@ -3410,6 +3448,59 @@ mod tests {
         assert_eq!(context.command_buffer()[6], 0x5555_6666);
         assert!(server.request_list.is_empty());
         assert!(server.current_request.is_some());
+    }
+
+    #[test]
+    fn receive_inline_request_hle_preserves_fifo_while_busy() {
+        let mut process = crate::hle::kernel::k_process::KProcess::new();
+        process.process_id = 9;
+        process.initialize_handle_table();
+        let process = Arc::new(ProcessLock::from_value(process));
+
+        let thread = Arc::new(KThreadLock::new(
+            crate::hle::kernel::k_thread::KThread::new(),
+        ));
+        {
+            let mut thread_guard = thread.lock().unwrap();
+            thread_guard.thread_id = 7;
+            thread_guard.object_id = 8;
+            thread_guard.parent = Some(Arc::downgrade(&process));
+            thread_guard.tls_address =
+                crate::hle::kernel::k_typed_address::KProcessAddress::new(0x2395000);
+        }
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(Arc::clone(&thread));
+        let make_request = |address: u64| {
+            let mut request = KSessionRequest::new();
+            request.initialize_with_process(&process.lock().unwrap(), None, address as usize, 0);
+            Arc::new(Mutex::new(request))
+        };
+
+        let first = make_request(0x2395400);
+        let second = make_request(0x2395800);
+
+        let mut server = KServerSession::new();
+        server.initialize(0x1000);
+        server.current_request = Some(Arc::new(Mutex::new(KSessionRequest::new())));
+        server
+            .enqueue_inline_request_hle(Arc::clone(&first))
+            .unwrap();
+        server
+            .enqueue_inline_request_hle(Arc::clone(&second))
+            .unwrap();
+
+        let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+        server.current_request = None;
+        match server.receive_queued_inline_request_hle(&second, &manager) {
+            Err(code) => assert_eq!(code, RESULT_NOT_FOUND.get_inner_value()),
+            Ok(_) => panic!("second inline request must not bypass first queued request"),
+        }
+
+        assert!(server.current_request.is_none());
+        assert_eq!(server.request_list.len(), 2);
+        assert!(Arc::ptr_eq(server.request_list.front().unwrap(), &first));
     }
 
     #[test]

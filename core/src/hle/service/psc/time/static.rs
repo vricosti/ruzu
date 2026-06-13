@@ -23,7 +23,7 @@ use super::errors::{
     RESULT_PERMISSION_DENIED, RESULT_TIME_NOT_FOUND,
 };
 use super::manager::TimeManager;
-use super::steady_clock::SteadyClock;
+use super::steady_clock::{SteadyClock, TimeManagerSteadyClockBackend};
 use super::system_clock::{SystemClock, SystemClockKind, TimeManagerBackend};
 use super::time_zone::TimeZone;
 use super::time_zone_service::TimeZoneService;
@@ -243,22 +243,10 @@ impl StaticService {
     pub fn get_standard_steady_clock(&self) -> SteadyClock {
         log::debug!("PSC::Time::StaticService::GetStandardSteadyClock called");
         if let Some(shared_time) = &self.shared_time {
-            let time = shared_time.lock().unwrap();
-            let core = &time.standard_steady_clock;
-            let current_time_point =
-                crate::hle::service::psc::time::clocks::steady_clock_core::get_current_time_point(
-                    core,
-                )
-                .unwrap_or_default();
-            return SteadyClock::with_state(
+            return SteadyClock::with_backend(
                 self.setup_info.can_write_steady_clock,
                 self.setup_info.can_write_uninitialized_clock,
-                core.state.is_initialized(),
-                core.get_test_offset_impl(),
-                core.get_internal_offset_impl(),
-                current_time_point,
-                core.get_setup_result_value_impl(),
-                core.state.is_reset_detected(),
+                Arc::new(TimeManagerSteadyClockBackend::new(Arc::clone(shared_time))),
             );
         }
         SteadyClock::new(
@@ -397,6 +385,14 @@ impl StaticService {
     pub fn is_standard_user_system_clock_automatic_correction_enabled(
         &self,
     ) -> Result<bool, ResultCode> {
+        if let Some(shared_time) = &self.shared_time {
+            let time = shared_time.lock().unwrap();
+            if !time.standard_user_system_clock.is_initialized() {
+                return Err(RESULT_CLOCK_UNINITIALIZED);
+            }
+            return Ok(time.standard_user_system_clock.get_automatic_correction());
+        }
+
         if !self.user_clock_initialized {
             return Err(RESULT_CLOCK_UNINITIALIZED);
         }
@@ -407,6 +403,45 @@ impl StaticService {
         &self,
         automatic_correction: bool,
     ) -> ResultCode {
+        if let Some(shared_time) = &self.shared_time {
+            let mut time = shared_time.lock().unwrap();
+            if !time.standard_user_system_clock.is_initialized()
+                || !time.standard_steady_clock.state.is_initialized()
+            {
+                return RESULT_CLOCK_UNINITIALIZED;
+            }
+            if !self.setup_info.can_write_user_clock {
+                return RESULT_PERMISSION_DENIED;
+            }
+
+            let local = std::ptr::addr_of_mut!(time.standard_local_system_clock);
+            let network = std::ptr::addr_of!(time.standard_network_system_clock);
+            let rc = unsafe {
+                time.standard_user_system_clock.set_automatic_correction(
+                    automatic_correction,
+                    &mut *local,
+                    &*network,
+                )
+            };
+            if rc != RESULT_SUCCESS {
+                return rc;
+            }
+
+            time.shared_memory
+                .set_automatic_correction(automatic_correction);
+
+            let time_point = match super::clocks::steady_clock_core::get_current_time_point(
+                &time.standard_steady_clock,
+            ) {
+                Ok(time_point) => time_point,
+                Err(rc) => return rc,
+            };
+            time.standard_user_system_clock
+                .set_time_point_and_signal(&time_point);
+            time.standard_user_system_clock.get_event().signal();
+            return RESULT_SUCCESS;
+        }
+
         if !self.user_clock_initialized || !self.steady_clock_initialized {
             return RESULT_CLOCK_UNINITIALIZED;
         }
@@ -444,12 +479,24 @@ impl StaticService {
     // =========================================================================
 
     pub fn is_standard_network_system_clock_accuracy_sufficient(&self) -> bool {
+        if let Some(shared_time) = &self.shared_time {
+            let time = shared_time.lock().unwrap();
+            return time.standard_network_system_clock.is_accuracy_sufficient();
+        }
         self.network_accuracy_sufficient
     }
 
     pub fn get_standard_user_system_clock_automatic_correction_updated_time(
         &self,
     ) -> Result<SteadyClockTimePoint, ResultCode> {
+        if let Some(shared_time) = &self.shared_time {
+            let time = shared_time.lock().unwrap();
+            if !time.standard_user_system_clock.is_initialized() {
+                return Err(RESULT_CLOCK_UNINITIALIZED);
+            }
+            return Ok(time.standard_user_system_clock.get_time_point());
+        }
+
         if !self.user_clock_initialized {
             return Err(RESULT_CLOCK_UNINITIALIZED);
         }
@@ -470,6 +517,23 @@ impl StaticService {
         &self,
         context: &SystemClockContext,
     ) -> Result<i64, ResultCode> {
+        if let Some(shared_time) = &self.shared_time {
+            let time = shared_time.lock().unwrap();
+            if !time.standard_steady_clock.state.is_initialized() {
+                return Err(RESULT_CLOCK_UNINITIALIZED);
+            }
+
+            let time_point = super::clocks::steady_clock_core::get_current_time_point(
+                &time.standard_steady_clock,
+            )?;
+            if !time_point.id_matches(&context.steady_time_point) {
+                return Err(RESULT_CLOCK_MISMATCH);
+            }
+
+            let current_time_s = time.standard_steady_clock.get_current_uptime_ns() / 1_000_000_000;
+            return Ok((context.offset + time_point.time_point) - current_time_s);
+        }
+
         if !self.steady_clock_initialized {
             return Err(RESULT_CLOCK_UNINITIALIZED);
         }
@@ -506,6 +570,22 @@ impl StaticService {
     /// Gets clock snapshot from the current user and network contexts.
     pub fn get_clock_snapshot(&self, type_: TimeType) -> Result<ClockSnapshot, ResultCode> {
         log::debug!("StaticService::GetClockSnapshot: type={:?}", type_);
+        if let Some(shared_time) = &self.shared_time {
+            let mut time = shared_time.lock().unwrap();
+            let local = std::ptr::addr_of_mut!(time.standard_local_system_clock);
+            let network = std::ptr::addr_of!(time.standard_network_system_clock);
+            let user_context = unsafe {
+                time.standard_user_system_clock
+                    .get_context(&mut *local, &*network)?
+            };
+            let network_context = time.standard_network_system_clock.clock.get_context()?;
+            return Self::get_clock_snapshot_impl_live(
+                &mut time,
+                &user_context,
+                &network_context,
+                type_,
+            );
+        }
         self.get_clock_snapshot_impl(&self.user_context, &self.network_context, type_)
     }
 
@@ -523,6 +603,15 @@ impl StaticService {
             "StaticService::GetClockSnapshotFromSystemClockContext: type={:?}",
             type_
         );
+        if let Some(shared_time) = &self.shared_time {
+            let mut time = shared_time.lock().unwrap();
+            return Self::get_clock_snapshot_impl_live(
+                &mut time,
+                user_context,
+                network_context,
+                type_,
+            );
+        }
         self.get_clock_snapshot_impl(user_context, network_context, type_)
     }
 
@@ -1030,6 +1119,50 @@ impl StaticService {
         snapshot.network_calendar_time = cal;
         snapshot.network_calendar_additional_time = cal_info;
 
+        snapshot.time_type = type_ as u8;
+        snapshot.unk_ce = 0;
+
+        Ok(snapshot)
+    }
+
+    fn get_clock_snapshot_impl_live(
+        time: &mut TimeManager,
+        user_context: &SystemClockContext,
+        network_context: &SystemClockContext,
+        type_: TimeType,
+    ) -> Result<ClockSnapshot, ResultCode> {
+        let mut snapshot = ClockSnapshot::default();
+
+        snapshot.user_context = *user_context;
+        snapshot.network_context = *network_context;
+        snapshot.steady_clock_time_point =
+            super::clocks::steady_clock_core::get_current_time_point(&time.standard_steady_clock)?;
+        snapshot.is_automatic_correction_enabled =
+            time.standard_user_system_clock.get_automatic_correction();
+        snapshot.location_name = time.time_zone.get_location_name().unwrap_or([0u8; 0x24]);
+
+        snapshot.user_time = get_time_from_time_point_and_context(
+            &snapshot.steady_clock_time_point,
+            &snapshot.user_context,
+        )?;
+        let (cal, cal_info) = time
+            .time_zone
+            .to_calendar_time_with_my_rule(snapshot.user_time)?;
+        snapshot.user_calendar_time = cal;
+        snapshot.user_calendar_additional_time = cal_info;
+
+        match get_time_from_time_point_and_context(
+            &snapshot.steady_clock_time_point,
+            &snapshot.network_context,
+        ) {
+            Ok(time) => snapshot.network_time = time,
+            Err(_) => snapshot.network_time = 0,
+        }
+        let (cal, cal_info) = time
+            .time_zone
+            .to_calendar_time_with_my_rule(snapshot.network_time)?;
+        snapshot.network_calendar_time = cal;
+        snapshot.network_calendar_additional_time = cal_info;
         snapshot.time_type = type_ as u8;
         snapshot.unk_ce = 0;
 
