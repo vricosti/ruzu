@@ -411,15 +411,10 @@ impl TextureCacheBase {
             if index > table.limit() {
                 return NULL_IMAGE_VIEW_ID;
             }
-            if graphics {
-                if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
-                    table.read_with(index, |gpu_addr, out| {
-                        gpu_memory.lock().read_block(gpu_addr, out)
-                    })
-                } else {
-                    let gpu_memory = self.device_memory.clone();
-                    table.read(&*gpu_memory, index)
-                }
+            if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
+                table.read_with(index, |gpu_addr, out| {
+                    gpu_memory.lock().read_block(gpu_addr, out)
+                })
             } else {
                 let gpu_memory = self.device_memory.clone();
                 table.read(&*gpu_memory, index)
@@ -929,6 +924,40 @@ impl TextureCacheBase {
         }
         let id = self.find_sampler(&descriptor);
         self.channel_state.graphics_sampler_ids[index as usize] = id;
+        id
+    }
+
+    /// Resolve a compute-stage sampler index to a `SamplerId`.
+    ///
+    /// Port of `TextureCache<P>::GetComputeSamplerId` (texture_cache.h:270-281).
+    pub fn get_compute_sampler_id(&mut self, index: u32) -> SamplerId {
+        use crate::texture_cache::types::NULL_SAMPLER_ID;
+        if index > self.channel_state.compute_sampler_table.limit() {
+            log::debug!(
+                "TextureCacheBase::get_compute_sampler_id: invalid index={}",
+                index
+            );
+            return NULL_SAMPLER_ID;
+        }
+        let (descriptor, is_new) =
+            if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
+                self.channel_state
+                    .compute_sampler_table
+                    .read_with(index, |gpu_addr, out| {
+                        gpu_memory.lock().read_block(gpu_addr, out)
+                    })
+            } else {
+                let gpu_memory_arc = self.device_memory.clone();
+                self.channel_state
+                    .compute_sampler_table
+                    .read(gpu_memory_arc.as_ref(), index)
+            };
+        let cached = self.channel_state.compute_sampler_ids[index as usize];
+        if !is_new && cached.is_valid() && cached != CORRUPT_ID {
+            return cached;
+        }
+        let id = self.find_sampler(&descriptor);
+        self.channel_state.compute_sampler_ids[index as usize] = id;
         id
     }
 
@@ -1992,7 +2021,7 @@ mod tests {
     use super::*;
     use crate::engines::maxwell_3d::{RenderTargetInfo, RtControlInfo};
     use crate::framebuffer_config::{AndroidPixelFormat, FramebufferConfig};
-    use crate::textures::texture::{ComponentType, TextureFormat, TextureType, TicEntry};
+    use crate::textures::texture::{ComponentType, TextureFormat, TextureType, TicEntry, TscEntry};
 
     fn color_2d_tic(address: u64, base_layer: u32) -> TicEntry {
         let word0 = (TextureFormat::A8B8G8R8 as u32)
@@ -2014,6 +2043,12 @@ mod tests {
                 0,
             ],
         }
+    }
+
+    fn descriptor_bytes(raw: [u64; 4]) -> Vec<u8> {
+        raw.into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect::<Vec<_>>()
     }
 
     fn test_cache() -> TextureCacheBase {
@@ -2063,6 +2098,118 @@ mod tests {
         assert_eq!(image_id.index, 1);
         assert_ne!(sampler_id, crate::texture_cache::types::NULL_SAMPLER_ID);
         assert_eq!(sampler_id.index, 1);
+    }
+
+    #[test]
+    fn fill_compute_image_views_uses_channel_gpu_memory_for_tic_reads() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex as ParkingMutex;
+        use std::sync::Arc;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let mut backing = vec![0u8; 0x6000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x9000_0000,
+            backing.as_mut_ptr(),
+            0x5000_0000,
+            backing.len(),
+            3,
+            true,
+        );
+        let gpu_memory = Arc::new(ParkingMutex::new(
+            MemoryManager::new_with_geometry_and_device_memory(
+                7,
+                Arc::clone(&device_memory),
+                32,
+                0x1_0000_0000,
+                16,
+                12,
+            ),
+        ));
+        {
+            let mut gpu_memory = gpu_memory.lock();
+            gpu_memory.map(0x1000, 0x9000_0000, 0x1000, 0, false);
+            gpu_memory.map(0x8000, 0x9000_1000, 0x4000, 0, false);
+            let tic = color_2d_tic(0x8000, 0);
+            assert!(gpu_memory.write_block(0x1000, &descriptor_bytes(tic.raw)));
+        }
+        cache.set_channel_gpu_memory(Arc::clone(&gpu_memory));
+        assert!(cache
+            .channel_state
+            .compute_image_table
+            .synchronize(0x1000, 0));
+        cache
+            .channel_state
+            .compute_image_view_ids
+            .resize(1, CORRUPT_ID);
+
+        let mut views = [ImageViewInOut {
+            index: 0,
+            blacklist: false,
+            id: NULL_IMAGE_VIEW_ID,
+        }];
+        cache.fill_compute_image_views(&mut views);
+
+        assert!(views[0].id.is_valid());
+        assert_ne!(views[0].id, NULL_IMAGE_VIEW_ID);
+        let view = &cache.slot_image_views[views[0].id];
+        assert_eq!(view.gpu_addr, 0x8000);
+    }
+
+    #[test]
+    fn get_compute_sampler_id_uses_channel_gpu_memory_for_tsc_reads() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex as ParkingMutex;
+        use std::sync::Arc;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let mut backing = vec![0u8; 0x1000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x9000_0000,
+            backing.as_mut_ptr(),
+            0x5000_0000,
+            backing.len(),
+            3,
+            true,
+        );
+        let gpu_memory = Arc::new(ParkingMutex::new(
+            MemoryManager::new_with_geometry_and_device_memory(
+                7,
+                Arc::clone(&device_memory),
+                32,
+                0x1_0000_0000,
+                16,
+                12,
+            ),
+        ));
+        let mut tsc = TscEntry::default();
+        tsc.raw[0] = 0x0000_03A2_0002_6080;
+        {
+            let mut gpu_memory = gpu_memory.lock();
+            gpu_memory.map(0x2000, 0x9000_0000, 0x1000, 0, false);
+            assert!(gpu_memory.write_block(0x2000, &descriptor_bytes(tsc.raw)));
+        }
+        cache.set_channel_gpu_memory(Arc::clone(&gpu_memory));
+        assert!(cache
+            .channel_state
+            .compute_sampler_table
+            .synchronize(0x2000, 0));
+        cache
+            .channel_state
+            .compute_sampler_ids
+            .resize(1, CORRUPT_ID);
+
+        let sampler_id = cache.get_compute_sampler_id(0);
+
+        assert!(sampler_id.is_valid());
+        assert_ne!(sampler_id, NULL_SAMPLER_ID);
+        assert_eq!(cache.slot_samplers[sampler_id].raw, tsc.raw);
     }
 
     #[test]

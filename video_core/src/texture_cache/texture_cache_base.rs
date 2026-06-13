@@ -138,10 +138,9 @@ pub struct DescriptorSyncRegs {
 /// tables plus cached sampler/image-view mappings.
 pub struct TextureCacheChannelInfo {
     // Descriptor tables — typed against the real `TicEntry`/`TscEntry`
-    // structs from `video_core::textures::texture`. `DescriptorTable::read`
-    // is still stubbed (returns `T::default()` until the GPU memory reader
-    // is wired in), so `VisitImageView` will see all-zero descriptors and
-    // never produce a non-NULL image view yet.
+    // structs from `video_core::textures::texture`. Reads are performed
+    // through the bound channel GPU memory when available, matching
+    // upstream's `DescriptorTable<T>{gpu_memory}` owner.
     pub graphics_image_table: DescriptorTable<crate::textures::texture::TicEntry>,
     pub graphics_sampler_table: DescriptorTable<crate::textures::texture::TscEntry>,
     pub graphics_sampler_ids: Vec<SamplerId>,
