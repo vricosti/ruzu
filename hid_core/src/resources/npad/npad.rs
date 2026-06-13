@@ -22,6 +22,32 @@ use crate::resources::vibration::vibration_device::NpadVibrationDevice;
 
 static NPAD_UPDATE_TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+fn trace_npad_update(
+    aruid: u64,
+    entry_index: usize,
+    buttons: u64,
+    sampling_number: i64,
+    style_bits: u32,
+    sixaxis_properties: u32,
+) {
+    if !common::trace::is_enabled(common::trace::cat::HID_NPAD) {
+        return;
+    }
+    common::trace::emit_raw(
+        common::trace::cat::HID_NPAD,
+        &[
+            0xFFFF,
+            0,
+            aruid,
+            entry_index as u64,
+            buttons,
+            sampling_number as u64,
+            style_bits as u64,
+            sixaxis_properties as u64,
+        ],
+    );
+}
+
 /// Main NPad controller resource
 pub struct NPad {
     npad_resource: NPadResource,
@@ -247,18 +273,18 @@ impl NPad {
                 let npad = &mut shared.npad.npad_entry[entry_index].internal_state;
 
                 // Mirror upstream `NPad::InitNewlyAddedController` for the
-                // Pro Controller (Fullkey) case (npad.cpp:202-215). These fields
-                // are normally written ONCE on a connect event; ruzu has no
-                // EmulatedController connect-event plumbing yet, so we keep
-                // re-writing them here. The values are idempotent.
-                npad.style_tag.raw |= NpadStyleSet::FULLKEY;
-                // device_type.fullkey = bit 0 (upstream `BitField<0,1,s32> fullkey`).
-                npad.device_type.raw |= 1 << 0;
-                // system_properties bits 11 (is_vertical), 13 (use_plus), 14 (use_minus).
-                npad.system_properties.raw |= (1 << 11) | (1 << 13) | (1 << 14);
-                npad.fullkey_color.attribute = ColorAttribute::Ok;
-                npad.applet_footer_type = AppletFooterUiType::SwitchProController;
-                npad.sixaxis_fullkey_properties.set_is_newly_assigned(true);
+                // Pro Controller (Fullkey) case (npad.cpp:202-215). These
+                // fields are connect-time state upstream, not per-poll state.
+                if !npad.style_tag.raw.contains(NpadStyleSet::FULLKEY) {
+                    npad.style_tag.raw |= NpadStyleSet::FULLKEY;
+                    // device_type.fullkey = bit 0 (upstream `BitField<0,1,s32> fullkey`).
+                    npad.device_type.raw |= 1 << 0;
+                    // system_properties bits 11 (is_vertical), 13 (use_plus), 14 (use_minus).
+                    npad.system_properties.raw |= (1 << 11) | (1 << 13) | (1 << 14);
+                    npad.fullkey_color.attribute = ColorAttribute::Ok;
+                    npad.applet_footer_type = AppletFooterUiType::SwitchProController;
+                    npad.sixaxis_fullkey_properties.set_is_newly_assigned(true);
+                }
 
                 // Build a Pro Controller / Fullkey `NPadGenericState`:
                 //   connection_status.raw bits: is_connected (0) | is_wired (1) = 0x3.
@@ -278,6 +304,16 @@ impl NPad {
                         entry_index,
                         pad_state.npad_buttons.raw.bits(),
                         pad_state.sampling_number
+                    );
+                }
+                if trace_update && trace_index % 600 == 0 {
+                    trace_npad_update(
+                        aruid,
+                        entry_index,
+                        pad_state.npad_buttons.raw.bits(),
+                        pad_state.sampling_number,
+                        npad.style_tag.raw.bits(),
+                        npad.sixaxis_fullkey_properties.raw as u32,
                     );
                 }
                 npad.fullkey_lifo.write_next_entry(pad_state);
@@ -479,6 +515,58 @@ impl NPad {
 
     pub fn set_vibration_master_volume(&self, master_volume: f32) -> ResultCode {
         self.vibration.set_vibration_master_volume(master_volume)
+    }
+
+    /// Port of NPad::ResetIsSixAxisSensorDeviceNewlyAssigned.
+    pub fn reset_is_six_axis_sensor_device_newly_assigned(
+        &mut self,
+        aruid: u64,
+        sixaxis_handle: &SixAxisSensorHandle,
+    ) -> ResultCode {
+        let valid = hid_util::is_sixaxis_handle_valid(sixaxis_handle);
+        if valid.is_error() {
+            return valid;
+        }
+
+        let Some(applet_resource) = self.applet_resource_holder.applet_resource.clone() else {
+            return ResultCode::SUCCESS;
+        };
+        let mut applet_resource = applet_resource.lock();
+        let Some(shared) = applet_resource.get_shared_memory_format_mut(aruid) else {
+            return ResultCode::SUCCESS;
+        };
+        let npad_id: NpadIdType =
+            unsafe { std::mem::transmute::<u32, NpadIdType>(sixaxis_handle.npad_id as u32) };
+        let index = hid_util::npad_id_type_to_index(npad_id);
+        let npad = &mut shared.npad.npad_entry[index].internal_state;
+
+        match sixaxis_handle.npad_type {
+            NpadStyleIndex::Fullkey | NpadStyleIndex::Pokeball => {
+                npad.sixaxis_fullkey_properties.set_is_newly_assigned(false);
+            }
+            NpadStyleIndex::Handheld => {
+                npad.sixaxis_handheld_properties
+                    .set_is_newly_assigned(false);
+            }
+            NpadStyleIndex::JoyconDual => match sixaxis_handle.device_index {
+                DeviceIndex::Left => npad
+                    .sixaxis_dual_left_properties
+                    .set_is_newly_assigned(false),
+                DeviceIndex::Right => npad
+                    .sixaxis_dual_right_properties
+                    .set_is_newly_assigned(false),
+                _ => {}
+            },
+            NpadStyleIndex::JoyconLeft => {
+                npad.sixaxis_left_properties.set_is_newly_assigned(false);
+            }
+            NpadStyleIndex::JoyconRight => {
+                npad.sixaxis_right_properties.set_is_newly_assigned(false);
+            }
+            _ => {}
+        }
+
+        ResultCode::SUCCESS
     }
 
     pub fn get_vibration_master_volume(&self) -> Result<f32, ResultCode> {

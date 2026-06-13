@@ -162,17 +162,32 @@ fn materialize_syntax_conditions(program: &mut Program, cfg_blocks: &[control_fl
     for (index, node) in program.syntax_list.iter().enumerate() {
         match node {
             SyntaxNode::Block(block) => current_block = Some(*block),
-            SyntaxNode::If { .. } | SyntaxNode::Repeat { .. } => {
+            SyntaxNode::If { cond, .. } | SyntaxNode::Repeat { cond, .. } => {
                 let Some(block) = current_block else {
                     continue;
                 };
                 let Some(cfg_block) = cfg_blocks.get(block as usize) else {
                     continue;
                 };
+                let invert = matches!(cond, Value::ImmU1(false));
                 if cfg_block.cond.is_always() {
+                    if invert {
+                        replacements.push((
+                            index,
+                            block,
+                            control_flow::Condition {
+                                pred: 7,
+                                negated: true,
+                            },
+                        ));
+                    }
                     continue;
                 }
-                replacements.push((index, block, cfg_block.cond));
+                let mut cond = cfg_block.cond;
+                if invert {
+                    cond.negated = !cond.negated;
+                }
+                replacements.push((index, block, cond));
             }
             _ => {}
         }
@@ -566,10 +581,17 @@ pub fn compile_shader_glsl_from_env_with_bindings_and_host_info(
     bindings: &mut backend::bindings::Bindings,
     host_info: &crate::host_translate_info::HostTranslateInfo,
 ) -> CompiledGlslShader {
+    let stage = env.shader_stage();
+    let dump = ShaderIrDumpConfig::from_env(stage, base_offset, code);
     let mut program = translate_program_from_env_with_host_info(code, base_offset, env, host_info);
+    if let Some(dump) = dump.as_ref() {
+        dump.write(&program, "00_env_translated");
+    }
     convert_legacy_to_generic(&mut program, runtime_info);
+    if let Some(dump) = dump.as_ref() {
+        dump.write(&program, "01_env_legacy_to_generic");
+    }
     let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, bindings);
-    let stage = program.stage;
     CompiledGlslShader {
         source,
         info: program.info,

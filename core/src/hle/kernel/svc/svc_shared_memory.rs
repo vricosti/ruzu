@@ -205,6 +205,20 @@ pub fn map_shared_memory(
             size,
             map_perm
         );
+        if std::env::var_os("RUZU_TRACE_FONT_SHMEM_BYTES").is_some() && size == 0x1100000 {
+            for offset in [0x0_u64, 0x8, 0x11d10c] {
+                let bytes = process.read_memory_vec(address + offset, 32);
+                let mut hex = String::with_capacity(bytes.len() * 2);
+                for byte in bytes {
+                    use std::fmt::Write as _;
+                    let _ = write!(hex, "{byte:02x}");
+                }
+                eprintln!(
+                    "[FONT_SHMEM_BYTES] base=0x{address:X} offset=0x{offset:X} addr=0x{:X} bytes={hex}",
+                    address + offset
+                );
+            }
+        }
     } else {
         process.remove_shared_memory(&shmem, address, size as usize);
         log::error!("svc::MapSharedMemory: map failed, result={:?}", result);

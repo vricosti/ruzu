@@ -26,11 +26,11 @@ use crate::texture_cache::texture_cache_base::{
 };
 use crate::texture_cache::types::{BufferImageCopy, ImageCopy};
 use crate::texture_cache::types::{
-    Extent2D, ImageId, ImageType, ImageViewId, ImageViewType, Offset2D, Region2D, RelaxedOptions,
-    SubresourceRange, NULL_IMAGE_ID,
+    Extent2D, Extent3D, ImageId, ImageType, ImageViewId, ImageViewType, Offset2D, Region2D,
+    RelaxedOptions, SubresourceRange, NULL_IMAGE_ID,
 };
 use crate::texture_cache::util::{
-    full_download_copies, map_size_bytes, swizzle_image, unswizzle_image,
+    full_download_copies, make_shrink_image_copies, map_size_bytes, swizzle_image, unswizzle_image,
 };
 
 /// Number of render targets.
@@ -84,6 +84,13 @@ fn scale_up_image_copies(copies: &[ImageCopy], both_2d: bool) -> Vec<ImageCopy> 
         .collect()
 }
 
+fn is_pixel_format_bgr(format: PixelFormat) -> bool {
+    matches!(
+        format,
+        PixelFormat::B5G6R5Unorm | PixelFormat::B8G8R8A8Unorm | PixelFormat::B8G8R8A8Srgb
+    )
+}
+
 fn texture_upload_trace_targets() -> Option<&'static [u64]> {
     static TARGETS: OnceLock<Option<Vec<u64>>> = OnceLock::new();
     TARGETS
@@ -109,6 +116,40 @@ fn should_dump_texture_upload(gpu_addr: u64) -> bool {
         return false;
     };
     targets.is_empty() || targets.contains(&gpu_addr)
+}
+
+fn texture_cache_trace_targets() -> Option<&'static [u64]> {
+    static TARGETS: OnceLock<Option<Vec<u64>>> = OnceLock::new();
+    TARGETS
+        .get_or_init(|| parse_u64_env_list("RUZU_TRACE_TEXTURE_CACHE_ADDRS"))
+        .as_deref()
+}
+
+fn should_trace_texture_cache_address(gpu_addr: u64) -> bool {
+    let Some(targets) = texture_cache_trace_targets() else {
+        return false;
+    };
+    targets.is_empty() || targets.contains(&gpu_addr)
+}
+
+fn texture_cache_cpu_trace_targets() -> Option<&'static [u64]> {
+    static TARGETS: OnceLock<Option<Vec<u64>>> = OnceLock::new();
+    TARGETS
+        .get_or_init(|| parse_u64_env_list("RUZU_TRACE_TEXTURE_CACHE_CPU_ADDRS"))
+        .as_deref()
+}
+
+fn should_trace_texture_cache_cpu_region(cpu_addr: u64, size: usize) -> bool {
+    let Some(targets) = texture_cache_cpu_trace_targets() else {
+        return false;
+    };
+    if targets.is_empty() {
+        return true;
+    }
+    let end = cpu_addr.saturating_add(size as u64);
+    targets
+        .iter()
+        .any(|&target| cpu_addr <= target && target < end)
 }
 
 fn image_view_trace_targets() -> Option<&'static [u64]> {
@@ -238,57 +279,79 @@ impl FormatConversionPass {
     pub fn convert_image(
         &mut self,
         dst_texture: u32,
-        dst_internal_format: u32,
-        width: u32,
-        height: u32,
-        depth: u32,
+        dst_target: u32,
+        dst_format: u32,
+        dst_type: u32,
+        src_texture: u32,
+        src_target: u32,
         src_format: u32,
         src_type: u32,
-        src_texture: u32,
+        src_pixel_format: crate::surface::PixelFormat,
+        copies: &[ImageCopy],
     ) {
-        let required_size = (width * height * depth * 4) as usize;
-        self.ensure_pbo_size(required_size);
-
         unsafe {
-            // Bind PBO for pack (GPU -> PBO)
-            gl::BindBuffer(gl::PIXEL_PACK_BUFFER, self.intermediate_pbo);
-            gl::GetTextureImage(
-                src_texture,
-                0,
-                src_format,
-                src_type,
-                required_size as i32,
-                std::ptr::null_mut(),
-            );
+            let img_bpp = crate::surface::bytes_per_block(src_pixel_format);
+            for copy in copies {
+                let src_origin =
+                    make_copy_origin(copy.src_offset, copy.src_subresource, src_target);
+                let dst_origin =
+                    make_copy_origin(copy.dst_offset, copy.dst_subresource, dst_target);
+                let region = make_copy_region(copy.extent, copy.dst_subresource, dst_target);
+                if region.width == 0 || region.height == 0 || region.depth == 0 || img_bpp == 0 {
+                    continue;
+                }
+                let copy_size = region.width as usize
+                    * region.height as usize
+                    * region.depth as usize
+                    * img_bpp as usize;
+                self.ensure_pbo_size(copy_size);
 
-            // Bind PBO for unpack (PBO -> GPU)
-            gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, self.intermediate_pbo);
+                gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
+                gl::PixelStorei(gl::PACK_ROW_LENGTH, copy.extent.width as i32);
+                gl::BindBuffer(gl::PIXEL_PACK_BUFFER, self.intermediate_pbo);
+                gl::GetTextureSubImage(
+                    src_texture,
+                    src_origin.level,
+                    src_origin.x,
+                    src_origin.y,
+                    src_origin.z,
+                    region.width,
+                    region.height,
+                    region.depth,
+                    src_format,
+                    src_type,
+                    self.pbo_size as i32,
+                    std::ptr::null_mut(),
+                );
+
+                gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
+                gl::PixelStorei(gl::UNPACK_ROW_LENGTH, copy.extent.width as i32);
+                gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, self.intermediate_pbo);
+                gl::TextureSubImage3D(
+                    dst_texture,
+                    dst_origin.level,
+                    dst_origin.x,
+                    dst_origin.y,
+                    dst_origin.z,
+                    region.width,
+                    region.height,
+                    region.depth,
+                    dst_format,
+                    dst_type,
+                    std::ptr::null(),
+                );
+            }
+
             gl::BindBuffer(gl::PIXEL_PACK_BUFFER, 0);
-
-            gl::TextureSubImage3D(
-                dst_texture,
-                0,
-                0,
-                0,
-                0,
-                width as i32,
-                height as i32,
-                depth as i32,
-                src_format,
-                src_type,
-                std::ptr::null(),
-            );
-
             gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, 0);
         }
-
-        let _ = dst_internal_format; // Used in full implementation for format validation
     }
 
     fn ensure_pbo_size(&mut self, required_size: usize) {
         if self.pbo_size >= required_size {
             return;
         }
+        let allocation_size = required_size.max(1).next_power_of_two();
         unsafe {
             if self.intermediate_pbo != 0 {
                 gl::DeleteBuffers(1, &self.intermediate_pbo);
@@ -296,12 +359,12 @@ impl FormatConversionPass {
             gl::CreateBuffers(1, &mut self.intermediate_pbo);
             gl::NamedBufferData(
                 self.intermediate_pbo,
-                required_size as isize,
+                allocation_size as isize,
                 std::ptr::null(),
                 gl::STREAM_COPY,
             );
         }
-        self.pbo_size = required_size;
+        self.pbo_size = allocation_size;
     }
 }
 
@@ -1252,11 +1315,14 @@ pub struct ImageView {
     pub buffer_size: u32,
     image_id: ImageId,
     format: PixelFormat,
+    view_type: ImageViewType,
     swizzle: [u8; 4],
     original_texture: u32,
     num_samples: i32,
     flat_range: SubresourceRange,
     full_range: SubresourceRange,
+    size: Extent3D,
+    flags: ImageViewFlagBits,
     is_render_target: bool,
     /// Snapshot of `ImageViewBase::supports_anisotropy()` captured at
     /// materialisation. Used by the rasterizer's bind loop to pick the
@@ -1283,6 +1349,7 @@ impl ImageView {
             buffer_size: 0,
             image_id: NULL_IMAGE_ID,
             format: PixelFormat::Invalid,
+            view_type: ImageViewType::Buffer,
             swizzle: [
                 SwizzleSource::R as u8,
                 SwizzleSource::G as u8,
@@ -1293,6 +1360,8 @@ impl ImageView {
             num_samples: 0,
             flat_range: SubresourceRange::default(),
             full_range: SubresourceRange::default(),
+            size: Extent3D::default(),
+            flags: ImageViewFlagBits::empty(),
             is_render_target: false,
             supports_anisotropy: false,
             owned_views: Vec::new(),
@@ -1331,10 +1400,14 @@ impl ImageView {
         view.image_id = base.image_id;
         view.internal_format = present_internal_format(base.format);
         view.format = base.format;
+        view.view_type = base.view_type;
+        view.swizzle = base.swizzle;
         view.original_texture = image.handle();
         view.num_samples = image.num_samples;
         view.flat_range = base.range;
         view.full_range = base.range;
+        view.size = base.size;
+        view.flags = base.flags;
         view.is_render_target = true;
         view.supports_anisotropy = base.supports_anisotropy();
 
@@ -1369,7 +1442,14 @@ impl ImageView {
     }
 
     fn matches_base_image(&self, base: &ImageViewBase, image: &Image) -> bool {
-        self.image_id == base.image_id && self.original_texture == image.handle()
+        self.image_id == base.image_id
+            && self.original_texture == image.handle()
+            && self.format == base.format
+            && self.view_type == base.view_type
+            && self.swizzle == base.swizzle
+            && self.full_range == base.range
+            && self.size == base.size
+            && self.flags == base.flags
     }
 
     /// Port of upstream `ImageView::ImageView(TextureCacheRuntime& runtime,
@@ -1407,11 +1487,14 @@ impl ImageView {
             present_internal_format(base.format)
         };
         view.format = base.format;
+        view.view_type = base.view_type;
         view.swizzle = base.swizzle;
         view.original_texture = image.handle();
         view.num_samples = image.num_samples;
         view.full_range = base.range;
         view.flat_range = base.range;
+        view.size = base.size;
+        view.flags = base.flags;
         view.supports_anisotropy = base.supports_anisotropy();
         // Upstream sets `is_render_target = info.IsRenderTarget()`; that
         // helper checks `info.range.base.layer != 0 || info.range.extent.layers != 1`.
@@ -1947,6 +2030,7 @@ pub struct TextureCache {
     samplers: HashMap<crate::texture_cache::types::SamplerId, Sampler>,
     framebuffers: HashMap<ImageViewId, TextureCacheFramebuffer>,
     render_target_framebuffers: HashMap<RenderTargets, TextureCacheFramebuffer>,
+    format_conversion_pass: FormatConversionPass,
     null_image_handles: [u32; 7],
     null_image_views: [u32; NUM_TEXTURE_TYPES],
     has_native_astc: bool,
@@ -2477,12 +2561,17 @@ impl TextureCache {
         let (null_image_handles, null_image_views) =
             create_null_image_views(has_debugging_tool_attached);
         Self {
-            base: CommonTextureCache::new(device_memory),
+            base: CommonTextureCache::new_with_caps(
+                device_memory,
+                has_broken_texture_view_formats,
+                has_native_bgr,
+            ),
             images: HashMap::new(),
             image_views: HashMap::new(),
             samplers: HashMap::new(),
             framebuffers: HashMap::new(),
             render_target_framebuffers: HashMap::new(),
+            format_conversion_pass: FormatConversionPass::new(),
             null_image_handles,
             null_image_views,
             has_native_astc,
@@ -2538,6 +2627,45 @@ impl TextureCache {
 
     pub fn set_guest_memory_writer(&mut self, writer: GuestMemoryWriter) {
         self.base.set_guest_memory_writer(writer);
+    }
+
+    /// OpenGL-backed port of `TextureCache<P>::PrepareImage`.
+    ///
+    /// The common Rust base owns the upstream method name, but it cannot reach
+    /// backend `Image::UploadMemory`. This wrapper keeps the upstream ordering
+    /// for the OpenGL specialization: refresh CPU-modified contents unless the
+    /// caller invalidates, then mark GPU modification when requested.
+    pub fn prepare_image_without_gpu_reader(
+        &mut self,
+        image_id: ImageId,
+        is_modification: bool,
+        invalidate: bool,
+    ) {
+        if !image_id.is_valid() {
+            return;
+        }
+        self.ensure_backend_image_flags(image_id);
+        if invalidate {
+            let image = &mut self.base.slot_images[image_id];
+            image
+                .flags
+                .remove(ImageFlagBits::CPU_MODIFIED | ImageFlagBits::GPU_MODIFIED);
+            if !self.base.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::TRACKED)
+            {
+                self.base.track_image(image_id);
+            }
+        } else {
+            // Upstream `PrepareImage` always runs `SynchronizeAliases` after
+            // `RefreshContents`. The reader-less Rust path cannot refresh
+            // guest CPU writes, but alias synchronization is a backend-local
+            // copy and must still run before sampling or modifying the image.
+            self.synchronize_aliases(image_id);
+        }
+        if is_modification {
+            self.base.mark_modification_by_id(image_id);
+        }
     }
 
     /// OpenGL-backed port of `TextureCache<P>::PrepareImage`.
@@ -2798,31 +2926,146 @@ impl TextureCache {
 
         aliases.sort_by_key(|alias| self.base.slot_images[alias.id].modification_tick);
         for alias in aliases {
-            self.copy_image_direct(image_id, alias.id, &alias.copies);
+            self.copy_image(image_id, alias.id, &alias.copies);
         }
     }
 
-    /// Port of upstream `TextureCache<P>::CopyImage` direct GL branch plus
-    /// `TextureCacheRuntime::CopyImage`.
-    fn copy_image_direct(&mut self, dst_id: ImageId, src_id: ImageId, copies: &[ImageCopy]) {
+    fn base_image_exists(&self, image_id: ImageId) -> bool {
+        image_id.is_valid() && self.base.slot_images.iter().any(|(id, _)| id == image_id)
+    }
+
+    fn finish_pending_join_copies(&mut self) {
+        let pending = std::mem::take(&mut self.base.pending_join_copies);
+        let trace_join = std::env::var_os("RUZU_TRACE_JOIN_IMAGES").is_some();
+        for join in pending {
+            if !self.base_image_exists(join.new_image_id) {
+                continue;
+            }
+            if trace_join {
+                let image = &self.base.slot_images[join.new_image_id];
+                log::warn!(
+                    "[JOIN_IMAGES] drain new={} gpu=0x{:X} cpu=0x{:X} fmt={:?} {}x{} copies={}",
+                    join.new_image_id.index,
+                    image.gpu_addr,
+                    image.cpu_addr,
+                    image.info.format,
+                    image.info.size.width,
+                    image.info.size.height,
+                    join.copies.len()
+                );
+            }
+            for copy_object in join.copies {
+                if !self.base_image_exists(copy_object.id) {
+                    continue;
+                }
+                if trace_join {
+                    let overlap = &self.base.slot_images[copy_object.id];
+                    log::warn!(
+                        "[JOIN_IMAGES] copy new={} overlap={} alias={} gpu_modified_at_join={} gpu=0x{:X} cpu=0x{:X} fmt={:?} {}x{} flags=0x{:X}",
+                        join.new_image_id.index,
+                        copy_object.id.index,
+                        copy_object.is_alias,
+                        copy_object.gpu_modified_at_join,
+                        overlap.gpu_addr,
+                        overlap.cpu_addr,
+                        overlap.info.format,
+                        overlap.info.size.width,
+                        overlap.info.size.height,
+                        overlap.flags.bits(),
+                    );
+                }
+
+                if copy_object.is_alias {
+                    if !self.base.slot_images[copy_object.id].is_safe_download() {
+                        continue;
+                    }
+                    let Some(&alias_index) = join.alias_indices.get(&copy_object.id) else {
+                        continue;
+                    };
+                    let Some(alias) = self.base.slot_images[join.new_image_id]
+                        .aliased_images
+                        .get(alias_index)
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    self.copy_image(join.new_image_id, alias.id, &alias.copies);
+                    let tick = self.base.slot_images[copy_object.id].modification_tick;
+                    self.base.slot_images[join.new_image_id].modification_tick = tick;
+                    continue;
+                }
+
+                let overlap_snapshot = self.base.slot_images[copy_object.id].clone();
+                if copy_object.gpu_modified_at_join
+                    || overlap_snapshot.flags.contains(ImageFlagBits::GPU_MODIFIED)
+                {
+                    self.base.slot_images[join.new_image_id]
+                        .flags
+                        .insert(ImageFlagBits::GPU_MODIFIED);
+                    if let Some(base) = self.base.slot_images[join.new_image_id]
+                        .try_find_base(overlap_snapshot.gpu_addr)
+                    {
+                        let new_info = self.base.slot_images[join.new_image_id].info.clone();
+                        let copies =
+                            make_shrink_image_copies(&new_info, &overlap_snapshot.info, base, 1, 0);
+                        if trace_join {
+                            log::warn!(
+                                "[JOIN_IMAGES] gl_copy new={} overlap={} copies={} base_level={} base_layer={}",
+                                join.new_image_id.index,
+                                copy_object.id.index,
+                                copies.len(),
+                                base.level,
+                                base.layer
+                            );
+                        }
+                        self.copy_image(join.new_image_id, copy_object.id, &copies);
+                        self.base.slot_images[join.new_image_id].modification_tick =
+                            overlap_snapshot.modification_tick;
+                    }
+                }
+
+                self.delete_join_overlap_image(copy_object.id);
+            }
+        }
+    }
+
+    fn delete_join_overlap_image(&mut self, image_id: ImageId) {
+        if !self.base_image_exists(image_id) {
+            return;
+        }
+        if self.base.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::TRACKED)
+        {
+            self.base.untrack_image(image_id);
+        }
+        if self.base.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::REGISTERED)
+        {
+            self.base.unregister_image(image_id);
+        }
+        let view_ids = self.base.slot_images[image_id].image_view_ids.clone();
+        self.images.remove(&image_id);
+        for view_id in view_ids {
+            self.image_views.remove(&view_id);
+            self.remove_framebuffers_for_view(view_id);
+        }
+        self.base.delete_image(image_id, false);
+    }
+
+    /// Port of upstream `TextureCache<P>::CopyImage` for OpenGL.
+    fn copy_image(&mut self, dst_id: ImageId, src_id: ImageId, copies: &[ImageCopy]) {
         if !dst_id.is_valid() || !src_id.is_valid() || copies.is_empty() {
             return;
         }
 
         let dst_base = self.base.slot_images[dst_id].clone();
         let src_base = self.base.slot_images[src_id].clone();
+        let trace_copy = should_trace_texture_cache_address(dst_base.gpu_addr)
+            || should_trace_texture_cache_address(src_base.gpu_addr);
         let src_rescaled = src_base.flags.contains(ImageFlagBits::RESCALED);
         let dst_rescaled = dst_base.flags.contains(ImageFlagBits::RESCALED);
-        if crate::surface::get_format_type(dst_base.info.format)
-            != crate::surface::get_format_type(src_base.info.format)
-        {
-            log::warn!(
-                "TextureCache::copy_image_direct: reinterpret/convert path not ported dst={:?} src={:?}",
-                dst_base.info.format,
-                src_base.info.format
-            );
-            return;
-        }
         if src_rescaled != dst_rescaled {
             log::warn!(
                 "TextureCache::copy_image_direct: mismatched rescaled alias copy src={} dst={}",
@@ -2847,6 +3090,9 @@ impl TextureCache {
             copies.to_vec()
         };
 
+        let dst_format_type = crate::surface::get_format_type(dst_base.info.format);
+        let src_format_type = crate::surface::get_format_type(src_base.info.format);
+
         self.images
             .entry(dst_id)
             .or_insert_with(|| Image::from_base(&dst_base, self.has_native_astc));
@@ -2862,8 +3108,76 @@ impl TextureCache {
 
         let dst_target = image_target(&dst_base.info);
         let src_target = image_target(&src_base.info);
+        if src_format_type == dst_format_type && self.can_image_be_copied(&dst_base, &src_base) {
+            if trace_copy {
+                log::warn!(
+                    "[COPY_IMAGE] path=direct src={} gpu=0x{:X} fmt={:?} dst={} gpu=0x{:X} fmt={:?} copies={}",
+                    src_id.index,
+                    src_base.gpu_addr,
+                    src_base.info.format,
+                    dst_id.index,
+                    dst_base.gpu_addr,
+                    dst_base.info.format,
+                    copies.len()
+                );
+            }
+            self.copy_image_direct_raw(dst_handle, dst_target, src_handle, src_target, &copies);
+            return;
+        }
+
+        if src_format_type == dst_format_type {
+            if trace_copy {
+                log::warn!(
+                    "[COPY_IMAGE] path=emulate src={} gpu=0x{:X} fmt={:?} dst={} gpu=0x{:X} fmt={:?} copies={}",
+                    src_id.index,
+                    src_base.gpu_addr,
+                    src_base.info.format,
+                    dst_id.index,
+                    dst_base.gpu_addr,
+                    dst_base.info.format,
+                    copies.len()
+                );
+            }
+            self.emulate_copy_image(dst_id, src_id, &copies);
+            return;
+        }
+
+        if dst_base.info.image_type != ImageType::E2D || src_base.info.image_type != ImageType::E2D
+        {
+            log::warn!(
+                "TextureCache::copy_image: reinterpret path only implemented for 2D images dst={:?} src={:?}",
+                dst_base.info.image_type,
+                src_base.info.image_type
+            );
+            return;
+        }
+        if trace_copy {
+            log::warn!(
+                "[COPY_IMAGE] path=reinterpret src={} gpu=0x{:X} fmt={:?}/{:?} dst={} gpu=0x{:X} fmt={:?}/{:?} copies={}",
+                src_id.index,
+                src_base.gpu_addr,
+                src_base.info.format,
+                src_format_type,
+                dst_id.index,
+                dst_base.gpu_addr,
+                dst_base.info.format,
+                dst_format_type,
+                copies.len()
+            );
+        }
+        self.reinterpret_image(dst_id, src_id, &copies);
+    }
+
+    fn copy_image_direct_raw(
+        &self,
+        dst_handle: u32,
+        dst_target: u32,
+        src_handle: u32,
+        src_target: u32,
+        copies: &[ImageCopy],
+    ) {
         unsafe {
-            for copy in &copies {
+            for copy in copies {
                 let src_origin =
                     make_copy_origin(copy.src_offset, copy.src_subresource, src_target);
                 let dst_origin =
@@ -2894,6 +3208,78 @@ impl TextureCache {
         }
     }
 
+    fn can_image_be_copied(&self, dst: &ImageBase, src: &ImageBase) -> bool {
+        if dst.info.image_type == ImageType::E3D
+            && dst.info.format == crate::surface::PixelFormat::Bc4Unorm
+        {
+            return false;
+        }
+        if is_pixel_format_bgr(dst.info.format) != is_pixel_format_bgr(src.info.format) {
+            return false;
+        }
+        true
+    }
+
+    fn emulate_copy_image(&mut self, dst_id: ImageId, src_id: ImageId, copies: &[ImageCopy]) {
+        let dst_base = self.base.slot_images[dst_id].clone();
+        let src_base = self.base.slot_images[src_id].clone();
+        if dst_base.info.image_type == ImageType::E3D
+            && dst_base.info.format == crate::surface::PixelFormat::Bc4Unorm
+        {
+            log::warn!("TextureCache::emulate_copy_image: BC4 copy path not wired to UtilShaders");
+            return;
+        }
+        if is_pixel_format_bgr(dst_base.info.format) || is_pixel_format_bgr(src_base.info.format) {
+            self.reinterpret_image(dst_id, src_id, copies);
+            return;
+        }
+        log::warn!(
+            "TextureCache::emulate_copy_image: unsupported emulated copy dst={:?} src={:?}",
+            dst_base.info.format,
+            src_base.info.format
+        );
+    }
+
+    fn reinterpret_image(&mut self, dst_id: ImageId, src_id: ImageId, copies: &[ImageCopy]) {
+        let dst_base = self.base.slot_images[dst_id].clone();
+        let src_base = self.base.slot_images[src_id].clone();
+        let Some(dst_image) = self.images.get(&dst_id) else {
+            return;
+        };
+        let Some(src_image) = self.images.get(&src_id) else {
+            return;
+        };
+        let dst_handle = dst_image.handle();
+        let src_handle = src_image.handle();
+        if dst_handle == 0 || src_handle == 0 {
+            return;
+        }
+        let dst_target = image_target(&dst_base.info);
+        let src_target = image_target(&src_base.info);
+        self.format_conversion_pass.convert_image(
+            dst_handle,
+            dst_target,
+            dst_image.gl_format,
+            dst_image.gl_type,
+            src_handle,
+            src_target,
+            src_image.gl_format,
+            src_image.gl_type,
+            src_base.info.format,
+            copies,
+        );
+        if src_base.info.format == crate::surface::PixelFormat::D24UnormS8Uint
+            && dst_base.info.format == crate::surface::PixelFormat::A8B8G8R8Unorm
+        {
+            log::warn!(
+                "TextureCache::reinterpret_image: S8D24 component swap not wired to UtilShaders"
+            );
+        }
+        unsafe {
+            gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        }
+    }
+
     /// Port of `TextureCache<P>::DownloadMemory` for `TextureCacheParams =
     /// OpenGL`. The base implementation uses an `image_downloader` closure
     /// callback so the borrow-checker doesn't let it reach into the backend
@@ -2906,15 +3292,56 @@ impl TextureCache {
     /// guest framebuffer pages stay zero, and the compositor reads zeros
     /// → black SDL window.
     pub fn download_memory(&mut self, cpu_addr: u64, size: usize) {
+        let trace_cpu = should_trace_texture_cache_cpu_region(cpu_addr, size);
         let Some(writer) = self.base.guest_memory_writer.as_ref().cloned() else {
+            if trace_cpu {
+                log::warn!(
+                    "[TEXTURE_DOWNLOAD] miss writer cpu=0x{:X} size={}",
+                    cpu_addr,
+                    size
+                );
+            }
             return;
         };
 
         // Snapshot the images we want to download, filtered + sorted exactly
         // as the base path used to do internally.
-        let mut images = self.base.collect_images_in_region(cpu_addr, size);
+        let candidates = self.base.collect_images_in_region(cpu_addr, size);
+        if trace_cpu {
+            log::warn!(
+                "[TEXTURE_DOWNLOAD] begin cpu=0x{:X} size={} candidates={}",
+                cpu_addr,
+                size,
+                candidates.len()
+            );
+            for &id in &candidates {
+                let image = &self.base.slot_images[id];
+                log::warn!(
+                    "[TEXTURE_DOWNLOAD] candidate id={} gpu=0x{:X} cpu=0x{:X} end=0x{:X} fmt={:?} {}x{} flags=0x{:X} safe={} tick={} overlaps={}",
+                    id.index,
+                    image.gpu_addr,
+                    image.cpu_addr,
+                    image.cpu_addr_end,
+                    image.info.format,
+                    image.info.size.width,
+                    image.info.size.height,
+                    image.flags.bits(),
+                    image.is_safe_download(),
+                    image.modification_tick,
+                    image.overlapping_images.len()
+                );
+            }
+        }
+        let mut images = candidates;
         images.retain(|&id| self.base.slot_images[id].is_safe_download());
         if images.is_empty() {
+            if trace_cpu {
+                log::warn!(
+                    "[TEXTURE_DOWNLOAD] skip no_safe_images cpu=0x{:X} size={}",
+                    cpu_addr,
+                    size
+                );
+            }
             return;
         }
         for &id in &images {
@@ -2944,6 +3371,28 @@ impl TextureCache {
             }
             let mut staging = vec![0u8; buffer_size];
             backend_image.download_memory(&mut staging, 0);
+            if trace_cpu {
+                let nonzero = staging.iter().filter(|&&byte| byte != 0).take(1024).count();
+                let first = staging
+                    .get(..16)
+                    .map(|bytes| {
+                        bytes
+                            .iter()
+                            .map(|byte| format!("{byte:02X}"))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                    .unwrap_or_default();
+                log::warn!(
+                    "[TEXTURE_DOWNLOAD] downloaded id={} gpu=0x{:X} cpu=0x{:X} bytes={} first16={} nonzero_first1k={}",
+                    image_id.index,
+                    base_image.gpu_addr,
+                    base_image.cpu_addr,
+                    buffer_size,
+                    first,
+                    nonzero
+                );
+            }
 
             // Swizzle (or pitch-copy) the staging buffer back into guest
             // memory at `image.cpu_addr`. For linear pitch surfaces (the
@@ -2959,6 +3408,15 @@ impl TextureCache {
                 &mut self.base.swizzle_data_buffer,
             );
         }
+    }
+
+    /// Port of `TextureCache<P>::GetFlushArea`.
+    pub fn get_flush_area(
+        &mut self,
+        cpu_addr: u64,
+        size: u64,
+    ) -> Option<crate::rasterizer_interface::RasterizerDownloadArea> {
+        self.base.get_flush_area(cpu_addr, size as usize)
     }
 
     /// Materialise GL-side `Image` and `ImageView` objects for every filled
@@ -3043,6 +3501,13 @@ impl TextureCache {
             trace_image_view_event(2, view_id, &view_base, image_ref, Some(&backend_view));
             self.image_views.insert(view_id, backend_view);
         }
+        // Upstream performs the JoinImages copy/delete tail synchronously before
+        // returning the newly-created image id. Ruzu's base cache queues that
+        // tail until backend GL objects exist, so drain it at the texture-view
+        // materialisation boundary as well as at render-target setup. Without
+        // this, a sampled view can bind an image before its overlapping source
+        // content has been copied into it.
+        self.finish_pending_join_copies();
     }
 
     /// Materialise GL-side `Sampler` objects for the given sampler ids.
@@ -3104,6 +3569,31 @@ impl TextureCache {
     }
 
     pub fn write_memory(&mut self, cpu_addr: u64, size: usize) {
+        if should_trace_texture_cache_cpu_region(cpu_addr, size) {
+            let candidates = self.base.collect_images_in_region(cpu_addr, size);
+            log::warn!(
+                "[TEXTURE_WRITE] cpu=0x{:X} size={} candidates={}",
+                cpu_addr,
+                size,
+                candidates.len()
+            );
+            for id in candidates {
+                let image = &self.base.slot_images[id];
+                log::warn!(
+                    "[TEXTURE_WRITE] candidate id={} gpu=0x{:X} cpu=0x{:X} end=0x{:X} fmt={:?} {}x{} flags_before=0x{:X} tick={} overlaps={}",
+                    id.index,
+                    image.gpu_addr,
+                    image.cpu_addr,
+                    image.cpu_addr_end,
+                    image.info.format,
+                    image.info.size.width,
+                    image.info.size.height,
+                    image.flags.bits(),
+                    image.modification_tick,
+                    image.overlapping_images.len()
+                );
+            }
+        }
         self.base.write_memory(cpu_addr, size);
     }
 
@@ -3207,14 +3697,6 @@ impl TextureCache {
     ) {
         self.base
             .update_render_targets_from_snapshot(render_targets, gpu_to_cpu);
-        for (image_id, image) in self.base.slot_images.iter() {
-            if image_id == crate::texture_cache::types::NULL_IMAGE_ID {
-                continue;
-            }
-            self.images
-                .entry(image_id)
-                .or_insert_with(|| Image::from_base(image, self.has_native_astc));
-        }
     }
 
     pub fn prepare_render_targets_from_snapshot(
@@ -3254,10 +3736,22 @@ impl TextureCache {
                     {
                         self.base.track_image(image_id);
                     }
+                } else {
+                    // Upstream `PrepareImage(image_id, true, false)` always
+                    // synchronizes aliases before marking the render target as
+                    // modified. The reader-less Rust path cannot refresh
+                    // CPU-modified contents, but alias synchronization is
+                    // backend-local and must still run.
+                    self.synchronize_aliases(image_id);
                 }
                 self.base.mark_modification_by_id(image_id);
             }
         }
+        // Upstream performs the JoinImages copy/delete tail after
+        // RefreshContents and before RegisterImage returns. The Rust cache
+        // splits UpdateRenderTargets and PrepareImageView, so drain after the
+        // prepare pass rather than immediately after target discovery.
+        self.finish_pending_join_copies();
     }
 
     fn is_full_clear_for_view(&self, view_id: ImageViewId, scissor: Option<ScissorInfo>) -> bool {
@@ -3526,6 +4020,7 @@ impl TextureCache {
         src: &crate::engines::fermi_2d::Surface,
         copy: &crate::engines::fermi_2d::Config,
         mut gpu_to_cpu: impl FnMut(u64) -> Option<u64>,
+        mut read_gpu: impl FnMut(u64, &mut [u8]) -> bool,
     ) -> bool {
         let dst_addr = dst.address();
         let src_addr = src.address();
@@ -3533,70 +4028,11 @@ impl TextureCache {
         let mut src_info = ImageInfo::from_fermi2d_surface(src);
         let can_be_depth_blit = dst_info.format == src_info.format
             && copy.filter == crate::engines::fermi_2d::Filter::Point;
-        let use_relaxed_fermi2d_lookup = std::env::var_os("RUZU_FERMI2D_RELAXED_LOOKUP").is_some();
-        let find_options = if can_be_depth_blit {
+        let try_options = if can_be_depth_blit {
             RelaxedOptions::SAMPLES | RelaxedOptions::FORMAT
         } else {
             RelaxedOptions::SAMPLES
         };
-
-        let src_id = if use_relaxed_fermi2d_lookup {
-            self.find_mapped_image_with_options(&src_info, src_addr, find_options)
-        } else {
-            self.base.find_image_with_caps(
-                &src_info,
-                src_addr,
-                RelaxedOptions::empty(),
-                self.has_broken_texture_view_formats,
-                self.has_native_bgr,
-            )
-        };
-        let dst_id = if use_relaxed_fermi2d_lookup {
-            self.find_mapped_image_with_options(&dst_info, dst_addr, find_options)
-        } else {
-            self.base.find_image_with_caps(
-                &dst_info,
-                dst_addr,
-                RelaxedOptions::empty(),
-                self.has_broken_texture_view_formats,
-                self.has_native_bgr,
-            )
-        };
-        if !copy.must_accelerate {
-            let src_gpu_modified = src_id
-                .map(|id| {
-                    self.base.slot_images[id]
-                        .flags
-                        .contains(ImageFlagBits::GPU_MODIFIED)
-                })
-                .unwrap_or(false);
-            let dst_gpu_modified = dst_id
-                .map(|id| {
-                    self.base.slot_images[id]
-                        .flags
-                        .contains(ImageFlagBits::GPU_MODIFIED)
-                })
-                .unwrap_or(false);
-            if !src_gpu_modified && !dst_gpu_modified {
-                return false;
-            }
-        }
-
-        if can_be_depth_blit {
-            let src_image = src_id.map(|id| &self.base.slot_images[id]);
-            let dst_image = dst_id.map(|id| &self.base.slot_images[id]);
-            crate::texture_cache::util::deduce_blit_images(
-                &mut dst_info,
-                &mut src_info,
-                dst_image,
-                src_image,
-            );
-            if crate::surface::get_format_type(dst_info.format)
-                != crate::surface::get_format_type(src_info.format)
-            {
-                return false;
-            }
-        }
 
         let Some(src_cpu_addr) = gpu_to_cpu(src_addr) else {
             if std::env::var_os("RUZU_TRACE_FERMI2D_BLIT").is_some() {
@@ -3611,88 +4047,167 @@ impl TextureCache {
             return false;
         };
 
-        let mut src_id = if use_relaxed_fermi2d_lookup {
-            self.find_or_insert_mapped_image_with_options(
+        let mut src_id;
+        let mut dst_id;
+        loop {
+            self.base.has_deleted_images = false;
+            src_id = self.base.find_image_in_cpu_region_with_caps(
                 &src_info,
                 src_addr,
                 src_cpu_addr,
-                find_options,
-            )
-        } else {
-            self.find_or_insert_mapped_image(&src_info, src_addr, src_cpu_addr)
-        };
-        let mut dst_id = if use_relaxed_fermi2d_lookup {
-            self.find_or_insert_mapped_image_with_options(
+                try_options,
+                self.has_broken_texture_view_formats,
+                self.has_native_bgr,
+            );
+            dst_id = self.base.find_image_in_cpu_region_with_caps(
                 &dst_info,
                 dst_addr,
                 dst_cpu_addr,
-                find_options,
-            )
-        } else {
-            self.find_or_insert_mapped_image(&dst_info, dst_addr, dst_cpu_addr)
-        };
-        if use_relaxed_fermi2d_lookup {
-            if self.base.slot_images[src_id].info.num_samples > 1 {
+                try_options,
+                self.has_broken_texture_view_formats,
+                self.has_native_bgr,
+            );
+            if !copy.must_accelerate {
+                let src_gpu_modified = src_id
+                    .map(|id| {
+                        self.base.slot_images[id]
+                            .flags
+                            .contains(ImageFlagBits::GPU_MODIFIED)
+                    })
+                    .unwrap_or(false);
+                let dst_gpu_modified = dst_id
+                    .map(|id| {
+                        self.base.slot_images[id]
+                            .flags
+                            .contains(ImageFlagBits::GPU_MODIFIED)
+                    })
+                    .unwrap_or(false);
+                if src_id.is_none() && dst_id.is_none() {
+                    return false;
+                }
+                if !src_gpu_modified && !dst_gpu_modified {
+                    return false;
+                }
+            }
+
+            let src_image = src_id.map(|id| &self.base.slot_images[id]);
+            if src_image.is_some_and(|image| image.info.num_samples > 1) {
                 let msaa_options = RelaxedOptions::SAMPLES | RelaxedOptions::FORCE_BROKEN_VIEWS;
-                src_id = self.find_or_insert_mapped_image_with_options(
+                src_id = Some(self.base.find_or_insert_image_from_info_with_options(
                     &src_info,
                     src_addr,
                     src_cpu_addr,
                     msaa_options,
-                );
-                dst_id = self.find_or_insert_mapped_image_with_options(
+                ));
+                dst_id = Some(self.base.find_or_insert_image_from_info_with_options(
                     &dst_info,
                     dst_addr,
                     dst_cpu_addr,
                     msaa_options,
-                );
+                ));
+                if self.base.has_deleted_images {
+                    continue;
+                }
+                break;
             }
 
-            let broken_views = self.has_broken_texture_view_formats;
-            let native_bgr = self.has_native_bgr;
-            if crate::surface::get_format_type(dst_info.format)
-                != crate::surface::get_format_type(self.base.slot_images[dst_id].info.format)
-                || crate::surface::get_format_type(src_info.format)
-                    != crate::surface::get_format_type(self.base.slot_images[src_id].info.format)
-                || !crate::surface::is_view_compatible(
-                    dst_info.format,
-                    self.base.slot_images[dst_id].info.format,
-                    broken_views,
-                    native_bgr,
-                )
-                || !crate::surface::is_view_compatible(
-                    src_info.format,
-                    self.base.slot_images[src_id].info.format,
-                    broken_views,
-                    native_bgr,
-                )
-            {
-                src_id = self.find_or_insert_mapped_image(&src_info, src_addr, src_cpu_addr);
-                dst_id = self.find_or_insert_mapped_image(&dst_info, dst_addr, dst_cpu_addr);
+            if can_be_depth_blit {
+                let src_image = src_id.map(|id| &self.base.slot_images[id]);
+                let dst_image = dst_id.map(|id| &self.base.slot_images[id]);
+                crate::texture_cache::util::deduce_blit_images(
+                    &mut dst_info,
+                    &mut src_info,
+                    dst_image,
+                    src_image,
+                );
+                if crate::surface::get_format_type(dst_info.format)
+                    != crate::surface::get_format_type(src_info.format)
+                {
+                    continue;
+                }
+            }
+
+            if src_id.is_none() {
+                src_id = Some(self.base.find_or_insert_image_from_info_with_options(
+                    &src_info,
+                    src_addr,
+                    src_cpu_addr,
+                    RelaxedOptions::empty(),
+                ));
+            }
+            if dst_id.is_none() {
+                dst_id = Some(self.base.find_or_insert_image_from_info_with_options(
+                    &dst_info,
+                    dst_addr,
+                    dst_cpu_addr,
+                    RelaxedOptions::empty(),
+                ));
+            }
+            if !self.base.has_deleted_images {
+                break;
             }
         }
 
-        let src_range = if use_relaxed_fermi2d_lookup {
-            let Some(base) = self.base.slot_images[src_id].try_find_base(src_addr) else {
-                return false;
-            };
-            SubresourceRange {
-                base,
-                ..Default::default()
+        let mut src_id = src_id.unwrap_or(NULL_IMAGE_ID);
+        let mut dst_id = dst_id.unwrap_or(NULL_IMAGE_ID);
+        if !src_id.is_valid() || !dst_id.is_valid() {
+            return false;
+        }
+
+        let native_bgr = self.has_native_bgr;
+        if crate::surface::get_format_type(dst_info.format)
+            != crate::surface::get_format_type(self.base.slot_images[dst_id].info.format)
+            || crate::surface::get_format_type(src_info.format)
+                != crate::surface::get_format_type(self.base.slot_images[src_id].info.format)
+            || !crate::surface::is_view_compatible(
+                dst_info.format,
+                self.base.slot_images[dst_id].info.format,
+                false,
+                native_bgr,
+            )
+            || !crate::surface::is_view_compatible(
+                src_info.format,
+                self.base.slot_images[src_id].info.format,
+                false,
+                native_bgr,
+            )
+        {
+            loop {
+                self.base.has_deleted_images = false;
+                src_id = self.base.find_or_insert_image_from_info_with_options(
+                    &src_info,
+                    src_addr,
+                    src_cpu_addr,
+                    RelaxedOptions::empty(),
+                );
+                dst_id = self.base.find_or_insert_image_from_info_with_options(
+                    &dst_info,
+                    dst_addr,
+                    dst_cpu_addr,
+                    RelaxedOptions::empty(),
+                );
+                if !self.base.has_deleted_images {
+                    break;
+                }
             }
-        } else {
-            SubresourceRange::default()
+        }
+
+        self.prepare_image_with_gpu_reader(src_id, false, false, &mut read_gpu);
+        self.prepare_image_with_gpu_reader(dst_id, true, false, &mut read_gpu);
+
+        let Some(src_base) = self.base.slot_images[src_id].try_find_base(src_addr) else {
+            return false;
         };
-        let dst_range = if use_relaxed_fermi2d_lookup {
-            let Some(base) = self.base.slot_images[dst_id].try_find_base(dst_addr) else {
-                return false;
-            };
-            SubresourceRange {
-                base,
-                ..Default::default()
-            }
-        } else {
-            SubresourceRange::default()
+        let Some(dst_base) = self.base.slot_images[dst_id].try_find_base(dst_addr) else {
+            return false;
+        };
+        let src_range = SubresourceRange {
+            base: src_base,
+            ..Default::default()
+        };
+        let dst_range = SubresourceRange {
+            base: dst_base,
+            ..Default::default()
         };
         let src_view_id = self.ensure_color_view_for_range(src_id, src_info.format, src_range);
         let dst_view_id = self.ensure_color_view_for_range(dst_id, dst_info.format, dst_range);
@@ -3703,20 +4218,12 @@ impl TextureCache {
             return false;
         };
 
-        let (src_samples_x, src_samples_y) = if use_relaxed_fermi2d_lookup {
-            crate::texture_cache::samples_helper::samples_log2(
-                self.base.slot_images[src_id].info.num_samples as i32,
-            )
-        } else {
-            (0, 0)
-        };
-        let (dst_samples_x, dst_samples_y) = if use_relaxed_fermi2d_lookup {
-            crate::texture_cache::samples_helper::samples_log2(
-                self.base.slot_images[dst_id].info.num_samples as i32,
-            )
-        } else {
-            (0, 0)
-        };
+        let (src_samples_x, src_samples_y) = crate::texture_cache::samples_helper::samples_log2(
+            self.base.slot_images[src_id].info.num_samples as i32,
+        );
+        let (dst_samples_x, dst_samples_y) = crate::texture_cache::samples_helper::samples_log2(
+            self.base.slot_images[dst_id].info.num_samples as i32,
+        );
 
         let src_region = Region2D {
             start: Offset2D {
@@ -4826,7 +5333,25 @@ mod tests {
 
         view.image_id = image_id;
         view.original_texture = 7;
+        view.format = base.format;
+        view.view_type = base.view_type;
+        view.swizzle = base.swizzle;
+        view.full_range = base.range;
+        view.size = base.size;
+        view.flags = base.flags;
         assert!(view.matches_base_image(&base, &image));
+
+        let mut different_view_info = view_info;
+        different_view_info.range.base.level = 1;
+        let different_base =
+            ImageViewBase::new(&different_view_info, &image_info, image_id, 0x1000);
+        assert!(!view.matches_base_image(&different_base, &image));
+
+        let mut different_view_info = view_info;
+        different_view_info.x_source = SwizzleSource::B as u8;
+        let different_base =
+            ImageViewBase::new(&different_view_info, &image_info, image_id, 0x1000);
+        assert!(!view.matches_base_image(&different_base, &image));
 
         image.current_texture = 8;
         assert!(!view.matches_base_image(&base, &image));

@@ -13,6 +13,7 @@ use crate::arm::arm_interface::{
 };
 use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::memory::memory::Memory;
+use common::page_table::PageInfo;
 
 use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
 
@@ -209,6 +210,119 @@ fn maybe_trace_w_at_vaddr(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value
         value,
         width = (size as usize) * 2
     );
+    if std::env::var_os("RUZU_TRACE_W_AT_REGS").is_some() {
+        if let Some(p) = pc_ptr {
+            let mut regs = [0u32; 16];
+            for (i, reg) in regs.iter_mut().enumerate() {
+                *reg = unsafe { p.offset((i as isize) - 15).read_volatile() };
+            }
+            eprintln!(
+                "[{:>10.6}] [W{}_AT_REGS] r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X} r12=0x{:08X} sp=0x{:08X} lr=0x{:08X} pc=0x{:08X}",
+                t,
+                size * 8,
+                regs[0],
+                regs[1],
+                regs[2],
+                regs[3],
+                regs[4],
+                regs[5],
+                regs[6],
+                regs[7],
+                regs[8],
+                regs[9],
+                regs[10],
+                regs[11],
+                regs[12],
+                regs[13],
+                regs[14],
+                regs[15],
+            );
+            if std::env::var_os("RUZU_TRACE_W_AT_DUMP_REG_PTRS").is_some() {
+                let mem = cb.mem();
+                for &(name, addr) in &[
+                    ("r0", regs[0]),
+                    ("r1", regs[1]),
+                    ("r2", regs[2]),
+                    ("r3", regs[3]),
+                    ("r4", regs[4]),
+                    ("r5", regs[5]),
+                    ("r6", regs[6]),
+                    ("r7", regs[7]),
+                    ("r8", regs[8]),
+                    ("r10", regs[10]),
+                    ("sp", regs[13]),
+                ] {
+                    if addr < 0x1000 {
+                        continue;
+                    }
+                    let mut words = [0u32; 8];
+                    for (i, word) in words.iter_mut().enumerate() {
+                        *word = mem.read_32(addr as u64 + (i as u64 * 4));
+                    }
+                    eprintln!(
+                        "[{:>10.6}] [W{}_AT_PTR] {}=0x{:08X}: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                        t,
+                        size * 8,
+                        name,
+                        addr,
+                        words[0],
+                        words[1],
+                        words[2],
+                        words[3],
+                        words[4],
+                        words[5],
+                        words[6],
+                        words[7],
+                    );
+                }
+            }
+            if let Ok(raw) = std::env::var("RUZU_TRACE_W_AT_EXTRA_PTRS") {
+                let mem = cb.mem();
+                for token in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let Some((name, addr_s)) = token.split_once('=') else {
+                        continue;
+                    };
+                    let addr_s = addr_s
+                        .strip_prefix("0x")
+                        .or_else(|| addr_s.strip_prefix("0X"))
+                        .unwrap_or(addr_s);
+                    let Ok(addr) = u32::from_str_radix(addr_s, 16) else {
+                        continue;
+                    };
+                    if addr < 0x1000 {
+                        continue;
+                    }
+                    let mut words = [0u32; 16];
+                    for (i, word) in words.iter_mut().enumerate() {
+                        *word = mem.read_32(addr as u64 + (i as u64 * 4));
+                    }
+                    eprintln!(
+                        "[{:>10.6}] [W{}_AT_EXTRA] {}=0x{:08X}: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                        t,
+                        size * 8,
+                        name,
+                        addr,
+                        words[0],
+                        words[1],
+                        words[2],
+                        words[3],
+                        words[4],
+                        words[5],
+                        words[6],
+                        words[7],
+                        words[8],
+                        words[9],
+                        words[10],
+                        words[11],
+                        words[12],
+                        words[13],
+                        words[14],
+                        words[15],
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[inline(always)]
@@ -268,8 +382,43 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
             .and_then(|raw| u128::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
             .map(|expected| expected == value)
             .unwrap_or(true);
-        if value_matches {
+        let addr_matches = std::env::var("RUZU_A32_TRACE_AFTER_WATCH_ADDR")
+            .ok()
+            .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+            .map(|expected| vaddr <= expected && expected < vaddr.saturating_add(size))
+            .unwrap_or(true);
+        let mut pc_matches = true;
+        let mut r2_matches = true;
+        let mut r7_matches = true;
+        if let Some(p) = cb.jit_pc_ptr {
+            let pc = unsafe { p.read_volatile() };
+            pc_matches = std::env::var("RUZU_A32_TRACE_AFTER_WATCH_PC")
+                .ok()
+                .and_then(|raw| u32::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+                .map(|expected| expected == pc)
+                .unwrap_or(true);
+            let r2 = unsafe { p.offset(-13).read_volatile() };
+            r2_matches = std::env::var("RUZU_A32_TRACE_AFTER_WATCH_R2")
+                .ok()
+                .and_then(|raw| u32::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+                .map(|expected| expected == r2)
+                .unwrap_or(true);
+            let r7 = unsafe { p.offset(-8).read_volatile() };
+            r7_matches = std::env::var("RUZU_A32_TRACE_AFTER_WATCH_R7")
+                .ok()
+                .and_then(|raw| u32::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+                .map(|expected| expected == r7)
+                .unwrap_or(true);
+        }
+        if value_matches && addr_matches && pc_matches && r2_matches && r7_matches {
             A32_TRACE_AFTER_WATCH_ARMED.store(true, Ordering::Relaxed);
+            if std::env::var_os("RUZU_A32_TRACE_HALT_AFTER_WATCH").is_some() {
+                eprintln!(
+                    "[A32TRACE] armed after watch write vaddr=0x{:08X} size={} value=0x{:X}",
+                    vaddr as u32, size, value
+                );
+                cb.halt_execution(rdynarmic::halt_reason::HaltReason::USER_DEFINED2);
+            }
         }
     }
     let pc_ptr = cb.jit_pc_ptr;
@@ -583,6 +732,72 @@ fn maybe_dump_instance_at_pc(cb: &DynarmicCallbacks32, pc_ptr: Option<*const u32
             );
         }
     }
+}
+
+/// `RUZU_TRACE_UNMAPPED_GUEST_REGS=1` — dump live A32 JIT registers on the
+/// first low-address unmapped guest reads. Unlike the generic Memory hook,
+/// this reads Dynarmic's live register array at the memory callback boundary.
+fn trace_unmapped_guest_read_regs(cb: &DynarmicCallbacks32, vaddr: u64, size: u64) {
+    if std::env::var_os("RUZU_TRACE_UNMAPPED_GUEST_REGS").is_none() || vaddr >= 0x1000 {
+        return;
+    }
+    let mapped = if let Some(ref cm) = cb.core_memory {
+        cm.lock()
+            .unwrap()
+            .is_valid_virtual_address_range(vaddr, size)
+    } else {
+        cb.memory
+            .read()
+            .unwrap()
+            .is_valid_range(vaddr, size as usize)
+    };
+    if mapped {
+        return;
+    }
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static HITS: AtomicU32 = AtomicU32::new(0);
+    let n = HITS.fetch_add(1, Ordering::Relaxed);
+    if n >= 32 {
+        return;
+    }
+
+    let Some(p) = cb.jit_pc_ptr else { return };
+    let mut r = [0u32; 16];
+    for (i, out) in r.iter_mut().enumerate() {
+        *out = unsafe { p.offset((i as isize) - 15).read_volatile() };
+    }
+    let core = cb.parent.load(Ordering::Relaxed);
+    let core_id = if core.is_null() {
+        -1
+    } else {
+        unsafe { (*core).core_index() as i32 }
+    };
+    let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+    eprintln!(
+        "[UNMAPPED_GUEST_REGS] #{} tid={} core={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} bits={} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} r8=0x{:08X} sb=0x{:08X} sl=0x{:08X} fp=0x{:08X} ip=0x{:08X} sp=0x{:08X}",
+        n,
+        tid,
+        core_id,
+        r[15],
+        r[14],
+        vaddr,
+        size * 8,
+        r[0],
+        r[1],
+        r[2],
+        r[3],
+        r[4],
+        r[5],
+        r[6],
+        r[7],
+        r[8],
+        r[9],
+        r[10],
+        r[11],
+        r[12],
+        r[13],
+    );
 }
 
 /// One-shot stack dump on the first watch_read hit. Prints 16 32-bit words
@@ -1616,11 +1831,13 @@ impl UserCallbacks for DynarmicCallbacks32 {
 
     fn memory_read_8(&self, vaddr: u64) -> u8 {
         self.check_memory_access(vaddr, 1);
+        trace_unmapped_guest_read_regs(self, vaddr, 1);
         self.mem().read_8(vaddr)
     }
 
     fn memory_read_16(&self, vaddr: u64) -> u16 {
         self.check_memory_access(vaddr, 2);
+        trace_unmapped_guest_read_regs(self, vaddr, 2);
         let v = self.mem().read_16(vaddr);
         watch_read(self, vaddr, 2, v as u128);
         v
@@ -1628,6 +1845,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
 
     fn memory_read_32(&self, vaddr: u64) -> u32 {
         self.check_memory_access(vaddr, 4);
+        trace_unmapped_guest_read_regs(self, vaddr, 4);
         let v = self.mem().read_32(vaddr);
         watch_read(self, vaddr, 4, v as u128);
         v
@@ -1635,6 +1853,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
 
     fn memory_read_64(&self, vaddr: u64) -> u64 {
         self.check_memory_access(vaddr, 8);
+        trace_unmapped_guest_read_regs(self, vaddr, 8);
         let v = self.mem().read_64(vaddr);
         watch_read(self, vaddr, 8, v as u128);
         v
@@ -1642,6 +1861,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
 
     fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
         self.check_memory_access(vaddr, 16);
+        trace_unmapped_guest_read_regs(self, vaddr, 16);
         let m = self.mem();
         (m.read_64(vaddr), m.read_64(vaddr + 8))
     }
@@ -1695,6 +1915,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
     fn exclusive_read_8(&self, vaddr: u64) -> u8 {
         // memory_read_8 doesn't currently watch — add inline.
         self.check_memory_access(vaddr, 1);
+        trace_unmapped_guest_read_regs(self, vaddr, 1);
         let v = self.mem().read_8(vaddr);
         watch_read(self, vaddr, 1, v as u128);
         v
@@ -2017,12 +2238,44 @@ impl ArmDynarmic32 {
         core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
         debugger_enabled: bool,
     ) -> Self {
-        // Get fastmem pointer from core_memory before moving it into callbacks.
-        // Matches upstream: process->GetPageTable().GetBasePageTable().GetImpl().fastmem_arena
-        let fastmem_pointer: Option<*mut u8> = core_memory
-            .as_ref()
-            .map(|cm| cm.lock().unwrap().fastmem_pointer())
-            .filter(|p| !p.is_null());
+        // Get page-table and fastmem pointers from core_memory before moving
+        // it into callbacks. Matches upstream `ArmDynarmic32::MakeJit`:
+        // `config.page_table = page_table->pointers.data()` and
+        // `config.fastmem_pointer = page_table->fastmem_arena`.
+        let use_page_table_fastmem = std::env::var_os("RUZU_A32_PAGE_TABLE_FASTMEM").is_some()
+            && std::env::var_os("RUZU_A32_LEGACY_FASTMEM").is_none();
+        let (mut page_table_pointer, fastmem_pointer): (Option<*const u8>, Option<*mut u8>) =
+            if std::env::var_os("RUZU_NO_FASTMEM").is_some() {
+                (None, None)
+            } else {
+                core_memory
+                    .as_ref()
+                    .and_then(|cm| {
+                        let guard = cm.lock().unwrap();
+                        let page_table = guard.current_page_table_raw();
+                        if page_table.is_null() {
+                            return None;
+                        }
+                        let page_table = unsafe { &*page_table };
+                        let page_table_pointer = page_table.pointers.data() as *const u8;
+                        let fastmem_pointer = page_table.fastmem_arena;
+                        if page_table_pointer.is_null() || fastmem_pointer.is_null() {
+                            None
+                        } else {
+                            Some((Some(page_table_pointer), Some(fastmem_pointer)))
+                        }
+                    })
+                    .unwrap_or((None, None))
+            };
+        // Upstream wires both `page_table` and `fastmem_pointer` for A32.
+        // rdynarmic's current A32 page-table fastmem path regresses MK8D's
+        // title transition by making the guest stop submitting active audio
+        // voices. Keep the stable pre-page-table fastmem path as the default
+        // until the backend path is fixed; use RUZU_A32_PAGE_TABLE_FASTMEM=1
+        // to re-enable the upstream-shaped path for targeted validation.
+        if !use_page_table_fastmem {
+            page_table_pointer = None;
+        }
 
         let svc_swi = Arc::new(AtomicU32::new(0));
         let last_exception_address = Arc::new(AtomicU64::new(0));
@@ -2068,20 +2321,39 @@ impl ArmDynarmic32 {
             } else {
                 Some(unsafe { (*exclusive_monitor).get_monitor() as *mut _ })
             },
-            fastmem_pointer: if std::env::var("RUZU_NO_FASTMEM").is_ok() {
-                None
-            } else {
-                fastmem_pointer
-            },
+            fastmem_pointer,
+            page_table_pointer,
             // Upstream: config.define_unpredictable_behaviour = true
             define_unpredictable_behaviour: true,
             // Upstream: config.processor_id = m_core_index
             processor_id: core_index as usize,
             // Upstream: config.wall_clock_cntpct = m_uses_wall_clock
             wall_clock_cntpct: uses_wall_clock,
-            // A32 doesn't use the upstream-faithful A64 memory helpers;
-            // its existing fastmem path is per-emission. Pass defaults.
-            memory: rdynarmic::backend::x64::emit_context::MemoryEmitConfig::default(),
+            // Upstream `ArmDynarmic32::MakeJit` configures A32 with the
+            // process page table and 32-bit fastmem. rdynarmic uses the page
+            // table to reject free/debug pages before falling back to memory
+            // callbacks, avoiding silent writes through the sparse fastmem
+            // arena.
+            memory: if use_page_table_fastmem {
+                rdynarmic::backend::x64::emit_context::MemoryEmitConfig {
+                    fastmem_address_space_bits: 32,
+                    silently_mirror_fastmem: false,
+                    fastmem_exclusive_access: fastmem_pointer.is_some()
+                        && !exclusive_monitor.is_null(),
+                    recompile_on_fastmem_failure: true,
+                    page_table_present: page_table_pointer.is_some(),
+                    page_table_address_space_bits: 32,
+                    silently_mirror_page_table: false,
+                    absolute_offset_page_table: true,
+                    page_table_pointer_mask_bits: PageInfo::ATTRIBUTE_BITS as u32,
+                    detect_misaligned_access_via_page_table: 16 | 32 | 64 | 128,
+                    only_detect_misalignment_via_page_table_on_page_boundary: true,
+                    check_halt_on_memory_access: false,
+                    processor_id: core_index as usize,
+                }
+            } else {
+                rdynarmic::backend::x64::emit_context::MemoryEmitConfig::default()
+            },
         };
 
         log::warn!(
@@ -2273,10 +2545,12 @@ impl ArmInterface for ArmDynarmic32 {
                 return translate_halt_reason(rdynarmic_hr);
             }
             let trace_after_watch = std::env::var_os("RUZU_A32_TRACE_AFTER_WATCH").is_some();
+            let trace_strict_after_watch =
+                std::env::var_os("RUZU_A32_TRACE_STRICT_AFTER_WATCH").is_some();
             if trace_after_watch
                 && trace_search_limit > 0
                 && !A32_TRACE_AFTER_WATCH_ARMED.load(Ordering::Relaxed)
-                && !(current_pc >= start && current_pc < end)
+                && (trace_strict_after_watch || !(current_pc >= start && current_pc < end))
             {
                 let rdynarmic_hr = jit.run();
                 return translate_halt_reason(rdynarmic_hr);
@@ -2374,6 +2648,11 @@ impl ArmInterface for ArmDynarmic32 {
                     );
                     logged_steps += 1;
                     last_hr = jit.step();
+                    if std::env::var_os("RUZU_A32_TRACE_HALT_AFTER_WATCH").is_some()
+                        && last_hr.contains(rdynarmic::halt_reason::HaltReason::USER_DEFINED2)
+                    {
+                        last_hr = rdynarmic::halt_reason::HaltReason::STEP;
+                    }
                     if !last_hr.is_empty() && last_hr != rdynarmic::halt_reason::HaltReason::STEP {
                         log::info!("[A32TRACE] halt={:?}", last_hr);
                         break;

@@ -611,8 +611,7 @@ impl NvdrvService {
         } else {
             None
         };
-        let trace_iocalloc_context = std::env::var_os("RUZU_TRACE_IOCALLOC_CTX").is_some()
-            || nvmap_alloc_address.is_some_and(|address| address < 0x4000_0000);
+        let trace_iocalloc_context = std::env::var_os("RUZU_TRACE_IOCALLOC_CTX").is_some();
         if trace_iocalloc_context && command.raw == 0xC020_0104 {
             let (tid, pc, lr, sp) = ctx
                 .get_thread()

@@ -186,11 +186,14 @@ impl IStorage {
                 })
                 .collect();
             log::warn!(
-                "IStorage::ReadContext tid={} thread_pc=0x{:X} thread_lr=0x{:X} thread_sp=0x{:X} offset=0x{:X} length={} buffer_size={} read_size={} result=0x{:08X} {}",
+                "IStorage::ReadContext tid={} thread_pc=0x{:X} thread_lr=0x{:X} thread_sp=0x{:X} backend_name={} backend_path={} backend_size={} offset=0x{:X} length={} buffer_size={} read_size={} result=0x{:08X} {}",
                 tid,
                 thread_pc,
                 thread_lr,
                 thread_sp,
+                storage.backend.get_name(),
+                storage.backend.get_full_path(),
+                storage.backend.get_size(),
                 offset,
                 length,
                 buffer_size,

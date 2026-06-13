@@ -1,5 +1,6 @@
 # Build artifacts
 /target/
+/target-clean-head/
 
 # Rust package manager
 Cargo.lock

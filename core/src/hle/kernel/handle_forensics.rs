@@ -47,7 +47,13 @@ pub fn record_svc(tid: u64, imm: u32, args: [u64; 4], ret0: u64) {
     if r.len() == RING_CAP {
         r.pop_front();
     }
-    r.push_back(SvcEvent { seq, tid, imm, args, ret0 });
+    r.push_back(SvcEvent {
+        seq,
+        tid,
+        imm,
+        args,
+        ret0,
+    });
 }
 
 /// Record where an IPC-output handle came from (service name + cmd).

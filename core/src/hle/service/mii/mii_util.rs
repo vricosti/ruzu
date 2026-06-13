@@ -5,6 +5,7 @@
 //!
 //! MiiUtil: CRC-16 calculations and random value generation for Mii data.
 
+use common::uuid::UUID;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::SystemTime;
@@ -78,21 +79,13 @@ pub fn calculate_device_crc16(uuid: &[u8; 16], data_size: usize) -> u16 {
 /// Generate a random RFC 4122 v4 UUID for Mii CreateId.
 /// Matches upstream MiiUtil::MakeCreateId.
 pub fn make_create_id() -> u128 {
-    let mut uuid_bytes = [0u8; 16];
-    simple_random_bytes(&mut uuid_bytes);
-
-    // Set version 4
-    uuid_bytes[6] = (uuid_bytes[6] & 0x0F) | 0x40;
-    // Set variant 1
-    uuid_bytes[8] = (uuid_bytes[8] & 0x3F) | 0x80;
-
-    u128::from_le_bytes(uuid_bytes)
+    UUID::make_random_rfc4122_v4().as_u128()
 }
 
 /// Get a device ID. Should be nn::settings::detail::GetMiiAuthorId().
 /// Matches upstream MiiUtil::GetDeviceId (returns default UUID).
 pub fn get_device_id() -> u128 {
-    0
+    UUID::make_default().as_u128()
 }
 
 /// Generate a random value in [min, max].
@@ -112,4 +105,22 @@ pub fn get_random_value<T: Into<u64> + TryFrom<u64> + Copy>(min: T, max: T) -> T
 pub fn is_font_region_valid(_font: super::mii_types::FontRegion, _text: &[u16]) -> bool {
     // Upstream TODO: This function needs to check against the font tables
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_device_id_returns_upstream_default_uuid() {
+        assert_eq!(get_device_id().to_le_bytes(), *b"yuzu Default UID");
+    }
+
+    #[test]
+    fn make_create_id_returns_rfc4122_v4_uuid() {
+        let uuid = make_create_id().to_le_bytes();
+        assert_ne!(uuid, [0; 16]);
+        assert_eq!(uuid[6] >> 4, 4);
+        assert_eq!(uuid[8] >> 6, 2);
+    }
 }

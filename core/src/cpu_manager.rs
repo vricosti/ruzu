@@ -984,6 +984,9 @@ impl CpuManager {
                             if zero_pc_break_loop
                                 && std::env::var_os("RUZU_DUMP_NULL_PC_CONTEXT").is_some()
                             {
+                                crate::hle::kernel::svc::svc_memory_history::dump(
+                                    "null_pc_context",
+                                );
                                 let system_ref = kernel.system();
                                 if !system_ref.is_null() {
                                     if let Some(memory) = system_ref.get().memory_shared() {

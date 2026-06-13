@@ -10,6 +10,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::core::System;
 use crate::hle::kernel::k_memory_block::KMemoryInfo;
+use crate::hle::kernel::kernel::{GUEST_LR, GUEST_PC};
 use crate::hle::kernel::svc::svc_types::MemoryInfo;
 
 const CAPACITY: usize = 256;
@@ -43,6 +44,8 @@ impl MemoryHistoryKind {
 struct MemoryHistoryEvent {
     sequence: u64,
     tid: u64,
+    pc: u64,
+    lr: u64,
     kind: MemoryHistoryKind,
     query_or_addr: u64,
     base_or_out: u64,
@@ -94,13 +97,46 @@ fn current_tls_tid() -> u64 {
         .unwrap_or(0)
 }
 
+fn current_guest_pc_lr(system: &System) -> (u64, u64) {
+    let Some(kernel) = system.kernel() else {
+        return (0, 0);
+    };
+    let core = kernel.current_physical_core_index();
+    if core >= GUEST_PC.len() {
+        return (0, 0);
+    }
+    (
+        GUEST_PC[core].load(Ordering::Acquire),
+        GUEST_LR[core].load(Ordering::Acquire),
+    )
+}
+
 fn range_covers(addr: u64, size: u64, point: u64) -> bool {
     let end = addr.saturating_add(size);
     addr <= point && point < end
 }
 
+fn history_radius() -> u64 {
+    static RADIUS: OnceLock<u64> = OnceLock::new();
+    *RADIUS.get_or_init(|| {
+        std::env::var("RUZU_TRACE_MEM_HISTORY_RADIUS")
+            .ok()
+            .and_then(|raw| {
+                let raw = raw.trim();
+                let digits = raw
+                    .strip_prefix("0x")
+                    .or_else(|| raw.strip_prefix("0X"))
+                    .unwrap_or(raw);
+                u64::from_str_radix(digits, 16)
+                    .ok()
+                    .or_else(|| raw.parse::<u64>().ok())
+            })
+            .unwrap_or(0x20_0000)
+    })
+}
+
 fn near(addr: u64, point: u64) -> bool {
-    addr.abs_diff(point) <= 0x20_0000
+    addr.abs_diff(point) <= history_radius()
 }
 
 fn push(event: MemoryHistoryEvent) {
@@ -124,9 +160,12 @@ pub fn record_query(system: &System, query_address: u64, info: &MemoryInfo) {
     if !range_covers(info.base_address, info.size, target) && !near(query_address, target) {
         return;
     }
+    let (pc, lr) = current_guest_pc_lr(system);
     push(MemoryHistoryEvent {
         sequence: 0,
         tid: current_tid(system),
+        pc,
+        lr,
         kind: MemoryHistoryKind::QueryMemory,
         query_or_addr: query_address,
         base_or_out: info.base_address,
@@ -164,9 +203,12 @@ pub fn record_heap(
                 info.m_permission.bits() as u32,
             )
         });
+    let (pc, lr) = current_guest_pc_lr(system);
     push(MemoryHistoryEvent {
         sequence: 0,
         tid: current_tid(system),
+        pc,
+        lr,
         kind: MemoryHistoryKind::SetHeapSize,
         query_or_addr: 0,
         base_or_out: out_address,
@@ -197,9 +239,12 @@ pub fn record_physical(
     if !range_covers(addr, size, target) && !near(addr, target) {
         return;
     }
+    let (pc, lr) = current_guest_pc_lr(system);
     push(MemoryHistoryEvent {
         sequence: 0,
         tid: current_tid(system),
+        pc,
+        lr,
         kind,
         query_or_addr: addr,
         base_or_out: addr,
@@ -235,9 +280,12 @@ pub fn record_map_memory(
     {
         return;
     }
+    let (pc, lr) = current_guest_pc_lr(system);
     push(MemoryHistoryEvent {
         sequence: 0,
         tid: current_tid(system),
+        pc,
+        lr,
         kind,
         query_or_addr: dst_addr,
         base_or_out: src_addr,
@@ -277,6 +325,8 @@ pub fn record_ipc_map_alias(
     push(MemoryHistoryEvent {
         sequence: 0,
         tid: current_tls_tid(),
+        pc: 0,
+        lr: 0,
         kind: MemoryHistoryKind::IpcMapAlias,
         query_or_addr: dst_addr,
         base_or_out: src_addr,
@@ -309,9 +359,11 @@ pub fn dump(reason: &str) {
         match event.kind {
             MemoryHistoryKind::QueryMemory => {
                 eprintln!(
-                    "[MEM_HISTORY] #{:05} tid={} {} query=0x{:X} -> base=0x{:X} size=0x{:X} state=0x{:X} attr=0x{:X} perm=0x{:X} ipc={} dev={}",
+                    "[MEM_HISTORY] #{:05} tid={} pc=0x{:X} lr=0x{:X} {} query=0x{:X} -> base=0x{:X} size=0x{:X} state=0x{:X} attr=0x{:X} perm=0x{:X} ipc={} dev={}",
                     event.sequence,
                     event.tid,
+                    event.pc,
+                    event.lr,
                     event.kind.as_str(),
                     event.query_or_addr,
                     event.base_or_out,
@@ -325,9 +377,11 @@ pub fn dump(reason: &str) {
             }
             MemoryHistoryKind::SetHeapSize => {
                 eprintln!(
-                    "[MEM_HISTORY] #{:05} tid={} {} size=0x{:X} -> result=0x{:08X} address=0x{:X} target_base=0x{:X} target_size=0x{:X} target_state=0x{:X} target_attr=0x{:X} target_perm=0x{:X}",
+                    "[MEM_HISTORY] #{:05} tid={} pc=0x{:X} lr=0x{:X} {} size=0x{:X} -> result=0x{:08X} address=0x{:X} target_base=0x{:X} target_size=0x{:X} target_state=0x{:X} target_attr=0x{:X} target_perm=0x{:X}",
                     event.sequence,
                     event.tid,
+                    event.pc,
+                    event.lr,
                     event.kind.as_str(),
                     event.size,
                     event.state_or_result,
@@ -341,9 +395,11 @@ pub fn dump(reason: &str) {
             }
             MemoryHistoryKind::MapMemory | MemoryHistoryKind::UnmapMemory => {
                 eprintln!(
-                    "[MEM_HISTORY] #{:05} tid={} {} dst=0x{:X} src=0x{:X} size=0x{:X} result=0x{:08X}",
+                    "[MEM_HISTORY] #{:05} tid={} pc=0x{:X} lr=0x{:X} {} dst=0x{:X} src=0x{:X} size=0x{:X} result=0x{:08X}",
                     event.sequence,
                     event.tid,
+                    event.pc,
+                    event.lr,
                     event.kind.as_str(),
                     event.query_or_addr,
                     event.base_or_out,
@@ -353,9 +409,11 @@ pub fn dump(reason: &str) {
             }
             MemoryHistoryKind::MapPhysicalMemory | MemoryHistoryKind::UnmapPhysicalMemory => {
                 eprintln!(
-                    "[MEM_HISTORY] #{:05} tid={} {} addr=0x{:X} size=0x{:X} result=0x{:08X}",
+                    "[MEM_HISTORY] #{:05} tid={} pc=0x{:X} lr=0x{:X} {} addr=0x{:X} size=0x{:X} result=0x{:08X}",
                     event.sequence,
                     event.tid,
+                    event.pc,
+                    event.lr,
                     event.kind.as_str(),
                     event.query_or_addr,
                     event.size,
@@ -364,9 +422,11 @@ pub fn dump(reason: &str) {
             }
             MemoryHistoryKind::IpcMapAlias => {
                 eprintln!(
-                    "[MEM_HISTORY] #{:05} tid={} {} dst=0x{:X} src=0x{:X} size=0x{:X} result=0x{:08X} state=0x{:X} perm=0x{:X} attr=0x{:X}",
+                    "[MEM_HISTORY] #{:05} tid={} pc=0x{:X} lr=0x{:X} {} dst=0x{:X} src=0x{:X} size=0x{:X} result=0x{:08X} state=0x{:X} perm=0x{:X} attr=0x{:X}",
                     event.sequence,
                     event.tid,
+                    event.pc,
+                    event.lr,
                     event.kind.as_str(),
                     event.query_or_addr,
                     event.base_or_out,

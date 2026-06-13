@@ -104,7 +104,7 @@ pub fn query_process_memory(
                 .filter_map(|p| p.trim().parse::<u64>().ok())
                 .any(|t| t == tid);
         if want {
-            log::info!(
+            eprintln!(
                 "[QUERY_RET] tid={} QueryMemory(addr=0x{:X}) -> base=0x{:X} size=0x{:X} state=0x{:X} attr=0x{:X} perm=0x{:X} ipc={} dev={}",
                 tid,
                 address,

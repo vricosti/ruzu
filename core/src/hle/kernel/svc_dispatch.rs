@@ -1083,9 +1083,16 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg32(args, 1, handle);
         }
         Some(SvcId::CreateSharedMemory) => {
+            // IN: size=arg32[1], owner_perm=arg32[2], remote_perm=arg32[3]
             // OUT: ret=arg32[0], handle=arg32[1]
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle(system));
+            let mut handle = 0;
+            let size = get_arg32(args, 1) as u64;
+            let owner_perm = unsafe { std::mem::transmute(get_arg32(args, 2)) };
+            let remote_perm = unsafe { std::mem::transmute(get_arg32(args, 3)) };
+            let result =
+                svc_shared_memory::create_shared_memory(&mut handle, size, owner_perm, remote_perm);
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, handle);
         }
         Some(SvcId::MapTransferMemory) => {
             // IN: handle=arg32[1], address=arg32[2], size=arg32[3], perm=arg32[4]; OUT: ret=arg32[0]
@@ -2087,7 +2094,10 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
             *CACHED.get_or_init(|| {
                 std::env::var("RUZU_TRACE_SVC_ERRVAL").ok().and_then(|s| {
                     let s = s.trim();
-                    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+                    let s = s
+                        .strip_prefix("0x")
+                        .or_else(|| s.strip_prefix("0X"))
+                        .unwrap_or(s);
                     u64::from_str_radix(s, 16).ok()
                 })
             })
@@ -2133,7 +2143,10 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                         s.split(',')
                             .filter_map(|p| {
                                 let p = p.trim();
-                                let p = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")).unwrap_or(p);
+                                let p = p
+                                    .strip_prefix("0x")
+                                    .or_else(|| p.strip_prefix("0X"))
+                                    .unwrap_or(p);
                                 u32::from_str_radix(p, 16).ok()
                             })
                             .collect()

@@ -186,6 +186,23 @@ fn trace_get_pointer_page(kind: &str, vaddr: u64) {
 /// HLE writers, plus the JIT memory-write callback path through write_32).
 /// Combine with `RUZU_NO_FASTMEM_W32=1`/`_W16`/`_W8` to also catch the JIT
 /// fastmem path (otherwise guest stores via fastmem bypass these helpers).
+
+/// Parse a `0xVADDR`-style diagnostic env var ONCE; hot paths pay a single
+/// atomic load afterwards. `std::env::var` takes a process-global lock, so
+/// per-access lookups on memory hot paths serialize every thread.
+fn cached_hex_env(cell: &'static std::sync::OnceLock<Option<u64>>, key: &str) -> Option<u64> {
+    *cell.get_or_init(|| {
+        std::env::var(key).ok().and_then(|s| {
+            let s = s.trim();
+            let s = s
+                .strip_prefix("0x")
+                .or_else(|| s.strip_prefix("0X"))
+                .unwrap_or(s);
+            u64::from_str_radix(s, 16).ok()
+        })
+    })
+}
+
 fn maybe_trace_write_in_range(vaddr: u64, size: u64, data: u64) {
     use std::sync::OnceLock;
     static RANGES: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
@@ -222,6 +239,66 @@ fn maybe_trace_write_in_range(vaddr: u64, size: u64, data: u64) {
                 width = (size as usize) * 2
             );
             break;
+        }
+    }
+}
+
+fn parse_trace_write_values() -> Vec<u64> {
+    let Ok(raw) = std::env::var("RUZU_TRACE_MEMORY_W_VALUE") else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .filter_map(|tok| {
+            let tok = tok.trim();
+            let tok = tok
+                .strip_prefix("0x")
+                .or_else(|| tok.strip_prefix("0X"))
+                .unwrap_or(tok);
+            u64::from_str_radix(tok, 16).ok()
+        })
+        .collect()
+}
+
+fn maybe_trace_write_value(kind: &str, vaddr: u64, size: u64, data: u64) {
+    use std::sync::OnceLock;
+    static VALUES: OnceLock<Vec<u64>> = OnceLock::new();
+    let values = VALUES.get_or_init(parse_trace_write_values);
+    if values.is_empty() {
+        return;
+    }
+    let mask = if size >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (size * 8)) - 1
+    };
+    let data = data & mask;
+    if !values.iter().any(|&value| (value & mask) == data) {
+        return;
+    }
+    let bt = std::backtrace::Backtrace::force_capture();
+    eprintln!(
+        "[MEMORY_W_VALUE:{kind}] vaddr=0x{vaddr:016X} size={size} data=0x{data:0width$X}\n{bt}",
+        width = (size as usize) * 2
+    );
+}
+
+fn maybe_trace_write_block_values(kind: &str, dest_addr: u64, src: &[u8]) {
+    use std::sync::OnceLock;
+    static VALUES: OnceLock<Vec<u64>> = OnceLock::new();
+    let values = VALUES.get_or_init(parse_trace_write_values);
+    if values.is_empty() || src.len() < 4 {
+        return;
+    }
+    for offset in 0..=src.len() - 4 {
+        let value = u32::from_le_bytes(src[offset..offset + 4].try_into().unwrap()) as u64;
+        if values.iter().any(|&target| (target & 0xFFFF_FFFF) == value) {
+            let bt = std::backtrace::Backtrace::force_capture();
+            let vaddr = dest_addr + offset as u64;
+            eprintln!(
+                "[MEMORY_W_VALUE:{kind}] vaddr=0x{vaddr:016X} size=4 data=0x{value:08X} block_dest=0x{dest_addr:016X} block_len=0x{:X}\n{bt}",
+                src.len()
+            );
+            return;
         }
     }
 }
@@ -814,12 +891,11 @@ impl Memory {
         if backing == 0 {
             return std::ptr::null_mut();
         }
-        unsafe {
-            let dm = &*self.device_memory;
-            dm.buffer
-                .backing_base_pointer()
-                .add(backing + vaddr as usize) as *mut u8
+        let phys_addr = (backing as u64).wrapping_add(vaddr);
+        if phys_addr < dram_memory_map::BASE {
+            return std::ptr::null_mut();
         }
+        unsafe { (*self.device_memory).get_pointer(phys_addr) }
     }
 
     /// Get pointer from rasterizer cached memory (slow path).
@@ -955,6 +1031,32 @@ impl Memory {
         }
     }
 
+    fn handle_rasterizer_download(&self, vaddr: u64, size: usize) {
+        let Some(device_addr) = self.current_physical_address(vaddr) else {
+            return;
+        };
+
+        if !self.system.is_null() {
+            if let Some(gpu) = self.system.get().gpu_core() {
+                let _ = gpu.on_cpu_read(device_addr, size as u64);
+            }
+        }
+    }
+
+    fn handle_rasterizer_download_for_read_range(&self, start_addr: u64, size: usize) {
+        let mut remaining = size;
+        let mut vaddr = start_addr;
+        while remaining > 0 {
+            let page_offset = (vaddr & PAGE_MASK) as usize;
+            let copy_amount = ((PAGE_SIZE as usize) - page_offset).min(remaining);
+            if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
+                self.handle_rasterizer_download(vaddr, copy_amount);
+            }
+            vaddr += copy_amount as u64;
+            remaining -= copy_amount;
+        }
+    }
+
     fn page_type_at(&self, vaddr: u64) -> Option<PageType> {
         if self.current_page_table.is_null() {
             return None;
@@ -965,6 +1067,27 @@ impl Memory {
             return None;
         }
         Some(PageInfo::extract_type(pt.pointers[page_idx].raw_value()))
+    }
+
+    fn page_debug_at(&self, vaddr: u64) -> Option<(PageType, usize, u64, Option<u64>)> {
+        if self.current_page_table.is_null() {
+            return None;
+        }
+        let pt = unsafe { &*self.current_page_table };
+        let page_idx = (vaddr >> PAGE_BITS) as usize;
+        if page_idx >= pt.pointers.size() || page_idx >= pt.backing_addr.size() {
+            return None;
+        }
+        let raw = pt.pointers[page_idx].raw_value();
+        let pointer = PageInfo::extract_pointer(raw);
+        let ptype = PageInfo::extract_type(raw);
+        let backing = pt.backing_addr[page_idx];
+        let phys = if backing == 0 {
+            None
+        } else {
+            Some(backing.wrapping_add(vaddr))
+        };
+        Some((ptype, pointer, backing, phys))
     }
 
     fn perform_cache_operation<F>(
@@ -1085,12 +1208,72 @@ impl Memory {
                     );
                 }
             }
+            if std::env::var_os("RUZU_TRACE_UNMAPPED_GUEST").is_some() && vaddr < 0x1000 {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static SHOWN: AtomicU32 = AtomicU32::new(0);
+                let n = SHOWN.fetch_add(1, Ordering::Relaxed);
+                if n < 64 {
+                    let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+                    let (core, regs) =
+                        crate::hle::kernel::kernel::with_current_thread_fast_mut(|t| {
+                            (
+                                t.get_current_core().max(0) as usize,
+                                [
+                                    t.thread_context.r[0],
+                                    t.thread_context.r[1],
+                                    t.thread_context.r[2],
+                                    t.thread_context.r[3],
+                                    t.thread_context.r[4],
+                                    t.thread_context.r[5],
+                                    t.thread_context.r[6],
+                                    t.thread_context.r[7],
+                                    t.thread_context.fp,
+                                    t.thread_context.sp,
+                                    t.thread_context.lr,
+                                ],
+                            )
+                        })
+                        .unwrap_or((usize::MAX, [0; 11]));
+                    let (pc, lr) = if core < crate::hle::kernel::kernel::GUEST_PC.len() {
+                        (
+                            crate::hle::kernel::kernel::GUEST_PC[core].load(Ordering::Acquire),
+                            crate::hle::kernel::kernel::GUEST_LR[core].load(Ordering::Acquire),
+                        )
+                    } else {
+                        (0, 0)
+                    };
+                    eprintln!(
+                        "[UNMAPPED_GUEST] #{} tid={} core={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} bits={} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} fp=0x{:08X} sp=0x{:08X} ctx_lr=0x{:08X}",
+                        n,
+                        tid,
+                        core,
+                        pc,
+                        lr,
+                        vaddr,
+                        std::mem::size_of::<T>() * 8,
+                        regs[0],
+                        regs[1],
+                        regs[2],
+                        regs[3],
+                        regs[4],
+                        regs[5],
+                        regs[6],
+                        regs[7],
+                        regs[8],
+                        regs[9],
+                        regs[10],
+                    );
+                }
+            }
             log::error!(
                 "Unmapped Read{} @ {:#018x}",
                 std::mem::size_of::<T>() * 8,
                 vaddr
             );
             return T::default();
+        }
+        if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
+            self.handle_rasterizer_download(vaddr, std::mem::size_of::<T>());
         }
         std::ptr::read_unaligned(ptr as *const T)
     }
@@ -1227,15 +1410,21 @@ impl Memory {
     /// Write a u8. Matches upstream `Memory::Write8`.
     pub fn write_8(&self, vaddr: u64, data: u8) {
         maybe_trace_write_in_range(vaddr, 1, data as u64);
-        self.handle_rasterizer_write(vaddr, std::mem::size_of::<u8>());
+        maybe_trace_write_value("write_8", vaddr, 1, data as u64);
+        if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
+            self.handle_rasterizer_write(vaddr, std::mem::size_of::<u8>());
+        }
         unsafe { self.write_raw::<u8>(vaddr, data) }
     }
 
     /// Write a u16 (LE). Matches upstream `Memory::Write16`.
     pub fn write_16(&self, vaddr: u64, data: u16) {
         maybe_trace_write_in_range(vaddr, 2, data as u64);
-        self.handle_rasterizer_write(vaddr, std::mem::size_of::<u16>());
+        maybe_trace_write_value("write_16", vaddr, 2, data as u64);
         if (vaddr & 1) == 0 {
+            if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
+                self.handle_rasterizer_write(vaddr, std::mem::size_of::<u16>());
+            }
             unsafe { self.write_raw::<u16>(vaddr, data) }
         } else {
             self.write_8(vaddr, data as u8);
@@ -1246,14 +1435,16 @@ impl Memory {
     /// Write a u32 (LE). Matches upstream `Memory::Write32`.
     pub fn write_32(&self, vaddr: u64, data: u32) {
         maybe_trace_write_in_range(vaddr, 4, data as u64);
+        maybe_trace_write_value("write_32", vaddr, 4, data as u64);
         // `RUZU_TRACE_MEMORY_W32_AT_VADDR=0xVADDR` — log every Rust-side
         // `Memory::write_32` call whose vaddr matches. Counterpart to the
         // existing `RUZU_TRACE_MEMORY_W64_AT_VADDR`. Catches HLE / kernel
         // writes (like `write_to_user` in k_condition_variable) that
         // bypass the JIT memory_write_32 callback. Pair with
         // `RUZU_NO_FASTMEM_W32=1` to see ALL writes (guest + kernel).
-        if let Ok(spec) = std::env::var("RUZU_TRACE_MEMORY_W32_AT_VADDR") {
-            if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
+        {
+            static W32_TARGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+            if let Some(target) = cached_hex_env(&W32_TARGET, "RUZU_TRACE_MEMORY_W32_AT_VADDR") {
                 if vaddr <= target && target < vaddr + 4 {
                     let bt = std::backtrace::Backtrace::force_capture();
                     eprintln!(
@@ -1263,8 +1454,10 @@ impl Memory {
                 }
             }
         }
-        self.handle_rasterizer_write(vaddr, std::mem::size_of::<u32>());
         if (vaddr & 3) == 0 {
+            if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
+                self.handle_rasterizer_write(vaddr, std::mem::size_of::<u32>());
+            }
             unsafe { self.write_raw::<u32>(vaddr, data) }
         } else {
             self.write_16(vaddr, data as u16);
@@ -1279,6 +1472,7 @@ impl Memory {
     /// invert Rust host locks (`Memory` -> shader cache) against the GPU thread
     /// (shader cache -> `Memory`). Guest/JIT writes must keep using `write_32`.
     pub fn write_32_no_rasterizer(&self, vaddr: u64, data: u32) {
+        maybe_trace_write_value("write_32_no_rasterizer", vaddr, 4, data as u64);
         if (vaddr & 3) == 0 {
             unsafe { self.write_raw::<u32>(vaddr, data) }
         } else {
@@ -1296,13 +1490,15 @@ impl Memory {
     /// Used for host-side HLE/service writes where ruzu already holds the global
     /// `Mutex<Memory>`. Guest/JIT writes must keep using `write_block`.
     pub fn write_block_no_rasterizer(&self, dest_addr: u64, src: &[u8]) -> bool {
+        maybe_trace_write_block_values("write_block_no_rasterizer", dest_addr, src);
         // `RUZU_TRACE_WRITE_BLOCK_AT=0xVADDR` — log every HLE-side
         // `write_block_no_rasterizer` whose [dest, dest+len) range covers
         // VADDR. Used to attribute non-fastmem writes (HLE WriteBuffer,
         // etc.) that bypass both JIT memory callbacks and the per-u32
         // `RUZU_TRACE_MEMORY_W32_AT_VADDR` hook in `write_32`.
-        if let Ok(spec) = std::env::var("RUZU_TRACE_WRITE_BLOCK_AT") {
-            if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
+        {
+            static WB_TARGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+            if let Some(target) = cached_hex_env(&WB_TARGET, "RUZU_TRACE_WRITE_BLOCK_AT") {
                 if dest_addr <= target && target < dest_addr + src.len() as u64 {
                     let bt = std::backtrace::Backtrace::force_capture();
                     let off = (target - dest_addr) as usize;
@@ -1358,14 +1554,16 @@ impl Memory {
 
     /// SEGV-safe variant for HLE IPC output buffers.
     ///
-    /// `write_block_no_rasterizer` uses direct host pointers, matching the hot
-    /// memory path. IPC out-buffers can race with guest-side unmapping/protection
-    /// while the service thread is copying a large file chunk; using
-    /// process_vm_writev turns a temporarily inaccessible host page into `EFAULT`
+    /// Upstream HLE writes call `Memory::WriteBlock`, so they still notify the
+    /// rasterizer before copying. IPC out-buffers can overlap protected GPU
+    /// cached pages while a service thread copies a large file chunk; using
+    /// `process_vm_writev` turns a still-inaccessible host page into `EFAULT`
     /// instead of taking the emulator down with SIGSEGV.
-    pub fn write_block_no_rasterizer_checked(&self, dest_addr: u64, src: &[u8]) -> bool {
-        if let Ok(spec) = std::env::var("RUZU_TRACE_WRITE_BLOCK_AT") {
-            if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
+    pub fn write_block_checked(&self, dest_addr: u64, src: &[u8]) -> bool {
+        maybe_trace_write_block_values("write_block_checked", dest_addr, src);
+        {
+            static WB_TARGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+            if let Some(target) = cached_hex_env(&WB_TARGET, "RUZU_TRACE_WRITE_BLOCK_AT") {
                 if dest_addr <= target && target < dest_addr + src.len() as u64 {
                     let bt = std::backtrace::Backtrace::force_capture();
                     let off = (target - dest_addr) as usize;
@@ -1398,37 +1596,6 @@ impl Memory {
         }
 
         let self_pid = unsafe { libc::getpid() };
-        let first_ptr = self.get_pointer_impl(dest_addr);
-        if !first_ptr.is_null() {
-            let local_iov = libc::iovec {
-                iov_base: src.as_ptr() as *mut libc::c_void,
-                iov_len: size,
-            };
-            let remote_iov = libc::iovec {
-                iov_base: first_ptr as *mut libc::c_void,
-                iov_len: size,
-            };
-            let written = unsafe {
-                libc::process_vm_writev(
-                    self_pid,
-                    &local_iov as *const _,
-                    1,
-                    &remote_iov as *const _,
-                    1,
-                    0,
-                )
-            };
-            if written == size as isize {
-                return true;
-            }
-            log::error!(
-                "checked WriteBlock fast path failed @ {:#018x} size={:#x} written={}",
-                dest_addr,
-                size,
-                written
-            );
-        }
-
         let mut remaining = size;
         let mut offset = 0usize;
         let mut vaddr = dest_addr;
@@ -1443,6 +1610,9 @@ impl Memory {
                 log::error!("Unmapped checked WriteBlock @ {:#018x}", vaddr);
                 user_accessible = false;
             } else {
+                if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
+                    self.handle_rasterizer_write(vaddr, copy_amount);
+                }
                 let local_iov = libc::iovec {
                     iov_base: src[offset..].as_ptr() as *mut libc::c_void,
                     iov_len: copy_amount,
@@ -1451,7 +1621,7 @@ impl Memory {
                     iov_base: ptr as *mut libc::c_void,
                     iov_len: copy_amount,
                 };
-                let written = unsafe {
+                let mut written = unsafe {
                     libc::process_vm_writev(
                         self_pid,
                         &local_iov as *const _,
@@ -1461,7 +1631,46 @@ impl Memory {
                         0,
                     )
                 };
+                if written != copy_amount as isize
+                    && self.invalidate_separate_heap(ptr as *const u8)
+                {
+                    written = unsafe {
+                        libc::process_vm_writev(
+                            self_pid,
+                            &local_iov as *const _,
+                            1,
+                            &remote_iov as *const _,
+                            1,
+                            0,
+                        )
+                    };
+                }
                 if written != copy_amount as isize {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static CHECKED_WRITE_FAILURES: AtomicU32 = AtomicU32::new(0);
+                    let failure = CHECKED_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failure < 16 || failure.is_power_of_two() {
+                        if let Some((ptype, pointer, backing, phys)) = self.page_debug_at(vaddr) {
+                            let buffer = unsafe { &*self.buffer };
+                            let backing_base = buffer.backing_base_pointer() as usize;
+                            let backing_size = buffer.backing_size();
+                            let ptr_offset = (ptr as usize).wrapping_sub(backing_base);
+                            let errno = std::io::Error::last_os_error();
+                            log::error!(
+                                "checked WriteBlock page debug @ {:#018x}: type={:?} pointer={:#x} backing={:#x} phys={:?} ptr={:#x} backing_base={:#x} ptr_offset={:#x} backing_size={:#x} errno={}",
+                                vaddr,
+                                ptype,
+                                pointer,
+                                backing,
+                                phys,
+                                ptr as usize,
+                                backing_base,
+                                ptr_offset,
+                                backing_size,
+                                errno,
+                            );
+                        }
+                    }
                     log::error!(
                         "checked WriteBlock failed @ {:#018x} size={:#x} written={}",
                         vaddr,
@@ -1481,11 +1690,14 @@ impl Memory {
 
     /// Write a u64 (LE). Matches upstream `Memory::Write64`.
     pub fn write_64(&self, vaddr: u64, data: u64) {
+        maybe_trace_write_value("write_64", vaddr, 8, data);
         // RUZU_TRACE_MEMORY_W64_AT_VADDR=0xVADDR — log every call into
         // Memory::write_64 with vaddr matching. Catches any Rust-side
         // write (HLE, kernel, etc.) that bypasses the JIT callback.
-        if let Ok(spec) = std::env::var("RUZU_TRACE_MEMORY_W64_AT_VADDR") {
-            if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
+        {
+            static W64_TARGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+            let spec_target = cached_hex_env(&W64_TARGET, "RUZU_TRACE_MEMORY_W64_AT_VADDR");
+            if let Some(target) = spec_target {
                 if vaddr == target {
                     let bt = std::backtrace::Backtrace::force_capture();
                     eprintln!(
@@ -1495,8 +1707,10 @@ impl Memory {
                 }
             }
         }
-        self.handle_rasterizer_write(vaddr, std::mem::size_of::<u64>());
         if (vaddr & 7) == 0 {
+            if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
+                self.handle_rasterizer_write(vaddr, std::mem::size_of::<u64>());
+            }
             unsafe { self.write_raw::<u64>(vaddr, data) }
         } else {
             self.write_32(vaddr, data as u32);
@@ -1523,18 +1737,23 @@ impl Memory {
     /// Matches upstream `Memory::ReadBlock` (via WalkBlock pattern).
     pub fn read_block(&self, src_addr: u64, dest: &mut [u8]) -> bool {
         let size = dest.len();
-        let trace_read_ptr = std::env::var("RUZU_TRACE_READ_BLOCK_PTR")
-            .ok()
-            .and_then(|raw| {
-                let raw = raw.trim();
-                let digits = raw
-                    .strip_prefix("0x")
-                    .or_else(|| raw.strip_prefix("0X"))
-                    .unwrap_or(raw);
-                u64::from_str_radix(digits, 16)
+        let trace_read_ptr = {
+            static RB_TARGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+            *RB_TARGET.get_or_init(|| {
+                std::env::var("RUZU_TRACE_READ_BLOCK_PTR")
                     .ok()
-                    .or_else(|| raw.parse::<u64>().ok())
-            });
+                    .and_then(|raw| {
+                        let raw = raw.trim();
+                        let digits = raw
+                            .strip_prefix("0x")
+                            .or_else(|| raw.strip_prefix("0X"))
+                            .unwrap_or(raw);
+                        u64::from_str_radix(digits, 16)
+                            .ok()
+                            .or_else(|| raw.parse::<u64>().ok())
+                    })
+            })
+        };
 
         // Upstream: AddressSpaceContains check before walking pages.
         if !self.address_space_contains(src_addr, size) {
@@ -1570,6 +1789,9 @@ impl Memory {
                         copy_amount,
                         size,
                     );
+                }
+                if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
+                    self.handle_rasterizer_download(vaddr, copy_amount);
                 }
                 unsafe {
                     std::ptr::copy_nonoverlapping(ptr, dest[offset..].as_mut_ptr(), copy_amount);
@@ -1621,6 +1843,7 @@ impl Memory {
         let self_pid = unsafe { libc::getpid() };
         let first_ptr = self.get_pointer_impl(src_addr);
         if !first_ptr.is_null() {
+            self.handle_rasterizer_download_for_read_range(src_addr, size);
             let local_iov = libc::iovec {
                 iov_base: dest.as_mut_ptr() as *mut libc::c_void,
                 iov_len: size,
@@ -1669,6 +1892,9 @@ impl Memory {
                 dest[offset..offset + copy_amount].fill(0);
                 user_accessible = false;
             } else {
+                if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
+                    self.handle_rasterizer_download(vaddr, copy_amount);
+                }
                 let local_iov = libc::iovec {
                     iov_base: dest[offset..].as_mut_ptr() as *mut libc::c_void,
                     iov_len: copy_amount,
@@ -1711,6 +1937,7 @@ impl Memory {
     /// Write a block of data to guest memory.
     /// Matches upstream `Memory::WriteBlock` (via WalkBlock pattern).
     pub fn write_block(&self, dest_addr: u64, src: &[u8]) -> bool {
+        maybe_trace_write_block_values("write_block", dest_addr, src);
         let size = src.len();
 
         // RUZU_WATCH_BLOCK=START:LEN — emit a backtrace + first 64 bytes of
@@ -1747,25 +1974,12 @@ impl Memory {
         while remaining > 0 {
             let page_offset = (vaddr & PAGE_MASK) as usize;
             let copy_amount = ((PAGE_SIZE as usize) - page_offset).min(remaining);
-            let mut rasterizer_notified = false;
-
-            if let Some(phys_addr) = self.current_physical_address(vaddr) {
-                self.handle_rasterizer_write(vaddr, copy_amount);
-                rasterizer_notified = true;
-                if self.write_phys_block(phys_addr, &src[offset..offset + copy_amount]) {
-                    vaddr += copy_amount as u64;
-                    offset += copy_amount;
-                    remaining -= copy_amount;
-                    continue;
-                }
-            }
-
             let ptr = self.get_pointer_impl(vaddr);
             if ptr.is_null() {
                 log::error!("Unmapped WriteBlock @ {:#018x}", vaddr);
                 user_accessible = false;
             } else {
-                if !rasterizer_notified {
+                if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
                     self.handle_rasterizer_write(vaddr, copy_amount);
                 }
                 unsafe {

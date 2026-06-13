@@ -45,7 +45,7 @@ pub fn get_info(
                 .filter_map(|p| p.trim().parse::<u64>().ok())
                 .any(|t| t == tid);
         if want {
-            log::info!(
+            eprintln!(
                 "[QUERY_RET] tid={} GetInfo(id={:?}, handle=0x{:08X}, sub=0x{:X}) -> rc=0x{:X} result=0x{:X}",
                 tid,
                 info_id_type,

@@ -148,7 +148,7 @@ impl fmt::Display for UUID {
 
 impl Hash for UUID {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.uuid.hash(state);
+        state.write_u64(self.hash_value());
     }
 }
 
@@ -304,5 +304,16 @@ mod tests {
         assert_eq!(uuid.uuid[6] >> 4, 4);
         // Check variant bits (byte 8, upper 2 bits should be 10)
         assert_eq!(uuid.uuid[8] >> 6, 2);
+    }
+
+    #[test]
+    fn test_uuid_hash_value_matches_upstream_algorithm() {
+        let uuid = UUID::from_bytes([
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ]);
+        let upper = u64::from_le_bytes(uuid.uuid[0..8].try_into().unwrap());
+        let lower = u64::from_le_bytes(uuid.uuid[8..16].try_into().unwrap());
+        assert_eq!(uuid.hash_value(), upper ^ lower.rotate_left(1));
     }
 }

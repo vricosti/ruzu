@@ -229,8 +229,7 @@ pub static GUEST_REGS: [[std::sync::atomic::AtomicU32; 12];
 /// cold, so we need to discover the hot LR empirically.
 static PC_SAMPLE_HIST: std::sync::Mutex<Option<std::collections::HashMap<(u32, u64), u64>>> =
     std::sync::Mutex::new(None);
-static PC_SAMPLE_STARTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static PC_SAMPLE_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn maybe_spawn_pc_sampler() {
     if std::env::var_os("RUZU_PC_SAMPLE").is_none() {
@@ -274,7 +273,10 @@ fn maybe_spawn_pc_sampler() {
             }
         })
         .ok();
-    eprintln!("[PC_SAMPLE] sampler started (interval {}µs); dump on SIGUSR1", interval_us);
+    eprintln!(
+        "[PC_SAMPLE] sampler started (interval {}µs); dump on SIGUSR1",
+        interval_us
+    );
 }
 
 pub fn dump_pc_sample_hist() {
@@ -285,11 +287,18 @@ pub fn dump_pc_sample_hist() {
     let total: u64 = hist.values().sum();
     let mut v: Vec<((u32, u64), u64)> = hist.iter().map(|(k, c)| (*k, *c)).collect();
     v.sort_by(|a, b| b.1.cmp(&a.1));
-    eprintln!("[PC_SAMPLE] === top guest (tid,LR,PC) by sample count (total={}) ===", total);
+    eprintln!(
+        "[PC_SAMPLE] === top guest (tid,LR,PC) by sample count (total={}) ===",
+        total
+    );
     for ((tid, lrpc), count) in v.iter().take(40) {
         let lr = lrpc >> 32;
         let pc = lrpc & 0xFFFF_FFFF;
-        let pct = if total > 0 { (*count as f64) * 100.0 / total as f64 } else { 0.0 };
+        let pct = if total > 0 {
+            (*count as f64) * 100.0 / total as f64
+        } else {
+            0.0
+        };
         eprintln!(
             "[PC_SAMPLE] tid={} lr=0x{:08X} pc=0x{:08X} count={} ({:.1}%)",
             tid, lr, pc, count, pct
@@ -787,6 +796,64 @@ fn dump_thread_state(kernel: &KernelCore) {
                         "[DUMP]   SVC21_MSG core={} tid={} handle=0x{:08X} msg=0x{:08X} size=0x{:X} <guest-memory-lock-busy>",
                         core_id, tid, handle, message_addr, size
                     ),
+                }
+            }
+            // RUZU_DUMP_HANDLE=0xNNN[,0xMMM...] — resolve each handle in the
+            // main process handle table and identify the kernel object kind
+            // (thread/session/event/...) plus thread state when applicable.
+            if let Ok(spec) = std::env::var("RUZU_DUMP_HANDLE") {
+                for s in spec.split(',') {
+                    let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+                    let Ok(handle) = u32::from_str_radix(s, 16) else {
+                        continue;
+                    };
+                    let Some(object_id) = guard.handle_table.get_object(handle) else {
+                        eprintln!("[DUMP]   HANDLE 0x{:08X} <not-in-handle-table>", handle);
+                        continue;
+                    };
+                    let mut kinds: Vec<String> = Vec::new();
+                    if let Some(thread) = guard.get_thread_by_object_id(object_id) {
+                        let state = match thread.try_lock() {
+                            Ok(t) => format!("tid={} state={:?}", t.thread_id, t.thread_state),
+                            Err(_) => "<thread-lock-busy>".to_string(),
+                        };
+                        kinds.push(format!("thread({})", state));
+                    }
+                    if guard.get_session_by_object_id(object_id).is_some() {
+                        kinds.push("session".to_string());
+                    }
+                    if guard.get_client_session_by_object_id(object_id).is_some() {
+                        kinds.push("client_session".to_string());
+                    }
+                    if guard.get_server_session_by_object_id(object_id).is_some() {
+                        kinds.push("server_session".to_string());
+                    }
+                    if let Some(event) = guard.get_event_by_object_id(object_id) {
+                        let state = match event.try_lock() {
+                            Ok(e) => format!("readable_event_id={}", e.readable_event_id),
+                            Err(_) => "<event-lock-busy>".to_string(),
+                        };
+                        kinds.push(format!("event({})", state));
+                    }
+                    if let Some(revent) = guard.get_readable_event_by_object_id(object_id) {
+                        let state = match revent.try_lock() {
+                            Ok(e) => format!("{}", e.is_signaled()),
+                            Err(_) => "<revent-lock-busy>".to_string(),
+                        };
+                        kinds.push(format!("readable_event(signaled={})", state));
+                    }
+                    if guard.get_shared_memory_by_object_id(object_id).is_some() {
+                        kinds.push("shared_memory".to_string());
+                    }
+                    if guard.get_transfer_memory_by_object_id(object_id).is_some() {
+                        kinds.push("transfer_memory".to_string());
+                    }
+                    eprintln!(
+                        "[DUMP]   HANDLE 0x{:08X} object_id=0x{:X} kinds=[{}]",
+                        handle,
+                        object_id,
+                        kinds.join(", ")
+                    );
                 }
             }
             // Dump 32 bytes (8 ARM32 insns) around each interesting PC so the
