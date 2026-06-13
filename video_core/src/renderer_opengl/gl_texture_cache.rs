@@ -426,6 +426,9 @@ pub struct TextureCacheRuntime {
     pub device_access_memory: u64,
     staging_buffer_pool: StagingBufferPool,
     util_shaders: UtilShaders,
+    format_conversion_pass: FormatConversionPass,
+    null_image_handles: [u32; 7],
+    null_image_views: [u32; NUM_TEXTURE_TYPES],
     rescale_draw_fbos: [u32; 4],
     rescale_read_fbos: [u32; 4],
 }
@@ -447,6 +450,7 @@ impl TextureCacheRuntime {
         Self::new_with_caps(
             device.has_broken_texture_view_formats(),
             device_access_memory,
+            device.has_debugging_tool_attached(),
             program_manager,
         )
     }
@@ -454,13 +458,19 @@ impl TextureCacheRuntime {
     pub fn new_with_caps(
         has_broken_texture_view_formats: bool,
         device_access_memory: u64,
+        has_debugging_tool_attached: bool,
         program_manager: ProgramManagerHandle,
     ) -> Self {
+        let (null_image_handles, null_image_views) =
+            create_null_image_views(has_debugging_tool_attached);
         let mut runtime = Self {
             has_broken_texture_view_formats,
             device_access_memory,
             staging_buffer_pool: StagingBufferPool::new(),
             util_shaders: UtilShaders::new(program_manager),
+            format_conversion_pass: FormatConversionPass::new(),
+            null_image_handles,
+            null_image_views,
             rescale_draw_fbos: [0; 4],
             rescale_read_fbos: [0; 4],
         };
@@ -481,6 +491,134 @@ impl TextureCacheRuntime {
 
     pub fn upload_staging_buffer(&mut self, size: usize) -> StagingBufferMap {
         self.staging_buffer_pool.request_upload_buffer(size)
+    }
+
+    pub fn download_staging_buffer(&mut self, size: usize, deferred: bool) -> StagingBufferMap {
+        self.staging_buffer_pool
+            .request_download_buffer(size, deferred)
+    }
+
+    pub fn free_deferred_staging_buffer(&mut self, buffer: &StagingBufferMap) {
+        self.staging_buffer_pool
+            .free_deferred_staging_buffer(buffer);
+    }
+
+    pub fn blit_framebuffer(
+        &self,
+        dst_framebuffer: u32,
+        src_framebuffer: u32,
+        dst_buffer_bits: u32,
+        src_buffer_bits: u32,
+        dst_region: Region2D,
+        src_region: Region2D,
+        filter: crate::engines::fermi_2d::Filter,
+        _operation: crate::engines::fermi_2d::Operation,
+    ) {
+        debug_assert_eq!(dst_buffer_bits, src_buffer_bits);
+        let buffer_bits = dst_buffer_bits;
+        let has_depth = (buffer_bits & !gl::COLOR_BUFFER_BIT) != 0;
+        let is_linear = !has_depth && filter == crate::engines::fermi_2d::Filter::Bilinear;
+        let gl_filter = if is_linear { gl::LINEAR } else { gl::NEAREST };
+        unsafe {
+            gl::Enable(gl::FRAMEBUFFER_SRGB);
+            gl::Disable(gl::RASTERIZER_DISCARD);
+            gl::Disablei(gl::SCISSOR_TEST, 0);
+            gl::BlitNamedFramebuffer(
+                src_framebuffer,
+                dst_framebuffer,
+                src_region.start.x,
+                src_region.start.y,
+                src_region.end.x,
+                src_region.end.y,
+                dst_region.start.x,
+                dst_region.start.y,
+                dst_region.end.x,
+                dst_region.end.y,
+                buffer_bits,
+                gl_filter,
+            );
+        }
+    }
+
+    pub fn can_image_be_copied(&self, dst: &ImageBase, src: &ImageBase) -> bool {
+        if dst.info.image_type == ImageType::E3D
+            && dst.info.format == crate::surface::PixelFormat::Bc4Unorm
+        {
+            return false;
+        }
+        if is_pixel_format_bgr(dst.info.format) != is_pixel_format_bgr(src.info.format) {
+            return false;
+        }
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reinterpret_image(
+        &mut self,
+        dst_handle: u32,
+        dst_target: u32,
+        dst_format: u32,
+        dst_type: u32,
+        dst_info: &ImageInfo,
+        src_handle: u32,
+        src_target: u32,
+        src_format: u32,
+        src_type: u32,
+        src_info: &ImageInfo,
+        copies: &[ImageCopy],
+    ) {
+        self.format_conversion_pass.convert_image(
+            dst_handle,
+            dst_target,
+            dst_format,
+            dst_type,
+            src_handle,
+            src_target,
+            src_format,
+            src_type,
+            src_info.format,
+            copies,
+        );
+        if src_info.format == crate::surface::PixelFormat::D24UnormS8Uint
+            && dst_info.format == crate::surface::PixelFormat::A8B8G8R8Unorm
+        {
+            self.util_shaders.convert_s8d24(dst_handle, copies);
+        }
+        unsafe {
+            gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn emulate_copy_image(
+        &mut self,
+        dst_handle: u32,
+        dst_target: u32,
+        dst_format: u32,
+        dst_type: u32,
+        dst_info: &ImageInfo,
+        src_handle: u32,
+        src_target: u32,
+        src_format: u32,
+        src_type: u32,
+        src_info: &ImageInfo,
+        copies: &[ImageCopy],
+    ) -> bool {
+        if dst_info.image_type == ImageType::E3D
+            && dst_info.format == crate::surface::PixelFormat::Bc4Unorm
+        {
+            debug_assert_eq!(src_info.image_type, ImageType::E3D);
+            self.util_shaders.copy_bc4(dst_handle, src_handle, copies);
+            return true;
+        }
+        if is_pixel_format_bgr(dst_info.format) || is_pixel_format_bgr(src_info.format) {
+            self.reinterpret_image(
+                dst_handle, dst_target, dst_format, dst_type, dst_info, src_handle, src_target,
+                src_format, src_type, src_info, copies,
+            );
+            return true;
+        }
+        false
     }
 
     pub fn get_device_local_memory(&self) -> u64 {
@@ -608,6 +746,11 @@ impl TextureCacheRuntime {
 impl Drop for TextureCacheRuntime {
     fn drop(&mut self) {
         unsafe {
+            for &handle in &self.null_image_handles {
+                if handle != 0 {
+                    gl::DeleteTextures(1, &handle);
+                }
+            }
             gl::DeleteFramebuffers(4, self.rescale_draw_fbos.as_ptr());
             gl::DeleteFramebuffers(4, self.rescale_read_fbos.as_ptr());
         }
@@ -2526,9 +2669,6 @@ pub struct TextureCache {
     samplers: HashMap<crate::texture_cache::types::SamplerId, Sampler>,
     framebuffers: HashMap<ImageViewId, TextureCacheFramebuffer>,
     render_target_framebuffers: HashMap<RenderTargets, TextureCacheFramebuffer>,
-    format_conversion_pass: FormatConversionPass,
-    null_image_handles: [u32; 7],
-    null_image_views: [u32; NUM_TEXTURE_TYPES],
     has_native_astc: bool,
     has_broken_texture_view_formats: bool,
     has_native_bgr: bool,
@@ -3044,7 +3184,6 @@ impl TextureCache {
             device.has_astc(),
             device.has_broken_texture_view_formats(),
             false,
-            device.has_debugging_tool_attached(),
             TextureCacheRuntime::new(device, program_manager),
         )
     }
@@ -3064,10 +3203,10 @@ impl TextureCache {
             has_native_astc,
             has_broken_texture_view_formats,
             has_native_bgr,
-            has_debugging_tool_attached,
             TextureCacheRuntime::new_with_caps(
                 has_broken_texture_view_formats,
                 2 * 1024 * 1024 * 1024,
+                has_debugging_tool_attached,
                 program_manager,
             ),
         )
@@ -3080,11 +3219,8 @@ impl TextureCache {
         has_native_astc: bool,
         has_broken_texture_view_formats: bool,
         has_native_bgr: bool,
-        has_debugging_tool_attached: bool,
         runtime: TextureCacheRuntime,
     ) -> Self {
-        let (null_image_handles, null_image_views) =
-            create_null_image_views(has_debugging_tool_attached);
         Self {
             base: CommonTextureCache::new_with_caps(
                 device_memory,
@@ -3097,9 +3233,6 @@ impl TextureCache {
             samplers: HashMap::new(),
             framebuffers: HashMap::new(),
             render_target_framebuffers: HashMap::new(),
-            format_conversion_pass: FormatConversionPass::new(),
-            null_image_handles,
-            null_image_views,
             has_native_astc,
             has_broken_texture_view_formats,
             has_native_bgr,
@@ -4177,7 +4310,9 @@ impl TextureCache {
 
         let dst_target = image_target(&dst_base.info);
         let src_target = image_target(&src_base.info);
-        if src_format_type == dst_format_type && self.can_image_be_copied(&dst_base, &src_base) {
+        if src_format_type == dst_format_type
+            && self.runtime.can_image_be_copied(&dst_base, &src_base)
+        {
             if trace_copy {
                 log::warn!(
                     "[COPY_IMAGE] path=direct src={} gpu=0x{:X} fmt={:?} dst={} gpu=0x{:X} fmt={:?} copies={}",
@@ -4655,50 +4790,40 @@ impl TextureCache {
         true
     }
 
-    fn can_image_be_copied(&self, dst: &ImageBase, src: &ImageBase) -> bool {
-        if dst.info.image_type == ImageType::E3D
-            && dst.info.format == crate::surface::PixelFormat::Bc4Unorm
-        {
-            return false;
-        }
-        if is_pixel_format_bgr(dst.info.format) != is_pixel_format_bgr(src.info.format) {
-            return false;
-        }
-        true
-    }
-
     fn emulate_copy_image(&mut self, dst_id: ImageId, src_id: ImageId, copies: &[ImageCopy]) {
         let dst_base = self.base.slot_images[dst_id].clone();
         let src_base = self.base.slot_images[src_id].clone();
-        if dst_base.info.image_type == ImageType::E3D
-            && dst_base.info.format == crate::surface::PixelFormat::Bc4Unorm
-        {
-            debug_assert_eq!(src_base.info.image_type, ImageType::E3D);
-            let Some(dst_image) = self.images.get(&dst_id) else {
-                return;
-            };
-            let Some(src_image) = self.images.get(&src_id) else {
-                return;
-            };
-            let dst_handle = dst_image.handle();
-            let src_handle = src_image.handle();
-            if dst_handle == 0 || src_handle == 0 {
-                return;
-            }
-            self.runtime
-                .util_shaders
-                .copy_bc4(dst_handle, src_handle, copies);
+        let Some(dst_image) = self.images.get(&dst_id) else {
+            return;
+        };
+        let Some(src_image) = self.images.get(&src_id) else {
+            return;
+        };
+        let dst_handle = dst_image.handle();
+        let src_handle = src_image.handle();
+        if dst_handle == 0 || src_handle == 0 {
             return;
         }
-        if is_pixel_format_bgr(dst_base.info.format) || is_pixel_format_bgr(src_base.info.format) {
-            self.reinterpret_image(dst_id, src_id, copies);
-            return;
-        }
-        log::warn!(
-            "TextureCache::emulate_copy_image: unsupported emulated copy dst={:?} src={:?}",
-            dst_base.info.format,
-            src_base.info.format
+        let handled = self.runtime.emulate_copy_image(
+            dst_handle,
+            image_target(&dst_base.info),
+            dst_image.gl_format,
+            dst_image.gl_type,
+            &dst_base.info,
+            src_handle,
+            image_target(&src_base.info),
+            src_image.gl_format,
+            src_image.gl_type,
+            &src_base.info,
+            copies,
         );
+        if !handled {
+            log::warn!(
+                "TextureCache::emulate_copy_image: unsupported emulated copy dst={:?} src={:?}",
+                dst_base.info.format,
+                src_base.info.format
+            );
+        }
     }
 
     fn reinterpret_image(&mut self, dst_id: ImageId, src_id: ImageId, copies: &[ImageCopy]) {
@@ -4717,26 +4842,19 @@ impl TextureCache {
         }
         let dst_target = image_target(&dst_base.info);
         let src_target = image_target(&src_base.info);
-        self.format_conversion_pass.convert_image(
+        self.runtime.reinterpret_image(
             dst_handle,
             dst_target,
             dst_image.gl_format,
             dst_image.gl_type,
+            &dst_base.info,
             src_handle,
             src_target,
             src_image.gl_format,
             src_image.gl_type,
-            src_base.info.format,
+            &src_base.info,
             copies,
         );
-        if src_base.info.format == crate::surface::PixelFormat::D24UnormS8Uint
-            && dst_base.info.format == crate::surface::PixelFormat::A8B8G8R8Unorm
-        {
-            self.runtime.util_shaders.convert_s8d24(dst_handle, copies);
-        }
-        unsafe {
-            gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
-        }
     }
 
     /// Port of `TextureCache<P>::DownloadMemory` for `TextureCacheParams =
@@ -4971,8 +5089,11 @@ impl TextureCache {
                 .images
                 .get(&image_id)
                 .expect("image inserted above must be present");
-            let backend_view =
-                ImageView::from_image_view_info(&view_base, image_ref, self.null_image_views);
+            let backend_view = ImageView::from_image_view_info(
+                &view_base,
+                image_ref,
+                self.runtime.null_image_views,
+            );
             trace_image_view_event(2, view_id, &view_base, image_ref, Some(&backend_view));
             self.image_views.insert(view_id, backend_view);
         }
@@ -5330,7 +5451,7 @@ impl TextureCache {
                 .get(&image_id)
                 .expect("image inserted above must be present");
             let backend_view = self.image_views.entry(view_id).or_insert_with(|| {
-                ImageView::new_color_2d(&view_base, backend_image, self.null_image_views)
+                ImageView::new_color_2d(&view_base, backend_image, self.runtime.null_image_views)
             });
             trace_image_view_event(6, view_id, &view_base, backend_image, Some(backend_view));
             let attachment_texture = if view_base.flags.contains(ImageViewFlagBits::SLICE) {
@@ -5361,7 +5482,7 @@ impl TextureCache {
                 .get(&image_id)
                 .expect("depth image inserted above must be present");
             let backend_view = self.image_views.entry(view_id).or_insert_with(|| {
-                ImageView::new_color_2d(&view_base, backend_image, self.null_image_views)
+                ImageView::new_color_2d(&view_base, backend_image, self.runtime.null_image_views)
             });
             depth_attachment_texture = backend_view.default_handle();
             depth_attachment_format = self.base.slot_images[image_id].info.format;
@@ -5808,7 +5929,7 @@ impl TextureCache {
         if is_dst_rescaled {
             scale_region(&mut dst_region);
         }
-        self.blit_framebuffer(
+        self.runtime.blit_framebuffer(
             dst_fbo,
             src_fbo,
             gl::COLOR_BUFFER_BIT,
@@ -5957,7 +6078,7 @@ impl TextureCache {
             .get(&image_id)
             .expect("image inserted above must be present");
         let backend_view = self.image_views.entry(view_id).or_insert_with(|| {
-            ImageView::new_color_2d(&view_base, backend_image, self.null_image_views)
+            ImageView::new_color_2d(&view_base, backend_image, self.runtime.null_image_views)
         });
         trace_image_view_event(4, view_id, &view_base, backend_image, Some(backend_view));
         let attachment_texture = if view_base.flags.contains(ImageViewFlagBits::SLICE) {
@@ -5989,45 +6110,6 @@ impl TextureCache {
         });
         let handle = framebuffer.handle();
         (handle != 0).then_some((handle, view_base.size.width, view_base.size.height))
-    }
-
-    fn blit_framebuffer(
-        &self,
-        dst_framebuffer: u32,
-        src_framebuffer: u32,
-        dst_buffer_bits: u32,
-        src_buffer_bits: u32,
-        dst_region: Region2D,
-        src_region: Region2D,
-        filter: crate::engines::fermi_2d::Filter,
-        _operation: crate::engines::fermi_2d::Operation,
-    ) {
-        debug_assert_eq!(dst_buffer_bits, src_buffer_bits);
-        let buffer_bits = dst_buffer_bits;
-        let has_depth = (buffer_bits & !gl::COLOR_BUFFER_BIT) != 0;
-        let is_linear = !has_depth && filter == crate::engines::fermi_2d::Filter::Bilinear;
-        let gl_filter = if is_linear { gl::LINEAR } else { gl::NEAREST };
-        unsafe {
-            // Matches upstream TextureCacheRuntime::BlitFramebuffer. Fermi2D
-            // copies must not inherit stale draw state from Maxwell rendering.
-            gl::Enable(gl::FRAMEBUFFER_SRGB);
-            gl::Disable(gl::RASTERIZER_DISCARD);
-            gl::Disablei(gl::SCISSOR_TEST, 0);
-            gl::BlitNamedFramebuffer(
-                src_framebuffer,
-                dst_framebuffer,
-                src_region.start.x,
-                src_region.start.y,
-                src_region.end.x,
-                src_region.end.y,
-                dst_region.start.x,
-                dst_region.start.y,
-                dst_region.end.x,
-                dst_region.end.y,
-                buffer_bits,
-                gl_filter,
-            );
-        }
     }
 
     /// Port of `TextureCache<P>::TryFindFramebufferImageView` for
@@ -6117,7 +6199,7 @@ impl TextureCache {
             .get(&image_id)
             .expect("image inserted above must be present");
         let backend_view = self.image_views.entry(view_id).or_insert_with(|| {
-            ImageView::from_image_view_info(&view, backend_image, self.null_image_views)
+            ImageView::from_image_view_info(&view, backend_image, self.runtime.null_image_views)
         });
         trace_image_view_event(4, view_id, &view, backend_image, Some(backend_view));
         let display_texture = backend_view.handle_for_texture_type(TextureType::Color2D);
@@ -6433,7 +6515,7 @@ impl TextureCache {
             .get(&image_id)
             .expect("image inserted above must be present");
         let backend_view = self.image_views.entry(view_id).or_insert_with(|| {
-            ImageView::new_color_2d(&view_base, backend_image, self.null_image_views)
+            ImageView::new_color_2d(&view_base, backend_image, self.runtime.null_image_views)
         });
         trace_image_view_event(6, view_id, &view_base, backend_image, Some(backend_view));
         let attachment_texture = if view_base.flags.contains(ImageViewFlagBits::SLICE) {
@@ -6652,18 +6734,6 @@ impl TextureCache {
         }
         let handle = framebuffer.handle();
         (handle != 0).then_some((handle, view_base.size.width, view_base.size.height))
-    }
-}
-
-impl Drop for TextureCache {
-    fn drop(&mut self) {
-        unsafe {
-            for &handle in &self.null_image_handles {
-                if handle != 0 {
-                    gl::DeleteTextures(1, &handle);
-                }
-            }
-        }
     }
 }
 
