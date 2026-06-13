@@ -7,8 +7,8 @@
 - OpenGL `Image::download_memory_to_buffer(...)` / `download_memory_to_staging(...)` now mirror upstream `Image::DownloadMemory` over `BufferImageCopy`: `GL_PIXEL_PACK_BUFFER`, `PACK_ALIGNMENT`, cached `PACK_ROW_LENGTH` / `PACK_IMAGE_HEIGHT`, `glGetTextureSubImage` or `glGetCompressedTextureSubImage`, and the staging-map overload.
 - `TextureCacheBase::run_garbage_collector(...)` keeps the old callback-backed download only as the backend-independent fallback used by non-OpenGL/test construction; production OpenGL GC no longer uses the stored `image_downloader` callback.
 - `TextureCacheBase::write_downloaded_image(...)` now prefers the channel `gpu_memory` owner and writes through `write_block_unsafe(image.gpu_addr, ...)`, matching upstream `SwizzleImage(*gpu_memory, image.gpu_addr, ...)` for production GC and CPU-read texture download writeback. The `GuestMemoryWriter` path remains only as a fallback for backend-independent/test construction without a bound channel.
-- `util::swizzle_image(...)` now mirrors upstream `SwizzlePitchLinearImage(...)`: it asserts the same single-level/single-layer/depth-one shape, uses `copy.image_extent.width * BytesPerBlock` for row length, reads source rows at `copy.buffer_offset + line * info.pitch`, and writes guest rows at `image_offset.x * bytes_per_block + (image_offset.y + line) * info.pitch`.
-- `util::swizzle_image(...)` now mirrors upstream `SwizzleBlockLinearImage(...)` for full-image `FullDownloadCopies(...)` copies: it computes `CalculateLevelSizes`, `CalculateLevelBytes(level)`, `AlignLayerSize`, `subresource_size`, swizzles each layer independently, and writes each layer to `gpu_addr + guest_offset` instead of using the host staging `buffer_offset` as a guest offset.
+- `util::swizzle_image(...)` now mirrors upstream `SwizzlePitchLinearImage(...)`: it asserts the same single-level/single-layer/depth-one shape, uses `copy.image_extent.width * BytesPerBlock` for row length, reads source rows at `copy.buffer_offset + line * info.pitch`, preserves C++ signed-to-unsigned offset bit patterns, and writes guest rows at `image_offset.x * bytes_per_block + (image_offset.y + line) * info.pitch`.
+- `util::swizzle_image(...)` now mirrors upstream `SwizzleBlockLinearImage(...)` for full-image `FullDownloadCopies(...)` copies: it computes `CalculateLevelSizes`, `CalculateLevelBytes(level)`, `AlignLayerSize`, `subresource_size`, swizzles each layer independently, writes each layer to `gpu_addr + guest_offset` instead of using the host staging `buffer_offset` as a guest offset, and rejects offset/partial rectangles with the same `UNIMPLEMENTED_IF` contract as upstream.
 - `TextureCacheBase` now owns `sentenced_images` and `sentenced_image_view` as `DelayedDestructionRing<_, TICKS_TO_DESTROY>` counterparts. `DeleteImage(..., immediate_delete=false)` and OpenGL `InvalidateScale` move image/image-view base objects into those rings with `SlotVector::take(...)`, matching upstream's `sentenced_* .Push(std::move(...)); erase(...)` ownership pattern for the ported base resources.
 - OpenGL framebuffers now use `TextureCacheBase::framebuffers` as the upstream `RenderTargets -> FramebufferId` key map for draw render targets, Fermi2D framebuffer blits, and the remaining compatibility render-target helper; concrete GL framebuffer objects live in `OpenGL::TextureCache::slot_framebuffers`.
 - OpenGL now owns `sentenced_framebuffers: DelayedDestructionRing<TextureCacheFramebuffer, TICKS_TO_DESTROY>` and moves removed framebuffer objects into it when image views are invalidated or when common GC/delete logic removes base framebuffer keys.
@@ -16,7 +16,6 @@
 
 ### Unintentional differences (to fix)
 - Upstream `TextureCache<P>` owns `slot_framebuffers` and `sentenced_framebuffers` in the same templated common object; Rust still splits the concrete GL framebuffer slot/ring into `OpenGL::TextureCache` because `TextureCacheBase` is backend-independent.
-- `util::swizzle_image(...)` still tracks block-linear subresource-offset rectangles as unsupported like upstream's `UNIMPLEMENTED_IF` guards.
 
 ### Missing items
 - Move `slot_framebuffers`/`sentenced_framebuffers` into the exact templated owner shape if/when `TextureCacheBase` becomes generic over backend resources rather than split from OpenGL.
@@ -31,11 +30,14 @@
 - Re-read upstream `SwizzleImage`, `SwizzlePitchLinearImage`, `SwizzleBlockLinearImage`, and `Tegra::MemoryManager::WriteBlockUnsafe` while moving production texture download writeback to channel `gpu_memory`.
 - Re-read upstream `SwizzleBlockLinearImage`, `CalculateLevelSizes`, `CalculateLevelBytes`, and `AlignLayerSize` while fixing full-image block-linear writeback offsets.
 - Re-read upstream `SwizzlePitchLinearImage` while fixing pitch-linear writeback source stride and assertions.
+- Re-read upstream `SwizzlePitchLinearImage`, `SwizzleBlockLinearImage`, and `common/assert.h` while making swizzle assertions release-active and keeping block-linear offset rectangles hard-unimplemented like upstream.
 - `cargo fmt --all`
 - `cargo check -p video_core --quiet`
 - `cargo test -p video_core write_downloaded_image_prefers_channel_gpu_memory -- --nocapture`
 - `cargo test -p video_core swizzle_image_pitch_linear_writes_rows_to_guest -- --nocapture`
+- `cargo test -p video_core swizzle_image_pitch_linear_preserves_signed_unsigned_offset_bits -- --nocapture`
 - `cargo test -p video_core swizzle_image_block_linear_uses_guest_level_offsets_and_layer_stride -- --nocapture`
+- `cargo test -p video_core swizzle_image_block_linear_rejects_offset_rectangles_like_upstream -- --nocapture`
 - `cargo test -p video_core run_garbage_collector -- --nocapture`
 - `cargo test -p video_core delete_image_removes_view_references_and_framebuffers -- --nocapture`
 - `cargo test -p video_core gl_staging_buffer_pool -- --nocapture`
@@ -12141,14 +12143,13 @@
 - Rust adds `GuestMemoryWriter` and `ImageDownloader` callbacks to stand in for upstream `Tegra::MemoryManager&`, `Runtime::DownloadStagingBuffer`, and backend `Image::DownloadMemory` in backend-independent/test construction. Current OpenGL production download and GC paths use `TextureCacheRuntime::download_staging_buffer(...)` and backend `Image::download_memory_to_staging(...)` directly; the remaining writer bridge is tracked in the newer 2026-06-13 texture-cache GC entry.
 - `util::swizzle_image` accepts an already translated CPU/device base address and a writer callback. Upstream accepts a GPU VA plus `Tegra::MemoryManager&`; the Rust adaptation is required because the renderer-side writer installed from `ruzu_cmd` writes CPU/device addresses.
 - `TextureCacheBase::download_memory` follows the upstream high-level order: collect overlapping images, filter `IsSafeDownload`, clear `GpuModified`, sort by `modification_tick`, call backend download, then swizzle/write to guest memory.
-- Pitch-linear `swizzle_image` now follows upstream `SwizzlePitchLinearImage` row addressing and single-subresource assertions.
-- Block-linear `swizzle_image` now follows upstream full-image download writeback offsets: host staging `buffer_offset` is only the source offset, while guest writes use `CalculateLevelBytes(level)` plus `AlignLayerSize(...)` per layer.
+- Pitch-linear `swizzle_image` now follows upstream `SwizzlePitchLinearImage` row addressing, release-active single-subresource assertions, and signed-to-unsigned offset bit patterns.
+- Block-linear `swizzle_image` now follows upstream full-image download writeback offsets: host staging `buffer_offset` is only the source offset, guest writes use `CalculateLevelBytes(level)` plus `AlignLayerSize(...)` per layer, and offset/partial rectangles assert as the upstream `UNIMPLEMENTED_IF` contract.
 
 ### Unintentional differences (to fix)
-- Block-linear `swizzle_image` remains limited to the same full-image rectangle accepted by upstream's currently ported path; arbitrary subresource offsets still need either an exact upstream `UNIMPLEMENTED_IF` equivalent or a later literal subrect port.
+- None known for the currently ported `SwizzleImage` pitch-linear and block-linear writeback contract after re-reading upstream `util.cpp`.
 
 ### Missing items
-- Decide whether block-linear subresource-offset rectangles should remain hard-unimplemented like upstream or be ported from a newer upstream if that code exists.
 - Replace the remaining callback-backed non-OpenGL/test fallback with Rust storage that mirrors upstream `TextureCache<P>` ownership of backend `Image`.
 
 ### Binary layout verification

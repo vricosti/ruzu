@@ -1085,22 +1085,23 @@ pub fn swizzle_image(
             if pitch == 0 {
                 continue;
             }
-            debug_assert_eq!(copy.image_offset.z, 0);
-            debug_assert_eq!(copy.image_extent.depth, 1);
-            debug_assert_eq!(copy.image_subresource.base_level, 0);
-            debug_assert_eq!(copy.image_subresource.base_layer, 0);
-            debug_assert_eq!(copy.image_subresource.num_layers, 1);
+            assert_eq!(copy.image_offset.z, 0);
+            assert_eq!(copy.image_extent.depth, 1);
+            assert_eq!(copy.image_subresource.base_level, 0);
+            assert_eq!(copy.image_subresource.base_layer, 0);
+            assert_eq!(copy.image_subresource.num_layers, 1);
 
             let row_length = copy.image_extent.width.saturating_mul(bytes_per_block) as usize;
-            let guest_offset_x = copy.image_offset.x.max(0) as u64 * bytes_per_block as u64;
+            let guest_offset_x = (copy.image_offset.x as u32).wrapping_mul(bytes_per_block) as u64;
             for line in 0..copy.image_extent.height {
                 let host_offset = copy.buffer_offset + line as usize * pitch as usize;
                 let host_end = host_offset.saturating_add(row_length);
                 if host_end > memory.len() {
                     break;
                 }
-                let guest_offset_y =
-                    (copy.image_offset.y.max(0) as u64 + line as u64) * pitch as u64;
+                let guest_offset_y = (copy.image_offset.y as u32)
+                    .wrapping_add(line)
+                    .wrapping_mul(pitch) as u64;
                 let guest_offset = guest_offset_x + guest_offset_y;
                 guest_memory_writer(cpu_addr + guest_offset, &memory[host_offset..host_end]);
             }
@@ -1112,8 +1113,12 @@ pub fn swizzle_image(
         let tile_size = default_block_size(info.format);
         let level_size = adjust_mip_size_3d(info.size, level);
 
-        debug_assert_eq!(copy.image_offset, Offset3D { x: 0, y: 0, z: 0 });
-        debug_assert_eq!(copy.image_extent, level_size);
+        assert_eq!(
+            copy.image_offset,
+            (Offset3D { x: 0, y: 0, z: 0 }),
+            "Unimplemented code!"
+        );
+        assert_eq!(copy.image_extent, level_size, "Unimplemented code!");
 
         let num_tiles = adjust_tile_size_3d(level_size, tile_size);
         let num_blocks_per_layer = num_tiles.width * num_tiles.height * num_tiles.depth;
@@ -1709,6 +1714,67 @@ mod tests {
     }
 
     #[test]
+    fn swizzle_image_pitch_linear_preserves_signed_unsigned_offset_bits() {
+        let writes = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
+        let writes_for_callback = Arc::clone(&writes);
+        let writer = move |addr: u64, bytes: &[u8]| {
+            writes_for_callback
+                .lock()
+                .unwrap()
+                .push((addr, bytes.to_vec()));
+        };
+
+        let info = ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::Linear,
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            tiling: TilingMode::PitchLinear(16),
+            layer_stride: 0,
+            maybe_unaligned_layer_stride: 0,
+            num_samples: 1,
+            tile_width_spacing: 0,
+            rescaleable: false,
+            downscaleable: false,
+            forced_flushed: false,
+            dma_downloaded: false,
+            is_sparse: false,
+        };
+        let copy = BufferImageCopy {
+            buffer_offset: 0,
+            buffer_size: 16,
+            buffer_row_length: 4,
+            buffer_image_height: 1,
+            image_subresource: SubresourceLayers {
+                base_level: 0,
+                base_layer: 0,
+                num_layers: 1,
+            },
+            image_offset: Offset3D { x: -1, y: 0, z: 0 },
+            image_extent: Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        };
+        let memory: Vec<u8> = (0..16).collect();
+        let mut tmp = Vec::new();
+
+        swizzle_image(&writer, 0x1000, &info, &[copy], &memory, &mut tmp);
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0], (0x1_0000_0FFC, vec![0, 1, 2, 3]));
+    }
+
+    #[test]
     fn swizzle_image_block_linear_uses_guest_level_offsets_and_layer_stride() {
         let writes = Arc::new(Mutex::new(Vec::<(u64, usize)>::new()));
         let writes_for_callback = Arc::clone(&writes);
@@ -1781,6 +1847,45 @@ mod tests {
             ]
         );
         assert_ne!(copies[1].buffer_offset as u32, sizes[0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unimplemented code!")]
+    fn swizzle_image_block_linear_rejects_offset_rectangles_like_upstream() {
+        let writer = |_addr: u64, _bytes: &[u8]| {};
+        let info = ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E2D,
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: 16,
+                height: 16,
+                depth: 1,
+            },
+            tiling: TilingMode::BlockLinear(Extent3D {
+                width: 0,
+                height: 1,
+                depth: 0,
+            }),
+            layer_stride: 0,
+            maybe_unaligned_layer_stride: 0,
+            num_samples: 1,
+            tile_width_spacing: 0,
+            rescaleable: false,
+            downscaleable: false,
+            forced_flushed: false,
+            dma_downloaded: false,
+            is_sparse: false,
+        };
+        let mut copy = full_download_copies(&info)[0];
+        copy.image_offset.x = 1;
+        let memory = vec![0x5a; copy.buffer_size];
+        let mut tmp = Vec::new();
+
+        swizzle_image(&writer, 0x4000, &info, &[copy], &memory, &mut tmp);
     }
 
     #[test]
