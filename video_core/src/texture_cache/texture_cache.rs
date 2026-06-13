@@ -649,8 +649,39 @@ impl TextureCacheBase {
     ///
     /// Checks whether any sampled image view matches a current render target;
     /// if so, emits a barrier via `Runtime::BarrierFeedbackLoop`.
-    pub fn check_feedback_loop(&self, _views: &[ImageViewInOut]) {
-        log::warn!("TextureCacheBase::check_feedback_loop: backend types not yet available");
+    pub fn check_feedback_loop(&self, views: &[ImageViewInOut]) -> bool {
+        if !*common::settings::values()
+            .barrier_feedback_loops
+            .get_value()
+        {
+            return false;
+        }
+
+        for view in views {
+            if !view.id.is_valid() || view.id == NULL_IMAGE_VIEW_ID {
+                continue;
+            }
+            let image_view = &self.slot_image_views[view.id];
+            for &ct_view_id in &self.render_targets.color_buffer_ids {
+                if !ct_view_id.is_valid() || ct_view_id == NULL_IMAGE_VIEW_ID {
+                    continue;
+                }
+                let ct_view = &self.slot_image_views[ct_view_id];
+                if image_view.image_id == ct_view.image_id {
+                    return true;
+                }
+            }
+
+            let depth_buffer_id = self.render_targets.depth_buffer_id;
+            if depth_buffer_id.is_valid() && depth_buffer_id != NULL_IMAGE_VIEW_ID {
+                let zt_view = &self.slot_image_views[depth_buffer_id];
+                if image_view.image_id == zt_view.image_id {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     // ── Descriptor synchronisation ─────────────────────────────────────
@@ -2411,5 +2442,86 @@ mod tests {
         let view = &cache.slot_image_views[view_id];
         assert_eq!(view.range.base.layer, 2);
         assert_eq!(cache.slot_images[view.image_id].gpu_addr, 0x5000_0000);
+    }
+
+    fn insert_test_image(cache: &mut TextureCacheBase, gpu_addr: u64) -> ImageId {
+        let info = ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E2D,
+            size: Extent3D {
+                width: 64,
+                height: 64,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        cache
+            .slot_images
+            .insert(crate::texture_cache::image_base::ImageBase::new(
+                info, gpu_addr, gpu_addr,
+            ))
+    }
+
+    fn insert_test_view(cache: &mut TextureCacheBase, image_id: ImageId) -> ImageViewId {
+        let mut view =
+            ImageViewBase::null(crate::texture_cache::image_view_base::NullImageViewParams);
+        view.image_id = image_id;
+        cache.slot_image_views.insert(view)
+    }
+
+    #[test]
+    fn check_feedback_loop_detects_color_target_alias() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let image_id = insert_test_image(&mut cache, 0x6000_0000);
+        let sampled_view_id = insert_test_view(&mut cache, image_id);
+        let color_view_id = insert_test_view(&mut cache, image_id);
+        cache.render_targets.color_buffer_ids[0] = color_view_id;
+
+        assert!(cache.check_feedback_loop(&[ImageViewInOut {
+            id: sampled_view_id,
+            ..ImageViewInOut::default()
+        }]));
+    }
+
+    #[test]
+    fn check_feedback_loop_detects_depth_target_alias() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let image_id = insert_test_image(&mut cache, 0x6100_0000);
+        let sampled_view_id = insert_test_view(&mut cache, image_id);
+        cache.render_targets.depth_buffer_id = insert_test_view(&mut cache, image_id);
+
+        assert!(cache.check_feedback_loop(&[ImageViewInOut {
+            id: sampled_view_id,
+            ..ImageViewInOut::default()
+        }]));
+    }
+
+    #[test]
+    fn check_feedback_loop_ignores_unrelated_and_null_views() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let sampled_image_id = insert_test_image(&mut cache, 0x6200_0000);
+        let target_image_id = insert_test_image(&mut cache, 0x6300_0000);
+        let sampled_view_id = insert_test_view(&mut cache, sampled_image_id);
+        cache.render_targets.color_buffer_ids[0] = insert_test_view(&mut cache, target_image_id);
+
+        assert!(!cache.check_feedback_loop(&[
+            ImageViewInOut {
+                id: NULL_IMAGE_VIEW_ID,
+                ..ImageViewInOut::default()
+            },
+            ImageViewInOut {
+                id: sampled_view_id,
+                ..ImageViewInOut::default()
+            },
+        ]));
     }
 }

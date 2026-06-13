@@ -441,6 +441,29 @@ impl TextureCacheBase {
         self.guest_memory_writer = Some(writer);
     }
 
+    /// Port of the `HAS_DEVICE_MEMORY_INFO` branch in
+    /// `TextureCache<P>::TextureCache`.
+    pub fn configure_device_memory_budget(&mut self, device_local_memory: u64) {
+        let device_local_memory = device_local_memory.min(i64::MAX as u64) as i64;
+        let min_spacing_expected = device_local_memory - 1024 * 1024 * 1024;
+        let min_spacing_critical = device_local_memory - 512 * 1024 * 1024;
+        let mem_threshold = device_local_memory.min(TARGET_THRESHOLD);
+        let min_vacancy_expected = (6 * mem_threshold) / 10;
+        let min_vacancy_critical = (2 * mem_threshold) / 10;
+
+        self.expected_memory = (device_local_memory - min_vacancy_expected)
+            .min(min_spacing_expected)
+            .max(DEFAULT_EXPECTED_MEMORY) as u64;
+        self.critical_memory = (device_local_memory - min_vacancy_critical)
+            .min(min_spacing_critical)
+            .max(DEFAULT_CRITICAL_MEMORY) as u64;
+        self.minimum_memory = ((device_local_memory - mem_threshold) / 2) as u64;
+    }
+
+    pub fn update_total_used_memory_from_runtime(&mut self, device_memory_usage: u64) {
+        self.total_used_memory = device_memory_usage;
+    }
+
     /// Notify the cache that a new frame has been queued.
     ///
     /// Port of `TextureCache<P>::TickFrame`.
@@ -837,5 +860,15 @@ mod tests {
         cache.commit_async_flushes();
 
         assert!(!cache.should_wait_async_flushes());
+    }
+
+    #[test]
+    fn configure_device_memory_budget_matches_upstream_formula() {
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        cache.configure_device_memory_budget(8 * 1024 * 1024 * 1024);
+
+        assert_eq!(cache.minimum_memory, 2 * 1024 * 1024 * 1024);
+        assert_eq!(cache.expected_memory, 6_012_954_215);
+        assert_eq!(cache.critical_memory, 7_730_941_133);
     }
 }
