@@ -1,3 +1,27 @@
+## 2026-06-13 — video_core/src/renderer_opengl/gl_rasterizer.rs and video_core/src/buffer_cache/buffer_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp
+
+### Intentional differences
+- `RasterizerOpenGL::dispatch_compute_with_call(...)` now installs a compute-specific `EngineState` snapshot before the compute pipeline resource state can bind storage buffers. `ComputeEngineAdapter` exposes `DispatchCall.qmd.const_buffer_enable_mask` and all eight QMD const-buffer configs as `ComputeLaunchInfo`, matching upstream `kepler_compute->launch_description`.
+- With that adapter installed, existing `BufferCache::bind_compute_storage_buffer(...)` can resolve `cbuf.address + cbuf_offset` and then run the upstream-style `StorageBufferBinding` path instead of preserving masks with `NULL_BINDING`.
+- Rust uses a dispatch snapshot rather than a persistent `KeplerCompute*` because the current rasterizer entry point receives `DispatchCall` from `KeplerCompute::execute_pending`. This is the same temporary ownership adaptation already used for compute descriptor synchronization.
+
+### Unintentional differences (to fix)
+- The real OpenGL dispatch path still does not obtain a shader-cache `ComputePipeline`, so the newly installed compute `EngineState` is only consumed once the pipeline configure path is actually called from dispatch.
+- `DrawStateEngineAdapter::get_compute_launch_info()` remains a default stub by design; draw and compute now have separate adapters, but code paths must continue installing the correct adapter before using the buffer cache.
+
+### Missing items
+- Port/route compute shader-cache creation and dispatch pipeline selection, then call `ComputePipeline::configure_resource_state(...)` with this installed compute engine state.
+- Port the remaining post-`FillComputeImageViews` OpenGL binding phase.
+
+### Binary layout verification
+- PASS: no guest-visible payload changed. QMD const-buffer address/size values are copied into host-side `ComputeLaunchInfo` without reinterpretation.
+
+### Tests
+- Re-read upstream `ComputePipeline::Configure` storage-buffer bind setup and ruzu `BufferCache::bind_compute_storage_buffer` / `storage_buffer_binding`.
+- `cargo fmt --all`
+- `cargo test -p video_core compute_engine_adapter_exposes_dispatch_cbuf_snapshot -- --nocapture`
+- `cargo test -p video_core compute_engine_adapter_feeds_compute_storage_buffer_binding -- --nocapture`
+
 ## 2026-06-13 — video_core/src/renderer_opengl/gl_compute_pipeline.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp
 
 ### Intentional differences
