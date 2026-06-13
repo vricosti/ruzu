@@ -6,10 +6,12 @@
 //! OpenGL texture cache -- manages GPU texture and image objects, framebuffers, and samplers.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 
 use common::settings;
 
+use super::gl_staging_buffer_pool::{StagingBufferMap, StagingBufferPool};
 use super::util_shaders::UtilShaders;
 use crate::engines::draw_manager::Maxwell3DRenderTargets;
 use crate::engines::maxwell_3d::{RenderTargetInfo, ScissorInfo};
@@ -23,7 +25,7 @@ use crate::texture_cache::image_view_base::{ImageViewBase, ImageViewFlagBits};
 use crate::texture_cache::image_view_info::{ImageViewInfo, SwizzleSource};
 use crate::texture_cache::render_targets::RenderTargets;
 use crate::texture_cache::texture_cache_base::{
-    FramebufferImageView, JoinCopy, TextureCacheBase as CommonTextureCache,
+    AsyncDecodeContext, FramebufferImageView, JoinCopy, TextureCacheBase as CommonTextureCache,
 };
 use crate::texture_cache::types::{BufferImageCopy, ImageCopy};
 use crate::texture_cache::types::{
@@ -34,6 +36,7 @@ use crate::texture_cache::util::{
     full_download_copies, full_upload_swizzles, make_shrink_image_copies, map_size_bytes,
     swizzle_image, unswizzle_image,
 };
+use crate::textures::workers::ThreadWorker;
 
 /// Number of render targets.
 pub const NUM_RT: usize = 8;
@@ -420,6 +423,8 @@ impl Drop for FormatConversionPass {
 pub struct TextureCacheRuntime {
     pub has_broken_texture_view_formats: bool,
     pub device_access_memory: u64,
+    staging_buffer_pool: StagingBufferPool,
+    util_shaders: UtilShaders,
 }
 
 impl TextureCacheRuntime {
@@ -436,16 +441,38 @@ impl TextureCacheRuntime {
         } else {
             2 * 1024 * 1024 * 1024
         };
-        Self {
-            has_broken_texture_view_formats: device.has_broken_texture_view_formats(),
+        Self::new_with_caps(
+            device.has_broken_texture_view_formats(),
             device_access_memory,
+        )
+    }
+
+    pub fn new_with_caps(has_broken_texture_view_formats: bool, device_access_memory: u64) -> Self {
+        Self {
+            has_broken_texture_view_formats,
+            device_access_memory,
+            staging_buffer_pool: StagingBufferPool::new(),
+            util_shaders: UtilShaders::new(),
         }
+    }
+
+    pub fn with_util_shader_caps(
+        mut self,
+        use_assembly_shaders: bool,
+        has_lmem_perf_bug: bool,
+    ) -> Self {
+        self.util_shaders = UtilShaders::new_with_caps(use_assembly_shaders, has_lmem_perf_bug);
+        self
     }
 
     pub fn finish(&self) {
         unsafe {
             gl::Finish();
         }
+    }
+
+    pub fn upload_staging_buffer(&mut self, size: usize) -> StagingBufferMap {
+        self.staging_buffer_pool.request_upload_buffer(size)
     }
 
     pub fn get_device_local_memory(&self) -> u64 {
@@ -514,6 +541,58 @@ impl TextureCacheRuntime {
     pub fn insert_upload_memory_barrier(&self) {
         unsafe {
             gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        }
+    }
+
+    pub fn accelerate_image_upload(
+        &mut self,
+        image_handle: u32,
+        info: &ImageInfo,
+        map: &StagingBufferMap,
+        swizzles: &[crate::texture_cache::types::SwizzleParameters],
+    ) {
+        match info.image_type {
+            ImageType::E2D => {
+                if crate::surface::is_pixel_format_astc(info.format) {
+                    self.util_shaders.astc_decode(
+                        image_handle,
+                        map.buffer,
+                        map.offset,
+                        map.mapped_size,
+                        info,
+                        swizzles,
+                    );
+                } else {
+                    self.util_shaders.block_linear_upload_2d(
+                        image_handle,
+                        map.buffer,
+                        map.offset,
+                        map.mapped_size,
+                        info,
+                        swizzles,
+                    );
+                }
+            }
+            ImageType::E3D => self.util_shaders.block_linear_upload_3d(
+                image_handle,
+                map.buffer,
+                map.offset,
+                map.mapped_size,
+                info,
+                swizzles,
+            ),
+            ImageType::Linear => self.util_shaders.pitch_upload(
+                image_handle,
+                map.buffer,
+                map.offset,
+                map.mapped_size,
+                info,
+                swizzles,
+            ),
+            _ => log::warn!(
+                "TextureCacheRuntime::accelerate_image_upload unsupported image type {:?}",
+                info.image_type
+            ),
         }
     }
 }
@@ -2424,6 +2503,7 @@ impl TextureCacheParams {
 /// `OpenGL::ImageView` slots keyed by the same `ImageViewId`.
 pub struct TextureCache {
     pub base: CommonTextureCache,
+    runtime: TextureCacheRuntime,
     images: HashMap<ImageId, Image>,
     image_views: HashMap<ImageViewId, ImageView>,
     samplers: HashMap<crate::texture_cache::types::SamplerId, Sampler>,
@@ -2432,13 +2512,13 @@ pub struct TextureCache {
     rescale_draw_fbos: [u32; 4],
     rescale_read_fbos: [u32; 4],
     format_conversion_pass: FormatConversionPass,
-    util_shaders: UtilShaders,
     null_image_handles: [u32; 7],
     null_image_views: [u32; NUM_TEXTURE_TYPES],
     has_native_astc: bool,
     has_broken_texture_view_formats: bool,
     has_native_bgr: bool,
     rescale_touched_viewport_scissor: bool,
+    texture_decode_worker: ThreadWorker,
 }
 
 /// OpenGL backend result of `TextureCache<P>::TryFindFramebufferImageView`.
@@ -2943,13 +3023,16 @@ impl TextureCache {
         >,
         device: &super::gl_device::Device,
     ) -> Self {
-        Self::new_with_caps(
+        let mut cache = Self::new_with_caps(
             device_memory,
             device.has_astc(),
             device.has_broken_texture_view_formats(),
             false,
             device.has_debugging_tool_attached(),
-        )
+        );
+        cache.runtime = TextureCacheRuntime::new(device)
+            .with_util_shader_caps(device.use_assembly_shaders(), device.has_lmem_perf_bug());
+        cache
     }
 
     pub(crate) fn new_with_caps(
@@ -2975,6 +3058,10 @@ impl TextureCache {
                 has_broken_texture_view_formats,
                 has_native_bgr,
             ),
+            runtime: TextureCacheRuntime::new_with_caps(
+                has_broken_texture_view_formats,
+                2 * 1024 * 1024 * 1024,
+            ),
             images: HashMap::new(),
             image_views: HashMap::new(),
             samplers: HashMap::new(),
@@ -2983,13 +3070,13 @@ impl TextureCache {
             rescale_draw_fbos,
             rescale_read_fbos,
             format_conversion_pass: FormatConversionPass::new(),
-            util_shaders: UtilShaders::new(),
             null_image_handles,
             null_image_views,
             has_native_astc,
             has_broken_texture_view_formats,
             has_native_bgr,
             rescale_touched_viewport_scissor: false,
+            texture_decode_worker: ThreadWorker::new_named(1, "TextureDecoder"),
         }
     }
 
@@ -3239,10 +3326,7 @@ impl TextureCache {
 
     fn apply_backend_image_flags(image: &mut ImageBase, has_native_astc: bool) {
         // Upstream sets ASYNCHRONOUS_DECODE / ACCELERATED_UPLOAD in
-        // OpenGL::Image::Image with this priority. Ruzu still performs the
-        // ASTC CPU decode synchronously during refresh until QueueAsyncDecode /
-        // TickAsyncDecode ownership is ported, but the image classification
-        // flag itself follows upstream.
+        // OpenGL::Image::Image with this priority.
         if can_be_decoded_async(has_native_astc, &image.info) {
             image.flags.insert(ImageFlagBits::ASYNCHRONOUS_DECODE);
         } else if can_be_accelerated(has_native_astc, &image.info) {
@@ -3271,6 +3355,120 @@ impl TextureCache {
             self.images.insert(image_id, image);
         }
         self.images.get_mut(&image_id)
+    }
+
+    fn upload_staging_to_image(
+        &mut self,
+        image_id: ImageId,
+        base_image: &ImageBase,
+        staging: &StagingBufferMap,
+        copies: &[BufferImageCopy],
+    ) -> bool {
+        if copies.is_empty() || staging.mapped_size == 0 {
+            return false;
+        }
+        let backend_image = self
+            .images
+            .entry(image_id)
+            .or_insert_with(|| Image::from_base(base_image, self.has_native_astc));
+        if backend_image.handle() == 0 {
+            return false;
+        }
+
+        staging.flush();
+        backend_image.upload_memory(staging.buffer, staging.offset, copies);
+        true
+    }
+
+    /// OpenGL-backed port of `TextureCache<P>::QueueAsyncDecode`.
+    fn queue_async_decode(
+        &mut self,
+        image_id: ImageId,
+        base_image: &ImageBase,
+        guest: &[u8],
+    ) -> bool {
+        if !base_image.flags.contains(ImageFlagBits::CONVERTED) {
+            log::warn!(
+                "TextureCache::queue_async_decode called for non-converted image id={}",
+                image_id.index
+            );
+            return false;
+        }
+        log::info!("Queuing async texture decode");
+        self.base.slot_images[image_id]
+            .flags
+            .insert(ImageFlagBits::IS_DECODING);
+
+        let decode = Arc::new(AsyncDecodeContext::new(image_id));
+        self.base.async_decodes.push(Arc::clone(&decode));
+
+        let mut unswizzled = vec![0u8; base_image.unswizzled_size_bytes as usize];
+        let mut copies = unswizzle_image(
+            &(),
+            base_image.gpu_addr,
+            &base_image.info,
+            guest,
+            &mut unswizzled,
+        );
+        let out_size = map_size_bytes(base_image) as usize;
+        let info = base_image.info.clone();
+        self.texture_decode_worker.queue_work(move || {
+            let mut decoded_data = vec![0u8; out_size];
+            crate::texture_cache::util::convert_image(
+                &unswizzled,
+                &info,
+                &mut decoded_data,
+                &mut copies,
+            );
+            {
+                let mut output = decode.output.lock().unwrap();
+                output.decoded_data = decoded_data;
+                output.copies = copies;
+            }
+            decode.complete.store(true, Ordering::Release);
+        });
+        true
+    }
+
+    /// OpenGL-backed port of `TextureCache<P>::TickAsyncDecode`.
+    fn tick_async_decode(&mut self) {
+        let mut has_uploads = false;
+        let mut index = 0;
+        while index < self.base.async_decodes.len() {
+            let decode = Arc::clone(&self.base.async_decodes[index]);
+            if !decode.complete.load(Ordering::Acquire) {
+                index += 1;
+                continue;
+            }
+
+            let image_id = decode.image_id;
+            let mut output = decode.output.lock().unwrap();
+            let decoded_data = std::mem::take(&mut output.decoded_data);
+            let copies = std::mem::take(&mut output.copies);
+            drop(output);
+
+            if image_id.is_valid()
+                && self
+                    .base
+                    .slot_images
+                    .iter()
+                    .any(|(candidate_id, _)| candidate_id == image_id)
+            {
+                let base_image = self.base.slot_images[image_id].clone();
+                let mut staging = self.runtime.upload_staging_buffer(decoded_data.len());
+                staging.mapped_span_mut().copy_from_slice(&decoded_data);
+                if self.upload_staging_to_image(image_id, &base_image, &staging, &copies) {
+                    self.base.slot_images[image_id]
+                        .flags
+                        .remove(ImageFlagBits::IS_DECODING);
+                    has_uploads = true;
+                }
+            }
+            self.base.async_decodes.remove(index);
+        }
+        if has_uploads {
+            self.runtime.insert_upload_memory_barrier();
+        }
     }
 
     pub fn set_guest_memory_writer(&mut self, writer: GuestMemoryWriter) {
@@ -3428,6 +3626,14 @@ impl TextureCache {
             return;
         }
 
+        if base_image
+            .flags
+            .contains(ImageFlagBits::ASYNCHRONOUS_DECODE)
+            && self.queue_async_decode(image_id, &base_image, &guest)
+        {
+            return;
+        }
+
         let staging_size = map_size_bytes(&base_image) as usize;
         if staging_size == 0 {
             return;
@@ -3442,31 +3648,12 @@ impl TextureCache {
                 return;
             }
             let swizzles = full_upload_swizzles(&base_image.info);
-            unsafe {
-                let mut pbo = 0u32;
-                gl::CreateBuffers(1, &mut pbo);
-                if pbo == 0 {
-                    return;
-                }
-                gl::NamedBufferData(
-                    pbo,
-                    guest.len() as isize,
-                    guest.as_ptr() as *const _,
-                    gl::STREAM_DRAW,
-                );
-                self.util_shaders.astc_decode(
-                    handle,
-                    pbo,
-                    0,
-                    guest.len(),
-                    &base_image.info,
-                    &swizzles,
-                );
-                gl::DeleteBuffers(1, &pbo);
-                gl::MemoryBarrier(
-                    gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT,
-                );
-            }
+            let mut staging = self.runtime.upload_staging_buffer(guest.len());
+            staging.mapped_span_mut().copy_from_slice(&guest);
+            staging.flush();
+            self.runtime
+                .accelerate_image_upload(handle, &base_image.info, &staging, &swizzles);
+            self.runtime.insert_upload_memory_barrier();
             if trace_upload {
                 log::warn!(
                     "[TEXTURE_UPLOAD] accelerated id={} gpu=0x{:X} cpu=0x{:X} guest={} swizzles={}",
@@ -3479,7 +3666,7 @@ impl TextureCache {
             }
             return;
         }
-        let mut staging = vec![0u8; staging_size];
+        let mut staging = self.runtime.upload_staging_buffer(staging_size);
         // Upstream `UploadImageContents`: converted images (ASTC without
         // native support, BC4/BC5 3D) are unswizzled into a scratch buffer
         // first, then `ConvertImage` decodes into the staging map and
@@ -3500,7 +3687,7 @@ impl TextureCache {
             crate::texture_cache::util::convert_image(
                 &unswizzled,
                 &base_image.info,
-                &mut staging,
+                staging.mapped_span_mut(),
                 &mut copies,
             );
             copies
@@ -3510,24 +3697,34 @@ impl TextureCache {
                 base_image.gpu_addr,
                 &base_image.info,
                 &guest,
-                &mut staging,
+                staging.mapped_span_mut(),
             )
         };
         if copies.is_empty() {
             return;
         }
         if should_dump_texture_upload(base_image.gpu_addr) {
-            dump_texture_upload_staging(image_id, &base_image, &staging, &copies);
+            dump_texture_upload_staging(image_id, &base_image, staging.mapped_span(), &copies);
         }
         if trace_upload {
             let guest_nonzero = guest.iter().filter(|&&b| b != 0).take(1).count() != 0;
-            let staging_nonzero = staging.iter().filter(|&&b| b != 0).take(1).count() != 0;
+            let staging_nonzero = staging
+                .mapped_span()
+                .iter()
+                .filter(|&&b| b != 0)
+                .take(1)
+                .count()
+                != 0;
             let guest_checksum = guest.iter().take(4096).fold(0u64, |acc, &b| {
                 acc.wrapping_mul(16777619).wrapping_add(b as u64)
             });
-            let staging_checksum = staging.iter().take(4096).fold(0u64, |acc, &b| {
-                acc.wrapping_mul(16777619).wrapping_add(b as u64)
-            });
+            let staging_checksum = staging
+                .mapped_span()
+                .iter()
+                .take(4096)
+                .fold(0u64, |acc, &b| {
+                    acc.wrapping_mul(16777619).wrapping_add(b as u64)
+                });
             log::warn!(
                 "[TEXTURE_UPLOAD] staging id={} gpu=0x{:X} cpu=0x{:X} guest_nonzero={} staging_nonzero={} guest_crc=0x{:X} staging_crc=0x{:X}",
                 image_id.index,
@@ -3540,29 +3737,8 @@ impl TextureCache {
             );
         }
 
-        let backend_image = self
-            .images
-            .entry(image_id)
-            .or_insert_with(|| Image::from_base(&base_image, self.has_native_astc));
-        if backend_image.handle() == 0 {
-            return;
-        }
-
-        unsafe {
-            let mut pbo = 0u32;
-            gl::CreateBuffers(1, &mut pbo);
-            if pbo == 0 {
-                return;
-            }
-            gl::NamedBufferData(
-                pbo,
-                staging.len() as isize,
-                staging.as_ptr() as *const _,
-                gl::STREAM_DRAW,
-            );
-            backend_image.upload_memory(pbo, 0, &copies);
-            gl::DeleteBuffers(1, &pbo);
-            gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        if self.upload_staging_to_image(image_id, &base_image, &staging, &copies) {
+            self.runtime.insert_upload_memory_barrier();
         }
 
         if trace_upload {
@@ -3572,7 +3748,7 @@ impl TextureCache {
                 base_image.gpu_addr,
                 base_image.cpu_addr,
                 guest.len(),
-                staging.len(),
+                staging.mapped_size,
                 copies.len(),
             );
         }
@@ -4045,7 +4221,8 @@ impl TextureCache {
             );
             return;
         }
-        self.util_shaders
+        self.runtime
+            .util_shaders
             .copy_msaa(dst_handle, src_handle, copies, src_msaa && !dst_msaa);
     }
 
@@ -4450,7 +4627,9 @@ impl TextureCache {
             if dst_handle == 0 || src_handle == 0 {
                 return;
             }
-            self.util_shaders.copy_bc4(dst_handle, src_handle, copies);
+            self.runtime
+                .util_shaders
+                .copy_bc4(dst_handle, src_handle, copies);
             return;
         }
         if is_pixel_format_bgr(dst_base.info.format) || is_pixel_format_bgr(src_base.info.format) {
@@ -4495,7 +4674,7 @@ impl TextureCache {
         if src_base.info.format == crate::surface::PixelFormat::D24UnormS8Uint
             && dst_base.info.format == crate::surface::PixelFormat::A8B8G8R8Unorm
         {
-            self.util_shaders.convert_s8d24(dst_handle, copies);
+            self.runtime.util_shaders.convert_s8d24(dst_handle, copies);
         }
         unsafe {
             gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
@@ -4907,6 +5086,7 @@ impl TextureCache {
     }
 
     pub fn tick_frame(&mut self) {
+        self.tick_async_decode();
         self.base.tick_frame();
     }
 

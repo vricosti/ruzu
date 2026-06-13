@@ -75,10 +75,26 @@ pub type ImageDownloader =
 /// Port of `VideoCommon::AsyncDecodeContext`.
 pub struct AsyncDecodeContext {
     pub image_id: ImageId,
+    pub output: Mutex<AsyncDecodeOutput>,
+    pub complete: std::sync::atomic::AtomicBool,
+}
+
+pub struct AsyncDecodeOutput {
     pub decoded_data: Vec<u8>,
     pub copies: Vec<BufferImageCopy>,
-    pub mutex: Mutex<()>,
-    pub complete: std::sync::atomic::AtomicBool,
+}
+
+impl AsyncDecodeContext {
+    pub fn new(image_id: ImageId) -> Self {
+        Self {
+            image_id,
+            output: Mutex::new(AsyncDecodeOutput {
+                decoded_data: Vec::new(),
+                copies: Vec::new(),
+            }),
+            complete: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
 }
 
 // ── TextureCacheGPUMap ─────────────────────────────────────────────────
@@ -276,7 +292,7 @@ pub struct TextureCacheBase {
     pub frame_tick: u64,
 
     // Async decode
-    pub async_decodes: Vec<Box<AsyncDecodeContext>>,
+    pub async_decodes: Vec<Arc<AsyncDecodeContext>>,
 
     // Join caching
     pub join_overlap_ids: Vec<ImageId>,
