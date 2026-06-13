@@ -3,21 +3,23 @@
 ### Intentional differences
 - `TextureCacheBase::synchronize_compute_descriptors(...)` now ports upstream `TextureCache<P>::SynchronizeComputeDescriptors`: it receives a KeplerCompute snapshot, chooses `tsc_limit = tic_limit` when `linked_tsc` is set, synchronizes compute TSC/TIC descriptor tables, and resizes `compute_sampler_ids` / `compute_image_view_ids` with `CORRUPT_ID`.
 - Rust passes `ComputeDescriptorSyncRegs` instead of reading `kepler_compute` directly because `TextureCacheBase` does not own a KeplerCompute pointer; this matches the existing graphics descriptor snapshot pattern.
-- `KeplerCompute::execute_pending(...)` now forwards the recorded `DispatchCall` to `RasterizerInterface::dispatch_compute_with_call(...)`, and OpenGL maps that snapshot into `ComputeDescriptorSyncRegs` before synchronizing the texture cache. This moves the synchronization onto the real KeplerCompute launch path without re-entering `KeplerCompute` mutably while it is already calling the rasterizer.
+- `KeplerCompute::execute_pending(...)` now forwards the recorded `DispatchCall` to `RasterizerInterface::dispatch_compute_with_call(...)`, and OpenGL delegates descriptor synchronization to `ComputePipeline::synchronize_texture_descriptors(...)`. This moves ownership closer to upstream `ComputePipeline::Configure` without re-entering `KeplerCompute` mutably while it is already calling the rasterizer.
+- `OpenGL::TextureCache::fill_compute_image_views(...)` now owns the backend `ScaleDown(image)` blacklist loop for compute image views, matching upstream `TextureCache<P>::FillComputeImageViews -> FillImageViews<true>`.
 
 ### Unintentional differences (to fix)
-- The synchronization currently happens in `RasterizerOpenGL::dispatch_compute_with_call(...)` immediately before the future compute-pipeline configure step. Upstream performs the same texture-cache call inside `ComputePipeline::Configure`; exact method ownership still needs to move there once Rust's OpenGL `ComputePipeline::configure` owns buffer/texture/cache references.
+- Full OpenGL `ComputePipeline::Configure` is still not ported: it does not yet iterate shader texture/sampler/image descriptors, read compute handles, fill views, materialize/bind GL textures, bind samplers, bind images, or bind texture buffers. The current rasterizer dispatch path only delegates the first descriptor-synchronization step to the compute-pipeline owner.
 
 ### Missing items
 - Port OpenGL `ComputePipeline::Configure` texture/sampler/image binding so synchronized compute descriptors are consumed by dispatch.
-- Apply backend blacklist `ScaleDown(image)` to `FillComputeImageViews` once the OpenGL compute configure path calls through the backend texture-cache wrapper.
+- Call `OpenGL::TextureCache::fill_compute_image_views(...)` from the full compute configure path after descriptor handle collection.
 
 ### Binary layout verification
 - PASS: no guest-visible payload changed; TIC/TSC descriptors remain raw 32-byte entries.
 
 ### Tests
-- Re-read upstream `TextureCache<P>::SynchronizeComputeDescriptors`, OpenGL `RasterizerOpenGL::DispatchCompute`, and OpenGL `ComputePipeline::Configure`.
+- Re-read upstream `TextureCache<P>::SynchronizeComputeDescriptors`, `TextureCache<P>::FillComputeImageViews`, OpenGL `RasterizerOpenGL::DispatchCompute`, and OpenGL `ComputePipeline::Configure`.
 - `cargo fmt --all --check`
+- `git diff --check`
 - `cargo test -p video_core compute_descriptor_sync_regs_come_from_dispatch_call -- --nocapture`
 - `cargo test -p video_core synchronize_compute_descriptors -- --nocapture`
 - `cargo check -p video_core --quiet`
@@ -34,7 +36,7 @@
 
 ### Missing items
 - Port OpenGL `ComputePipeline::Configure` texture/sampler/image binding so the newly ported compute descriptor reads are consumed by dispatch.
-- Apply the backend blacklist `ScaleDown(image)` side effect to `FillComputeImageViews` once the OpenGL compute configure path calls through the backend texture-cache wrapper.
+- Call the OpenGL compute image-view wrapper from `ComputePipeline::Configure` once descriptor collection is ported.
 
 ### Binary layout verification
 - PASS: TIC/TSC descriptors remain raw `#[repr(C)]` `[u64; 4]` values read from guest GPU memory; no guest-visible payload layout changed.

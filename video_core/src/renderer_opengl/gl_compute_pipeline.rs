@@ -7,6 +7,11 @@
 
 use std::sync::{Condvar, Mutex};
 
+use crate::engines::kepler_compute::DispatchCall;
+use crate::texture_cache::texture_cache_base::ComputeDescriptorSyncRegs;
+
+use super::gl_texture_cache::TextureCache;
+
 /// Maximum number of textures bound to a compute pipeline.
 pub const MAX_TEXTURES: u32 = 64;
 
@@ -133,6 +138,32 @@ impl ComputePipeline {
         // Full implementation requires buffer_cache and texture_cache integration
     }
 
+    /// Port of the `texture_cache.SynchronizeComputeDescriptors()` step at the
+    /// start of upstream `ComputePipeline::Configure()`.
+    ///
+    /// Upstream reads `kepler_compute->launch_description.linked_tsc` and
+    /// `kepler_compute->regs.{tic,tsc}` through the pipeline's current engine
+    /// owner. Ruzu receives the launch-boundary `DispatchCall` snapshot from
+    /// `KeplerCompute` until `ComputePipeline` stores the same engine pointer.
+    pub fn synchronize_texture_descriptors(
+        texture_cache: &mut TextureCache,
+        dispatch: &DispatchCall,
+    ) {
+        texture_cache
+            .base
+            .synchronize_compute_descriptors(Self::descriptor_sync_regs(dispatch));
+    }
+
+    pub(crate) fn descriptor_sync_regs(dispatch: &DispatchCall) -> ComputeDescriptorSyncRegs {
+        ComputeDescriptorSyncRegs {
+            linked_tsc: dispatch.qmd.linked_tsc,
+            tic_addr: dispatch.tic_address,
+            tic_limit: dispatch.tic_limit,
+            tsc_addr: dispatch.tsc_address,
+            tsc_limit: dispatch.tsc_limit,
+        }
+    }
+
     /// Returns whether any storage buffer descriptor is written.
     pub fn writes_global_memory(&self) -> bool {
         self.writes_global_memory
@@ -174,6 +205,7 @@ impl ComputePipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::kepler_compute::{DispatchCall, QueueMetaData};
 
     #[test]
     fn compute_pipeline_key_hash() {
@@ -200,5 +232,29 @@ mod tests {
             std::mem::size_of::<ComputePipelineKey>(),
             8 + 4 + 12 // u64 + u32 + 3*u32
         );
+    }
+
+    #[test]
+    fn descriptor_sync_regs_come_from_dispatch_call() {
+        let mut qmd = QueueMetaData::default();
+        qmd.linked_tsc = true;
+        let dispatch = DispatchCall {
+            qmd,
+            qmd_address: 0x1000,
+            code_address: 0x2000,
+            tsc_address: 0x3000,
+            tsc_limit: 1,
+            tic_address: 0x4000,
+            tic_limit: 6,
+            tex_cb_index: 0,
+        };
+
+        let regs = ComputePipeline::descriptor_sync_regs(&dispatch);
+
+        assert!(regs.linked_tsc);
+        assert_eq!(regs.tic_addr, 0x4000);
+        assert_eq!(regs.tic_limit, 6);
+        assert_eq!(regs.tsc_addr, 0x3000);
+        assert_eq!(regs.tsc_limit, 1);
     }
 }
