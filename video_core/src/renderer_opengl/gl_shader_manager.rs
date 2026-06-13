@@ -47,6 +47,10 @@ impl ProgramManager {
     ///
     /// Corresponds to `ProgramManager::ProgramManager()`.
     pub fn new(_device: &super::gl_device::Device) -> Self {
+        Self::new_with_caps(_device.use_assembly_shaders(), _device.has_lmem_perf_bug())
+    }
+
+    pub fn new_with_caps(use_assembly_shaders: bool, has_lmem_perf_bug: bool) -> Self {
         let mut pipeline: u32 = 0;
         unsafe {
             gl::CreateProgramPipelines(1, &mut pipeline);
@@ -55,14 +59,14 @@ impl ProgramManager {
         // GL_COMPUTE_PROGRAM_NV (0x90FB) is an NV extension enum not exposed by the gl crate.
         // Assembly shader support requires NV-specific function pointers (see gl_shader_util.rs).
         // Until those are loaded via runtime GetProcAddress, this is a no-op.
-        if _device.use_assembly_shaders() {
+        if use_assembly_shaders {
             const GL_COMPUTE_PROGRAM_NV: u32 = 0x90FB;
             unsafe {
                 gl::Enable(GL_COMPUTE_PROGRAM_NV);
             }
         }
 
-        let lmem_warmup_program = if _device.has_lmem_perf_bug() {
+        let lmem_warmup_program = if has_lmem_perf_bug {
             create_program_from_source(OPENGL_LMEM_WARMUP_COMP, gl::COMPUTE_SHADER)
         } else {
             0

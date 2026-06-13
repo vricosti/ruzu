@@ -39,6 +39,11 @@ pub struct ThreadWorker {
 impl ThreadWorker {
     /// Create a new worker pool with the specified number of threads.
     pub fn new(num_threads: usize) -> Self {
+        Self::new_named(num_threads, "ImageTranscode")
+    }
+
+    /// Create a new worker pool with the specified number of threads and name.
+    pub fn new_named(num_threads: usize, name: &str) -> Self {
         let queue = Arc::new(Mutex::new(Vec::<WorkItem>::new()));
         let condvar = Arc::new(Condvar::new());
         let active_count = Arc::new(AtomicUsize::new(0));
@@ -52,9 +57,10 @@ impl ThreadWorker {
             let active_count = Arc::clone(&active_count);
             let done_condvar = Arc::clone(&done_condvar);
             let stop_flag = Arc::clone(&stop_flag);
+            let thread_name = format!("{}:{}", name, i);
 
             let handle = std::thread::Builder::new()
-                .name(format!("ImageTranscode:{}", i))
+                .name(thread_name)
                 .spawn(move || loop {
                     let work = {
                         let mut locked = queue.lock().unwrap();

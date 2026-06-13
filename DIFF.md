@@ -18116,11 +18116,12 @@ The following still panic because upstream either also throws NotImplementedExce
 - Re-read upstream `FormatConversionPass::ConvertImage` and `UtilShaders::ConvertS8D24`.
 - `cargo fmt --all --check`
 - `cargo check -p video_core --quiet`
+- `cargo test -p video_core worker_ -- --nocapture`
 
 ## 2026-06-13 — video_core/src/renderer_opengl/util_shaders.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/util_shaders.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/util_shaders.h
 
 ### Intentional differences
-- Rust `UtilShaders` compiles the ASTC decoder, block-linear 2D/3D unswizzle, and pitch unswizzle compute programs directly from embedded host-shader strings with `create_program_from_source`, matching upstream's `MakeProgram(...)` responsibility without the C++ `ProgramManager` object.
+- Rust `UtilShaders` compiles the ASTC decoder, block-linear 2D/3D unswizzle, and pitch unswizzle compute programs directly from embedded host-shader strings with `create_program_from_source`, matching upstream's `MakeProgram(...)` responsibility. Utility dispatches now bind through `ProgramManager::bind_compute_program`, run `local_memory_warmup` for ASTC decode, and call `restore_guest_compute` after compute dispatches.
 - Rust upload helpers take a destination texture handle, staging buffer handle/offset/size, `ImageInfo`, and `SwizzleParameters` instead of upstream `Image&` plus `StagingBufferMap&`. The shader bindings, uniforms, workgroup division, swizzle-table binding, and image formats mirror upstream `ASTCDecode`, `BlockLinearUpload2D`, `BlockLinearUpload3D`, and `PitchUpload`.
 - Rust logs and skips the same assertion-only ASTC preconditions (`origin == 0`, `destination == 0`, ASTC 16-byte blocks) instead of aborting in release builds, following the existing Rust utility-shader pattern.
 
@@ -18128,8 +18129,8 @@ The following still panic because upstream either also throws NotImplementedExce
 - None known for the utility-shader program compilation and dispatch-parameter slice after re-reading upstream `UtilShaders::UtilShaders`, `ASTCDecode`, `BlockLinearUpload2D`, `BlockLinearUpload3D`, `PitchUpload`, and `StoreFormat`.
 
 ### Missing items
-- The broader upload lifecycle now calls the ASTC accelerated-upload helper when upstream `CanBeAccelerated` would set `ACCELERATED_UPLOAD`, and image classification now sets `ASYNCHRONOUS_DECODE` when upstream `CanBeDecodedAsync` is true. It still does not model upstream `TextureCacheRuntime::AccelerateImageUpload` / `UploadImageContents` as separate owners.
-- Runtime `ProgramManager::LocalMemoryWarmup` / `RestoreGuestCompute` ownership is still not represented because ruzu's OpenGL utility-shader layer does not yet own an upstream-shaped `ProgramManager`.
+- The broader upload lifecycle now calls `TextureCacheRuntime::accelerate_image_upload` when upstream `CanBeAccelerated` would set `ACCELERATED_UPLOAD`, and image classification now sets `ASYNCHRONOUS_DECODE` when upstream `CanBeDecodedAsync` is true. `UploadImageContents` itself is still collapsed into `OpenGL::TextureCache::refresh_contents_with_gpu_reader`.
+- The `ProgramManager` used by `UtilShaders` is currently owned by `TextureCacheRuntime` rather than shared from `RendererOpenGL`/`RasterizerOpenGL` exactly like upstream. This preserves the utility-shader bind/restore behavior, but the broader OpenGL owner graph still needs to be unified.
 
 ### Binary layout verification
 - N/A: OpenGL compute shader dispatch only. No guest-visible raw payload layout changed.
@@ -18139,38 +18140,42 @@ The following still panic because upstream either also throws NotImplementedExce
 - `cargo fmt --all --check`
 - `cargo check -p video_core --quiet`
 
-## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/util_shaders.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs, video_core/src/renderer_opengl/gl_staging_buffer_pool.rs, video_core/src/texture_cache/texture_cache_base.rs, video_core/src/textures/workers.rs, and video_core/src/renderer_opengl/util_shaders.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h, /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h, /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_staging_buffer_pool.cpp, and /home/vricosti/Dev/emulators/zuyu/src/video_core/textures/workers.cpp
 
 ### Intentional differences
-- Rust keeps `RefreshContents` / `UploadImageContents` collapsed inside `OpenGL::TextureCache::refresh_contents_with_gpu_reader` because ruzu does not yet own an upstream-shaped `TextureCacheRuntime` staging-buffer pool. Within that owner split, the ASTC accelerated-upload branch now follows upstream ordering: set `ACCELERATED_UPLOAD` when `CanBeAccelerated` is true, read raw guest bytes into a PBO-sized staging buffer, build `FullUploadSwizzles`, dispatch `UtilShaders::astc_decode`, then issue the upload memory barrier.
-- Rust still uses `gl::UseProgram` directly in `UtilShaders` instead of upstream `ProgramManager::BindComputeProgram`; this is the current OpenGL utility-shader ownership adaptation.
+- Rust keeps `RefreshContents` / `UploadImageContents` collapsed inside `OpenGL::TextureCache::refresh_contents_with_gpu_reader`, but upload staging now goes through `TextureCacheRuntime::upload_staging_buffer`, the existing OpenGL `StagingBufferPool`, and `StagingBufferMap`. Within the remaining owner split, the ASTC accelerated-upload branch follows upstream ordering: set `ACCELERATED_UPLOAD` when `CanBeAccelerated` is true, read raw guest bytes into a staging map, build `FullUploadSwizzles`, dispatch `UtilShaders::astc_decode`, then issue `TextureCacheRuntime::insert_upload_memory_barrier`.
+- Rust `StagingBufferMap` now exposes mapped-span helpers, explicit flush, and creates the upload fence on drop, matching upstream `StagingBufferMap::~StagingBufferMap` / `StagingBuffers::RequestMap` ownership without duplicating staging state inside `gl_texture_cache.rs`.
+- Rust ports upstream `QueueAsyncDecode` / `TickAsyncDecode` inside the OpenGL texture-cache wrapper because that is the current owner of `Image::UploadMemory`; the queue state itself remains in `TextureCacheBase::async_decodes` with the upstream `AsyncDecodeContext` shape. The dedicated worker is `ThreadWorker::new_named(1, "TextureDecoder")`, matching upstream's one-thread `texture_decode_worker`.
+- Rust `AsyncDecodeContext` uses `Arc<AsyncDecodeContext>` plus a mutex-protected output payload instead of upstream `unique_ptr` plus a raw pointer captured by the worker lambda. This preserves the same lifetime contract without exposing an unsafe pointer to a Rust thread.
+- Rust `TextureCacheRuntime` owns `UtilShaders`, and `TextureCacheRuntime::accelerate_image_upload` now dispatches ASTC, block-linear 2D/3D, and pitch accelerated upload branches through the same image-type switch as upstream `TextureCacheRuntime::AccelerateImageUpload`.
 
 ### Unintentional differences (to fix)
-- The async ASTC path is still only partially represented: Rust now sets `ASYNCHRONOUS_DECODE` for `AstcDecodeMode::CpuAsynchronous`, matching upstream image classification, but it still performs CPU ASTC conversion synchronously during refresh instead of queuing `QueueAsyncDecode` and uploading through `TickAsyncDecode`.
-- The runtime/staging ownership is still flattened: upstream uses `runtime.UploadStagingBuffer(MapSizeBytes(image))`, passes a `StagingBufferMap`, and restores guest compute through `ProgramManager`; Rust allocates a temporary PBO in the texture-cache method.
+- The OpenGL `ProgramManager` is still not the exact shared owner from upstream: ruzu constructs a runtime-local manager for utility shaders because `RasterizerOpenGL` does not yet own/pass a renderer-level `ProgramManager&` through the texture-cache runtime.
 
 ### Missing items
-- Split `UploadImageContents` / `TextureCacheRuntime::AccelerateImageUpload` into upstream-shaped owners once the runtime staging-buffer pool exists.
-- Port `QueueAsyncDecode` / `ASYNCHRONOUS_DECODE` lifecycle.
+- Thread the renderer/rasterizer-level `ProgramManager` through `TextureCacheRuntime` so utility shaders use the same manager instance as graphics/compute pipeline binding, matching upstream object ownership.
 
 ### Binary layout verification
 - N/A: OpenGL upload staging and compute dispatch only. No guest-visible raw payload layout changed.
 
 ### Tests
-- Re-read upstream `CanBeAccelerated`, `CanBeDecodedAsync`, `TextureCache<P>::RefreshContents`, `TextureCache<P>::UploadImageContents`, and `TextureCacheRuntime::AccelerateImageUpload`.
+- Re-read upstream `CanBeAccelerated`, `CanBeDecodedAsync`, `TextureCache<P>::RefreshContents`, `TextureCache<P>::UploadImageContents`, `TextureCache<P>::QueueAsyncDecode`, `TextureCache<P>::TickAsyncDecode`, `AsyncDecodeContext`, `TextureCacheRuntime::UploadStagingBuffer`, `StagingBufferMap`, `TextureCacheRuntime::AccelerateImageUpload`, `UtilShaders::*`, and `ProgramManager::{BindComputeProgram,LocalMemoryWarmup,RestoreGuestCompute}`.
 - `cargo fmt --all --check`
 - `cargo check -p video_core --quiet`
+- `cargo test -p video_core gl_staging_buffer_pool -- --nocapture`
 
-## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs, video_core/src/texture_cache/texture_cache_base.rs, and video_core/src/textures/workers.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h, /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h, and /home/vricosti/Dev/emulators/zuyu/src/video_core/textures/workers.cpp
 
 ### Intentional differences
 - Rust factors upstream `OpenGL::Image::Image` flag classification into `TextureCache::apply_backend_image_flags`, because backend image flags are applied lazily when the split OpenGL wrapper materializes or prepares an image. The classification priority now matches upstream: `CanBeDecodedAsync` sets `ASYNCHRONOUS_DECODE`; otherwise `CanBeAccelerated` sets `ACCELERATED_UPLOAD`; converted formats still set `CONVERTED | COSTLY_LOAD`.
+- Rust queues `ASYNCHRONOUS_DECODE` images after `RefreshContents` clears `CPU_MODIFIED` and tracks the image, runs `UnswizzleImage` before queueing, decodes with `ConvertImage` on the dedicated one-thread `TextureDecoder` worker, and uploads completed decode output from `TextureCache::tick_frame` before advancing the common frame tick. That matches upstream `RefreshContents -> QueueAsyncDecode` and `TickFrame -> TickAsyncDecode` ordering within ruzu's current OpenGL wrapper split.
+- Rust uses mutex-protected decode output inside `Arc<AsyncDecodeContext>` rather than upstream's raw pointer capture from a `unique_ptr`; this is a Rust lifetime adaptation, not a behavioral divergence.
 
 ### Unintentional differences (to fix)
-- Upstream `RefreshContents` queues `QueueAsyncDecode` for `ASYNCHRONOUS_DECODE` images and `TickAsyncDecode` uploads completed decodes later. Rust still falls through to the synchronous CPU convert/upload path because the async decode worker/tick owner is not ported.
+- None known for the image classification and async decode queue/tick lifecycle after re-reading upstream `OpenGL::Image::Image`, `TextureCache<P>::RefreshContents`, `QueueAsyncDecode`, and `TickAsyncDecode`.
 
 ### Missing items
-- Port `QueueAsyncDecode`, `TickAsyncDecode`, and the dedicated `texture_decode_worker` lifecycle.
+- The broader runtime/staging owner split remains tracked above: Rust now routes upload staging through `TextureCacheRuntime::upload_staging_buffer`, `StagingBufferPool`, and `StagingBufferMap`, but it still lacks the full `ProgramManager` accelerated-upload owner.
 
 ### Binary layout verification
 - N/A: image flag classification only. No guest-visible raw payload layout changed.
@@ -18178,6 +18183,7 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Tests
 - Re-read upstream `CanBeDecodedAsync`, `OpenGL::Image::Image`, `TextureCache<P>::RefreshContents`, `QueueAsyncDecode`, and `TickAsyncDecode`.
 - `cargo test -p video_core astc_upload_flags_follow_upstream_policy -- --nocapture`
+- `cargo test -p video_core worker_ -- --nocapture`
 - `cargo fmt --all --check`
 - `cargo check -p video_core --quiet`
 
