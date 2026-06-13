@@ -1,6 +1,31 @@
 ## 2026-06-13 — video_core/src/renderer_opengl/gl_compute_pipeline.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.h
 
 ### Intentional differences
+- `ComputePipeline` now owns a cloned `Shader::Info` (`shader_recompiler::shader_info::Info`) like upstream's `Shader::Info info` member, and `new_with_info(...)` derives constructor metadata from it instead of leaving those fields zeroed.
+- `ComputePipeline::info_state(...)` ports the constructor metadata slice from upstream: copy the first `VideoCommon::ComputeUniformBufferSizes` entries from `constant_buffer_used_sizes`, count texture-buffer and image-buffer descriptors with `Shader::NumDescriptors`, assert total sampled textures/images fit `MAX_TEXTURES`/`MAX_IMAGES`, derive `use_storage_buffers` from the GLASM path and `Device::GetMaxGLASMStorageBufferBlocks`, gate `writes_global_memory` on written storage descriptors only when storage buffers cannot be used, and copy `uses_local_memory`.
+- Rust keeps the existing `new(...)` compatibility constructor by passing `Info::default()` into `new_with_info(...)` until `ShaderCache::CreateComputePipeline` is fully ported and can supply the translated compute shader `Info`.
+
+### Unintentional differences (to fix)
+- The constructor still does not create GLSL/GLASM/SPIR-V OpenGL programs from `code` / `code_v`, so `source_program` and `assembly_program` remain zero after construction.
+- `ComputePipeline` still does not own upstream's `TextureCache&`, `BufferCache&`, `ProgramManager&`, `kepler_compute`, and `gpu_memory` members, so `Configure` cannot yet consume the stored `info` through the real runtime bind path.
+- The `force_context_flush`/`built_fence` constructor branch is still not ported; Rust keeps `is_built = true` for the current synchronous placeholder path.
+
+### Missing items
+- Port `ShaderCache::CreateComputePipeline` enough to translate compute shaders and call `ComputePipeline::new_with_info(...)` with real `Info`, code, and code_v.
+- Store the remaining upstream cache/engine owners on `ComputePipeline`, then move the real `Configure` path from descriptor preparation into buffer-cache, texture/sampler/image GL binding, rescaling uniforms, and program-manager binds.
+
+### Binary layout verification
+- PASS: no guest-visible payload changed. This slice only copies host shader metadata and descriptor counts.
+
+### Tests
+- Re-read upstream OpenGL `ComputePipeline` members in `gl_compute_pipeline.h` and constructor body in `gl_compute_pipeline.cpp`.
+- `cargo fmt --all`
+- `cargo test -p video_core compute_pipeline_info_state_matches_upstream_constructor_metadata -- --nocapture`
+- `cargo test -p video_core collect_texture_handles_follows_upstream_compute_order_and_pairs -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_compute_pipeline.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.h
+
+### Intentional differences
 - `ComputePipeline::collect_texture_handles(...)` now ports the handle-collection half of upstream `ComputePipeline::Configure`: it reads QMD constant-buffer handles, preserves upstream texture-buffer -> image-buffer -> sampled-texture -> storage-image view ordering, handles secondary texture descriptors, splits handles through `TexturePair`, records sampled-texture TSC indices, and marks written storage images as blacklisted.
 - `ComputePipeline::prepare_texture_bindings(...)` resolves compute sampler ids through `TextureCacheBase::get_compute_sampler_id(...)` and calls the OpenGL `TextureCache::fill_compute_image_views(...)` wrapper, matching upstream's `GetComputeSamplerId` / `FillComputeImageViews` ownership for this slice.
 - Rust passes an explicit `DispatchCall` snapshot and `read_u32` closure because `ComputePipeline` still does not store upstream's `kepler_compute` / `gpu_memory` pointers. This is the same temporary ownership adaptation tracked for descriptor synchronization.
