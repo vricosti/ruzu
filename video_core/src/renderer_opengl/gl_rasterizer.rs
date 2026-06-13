@@ -327,6 +327,83 @@ struct DrawStateEngineAdapter {
     registers: crate::engines::draw_manager::Maxwell3DDrawRegisters,
 }
 
+struct ComputeEngineAdapter {
+    dispatch: DispatchCall,
+}
+
+impl ComputeEngineAdapter {
+    fn launch_info(&self) -> crate::buffer_cache::buffer_cache_base::ComputeLaunchInfo {
+        crate::buffer_cache::buffer_cache_base::ComputeLaunchInfo {
+            const_buffer_enable_mask: self.dispatch.qmd.const_buffer_enable_mask,
+            const_buffer_config: self
+                .dispatch
+                .qmd
+                .const_buffers
+                .iter()
+                .map(
+                    |cbuf| crate::buffer_cache::buffer_cache_base::ComputeConstBufferConfig {
+                        address: cbuf.address,
+                        size: cbuf.size,
+                    },
+                )
+                .collect(),
+        }
+    }
+}
+
+impl crate::buffer_cache::buffer_cache_base::EngineState for ComputeEngineAdapter {
+    fn get_index_buffer(&self) -> crate::buffer_cache::buffer_cache_base::IndexBufferRef {
+        crate::buffer_cache::buffer_cache_base::IndexBufferRef::default()
+    }
+
+    fn get_inline_index_draw_indexes(&self) -> &[u8] {
+        &[]
+    }
+
+    fn is_dirty(&self, _flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) -> bool {
+        false
+    }
+
+    fn clear_dirty(&mut self, _flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) {}
+
+    fn get_vertex_stream(
+        &self,
+        _index: u32,
+    ) -> crate::buffer_cache::buffer_cache_base::VertexStreamInfo {
+        crate::buffer_cache::buffer_cache_base::VertexStreamInfo::default()
+    }
+
+    fn get_vertex_stream_limit(
+        &self,
+        _index: u32,
+    ) -> crate::buffer_cache::buffer_cache_base::VertexStreamLimit {
+        crate::buffer_cache::buffer_cache_base::VertexStreamLimit::default()
+    }
+
+    fn is_transform_feedback_enabled(&self) -> bool {
+        false
+    }
+
+    fn get_transform_feedback_buffer(
+        &self,
+        _index: u32,
+    ) -> crate::buffer_cache::buffer_cache_base::TransformFeedbackBufferInfo {
+        crate::buffer_cache::buffer_cache_base::TransformFeedbackBufferInfo::default()
+    }
+
+    fn get_const_buffer(
+        &self,
+        _stage: usize,
+        _cbuf_index: u32,
+    ) -> crate::buffer_cache::buffer_cache_base::ConstBufferInfo {
+        crate::buffer_cache::buffer_cache_base::ConstBufferInfo::default()
+    }
+
+    fn get_compute_launch_info(&self) -> crate::buffer_cache::buffer_cache_base::ComputeLaunchInfo {
+        self.launch_info()
+    }
+}
+
 impl crate::buffer_cache::buffer_cache_base::EngineState for DrawStateEngineAdapter {
     fn get_index_buffer(&self) -> crate::buffer_cache::buffer_cache_base::IndexBufferRef {
         let ds = &self.draw_state;
@@ -7989,6 +8066,10 @@ impl RasterizerInterface for RasterizerOpenGL {
         if let Some(mm) = self.channel_memory_manager.as_ref().cloned() {
             mm.lock().flush_caching();
         }
+        self.buffer_cache
+            .set_engine_state(Box::new(ComputeEngineAdapter {
+                dispatch: dispatch.clone(),
+            }));
         ComputePipeline::synchronize_texture_descriptors(&mut self.texture_cache, dispatch);
         debug!(
             "RasterizerOpenGL::dispatch_compute_with_call grid=({},{},{}) block=({},{},{}) code=0x{:X}",
@@ -8543,6 +8624,12 @@ impl RasterizerInterface for RasterizerOpenGL {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer_cache::buffer_cache::BufferCache;
+    use crate::buffer_cache::buffer_cache_base::{
+        BufferCacheChannelInfo, BufferCacheParams, GpuMemoryAccess,
+    };
+    use crate::buffer_cache::word_manager::DeviceTracker;
+    use crate::engines::kepler_compute::{QmdConstBuffer, QueueMetaData};
     use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
     use crate::memory_manager::MemoryManager;
     use common::settings;
@@ -8578,6 +8665,135 @@ mod tests {
         rast.query_cache.create_channel(&channel);
         rast.query_cache.bind_to_channel(channel.bind_id);
         backing
+    }
+
+    struct DummyTracker;
+
+    impl DeviceTracker for DummyTracker {
+        fn update_pages_cached_count(&self, _addr: u64, _size: u64, _delta: i32) {}
+    }
+
+    struct TestParams;
+
+    impl BufferCacheParams for TestParams {
+        const IS_OPENGL: bool = false;
+        const HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS: bool = false;
+        const HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT: bool = true;
+        const NEEDS_BIND_UNIFORM_INDEX: bool = false;
+        const NEEDS_BIND_STORAGE_INDEX: bool = false;
+        const USE_MEMORY_MAPS: bool = false;
+        const SEPARATE_IMAGE_BUFFER_BINDINGS: bool = false;
+        const USE_MEMORY_MAPS_FOR_UPLOADS: bool = false;
+    }
+
+    struct TestGpuMemory;
+
+    impl GpuMemoryAccess for TestGpuMemory {
+        fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
+            Some(0x100000 + gpu_addr)
+        }
+
+        fn read_u64(&self, gpu_addr: u64) -> Option<u64> {
+            match gpu_addr {
+                0x1020 => Some(0x5008),
+                _ => None,
+            }
+        }
+
+        fn read_u32(&self, gpu_addr: u64) -> Option<u32> {
+            match gpu_addr {
+                0x1028 => Some(0x30),
+                _ => None,
+            }
+        }
+
+        fn is_within_gpu_address_range(&self, _gpu_addr: u64) -> bool {
+            true
+        }
+
+        fn max_continuous_range(&self, _gpu_addr: u64, size: u64) -> u64 {
+            size
+        }
+
+        fn get_memory_layout_size(&self, _gpu_addr: u64) -> u64 {
+            0x1000
+        }
+    }
+
+    #[test]
+    fn compute_engine_adapter_exposes_dispatch_cbuf_snapshot() {
+        let mut qmd = QueueMetaData::default();
+        qmd.const_buffer_enable_mask = 0b1010_0101;
+        qmd.const_buffers[0] = QmdConstBuffer {
+            address: 0x1000,
+            size: 0x20,
+        };
+        qmd.const_buffers[3] = QmdConstBuffer {
+            address: 0x3000,
+            size: 0x40,
+        };
+        qmd.const_buffers[7] = QmdConstBuffer {
+            address: 0x7000,
+            size: 0x80,
+        };
+        let dispatch = DispatchCall {
+            qmd,
+            qmd_address: 0,
+            code_address: 0,
+            tsc_address: 0,
+            tsc_limit: 0,
+            tic_address: 0,
+            tic_limit: 0,
+            tex_cb_index: 0,
+        };
+
+        let adapter = ComputeEngineAdapter { dispatch };
+        let info = adapter.launch_info();
+
+        assert_eq!(info.const_buffer_enable_mask, 0b1010_0101);
+        assert_eq!(info.const_buffer_config.len(), 8);
+        assert_eq!(info.const_buffer_config[0].address, 0x1000);
+        assert_eq!(info.const_buffer_config[0].size, 0x20);
+        assert_eq!(info.const_buffer_config[3].address, 0x3000);
+        assert_eq!(info.const_buffer_config[3].size, 0x40);
+        assert_eq!(info.const_buffer_config[7].address, 0x7000);
+        assert_eq!(info.const_buffer_config[7].size, 0x80);
+    }
+
+    #[test]
+    fn compute_engine_adapter_feeds_compute_storage_buffer_binding() {
+        let mut qmd = QueueMetaData::default();
+        qmd.const_buffer_enable_mask = 1;
+        qmd.const_buffers[0] = QmdConstBuffer {
+            address: 0x1000,
+            size: 0x100,
+        };
+        let dispatch = DispatchCall {
+            qmd,
+            qmd_address: 0,
+            code_address: 0,
+            tsc_address: 0,
+            tsc_limit: 0,
+            tic_address: 0,
+            tic_limit: 0,
+            tex_cb_index: 0,
+        };
+
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        cache.channel_state = Some(Box::new(BufferCacheChannelInfo::default()));
+        cache.set_gpu_memory(Box::new(TestGpuMemory));
+        cache.set_engine_state(Box::new(ComputeEngineAdapter { dispatch }));
+
+        cache.bind_compute_storage_buffer(0, 0, 0x20, true);
+
+        let binding = cache
+            .channel_state
+            .as_ref()
+            .unwrap()
+            .compute_storage_buffers[0];
+        assert_eq!(binding.device_addr, 0x105000);
+        assert_eq!(binding.size, 0x38);
     }
 
     #[test]
