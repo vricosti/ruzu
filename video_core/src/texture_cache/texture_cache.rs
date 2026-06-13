@@ -359,10 +359,9 @@ impl TextureCacheBase {
             for view in views.iter_mut() {
                 view.id = self.visit_image_view(graphics, view.index);
                 if has_blacklists && view.blacklist && view.id != NULL_IMAGE_VIEW_ID {
-                    // Upstream: ScaleDown(slot_images[image_view.image_id])
-                    // sets has_blacklisted=true when a rescale-down fires.
-                    // Needs backend image scaling; TODO once the GL texture
-                    // pool lands.
+                    // Upstream `ScaleDown(slot_images[image_view.image_id])`
+                    // is backend-owned. Concrete texture-cache wrappers apply
+                    // it after this base descriptor pass.
                 }
             }
             if !self.has_deleted_images && !(has_blacklists && has_blacklisted) {

@@ -5303,6 +5303,41 @@ impl TextureCache {
         self.base.get_flush_area(cpu_addr, size as usize)
     }
 
+    /// OpenGL-backed wrapper for `TextureCache<P>::FillGraphicsImageViews`.
+    ///
+    /// `TextureCacheBase` resolves TIC descriptors and base image-view slots.
+    /// The upstream blacklist branch also calls `ScaleDown(image)`, which is
+    /// backend-specific, so the OpenGL wrapper owns that part.
+    pub fn fill_graphics_image_views(
+        &mut self,
+        views: &mut [crate::texture_cache::texture_cache_base::ImageViewInOut],
+        has_blacklists: bool,
+    ) {
+        loop {
+            self.base.fill_graphics_image_views(views, has_blacklists);
+            if !has_blacklists {
+                break;
+            }
+
+            let mut has_blacklisted = false;
+            for view in views.iter() {
+                if !view.blacklist || !view.id.is_valid() || view.id == NULL_IMAGE_VIEW_ID {
+                    continue;
+                }
+                let image_id = self.base.slot_image_views[view.id].image_id;
+                if !image_id.is_valid() || image_id == NULL_IMAGE_ID {
+                    continue;
+                }
+                self.ensure_backend_image(image_id);
+                has_blacklisted |= self.scale_down_image(image_id);
+                self.base.slot_images[image_id].scale_rating = 0;
+            }
+            if !has_blacklisted {
+                break;
+            }
+        }
+    }
+
     /// Materialise GL-side `Image` and `ImageView` objects for every filled
     /// view returned by `TextureCacheBase::fill_graphics_image_views`.
     ///
