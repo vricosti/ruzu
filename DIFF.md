@@ -1726,14 +1726,14 @@
 
 ### Intentional differences
 - `TextureCacheBase::find_or_insert_image_from_info_with_options(...)` is a Rust CPU-address-aware counterpart of upstream `FindOrInsertImage(info, gpu_addr, options)`. Upstream translates through its live `gpu_memory`; the Rust OpenGL Fermi2D caller already has the translated CPU address from its channel memory manager.
-- `OpenGLTextureCache::blit_image` still owns the OpenGL framebuffer-blit body directly instead of routing through an upstream-shaped `TextureCacheRuntime`, because the runtime owner split is not ported yet.
+- `OpenGLTextureCache::blit_image` still owns the OpenGL view/FBO materialization bridge because the common Rust texture-cache layer cannot yet call backend framebuffer helpers directly.
 
 ### Unintentional differences (to fix)
 - None known for the Fermi2D `BlitImage` rescale/region slice after re-reading upstream `TextureCache<P>::BlitImage`; Rust now calls `PrepareImage`, applies `ImageCanRescale` / `ScaleUp` / `ScaleDown`, handles resolve downscaling, and scales source/destination regions before the OpenGL framebuffer blit.
 
 ### Missing items
 - Port the full common `TextureCache<P>::BlitImage` ownership once backend hooks can call OpenGL upload/framebuffer operations without duplicating lifecycle in `gl_texture_cache.rs`.
-- Move the remaining OpenGL-specific Fermi2D runtime operations into an upstream-shaped `TextureCacheRuntime` owner.
+- Exact `StateTracker&` ownership for `TextureCacheRuntime::BlitFramebuffer` remains represented by rasterizer-side invalidation before entering the texture-cache blit, because ruzu cannot yet store the upstream direct reference without self-referential ownership.
 
 ### Binary layout verification
 - N/A: OpenGL texture-cache image selection and host-side framebuffer blit behavior only. No guest-visible raw payload layout changed.
@@ -18216,5 +18216,121 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Tests
 - Re-read upstream `TextureCache<P>::JoinImages` around `join_ignore_textures`.
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- Rust now stores the upstream null texture owners (`null_image_1d_array`, `null_image_cube_array`, `null_image_3d`) and null texture-view owners (`null_image_view_1d`, `null_image_view_2d`, `null_image_view_2d_array`, `null_image_view_cube`) as a single `[u32; 7]` on `OpenGL::TextureCacheRuntime`; `TextureCacheRuntime::Drop` deletes those GL texture names. This preserves the upstream runtime ownership while using raw GL handles instead of C++ `OGLTexture` / `OGLTextureView` RAII wrappers.
+- Rust keeps `TextureCacheRuntime::new_with_caps(...)` for tests/default construction and passes `has_debugging_tool_attached` explicitly instead of holding a `const Device&`; production construction still derives the value from `Device::has_debugging_tool_attached()`.
+- `ImageView` constructors still receive a copied `[u32; NUM_TEXTURE_TYPES]` rather than a `TextureCacheRuntime&`, because Rust image views do not store a runtime reference. The copied source is now `TextureCacheRuntime::null_image_views`, matching upstream data ownership.
+
+### Unintentional differences (to fix)
+- None known for the null-image ownership slice after re-reading upstream `TextureCacheRuntime::TextureCacheRuntime`, `TextureCacheRuntime::~TextureCacheRuntime`, `ImageView::ImageView(TextureCacheRuntime&, ...)`, and the runtime member declarations.
+
+### Missing items
+- Broader runtime parity remains tracked separately: the exact `StateTracker&` ownership is still not fully shaped like upstream `TextureCacheRuntime`.
+
+### Binary layout verification
+- N/A: OpenGL host texture handles and image-view default bindings only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::TextureCacheRuntime`, `TextureCacheRuntime::~TextureCacheRuntime`, `ImageView::ImageView(TextureCacheRuntime&, ...)`, and `gl_texture_cache.h` runtime member declarations.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core texture_cache::texture_cache::tests::update_render_targets_from_snapshot_registers_presentable_view -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- Rust now stores `FormatConversionPass` on `OpenGL::TextureCacheRuntime`, matching upstream `TextureCacheRuntime::format_conversion_pass` ownership and teardown with the runtime.
+- Rust `FormatConversionPass::new()` does not take `UtilShaders&` because the current Rust conversion implementation only owns the intermediate PBO path. The upstream-shaped owner is now correct; the missing utility-shader reference is not needed by the currently ported body.
+
+### Unintentional differences (to fix)
+- None known for the `FormatConversionPass` ownership slice after re-reading upstream `TextureCacheRuntime::TextureCacheRuntime`, `TextureCacheRuntime::ReinterpretImage`, `TextureCacheRuntime::EmulateCopyImage`, and the runtime member declarations.
+
+### Missing items
+- The exact upstream constructor dependency `FormatConversionPass(UtilShaders&)` remains unnecessary in Rust until the conversion pass uses utility-shader helpers directly.
+
+### Binary layout verification
+- N/A: OpenGL host PBO ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `FormatConversionPass`, `TextureCacheRuntime::TextureCacheRuntime`, `TextureCacheRuntime::ReinterpretImage`, `TextureCacheRuntime::EmulateCopyImage`, and `gl_texture_cache.h` runtime member declarations.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core texture_cache::texture_cache::tests::update_render_targets_from_snapshot_registers_presentable_view -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/gl_staging_buffer_pool.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_staging_buffer_pool.cpp
+
+### Intentional differences
+- Rust `TextureCacheRuntime` now exposes `upload_staging_buffer`, `download_staging_buffer`, and `free_deferred_staging_buffer`, matching upstream `TextureCacheRuntime::{UploadStagingBuffer,DownloadStagingBuffer,FreeDeferredStagingBuffer}` delegation to `StagingBufferPool`.
+- Rust still owns `StagingBufferPool` by value inside `TextureCacheRuntime` rather than storing the upstream external `StagingBufferPool&`, because the current Rust renderer/rasterizer construction does not yet have a separate shared staging-pool owner.
+
+### Unintentional differences (to fix)
+- None known for the runtime staging API slice after re-reading upstream `TextureCacheRuntime::{UploadStagingBuffer,DownloadStagingBuffer,FreeDeferredStagingBuffer}` and `StagingBufferPool::{RequestUploadBuffer,RequestDownloadBuffer,FreeDeferredStagingBuffer}`.
+
+### Missing items
+- Exact external `StagingBufferPool&` lifetime parity remains part of the broader renderer/rasterizer owner graph audit.
+
+### Binary layout verification
+- N/A: OpenGL host staging-buffer ownership and delegation only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::{UploadStagingBuffer,DownloadStagingBuffer,FreeDeferredStagingBuffer}` and `StagingBufferPool::{RequestUploadBuffer,RequestDownloadBuffer,FreeDeferredStagingBuffer}`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core gl_staging_buffer_pool -- --nocapture`
 - `cargo test -p video_core join_images_preserves_gpu_modified_ignored_overlap_as_bad_overlap -- --nocapture`
 - `cargo test -p video_core join_images -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- Rust now routes the OpenGL Fermi2D blit body through `TextureCacheRuntime::blit_framebuffer`, matching upstream `TextureCacheRuntime::BlitFramebuffer` ownership for `glEnable(GL_FRAMEBUFFER_SRGB)`, `glDisable(GL_RASTERIZER_DISCARD)`, `glDisablei(GL_SCISSOR_TEST, 0)`, filter selection, and `glBlitNamedFramebuffer`.
+- Rust passes raw framebuffer handles and buffer-bit masks instead of upstream `Framebuffer*` because ruzu's framebuffer cache is still owned by `OpenGL::TextureCache`; the runtime body receives the same data that upstream reads through `Framebuffer::{Handle,BufferBits}`.
+- Upstream invalidates `StateTracker` inside `TextureCacheRuntime::BlitFramebuffer`. Rust still performs `notify_scissor0`, `notify_rasterize_enable`, and `notify_framebuffer_srgb` in `RasterizerOpenGL::accelerate_surface_copy` before entering the texture-cache blit path, preserving the side effect while avoiding a self-referential `StateTracker&` in the current owner graph.
+
+### Unintentional differences (to fix)
+- None known for the runtime Fermi2D GL blit body after re-reading upstream `TextureCacheRuntime::BlitFramebuffer`.
+
+### Missing items
+- Move the `StateTracker&` dependency into `TextureCacheRuntime` once the renderer/rasterizer owner graph can represent upstream references without self-referential Rust structs.
+- Move the full common `TextureCache<P>::BlitImage` ownership out of the OpenGL wrapper once backend hooks can materialize framebuffers without duplicating lifecycle.
+
+### Binary layout verification
+- N/A: OpenGL host framebuffer state only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::BlitFramebuffer` and `TextureCache<P>::BlitImage`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core blit_image -- --nocapture` (0 tests matched; compile-only evidence for this filter)
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- Rust now owns `can_image_be_copied`, `reinterpret_image`, and the GL bodies of `emulate_copy_image` on `TextureCacheRuntime`, matching upstream `TextureCacheRuntime::{CanImageBeCopied,ReinterpretImage,EmulateCopyImage}` ownership.
+- Rust runtime methods receive raw GL handles, GL target/format/type values, and `ImageInfo` references instead of upstream `Image&`, because ruzu's OpenGL image table still belongs to `OpenGL::TextureCache`. The runtime receives the same data upstream reads through `Image::{Handle,GlFormat,GlType,info}`.
+- Upstream `FormatConversionPass::ConvertImage` owns the S8D24 post-conversion component swap through its `UtilShaders&`. Rust keeps `FormatConversionPass` independent of `UtilShaders`, so `TextureCacheRuntime::reinterpret_image` performs the same `convert_s8d24` call immediately after `format_conversion_pass.convert_image`.
+
+### Unintentional differences (to fix)
+- None known for the runtime copy-policy slice after re-reading upstream `TextureCacheRuntime::{CanImageBeCopied,ReinterpretImage,EmulateCopyImage}` and `FormatConversionPass::ConvertImage`.
+
+### Missing items
+- Exact upstream `Image&` signatures can only be restored after backend image ownership moves closer to the runtime/common texture-cache owner graph.
+- Exact `FormatConversionPass(UtilShaders&)` construction remains pending until the Rust pass can own the S8D24 utility-shader call directly.
+
+### Binary layout verification
+- N/A: OpenGL host copy policy and framebuffer/image handles only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::{CanImageBeCopied,ReinterpretImage,EmulateCopyImage}` and `FormatConversionPass::ConvertImage`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core astc_upload_flags_follow_upstream_policy -- --nocapture`
+- `cargo test -p video_core s8d24 -- --nocapture` (0 tests matched; compile-only evidence for this filter)
