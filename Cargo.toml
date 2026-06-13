@@ -32,8 +32,9 @@ network = { path = "network" }
 web_service = { path = "web_service" }
 frontend_common = { path = "frontend_common" }
 
-# JIT recompiler
-rdynarmic = { path = "../rdynarmic" }
+# JIT recompiler (vendored as a git submodule under externals/; rdynarmic in
+# turn references rxbyak via `../rxbyak`, which resolves to externals/rxbyak).
+rdynarmic = { path = "externals/rdynarmic" }
 
 # CLI / Config
 clap = { version = "4", features = ["derive"] }

@@ -1096,6 +1096,7 @@ name = "rxbyak"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.0",
+ "cc",
  "libc",
  "windows-sys 0.59.0",
 ]
