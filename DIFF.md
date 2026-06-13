@@ -1,3 +1,24 @@
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs, video_core/src/renderer_opengl/gl_rasterizer.rs, and video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `OpenGL::TextureCache::fill_graphics_image_views(...)` now owns the backend part of upstream `TextureCache<P>::FillImageViews`: after the base TIC/image-view pass, blacklisted image views run `ScaleDown(image)` and reset `image.scale_rating = 0`, then repeat while any scale-down happened.
+- `TextureCacheBase::fill_image_views(...)` still owns descriptor-table traversal and image-view id resolution. The `ScaleDown` side effect lives in the OpenGL wrapper because ruzu splits upstream's templated `P::Image` from the backend-independent base slot.
+
+### Unintentional differences (to fix)
+- None known for the OpenGL graphics-image blacklist scale-down behavior after re-reading upstream `TextureCache<P>::FillImageViews`, `TextureCache<P>::ScaleDown`, and OpenGL `Image::ScaleDown`.
+
+### Missing items
+- The same blacklist scale-down hook is still absent from non-OpenGL/reduced construction paths until those paths have a backend image owner equivalent to upstream `P::Image`.
+
+### Binary layout verification
+- N/A: texture-cache rescale control flow only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::FillImageViews`, `TextureCache<P>::ScaleDown`, and OpenGL `Image::ScaleDown`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+
 ## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs, video_core/src/renderer_opengl/gl_rasterizer.rs, and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
 
 ### Intentional differences

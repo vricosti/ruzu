@@ -4103,7 +4103,6 @@ impl RasterizerInterface for RasterizerOpenGL {
             // gl_graphics_pipeline.cpp:380. `has_blacklists = has_images` per
             // upstream's `Spec::has_images` template parameter.
             self.texture_cache
-                .base
                 .fill_graphics_image_views(&mut views, has_images);
             record_gl_draw_stage(draw_seq, 17);
             trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_fill_image_views", draw_seq);
