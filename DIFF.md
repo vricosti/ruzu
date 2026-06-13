@@ -1,20 +1,20 @@
-## 2026-06-13 — video_core/src/renderer_opengl/gl_rasterizer.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs, video_core/src/renderer_opengl/gl_rasterizer.rs, and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
 
 ### Intentional differences
-- The OpenGL draw path no longer passes ad hoc GPU-read closures into sampled-image `PrepareImage`, view materialisation join-drain, or render-target `PrepareImage` calls. Those steps now use the texture cache's bound channel `gpu_memory`, matching upstream `TextureCache<P>::gpu_memory` ownership for `PrepareImage`, `RefreshContents`, and `UploadImageContents`.
-- Descriptor-table synchronization still receives an explicit reader/address translator from the current Maxwell channel snapshot because ruzu's Rust draw view still resolves descriptors outside the exact upstream `TextureCache<P>::FillGraphicsImageViews` owner shape.
+- The OpenGL draw path no longer passes ad hoc GPU-read closures into `FillGraphicsImageViews`, graphics TSC `GetGraphicsSamplerId`, sampled-image `PrepareImage`, view materialisation join-drain, or render-target `PrepareImage` calls. Those steps now use the texture cache's bound channel `gpu_memory`, matching upstream `TextureCache<P>::gpu_memory` ownership for descriptor-table reads, `PrepareImage`, `RefreshContents`, and `UploadImageContents`.
+- `TextureCacheBase::{fill_graphics_image_views,get_graphics_sampler_id}` now prefer `channel_gpu_memory` for TIC/TSC descriptor reads and GPU-address validation; the old `device_memory` path remains only as a reduced-construction fallback when no channel is bound.
 
 ### Unintentional differences (to fix)
-- The draw path still has a reader closure for descriptor synchronization. Upstream reaches the same memory through `channel_state`/`gpu_memory` owned by `TextureCache<P>`.
+- None known for the OpenGL draw-path TIC/TSC descriptor synchronization source after re-reading upstream `TextureCache<P>::FillGraphicsImageViews`, `TextureCache<P>::VisitImageView`, and `TextureCache<P>::GetGraphicsSamplerId`.
 
 ### Missing items
-- Move descriptor-table synchronization onto the same bound-channel memory owner so `FillGraphicsImageViews` call sites no longer need a caller-provided reader/translator.
+- Remove the explicit reader bridge helpers `fill_graphics_image_views_with_gpu_reader(...)` and `get_graphics_sampler_id_with_gpu_reader(...)` once every remaining reduced/test construction path binds a channel `gpu_memory` owner.
 
 ### Binary layout verification
 - N/A: texture-cache call ownership only. No guest-visible raw payload layout changed.
 
 ### Tests
-- Re-read upstream `TextureCache<P>::PrepareImage`, `TextureCache<P>::RefreshContents`, `TextureCache<P>::UploadImageContents`, `TextureCache<P>::FillGraphicsImageViews`, and OpenGL `GraphicsPipeline::ConfigureImpl` ordering.
+- Re-read upstream `TextureCache<P>::PrepareImage`, `TextureCache<P>::RefreshContents`, `TextureCache<P>::UploadImageContents`, `TextureCache<P>::FillGraphicsImageViews`, `TextureCache<P>::VisitImageView`, `TextureCache<P>::GetGraphicsSamplerId`, and OpenGL `GraphicsPipeline::ConfigureImpl` ordering.
 - `cargo fmt --all --check`
 - `git diff --check`
 - `cargo check -p video_core --quiet`

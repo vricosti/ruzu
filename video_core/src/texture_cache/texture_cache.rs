@@ -329,6 +329,20 @@ impl TextureCacheBase {
         views: &mut [ImageViewInOut],
         has_blacklists: bool,
     ) {
+        if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
+            self.fill_graphics_image_views_with_gpu_reader(
+                views,
+                has_blacklists,
+                &mut |gpu_addr, out| gpu_memory.lock().read_block(gpu_addr, out),
+                &mut |gpu_addr, size| {
+                    let gpu_memory = gpu_memory.lock();
+                    gpu_memory
+                        .gpu_to_cpu_address(gpu_addr)
+                        .or_else(|| gpu_memory.gpu_to_cpu_address_range(gpu_addr, size))
+                },
+            );
+            return;
+        }
         self.fill_image_views(true, views, has_blacklists);
     }
 
@@ -960,11 +974,19 @@ impl TextureCacheBase {
             );
             return NULL_SAMPLER_ID;
         }
-        let gpu_memory_arc = self.device_memory.clone();
-        let (descriptor, is_new) = self
-            .channel_state
-            .graphics_sampler_table
-            .read(gpu_memory_arc.as_ref(), index);
+        let (descriptor, is_new) =
+            if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
+                self.channel_state
+                    .graphics_sampler_table
+                    .read_with(index, |gpu_addr, out| {
+                        gpu_memory.lock().read_block(gpu_addr, out)
+                    })
+            } else {
+                let gpu_memory_arc = self.device_memory.clone();
+                self.channel_state
+                    .graphics_sampler_table
+                    .read(gpu_memory_arc.as_ref(), index)
+            };
         let cached = self.channel_state.graphics_sampler_ids[index as usize];
         if !is_new && cached.is_valid() && cached != CORRUPT_ID {
             return cached;
