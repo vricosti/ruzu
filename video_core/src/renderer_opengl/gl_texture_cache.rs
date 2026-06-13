@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 
 use common::settings;
 
+use super::gl_shader_manager::{ProgramManager, ProgramManagerHandle};
 use super::gl_staging_buffer_pool::{StagingBufferMap, StagingBufferPool};
 use super::util_shaders::UtilShaders;
 use crate::engines::draw_manager::Maxwell3DRenderTargets;
@@ -425,6 +426,8 @@ pub struct TextureCacheRuntime {
     pub device_access_memory: u64,
     staging_buffer_pool: StagingBufferPool,
     util_shaders: UtilShaders,
+    rescale_draw_fbos: [u32; 4],
+    rescale_read_fbos: [u32; 4],
 }
 
 impl TextureCacheRuntime {
@@ -434,7 +437,7 @@ impl TextureCacheRuntime {
     /// `TextureCacheRuntime::TextureCacheRuntime` budget: NVX total +
     /// 512 MiB when the extension is present, else a 2 GiB minimum. Kept
     /// in sync with the buffer-cache runtime (gl_buffer_cache.cpp:139).
-    pub fn new(device: &super::gl_device::Device) -> Self {
+    pub fn new(device: &super::gl_device::Device, program_manager: ProgramManagerHandle) -> Self {
         const HALF_GIB: u64 = 512 * 1024 * 1024;
         let device_access_memory = if device.can_report_memory() {
             device.get_current_dedicated_video_memory() + HALF_GIB
@@ -444,25 +447,30 @@ impl TextureCacheRuntime {
         Self::new_with_caps(
             device.has_broken_texture_view_formats(),
             device_access_memory,
+            program_manager,
         )
     }
 
-    pub fn new_with_caps(has_broken_texture_view_formats: bool, device_access_memory: u64) -> Self {
-        Self {
+    pub fn new_with_caps(
+        has_broken_texture_view_formats: bool,
+        device_access_memory: u64,
+        program_manager: ProgramManagerHandle,
+    ) -> Self {
+        let mut runtime = Self {
             has_broken_texture_view_formats,
             device_access_memory,
             staging_buffer_pool: StagingBufferPool::new(),
-            util_shaders: UtilShaders::new(),
+            util_shaders: UtilShaders::new(program_manager),
+            rescale_draw_fbos: [0; 4],
+            rescale_read_fbos: [0; 4],
+        };
+        if settings::values().resolution_info.active {
+            unsafe {
+                gl::CreateFramebuffers(4, runtime.rescale_draw_fbos.as_mut_ptr());
+                gl::CreateFramebuffers(4, runtime.rescale_read_fbos.as_mut_ptr());
+            }
         }
-    }
-
-    pub fn with_util_shader_caps(
-        mut self,
-        use_assembly_shaders: bool,
-        has_lmem_perf_bug: bool,
-    ) -> Self {
-        self.util_shaders = UtilShaders::new_with_caps(use_assembly_shaders, has_lmem_perf_bug);
-        self
+        runtime
     }
 
     pub fn finish(&self) {
@@ -593,6 +601,15 @@ impl TextureCacheRuntime {
                 "TextureCacheRuntime::accelerate_image_upload unsupported image type {:?}",
                 info.image_type
             ),
+        }
+    }
+}
+
+impl Drop for TextureCacheRuntime {
+    fn drop(&mut self) {
+        unsafe {
+            gl::DeleteFramebuffers(4, self.rescale_draw_fbos.as_ptr());
+            gl::DeleteFramebuffers(4, self.rescale_read_fbos.as_ptr());
         }
     }
 }
@@ -2509,8 +2526,6 @@ pub struct TextureCache {
     samplers: HashMap<crate::texture_cache::types::SamplerId, Sampler>,
     framebuffers: HashMap<ImageViewId, TextureCacheFramebuffer>,
     render_target_framebuffers: HashMap<RenderTargets, TextureCacheFramebuffer>,
-    rescale_draw_fbos: [u32; 4],
-    rescale_read_fbos: [u32; 4],
     format_conversion_pass: FormatConversionPass,
     null_image_handles: [u32; 7],
     null_image_views: [u32; NUM_TEXTURE_TYPES],
@@ -3022,17 +3037,16 @@ impl TextureCache {
             crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
         >,
         device: &super::gl_device::Device,
+        program_manager: ProgramManagerHandle,
     ) -> Self {
-        let mut cache = Self::new_with_caps(
+        Self::new_with_runtime(
             device_memory,
             device.has_astc(),
             device.has_broken_texture_view_formats(),
             false,
             device.has_debugging_tool_attached(),
-        );
-        cache.runtime = TextureCacheRuntime::new(device)
-            .with_util_shader_caps(device.use_assembly_shaders(), device.has_lmem_perf_bug());
-        cache
+            TextureCacheRuntime::new(device, program_manager),
+        )
     }
 
     pub(crate) fn new_with_caps(
@@ -3043,32 +3057,46 @@ impl TextureCache {
         has_broken_texture_view_formats: bool,
         has_native_bgr: bool,
         has_debugging_tool_attached: bool,
+        program_manager: ProgramManagerHandle,
+    ) -> Self {
+        Self::new_with_runtime(
+            device_memory,
+            has_native_astc,
+            has_broken_texture_view_formats,
+            has_native_bgr,
+            has_debugging_tool_attached,
+            TextureCacheRuntime::new_with_caps(
+                has_broken_texture_view_formats,
+                2 * 1024 * 1024 * 1024,
+                program_manager,
+            ),
+        )
+    }
+
+    fn new_with_runtime(
+        device_memory: std::sync::Arc<
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
+        >,
+        has_native_astc: bool,
+        has_broken_texture_view_formats: bool,
+        has_native_bgr: bool,
+        has_debugging_tool_attached: bool,
+        runtime: TextureCacheRuntime,
     ) -> Self {
         let (null_image_handles, null_image_views) =
             create_null_image_views(has_debugging_tool_attached);
-        let mut rescale_draw_fbos = [0u32; 4];
-        let mut rescale_read_fbos = [0u32; 4];
-        unsafe {
-            gl::CreateFramebuffers(4, rescale_draw_fbos.as_mut_ptr());
-            gl::CreateFramebuffers(4, rescale_read_fbos.as_mut_ptr());
-        }
         Self {
             base: CommonTextureCache::new_with_caps(
                 device_memory,
                 has_broken_texture_view_formats,
                 has_native_bgr,
             ),
-            runtime: TextureCacheRuntime::new_with_caps(
-                has_broken_texture_view_formats,
-                2 * 1024 * 1024 * 1024,
-            ),
+            runtime,
             images: HashMap::new(),
             image_views: HashMap::new(),
             samplers: HashMap::new(),
             framebuffers: HashMap::new(),
             render_target_framebuffers: HashMap::new(),
-            rescale_draw_fbos,
-            rescale_read_fbos,
             format_conversion_pass: FormatConversionPass::new(),
             null_image_handles,
             null_image_views,
@@ -3142,11 +3170,13 @@ impl TextureCache {
         let Some(image) = self.images.get_mut(&image_id) else {
             return false;
         };
+        let rescale_read_fbos = self.runtime.rescale_read_fbos;
+        let rescale_draw_fbos = self.runtime.rescale_draw_fbos;
         let has_copy = self.base.slot_images[image_id].has_scaled;
         let rescaled = image.scale_up(
             &mut self.base.slot_images[image_id],
-            &self.rescale_read_fbos,
-            &self.rescale_draw_fbos,
+            &rescale_read_fbos,
+            &rescale_draw_fbos,
             false,
         );
         if rescaled {
@@ -3170,10 +3200,12 @@ impl TextureCache {
         let Some(image) = self.images.get_mut(&image_id) else {
             return false;
         };
+        let rescale_read_fbos = self.runtime.rescale_read_fbos;
+        let rescale_draw_fbos = self.runtime.rescale_draw_fbos;
         let rescaled = image.scale_down(
             &mut self.base.slot_images[image_id],
-            &self.rescale_read_fbos,
-            &self.rescale_draw_fbos,
+            &rescale_read_fbos,
+            &rescale_draw_fbos,
             false,
         );
         if rescaled {
@@ -3471,6 +3503,146 @@ impl TextureCache {
         }
     }
 
+    /// OpenGL-backed port of `TextureCache<P>::UploadImageContents`.
+    fn upload_image_contents_with_gpu_reader(
+        &mut self,
+        image_id: ImageId,
+        base_image: &ImageBase,
+        read_gpu: &mut dyn FnMut(u64, &mut [u8]) -> bool,
+    ) -> bool {
+        let mut guest = vec![0u8; base_image.guest_size_bytes as usize];
+        let trace_upload = should_trace_texture_upload(base_image.gpu_addr);
+        if !read_gpu(base_image.gpu_addr, &mut guest) {
+            if trace_upload {
+                log::warn!(
+                    "[TEXTURE_UPLOAD] read_miss id={} gpu=0x{:X} size={}",
+                    image_id.index,
+                    base_image.gpu_addr,
+                    guest.len(),
+                );
+            }
+            return false;
+        }
+
+        let staging_size = map_size_bytes(base_image) as usize;
+        if staging_size == 0 {
+            return false;
+        }
+
+        if base_image.flags.contains(ImageFlagBits::ACCELERATED_UPLOAD) {
+            let backend_image = self
+                .images
+                .entry(image_id)
+                .or_insert_with(|| Image::from_base(base_image, self.has_native_astc));
+            let handle = backend_image.handle();
+            if handle == 0 {
+                return false;
+            }
+            let swizzles = full_upload_swizzles(&base_image.info);
+            let mut staging = self.runtime.upload_staging_buffer(guest.len());
+            staging.mapped_span_mut().copy_from_slice(&guest);
+            staging.flush();
+            self.runtime
+                .accelerate_image_upload(handle, &base_image.info, &staging, &swizzles);
+            if trace_upload {
+                log::warn!(
+                    "[TEXTURE_UPLOAD] accelerated id={} gpu=0x{:X} cpu=0x{:X} guest={} swizzles={}",
+                    image_id.index,
+                    base_image.gpu_addr,
+                    base_image.cpu_addr,
+                    guest.len(),
+                    swizzles.len(),
+                );
+            }
+            return true;
+        }
+
+        let mut staging = self.runtime.upload_staging_buffer(staging_size);
+        // Upstream `UploadImageContents`: converted images (ASTC without
+        // native support, BC4/BC5 3D) are unswizzled into a scratch buffer
+        // first, then `ConvertImage` decodes into the staging map and
+        // rewrites the copies to the converted layout (RGBA8 offsets/sizes,
+        // tight row_length/image_height). Uploading the raw unswizzled bytes
+        // with unconverted copies leaves the GL_RGBA8 texture empty
+        // (GL_INVALID_OPERATION: out-of-bounds PBO access -- MK8D splash text
+        // and demo assets).
+        let copies = if base_image.flags.contains(ImageFlagBits::CONVERTED) {
+            let mut unswizzled = vec![0u8; base_image.unswizzled_size_bytes as usize];
+            let mut copies = unswizzle_image(
+                &(),
+                base_image.gpu_addr,
+                &base_image.info,
+                &guest,
+                &mut unswizzled,
+            );
+            crate::texture_cache::util::convert_image(
+                &unswizzled,
+                &base_image.info,
+                staging.mapped_span_mut(),
+                &mut copies,
+            );
+            copies
+        } else {
+            unswizzle_image(
+                &(),
+                base_image.gpu_addr,
+                &base_image.info,
+                &guest,
+                staging.mapped_span_mut(),
+            )
+        };
+        if copies.is_empty() {
+            return false;
+        }
+        if should_dump_texture_upload(base_image.gpu_addr) {
+            dump_texture_upload_staging(image_id, base_image, staging.mapped_span(), &copies);
+        }
+        if trace_upload {
+            let guest_nonzero = guest.iter().filter(|&&b| b != 0).take(1).count() != 0;
+            let staging_nonzero = staging
+                .mapped_span()
+                .iter()
+                .filter(|&&b| b != 0)
+                .take(1)
+                .count()
+                != 0;
+            let guest_checksum = guest.iter().take(4096).fold(0u64, |acc, &b| {
+                acc.wrapping_mul(16777619).wrapping_add(b as u64)
+            });
+            let staging_checksum = staging
+                .mapped_span()
+                .iter()
+                .take(4096)
+                .fold(0u64, |acc, &b| {
+                    acc.wrapping_mul(16777619).wrapping_add(b as u64)
+                });
+            log::warn!(
+                "[TEXTURE_UPLOAD] staging id={} gpu=0x{:X} cpu=0x{:X} guest_nonzero={} staging_nonzero={} guest_crc=0x{:X} staging_crc=0x{:X}",
+                image_id.index,
+                base_image.gpu_addr,
+                base_image.cpu_addr,
+                guest_nonzero,
+                staging_nonzero,
+                guest_checksum,
+                staging_checksum,
+            );
+        }
+
+        let uploaded = self.upload_staging_to_image(image_id, base_image, &staging, &copies);
+        if trace_upload {
+            log::warn!(
+                "[TEXTURE_UPLOAD] uploaded id={} gpu=0x{:X} cpu=0x{:X} guest={} staging={} copies={}",
+                image_id.index,
+                base_image.gpu_addr,
+                base_image.cpu_addr,
+                guest.len(),
+                staging.mapped_size,
+                copies.len(),
+            );
+        }
+        uploaded
+    }
+
     pub fn set_guest_memory_writer(&mut self, writer: GuestMemoryWriter) {
         self.base.set_guest_memory_writer(writer);
     }
@@ -3612,145 +3784,31 @@ impl TextureCache {
             self.base.track_image(image_id);
         }
 
-        let mut guest = vec![0u8; base_image.guest_size_bytes as usize];
-        let trace_upload = should_trace_texture_upload(base_image.gpu_addr);
-        if !read_gpu(base_image.gpu_addr, &mut guest) {
-            if trace_upload {
-                log::warn!(
-                    "[TEXTURE_UPLOAD] read_miss id={} gpu=0x{:X} size={}",
-                    image_id.index,
-                    base_image.gpu_addr,
-                    guest.len(),
-                );
-            }
-            return;
-        }
-
         if base_image
             .flags
             .contains(ImageFlagBits::ASYNCHRONOUS_DECODE)
-            && self.queue_async_decode(image_id, &base_image, &guest)
         {
-            return;
-        }
-
-        let staging_size = map_size_bytes(&base_image) as usize;
-        if staging_size == 0 {
-            return;
-        }
-        if base_image.flags.contains(ImageFlagBits::ACCELERATED_UPLOAD) {
-            let backend_image = self
-                .images
-                .entry(image_id)
-                .or_insert_with(|| Image::from_base(&base_image, self.has_native_astc));
-            let handle = backend_image.handle();
-            if handle == 0 {
+            let mut guest = vec![0u8; base_image.guest_size_bytes as usize];
+            let trace_upload = should_trace_texture_upload(base_image.gpu_addr);
+            if !read_gpu(base_image.gpu_addr, &mut guest) {
+                if trace_upload {
+                    log::warn!(
+                        "[TEXTURE_UPLOAD] read_miss id={} gpu=0x{:X} size={}",
+                        image_id.index,
+                        base_image.gpu_addr,
+                        guest.len(),
+                    );
+                }
                 return;
             }
-            let swizzles = full_upload_swizzles(&base_image.info);
-            let mut staging = self.runtime.upload_staging_buffer(guest.len());
-            staging.mapped_span_mut().copy_from_slice(&guest);
-            staging.flush();
-            self.runtime
-                .accelerate_image_upload(handle, &base_image.info, &staging, &swizzles);
-            self.runtime.insert_upload_memory_barrier();
-            if trace_upload {
-                log::warn!(
-                    "[TEXTURE_UPLOAD] accelerated id={} gpu=0x{:X} cpu=0x{:X} guest={} swizzles={}",
-                    image_id.index,
-                    base_image.gpu_addr,
-                    base_image.cpu_addr,
-                    guest.len(),
-                    swizzles.len(),
-                );
+            if self.queue_async_decode(image_id, &base_image, &guest) {
+                return;
             }
-            return;
-        }
-        let mut staging = self.runtime.upload_staging_buffer(staging_size);
-        // Upstream `UploadImageContents`: converted images (ASTC without
-        // native support, BC4/BC5 3D) are unswizzled into a scratch buffer
-        // first, then `ConvertImage` decodes into the staging map and
-        // rewrites the copies to the converted layout (RGBA8 offsets/sizes,
-        // tight row_length/image_height). Uploading the raw unswizzled bytes
-        // with unconverted copies leaves the GL_RGBA8 texture empty
-        // (GL_INVALID_OPERATION: out-of-bounds PBO access — MK8D splash text
-        // and demo assets).
-        let copies = if base_image.flags.contains(ImageFlagBits::CONVERTED) {
-            let mut unswizzled = vec![0u8; base_image.unswizzled_size_bytes as usize];
-            let mut copies = unswizzle_image(
-                &(),
-                base_image.gpu_addr,
-                &base_image.info,
-                &guest,
-                &mut unswizzled,
-            );
-            crate::texture_cache::util::convert_image(
-                &unswizzled,
-                &base_image.info,
-                staging.mapped_span_mut(),
-                &mut copies,
-            );
-            copies
-        } else {
-            unswizzle_image(
-                &(),
-                base_image.gpu_addr,
-                &base_image.info,
-                &guest,
-                staging.mapped_span_mut(),
-            )
-        };
-        if copies.is_empty() {
-            return;
-        }
-        if should_dump_texture_upload(base_image.gpu_addr) {
-            dump_texture_upload_staging(image_id, &base_image, staging.mapped_span(), &copies);
-        }
-        if trace_upload {
-            let guest_nonzero = guest.iter().filter(|&&b| b != 0).take(1).count() != 0;
-            let staging_nonzero = staging
-                .mapped_span()
-                .iter()
-                .filter(|&&b| b != 0)
-                .take(1)
-                .count()
-                != 0;
-            let guest_checksum = guest.iter().take(4096).fold(0u64, |acc, &b| {
-                acc.wrapping_mul(16777619).wrapping_add(b as u64)
-            });
-            let staging_checksum = staging
-                .mapped_span()
-                .iter()
-                .take(4096)
-                .fold(0u64, |acc, &b| {
-                    acc.wrapping_mul(16777619).wrapping_add(b as u64)
-                });
-            log::warn!(
-                "[TEXTURE_UPLOAD] staging id={} gpu=0x{:X} cpu=0x{:X} guest_nonzero={} staging_nonzero={} guest_crc=0x{:X} staging_crc=0x{:X}",
-                image_id.index,
-                base_image.gpu_addr,
-                base_image.cpu_addr,
-                guest_nonzero,
-                staging_nonzero,
-                guest_checksum,
-                staging_checksum,
-            );
         }
 
-        if self.upload_staging_to_image(image_id, &base_image, &staging, &copies) {
+        if self.upload_image_contents_with_gpu_reader(image_id, &base_image, read_gpu) {
             self.runtime.insert_upload_memory_barrier();
-        }
-
-        if trace_upload {
-            log::warn!(
-                "[TEXTURE_UPLOAD] uploaded id={} gpu=0x{:X} cpu=0x{:X} guest={} staging={} copies={}",
-                image_id.index,
-                base_image.gpu_addr,
-                base_image.cpu_addr,
-                guest.len(),
-                staging.mapped_size,
-                copies.len(),
-            );
+            return;
         }
     }
 
@@ -5117,20 +5175,15 @@ impl TextureCache {
         render_targets: &Maxwell3DRenderTargets,
         mut gpu_to_cpu: impl FnMut(crate::texture_cache::image_base::GPUVAddr) -> Option<u64>,
     ) {
-        let mut rescaled = false;
-        let mut scale_rating = 0;
-        let mut color_images = [None; NUM_RT];
-        let mut depth_image = None;
-        loop {
+        let (rescaled, scale_rating, color_images, depth_image) = loop {
             self.base.has_deleted_images = false;
             self.base
                 .update_render_targets_from_snapshot(render_targets, &mut gpu_to_cpu);
-            (rescaled, scale_rating, color_images, depth_image) =
-                self.rescale_current_render_targets();
+            let result = self.rescale_current_render_targets();
             if !self.base.has_deleted_images {
-                break;
+                break result;
             }
-        }
+        };
         self.set_render_target_scale_rating(scale_rating, color_images, depth_image);
         self.base.is_rescaling = rescaled;
         self.update_rescaled_render_target_size(render_targets);
@@ -6610,8 +6663,6 @@ impl Drop for TextureCache {
                     gl::DeleteTextures(1, &handle);
                 }
             }
-            gl::DeleteFramebuffers(4, self.rescale_draw_fbos.as_ptr());
-            gl::DeleteFramebuffers(4, self.rescale_read_fbos.as_ptr());
         }
     }
 }
@@ -6629,6 +6680,7 @@ impl Default for TextureCache {
             false,
             false,
             false,
+            ProgramManager::new_shared_with_caps(false, false),
         )
     }
 }

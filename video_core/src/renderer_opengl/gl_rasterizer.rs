@@ -23,6 +23,7 @@ use super::gl_device::Device;
 use super::gl_fence_manager::{Fence, FenceManagerOpenGL};
 use super::gl_query_cache::QueryCache;
 use super::gl_shader_cache::ShaderCache as OpenGLShaderCache;
+use super::gl_shader_manager::{ProgramManager, ProgramManagerHandle};
 use super::gl_state_tracker::{dirty as GlDirty, StateTracker};
 use super::gl_texture_cache::TextureCache as OpenGLTextureCache;
 use crate::buffer_cache::buffer_cache::BufferCache as CommonBufferCache;
@@ -1788,6 +1789,12 @@ pub struct RasterizerOpenGL {
     total_draw_count: u64,
     has_written_global_memory: bool,
     buffer_cache: CommonBufferCache<OpenGLBufferCacheParams, OpenGLDeviceTracker>,
+    /// Shared OpenGL program manager reference.
+    ///
+    /// Upstream `RasterizerOpenGL` stores `ProgramManager&`, with the concrete
+    /// manager owned by `RendererOpenGL`.
+    #[allow(dead_code)]
+    program_manager: ProgramManagerHandle,
     texture_cache: OpenGLTextureCache,
     /// Generic region-tracking shader cache (region invalidation, guest address bookkeeping).
     /// Upstream inherits `GL::ShaderCache` from `VideoCommon::ShaderCache`; we keep them
@@ -2891,6 +2898,7 @@ impl RasterizerOpenGL {
         device: &Device,
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
+        program_manager: ProgramManagerHandle,
     ) -> Self {
         let mut transient_vao: u32 = 0;
         unsafe {
@@ -2911,7 +2919,8 @@ impl RasterizerOpenGL {
             total_draw_count: 0,
             has_written_global_memory: false,
             buffer_cache,
-            texture_cache: OpenGLTextureCache::new(device_memory.clone(), device),
+            program_manager: program_manager.clone(),
+            texture_cache: OpenGLTextureCache::new(device_memory.clone(), device, program_manager),
             shader_cache: ShaderCache::new(device_memory),
             gl_shader_cache: OpenGLShaderCache::new(device),
             query_cache: QueryCache::new(),
@@ -2934,6 +2943,7 @@ impl RasterizerOpenGL {
         let test_device_memory = Arc::new(
             crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
         );
+        let program_manager = ProgramManager::new_shared_with_caps(false, false);
         Self {
             syncpoints,
             fence_backend: FenceManagerOpenGL::new(),
@@ -2943,12 +2953,14 @@ impl RasterizerOpenGL {
             total_draw_count: 0,
             has_written_global_memory: false,
             buffer_cache: CommonBufferCache::new(&OPENGL_DEVICE_TRACKER),
+            program_manager: program_manager.clone(),
             texture_cache: OpenGLTextureCache::new_with_caps(
                 test_device_memory,
                 true,
                 false,
                 false,
                 false,
+                program_manager,
             ),
             shader_cache: ShaderCache::default(),
             gl_shader_cache: OpenGLShaderCache::new_for_test(),

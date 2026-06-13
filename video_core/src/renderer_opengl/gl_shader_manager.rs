@@ -7,6 +7,9 @@
 
 use super::gl_shader_util::create_program_from_source;
 use crate::host_shaders::compute_shaders::OPENGL_LMEM_WARMUP_COMP;
+use std::sync::Arc;
+
+pub type ProgramManagerHandle = Arc<parking_lot::Mutex<ProgramManager>>;
 
 /// Number of shader stages.
 const NUM_STAGES: usize = 5;
@@ -81,6 +84,20 @@ impl ProgramManager {
             current_assembly_compute_program: 0,
             lmem_warmup_program,
         }
+    }
+
+    pub fn new_shared(device: &super::gl_device::Device) -> ProgramManagerHandle {
+        Arc::new(parking_lot::Mutex::new(Self::new(device)))
+    }
+
+    pub fn new_shared_with_caps(
+        use_assembly_shaders: bool,
+        has_lmem_perf_bug: bool,
+    ) -> ProgramManagerHandle {
+        Arc::new(parking_lot::Mutex::new(Self::new_with_caps(
+            use_assembly_shaders,
+            has_lmem_perf_bug,
+        )))
     }
 
     /// Bind a compute program (GLSL/SPIR-V).

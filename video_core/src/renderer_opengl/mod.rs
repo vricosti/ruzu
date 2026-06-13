@@ -52,6 +52,7 @@ pub use gl_blit_screen::BlitScreen;
 pub use gl_device::Device;
 pub use gl_rasterizer::{dump_gl_draw_stall_profile, RasterizerOpenGL};
 pub use gl_shader_cache::dump_shader_pipeline_stall_profile;
+use gl_shader_manager::{ProgramManager, ProgramManagerHandle};
 #[allow(unused_imports)]
 pub use gl_state_tracker::StateTracker;
 
@@ -352,6 +353,13 @@ pub struct RendererOpenGL {
     device: Device,
     blit_screen: BlitScreen,
     rasterizer: RasterizerOpenGL,
+    /// Concrete owner of the shared OpenGL program manager.
+    ///
+    /// Upstream declares this before `rasterizer`, but C++ destroys members in
+    /// reverse order. Rust drops fields in declaration order, so this field is
+    /// declared after `rasterizer` to keep the same effective teardown order.
+    #[allow(dead_code)]
+    program_manager: ProgramManagerHandle,
     /// Graphics context for swap buffers / make current.
     /// Upstream: `std::unique_ptr<Core::Frontend::GraphicsContext> context` in RendererBase.
     context: Box<dyn GraphicsContext + Send>,
@@ -408,7 +416,13 @@ impl RendererOpenGL {
         // `RendererOpenGL` and injects a reference into `RasterizerOpenGL`;
         // Rust cannot express member references, so ruzu lets the rasterizer
         // own the tracker directly (see `RasterizerOpenGL::state_tracker_mut`).
-        let rasterizer = RasterizerOpenGL::new(&device, syncpoints, device_memory);
+        let program_manager = ProgramManager::new_shared(&device);
+        let rasterizer = RasterizerOpenGL::new(
+            &device,
+            syncpoints,
+            device_memory,
+            Arc::clone(&program_manager),
+        );
 
         // Set up initial GL state (matching zuyu's RendererOpenGL constructor)
         unsafe {
@@ -480,6 +494,7 @@ impl RendererOpenGL {
             device,
             blit_screen,
             rasterizer,
+            program_manager,
             context,
             base_data: RendererBaseData::new(),
             screenshot_framebuffer: OGLFramebuffer::new(),
