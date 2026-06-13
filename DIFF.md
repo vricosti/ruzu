@@ -1,3 +1,28 @@
+## 2026-06-13 — video_core/src/renderer_opengl/gl_compute_pipeline.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp
+
+### Intentional differences
+- `ComputePipeline::configure_resource_state(...)` now ports the front half of upstream `ComputePipeline::Configure` in the same owner and order: `SetComputeUniformBufferState`, `UnbindComputeStorageBuffers`, per-descriptor `BindComputeStorageBuffer` with `ASSERT(desc.count == 1)` semantics, `SynchronizeComputeDescriptors`, and the existing QMD texture/sampler/image descriptor preparation through `FillComputeImageViews`.
+- `ComputePipeline::prepare_texture_bindings_for_dispatch(...)` consumes the pipeline-owned `self.info`, removing the older need for callers to pass `Shader::Info` into the descriptor walker once they have a real pipeline instance.
+- The method remains parameterized over Rust's `BufferCache<P, DT>` because ruzu stores the templated upstream `BufferCache&` as a generic Rust cache rather than a C++ reference member.
+
+### Unintentional differences (to fix)
+- The real OpenGL dispatch path still does not call `ComputePipeline::configure_resource_state(...)` because `ShaderCache::CreateComputePipeline` / `current_compute_pipeline` remain stubs and no runtime `ComputePipeline` instance is selected for dispatch.
+- `BufferCache::BindComputeStorageBuffer` still needs a compute `EngineState` with the launch cbuf snapshot to resolve real SSBO addresses. Without that state it preserves masks but stores `NULL_BINDING`.
+- The post-`FillComputeImageViews` phase is still missing from `ComputePipeline`: program-manager bind, `UnbindComputeTextureBuffers`, per-view `BindComputeTextureBuffer`, `UpdateComputeBuffers`, `SetImagePointers`, `BindHostComputeBuffers`, sampled texture/sampler GL handles, image storage handles, rescaling uniforms, and `glBindTextures` / `glBindSamplers` / `glBindImageTextures`.
+
+### Missing items
+- Port/route compute shader-cache creation so dispatch obtains a real `ComputePipeline` and calls `configure_resource_state(...)`.
+- Install a compute launch `EngineState` on `BufferCache` before compute `BindComputeStorageBuffer`.
+- Port the post-image-view bind phase of upstream `ComputePipeline::Configure`.
+
+### Binary layout verification
+- PASS: no guest-visible payload changed. This slice mutates host-side cache masks, descriptor state, and image-view preparation only.
+
+### Tests
+- Re-read upstream `ComputePipeline::Configure` front half and ruzu `BufferCache::{SetComputeUniformBufferState,UnbindComputeStorageBuffers,BindComputeStorageBuffer}`.
+- `cargo fmt --all`
+- `cargo test -p video_core configure_buffer_state_follows_upstream_compute_order -- --nocapture`
+
 ## 2026-06-13 — video_core/src/renderer_opengl/gl_compute_pipeline.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.h
 
 ### Intentional differences

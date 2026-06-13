@@ -7,6 +7,9 @@
 
 use std::sync::{Condvar, Mutex};
 
+use crate::buffer_cache::buffer_cache::BufferCache;
+use crate::buffer_cache::buffer_cache_base::BufferCacheParams;
+use crate::buffer_cache::word_manager::DeviceTracker;
 use crate::engines::kepler_compute::{DispatchCall, QueueMetaData};
 use crate::texture_cache::texture_cache_base::{ComputeDescriptorSyncRegs, ImageViewInOut};
 use crate::texture_cache::types::SamplerId;
@@ -154,6 +157,26 @@ impl ComputePipeline {
             device.max_glasm_storage_buffer_blocks(),
         );
 
+        Self {
+            info,
+            source_program: 0,
+            assembly_program: 0,
+            uniform_buffer_sizes: state.uniform_buffer_sizes,
+            num_texture_buffers: state.num_texture_buffers,
+            num_image_buffers: state.num_image_buffers,
+            use_storage_buffers: state.use_storage_buffers,
+            writes_global_memory: state.writes_global_memory,
+            uses_local_memory: state.uses_local_memory,
+            built_mutex: Mutex::new(false),
+            built_condvar: Condvar::new(),
+            built_fence: 0,
+            is_built: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(info: Info, is_glasm: bool, max_glasm_storage_buffer_blocks: u32) -> Self {
+        let state = Self::info_state(&info, is_glasm, max_glasm_storage_buffer_blocks);
         Self {
             info,
             source_program: 0,
@@ -333,6 +356,62 @@ impl ComputePipeline {
             tic_limit: dispatch.tic_limit,
             tsc_addr: dispatch.tsc_address,
             tsc_limit: dispatch.tsc_limit,
+        }
+    }
+
+    /// Port of the resource-state front half of upstream
+    /// `ComputePipeline::Configure()`.
+    ///
+    /// This covers the ordering through `FillComputeImageViews`: compute UBO
+    /// state, storage-buffer masks/bindings, compute descriptor
+    /// synchronization, QMD handle collection, sampler-id resolution, and
+    /// backend image-view preparation.
+    pub fn configure_resource_state<P, DT>(
+        &self,
+        buffer_cache: &mut BufferCache<P, DT>,
+        texture_cache: &mut TextureCache,
+        dispatch: &DispatchCall,
+        read_u32: impl FnMut(u64) -> u32,
+    ) -> ComputeTextureBindings
+    where
+        P: BufferCacheParams,
+        DT: DeviceTracker,
+    {
+        self.configure_buffer_state(buffer_cache);
+        Self::synchronize_texture_descriptors(texture_cache, dispatch);
+        self.prepare_texture_bindings_for_dispatch(texture_cache, dispatch, read_u32)
+    }
+
+    pub fn prepare_texture_bindings_for_dispatch(
+        &self,
+        texture_cache: &mut TextureCache,
+        dispatch: &DispatchCall,
+        read_u32: impl FnMut(u64) -> u32,
+    ) -> ComputeTextureBindings {
+        Self::prepare_texture_bindings(texture_cache, &self.info, dispatch, read_u32)
+    }
+
+    fn configure_buffer_state<P, DT>(&self, buffer_cache: &mut BufferCache<P, DT>)
+    where
+        P: BufferCacheParams,
+        DT: DeviceTracker,
+    {
+        buffer_cache.set_compute_uniform_buffer_state(
+            self.info.constant_buffer_mask,
+            &self.uniform_buffer_sizes,
+        );
+        buffer_cache.unbind_compute_storage_buffers();
+        for (ssbo_index, desc) in self.info.storage_buffers_descriptors.iter().enumerate() {
+            assert_eq!(
+                desc.count, 1,
+                "ComputePipeline::Configure expects one storage-buffer descriptor per binding"
+            );
+            buffer_cache.bind_compute_storage_buffer(
+                ssbo_index,
+                desc.cbuf_index,
+                desc.cbuf_offset,
+                desc.is_written,
+            );
         }
     }
 
@@ -570,11 +649,33 @@ impl ComputeImageHandleDescriptor for ImageDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer_cache::buffer_cache::BufferCache;
+    use crate::buffer_cache::buffer_cache_base::{BufferCacheChannelInfo, BufferCacheParams};
+    use crate::buffer_cache::word_manager::DeviceTracker;
     use crate::engines::kepler_compute::{DispatchCall, QmdConstBuffer, QueueMetaData};
     use shader_recompiler::shader_info::{
         ImageBufferDescriptor, ImageDescriptor, ImageFormat, StorageBufferDescriptor,
         TextureBufferDescriptor, TextureDescriptor, TextureType,
     };
+
+    struct DummyTracker;
+
+    impl DeviceTracker for DummyTracker {
+        fn update_pages_cached_count(&self, _addr: u64, _size: u64, _delta: i32) {}
+    }
+
+    struct TestParams;
+
+    impl BufferCacheParams for TestParams {
+        const IS_OPENGL: bool = false;
+        const HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS: bool = false;
+        const HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT: bool = true;
+        const NEEDS_BIND_UNIFORM_INDEX: bool = false;
+        const NEEDS_BIND_STORAGE_INDEX: bool = false;
+        const USE_MEMORY_MAPS: bool = false;
+        const SEPARATE_IMAGE_BUFFER_BINDINGS: bool = false;
+        const USE_MEMORY_MAPS_FOR_UPLOADS: bool = false;
+    }
 
     #[test]
     fn compute_pipeline_key_hash() {
@@ -719,6 +820,49 @@ mod tests {
         let glasm_state_with_capacity = ComputePipeline::info_state(&info, true, 3);
         assert!(glasm_state_with_capacity.use_storage_buffers);
         assert!(!glasm_state_with_capacity.writes_global_memory);
+    }
+
+    #[test]
+    fn configure_buffer_state_follows_upstream_compute_order() {
+        let mut info = Info::default();
+        info.constant_buffer_mask = 0b101;
+        info.constant_buffer_used_sizes[0] = 0x20;
+        info.constant_buffer_used_sizes[2] = 0x40;
+        info.storage_buffers_descriptors
+            .push(StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0x100,
+                count: 1,
+                is_written: false,
+            });
+        info.storage_buffers_descriptors
+            .push(StorageBufferDescriptor {
+                cbuf_index: 2,
+                cbuf_offset: 0x200,
+                count: 1,
+                is_written: true,
+            });
+
+        let pipeline = ComputePipeline::new_for_test(info, false, 0);
+        let tracker = DummyTracker;
+        let mut buffer_cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        buffer_cache.channel_state = Some(Box::new(BufferCacheChannelInfo::default()));
+        {
+            let cs = buffer_cache.channel_state.as_mut().unwrap();
+            cs.enabled_compute_storage_buffers = 0xFFFF;
+            cs.written_compute_storage_buffers = 0xFFFF;
+        }
+
+        pipeline.configure_buffer_state(&mut buffer_cache);
+
+        let cs = buffer_cache.channel_state.as_ref().unwrap();
+        assert_eq!(cs.enabled_compute_uniform_buffer_mask, 0b101);
+        assert_eq!(
+            *cs.compute_uniform_buffer_sizes.as_ref().unwrap().as_ref(),
+            [0x20, 0, 0x40, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(cs.enabled_compute_storage_buffers, 0b11);
+        assert_eq!(cs.written_compute_storage_buffers, 0b10);
     }
 
     #[test]
