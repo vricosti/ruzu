@@ -5338,6 +5338,37 @@ impl TextureCache {
         }
     }
 
+    /// OpenGL-backed wrapper for `TextureCache<P>::FillComputeImageViews`.
+    ///
+    /// Upstream always instantiates compute image-view filling with
+    /// `has_blacklists=true`; the blacklist branch scales down written images
+    /// through the backend `P::Image` owner.
+    pub fn fill_compute_image_views(
+        &mut self,
+        views: &mut [crate::texture_cache::texture_cache_base::ImageViewInOut],
+    ) {
+        loop {
+            self.base.fill_compute_image_views(views);
+
+            let mut has_blacklisted = false;
+            for view in views.iter() {
+                if !view.blacklist || !view.id.is_valid() || view.id == NULL_IMAGE_VIEW_ID {
+                    continue;
+                }
+                let image_id = self.base.slot_image_views[view.id].image_id;
+                if !image_id.is_valid() || image_id == NULL_IMAGE_ID {
+                    continue;
+                }
+                self.ensure_backend_image(image_id);
+                has_blacklisted |= self.scale_down_image(image_id);
+                self.base.slot_images[image_id].scale_rating = 0;
+            }
+            if !has_blacklisted {
+                break;
+            }
+        }
+    }
+
     /// Materialise GL-side `Image` and `ImageView` objects for every filled
     /// view returned by `TextureCacheBase::fill_graphics_image_views`.
     ///
