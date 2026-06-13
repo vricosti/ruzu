@@ -877,11 +877,41 @@ impl TextureCacheBase {
         }
     }
 
-    /// Port of `TextureCache<P>::SynchronizeComputeDescriptors`.
-    pub fn synchronize_compute_descriptors(&mut self) {
-        log::warn!(
-            "TextureCacheBase::synchronize_compute_descriptors: Kepler Compute regs not yet ported"
-        );
+    /// Port of `TextureCache<P>::SynchronizeComputeDescriptors`
+    /// (texture_cache.h:310-322).
+    ///
+    /// Upstream reads `kepler_compute->regs` and
+    /// `kepler_compute->launch_description.linked_tsc` directly. Ruzu passes
+    /// those values as a snapshot, matching the graphics descriptor sync
+    /// pattern.
+    pub fn synchronize_compute_descriptors(
+        &mut self,
+        regs: crate::texture_cache::texture_cache_base::ComputeDescriptorSyncRegs,
+    ) {
+        let tic_limit = regs.tic_limit;
+        let tsc_limit = if regs.linked_tsc {
+            tic_limit
+        } else {
+            regs.tsc_limit
+        };
+
+        let channel = &mut self.channel_state;
+        if channel
+            .compute_sampler_table
+            .synchronize(regs.tsc_addr, tsc_limit)
+        {
+            channel
+                .compute_sampler_ids
+                .resize(tsc_limit as usize + 1, CORRUPT_ID);
+        }
+        if channel
+            .compute_image_table
+            .synchronize(regs.tic_addr, tic_limit)
+        {
+            channel
+                .compute_image_view_ids
+                .resize(tic_limit as usize + 1, CORRUPT_ID);
+        }
     }
 
     // ── Sampler resolution ─────────────────────────────────────────────
@@ -2210,6 +2240,56 @@ mod tests {
         assert!(sampler_id.is_valid());
         assert_ne!(sampler_id, NULL_SAMPLER_ID);
         assert_eq!(cache.slot_samplers[sampler_id].raw, tsc.raw);
+    }
+
+    #[test]
+    fn synchronize_compute_descriptors_resizes_compute_tables() {
+        let mut cache = test_cache();
+
+        cache.synchronize_compute_descriptors(
+            crate::texture_cache::texture_cache_base::ComputeDescriptorSyncRegs {
+                linked_tsc: false,
+                tic_addr: 0x3000,
+                tic_limit: 4,
+                tsc_addr: 0x2000,
+                tsc_limit: 2,
+            },
+        );
+
+        assert_eq!(cache.channel_state.compute_image_table.limit(), 4);
+        assert_eq!(cache.channel_state.compute_sampler_table.limit(), 2);
+        assert_eq!(cache.channel_state.compute_image_view_ids.len(), 5);
+        assert_eq!(cache.channel_state.compute_sampler_ids.len(), 3);
+        assert!(cache
+            .channel_state
+            .compute_image_view_ids
+            .iter()
+            .all(|&id| id == CORRUPT_ID));
+        assert!(cache
+            .channel_state
+            .compute_sampler_ids
+            .iter()
+            .all(|&id| id == CORRUPT_ID));
+    }
+
+    #[test]
+    fn synchronize_compute_descriptors_uses_tic_limit_when_tsc_is_linked() {
+        let mut cache = test_cache();
+
+        cache.synchronize_compute_descriptors(
+            crate::texture_cache::texture_cache_base::ComputeDescriptorSyncRegs {
+                linked_tsc: true,
+                tic_addr: 0x7000,
+                tic_limit: 6,
+                tsc_addr: 0x6000,
+                tsc_limit: 1,
+            },
+        );
+
+        assert_eq!(cache.channel_state.compute_image_table.limit(), 6);
+        assert_eq!(cache.channel_state.compute_sampler_table.limit(), 6);
+        assert_eq!(cache.channel_state.compute_image_view_ids.len(), 7);
+        assert_eq!(cache.channel_state.compute_sampler_ids.len(), 7);
     }
 
     #[test]
