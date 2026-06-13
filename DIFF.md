@@ -1,3 +1,32 @@
+## 2026-06-13 — video_core/src/renderer_opengl/gl_shader_cache.rs, video_core/src/renderer_opengl/gl_rasterizer.rs, video_core/src/renderer_opengl/gl_compute_pipeline.rs, and video_core/src/shader_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- `OpenGL::ShaderCache::current_compute_pipeline_with_shared_cache(...)` now ports the runtime shape of upstream `ShaderCache::CurrentComputePipeline`: query `VideoCommon::ShaderCache::ComputeShader`, build `ComputePipelineKey` from `shader->unique_hash`, `qmd.shared_alloc`, and QMD block dimensions, reuse `compute_cache` hits, and create/insert a pipeline on misses.
+- Rust reconstructs `ComputeEnvironment` through the composed shared `ShaderCache` owner (`current_kepler_compute` / `current_gpu_memory`) instead of direct inherited `kepler_compute` / `gpu_memory` members. This follows the existing Rust split between generic shader tracking and OpenGL pipeline ownership.
+- `RasterizerOpenGL::dispatch_compute_with_call(...)` now follows the upstream ordering through resource configuration: `FlushCaching`, get current compute pipeline, optional `ProgramManager::local_memory_warmup`, installed compute `EngineState`, and `ComputePipeline::configure_resource_state(...)`.
+- `ComputePipeline::new_with_backend_state(...)` lets the OpenGL shader cache pass the device-derived backend capability snapshot already owned by `ShaderCache::new(device)`. This avoids adding an incomplete `Device&` ownership edge while keeping constructor metadata derived from the same capability values.
+
+### Unintentional differences (to fix)
+- `ComputePipeline` still does not compile/store real `source_program` or `assembly_program` handles from GLSL/GLASM/SPIR-V source, so upstream `program_manager.BindComputeProgram` / `BindComputeAssemblyProgram` is still not executable in this Rust path.
+- The runtime compute dispatch still stops after resource-state configuration. It does not yet port upstream `glDispatchCompute`, `glDispatchComputeIndirect`, indirect-buffer obtain/bind, `++num_queued_commands`, or full post-dispatch write tracking order.
+- The post-`FillComputeImageViews` binding phase remains missing: `UnbindComputeTextureBuffers`, `BindComputeTextureBuffer`, `UpdateComputeBuffers`, `SetImagePointers`, `BindHostComputeBuffers`, texture/sampler/image handle arrays, rescaling uniforms, and `glBindTextures` / `glBindSamplers` / `glBindImageTextures`.
+- Runtime compute creation currently emits GLSL through the existing Rust GLSL environment bridge. Upstream switches across GLSL/GLASM/SPIR-V backends and computes `RuntimeInfo::glasm_use_storage_buffers` before GLASM emission.
+
+### Missing items
+- Port real OpenGL compute program creation in `ComputePipeline::new_with_backend_state(...)` or restore exact upstream constructor ownership so `CreateProgram` / `CompileProgram` handles are stored.
+- Port the remaining backend switch in `ShaderCache::CreateComputePipeline`: GLASM and SPIR-V emission, plus async/strict-context worker construction when that owner graph exists.
+- Port compute indirect dispatch and final `glDispatchCompute` execution in `RasterizerOpenGL::dispatch_compute_with_call(...)`.
+- Port the post-image-view OpenGL binding phase in `ComputePipeline::Configure`.
+
+### Binary layout verification
+- PASS: no guest-visible payload layout changed. `ComputePipelineKey` field selection now matches upstream `CurrentComputePipeline`; host-side shader/pipeline cache state only.
+
+### Tests
+- Re-read upstream `ShaderCache::CurrentComputePipeline`, both `CreateComputePipeline` overloads, `RasterizerOpenGL::DispatchCompute`, and `ComputePipeline` constructor/configure ordering.
+- `cargo fmt --all --check`
+- `cargo test -p video_core compute_pipeline_key_matches_upstream_current_compute_pipeline_fields -- --nocapture`
+- `cargo check -p video_core --quiet`
+
 ## 2026-06-13 — video_core/src/renderer_opengl/gl_rasterizer.rs and video_core/src/buffer_cache/buffer_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp
 
 ### Intentional differences

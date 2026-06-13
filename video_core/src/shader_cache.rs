@@ -781,7 +781,7 @@ impl ShaderCache {
         }
     }
 
-    fn current_kepler_compute(&self) -> Option<&KeplerCompute> {
+    pub fn current_kepler_compute(&self) -> Option<&KeplerCompute> {
         let channel = self.current_channel_info()?;
         let ptr = channel.kepler_compute as *const KeplerCompute;
         if ptr.is_null() {
@@ -791,7 +791,7 @@ impl ShaderCache {
         }
     }
 
-    fn current_gpu_memory(
+    pub fn current_gpu_memory(
         &self,
     ) -> Option<Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>> {
         self.current_channel_info()?

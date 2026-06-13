@@ -8070,7 +8070,29 @@ impl RasterizerInterface for RasterizerOpenGL {
             .set_engine_state(Box::new(ComputeEngineAdapter {
                 dispatch: dispatch.clone(),
             }));
-        ComputePipeline::synchronize_texture_descriptors(&mut self.texture_cache, dispatch);
+        let Some(pipeline) = self
+            .gl_shader_cache
+            .current_compute_pipeline_with_shared_cache(&mut self.shader_cache)
+        else {
+            return;
+        };
+        if pipeline.uses_local_memory() {
+            self.program_manager.lock().local_memory_warmup();
+        }
+        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
+            return;
+        };
+        pipeline.configure_resource_state(
+            &mut self.buffer_cache,
+            &mut self.texture_cache,
+            dispatch,
+            |gpu_addr| {
+                let mut buf = [0u8; 4];
+                mm.lock().read_block(gpu_addr, &mut buf);
+                u32::from_le_bytes(buf)
+            },
+        );
+        self.has_written_global_memory |= pipeline.writes_global_memory();
         debug!(
             "RasterizerOpenGL::dispatch_compute_with_call grid=({},{},{}) block=({},{},{}) code=0x{:X}",
             dispatch.qmd.grid_dim_x,
