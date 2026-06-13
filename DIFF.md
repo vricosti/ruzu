@@ -8,7 +8,7 @@
 - None known for the OpenGL draw-path TIC/TSC descriptor synchronization source after re-reading upstream `TextureCache<P>::FillGraphicsImageViews`, `TextureCache<P>::VisitImageView`, and `TextureCache<P>::GetGraphicsSamplerId`.
 
 ### Missing items
-- Remove the explicit reader bridge helpers `fill_graphics_image_views_with_gpu_reader(...)` and `get_graphics_sampler_id_with_gpu_reader(...)` once every remaining reduced/test construction path binds a channel `gpu_memory` owner.
+- None known for the OpenGL draw-path TIC/TSC descriptor synchronization source after removing the explicit reader bridge helpers.
 
 ### Binary layout verification
 - N/A: texture-cache call ownership only. No guest-visible raw payload layout changed.
