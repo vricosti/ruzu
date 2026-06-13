@@ -6,7 +6,7 @@
 //! Utility compute shaders for texture swizzling, ASTC decoding, format conversion, and MSAA.
 
 use crate::host_shaders::compute_shaders::{
-    CONVERT_MSAA_TO_NON_MSAA_COMP, CONVERT_NON_MSAA_TO_MSAA_COMP,
+    CONVERT_MSAA_TO_NON_MSAA_COMP, CONVERT_NON_MSAA_TO_MSAA_COMP, OPENGL_COPY_BC4_COMP,
 };
 use crate::renderer_opengl::gl_shader_util::create_program_from_source;
 use crate::texture_cache::types::ImageCopy;
@@ -57,7 +57,7 @@ impl UtilShaders {
             block_linear_unswizzle_2d_program: 0,
             block_linear_unswizzle_3d_program: 0,
             pitch_unswizzle_program: 0,
-            copy_bc4_program: 0,
+            copy_bc4_program: create_program_from_source(OPENGL_COPY_BC4_COMP, gl::COMPUTE_SHADER),
             convert_s8d24_program: 0,
             convert_ms_to_nonms_program: create_program_from_source(
                 CONVERT_MSAA_TO_NON_MSAA_COMP,
@@ -276,42 +276,62 @@ impl UtilShaders {
         }
     }
 
-    /// Copy BC4 texture data.
-    ///
     /// Port of `UtilShaders::CopyBC4`.
-    pub fn copy_bc4(
-        &self,
-        dst_image: u32,
-        src_buffer: u32,
-        width: u32,
-        height: u32,
-        depth: u32,
-        level: u32,
-    ) {
+    pub fn copy_bc4(&self, dst_image: u32, src_image: u32, copies: &[ImageCopy]) {
         if self.copy_bc4_program == 0 {
             log::warn!("Copy BC4 program not compiled");
             return;
         }
         unsafe {
             gl::UseProgram(self.copy_bc4_program);
-            gl::BindImageTexture(
-                0,
-                dst_image,
-                level as i32,
-                gl::TRUE,
-                0,
-                gl::WRITE_ONLY,
-                gl::RGBA8,
-            );
-            gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, src_buffer);
+            for copy in copies {
+                if copy.src_subresource.base_layer != 0
+                    || copy.src_subresource.num_layers != 1
+                    || copy.dst_subresource.base_layer != 0
+                    || copy.dst_subresource.num_layers != 1
+                {
+                    log::warn!(
+                        "UtilShaders::copy_bc4: unsupported layer copy src_base={} src_layers={} dst_base={} dst_layers={}",
+                        copy.src_subresource.base_layer,
+                        copy.src_subresource.num_layers,
+                        copy.dst_subresource.base_layer,
+                        copy.dst_subresource.num_layers
+                    );
+                    continue;
+                }
 
-            gl::Uniform1ui(0, width);
-            gl::Uniform1ui(1, height);
-            gl::Uniform1ui(2, depth);
-
-            let block_w = (width + 3) / 4;
-            let block_h = (height + 3) / 4;
-            gl::DispatchCompute(block_w, block_h, depth);
+                gl::Uniform3ui(
+                    0,
+                    copy.src_offset.x as u32,
+                    copy.src_offset.y as u32,
+                    copy.src_offset.z as u32,
+                );
+                gl::Uniform3ui(
+                    1,
+                    copy.dst_offset.x as u32,
+                    copy.dst_offset.y as u32,
+                    copy.dst_offset.z as u32,
+                );
+                gl::BindImageTexture(
+                    0,
+                    src_image,
+                    copy.src_subresource.base_level as i32,
+                    gl::TRUE,
+                    0,
+                    gl::READ_ONLY,
+                    gl::RG32UI,
+                );
+                gl::BindImageTexture(
+                    1,
+                    dst_image,
+                    copy.dst_subresource.base_level as i32,
+                    gl::TRUE,
+                    0,
+                    gl::WRITE_ONLY,
+                    gl::RGBA8UI,
+                );
+                gl::DispatchCompute(copy.extent.width, copy.extent.height, copy.extent.depth);
+            }
             gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
     }

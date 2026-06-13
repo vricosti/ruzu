@@ -4144,8 +4144,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                     image_ids.push(image_id);
                 }
             }
-            if let (Some(mm), Some(_reader)) = (cbuf_mm_guard.as_ref(), cbuf_device_reader.as_ref())
-            {
+            if let Some(mm) = cbuf_mm_guard.as_ref() {
                 for image_id in image_ids {
                     self.texture_cache.prepare_image_with_gpu_reader(
                         image_id,
@@ -4174,8 +4173,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             // GL wrapper lazily mirrors the slots into its HashMaps here.
             // Required before any future `glBindTextureUnit` step can resolve
             // a view-id to a real GL texture name.
-            if let (Some(mm), Some(_reader)) = (cbuf_mm_guard.as_ref(), cbuf_device_reader.as_ref())
-            {
+            if let Some(mm) = cbuf_mm_guard.as_ref() {
                 self.texture_cache.materialize_views_with_gpu_reader(
                     &views,
                     &mut |gpu_addr, out| {
@@ -4214,24 +4212,15 @@ impl RasterizerInterface for RasterizerOpenGL {
                     .update_render_targets_from_snapshot(&render_targets, |gpu_addr| {
                         mm.gpu_to_cpu_address(gpu_addr)
                     });
-                if cbuf_device_reader.is_some() {
-                    self.texture_cache.prepare_render_targets_from_snapshot(
-                        &render_targets,
-                        Some(&mut |gpu_addr, out| {
-                            mm.read_block(gpu_addr, out);
-                            true
-                        }),
-                        false,
-                        None,
-                    );
-                } else {
-                    self.texture_cache.prepare_render_targets_from_snapshot(
-                        &render_targets,
-                        None,
-                        false,
-                        None,
-                    );
-                }
+                self.texture_cache.prepare_render_targets_from_snapshot(
+                    &render_targets,
+                    Some(&mut |gpu_addr, out| {
+                        mm.read_block(gpu_addr, out);
+                        true
+                    }),
+                    false,
+                    None,
+                );
                 let surface_clip = draw_view.surface_clip();
                 bound_draw_framebuffer = self
                     .texture_cache
@@ -5666,6 +5655,10 @@ impl RasterizerInterface for RasterizerOpenGL {
         if can_draw_gl {
             record_gl_draw_stage(draw_seq, 31);
             trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_fixed_state_sync", draw_seq);
+            if self.texture_cache.take_rescale_viewport_scissor_dirty() {
+                self.state_tracker.notify_viewport0();
+                self.state_tracker.notify_scissor0();
+            }
             let viewport_scale = if self.texture_cache.is_rescaling_active() {
                 settings::values().resolution_info.up_factor
             } else {
@@ -7917,9 +7910,13 @@ impl RasterizerInterface for RasterizerOpenGL {
                 mm.lock().gpu_to_cpu_address(gpu_addr)
             });
             let clear_scissor = clear_view.use_scissor().then(|| clear_view.scissor(0));
+            let mm_for_read = mm.clone();
             (*texture_cache).prepare_render_targets_from_snapshot(
                 &render_targets,
-                None,
+                Some(&mut |gpu_addr, out| {
+                    mm_for_read.lock().read_block(gpu_addr, out);
+                    true
+                }),
                 true,
                 clear_scissor,
             );
@@ -7937,6 +7934,10 @@ impl RasterizerInterface for RasterizerOpenGL {
             }
             return;
         };
+        if self.texture_cache.take_rescale_viewport_scissor_dirty() {
+            self.state_tracker.notify_viewport0();
+            self.state_tracker.notify_scissor0();
+        }
 
         unsafe {
             self.state_tracker.bind_framebuffer(framebuffer);
@@ -8452,7 +8453,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         self.state_tracker.notify_rasterize_enable();
         self.state_tracker.notify_framebuffer_srgb();
         let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
-        unsafe {
+        let accelerated = unsafe {
             let _texture_lock = (*texture_cache).base.mutex.lock();
             (*texture_cache).blit_image(
                 dst,
@@ -8465,7 +8466,12 @@ impl RasterizerInterface for RasterizerOpenGL {
                     true
                 },
             )
+        };
+        if self.texture_cache.take_rescale_viewport_scissor_dirty() {
+            self.state_tracker.notify_viewport0();
+            self.state_tracker.notify_scissor0();
         }
+        accelerated
     }
 
     fn accelerate_inline_to_memory(&mut self, address: u64, copy_size: usize, memory: &[u8]) {
