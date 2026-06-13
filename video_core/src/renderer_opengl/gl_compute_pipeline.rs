@@ -148,14 +148,32 @@ impl ComputePipeline {
         _code_v: &[u32],
         _force_context_flush: bool,
     ) -> Self {
-        // Full implementation would:
-        // 1. Check device.get_shader_backend() (GLSL vs GLASM)
-        // 2. Compile shader from source code
-        let state = Self::info_state(
-            &info,
+        Self::new_with_backend_state(
+            info,
+            _code,
+            _code_v,
             device.use_assembly_shaders(),
             device.max_glasm_storage_buffer_blocks(),
-        );
+            _force_context_flush,
+        )
+    }
+
+    /// Create a pipeline from the backend capability snapshot owned by
+    /// `ShaderCache`. This keeps compute shader-cache creation in the
+    /// OpenGL shader-cache owner until `ComputePipeline` stores the same
+    /// upstream cache references as C++.
+    pub(crate) fn new_with_backend_state(
+        info: Info,
+        _code: &str,
+        _code_v: &[u32],
+        use_assembly_shaders: bool,
+        max_glasm_storage_buffer_blocks: u32,
+        _force_context_flush: bool,
+    ) -> Self {
+        // Full implementation would compile `_code` / `_code_v` into
+        // source_program or assembly_program. This slice ports selection and
+        // shader-info ownership so resource configuration can consume `info`.
+        let state = Self::info_state(&info, use_assembly_shaders, max_glasm_storage_buffer_blocks);
 
         Self {
             info,

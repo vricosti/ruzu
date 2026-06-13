@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use common::{cityhash::city_hash64, trace};
+use shader_recompiler::environment::Environment;
 use shader_recompiler::frontend::translate_program::{
     convert_legacy_to_generic, generate_geometry_passthrough,
 };
@@ -30,8 +31,11 @@ use shader_recompiler::{
     compile_shader_glsl_from_env_with_bindings_and_host_info, CompiledGlslShader, ShaderStage,
 };
 
-use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
-use crate::shader_environment::GraphicsEnvironment;
+use crate::engines::kepler_compute::QueueMetaData;
+use crate::shader_cache::{
+    GraphicsEnvironments, ShaderCache as SharedShaderCache, ShaderInfo as SharedShaderInfo,
+};
+use crate::shader_environment::{ComputeEnvironment, GraphicsEnvironment};
 use crate::transform_feedback;
 use shader_recompiler::program_header::ProgramHeader;
 
@@ -359,6 +363,8 @@ pub struct ShaderCache {
     pub strict_context_required: bool,
     profile: ShaderProfile,
     host_info: HostTranslateInfo,
+    use_assembly_shaders: bool,
+    max_glasm_storage_buffer_blocks: u32,
 
     /// Current graphics pipeline key.
     graphics_key: GraphicsPipelineKey,
@@ -387,12 +393,15 @@ impl ShaderCache {
     ///
     /// Corresponds to `ShaderCache::ShaderCache()`.
     pub fn new(device: &Device) -> Self {
-        Self::new_with_profile(
+        let mut cache = Self::new_with_profile(
             opengl_shader_profile(device),
             opengl_host_translate_info(device),
             device.use_asynchronous_shaders(),
             device.strict_context_required(),
-        )
+        );
+        cache.use_assembly_shaders = device.use_assembly_shaders();
+        cache.max_glasm_storage_buffer_blocks = device.max_glasm_storage_buffer_blocks();
+        cache
     }
 
     pub(crate) fn new_with_profile(
@@ -406,6 +415,8 @@ impl ShaderCache {
             strict_context_required,
             profile,
             host_info,
+            use_assembly_shaders: false,
+            max_glasm_storage_buffer_blocks: 0,
             graphics_key: GraphicsPipelineKey::default(),
             current_pipeline: None,
             graphics_cache: HashMap::new(),
@@ -563,11 +574,35 @@ impl ShaderCache {
     /// Port of `ShaderCache::CurrentComputePipeline()`.
     pub fn current_compute_pipeline(&mut self) -> Option<&mut ComputePipeline> {
         self.assert_single_owner("current_compute_pipeline");
-        // In the full implementation:
-        // 1. Build compute key from KeplerCompute engine state
-        // 2. Look up in compute_cache
-        // 3. If not found, create and insert
         None
+    }
+
+    /// Shared-owner runtime path matching upstream
+    /// `OpenGL::ShaderCache::CurrentComputePipeline()`.
+    pub fn current_compute_pipeline_with_shared_cache(
+        &mut self,
+        shared_cache: &mut SharedShaderCache,
+    ) -> Option<&mut ComputePipeline> {
+        self.assert_single_owner("current_compute_pipeline_with_shared_cache");
+        let (shader_hash, shader_size) = {
+            let shader = shared_cache.compute_shader()?;
+            (shader.unique_hash, shader.size_bytes)
+        };
+        let qmd = shared_cache.current_kepler_compute()?.launch_description();
+        let key = Self::compute_pipeline_key_from_shader_and_qmd(
+            SharedShaderInfo {
+                unique_hash: shader_hash,
+                size_bytes: shader_size,
+            },
+            qmd,
+        );
+        if self.compute_cache.contains_key(&key) {
+            return self.compute_cache.get_mut(&key);
+        }
+        let pipeline =
+            self.create_compute_pipeline_with_shared_cache(shared_cache, &key, shader_size)?;
+        self.compute_cache.insert(key, pipeline);
+        self.compute_cache.get_mut(&key)
     }
 
     fn current_graphics_pipeline_slow_path_with_shared_cache(
@@ -1404,16 +1439,70 @@ impl ShaderCache {
         compiled
     }
 
+    fn compute_pipeline_key_from_shader_and_qmd(
+        shader: SharedShaderInfo,
+        qmd: &QueueMetaData,
+    ) -> ComputePipelineKey {
+        ComputePipelineKey {
+            unique_hash: shader.unique_hash,
+            shared_memory_size: qmd.shared_alloc,
+            workgroup_size: [qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z],
+        }
+    }
+
     /// Create a new compute pipeline.
     ///
-    /// Port of `ShaderCache::CreateComputePipeline()`.
-    fn create_compute_pipeline(&mut self, _key: &ComputePipelineKey) -> Option<ComputePipeline> {
-        // In the full implementation:
-        // 1. Read compute shader from KeplerCompute engine state
-        // 2. Create shader environment
-        // 3. Recompile shader
-        // 4. Return new ComputePipeline
-        None
+    /// Port of `ShaderCache::CreateComputePipeline(...)`.
+    fn create_compute_pipeline_with_shared_cache(
+        &mut self,
+        shared_cache: &SharedShaderCache,
+        key: &ComputePipelineKey,
+        shader_size: usize,
+    ) -> Option<ComputePipeline> {
+        let kepler_compute = shared_cache.current_kepler_compute()?;
+        let gpu_memory = shared_cache.current_gpu_memory()?;
+        let mut env = ComputeEnvironment::from_kepler_compute(kepler_compute, gpu_memory);
+        env.generic_environment_mut().set_cached_size(shader_size);
+        self.create_compute_pipeline_from_environment(key, &mut env, false)
+    }
+
+    fn create_compute_pipeline_from_environment(
+        &mut self,
+        key: &ComputePipelineKey,
+        env: &mut ComputeEnvironment,
+        force_context_flush: bool,
+    ) -> Option<ComputePipeline> {
+        let hash = key.hash_key();
+        log::info!("0x{:016x}", hash);
+
+        if *common::settings::values().dump_shaders.get_value() {
+            env.dump(hash, key.unique_hash);
+        }
+
+        let mut bindings = shader_recompiler::backend::bindings::Bindings::default();
+        let runtime_info = RuntimeInfo::default();
+        let code = env
+            .generic_environment()
+            .cached_instruction_slice()
+            .to_vec();
+        let base_offset = env.generic_environment().cached_instruction_start();
+        let compiled = compile_shader_glsl_from_env_with_bindings_and_host_info(
+            &code,
+            base_offset,
+            env,
+            &self.profile,
+            &runtime_info,
+            &mut bindings,
+            &self.host_info,
+        );
+        Some(ComputePipeline::new_with_backend_state(
+            compiled.info,
+            &compiled.source,
+            &[],
+            self.use_assembly_shaders,
+            self.max_glasm_storage_buffer_blocks,
+            force_context_flush,
+        ))
     }
 
     /// Returns the number of cached graphics pipelines.
@@ -1494,6 +1583,25 @@ mod tests {
     #[test]
     fn cache_version() {
         assert_eq!(CACHE_VERSION, 10);
+    }
+
+    #[test]
+    fn compute_pipeline_key_matches_upstream_current_compute_pipeline_fields() {
+        let mut qmd = QueueMetaData::default();
+        qmd.shared_alloc = 0x240;
+        qmd.block_dim_x = 8;
+        qmd.block_dim_y = 4;
+        qmd.block_dim_z = 2;
+        let shader = SharedShaderInfo {
+            unique_hash: 0x1234_5678_9ABC_DEF0,
+            size_bytes: 0x180,
+        };
+
+        let key = ShaderCache::compute_pipeline_key_from_shader_and_qmd(shader, &qmd);
+
+        assert_eq!(key.unique_hash, 0x1234_5678_9ABC_DEF0);
+        assert_eq!(key.shared_memory_size, 0x240);
+        assert_eq!(key.workgroup_size, [8, 4, 2]);
     }
 
     #[test]
