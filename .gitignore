@@ -2,6 +2,8 @@
 /target/
 /target-clean-head/
 
+screenshots/
+
 # Rust package manager
 Cargo.lock
 # 👉 Garde Cargo.lock pour les applications (binaires)

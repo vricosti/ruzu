@@ -5,6 +5,12 @@
 //!
 //! Utility compute shaders for texture swizzling, ASTC decoding, format conversion, and MSAA.
 
+use crate::host_shaders::compute_shaders::{
+    CONVERT_MSAA_TO_NON_MSAA_COMP, CONVERT_NON_MSAA_TO_MSAA_COMP,
+};
+use crate::renderer_opengl::gl_shader_util::create_program_from_source;
+use crate::texture_cache::types::ImageCopy;
+
 /// Swizzle table dimensions (64x8 = 512 bytes).
 const SWIZZLE_TABLE_SIZE: usize = 512;
 
@@ -53,8 +59,14 @@ impl UtilShaders {
             pitch_unswizzle_program: 0,
             copy_bc4_program: 0,
             convert_s8d24_program: 0,
-            convert_ms_to_nonms_program: 0,
-            convert_nonms_to_ms_program: 0,
+            convert_ms_to_nonms_program: create_program_from_source(
+                CONVERT_MSAA_TO_NON_MSAA_COMP,
+                gl::COMPUTE_SHADER,
+            ),
+            convert_nonms_to_ms_program: create_program_from_source(
+                CONVERT_NON_MSAA_TO_MSAA_COMP,
+                gl::COMPUTE_SHADER,
+            ),
         }
     }
 
@@ -332,9 +344,7 @@ impl UtilShaders {
         &self,
         dst_image: u32,
         src_image: u32,
-        width: u32,
-        height: u32,
-        samples: u32,
+        copies: &[ImageCopy],
         ms_to_nonms: bool,
     ) {
         let program = if ms_to_nonms {
@@ -348,14 +358,45 @@ impl UtilShaders {
         }
         unsafe {
             gl::UseProgram(program);
-            gl::BindImageTexture(0, dst_image, 0, gl::TRUE, 0, gl::WRITE_ONLY, gl::RGBA8);
-            gl::BindImageTexture(1, src_image, 0, gl::TRUE, 0, gl::READ_ONLY, gl::RGBA8);
+            for copy in copies {
+                if copy.src_subresource.base_layer != 0
+                    || copy.src_subresource.num_layers != 1
+                    || copy.dst_subresource.base_layer != 0
+                    || copy.dst_subresource.num_layers != 1
+                {
+                    log::warn!(
+                        "UtilShaders::copy_msaa: unsupported layer copy src_base={} src_layers={} dst_base={} dst_layers={}",
+                        copy.src_subresource.base_layer,
+                        copy.src_subresource.num_layers,
+                        copy.dst_subresource.base_layer,
+                        copy.dst_subresource.num_layers
+                    );
+                    continue;
+                }
 
-            gl::Uniform1ui(0, width);
-            gl::Uniform1ui(1, height);
-            gl::Uniform1ui(2, samples);
+                gl::BindImageTexture(
+                    0,
+                    src_image,
+                    copy.src_subresource.base_level as i32,
+                    gl::TRUE,
+                    0,
+                    gl::READ_ONLY,
+                    gl::RGBA8,
+                );
+                gl::BindImageTexture(
+                    1,
+                    dst_image,
+                    copy.dst_subresource.base_level as i32,
+                    gl::TRUE,
+                    0,
+                    gl::WRITE_ONLY,
+                    gl::RGBA8,
+                );
 
-            gl::DispatchCompute((width + 15) / 16, (height + 15) / 16, 1);
+                let groups_x = copy.extent.width.div_ceil(8);
+                let groups_y = copy.extent.height.div_ceil(8);
+                gl::DispatchCompute(groups_x, groups_y, copy.extent.depth);
+            }
             gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
     }
