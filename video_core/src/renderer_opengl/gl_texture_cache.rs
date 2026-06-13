@@ -11,11 +11,13 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 
 use common::settings;
+use common::slot_vector::SlotVector;
 
 use super::gl_shader_manager::{ProgramManager, ProgramManagerHandle};
 use super::gl_staging_buffer_pool::{StagingBufferMap, StagingBufferPool};
 use super::gl_state_tracker::StateTracker;
 use super::util_shaders::UtilShaders;
+use crate::delayed_destruction_ring::DelayedDestructionRing;
 use crate::engines::draw_manager::Maxwell3DRenderTargets;
 use crate::engines::maxwell_3d::{RenderTargetInfo, ScissorInfo};
 use crate::framebuffer_config::FramebufferConfig;
@@ -29,11 +31,12 @@ use crate::texture_cache::image_view_info::{ImageViewInfo, SwizzleSource};
 use crate::texture_cache::render_targets::RenderTargets;
 use crate::texture_cache::texture_cache_base::{
     AsyncDecodeContext, FramebufferImageView, JoinCopy, TextureCacheBase as CommonTextureCache,
+    TICKS_TO_DESTROY,
 };
 use crate::texture_cache::types::{BufferImageCopy, ImageCopy};
 use crate::texture_cache::types::{
-    Extent2D, Extent3D, ImageId, ImageType, ImageViewId, ImageViewType, Offset2D, Region2D,
-    RelaxedOptions, SubresourceRange, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID,
+    Extent2D, Extent3D, FramebufferId, ImageId, ImageType, ImageViewId, ImageViewType, Offset2D,
+    Region2D, RelaxedOptions, SubresourceRange, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID,
 };
 use crate::texture_cache::util::{
     full_download_copies, full_upload_swizzles, make_shrink_image_copies, map_size_bytes,
@@ -2711,8 +2714,8 @@ pub struct TextureCache {
     images: HashMap<ImageId, Image>,
     image_views: HashMap<ImageViewId, ImageView>,
     samplers: HashMap<crate::texture_cache::types::SamplerId, Sampler>,
-    framebuffers: HashMap<ImageViewId, TextureCacheFramebuffer>,
-    render_target_framebuffers: HashMap<RenderTargets, TextureCacheFramebuffer>,
+    slot_framebuffers: SlotVector<TextureCacheFramebuffer>,
+    sentenced_framebuffers: DelayedDestructionRing<TextureCacheFramebuffer, TICKS_TO_DESTROY>,
     has_native_astc: bool,
     has_broken_texture_view_formats: bool,
     has_native_bgr: bool,
@@ -3334,8 +3337,8 @@ impl TextureCache {
             images: HashMap::new(),
             image_views: HashMap::new(),
             samplers: HashMap::new(),
-            framebuffers: HashMap::new(),
-            render_target_framebuffers: HashMap::new(),
+            slot_framebuffers: SlotVector::new(),
+            sentenced_framebuffers: DelayedDestructionRing::new(),
             has_native_astc,
             has_broken_texture_view_formats,
             has_native_bgr,
@@ -5343,8 +5346,8 @@ impl TextureCache {
                     u64::MAX,
                     self.images.len() as u64,
                     self.image_views.len() as u64,
-                    self.framebuffers.len() as u64,
-                    self.render_target_framebuffers.len() as u64,
+                    self.base.framebuffers.len() as u64,
+                    self.slot_framebuffers.size() as u64,
                     deleted_images.len() as u64,
                     0,
                     0,
@@ -5390,9 +5393,12 @@ impl TextureCache {
                 .update_total_used_memory_from_runtime(self.runtime.get_device_memory_usage());
         }
         if self.base.total_used_memory > self.base.minimum_memory {
+            let framebuffers_before_gc = self.base.framebuffers.clone();
             self.base.run_garbage_collector();
+            self.sentence_framebuffers_removed_by_base(&framebuffers_before_gc);
         }
         self.base.tick_delayed_destruction_rings();
+        self.sentenced_framebuffers.tick();
         self.tick_async_decode();
         self.runtime.tick_frame();
         self.base.tick_frame();
@@ -5415,9 +5421,31 @@ impl TextureCache {
     }
 
     fn remove_framebuffers_for_view(&mut self, view_id: ImageViewId) {
-        self.framebuffers.remove(&view_id);
-        self.render_target_framebuffers
-            .retain(|key, _| !key.contains(&[view_id]));
+        let removed_ids = [view_id];
+        self.base.framebuffers.retain(|key, framebuffer_id| {
+            if key.contains(&removed_ids) {
+                let framebuffer = self.slot_framebuffers.take(*framebuffer_id);
+                self.sentenced_framebuffers.push(framebuffer);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn sentence_framebuffers_removed_by_base(
+        &mut self,
+        old_framebuffers: &HashMap<RenderTargets, FramebufferId>,
+    ) {
+        for (key, &framebuffer_id) in old_framebuffers {
+            if self.base.framebuffers.contains_key(key) {
+                continue;
+            }
+            if framebuffer_id.is_valid() {
+                let framebuffer = self.slot_framebuffers.take(framebuffer_id);
+                self.sentenced_framebuffers.push(framebuffer);
+            }
+        }
     }
 
     pub fn update_render_targets_from_snapshot(
@@ -5636,124 +5664,126 @@ impl TextureCache {
             key.size.height = max_height;
         }
 
-        let framebuffer = self
-            .render_target_framebuffers
-            .entry(key)
-            .or_insert_with(|| {
-                let mut framebuffer = 0;
-                let mut buffer_bits = gl::NONE;
-                unsafe {
-                    gl::CreateFramebuffers(1, &mut framebuffer);
-                    if framebuffer != 0 {
-                        let mut num_buffers = 0i32;
-                        let mut gl_draw_buffers = [gl::NONE; NUM_RT];
-                        for index in 0..NUM_RT {
-                            let texture = attachment_textures[index];
-                            if texture == 0 {
-                                continue;
-                            }
-                            buffer_bits |= gl::COLOR_BUFFER_BIT;
-                            gl_draw_buffers[index] =
-                                gl::COLOR_ATTACHMENT0 + key.draw_buffers[index] as u32;
-                            num_buffers = index as i32 + 1;
-
-                            let view_id = key.color_buffer_ids[index];
-                            let view_base = self.base.slot_image_views[view_id].clone();
-                            let attachment = gl::COLOR_ATTACHMENT0 + index as u32;
-                            if view_base.flags.contains(ImageViewFlagBits::SLICE)
-                                && view_base.range.extent.layers == 1
-                            {
-                                gl::NamedFramebufferTextureLayer(
-                                    framebuffer,
-                                    attachment,
-                                    texture,
-                                    0,
-                                    view_base.range.base.layer,
-                                );
-                            } else {
-                                gl::NamedFramebufferTexture(framebuffer, attachment, texture, 0);
-                            }
+        let framebuffer_id = if let Some(&framebuffer_id) = self.base.framebuffers.get(&key) {
+            framebuffer_id
+        } else {
+            let mut framebuffer = 0;
+            let mut buffer_bits = gl::NONE;
+            unsafe {
+                gl::CreateFramebuffers(1, &mut framebuffer);
+                if framebuffer != 0 {
+                    let mut num_buffers = 0i32;
+                    let mut gl_draw_buffers = [gl::NONE; NUM_RT];
+                    for index in 0..NUM_RT {
+                        let texture = attachment_textures[index];
+                        if texture == 0 {
+                            continue;
                         }
-                        if depth_attachment_texture != 0 {
-                            let attachment = framebuffer_attachment_type(depth_attachment_format);
-                            depth_attachment_gl = attachment;
-                            buffer_bits |=
-                                match crate::surface::get_format_type(depth_attachment_format) {
-                                    SurfaceType::Depth => gl::DEPTH_BUFFER_BIT,
-                                    SurfaceType::Stencil => gl::STENCIL_BUFFER_BIT,
-                                    SurfaceType::DepthStencil => {
-                                        gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT
-                                    }
-                                    _ => gl::DEPTH_BUFFER_BIT,
-                                };
-                            gl::NamedFramebufferTexture(
+                        buffer_bits |= gl::COLOR_BUFFER_BIT;
+                        gl_draw_buffers[index] =
+                            gl::COLOR_ATTACHMENT0 + key.draw_buffers[index] as u32;
+                        num_buffers = index as i32 + 1;
+
+                        let view_id = key.color_buffer_ids[index];
+                        let view_base = self.base.slot_image_views[view_id].clone();
+                        let attachment = gl::COLOR_ATTACHMENT0 + index as u32;
+                        if view_base.flags.contains(ImageViewFlagBits::SLICE)
+                            && view_base.range.extent.layers == 1
+                        {
+                            gl::NamedFramebufferTextureLayer(
                                 framebuffer,
                                 attachment,
-                                depth_attachment_texture,
+                                texture,
                                 0,
+                                view_base.range.base.layer,
                             );
-                        }
-
-                        if num_buffers > 1 {
-                            gl::NamedFramebufferDrawBuffers(
-                                framebuffer,
-                                num_buffers,
-                                gl_draw_buffers.as_ptr(),
-                            );
-                        } else if num_buffers > 0 {
-                            gl::NamedFramebufferDrawBuffer(framebuffer, gl_draw_buffers[0]);
                         } else {
-                            gl::NamedFramebufferDrawBuffer(framebuffer, gl::NONE);
-                        }
-                        gl::NamedFramebufferParameteri(
-                            framebuffer,
-                            gl::FRAMEBUFFER_DEFAULT_WIDTH,
-                            key.size.width as i32,
-                        );
-                        gl::NamedFramebufferParameteri(
-                            framebuffer,
-                            gl::FRAMEBUFFER_DEFAULT_HEIGHT,
-                            key.size.height as i32,
-                        );
-                        if common::trace::is_enabled(common::trace::cat::RT_DEPTH_ATTACH)
-                            && depth_attachment_texture != 0
-                        {
-                            let draw_buffers_pack = key
-                                .draw_buffers
-                                .iter()
-                                .take(8)
-                                .enumerate()
-                                .fold(0u64, |acc, (index, &buffer)| {
-                                    acc | ((buffer as u64) << (index * 8))
-                                });
-                            let status =
-                                gl::CheckNamedFramebufferStatus(framebuffer, gl::DRAW_FRAMEBUFFER);
-                            common::trace::emit_raw(
-                                common::trace::cat::RT_DEPTH_ATTACH,
-                                &[
-                                    framebuffer as u64,
-                                    depth_attachment_view_id.index as u64,
-                                    depth_attachment_image_id.index as u64,
-                                    depth_attachment_gpu_addr,
-                                    depth_attachment_format as u64,
-                                    ((key.size.width as u64) << 32) | key.size.height as u64,
-                                    depth_attachment_texture as u64,
-                                    depth_attachment_gl as u64,
-                                    buffer_bits as u64,
-                                    status as u64,
-                                    key.color_buffer_ids[0].index as u64,
-                                    key.color_buffer_ids[1].index as u64,
-                                    draw_buffers_pack,
-                                ],
-                            );
+                            gl::NamedFramebufferTexture(framebuffer, attachment, texture, 0);
                         }
                     }
+                    if depth_attachment_texture != 0 {
+                        let attachment = framebuffer_attachment_type(depth_attachment_format);
+                        depth_attachment_gl = attachment;
+                        buffer_bits |=
+                            match crate::surface::get_format_type(depth_attachment_format) {
+                                SurfaceType::Depth => gl::DEPTH_BUFFER_BIT,
+                                SurfaceType::Stencil => gl::STENCIL_BUFFER_BIT,
+                                SurfaceType::DepthStencil => {
+                                    gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT
+                                }
+                                _ => gl::DEPTH_BUFFER_BIT,
+                            };
+                        gl::NamedFramebufferTexture(
+                            framebuffer,
+                            attachment,
+                            depth_attachment_texture,
+                            0,
+                        );
+                    }
+
+                    if num_buffers > 1 {
+                        gl::NamedFramebufferDrawBuffers(
+                            framebuffer,
+                            num_buffers,
+                            gl_draw_buffers.as_ptr(),
+                        );
+                    } else if num_buffers > 0 {
+                        gl::NamedFramebufferDrawBuffer(framebuffer, gl_draw_buffers[0]);
+                    } else {
+                        gl::NamedFramebufferDrawBuffer(framebuffer, gl::NONE);
+                    }
+                    gl::NamedFramebufferParameteri(
+                        framebuffer,
+                        gl::FRAMEBUFFER_DEFAULT_WIDTH,
+                        key.size.width as i32,
+                    );
+                    gl::NamedFramebufferParameteri(
+                        framebuffer,
+                        gl::FRAMEBUFFER_DEFAULT_HEIGHT,
+                        key.size.height as i32,
+                    );
+                    if common::trace::is_enabled(common::trace::cat::RT_DEPTH_ATTACH)
+                        && depth_attachment_texture != 0
+                    {
+                        let draw_buffers_pack = key
+                            .draw_buffers
+                            .iter()
+                            .take(8)
+                            .enumerate()
+                            .fold(0u64, |acc, (index, &buffer)| {
+                                acc | ((buffer as u64) << (index * 8))
+                            });
+                        let status =
+                            gl::CheckNamedFramebufferStatus(framebuffer, gl::DRAW_FRAMEBUFFER);
+                        common::trace::emit_raw(
+                            common::trace::cat::RT_DEPTH_ATTACH,
+                            &[
+                                framebuffer as u64,
+                                depth_attachment_view_id.index as u64,
+                                depth_attachment_image_id.index as u64,
+                                depth_attachment_gpu_addr,
+                                depth_attachment_format as u64,
+                                ((key.size.width as u64) << 32) | key.size.height as u64,
+                                depth_attachment_texture as u64,
+                                depth_attachment_gl as u64,
+                                buffer_bits as u64,
+                                status as u64,
+                                key.color_buffer_ids[0].index as u64,
+                                key.color_buffer_ids[1].index as u64,
+                                draw_buffers_pack,
+                            ],
+                        );
+                    }
                 }
-                TextureCacheFramebuffer {
-                    framebuffer,
-                    buffer_bits,
-                }
+            }
+            let framebuffer_id = self.slot_framebuffers.insert(TextureCacheFramebuffer {
+                framebuffer,
+                buffer_bits,
             });
+            self.base.framebuffers.insert(key, framebuffer_id);
+            framebuffer_id
+        };
+        let framebuffer = &self.slot_framebuffers[framebuffer_id];
         let handle = framebuffer.handle();
         (handle != 0).then_some((handle, key.size.width, key.size.height))
     }
@@ -6220,27 +6250,98 @@ impl TextureCache {
         if attachment_texture == 0 {
             return None;
         }
-        let framebuffer = self.framebuffers.entry(view_id).or_insert_with(|| {
-            let mut framebuffer = 0;
-            unsafe {
-                gl::CreateFramebuffers(1, &mut framebuffer);
-                if framebuffer != 0 {
+        let key = self.render_targets_key_for_image_view(view_id, &view_base);
+        let framebuffer_id = if let Some(&framebuffer_id) = self.base.framebuffers.get(&key) {
+            framebuffer_id
+        } else {
+            let framebuffer =
+                self.create_color_framebuffer_for_view(key, &view_base, attachment_texture);
+            let framebuffer_id = self.slot_framebuffers.insert(framebuffer);
+            self.base.framebuffers.insert(key, framebuffer_id);
+            framebuffer_id
+        };
+        let framebuffer = &self.slot_framebuffers[framebuffer_id];
+        let handle = framebuffer.handle();
+        (handle != 0).then_some((handle, key.size.width, key.size.height))
+    }
+
+    fn render_targets_key_for_image_view(
+        &self,
+        view_id: ImageViewId,
+        view_base: &ImageViewBase,
+    ) -> RenderTargets {
+        let image = &self.base.slot_images[view_base.image_id];
+        let is_rescaled = image.flags.contains(ImageFlagBits::RESCALED);
+        let resolution = settings::values().resolution_info.clone();
+        let mut width = view_base.size.width;
+        let mut height = view_base.size.height;
+        if is_rescaled {
+            width = resolution.scale_up_u32(width);
+            if image.info.image_type == ImageType::E2D {
+                height = resolution.scale_up_u32(height);
+            }
+        }
+        let (samples_x, samples_y) =
+            crate::texture_cache::samples_helper::samples_log2(image.info.num_samples as i32);
+        let mut color_buffer_ids = [ImageViewId::default(); NUM_RT];
+        color_buffer_ids[0] = view_id;
+        RenderTargets {
+            color_buffer_ids,
+            depth_buffer_id: ImageViewId::default(),
+            draw_buffers: [0; NUM_RT],
+            size: Extent2D {
+                width: (width >> samples_x).max(1),
+                height: (height >> samples_y).max(1),
+            },
+            is_rescaled,
+        }
+    }
+
+    fn create_color_framebuffer_for_view(
+        &self,
+        key: RenderTargets,
+        view_base: &ImageViewBase,
+        attachment_texture: u32,
+    ) -> TextureCacheFramebuffer {
+        let mut framebuffer = 0;
+        unsafe {
+            gl::CreateFramebuffers(1, &mut framebuffer);
+            if framebuffer != 0 {
+                if view_base.flags.contains(ImageViewFlagBits::SLICE)
+                    && view_base.range.extent.layers == 1
+                {
+                    gl::NamedFramebufferTextureLayer(
+                        framebuffer,
+                        gl::COLOR_ATTACHMENT0,
+                        attachment_texture,
+                        0,
+                        view_base.range.base.layer,
+                    );
+                } else {
                     gl::NamedFramebufferTexture(
                         framebuffer,
                         gl::COLOR_ATTACHMENT0,
                         attachment_texture,
                         0,
                     );
-                    gl::NamedFramebufferDrawBuffer(framebuffer, gl::COLOR_ATTACHMENT0);
                 }
+                gl::NamedFramebufferDrawBuffer(framebuffer, gl::COLOR_ATTACHMENT0);
+                gl::NamedFramebufferParameteri(
+                    framebuffer,
+                    gl::FRAMEBUFFER_DEFAULT_WIDTH,
+                    key.size.width as i32,
+                );
+                gl::NamedFramebufferParameteri(
+                    framebuffer,
+                    gl::FRAMEBUFFER_DEFAULT_HEIGHT,
+                    key.size.height as i32,
+                );
             }
-            TextureCacheFramebuffer {
-                framebuffer,
-                buffer_bits: gl::COLOR_BUFFER_BIT,
-            }
-        });
-        let handle = framebuffer.handle();
-        (handle != 0).then_some((handle, view_base.size.width, view_base.size.height))
+        }
+        TextureCacheFramebuffer {
+            framebuffer,
+            buffer_bits: gl::COLOR_BUFFER_BIT,
+        }
     }
 
     /// Port of `TextureCache<P>::TryFindFramebufferImageView` for
@@ -6340,16 +6441,25 @@ impl TextureCache {
         if std::env::var_os("RUZU_TRACE_PRESENT_HANDLES").is_some() {
             let mut fbo_handle: u32 = 0;
             let mut fbo_attachment: i32 = 0;
-            if let Some(fb) = self.framebuffers.get(&view_id) {
-                fbo_handle = fb.framebuffer;
-                if fbo_handle != 0 {
-                    unsafe {
-                        gl::GetNamedFramebufferAttachmentParameteriv(
-                            fbo_handle,
-                            gl::COLOR_ATTACHMENT0,
-                            gl::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
-                            &mut fbo_attachment,
-                        );
+            let view_ids = [view_id];
+            if let Some((_, &framebuffer_id)) = self
+                .base
+                .framebuffers
+                .iter()
+                .find(|(key, _)| key.contains(&view_ids))
+            {
+                if framebuffer_id.is_valid() {
+                    let fb = &self.slot_framebuffers[framebuffer_id];
+                    fbo_handle = fb.framebuffer;
+                    if fbo_handle != 0 {
+                        unsafe {
+                            gl::GetNamedFramebufferAttachmentParameteriv(
+                                fbo_handle,
+                                gl::COLOR_ATTACHMENT0,
+                                gl::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                                &mut fbo_attachment,
+                            );
+                        }
                     }
                 }
             }
@@ -6658,59 +6768,17 @@ impl TextureCache {
             return None;
         }
 
-        let view_w = view_base.size.width as i32;
-        let view_h = view_base.size.height as i32;
-        let framebuffer = self.framebuffers.entry(view_id).or_insert_with(|| {
-            let mut framebuffer = 0;
-            unsafe {
-                gl::CreateFramebuffers(1, &mut framebuffer);
-                if framebuffer != 0 {
-                    if view_base.flags.contains(ImageViewFlagBits::SLICE) {
-                        if view_base.range.extent.layers > 1 {
-                            gl::NamedFramebufferTexture(
-                                framebuffer,
-                                gl::COLOR_ATTACHMENT0,
-                                attachment_texture,
-                                0,
-                            );
-                        } else {
-                            gl::NamedFramebufferTextureLayer(
-                                framebuffer,
-                                gl::COLOR_ATTACHMENT0,
-                                attachment_texture,
-                                0,
-                                view_base.range.base.layer,
-                            );
-                        }
-                    } else {
-                        gl::NamedFramebufferTexture(
-                            framebuffer,
-                            gl::COLOR_ATTACHMENT0,
-                            attachment_texture,
-                            0,
-                        );
-                    }
-                    // Upstream `Framebuffer::Framebuffer` (gl_texture_cache.cpp:1326)
-                    // uses `glNamedFramebufferDrawBuffer` (direct state access)
-                    // and sets GL_FRAMEBUFFER_DEFAULT_WIDTH/HEIGHT.
-                    gl::NamedFramebufferDrawBuffer(framebuffer, gl::COLOR_ATTACHMENT0);
-                    gl::NamedFramebufferParameteri(
-                        framebuffer,
-                        gl::FRAMEBUFFER_DEFAULT_WIDTH,
-                        view_w,
-                    );
-                    gl::NamedFramebufferParameteri(
-                        framebuffer,
-                        gl::FRAMEBUFFER_DEFAULT_HEIGHT,
-                        view_h,
-                    );
-                }
-            }
-            TextureCacheFramebuffer {
-                framebuffer,
-                buffer_bits: gl::COLOR_BUFFER_BIT,
-            }
-        });
+        let key = self.render_targets_key_for_image_view(view_id, &view_base);
+        let framebuffer_id = if let Some(&framebuffer_id) = self.base.framebuffers.get(&key) {
+            framebuffer_id
+        } else {
+            let framebuffer =
+                self.create_color_framebuffer_for_view(key, &view_base, attachment_texture);
+            let framebuffer_id = self.slot_framebuffers.insert(framebuffer);
+            self.base.framebuffers.insert(key, framebuffer_id);
+            framebuffer_id
+        };
+        let framebuffer = &self.slot_framebuffers[framebuffer_id];
         if std::env::var_os("RUZU_TRACE_RT_FBO").is_some() {
             let fbo = framebuffer.framebuffer;
             let mut attached: i32 = 0;
@@ -6864,7 +6932,7 @@ impl TextureCache {
             );
         }
         let handle = framebuffer.handle();
-        (handle != 0).then_some((handle, view_base.size.width, view_base.size.height))
+        (handle != 0).then_some((handle, key.size.width, key.size.height))
     }
 }
 

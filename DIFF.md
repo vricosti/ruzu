@@ -5,22 +5,24 @@
 - `TextureCacheBase::run_garbage_collector(...)` now ports upstream's two-pass memory-pressure policy: normal/high/aggressive mode selection, age thresholds `50/25/10`, iteration limits `10/20/40`, `IS_DECODING` and non-aggressive `COSTLY_LOAD` skips, safe-download gating, unregister, and delete ordering.
 - Rust uses the existing callback-backed `image_downloader` + `guest_memory_writer` for the `must_download` GC path. If those callbacks are absent or fail, Rust preserves the GPU-modified image instead of deleting dirty contents; this is a safety-preserving adaptation until every backend construction path provides the same runtime/GPU-memory availability as upstream.
 - `TextureCacheBase` now owns `sentenced_images` and `sentenced_image_view` as `DelayedDestructionRing<_, TICKS_TO_DESTROY>` counterparts. `DeleteImage(..., immediate_delete=false)` and OpenGL `InvalidateScale` move image/image-view base objects into those rings with `SlotVector::take(...)`, matching upstream's `sentenced_* .Push(std::move(...)); erase(...)` ownership pattern for the ported base resources.
-- OpenGL `TextureCache::tick_frame(...)` now runs the memory-pressure GC, ticks the delayed image/image-view destruction rings, then runs async decode/runtime/common frame ticking, matching upstream `TextureCache<P>::TickFrame` ordering for the ported parts.
+- OpenGL framebuffers now use `TextureCacheBase::framebuffers` as the upstream `RenderTargets -> FramebufferId` key map for draw render targets, Fermi2D framebuffer blits, and the remaining compatibility render-target helper; concrete GL framebuffer objects live in `OpenGL::TextureCache::slot_framebuffers`.
+- OpenGL now owns `sentenced_framebuffers: DelayedDestructionRing<TextureCacheFramebuffer, TICKS_TO_DESTROY>` and moves removed framebuffer objects into it when image views are invalidated or when common GC/delete logic removes base framebuffer keys.
+- OpenGL `TextureCache::tick_frame(...)` now runs the memory-pressure GC, reconciles framebuffer ids removed by common GC, ticks the delayed image/image-view/framebuffer destruction rings, then runs async decode/runtime/common frame ticking, matching upstream `TextureCache<P>::TickFrame` ordering for the ported parts.
 
 ### Unintentional differences (to fix)
-- Rust still has no `sentenced_framebuffers` counterpart in `TextureCacheBase` because base framebuffer slot ownership (`slot_framebuffers`) is still represented as the `framebuffers: HashMap<RenderTargets, FramebufferId>` bridge plus backend OpenGL framebuffer cache.
+- Upstream `TextureCache<P>` owns `slot_framebuffers` and `sentenced_framebuffers` in the same templated common object; Rust still splits the concrete GL framebuffer slot/ring into `OpenGL::TextureCache` because `TextureCacheBase` is backend-independent.
 - The GC download path uses callback staging instead of exact `runtime.DownloadStagingBuffer(...)`, `image.DownloadMemory(...)`, `runtime.Finish()`, and channel `gpu_memory` ownership.
 
 ### Missing items
-- Port common framebuffer slot ownership and `sentenced_framebuffers` so framebuffer destruction can be deferred like upstream.
+- Move `slot_framebuffers`/`sentenced_framebuffers` into the exact templated owner shape if/when `TextureCacheBase` becomes generic over backend resources rather than split from OpenGL.
 - Move the GC download path to exact backend runtime ownership once `TextureCacheBase` can call the same runtime/image hooks as upstream `TextureCache<P>`.
 
 ### Binary layout verification
 - N/A: host texture-cache ownership and lifecycle only. No guest-visible raw payload layout changed.
 
 ### Tests
-- Re-read upstream `TextureCache<P>::RunGarbageCollector`, `TextureCache<P>::TickFrame`, `TextureCache<P>::RegisterImage`, `TextureCache<P>::UnregisterImage`, `TextureCache<P>::DeleteImage`, and `TextureCache<P>::PrepareImage`.
-- Re-read upstream `TextureCache<P>::InvalidateScale`, `texture_cache_base.h` `sentenced_*` members, and `video_core/delayed_destruction_ring.h`.
+- Re-read upstream `TextureCache<P>::RunGarbageCollector`, `TextureCache<P>::TickFrame`, `TextureCache<P>::RegisterImage`, `TextureCache<P>::UnregisterImage`, `TextureCache<P>::DeleteImage`, `TextureCache<P>::PrepareImage`, `TextureCache<P>::GetFramebufferId`, `TextureCache<P>::RenderTargetFromImage`, `TextureCache<P>::BlitImage`, and `TextureCache<P>::RemoveFramebuffers`.
+- Re-read upstream `TextureCache<P>::InvalidateScale`, `texture_cache_base.h` `slot_framebuffers`/`sentenced_*` members, `video_core/delayed_destruction_ring.h`, and OpenGL `Framebuffer`.
 - `cargo fmt --all`
 - `cargo check -p video_core --quiet`
 - `cargo test -p video_core run_garbage_collector -- --nocapture`
@@ -12949,14 +12951,14 @@
 
 ### Intentional differences
 - Added env-gated `RUZU_DUMP_PRESENT_TEXTURE` readback in `AccelerateDisplay` to checksum the GL texture selected for presentation. Upstream has no equivalent diagnostic; it is disabled by default and does not alter normal presentation.
-- Rust now prepares sampled image views before `update_render_targets_from_snapshot(...)` and binds the current draw framebuffer immediately after, matching upstream's `texture_cache.FillGraphicsImageViews(...); texture_cache.UpdateRenderTargets(false); state_tracker.BindFramebuffer(texture_cache.GetFramebuffer()->Handle())` ordering. The OpenGL framebuffer helper is keyed by the full `RenderTargets` tuple and attaches color plus depth/stencil targets, but it still lives as a Rust-side backend bridge rather than upstream's base-cache `slot_framebuffers` owner.
+- Rust now prepares sampled image views before `update_render_targets_from_snapshot(...)` and binds the current draw framebuffer immediately after, matching upstream's `texture_cache.FillGraphicsImageViews(...); texture_cache.UpdateRenderTargets(false); state_tracker.BindFramebuffer(texture_cache.GetFramebuffer()->Handle())` ordering. The OpenGL framebuffer helper is keyed by the full `RenderTargets` tuple, attaches color plus depth/stencil targets, and now stores the GL object in an OpenGL-side `slot_framebuffers` while `TextureCacheBase::framebuffers` owns the upstream-shaped key map.
 
 ### Unintentional differences (to fix)
-- Rust still lacks the upstream full `TextureCache<P>::GetFramebuffer()` owner model: framebuffer lifecycle is not yet owned by base-cache `slot_framebuffers`, dependency scanning is still incomplete, and rescale metadata/lifecycle is only partially represented.
+- Rust still lacks the exact upstream full `TextureCache<P>::GetFramebuffer()` owner model: concrete framebuffer lifecycle is split into the OpenGL wrapper rather than the templated common cache, and rescale metadata/lifecycle is only partially represented.
 
 ### Missing items
 - Port full `RasterizerOpenGL::PrepareDraw` / `GraphicsPipeline::ConfigureImpl` ownership around render-target updates, `StateTracker::BindFramebuffer`, and descriptor/buffer binding order.
-- Move the current `RenderTargets` framebuffer bridge into upstream-faithful base-cache `TextureCache<P>::GetFramebufferId(RenderTargets)` / `slot_framebuffers` ownership.
+- Finish retiring legacy framebuffer helper paths so all draw/clear framebuffer lookup goes through the upstream-shaped `RenderTargets -> FramebufferId` map and GL `slot_framebuffers` owner.
 
 ### Binary layout verification
 - N/A: OpenGL state binding and diagnostics only; no guest-visible raw struct or serialized payload layout changed.
@@ -15094,14 +15096,14 @@ The following still panic because upstream either also throws NotImplementedExce
 ## 2026-05-25 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
 
 ### Intentional differences
-- Added a Rust `render_target_framebuffers: HashMap<RenderTargets, TextureCacheFramebuffer>` side cache so draw FBO lookup can be keyed by the full upstream `RenderTargets` tuple instead of only the first color render-target view. This mirrors upstream `TextureCache<P>::GetFramebufferId(render_targets)` while preserving ruzu's current split backend-cache storage.
+- Draw FBO lookup is keyed by the full upstream `RenderTargets` tuple instead of only the first color render-target view. The current port uses `TextureCacheBase::framebuffers: HashMap<RenderTargets, FramebufferId>` plus OpenGL `slot_framebuffers`, mirroring upstream `TextureCache<P>::GetFramebufferId(render_targets)` while preserving ruzu's split backend-cache storage.
 - `RasterizerOpenGL::draw` now asks the texture cache for a framebuffer from the full `Maxwell3DRenderTargets` snapshot and `surface_clip` size. Upstream gets the same values through live `maxwell3d->regs` in `UpdateRenderTargets`.
 
 ### Unintentional differences (to fix)
 - Ruzu still does not clear Maxwell dirty flags per upstream `UpdateRenderTargets`; it consumes draw snapshots and leaves dirty-flag lifecycle outside the texture cache.
 
 ### Missing items
-- Full upstream framebuffer lifecycle: rescale metadata, dependency scanning equivalent to upstream `RemoveFramebuffers`, and slot-framebuffer ownership in the base texture cache.
+- Full upstream framebuffer lifecycle: exact rescale metadata/lifecycle and eventual templated common ownership of concrete framebuffer objects.
 - Full `UpdateRenderTargets` structural port using live Maxwell dirty flags rather than draw-time snapshots.
 
 ### Binary layout verification
@@ -17486,21 +17488,21 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Intentional differences
 - `TextureCacheBase::remove_image_view_references(...)` currently applies to the active Rust `channel_state` only. Upstream scans `active_channel_ids` and removes each deleted `ImageViewId` from every `channel_storage[c].image_views`; ruzu does not yet have upstream-shaped multi-channel `ChannelSetupCaches` ownership in the common texture cache.
-- `TextureCacheBase::remove_framebuffers(...)` now scans framebuffer keys by full `RenderTargets` membership, matching upstream's dependency test shape, but Rust still stores only the base cache id and leaves backend delayed destruction to the current OpenGL-side object caches until `slot_framebuffers` / `sentenced_framebuffers` ownership is ported.
+- `TextureCacheBase::remove_framebuffers(...)` now scans framebuffer keys by full `RenderTargets` membership, matching upstream's dependency test shape. OpenGL now stores the matching concrete framebuffer objects in `slot_framebuffers` and defers removed objects through `sentenced_framebuffers`; the remaining difference is that those backend objects still live in the OpenGL wrapper instead of a templated common cache.
 - `TextureCacheBase::JoinImages(...)` now ports the upstream CPU-region overlap scan, `ResolveOverlap`/`IsSubresource` classification, alias creation, bad-overlap bookkeeping, and final `RegisterImage` call in the common cache. Because Rust splits common texture-cache state from OpenGL backend images, the upstream immediate copy/delete tail is queued as `PendingJoinCopies` and drained by `OpenGLTextureCache::finish_pending_join_copies(...)` at both backend materialization boundaries that can expose a newly-created image to GL: texture-view materialization and render-target setup.
 - `OpenGLTextureCache::copy_image_direct(...)` no longer rejects copies solely because `Surface::GetFormatType` differs. Upstream `TextureCacheRuntime::CopyImage` calls `glCopyImageSubData` directly for non-MSAA copies and relies on GL/runtime compatibility rather than a host-side type gate.
 
 ### Unintentional differences (to fix)
 - `TextureCacheBase::delete_image(...)` still cannot mark Maxwell3D dirty flags for render targets, zeta, and color buffers because the common Rust cache does not own a live `Maxwell3D*` equivalent.
 - Deleted image-view references are not yet purged across all active channels because common texture-cache channel storage is still collapsed to the current Rust channel state.
-- Framebuffer deletion does not yet push base framebuffer objects to an upstream-equivalent delayed-destruction queue.
+- Framebuffer deletion for the OpenGL path now pushes removed GL framebuffer objects to `sentenced_framebuffers`; the remaining gap is exact templated common ownership.
 - `TextureCacheBase::JoinImages(...)` still does not run the upstream sparse-image GPU-region scan (`ForEachSparseImageInRegion`) because ruzu's common cache does not yet carry the same channel GPU-memory id / sparse-view lookup ownership.
 - `TextureCacheBase::JoinImages(...)` still cannot refresh guest contents synchronously before insertion because that operation remains backend/runtime-owned in ruzu. The OpenGL wrapper now refreshes through caller-supplied GPU readers, handles sibling/new-image rescale, copies GPU-modified overlap contents through the same `CopyImage` policy used by alias synchronization, and unregisters/deletes copied non-alias overlaps.
 - `PendingJoinCopies` is a Rust ownership adaptation caused by split common/backend storage. Upstream does this work synchronously inside one templated `TextureCache<P>::JoinImages(...)` body.
 
 ### Missing items
 - Port upstream `active_channel_ids` / `channel_storage` ownership for common texture-cache channel state.
-- Port upstream base framebuffer slot ownership and `sentenced_framebuffers` delayed destruction.
+- Revisit exact templated common ownership for `slot_framebuffers` / `sentenced_framebuffers` if `TextureCacheBase` becomes generic over backend objects.
 - Wire Maxwell3D dirty render-target flag updates into `delete_image(...)` once the live engine ownership model is available.
 - Port the remaining backend/runtime-owned `JoinImages` tail into a single upstream-shaped owner: synchronous `RefreshContents`, bad-overlap download interactions, exact descriptor-table/dirty-flag invalidation after rescale, and delete/register ordering without exposing intermediate image ids.
 
@@ -18276,10 +18278,10 @@ The following still panic because upstream either also throws NotImplementedExce
 - `OpenGL::TextureCache::tick_frame(...)` now applies upstream's first `TickFrame` step: when the runtime can report memory usage, replace the cache estimate with `TextureCacheRuntime::get_device_memory_usage()` before async decode/runtime/common ticking.
 
 ### Unintentional differences (to fix)
-- Rust now runs the ported LRU/memory-pressure portion of upstream `RunGarbageCollector()` from OpenGL `tick_frame(...)`, but the backend delayed-destruction rings and exact runtime/image download hooks are still tracked in the newer 2026-06-13 GC parity entry.
+- Rust now runs the ported LRU/memory-pressure portion of upstream `RunGarbageCollector()` from OpenGL `tick_frame(...)`; OpenGL framebuffers now have a delayed-destruction ring, while exact runtime/image download hooks are still tracked in the newer 2026-06-13 GC parity entry.
 
 ### Missing items
-- Port the delayed-destruction owner graph needed for `sentenced_images.Tick()`, `sentenced_framebuffers.Tick()`, and `sentenced_image_view.Tick()` parity.
+- Exact templated ownership for delayed destruction remains tracked in the newer 2026-06-13 GC parity entry; the OpenGL render-target framebuffer path now ticks `sentenced_framebuffers`.
 
 ### Binary layout verification
 - N/A: host memory-budget accounting and frame lifecycle only. No guest-visible raw payload layout changed.

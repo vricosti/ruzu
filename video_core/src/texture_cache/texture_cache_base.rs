@@ -241,7 +241,7 @@ const TARGET_THRESHOLD: i64 = 4 * 1024 * 1024 * 1024; // 4 GiB
 const DEFAULT_EXPECTED_MEMORY: i64 = 1024 * 1024 * 1024 + 125 * 1024 * 1024; // 1 GiB + 125 MiB
 const DEFAULT_CRITICAL_MEMORY: i64 = 1024 * 1024 * 1024 + 625 * 1024 * 1024; // 1 GiB + 625 MiB
 const GC_EMERGENCY_COUNTS: usize = 2;
-const TICKS_TO_DESTROY: usize = 8;
+pub(crate) const TICKS_TO_DESTROY: usize = 8;
 const UNSET_CHANNEL: usize = usize::MAX;
 
 /// The main texture cache.
@@ -264,7 +264,7 @@ pub struct TextureCacheBase {
     /// the GL wrapper's `HashMap<SamplerId, Sampler>`. Mirrors the
     /// `slot_images` / `slot_image_views` split.
     pub slot_samplers: SlotVector<crate::textures::texture::TscEntry>,
-    // slot_framebuffers: needs backend types
+    // slot_framebuffers: concrete backend objects are still owned by renderer backends.
 
     // Render state
     pub render_targets: RenderTargets,
