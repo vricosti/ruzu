@@ -7,10 +7,15 @@
 
 use std::sync::{Condvar, Mutex};
 
-use crate::engines::kepler_compute::DispatchCall;
-use crate::texture_cache::texture_cache_base::ComputeDescriptorSyncRegs;
+use crate::engines::kepler_compute::{DispatchCall, QueueMetaData};
+use crate::texture_cache::texture_cache_base::{ComputeDescriptorSyncRegs, ImageViewInOut};
+use crate::texture_cache::types::SamplerId;
+use crate::textures::texture::texture_pair;
 
 use super::gl_texture_cache::TextureCache;
+use shader_recompiler::shader_info::{
+    ImageBufferDescriptor, ImageDescriptor, Info, TextureBufferDescriptor, TextureDescriptor,
+};
 
 /// Maximum number of textures bound to a compute pipeline.
 pub const MAX_TEXTURES: u32 = 64;
@@ -53,6 +58,24 @@ impl ComputePipelineKey {
 ///
 /// Corresponds to `VideoCommon::ComputeUniformBufferSizes`.
 pub type ComputeUniformBufferSizes = [u32; 8];
+
+/// Host-side descriptors resolved by the texture/image part of
+/// `ComputePipeline::Configure`.
+#[derive(Debug, Clone, Default)]
+pub struct ComputeTextureBindings {
+    pub views: Vec<ImageViewInOut>,
+    pub samplers: Vec<SamplerId>,
+    pub num_texture_buffers: u32,
+    pub num_image_buffers: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ComputeTextureHandles {
+    pub views: Vec<ImageViewInOut>,
+    pub sampler_indices: Vec<u32>,
+    pub num_texture_buffers: u32,
+    pub num_image_buffers: u32,
+}
 
 /// OpenGL compute pipeline.
 ///
@@ -154,6 +177,79 @@ impl ComputePipeline {
             .synchronize_compute_descriptors(Self::descriptor_sync_regs(dispatch));
     }
 
+    /// Port of the descriptor-handle collection at the start of upstream
+    /// `ComputePipeline::Configure()`.
+    ///
+    /// This reads compute handles from QMD constant buffers, builds the
+    /// `ImageViewInOut` list in the same texture-buffer, image-buffer,
+    /// sampled-texture, storage-image order, resolves compute samplers, then
+    /// calls the OpenGL texture-cache wrapper for `FillComputeImageViews`.
+    pub fn prepare_texture_bindings(
+        texture_cache: &mut TextureCache,
+        info: &Info,
+        dispatch: &DispatchCall,
+        mut read_u32: impl FnMut(u64) -> u32,
+    ) -> ComputeTextureBindings {
+        let mut handles = Self::collect_texture_handles(info, dispatch, &mut read_u32);
+        let samplers = handles
+            .sampler_indices
+            .iter()
+            .map(|&index| texture_cache.base.get_compute_sampler_id(index))
+            .collect();
+        texture_cache.fill_compute_image_views(&mut handles.views);
+        ComputeTextureBindings {
+            views: handles.views,
+            samplers,
+            num_texture_buffers: handles.num_texture_buffers,
+            num_image_buffers: handles.num_image_buffers,
+        }
+    }
+
+    pub(crate) fn collect_texture_handles(
+        info: &Info,
+        dispatch: &DispatchCall,
+        mut read_u32: impl FnMut(u64) -> u32,
+    ) -> ComputeTextureHandles {
+        let mut result = ComputeTextureHandles::default();
+        let qmd = &dispatch.qmd;
+        let via_header_index = qmd.linked_tsc;
+
+        for desc in &info.texture_buffer_descriptors {
+            for index in 0..desc.count {
+                let (tic_index, _) =
+                    Self::read_texture_handle(qmd, desc, index, via_header_index, &mut read_u32);
+                result.views.push(ImageViewInOut {
+                    index: tic_index,
+                    ..Default::default()
+                });
+            }
+        }
+        result.num_texture_buffers = result.views.len() as u32;
+
+        for desc in &info.image_buffer_descriptors {
+            Self::add_image_handles(&mut result.views, qmd, desc, false, &mut read_u32);
+        }
+        result.num_image_buffers = result.views.len() as u32 - result.num_texture_buffers;
+
+        for desc in &info.texture_descriptors {
+            for index in 0..desc.count {
+                let (tic_index, tsc_index) =
+                    Self::read_texture_handle(qmd, desc, index, via_header_index, &mut read_u32);
+                result.views.push(ImageViewInOut {
+                    index: tic_index,
+                    ..Default::default()
+                });
+                result.sampler_indices.push(tsc_index);
+            }
+        }
+
+        for desc in &info.image_descriptors {
+            Self::add_image_handles(&mut result.views, qmd, desc, desc.is_written, &mut read_u32);
+        }
+
+        result
+    }
+
     pub(crate) fn descriptor_sync_regs(dispatch: &DispatchCall) -> ComputeDescriptorSyncRegs {
         ComputeDescriptorSyncRegs {
             linked_tsc: dispatch.qmd.linked_tsc,
@@ -161,6 +257,64 @@ impl ComputePipeline {
             tic_limit: dispatch.tic_limit,
             tsc_addr: dispatch.tsc_address,
             tsc_limit: dispatch.tsc_limit,
+        }
+    }
+
+    fn read_texture_handle(
+        qmd: &QueueMetaData,
+        desc: &impl ComputeTextureHandleDescriptor,
+        index: u32,
+        via_header_index: bool,
+        read_u32: &mut impl FnMut(u64) -> u32,
+    ) -> (u32, u32) {
+        assert_compute_cbuf_enabled(qmd, desc.cbuf_index());
+        let index_offset = index << desc.size_shift();
+        let offset = desc.cbuf_offset().wrapping_add(index_offset);
+        let addr = qmd.const_buffers[desc.cbuf_index() as usize]
+            .address
+            .wrapping_add(offset as u64);
+        let raw = if desc.has_secondary() {
+            assert_compute_cbuf_enabled(qmd, desc.secondary_cbuf_index());
+            let secondary_offset = desc.secondary_cbuf_offset().wrapping_add(index_offset);
+            let secondary_addr = qmd.const_buffers[desc.secondary_cbuf_index() as usize]
+                .address
+                .wrapping_add(secondary_offset as u64);
+            (read_u32(addr) << desc.shift_left())
+                | (read_u32(secondary_addr) << desc.secondary_shift_left())
+        } else {
+            read_u32(addr)
+        };
+        texture_pair(raw, via_header_index)
+    }
+
+    fn read_image_handle(
+        qmd: &QueueMetaData,
+        desc: &impl ComputeImageHandleDescriptor,
+        index: u32,
+        read_u32: &mut impl FnMut(u64) -> u32,
+    ) -> u32 {
+        assert_compute_cbuf_enabled(qmd, desc.cbuf_index());
+        let index_offset = index << desc.size_shift();
+        let offset = desc.cbuf_offset().wrapping_add(index_offset);
+        let addr = qmd.const_buffers[desc.cbuf_index() as usize]
+            .address
+            .wrapping_add(offset as u64);
+        read_u32(addr)
+    }
+
+    fn add_image_handles(
+        views: &mut Vec<ImageViewInOut>,
+        qmd: &QueueMetaData,
+        desc: &impl ComputeImageHandleDescriptor,
+        blacklist: bool,
+        read_u32: &mut impl FnMut(u64) -> u32,
+    ) {
+        for index in 0..desc.count() {
+            views.push(ImageViewInOut {
+                index: Self::read_image_handle(qmd, desc, index, read_u32),
+                blacklist,
+                ..Default::default()
+            });
         }
     }
 
@@ -202,10 +356,149 @@ impl ComputePipeline {
     }
 }
 
+fn assert_compute_cbuf_enabled(qmd: &QueueMetaData, cbuf_index: u32) {
+    assert!(
+        cbuf_index < qmd.const_buffers.len() as u32,
+        "ComputePipeline::Configure descriptor cbuf index {} exceeds QMD const buffers",
+        cbuf_index
+    );
+    assert!(
+        ((qmd.const_buffer_enable_mask >> cbuf_index) & 1) != 0,
+        "ComputePipeline::Configure descriptor cbuf {} is disabled",
+        cbuf_index
+    );
+}
+
+trait ComputeTextureHandleDescriptor {
+    fn has_secondary(&self) -> bool;
+    fn cbuf_index(&self) -> u32;
+    fn cbuf_offset(&self) -> u32;
+    fn shift_left(&self) -> u32;
+    fn secondary_cbuf_index(&self) -> u32;
+    fn secondary_cbuf_offset(&self) -> u32;
+    fn secondary_shift_left(&self) -> u32;
+    fn size_shift(&self) -> u32;
+}
+
+impl ComputeTextureHandleDescriptor for TextureBufferDescriptor {
+    fn has_secondary(&self) -> bool {
+        self.has_secondary
+    }
+
+    fn cbuf_index(&self) -> u32 {
+        self.cbuf_index
+    }
+
+    fn cbuf_offset(&self) -> u32 {
+        self.cbuf_offset
+    }
+
+    fn shift_left(&self) -> u32 {
+        self.shift_left
+    }
+
+    fn secondary_cbuf_index(&self) -> u32 {
+        self.secondary_cbuf_index
+    }
+
+    fn secondary_cbuf_offset(&self) -> u32 {
+        self.secondary_cbuf_offset
+    }
+
+    fn secondary_shift_left(&self) -> u32 {
+        self.secondary_shift_left
+    }
+
+    fn size_shift(&self) -> u32 {
+        self.size_shift
+    }
+}
+
+impl ComputeTextureHandleDescriptor for TextureDescriptor {
+    fn has_secondary(&self) -> bool {
+        self.has_secondary
+    }
+
+    fn cbuf_index(&self) -> u32 {
+        self.cbuf_index
+    }
+
+    fn cbuf_offset(&self) -> u32 {
+        self.cbuf_offset
+    }
+
+    fn shift_left(&self) -> u32 {
+        self.shift_left
+    }
+
+    fn secondary_cbuf_index(&self) -> u32 {
+        self.secondary_cbuf_index
+    }
+
+    fn secondary_cbuf_offset(&self) -> u32 {
+        self.secondary_cbuf_offset
+    }
+
+    fn secondary_shift_left(&self) -> u32 {
+        self.secondary_shift_left
+    }
+
+    fn size_shift(&self) -> u32 {
+        self.size_shift
+    }
+}
+
+trait ComputeImageHandleDescriptor {
+    fn cbuf_index(&self) -> u32;
+    fn cbuf_offset(&self) -> u32;
+    fn count(&self) -> u32;
+    fn size_shift(&self) -> u32;
+}
+
+impl ComputeImageHandleDescriptor for ImageBufferDescriptor {
+    fn cbuf_index(&self) -> u32 {
+        self.cbuf_index
+    }
+
+    fn cbuf_offset(&self) -> u32 {
+        self.cbuf_offset
+    }
+
+    fn count(&self) -> u32 {
+        self.count
+    }
+
+    fn size_shift(&self) -> u32 {
+        self.size_shift
+    }
+}
+
+impl ComputeImageHandleDescriptor for ImageDescriptor {
+    fn cbuf_index(&self) -> u32 {
+        self.cbuf_index
+    }
+
+    fn cbuf_offset(&self) -> u32 {
+        self.cbuf_offset
+    }
+
+    fn count(&self) -> u32 {
+        self.count
+    }
+
+    fn size_shift(&self) -> u32 {
+        self.size_shift
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::kepler_compute::{DispatchCall, QueueMetaData};
+    use crate::engines::kepler_compute::{DispatchCall, QmdConstBuffer, QueueMetaData};
+    use shader_recompiler::shader_info::{
+        ImageBufferDescriptor, ImageDescriptor, ImageFormat, TextureBufferDescriptor,
+        TextureDescriptor, TextureType,
+    };
 
     #[test]
     fn compute_pipeline_key_hash() {
@@ -256,5 +549,111 @@ mod tests {
         assert_eq!(regs.tic_limit, 6);
         assert_eq!(regs.tsc_addr, 0x3000);
         assert_eq!(regs.tsc_limit, 1);
+    }
+
+    #[test]
+    fn collect_texture_handles_follows_upstream_compute_order_and_pairs() {
+        let mut info = Info::default();
+        info.texture_buffer_descriptors
+            .push(TextureBufferDescriptor {
+                has_secondary: false,
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                shift_left: 0,
+                secondary_cbuf_index: 0,
+                secondary_cbuf_offset: 0,
+                secondary_shift_left: 0,
+                count: 1,
+                size_shift: 2,
+            });
+        info.image_buffer_descriptors.push(ImageBufferDescriptor {
+            format: ImageFormat::R32Uint,
+            is_written: false,
+            is_read: true,
+            is_integer: true,
+            cbuf_index: 0,
+            cbuf_offset: 4,
+            count: 1,
+            size_shift: 2,
+        });
+        info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth: false,
+            is_multisample: false,
+            has_secondary: true,
+            cbuf_index: 0,
+            cbuf_offset: 8,
+            shift_left: 0,
+            secondary_cbuf_index: 1,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 20,
+            count: 2,
+            size_shift: 2,
+        });
+        info.image_descriptors.push(ImageDescriptor {
+            texture_type: TextureType::Color2D,
+            format: ImageFormat::R32Uint,
+            is_written: true,
+            is_read: false,
+            is_integer: true,
+            cbuf_index: 0,
+            cbuf_offset: 16,
+            count: 1,
+            size_shift: 2,
+        });
+
+        let mut qmd = QueueMetaData::default();
+        qmd.linked_tsc = false;
+        qmd.const_buffer_enable_mask = 0b11;
+        qmd.const_buffers[0] = QmdConstBuffer {
+            address: 0x1000,
+            size: 0x100,
+        };
+        qmd.const_buffers[1] = QmdConstBuffer {
+            address: 0x2000,
+            size: 0x100,
+        };
+        let dispatch = DispatchCall {
+            qmd,
+            qmd_address: 0,
+            code_address: 0,
+            tsc_address: 0,
+            tsc_limit: 0,
+            tic_address: 0,
+            tic_limit: 0,
+            tex_cb_index: 0,
+        };
+
+        let handles =
+            ComputePipeline::collect_texture_handles(&info, &dispatch, |addr| match addr {
+                0x1000 => 0x0000_0011,
+                0x1004 => 0x0000_0022,
+                0x1008 => 0x0000_0033,
+                0x100c => 0x0000_0044,
+                0x1010 => 0x0000_0055,
+                0x2000 => 0x0000_0007,
+                0x2004 => 0x0000_0008,
+                _ => panic!("unexpected read at 0x{addr:X}"),
+            });
+
+        assert_eq!(handles.num_texture_buffers, 1);
+        assert_eq!(handles.num_image_buffers, 1);
+        assert_eq!(handles.sampler_indices, vec![7, 8]);
+        assert_eq!(
+            handles
+                .views
+                .iter()
+                .map(|view| view.index)
+                .collect::<Vec<_>>(),
+            vec![0x11, 0x22, 0x33, 0x44, 0x55]
+        );
+        assert_eq!(
+            handles
+                .views
+                .iter()
+                .map(|view| view.blacklist)
+                .collect::<Vec<_>>(),
+            vec![false, false, false, false, true]
+        );
     }
 }
