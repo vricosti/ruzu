@@ -10,7 +10,7 @@ use crate::host_shaders::compute_shaders::{
     CONVERT_MSAA_TO_NON_MSAA_COMP, CONVERT_NON_MSAA_TO_MSAA_COMP, OPENGL_CONVERT_S8D24_COMP,
     OPENGL_COPY_BC4_COMP, PITCH_UNSWIZZLE_COMP,
 };
-use crate::renderer_opengl::gl_shader_manager::ProgramManager;
+use crate::renderer_opengl::gl_shader_manager::ProgramManagerHandle;
 use crate::renderer_opengl::gl_shader_util::create_program_from_source;
 use crate::surface::{bytes_per_block, default_block_height, default_block_width};
 use crate::texture_cache::accelerated_swizzle::{
@@ -26,7 +26,7 @@ const SWIZZLE_TABLE_SIZE: usize = 512;
 ///
 /// Corresponds to `OpenGL::UtilShaders`.
 pub struct UtilShaders {
-    program_manager: ProgramManager,
+    program_manager: ProgramManagerHandle,
     swizzle_table_buffer: u32,
     astc_decoder_program: u32,
     block_linear_unswizzle_2d_program: u32,
@@ -44,11 +44,7 @@ impl UtilShaders {
     /// Port of `UtilShaders::UtilShaders()`.
     /// In the full implementation, this compiles compute shaders from host shader
     /// sources and creates the swizzle table buffer.
-    pub fn new() -> Self {
-        Self::new_with_caps(false, false)
-    }
-
-    pub fn new_with_caps(use_assembly_shaders: bool, has_lmem_perf_bug: bool) -> Self {
+    pub fn new(program_manager: ProgramManagerHandle) -> Self {
         let mut swizzle_table_buffer: u32 = 0;
 
         // Create and fill the swizzle table buffer
@@ -65,7 +61,7 @@ impl UtilShaders {
         }
 
         Self {
-            program_manager: ProgramManager::new_with_caps(use_assembly_shaders, has_lmem_perf_bug),
+            program_manager,
             swizzle_table_buffer,
             astc_decoder_program: create_program_from_source(ASTC_DECODER_COMP, gl::COMPUTE_SHADER),
             block_linear_unswizzle_2d_program: create_program_from_source(
@@ -126,9 +122,9 @@ impl UtilShaders {
         }
         let tile_width = default_block_width(info.format);
         let tile_height = default_block_height(info.format);
-        self.program_manager.local_memory_warmup();
-        self.program_manager
-            .bind_compute_program(self.astc_decoder_program);
+        let mut program_manager = self.program_manager.lock();
+        program_manager.local_memory_warmup();
+        program_manager.bind_compute_program(self.astc_decoder_program);
         unsafe {
             gl::FlushMappedNamedBufferRange(
                 src_buffer,
@@ -192,7 +188,7 @@ impl UtilShaders {
                     | gl::CLIENT_MAPPED_BUFFER_BARRIER_BIT,
             );
         }
-        self.program_manager.restore_guest_compute();
+        program_manager.restore_guest_compute();
     }
 
     /// Port of `UtilShaders::BlockLinearUpload2D`.
@@ -210,8 +206,8 @@ impl UtilShaders {
             return;
         }
         let store_fmt = store_format(bytes_per_block(info.format));
-        self.program_manager
-            .bind_compute_program(self.block_linear_unswizzle_2d_program);
+        let mut program_manager = self.program_manager.lock();
+        program_manager.bind_compute_program(self.block_linear_unswizzle_2d_program);
         unsafe {
             gl::FlushMappedNamedBufferRange(
                 src_buffer,
@@ -254,7 +250,7 @@ impl UtilShaders {
                 );
             }
         }
-        self.program_manager.restore_guest_compute();
+        program_manager.restore_guest_compute();
     }
 
     /// Port of `UtilShaders::BlockLinearUpload3D`.
@@ -272,8 +268,8 @@ impl UtilShaders {
             return;
         }
         let store_fmt = store_format(bytes_per_block(info.format));
-        self.program_manager
-            .bind_compute_program(self.block_linear_unswizzle_3d_program);
+        let mut program_manager = self.program_manager.lock();
+        program_manager.bind_compute_program(self.block_linear_unswizzle_3d_program);
         unsafe {
             gl::FlushMappedNamedBufferRange(
                 src_buffer,
@@ -318,7 +314,7 @@ impl UtilShaders {
                 );
             }
         }
-        self.program_manager.restore_guest_compute();
+        program_manager.restore_guest_compute();
     }
 
     /// Port of `UtilShaders::PitchUpload`.
@@ -344,8 +340,8 @@ impl UtilShaders {
                 return;
             }
         };
-        self.program_manager
-            .bind_compute_program(self.pitch_unswizzle_program);
+        let mut program_manager = self.program_manager.lock();
+        program_manager.bind_compute_program(self.pitch_unswizzle_program);
         unsafe {
             gl::FlushMappedNamedBufferRange(
                 src_buffer,
@@ -374,7 +370,7 @@ impl UtilShaders {
                 );
             }
         }
-        self.program_manager.restore_guest_compute();
+        program_manager.restore_guest_compute();
     }
 
     /// Port of `UtilShaders::CopyBC4`.
@@ -383,8 +379,8 @@ impl UtilShaders {
             log::warn!("Copy BC4 program not compiled");
             return;
         }
-        self.program_manager
-            .bind_compute_program(self.copy_bc4_program);
+        let mut program_manager = self.program_manager.lock();
+        program_manager.bind_compute_program(self.copy_bc4_program);
         unsafe {
             for copy in copies {
                 if copy.src_subresource.base_layer != 0
@@ -436,7 +432,7 @@ impl UtilShaders {
             }
             gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
-        self.program_manager.restore_guest_compute();
+        program_manager.restore_guest_compute();
     }
 
     /// Port of `UtilShaders::ConvertS8D24`.
@@ -445,8 +441,8 @@ impl UtilShaders {
             log::warn!("Convert S8D24 program not compiled");
             return;
         }
-        self.program_manager
-            .bind_compute_program(self.convert_s8d24_program);
+        let mut program_manager = self.program_manager.lock();
+        program_manager.bind_compute_program(self.convert_s8d24_program);
         unsafe {
             for copy in copies {
                 if copy.src_subresource.base_layer != 0
@@ -482,7 +478,7 @@ impl UtilShaders {
             }
             gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
-        self.program_manager.restore_guest_compute();
+        program_manager.restore_guest_compute();
     }
 
     /// Copy between MSAA and non-MSAA textures.
@@ -504,7 +500,8 @@ impl UtilShaders {
             log::warn!("MSAA copy program not compiled");
             return;
         }
-        self.program_manager.bind_compute_program(program);
+        let mut program_manager = self.program_manager.lock();
+        program_manager.bind_compute_program(program);
         unsafe {
             for copy in copies {
                 if copy.src_subresource.base_layer != 0
@@ -547,7 +544,7 @@ impl UtilShaders {
             }
             gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
-        self.program_manager.restore_guest_compute();
+        program_manager.restore_guest_compute();
     }
 }
 
