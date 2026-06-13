@@ -1,3 +1,28 @@
+## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs and video_core/src/texture_cache/texture_cache_base.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h
+
+### Intentional differences
+- `TextureCacheBase::visit_image_view(...)` now reads compute TIC descriptors through the bound channel `gpu_memory` when available, matching upstream `DescriptorTable<TICEntry> compute_image_table{gpu_memory}` ownership. The reduced `device_memory` reader remains only as fallback construction when no channel is bound.
+- `TextureCacheBase::get_compute_sampler_id(...)` now ports upstream `TextureCache<P>::GetComputeSamplerId`: range-check `compute_sampler_table`, read the TSC descriptor, reuse the cached id when unchanged, and call `FindSampler` on new/changed descriptors. It uses the same bound channel `gpu_memory` source as graphics sampler lookup.
+- `TextureCacheChannelInfo` comments now describe the current descriptor-table ownership instead of the old pre-reader stub state.
+
+### Unintentional differences (to fix)
+- `TextureCacheBase::synchronize_compute_descriptors(...)` is still a stub because ruzu has not yet passed the upstream `kepler_compute->regs` / `launch_description.linked_tsc` snapshot into the texture cache. Without that call, production compute descriptor tables are not synchronized by the OpenGL compute path.
+
+### Missing items
+- Port `TextureCache<P>::SynchronizeComputeDescriptors` with a Rust snapshot of KeplerCompute TIC/TSC address, limit, and linked-TSC state.
+- Port OpenGL `ComputePipeline::Configure` texture/sampler/image binding so the newly ported compute descriptor reads are consumed by dispatch.
+- Apply the backend blacklist `ScaleDown(image)` side effect to `FillComputeImageViews` once the OpenGL compute configure path calls through the backend texture-cache wrapper.
+
+### Binary layout verification
+- PASS: TIC/TSC descriptors remain raw `#[repr(C)]` `[u64; 4]` values read from guest GPU memory; no guest-visible payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::FillComputeImageViews`, `TextureCache<P>::GetComputeSamplerId`, `TextureCache<P>::SynchronizeComputeDescriptors`, and `TextureCacheChannelInfo` descriptor-table members.
+- Re-read upstream OpenGL `ComputePipeline::Configure` to confirm this slice only prepares descriptor resolution; the full compute binding path remains missing in ruzu.
+- `cargo fmt --all --check`
+- `cargo test -p video_core fill_compute_image_views_uses_channel_gpu_memory_for_tic_reads -- --nocapture`
+- `cargo test -p video_core get_compute_sampler_id_uses_channel_gpu_memory_for_tsc_reads -- --nocapture`
+
 ## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs, video_core/src/renderer_opengl/gl_rasterizer.rs, and video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
 
 ### Intentional differences
