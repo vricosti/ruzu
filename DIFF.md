@@ -3,12 +3,12 @@
 ### Intentional differences
 - `TextureCacheBase::synchronize_compute_descriptors(...)` now ports upstream `TextureCache<P>::SynchronizeComputeDescriptors`: it receives a KeplerCompute snapshot, chooses `tsc_limit = tic_limit` when `linked_tsc` is set, synchronizes compute TSC/TIC descriptor tables, and resizes `compute_sampler_ids` / `compute_image_view_ids` with `CORRUPT_ID`.
 - Rust passes `ComputeDescriptorSyncRegs` instead of reading `kepler_compute` directly because `TextureCacheBase` does not own a KeplerCompute pointer; this matches the existing graphics descriptor snapshot pattern.
+- `KeplerCompute::execute_pending(...)` now forwards the recorded `DispatchCall` to `RasterizerInterface::dispatch_compute_with_call(...)`, and OpenGL maps that snapshot into `ComputeDescriptorSyncRegs` before synchronizing the texture cache. This moves the synchronization onto the real KeplerCompute launch path without re-entering `KeplerCompute` mutably while it is already calling the rasterizer.
 
 ### Unintentional differences (to fix)
-- The OpenGL compute dispatch path still does not call this method because `RasterizerOpenGL::dispatch_compute` does not yet drain `KeplerCompute::DispatchCall` or configure an OpenGL `ComputePipeline`.
+- The synchronization currently happens in `RasterizerOpenGL::dispatch_compute_with_call(...)` immediately before the future compute-pipeline configure step. Upstream performs the same texture-cache call inside `ComputePipeline::Configure`; exact method ownership still needs to move there once Rust's OpenGL `ComputePipeline::configure` owns buffer/texture/cache references.
 
 ### Missing items
-- Thread `ComputeDescriptorSyncRegs` from `KeplerCompute::DispatchCall` into OpenGL compute dispatch/configure, then call `synchronize_compute_descriptors(...)` at the upstream `ComputePipeline::Configure` point.
 - Port OpenGL `ComputePipeline::Configure` texture/sampler/image binding so synchronized compute descriptors are consumed by dispatch.
 - Apply backend blacklist `ScaleDown(image)` to `FillComputeImageViews` once the OpenGL compute configure path calls through the backend texture-cache wrapper.
 
@@ -16,8 +16,9 @@
 - PASS: no guest-visible payload changed; TIC/TSC descriptors remain raw 32-byte entries.
 
 ### Tests
-- Re-read upstream `TextureCache<P>::SynchronizeComputeDescriptors` and OpenGL `ComputePipeline::Configure`.
+- Re-read upstream `TextureCache<P>::SynchronizeComputeDescriptors`, OpenGL `RasterizerOpenGL::DispatchCompute`, and OpenGL `ComputePipeline::Configure`.
 - `cargo fmt --all --check`
+- `cargo test -p video_core compute_descriptor_sync_regs_come_from_dispatch_call -- --nocapture`
 - `cargo test -p video_core synchronize_compute_descriptors -- --nocapture`
 - `cargo check -p video_core --quiet`
 

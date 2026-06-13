@@ -504,7 +504,11 @@ impl Engine for KeplerCompute {
 
             self.dispatch_calls.push(dispatch);
             if let Some(rasterizer) = self.rasterizer.map(|handle| unsafe { handle.as_mut() }) {
-                rasterizer.dispatch_compute();
+                let dispatch = self
+                    .dispatch_calls
+                    .last()
+                    .expect("dispatch was just recorded before rasterizer callback");
+                rasterizer.dispatch_compute_with_call(dispatch);
             }
             self.indirect_compute = None;
         }
