@@ -1349,7 +1349,8 @@ impl TextureCacheBase {
             }
         }
 
-        if !self.join_copies_to_do.is_empty() {
+        let has_pending_join_tail = !self.join_copies_to_do.is_empty();
+        if has_pending_join_tail {
             self.join_copies_to_do
                 .sort_by_key(|copy| self.slot_images[copy.id].modification_tick);
             self.pending_join_copies.push(PendingJoinCopies {
@@ -1362,7 +1363,9 @@ impl TextureCacheBase {
         // Upstream now refreshes contents, creates backend copies from GPU-modified overlaps,
         // then unregisters and deletes superseded images. The base cache has no backend
         // `Runtime::CopyImage`, so it queues the copy/delete tail for the backend wrapper.
-        self.register_image(new_image_id);
+        if !has_pending_join_tail {
+            self.register_image(new_image_id);
+        }
         if trace_addr {
             log::warn!(
                 "[TEX_CACHE] join_end id={} gpu=0x{:X} cpu=0x{:X} fmt={:?} {}x{} copies={} left_alias={} right_alias={} bad={}",

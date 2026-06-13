@@ -28,7 +28,7 @@ use crate::texture_cache::texture_cache_base::{
 use crate::texture_cache::types::{BufferImageCopy, ImageCopy};
 use crate::texture_cache::types::{
     Extent2D, Extent3D, ImageId, ImageType, ImageViewId, ImageViewType, Offset2D, Region2D,
-    RelaxedOptions, SubresourceRange, NULL_IMAGE_ID,
+    RelaxedOptions, SubresourceRange, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID,
 };
 use crate::texture_cache::util::{
     full_download_copies, make_shrink_image_copies, map_size_bytes, swizzle_image, unswizzle_image,
@@ -2995,6 +2995,18 @@ impl TextureCache {
         self.base.is_rescaling_active()
     }
 
+    fn ensure_backend_image(&mut self, image_id: ImageId) -> bool {
+        if !image_id.is_valid() || image_id == NULL_IMAGE_ID {
+            return false;
+        }
+        let base_image = self.base.slot_images[image_id].clone();
+        let image = self
+            .images
+            .entry(image_id)
+            .or_insert_with(|| Image::from_base(&base_image, self.has_native_astc));
+        image.handle() != 0
+    }
+
     fn image_can_rescale(&mut self, image_id: ImageId) -> bool {
         if !image_id.is_valid() {
             return false;
@@ -3036,6 +3048,7 @@ impl TextureCache {
         let Some(image) = self.images.get_mut(&image_id) else {
             return false;
         };
+        let has_copy = self.base.slot_images[image_id].has_scaled;
         let rescaled = image.scale_up(
             &mut self.base.slot_images[image_id],
             &self.rescale_read_fbos,
@@ -3043,6 +3056,16 @@ impl TextureCache {
             false,
         );
         if rescaled {
+            if !has_copy {
+                let resolution = settings::values().resolution_info.clone();
+                let scale_up = (resolution.up_scale * resolution.up_scale) as u64;
+                let down_shift = (resolution.down_shift + resolution.down_shift) as u64;
+                let image = &self.base.slot_images[image_id];
+                let image_size_bytes =
+                    u64::from(image.guest_size_bytes.max(image.unswizzled_size_bytes));
+                let tentative_size = (image_size_bytes * scale_up) >> down_shift;
+                self.base.total_used_memory += common::alignment::align_up(tentative_size, 1024);
+            }
             self.invalidate_scale(image_id);
         }
         rescaled
@@ -3065,6 +3088,9 @@ impl TextureCache {
     }
 
     fn invalidate_scale(&mut self, image_id: ImageId) {
+        if self.base.slot_images[image_id].scale_tick <= self.base.frame_tick {
+            self.base.slot_images[image_id].scale_tick = self.base.frame_tick + 1;
+        }
         let image_view_ids = self.base.slot_images[image_id].image_view_ids.clone();
         for view_id in &image_view_ids {
             for color_buffer_id in &mut self.base.render_targets.color_buffer_ids {
@@ -3078,9 +3104,120 @@ impl TextureCache {
             self.image_views.remove(view_id);
             self.remove_framebuffers_for_view(*view_id);
         }
+        self.base
+            .channel_state
+            .image_views
+            .retain(|_, id| !image_view_ids.contains(id));
+        self.base.channel_state.graphics_image_table.invalidate();
+        self.base.channel_state.compute_image_table.invalidate();
+        self.base
+            .channel_state
+            .graphics_image_view_ids
+            .fill(crate::texture_cache::types::CORRUPT_ID);
+        self.base
+            .channel_state
+            .compute_image_view_ids
+            .fill(crate::texture_cache::types::CORRUPT_ID);
         self.base.slot_images[image_id].image_view_ids.clear();
         self.base.slot_images[image_id].image_view_infos.clear();
         self.base.has_deleted_images = true;
+    }
+
+    /// Port of upstream `TextureCache<P>::RescaleRenderTargets` for the
+    /// current Rust render-target snapshot bridge.
+    fn rescale_current_render_targets(
+        &mut self,
+    ) -> (bool, u32, [Option<ImageId>; NUM_RT], Option<ImageId>) {
+        let mut scale_rating = 0u32;
+        let mut any_rescaled = false;
+        let mut can_rescale = true;
+        let mut color_images = [None; NUM_RT];
+        let mut depth_image = None;
+
+        let mut check_rescale =
+            |cache: &mut Self, view_id: ImageViewId, save: &mut Option<ImageId>| {
+                if view_id.is_valid() && view_id != NULL_IMAGE_VIEW_ID {
+                    let image_id = cache.base.slot_image_views[view_id].image_id;
+                    *save = Some(image_id);
+                    cache.ensure_backend_image(image_id);
+                    can_rescale &= cache.image_can_rescale(image_id);
+                    let image = &cache.base.slot_images[image_id];
+                    any_rescaled |= image.flags.contains(ImageFlagBits::RESCALED)
+                        || crate::surface::get_format_type(image.info.format)
+                            != SurfaceType::ColorTexture;
+                    scale_rating = scale_rating.max(if image.scale_tick <= cache.base.frame_tick {
+                        image.scale_rating + 1
+                    } else {
+                        image.scale_rating
+                    });
+                } else {
+                    *save = None;
+                }
+            };
+
+        for index in 0..NUM_RT {
+            let view_id = self.base.render_targets.color_buffer_ids[index];
+            check_rescale(self, view_id, &mut color_images[index]);
+        }
+        check_rescale(
+            self,
+            self.base.render_targets.depth_buffer_id,
+            &mut depth_image,
+        );
+
+        let rescaled = if can_rescale {
+            let rescaled = any_rescaled || scale_rating >= 2;
+            if rescaled {
+                for image_id in color_images.into_iter().flatten() {
+                    self.scale_up_image(image_id);
+                }
+                if let Some(image_id) = depth_image {
+                    self.scale_up_image(image_id);
+                }
+                scale_rating = 2;
+            }
+            rescaled
+        } else {
+            for image_id in color_images.into_iter().flatten() {
+                self.scale_down_image(image_id);
+            }
+            if let Some(image_id) = depth_image {
+                self.scale_down_image(image_id);
+            }
+            scale_rating = 1;
+            false
+        };
+
+        (rescaled, scale_rating, color_images, depth_image)
+    }
+
+    fn set_render_target_scale_rating(
+        &mut self,
+        scale_rating: u32,
+        color_images: [Option<ImageId>; NUM_RT],
+        depth_image: Option<ImageId>,
+    ) {
+        for image_id in color_images.into_iter().flatten().chain(depth_image) {
+            let image = &mut self.base.slot_images[image_id];
+            image.scale_rating = scale_rating;
+            if image.scale_tick <= self.base.frame_tick {
+                image.scale_tick = self.base.frame_tick + 1;
+            }
+        }
+    }
+
+    fn update_rescaled_render_target_size(&mut self, render_targets: &Maxwell3DRenderTargets) {
+        let resolution = settings::values().resolution_info.clone();
+        let (up_scale, down_shift) = if self.base.is_rescaling {
+            (resolution.up_scale, resolution.down_shift)
+        } else {
+            (1, 0)
+        };
+        self.base.render_targets.size = Extent2D {
+            width: (render_targets.surface_clip.width.saturating_mul(up_scale)) >> down_shift,
+            height: (render_targets.surface_clip.height.saturating_mul(up_scale)) >> down_shift,
+        };
+        self.base.render_targets.is_rescaled = self.base.is_rescaling;
     }
 
     fn ensure_backend_image_flags(&mut self, image_id: ImageId) {
@@ -3433,6 +3570,20 @@ impl TextureCache {
     }
 
     fn finish_pending_join_copies(&mut self) {
+        self.finish_pending_join_copies_impl(None);
+    }
+
+    fn finish_pending_join_copies_with_gpu_reader(
+        &mut self,
+        read_gpu: &mut dyn FnMut(u64, &mut [u8]) -> bool,
+    ) {
+        self.finish_pending_join_copies_impl(Some(read_gpu));
+    }
+
+    fn finish_pending_join_copies_impl(
+        &mut self,
+        mut read_gpu: Option<&mut dyn FnMut(u64, &mut [u8]) -> bool>,
+    ) {
         let pending = std::mem::take(&mut self.base.pending_join_copies);
         let trace_join = std::env::var_os("RUZU_TRACE_JOIN_IMAGES").is_some();
         for join in pending {
@@ -3451,6 +3602,9 @@ impl TextureCache {
                     image.info.size.height,
                     join.copies.len()
                 );
+            }
+            if let Some(reader) = read_gpu.as_deref_mut() {
+                self.refresh_contents_with_gpu_reader(join.new_image_id, reader);
             }
             let can_rescale =
                 self.prepare_pending_join_rescale(join.new_image_id, &join.copies, trace_join);
@@ -3537,6 +3691,13 @@ impl TextureCache {
                 }
 
                 self.delete_join_overlap_image(copy_object.id);
+            }
+            if self.base_image_exists(join.new_image_id)
+                && !self.base.slot_images[join.new_image_id]
+                    .flags
+                    .contains(ImageFlagBits::REGISTERED)
+            {
+                self.base.register_image(join.new_image_id);
             }
         }
     }
@@ -4406,6 +4567,22 @@ impl TextureCache {
         &mut self,
         views: &[crate::texture_cache::texture_cache_base::ImageViewInOut],
     ) {
+        self.materialize_views_impl(views, None);
+    }
+
+    pub fn materialize_views_with_gpu_reader(
+        &mut self,
+        views: &[crate::texture_cache::texture_cache_base::ImageViewInOut],
+        read_gpu: &mut dyn FnMut(u64, &mut [u8]) -> bool,
+    ) {
+        self.materialize_views_impl(views, Some(read_gpu));
+    }
+
+    fn materialize_views_impl(
+        &mut self,
+        views: &[crate::texture_cache::texture_cache_base::ImageViewInOut],
+        mut read_gpu: Option<&mut dyn FnMut(u64, &mut [u8]) -> bool>,
+    ) {
         use crate::texture_cache::types::{NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID};
         for view in views {
             let view_id = view.id;
@@ -4470,7 +4647,11 @@ impl TextureCache {
         // materialisation boundary as well as at render-target setup. Without
         // this, a sampled view can bind an image before its overlapping source
         // content has been copied into it.
-        self.finish_pending_join_copies();
+        if let Some(reader) = read_gpu.as_deref_mut() {
+            self.finish_pending_join_copies_with_gpu_reader(reader);
+        } else {
+            self.finish_pending_join_copies();
+        }
     }
 
     /// Materialise GL-side `Sampler` objects for the given sampler ids.
@@ -4656,10 +4837,25 @@ impl TextureCache {
     pub fn update_render_targets_from_snapshot(
         &mut self,
         render_targets: &Maxwell3DRenderTargets,
-        gpu_to_cpu: impl FnMut(crate::texture_cache::image_base::GPUVAddr) -> Option<u64>,
+        mut gpu_to_cpu: impl FnMut(crate::texture_cache::image_base::GPUVAddr) -> Option<u64>,
     ) {
-        self.base
-            .update_render_targets_from_snapshot(render_targets, gpu_to_cpu);
+        let mut rescaled = false;
+        let mut scale_rating = 0;
+        let mut color_images = [None; NUM_RT];
+        let mut depth_image = None;
+        loop {
+            self.base.has_deleted_images = false;
+            self.base
+                .update_render_targets_from_snapshot(render_targets, &mut gpu_to_cpu);
+            (rescaled, scale_rating, color_images, depth_image) =
+                self.rescale_current_render_targets();
+            if !self.base.has_deleted_images {
+                break;
+            }
+        }
+        self.set_render_target_scale_rating(scale_rating, color_images, depth_image);
+        self.base.is_rescaling = rescaled;
+        self.update_rescaled_render_target_size(render_targets);
     }
 
     pub fn prepare_render_targets_from_snapshot(
@@ -4714,7 +4910,11 @@ impl TextureCache {
         // RefreshContents and before RegisterImage returns. The Rust cache
         // splits UpdateRenderTargets and PrepareImageView, so drain after the
         // prepare pass rather than immediately after target discovery.
-        self.finish_pending_join_copies();
+        if let Some(reader) = read_gpu.as_deref_mut() {
+            self.finish_pending_join_copies_with_gpu_reader(reader);
+        } else {
+            self.finish_pending_join_copies();
+        }
     }
 
     fn is_full_clear_for_view(&self, view_id: ImageViewId, scissor: Option<ScissorInfo>) -> bool {
@@ -5117,6 +5317,11 @@ impl TextureCache {
             return false;
         }
 
+        self.finish_pending_join_copies_with_gpu_reader(&mut read_gpu);
+        if !self.base_image_exists(src_id) || !self.base_image_exists(dst_id) {
+            return false;
+        }
+
         let native_bgr = self.has_native_bgr;
         if crate::surface::get_format_type(dst_info.format)
             != crate::surface::get_format_type(self.base.slot_images[dst_id].info.format)
@@ -5152,6 +5357,10 @@ impl TextureCache {
                 if !self.base.has_deleted_images {
                     break;
                 }
+            }
+            self.finish_pending_join_copies_with_gpu_reader(&mut read_gpu);
+            if !self.base_image_exists(src_id) || !self.base_image_exists(dst_id) {
+                return false;
             }
         }
 

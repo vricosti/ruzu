@@ -18049,14 +18049,17 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Intentional differences
 - Rust stores the upstream `TextureCacheRuntime::rescale_draw_fbos` / `rescale_read_fbos` objects directly on `OpenGL::TextureCache`, because ruzu does not split a separate OpenGL texture-cache runtime object. Ownership remains in the OpenGL texture-cache backend.
 - Rust `Image::scale_up` / `scale_down` take the corresponding `ImageBase` as an explicit parameter instead of inheriting from it like upstream `OpenGL::Image : ImageBase`.
-- Rust `invalidate_scale` removes backend GL image views/framebuffers and clears the base image view lists locally. The full upstream channel descriptor-table invalidation is still broader texture-cache ownership work, but the scaled image views used by `BlitImage` are recreated against the new `current_texture`.
+- Rust `update_render_targets_from_snapshot` reruns the snapshot bridge while `has_deleted_images` is raised by rescale invalidation, instead of upstream rerunning `FindColorBuffer` / `FindDepthBuffer` through Maxwell dirty flags. This preserves the upstream `RescaleRenderTargets` loop ordering while ruzu still receives render-target registers as a draw snapshot.
+- Rust `invalidate_scale` removes backend GL image views/framebuffers, clears the base image view lists, invalidates the single channel's graphics/compute TIC tables, and marks cached graphics/compute image-view ids corrupt. Upstream iterates `active_channel_ids`; ruzu currently models one inline channel state.
+- Rust updates `render_targets.is_rescaled` and scaled `render_targets.size` in the OpenGL snapshot bridge after the rescale decision. Upstream also marks `Dirty::RescaleViewports`, `Dirty::RescaleScissors`, and `Dirty::DepthBiasGlobal`; ruzu's remaining viewport/scissor/depth-bias dirty propagation still lives outside the texture-cache snapshot bridge.
 
 ### Unintentional differences (to fix)
-- `TextureCache<P>::RescaleRenderTargets` remains incomplete in Rust, so render-target binding-time scale transitions are still not fully upstream-equivalent.
+- Upstream `TextureCache<P>::UpdateRenderTargets` is skipped entirely when `Dirty::RenderTargets` is false and only prepares existing views. Rust has no Maxwell dirty-flag owner in `OpenGL::TextureCache`, so the snapshot bridge re-resolves render-target views on each draw/clear call.
+- Upstream dirty-flag side effects from `InvalidateScale` (`RenderTargets`, `ZetaBuffer`, each `ColorBuffer`, rescale viewport/scissor, depth-bias) are not represented literally because ruzu does not yet store Maxwell3D dirty flags inside the texture cache.
 
 ### Missing items
-- Full upstream `InvalidateScale` side effects on active graphics/compute descriptor tables and dirty flags.
-- Full `RescaleRenderTargets` parity outside the `BlitImage` rescale/resolve path.
+- Multi-channel `active_channel_ids` / `channel_storage` parity for `InvalidateScale`; Rust invalidates the current inline channel only.
+- Move the snapshot bridge back toward upstream `TextureCache<P>::UpdateRenderTargets` ownership once the Rust texture cache owns Maxwell3D dirty flags and live register access.
 
 ### Binary layout verification
 - N/A: OpenGL image scaling and framebuffer blit behavior only. No guest-visible raw payload layout changed.
@@ -18065,20 +18068,23 @@ The following still panic because upstream either also throws NotImplementedExce
 - `cargo fmt --all --check`
 - `cargo test -p video_core present_internal_format_matches_basic_surface_formats -- --nocapture`
 - `cargo build --release --bin ruzu-cmd`
+- `cargo check -p video_core`
 
 ## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
 
 ### Intentional differences
 - Upstream `TextureCache<P>::JoinImages` owns the full templated runtime tail synchronously. Rust still splits common image metadata from OpenGL backend images, so `TextureCacheBase::JoinImages` queues `PendingJoinCopies` and `OpenGL::TextureCache::finish_pending_join_copies` drains the backend work once GL images exist.
 - The new Rust `prepare_pending_join_rescale` helper ports the backend-owned part of upstream `JoinImages`: compute `can_rescale` from `new_info.rescaleable`, sibling `ImageCanRescale`, and sibling `Rescaled` flags; scale siblings up/down before copy; scale the new image up/down; and pass the matching `up_scale/down_shift` to `make_shrink_image_copies`.
+- `OpenGLTextureCache::materialize_views_with_gpu_reader` and `prepare_render_targets_from_snapshot` now carry the channel GPU reader into `finish_pending_join_copies`, so draw/render-target drains perform `RefreshContents(new_image)` before rescale and copy when the same reader that upstream `TextureCache<P>` would use is available.
+- For joins with pending backend copies, Rust now delays `RegisterImage(new_image_id)` until `finish_pending_join_copies` has refreshed, rescaled, copied from GPU-modified overlaps, unregistered/deleted superseded overlaps, and is about to return. Joins without pending backend copies still register in `TextureCacheBase::JoinImages`.
 
 ### Unintentional differences (to fix)
-- Upstream calls `RefreshContents(new_image, new_image_id)` before scaling/copying the new joined image. Rust cannot do that at every `PendingJoinCopies` drain point because texture-view materialisation lacks the channel GPU reader required by `refresh_contents_with_gpu_reader`.
-- Upstream executes the copy/delete tail before `RegisterImage(new_image_id)`. Rust still registers in the common cache before the OpenGL deferred tail runs, exposing a split-owner ordering difference.
+- Upstream calls `RefreshContents(new_image, new_image_id)` inside `JoinImages`, before any caller can observe the new image. Rust still cannot do that at every `PendingJoinCopies` drain point: reader-backed draw/render-target drains now refresh first, but reader-less fallback drains still run without upload because they lack a channel GPU reader.
+- Upstream executes the copy/delete tail before returning from `JoinImages`; Rust still exposes `new_image_id` to its immediate caller before the deferred OpenGL tail runs, although registration in CPU/GPU page tables is now delayed until after that tail for pending-copy joins.
 
 ### Missing items
-- Restore upstream-equivalent `RefreshContents(new_image)` ordering for joined images, either by moving the backend tail to a point that always has a GPU reader or by carrying an equivalent upload hook through the texture-cache owner.
-- Remove or tighten the `PendingJoinCopies` split so `JoinImages` cannot expose registered intermediate state before backend copies/deletes complete.
+- Complete upstream-equivalent `RefreshContents(new_image)` ordering for reader-less joined-image drains, either by moving all backend tail execution to a point that always has a GPU reader or by carrying an equivalent upload hook through the texture-cache owner.
+- Remove or tighten the `PendingJoinCopies` split further so `JoinImages` cannot expose the unregistered intermediate image id before backend copies/deletes complete.
 - Remaining upstream `JoinImages` runtime branches not covered by this slice: full reinterpret/emulated copy parity, bad-overlap download interactions, and exact descriptor-table/dirty-flag invalidation after rescale.
 
 ### Binary layout verification
@@ -18087,3 +18093,4 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Tests
 - `cargo fmt --all --check`
 - `cargo check -p video_core`
+- `cargo test -p video_core join_images -- --nocapture`

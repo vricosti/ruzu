@@ -4174,7 +4174,18 @@ impl RasterizerInterface for RasterizerOpenGL {
             // GL wrapper lazily mirrors the slots into its HashMaps here.
             // Required before any future `glBindTextureUnit` step can resolve
             // a view-id to a real GL texture name.
-            self.texture_cache.materialize_views(&views);
+            if let (Some(mm), Some(_reader)) = (cbuf_mm_guard.as_ref(), cbuf_device_reader.as_ref())
+            {
+                self.texture_cache.materialize_views_with_gpu_reader(
+                    &views,
+                    &mut |gpu_addr, out| {
+                        mm.read_block(gpu_addr, out);
+                        true
+                    },
+                );
+            } else {
+                self.texture_cache.materialize_views(&views);
+            }
             record_gl_draw_stage(draw_seq, 19);
             trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_materialize_views", draw_seq);
             // Slice 13: materialise the GL `Sampler` objects for the same
