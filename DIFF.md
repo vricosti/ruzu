@@ -1621,13 +1621,12 @@
 - Added env-gated `RUZU_TRACE_ALIAS_SYNC=1` logging for alias-copy skips and GL copy errors. Upstream has no equivalent diagnostic hook; default execution is unchanged.
 
 ### Unintentional differences (to fix)
-- Upstream handles resolution scaling around alias copies by calling `ScaleUp` / `ScaleDown` on the involved images before copying. Ruzu now adjusts `ImageCopy` offsets/extents for already-rescaled same-format direct copies, but the OpenGL `Image::ScaleUp` / `Image::ScaleDown` texture-blit implementation is still stubbed.
 - Upstream `PrepareImage` always performs `RefreshContents` before `SynchronizeAliases`. Ruzu's reader-less fallback can only perform alias synchronization; CPU-modified texture upload still requires the `prepare_image_with_gpu_reader` path.
-- Upstream routes MSAA copies, BGR/BC4 emulated copies, and reinterpret/format-conversion copies through runtime helpers. Ruzu currently skips different sample-count and different-format alias copies.
+- Upstream routes all copy policy through `TextureCacheRuntime`. Rust now covers direct copies, MSAA copies, BGR/format conversion via `FormatConversionPass`, and BC4 3D emulated copies through `UtilShaders::copy_bc4`, but the S8D24 post-conversion utility pass is still not wired.
 - Ruzu still depends on registered `aliased_images`; if the image insertion path failed to create aliases because `JoinImages` / `ResolveOverlap` parity is incomplete, this synchronization has no aliases to process.
 
 ### Missing items
-- Port full `TextureCache<P>::CopyImage` policy including MSAA copy shader path and reinterpret/format-conversion fallback.
+- Port the remaining `TextureCache<P>::CopyImage` utility path for S8D24 component conversion after `FormatConversionPass`.
 - Complete `JoinImages` / `ResolveOverlap` parity so all upstream alias relationships are registered before `SynchronizeAliases` runs.
 
 ### Binary layout verification
@@ -1731,7 +1730,7 @@
 - `OpenGLTextureCache::blit_image` still owns the OpenGL framebuffer-blit body directly instead of routing through an upstream-shaped `TextureCacheRuntime`, because the runtime owner split is not ported yet.
 
 ### Unintentional differences (to fix)
-- Upstream handles rescaled source/destination images (`ImageCanRescale`, `ScaleUp`, `ScaleDown`, resolution scaling). Ruzu still does not rescale Fermi2D blit regions.
+- None known for the Fermi2D `BlitImage` rescale/region slice after re-reading upstream `TextureCache<P>::BlitImage`; Rust now calls `PrepareImage`, applies `ImageCanRescale` / `ScaleUp` / `ScaleDown`, handles resolve downscaling, and scales source/destination regions before the OpenGL framebuffer blit.
 
 ### Missing items
 - Port the full common `TextureCache<P>::BlitImage` ownership once backend hooks can call OpenGL upload/framebuffer operations without duplicating lifecycle in `gl_texture_cache.rs`.
@@ -18016,8 +18015,8 @@ The following still panic because upstream either also throws NotImplementedExce
 - None known for the `CopyImageMSAA` dispatch slice after re-reading upstream `TextureCacheRuntime::CopyImageMSAA` and `UtilShaders::CopyMSAA`.
 
 ### Missing items
-- `UtilShaders::CopyBC4`, `UtilShaders::ConvertS8D24`, and block-linear/pitch upload shader compilation remain broader utility-shader parity gaps outside this MSAA-copy slice.
-- Resolution scaling around `TextureCache<P>::JoinImages` still has broader parity gaps because Rust `Image::scale_up`/`scale_down` are stubs; this pass only removes the sample-count mismatch early return.
+- `UtilShaders::ConvertS8D24` and block-linear/pitch upload shader compilation remain broader utility-shader parity gaps outside this MSAA-copy slice. `UtilShaders::CopyBC4` is now wired for the OpenGL emulated-copy path.
+- Resolution scaling around `TextureCache<P>::JoinImages` still has broader owner-placement and deferred-backend-execution parity gaps, but Rust now has OpenGL `Image::scale_up`/`scale_down` and `TextureCache::ScaleUp`/`ScaleDown` counterparts.
 
 ### Binary layout verification
 - N/A: OpenGL shader dispatch behavior only. No guest-visible raw payload layout changed.
@@ -18035,7 +18034,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - None known for the `UpdateRenderTargets` `render_targets.size` slice after re-reading upstream `TextureCache<P>::UpdateRenderTargets`.
 
 ### Missing items
-- Upstream `RescaleRenderTargets`, `ImageCanRescale`, `ScaleUp`, and `ScaleDown` are still incomplete/stubbed in the Rust texture-cache path. This remains a broader parity gap for resolution scaling and blacklisted texture views.
+- Upstream `RescaleRenderTargets`, `ImageCanRescale`, `ScaleUp`, and `ScaleDown` now have Rust counterparts, but the full upstream dirty-flag ownership around resolution scaling and blacklisted texture views is still incomplete.
 
 ### Binary layout verification
 - N/A: render-target snapshot and cache key behavior only. No guest-visible raw payload layout changed.
@@ -18049,13 +18048,14 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Intentional differences
 - Rust stores the upstream `TextureCacheRuntime::rescale_draw_fbos` / `rescale_read_fbos` objects directly on `OpenGL::TextureCache`, because ruzu does not split a separate OpenGL texture-cache runtime object. Ownership remains in the OpenGL texture-cache backend.
 - Rust `Image::scale_up` / `scale_down` take the corresponding `ImageBase` as an explicit parameter instead of inheriting from it like upstream `OpenGL::Image : ImageBase`.
+- Upstream `OpenGL::Image::Scale(...)` calls `state_tracker.NotifyViewport0()` / `NotifyScissor0()` directly after its internal `glBlitNamedFramebuffer` loop. Rust cannot store a direct `StateTracker&` in `TextureCache` without making `RasterizerOpenGL` self-referential, so `TextureCache` records `rescale_touched_viewport_scissor` and `RasterizerOpenGL` consumes it to call `StateTracker::notify_viewport0()` / `notify_scissor0()` before draw, clear, or after Fermi2D blit.
 - Rust `update_render_targets_from_snapshot` reruns the snapshot bridge while `has_deleted_images` is raised by rescale invalidation, instead of upstream rerunning `FindColorBuffer` / `FindDepthBuffer` through Maxwell dirty flags. This preserves the upstream `RescaleRenderTargets` loop ordering while ruzu still receives render-target registers as a draw snapshot.
 - Rust `invalidate_scale` removes backend GL image views/framebuffers, clears the base image view lists, invalidates the single channel's graphics/compute TIC tables, and marks cached graphics/compute image-view ids corrupt. Upstream iterates `active_channel_ids`; ruzu currently models one inline channel state.
-- Rust updates `render_targets.is_rescaled` and scaled `render_targets.size` in the OpenGL snapshot bridge after the rescale decision. Upstream also marks `Dirty::RescaleViewports`, `Dirty::RescaleScissors`, and `Dirty::DepthBiasGlobal`; ruzu's remaining viewport/scissor/depth-bias dirty propagation still lives outside the texture-cache snapshot bridge.
+- Rust updates `render_targets.is_rescaled` and scaled `render_targets.size` in the OpenGL snapshot bridge after the rescale decision. Upstream also marks `Dirty::RescaleViewports`, `Dirty::RescaleScissors`, and `Dirty::DepthBiasGlobal`; ruzu still lacks the exact Maxwell3D dirty-flag owner for those common flags, but backend GL viewport/scissor invalidation after `Image::Scale(...)` is now represented through the rasterizer-owned state tracker.
 
 ### Unintentional differences (to fix)
 - Upstream `TextureCache<P>::UpdateRenderTargets` is skipped entirely when `Dirty::RenderTargets` is false and only prepares existing views. Rust has no Maxwell dirty-flag owner in `OpenGL::TextureCache`, so the snapshot bridge re-resolves render-target views on each draw/clear call.
-- Upstream dirty-flag side effects from `InvalidateScale` (`RenderTargets`, `ZetaBuffer`, each `ColorBuffer`, rescale viewport/scissor, depth-bias) are not represented literally because ruzu does not yet store Maxwell3D dirty flags inside the texture cache.
+- Upstream dirty-flag side effects from `InvalidateScale` (`RenderTargets`, `ZetaBuffer`, each `ColorBuffer`, common rescale viewport/scissor flags, depth-bias) are not represented literally because ruzu does not yet store Maxwell3D dirty flags inside the texture cache.
 
 ### Missing items
 - Multi-channel `active_channel_ids` / `channel_storage` parity for `InvalidateScale`; Rust invalidates the current inline channel only.
@@ -18076,14 +18076,16 @@ The following still panic because upstream either also throws NotImplementedExce
 - Upstream `TextureCache<P>::JoinImages` owns the full templated runtime tail synchronously. Rust still splits common image metadata from OpenGL backend images, so `TextureCacheBase::JoinImages` queues `PendingJoinCopies` and `OpenGL::TextureCache::finish_pending_join_copies` drains the backend work once GL images exist.
 - The new Rust `prepare_pending_join_rescale` helper ports the backend-owned part of upstream `JoinImages`: compute `can_rescale` from `new_info.rescaleable`, sibling `ImageCanRescale`, and sibling `Rescaled` flags; scale siblings up/down before copy; scale the new image up/down; and pass the matching `up_scale/down_shift` to `make_shrink_image_copies`.
 - `OpenGLTextureCache::materialize_views_with_gpu_reader` and `prepare_render_targets_from_snapshot` now carry the channel GPU reader into `finish_pending_join_copies`, so draw/render-target drains perform `RefreshContents(new_image)` before rescale and copy when the same reader that upstream `TextureCache<P>` would use is available.
+- `RasterizerOpenGL::draw` and `RasterizerOpenGL::clear` now pass `MemoryManager::read_block` into image prepare/materialization/render-target prepare whenever the channel memory manager exists, even if the optional generic `DeviceMemoryReader` handle is absent. This matches upstream's texture cache use of the live channel `gpu_memory` owner more closely than the previous reader-less fallback.
+- Reader-less `finish_pending_join_copies` no longer drains a join whose new image is still `CpuModified`; it leaves the join queued, preserving FIFO order, until a later draw/render-target/clear path can run upstream-equivalent `RefreshContents(new_image)` with a GPU reader. Reader-less drains are still allowed when `RefreshContents` would be a no-op because the image is not CPU-modified.
 - For joins with pending backend copies, Rust now delays `RegisterImage(new_image_id)` until `finish_pending_join_copies` has refreshed, rescaled, copied from GPU-modified overlaps, unregistered/deleted superseded overlaps, and is about to return. Joins without pending backend copies still register in `TextureCacheBase::JoinImages`.
 
 ### Unintentional differences (to fix)
-- Upstream calls `RefreshContents(new_image, new_image_id)` inside `JoinImages`, before any caller can observe the new image. Rust still cannot do that at every `PendingJoinCopies` drain point: reader-backed draw/render-target drains now refresh first, but reader-less fallback drains still run without upload because they lack a channel GPU reader.
+- Upstream calls `RefreshContents(new_image, new_image_id)` inside `JoinImages`, before any caller can observe the new image. Rust still cannot do that synchronously inside `TextureCacheBase::JoinImages`; if no channel GPU reader is available and the new image remains CPU-modified, Rust defers the backend tail rather than running an upload-less copy/delete sequence.
 - Upstream executes the copy/delete tail before returning from `JoinImages`; Rust still exposes `new_image_id` to its immediate caller before the deferred OpenGL tail runs, although registration in CPU/GPU page tables is now delayed until after that tail for pending-copy joins.
 
 ### Missing items
-- Complete upstream-equivalent `RefreshContents(new_image)` ordering for reader-less joined-image drains, either by moving all backend tail execution to a point that always has a GPU reader or by carrying an equivalent upload hook through the texture-cache owner.
+- Complete upstream-equivalent `RefreshContents(new_image)` ordering inside the `JoinImages` owner instead of relying on deferred backend drains with caller-supplied GPU readers.
 - Remove or tighten the `PendingJoinCopies` split further so `JoinImages` cannot expose the unregistered intermediate image id before backend copies/deletes complete.
 - Remaining upstream `JoinImages` runtime branches not covered by this slice: full reinterpret/emulated copy parity, bad-overlap download interactions, and exact descriptor-table/dirty-flag invalidation after rescale.
 

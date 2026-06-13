@@ -2437,6 +2437,7 @@ pub struct TextureCache {
     has_native_astc: bool,
     has_broken_texture_view_formats: bool,
     has_native_bgr: bool,
+    rescale_touched_viewport_scissor: bool,
 }
 
 /// OpenGL backend result of `TextureCache<P>::TryFindFramebufferImageView`.
@@ -2987,12 +2988,17 @@ impl TextureCache {
             has_native_astc,
             has_broken_texture_view_formats,
             has_native_bgr,
+            rescale_touched_viewport_scissor: false,
         }
     }
 
     /// Port of `TextureCache<P>::IsRescaling`.
     pub fn is_rescaling_active(&self) -> bool {
         self.base.is_rescaling_active()
+    }
+
+    pub fn take_rescale_viewport_scissor_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.rescale_touched_viewport_scissor)
     }
 
     fn ensure_backend_image(&mut self, image_id: ImageId) -> bool {
@@ -3056,6 +3062,7 @@ impl TextureCache {
             false,
         );
         if rescaled {
+            self.rescale_touched_viewport_scissor = true;
             if !has_copy {
                 let resolution = settings::values().resolution_info.clone();
                 let scale_up = (resolution.up_scale * resolution.up_scale) as u64;
@@ -3082,6 +3089,7 @@ impl TextureCache {
             false,
         );
         if rescaled {
+            self.rescale_touched_viewport_scissor = true;
             self.invalidate_scale(image_id);
         }
         rescaled
@@ -3585,8 +3593,14 @@ impl TextureCache {
         mut read_gpu: Option<&mut dyn FnMut(u64, &mut [u8]) -> bool>,
     ) {
         let pending = std::mem::take(&mut self.base.pending_join_copies);
+        let mut deferred = Vec::new();
+        let mut blocked_on_reader = false;
         let trace_join = std::env::var_os("RUZU_TRACE_JOIN_IMAGES").is_some();
         for join in pending {
+            if blocked_on_reader {
+                deferred.push(join);
+                continue;
+            }
             if !self.base_image_exists(join.new_image_id) {
                 continue;
             }
@@ -3603,8 +3617,25 @@ impl TextureCache {
                     join.copies.len()
                 );
             }
-            if let Some(reader) = read_gpu.as_deref_mut() {
-                self.refresh_contents_with_gpu_reader(join.new_image_id, reader);
+            match read_gpu.as_deref_mut() {
+                Some(reader) => {
+                    self.refresh_contents_with_gpu_reader(join.new_image_id, reader);
+                }
+                None if self.base.slot_images[join.new_image_id]
+                    .flags
+                    .contains(ImageFlagBits::CPU_MODIFIED) =>
+                {
+                    if trace_join {
+                        log::warn!(
+                            "[JOIN_IMAGES] defer new={} because RefreshContents needs a GPU reader",
+                            join.new_image_id.index
+                        );
+                    }
+                    deferred.push(join);
+                    blocked_on_reader = true;
+                    continue;
+                }
+                None => {}
             }
             let can_rescale =
                 self.prepare_pending_join_rescale(join.new_image_id, &join.copies, trace_join);
@@ -3699,6 +3730,11 @@ impl TextureCache {
             {
                 self.base.register_image(join.new_image_id);
             }
+        }
+        if !deferred.is_empty() {
+            let mut newly_queued = std::mem::take(&mut self.base.pending_join_copies);
+            deferred.append(&mut newly_queued);
+            self.base.pending_join_copies = deferred;
         }
     }
 
@@ -4350,7 +4386,19 @@ impl TextureCache {
         if dst_base.info.image_type == ImageType::E3D
             && dst_base.info.format == crate::surface::PixelFormat::Bc4Unorm
         {
-            log::warn!("TextureCache::emulate_copy_image: BC4 copy path not wired to UtilShaders");
+            debug_assert_eq!(src_base.info.image_type, ImageType::E3D);
+            let Some(dst_image) = self.images.get(&dst_id) else {
+                return;
+            };
+            let Some(src_image) = self.images.get(&src_id) else {
+                return;
+            };
+            let dst_handle = dst_image.handle();
+            let src_handle = src_image.handle();
+            if dst_handle == 0 || src_handle == 0 {
+                return;
+            }
+            self.util_shaders.copy_bc4(dst_handle, src_handle, copies);
             return;
         }
         if is_pixel_format_bgr(dst_base.info.format) || is_pixel_format_bgr(src_base.info.format) {
