@@ -1105,54 +1105,67 @@ pub fn swizzle_image(
             continue;
         }
 
-        let block = info.block();
-        let width = if copy.buffer_row_length != 0 {
-            copy.buffer_row_length
-        } else {
-            copy.image_extent.width
-        };
-        let height = if copy.buffer_image_height != 0 {
-            copy.buffer_image_height
-        } else {
-            copy.image_extent.height
-        };
-        let swizzled_size = crate::textures::decoders::calculate_size(
-            true,
-            bytes_per_block,
-            width,
-            height,
-            copy.image_extent.depth.max(1),
-            block.height,
-            block.depth,
-        );
-        if swizzled_size == 0 {
+        let level = copy.image_subresource.base_level.max(0) as u32;
+        let level_info = make_level_info_from_image(info);
+        let tile_size = default_block_size(info.format);
+        let level_size = adjust_mip_size_3d(info.size, level);
+
+        debug_assert_eq!(copy.image_offset, Offset3D { x: 0, y: 0, z: 0 });
+        debug_assert_eq!(copy.image_extent, level_size);
+
+        let num_tiles = adjust_tile_size_3d(level_size, tile_size);
+        let num_blocks_per_layer = num_tiles.width * num_tiles.height * num_tiles.depth;
+        let host_bytes_per_layer = num_blocks_per_layer * bytes_per_block;
+        if host_bytes_per_layer == 0 {
             continue;
         }
-        tmp_buffer.clear();
-        tmp_buffer.resize(swizzled_size, 0);
 
-        let src_offset = copy.buffer_offset;
-        if src_offset >= memory.len() {
+        let block =
+            adjust_mip_block_size_3d(num_tiles, level_info.block, level, level_info.num_levels);
+        let num_levels = info.resources.levels as u32;
+        let sizes = calculate_level_sizes(&level_info, num_levels);
+        let mut guest_offset = calculate_level_bytes(&sizes, level) as u64;
+        let layer_stride = align_layer_size(
+            calculate_level_bytes(&sizes, num_levels),
+            info.size,
+            level_info.block,
+            tile_size.height,
+            info.tile_width_spacing,
+        ) as u64;
+        let subresource_size = sizes[level as usize] as usize;
+        if subresource_size == 0 {
             continue;
         }
-        let src = &memory[src_offset..];
-        crate::textures::decoders::swizzle_texture(
-            tmp_buffer,
-            src,
-            bytes_per_block,
-            width,
-            height,
-            copy.image_extent.depth.max(1),
-            block.height,
-            block.depth,
-            calculate_level_stride_alignment(info, copy.image_subresource.base_level as u32),
-        );
 
-        // For the full-image download path, `buffer_offset` follows the same
-        // per-level order as the guest image layout calculated by
-        // `FullDownloadCopies`. Subresource-offset writes need the full
-        // upstream `SwizzleBlockLinearImage` port.
-        guest_memory_writer(cpu_addr + copy.buffer_offset as u64, tmp_buffer);
+        let mut host_offset = copy.buffer_offset;
+        for _layer in 0..info.resources.layers.max(0) as u32 {
+            let src_end = host_offset.saturating_add(host_bytes_per_layer as usize);
+            if src_end > memory.len() {
+                break;
+            }
+
+            tmp_buffer.clear();
+            tmp_buffer.resize(subresource_size, 0);
+            crate::textures::decoders::swizzle_texture(
+                tmp_buffer,
+                &memory[host_offset..src_end],
+                bytes_per_block,
+                num_tiles.width,
+                num_tiles.height,
+                num_tiles.depth,
+                block.height,
+                block.depth,
+                calculate_level_stride_alignment(info, level),
+            );
+
+            guest_memory_writer(cpu_addr + guest_offset, tmp_buffer);
+            host_offset += host_bytes_per_layer as usize;
+            guest_offset += layer_stride;
+        }
+        debug_assert_eq!(
+            host_offset.saturating_sub(copy.buffer_offset),
+            copy.buffer_size
+        );
     }
 }
 
@@ -1689,6 +1702,81 @@ mod tests {
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0], (0x1000, vec![0, 1, 2, 3, 4, 5, 6, 7]));
         assert_eq!(writes[1], (0x1010, vec![8, 9, 10, 11, 12, 13, 14, 15]));
+    }
+
+    #[test]
+    fn swizzle_image_block_linear_uses_guest_level_offsets_and_layer_stride() {
+        let writes = Arc::new(Mutex::new(Vec::<(u64, usize)>::new()));
+        let writes_for_callback = Arc::clone(&writes);
+        let writer = move |addr: u64, bytes: &[u8]| {
+            writes_for_callback
+                .lock()
+                .unwrap()
+                .push((addr, bytes.len()));
+        };
+
+        let info = ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E2D,
+            resources: SubresourceExtent {
+                levels: 2,
+                layers: 2,
+            },
+            size: Extent3D {
+                width: 64,
+                height: 64,
+                depth: 1,
+            },
+            tiling: TilingMode::BlockLinear(Extent3D {
+                width: 0,
+                height: 1,
+                depth: 0,
+            }),
+            layer_stride: 0,
+            maybe_unaligned_layer_stride: 0,
+            num_samples: 1,
+            tile_width_spacing: 0,
+            rescaleable: false,
+            downscaleable: false,
+            forced_flushed: false,
+            dma_downloaded: false,
+            is_sparse: false,
+        };
+        let copies = full_download_copies(&info);
+        let memory = vec![0x5a; calculate_unswizzled_size_bytes(&info) as usize];
+        let mut tmp = Vec::new();
+
+        swizzle_image(&writer, 0x4000, &info, &copies, &memory, &mut tmp);
+
+        let level_info = make_level_info_from_image(&info);
+        let sizes = calculate_level_sizes(&level_info, info.resources.levels as u32);
+        let layer_stride = align_layer_size(
+            calculate_level_bytes(&sizes, info.resources.levels as u32),
+            info.size,
+            info.block(),
+            surface::default_block_height(info.format),
+            info.tile_width_spacing,
+        );
+        let writes = writes.lock().unwrap();
+        assert_eq!(
+            writes.iter().map(|&(addr, _)| addr).collect::<Vec<_>>(),
+            vec![
+                0x4000,
+                0x4000 + layer_stride as u64,
+                0x4000 + sizes[0] as u64,
+                0x4000 + sizes[0] as u64 + layer_stride as u64,
+            ]
+        );
+        assert_eq!(
+            writes.iter().map(|&(_, len)| len).collect::<Vec<_>>(),
+            vec![
+                sizes[0] as usize,
+                sizes[0] as usize,
+                sizes[1] as usize,
+                sizes[1] as usize,
+            ]
+        );
+        assert_ne!(copies[1].buffer_offset as u32, sizes[0]);
     }
 
     #[test]
