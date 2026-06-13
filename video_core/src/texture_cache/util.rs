@@ -748,6 +748,13 @@ pub fn is_valid_entry_with_addr_valid(
     config: &crate::textures::texture::TicEntry,
     mut addr_valid: impl FnMut(GPUVAddr) -> bool,
 ) -> bool {
+    is_valid_entry_with_range_valid(config, |address, _size| addr_valid(address))
+}
+
+pub fn is_valid_entry_with_range_valid(
+    config: &crate::textures::texture::TicEntry,
+    mut range_valid: impl FnMut(GPUVAddr, u64) -> bool,
+) -> bool {
     let address = config.address();
     if address == 0 {
         return false;
@@ -755,15 +762,12 @@ pub fn is_valid_entry_with_addr_valid(
     if address >= 1u64 << 40 {
         return false;
     }
-    if addr_valid(address) {
+    if range_valid(address, 1) {
         return true;
     }
-    // Upstream: second has_value with explicit size. Compute the size so
-    // the call site keeps the contract; until the range-aware SMMU walk
-    // lands, the check itself collapses to the same single-page validation.
     let info = super::image_info::ImageInfo::from_tic_entry(config);
-    let _guest_size_bytes = calculate_guest_size_in_bytes(&info);
-    addr_valid(address)
+    let guest_size_bytes = calculate_guest_size_in_bytes(&info) as u64;
+    range_valid(address, guest_size_bytes)
 }
 
 // ── Swizzle / unswizzle ────────────────────────────────────────────────
@@ -1584,7 +1588,46 @@ pub fn map_size_bytes(image: &ImageBase) -> u32 {
 mod tests {
     use super::*;
     use crate::texture_cache::image_info::TilingMode;
+    use crate::textures::texture::{ComponentType, TextureFormat, TextureType, TicEntry};
     use std::sync::{Arc, Mutex};
+
+    fn make_2d_tic(address: GPUVAddr) -> TicEntry {
+        let word0 = (TextureFormat::A8B8G8R8 as u32)
+            | ((ComponentType::Unorm as u32) << 7)
+            | ((ComponentType::Unorm as u32) << 10)
+            | ((ComponentType::Unorm as u32) << 13)
+            | ((ComponentType::Unorm as u32) << 16);
+        let word1 = address as u32;
+        let word2 = ((address >> 32) as u32 & 0xFFFF) | (3 << 21);
+        let word3 = 1 << 10;
+        let word4 = 63 | ((TextureType::Texture2D as u32) << 23);
+        let word5 = 31 | (1 << 31);
+        TicEntry {
+            raw: [
+                word0 as u64 | ((word1 as u64) << 32),
+                word2 as u64 | ((word3 as u64) << 32),
+                word4 as u64 | ((word5 as u64) << 32),
+                0,
+            ],
+        }
+    }
+
+    #[test]
+    fn is_valid_entry_accepts_size_aware_range_like_upstream() {
+        let tic = make_2d_tic(0x5000_0000);
+        let expected_size = calculate_guest_size_in_bytes(
+            &super::super::image_info::ImageInfo::from_tic_entry(&tic),
+        ) as u64;
+        let mut calls = Vec::new();
+
+        let valid = is_valid_entry_with_range_valid(&tic, |addr, size| {
+            calls.push((addr, size));
+            size == expected_size
+        });
+
+        assert!(valid);
+        assert_eq!(calls, vec![(0x5000_0000, 1), (0x5000_0000, expected_size)]);
+    }
 
     #[test]
     fn swizzle_image_pitch_linear_writes_rows_to_guest() {

@@ -1896,7 +1896,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 .memory_tracker
                 .is_region_gpu_modified(device_addr, size as u64);
 
-
         if use_fast_buffer {
             // Upstream fast path: either BindMappedUniformBuffer or PushFastUniformBuffer.
             let mut fast_buffer_bound = false;

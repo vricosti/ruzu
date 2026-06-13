@@ -608,6 +608,7 @@ pub struct Maxwell3DRenderTargets {
     pub render_targets: [RenderTargetInfo; 8],
     pub zeta: crate::engines::maxwell_3d::ZetaInfo,
     pub anti_alias_samples_mode: u32,
+    pub surface_clip: crate::engines::maxwell_3d::SurfaceClipInfo,
 }
 
 #[derive(Debug, Clone)]
@@ -712,6 +713,7 @@ impl Maxwell3DDrawRegisters {
                 render_targets: std::array::from_fn(|i| maxwell3d.rt_info(i)),
                 zeta: maxwell3d.zeta_info(),
                 anti_alias_samples_mode: maxwell3d.anti_alias_samples_mode(),
+                surface_clip: maxwell3d.surface_clip_info(),
             },
             cb_bindings: std::array::from_fn(|stage| {
                 std::array::from_fn(|slot| maxwell3d.const_buffer_binding(stage, slot))
@@ -856,6 +858,7 @@ impl<'a> Maxwell3DDrawView<'a> {
                 render_targets: std::array::from_fn(|i| maxwell3d.rt_info(i)),
                 zeta: maxwell3d.zeta_info(),
                 anti_alias_samples_mode: maxwell3d.anti_alias_samples_mode(),
+                surface_clip: maxwell3d.surface_clip_info(),
             },
             Maxwell3DDrawSource::Snapshot(registers) => registers.render_targets,
         }
@@ -1222,6 +1225,7 @@ impl<'a> Maxwell3DClearView<'a> {
                 render_targets: std::array::from_fn(|i| maxwell3d.rt_info(i)),
                 zeta: maxwell3d.zeta_info(),
                 anti_alias_samples_mode: maxwell3d.anti_alias_samples_mode(),
+                surface_clip: maxwell3d.surface_clip_info(),
             },
             Maxwell3DClearSource::Snapshot { render_targets, .. } => render_targets,
         }

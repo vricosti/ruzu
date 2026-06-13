@@ -18,7 +18,10 @@
 
 use crate::engines::draw_manager::Maxwell3DRenderTargets;
 use crate::engines::maxwell_3d::RenderTargetInfo;
+use crate::memory_manager::MemoryManager;
 use crate::surface;
+use parking_lot::Mutex as ParkingMutex;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 use super::descriptor_table::DescriptorTable;
@@ -74,6 +77,14 @@ fn should_trace_texture_cache_addr(gpu_addr: GPUVAddr) -> bool {
 }
 
 impl TextureCacheBase {
+    pub fn set_channel_gpu_memory(&mut self, gpu_memory: Arc<ParkingMutex<MemoryManager>>) {
+        self.channel_gpu_memory = Some(gpu_memory);
+    }
+
+    pub fn clear_channel_gpu_memory(&mut self) {
+        self.channel_gpu_memory = None;
+    }
+
     fn can_add_image_alias(lhs: &ImageBase, rhs: &ImageBase) -> bool {
         if lhs.info.image_type != rhs.info.image_type {
             return false;
@@ -343,8 +354,8 @@ impl TextureCacheBase {
         descriptor: &crate::textures::texture::TicEntry,
         gpu_to_cpu: &mut dyn FnMut(GPUVAddr, u64) -> Option<u64>,
     ) -> ImageViewId {
-        if !super::util::is_valid_entry_with_addr_valid(descriptor, |gpu_addr| {
-            gpu_to_cpu(gpu_addr, 1).is_some()
+        if !super::util::is_valid_entry_with_range_valid(descriptor, |gpu_addr, size| {
+            gpu_to_cpu(gpu_addr, size).is_some()
         }) {
             return NULL_IMAGE_VIEW_ID;
         }
@@ -849,6 +860,10 @@ impl TextureCacheBase {
         }
 
         self.render_targets.is_rescaled = self.is_rescaling;
+        self.render_targets.size = Extent2D {
+            width: render_targets.surface_clip.width,
+            height: render_targets.surface_clip.height,
+        };
 
         for index in 0..NUM_RT {
             let rt = render_targets.render_targets[index];
@@ -1216,10 +1231,33 @@ impl TextureCacheBase {
                 self.join_bad_overlap_ids.push(overlap_id);
             }
         }
+        for overlap_id in self.collect_images_in_gpu_region(gpu_addr, size_bytes, true) {
+            if self.join_overlaps_found.contains(&overlap_id) {
+                continue;
+            }
+            let overlap = &self.slot_images[overlap_id];
+            if overlap.flags.contains(ImageFlagBits::REMAPPED)
+                || (overlap.gpu_addr == gpu_addr && overlap.guest_size_bytes as usize == size_bytes)
+            {
+                self.join_ignore_textures.insert(overlap_id);
+            }
+        }
 
         let new_image_id =
             self.slot_images
                 .insert(ImageBase::new(new_info.clone(), gpu_addr, cpu_addr));
+        if new_info.is_sparse {
+            let gpu_memory = self
+                .channel_gpu_memory
+                .as_ref()
+                .expect("TextureCache::join_images sparse image requires channel GPU memory")
+                .lock();
+            if !gpu_memory.is_continuous_range(gpu_addr, size_bytes as u64) {
+                self.slot_images[new_image_id]
+                    .flags
+                    .insert(ImageFlagBits::SPARSE);
+            }
+        }
 
         for overlap_id in self.join_ignore_textures.clone() {
             if !overlap_id.is_valid() || overlap_id == NULL_IMAGE_ID {
@@ -1349,12 +1387,79 @@ impl TextureCacheBase {
     ///
     /// Inserts the image into page tables and marks it for CPU write-tracking.
     pub fn register_image(&mut self, image_id: ImageId) {
-        let mut map_id = self.slot_images[image_id].map_view_id;
-        if !map_id.is_valid()
-            && !self.slot_images[image_id]
+        let (gpu_addr, guest_size_bytes, is_sparse) = {
+            let image = &self.slot_images[image_id];
+            (
+                image.gpu_addr,
+                image.guest_size_bytes as usize,
+                image.flags.contains(ImageFlagBits::SPARSE),
+            )
+        };
+        if let Some(table) = self.channel_state.gpu_page_table.as_deref_mut() {
+            Self::for_each_gpu_page(gpu_addr, guest_size_bytes, |page| {
+                let entries = table.entry(page).or_default();
+                if !entries.contains(&image_id) {
+                    entries.push(image_id);
+                }
+            });
+        }
+        if is_sparse {
+            if let Some(table) = self.channel_state.sparse_page_table.as_deref_mut() {
+                Self::for_each_gpu_page(gpu_addr, guest_size_bytes, |page| {
+                    let entries = table.entry(page).or_default();
+                    if !entries.contains(&image_id) {
+                        entries.push(image_id);
+                    }
+                });
+            }
+        }
+
+        if is_sparse {
+            let segments = {
+                let gpu_memory = self
+                    .channel_gpu_memory
+                    .as_ref()
+                    .expect("TextureCache::register_image sparse image requires channel GPU memory")
+                    .lock();
+                gpu_memory.get_submapped_range(gpu_addr, guest_size_bytes as u64)
+            };
+            let mut sparse_maps = Vec::new();
+            for (segment_gpu_addr, segment_size) in segments {
+                let cpu_addr = {
+                    let gpu_memory = self
+                        .channel_gpu_memory
+                        .as_ref()
+                        .expect(
+                            "TextureCache::register_image sparse image requires channel GPU memory",
+                        )
+                        .lock();
+                    gpu_memory
+                        .gpu_to_cpu_address(segment_gpu_addr)
+                        .expect("TextureCache::register_image sparse segment must have CPU address")
+                };
+                let map_id = self.slot_map_views.insert(ImageMapView::new(
+                    segment_gpu_addr,
+                    cpu_addr,
+                    segment_size as usize,
+                    image_id,
+                ));
+                Self::for_each_cpu_page(cpu_addr, segment_size as usize, |page| {
+                    let entries = self.page_table.entry(page).or_default();
+                    if !entries.contains(&map_id) {
+                        entries.push(map_id);
+                    }
+                });
+                sparse_maps.push(map_id);
+            }
+            self.sparse_views.insert(image_id, sparse_maps);
+            self.slot_images[image_id]
                 .flags
-                .contains(ImageFlagBits::SPARSE)
-        {
+                .insert(ImageFlagBits::REGISTERED);
+            return;
+        }
+
+        let mut map_id = self.slot_images[image_id].map_view_id;
+        if !map_id.is_valid() {
             let image = &self.slot_images[image_id];
             map_id = self.slot_map_views.insert(ImageMapView::new(
                 image.gpu_addr,
@@ -1364,10 +1469,7 @@ impl TextureCacheBase {
             ));
             self.slot_images[image_id].map_view_id = map_id;
         }
-        if !map_id.is_valid() {
-            log::warn!("TextureCacheBase::register_image: image has no map view");
-            return;
-        }
+        debug_assert!(map_id.is_valid());
         let (cpu_addr, size) = {
             let map = &self.slot_map_views[map_id];
             (map.cpu_addr, map.size)
@@ -1393,6 +1495,30 @@ impl TextureCacheBase {
             "TextureCache::unregister_image: image not registered"
         );
         let is_sparse = image.flags.contains(ImageFlagBits::SPARSE);
+        let gpu_addr = image.gpu_addr;
+        let guest_size_bytes = image.guest_size_bytes as usize;
+        if let Some(table) = self.channel_state.gpu_page_table.as_deref_mut() {
+            Self::for_each_gpu_page(gpu_addr, guest_size_bytes, |page| {
+                if let Some(image_ids) = table.get_mut(&page) {
+                    image_ids.retain(|&id| id != image_id);
+                    if image_ids.is_empty() {
+                        table.remove(&page);
+                    }
+                }
+            });
+        }
+        if is_sparse {
+            if let Some(table) = self.channel_state.sparse_page_table.as_deref_mut() {
+                Self::for_each_gpu_page(gpu_addr, guest_size_bytes, |page| {
+                    if let Some(image_ids) = table.get_mut(&page) {
+                        image_ids.retain(|&id| id != image_id);
+                        if image_ids.is_empty() {
+                            table.remove(&page);
+                        }
+                    }
+                });
+            }
+        }
         let map_ids = if is_sparse {
             self.sparse_views
                 .remove(&image_id)
@@ -1746,6 +1872,8 @@ mod tests {
         use std::sync::Arc;
         let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
         let mut render_targets = Maxwell3DRenderTargets::default();
+        render_targets.surface_clip.width = 1280;
+        render_targets.surface_clip.height = 720;
         render_targets.rt_control = RtControlInfo {
             count: 1,
             map: [0, 0, 0, 0, 0, 0, 0, 0],
@@ -1789,6 +1917,8 @@ mod tests {
         assert!(cache.render_targets.color_buffer_ids[0].is_valid());
         assert!(cache.render_targets.depth_buffer_id.is_valid());
         assert_eq!(cache.render_targets.draw_buffers[0], 0);
+        assert_eq!(cache.render_targets.size.width, 1280);
+        assert_eq!(cache.render_targets.size.height, 720);
         assert_eq!(cache.slot_images.size(), 3);
         assert_eq!(cache.slot_image_views.size(), 4);
     }
@@ -1932,6 +2062,86 @@ mod tests {
         let image = &cache.slot_images[image_id];
         assert!(image.flags.contains(ImageFlagBits::CPU_MODIFIED));
         assert!(!image.flags.contains(ImageFlagBits::TRACKED));
+    }
+
+    #[test]
+    fn register_image_updates_gpu_page_table_and_unregister_clears_it() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let info = ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            size: crate::texture_cache::types::Extent3D {
+                width: 16,
+                height: 16,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+
+        let image_id = cache.insert_image(&info, 0x4000);
+
+        assert_eq!(
+            cache.collect_images_in_gpu_region(0x4000, 4, false),
+            vec![image_id]
+        );
+
+        cache.unregister_image(image_id);
+
+        assert!(cache
+            .collect_images_in_gpu_region(0x4000, 4, false)
+            .is_empty());
+    }
+
+    #[test]
+    fn join_images_deletes_exact_sparse_gpu_overlap() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex as ParkingMutex;
+        use std::sync::Arc;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
+            7,
+            22,
+            1 << 22,
+            16,
+            12,
+        )));
+        {
+            let mut gpu_memory = gpu_memory.lock();
+            gpu_memory.map(0x8000, 0xA000, 0x1000, 0, false);
+            gpu_memory.map(0x9000, 0xC000, 0x1000, 0, false);
+        }
+        cache.set_channel_gpu_memory(Arc::clone(&gpu_memory));
+        let mut info = ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            size: crate::texture_cache::types::Extent3D {
+                width: 512,
+                height: 1,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        info.is_sparse = true;
+        let old_id = cache.join_images(&info, 0x8000, 0xA000);
+        assert!(cache.slot_images[old_id]
+            .flags
+            .contains(ImageFlagBits::SPARSE));
+        assert_eq!(
+            cache.sparse_views.get(&old_id).expect("sparse maps").len(),
+            2
+        );
+
+        let new_id = cache.join_images(&info, 0x8000, 0xD000);
+
+        assert_ne!(new_id, old_id);
+        assert!(!cache.slot_images.iter().any(|(id, _)| id == old_id));
+        assert_eq!(
+            cache.collect_images_in_gpu_region(0x8000, 4, false),
+            vec![new_id]
+        );
     }
 
     #[test]

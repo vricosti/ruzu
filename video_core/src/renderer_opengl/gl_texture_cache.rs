@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 
 use common::settings;
 
+use super::util_shaders::UtilShaders;
 use crate::engines::draw_manager::Maxwell3DRenderTargets;
 use crate::engines::maxwell_3d::{RenderTargetInfo, ScissorInfo};
 use crate::framebuffer_config::FramebufferConfig;
@@ -22,7 +23,7 @@ use crate::texture_cache::image_view_base::{ImageViewBase, ImageViewFlagBits};
 use crate::texture_cache::image_view_info::{ImageViewInfo, SwizzleSource};
 use crate::texture_cache::render_targets::RenderTargets;
 use crate::texture_cache::texture_cache_base::{
-    FramebufferImageView, TextureCacheBase as CommonTextureCache,
+    FramebufferImageView, JoinCopy, TextureCacheBase as CommonTextureCache,
 };
 use crate::texture_cache::types::{BufferImageCopy, ImageCopy};
 use crate::texture_cache::types::{
@@ -152,6 +153,10 @@ fn should_trace_texture_cache_cpu_region(cpu_addr: u64, size: usize) -> bool {
         .any(|&target| cpu_addr <= target && target < end)
 }
 
+fn should_trace_invalid_copy_image() -> bool {
+    std::env::var_os("RUZU_TRACE_COPY_IMAGE_INVALID").is_some()
+}
+
 fn image_view_trace_targets() -> Option<&'static [u64]> {
     static TARGETS: OnceLock<Option<Vec<u64>>> = OnceLock::new();
     TARGETS
@@ -172,6 +177,36 @@ fn framebuffer_attachment_type(format: PixelFormat) -> u32 {
         SurfaceType::Stencil => gl::STENCIL_ATTACHMENT,
         SurfaceType::DepthStencil => gl::DEPTH_STENCIL_ATTACHMENT,
         _ => gl::DEPTH_ATTACHMENT,
+    }
+}
+
+fn rescale_attachment_type(format_type: SurfaceType) -> u32 {
+    match format_type {
+        SurfaceType::ColorTexture => gl::COLOR_ATTACHMENT0,
+        SurfaceType::Depth => gl::DEPTH_ATTACHMENT,
+        SurfaceType::Stencil => gl::STENCIL_ATTACHMENT,
+        SurfaceType::DepthStencil => gl::DEPTH_STENCIL_ATTACHMENT,
+        _ => gl::COLOR_ATTACHMENT0,
+    }
+}
+
+fn rescale_buffer_mask(format_type: SurfaceType) -> u32 {
+    match format_type {
+        SurfaceType::ColorTexture => gl::COLOR_BUFFER_BIT,
+        SurfaceType::Depth => gl::DEPTH_BUFFER_BIT,
+        SurfaceType::Stencil => gl::STENCIL_BUFFER_BIT,
+        SurfaceType::DepthStencil => gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT,
+        _ => gl::COLOR_BUFFER_BIT,
+    }
+}
+
+fn rescale_fbo_index(format_type: SurfaceType) -> usize {
+    match format_type {
+        SurfaceType::ColorTexture => 0,
+        SurfaceType::Depth => 1,
+        SurfaceType::Stencil => 2,
+        SurfaceType::DepthStencil => 3,
+        _ => 0,
     }
 }
 
@@ -505,7 +540,7 @@ fn image_target(info: &ImageInfo) -> u32 {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CopyOrigin {
     level: i32,
     x: i32,
@@ -513,11 +548,204 @@ struct CopyOrigin {
     z: i32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CopyRegion {
     width: i32,
     height: i32,
     depth: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompressedBlockCopyRect {
+    read_width: i32,
+    read_height: i32,
+    write_width: i32,
+    write_height: i32,
+    buffer_size: i32,
+}
+
+fn compressed_block_copy_rect(
+    src_size: (i32, i32, i32),
+    dst_size: (i32, i32, i32),
+    src_origin: CopyOrigin,
+    dst_origin: CopyOrigin,
+    region: CopyRegion,
+    block_width: u32,
+    block_height: u32,
+    bytes_per_block: u32,
+) -> Option<CompressedBlockCopyRect> {
+    if block_width <= 1 && block_height <= 1
+        || bytes_per_block == 0
+        || region.width <= 0
+        || region.height <= 0
+        || region.depth <= 0
+        || src_origin.x < 0
+        || src_origin.y < 0
+        || dst_origin.x < 0
+        || dst_origin.y < 0
+    {
+        return None;
+    }
+
+    let block_width = block_width as i32;
+    let block_height = block_height as i32;
+    if src_origin.x % block_width != 0
+        || src_origin.y % block_height != 0
+        || dst_origin.x % block_width != 0
+        || dst_origin.y % block_height != 0
+    {
+        return None;
+    }
+
+    let src_remaining_width = src_size.0 - src_origin.x;
+    let src_remaining_height = src_size.1 - src_origin.y;
+    let dst_remaining_width = dst_size.0 - dst_origin.x;
+    let dst_remaining_height = dst_size.1 - dst_origin.y;
+    let src_remaining_depth = src_size.2 - src_origin.z;
+    let dst_remaining_depth = dst_size.2 - dst_origin.z;
+    if src_remaining_width <= 0
+        || src_remaining_height <= 0
+        || dst_remaining_width <= 0
+        || dst_remaining_height <= 0
+        || src_remaining_depth < region.depth
+        || dst_remaining_depth < region.depth
+    {
+        return None;
+    }
+
+    let blocks_x = (region.width + block_width - 1) / block_width;
+    let blocks_y = (region.height + block_height - 1) / block_height;
+    let block_width_pixels = blocks_x * block_width;
+    let block_height_pixels = blocks_y * block_height;
+    let read_width = block_width_pixels.min(src_remaining_width);
+    let read_height = block_height_pixels.min(src_remaining_height);
+    let write_width = block_width_pixels.min(dst_remaining_width);
+    let write_height = block_height_pixels.min(dst_remaining_height);
+    if read_width <= 0 || read_height <= 0 || write_width <= 0 || write_height <= 0 {
+        return None;
+    }
+
+    let buffer_size = blocks_x
+        .checked_mul(blocks_y)?
+        .checked_mul(region.depth)?
+        .checked_mul(bytes_per_block as i32)?;
+    Some(CompressedBlockCopyRect {
+        read_width,
+        read_height,
+        write_width,
+        write_height,
+        buffer_size,
+    })
+}
+
+fn compressed_copy_fallback_format(
+    dst_format: PixelFormat,
+    src_format: PixelFormat,
+) -> Option<(u32, u32, u32)> {
+    if compressed_copy_layout_class(dst_format)? != compressed_copy_layout_class(src_format)? {
+        return None;
+    }
+    let block_width = crate::surface::default_block_width(dst_format);
+    let block_height = crate::surface::default_block_height(dst_format);
+    if block_width != crate::surface::default_block_width(src_format)
+        || block_height != crate::surface::default_block_height(src_format)
+    {
+        return None;
+    }
+    if block_width <= 1 && block_height <= 1 {
+        return None;
+    }
+    let bytes_per_block = crate::surface::bytes_per_block(dst_format);
+    if bytes_per_block != crate::surface::bytes_per_block(src_format) {
+        return None;
+    }
+    (bytes_per_block != 0).then_some((block_width, block_height, bytes_per_block))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawCompressedCopyDirection {
+    RawToCompressed,
+    CompressedToRaw,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RawCompressedCopyFormat {
+    direction: RawCompressedCopyDirection,
+    compressed_format: PixelFormat,
+    raw_format: PixelFormat,
+    block_width: u32,
+    block_height: u32,
+    bytes_per_block: u32,
+}
+
+fn raw_compressed_copy_fallback_format(
+    dst_format: PixelFormat,
+    src_format: PixelFormat,
+) -> Option<RawCompressedCopyFormat> {
+    let dst_compressed = compressed_copy_layout_class(dst_format).is_some();
+    let src_compressed = compressed_copy_layout_class(src_format).is_some();
+    let (direction, compressed_format, raw_format) = match (dst_compressed, src_compressed) {
+        (true, false) => (
+            RawCompressedCopyDirection::RawToCompressed,
+            dst_format,
+            src_format,
+        ),
+        (false, true) => (
+            RawCompressedCopyDirection::CompressedToRaw,
+            src_format,
+            dst_format,
+        ),
+        _ => return None,
+    };
+    let block_width = crate::surface::default_block_width(compressed_format);
+    let block_height = crate::surface::default_block_height(compressed_format);
+    let bytes_per_block = crate::surface::bytes_per_block(compressed_format);
+    let raw_bytes_per_texel = crate::surface::bytes_per_block(raw_format);
+    let raw_tuple = super::maxwell_to_gl::get_format_tuple(raw_format as usize);
+    if block_width <= 1 && block_height <= 1
+        || bytes_per_block == 0
+        || raw_bytes_per_texel == 0
+        || bytes_per_block != raw_bytes_per_texel
+        || raw_tuple.format == gl::NONE
+        || raw_tuple.gl_type == gl::NONE
+    {
+        return None;
+    }
+    Some(RawCompressedCopyFormat {
+        direction,
+        compressed_format,
+        raw_format,
+        block_width,
+        block_height,
+        bytes_per_block,
+    })
+}
+
+fn compressed_copy_layout_class(format: PixelFormat) -> Option<u8> {
+    match format {
+        PixelFormat::Bc1RgbaUnorm | PixelFormat::Bc1RgbaSrgb => Some(1),
+        PixelFormat::Bc2Unorm | PixelFormat::Bc2Srgb => Some(2),
+        PixelFormat::Bc3Unorm | PixelFormat::Bc3Srgb => Some(3),
+        PixelFormat::Bc4Unorm | PixelFormat::Bc4Snorm => Some(4),
+        PixelFormat::Bc5Unorm | PixelFormat::Bc5Snorm => Some(5),
+        PixelFormat::Bc6hUfloat | PixelFormat::Bc6hSfloat => Some(6),
+        PixelFormat::Bc7Unorm | PixelFormat::Bc7Srgb => Some(7),
+        PixelFormat::Astc2d4x4Unorm | PixelFormat::Astc2d4x4Srgb => Some(20),
+        PixelFormat::Astc2d5x4Unorm | PixelFormat::Astc2d5x4Srgb => Some(21),
+        PixelFormat::Astc2d5x5Unorm | PixelFormat::Astc2d5x5Srgb => Some(22),
+        PixelFormat::Astc2d6x5Unorm | PixelFormat::Astc2d6x5Srgb => Some(23),
+        PixelFormat::Astc2d6x6Unorm | PixelFormat::Astc2d6x6Srgb => Some(24),
+        PixelFormat::Astc2d8x5Unorm | PixelFormat::Astc2d8x5Srgb => Some(25),
+        PixelFormat::Astc2d8x6Unorm | PixelFormat::Astc2d8x6Srgb => Some(26),
+        PixelFormat::Astc2d8x8Unorm | PixelFormat::Astc2d8x8Srgb => Some(27),
+        PixelFormat::Astc2d10x5Unorm | PixelFormat::Astc2d10x5Srgb => Some(28),
+        PixelFormat::Astc2d10x6Unorm | PixelFormat::Astc2d10x6Srgb => Some(29),
+        PixelFormat::Astc2d10x8Unorm | PixelFormat::Astc2d10x8Srgb => Some(30),
+        PixelFormat::Astc2d10x10Unorm | PixelFormat::Astc2d10x10Srgb => Some(31),
+        PixelFormat::Astc2d12x10Unorm | PixelFormat::Astc2d12x10Srgb => Some(32),
+        PixelFormat::Astc2d12x12Unorm | PixelFormat::Astc2d12x12Srgb => Some(33),
+        _ => None,
+    }
 }
 
 /// Port of upstream `MakeCopyOrigin` (gl_texture_cache.cpp:278).
@@ -599,6 +827,18 @@ fn make_copy_region(
             }
         }
     }
+}
+
+fn texture_level_extent(texture: u32, level: i32) -> (i32, i32, i32) {
+    let mut width = 0;
+    let mut height = 0;
+    let mut depth = 0;
+    unsafe {
+        gl::GetTextureLevelParameteriv(texture, level, gl::TEXTURE_WIDTH, &mut width);
+        gl::GetTextureLevelParameteriv(texture, level, gl::TEXTURE_HEIGHT, &mut height);
+        gl::GetTextureLevelParameteriv(texture, level, gl::TEXTURE_DEPTH, &mut depth);
+    }
+    (width, height, depth)
 }
 
 /// Port of upstream `OpenGL::ImageTarget(Shader::TextureType, int)`
@@ -1018,8 +1258,6 @@ impl Image {
     /// `GL_UNPACK_ROW_LENGTH` / `GL_UNPACK_IMAGE_HEIGHT` is updated
     /// only when it changes, mirroring upstream's cached comparison.
     ///
-    /// The rescale path (`ScaleDown` / `ScaleUp`) upstream wraps the
-    /// upload is omitted — ruzu hasn't ported rescaling yet.
     pub fn upload_memory(
         &mut self,
         buffer_handle: u32,
@@ -1261,16 +1499,176 @@ impl Image {
 
     /// Port of `Image::ScaleUp`.
     /// Scales the image up by the resolution scaling factor.
-    pub fn scale_up(&mut self, _ignore: bool) -> bool {
-        // Full implementation creates upscaled_backup texture and blits
-        false
+    pub fn scale_up(
+        &mut self,
+        base: &mut ImageBase,
+        rescale_read_fbos: &[u32; 4],
+        rescale_draw_fbos: &[u32; 4],
+        ignore: bool,
+    ) -> bool {
+        let resolution = settings::values().resolution_info.clone();
+        if !resolution.active {
+            return false;
+        }
+        if base.flags.contains(ImageFlagBits::RESCALED) {
+            return false;
+        }
+        if self.gl_format == gl::NONE && self.gl_type == gl::NONE {
+            return false;
+        }
+        if base.info.image_type == ImageType::Linear {
+            debug_assert!(false, "Image::scale_up called for linear image");
+            return false;
+        }
+        base.flags.insert(ImageFlagBits::RESCALED);
+        base.has_scaled = true;
+        if ignore {
+            self.current_texture = self.upscaled_backup;
+            return true;
+        }
+        self.scale(base, rescale_read_fbos, rescale_draw_fbos, true);
+        true
     }
 
     /// Port of `Image::ScaleDown`.
     /// Scales the image down from the resolution scaling factor.
-    pub fn scale_down(&mut self, _ignore: bool) -> bool {
-        // Full implementation blits from upscaled_backup back to original
-        false
+    pub fn scale_down(
+        &mut self,
+        base: &mut ImageBase,
+        rescale_read_fbos: &[u32; 4],
+        rescale_draw_fbos: &[u32; 4],
+        ignore: bool,
+    ) -> bool {
+        let resolution = settings::values().resolution_info.clone();
+        if !resolution.active {
+            return false;
+        }
+        if !base.flags.contains(ImageFlagBits::RESCALED) {
+            return false;
+        }
+        base.flags.remove(ImageFlagBits::RESCALED);
+        if ignore {
+            self.current_texture = self.texture;
+            return true;
+        }
+        self.scale(base, rescale_read_fbos, rescale_draw_fbos, false);
+        true
+    }
+
+    fn scale(
+        &mut self,
+        base: &ImageBase,
+        rescale_read_fbos: &[u32; 4],
+        rescale_draw_fbos: &[u32; 4],
+        up_scale: bool,
+    ) {
+        let format_type = crate::surface::get_format_type(base.info.format);
+        let attachment = rescale_attachment_type(format_type);
+        let mask = rescale_buffer_mask(format_type);
+        let fbo_index = rescale_fbo_index(format_type);
+        let is_2d = base.info.image_type == ImageType::E2D;
+        let is_color = (mask & gl::COLOR_BUFFER_BIT) != 0;
+        let linear_color_format =
+            is_color && !crate::surface::is_pixel_format_integer(base.info.format);
+        let filter = if linear_color_format {
+            gl::LINEAR
+        } else {
+            gl::NEAREST
+        };
+        let resolution = settings::values().resolution_info.clone();
+        let scaled_width = resolution.scale_up_u32(base.info.size.width);
+        let scaled_height = if is_2d {
+            resolution.scale_up_u32(base.info.size.height)
+        } else {
+            base.info.size.height
+        };
+        let original_width = base.info.size.width;
+        let original_height = base.info.size.height;
+
+        if self.upscaled_backup == 0 {
+            let mut dst_info = base.info.clone();
+            dst_info.size.width = scaled_width;
+            dst_info.size.height = scaled_height;
+            self.upscaled_backup = make_image(
+                &dst_info,
+                self.gl_internal_format,
+                self.gl_num_levels,
+                image_target(&dst_info),
+            );
+        }
+        if self.upscaled_backup == 0 || self.texture == 0 {
+            return;
+        }
+
+        let src_width = if up_scale {
+            original_width
+        } else {
+            scaled_width
+        };
+        let src_height = if up_scale {
+            original_height
+        } else {
+            scaled_height
+        };
+        let dst_width = if up_scale {
+            scaled_width
+        } else {
+            original_width
+        };
+        let dst_height = if up_scale {
+            scaled_height
+        } else {
+            original_height
+        };
+        let src_handle = if up_scale {
+            self.texture
+        } else {
+            self.upscaled_backup
+        };
+        let dst_handle = if up_scale {
+            self.upscaled_backup
+        } else {
+            self.texture
+        };
+        let read_fbo = rescale_read_fbos[fbo_index];
+        let draw_fbo = rescale_draw_fbos[fbo_index];
+        if read_fbo == 0 || draw_fbo == 0 {
+            return;
+        }
+
+        unsafe {
+            gl::Disablei(gl::SCISSOR_TEST, 0);
+            gl::ViewportIndexedf(0, 0.0, 0.0, dst_width as f32, dst_height as f32);
+            for layer in 0..base.info.resources.layers {
+                for level in 0..base.info.resources.levels.min(self.gl_num_levels) {
+                    let src_level_width = std::cmp::max(1, src_width >> level);
+                    let src_level_height = std::cmp::max(1, src_height >> level);
+                    let dst_level_width = std::cmp::max(1, dst_width >> level);
+                    let dst_level_height = std::cmp::max(1, dst_height >> level);
+                    gl::NamedFramebufferTextureLayer(
+                        read_fbo, attachment, src_handle, level, layer,
+                    );
+                    gl::NamedFramebufferTextureLayer(
+                        draw_fbo, attachment, dst_handle, level, layer,
+                    );
+                    gl::BlitNamedFramebuffer(
+                        read_fbo,
+                        draw_fbo,
+                        0,
+                        0,
+                        src_level_width as i32,
+                        src_level_height as i32,
+                        0,
+                        0,
+                        dst_level_width as i32,
+                        dst_level_height as i32,
+                        mask,
+                        filter,
+                    );
+                }
+            }
+        }
+        self.current_texture = dst_handle;
     }
 }
 
@@ -2030,7 +2428,10 @@ pub struct TextureCache {
     samplers: HashMap<crate::texture_cache::types::SamplerId, Sampler>,
     framebuffers: HashMap<ImageViewId, TextureCacheFramebuffer>,
     render_target_framebuffers: HashMap<RenderTargets, TextureCacheFramebuffer>,
+    rescale_draw_fbos: [u32; 4],
+    rescale_read_fbos: [u32; 4],
     format_conversion_pass: FormatConversionPass,
+    util_shaders: UtilShaders,
     null_image_handles: [u32; 7],
     null_image_views: [u32; NUM_TEXTURE_TYPES],
     has_native_astc: bool,
@@ -2560,6 +2961,12 @@ impl TextureCache {
     ) -> Self {
         let (null_image_handles, null_image_views) =
             create_null_image_views(has_debugging_tool_attached);
+        let mut rescale_draw_fbos = [0u32; 4];
+        let mut rescale_read_fbos = [0u32; 4];
+        unsafe {
+            gl::CreateFramebuffers(4, rescale_draw_fbos.as_mut_ptr());
+            gl::CreateFramebuffers(4, rescale_read_fbos.as_mut_ptr());
+        }
         Self {
             base: CommonTextureCache::new_with_caps(
                 device_memory,
@@ -2571,7 +2978,10 @@ impl TextureCache {
             samplers: HashMap::new(),
             framebuffers: HashMap::new(),
             render_target_framebuffers: HashMap::new(),
+            rescale_draw_fbos,
+            rescale_read_fbos,
             format_conversion_pass: FormatConversionPass::new(),
+            util_shaders: UtilShaders::new(),
             null_image_handles,
             null_image_views,
             has_native_astc,
@@ -2583,6 +2993,94 @@ impl TextureCache {
     /// Port of `TextureCache<P>::IsRescaling`.
     pub fn is_rescaling_active(&self) -> bool {
         self.base.is_rescaling_active()
+    }
+
+    fn image_can_rescale(&mut self, image_id: ImageId) -> bool {
+        if !image_id.is_valid() {
+            return false;
+        }
+        let image = &mut self.base.slot_images[image_id];
+        if !image.info.rescaleable {
+            return false;
+        }
+        let resolution = settings::values().resolution_info.clone();
+        if resolution.downscale && !image.info.downscaleable {
+            return false;
+        }
+        if image
+            .flags
+            .intersects(ImageFlagBits::RESCALED | ImageFlagBits::CHECKING_RESCALABLE)
+        {
+            return true;
+        }
+        if image.flags.contains(ImageFlagBits::IS_RESCALABLE) {
+            return true;
+        }
+        image.flags.insert(ImageFlagBits::CHECKING_RESCALABLE);
+        let aliases: Vec<ImageId> = image.aliased_images.iter().map(|alias| alias.id).collect();
+        for alias_id in aliases {
+            if !self.image_can_rescale(alias_id) {
+                self.base.slot_images[image_id]
+                    .flags
+                    .remove(ImageFlagBits::CHECKING_RESCALABLE);
+                return false;
+            }
+        }
+        let image = &mut self.base.slot_images[image_id];
+        image.flags.remove(ImageFlagBits::CHECKING_RESCALABLE);
+        image.flags.insert(ImageFlagBits::IS_RESCALABLE);
+        true
+    }
+
+    fn scale_up_image(&mut self, image_id: ImageId) -> bool {
+        let Some(image) = self.images.get_mut(&image_id) else {
+            return false;
+        };
+        let rescaled = image.scale_up(
+            &mut self.base.slot_images[image_id],
+            &self.rescale_read_fbos,
+            &self.rescale_draw_fbos,
+            false,
+        );
+        if rescaled {
+            self.invalidate_scale(image_id);
+        }
+        rescaled
+    }
+
+    fn scale_down_image(&mut self, image_id: ImageId) -> bool {
+        let Some(image) = self.images.get_mut(&image_id) else {
+            return false;
+        };
+        let rescaled = image.scale_down(
+            &mut self.base.slot_images[image_id],
+            &self.rescale_read_fbos,
+            &self.rescale_draw_fbos,
+            false,
+        );
+        if rescaled {
+            self.invalidate_scale(image_id);
+        }
+        rescaled
+    }
+
+    fn invalidate_scale(&mut self, image_id: ImageId) {
+        let image_view_ids = self.base.slot_images[image_id].image_view_ids.clone();
+        for view_id in &image_view_ids {
+            for color_buffer_id in &mut self.base.render_targets.color_buffer_ids {
+                if *color_buffer_id == *view_id {
+                    *color_buffer_id = ImageViewId::default();
+                }
+            }
+            if self.base.render_targets.depth_buffer_id == *view_id {
+                self.base.render_targets.depth_buffer_id = ImageViewId::default();
+            }
+            self.image_views.remove(view_id);
+            self.remove_framebuffers_for_view(*view_id);
+        }
+        self.base.slot_images[image_id].image_view_ids.clear();
+        self.base.slot_images[image_id].image_view_infos.clear();
+        self.base.has_deleted_images = true;
     }
 
     fn ensure_backend_image_flags(&mut self, image_id: ImageId) {
@@ -2954,6 +3452,14 @@ impl TextureCache {
                     join.copies.len()
                 );
             }
+            let can_rescale =
+                self.prepare_pending_join_rescale(join.new_image_id, &join.copies, trace_join);
+            let resolution = settings::values().resolution_info.clone();
+            let (copy_up_scale, copy_down_shift) = if can_rescale {
+                (resolution.up_scale, resolution.down_shift)
+            } else {
+                (1, 0)
+            };
             for copy_object in join.copies {
                 if !self.base_image_exists(copy_object.id) {
                     continue;
@@ -3006,16 +3512,22 @@ impl TextureCache {
                         .try_find_base(overlap_snapshot.gpu_addr)
                     {
                         let new_info = self.base.slot_images[join.new_image_id].info.clone();
-                        let copies =
-                            make_shrink_image_copies(&new_info, &overlap_snapshot.info, base, 1, 0);
+                        let copies = make_shrink_image_copies(
+                            &new_info,
+                            &overlap_snapshot.info,
+                            base,
+                            copy_up_scale,
+                            copy_down_shift,
+                        );
                         if trace_join {
                             log::warn!(
-                                "[JOIN_IMAGES] gl_copy new={} overlap={} copies={} base_level={} base_layer={}",
+                                "[JOIN_IMAGES] gl_copy new={} overlap={} copies={} base_level={} base_layer={} can_rescale={}",
                                 join.new_image_id.index,
                                 copy_object.id.index,
                                 copies.len(),
                                 base.level,
-                                base.layer
+                                base.layer,
+                                can_rescale
                             );
                         }
                         self.copy_image(join.new_image_id, copy_object.id, &copies);
@@ -3027,6 +3539,67 @@ impl TextureCache {
                 self.delete_join_overlap_image(copy_object.id);
             }
         }
+    }
+
+    fn prepare_pending_join_rescale(
+        &mut self,
+        new_image_id: ImageId,
+        copies: &[JoinCopy],
+        trace_join: bool,
+    ) -> bool {
+        if !self.base_image_exists(new_image_id) {
+            return false;
+        }
+
+        let mut can_rescale = self.base.slot_images[new_image_id].info.rescaleable;
+        let mut any_rescaled = false;
+        for copy in copies {
+            if !can_rescale {
+                break;
+            }
+            if !self.base_image_exists(copy.id) {
+                can_rescale = false;
+                break;
+            }
+            self.ensure_backend_image_flags(copy.id);
+            can_rescale &= self.image_can_rescale(copy.id);
+            any_rescaled |= self.base.slot_images[copy.id]
+                .flags
+                .contains(ImageFlagBits::RESCALED);
+        }
+        can_rescale &= any_rescaled;
+
+        for copy in copies {
+            if !self.base_image_exists(copy.id) {
+                continue;
+            }
+            self.ensure_backend_image_flags(copy.id);
+            if can_rescale {
+                self.scale_up_image(copy.id);
+            } else {
+                self.scale_down_image(copy.id);
+            }
+        }
+
+        self.ensure_backend_image_flags(new_image_id);
+        if can_rescale {
+            self.scale_up_image(new_image_id);
+        } else {
+            self.scale_down_image(new_image_id);
+        }
+
+        if trace_join {
+            let image = &self.base.slot_images[new_image_id];
+            log::warn!(
+                "[JOIN_IMAGES] rescale new={} gpu=0x{:X} can_rescale={} any_rescaled={} flags=0x{:X}",
+                new_image_id.index,
+                image.gpu_addr,
+                can_rescale,
+                any_rescaled,
+                image.flags.bits()
+            );
+        }
+        can_rescale
     }
 
     fn delete_join_overlap_image(&mut self, image_id: ImageId) {
@@ -3075,11 +3648,19 @@ impl TextureCache {
             return;
         }
         if src_base.info.num_samples != dst_base.info.num_samples {
-            log::warn!(
-                "TextureCache::copy_image_direct: MSAA copy path not ported src_samples={} dst_samples={}",
-                src_base.info.num_samples,
-                dst_base.info.num_samples
-            );
+            if trace_copy {
+                log::warn!(
+                    "[COPY_IMAGE] path=msaa src={} gpu=0x{:X} samples={} dst={} gpu=0x{:X} samples={} copies={}",
+                    src_id.index,
+                    src_base.gpu_addr,
+                    src_base.info.num_samples,
+                    dst_id.index,
+                    dst_base.gpu_addr,
+                    dst_base.info.num_samples,
+                    copies.len()
+                );
+            }
+            self.copy_image_msaa(dst_id, src_id, copies);
             return;
         }
         let copies = if src_rescaled {
@@ -3102,6 +3683,11 @@ impl TextureCache {
 
         let dst_handle = self.images.get(&dst_id).map(Image::handle).unwrap_or(0);
         let src_handle = self.images.get(&src_id).map(Image::handle).unwrap_or(0);
+        let dst_gl_internal_format = self
+            .images
+            .get(&dst_id)
+            .map(|image| image.gl_internal_format)
+            .unwrap_or(gl::NONE);
         if dst_handle == 0 || src_handle == 0 {
             return;
         }
@@ -3121,7 +3707,16 @@ impl TextureCache {
                     copies.len()
                 );
             }
-            self.copy_image_direct_raw(dst_handle, dst_target, src_handle, src_target, &copies);
+            self.copy_image_direct_raw(
+                dst_handle,
+                dst_target,
+                dst_gl_internal_format,
+                dst_base.info.format,
+                src_handle,
+                src_target,
+                src_base.info.format,
+                &copies,
+            );
             return;
         }
 
@@ -3168,15 +3763,60 @@ impl TextureCache {
         self.reinterpret_image(dst_id, src_id, &copies);
     }
 
+    fn copy_image_msaa(&mut self, dst_id: ImageId, src_id: ImageId, copies: &[ImageCopy]) {
+        let dst_base = self.base.slot_images[dst_id].clone();
+        let src_base = self.base.slot_images[src_id].clone();
+
+        self.images
+            .entry(dst_id)
+            .or_insert_with(|| Image::from_base(&dst_base, self.has_native_astc));
+        self.images
+            .entry(src_id)
+            .or_insert_with(|| Image::from_base(&src_base, self.has_native_astc));
+
+        let Some(dst_image) = self.images.get(&dst_id) else {
+            return;
+        };
+        let Some(src_image) = self.images.get(&src_id) else {
+            return;
+        };
+        let dst_handle = dst_image.handle();
+        let src_handle = src_image.handle();
+        if dst_handle == 0 || src_handle == 0 {
+            return;
+        }
+
+        let src_msaa = src_base.info.num_samples > 1;
+        let dst_msaa = dst_base.info.num_samples > 1;
+        if src_msaa == dst_msaa {
+            log::warn!(
+                "TextureCache::copy_image_msaa: unsupported sample transition src_samples={} dst_samples={}",
+                src_base.info.num_samples,
+                dst_base.info.num_samples
+            );
+            return;
+        }
+        self.util_shaders
+            .copy_msaa(dst_handle, src_handle, copies, src_msaa && !dst_msaa);
+    }
+
     fn copy_image_direct_raw(
         &self,
         dst_handle: u32,
         dst_target: u32,
+        dst_gl_internal_format: u32,
+        dst_format: PixelFormat,
         src_handle: u32,
         src_target: u32,
+        src_format: PixelFormat,
         copies: &[ImageCopy],
     ) {
         unsafe {
+            let trace_invalid = should_trace_invalid_copy_image();
+            let compressed_copy_fallback =
+                compressed_copy_fallback_format(dst_format, src_format).is_some();
+            let raw_compressed_copy_fallback =
+                raw_compressed_copy_fallback_format(dst_format, src_format);
             for copy in copies {
                 let src_origin =
                     make_copy_origin(copy.src_offset, copy.src_subresource, src_target);
@@ -3185,6 +3825,12 @@ impl TextureCache {
                 let region = make_copy_region(copy.extent, copy.dst_subresource, dst_target);
                 if region.width == 0 || region.height == 0 || region.depth == 0 {
                     continue;
+                }
+                if trace_invalid
+                    || compressed_copy_fallback
+                    || raw_compressed_copy_fallback.is_some()
+                {
+                    while gl::GetError() != gl::NO_ERROR {}
                 }
                 gl::CopyImageSubData(
                     src_handle,
@@ -3203,9 +3849,326 @@ impl TextureCache {
                     region.height,
                     region.depth,
                 );
+                if trace_invalid
+                    || compressed_copy_fallback
+                    || raw_compressed_copy_fallback.is_some()
+                {
+                    let err = gl::GetError();
+                    if err != gl::NO_ERROR {
+                        let src_size = texture_level_extent(src_handle, src_origin.level);
+                        let dst_size = texture_level_extent(dst_handle, dst_origin.level);
+                        let mut fallback_name = "none";
+                        let mut fallback_ok = compressed_copy_fallback
+                            && self.copy_compressed_block_fallback(
+                                dst_handle,
+                                dst_gl_internal_format,
+                                dst_format,
+                                src_handle,
+                                src_origin,
+                                dst_origin,
+                                region,
+                                src_size,
+                                dst_size,
+                            );
+                        if fallback_ok {
+                            fallback_name = "compressed_block";
+                        }
+                        if !fallback_ok {
+                            if let Some(format) = raw_compressed_copy_fallback {
+                                fallback_ok = self.copy_raw_compressed_block_fallback(
+                                    dst_handle,
+                                    dst_gl_internal_format,
+                                    src_handle,
+                                    format,
+                                    src_origin,
+                                    dst_origin,
+                                    region,
+                                    src_size,
+                                    dst_size,
+                                );
+                                if fallback_ok {
+                                    fallback_name = "raw_compressed_block";
+                                }
+                            }
+                        }
+                        if trace_invalid {
+                            log::warn!(
+                                "[COPY_IMAGE_INVALID] err=0x{:X} fallback={} src={} fmt={:?} target=0x{:X} level={} origin=({}, {}, {}) size={:?} dst={} fmt={:?} target=0x{:X} level={} origin=({}, {}, {}) size={:?} region={}x{}x{} copy={:?}",
+                                err,
+                                fallback_name,
+                                src_handle,
+                                src_format,
+                                src_target,
+                                src_origin.level,
+                                src_origin.x,
+                                src_origin.y,
+                                src_origin.z,
+                                src_size,
+                                dst_handle,
+                                dst_format,
+                                dst_target,
+                                dst_origin.level,
+                                dst_origin.x,
+                                dst_origin.y,
+                                dst_origin.z,
+                                dst_size,
+                                region.width,
+                                region.height,
+                                region.depth,
+                                copy,
+                            );
+                        } else if !fallback_ok {
+                            log::warn!(
+                                "TextureCache::copy_image_direct_raw: glCopyImageSubData failed err=0x{:X} without fallback dst_fmt={:?} src_fmt={:?}",
+                                err,
+                                dst_format,
+                                src_format
+                            );
+                        }
+                    }
+                }
             }
             gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
+    }
+
+    fn copy_compressed_block_fallback(
+        &self,
+        dst_handle: u32,
+        dst_gl_internal_format: u32,
+        dst_format: PixelFormat,
+        src_handle: u32,
+        src_origin: CopyOrigin,
+        dst_origin: CopyOrigin,
+        region: CopyRegion,
+        src_size: (i32, i32, i32),
+        dst_size: (i32, i32, i32),
+    ) -> bool {
+        let Some((block_width, block_height, bytes_per_block)) =
+            compressed_copy_fallback_format(dst_format, dst_format)
+        else {
+            return false;
+        };
+        let Some(rect) = compressed_block_copy_rect(
+            src_size,
+            dst_size,
+            src_origin,
+            dst_origin,
+            region,
+            block_width,
+            block_height,
+            bytes_per_block,
+        ) else {
+            return false;
+        };
+        let mut buffer = vec![0u8; rect.buffer_size as usize];
+        unsafe {
+            while gl::GetError() != gl::NO_ERROR {}
+            gl::GetCompressedTextureSubImage(
+                src_handle,
+                src_origin.level,
+                src_origin.x,
+                src_origin.y,
+                src_origin.z,
+                rect.read_width,
+                rect.read_height,
+                region.depth,
+                rect.buffer_size,
+                buffer.as_mut_ptr() as *mut _,
+            );
+            let read_error = gl::GetError();
+            if read_error != gl::NO_ERROR {
+                log::warn!(
+                    "TextureCache::copy_compressed_block_fallback: read failed err=0x{:X}",
+                    read_error
+                );
+                return false;
+            }
+            gl::CompressedTextureSubImage3D(
+                dst_handle,
+                dst_origin.level,
+                dst_origin.x,
+                dst_origin.y,
+                dst_origin.z,
+                rect.write_width,
+                rect.write_height,
+                region.depth,
+                dst_gl_internal_format,
+                rect.buffer_size,
+                buffer.as_ptr() as *const _,
+            );
+            let write_error = gl::GetError();
+            if write_error != gl::NO_ERROR {
+                log::warn!(
+                    "TextureCache::copy_compressed_block_fallback: write failed err=0x{:X}",
+                    write_error
+                );
+                return false;
+            }
+        }
+        true
+    }
+
+    fn copy_raw_compressed_block_fallback(
+        &self,
+        dst_handle: u32,
+        dst_gl_internal_format: u32,
+        src_handle: u32,
+        format: RawCompressedCopyFormat,
+        src_origin: CopyOrigin,
+        dst_origin: CopyOrigin,
+        region: CopyRegion,
+        src_size: (i32, i32, i32),
+        dst_size: (i32, i32, i32),
+    ) -> bool {
+        if region.width <= 0
+            || region.height <= 0
+            || region.depth <= 0
+            || src_origin.x < 0
+            || src_origin.y < 0
+            || dst_origin.x < 0
+            || dst_origin.y < 0
+        {
+            return false;
+        }
+        let compressed_size = match format.direction {
+            RawCompressedCopyDirection::RawToCompressed => dst_size,
+            RawCompressedCopyDirection::CompressedToRaw => src_size,
+        };
+        let compressed_origin = match format.direction {
+            RawCompressedCopyDirection::RawToCompressed => dst_origin,
+            RawCompressedCopyDirection::CompressedToRaw => src_origin,
+        };
+        let raw_size = match format.direction {
+            RawCompressedCopyDirection::RawToCompressed => src_size,
+            RawCompressedCopyDirection::CompressedToRaw => dst_size,
+        };
+        let raw_origin = match format.direction {
+            RawCompressedCopyDirection::RawToCompressed => src_origin,
+            RawCompressedCopyDirection::CompressedToRaw => dst_origin,
+        };
+        if raw_origin.x + region.width > raw_size.0
+            || raw_origin.y + region.height > raw_size.1
+            || raw_origin.z + region.depth > raw_size.2
+            || compressed_origin.z + region.depth > compressed_size.2
+        {
+            return false;
+        }
+
+        let block_width = format.block_width as i32;
+        let block_height = format.block_height as i32;
+        let compressed_remaining_width = compressed_size.0 - compressed_origin.x;
+        let compressed_remaining_height = compressed_size.1 - compressed_origin.y;
+        if compressed_remaining_width <= 0 || compressed_remaining_height <= 0 {
+            return false;
+        }
+        let compressed_width = (region.width * block_width).min(compressed_remaining_width);
+        let compressed_height = (region.height * block_height).min(compressed_remaining_height);
+        if compressed_width <= 0 || compressed_height <= 0 {
+            return false;
+        }
+
+        let buffer_size = region
+            .width
+            .checked_mul(region.height)
+            .and_then(|size| size.checked_mul(region.depth))
+            .and_then(|size| size.checked_mul(format.bytes_per_block as i32));
+        let Some(buffer_size) = buffer_size else {
+            return false;
+        };
+        let raw_tuple = super::maxwell_to_gl::get_format_tuple(format.raw_format as usize);
+        let mut buffer = vec![0u8; buffer_size as usize];
+        unsafe {
+            while gl::GetError() != gl::NO_ERROR {}
+            match format.direction {
+                RawCompressedCopyDirection::RawToCompressed => {
+                    gl::GetTextureSubImage(
+                        src_handle,
+                        src_origin.level,
+                        src_origin.x,
+                        src_origin.y,
+                        src_origin.z,
+                        region.width,
+                        region.height,
+                        region.depth,
+                        raw_tuple.format,
+                        raw_tuple.gl_type,
+                        buffer_size,
+                        buffer.as_mut_ptr() as *mut _,
+                    );
+                }
+                RawCompressedCopyDirection::CompressedToRaw => {
+                    gl::GetCompressedTextureSubImage(
+                        src_handle,
+                        src_origin.level,
+                        src_origin.x,
+                        src_origin.y,
+                        src_origin.z,
+                        compressed_width,
+                        compressed_height,
+                        region.depth,
+                        buffer_size,
+                        buffer.as_mut_ptr() as *mut _,
+                    );
+                }
+            }
+            let read_error = gl::GetError();
+            if read_error != gl::NO_ERROR {
+                log::warn!(
+                    "TextureCache::copy_raw_compressed_block_fallback: read failed err=0x{:X} direction={:?} compressed_fmt={:?} raw_fmt={:?}",
+                    read_error,
+                    format.direction,
+                    format.compressed_format,
+                    format.raw_format
+                );
+                return false;
+            }
+
+            match format.direction {
+                RawCompressedCopyDirection::RawToCompressed => {
+                    gl::CompressedTextureSubImage3D(
+                        dst_handle,
+                        dst_origin.level,
+                        dst_origin.x,
+                        dst_origin.y,
+                        dst_origin.z,
+                        compressed_width,
+                        compressed_height,
+                        region.depth,
+                        dst_gl_internal_format,
+                        buffer_size,
+                        buffer.as_ptr() as *const _,
+                    );
+                }
+                RawCompressedCopyDirection::CompressedToRaw => {
+                    gl::TextureSubImage3D(
+                        dst_handle,
+                        dst_origin.level,
+                        dst_origin.x,
+                        dst_origin.y,
+                        dst_origin.z,
+                        region.width,
+                        region.height,
+                        region.depth,
+                        raw_tuple.format,
+                        raw_tuple.gl_type,
+                        buffer.as_ptr() as *const _,
+                    );
+                }
+            }
+            let write_error = gl::GetError();
+            if write_error != gl::NO_ERROR {
+                log::warn!(
+                    "TextureCache::copy_raw_compressed_block_fallback: write failed err=0x{:X} direction={:?} compressed_fmt={:?} raw_fmt={:?}",
+                    write_error,
+                    format.direction,
+                    format.compressed_format,
+                    format.raw_format
+                );
+                return false;
+            }
+        }
+        true
     }
 
     fn can_image_be_copied(&self, dst: &ImageBase, src: &ImageBase) -> bool {
@@ -4195,6 +5158,60 @@ impl TextureCache {
         self.prepare_image_with_gpu_reader(src_id, false, false, &mut read_gpu);
         self.prepare_image_with_gpu_reader(dst_id, true, false, &mut read_gpu);
 
+        self.images.entry(dst_id).or_insert_with(|| {
+            Image::from_base(&self.base.slot_images[dst_id], self.has_native_astc)
+        });
+        self.images.entry(src_id).or_insert_with(|| {
+            Image::from_base(&self.base.slot_images[src_id], self.has_native_astc)
+        });
+
+        let mut is_src_rescaled = self.base.slot_images[src_id]
+            .flags
+            .contains(ImageFlagBits::RESCALED);
+        let mut is_dst_rescaled = self.base.slot_images[dst_id]
+            .flags
+            .contains(ImageFlagBits::RESCALED);
+        let is_resolve = self.base.slot_images[src_id].info.num_samples != 1
+            && self.base.slot_images[dst_id].info.num_samples == 1;
+        if is_src_rescaled != is_dst_rescaled {
+            if self.image_can_rescale(src_id) {
+                self.scale_up_image(src_id);
+                is_src_rescaled = self.base.slot_images[src_id]
+                    .flags
+                    .contains(ImageFlagBits::RESCALED);
+                if is_resolve {
+                    self.base.slot_images[dst_id].info.rescaleable = true;
+                    let aliases = self.base.slot_images[dst_id].aliased_images.clone();
+                    for alias in aliases {
+                        self.base.slot_images[alias.id].info.rescaleable = true;
+                    }
+                }
+            }
+            if self.image_can_rescale(dst_id) {
+                self.scale_up_image(dst_id);
+                is_dst_rescaled = self.base.slot_images[dst_id]
+                    .flags
+                    .contains(ImageFlagBits::RESCALED);
+            }
+        }
+        if is_resolve && is_src_rescaled != is_dst_rescaled {
+            self.scale_down_image(src_id);
+            self.scale_down_image(dst_id);
+            is_src_rescaled = self.base.slot_images[src_id]
+                .flags
+                .contains(ImageFlagBits::RESCALED);
+            is_dst_rescaled = self.base.slot_images[dst_id]
+                .flags
+                .contains(ImageFlagBits::RESCALED);
+        }
+        let resolution = settings::values().resolution_info.clone();
+        let scale_region = |region: &mut Region2D| {
+            region.start.x = resolution.scale_up_i32(region.start.x);
+            region.start.y = resolution.scale_up_i32(region.start.y);
+            region.end.x = resolution.scale_up_i32(region.end.x);
+            region.end.y = resolution.scale_up_i32(region.end.y);
+        };
+
         let Some(src_base) = self.base.slot_images[src_id].try_find_base(src_addr) else {
             return false;
         };
@@ -4225,7 +5242,7 @@ impl TextureCache {
             self.base.slot_images[dst_id].info.num_samples as i32,
         );
 
-        let src_region = Region2D {
+        let mut src_region = Region2D {
             start: Offset2D {
                 x: copy.src_x0 >> src_samples_x,
                 y: copy.src_y0 >> src_samples_y,
@@ -4235,7 +5252,10 @@ impl TextureCache {
                 y: copy.src_y1 >> src_samples_y,
             },
         };
-        let dst_region = Region2D {
+        if is_src_rescaled {
+            scale_region(&mut src_region);
+        }
+        let mut dst_region = Region2D {
             start: Offset2D {
                 x: copy.dst_x0 >> dst_samples_x,
                 y: copy.dst_y0 >> dst_samples_y,
@@ -4245,6 +5265,9 @@ impl TextureCache {
                 y: copy.dst_y1 >> dst_samples_y,
             },
         };
+        if is_dst_rescaled {
+            scale_region(&mut dst_region);
+        }
         self.blit_framebuffer(
             dst_fbo,
             src_fbo,
@@ -5100,6 +6123,8 @@ impl Drop for TextureCache {
                     gl::DeleteTextures(1, &handle);
                 }
             }
+            gl::DeleteFramebuffers(4, self.rescale_draw_fbos.as_ptr());
+            gl::DeleteFramebuffers(4, self.rescale_read_fbos.as_ptr());
         }
     }
 }
@@ -5144,6 +6169,194 @@ mod tests {
         assert!(TextureCacheParams::ENABLE_VALIDATION);
         assert!(TextureCacheParams::FRAMEBUFFER_BLITS);
         assert!(TextureCacheParams::HAS_EMULATED_COPIES);
+    }
+
+    #[test]
+    fn compressed_block_copy_rect_clamps_source_and_destination_mip_edges() {
+        let rect = compressed_block_copy_rect(
+            (4, 1, 48),
+            (2, 2, 48),
+            CopyOrigin {
+                level: 0,
+                x: 0,
+                y: 0,
+                z: 0,
+            },
+            CopyOrigin {
+                level: 6,
+                x: 0,
+                y: 0,
+                z: 0,
+            },
+            CopyRegion {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            4,
+            4,
+            8,
+        );
+        assert_eq!(
+            rect,
+            Some(CompressedBlockCopyRect {
+                read_width: 4,
+                read_height: 1,
+                write_width: 2,
+                write_height: 2,
+                buffer_size: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn compressed_block_copy_rect_uses_one_block_for_small_region() {
+        let rect = compressed_block_copy_rect(
+            (8, 8, 48),
+            (4, 2, 1),
+            CopyOrigin {
+                level: 4,
+                x: 0,
+                y: 0,
+                z: 6,
+            },
+            CopyOrigin {
+                level: 0,
+                x: 0,
+                y: 0,
+                z: 0,
+            },
+            CopyRegion {
+                width: 2,
+                height: 2,
+                depth: 1,
+            },
+            4,
+            4,
+            8,
+        );
+        assert_eq!(
+            rect,
+            Some(CompressedBlockCopyRect {
+                read_width: 4,
+                read_height: 4,
+                write_width: 4,
+                write_height: 2,
+                buffer_size: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn compressed_block_copy_rect_rejects_unaligned_origins() {
+        assert_eq!(
+            compressed_block_copy_rect(
+                (8, 8, 1),
+                (8, 8, 1),
+                CopyOrigin {
+                    level: 0,
+                    x: 1,
+                    y: 0,
+                    z: 0,
+                },
+                CopyOrigin {
+                    level: 0,
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                },
+                CopyRegion {
+                    width: 2,
+                    height: 2,
+                    depth: 1,
+                },
+                4,
+                4,
+                8,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn compressed_copy_fallback_accepts_same_layout_srgb_pairs_only() {
+        assert_eq!(
+            compressed_copy_fallback_format(PixelFormat::Bc1RgbaUnorm, PixelFormat::Bc1RgbaSrgb),
+            Some((4, 4, 8))
+        );
+        assert_eq!(
+            compressed_copy_fallback_format(PixelFormat::Bc3Unorm, PixelFormat::Bc3Srgb),
+            Some((4, 4, 16))
+        );
+        assert_eq!(
+            compressed_copy_fallback_format(PixelFormat::Bc3Unorm, PixelFormat::Bc5Unorm),
+            None
+        );
+        assert_eq!(
+            compressed_copy_fallback_format(
+                PixelFormat::Astc2d8x5Unorm,
+                PixelFormat::Astc2d8x5Srgb
+            ),
+            Some((8, 5, 16))
+        );
+        assert_eq!(
+            compressed_copy_fallback_format(
+                PixelFormat::Astc2d8x5Unorm,
+                PixelFormat::Astc2d8x8Unorm
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn raw_compressed_copy_fallback_accepts_matching_block_bytes() {
+        assert_eq!(
+            raw_compressed_copy_fallback_format(
+                PixelFormat::Bc3Unorm,
+                PixelFormat::R32G32B32A32Uint
+            ),
+            Some(RawCompressedCopyFormat {
+                direction: RawCompressedCopyDirection::RawToCompressed,
+                compressed_format: PixelFormat::Bc3Unorm,
+                raw_format: PixelFormat::R32G32B32A32Uint,
+                block_width: 4,
+                block_height: 4,
+                bytes_per_block: 16,
+            })
+        );
+        assert_eq!(
+            raw_compressed_copy_fallback_format(
+                PixelFormat::R32G32B32A32Uint,
+                PixelFormat::Bc3Unorm
+            ),
+            Some(RawCompressedCopyFormat {
+                direction: RawCompressedCopyDirection::CompressedToRaw,
+                compressed_format: PixelFormat::Bc3Unorm,
+                raw_format: PixelFormat::R32G32B32A32Uint,
+                block_width: 4,
+                block_height: 4,
+                bytes_per_block: 16,
+            })
+        );
+    }
+
+    #[test]
+    fn raw_compressed_copy_fallback_rejects_mismatched_block_bytes() {
+        assert_eq!(
+            raw_compressed_copy_fallback_format(
+                PixelFormat::Bc1RgbaUnorm,
+                PixelFormat::R32G32B32A32Uint
+            ),
+            None
+        );
+        assert_eq!(
+            raw_compressed_copy_fallback_format(PixelFormat::Bc3Unorm, PixelFormat::A8B8G8R8Unorm),
+            None
+        );
+        assert_eq!(
+            raw_compressed_copy_fallback_format(PixelFormat::Bc3Unorm, PixelFormat::Bc3Srgb),
+            None
+        );
     }
 
     #[test]

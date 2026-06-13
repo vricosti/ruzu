@@ -1,3 +1,26 @@
+## 2026-06-13 — `video_core/src/renderer_opengl/gl_texture_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h`
+
+### Intentional differences
+- `OpenGLTextureCache::copy_image_direct_raw(...)` still attempts upstream `TextureCacheRuntime::CopyImage(...)` first with `glCopyImageSubData`. If Mesa rejects a byte-compatible compressed/raw alias copy, Rust now falls back to a backend-local byte copy: raw `R32G32B32A32Uint` is read/written with `glGetTextureSubImage`/`glTextureSubImage3D`, and compressed BC/ASTC data is read/written with `glGetCompressedTextureSubImage`/`glCompressedTextureSubImage3D`.
+- The raw/compressed fallback is intentionally guarded to equal byte sizes only, e.g. `BC3` 16-byte blocks with `R32G32B32A32_UINT` 16-byte texels. This preserves alias-copy byte semantics rather than inventing a format conversion.
+- For one-side-compressed aliases, Rust interprets `ImageCopy::extent` the same way upstream `ImageBase::TryFindBase(...)` constructs it: compressed dimensions are already reduced to block units before the copy is emitted, so the fallback expands only the compressed GL rectangle by the block width/height while keeping the raw rectangle in texels.
+
+### Unintentional differences (to fix)
+- Upstream currently has no explicit fallback after `glCopyImageSubData`; this Rust path compensates for observed Mesa `GL_INVALID_VALUE` on MK8D small-mip compressed/raw aliases. Keep it narrow unless another driver/API path proves broader handling is required.
+
+### Missing items
+- No shader-based general raw/compressed conversion fallback is implemented. That is intentionally not added here because the observed alias copies are byte-compatible copies, not semantic pixel conversions.
+
+### Binary layout verification
+- PASS: fallback copies exact byte buffers only. The accepted raw/compressed pairs require `surface::bytes_per_block(compressed) == surface::bytes_per_block(raw)`.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::CopyImage`, `CopyImageMSAA`, `CanImageBeCopied`, and `EmulateCopyImage`.
+- Re-read upstream `ImageBase::TryFindBase` alias copy-size construction for compressed/non-compressed pairs.
+- `cargo test -p video_core raw_compressed_copy_fallback -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo build --release --bin ruzu-cmd` pending after this entry.
+
 ## 2026-06-13 — `core/src/memory/memory.rs`, `video_core/src/texture_cache/texture_cache_base.rs`, `video_core/src/renderer_opengl/gl_texture_cache.rs`, and `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/memory.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`
 
 ### Intentional differences
@@ -1616,6 +1639,25 @@
 - `cargo test -p video_core inline_upload_linear_uses_constructor_memory_manager_owner_without_guest_writer -- --nocapture`
 - `cargo test -p video_core data_register_writes_through_memory_manager -- --nocapture`
 - `cargo test -p video_core memory_manager -- --nocapture`
+
+## 2026-06-13 — video_core/src/texture_cache/{texture_cache.rs,texture_cache_base.rs} vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/{texture_cache.h,texture_cache_base.h}
+
+### Intentional differences
+- Rust stores per-channel GPU page tables as owned `Box<TextureCacheGPUMap>` values in `TextureCacheChannelInfo` instead of upstream raw pointers supplied by `ChannelInfo`, preserving the same table ownership while avoiding dangling pointer state.
+- Rust stores the channel `MemoryManager` as `Arc<parking_lot::Mutex<MemoryManager>>` on `TextureCacheBase`, while upstream reaches the same owner through `channel_state->gpu_memory`.
+- `JoinImages` still queues the backend copy/delete tail through `pending_join_copies` because `TextureCacheBase` has no backend `Runtime::CopyImage` object. The sparse GPU overlap check and sparse image classification now run at the corresponding upstream points before registration.
+
+### Unintentional differences (to fix)
+- None for the sparse GPU page-table and sparse-segment registration slice after re-checking upstream `JoinImages`, `ForEachSparseSegment`, `RegisterImage`, and `UnregisterImage`.
+
+### Missing items
+- None for this slice.
+
+### Binary layout verification
+- N/A: texture-cache page-table ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo test -p video_core texture_cache::texture_cache::tests::`
 
 ## 2026-06-05 — video_core/src/renderer_opengl/gl_rasterizer.rs and common/src/trace.example.toml vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
 
@@ -17854,6 +17896,26 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Binary layout verification
 - N/A: OpenGL device policy only. No guest-visible raw payload layout changed.
 
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- Upstream `TextureCacheRuntime::CopyImage` dispatches `glCopyImageSubData` directly for every direct-copy region. Rust still tries that direct path first, but adds a backend-local fallback when the driver returns `GL_INVALID_VALUE` for compressed textures whose requested pixel region is smaller than a compression block or touches a partial mip edge. The fallback is limited to matching compressed block-layout families (for example BC1 unorm/sRGB or ASTC 8x5 unorm/sRGB), preserving raw compressed-block copy semantics by reading the source block with `glGetCompressedTextureSubImage` and writing it with destination-edge dimensions through `glCompressedTextureSubImage3D`.
+- `RUZU_TRACE_COPY_IMAGE_INVALID` remains an opt-in diagnostic for logging direct-copy failures and whether the compressed-block fallback handled them. It is inactive by default and does not change copy behavior.
+
+### Unintentional differences (to fix)
+- None known for this compressed sub-block copy fallback after re-reading upstream `TextureCacheRuntime::CopyImage`, `CanImageBeCopied`, and `EmulateCopyImage`.
+
+### Missing items
+- Broader OpenGL utility-shader parity gaps remain documented in the previous entry: `UtilShaders::CopyBC4`, `ConvertS8D24`, and block-linear/pitch upload shader paths are still not fully ported.
+
+### Binary layout verification
+- N/A: OpenGL host texture copy behavior only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo test -p video_core compressed_block_copy_rect -- --nocapture`
+- `cargo test -p video_core compressed_ -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+
 ## 2026-06-12 — core/src/hle/service/hid/hid_server.rs and common/src/trace.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hid/hid_server.cpp
 
 ### Intentional differences
@@ -17922,4 +17984,106 @@ The following still panic because upstream either also throws NotImplementedExce
 - PASS: query report writes preserve upstream raw payload sizes (`u32` short report, `u64 payload + u64 timestamp` long report). No Rust struct layout is serialized here.
 
 ### Tests
+- `cargo check -p video_core`
+
+## 2026-06-13 — video_core/src/texture_cache/util.rs, video_core/src/texture_cache/texture_cache.rs, video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/util.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h, /home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.cpp
+
+### Intentional differences
+- `is_valid_entry_with_range_valid` exposes the upstream `GpuToCpuAddress(address, guest_size_bytes)` fallback as a Rust closure-taking helper so callers that own a channel `MemoryManager` can supply range-aware validation while older single-address call sites keep using `is_valid_entry_with_addr_valid`.
+- OpenGL rasterizer GPU-reader closures now delegate directly to `MemoryManager::read_block`, matching upstream `ReadBlock` ownership for sparse/reserved page walking and zero fill, instead of pre-rejecting when `GpuToCpuAddress(gpu_addr)` has no start-page mapping.
+
+### Unintentional differences (to fix)
+- None known for the validated TIC entry/rasterizer GPU-reader slice after re-reading the upstream files listed above.
+
+### Missing items
+- Broader MK8D overexposure/present-color parity remains under investigation; the OpenGL 10-bit format table was checked against upstream and was not changed in this slice.
+
+### Binary layout verification
+- N/A: no guest-visible raw struct layout changed. TIC validation and GPU read dispatch behavior only.
+
+### Tests
+- `cargo test -p video_core texture_cache::util::tests::is_valid_entry_accepts_size_aware_range_like_upstream`
+- `cargo test -p video_core texture_cache::texture_cache::tests::`
+- `cargo test -p video_core texture_cache::util::tests::`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/util_shaders.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/util_shaders.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/util_shaders.h
+
+### Intentional differences
+- Rust `TextureCache` owns `UtilShaders` directly instead of going through upstream's `TextureCacheRuntime`/`ProgramManager` object graph. The ownership remains in the OpenGL texture-cache runtime layer and preserves the same `CopyImageMSAA` dispatch responsibility.
+- Rust compiles the embedded GLSL source strings with `gl_shader_util::create_program_from_source`; upstream compiles generated host-shader headers with `MakeProgram(...)`.
+
+### Unintentional differences (to fix)
+- None known for the `CopyImageMSAA` dispatch slice after re-reading upstream `TextureCacheRuntime::CopyImageMSAA` and `UtilShaders::CopyMSAA`.
+
+### Missing items
+- `UtilShaders::CopyBC4`, `UtilShaders::ConvertS8D24`, and block-linear/pitch upload shader compilation remain broader utility-shader parity gaps outside this MSAA-copy slice.
+- Resolution scaling around `TextureCache<P>::JoinImages` still has broader parity gaps because Rust `Image::scale_up`/`scale_down` are stubs; this pass only removes the sample-count mismatch early return.
+
+### Binary layout verification
+- N/A: OpenGL shader dispatch behavior only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo fmt --all`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-13 — video_core/src/engines/draw_manager.rs, video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust snapshots Maxwell3D render-target register state through `Maxwell3DRenderTargets` instead of storing a direct `maxwell3d` pointer in `TextureCacheBase`. The snapshot now includes `surface_clip`, preserving the upstream `UpdateRenderTargets` owner data without changing Rust ownership.
+
+### Unintentional differences (to fix)
+- None known for the `UpdateRenderTargets` `render_targets.size` slice after re-reading upstream `TextureCache<P>::UpdateRenderTargets`.
+
+### Missing items
+- Upstream `RescaleRenderTargets`, `ImageCanRescale`, `ScaleUp`, and `ScaleDown` are still incomplete/stubbed in the Rust texture-cache path. This remains a broader parity gap for resolution scaling and blacklisted texture views.
+
+### Binary layout verification
+- N/A: render-target snapshot and cache key behavior only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo fmt --all --check`
+- `cargo test -p video_core update_render_targets_from_snapshot_registers_presentable_view -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust stores the upstream `TextureCacheRuntime::rescale_draw_fbos` / `rescale_read_fbos` objects directly on `OpenGL::TextureCache`, because ruzu does not split a separate OpenGL texture-cache runtime object. Ownership remains in the OpenGL texture-cache backend.
+- Rust `Image::scale_up` / `scale_down` take the corresponding `ImageBase` as an explicit parameter instead of inheriting from it like upstream `OpenGL::Image : ImageBase`.
+- Rust `invalidate_scale` removes backend GL image views/framebuffers and clears the base image view lists locally. The full upstream channel descriptor-table invalidation is still broader texture-cache ownership work, but the scaled image views used by `BlitImage` are recreated against the new `current_texture`.
+
+### Unintentional differences (to fix)
+- `TextureCache<P>::RescaleRenderTargets` remains incomplete in Rust, so render-target binding-time scale transitions are still not fully upstream-equivalent.
+
+### Missing items
+- Full upstream `InvalidateScale` side effects on active graphics/compute descriptor tables and dirty flags.
+- Full `RescaleRenderTargets` parity outside the `BlitImage` rescale/resolve path.
+
+### Binary layout verification
+- N/A: OpenGL image scaling and framebuffer blit behavior only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo fmt --all --check`
+- `cargo test -p video_core present_internal_format_matches_basic_surface_formats -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Upstream `TextureCache<P>::JoinImages` owns the full templated runtime tail synchronously. Rust still splits common image metadata from OpenGL backend images, so `TextureCacheBase::JoinImages` queues `PendingJoinCopies` and `OpenGL::TextureCache::finish_pending_join_copies` drains the backend work once GL images exist.
+- The new Rust `prepare_pending_join_rescale` helper ports the backend-owned part of upstream `JoinImages`: compute `can_rescale` from `new_info.rescaleable`, sibling `ImageCanRescale`, and sibling `Rescaled` flags; scale siblings up/down before copy; scale the new image up/down; and pass the matching `up_scale/down_shift` to `make_shrink_image_copies`.
+
+### Unintentional differences (to fix)
+- Upstream calls `RefreshContents(new_image, new_image_id)` before scaling/copying the new joined image. Rust cannot do that at every `PendingJoinCopies` drain point because texture-view materialisation lacks the channel GPU reader required by `refresh_contents_with_gpu_reader`.
+- Upstream executes the copy/delete tail before `RegisterImage(new_image_id)`. Rust still registers in the common cache before the OpenGL deferred tail runs, exposing a split-owner ordering difference.
+
+### Missing items
+- Restore upstream-equivalent `RefreshContents(new_image)` ordering for joined images, either by moving the backend tail to a point that always has a GPU reader or by carrying an equivalent upload hook through the texture-cache owner.
+- Remove or tighten the `PendingJoinCopies` split so `JoinImages` cannot expose registered intermediate state before backend copies/deletes complete.
+- Remaining upstream `JoinImages` runtime branches not covered by this slice: full reinterpret/emulated copy parity, bad-overlap download interactions, and exact descriptor-table/dirty-flag invalidation after rescale.
+
+### Binary layout verification
+- N/A: OpenGL texture-cache lifecycle/copy ordering only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo fmt --all --check`
 - `cargo check -p video_core`

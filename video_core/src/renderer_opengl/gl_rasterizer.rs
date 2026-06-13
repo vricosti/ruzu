@@ -3887,9 +3887,6 @@ impl RasterizerInterface for RasterizerOpenGL {
                                     |gpu_addr| mm.gpu_to_cpu_address(gpu_addr),
                                     |gpu_addr| mm.get_memory_layout_size(gpu_addr),
                                     |gpu_addr, out| {
-                                        if mm.gpu_to_cpu_address(gpu_addr).is_none() {
-                                            return false;
-                                        }
                                         mm.read_block(gpu_addr, out);
                                         true
                                     },
@@ -4055,9 +4052,6 @@ impl RasterizerInterface for RasterizerOpenGL {
                                             descriptor_sync_regs.tex_sampler_limit
                                         },
                                         |gpu_addr, out| {
-                                            if mm.gpu_to_cpu_address(gpu_addr).is_none() {
-                                                return false;
-                                            }
                                             mm.read_block(gpu_addr, out);
                                             true
                                         },
@@ -4118,9 +4112,6 @@ impl RasterizerInterface for RasterizerOpenGL {
                         &mut views,
                         has_images,
                         &mut |gpu_addr, out| {
-                            if mm.gpu_to_cpu_address(gpu_addr).is_none() {
-                                return false;
-                            }
                             mm.read_block(gpu_addr, out);
                             true
                         },
@@ -4161,9 +4152,6 @@ impl RasterizerInterface for RasterizerOpenGL {
                         false,
                         false,
                         &mut |gpu_addr, out| {
-                            if mm.gpu_to_cpu_address(gpu_addr).is_none() {
-                                return false;
-                            }
                             mm.read_block(gpu_addr, out);
                             true
                         },
@@ -4219,9 +4207,6 @@ impl RasterizerInterface for RasterizerOpenGL {
                     self.texture_cache.prepare_render_targets_from_snapshot(
                         &render_targets,
                         Some(&mut |gpu_addr, out| {
-                            if mm.gpu_to_cpu_address(gpu_addr).is_none() {
-                                return false;
-                            }
                             mm.read_block(gpu_addr, out);
                             true
                         }),
@@ -6626,64 +6611,45 @@ impl RasterizerInterface for RasterizerOpenGL {
                         num_instances,
                     );
                 } else {
-                unsafe {
-                    let mut any_samples_query = 0u32;
-                    if trace_any_samples {
-                        while gl::GetError() != gl::NO_ERROR {}
-                        gl::GenQueries(1, &mut any_samples_query);
-                        if any_samples_query != 0 {
-                            gl::BeginQuery(gl::SAMPLES_PASSED, any_samples_query);
+                    unsafe {
+                        let mut any_samples_query = 0u32;
+                        if trace_any_samples {
+                            while gl::GetError() != gl::NO_ERROR {}
+                            gl::GenQueries(1, &mut any_samples_query);
+                            if any_samples_query != 0 {
+                                gl::BeginQuery(gl::SAMPLES_PASSED, any_samples_query);
+                            }
                         }
-                    }
-                    gl::BindVertexArray(self.transient_vao);
-                    gl::DrawElementsInstancedBaseVertexBaseInstance(
-                        primitive_mode,
-                        num_vertices as i32,
-                        index_format,
-                        index_offset as *const _,
-                        num_instances as i32,
-                        base_vertex,
-                        base_instance,
-                    );
-                    let mut any_samples = 0u64;
-                    if any_samples_query != 0 {
-                        gl::EndQuery(gl::SAMPLES_PASSED);
-                        gl::GetQueryObjectui64v(
-                            any_samples_query,
-                            gl::QUERY_RESULT,
-                            &mut any_samples,
+                        gl::BindVertexArray(self.transient_vao);
+                        gl::DrawElementsInstancedBaseVertexBaseInstance(
+                            primitive_mode,
+                            num_vertices as i32,
+                            index_format,
+                            index_offset as *const _,
+                            num_instances as i32,
+                            base_vertex,
+                            base_instance,
                         );
-                        gl::DeleteQueries(1, &any_samples_query);
-                    }
-                    let gl_error_after_draw = if trace_any_samples {
-                        gl::GetError()
-                    } else {
-                        gl::NO_ERROR
-                    };
-                    if trace_any_samples {
-                        common::trace::emit_raw(
-                            common::trace::cat::GL_DRAW_STATE,
-                            &[
-                                4,
-                                draw_seq,
-                                pipeline.program_pipeline_handle() as u64,
-                                (any_samples_query != 0) as u64,
-                                (any_samples != 0) as u64,
-                                gl_error_after_draw as u64,
-                                1,
-                                primitive_mode as u64,
-                                num_vertices as u64,
-                                num_instances as u64,
-                            ],
-                        );
-                    }
-                    if trace_any_samples_rt {
-                        if let Some((framebuffer, width, height)) = bound_draw_framebuffer {
-                            let rt0 = draw_view.render_targets().render_targets[0];
+                        let mut any_samples = 0u64;
+                        if any_samples_query != 0 {
+                            gl::EndQuery(gl::SAMPLES_PASSED);
+                            gl::GetQueryObjectui64v(
+                                any_samples_query,
+                                gl::QUERY_RESULT,
+                                &mut any_samples,
+                            );
+                            gl::DeleteQueries(1, &any_samples_query);
+                        }
+                        let gl_error_after_draw = if trace_any_samples {
+                            gl::GetError()
+                        } else {
+                            gl::NO_ERROR
+                        };
+                        if trace_any_samples {
                             common::trace::emit_raw(
-                                common::trace::cat::RT_BIND,
+                                common::trace::cat::GL_DRAW_STATE,
                                 &[
-                                    u64::MAX - 1,
+                                    4,
                                     draw_seq,
                                     pipeline.program_pipeline_handle() as u64,
                                     (any_samples_query != 0) as u64,
@@ -6693,14 +6659,33 @@ impl RasterizerInterface for RasterizerOpenGL {
                                     primitive_mode as u64,
                                     num_vertices as u64,
                                     num_instances as u64,
-                                    ((width as u64) << 32) | height as u64,
-                                    rt0.address,
-                                    framebuffer as u64,
                                 ],
                             );
                         }
+                        if trace_any_samples_rt {
+                            if let Some((framebuffer, width, height)) = bound_draw_framebuffer {
+                                let rt0 = draw_view.render_targets().render_targets[0];
+                                common::trace::emit_raw(
+                                    common::trace::cat::RT_BIND,
+                                    &[
+                                        u64::MAX - 1,
+                                        draw_seq,
+                                        pipeline.program_pipeline_handle() as u64,
+                                        (any_samples_query != 0) as u64,
+                                        (any_samples != 0) as u64,
+                                        gl_error_after_draw as u64,
+                                        1,
+                                        primitive_mode as u64,
+                                        num_vertices as u64,
+                                        num_instances as u64,
+                                        ((width as u64) << 32) | height as u64,
+                                        rt0.address,
+                                        framebuffer as u64,
+                                    ],
+                                );
+                            }
+                        }
                     }
-                }
                 }
             } else {
                 debug!(
@@ -6768,62 +6753,43 @@ impl RasterizerInterface for RasterizerOpenGL {
                         num_instances,
                     );
                 } else {
-                unsafe {
-                    let mut any_samples_query = 0u32;
-                    if trace_any_samples {
-                        while gl::GetError() != gl::NO_ERROR {}
-                        gl::GenQueries(1, &mut any_samples_query);
-                        if any_samples_query != 0 {
-                            gl::BeginQuery(gl::SAMPLES_PASSED, any_samples_query);
+                    unsafe {
+                        let mut any_samples_query = 0u32;
+                        if trace_any_samples {
+                            while gl::GetError() != gl::NO_ERROR {}
+                            gl::GenQueries(1, &mut any_samples_query);
+                            if any_samples_query != 0 {
+                                gl::BeginQuery(gl::SAMPLES_PASSED, any_samples_query);
+                            }
                         }
-                    }
-                    gl::BindVertexArray(self.transient_vao);
-                    gl::DrawArraysInstancedBaseInstance(
-                        primitive_mode,
-                        base_vertex,
-                        num_vertices as i32,
-                        num_instances as i32,
-                        base_instance,
-                    );
-                    let mut any_samples = 0u64;
-                    if any_samples_query != 0 {
-                        gl::EndQuery(gl::SAMPLES_PASSED);
-                        gl::GetQueryObjectui64v(
-                            any_samples_query,
-                            gl::QUERY_RESULT,
-                            &mut any_samples,
+                        gl::BindVertexArray(self.transient_vao);
+                        gl::DrawArraysInstancedBaseInstance(
+                            primitive_mode,
+                            base_vertex,
+                            num_vertices as i32,
+                            num_instances as i32,
+                            base_instance,
                         );
-                        gl::DeleteQueries(1, &any_samples_query);
-                    }
-                    let gl_error_after_draw = if trace_any_samples {
-                        gl::GetError()
-                    } else {
-                        gl::NO_ERROR
-                    };
-                    if trace_any_samples {
-                        common::trace::emit_raw(
-                            common::trace::cat::GL_DRAW_STATE,
-                            &[
-                                4,
-                                draw_seq,
-                                pipeline.program_pipeline_handle() as u64,
-                                (any_samples_query != 0) as u64,
-                                (any_samples != 0) as u64,
-                                gl_error_after_draw as u64,
-                                0,
-                                primitive_mode as u64,
-                                num_vertices as u64,
-                                num_instances as u64,
-                            ],
-                        );
-                    }
-                    if trace_any_samples_rt {
-                        if let Some((framebuffer, width, height)) = bound_draw_framebuffer {
-                            let rt0 = draw_view.render_targets().render_targets[0];
+                        let mut any_samples = 0u64;
+                        if any_samples_query != 0 {
+                            gl::EndQuery(gl::SAMPLES_PASSED);
+                            gl::GetQueryObjectui64v(
+                                any_samples_query,
+                                gl::QUERY_RESULT,
+                                &mut any_samples,
+                            );
+                            gl::DeleteQueries(1, &any_samples_query);
+                        }
+                        let gl_error_after_draw = if trace_any_samples {
+                            gl::GetError()
+                        } else {
+                            gl::NO_ERROR
+                        };
+                        if trace_any_samples {
                             common::trace::emit_raw(
-                                common::trace::cat::RT_BIND,
+                                common::trace::cat::GL_DRAW_STATE,
                                 &[
-                                    u64::MAX - 1,
+                                    4,
                                     draw_seq,
                                     pipeline.program_pipeline_handle() as u64,
                                     (any_samples_query != 0) as u64,
@@ -6833,14 +6799,33 @@ impl RasterizerInterface for RasterizerOpenGL {
                                     primitive_mode as u64,
                                     num_vertices as u64,
                                     num_instances as u64,
-                                    ((width as u64) << 32) | height as u64,
-                                    rt0.address,
-                                    framebuffer as u64,
                                 ],
                             );
                         }
+                        if trace_any_samples_rt {
+                            if let Some((framebuffer, width, height)) = bound_draw_framebuffer {
+                                let rt0 = draw_view.render_targets().render_targets[0];
+                                common::trace::emit_raw(
+                                    common::trace::cat::RT_BIND,
+                                    &[
+                                        u64::MAX - 1,
+                                        draw_seq,
+                                        pipeline.program_pipeline_handle() as u64,
+                                        (any_samples_query != 0) as u64,
+                                        (any_samples != 0) as u64,
+                                        gl_error_after_draw as u64,
+                                        0,
+                                        primitive_mode as u64,
+                                        num_vertices as u64,
+                                        num_instances as u64,
+                                        ((width as u64) << 32) | height as u64,
+                                        rt0.address,
+                                        framebuffer as u64,
+                                    ],
+                                );
+                            }
+                        }
                     }
-                }
                 }
             } else {
                 debug!(
@@ -7222,8 +7207,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         let rt0_addr_for_debug = draw_view.render_targets().render_targets[0].address;
         let rt_dump_elapsed_ms = trace_elapsed_ms();
         let rt_dump_in_time_window = rt_dump_elapsed_ms
-            >= trace_u64_env_cached(&DUMP_RT_TIME_START, "RUZU_DUMP_RT_TIME_START_MS")
-                .unwrap_or(0)
+            >= trace_u64_env_cached(&DUMP_RT_TIME_START, "RUZU_DUMP_RT_TIME_START_MS").unwrap_or(0)
             && rt_dump_elapsed_ms
                 <= trace_u64_env_cached(&DUMP_RT_TIME_END, "RUZU_DUMP_RT_TIME_END_MS")
                     .unwrap_or(u64::MAX);
@@ -7233,9 +7217,9 @@ impl RasterizerInterface for RasterizerOpenGL {
             && rt_dump_in_time_window
             && DUMP_RT_COUNT.load(Ordering::Relaxed)
                 < trace_u64_env_cached(&DUMP_RT_LIMIT, "RUZU_DUMP_RT_LIMIT").unwrap_or(u64::MAX);
-        let should_dump_rt_seq =
-            trace_u64_env_cached(&DUMP_RT_SEQ, "RUZU_DUMP_RT_SEQ") == Some(draw_seq)
-                && rt_dump_in_time_window;
+        let should_dump_rt_seq = trace_u64_env_cached(&DUMP_RT_SEQ, "RUZU_DUMP_RT_SEQ")
+            == Some(draw_seq)
+            && rt_dump_in_time_window;
         let should_trace_summary = if trace_draw_summary {
             static SUMMARY_LIMIT: OnceLock<Option<u64>> = OnceLock::new();
             static SUMMARY_SEQ_MIN: OnceLock<Option<u64>> = OnceLock::new();
@@ -7254,11 +7238,9 @@ impl RasterizerInterface for RasterizerOpenGL {
             let summary_rt_addr =
                 trace_u64_env_cached(&SUMMARY_RT_ADDR, "RUZU_TRACE_DRAW_SUMMARY_RT_ADDR");
             let summary_elapsed_ms = trace_elapsed_ms();
-            let summary_time_start = trace_u64_env_cached(
-                &SUMMARY_TIME_START,
-                "RUZU_TRACE_DRAW_SUMMARY_TIME_START_MS",
-            )
-            .unwrap_or(0);
+            let summary_time_start =
+                trace_u64_env_cached(&SUMMARY_TIME_START, "RUZU_TRACE_DRAW_SUMMARY_TIME_START_MS")
+                    .unwrap_or(0);
             let summary_time_end =
                 trace_u64_env_cached(&SUMMARY_TIME_END, "RUZU_TRACE_DRAW_SUMMARY_TIME_END_MS")
                     .unwrap_or(u64::MAX);
@@ -8468,9 +8450,6 @@ impl RasterizerInterface for RasterizerOpenGL {
                 |gpu_addr| mm.lock().gpu_to_cpu_address(gpu_addr),
                 |gpu_addr, out| {
                     let guard = mm.lock();
-                    if guard.gpu_to_cpu_address(gpu_addr).is_none() {
-                        return false;
-                    }
                     guard.read_block(gpu_addr, out);
                     true
                 },
@@ -8564,6 +8543,9 @@ impl RasterizerInterface for RasterizerOpenGL {
                 );
             }
             self.channel_memory_manager = Some(Arc::clone(mm));
+            self.texture_cache
+                .base
+                .set_channel_gpu_memory(Arc::clone(mm));
 
             // The buffer cache reads through the channel's upstream-shaped
             // MemoryManager owner.
@@ -8582,6 +8564,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         self.shader_cache.erase_channel(channel_id);
         self.query_cache.erase_channel(channel_id);
         self.channel_memory_manager = None;
+        self.texture_cache.base.clear_channel_gpu_memory();
     }
 }
 

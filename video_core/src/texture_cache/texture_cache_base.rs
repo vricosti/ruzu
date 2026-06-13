@@ -17,11 +17,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use parking_lot::ReentrantMutex;
+use parking_lot::{Mutex as ParkingMutex, ReentrantMutex};
 
 use common::slot_vector::SlotVector;
 
 use crate::framebuffer_config::{BlendMode, FramebufferConfig};
+use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::RasterizerDownloadArea;
 use crate::renderer_base::GuestMemoryWriter;
 
@@ -160,8 +161,8 @@ impl TextureCacheChannelInfo {
             compute_image_view_ids: Vec::new(),
             image_views: HashMap::new(),
             samplers: HashMap::new(),
-            gpu_page_table: None,
-            sparse_page_table: None,
+            gpu_page_table: Some(Box::new(TextureCacheGPUMap::default())),
+            sparse_page_table: Some(Box::new(TextureCacheGPUMap::default())),
         }
     }
 }
@@ -254,7 +255,7 @@ pub struct TextureCacheBase {
 
     // Page tables
     pub page_table: HashMap<u64, Vec<ImageMapId>>,
-    pub sparse_views: HashMap<ImageId, Vec<ImageViewId>>,
+    pub sparse_views: HashMap<ImageId, Vec<ImageMapId>>,
 
     // Memory tracking
     pub has_deleted_images: bool,
@@ -299,6 +300,12 @@ pub struct TextureCacheBase {
     // backend `Image::DownloadMemory` and `Tegra::MemoryManager`.
     pub image_downloader: Option<ImageDownloader>,
     pub guest_memory_writer: Option<GuestMemoryWriter>,
+    /// Channel-bound GPU memory manager.
+    ///
+    /// Upstream reaches this through `channel_state->gpu_memory`; sparse
+    /// texture registration needs it for `GetSubmappedRange` and
+    /// `GpuToCpuAddress`.
+    pub channel_gpu_memory: Option<Arc<ParkingMutex<MemoryManager>>>,
 
     /// Shared `MaxwellDeviceMemoryManager` reference. Mirrors upstream
     /// `MaxwellDeviceMemoryManager& device_memory` member used by
@@ -377,6 +384,7 @@ impl TextureCacheBase {
             unswizzle_data_buffer: vec![0u8; 1 * 1024 * 1024], // 1 MiB
             image_downloader: None,
             guest_memory_writer: None,
+            channel_gpu_memory: None,
             device_memory,
             channel_state: TextureCacheChannelInfo::new(),
             mutex: ReentrantMutex::new(()),
@@ -639,6 +647,43 @@ impl TextureCacheBase {
                         continue;
                     }
                     image_ids.push(map.image_id);
+                }
+            }
+        });
+        image_ids
+    }
+
+    /// Collect every `ImageId` whose registered GPU pages overlap the given
+    /// region. Mirrors upstream `ForEachImageInRegionGPU` /
+    /// `ForEachSparseImageInRegion`; the caller selects which per-channel GPU
+    /// page table to inspect.
+    pub fn collect_images_in_gpu_region(
+        &self,
+        gpu_addr: GPUVAddr,
+        size: usize,
+        sparse: bool,
+    ) -> Vec<ImageId> {
+        let table = if sparse {
+            self.channel_state.sparse_page_table.as_deref()
+        } else {
+            self.channel_state.gpu_page_table.as_deref()
+        };
+        let Some(table) = table else {
+            return Vec::new();
+        };
+
+        let mut image_ids = Vec::new();
+        let mut seen = HashSet::new();
+        Self::for_each_gpu_page(gpu_addr, size, |page| {
+            if let Some(ids) = table.get(&page) {
+                for &image_id in ids {
+                    if !seen.insert(image_id) {
+                        continue;
+                    }
+                    if !self.slot_images[image_id].overlaps_gpu(gpu_addr, size) {
+                        continue;
+                    }
+                    image_ids.push(image_id);
                 }
             }
         });
