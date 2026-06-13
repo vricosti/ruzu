@@ -4050,35 +4050,13 @@ impl RasterizerInterface for RasterizerOpenGL {
                                 blacklist: false,
                                 id: Default::default(),
                             });
-                            // Slice 13: resolve the TSC handle → SamplerId via
-                            // the cache's per-index dedup table. Pushed in
-                            // lock-step with the view so the bind loop can
-                            // walk both in parallel. MK8D's TSC table pointer
-                            // is a GPU VA, so read it through the channel
-                            // MemoryManager rather than the Host1x SMMU device
-                            // manager stored in the cache base.
+                            // Resolve the TSC handle through the texture
+                            // cache's per-index descriptor table, in lock-step
+                            // with the TIC view so the bind loop can walk both
+                            // arrays in parallel like upstream.
                             record_gl_draw_stage_detail(draw_seq, 48, stage as u64, packed_desc);
-                            let sampler_id = if let (Some(mm), Some(reader)) =
-                                (cbuf_mm_guard.as_ref(), cbuf_device_reader.as_ref())
-                            {
-                                self.texture_cache
-                                    .base
-                                    .get_graphics_sampler_id_with_gpu_reader(
-                                        tsc_id,
-                                        descriptor_sync_regs.tex_sampler_addr,
-                                        if via_header_index {
-                                            descriptor_sync_regs.tex_header_limit
-                                        } else {
-                                            descriptor_sync_regs.tex_sampler_limit
-                                        },
-                                        |gpu_addr, out| {
-                                            mm.read_block(gpu_addr, out);
-                                            true
-                                        },
-                                    )
-                            } else {
-                                self.texture_cache.base.get_graphics_sampler_id(tsc_id)
-                            };
+                            let sampler_id =
+                                self.texture_cache.base.get_graphics_sampler_id(tsc_id);
                             record_gl_draw_stage_detail(draw_seq, 49, stage as u64, packed_desc);
                             sampler_ids.push(sampler_id);
                             record_gl_draw_stage_detail(draw_seq, 50, stage as u64, packed_desc);
@@ -4124,27 +4102,9 @@ impl RasterizerInterface for RasterizerOpenGL {
             // Mirror upstream `FillGraphicsImageViews<has_images>(views)` from
             // gl_graphics_pipeline.cpp:380. `has_blacklists = has_images` per
             // upstream's `Spec::has_images` template parameter.
-            if let (Some(mm), Some(reader)) = (cbuf_mm_guard.as_ref(), cbuf_device_reader.as_ref())
-            {
-                self.texture_cache
-                    .base
-                    .fill_graphics_image_views_with_gpu_reader(
-                        &mut views,
-                        has_images,
-                        &mut |gpu_addr, out| {
-                            mm.read_block(gpu_addr, out);
-                            true
-                        },
-                        &mut |gpu_addr, size| {
-                            mm.gpu_to_cpu_address(gpu_addr)
-                                .or_else(|| mm.gpu_to_cpu_address_range(gpu_addr, size))
-                        },
-                    );
-            } else {
-                self.texture_cache
-                    .base
-                    .fill_graphics_image_views(&mut views, has_images);
-            }
+            self.texture_cache
+                .base
+                .fill_graphics_image_views(&mut views, has_images);
             record_gl_draw_stage(draw_seq, 17);
             trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_fill_image_views", draw_seq);
 
