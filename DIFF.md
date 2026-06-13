@@ -18337,20 +18337,20 @@ The following still panic because upstream either also throws NotImplementedExce
 ## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
 
 ### Intentional differences
-- Reader-less `OpenGL::TextureCache::{prepare_image_without_gpu_reader,prepare_render_targets_from_snapshot}` now call `SynchronizeAliases` only when `RefreshContents` would be a no-op (`CPU_MODIFIED` is not set). Upstream always executes `RefreshContents` before `SynchronizeAliases`; without a channel GPU reader, Rust cannot upload CPU-modified guest contents, so copying backend aliases in that state could propagate stale texture data.
-- This keeps reader-less alias synchronization for already-clean images, preserving the backend-local part of upstream `PrepareImage` when no upload is required.
+- Reader-less `OpenGL::TextureCache::{prepare_image_without_gpu_reader,prepare_render_targets_from_snapshot}` first try the bound channel `gpu_memory` and route through `prepare_image_with_gpu_reader`, restoring upstream `PrepareImage` order (`RefreshContents`, `SynchronizeAliases`, optional `MarkModification`) when a channel is bound.
+- If no channel GPU memory is available, the fallback still calls `SynchronizeAliases` only when `RefreshContents` would be a no-op (`CPU_MODIFIED` is not set). Upstream always executes `RefreshContents` before `SynchronizeAliases`; without any GPU reader, Rust cannot upload CPU-modified guest contents, so copying backend aliases in that state could propagate stale texture data.
 
 ### Unintentional differences (to fix)
-- CPU-modified images in reader-less paths still cannot complete upstream `RefreshContents`; they wait for a later path with a GPU reader to upload contents before alias synchronization can safely run.
+- CPU-modified images in paths that have neither a caller-supplied GPU reader nor a bound channel GPU memory still cannot complete upstream `RefreshContents`; they wait for a later path with GPU memory access to upload contents before alias synchronization can safely run.
 
 ### Missing items
-- Move `RefreshContents` / `UploadImageContents` ownership into a common/backend hook shape so every `PrepareImage` caller can execute the upstream refresh-before-alias order without requiring separate reader/non-reader wrappers.
+- Move `RefreshContents` / `UploadImageContents` ownership into a common/backend hook shape so every `PrepareImage` caller executes the upstream refresh-before-alias order directly, instead of relying on OpenGL wrapper fallbacks.
 
 ### Binary layout verification
 - N/A: OpenGL texture-cache ordering guard only. No guest-visible raw payload layout changed.
 
 ### Tests
-- Re-read upstream `TextureCache<P>::PrepareImage` and `TextureCache<P>::RefreshContents`.
+- Re-read upstream `TextureCache<P>::PrepareImage`, `TextureCache<P>::RefreshContents`, and `TextureCache<P>::UploadImageContents`.
 - `cargo fmt --all --check`
 - `git diff --check`
 - `cargo check -p video_core --quiet`
