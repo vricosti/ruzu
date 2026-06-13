@@ -10,6 +10,7 @@
 use crate::control::channel_state::ChannelState;
 use crate::engines::draw_manager::{Maxwell3DClearView, Maxwell3DDrawView, Maxwell3DIndirectView};
 use crate::engines::fermi_2d::{Config as Fermi2DConfig, Surface as Fermi2DSurface};
+use crate::engines::kepler_compute::DispatchCall;
 use crate::query_cache::types::QueryPropertiesFlags;
 
 /// Shader loading callback stages.
@@ -113,6 +114,17 @@ pub trait RasterizerInterface {
 
     /// Dispatch a compute shader invocation.
     fn dispatch_compute(&mut self);
+
+    /// Dispatch a compute shader invocation with the KeplerCompute state captured
+    /// at the launch boundary.
+    ///
+    /// Upstream `RasterizerOpenGL::DispatchCompute` reads the currently bound
+    /// `KeplerCompute` owner directly. Rust passes the already-recorded dispatch
+    /// snapshot to avoid re-entering `KeplerCompute` mutably while it is calling
+    /// into the rasterizer.
+    fn dispatch_compute_with_call(&mut self, _dispatch: &DispatchCall) {
+        self.dispatch_compute();
+    }
 
     // ── Queries ──────────────────────────────────────────────────────────
 

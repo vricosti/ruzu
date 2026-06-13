@@ -31,6 +31,7 @@ use crate::buffer_cache::word_manager::DeviceTracker;
 use crate::engines::draw_manager::{
     DrawState, Maxwell3DClearView, Maxwell3DDrawView, Maxwell3DIndirectView,
 };
+use crate::engines::kepler_compute::DispatchCall;
 use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, ComparisonOp, CullFace, DepthMode, DrawCall, FillViaTriangleMode,
     FrontFace, PolygonMode, StencilFaceInfo, StencilOp,
@@ -46,6 +47,7 @@ use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
 use crate::renderer_base::GuestMemoryWriter;
 use crate::renderer_opengl::present::layer::FramebufferTextureInfo;
 use crate::shader_cache::ShaderCache;
+use crate::texture_cache::texture_cache_base::ComputeDescriptorSyncRegs;
 
 macro_rules! lock_two_reentrant_mutexes {
     ($first_mutex:expr, $second_mutex:expr, $first_guard:ident, $second_guard:ident) => {
@@ -1898,6 +1900,18 @@ fn dump_gl_buffer_prefix(label: &str, handle: u32, offset: isize, max_bytes: usi
             bytes,
             err
         );
+    }
+}
+
+fn compute_descriptor_sync_regs_from_dispatch(
+    dispatch: &DispatchCall,
+) -> ComputeDescriptorSyncRegs {
+    ComputeDescriptorSyncRegs {
+        linked_tsc: dispatch.qmd.linked_tsc,
+        tic_addr: dispatch.tic_address,
+        tic_limit: dispatch.tic_limit,
+        tsc_addr: dispatch.tsc_address,
+        tsc_limit: dispatch.tsc_limit,
     }
 }
 
@@ -7980,6 +7994,28 @@ impl RasterizerInterface for RasterizerOpenGL {
         debug!("RasterizerOpenGL::dispatch_compute");
     }
 
+    fn dispatch_compute_with_call(&mut self, dispatch: &DispatchCall) {
+        // Upstream `RasterizerOpenGL::DispatchCompute` starts with
+        // `gpu_memory->FlushCaching()`, then obtains the current compute
+        // pipeline whose `Configure()` synchronizes compute TIC/TSC descriptors.
+        if let Some(mm) = self.channel_memory_manager.as_ref().cloned() {
+            mm.lock().flush_caching();
+        }
+        self.texture_cache
+            .base
+            .synchronize_compute_descriptors(compute_descriptor_sync_regs_from_dispatch(dispatch));
+        debug!(
+            "RasterizerOpenGL::dispatch_compute_with_call grid=({},{},{}) block=({},{},{}) code=0x{:X}",
+            dispatch.qmd.grid_dim_x,
+            dispatch.qmd.grid_dim_y,
+            dispatch.qmd.grid_dim_z,
+            dispatch.qmd.block_dim_x,
+            dispatch.qmd.block_dim_y,
+            dispatch.qmd.block_dim_z,
+            dispatch.code_address
+        );
+    }
+
     fn reset_counter(&mut self, query_type: u32) {
         let Some(mapped_query_type) = maxwell_to_video_core_query(query_type) else {
             return;
@@ -8602,6 +8638,37 @@ mod tests {
 
         assert!(!rast.buffer_cache.has_uncommitted_flushes());
         assert!(rast.buffer_cache.should_wait_async_flushes());
+    }
+
+    #[test]
+    fn compute_descriptor_sync_regs_come_from_dispatch_call() {
+        let mut qmd = crate::engines::kepler_compute::QueueMetaData::default();
+        qmd.linked_tsc = true;
+        qmd.grid_dim_x = 2;
+        qmd.grid_dim_y = 3;
+        qmd.grid_dim_z = 4;
+        qmd.block_dim_x = 8;
+        qmd.block_dim_y = 1;
+        qmd.block_dim_z = 1;
+
+        let dispatch = DispatchCall {
+            qmd,
+            qmd_address: 0x1000,
+            code_address: 0x2000,
+            tsc_address: 0x3000,
+            tsc_limit: 1,
+            tic_address: 0x4000,
+            tic_limit: 6,
+            tex_cb_index: 0,
+        };
+
+        let regs = compute_descriptor_sync_regs_from_dispatch(&dispatch);
+
+        assert!(regs.linked_tsc);
+        assert_eq!(regs.tic_addr, 0x4000);
+        assert_eq!(regs.tic_limit, 6);
+        assert_eq!(regs.tsc_addr, 0x3000);
+        assert_eq!(regs.tsc_limit, 1);
     }
 
     #[test]
