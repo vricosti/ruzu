@@ -1,3 +1,24 @@
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `OpenGL::TextureCache::finish_pending_join_copies_impl(...)` now refreshes CPU-modified joined images through the bound channel `gpu_memory` when no caller-supplied GPU reader is present. This matches upstream `TextureCache<P>::JoinImages` / `RefreshContents` ownership more closely: upstream `RefreshContents(new_image, new_image_id)` reads through the texture cache's `gpu_memory` member, not through an ad hoc call-site reader.
+- The method still keeps the explicit reader path for Rust call sites that already supply one, and falls back to deferring only when both reader sources are unavailable.
+
+### Unintentional differences (to fix)
+- None known for this join-image refresh source after re-reading upstream `TextureCache<P>::RefreshContents`, `TextureCache<P>::UploadImageContents`, and the `JoinImages` call to `RefreshContents(new_image, new_image_id)`.
+
+### Missing items
+- The broader `RefreshContents` / `UploadImageContents` ownership debt remains: these methods still live in the OpenGL wrapper because backend image upload and staging ownership are split from `TextureCacheBase`.
+
+### Binary layout verification
+- N/A: texture-cache control flow only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::RefreshContents`, `TextureCache<P>::UploadImageContents`, and the `JoinImages` refresh point.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+
 ## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs, video_core/src/texture_cache/texture_cache_base.rs, and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h
 
 ### Intentional differences
