@@ -40,7 +40,7 @@ use crate::texture_cache::types::{
 };
 use crate::texture_cache::util::{
     full_download_copies, full_upload_swizzles, make_shrink_image_copies, map_size_bytes,
-    swizzle_image, unswizzle_image,
+    unswizzle_image,
 };
 use crate::textures::workers::ThreadWorker;
 
@@ -1750,36 +1750,197 @@ impl Image {
         }
     }
 
-    /// Port of `Image::DownloadMemory`.
-    /// Downloads pixel data from GPU texture to CPU.
-    ///
-    /// Upstream calls `glGetTextureImage(texture, level, gl_format, gl_type,
-    /// size, buffer)` to read the mip level into `output`. Without this, the
-    /// `TextureCache::download_memory` path has nothing to write back to
-    /// guest memory and rendered framebuffers stay zero — visible to user
-    /// as a black SDL window even though MK8D submitted layers correctly.
-    pub fn download_memory(&mut self, output: &mut [u8], level: i32) {
-        if self.current_texture == 0
-            || self.gl_format == gl::NONE
-            || self.gl_type == gl::NONE
-            || output.is_empty()
-        {
+    /// Port of `Image::DownloadMemory(GLuint, size_t, span<BufferImageCopy>)`.
+    pub fn download_memory_to_buffer(
+        &mut self,
+        buffer_handle: u32,
+        buffer_offset: usize,
+        copies: &[BufferImageCopy],
+    ) {
+        if self.current_texture == 0 || buffer_handle == 0 {
             return;
         }
-        // Safety: glGetTextureImage on a valid texture; `output` length
-        // must be at least `buf_size` (caller's responsibility — upstream
-        // sizes via `image.unswizzled_size_bytes`). Pass output.len() as
-        // bufSize so the driver clips if needed.
         unsafe {
+            gl::MemoryBarrier(gl::PIXEL_BUFFER_BARRIER_BIT);
+            gl::BindBuffer(gl::PIXEL_PACK_BUFFER, buffer_handle);
             gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
-            gl::GetTextureImage(
-                self.current_texture,
-                level,
-                self.gl_format,
-                self.gl_type,
-                output.len() as i32,
-                output.as_mut_ptr() as *mut _,
-            );
+        }
+        let mut current_row_length = u32::MAX;
+        let mut current_image_height = u32::MAX;
+        for copy in copies {
+            if copy.image_subresource.base_level >= self.gl_num_levels {
+                continue;
+            }
+            if current_row_length != copy.buffer_row_length {
+                current_row_length = copy.buffer_row_length;
+                unsafe {
+                    gl::PixelStorei(gl::PACK_ROW_LENGTH, current_row_length as i32);
+                }
+            }
+            if current_image_height != copy.buffer_image_height {
+                current_image_height = copy.buffer_image_height;
+                unsafe {
+                    gl::PixelStorei(gl::PACK_IMAGE_HEIGHT, current_image_height as i32);
+                }
+            }
+            self.copy_image_to_buffer(copy, buffer_offset);
+        }
+        unsafe {
+            gl::BindBuffer(gl::PIXEL_PACK_BUFFER, 0);
+        }
+    }
+
+    /// Port of `Image::DownloadMemory(StagingBufferMap&, span<BufferImageCopy>)`.
+    pub fn download_memory_to_staging(
+        &mut self,
+        map: &mut StagingBufferMap,
+        copies: &[BufferImageCopy],
+    ) {
+        self.download_memory_to_buffer(map.buffer, map.offset, copies);
+    }
+
+    /// Backward-compatible direct host read helper for diagnostics/tests.
+    pub fn download_memory(&mut self, output: &mut [u8], level: i32) {
+        if self.current_texture == 0 || output.is_empty() {
+            return;
+        }
+        unsafe {
+            gl::BindBuffer(gl::PIXEL_PACK_BUFFER, 0);
+            gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
+            if self.gl_format == gl::NONE {
+                gl::GetCompressedTextureImage(
+                    self.current_texture,
+                    level,
+                    output.len() as i32,
+                    output.as_mut_ptr() as *mut _,
+                );
+            } else {
+                gl::GetTextureImage(
+                    self.current_texture,
+                    level,
+                    self.gl_format,
+                    self.gl_type,
+                    output.len() as i32,
+                    output.as_mut_ptr() as *mut _,
+                );
+            }
+        }
+    }
+
+    /// Port of `Image::CopyImageToBuffer`.
+    fn copy_image_to_buffer(&self, copy: &BufferImageCopy, buffer_offset: usize) {
+        let level = copy.image_subresource.base_level;
+        let base_layer = copy.image_subresource.base_layer;
+        let num_layers = copy.image_subresource.num_layers;
+        let width = copy.image_extent.width as i32;
+        let height = copy.image_extent.height as i32;
+        let depth = copy.image_extent.depth as i32;
+        let ox = copy.image_offset.x;
+        let oy = copy.image_offset.y;
+        let oz = copy.image_offset.z;
+        let offset = (copy.buffer_offset + buffer_offset) as *mut std::ffi::c_void;
+        let buf_size = copy.buffer_size as i32;
+        unsafe {
+            match self.image_type {
+                ImageType::E1D => {
+                    if self.gl_format == gl::NONE {
+                        gl::GetCompressedTextureSubImage(
+                            self.current_texture,
+                            level,
+                            ox,
+                            base_layer,
+                            0,
+                            width,
+                            num_layers,
+                            1,
+                            buf_size,
+                            offset,
+                        );
+                    } else {
+                        gl::GetTextureSubImage(
+                            self.current_texture,
+                            level,
+                            ox,
+                            base_layer,
+                            0,
+                            width,
+                            num_layers,
+                            1,
+                            self.gl_format,
+                            self.gl_type,
+                            buf_size,
+                            offset,
+                        );
+                    }
+                }
+                ImageType::E2D | ImageType::Linear => {
+                    if self.gl_format == gl::NONE {
+                        gl::GetCompressedTextureSubImage(
+                            self.current_texture,
+                            level,
+                            ox,
+                            oy,
+                            base_layer,
+                            width,
+                            height,
+                            num_layers,
+                            buf_size,
+                            offset,
+                        );
+                    } else {
+                        gl::GetTextureSubImage(
+                            self.current_texture,
+                            level,
+                            ox,
+                            oy,
+                            base_layer,
+                            width,
+                            height,
+                            num_layers,
+                            self.gl_format,
+                            self.gl_type,
+                            buf_size,
+                            offset,
+                        );
+                    }
+                }
+                ImageType::E3D => {
+                    if self.gl_format == gl::NONE {
+                        gl::GetCompressedTextureSubImage(
+                            self.current_texture,
+                            level,
+                            ox,
+                            oy,
+                            oz,
+                            width,
+                            height,
+                            depth,
+                            buf_size,
+                            offset,
+                        );
+                    } else {
+                        gl::GetTextureSubImage(
+                            self.current_texture,
+                            level,
+                            ox,
+                            oy,
+                            oz,
+                            width,
+                            height,
+                            depth,
+                            self.gl_format,
+                            self.gl_type,
+                            buf_size,
+                            offset,
+                        );
+                    }
+                }
+                ImageType::Buffer => {
+                    log::warn!(
+                        "Image::copy_image_to_buffer: called on Buffer-type image — should never happen"
+                    );
+                }
+            }
         }
     }
 
@@ -4981,28 +5142,23 @@ impl TextureCache {
     }
 
     /// Port of `TextureCache<P>::DownloadMemory` for `TextureCacheParams =
-    /// OpenGL`. The base implementation uses an `image_downloader` closure
-    /// callback so the borrow-checker doesn't let it reach into the backend
-    /// image table; ruzu inverts the call here so the OpenGL wrapper does
-    /// the per-image loop in user code with direct access to
-    /// `self.images: HashMap<ImageId, Image>`.
+    /// OpenGL`.
     ///
-    /// Without this, `gl_rasterizer::flush_region` → base
-    /// `download_memory` early-returns at the missing-downloader guard,
-    /// guest framebuffer pages stay zero, and the compositor reads zeros
-    /// → black SDL window.
+    /// The OpenGL wrapper owns the backend image table, so it performs the
+    /// upstream runtime/image download sequence directly, then uses the common
+    /// swizzle/writeback helper for guest memory.
     pub fn download_memory(&mut self, cpu_addr: u64, size: usize) {
         let trace_cpu = should_trace_texture_cache_cpu_region(cpu_addr, size);
-        let Some(writer) = self.base.guest_memory_writer.as_ref().cloned() else {
+        if self.base.channel_gpu_memory.is_none() && self.base.guest_memory_writer.is_none() {
             if trace_cpu {
                 log::warn!(
-                    "[TEXTURE_DOWNLOAD] miss writer cpu=0x{:X} size={}",
+                    "[TEXTURE_DOWNLOAD] miss writeback cpu=0x{:X} size={}",
                     cpu_addr,
                     size
                 );
             }
             return;
-        };
+        }
 
         // Snapshot the images we want to download, filtered + sorted exactly
         // as the base path used to do internally.
@@ -5052,25 +5208,9 @@ impl TextureCache {
         images.sort_by_key(|&id| self.base.slot_images[id].modification_tick);
 
         for image_id in images {
-            // Make sure the backend image slot exists for this base image —
-            // `update_render_targets_from_snapshot` typically pre-populates
-            // it, but defensive insertion here keeps offscreen downloads
-            // working even before any draw has touched the slot.
-            let base_image = self.base.slot_images[image_id].clone();
-            let backend_image = self
-                .images
-                .entry(image_id)
-                .or_insert_with(|| Image::from_base(&base_image, self.has_native_astc));
-
-            // Drain the GPU texture into a staging buffer sized by the
-            // upstream `unswizzled_size_bytes` (the in-memory layout the
-            // guest expects).
-            let buffer_size = base_image.unswizzled_size_bytes as usize;
-            if buffer_size == 0 {
+            let Some((base_image, staging)) = self.download_image_to_host_staging(image_id) else {
                 continue;
-            }
-            let mut staging = vec![0u8; buffer_size];
-            backend_image.download_memory(&mut staging, 0);
+            };
             if trace_cpu {
                 let nonzero = staging.iter().filter(|&&byte| byte != 0).take(1024).count();
                 let first = staging
@@ -5088,26 +5228,37 @@ impl TextureCache {
                     image_id.index,
                     base_image.gpu_addr,
                     base_image.cpu_addr,
-                    buffer_size,
+                    staging.len(),
                     first,
                     nonzero
                 );
             }
 
-            // Swizzle (or pitch-copy) the staging buffer back into guest
-            // memory at `image.cpu_addr`. For linear pitch surfaces (the
-            // common framebuffer case) this is a row-by-row block copy;
-            // for block-linear surfaces it walks `swizzle_texture`.
             let copies = full_download_copies(&base_image.info);
-            swizzle_image(
-                writer.as_ref(),
-                base_image.cpu_addr,
-                &base_image.info,
-                &copies,
-                &staging,
-                &mut self.base.swizzle_data_buffer,
-            );
+            let _ = self
+                .base
+                .write_downloaded_image(&base_image, &copies, &staging);
         }
+    }
+
+    fn download_image_to_host_staging(
+        &mut self,
+        image_id: ImageId,
+    ) -> Option<(ImageBase, Vec<u8>)> {
+        let base_image = self.base.slot_images[image_id].clone();
+        let buffer_size = base_image.unswizzled_size_bytes as usize;
+        if buffer_size == 0 {
+            return None;
+        }
+        let copies = full_download_copies(&base_image.info);
+        let backend_image = self
+            .images
+            .entry(image_id)
+            .or_insert_with(|| Image::from_base(&base_image, self.has_native_astc));
+        let mut map = self.runtime.download_staging_buffer(buffer_size, false);
+        backend_image.download_memory_to_staging(&mut map, &copies);
+        self.runtime.finish();
+        Some((base_image, map.mapped_span().to_vec()))
     }
 
     /// Port of `TextureCache<P>::GetFlushArea`.
@@ -5394,7 +5545,24 @@ impl TextureCache {
         }
         if self.base.total_used_memory > self.base.minimum_memory {
             let framebuffers_before_gc = self.base.framebuffers.clone();
-            self.base.run_garbage_collector();
+            let runtime = &mut self.runtime;
+            let images = &mut self.images;
+            let has_native_astc = self.has_native_astc;
+            self.base
+                .run_garbage_collector_with_downloader(|image_id, base_image, staging| {
+                    if staging.is_empty() {
+                        return false;
+                    }
+                    let copies = full_download_copies(&base_image.info);
+                    let backend_image = images
+                        .entry(image_id)
+                        .or_insert_with(|| Image::from_base(base_image, has_native_astc));
+                    let mut map = runtime.download_staging_buffer(staging.len(), false);
+                    backend_image.download_memory_to_staging(&mut map, &copies);
+                    runtime.finish();
+                    staging.copy_from_slice(map.mapped_span());
+                    true
+                });
             self.sentence_framebuffers_removed_by_base(&framebuffers_before_gc);
         }
         self.base.tick_delayed_destruction_rings();
