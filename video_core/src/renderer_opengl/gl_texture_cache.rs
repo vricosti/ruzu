@@ -31,7 +31,8 @@ use crate::texture_cache::types::{
     RelaxedOptions, SubresourceRange, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID,
 };
 use crate::texture_cache::util::{
-    full_download_copies, make_shrink_image_copies, map_size_bytes, swizzle_image, unswizzle_image,
+    full_download_copies, full_upload_swizzles, make_shrink_image_copies, map_size_bytes,
+    swizzle_image, unswizzle_image,
 };
 
 /// Number of render targets.
@@ -3233,26 +3234,30 @@ impl TextureCache {
             return;
         }
         let image = &mut self.base.slot_images[image_id];
-        // Upstream sets ASYNCHRONOUS_DECODE / ACCELERATED_UPLOAD here, but
-        // ruzu has ported neither the async ASTC decoder thread nor the
-        // compute-shader accelerated upload. Setting the flags without the
-        // backend paths breaks `map_size_bytes` (ACCELERATED_UPLOAD makes it
-        // return the guest ASTC size while the CPU convert path produces
-        // RGBA8 output → staging PBO too small, GL_INVALID_OPERATION, empty
-        // textures on the MK8D splash/demo). Keep the flags off until those
-        // subsystems are ported — mirroring upstream's own "disable
-        // accelerated uploads we don't implement" pattern.
-        let _ = can_be_decoded_async(self.has_native_astc, &image.info);
-        let _ = can_be_accelerated(self.has_native_astc, &image.info);
-        if is_converted_image(
-            self.has_native_astc,
-            image.info.format,
-            image.info.image_type,
-        ) {
+        Self::apply_backend_image_flags(image, self.has_native_astc);
+    }
+
+    fn apply_backend_image_flags(image: &mut ImageBase, has_native_astc: bool) {
+        // Upstream sets ASYNCHRONOUS_DECODE / ACCELERATED_UPLOAD in
+        // OpenGL::Image::Image with this priority. Ruzu still performs the
+        // ASTC CPU decode synchronously during refresh until QueueAsyncDecode /
+        // TickAsyncDecode ownership is ported, but the image classification
+        // flag itself follows upstream.
+        if can_be_decoded_async(has_native_astc, &image.info) {
+            image.flags.insert(ImageFlagBits::ASYNCHRONOUS_DECODE);
+        } else if can_be_accelerated(has_native_astc, &image.info) {
+            image.flags.insert(ImageFlagBits::ACCELERATED_UPLOAD);
+        }
+        if is_converted_image(has_native_astc, image.info.format, image.info.image_type) {
             image
                 .flags
                 .insert(ImageFlagBits::CONVERTED | ImageFlagBits::COSTLY_LOAD);
         }
+    }
+
+    #[cfg(test)]
+    fn apply_backend_image_flags_for_test(image: &mut ImageBase, has_native_astc: bool) {
+        Self::apply_backend_image_flags(image, has_native_astc);
     }
 
     fn materialize_image(&mut self, image_id: ImageId) -> Option<&mut Image> {
@@ -3425,6 +3430,53 @@ impl TextureCache {
 
         let staging_size = map_size_bytes(&base_image) as usize;
         if staging_size == 0 {
+            return;
+        }
+        if base_image.flags.contains(ImageFlagBits::ACCELERATED_UPLOAD) {
+            let backend_image = self
+                .images
+                .entry(image_id)
+                .or_insert_with(|| Image::from_base(&base_image, self.has_native_astc));
+            let handle = backend_image.handle();
+            if handle == 0 {
+                return;
+            }
+            let swizzles = full_upload_swizzles(&base_image.info);
+            unsafe {
+                let mut pbo = 0u32;
+                gl::CreateBuffers(1, &mut pbo);
+                if pbo == 0 {
+                    return;
+                }
+                gl::NamedBufferData(
+                    pbo,
+                    guest.len() as isize,
+                    guest.as_ptr() as *const _,
+                    gl::STREAM_DRAW,
+                );
+                self.util_shaders.astc_decode(
+                    handle,
+                    pbo,
+                    0,
+                    guest.len(),
+                    &base_image.info,
+                    &swizzles,
+                );
+                gl::DeleteBuffers(1, &pbo);
+                gl::MemoryBarrier(
+                    gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT,
+                );
+            }
+            if trace_upload {
+                log::warn!(
+                    "[TEXTURE_UPLOAD] accelerated id={} gpu=0x{:X} cpu=0x{:X} guest={} swizzles={}",
+                    image_id.index,
+                    base_image.gpu_addr,
+                    base_image.cpu_addr,
+                    guest.len(),
+                    swizzles.len(),
+                );
+            }
             return;
         }
         let mut staging = vec![0u8; staging_size];
@@ -4443,9 +4495,7 @@ impl TextureCache {
         if src_base.info.format == crate::surface::PixelFormat::D24UnormS8Uint
             && dst_base.info.format == crate::surface::PixelFormat::A8B8G8R8Unorm
         {
-            log::warn!(
-                "TextureCache::reinterpret_image: S8D24 component swap not wired to UtilShaders"
-            );
+            self.util_shaders.convert_s8d24(dst_handle, copies);
         }
         unsafe {
             gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
@@ -6737,6 +6787,14 @@ mod tests {
         }
         assert!(can_be_decoded_async(false, &info));
         assert!(!can_be_accelerated(false, &info));
+        let mut async_image = ImageBase::new(info.clone(), 0, 0);
+        TextureCache::apply_backend_image_flags_for_test(&mut async_image, false);
+        assert!(async_image
+            .flags
+            .contains(ImageFlagBits::ASYNCHRONOUS_DECODE));
+        assert!(!async_image
+            .flags
+            .contains(ImageFlagBits::ACCELERATED_UPLOAD));
 
         {
             let mut values = common::settings::values_mut();
@@ -6747,6 +6805,14 @@ mod tests {
         }
         assert!(!can_be_decoded_async(false, &info));
         assert!(can_be_accelerated(false, &info));
+        let mut accelerated_image = ImageBase::new(info.clone(), 0, 0);
+        TextureCache::apply_backend_image_flags_for_test(&mut accelerated_image, false);
+        assert!(!accelerated_image
+            .flags
+            .contains(ImageFlagBits::ASYNCHRONOUS_DECODE));
+        assert!(accelerated_image
+            .flags
+            .contains(ImageFlagBits::ACCELERATED_UPLOAD));
 
         common::settings::values_mut()
             .astc_recompression
@@ -6754,6 +6820,14 @@ mod tests {
         assert!(!can_be_accelerated(false, &info));
         assert!(!can_be_decoded_async(true, &info));
         assert!(!can_be_accelerated(true, &info));
+        let mut native_image = ImageBase::new(info, 0, 0);
+        TextureCache::apply_backend_image_flags_for_test(&mut native_image, true);
+        assert!(!native_image
+            .flags
+            .contains(ImageFlagBits::ASYNCHRONOUS_DECODE));
+        assert!(!native_image
+            .flags
+            .contains(ImageFlagBits::ACCELERATED_UPLOAD));
     }
 
     #[test]

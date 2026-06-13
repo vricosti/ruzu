@@ -1622,11 +1622,10 @@
 
 ### Unintentional differences (to fix)
 - Upstream `PrepareImage` always performs `RefreshContents` before `SynchronizeAliases`. Ruzu's reader-less fallback can only perform alias synchronization; CPU-modified texture upload still requires the `prepare_image_with_gpu_reader` path.
-- Upstream routes all copy policy through `TextureCacheRuntime`. Rust now covers direct copies, MSAA copies, BGR/format conversion via `FormatConversionPass`, and BC4 3D emulated copies through `UtilShaders::copy_bc4`, but the S8D24 post-conversion utility pass is still not wired.
+- Upstream routes all copy policy through `TextureCacheRuntime`. Rust now covers direct copies, MSAA copies, BGR/format conversion via `FormatConversionPass`, BC4 3D emulated copies through `UtilShaders::copy_bc4`, and the S8D24 post-conversion component swap through `UtilShaders::convert_s8d24`.
 - Ruzu still depends on registered `aliased_images`; if the image insertion path failed to create aliases because `JoinImages` / `ResolveOverlap` parity is incomplete, this synchronization has no aliases to process.
 
 ### Missing items
-- Port the remaining `TextureCache<P>::CopyImage` utility path for S8D24 component conversion after `FormatConversionPass`.
 - Complete `JoinImages` / `ResolveOverlap` parity so all upstream alias relationships are registered before `SynchronizeAliases` runs.
 
 ### Binary layout verification
@@ -13012,32 +13011,32 @@
 ## 2026-05-15 — `video_core/src/renderer_opengl/gl_rasterizer.rs`, `video_core/src/texture_cache/texture_cache.rs`, and `video_core/src/texture_cache/texture_cache_base.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h`
 
 ### Intentional differences
-- Rust `gl_rasterizer.rs` performs the current graphics descriptor fill/bind bridge directly under `RUZU_TEXTURE_CACHE_FILL=1`; upstream does this in `GraphicsPipeline::ConfigureImpl`/`prepare_stage` with backend template ownership.
+- Rust `gl_rasterizer.rs` still performs the current graphics descriptor fill/bind bridge directly; upstream does this in `GraphicsPipeline::ConfigureImpl`/`prepare_stage` with backend template ownership. The old `RUZU_TEXTURE_CACHE_FILL` gate is gone.
 - `get_graphics_sampler_id_with_gpu_reader` lives next to upstream-owned `GetGraphicsSamplerId` logic but accepts a caller-provided GPU-VA reader. This is a Rust ownership bridge because the current cache base stores Host1x SMMU device memory while MK8D's graphics cbuf/TSC table addresses are channel GPU virtual addresses.
 - Env-gated diagnostics (`RUZU_TRACE_TEXTURE_DESCRIPTORS`, `RUZU_TRACE_TSC_READ`, `RUZU_TRACE_BIND_TEXTURES`) are local debugging additions and are inert when unset.
 
 ### Missing items
 - Move descriptor fill/bind ownership out of `gl_rasterizer.rs` into the upstream-corresponding graphics pipeline/texture-cache structure once the Rust backend types can mirror C++ templates more closely.
-- Reserve upstream null image and null image-view slots with backend-equivalent objects; only the sampler null slot is currently aligned.
-- Remove the `RUZU_TEXTURE_CACHE_FILL` gate after the descriptor path is fully upstream-faithful and no longer partial.
+- Move descriptor fill/bind ownership out of `gl_rasterizer.rs` into the upstream-corresponding graphics pipeline/texture-cache structure once the Rust backend types can mirror C++ templates more closely.
 
 ### Binary layout verification
 - PASS: `TscEntry` remains `repr(C)` and 0x20 bytes; TSC reads use `size_of::<TscEntry>()` and `read_unaligned`, matching raw descriptor-table semantics.
 - PASS: the null sampler descriptor initializes the same upstream fields (`min_filter`, `mag_filter`, `mipmap_filter`, `cubemap_anisotropy`) before insertion into slot 0.
+- PASS: null image and null image-view ids are reserved at slot index 0 before any real insertion.
 
 ## 2026-05-15 — `video_core/src/texture_cache/descriptor_table.rs`, `video_core/src/texture_cache/texture_cache.rs`, `video_core/src/texture_cache/texture_cache_base.rs`, `video_core/src/texture_cache/util.rs`, `video_core/src/renderer_opengl/gl_rasterizer.rs`, and `video_core/src/renderer_opengl/gl_texture_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/descriptor_table.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/util.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp`
 
 ### Intentional differences
 - `DescriptorTable::read_with` is a Rust-only overload of upstream `DescriptorTable::Read`. It preserves descriptor-table ownership and behavior but lets current ruzu call sites supply the channel `MemoryManager` GPU-VA reader explicitly, because the Rust cache base does not yet store the same live `Tegra::MemoryManager&` reference that upstream `TextureCacheChannelInfo` owns.
 - `fill_graphics_image_views_with_gpu_reader` mirrors upstream `FillGraphicsImageViews`/`VisitImageView` but is limited to the graphics path and takes explicit reader/address-valid callbacks. This is a bridge until the channel memory-manager ownership is made upstream-faithful inside `TextureCacheChannelInfo`.
-- `TextureCache::refresh_contents_with_gpu_reader` uploads through a temporary OpenGL PBO and existing `Image::upload_memory`. Upstream uses `runtime.UploadStagingBuffer`, `UploadImageContents`, conversion helpers, async decode, and richer alias synchronization. The temporary PBO keeps behavior functional without pretending the staging runtime is ported.
+- `TextureCache::refresh_contents_with_gpu_reader` uploads through temporary OpenGL PBOs. For upstream `ACCELERATED_UPLOAD` ASTC GPU decode, Rust now reads guest ASTC bytes into the PBO and dispatches `UtilShaders::astc_decode`; other paths still use CPU unswizzle/convert plus existing `Image::upload_memory`. Upstream owns this through `runtime.UploadStagingBuffer`, `UploadImageContents`, and richer alias/staging lifecycle.
 - Env-gated `RUZU_TRACE_TEXTURE_UPLOAD` diagnostics report prepare/upload/read-miss decisions, with optional `RUZU_TRACE_TEXTURE_UPLOAD_ADDRS` filtering for targeted guest GPU addresses. Upstream has different logging/profiling infrastructure; runtime behavior is unchanged when the env var is unset.
 
 ### Missing items
 - Move the channel GPU-VA reader into `TextureCacheChannelInfo`/descriptor-table ownership instead of passing closures from `gl_rasterizer.rs`; upstream stores the memory manager reference in the descriptor table itself.
-- Port full upstream `PrepareImageView`, `PrepareImage`, `RefreshContents`, `UploadImageContents`, `SynchronizeAliases`, converted/accelerated upload paths, async ASTC decode, sparse image handling, rescale handling, and runtime staging-buffer management.
-- `unswizzle_image` currently covers the direct linear and block-linear full-image path used by the current smoke. It still needs line-by-line parity for all copy rectangles, conversion formats, per-subresource edge cases, accelerated uploads, and exact staging-buffer layout.
-- Descriptor/bind ownership remains under the partial `RUZU_TEXTURE_CACHE_FILL` bridge in `gl_rasterizer.rs`; upstream performs this in graphics pipeline `prepare_stage`.
+- Port full upstream `PrepareImageView`, `PrepareImage`, `RefreshContents`, `UploadImageContents`, `SynchronizeAliases`, converted upload paths, async ASTC decode, sparse image handling, rescale handling, and runtime staging-buffer management.
+- `unswizzle_image` currently covers the direct linear and block-linear full-image path used by the current smoke. It still needs line-by-line parity for all copy rectangles, conversion formats, per-subresource edge cases, non-ASTC accelerated uploads if upstream re-enables them, and exact staging-buffer layout.
+- Descriptor/bind ownership remains in `gl_rasterizer.rs`; upstream performs this in graphics pipeline `prepare_stage`.
 
 ### Binary layout verification
 - PASS: `TicEntry`/`TscEntry` remain raw 0x20-byte descriptor payloads; descriptor-table reads use `size_of::<T>()` and unaligned raw copy, matching upstream `ReadBlockUnsafe`.
@@ -17467,14 +17466,14 @@ The following still panic because upstream either also throws NotImplementedExce
 - Deleted image-view references are not yet purged across all active channels because common texture-cache channel storage is still collapsed to the current Rust channel state.
 - Framebuffer deletion does not yet push base framebuffer objects to an upstream-equivalent delayed-destruction queue.
 - `TextureCacheBase::JoinImages(...)` still does not run the upstream sparse-image GPU-region scan (`ForEachSparseImageInRegion`) because ruzu's common cache does not yet carry the same channel GPU-memory id / sparse-view lookup ownership.
-- `TextureCacheBase::JoinImages(...)` still does not refresh guest contents or rescale sibling images before insertion because those operations remain backend/runtime-owned in ruzu. The OpenGL wrapper now copies GPU-modified overlap contents and unregisters/deletes copied non-alias overlaps, but it does not yet port `CopyImageMSAA`, `ReinterpretImage`, `EmulateCopyImage`, or the rescale-aware copy branches.
+- `TextureCacheBase::JoinImages(...)` still cannot refresh guest contents synchronously before insertion because that operation remains backend/runtime-owned in ruzu. The OpenGL wrapper now refreshes through caller-supplied GPU readers, handles sibling/new-image rescale, copies GPU-modified overlap contents through the same `CopyImage` policy used by alias synchronization, and unregisters/deletes copied non-alias overlaps.
 - `PendingJoinCopies` is a Rust ownership adaptation caused by split common/backend storage. Upstream does this work synchronously inside one templated `TextureCache<P>::JoinImages(...)` body.
 
 ### Missing items
 - Port upstream `active_channel_ids` / `channel_storage` ownership for common texture-cache channel state.
 - Port upstream base framebuffer slot ownership and `sentenced_framebuffers` delayed destruction.
 - Wire Maxwell3D dirty render-target flag updates into `delete_image(...)` once the live engine ownership model is available.
-- Port the remaining backend/runtime-owned `JoinImages` tail: `RefreshContents`, `ImageCanRescale`, `ScaleUp`/`ScaleDown`, sorted `join_copies_to_do`, `CopyImageMSAA`, `ReinterpretImage`, and `EmulateCopyImage`.
+- Port the remaining backend/runtime-owned `JoinImages` tail into a single upstream-shaped owner: synchronous `RefreshContents`, bad-overlap download interactions, exact descriptor-table/dirty-flag invalidation after rescale, and delete/register ordering without exposing intermediate image ids.
 
 ### Binary layout verification
 - N/A: texture-cache host ownership/state only. No guest-visible raw payload layout changed.
@@ -17673,7 +17672,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - MK8D texture `0x5218D0000` still samples red after this change because the copied mip source `0x521984000` is itself uploaded from guest bytes `80 ff ff ff`; the next divergence to isolate is whether that guest content should have been downloaded from an overlapping GPU image before upload, or overwritten by a later render-target operation.
 
 ### Missing items
-- Port the remaining upstream `JoinImages(...)`/overlap lifecycle in one owner or an equivalent backend hook sequence: `RefreshContents`, rescale, sorted copy execution, `CopyImageMSAA`, reinterpret/emulated copies, bad-overlap download interactions, and delete/register ordering without exposing intermediate states.
+- Port the remaining upstream `JoinImages(...)`/overlap lifecycle in one owner or an equivalent backend hook sequence: synchronous `RefreshContents`, bad-overlap download interactions, exact descriptor-table/dirty-flag invalidation after rescale, and delete/register ordering without exposing intermediate states.
 
 ### Binary layout verification
 - N/A: texture-cache host metadata only. No guest-visible raw payload layout changed.
@@ -17905,7 +17904,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - None known for this compressed sub-block copy fallback after re-reading upstream `TextureCacheRuntime::CopyImage`, `CanImageBeCopied`, and `EmulateCopyImage`.
 
 ### Missing items
-- Broader OpenGL utility-shader parity gaps remain documented in the previous entry: `UtilShaders::CopyBC4`, `ConvertS8D24`, and block-linear/pitch upload shader paths are still not fully ported.
+- Broader OpenGL utility-shader parity gaps remain documented in later entries: accelerated upload lifecycle wiring is still not fully ported. `UtilShaders::CopyBC4`, `ConvertS8D24`, and the ASTC/block-linear/pitch upload shader programs are now wired at the utility-shader layer.
 
 ### Binary layout verification
 - N/A: OpenGL host texture copy behavior only. No guest-visible raw payload layout changed.
@@ -18015,7 +18014,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - None known for the `CopyImageMSAA` dispatch slice after re-reading upstream `TextureCacheRuntime::CopyImageMSAA` and `UtilShaders::CopyMSAA`.
 
 ### Missing items
-- `UtilShaders::ConvertS8D24` and block-linear/pitch upload shader compilation remain broader utility-shader parity gaps outside this MSAA-copy slice. `UtilShaders::CopyBC4` is now wired for the OpenGL emulated-copy path.
+- Accelerated upload lifecycle wiring remains a broader texture-cache/runtime parity gap outside this MSAA-copy slice. `UtilShaders::CopyBC4` is wired for the OpenGL emulated-copy path, `UtilShaders::ConvertS8D24` is wired for the post-format-conversion component swap, and the ASTC/block-linear/pitch upload utility programs are compiled with upstream-shaped dispatch uniforms.
 - Resolution scaling around `TextureCache<P>::JoinImages` still has broader owner-placement and deferred-backend-execution parity gaps, but Rust now has OpenGL `Image::scale_up`/`scale_down` and `TextureCache::ScaleUp`/`ScaleDown` counterparts.
 
 ### Binary layout verification
@@ -18087,7 +18086,7 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Missing items
 - Complete upstream-equivalent `RefreshContents(new_image)` ordering inside the `JoinImages` owner instead of relying on deferred backend drains with caller-supplied GPU readers.
 - Remove or tighten the `PendingJoinCopies` split further so `JoinImages` cannot expose the unregistered intermediate image id before backend copies/deletes complete.
-- Remaining upstream `JoinImages` runtime branches not covered by this slice: full reinterpret/emulated copy parity, bad-overlap download interactions, and exact descriptor-table/dirty-flag invalidation after rescale.
+- Remaining upstream `JoinImages` runtime branches not covered by this slice: bad-overlap download interactions and exact descriptor-table/dirty-flag invalidation after rescale.
 
 ### Binary layout verification
 - N/A: OpenGL texture-cache lifecycle/copy ordering only. No guest-visible raw payload layout changed.
@@ -18095,4 +18094,110 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Tests
 - `cargo fmt --all --check`
 - `cargo check -p video_core`
+- `cargo test -p video_core join_images -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/util_shaders.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/util_shaders.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- Rust `UtilShaders::convert_s8d24` takes the destination OpenGL texture handle directly instead of an `Image&`, because ruzu stores backend image metadata in `OpenGL::TextureCache` and passes GL object names into utility helpers. The binding, uniform, dispatch dimensions, and call site mirror upstream `UtilShaders::ConvertS8D24`.
+- Rust logs and skips unsupported layered copies where upstream uses `ASSERT`; this matches the existing Rust utility-shader pattern for non-fatal release builds while preserving the accepted upstream copy shape.
+
+### Unintentional differences (to fix)
+- None known for the S8D24 component-swap slice after re-reading upstream `FormatConversionPass::ConvertImage` and `UtilShaders::ConvertS8D24`.
+
+### Missing items
+- Broader accelerated upload lifecycle wiring remains separate: ASTC `ACCELERATED_UPLOAD` now reaches `UtilShaders::astc_decode`, but the upstream runtime/staging owner split, non-ASTC accelerated upload branches currently disabled upstream, and async ASTC decode are still not fully ported.
+- Broader `TextureCache<P>::JoinImages` owner/order parity remains open as documented above.
+
+### Binary layout verification
+- N/A: OpenGL compute shader dispatch only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `FormatConversionPass::ConvertImage` and `UtilShaders::ConvertS8D24`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/renderer_opengl/util_shaders.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/util_shaders.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/util_shaders.h
+
+### Intentional differences
+- Rust `UtilShaders` compiles the ASTC decoder, block-linear 2D/3D unswizzle, and pitch unswizzle compute programs directly from embedded host-shader strings with `create_program_from_source`, matching upstream's `MakeProgram(...)` responsibility without the C++ `ProgramManager` object.
+- Rust upload helpers take a destination texture handle, staging buffer handle/offset/size, `ImageInfo`, and `SwizzleParameters` instead of upstream `Image&` plus `StagingBufferMap&`. The shader bindings, uniforms, workgroup division, swizzle-table binding, and image formats mirror upstream `ASTCDecode`, `BlockLinearUpload2D`, `BlockLinearUpload3D`, and `PitchUpload`.
+- Rust logs and skips the same assertion-only ASTC preconditions (`origin == 0`, `destination == 0`, ASTC 16-byte blocks) instead of aborting in release builds, following the existing Rust utility-shader pattern.
+
+### Unintentional differences (to fix)
+- None known for the utility-shader program compilation and dispatch-parameter slice after re-reading upstream `UtilShaders::UtilShaders`, `ASTCDecode`, `BlockLinearUpload2D`, `BlockLinearUpload3D`, `PitchUpload`, and `StoreFormat`.
+
+### Missing items
+- The broader upload lifecycle now calls the ASTC accelerated-upload helper when upstream `CanBeAccelerated` would set `ACCELERATED_UPLOAD`, and image classification now sets `ASYNCHRONOUS_DECODE` when upstream `CanBeDecodedAsync` is true. It still does not model upstream `TextureCacheRuntime::AccelerateImageUpload` / `UploadImageContents` as separate owners.
+- Runtime `ProgramManager::LocalMemoryWarmup` / `RestoreGuestCompute` ownership is still not represented because ruzu's OpenGL utility-shader layer does not yet own an upstream-shaped `ProgramManager`.
+
+### Binary layout verification
+- N/A: OpenGL compute shader dispatch only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `UtilShaders::UtilShaders`, `ASTCDecode`, `BlockLinearUpload2D`, `BlockLinearUpload3D`, `PitchUpload`, and `StoreFormat`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/util_shaders.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- Rust keeps `RefreshContents` / `UploadImageContents` collapsed inside `OpenGL::TextureCache::refresh_contents_with_gpu_reader` because ruzu does not yet own an upstream-shaped `TextureCacheRuntime` staging-buffer pool. Within that owner split, the ASTC accelerated-upload branch now follows upstream ordering: set `ACCELERATED_UPLOAD` when `CanBeAccelerated` is true, read raw guest bytes into a PBO-sized staging buffer, build `FullUploadSwizzles`, dispatch `UtilShaders::astc_decode`, then issue the upload memory barrier.
+- Rust still uses `gl::UseProgram` directly in `UtilShaders` instead of upstream `ProgramManager::BindComputeProgram`; this is the current OpenGL utility-shader ownership adaptation.
+
+### Unintentional differences (to fix)
+- The async ASTC path is still only partially represented: Rust now sets `ASYNCHRONOUS_DECODE` for `AstcDecodeMode::CpuAsynchronous`, matching upstream image classification, but it still performs CPU ASTC conversion synchronously during refresh instead of queuing `QueueAsyncDecode` and uploading through `TickAsyncDecode`.
+- The runtime/staging ownership is still flattened: upstream uses `runtime.UploadStagingBuffer(MapSizeBytes(image))`, passes a `StagingBufferMap`, and restores guest compute through `ProgramManager`; Rust allocates a temporary PBO in the texture-cache method.
+
+### Missing items
+- Split `UploadImageContents` / `TextureCacheRuntime::AccelerateImageUpload` into upstream-shaped owners once the runtime staging-buffer pool exists.
+- Port `QueueAsyncDecode` / `ASYNCHRONOUS_DECODE` lifecycle.
+
+### Binary layout verification
+- N/A: OpenGL upload staging and compute dispatch only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `CanBeAccelerated`, `CanBeDecodedAsync`, `TextureCache<P>::RefreshContents`, `TextureCache<P>::UploadImageContents`, and `TextureCacheRuntime::AccelerateImageUpload`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust factors upstream `OpenGL::Image::Image` flag classification into `TextureCache::apply_backend_image_flags`, because backend image flags are applied lazily when the split OpenGL wrapper materializes or prepares an image. The classification priority now matches upstream: `CanBeDecodedAsync` sets `ASYNCHRONOUS_DECODE`; otherwise `CanBeAccelerated` sets `ACCELERATED_UPLOAD`; converted formats still set `CONVERTED | COSTLY_LOAD`.
+
+### Unintentional differences (to fix)
+- Upstream `RefreshContents` queues `QueueAsyncDecode` for `ASYNCHRONOUS_DECODE` images and `TickAsyncDecode` uploads completed decodes later. Rust still falls through to the synchronous CPU convert/upload path because the async decode worker/tick owner is not ported.
+
+### Missing items
+- Port `QueueAsyncDecode`, `TickAsyncDecode`, and the dedicated `texture_decode_worker` lifecycle.
+
+### Binary layout verification
+- N/A: image flag classification only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `CanBeDecodedAsync`, `OpenGL::Image::Image`, `TextureCache<P>::RefreshContents`, `QueueAsyncDecode`, and `TickAsyncDecode`.
+- `cargo test -p video_core astc_upload_flags_follow_upstream_policy -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Upstream `JoinImages` hits `UNIMPLEMENTED()` if an ignored overlap is still `GpuModified`, because it cannot safely delete that image without preserving GPU-side contents. Rust now preserves that image instead of deleting it silently: the overlap is moved into `join_bad_overlap_ids`, remains registered/tracked, and receives the same overlap relationship bookkeeping as other bad overlaps.
+- This diverges from upstream's aborting behavior only to preserve data and keep the emulator running; it removes the previous Rust data-loss divergence where a GPU-modified ignored overlap was untracked/unregistered/deleted after a warning.
+
+### Unintentional differences (to fix)
+- Rust still does not implement the full upstream-equivalent download/resolve path for GPU-modified ignored overlaps. The image is preserved as a bad overlap until that owner path exists.
+
+### Missing items
+- Implement the real GPU-modified ignored-overlap resolution/download path once texture-cache download ownership and pending-download scheduling match upstream.
+- Continue reducing the broader `PendingJoinCopies` split so `JoinImages` can execute the copy/delete/register tail synchronously.
+
+### Binary layout verification
+- N/A: texture-cache overlap lifecycle only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::JoinImages` around `join_ignore_textures`.
+- `cargo test -p video_core join_images_preserves_gpu_modified_ignored_overlap_as_bad_overlap -- --nocapture`
 - `cargo test -p video_core join_images -- --nocapture`

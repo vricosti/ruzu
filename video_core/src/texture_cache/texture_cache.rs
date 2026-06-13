@@ -1267,10 +1267,10 @@ impl TextureCacheBase {
                 .flags
                 .contains(ImageFlagBits::GPU_MODIFIED)
             {
-                log::warn!(
-                    "TextureCache::join_images: deleting GPU-modified ignored overlap {}",
-                    overlap_id.index
-                );
+                if !self.join_bad_overlap_ids.contains(&overlap_id) {
+                    self.join_bad_overlap_ids.push(overlap_id);
+                }
+                continue;
             }
             if self.slot_images[overlap_id]
                 .flags
@@ -2145,6 +2145,54 @@ mod tests {
             cache.collect_images_in_gpu_region(0x8000, 4, false),
             vec![new_id]
         );
+    }
+
+    #[test]
+    fn join_images_preserves_gpu_modified_ignored_overlap_as_bad_overlap() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex as ParkingMutex;
+        use std::sync::Arc;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
+            7,
+            22,
+            1 << 22,
+            16,
+            12,
+        )));
+        {
+            let mut gpu_memory = gpu_memory.lock();
+            gpu_memory.map(0x8000, 0xA000, 0x1000, 0, false);
+            gpu_memory.map(0x9000, 0xC000, 0x1000, 0, false);
+        }
+        cache.set_channel_gpu_memory(Arc::clone(&gpu_memory));
+        let mut info = ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            size: crate::texture_cache::types::Extent3D {
+                width: 512,
+                height: 1,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        info.is_sparse = true;
+        let old_id = cache.join_images(&info, 0x8000, 0xA000);
+        cache.slot_images[old_id]
+            .flags
+            .insert(ImageFlagBits::GPU_MODIFIED);
+
+        let new_id = cache.join_images(&info, 0x8000, 0xD000);
+
+        assert_ne!(new_id, old_id);
+        assert!(cache.slot_images.iter().any(|(id, _)| id == old_id));
+        assert!(cache.slot_images[old_id]
+            .overlapping_images
+            .contains(&new_id));
+        assert!(cache.slot_images[new_id]
+            .overlapping_images
+            .contains(&old_id));
     }
 
     #[test]
