@@ -2910,6 +2910,7 @@ impl RasterizerOpenGL {
         // can issue GL calls once channel_state is populated.
         let gl_runtime = super::gl_buffer_cache::BufferCacheRuntime::new(device);
         buffer_cache.set_runtime(Box::new(gl_runtime));
+        let mut state_tracker = Box::new(StateTracker::new());
         Self {
             syncpoints,
             fence_backend: FenceManagerOpenGL::new(),
@@ -2920,11 +2921,16 @@ impl RasterizerOpenGL {
             has_written_global_memory: false,
             buffer_cache,
             program_manager: program_manager.clone(),
-            texture_cache: OpenGLTextureCache::new(device_memory.clone(), device, program_manager),
+            texture_cache: OpenGLTextureCache::new(
+                device_memory.clone(),
+                device,
+                program_manager,
+                state_tracker.as_mut(),
+            ),
             shader_cache: ShaderCache::new(device_memory),
             gl_shader_cache: OpenGLShaderCache::new(device),
             query_cache: QueryCache::new(),
-            state_tracker: Box::new(StateTracker::new()),
+            state_tracker,
             has_depth_buffer_float: device.has_depth_buffer_float(),
             has_viewport_swizzle: device.has_viewport_swizzle(),
             has_fill_rectangle: device.has_fill_rectangle(),
@@ -2944,6 +2950,7 @@ impl RasterizerOpenGL {
             crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
         );
         let program_manager = ProgramManager::new_shared_with_caps(false, false);
+        let mut state_tracker = Box::new(StateTracker::new());
         Self {
             syncpoints,
             fence_backend: FenceManagerOpenGL::new(),
@@ -2961,11 +2968,12 @@ impl RasterizerOpenGL {
                 false,
                 false,
                 program_manager,
+                state_tracker.as_mut(),
             ),
             shader_cache: ShaderCache::default(),
             gl_shader_cache: OpenGLShaderCache::new_for_test(),
             query_cache: QueryCache::new(),
-            state_tracker: Box::new(StateTracker::new()),
+            state_tracker,
             has_depth_buffer_float: false,
             has_viewport_swizzle: false,
             has_fill_rectangle: false,
@@ -5667,10 +5675,6 @@ impl RasterizerInterface for RasterizerOpenGL {
         if can_draw_gl {
             record_gl_draw_stage(draw_seq, 31);
             trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_fixed_state_sync", draw_seq);
-            if self.texture_cache.take_rescale_viewport_scissor_dirty() {
-                self.state_tracker.notify_viewport0();
-                self.state_tracker.notify_scissor0();
-            }
             let viewport_scale = if self.texture_cache.is_rescaling_active() {
                 settings::values().resolution_info.up_factor
             } else {
@@ -7946,11 +7950,6 @@ impl RasterizerInterface for RasterizerOpenGL {
             }
             return;
         };
-        if self.texture_cache.take_rescale_viewport_scissor_dirty() {
-            self.state_tracker.notify_viewport0();
-            self.state_tracker.notify_scissor0();
-        }
-
         unsafe {
             self.state_tracker.bind_framebuffer(framebuffer);
             self.state_tracker.notify_viewport0();
@@ -8458,12 +8457,6 @@ impl RasterizerInterface for RasterizerOpenGL {
         let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
             return false;
         };
-        // Upstream TextureCacheRuntime::BlitFramebuffer mutates these fixed
-        // function states for the Fermi2D blit path and invalidates the state
-        // tracker before doing so.
-        self.state_tracker.notify_scissor0();
-        self.state_tracker.notify_rasterize_enable();
-        self.state_tracker.notify_framebuffer_srgb();
         let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
         let accelerated = unsafe {
             let _texture_lock = (*texture_cache).base.mutex.lock();
@@ -8479,10 +8472,6 @@ impl RasterizerInterface for RasterizerOpenGL {
                 },
             )
         };
-        if self.texture_cache.take_rescale_viewport_scissor_dirty() {
-            self.state_tracker.notify_viewport0();
-            self.state_tracker.notify_scissor0();
-        }
         accelerated
     }
 

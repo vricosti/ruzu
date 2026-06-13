@@ -18048,10 +18048,10 @@ The following still panic because upstream either also throws NotImplementedExce
 - Rust now stores upstream `TextureCacheRuntime::rescale_draw_fbos` / `rescale_read_fbos` on `OpenGL::TextureCacheRuntime`, creates them only when `resolution_info.active` is true, and destroys them from `TextureCacheRuntime::Drop`, matching upstream `TextureCacheRuntime::TextureCacheRuntime` / destructor ownership.
 - Rust `TextureCache::new` now constructs the production `TextureCacheRuntime` once and passes it into the cache, rather than creating a capability-default runtime and replacing it. Test/default construction still uses `TextureCacheRuntime::new_with_caps`.
 - Rust `Image::scale_up` / `scale_down` take the corresponding `ImageBase` as an explicit parameter instead of inheriting from it like upstream `OpenGL::Image : ImageBase`.
-- Upstream `OpenGL::Image::Scale(...)` calls `state_tracker.NotifyViewport0()` / `NotifyScissor0()` directly after its internal `glBlitNamedFramebuffer` loop. Rust cannot store a direct `StateTracker&` in `TextureCache` without making `RasterizerOpenGL` self-referential, so `TextureCache` records `rescale_touched_viewport_scissor` and `RasterizerOpenGL` consumes it to call `StateTracker::notify_viewport0()` / `notify_scissor0()` before draw, clear, or after Fermi2D blit.
+- Upstream `OpenGL::Image::Scale(...)` calls `state_tracker.NotifyViewport0()` / `NotifyScissor0()` directly after its internal `glBlitNamedFramebuffer` loop. Rust now routes that side effect through `TextureCacheRuntime::notify_rescale_blit_state_changed()` immediately after backend `Image::scale_up` / `scale_down`, using the runtime-owned `StateTracker` pointer.
 - Rust `update_render_targets_from_snapshot` reruns the snapshot bridge while `has_deleted_images` is raised by rescale invalidation, instead of upstream rerunning `FindColorBuffer` / `FindDepthBuffer` through Maxwell dirty flags. This preserves the upstream `RescaleRenderTargets` loop ordering while ruzu still receives render-target registers as a draw snapshot.
 - Rust `invalidate_scale` removes backend GL image views/framebuffers, clears the base image view lists, invalidates the single channel's graphics/compute TIC tables, and marks cached graphics/compute image-view ids corrupt. Upstream iterates `active_channel_ids`; ruzu currently models one inline channel state.
-- Rust updates `render_targets.is_rescaled` and scaled `render_targets.size` in the OpenGL snapshot bridge after the rescale decision. Upstream also marks `Dirty::RescaleViewports`, `Dirty::RescaleScissors`, and `Dirty::DepthBiasGlobal`; ruzu still lacks the exact Maxwell3D dirty-flag owner for those common flags, but backend GL viewport/scissor invalidation after `Image::Scale(...)` is now represented through the rasterizer-owned state tracker.
+- Rust updates `render_targets.is_rescaled` and scaled `render_targets.size` in the OpenGL snapshot bridge after the rescale decision. Upstream also marks `Dirty::RescaleViewports`, `Dirty::RescaleScissors`, and `Dirty::DepthBiasGlobal`; ruzu still lacks the exact Maxwell3D dirty-flag owner for those common flags, but backend GL viewport/scissor invalidation after `Image::Scale(...)` is now represented through the runtime-owned state tracker.
 
 ### Unintentional differences (to fix)
 - Upstream `TextureCache<P>::UpdateRenderTargets` is skipped entirely when `Dirty::RenderTargets` is false and only prepares existing views. Rust has no Maxwell dirty-flag owner in `OpenGL::TextureCache`, so the snapshot bridge re-resolves render-target views on each draw/clear call.
@@ -18291,13 +18291,12 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Intentional differences
 - Rust now routes the OpenGL Fermi2D blit body through `TextureCacheRuntime::blit_framebuffer`, matching upstream `TextureCacheRuntime::BlitFramebuffer` ownership for `glEnable(GL_FRAMEBUFFER_SRGB)`, `glDisable(GL_RASTERIZER_DISCARD)`, `glDisablei(GL_SCISSOR_TEST, 0)`, filter selection, and `glBlitNamedFramebuffer`.
 - Rust passes raw framebuffer handles and buffer-bit masks instead of upstream `Framebuffer*` because ruzu's framebuffer cache is still owned by `OpenGL::TextureCache`; the runtime body receives the same data that upstream reads through `Framebuffer::{Handle,BufferBits}`.
-- Upstream invalidates `StateTracker` inside `TextureCacheRuntime::BlitFramebuffer`. Rust still performs `notify_scissor0`, `notify_rasterize_enable`, and `notify_framebuffer_srgb` in `RasterizerOpenGL::accelerate_surface_copy` before entering the texture-cache blit path, preserving the side effect while avoiding a self-referential `StateTracker&` in the current owner graph.
+- Rust now stores the upstream `StateTracker&` dependency as a non-null pointer inside `TextureCacheRuntime`; `TextureCacheRuntime::blit_framebuffer` performs `notify_scissor0`, `notify_rasterize_enable`, and `notify_framebuffer_srgb` before mutating the fixed-function GL state, matching upstream ordering. Standalone/default test construction keeps a boxed tracker alive inside `TextureCache` for the same pointer lifetime.
 
 ### Unintentional differences (to fix)
 - None known for the runtime Fermi2D GL blit body after re-reading upstream `TextureCacheRuntime::BlitFramebuffer`.
 
 ### Missing items
-- Move the `StateTracker&` dependency into `TextureCacheRuntime` once the renderer/rasterizer owner graph can represent upstream references without self-referential Rust structs.
 - Move the full common `TextureCache<P>::BlitImage` ownership out of the OpenGL wrapper once backend hooks can materialize framebuffers without duplicating lifecycle.
 
 ### Binary layout verification
@@ -18309,6 +18308,90 @@ The following still panic because upstream either also throws NotImplementedExce
 - `git diff --check`
 - `cargo check -p video_core --quiet`
 - `cargo test -p video_core blit_image -- --nocapture` (0 tests matched; compile-only evidence for this filter)
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- Rust no longer defers `Image::Scale(...)` viewport/scissor invalidation through `OpenGL::TextureCache::rescale_touched_viewport_scissor` and `RasterizerOpenGL`. `TextureCacheRuntime::notify_rescale_blit_state_changed()` now invalidates `StateTracker` immediately after backend scale-up/scale-down calls, matching upstream `Image::Scale(...)` ownership and order more closely.
+- Rust keeps the notification just outside `Image::scale(...)` rather than storing a runtime pointer inside each `Image`, because backend images are still owned by `OpenGL::TextureCache`; the call is still adjacent to the scale blit and happens before `invalidate_scale(...)`, matching the upstream side-effect point.
+
+### Unintentional differences (to fix)
+- None known for the rescale viewport/scissor state-tracker invalidation slice after re-reading upstream `OpenGL::Image::Scale`.
+
+### Missing items
+- Exact upstream `Image` ownership of `TextureCacheRuntime* runtime` remains pending until backend image construction/lifetime mirrors upstream more closely.
+
+### Binary layout verification
+- N/A: OpenGL host state-tracker invalidation only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `OpenGL::Image::Scale`, `ScaleUp`, and `ScaleDown`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h, and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Rust represents upstream `TextureCacheRuntime::state_tracker` (`StateTracker&`) as `NonNull<StateTracker>` because `RasterizerOpenGL` owns the tracker allocation by `Box<StateTracker>`. The pointer remains stable when the box is moved into the rasterizer, and the texture cache drops before the boxed tracker under the current field order.
+- Rust `TextureCache::default()` owns a private boxed tracker solely to keep standalone test/fallback construction sound; production construction passes the rasterizer-owned tracker, matching upstream renderer/rasterizer ownership more closely than the previous rasterizer-side pre-invalidation.
+
+### Unintentional differences (to fix)
+- None known for the `StateTracker&` runtime ownership slice after re-reading upstream `TextureCacheRuntime::{TextureCacheRuntime,BlitFramebuffer}` and `RasterizerOpenGL::AccelerateSurfaceCopy`.
+
+### Missing items
+- The full common `TextureCache<P>::BlitImage` ownership is still split through `OpenGL::TextureCache` until backend framebuffer hooks can be represented without duplicating lifecycle.
+
+### Binary layout verification
+- N/A: OpenGL host state-tracker reference ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::TextureCacheRuntime`, `TextureCacheRuntime::BlitFramebuffer`, `gl_texture_cache.h` runtime members, and `RasterizerOpenGL::AccelerateSurfaceCopy`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core blit_image -- --nocapture` (0 tests matched; compile-only evidence for this filter)
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- Rust `TextureCacheRuntime` now stores the upstream device-derived runtime capability values for `CanReportMemoryUsage()` and `HasNativeASTC()` at construction time. Production construction passes `Device::can_report_memory()` and `Device::has_astc()`, matching upstream's `device.CanReportMemoryUsage()` / `device.HasASTC()` source instead of re-querying OpenGL extensions inside `HasNativeASTC()`.
+- Rust test/default construction passes explicit capability booleans because it does not own an upstream `const Device&`; this keeps the same capability source as the surrounding `TextureCache::new_with_caps(...)` test fixture.
+
+### Unintentional differences (to fix)
+- Rust still stores capability snapshots instead of upstream's `const Device& device` reference on `TextureCacheRuntime`. The observed runtime behavior for memory reporting and ASTC support now follows the same device-derived values, but exact reference ownership remains part of broader renderer/device owner parity.
+
+### Missing items
+- None known for the runtime memory/ASTC capability slice after re-reading upstream `TextureCacheRuntime::{TextureCacheRuntime,GetDeviceMemoryUsage,CanReportMemoryUsage,HasNativeASTC}`.
+
+### Binary layout verification
+- N/A: OpenGL runtime capability state only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::{TextureCacheRuntime,GetDeviceMemoryUsage,CanReportMemoryUsage,HasNativeASTC}` and the runtime member declaration.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core astc_upload_flags_follow_upstream_policy -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- Rust now stores `format_properties: [HashMap<u32, FormatProperties>; 3]` on `TextureCacheRuntime`, matching upstream `std::array<std::unordered_map<GLenum, FormatProperties>, 3> format_properties`.
+- Rust populates that table during `TextureCacheRuntime` construction by querying `GL_IMAGE_COMPATIBILITY_CLASS`, `GL_IMAGE_FORMAT_COMPATIBILITY_TYPE`, and `GL_TEXTURE_COMPRESSED` for upstream's three targets (`GL_TEXTURE_1D_ARRAY`, `GL_TEXTURE_2D_ARRAY`, `GL_TEXTURE_3D`) over `MaxwellToGL::FORMAT_TABLE`.
+- Rust `TextureCacheRuntime::format_info(...)` maps `ImageType::{E1D,E2D,Linear,E3D}` to the same table indices as upstream `TextureCacheRuntime::FormatInfo`.
+
+### Unintentional differences (to fix)
+- None known for the `FormatInfo` ownership/table-construction slice after re-reading upstream `TextureCacheRuntime::TextureCacheRuntime` and `TextureCacheRuntime::FormatInfo`.
+
+### Missing items
+- The broader accelerated-upload compatibility path after upstream's currently disabled `return false` remains intentionally inactive; if that branch is restored, it should consume `TextureCacheRuntime::format_info(...)` instead of reintroducing ad hoc format checks.
+
+### Binary layout verification
+- N/A: OpenGL host format-capability cache only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::TextureCacheRuntime`, `TextureCacheRuntime::FormatInfo`, and `gl_texture_cache.h` runtime member declarations.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
 
 ## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
 
