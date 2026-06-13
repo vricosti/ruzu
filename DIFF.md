@@ -3,7 +3,10 @@
 ### Intentional differences
 - `TextureCacheBase` now owns `LeastRecentlyUsedCache<ImageId, i64>` in the same conceptual slot as upstream `Common::LeastRecentlyUsedCache<LRUItemParams> lru_cache`; `RegisterImage` inserts into it, `UnregisterImage` frees it, and OpenGL `PrepareImage` paths call `touch_image(...)`, matching upstream `lru_cache.Touch(image.lru_index, frame_tick)`.
 - `TextureCacheBase::run_garbage_collector(...)` now ports upstream's two-pass memory-pressure policy: normal/high/aggressive mode selection, age thresholds `50/25/10`, iteration limits `10/20/40`, `IS_DECODING` and non-aggressive `COSTLY_LOAD` skips, safe-download gating, unregister, and delete ordering.
-- Rust uses the existing callback-backed `image_downloader` + `guest_memory_writer` for the `must_download` GC path. If those callbacks are absent or fail, Rust preserves the GPU-modified image instead of deleting dirty contents; this is a safety-preserving adaptation until every backend construction path provides the same runtime/GPU-memory availability as upstream.
+- OpenGL `TextureCache::tick_frame(...)` now supplies `TextureCacheBase::run_garbage_collector_with_downloader(...)` with the backend download body for the `must_download` GC path: `TextureCacheRuntime::download_staging_buffer(...)`, `Image::download_memory_to_staging(...)`, `TextureCacheRuntime::finish()`, then common swizzle/writeback.
+- OpenGL `Image::download_memory_to_buffer(...)` / `download_memory_to_staging(...)` now mirror upstream `Image::DownloadMemory` over `BufferImageCopy`: `GL_PIXEL_PACK_BUFFER`, `PACK_ALIGNMENT`, cached `PACK_ROW_LENGTH` / `PACK_IMAGE_HEIGHT`, `glGetTextureSubImage` or `glGetCompressedTextureSubImage`, and the staging-map overload.
+- `TextureCacheBase::run_garbage_collector(...)` keeps the old callback-backed download only as the backend-independent fallback used by non-OpenGL/test construction; production OpenGL GC no longer uses the stored `image_downloader` callback.
+- `TextureCacheBase::write_downloaded_image(...)` now prefers the channel `gpu_memory` owner and writes through `write_block_unsafe(image.gpu_addr, ...)`, matching upstream `SwizzleImage(*gpu_memory, image.gpu_addr, ...)` for production GC and CPU-read texture download writeback. The `GuestMemoryWriter` path remains only as a fallback for backend-independent/test construction without a bound channel.
 - `TextureCacheBase` now owns `sentenced_images` and `sentenced_image_view` as `DelayedDestructionRing<_, TICKS_TO_DESTROY>` counterparts. `DeleteImage(..., immediate_delete=false)` and OpenGL `InvalidateScale` move image/image-view base objects into those rings with `SlotVector::take(...)`, matching upstream's `sentenced_* .Push(std::move(...)); erase(...)` ownership pattern for the ported base resources.
 - OpenGL framebuffers now use `TextureCacheBase::framebuffers` as the upstream `RenderTargets -> FramebufferId` key map for draw render targets, Fermi2D framebuffer blits, and the remaining compatibility render-target helper; concrete GL framebuffer objects live in `OpenGL::TextureCache::slot_framebuffers`.
 - OpenGL now owns `sentenced_framebuffers: DelayedDestructionRing<TextureCacheFramebuffer, TICKS_TO_DESTROY>` and moves removed framebuffer objects into it when image views are invalidated or when common GC/delete logic removes base framebuffer keys.
@@ -11,23 +14,25 @@
 
 ### Unintentional differences (to fix)
 - Upstream `TextureCache<P>` owns `slot_framebuffers` and `sentenced_framebuffers` in the same templated common object; Rust still splits the concrete GL framebuffer slot/ring into `OpenGL::TextureCache` because `TextureCacheBase` is backend-independent.
-- The GC download path uses callback staging instead of exact `runtime.DownloadStagingBuffer(...)`, `image.DownloadMemory(...)`, `runtime.Finish()`, and channel `gpu_memory` ownership.
+- `util::swizzle_image(...)` is still tracked separately as not yet a line-by-line port of upstream `SwizzlePitchLinearImage` / `SwizzleBlockLinearImage` for every subresource-offset case.
 
 ### Missing items
 - Move `slot_framebuffers`/`sentenced_framebuffers` into the exact templated owner shape if/when `TextureCacheBase` becomes generic over backend resources rather than split from OpenGL.
-- Move the GC download path to exact backend runtime ownership once `TextureCacheBase` can call the same runtime/image hooks as upstream `TextureCache<P>`.
+- Remove the backend-independent `GuestMemoryWriter` texture-download fallback once every non-OpenGL/test construction binds a channel `gpu_memory` owner.
 
 ### Binary layout verification
 - N/A: host texture-cache ownership and lifecycle only. No guest-visible raw payload layout changed.
 
 ### Tests
 - Re-read upstream `TextureCache<P>::RunGarbageCollector`, `TextureCache<P>::TickFrame`, `TextureCache<P>::RegisterImage`, `TextureCache<P>::UnregisterImage`, `TextureCache<P>::DeleteImage`, `TextureCache<P>::PrepareImage`, `TextureCache<P>::GetFramebufferId`, `TextureCache<P>::RenderTargetFromImage`, `TextureCache<P>::BlitImage`, and `TextureCache<P>::RemoveFramebuffers`.
-- Re-read upstream `TextureCache<P>::InvalidateScale`, `texture_cache_base.h` `slot_framebuffers`/`sentenced_*` members, `video_core/delayed_destruction_ring.h`, and OpenGL `Framebuffer`.
+- Re-read upstream `TextureCache<P>::InvalidateScale`, `TextureCache<P>::DownloadMemory`, OpenGL `TextureCacheRuntime::{DownloadStagingBuffer,Finish}`, OpenGL `Image::DownloadMemory`, `texture_cache_base.h` `slot_framebuffers`/`sentenced_*` members, `video_core/delayed_destruction_ring.h`, and OpenGL `Framebuffer`.
+- Re-read upstream `SwizzleImage`, `SwizzlePitchLinearImage`, `SwizzleBlockLinearImage`, and `Tegra::MemoryManager::WriteBlockUnsafe` while moving production texture download writeback to channel `gpu_memory`.
 - `cargo fmt --all`
 - `cargo check -p video_core --quiet`
+- `cargo test -p video_core write_downloaded_image_prefers_channel_gpu_memory -- --nocapture`
 - `cargo test -p video_core run_garbage_collector -- --nocapture`
-- `cargo test -p video_core delete_image -- --nocapture`
-- `cargo test -p video_core update_render_targets_from_snapshot_registers_presentable_view -- --nocapture`
+- `cargo test -p video_core delete_image_removes_view_references_and_framebuffers -- --nocapture`
+- `cargo test -p video_core gl_staging_buffer_pool -- --nocapture`
 
 ## 2026-06-13 — `video_core/src/renderer_opengl/gl_texture_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h`
 
@@ -12127,7 +12132,7 @@
 ## 2026-05-13 — `video_core/src/texture_cache/texture_cache_base.rs` and `video_core/src/texture_cache/util.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.{h}` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/util.{h,cpp}`
 
 ### Intentional differences
-- Rust adds `GuestMemoryWriter` and `ImageDownloader` callbacks to stand in for upstream `Tegra::MemoryManager&`, `Runtime::DownloadStagingBuffer`, and backend `Image::DownloadMemory`. This keeps method ownership in `TextureCacheBase` while the Rust port lacks the upstream `TextureCache<P>` template storage of backend `Image`.
+- Rust adds `GuestMemoryWriter` and `ImageDownloader` callbacks to stand in for upstream `Tegra::MemoryManager&`, `Runtime::DownloadStagingBuffer`, and backend `Image::DownloadMemory` in backend-independent/test construction. Current OpenGL production download and GC paths use `TextureCacheRuntime::download_staging_buffer(...)` and backend `Image::download_memory_to_staging(...)` directly; the remaining writer bridge is tracked in the newer 2026-06-13 texture-cache GC entry.
 - `util::swizzle_image` accepts an already translated CPU/device base address and a writer callback. Upstream accepts a GPU VA plus `Tegra::MemoryManager&`; the Rust adaptation is required because the renderer-side writer installed from `ruzu_cmd` writes CPU/device addresses.
 - `TextureCacheBase::download_memory` follows the upstream high-level order: collect overlapping images, filter `IsSafeDownload`, clear `GpuModified`, sort by `modification_tick`, call backend download, then swizzle/write to guest memory.
 
@@ -12136,8 +12141,7 @@
 
 ### Missing items
 - Port `SwizzlePitchLinearImage` and `SwizzleBlockLinearImage` literally from upstream `util.cpp`.
-- Replace the callback-based backend download with Rust storage that mirrors upstream `TextureCache<P>` ownership of backend `Image`.
-- Wire OpenGL `Image::download_memory` into `TextureCacheBase::set_image_downloader` once backend image slots exist.
+- Replace the remaining callback-backed non-OpenGL/test fallback with Rust storage that mirrors upstream `TextureCache<P>` ownership of backend `Image`.
 
 ### Binary layout verification
 - N/A: no guest-visible struct layout changed.

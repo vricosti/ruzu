@@ -100,6 +100,22 @@ impl TextureCacheBase {
 
     /// Port of `TextureCache<P>::RunGarbageCollector`.
     pub fn run_garbage_collector(&mut self) {
+        let downloader = self.image_downloader.as_ref().cloned();
+        self.run_garbage_collector_with_downloader(|_image_id, image, staging| {
+            let Some(downloader) = downloader.as_ref() else {
+                return false;
+            };
+            downloader(_image_id, image, staging)
+        });
+    }
+
+    /// Port of `TextureCache<P>::RunGarbageCollector`, with the backend
+    /// `Runtime::DownloadStagingBuffer` + `Image::DownloadMemory` operation
+    /// supplied by the concrete renderer wrapper.
+    pub fn run_garbage_collector_with_downloader(
+        &mut self,
+        mut download_image: impl FnMut(ImageId, &ImageBase, &mut [u8]) -> bool,
+    ) {
         let mut high_priority_mode = false;
         let mut aggressive_mode = false;
         let mut ticks_to_destroy = 0u64;
@@ -142,6 +158,7 @@ impl TextureCacheBase {
             &mut num_iterations,
             &mut high_priority_mode,
             &mut aggressive_mode,
+            &mut download_image,
         );
 
         if self.total_used_memory >= self.critical_memory {
@@ -158,6 +175,7 @@ impl TextureCacheBase {
                 &mut num_iterations,
                 &mut high_priority_mode,
                 &mut aggressive_mode,
+                &mut download_image,
             );
         }
     }
@@ -168,6 +186,7 @@ impl TextureCacheBase {
         num_iterations: &mut usize,
         high_priority_mode: &mut bool,
         aggressive_mode: &mut bool,
+        download_image: &mut impl FnMut(ImageId, &ImageBase, &mut [u8]) -> bool,
     ) {
         let mut candidates = Vec::new();
         self.lru_cache
@@ -197,7 +216,7 @@ impl TextureCacheBase {
             if !*high_priority_mode && must_download {
                 continue;
             }
-            if must_download && !self.download_image_for_gc(image_id) {
+            if must_download && !self.download_image_for_gc(image_id, download_image) {
                 continue;
             }
             if self.slot_images[image_id]
@@ -224,30 +243,59 @@ impl TextureCacheBase {
         }
     }
 
-    fn download_image_for_gc(&mut self, image_id: ImageId) -> bool {
-        let Some(downloader) = self.image_downloader.as_ref().cloned() else {
-            return false;
-        };
-        let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
-            return false;
-        };
+    fn download_image_for_gc(
+        &mut self,
+        image_id: ImageId,
+        download_image: &mut impl FnMut(ImageId, &ImageBase, &mut [u8]) -> bool,
+    ) -> bool {
         let image = self.slot_images[image_id].clone();
         let mut staging = vec![0u8; image.unswizzled_size_bytes as usize];
-        if !downloader(image_id, &image, &mut staging) {
+        if !download_image(image_id, &image, &mut staging) {
             return false;
         }
         let copies = super::util::full_download_copies(&image.info);
+        if !self.write_downloaded_image(&image, &copies, &staging) {
+            return false;
+        }
+        self.slot_images[image_id]
+            .flags
+            .remove(ImageFlagBits::GPU_MODIFIED);
+        true
+    }
+
+    /// Common writeback half of upstream `SwizzleImage(*gpu_memory, image.gpu_addr, ...)`.
+    pub fn write_downloaded_image(
+        &mut self,
+        image: &ImageBase,
+        copies: &[BufferImageCopy],
+        staging: &[u8],
+    ) -> bool {
+        if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
+            let gpu_memory = gpu_memory.lock();
+            super::util::swizzle_image(
+                &|gpu_addr, data| {
+                    let _ = gpu_memory.write_block_unsafe(gpu_addr, data);
+                },
+                image.gpu_addr,
+                &image.info,
+                copies,
+                staging,
+                &mut self.swizzle_data_buffer,
+            );
+            return true;
+        }
+
+        let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
+            return false;
+        };
         super::util::swizzle_image(
             writer.as_ref(),
             image.cpu_addr,
             &image.info,
-            &copies,
-            &staging,
+            copies,
+            staging,
             &mut self.swizzle_data_buffer,
         );
-        self.slot_images[image_id]
-            .flags
-            .remove(ImageFlagBits::GPU_MODIFIED);
         true
     }
 
@@ -2368,6 +2416,65 @@ mod tests {
         assert!(cache.slot_images[image_id]
             .flags
             .contains(ImageFlagBits::GPU_MODIFIED));
+    }
+
+    #[test]
+    fn write_downloaded_image_prefers_channel_gpu_memory() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex as ParkingMutex;
+        use std::sync::Arc;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
+            7,
+            22,
+            1 << 22,
+            16,
+            12,
+        )));
+        {
+            let mut gpu_memory = gpu_memory.lock();
+            gpu_memory.map(0, 0, 0x1_0000, 0, false);
+        }
+        cache.set_channel_gpu_memory(Arc::clone(&gpu_memory));
+        cache.set_guest_memory_writer(Arc::new(|_, _| {
+            panic!("channel gpu_memory should own texture download writeback")
+        }));
+
+        let mut info = ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::Linear,
+            size: crate::texture_cache::types::Extent3D {
+                width: 2,
+                height: 2,
+                depth: 1,
+            },
+            tiling: TilingMode::PitchLinear(16),
+            ..ImageInfo::default()
+        };
+        info.resources.levels = 1;
+        info.resources.layers = 1;
+        let image = ImageBase::new(info.clone(), 0x4000, 0x8000);
+        let copy = BufferImageCopy {
+            buffer_offset: 0,
+            buffer_size: 16,
+            buffer_row_length: 4,
+            buffer_image_height: 2,
+            image_subresource: SubresourceLayers::default(),
+            image_offset: Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: Extent3D {
+                width: 2,
+                height: 2,
+                depth: 1,
+            },
+        };
+        let staging = [
+            1, 2, 3, 4, 5, 6, 7, 8, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 9, 10, 11, 12,
+            13, 14, 15, 16,
+        ];
+
+        assert!(cache.write_downloaded_image(&image, &[copy], &staging));
     }
 
     #[test]
