@@ -146,7 +146,7 @@ struct LoggerState {
 pub fn initialize(log_dir: Option<PathBuf>, filter_string: Option<&str>) {
     let mut guard = LOGGER.lock().unwrap();
     if guard.is_some() {
-        log::warn!("Reinitializing logging backend");
+        eprintln!("Reinitializing logging backend");
         return;
     }
 
@@ -215,6 +215,109 @@ pub fn initialize(log_dir: Option<PathBuf>, filter_string: Option<&str>) {
 }
 
 static COLOR_FLAG: Mutex<Option<std::sync::Arc<AtomicBool>>> = Mutex::new(None);
+
+struct FacadeLogger;
+
+static FACADE_LOGGER: FacadeLogger = FacadeLogger;
+
+impl log::Log for FacadeLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        if SUPPRESS_LOGGING.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        let guard = LOGGER.lock().unwrap();
+        guard.as_ref().is_some_and(|state| {
+            state.filter.check_message(
+                class_from_target(metadata.target()),
+                level_from_log(metadata.level()),
+            )
+        })
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
+        push_entry(
+            class_from_target(record.target()),
+            level_from_log(record.level()),
+            record.file().unwrap_or("<unknown>"),
+            record.line().unwrap_or(0),
+            record.module_path().unwrap_or(record.target()),
+            record.args().to_string(),
+        );
+    }
+
+    fn flush(&self) {}
+}
+
+/// Initialize the yuzu-style asynchronous backend and connect Rust's `log`
+/// facade to it. `RUZU_LOG_FILTER` uses the native class syntax
+/// (`*:Info Render.OpenGL:Debug`). A simple `RUST_LOG=info` style value is
+/// also accepted for command-line compatibility.
+pub fn initialize_from_env(log_dir: Option<PathBuf>) {
+    let filter = std::env::var("RUZU_LOG_FILTER")
+        .ok()
+        .or_else(|| {
+            std::env::var("RUST_LOG")
+                .ok()
+                .and_then(|s| rust_log_to_filter(&s))
+        })
+        .unwrap_or_else(|| "*:Warning".to_string());
+
+    initialize(log_dir, Some(&filter));
+    set_color_console_backend_enabled(env_flag_enabled("RUZU_LOG_COLOR", true));
+
+    match log::set_logger(&FACADE_LOGGER) {
+        Ok(()) => log::set_max_level(log::LevelFilter::Trace),
+        Err(_) => eprintln!("logging facade was already initialized"),
+    }
+}
+
+fn rust_log_to_filter(value: &str) -> Option<String> {
+    let first = value.split(',').next()?.trim();
+    let level = first.rsplit('=').next()?.trim();
+    match level.to_ascii_lowercase().as_str() {
+        "trace" => Some("*:Trace".to_string()),
+        "debug" => Some("*:Debug".to_string()),
+        "info" => Some("*:Info".to_string()),
+        "warn" | "warning" => Some("*:Warning".to_string()),
+        "error" => Some("*:Error".to_string()),
+        "off" => Some("*:Critical".to_string()),
+        _ => None,
+    }
+}
+
+fn env_flag_enabled(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "False" | "FALSE" | "off" | "OFF"))
+        .unwrap_or(default)
+}
+
+fn level_from_log(level: log::Level) -> Level {
+    match level {
+        log::Level::Error => Level::Error,
+        log::Level::Warn => Level::Warning,
+        log::Level::Info => Level::Info,
+        log::Level::Debug => Level::Debug,
+        log::Level::Trace => Level::Trace,
+    }
+}
+
+fn class_from_target(target: &str) -> Class {
+    let normalized = target.replace("::", ".").replace('_', ".");
+    Class::from_name(target)
+        .or_else(|| Class::from_name(&normalized))
+        .or_else(|| {
+            Class::all()
+                .filter(|class| normalized.starts_with(class.name()))
+                .max_by_key(|class| class.name().len())
+        })
+        .unwrap_or(Class::Log)
+}
 
 /// Stops the logger thread and flushes buffers.
 pub fn stop() {
@@ -357,4 +460,45 @@ macro_rules! log_critical {
     ($class:expr, $($arg:tt)*) => {
         $crate::log_message!($class, $crate::logging::types::Level::Critical, $($arg)*)
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rust_log_level_maps_to_yuzu_filter() {
+        assert_eq!(rust_log_to_filter("info").as_deref(), Some("*:Info"));
+        assert_eq!(
+            rust_log_to_filter("video_core=debug").as_deref(),
+            Some("*:Debug")
+        );
+        assert_eq!(rust_log_to_filter("off").as_deref(), Some("*:Critical"));
+    }
+
+    #[test]
+    fn log_target_maps_to_known_class() {
+        assert_eq!(class_from_target("Render.OpenGL"), Class::Render_OpenGL);
+        assert_eq!(class_from_target("Render_OpenGL"), Class::Render_OpenGL);
+        assert_eq!(
+            class_from_target("Render.OpenGL.texture_cache"),
+            Class::Render_OpenGL
+        );
+        assert_eq!(class_from_target("unknown_target"), Class::Log);
+    }
+
+    #[test]
+    fn env_flag_default_and_false_values() {
+        std::env::remove_var("RUZU_TEST_LOG_FLAG");
+        assert!(env_flag_enabled("RUZU_TEST_LOG_FLAG", true));
+        assert!(!env_flag_enabled("RUZU_TEST_LOG_FLAG", false));
+
+        std::env::set_var("RUZU_TEST_LOG_FLAG", "0");
+        assert!(!env_flag_enabled("RUZU_TEST_LOG_FLAG", true));
+        std::env::set_var("RUZU_TEST_LOG_FLAG", "false");
+        assert!(!env_flag_enabled("RUZU_TEST_LOG_FLAG", true));
+        std::env::set_var("RUZU_TEST_LOG_FLAG", "1");
+        assert!(env_flag_enabled("RUZU_TEST_LOG_FLAG", false));
+        std::env::remove_var("RUZU_TEST_LOG_FLAG");
+    }
 }
