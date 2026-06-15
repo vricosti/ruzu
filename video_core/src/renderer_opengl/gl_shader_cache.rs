@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use common::settings_enums::ShaderBackend;
 use common::{cityhash::city_hash64, trace};
 use shader_recompiler::environment::Environment;
 use shader_recompiler::frontend::translate_program::{
@@ -18,6 +19,7 @@ use shader_recompiler::frontend::translate_program::{
 use shader_recompiler::host_translate_info::HostTranslateInfo;
 use shader_recompiler::ir::program::Program as ShaderProgram;
 use shader_recompiler::ir::types::OutputTopology;
+use shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info;
 use shader_recompiler::profile::Profile as ShaderProfile;
 use shader_recompiler::runtime_info::{
     CompareFunction, InputTopology, RuntimeInfo, TessPrimitive, TessSpacing,
@@ -163,7 +165,7 @@ fn trace_fragment_source_hash(key: &GraphicsPipelineKey, stage: ShaderStage, sou
     );
 }
 
-use super::gl_compute_pipeline::{ComputePipeline, ComputePipelineKey};
+use super::gl_compute_pipeline::{ComputePipeline, ComputePipelineKey, ComputeProgramBackend};
 use super::gl_device::Device;
 use super::gl_graphics_pipeline::{GraphicsPipeline, GraphicsPipelineKey};
 
@@ -364,6 +366,7 @@ pub struct ShaderCache {
     profile: ShaderProfile,
     host_info: HostTranslateInfo,
     use_assembly_shaders: bool,
+    shader_backend: ShaderBackend,
     max_glasm_storage_buffer_blocks: u32,
 
     /// Current graphics pipeline key.
@@ -400,6 +403,7 @@ impl ShaderCache {
             device.strict_context_required(),
         );
         cache.use_assembly_shaders = device.use_assembly_shaders();
+        cache.shader_backend = device.shader_backend();
         cache.max_glasm_storage_buffer_blocks = device.max_glasm_storage_buffer_blocks();
         cache
     }
@@ -416,6 +420,7 @@ impl ShaderCache {
             profile,
             host_info,
             use_assembly_shaders: false,
+            shader_backend: ShaderBackend::Glsl,
             max_glasm_storage_buffer_blocks: 0,
             graphics_key: GraphicsPipelineKey::default(),
             current_pipeline: None,
@@ -1486,20 +1491,84 @@ impl ShaderCache {
             .cached_instruction_slice()
             .to_vec();
         let base_offset = env.generic_environment().cached_instruction_start();
-        let compiled = compile_shader_glsl_from_env_with_bindings_and_host_info(
-            &code,
-            base_offset,
-            env,
-            &self.profile,
-            &runtime_info,
-            &mut bindings,
-            &self.host_info,
-        );
+        let (info, source, spirv_words, backend) = match self.shader_backend {
+            ShaderBackend::Glsl => {
+                let compiled = compile_shader_glsl_from_env_with_bindings_and_host_info(
+                    &code,
+                    base_offset,
+                    env,
+                    &self.profile,
+                    &runtime_info,
+                    &mut bindings,
+                    &self.host_info,
+                );
+                (
+                    compiled.info,
+                    compiled.source,
+                    Vec::new(),
+                    ComputeProgramBackend::Glsl,
+                )
+            }
+            ShaderBackend::Glasm if self.use_assembly_shaders => {
+                let mut program = translate_program_from_env_with_host_info(
+                    &code,
+                    base_offset,
+                    env,
+                    &self.host_info,
+                );
+                let source = shader_recompiler::backend::glasm::emit_glasm(
+                    &self.profile,
+                    &runtime_info,
+                    &program,
+                    &mut bindings,
+                );
+                (
+                    program.info,
+                    source,
+                    Vec::new(),
+                    ComputeProgramBackend::Glasm,
+                )
+            }
+            ShaderBackend::SpirV => {
+                let mut program = translate_program_from_env_with_host_info(
+                    &code,
+                    base_offset,
+                    env,
+                    &self.host_info,
+                );
+                convert_legacy_to_generic(&mut program, &runtime_info);
+                let spirv_words =
+                    shader_recompiler::backend::emit_spirv(&program, &self.profile, &runtime_info);
+                (
+                    program.info,
+                    String::new(),
+                    spirv_words,
+                    ComputeProgramBackend::SpirV,
+                )
+            }
+            ShaderBackend::Glasm => {
+                let compiled = compile_shader_glsl_from_env_with_bindings_and_host_info(
+                    &code,
+                    base_offset,
+                    env,
+                    &self.profile,
+                    &runtime_info,
+                    &mut bindings,
+                    &self.host_info,
+                );
+                (
+                    compiled.info,
+                    compiled.source,
+                    Vec::new(),
+                    ComputeProgramBackend::Glsl,
+                )
+            }
+        };
         Some(ComputePipeline::new_with_backend_state(
-            compiled.info,
-            &compiled.source,
-            &[],
-            self.use_assembly_shaders,
+            info,
+            &source,
+            &spirv_words,
+            backend,
             self.max_glasm_storage_buffer_blocks,
             force_context_flush,
         ))

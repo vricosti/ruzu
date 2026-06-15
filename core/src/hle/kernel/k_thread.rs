@@ -2721,16 +2721,26 @@ impl KThread {
     }
 
     fn notify_priority_change(&self, old_priority: i32) {
-        // Same note as notify_state_transition: PQ updates cannot happen here
-        // due to lock ordering. Callers holding the process lock should call
-        // process.change_priority_in_queue directly.
-
-        if self
+        // Match upstream KScheduler::OnThreadPriorityChanged: the scheduler
+        // must observe every priority change, including priority inheritance.
+        // Pass already-owned thread properties so the GSC does not need to
+        // lock this KThread again.
+        if let Some(gsc_arc) = self
             .global_scheduler_context
             .as_ref()
             .and_then(Weak::upgrade)
-            .is_none()
         {
+            gsc_arc.lock().unwrap().on_thread_priority_changed(
+                self.thread_id,
+                old_priority,
+                self.priority,
+                self.core_id,
+                self.physical_affinity_mask.get_affinity_mask(),
+                self.get_state() == ThreadState::RUNNABLE,
+                self.thread_type == ThreadType::Dummy,
+                self.thread_id,
+            );
+        } else {
             if let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) {
                 scheduler
                     .lock()

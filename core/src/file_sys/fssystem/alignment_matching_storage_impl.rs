@@ -11,7 +11,6 @@
 //! - Core portion (aligned middle, directly into user buffer when possible)
 //! - Tail portion (unaligned end)
 
-use crate::file_sys::vfs::vfs::VfsFile;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
 
 /// Round down `x` to alignment `align`, return the difference.
@@ -74,9 +73,17 @@ impl AlignmentMatchingStorageImpl {
 
         // Check if the buffer is usable for aligned core reads.
         let buf_ptr = buffer.as_ptr() as usize;
-        let (core_offset, core_size, buffer_gap, offset_gap, covered_offset);
+        let (
+            aligned_core_buffer_offset,
+            core_offset,
+            core_size,
+            buffer_gap,
+            offset_gap,
+            covered_offset,
+        );
 
         if is_aligned(buf_ptr + offset_round_up_diff, buffer_alignment) {
+            aligned_core_buffer_offset = offset_round_up_diff;
             core_offset = align_up(offset, data_alignment);
             core_size = if size < offset_round_up_diff {
                 0
@@ -88,6 +95,7 @@ impl AlignmentMatchingStorageImpl {
             covered_offset = if core_size > 0 { core_offset } else { offset };
         } else {
             let buffer_round_up_diff = get_round_up_difference(buf_ptr, buffer_alignment);
+            aligned_core_buffer_offset = buffer_round_up_diff;
             core_offset = align_down(offset, data_alignment);
             core_size = if size < buffer_round_up_diff {
                 0
@@ -101,10 +109,7 @@ impl AlignmentMatchingStorageImpl {
 
         // Read the core portion.
         if core_size > 0 {
-            let core_buf_start = buffer_gap;
-            // Buffer may not be perfectly aligned here; we read into it offset
-            // by buffer_gap from the start.
-            // Read is offset_gap bytes earlier than needed, so we shift after.
+            let core_buf_start = aligned_core_buffer_offset;
             let read_end = core_buf_start + core_size;
             // Safety: we must have enough room in buffer.
             if read_end <= buffer.len() {
@@ -255,6 +260,8 @@ impl AlignmentMatchingStorageImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+    use std::sync::Arc;
 
     #[test]
     fn test_align_helpers() {
@@ -265,5 +272,20 @@ mod tests {
         assert!(!is_aligned(0x1001, 0x100));
         assert_eq!(get_round_down_difference(0x1234, 0x100), 0x34);
         assert_eq!(get_round_up_difference(0x1234, 0x100), 0xCC);
+    }
+
+    #[test]
+    fn read_places_aligned_core_after_offset_gap_like_upstream() {
+        let source: Vec<u8> = (0..128).map(|value| value as u8).collect();
+        let base: VirtualFile =
+            Arc::new(VectorVfsFile::new(source.clone(), "base".to_string(), None));
+        let mut work_buf = vec![0u8; 16];
+        let mut out = vec![0xCC; 40];
+
+        let read =
+            AlignmentMatchingStorageImpl::read(&base, &mut work_buf, 16, 16, 1, 3, &mut out, 40);
+
+        assert_eq!(read, 40);
+        assert_eq!(out, source[3..43]);
     }
 }

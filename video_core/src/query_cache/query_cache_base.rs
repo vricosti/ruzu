@@ -984,7 +984,7 @@ impl QueryCacheBase {
             log::warn!("QueryCacheBase::request_guest_host_sync: rasterizer not yet bound");
             return;
         };
-        unsafe { (&mut *rasterizer).release_fences(false) };
+        unsafe { (&mut *rasterizer).release_fences(true) };
     }
 
     /// Unregister queries that have been processed.
@@ -1526,7 +1526,7 @@ mod tests {
         assert_eq!(payload_streamer.free_calls, 1);
 
         cache.request_guest_host_sync();
-        assert_eq!(rasterizer.release_fences_calls, vec![false]);
+        assert_eq!(rasterizer.release_fences_calls, vec![true]);
     }
 
     #[test]

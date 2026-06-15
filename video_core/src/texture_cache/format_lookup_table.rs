@@ -334,14 +334,57 @@ pub fn pixel_format_from_texture_info(
     alpha: ComponentType,
     is_srgb: bool,
 ) -> PixelFormat {
-    let hash = format_hash(
+    pixel_format_from_texture_info_raw(
         format as u32,
         red as u32,
         green as u32,
         blue as u32,
         alpha as u32,
         is_srgb,
+    )
+}
+
+fn stop_unimplemented_texture_format(
+    format: u32,
+    red: u32,
+    green: u32,
+    blue: u32,
+    alpha: u32,
+    is_srgb: bool,
+) -> ! {
+    #[cfg(not(test))]
+    {
+        let path = std::path::Path::new(".agents/format_lookup_table_unimplemented_state.md");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            path,
+            format!(
+                "# Texture format lookup unimplemented\n\n\
+                 - format: {format}\n\
+                 - srgb: {is_srgb}\n\
+                 - components: {{{red} {green} {blue} {alpha}}}\n\
+                 - upstream: PixelFormatFromTextureInfo reaches UNIMPLEMENTED_MSG before returning the fallback format\n\
+                 - rust: stopped before treating the fallback A8B8G8R8Unorm as an implemented mapping\n"
+            ),
+        );
+    }
+    panic!(
+        "PixelFormatFromTextureInfo unimplemented texture format={} srgb={} components=({} {} {} {})",
+        format, is_srgb, red, green, blue, alpha
     );
+}
+
+pub fn pixel_format_from_texture_info_raw(
+    format: u32,
+    red: u32,
+    green: u32,
+    blue: u32,
+    alpha: u32,
+    is_srgb: bool,
+) -> PixelFormat {
+    let hash = format_hash(format, red, green, blue, alpha, is_srgb);
 
     // Shorthand constants matching upstream
     const SNORM: u32 = ComponentType::Snorm as u32;
@@ -470,12 +513,35 @@ pub fn pixel_format_from_texture_info(
         x if x == h_uni!(TF::Astc2d8x6, UNORM, srgb) => PixelFormat::Astc2d8x6Srgb,
         x if x == h_uni!(TF::Astc2d6x5, UNORM) => PixelFormat::Astc2d6x5Unorm,
         x if x == h_uni!(TF::Astc2d6x5, UNORM, srgb) => PixelFormat::Astc2d6x5Srgb,
-        _ => {
-            log::error!(
-                "PixelFormatFromTextureInfo: unimplemented format={:?} srgb={} components=({:?} {:?} {:?} {:?})",
-                format, is_srgb, red, green, blue, alpha
-            );
+        _ => stop_unimplemented_texture_format(format, red, green, blue, alpha, is_srgb),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_texture_format_mapping_still_matches_upstream_table() {
+        assert_eq!(
+            pixel_format_from_texture_info(
+                TextureFormat::A8B8G8R8,
+                ComponentType::Unorm,
+                ComponentType::Unorm,
+                ComponentType::Unorm,
+                ComponentType::Unorm,
+                false,
+            ),
             PixelFormat::A8B8G8R8Unorm
-        }
+        );
+    }
+
+    #[test]
+    fn unknown_texture_format_stops_like_upstream_unimplemented_msg() {
+        let result = std::panic::catch_unwind(|| {
+            pixel_format_from_texture_info_raw(0xFFFF_FFFF, 0, 0, 0, 0, false);
+        });
+
+        assert!(result.is_err());
     }
 }

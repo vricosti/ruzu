@@ -22,7 +22,14 @@ use parking_lot::{Mutex as ParkingMutex, ReentrantMutex};
 
 use common::slot_vector::SlotVector;
 
+use crate::control::channel_state::ChannelState;
+use crate::control::channel_state_cache::{
+    ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches, FromChannelState,
+};
 use crate::delayed_destruction_ring::DelayedDestructionRing;
+use crate::dirty_flags;
+use crate::engines::draw_manager::Maxwell3DAccess;
+use crate::engines::maxwell_3d::Maxwell3D;
 use crate::framebuffer_config::{BlendMode, FramebufferConfig};
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::RasterizerDownloadArea;
@@ -65,6 +72,14 @@ pub struct FramebufferImageView {
     pub view_id: ImageViewId,
     pub view: ImageViewBase,
     pub scaled: bool,
+}
+
+fn framebuffer_config_view_format(config: &FramebufferConfig) -> PixelFormat {
+    match config.pixel_format.0 {
+        4 => PixelFormat::R5G6B5Unorm,
+        5 => PixelFormat::B8G8R8A8Unorm,
+        _ => PixelFormat::A8B8G8R8Unorm,
+    }
 }
 
 pub type ImageDownloader =
@@ -153,6 +168,8 @@ pub struct ComputeDescriptorSyncRegs {
 /// The upstream class inherits from `ChannelInfo` and holds descriptor
 /// tables plus cached sampler/image-view mappings.
 pub struct TextureCacheChannelInfo {
+    pub channel_info: ChannelInfo,
+
     // Descriptor tables — typed against the real `TicEntry`/`TscEntry`
     // structs from `video_core::textures::texture`. Reads are performed
     // through the bound channel GPU memory when available, matching
@@ -177,13 +194,20 @@ pub struct TextureCacheChannelInfo {
     pub image_views: HashMap<crate::textures::texture::TicEntry, ImageViewId>,
     pub samplers: HashMap<crate::textures::texture::TscEntry, SamplerId>,
 
-    pub gpu_page_table: Option<Box<TextureCacheGPUMap>>,
-    pub sparse_page_table: Option<Box<TextureCacheGPUMap>>,
+    pub gpu_page_table_index: Option<usize>,
+    pub sparse_page_table_index: Option<usize>,
 }
 
 impl TextureCacheChannelInfo {
     pub fn new() -> Self {
         Self {
+            channel_info: ChannelInfo {
+                maxwell3d: 0,
+                kepler_compute: 0,
+                gpu_memory_index: 0,
+                gpu_memory: None,
+                program_id: 0,
+            },
             graphics_image_table: DescriptorTable::new(),
             graphics_sampler_table: DescriptorTable::new(),
             graphics_sampler_ids: Vec::new(),
@@ -194,9 +218,39 @@ impl TextureCacheChannelInfo {
             compute_image_view_ids: Vec::new(),
             image_views: HashMap::new(),
             samplers: HashMap::new(),
-            gpu_page_table: Some(Box::new(TextureCacheGPUMap::default())),
-            sparse_page_table: Some(Box::new(TextureCacheGPUMap::default())),
+            gpu_page_table_index: None,
+            sparse_page_table_index: None,
         }
+    }
+}
+
+impl FromChannelState for TextureCacheChannelInfo {
+    fn from_channel_state(state: &ChannelState) -> Self {
+        let mut info = Self::new();
+        info.channel_info = ChannelInfo::from_channel_state(state);
+        info
+    }
+}
+
+impl ChannelCacheAccessor for TextureCacheChannelInfo {
+    fn maxwell3d_ref(&self) -> usize {
+        self.channel_info.maxwell3d
+    }
+
+    fn kepler_compute_ref(&self) -> usize {
+        self.channel_info.kepler_compute
+    }
+
+    fn gpu_memory_ref(&self) -> usize {
+        self.channel_info.gpu_memory_index
+    }
+
+    fn gpu_memory_arc(&self) -> Option<Arc<ParkingMutex<MemoryManager>>> {
+        self.channel_info.gpu_memory.as_ref().map(Arc::clone)
+    }
+
+    fn program_id_val(&self) -> u64 {
+        self.channel_info.program_id
     }
 }
 
@@ -246,7 +300,17 @@ pub struct JoinCopy {
 pub struct PendingJoinCopies {
     pub new_image_id: ImageId,
     pub copies: Vec<JoinCopy>,
+    pub left_aliased_ids: Vec<ImageId>,
+    pub right_aliased_ids: Vec<ImageId>,
+    pub bad_overlap_ids: Vec<ImageId>,
     pub alias_indices: HashMap<ImageId, usize>,
+    pub alias_relations_applied: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingBackendDeletion {
+    pub image_id: ImageId,
+    pub image_view_ids: Vec<ImageViewId>,
 }
 
 // ── TextureCache<P> ────────────────────────────────────────────────────
@@ -327,9 +391,23 @@ pub struct TextureCacheBase {
     pub join_copies_to_do: Vec<JoinCopy>,
     pub join_alias_indices: HashMap<ImageId, usize>,
     pub pending_join_copies: Vec<PendingJoinCopies>,
+    pub pending_backend_insertions: Vec<ImageId>,
+    pub pending_backend_deletions: Vec<PendingBackendDeletion>,
+    /// Rust owner-graph bridge for upstream `TextureCache<P>::JoinImages`.
+    ///
+    /// Upstream owns `Runtime`, backend images, and page-table registration in
+    /// the same method, so `RegisterImage(new_image_id)` happens only after
+    /// `RefreshContents`, rescale, alias/copy relations, deletion, and backend
+    /// copies complete. Backends that own those runtime resources set this and
+    /// complete registration/allocation from their wrapper hook.
+    pub backend_completes_join_images: bool,
 
     // Image alloc table
     pub image_allocs_table: HashMap<GPUVAddr, ImageAllocId>,
+    /// Upstream `virtual_invalid_space`, used to allocate stable fake CPU
+    /// ranges for images whose GPU address cannot be translated.
+    pub virtual_invalid_space: u64,
+    pub virtual_invalid_ranges: HashMap<(GPUVAddr, u64), u64>,
 
     // Scratch buffers
     pub swizzle_data_buffer: Vec<u8>,
@@ -353,7 +431,16 @@ pub struct TextureCacheBase {
     pub device_memory:
         std::sync::Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
 
+    /// Upstream `gpu_page_table_storage`, two maps per registered GPU address
+    /// space: dense pages at `storage_id * 2`, sparse pages at `storage_id * 2 + 1`.
+    pub gpu_page_table_storage: Vec<TextureCacheGPUMap>,
+
     /// Per-channel descriptor state (TIC/TSC tables + cached id arrays).
+    /// Upstream: inherited `ChannelSetupCaches<TextureCacheChannelInfo>`.
+    pub channel_caches: ChannelSetupCaches<TextureCacheChannelInfo>,
+
+    /// Fallback per-channel descriptor state for reduced tests that construct
+    /// `TextureCacheBase` without creating/binding a real GPU channel first.
     /// Upstream: `TextureCache<P>` inherits from
     /// `VideoCommon::ChannelSetupCaches<TextureCacheChannelInfo>` which
     /// owns `channel_state` as a pointer to the currently-active channel.
@@ -367,6 +454,106 @@ pub struct TextureCacheBase {
 }
 
 impl TextureCacheBase {
+    pub fn create_channel(&mut self, channel: &ChannelState) {
+        {
+            let channel_caches = &mut self.channel_caches;
+            let gpu_page_table_storage = &mut self.gpu_page_table_storage;
+            channel_caches.create_channel_with_on_gpu_as_register(
+                channel,
+                |_memory_id, storage_id| {
+                    let sparse_index = storage_id * 2 + 1;
+                    if gpu_page_table_storage.len() <= sparse_index {
+                        gpu_page_table_storage
+                            .resize_with(sparse_index + 1, TextureCacheGPUMap::default);
+                    }
+                },
+            );
+        }
+        let Some(memory_manager) = channel.memory_manager.as_ref() else {
+            return;
+        };
+        let memory_id = memory_manager.lock().get_id();
+        let Some(storage_id) = self.channel_caches.get_storage_id(memory_id) else {
+            return;
+        };
+        let dense_index = storage_id * 2;
+        let sparse_index = dense_index + 1;
+        if let Some(channel_state) = self
+            .channel_caches
+            .channel_state_by_bind_id_mut(channel.bind_id)
+        {
+            channel_state.gpu_page_table_index = Some(dense_index);
+            channel_state.sparse_page_table_index = Some(sparse_index);
+        }
+    }
+
+    pub fn bind_to_channel(&mut self, channel_id: i32) {
+        self.channel_caches.bind_to_channel(channel_id);
+        self.channel_gpu_memory = self
+            .channel_caches
+            .current_channel_state()
+            .and_then(|channel| channel.channel_info.gpu_memory.as_ref().map(Arc::clone));
+        self.rebase_virtual_invalid_images();
+    }
+
+    pub fn erase_channel(&mut self, channel_id: i32) {
+        self.channel_caches.erase_channel(channel_id);
+    }
+
+    pub(crate) fn current_channel_state(&self) -> &TextureCacheChannelInfo {
+        self.channel_caches
+            .current_channel_state()
+            .unwrap_or(&self.channel_state)
+    }
+
+    pub(crate) fn current_channel_state_mut(&mut self) -> &mut TextureCacheChannelInfo {
+        if self.channel_caches.has_current_channel_state() {
+            self.channel_caches
+                .current_channel_state_mut()
+                .expect("current texture-cache channel must exist")
+        } else {
+            &mut self.channel_state
+        }
+    }
+
+    pub(crate) fn for_each_active_channel_state_mut(
+        &mut self,
+        mut f: impl FnMut(&mut TextureCacheChannelInfo),
+    ) {
+        if self.channel_caches.has_current_channel_state() {
+            self.channel_caches
+                .for_each_active_channel_state_mut(|channel| f(channel));
+        } else {
+            f(&mut self.channel_state);
+        }
+    }
+
+    pub(crate) fn current_gpu_page_table_index(&self, sparse: bool) -> Option<usize> {
+        let channel_state = self.current_channel_state();
+        if sparse {
+            channel_state.sparse_page_table_index
+        } else {
+            channel_state.gpu_page_table_index
+        }
+    }
+
+    pub(crate) fn mark_render_targets_dirty(&mut self) {
+        let maxwell3d = self.current_channel_state().channel_info.maxwell3d;
+        if maxwell3d == 0 {
+            return;
+        }
+
+        // Upstream stores `Tegra::Engines::Maxwell3D* maxwell3d` on
+        // `ChannelSetupCaches` and writes directly into `maxwell3d->dirty.flags`.
+        // The Rust channel snapshot carries the same non-owning pointer.
+        let maxwell3d = unsafe { &mut *(maxwell3d as *mut Maxwell3D) };
+        maxwell3d.set_dirty_flag(dirty_flags::flags::RENDER_TARGETS);
+        maxwell3d.set_dirty_flag(dirty_flags::flags::ZETA_BUFFER);
+        for rt in 0..8 {
+            maxwell3d.set_dirty_flag(dirty_flags::flags::COLOR_BUFFER0 + rt);
+        }
+    }
+
     /// Create a new texture cache.
     ///
     /// Port of `TextureCache<P>::TextureCache(Runtime&, MaxwellDeviceMemoryManager&)`.
@@ -386,6 +573,10 @@ impl TextureCacheBase {
         has_broken_texture_view_formats: bool,
         has_native_bgr: bool,
     ) -> Self {
+        let mut fallback_channel_state = TextureCacheChannelInfo::new();
+        fallback_channel_state.gpu_page_table_index = Some(0);
+        fallback_channel_state.sparse_page_table_index = Some(1);
+
         let mut cache = Self {
             slot_images: SlotVector::new(),
             slot_map_views: SlotVector::new(),
@@ -421,14 +612,24 @@ impl TextureCacheBase {
             join_copies_to_do: Vec::new(),
             join_alias_indices: HashMap::new(),
             pending_join_copies: Vec::new(),
+            pending_backend_insertions: Vec::new(),
+            pending_backend_deletions: Vec::new(),
+            backend_completes_join_images: false,
             image_allocs_table: HashMap::new(),
+            virtual_invalid_space: 0,
+            virtual_invalid_ranges: HashMap::new(),
             swizzle_data_buffer: vec![0u8; 8 * 1024 * 1024], // 8 MiB
             unswizzle_data_buffer: vec![0u8; 1 * 1024 * 1024], // 1 MiB
             image_downloader: None,
             guest_memory_writer: None,
             channel_gpu_memory: None,
             device_memory,
-            channel_state: TextureCacheChannelInfo::new(),
+            gpu_page_table_storage: vec![
+                TextureCacheGPUMap::default(),
+                TextureCacheGPUMap::default(),
+            ],
+            channel_caches: ChannelSetupCaches::new(),
+            channel_state: fallback_channel_state,
             mutex: ReentrantMutex::new(()),
         };
 
@@ -494,10 +695,9 @@ impl TextureCacheBase {
     ///
     /// Port of `TextureCache<P>::TickFrame`.
     ///
-    /// In the full implementation, this:
-    /// 1. Ticks the delayed destruction ring
-    /// 2. Increments the frame tick counter
-    /// 3. Rescales images if resolution settings changed
+    /// The OpenGL wrapper calls `tick_delayed_destruction_rings`,
+    /// backend framebuffer rings, async decode, and runtime tick before
+    /// this method so the frame counter advances in upstream order.
     pub fn tick_frame(&mut self) {
         self.frame_tick += 1;
         self.has_deleted_images = false;
@@ -624,11 +824,7 @@ impl TextureCacheBase {
                 .expect("non-empty image list"),
         };
 
-        let view_format = match config.pixel_format.0 {
-            4 => PixelFormat::R5G6B5Unorm,
-            5 => PixelFormat::B8G8R8A8Unorm,
-            _ => PixelFormat::A8B8G8R8Unorm,
-        };
+        let view_format = framebuffer_config_view_format(config);
         let mut info = ImageViewInfo::for_render_target(
             ImageViewType::E2D,
             view_format,
@@ -732,12 +928,10 @@ impl TextureCacheBase {
         size: usize,
         sparse: bool,
     ) -> Vec<ImageId> {
-        let table = if sparse {
-            self.channel_state.sparse_page_table.as_deref()
-        } else {
-            self.channel_state.gpu_page_table.as_deref()
+        let Some(table_index) = self.current_gpu_page_table_index(sparse) else {
+            return Vec::new();
         };
-        let Some(table) = table else {
+        let Some(table) = self.gpu_page_table_storage.get(table_index) else {
             return Vec::new();
         };
 

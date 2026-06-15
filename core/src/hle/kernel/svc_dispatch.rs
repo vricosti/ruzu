@@ -514,13 +514,21 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::MapPhysicalMemoryUnsafe) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let address = get_arg32(args, 0) as u64;
+            let size = get_arg32(args, 1) as u64;
+            let result = svc_physical_memory::map_physical_memory_unsafe(address, size);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::UnmapPhysicalMemoryUnsafe) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let address = get_arg32(args, 0) as u64;
+            let size = get_arg32(args, 1) as u64;
+            let result = svc_physical_memory::unmap_physical_memory_unsafe(address, size);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::SetUnsafeLimit) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let limit = get_arg32(args, 0) as u64;
+            let result = svc_physical_memory::set_unsafe_limit(limit);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::MapInsecureMemory) => {
             set_arg32(args, 0, STUB_SUCCESS);

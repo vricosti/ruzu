@@ -5,6 +5,12 @@
 //!
 //! Fast Approximate Anti-Aliasing (FXAA) post-processing pass for OpenGL.
 
+use super::util::create_bilinear_sampler;
+use crate::host_shaders::fragment_shaders::FXAA_FRAG;
+use crate::host_shaders::vertex_shaders::FXAA_VERT;
+use crate::renderer_opengl::gl_shader_manager::ProgramManager;
+use crate::renderer_opengl::gl_shader_util::create_program_from_source;
+
 /// FXAA anti-aliasing pass.
 ///
 /// Corresponds to `OpenGL::FXAA`.
@@ -25,18 +31,14 @@ impl FXAA {
     /// shaders from host shader sources, creates a bilinear sampler, and
     /// allocates a RGBA16F texture + framebuffer at the given dimensions.
     pub fn new(width: u32, height: u32) -> Self {
-        let mut sampler: u32 = 0;
         let mut framebuffer: u32 = 0;
         let mut texture: u32 = 0;
 
-        unsafe {
-            // Create bilinear sampler
-            gl::CreateSamplers(1, &mut sampler);
-            gl::SamplerParameteri(sampler, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
-            gl::SamplerParameteri(sampler, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
-            gl::SamplerParameteri(sampler, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
-            gl::SamplerParameteri(sampler, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+        let vert_shader = create_program_from_source(FXAA_VERT, gl::VERTEX_SHADER);
+        let frag_shader = create_program_from_source(FXAA_FRAG, gl::FRAGMENT_SHADER);
+        let sampler = create_bilinear_sampler();
 
+        unsafe {
             // Create output texture
             gl::CreateTextures(gl::TEXTURE_2D, 1, &mut texture);
             gl::TextureStorage2D(texture, 1, gl::RGBA16F, width as i32, height as i32);
@@ -46,12 +48,9 @@ impl FXAA {
             gl::NamedFramebufferTexture(framebuffer, gl::COLOR_ATTACHMENT0, texture, 0);
         }
 
-        // Shader programs require host shader sources (FXAA_VERT, FXAA_FRAG);
-        // these are compiled at build time. For now, set to 0 — the draw method
-        // guards against zero handles.
         Self {
-            vert_shader: 0,
-            frag_shader: 0,
+            vert_shader,
+            frag_shader,
             sampler,
             framebuffer,
             texture,
@@ -64,16 +63,11 @@ impl FXAA {
     ///
     /// Binds the FXAA shader pipeline, renders a full-screen triangle with the
     /// input texture, and returns the anti-aliased output texture.
-    pub fn draw(&self, input_texture: u32) -> u32 {
-        if self.vert_shader == 0 || self.frag_shader == 0 {
-            // Shaders not yet compiled; return input unchanged
-            return input_texture;
-        }
-
+    pub fn draw(&self, program_manager: &mut ProgramManager, input_texture: u32) -> u32 {
         unsafe {
             gl::FrontFace(gl::CCW);
 
-            // Bind pipeline (in full impl, uses ProgramManager::BindPresentPrograms)
+            program_manager.bind_present_programs(self.vert_shader, self.frag_shader);
             gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, self.framebuffer);
             gl::BindTextureUnit(0, input_texture);
             gl::BindSampler(0, self.sampler);

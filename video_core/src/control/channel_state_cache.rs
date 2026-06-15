@@ -169,6 +169,21 @@ impl<P> ChannelSetupCaches<P> {
     where
         P: FromChannelState,
     {
+        self.create_channel_with_on_gpu_as_register(channel, |_, _| {});
+    }
+
+    /// Create channel state and run the derived-cache address-space hook when
+    /// a new GPU address space is registered.
+    ///
+    /// Corresponds to `ChannelSetupCaches<P>::CreateChannel` calling virtual
+    /// `OnGPUASRegister(map_id)` before returning.
+    pub fn create_channel_with_on_gpu_as_register(
+        &mut self,
+        channel: &ChannelState,
+        mut on_gpu_as_register: impl FnMut(usize, usize),
+    ) where
+        P: FromChannelState,
+    {
         // Note: upstream locks config_mutex here, but &mut self already
         // guarantees exclusive access in Rust.
         assert!(
@@ -210,7 +225,7 @@ impl<P> ChannelSetupCaches<P> {
                     gpu_memory_id: mm_id,
                 },
             );
-            self.on_gpu_as_register(mm_id);
+            on_gpu_as_register(mm_id, storage_id);
         }
     }
 
@@ -296,13 +311,32 @@ impl<P> ChannelSetupCaches<P> {
         self.channel_storage.get(channel_state)
     }
 
-    /// Hook called when a new GPU address space is registered.
-    ///
-    /// Corresponds to `ChannelSetupCaches<P>::OnGPUASRegister`.
-    /// Override in derived types if needed.
-    #[allow(unused_variables)]
-    fn on_gpu_as_register(&mut self, map_id: usize) {
-        // Default: no-op, matching upstream.
+    pub fn has_current_channel_state(&self) -> bool {
+        self.channel_state.is_some()
+    }
+
+    pub fn current_channel_state_mut(&mut self) -> Option<&mut P> {
+        let channel_state = self.channel_state?;
+        self.channel_storage.get_mut(channel_state)
+    }
+
+    pub fn channel_state_by_bind_id(&self, id: i32) -> Option<&P> {
+        let &storage_id = self.channel_map.get(&id)?;
+        self.channel_storage.get(storage_id)
+    }
+
+    pub fn channel_state_by_bind_id_mut(&mut self, id: i32) -> Option<&mut P> {
+        let &storage_id = self.channel_map.get(&id)?;
+        self.channel_storage.get_mut(storage_id)
+    }
+
+    pub fn for_each_active_channel_state_mut(&mut self, mut f: impl FnMut(&mut P)) {
+        let active_channel_ids = self.active_channel_ids.clone();
+        for id in active_channel_ids {
+            if let Some(state) = self.channel_storage.get_mut(id) {
+                f(state);
+            }
+        }
     }
 }
 
@@ -427,6 +461,36 @@ mod tests {
             .and_then(ChannelCacheAccessor::gpu_memory_arc)
             .expect("bound gpu memory");
         assert_eq!(bound.lock().get_id(), 42);
+    }
+
+    #[test]
+    fn create_channel_runs_gpu_as_register_once_per_address_space() {
+        use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+
+        let shared = Arc::new(Mutex::new(MemoryManager::new(42)));
+        let separate = Arc::new(Mutex::new(MemoryManager::new(77)));
+        let mut first = ChannelState::new(3);
+        first.memory_manager = Some(Arc::clone(&shared));
+        let mut second = ChannelState::new(4);
+        second.memory_manager = Some(Arc::clone(&shared));
+        let mut third = ChannelState::new(5);
+        third.memory_manager = Some(Arc::clone(&separate));
+
+        let mut registrations = Vec::new();
+        let mut caches: ChannelSetupCaches<ChannelInfo> = ChannelSetupCaches::new();
+        caches.create_channel_with_on_gpu_as_register(&first, |memory_id, storage_id| {
+            registrations.push((memory_id, storage_id));
+        });
+        caches.create_channel_with_on_gpu_as_register(&second, |memory_id, storage_id| {
+            registrations.push((memory_id, storage_id));
+        });
+        caches.create_channel_with_on_gpu_as_register(&third, |memory_id, storage_id| {
+            registrations.push((memory_id, storage_id));
+        });
+
+        assert_eq!(registrations, vec![(42, 0), (77, 1)]);
     }
 
     #[test]

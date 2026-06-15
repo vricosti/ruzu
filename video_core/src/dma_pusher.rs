@@ -233,6 +233,24 @@ pub fn puller_trace_submits_limit() -> Option<u64> {
     })
 }
 
+fn puller_trace_submit_range() -> Option<(u64, u64)> {
+    static V: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *V.get_or_init(|| {
+        let raw = std::env::var("RUZU_TRACE_PULLER_SUBMIT_RANGE").ok()?;
+        let (start, end) = raw.split_once(':')?;
+        let start = start.parse::<u64>().ok()?;
+        let end = end.parse::<u64>().ok()?;
+        (start <= end).then_some((start, end))
+    })
+}
+
+pub fn should_trace_submit_idx(idx: u64) -> bool {
+    if let Some((start, end)) = puller_trace_submit_range() {
+        return idx >= start && idx <= end;
+    }
+    puller_trace_submits_limit().is_some_and(|limit| idx < limit)
+}
+
 pub fn current_submit_traced() -> Option<u64> {
     let v = ACTIVE_SUBMIT_IDX.load(Ordering::Relaxed);
     if v < 0 {
@@ -240,6 +258,10 @@ pub fn current_submit_traced() -> Option<u64> {
     } else {
         Some(v as u64)
     }
+}
+
+fn should_trace_puller_raw_headers() -> bool {
+    std::env::var_os("RUZU_TRACE_PULLER_RAW_HEADERS").is_some()
 }
 
 /// GPU virtual address type.
@@ -702,7 +724,9 @@ impl DmaPusher {
             );
             self.dma_pushbuffer.pop_front();
         } else {
-            let command_list_header = command_list.command_lists[self.dma_pushbuffer_subindex];
+            let command_list_index = self.dma_pushbuffer_subindex;
+            let command_list_total = command_list.command_lists.len();
+            let command_list_header = command_list.command_lists[command_list_index];
             trace_dma_pusher_step(
                 6,
                 self.dma_pushbuffer.len(),
@@ -759,6 +783,14 @@ impl DmaPusher {
                 .extend(raw.chunks_exact(4).map(|chunk| CommandHeader {
                     raw: u32::from_le_bytes(chunk.try_into().unwrap()),
                 }));
+            if should_trace_puller_raw_headers() {
+                self.trace_puller_raw_headers(
+                    command_list_index,
+                    command_list_total,
+                    command_list_header,
+                    &self.command_headers,
+                );
+            }
             let non_zero = self.command_headers.iter().filter(|h| h.raw != 0).count();
             if non_zero > 0 {
                 if should_trace_dma_flow() {
@@ -820,7 +852,9 @@ impl DmaPusher {
             self.process_commands_with_engine(&commands, engine);
             self.dma_pushbuffer.pop_front();
         } else {
-            let command_list_header = command_list.command_lists[self.dma_pushbuffer_subindex];
+            let command_list_index = self.dma_pushbuffer_subindex;
+            let command_list_total = command_list.command_lists.len();
+            let command_list_header = command_list.command_lists[command_list_index];
             self.dma_pushbuffer_subindex += 1;
             self.dma_state.dma_get = command_list_header.addr();
 
@@ -846,6 +880,14 @@ impl DmaPusher {
                 .extend(raw.chunks_exact(4).map(|chunk| CommandHeader {
                     raw: u32::from_le_bytes(chunk.try_into().unwrap()),
                 }));
+            if should_trace_puller_raw_headers() {
+                self.trace_puller_raw_headers(
+                    command_list_index,
+                    command_list_total,
+                    command_list_header,
+                    &self.command_headers,
+                );
+            }
             let commands = self.command_headers.clone();
             self.process_commands_with_engine(&commands, engine);
         }
@@ -919,6 +961,50 @@ impl DmaPusher {
             }
         }
         raw
+    }
+
+    fn trace_puller_raw_headers(
+        &self,
+        command_list_index: usize,
+        command_list_total: usize,
+        command_list_header: CommandListHeader,
+        commands: &[CommandHeader],
+    ) {
+        let Some(submit) = current_submit_traced() else {
+            return;
+        };
+        let syncpoint_hits: Vec<String> = commands
+            .iter()
+            .enumerate()
+            .filter_map(|(index, header)| {
+                (header.method() == BufferMethods::SyncpointOperation as u32).then(|| {
+                    format!(
+                        "{}:raw=0x{:08X}:mode={:?}:count={}",
+                        index,
+                        header.raw,
+                        header.mode(),
+                        header.method_count()
+                    )
+                })
+            })
+            .collect();
+        let preview: Vec<String> = commands
+            .iter()
+            .take(8)
+            .map(|header| format!("{:08X}", header.raw))
+            .collect();
+        log::info!(
+            "[PULLER_RAW] s#{} list={}/{} addr=0x{:X} size={} non_main={} words={} syncpoint_header_hits=[{}] preview={}",
+            submit,
+            command_list_index,
+            command_list_total,
+            command_list_header.addr(),
+            command_list_header.size(),
+            command_list_header.is_non_main(),
+            commands.len(),
+            syncpoint_hits.join(","),
+            preview.join(" "),
+        );
     }
 
     fn process_commands(&mut self, commands: &[CommandHeader]) {
@@ -1486,8 +1572,10 @@ mod tests {
         dma.push(CommandList::from_prefetch(vec![CommandHeader {
             raw: build_command_header(BufferMethods::Nop, 0, SubmissionMode::Increasing).raw,
         }]));
+        dma.dma_pushbuffer_subindex = 7;
         dma.dispatch_calls();
 
         assert_eq!(dma.dma_pushbuffer.len(), 1);
+        assert_eq!(dma.dma_pushbuffer_subindex, 0);
     }
 }

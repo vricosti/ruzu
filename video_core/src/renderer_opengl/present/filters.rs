@@ -13,6 +13,7 @@ use crate::host_shaders::fragment_shaders::{
     OPENGL_PRESENT_FRAG, OPENGL_PRESENT_SCALEFORCE_FRAG, PRESENT_BICUBIC_FRAG,
     PRESENT_GAUSSIAN_FRAG,
 };
+use crate::renderer_opengl::Device;
 
 // ---------------------------------------------------------------------------
 // Factory functions
@@ -21,43 +22,43 @@ use crate::host_shaders::fragment_shaders::{
 /// Create a nearest-neighbor scaling filter pass.
 ///
 /// Port of `OpenGL::MakeNearestNeighbor()`.
-pub fn make_nearest_neighbor() -> WindowAdaptPass {
+pub fn make_nearest_neighbor(device: *const Device) -> WindowAdaptPass {
     let sampler = util::create_nearest_neighbor_sampler();
-    WindowAdaptPass::new(sampler, OPENGL_PRESENT_FRAG)
+    WindowAdaptPass::new(device, sampler, OPENGL_PRESENT_FRAG)
 }
 
 /// Create a bilinear scaling filter pass.
 ///
 /// Port of `OpenGL::MakeBilinear()`.
-pub fn make_bilinear() -> WindowAdaptPass {
+pub fn make_bilinear(device: *const Device) -> WindowAdaptPass {
     let sampler = util::create_bilinear_sampler();
-    WindowAdaptPass::new(sampler, OPENGL_PRESENT_FRAG)
+    WindowAdaptPass::new(device, sampler, OPENGL_PRESENT_FRAG)
 }
 
 /// Create a bicubic scaling filter pass.
 ///
 /// Port of `OpenGL::MakeBicubic()`.
-pub fn make_bicubic() -> WindowAdaptPass {
+pub fn make_bicubic(device: *const Device) -> WindowAdaptPass {
     let sampler = util::create_bilinear_sampler();
-    WindowAdaptPass::new(sampler, PRESENT_BICUBIC_FRAG)
+    WindowAdaptPass::new(device, sampler, PRESENT_BICUBIC_FRAG)
 }
 
 /// Create a Gaussian scaling filter pass.
 ///
 /// Port of `OpenGL::MakeGaussian()`.
-pub fn make_gaussian() -> WindowAdaptPass {
+pub fn make_gaussian(device: *const Device) -> WindowAdaptPass {
     let sampler = util::create_bilinear_sampler();
-    WindowAdaptPass::new(sampler, PRESENT_GAUSSIAN_FRAG)
+    WindowAdaptPass::new(device, sampler, PRESENT_GAUSSIAN_FRAG)
 }
 
 /// Create a ScaleForce scaling filter pass.
 ///
 /// Port of `OpenGL::MakeScaleForce()`.
 /// Upstream prepends `#version 460\n` to the scaleforce shader source.
-pub fn make_scale_force() -> WindowAdaptPass {
+pub fn make_scale_force(device: *const Device) -> WindowAdaptPass {
     let sampler = util::create_bilinear_sampler();
     let source = format!("#version 460\n{}", OPENGL_PRESENT_SCALEFORCE_FRAG);
-    WindowAdaptPass::new(sampler, &source)
+    WindowAdaptPass::new(device, sampler, &source)
 }
 
 /// Scaling filter enum for dispatching.
@@ -72,12 +73,12 @@ pub enum ScalingFilter {
 }
 
 /// Create the appropriate scaling filter based on the enum variant.
-pub fn make_filter(filter: ScalingFilter) -> WindowAdaptPass {
+pub fn make_filter(filter: ScalingFilter, device: *const Device) -> WindowAdaptPass {
     match filter {
-        ScalingFilter::NearestNeighbor => make_nearest_neighbor(),
-        ScalingFilter::Bilinear | ScalingFilter::Fsr => make_bilinear(),
-        ScalingFilter::Bicubic => make_bicubic(),
-        ScalingFilter::Gaussian => make_gaussian(),
-        ScalingFilter::ScaleForce => make_scale_force(),
+        ScalingFilter::NearestNeighbor => make_nearest_neighbor(device),
+        ScalingFilter::Bilinear | ScalingFilter::Fsr => make_bilinear(device),
+        ScalingFilter::Bicubic => make_bicubic(device),
+        ScalingFilter::Gaussian => make_gaussian(device),
+        ScalingFilter::ScaleForce => make_scale_force(device),
     }
 }

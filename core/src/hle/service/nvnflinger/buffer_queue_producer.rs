@@ -73,6 +73,51 @@ fn next_bqp_seq() -> u64 {
     BQP_RING_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+fn stop_unimplemented_transact(code: u32, name: &str) -> ! {
+    #[cfg(not(test))]
+    {
+        let path = std::path::Path::new(".agents/buffer_queue_unimplemented_state.md");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            path,
+            format!(
+                "# BufferQueueProducer unimplemented transaction\n\n\
+                 - transaction: {name}\n\
+                 - code: {code}\n\
+                 - upstream: BufferQueueProducer::Transact falls through to ASSERT_MSG(false, \"Unimplemented TransactionId {{}}\", code) for this transaction\n\
+                 - rust: stopped before returning a silent Binder status\n"
+            ),
+        );
+    }
+    panic!(
+        "BufferQueueProducer::transact unimplemented transaction {} ({})",
+        name, code
+    );
+}
+
+fn stop_unimplemented_connect_listener(code: u32) -> ! {
+    #[cfg(not(test))]
+    {
+        let path = std::path::Path::new(".agents/buffer_queue_unimplemented_state.md");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            path,
+            format!(
+                "# BufferQueueProducer unimplemented Connect listener\n\n\
+                 - transaction: Connect\n\
+                 - code: {code}\n\
+                 - upstream: BufferQueueProducer::Transact calls UNIMPLEMENTED_IF_MSG(enable_listener, \"Listener is unimplemented!\")\n\
+                 - rust: stopped before accepting a Connect listener path as implemented\n"
+            ),
+        );
+    }
+    panic!("BufferQueueProducer::transact Connect listener is unimplemented");
+}
+
 pub struct BufferQueueProducer {
     service_context: Arc<Mutex<ServiceContext>>,
     core: Arc<BufferQueueCore>,
@@ -282,7 +327,7 @@ impl BufferQueueProducer {
         trace_bqp(format_args!("BQP::set_buffer_count count={}", buffer_count));
         log::info!("[BQP_SET_COUNT] buffer_count={}", buffer_count);
         let mut inner = self.core.mutex.lock().unwrap();
-        inner.wait_while_allocating_locked();
+        inner = self.core.wait_while_allocating_locked(inner);
 
         if inner.is_abandoned {
             log::error!("BufferQueueProducer: BufferQueue has been abandoned");
@@ -399,7 +444,7 @@ impl BufferQueueProducer {
         let out_fence;
         {
             let mut inner = self.core.mutex.lock().unwrap();
-            inner.wait_while_allocating_locked();
+            inner = self.core.wait_while_allocating_locked(inner);
 
             if format == PixelFormat::NoFormat {
                 format = inner.default_buffer_format;
@@ -534,6 +579,109 @@ impl BufferQueueProducer {
             ],
         );
         (return_flags, out_slot, out_fence)
+    }
+
+    pub fn detach_buffer(&self, slot: i32) -> Status {
+        let mut inner = self.core.mutex.lock().unwrap();
+
+        if inner.is_abandoned {
+            log::error!("BufferQueueProducer: BufferQueue has been abandoned");
+            return Status::NoInit;
+        }
+
+        if slot < 0 || slot as usize >= super::buffer_queue_defs::NUM_BUFFER_SLOTS {
+            log::error!(
+                "BufferQueueProducer::detach_buffer: slot {} out of range",
+                slot
+            );
+            return Status::BadValue;
+        }
+
+        let s = slot as usize;
+        if inner.slots[s].buffer_state != super::buffer_slot::BufferState::Dequeued {
+            log::error!(
+                "BufferQueueProducer::detach_buffer: slot {} is not owned by producer (state={:?})",
+                slot,
+                inner.slots[s].buffer_state
+            );
+            return Status::BadValue;
+        }
+
+        if !inner.slots[s].request_buffer_called {
+            log::error!(
+                "BufferQueueProducer::detach_buffer: buffer in slot {} has not been requested",
+                slot
+            );
+            return Status::BadValue;
+        }
+
+        inner.free_buffer_locked(slot);
+        self.core.signal_dequeue_condition();
+
+        Status::NoError
+    }
+
+    pub fn detach_next_buffer(&self) -> (Status, Option<Arc<GraphicBuffer>>, Fence) {
+        let mut inner = self.core.mutex.lock().unwrap();
+        inner = self.core.wait_while_allocating_locked(inner);
+
+        if inner.is_abandoned {
+            log::error!("BufferQueueProducer: BufferQueue has been abandoned");
+            return (Status::NoInit, None, Fence::default());
+        }
+
+        let mut found = BufferQueueCore::INVALID_BUFFER_SLOT;
+        for s in 0..super::buffer_queue_defs::NUM_BUFFER_SLOTS {
+            if inner.slots[s].buffer_state == super::buffer_slot::BufferState::Free
+                && inner.slots[s].graphic_buffer.is_some()
+                && (found == BufferQueueCore::INVALID_BUFFER_SLOT
+                    || inner.slots[s].frame_number < inner.slots[found as usize].frame_number)
+            {
+                found = s as i32;
+            }
+        }
+
+        if found == BufferQueueCore::INVALID_BUFFER_SLOT {
+            return (Status::NoMemory, None, Fence::default());
+        }
+
+        let s = found as usize;
+        let buffer = inner.slots[s].graphic_buffer.clone();
+        let fence = inner.slots[s].fence;
+        inner.free_buffer_locked(found);
+
+        (Status::NoError, buffer, fence)
+    }
+
+    pub fn attach_buffer(&self, buffer: Option<Arc<GraphicBuffer>>) -> (StatusCode, i32) {
+        let Some(buffer) = buffer else {
+            log::error!("BufferQueueProducer::attach_buffer: cannot attach null buffer");
+            return (Status::BadValue.into(), -1);
+        };
+
+        let mut inner = self.core.mutex.lock().unwrap();
+        inner = self.core.wait_while_allocating_locked(inner);
+
+        let mut return_flags = StatusCode::NO_ERROR;
+        let mut found = 0;
+        let (status, mut inner) =
+            self.wait_for_free_slot_then_relock(false, &mut found, &mut return_flags, inner);
+        if status != Status::NoError {
+            return (status.into(), -1);
+        }
+
+        if found == BufferQueueCore::INVALID_BUFFER_SLOT {
+            log::error!("BufferQueueProducer::attach_buffer: no available buffer slots");
+            return (Status::Busy.into(), -1);
+        }
+
+        let s = found as usize;
+        inner.slots[s].graphic_buffer = Some(buffer);
+        inner.slots[s].buffer_state = super::buffer_slot::BufferState::Dequeued;
+        inner.slots[s].fence = Fence::no_fence();
+        inner.slots[s].request_buffer_called = true;
+
+        (return_flags, found)
     }
 
     pub fn queue_buffer(&self, slot: i32, input: &QueueBufferInput) -> (Status, QueueBufferOutput) {
@@ -956,30 +1104,52 @@ impl BufferQueueProducer {
             "disconnect",
             [api as i32 as u64, current_bqp_tid(), 0, 0, 0, 0],
         );
+        let mut status = Status::NoError;
+        let listener;
+
         let mut inner = self.core.mutex.lock().unwrap();
+        inner = self.core.wait_while_allocating_locked(inner);
 
         if inner.is_abandoned {
-            return Status::NoInit;
+            return Status::NoError;
         }
 
-        if inner.connected_api != api {
-            log::error!(
-                "BufferQueueProducer: disconnect wrong API {:?} (connected={:?})",
-                api,
-                inner.connected_api
-            );
-            return Status::BadValue;
+        match api {
+            NativeWindowApi::Egl
+            | NativeWindowApi::Cpu
+            | NativeWindowApi::Media
+            | NativeWindowApi::Camera => {
+                if inner.connected_api == api {
+                    inner.queue.clear();
+                    inner.free_all_buffers_locked();
+                    inner.connected_producer_listener = None;
+                    inner.connected_api = NativeWindowApi::NoConnectedApi;
+                    self.core.signal_dequeue_condition();
+                    self.signal_buffer_wait_event();
+                    listener = inner.consumer_listener.clone();
+                } else {
+                    log::error!(
+                        "BufferQueueProducer: still connected to another API {:?} (requested={:?})",
+                        inner.connected_api,
+                        api
+                    );
+                    status = Status::BadValue;
+                    listener = None;
+                }
+            }
+            _ => {
+                log::error!("BufferQueueProducer: unknown API {:?}", api);
+                status = Status::BadValue;
+                listener = None;
+            }
         }
-
-        inner.connected_api = NativeWindowApi::NoConnectedApi;
-        inner.connected_producer_listener = None;
-        inner.queue.clear();
-        inner.free_all_buffers_locked();
-        self.core.signal_dequeue_condition();
-        self.signal_buffer_wait_event();
         drop(inner);
 
-        Status::NoError
+        if let Some(listener) = listener {
+            listener.on_buffers_released();
+        }
+
+        status
     }
 
     pub fn set_preallocated_buffer(
@@ -1098,7 +1268,7 @@ impl IBinder for BufferQueueProducer {
                 let producer_controlled_by_app = parcel_in.read::<u8>() != 0;
 
                 if enable_listener {
-                    log::warn!("BufferQueueProducer::transact Connect listener is unimplemented");
+                    stop_unimplemented_connect_listener(code);
                 }
 
                 let (new_status, output) = self.connect(None, api, producer_controlled_by_app);
@@ -1217,11 +1387,7 @@ impl IBinder for BufferQueueProducer {
             }
             x if x == TransactionId::DetachBuffer as u32 => {
                 let slot = parcel_in.read::<i32>();
-                status = Status::BadValue;
-                log::warn!(
-                    "BufferQueueProducer::transact DetachBuffer(slot={}) unimplemented",
-                    slot
-                );
+                status = self.detach_buffer(slot);
             }
             x if x == TransactionId::SetBufferCount as u32 => {
                 let buffer_count = parcel_in.read::<i32>();
@@ -1231,20 +1397,16 @@ impl IBinder for BufferQueueProducer {
                 log::warn!("BufferQueueProducer::transact GetBufferHistory (STUBBED)");
             }
             x if x == TransactionId::DetachNextBuffer as u32 => {
-                status = Status::BadValue;
-                log::warn!("BufferQueueProducer::transact DetachNextBuffer unimplemented");
+                stop_unimplemented_transact(code, "DetachNextBuffer");
             }
             x if x == TransactionId::AttachBuffer as u32 => {
-                status = Status::BadValue;
-                log::warn!("BufferQueueProducer::transact AttachBuffer unimplemented");
+                stop_unimplemented_transact(code, "AttachBuffer");
             }
             x if x == TransactionId::AllocateBuffers as u32 => {
-                status = Status::BadValue;
-                log::warn!("BufferQueueProducer::transact AllocateBuffers unimplemented");
+                stop_unimplemented_transact(code, "AllocateBuffers");
             }
             _ => {
-                status = Status::BadValue;
-                log::error!("BufferQueueProducer::transact unknown code={}", code);
+                stop_unimplemented_transact(code, "Unknown");
             }
         }
 
@@ -1516,6 +1678,16 @@ mod tests {
     }
 
     #[test]
+    fn disconnect_after_abandon_is_noop_success() {
+        let core = BufferQueueCore::new();
+        install_test_consumer(&core);
+        core.mutex.lock().unwrap().is_abandoned = true;
+        let producer = BufferQueueProducer::new(test_service_context(), core, test_nvmap());
+
+        assert_eq!(producer.disconnect(NativeWindowApi::Egl), Status::NoError);
+    }
+
+    #[test]
     fn set_preallocated_buffer_signals_wait_event_and_updates_defaults() {
         let core = BufferQueueCore::new();
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
@@ -1606,6 +1778,89 @@ mod tests {
 
         let (status, _) = producer.queue_buffer(slot, &QueueBufferInput::default());
         assert_eq!(status, Status::BadValue);
+    }
+
+    #[test]
+    fn detach_buffer_requires_request_buffer_and_frees_requested_slot() {
+        let core = BufferQueueCore::new();
+        install_test_consumer(&core);
+        let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
+        let buffer = Arc::new(NvGraphicBuffer::new(16, 16, PixelFormat::Rgba8888, 0));
+        assert_eq!(
+            producer.set_preallocated_buffer(0, Some(buffer)),
+            Status::NoError
+        );
+
+        let (status, slot, _fence) =
+            producer.dequeue_buffer(false, 16, 16, PixelFormat::Rgba8888, 0);
+        assert_eq!(status, Status::NoError.into());
+        assert_eq!(producer.detach_buffer(slot), Status::BadValue);
+
+        let (status, _buffer) = producer.request_buffer(slot);
+        assert_eq!(status, Status::NoError);
+        assert_eq!(producer.detach_buffer(slot), Status::NoError);
+
+        let inner = core.mutex.lock().unwrap();
+        assert_eq!(
+            inner.slots[slot as usize].buffer_state,
+            super::super::buffer_slot::BufferState::Free
+        );
+        assert!(inner.slots[slot as usize].graphic_buffer.is_none());
+    }
+
+    #[test]
+    fn detach_next_buffer_returns_oldest_free_graphic_buffer() {
+        let core = BufferQueueCore::new();
+        let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
+        {
+            let mut inner = core.mutex.lock().unwrap();
+            inner.slots[0].graphic_buffer = Some(Arc::new(GraphicBuffer::new(
+                16,
+                16,
+                PixelFormat::Rgba8888,
+                0,
+            )));
+            inner.slots[0].frame_number = 10;
+            inner.slots[1].graphic_buffer = Some(Arc::new(GraphicBuffer::new(
+                32,
+                32,
+                PixelFormat::Rgba8888,
+                0,
+            )));
+            inner.slots[1].frame_number = 5;
+        }
+
+        let (status, buffer, _fence) = producer.detach_next_buffer();
+        assert_eq!(status, Status::NoError);
+        assert_eq!(buffer.unwrap().get_width(), 32);
+        assert!(core.mutex.lock().unwrap().slots[1].graphic_buffer.is_none());
+    }
+
+    #[test]
+    fn attach_buffer_places_buffer_in_dequeued_requested_slot() {
+        let core = BufferQueueCore::new();
+        let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
+        core.mutex.lock().unwrap().override_max_buffer_count = 1;
+
+        let (status, slot) = producer.attach_buffer(Some(Arc::new(GraphicBuffer::new(
+            64,
+            32,
+            PixelFormat::Rgba8888,
+            0,
+        ))));
+        assert_eq!(status, StatusCode::NO_ERROR);
+        assert_eq!(slot, 0);
+
+        let inner = core.mutex.lock().unwrap();
+        assert_eq!(
+            inner.slots[0].buffer_state,
+            super::super::buffer_slot::BufferState::Dequeued
+        );
+        assert!(inner.slots[0].request_buffer_called);
+        assert_eq!(
+            inner.slots[0].graphic_buffer.as_ref().unwrap().get_width(),
+            64
+        );
     }
 
     #[test]
@@ -1725,5 +1980,55 @@ mod tests {
             super::super::buffer_slot::BufferState::Dequeued
         );
         assert!(!inner.slots[0].request_buffer_called);
+    }
+
+    #[test]
+    fn unimplemented_transact_panics_instead_of_returning_silent_status() {
+        let core = BufferQueueCore::new();
+        let producer = BufferQueueProducer::new(test_service_context(), core, test_nvmap());
+        let mut parcel = Vec::new();
+        parcel.extend_from_slice(&8u32.to_ne_bytes());
+        parcel.extend_from_slice(&16u32.to_ne_bytes());
+        parcel.extend_from_slice(&0u32.to_ne_bytes());
+        parcel.extend_from_slice(&24u32.to_ne_bytes());
+        parcel.extend_from_slice(&0u32.to_ne_bytes());
+        parcel.extend_from_slice(&0u32.to_ne_bytes());
+        parcel.extend_from_slice(&0u16.to_ne_bytes());
+        parcel.extend_from_slice(&0u16.to_ne_bytes());
+        let mut reply = [0u8; 64];
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            IBinder::transact(&producer, 6, &parcel, &mut reply, 0);
+        }));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn connect_listener_transact_panics_like_upstream_unimplemented_if() {
+        let core = BufferQueueCore::new();
+        install_test_consumer(&core);
+        let producer = BufferQueueProducer::new(test_service_context(), core, test_nvmap());
+        let mut parcel = Vec::new();
+        parcel.extend_from_slice(&20u32.to_ne_bytes());
+        parcel.extend_from_slice(&16u32.to_ne_bytes());
+        parcel.extend_from_slice(&0u32.to_ne_bytes());
+        parcel.extend_from_slice(&36u32.to_ne_bytes());
+        parcel.extend_from_slice(&0u32.to_ne_bytes());
+        parcel.extend_from_slice(&0u32.to_ne_bytes());
+        parcel.extend_from_slice(&0u16.to_ne_bytes());
+        parcel.extend_from_slice(&0u16.to_ne_bytes());
+        parcel.extend_from_slice(&1u8.to_ne_bytes());
+        parcel.extend_from_slice(&[0u8; 3]);
+        parcel.extend_from_slice(&(NativeWindowApi::Egl as i32).to_ne_bytes());
+        parcel.extend_from_slice(&0u8.to_ne_bytes());
+        parcel.extend_from_slice(&[0u8; 3]);
+        let mut reply = [0u8; 64];
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            IBinder::transact(&producer, 10, &parcel, &mut reply, 0);
+        }));
+
+        assert!(result.is_err());
     }
 }

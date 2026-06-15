@@ -11,7 +11,6 @@ use super::utility::add_counter;
 use crate::crypto::aes_util::{AesCipher, Mode, Op};
 use crate::file_sys::vfs::vfs::VfsFile;
 use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
-use parking_lot::Mutex;
 
 /// AES block size in bytes.
 ///
@@ -35,8 +34,6 @@ pub struct AesCtrStorage {
     base_storage: VirtualFile,
     key: [u8; KEY_SIZE],
     iv: [u8; IV_SIZE],
-    /// AES cipher context; interior-mutable because cipher state changes during read.
-    cipher: Mutex<AesCipher>,
 }
 
 impl AesCtrStorage {
@@ -52,13 +49,10 @@ impl AesCtrStorage {
         k.copy_from_slice(key);
         i.copy_from_slice(iv);
 
-        let cipher = AesCipher::new_128(k, Mode::CTR);
-
         Self {
             base_storage: base,
             key: k,
             iv: i,
-            cipher: Mutex::new(cipher),
         }
     }
 
@@ -88,8 +82,7 @@ impl AesCtrStorage {
 
     /// Read and decrypt data from the storage.
     ///
-    /// In upstream, this reads data in block-aligned chunks and decrypts
-    /// using AES-CTR. Currently reads without decryption.
+    /// In upstream, this reads block-aligned data and decrypts using AES-CTR.
     ///
     /// Corresponds to upstream `AesCtrStorage::Read`.
     pub fn read_at(&self, buffer: &mut [u8], offset: usize) -> usize {
@@ -118,7 +111,7 @@ impl AesCtrStorage {
         add_counter(&mut ctr, (offset / BLOCK_SIZE) as u64);
 
         // Decrypt using AES-CTR.
-        let mut cipher = self.cipher.lock();
+        let mut cipher = AesCipher::new_128(self.key, Mode::CTR);
         cipher.set_iv(&ctr);
         let src = buffer[..read_len].to_vec();
         cipher.transcode(&src, &mut buffer[..read_len], Op::Decrypt);
@@ -129,7 +122,6 @@ impl AesCtrStorage {
     /// Write encrypted data to the storage.
     ///
     /// In upstream, this encrypts data using AES-CTR before writing.
-    /// Currently writes without encryption.
     ///
     /// Corresponds to upstream `AesCtrStorage::Write`.
     pub fn write_at(&self, buffer: &[u8], offset: usize) -> usize {
@@ -156,11 +148,9 @@ impl AesCtrStorage {
 
         // Encrypt data before writing, matching upstream AesCtrStorage::Write.
         let mut encrypted = vec![0u8; size];
-        {
-            let mut cipher = self.cipher.lock();
-            cipher.set_iv(&ctr);
-            cipher.transcode(&buffer[..size], &mut encrypted, Op::Encrypt);
-        }
+        let mut cipher = AesCipher::new_128(self.key, Mode::CTR);
+        cipher.set_iv(&ctr);
+        cipher.transcode(&buffer[..size], &mut encrypted, Op::Encrypt);
         self.base_storage.write(&encrypted, size, offset)
     }
 }
@@ -233,6 +223,8 @@ impl VfsFile for AesCtrStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+    use std::sync::Arc;
 
     #[test]
     fn test_make_iv() {
@@ -256,5 +248,22 @@ mod tests {
         assert_eq!(BLOCK_SIZE, 16);
         assert_eq!(KEY_SIZE, 16);
         assert_eq!(IV_SIZE, 16);
+    }
+
+    #[test]
+    fn aes_ctr_write_then_read_round_trips_block_aligned_data() {
+        let base: VirtualFile = Arc::new(VectorVfsFile::new(vec![0; 0x40], "base".into(), None));
+        let key = [0x31; KEY_SIZE];
+        let iv = [0x42; IV_SIZE];
+        let storage = AesCtrStorage::new(base.clone(), &key, &iv);
+        let plain: Vec<u8> = (0..0x40).map(|i| (i * 3) as u8).collect();
+
+        assert_eq!(storage.write_at(&plain, 0), plain.len());
+        let encrypted = base.read_bytes(plain.len(), 0);
+        assert_ne!(encrypted, plain);
+
+        let mut out = vec![0; plain.len()];
+        assert_eq!(storage.read_at(&mut out, 0), plain.len());
+        assert_eq!(out, plain);
     }
 }

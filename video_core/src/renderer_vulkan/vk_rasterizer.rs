@@ -348,7 +348,7 @@ impl RasterizerVulkan {
     pub fn signal_fence(&mut self, func: Box<dyn FnOnce() + Send>) {
         let this = self as *mut Self;
         let this_for_pop = this as usize;
-        let should_flush_now = self.fence_manager.signal_fence(
+        self.fence_manager.signal_fence(
             func,
             move |is_stubbed| unsafe { (*this).fence_backend.create_fence(is_stubbed) },
             move |fence| unsafe {
@@ -363,11 +363,9 @@ impl RasterizerVulkan {
             move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
             move || unsafe { (*this).num_queued_commands != 0 || (*this).should_flush_async() },
             move || unsafe { (*this).commit_async_flushes() },
+            move || unsafe { (*this).flush_commands() },
+            move || unsafe { (*this).invalidate_gpu_cache() },
         );
-        if should_flush_now {
-            self.flush_commands();
-        }
-        self.invalidate_gpu_cache();
     }
 
     /// Port of `RasterizerVulkan::SyncOperation`.

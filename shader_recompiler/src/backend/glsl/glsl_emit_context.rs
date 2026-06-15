@@ -211,6 +211,10 @@ impl<'a> EmitContext<'a> {
     fn setup_extensions(&mut self, program: &ir::Program) {
         self.header
             .push_str("#extension GL_ARB_separate_shader_objects : enable\n");
+        if program.info.uses_shadow_lod && self.profile.support_gl_texture_shadow_lod {
+            self.header
+                .push_str("#extension GL_EXT_texture_shadow_lod : enable\n");
+        }
         if program.info.uses_int64 && self.profile.support_int64 {
             self.header
                 .push_str("#extension GL_ARB_gpu_shader_int64 : enable\n");
@@ -934,5 +938,21 @@ mod tests {
             .header
             .contains("void WriteGlobal32(uint64_t addr,uint data){"));
         assert!(ctx.header.contains("uint64_t ssbo_addr0=packUint2x32"));
+    }
+
+    #[test]
+    fn shadow_lod_extension_header_matches_upstream_guard() {
+        let mut program = ir::Program::new(Stage::Fragment);
+        program.info.uses_shadow_lod = true;
+        let mut bindings = Bindings::default();
+        let mut profile = Profile::default();
+        profile.support_gl_texture_shadow_lod = true;
+        let runtime_info = RuntimeInfo::default();
+
+        let ctx = EmitContext::new(&program, &mut bindings, &profile, &runtime_info);
+
+        assert!(ctx
+            .header
+            .contains("#extension GL_EXT_texture_shadow_lod : enable"));
     }
 }

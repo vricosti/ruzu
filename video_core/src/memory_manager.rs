@@ -550,7 +550,7 @@ impl GpuMemoryManager {
     /// Search pages in the range for the first mapped address.
     pub fn gpu_to_cpu_address_range(&self, addr: u64, size: u64) -> Option<u64> {
         let mut page_index = addr >> self.page_bits;
-        let page_last = (addr + size + self.page_size - 1) >> self.page_bits;
+        let page_last = addr.wrapping_add(size).wrapping_add(self.page_size - 1) >> self.page_bits;
         while page_index < page_last {
             if let Some(page_addr) = self.gpu_to_cpu_address(page_index << self.page_bits) {
                 return Some(page_addr);
@@ -2710,5 +2710,24 @@ mod tests {
         assert_eq!(ranges.len(), 2);
         assert_eq!(ranges[0], (0x10000, 0x20000));
         assert_eq!(ranges[1], (0x40000, 0x10000));
+    }
+
+    #[test]
+    fn get_submapped_range_falls_back_to_small_pages_like_upstream() {
+        let mut mm = GpuMemoryManager::new();
+        mm.map_ex(0x1000, 0x8000_0000, 0x1000, PteKind::INVALID, false);
+        mm.map_ex(0x2000, 0x8000_1000, 0x1000, PteKind::INVALID, false);
+        mm.map_ex(0x3000, 0x9000_0000, 0x1000, PteKind::INVALID, false);
+
+        let ranges = mm.get_submapped_range(0x1000, 0x4000);
+
+        assert_eq!(ranges, vec![(0x1000, 0x2000), (0x3000, 0x1000)]);
+    }
+
+    #[test]
+    fn gpu_to_cpu_address_range_uses_wrapping_page_last_like_upstream() {
+        let mm = GpuMemoryManager::new();
+
+        assert_eq!(mm.gpu_to_cpu_address_range(u64::MAX - 0x800, 0x2000), None);
     }
 }

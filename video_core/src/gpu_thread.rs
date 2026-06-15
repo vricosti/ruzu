@@ -15,6 +15,7 @@ use crate::control::scheduler::Scheduler;
 use crate::dma_pusher::CommandList;
 use crate::rasterizer_interface::RasterizerHandle;
 use common::bounded_threadsafe_queue::BoundedMPSCQueue;
+use common::settings;
 use common::thread::{set_current_thread_name, set_current_thread_priority, ThreadPriority};
 use ruzu_core::core::SystemRef;
 use ruzu_core::frontend::graphics_context::{GraphicsContextHandle, ScopedGraphicsContext};
@@ -257,6 +258,12 @@ pub struct ThreadManager {
     thread: Option<JoinHandle<()>>,
     /// Matches upstream `VideoCore::RasterizerInterface* rasterizer`.
     rasterizer: Option<RasterizerHandle>,
+    /// Raw pointer to owning GPU, installed by `start_thread`.
+    ///
+    /// Upstream reaches this through `system.GPU()` in `FlushRegion`.
+    /// Rust stores the pointer already supplied to `StartThread` so the
+    /// `ThreadManager` can call the same owner-local sync-operation methods.
+    gpu: Option<usize>,
 }
 
 // Safety: ThreadManager is accessed under Gpu's Mutex lock.
@@ -274,6 +281,7 @@ impl ThreadManager {
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
             rasterizer: None,
+            gpu: None,
         }
     }
 
@@ -305,6 +313,7 @@ impl ThreadManager {
         //   rasterizer = renderer.ReadRasterizer();
         let rasterizer_ptr = unsafe { &*renderer_ptr }.read_rasterizer();
         self.rasterizer = Some(RasterizerHandle::from_ref(unsafe { &*rasterizer_ptr }));
+        self.gpu = Some(gpu_ptr as usize);
 
         let state = self.state.clone();
         let stop = self.stop.clone();
@@ -360,6 +369,17 @@ impl ThreadManager {
         // In async mode with extreme GPU accuracy, upstream does:
         //   gpu.RequestFlush(addr, size) → TickGPU() → WaitForSyncOperation()
         // In non-extreme async mode, upstream skips flush entirely.
+        if !settings::is_gpu_level_extreme(&settings::values()) {
+            return;
+        }
+        let Some(gpu) = self.gpu else {
+            log::warn!("ThreadManager::flush_region: GPU pointer not installed");
+            return;
+        };
+        let gpu = unsafe { &*(gpu as *const crate::gpu::Gpu) };
+        let fence = gpu.request_flush(addr, size as usize);
+        self.tick_gpu();
+        gpu.wait_for_sync_operation(fence);
     }
 
     /// Notify rasterizer that a region should be invalidated.

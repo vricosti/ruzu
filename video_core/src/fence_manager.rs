@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Condvar, Mutex,
 };
 use std::thread::{self, JoinHandle};
@@ -15,6 +15,8 @@ use common::settings;
 use crate::delayed_destruction_ring::DelayedDestructionRing;
 
 type Operation = Box<dyn FnOnce() + Send + 'static>;
+static FENCE_TRACE_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Base trait for fence objects.
 pub trait FenceBase {
     /// Returns true if this fence is stubbed (no actual GPU wait needed).
@@ -25,6 +27,7 @@ pub trait FenceBase {
 }
 
 struct PendingFence<F: FenceBase + Send + 'static> {
+    trace_id: u64,
     fence: F,
     pre_operations: VecDeque<Operation>,
     operations: VecDeque<Operation>,
@@ -117,7 +120,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
     }
 
     /// Port of `FenceManager::SignalReference()`.
-    pub fn signal_reference<FC, FQ, FSW, FIS, FPF, FSHF, FCAF>(
+    pub fn signal_reference<FC, FQ, FSW, FIS, FPF, FSHF, FCAF, FFL, FINV>(
         &mut self,
         create_fence: FC,
         queue_fence: FQ,
@@ -126,6 +129,8 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         pop_async_flushes: FPF,
         should_flush: FSHF,
         commit_async_flushes: FCAF,
+        flush_commands: FFL,
+        invalidate_gpu_cache: FINV,
     ) -> bool
     where
         FC: FnMut(bool) -> F,
@@ -135,7 +140,11 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         FPF: FnMut() + Send + 'static,
         FSHF: FnMut() -> bool,
         FCAF: FnMut(),
+        FFL: FnMut(),
+        FINV: FnMut(),
     {
+        let trace_id = next_fence_trace_id();
+        trace_fence_flow(trace_id, "signal_reference");
         self.signal_fence(
             Box::new(|| {}),
             create_fence,
@@ -145,6 +154,8 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
             pop_async_flushes,
             should_flush,
             commit_async_flushes,
+            flush_commands,
+            invalidate_gpu_cache,
         )
     }
 
@@ -155,7 +166,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
     }
 
     /// Port of `FenceManager::SignalFence()`.
-    pub fn signal_fence<FC, FQ, FSW, FIS, FPF, FSHF, FCAF>(
+    pub fn signal_fence<FC, FQ, FSW, FIS, FPF, FSHF, FCAF, FFL, FINV>(
         &mut self,
         func: Operation,
         mut create_fence: FC,
@@ -165,6 +176,8 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         mut pop_async_flushes: FPF,
         mut should_flush: FSHF,
         mut commit_async_flushes: FCAF,
+        mut flush_commands: FFL,
+        mut invalidate_gpu_cache: FINV,
     ) -> bool
     where
         FC: FnMut(bool) -> F,
@@ -174,7 +187,11 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         FPF: FnMut() + Send + 'static,
         FSHF: FnMut() -> bool,
         FCAF: FnMut(),
+        FFL: FnMut(),
+        FINV: FnMut(),
     {
+        let trace_id = next_fence_trace_id();
+        trace_fence_flow(trace_id, "signal_fence begin");
         let delay_fence = settings::is_gpu_level_high(&settings::values());
 
         if !self.has_async_check {
@@ -191,11 +208,21 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         }
 
         let should_flush_now = should_flush();
+        trace_fence_flow(
+            trace_id,
+            if should_flush_now {
+                "signal_fence should_flush=true"
+            } else {
+                "signal_fence should_flush=false"
+            },
+        );
         commit_async_flushes();
+        trace_fence_flow(trace_id, "signal_fence commit_async_flushes end");
 
         let mut new_fence = create_fence(!should_flush_now);
+        trace_fence_flow(trace_id, "signal_fence create_fence end");
         let mut maybe_func = Some(func);
-        let mut operations = {
+        let operations = {
             let mut state = self.shared.state.lock().unwrap();
             if delay_fence {
                 state.uncommitted_operations.push_back(
@@ -207,35 +234,46 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
             std::mem::take(&mut state.uncommitted_operations)
         };
 
-        queue_fence(&mut new_fence);
-        if !delay_fence {
-            maybe_func
-                .take()
-                .expect("fence callback must be consumed once")();
-        }
         let mut pre_operations = VecDeque::new();
         if self.has_async_check {
             pre_operations.push_back(Box::new(move || pop_async_flushes()) as Operation);
         }
 
-        let pending_fence = PendingFence {
-            fence: new_fence,
-            pre_operations,
-            operations: std::mem::take(&mut operations),
-        };
         {
             let mut state = self.shared.state.lock().unwrap();
-            state.fences.push_back(pending_fence);
+            trace_fence_flow(trace_id, "signal_fence queue_fence begin");
+            queue_fence(&mut new_fence);
+            trace_fence_flow(trace_id, "signal_fence queue_fence end");
+            if !delay_fence {
+                maybe_func
+                    .take()
+                    .expect("fence callback must be consumed once")();
+                trace_fence_flow(trace_id, "signal_fence callback end");
+            }
+            state.fences.push_back(PendingFence {
+                trace_id,
+                fence: new_fence,
+                pre_operations,
+                operations,
+            });
+            if should_flush_now {
+                trace_fence_flow(trace_id, "signal_fence flush_commands begin");
+                flush_commands();
+                trace_fence_flow(trace_id, "signal_fence flush_commands end");
+            }
         }
         if self.has_async_check {
             self.shared.cv.notify_all();
         }
+        trace_fence_flow(trace_id, "signal_fence invalidate_gpu_cache begin");
+        invalidate_gpu_cache();
+        trace_fence_flow(trace_id, "signal_fence invalidate_gpu_cache end");
 
         should_flush_now
     }
 
     /// Port of `FenceManager::SignalSyncPoint()`.
-    pub fn signal_sync_point<FG, FH, FC, FQ, FSW, FIS, FPF, FSHF, FCAF>(
+    pub fn signal_sync_point<FG, FH, FC, FQ, FSW, FIS, FPF, FSHF, FCAF, FFL, FINV>(
         &mut self,
         value: u32,
         mut increment_guest: FG,
@@ -247,6 +285,8 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         pop_async_flushes: FPF,
         should_flush: FSHF,
         commit_async_flushes: FCAF,
+        flush_commands: FFL,
+        invalidate_gpu_cache: FINV,
     ) -> bool
     where
         FG: FnMut(u32),
@@ -258,8 +298,13 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         FPF: FnMut() + Send + 'static,
         FSHF: FnMut() -> bool,
         FCAF: FnMut(),
+        FFL: FnMut(),
+        FINV: FnMut(),
     {
+        let trace_id = next_fence_trace_id();
+        trace_fence_flow(trace_id, "signal_sync_point begin");
         increment_guest(value);
+        trace_fence_flow(trace_id, "signal_sync_point increment_guest end");
         self.signal_fence(
             Box::new(move || increment_host(value)),
             create_fence,
@@ -269,22 +314,36 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
             pop_async_flushes,
             should_flush,
             commit_async_flushes,
+            flush_commands,
+            invalidate_gpu_cache,
         )
     }
 
     /// Port of `FenceManager::WaitPendingFences()`.
-    pub fn wait_pending_fences<FS, FW, FSW, FPF>(
+    pub fn wait_pending_fences<FC, FQ, FS, FW, FSW, FPF, FSHF, FCAF, FFL, FINV>(
         &mut self,
         force: bool,
+        create_fence: FC,
+        queue_fence: FQ,
         mut should_wait_async_flushes: FSW,
         mut is_fence_signaled: FS,
         mut wait_fence: FW,
         mut pop_async_flushes: FPF,
+        should_flush: FSHF,
+        commit_async_flushes: FCAF,
+        flush_commands: FFL,
+        invalidate_gpu_cache: FINV,
     ) where
+        FC: FnMut(bool) -> F,
+        FQ: FnMut(&mut F),
         FS: FnMut(&F) -> bool,
         FW: FnMut(&F),
         FSW: FnMut() -> bool,
-        FPF: FnMut(),
+        FPF: FnMut() + Send + 'static,
+        FSHF: FnMut() -> bool,
+        FCAF: FnMut(),
+        FFL: FnMut(),
+        FINV: FnMut(),
     {
         if !self.has_async_check {
             self.try_release_pending_fences(force, |pending_fence, force_wait| {
@@ -305,22 +364,27 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         }
 
         let wait_pair = Arc::new((Mutex::new(false), Condvar::new()));
-        let _ = (
-            &mut should_wait_async_flushes,
-            &mut is_fence_signaled,
-            &mut wait_fence,
-            &mut pop_async_flushes,
-        );
-        loop {
-            if self.shared.state.lock().unwrap().fences.is_empty() {
-                let (lock, cv) = &*wait_pair;
+        let wait_pair_for_callback = Arc::clone(&wait_pair);
+        let trace_id = next_fence_trace_id();
+        trace_fence_flow(trace_id, "wait_pending_fences force drain begin");
+        self.signal_fence(
+            Box::new(move || {
+                let (lock, cv) = &*wait_pair_for_callback;
                 let mut finished = lock.lock().unwrap();
                 *finished = true;
                 cv.notify_all();
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+            }),
+            create_fence,
+            queue_fence,
+            should_wait_async_flushes,
+            is_fence_signaled,
+            pop_async_flushes,
+            should_flush,
+            commit_async_flushes,
+            flush_commands,
+            invalidate_gpu_cache,
+        );
+
         let (lock, cv) = &*wait_pair;
         let mut finished = lock.lock().unwrap();
         while !*finished {
@@ -375,15 +439,27 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
                     .pop_front()
                     .expect("pending fence must exist while releasing")
             };
+            trace_fence_flow(pending_fence.trace_id, "release_pending popped");
             for operation in pending_fence.pre_operations {
                 operation();
             }
             for operation in pending_fence.operations {
                 operation();
             }
+            trace_fence_flow(pending_fence.trace_id, "release_pending operations end");
             let mut ring = self.shared.ring_guard.lock().unwrap();
             ring.push(pending_fence.fence);
         }
+    }
+}
+
+fn next_fence_trace_id() -> u64 {
+    FENCE_TRACE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn trace_fence_flow(trace_id: u64, stage: &str) {
+    if std::env::var_os("RUZU_TRACE_GL_FENCE_FLOW").is_some() {
+        log::info!("[GL_FENCE_FLOW] id={} {}", trace_id, stage);
     }
 }
 
@@ -429,6 +505,7 @@ fn release_thread_func<F: FenceBase + Send + 'static>(shared: Arc<FenceManagerSh
             .pop_front()
             .expect("fence queue must contain the signaled fence");
         drop(state);
+        trace_fence_flow(pending_fence.trace_id, "release_thread popped");
 
         if !pending_fence.fence.is_stubbed() {
             pending_fence.fence.wait_for_fence();
@@ -439,6 +516,7 @@ fn release_thread_func<F: FenceBase + Send + 'static>(shared: Arc<FenceManagerSh
         for operation in pending_fence.operations {
             operation();
         }
+        trace_fence_flow(pending_fence.trace_id, "release_thread operations end");
         let mut ring = shared.ring_guard.lock().unwrap();
         ring.push(pending_fence.fence);
     }
@@ -485,6 +563,7 @@ mod tests {
         {
             let mut state = manager.shared.state.lock().unwrap();
             state.fences.push_back(PendingFence {
+                trace_id: 0,
                 fence: TestFence { stubbed: false },
                 pre_operations: VecDeque::new(),
                 operations: VecDeque::from([Box::new({
@@ -527,6 +606,8 @@ mod tests {
         let mut manager = FenceManager::<TestFence>::new(false);
         let committed = Arc::new(AtomicBool::new(false));
         let callback_hit = Arc::new(AtomicBool::new(false));
+        let flushed = Arc::new(AtomicBool::new(false));
+        let invalidated = Arc::new(AtomicBool::new(false));
 
         manager.signal_fence(
             Box::new({
@@ -545,10 +626,20 @@ mod tests {
                 let committed = Arc::clone(&committed);
                 move || committed.store(true, Ordering::Relaxed)
             },
+            {
+                let flushed = Arc::clone(&flushed);
+                move || flushed.store(true, Ordering::Relaxed)
+            },
+            {
+                let invalidated = Arc::clone(&invalidated);
+                move || invalidated.store(true, Ordering::Relaxed)
+            },
         );
 
         assert!(committed.load(Ordering::Relaxed));
         assert!(callback_hit.load(Ordering::Relaxed));
+        assert!(flushed.load(Ordering::Relaxed));
+        assert!(invalidated.load(Ordering::Relaxed));
         assert_eq!(manager.queued_fence_count(), 1);
 
         settings::values_mut().current_gpu_accuracy = previous_gpu_accuracy;
@@ -586,6 +677,8 @@ mod tests {
             || {},
             || false,
             || {},
+            || {},
+            || {},
         );
 
         assert_eq!(guest.load(Ordering::Relaxed), 7);
@@ -602,16 +695,31 @@ mod tests {
         {
             let mut state = manager.shared.state.lock().unwrap();
             state.fences.push_back(PendingFence {
+                trace_id: 0,
                 fence: TestFence { stubbed: true },
                 pre_operations: VecDeque::new(),
                 operations: VecDeque::new(),
             });
         }
 
-        manager.wait_pending_fences(false, || false, |_| true, |_| {}, {
-            let popped = Arc::clone(&popped);
-            move || popped.store(true, Ordering::Relaxed)
-        });
+        manager.wait_pending_fences(
+            false,
+            |is_stubbed| TestFence {
+                stubbed: is_stubbed,
+            },
+            |_| {},
+            || false,
+            |_| true,
+            |_| {},
+            {
+                let popped = Arc::clone(&popped);
+                move || popped.store(true, Ordering::Relaxed)
+            },
+            || false,
+            || {},
+            || {},
+            || {},
+        );
 
         assert!(popped.load(Ordering::Relaxed));
         assert_eq!(manager.queued_fence_count(), 0);
@@ -647,10 +755,59 @@ mod tests {
             },
             || false,
             || {},
+            || {},
+            || {},
         );
 
         wait_until(&popped);
         wait_until(&callback_hit);
+        settings::values_mut().current_gpu_accuracy = previous_gpu_accuracy;
+    }
+
+    #[test]
+    fn async_wait_pending_fences_force_signals_drain_fence_and_waits_for_callback() {
+        let previous_gpu_accuracy = {
+            let mut values = settings::values_mut();
+            let previous = values.current_gpu_accuracy;
+            values.current_gpu_accuracy = GpuAccuracy::High;
+            previous
+        };
+
+        let mut manager = FenceManager::<TestFence>::new(true);
+        let created = Arc::new(AtomicU32::new(0));
+        let queued = Arc::new(AtomicU32::new(0));
+
+        manager.wait_pending_fences(
+            true,
+            {
+                let created = Arc::clone(&created);
+                move |is_stubbed| {
+                    created.fetch_add(1, Ordering::Relaxed);
+                    TestFence {
+                        stubbed: is_stubbed,
+                    }
+                }
+            },
+            {
+                let queued = Arc::clone(&queued);
+                move |_| {
+                    queued.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+            || false,
+            |_| true,
+            |_| {},
+            || {},
+            || false,
+            || {},
+            || {},
+            || {},
+        );
+
+        assert_eq!(created.load(Ordering::Relaxed), 1);
+        assert_eq!(queued.load(Ordering::Relaxed), 1);
+        assert_eq!(manager.queued_fence_count(), 0);
+
         settings::values_mut().current_gpu_accuracy = previous_gpu_accuracy;
     }
 }

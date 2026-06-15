@@ -5,6 +5,7 @@
 
 use super::aes_ctr_counter_extended_storage::AesCtrCounterExtendedStorage;
 use super::aes_ctr_storage::AesCtrStorage;
+use super::alignment_matching_storage::AlignmentMatchingStorage;
 use super::compressed_storage::CompressedStorage;
 use super::compression_common::GetDecompressorFunction;
 use super::indirect_storage::IndirectStorage;
@@ -409,9 +410,13 @@ impl NcaFileSystemDriver {
                 fs_size
             );
 
-            // Wrap the body storage in an AES-CTR decryption layer.
+            // Wrap the body storage in AES-CTR, then in alignment matching storage.
             let ctr_storage: VirtualFile = Arc::new(AesCtrStorage::new(body_storage, key, &iv));
-            ctr_storage
+            Arc::new(AlignmentMatchingStorage::new(
+                ctr_storage,
+                NcaHeader::CTR_BLOCK_SIZE,
+                1,
+            ))
         } else if encryption_type == NcaFsEncryptionType::None as u8 {
             // No encryption; use body storage as-is.
             body_storage

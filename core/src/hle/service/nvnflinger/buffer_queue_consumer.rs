@@ -26,6 +26,36 @@ pub struct BufferQueueConsumer {
     core: Arc<BufferQueueCore>,
 }
 
+fn stop_unimplemented_transact(code: u32, flags: u32, name: &str) -> ! {
+    #[cfg(not(test))]
+    {
+        let path = std::path::Path::new(".agents/buffer_queue_consumer_unimplemented_state.md");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let entry = format!(
+            "\n## BufferQueueConsumer unsupported transaction\n\
+             - code: {}\n\
+             - name: {}\n\
+             - flags: {}\n\
+             - upstream: core/hle/service/nvnflinger/buffer_queue_consumer.cpp asserts for unsupported Transact paths; AcquireBuffer reaches UNREACHABLE because BufferItem flattening is not implemented\n",
+            code, name, flags
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| {
+                use std::io::Write;
+                file.write_all(entry.as_bytes())
+            });
+    }
+    panic!(
+        "BufferQueueConsumer::transact unimplemented transaction {} ({}) flags={}",
+        code, name, flags
+    );
+}
+
 impl BufferQueueConsumer {
     pub fn new(core: Arc<BufferQueueCore>) -> Self {
         Self { core }
@@ -283,7 +313,7 @@ impl BufferQueueConsumer {
 }
 
 impl IBinder for BufferQueueConsumer {
-    fn transact(&self, code: u32, parcel_data: &[u8], parcel_reply: &mut [u8], _flags: u32) {
+    fn transact(&self, code: u32, parcel_data: &[u8], parcel_reply: &mut [u8], flags: u32) {
         #[repr(u32)]
         enum TransactionId {
             AcquireBuffer = 1,
@@ -315,9 +345,8 @@ impl IBinder for BufferQueueConsumer {
                 let mut item = BufferItem::default();
                 let present_when = parcel_in.read::<i64>();
                 status = self.acquire_buffer(&mut item, present_when);
-                log::warn!(
-                    "BufferQueueConsumer::transact AcquireBuffer flattening is unimplemented"
-                );
+                let _ = status;
+                stop_unimplemented_transact(code, flags, "AcquireBuffer");
             }
             x if x == TransactionId::ReleaseBuffer as u32 => {
                 let slot = parcel_in.read::<i32>();
@@ -346,12 +375,12 @@ impl IBinder for BufferQueueConsumer {
                 || x == TransactionId::Unknown18 as u32
                 || x == TransactionId::Unknown20 as u32 =>
             {
-                status = Status::BadValue;
-                log::warn!("BufferQueueConsumer::transact unimplemented code={}", code);
+                let _ = status;
+                stop_unimplemented_transact(code, flags, "Unsupported");
             }
             _ => {
-                status = Status::BadValue;
-                log::error!("BufferQueueConsumer::transact unknown code={}", code);
+                let _ = status;
+                stop_unimplemented_transact(code, flags, "Unknown");
             }
         }
 
@@ -370,5 +399,62 @@ impl IBinder for BufferQueueConsumer {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn consumer() -> BufferQueueConsumer {
+        BufferQueueConsumer::new(BufferQueueCore::new())
+    }
+
+    fn parcel(payload: &[u8]) -> Vec<u8> {
+        let data_offset = 16u32;
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.resize(12, 0);
+        data.extend_from_slice(payload);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data_offset.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(data_offset + data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        out
+    }
+
+    #[test]
+    #[should_panic(expected = "BufferQueueConsumer::transact unimplemented transaction 1")]
+    fn acquire_buffer_transact_stops_after_unimplemented_flattening_like_upstream() {
+        let consumer = consumer();
+        let present_when = parcel(&0i64.to_le_bytes());
+        let mut reply = [0u8; 64];
+
+        consumer.transact(1, &present_when, &mut reply, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "BufferQueueConsumer::transact unimplemented transaction 5")]
+    fn unsupported_consumer_transact_stops_like_upstream_assert() {
+        let consumer = consumer();
+        let input = parcel(&[]);
+        let mut reply = [0u8; 64];
+
+        consumer.transact(5, &input, &mut reply, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "BufferQueueConsumer::transact unimplemented transaction 99")]
+    fn unknown_consumer_transact_stops_like_upstream_assert() {
+        let consumer = consumer();
+        let input = parcel(&[]);
+        let mut reply = [0u8; 64];
+
+        consumer.transact(99, &input, &mut reply, 0);
     }
 }
