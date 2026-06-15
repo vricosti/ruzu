@@ -432,7 +432,7 @@ extern "C" fn ruzu_sigill_handler(
 fn main() {
     // Initialise logging backend (upstream: Common::Log::Initialize /
     // SetColorConsoleBackendEnabled / Start).
-    env_logger::init();
+    common::logging::backend::initialize_from_env(None);
 
     // `RUZU_PROFILE_IPC=1` / `RUZU_PROFILE_SVC=1` — install a single SIGUSR2
     // handler that dumps whichever profile is enabled. atexit hooks fire on
