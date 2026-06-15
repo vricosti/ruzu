@@ -24479,3 +24479,29 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo fmt -- video_core/src/renderer_opengl/gl_rasterizer.rs video_core/src/renderer_opengl/gl_fence_manager.rs`
 - `cargo test -p video_core signal_reference -- --nocapture`
 - `cargo check -p video_core`
+
+## 2026-06-15 — common/src/logging/backend.rs + ruzu_cmd/src/main.rs vs common/logging/backend.cpp + yuzu_cmd/yuzu.cpp
+
+### Intentional differences
+- Rust adds `initialize_from_env()` and a `log::Log` facade bridge so existing `log::info!` / `log::warn!` call sites enqueue through the yuzu-style asynchronous logging backend instead of `env_logger` writing synchronously from runtime threads. Upstream has native `LOG_*` macros wired directly to `Common::Log::Impl::PushEntry`; this bridge is the Rust equivalent needed while many ported call sites use the Rust `log` facade.
+- Rust accepts `RUZU_LOG_FILTER` in upstream class-filter syntax and a simple `RUST_LOG=<level>` compatibility form. Upstream reads `Settings::values.log_filter`; ruzu-cmd settings plumbing is not complete enough to source that value yet.
+- Rust defaults the facade filter to `*:Warning` when neither `RUZU_LOG_FILTER` nor `RUST_LOG` is set. This avoids reintroducing broad `Info` logging overhead during MK8D runtime tests while preserving opt-in `Info`/`Debug` behavior.
+- Rust enables the console backend by default to match `yuzu_cmd/yuzu.cpp` and adds `RUZU_LOG_COLOR=0` as a local escape hatch for silent/redirected test runs.
+- Rust leaves `common::trace` as the separate fixed-record ring trace path for high-frequency diagnostics. This mirrors the current Rust investigation infrastructure and is intentionally not used for arbitrary text logs.
+
+### Unintentional differences (to fix)
+- The Rust backend still uses `std::sync::mpsc` and a short global mutex around filtering/enqueue metadata, while upstream uses `Common::BoundedThreadsafeQueue::EmplaceWait`. This removes synchronous stderr/file writes from producer threads but is not a perfect structural port of the queue implementation.
+
+### Missing items
+- Full settings-backed log filter loading from the ported settings system.
+- Exact upstream `Start()` / `Stop()` lifecycle split for frontend startup/shutdown.
+- Windows debugger and Android logcat backends remain absent from the Rust backend.
+
+### Binary layout verification
+- PASS: no raw binary payload layout is involved in this logging/frontend initialization change.
+
+### Verification
+- Re-read upstream `common/logging/backend.h` and `common/logging/backend.cpp`.
+- Re-read upstream `yuzu_cmd/yuzu.cpp` logging initialization.
+- `cargo test -p common logging::backend::tests -- --nocapture`
+- `cargo check -p ruzu_cmd`
