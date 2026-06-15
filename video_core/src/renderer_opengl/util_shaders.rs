@@ -5,6 +5,20 @@
 //!
 //! Utility compute shaders for texture swizzling, ASTC decoding, format conversion, and MSAA.
 
+use crate::host_shaders::compute_shaders::{
+    ASTC_DECODER_COMP, BLOCK_LINEAR_UNSWIZZLE_2D_COMP, BLOCK_LINEAR_UNSWIZZLE_3D_COMP,
+    CONVERT_MSAA_TO_NON_MSAA_COMP, CONVERT_NON_MSAA_TO_MSAA_COMP, OPENGL_CONVERT_S8D24_COMP,
+    OPENGL_COPY_BC4_COMP, PITCH_UNSWIZZLE_COMP,
+};
+use crate::renderer_opengl::gl_shader_manager::ProgramManagerHandle;
+use crate::renderer_opengl::gl_shader_util::create_program_from_source;
+use crate::surface::{bytes_per_block, default_block_height, default_block_width};
+use crate::texture_cache::accelerated_swizzle::{
+    make_block_linear_swizzle_2d_params, make_block_linear_swizzle_3d_params,
+};
+use crate::texture_cache::image_info::{ImageInfo, TilingMode};
+use crate::texture_cache::types::{ImageCopy, SwizzleParameters};
+
 /// Swizzle table dimensions (64x8 = 512 bytes).
 const SWIZZLE_TABLE_SIZE: usize = 512;
 
@@ -12,6 +26,7 @@ const SWIZZLE_TABLE_SIZE: usize = 512;
 ///
 /// Corresponds to `OpenGL::UtilShaders`.
 pub struct UtilShaders {
+    program_manager: ProgramManagerHandle,
     swizzle_table_buffer: u32,
     astc_decoder_program: u32,
     block_linear_unswizzle_2d_program: u32,
@@ -29,7 +44,7 @@ impl UtilShaders {
     /// Port of `UtilShaders::UtilShaders()`.
     /// In the full implementation, this compiles compute shaders from host shader
     /// sources and creates the swizzle table buffer.
-    pub fn new() -> Self {
+    pub fn new(program_manager: ProgramManagerHandle) -> Self {
         let mut swizzle_table_buffer: u32 = 0;
 
         // Create and fill the swizzle table buffer
@@ -46,15 +61,34 @@ impl UtilShaders {
         }
 
         Self {
+            program_manager,
             swizzle_table_buffer,
-            astc_decoder_program: 0,
-            block_linear_unswizzle_2d_program: 0,
-            block_linear_unswizzle_3d_program: 0,
-            pitch_unswizzle_program: 0,
-            copy_bc4_program: 0,
-            convert_s8d24_program: 0,
-            convert_ms_to_nonms_program: 0,
-            convert_nonms_to_ms_program: 0,
+            astc_decoder_program: create_program_from_source(ASTC_DECODER_COMP, gl::COMPUTE_SHADER),
+            block_linear_unswizzle_2d_program: create_program_from_source(
+                BLOCK_LINEAR_UNSWIZZLE_2D_COMP,
+                gl::COMPUTE_SHADER,
+            ),
+            block_linear_unswizzle_3d_program: create_program_from_source(
+                BLOCK_LINEAR_UNSWIZZLE_3D_COMP,
+                gl::COMPUTE_SHADER,
+            ),
+            pitch_unswizzle_program: create_program_from_source(
+                PITCH_UNSWIZZLE_COMP,
+                gl::COMPUTE_SHADER,
+            ),
+            copy_bc4_program: create_program_from_source(OPENGL_COPY_BC4_COMP, gl::COMPUTE_SHADER),
+            convert_s8d24_program: create_program_from_source(
+                OPENGL_CONVERT_S8D24_COMP,
+                gl::COMPUTE_SHADER,
+            ),
+            convert_ms_to_nonms_program: create_program_from_source(
+                CONVERT_MSAA_TO_NON_MSAA_COMP,
+                gl::COMPUTE_SHADER,
+            ),
+            convert_nonms_to_ms_program: create_program_from_source(
+                CONVERT_NON_MSAA_TO_MSAA_COMP,
+                gl::COMPUTE_SHADER,
+            ),
         }
     }
 
@@ -72,269 +106,389 @@ impl UtilShaders {
         table
     }
 
-    /// Decode ASTC textures using compute shader.
-    ///
     /// Port of `UtilShaders::ASTCDecode`.
-    /// Dispatches the ASTC decoder compute shader to decompress ASTC-encoded
-    /// texture data stored in a buffer into an uncompressed image.
     pub fn astc_decode(
-        &self,
+        &mut self,
         dst_image: u32,
         src_buffer: u32,
-        block_width: u32,
-        block_height: u32,
-        layer_stride: u32,
-        width: u32,
-        height: u32,
-        depth: u32,
-        layer: u32,
-        level: u32,
+        buffer_offset: usize,
+        guest_size_bytes: usize,
+        info: &ImageInfo,
+        swizzles: &[SwizzleParameters],
     ) {
         if self.astc_decoder_program == 0 {
             log::warn!("ASTC decoder program not compiled");
             return;
         }
+        let tile_width = default_block_width(info.format);
+        let tile_height = default_block_height(info.format);
+        let mut program_manager = self.program_manager.lock();
+        program_manager.local_memory_warmup();
+        program_manager.bind_compute_program(self.astc_decoder_program);
         unsafe {
-            gl::UseProgram(self.astc_decoder_program);
-
-            // Bind output image
-            gl::BindImageTexture(
-                0,
-                dst_image,
-                level as i32,
-                gl::TRUE,
-                layer as i32,
-                gl::WRITE_ONLY,
-                gl::RGBA8,
+            gl::FlushMappedNamedBufferRange(
+                src_buffer,
+                buffer_offset as isize,
+                guest_size_bytes as isize,
             );
-
-            // Bind source buffer
-            gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, src_buffer);
-
-            // Set uniforms
-            gl::Uniform1ui(0, block_width);
-            gl::Uniform1ui(1, block_height);
-            gl::Uniform1ui(2, layer_stride);
-            gl::Uniform1ui(3, width);
-            gl::Uniform1ui(4, height);
-            gl::Uniform1ui(5, depth);
-            gl::Uniform1ui(6, layer);
-
-            // Dispatch
-            let groups_x = (width + block_width - 1) / block_width;
-            let groups_y = (height + block_height - 1) / block_height;
-            gl::DispatchCompute(groups_x, groups_y, depth);
-
-            gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
+            gl::Uniform2ui(1, tile_width, tile_height);
+            for swizzle in swizzles {
+                let input_offset = buffer_offset + swizzle.buffer_offset;
+                let range_size = guest_size_bytes.saturating_sub(swizzle.buffer_offset);
+                let params = make_block_linear_swizzle_2d_params(swizzle, info);
+                if params.origin != [0, 0, 0] || params.destination != [0, 0, 0] {
+                    log::warn!(
+                        "UtilShaders::astc_decode: unsupported swizzle origin/destination {:?}/{:?}",
+                        params.origin,
+                        params.destination
+                    );
+                    continue;
+                }
+                if params.bytes_per_block_log2 != 4 {
+                    log::warn!(
+                        "UtilShaders::astc_decode: unexpected bytes_per_block_log2={}",
+                        params.bytes_per_block_log2
+                    );
+                    continue;
+                }
+                gl::Uniform1ui(2, params.layer_stride);
+                gl::Uniform1ui(3, params.block_size);
+                gl::Uniform1ui(4, params.x_shift);
+                gl::Uniform1ui(5, params.block_height);
+                gl::Uniform1ui(6, params.block_height_mask);
+                gl::BindBufferRange(
+                    gl::SHADER_STORAGE_BUFFER,
+                    0,
+                    src_buffer,
+                    input_offset as isize,
+                    range_size as isize,
+                );
+                gl::BindImageTexture(
+                    0,
+                    dst_image,
+                    swizzle.level,
+                    gl::TRUE,
+                    0,
+                    gl::WRITE_ONLY,
+                    gl::RGBA8,
+                );
+                gl::DispatchCompute(
+                    swizzle.num_tiles.width.div_ceil(8),
+                    swizzle.num_tiles.height.div_ceil(8),
+                    info.resources.layers as u32,
+                );
+            }
+            gl::MemoryBarrier(
+                gl::UNIFORM_BARRIER_BIT
+                    | gl::COMMAND_BARRIER_BIT
+                    | gl::PIXEL_BUFFER_BARRIER_BIT
+                    | gl::TEXTURE_UPDATE_BARRIER_BIT
+                    | gl::BUFFER_UPDATE_BARRIER_BIT
+                    | gl::SHADER_STORAGE_BARRIER_BIT
+                    | gl::CLIENT_MAPPED_BUFFER_BARRIER_BIT,
+            );
         }
+        program_manager.restore_guest_compute();
     }
 
-    /// Upload a 2D block-linear image using compute shader.
-    ///
     /// Port of `UtilShaders::BlockLinearUpload2D`.
     pub fn block_linear_upload_2d(
-        &self,
+        &mut self,
         dst_image: u32,
         src_buffer: u32,
-        width: u32,
-        height: u32,
-        depth: u32,
-        level: u32,
-        block_height: u32,
-        bytes_per_block: u32,
+        buffer_offset: usize,
+        guest_size_bytes: usize,
+        info: &ImageInfo,
+        swizzles: &[SwizzleParameters],
     ) {
         if self.block_linear_unswizzle_2d_program == 0 {
             log::warn!("Block linear unswizzle 2D program not compiled");
             return;
         }
-        let store_fmt = store_format(bytes_per_block);
+        let store_fmt = store_format(bytes_per_block(info.format));
+        let mut program_manager = self.program_manager.lock();
+        program_manager.bind_compute_program(self.block_linear_unswizzle_2d_program);
         unsafe {
-            gl::UseProgram(self.block_linear_unswizzle_2d_program);
-            gl::BindImageTexture(
-                0,
-                dst_image,
-                level as i32,
-                gl::TRUE,
-                0,
-                gl::WRITE_ONLY,
-                store_fmt,
+            gl::FlushMappedNamedBufferRange(
+                src_buffer,
+                buffer_offset as isize,
+                guest_size_bytes as isize,
             );
-            gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, src_buffer);
-            gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 1, self.swizzle_table_buffer);
-
-            gl::Uniform1ui(0, width);
-            gl::Uniform1ui(1, height);
-            gl::Uniform1ui(2, depth);
-            gl::Uniform1ui(3, block_height);
-            gl::Uniform1ui(4, bytes_per_block);
-
-            gl::DispatchCompute((width + 15) / 16, (height + 15) / 16, depth);
-            gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
+            gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, self.swizzle_table_buffer);
+            for swizzle in swizzles {
+                let input_offset = buffer_offset + swizzle.buffer_offset;
+                let range_size = guest_size_bytes.saturating_sub(swizzle.buffer_offset);
+                let params = make_block_linear_swizzle_2d_params(swizzle, info);
+                gl::Uniform3uiv(0, 1, params.origin.as_ptr());
+                gl::Uniform3iv(1, 1, params.destination.as_ptr());
+                gl::Uniform1ui(2, params.bytes_per_block_log2);
+                gl::Uniform1ui(3, params.layer_stride);
+                gl::Uniform1ui(4, params.block_size);
+                gl::Uniform1ui(5, params.x_shift);
+                gl::Uniform1ui(6, params.block_height);
+                gl::Uniform1ui(7, params.block_height_mask);
+                gl::BindBufferRange(
+                    gl::SHADER_STORAGE_BUFFER,
+                    1,
+                    src_buffer,
+                    input_offset as isize,
+                    range_size as isize,
+                );
+                gl::BindImageTexture(
+                    0,
+                    dst_image,
+                    swizzle.level,
+                    gl::TRUE,
+                    0,
+                    gl::WRITE_ONLY,
+                    store_fmt,
+                );
+                gl::DispatchCompute(
+                    swizzle.num_tiles.width.div_ceil(32),
+                    swizzle.num_tiles.height.div_ceil(32),
+                    info.resources.layers as u32,
+                );
+            }
         }
+        program_manager.restore_guest_compute();
     }
 
-    /// Upload a 3D block-linear image using compute shader.
-    ///
     /// Port of `UtilShaders::BlockLinearUpload3D`.
     pub fn block_linear_upload_3d(
-        &self,
+        &mut self,
         dst_image: u32,
         src_buffer: u32,
-        width: u32,
-        height: u32,
-        depth: u32,
-        level: u32,
-        block_height: u32,
-        block_depth: u32,
-        bytes_per_block: u32,
+        buffer_offset: usize,
+        guest_size_bytes: usize,
+        info: &ImageInfo,
+        swizzles: &[SwizzleParameters],
     ) {
         if self.block_linear_unswizzle_3d_program == 0 {
             log::warn!("Block linear unswizzle 3D program not compiled");
             return;
         }
-        let store_fmt = store_format(bytes_per_block);
+        let store_fmt = store_format(bytes_per_block(info.format));
+        let mut program_manager = self.program_manager.lock();
+        program_manager.bind_compute_program(self.block_linear_unswizzle_3d_program);
         unsafe {
-            gl::UseProgram(self.block_linear_unswizzle_3d_program);
-            gl::BindImageTexture(
-                0,
-                dst_image,
-                level as i32,
-                gl::TRUE,
-                0,
-                gl::WRITE_ONLY,
-                store_fmt,
+            gl::FlushMappedNamedBufferRange(
+                src_buffer,
+                buffer_offset as isize,
+                guest_size_bytes as isize,
             );
-            gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, src_buffer);
-            gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 1, self.swizzle_table_buffer);
-
-            gl::Uniform1ui(0, width);
-            gl::Uniform1ui(1, height);
-            gl::Uniform1ui(2, depth);
-            gl::Uniform1ui(3, block_height);
-            gl::Uniform1ui(4, block_depth);
-            gl::Uniform1ui(5, bytes_per_block);
-
-            gl::DispatchCompute((width + 15) / 16, (height + 15) / 16, (depth + 3) / 4);
-            gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
+            gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, self.swizzle_table_buffer);
+            for swizzle in swizzles {
+                let input_offset = buffer_offset + swizzle.buffer_offset;
+                let range_size = guest_size_bytes.saturating_sub(swizzle.buffer_offset);
+                let params = make_block_linear_swizzle_3d_params(swizzle, info);
+                gl::Uniform3uiv(0, 1, params.origin.as_ptr());
+                gl::Uniform3iv(1, 1, params.destination.as_ptr());
+                gl::Uniform1ui(2, params.bytes_per_block_log2);
+                gl::Uniform1ui(3, params.slice_size);
+                gl::Uniform1ui(4, params.block_size);
+                gl::Uniform1ui(5, params.x_shift);
+                gl::Uniform1ui(6, params.block_height);
+                gl::Uniform1ui(7, params.block_height_mask);
+                gl::Uniform1ui(8, params.block_depth);
+                gl::Uniform1ui(9, params.block_depth_mask);
+                gl::BindBufferRange(
+                    gl::SHADER_STORAGE_BUFFER,
+                    1,
+                    src_buffer,
+                    input_offset as isize,
+                    range_size as isize,
+                );
+                gl::BindImageTexture(
+                    0,
+                    dst_image,
+                    swizzle.level,
+                    gl::TRUE,
+                    0,
+                    gl::WRITE_ONLY,
+                    store_fmt,
+                );
+                gl::DispatchCompute(
+                    swizzle.num_tiles.width.div_ceil(16),
+                    swizzle.num_tiles.height.div_ceil(8),
+                    swizzle.num_tiles.depth.div_ceil(8),
+                );
+            }
         }
+        program_manager.restore_guest_compute();
     }
 
-    /// Upload a pitch-linear image using compute shader.
-    ///
     /// Port of `UtilShaders::PitchUpload`.
     pub fn pitch_upload(
-        &self,
+        &mut self,
         dst_image: u32,
         src_buffer: u32,
-        width: u32,
-        height: u32,
-        depth: u32,
-        level: u32,
-        bytes_per_block: u32,
-        origin_x: u32,
-        origin_y: u32,
+        buffer_offset: usize,
+        guest_size_bytes: usize,
+        info: &ImageInfo,
+        swizzles: &[SwizzleParameters],
     ) {
         if self.pitch_unswizzle_program == 0 {
             log::warn!("Pitch unswizzle program not compiled");
             return;
         }
+        let bytes_per_block = bytes_per_block(info.format);
         let store_fmt = store_format(bytes_per_block);
+        let pitch = match info.tiling {
+            TilingMode::PitchLinear(pitch) => pitch,
+            TilingMode::BlockLinear(_) => {
+                log::warn!("UtilShaders::pitch_upload called for block-linear image");
+                return;
+            }
+        };
+        let mut program_manager = self.program_manager.lock();
+        program_manager.bind_compute_program(self.pitch_unswizzle_program);
         unsafe {
-            gl::UseProgram(self.pitch_unswizzle_program);
-            gl::BindImageTexture(
-                0,
-                dst_image,
-                level as i32,
-                gl::TRUE,
-                0,
-                gl::WRITE_ONLY,
-                store_fmt,
+            gl::FlushMappedNamedBufferRange(
+                src_buffer,
+                buffer_offset as isize,
+                guest_size_bytes as isize,
             );
-            gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, src_buffer);
-
-            gl::Uniform1ui(0, width);
-            gl::Uniform1ui(1, height);
-            gl::Uniform1ui(2, depth);
-            gl::Uniform1ui(3, bytes_per_block);
-            gl::Uniform1ui(4, origin_x);
-            gl::Uniform1ui(5, origin_y);
-
-            gl::DispatchCompute((width + 15) / 16, (height + 15) / 16, depth);
-            gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
+            gl::Uniform2ui(0, 0, 0);
+            gl::Uniform2i(1, 0, 0);
+            gl::Uniform1ui(2, bytes_per_block);
+            gl::Uniform1ui(3, pitch);
+            gl::BindImageTexture(0, dst_image, 0, gl::FALSE, 0, gl::WRITE_ONLY, store_fmt);
+            for swizzle in swizzles {
+                let input_offset = buffer_offset + swizzle.buffer_offset;
+                let range_size = guest_size_bytes.saturating_sub(swizzle.buffer_offset);
+                gl::BindBufferRange(
+                    gl::SHADER_STORAGE_BUFFER,
+                    0,
+                    src_buffer,
+                    input_offset as isize,
+                    range_size as isize,
+                );
+                gl::DispatchCompute(
+                    swizzle.num_tiles.width.div_ceil(32),
+                    swizzle.num_tiles.height.div_ceil(32),
+                    1,
+                );
+            }
         }
+        program_manager.restore_guest_compute();
     }
 
-    /// Copy BC4 texture data.
-    ///
     /// Port of `UtilShaders::CopyBC4`.
-    pub fn copy_bc4(
-        &self,
-        dst_image: u32,
-        src_buffer: u32,
-        width: u32,
-        height: u32,
-        depth: u32,
-        level: u32,
-    ) {
+    pub fn copy_bc4(&mut self, dst_image: u32, src_image: u32, copies: &[ImageCopy]) {
         if self.copy_bc4_program == 0 {
             log::warn!("Copy BC4 program not compiled");
             return;
         }
+        let mut program_manager = self.program_manager.lock();
+        program_manager.bind_compute_program(self.copy_bc4_program);
         unsafe {
-            gl::UseProgram(self.copy_bc4_program);
-            gl::BindImageTexture(
-                0,
-                dst_image,
-                level as i32,
-                gl::TRUE,
-                0,
-                gl::WRITE_ONLY,
-                gl::RGBA8,
-            );
-            gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, src_buffer);
+            for copy in copies {
+                if copy.src_subresource.base_layer != 0
+                    || copy.src_subresource.num_layers != 1
+                    || copy.dst_subresource.base_layer != 0
+                    || copy.dst_subresource.num_layers != 1
+                {
+                    log::warn!(
+                        "UtilShaders::copy_bc4: unsupported layer copy src_base={} src_layers={} dst_base={} dst_layers={}",
+                        copy.src_subresource.base_layer,
+                        copy.src_subresource.num_layers,
+                        copy.dst_subresource.base_layer,
+                        copy.dst_subresource.num_layers
+                    );
+                    continue;
+                }
 
-            gl::Uniform1ui(0, width);
-            gl::Uniform1ui(1, height);
-            gl::Uniform1ui(2, depth);
-
-            let block_w = (width + 3) / 4;
-            let block_h = (height + 3) / 4;
-            gl::DispatchCompute(block_w, block_h, depth);
+                gl::Uniform3ui(
+                    0,
+                    copy.src_offset.x as u32,
+                    copy.src_offset.y as u32,
+                    copy.src_offset.z as u32,
+                );
+                gl::Uniform3ui(
+                    1,
+                    copy.dst_offset.x as u32,
+                    copy.dst_offset.y as u32,
+                    copy.dst_offset.z as u32,
+                );
+                gl::BindImageTexture(
+                    0,
+                    src_image,
+                    copy.src_subresource.base_level as i32,
+                    gl::TRUE,
+                    0,
+                    gl::READ_ONLY,
+                    gl::RG32UI,
+                );
+                gl::BindImageTexture(
+                    1,
+                    dst_image,
+                    copy.dst_subresource.base_level as i32,
+                    gl::TRUE,
+                    0,
+                    gl::WRITE_ONLY,
+                    gl::RGBA8UI,
+                );
+                gl::DispatchCompute(copy.extent.width, copy.extent.height, copy.extent.depth);
+            }
             gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
+        program_manager.restore_guest_compute();
     }
 
-    /// Convert S8D24 depth-stencil format.
-    ///
     /// Port of `UtilShaders::ConvertS8D24`.
-    pub fn convert_s8d24(&self, dst_image: u32, src_buffer: u32, width: u32, height: u32) {
+    pub fn convert_s8d24(&mut self, dst_image: u32, copies: &[ImageCopy]) {
         if self.convert_s8d24_program == 0 {
             log::warn!("Convert S8D24 program not compiled");
             return;
         }
+        let mut program_manager = self.program_manager.lock();
+        program_manager.bind_compute_program(self.convert_s8d24_program);
         unsafe {
-            gl::UseProgram(self.convert_s8d24_program);
-            gl::BindImageTexture(0, dst_image, 0, gl::FALSE, 0, gl::WRITE_ONLY, gl::R32UI);
-            gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, src_buffer);
+            for copy in copies {
+                if copy.src_subresource.base_layer != 0
+                    || copy.src_subresource.num_layers != 1
+                    || copy.dst_subresource.base_layer != 0
+                    || copy.dst_subresource.num_layers != 1
+                {
+                    log::warn!(
+                        "UtilShaders::convert_s8d24: unsupported layer copy src_base={} src_layers={} dst_base={} dst_layers={}",
+                        copy.src_subresource.base_layer,
+                        copy.src_subresource.num_layers,
+                        copy.dst_subresource.base_layer,
+                        copy.dst_subresource.num_layers
+                    );
+                    continue;
+                }
 
-            gl::Uniform1ui(0, width);
-            gl::Uniform1ui(1, height);
-
-            gl::DispatchCompute((width + 15) / 16, (height + 15) / 16, 1);
+                gl::Uniform3ui(0, copy.extent.width, copy.extent.height, copy.extent.depth);
+                gl::BindImageTexture(
+                    0,
+                    dst_image,
+                    copy.dst_subresource.base_level as i32,
+                    gl::TRUE,
+                    0,
+                    gl::READ_WRITE,
+                    gl::RGBA8UI,
+                );
+                gl::DispatchCompute(
+                    copy.extent.width.div_ceil(16),
+                    copy.extent.height.div_ceil(8),
+                    copy.extent.depth,
+                );
+            }
             gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
+        program_manager.restore_guest_compute();
     }
 
     /// Copy between MSAA and non-MSAA textures.
     ///
     /// Port of `UtilShaders::CopyMSAA`.
     pub fn copy_msaa(
-        &self,
+        &mut self,
         dst_image: u32,
         src_image: u32,
-        width: u32,
-        height: u32,
-        samples: u32,
+        copies: &[ImageCopy],
         ms_to_nonms: bool,
     ) {
         let program = if ms_to_nonms {
@@ -346,18 +500,51 @@ impl UtilShaders {
             log::warn!("MSAA copy program not compiled");
             return;
         }
+        let mut program_manager = self.program_manager.lock();
+        program_manager.bind_compute_program(program);
         unsafe {
-            gl::UseProgram(program);
-            gl::BindImageTexture(0, dst_image, 0, gl::TRUE, 0, gl::WRITE_ONLY, gl::RGBA8);
-            gl::BindImageTexture(1, src_image, 0, gl::TRUE, 0, gl::READ_ONLY, gl::RGBA8);
+            for copy in copies {
+                if copy.src_subresource.base_layer != 0
+                    || copy.src_subresource.num_layers != 1
+                    || copy.dst_subresource.base_layer != 0
+                    || copy.dst_subresource.num_layers != 1
+                {
+                    log::warn!(
+                        "UtilShaders::copy_msaa: unsupported layer copy src_base={} src_layers={} dst_base={} dst_layers={}",
+                        copy.src_subresource.base_layer,
+                        copy.src_subresource.num_layers,
+                        copy.dst_subresource.base_layer,
+                        copy.dst_subresource.num_layers
+                    );
+                    continue;
+                }
 
-            gl::Uniform1ui(0, width);
-            gl::Uniform1ui(1, height);
-            gl::Uniform1ui(2, samples);
+                gl::BindImageTexture(
+                    0,
+                    src_image,
+                    copy.src_subresource.base_level as i32,
+                    gl::TRUE,
+                    0,
+                    gl::READ_ONLY,
+                    gl::RGBA8,
+                );
+                gl::BindImageTexture(
+                    1,
+                    dst_image,
+                    copy.dst_subresource.base_level as i32,
+                    gl::TRUE,
+                    0,
+                    gl::WRITE_ONLY,
+                    gl::RGBA8,
+                );
 
-            gl::DispatchCompute((width + 15) / 16, (height + 15) / 16, 1);
+                let groups_x = copy.extent.width.div_ceil(8);
+                let groups_y = copy.extent.height.div_ceil(8);
+                gl::DispatchCompute(groups_x, groups_y, copy.extent.depth);
+            }
             gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
+        program_manager.restore_guest_compute();
     }
 }
 

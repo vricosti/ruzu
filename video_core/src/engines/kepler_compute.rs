@@ -159,6 +159,7 @@ impl QueueMetaData {
 pub struct DispatchCall {
     pub qmd: QueueMetaData,
     pub qmd_address: u64,
+    pub indirect_compute_address: Option<u64>,
     pub code_address: u64,
     pub tsc_address: u64,
     pub tsc_limit: u32,
@@ -483,6 +484,7 @@ impl Engine for KeplerCompute {
             let dispatch = DispatchCall {
                 qmd,
                 qmd_address: qmd_addr,
+                indirect_compute_address: self.indirect_compute,
                 code_address: self.code_address(),
                 tsc_address: self.tsc_address(),
                 tsc_limit: self.tsc_limit(),
@@ -504,7 +506,11 @@ impl Engine for KeplerCompute {
 
             self.dispatch_calls.push(dispatch);
             if let Some(rasterizer) = self.rasterizer.map(|handle| unsafe { handle.as_mut() }) {
-                rasterizer.dispatch_compute();
+                let dispatch = self
+                    .dispatch_calls
+                    .last()
+                    .expect("dispatch was just recorded before rasterizer callback");
+                rasterizer.dispatch_compute_with_call(dispatch);
             }
             self.indirect_compute = None;
         }

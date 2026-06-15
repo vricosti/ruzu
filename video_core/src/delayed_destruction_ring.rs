@@ -35,6 +35,11 @@ impl<T, const TICKS_TO_DESTROY: usize> DelayedDestructionRing<T, TICKS_TO_DESTRO
     pub fn push(&mut self, object: T) {
         self.elements[self.index].push(object);
     }
+
+    #[cfg(test)]
+    pub(crate) fn retained_len(&self) -> usize {
+        self.elements.iter().map(Vec::len).sum()
+    }
 }
 
 impl<T, const TICKS_TO_DESTROY: usize> Default for DelayedDestructionRing<T, TICKS_TO_DESTROY> {

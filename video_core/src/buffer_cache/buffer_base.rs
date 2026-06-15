@@ -64,6 +64,16 @@ pub struct BufferBase {
     /// the shared `BufferBase` as a pragmatic adaptation since the slot
     /// vector is not parameterised by backend type.
     pub gpu_handle: u32,
+    /// Backend GPU virtual address used by OpenGL bindless buffer paths.
+    ///
+    /// Upstream stores this on `OpenGL::Buffer::address` and exposes it via
+    /// `HostGpuAddr()`. It is zero when the backend does not support or has
+    /// not initialized bindless buffer addressing.
+    pub host_gpu_addr: u64,
+    /// Current OpenGL residency access for bindless buffers.
+    ///
+    /// Mirrors upstream `OpenGL::Buffer::current_residency_access`.
+    pub current_residency_access: u32,
 }
 
 impl BufferBase {
@@ -76,6 +86,8 @@ impl BufferBase {
             lru_id: usize::MAX,
             size_bytes: size_bytes as usize,
             gpu_handle: 0,
+            host_gpu_addr: 0,
+            current_residency_access: gl::NONE,
         }
     }
 
@@ -88,6 +100,8 @@ impl BufferBase {
             lru_id: usize::MAX,
             size_bytes: 0,
             gpu_handle: 0,
+            host_gpu_addr: 0,
+            current_residency_access: gl::NONE,
         }
     }
 
@@ -107,6 +121,24 @@ impl BufferBase {
                 offset as isize,
                 data.len() as isize,
                 data.as_ptr() as *const _,
+            );
+        }
+    }
+
+    /// Download data from this buffer's GPU storage at the given byte offset.
+    ///
+    /// Port of upstream `Buffer::ImmediateDownload(offset, span)`. No-op when
+    /// `gpu_handle == 0`.
+    pub fn immediate_download(&self, offset: u64, data: &mut [u8]) {
+        if self.gpu_handle == 0 || data.is_empty() {
+            return;
+        }
+        unsafe {
+            gl::GetNamedBufferSubData(
+                self.gpu_handle,
+                offset as isize,
+                data.len() as isize,
+                data.as_mut_ptr() as *mut _,
             );
         }
     }
@@ -208,6 +240,18 @@ mod tests {
         assert_eq!(buf.cpu_addr(), 0);
         assert_eq!(buf.size_bytes(), 0);
         assert!(!buf.is_picked());
+    }
+
+    #[test]
+    fn immediate_upload_download_noop_for_null_buffer() {
+        let buf = BufferBase::null(NullBufferParams);
+        let upload = [1, 2, 3, 4];
+        let mut download = [0xAA, 0xBB, 0xCC, 0xDD];
+
+        buf.immediate_upload(0, &upload);
+        buf.immediate_download(0, &mut download);
+
+        assert_eq!(download, [0xAA, 0xBB, 0xCC, 0xDD]);
     }
 
     #[test]

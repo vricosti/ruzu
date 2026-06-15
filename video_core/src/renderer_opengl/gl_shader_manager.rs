@@ -5,8 +5,11 @@
 //!
 //! OpenGL program manager — manages binding of shader programs and assembly programs.
 
-use super::gl_shader_util::create_program_from_source;
+use super::gl_shader_util::{bind_assembly_program, create_program_from_source};
 use crate::host_shaders::compute_shaders::OPENGL_LMEM_WARMUP_COMP;
+use std::sync::Arc;
+
+pub type ProgramManagerHandle = Arc<parking_lot::Mutex<ProgramManager>>;
 
 /// Number of shader stages.
 const NUM_STAGES: usize = 5;
@@ -47,6 +50,10 @@ impl ProgramManager {
     ///
     /// Corresponds to `ProgramManager::ProgramManager()`.
     pub fn new(_device: &super::gl_device::Device) -> Self {
+        Self::new_with_caps(_device.use_assembly_shaders(), _device.has_lmem_perf_bug())
+    }
+
+    pub fn new_with_caps(use_assembly_shaders: bool, has_lmem_perf_bug: bool) -> Self {
         let mut pipeline: u32 = 0;
         unsafe {
             gl::CreateProgramPipelines(1, &mut pipeline);
@@ -55,14 +62,14 @@ impl ProgramManager {
         // GL_COMPUTE_PROGRAM_NV (0x90FB) is an NV extension enum not exposed by the gl crate.
         // Assembly shader support requires NV-specific function pointers (see gl_shader_util.rs).
         // Until those are loaded via runtime GetProcAddress, this is a no-op.
-        if _device.use_assembly_shaders() {
+        if use_assembly_shaders {
             const GL_COMPUTE_PROGRAM_NV: u32 = 0x90FB;
             unsafe {
                 gl::Enable(GL_COMPUTE_PROGRAM_NV);
             }
         }
 
-        let lmem_warmup_program = if _device.has_lmem_perf_bug() {
+        let lmem_warmup_program = if has_lmem_perf_bug {
             create_program_from_source(OPENGL_LMEM_WARMUP_COMP, gl::COMPUTE_SHADER)
         } else {
             0
@@ -77,6 +84,33 @@ impl ProgramManager {
             current_assembly_compute_program: 0,
             lmem_warmup_program,
         }
+    }
+
+    pub fn new_shared(device: &super::gl_device::Device) -> ProgramManagerHandle {
+        Arc::new(parking_lot::Mutex::new(Self::new(device)))
+    }
+
+    pub fn new_shared_with_caps(
+        use_assembly_shaders: bool,
+        has_lmem_perf_bug: bool,
+    ) -> ProgramManagerHandle {
+        Arc::new(parking_lot::Mutex::new(Self::new_with_caps(
+            use_assembly_shaders,
+            has_lmem_perf_bug,
+        )))
+    }
+
+    #[cfg(test)]
+    pub fn new_shared_for_test() -> ProgramManagerHandle {
+        Arc::new(parking_lot::Mutex::new(Self {
+            pipeline: 0,
+            is_pipeline_bound: false,
+            is_compute_bound: false,
+            current_stage_mask: 0,
+            current_programs: [0; NUM_STAGES],
+            current_assembly_compute_program: 0,
+            lmem_warmup_program: 0,
+        }))
     }
 
     /// Bind a compute program (GLSL/SPIR-V).
@@ -95,7 +129,8 @@ impl ProgramManager {
     pub fn bind_compute_assembly_program(&mut self, program: u32) {
         if self.current_assembly_compute_program != program {
             self.current_assembly_compute_program = program;
-            // glBindProgramARB(GL_COMPUTE_PROGRAM_NV, program) — NV extension
+            const GL_COMPUTE_PROGRAM_NV: u32 = 0x90FB;
+            bind_assembly_program(GL_COMPUTE_PROGRAM_NV, program);
         }
         self.unbind_pipeline();
     }
@@ -146,7 +181,11 @@ impl ProgramManager {
 
         if self.current_stage_mask != 0 {
             self.current_stage_mask = 0;
-            // Disable all assembly stages
+            for program_type in ASSEMBLY_PROGRAM_ENUMS {
+                unsafe {
+                    gl::Disable(program_type);
+                }
+            }
         }
         self.bind_pipeline();
     }
@@ -161,15 +200,20 @@ impl ProgramManager {
         if changed_mask != 0 {
             for stage in 0..NUM_STAGES {
                 if ((changed_mask >> stage) & 1) != 0 {
-                    // Enable/disable assembly stage via NV extension
-                    let _ = ASSEMBLY_PROGRAM_ENUMS[stage];
+                    unsafe {
+                        if ((stage_mask >> stage) & 1) != 0 {
+                            gl::Enable(ASSEMBLY_PROGRAM_ENUMS[stage]);
+                        } else {
+                            gl::Disable(ASSEMBLY_PROGRAM_ENUMS[stage]);
+                        }
+                    }
                 }
             }
         }
         for stage in 0..NUM_STAGES {
             if self.current_programs[stage] != programs[stage] {
                 self.current_programs[stage] = programs[stage];
-                // glBindProgramARB(ASSEMBLY_PROGRAM_ENUMS[stage], programs[stage])
+                bind_assembly_program(ASSEMBLY_PROGRAM_ENUMS[stage], programs[stage]);
             }
         }
         self.unbind_pipeline();
@@ -191,11 +235,9 @@ impl ProgramManager {
     }
 
     fn bind_pipeline(&mut self) {
-        if !self.is_pipeline_bound {
-            self.is_pipeline_bound = true;
-            unsafe {
-                gl::BindProgramPipeline(self.pipeline);
-            }
+        self.is_pipeline_bound = true;
+        unsafe {
+            gl::BindProgramPipeline(self.pipeline);
         }
         self.unbind_compute();
     }

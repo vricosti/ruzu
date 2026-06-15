@@ -34,6 +34,73 @@ pub struct StagingBufferMap {
     pub index: usize,
     /// Whether this map has an associated sync object.
     pub has_sync: bool,
+    sync: *mut gl::types::GLsync,
+}
+
+pub struct StagingBufferRawParts {
+    pub mapped_ptr: *mut u8,
+    pub mapped_size: usize,
+    pub offset: usize,
+    pub buffer: u32,
+    pub index: usize,
+    pub sync: *mut gl::types::GLsync,
+}
+
+impl StagingBufferMap {
+    pub fn mapped_span_mut(&mut self) -> &mut [u8] {
+        if self.mapped_size == 0 {
+            return &mut [];
+        }
+        assert!(!self.mapped_ptr.is_null());
+        unsafe { std::slice::from_raw_parts_mut(self.mapped_ptr, self.mapped_size) }
+    }
+
+    pub fn mapped_span(&self) -> &[u8] {
+        if self.mapped_size == 0 {
+            return &[];
+        }
+        assert!(!self.mapped_ptr.is_null());
+        unsafe { std::slice::from_raw_parts(self.mapped_ptr, self.mapped_size) }
+    }
+
+    pub fn flush(&self) {
+        if self.buffer == 0 || self.mapped_size == 0 {
+            return;
+        }
+        unsafe {
+            gl::FlushMappedNamedBufferRange(
+                self.buffer,
+                self.offset as isize,
+                self.mapped_size as isize,
+            );
+        }
+    }
+
+    pub fn into_raw_parts(self) -> StagingBufferRawParts {
+        let map = std::mem::ManuallyDrop::new(self);
+        StagingBufferRawParts {
+            mapped_ptr: map.mapped_ptr,
+            mapped_size: map.mapped_size,
+            offset: map.offset,
+            buffer: map.buffer,
+            index: map.index,
+            sync: map.sync,
+        }
+    }
+}
+
+impl Drop for StagingBufferMap {
+    fn drop(&mut self) {
+        if self.sync.is_null() {
+            return;
+        }
+        unsafe {
+            if !(*self.sync).is_null() {
+                gl::DeleteSync(*self.sync);
+            }
+            *self.sync = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
+        }
+    }
 }
 
 /// A single staging buffer allocation.
@@ -109,6 +176,11 @@ impl StagingBuffers {
             buffer: alloc.buffer,
             index,
             has_sync: insert_fence,
+            sync: if insert_fence {
+                &mut alloc.sync as *mut _
+            } else {
+                std::ptr::null_mut()
+            },
         }
     }
 
@@ -399,6 +471,10 @@ impl StagingBufferPool {
     pub fn free_deferred_staging_buffer(&mut self, buffer: &StagingBufferMap) {
         self.download_buffers
             .free_deferred_staging_buffer(buffer.index);
+    }
+
+    pub fn free_deferred_staging_buffer_by_index(&mut self, index: usize) {
+        self.download_buffers.free_deferred_staging_buffer(index);
     }
 }
 

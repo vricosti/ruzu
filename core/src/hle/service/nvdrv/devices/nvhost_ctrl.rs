@@ -502,8 +502,11 @@ impl NvHostCtrl {
         }
 
         let result = {
-            let mut events = self.events.lock().unwrap();
+            // Upstream uses one NvEventsLock() for the event table and mask.
+            // Rust stores them in two mutexes; keep the acquisition order
+            // identical to register/unregister/free_event paths.
             let mut mask = self.events_mask.lock().unwrap();
+            let mut events = self.events.lock().unwrap();
             let slot = if is_allocation {
                 params.value.raw = 0;
                 self.find_free_nv_event(&mut events, &mut mask, fence_id)

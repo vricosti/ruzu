@@ -6,6 +6,7 @@
 //!
 //! Queries OpenGL device capabilities and exposes them as boolean flags.
 
+use common::settings_enums::ShaderBackend;
 use log::{info, warn};
 use std::ffi::CStr;
 
@@ -23,7 +24,7 @@ pub struct Device {
     max_varyings: u32,
     max_compute_shared_memory_size: u32,
     max_glasm_storage_buffer_blocks: u32,
-
+    shader_backend: ShaderBackend,
     // Extension flags
     has_warp_intrinsics: bool,
     has_shader_ballot: bool,
@@ -152,11 +153,16 @@ impl Device {
         let warp_size_potentially_larger_than_guest = !is_nvidia && !is_intel;
         let needs_fastmath_off = is_nvidia;
 
-        let use_assembly_shaders = is_nvidia
+        let mut shader_backend = *common::settings::values().shader_backend.get_value();
+        let use_assembly_shaders = shader_backend == ShaderBackend::Glasm
             && has_ext("GL_NV_gpu_program5")
             && has_ext("GL_NV_compute_program5")
             && has_ext("GL_NV_transform_feedback")
             && has_ext("GL_NV_transform_feedback2");
+        if shader_backend == ShaderBackend::Glasm && !use_assembly_shaders {
+            log::error!("Assembly shaders enabled but not supported");
+            shader_backend = ShaderBackend::Glsl;
+        }
         let use_driver_cache = is_nvidia;
 
         let can_report_memory = has_ext("GL_NVX_gpu_memory_info");
@@ -210,6 +216,7 @@ impl Device {
             max_varyings,
             max_compute_shared_memory_size,
             max_glasm_storage_buffer_blocks,
+            shader_backend,
             has_warp_intrinsics,
             has_shader_ballot,
             has_vertex_viewport_layer,
@@ -370,6 +377,9 @@ impl Device {
     }
     pub fn use_assembly_shaders(&self) -> bool {
         self.use_assembly_shaders
+    }
+    pub fn shader_backend(&self) -> ShaderBackend {
+        self.shader_backend
     }
     pub fn use_asynchronous_shaders(&self) -> bool {
         self.use_asynchronous_shaders

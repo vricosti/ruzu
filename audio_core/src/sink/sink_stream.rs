@@ -37,6 +37,7 @@ pub struct ReleaseSync {
     pub queued_buffers: AtomicU32,
     pub max_queue_size: AtomicU32,
     pub paused: AtomicBool,
+    pub realtime_pacing: AtomicBool,
     pub cv: Condvar,
     pub mutex: StdMutex<()>,
 }
@@ -47,6 +48,7 @@ impl ReleaseSync {
             queued_buffers: AtomicU32::new(0),
             max_queue_size: AtomicU32::new(0),
             paused: AtomicBool::new(true),
+            realtime_pacing: AtomicBool::new(false),
             cv: Condvar::new(),
             mutex: StdMutex::new(()),
         }
@@ -60,6 +62,18 @@ impl ReleaseSync {
         }
 
         let guard = self.mutex.lock().expect("release mutex poisoned");
+
+        if self.realtime_pacing.load(Ordering::Acquire)
+            && !self.paused.load(Ordering::Acquire)
+            && self.queued_buffers.load(Ordering::Acquire) < max
+            && !stop_requested.load(Ordering::SeqCst)
+        {
+            let (_guard, _) = self
+                .cv
+                .wait_timeout(guard, Duration::from_millis(5))
+                .expect("release condvar poisoned");
+            return;
+        }
 
         let (mut guard, _) = self
             .cv
@@ -142,6 +156,12 @@ impl SinkStream {
 
     pub fn set_discard_buffers(&mut self, discard: bool) {
         self.discard_buffers = discard;
+    }
+
+    pub fn set_realtime_pacing(&mut self, enabled: bool) {
+        self.release
+            .realtime_pacing
+            .store(enabled, Ordering::Release);
     }
 
     /// Matches upstream CubebSinkStream::Start → cubeb_stream_start.

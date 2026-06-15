@@ -27,6 +27,16 @@ pub trait GpuMemoryReader {
     /// SMMU page. Equivalent to upstream
     /// `Tegra::MemoryManager::GpuToCpuAddress(addr).has_value()`.
     fn addr_valid(&self, d_address: u64) -> bool;
+
+    /// Returns `true` if the GPU device range contains a backing host mapping.
+    ///
+    /// Equivalent to upstream
+    /// `Tegra::MemoryManager::GpuToCpuAddress(addr, size).has_value()` for
+    /// TIC validation.
+    fn range_valid(&self, d_address: u64, size: u64) -> bool {
+        let _ = size;
+        self.addr_valid(d_address)
+    }
 }
 
 // ── DescriptorTable<T> ────────────────────────────────────────────────

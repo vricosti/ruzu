@@ -587,6 +587,10 @@ impl crate::texture_cache::descriptor_table::GpuMemoryReader for MaxwellDeviceMe
     fn addr_valid(&self, d_address: u64) -> bool {
         self.smmu_get_host_ptr(d_address).is_some()
     }
+
+    fn range_valid(&self, d_address: u64, size: u64) -> bool {
+        self.smmu_range_has_mapping(d_address, size as usize)
+    }
 }
 
 impl Default for MaxwellDeviceMemoryManager {
@@ -1301,6 +1305,25 @@ impl MaxwellDeviceMemoryManager {
                 self.smmu_host_ptr_from_compressed_physical(compressed, page_offset)
             })
             .map(|host_ptr| host_ptr as *const u8)
+    }
+
+    /// Return whether any page in a device-address range has backing memory.
+    ///
+    /// Port of upstream `MemoryManager::GpuToCpuAddress(addr, size)`, which
+    /// scans pages and succeeds on the first translatable page.
+    pub fn smmu_range_has_mapping(&self, d_address: DAddr, size: usize) -> bool {
+        let mut page = d_address >> SMMU_PAGE_BITS;
+        let page_last = d_address
+            .wrapping_add(size as u64)
+            .wrapping_add(SMMU_PAGE_SIZE - 1)
+            >> SMMU_PAGE_BITS;
+        while page < page_last {
+            if self.smmu_get_host_ptr(page << SMMU_PAGE_BITS).is_some() {
+                return true;
+            }
+            page += 1;
+        }
+        false
     }
 
     fn smmu_walk_block<F, U>(
@@ -2189,6 +2212,18 @@ mod tests {
             mgr.smmu_walk_block_segments_for_test(0x8800, 0x1800),
             Some(vec![0x1800])
         );
+    }
+
+    #[test]
+    fn smmu_range_has_mapping_matches_upstream_size_aware_gpu_to_cpu_address() {
+        let mgr = MaxwellDeviceMemoryManager::default();
+        let backing = vec![0u8; 0x1000];
+        install_test_physical_base(&mgr, backing.as_ptr());
+        mgr.smmu_map_with_cpu_backing(0x9000, backing.as_ptr(), 0x4000_0000, 0x1000, 5, true);
+
+        assert!(mgr.smmu_get_host_ptr(0x8000).is_none());
+        assert!(mgr.smmu_range_has_mapping(0x8004, 0x2000));
+        assert!(!mgr.smmu_range_has_mapping(0xA000, 0x1000));
     }
 
     #[test]

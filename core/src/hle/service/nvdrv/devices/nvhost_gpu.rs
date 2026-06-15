@@ -615,6 +615,25 @@ impl NvHostGpu {
         params.fence.value = self
             .syncpoint_manager()
             .increment_syncpoint_max_ext(channel_syncpoint, increment);
+        if std::env::var_os("RUZU_TRACE_GPU_SUBMIT").is_some() {
+            log::info!(
+                "nvhost_gpu::SubmitGPFIFOImpl syncpoint_update seq={} bind_id={} flags=0x{:X} fence_wait={} fence_increment={} suppress_wfi={} increment_value={} increment={} fence_in={{id={}, value={}}} fence_out={{id={}, value={}}} main_lists={} main_prefetch_words={}",
+                submit_trace_seq,
+                bind_id,
+                flags_raw,
+                (flags_raw & 1) != 0,
+                ((flags_raw >> 1) & 1) != 0,
+                ((flags_raw >> 4) & 1) != 0,
+                ((flags_raw >> 8) & 1) != 0,
+                increment,
+                fence_in_id,
+                fence_in_value,
+                params.fence.id,
+                params.fence.value,
+                entries.command_lists.len(),
+                entries.prefetch_command_list.len(),
+            );
+        }
         trace_submit_gpfifo_ring(
             1,
             submit_trace_seq,
@@ -680,7 +699,11 @@ impl NvHostGpu {
             use std::sync::atomic::{AtomicU64, Ordering};
             static COUNT: AtomicU64 = AtomicU64::new(0);
             let n = COUNT.fetch_add(1, Ordering::Relaxed);
-            if n < 16 || n.is_power_of_two() {
+            let trace_after = std::env::var("RUZU_TRACE_SUBMIT_AFTER")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok());
+            if n < 16 || n.is_power_of_two() || trace_after.is_some_and(|v| params.fence.value >= v)
+            {
                 let min_v = self
                     .syncpoint_manager()
                     .read_syncpoint_min_value(channel_syncpoint);

@@ -161,6 +161,64 @@ impl IStorage {
         }
         let mut buffer = vec![0u8; read_size];
         let result = storage.read(&mut buffer, offset, length);
+        if let Ok(raw_values) = std::env::var("RUZU_ISTORAGE_SCAN_U32_VALUE") {
+            let output_address = ctx
+                .buffer_descriptor_b()
+                .get(0)
+                .filter(|desc| desc.size() > 0)
+                .map(|desc| desc.address())
+                .or_else(|| ctx.buffer_descriptor_c().get(0).map(|desc| desc.address()))
+                .unwrap_or(0);
+            let targets: Vec<u32> = raw_values
+                .split(',')
+                .filter_map(|raw| {
+                    let raw = raw.trim();
+                    if raw.is_empty() {
+                        return None;
+                    }
+                    let raw = raw
+                        .strip_prefix("0x")
+                        .or_else(|| raw.strip_prefix("0X"))
+                        .unwrap_or(raw);
+                    u32::from_str_radix(raw, 16).ok()
+                })
+                .collect();
+            if !targets.is_empty() {
+                for (idx, word) in buffer.windows(4).enumerate() {
+                    let value = u32::from_le_bytes(word.try_into().unwrap());
+                    if targets.contains(&value) {
+                        let (tid, thread_pc, thread_lr, thread_sp) = ctx
+                            .get_thread()
+                            .map(|thread| {
+                                let guard = thread.lock().unwrap();
+                                (
+                                    guard.get_thread_id(),
+                                    guard.thread_context.pc,
+                                    guard.thread_context.lr,
+                                    guard.thread_context.sp,
+                                )
+                            })
+                            .unwrap_or((0, 0, 0, 0));
+                        log::warn!(
+                            "IStorage::ReadScanU32 tid={} thread_pc=0x{:X} thread_lr=0x{:X} thread_sp=0x{:X} backend_name={} backend_path={} backend_size={} storage_offset=0x{:X} length={} buffer_guest=0x{:X} buffer_off=0x{:X} guest_addr=0x{:X} value=0x{:08X}",
+                            tid,
+                            thread_pc,
+                            thread_lr,
+                            thread_sp,
+                            storage.backend.get_name(),
+                            storage.backend.get_full_path(),
+                            storage.backend.get_size(),
+                            offset,
+                            length,
+                            output_address,
+                            idx,
+                            output_address.saturating_add(idx as u64),
+                            value
+                        );
+                    }
+                }
+            }
+        }
         if std::env::var_os("RUZU_ISTORAGE_READ_CONTEXT").is_some() {
             let (tid, thread_pc, thread_lr, thread_sp) = ctx
                 .get_thread()

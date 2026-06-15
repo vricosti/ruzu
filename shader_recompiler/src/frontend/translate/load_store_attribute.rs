@@ -91,6 +91,9 @@ pub fn ast(tv: &mut TranslatorVisitor, insn: u64) {
     if attr_offset % 4 != 0 {
         panic!("Unaligned absolute offset {}", attr_offset);
     }
+    if index_reg != Reg::RZ.0 as u32 {
+        panic!("Indexed store");
+    }
     let vertex = tv.x(vertex_reg);
     let num = num_elements(size);
     if index_reg == Reg::RZ.0 as u32 {
@@ -108,14 +111,6 @@ pub fn ast(tv: &mut TranslatorVisitor, insn: u64) {
         }
         return;
     }
-    if patch {
-        panic!("Indexed tessellation patch store");
-    }
-    handle_indexed(tv, index_reg, num, |tv, element, final_offset| {
-        let value = tv.f(src_reg + element);
-        tv.ir
-            .set_attribute_indexed(final_offset, value, vertex.clone());
-    });
 }
 
 /// IPA — Interpolate Pixel Attribute.
