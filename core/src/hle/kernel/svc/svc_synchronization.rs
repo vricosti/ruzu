@@ -233,20 +233,20 @@ pub fn wait_synchronization(
             timeout_ns
         );
     }
-    // Narrow diagnostic for the MK8D freeze choke point: tid=73 (game main)
-    // and tid=102 (audio renderer) both stall in WaitSynchronization from
-    // nnSdk PC 0x1D50400. Log their handles + object kinds + timeout every
-    // time so we can see which event they're waiting on and whether the
-    // timeout is finite. Sampled once per tid to avoid flooding.
-    if matches!(current_thread_id, 73 | 102) {
+    // Narrow diagnostic for wait wedges. Set RUZU_TRACE_WAITSYNC_TID to a
+    // comma-separated tid list after identifying the target with SIGUSR1.
+    let trace_this_tid = std::env::var("RUZU_TRACE_WAITSYNC_TID")
+        .ok()
+        .map(|spec| {
+            spec.split(',')
+                .filter_map(|part| part.trim().parse::<u64>().ok())
+                .any(|tid| tid == current_thread_id)
+        })
+        .unwrap_or(false);
+    if trace_this_tid {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        static TID73_COUNT: AtomicUsize = AtomicUsize::new(0);
-        static TID102_COUNT: AtomicUsize = AtomicUsize::new(0);
-        let cnt = if current_thread_id == 73 {
-            TID73_COUNT.fetch_add(1, Ordering::Relaxed)
-        } else {
-            TID102_COUNT.fetch_add(1, Ordering::Relaxed)
-        };
+        static TRACE_TID_COUNT: AtomicUsize = AtomicUsize::new(0);
+        let cnt = TRACE_TID_COUNT.fetch_add(1, Ordering::Relaxed);
         // First 16 calls verbose, then every 256th call.
         if cnt < 16 || cnt.is_power_of_two() {
             log::info!(

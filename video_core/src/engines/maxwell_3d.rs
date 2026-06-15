@@ -701,6 +701,37 @@ impl ReportOperation {
     }
 }
 
+fn stop_unimplemented_query_operation(
+    operation: ReportOperation,
+    query_word: u32,
+    gpu_va: u64,
+    payload: u32,
+) -> ! {
+    #[cfg(not(test))]
+    {
+        let path = std::path::Path::new(".agents/maxwell_3d_unimplemented_state.md");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            path,
+            format!(
+                "# Maxwell3D unimplemented query operation\n\n\
+                 - operation: {operation:?}\n\
+                 - query_word: 0x{query_word:08X}\n\
+                 - gpu_va: 0x{gpu_va:X}\n\
+                 - payload: 0x{payload:08X}\n\
+                 - upstream: Maxwell3D::ProcessQueryGet reaches UNIMPLEMENTED_MSG for this query operation\n\
+                 - rust: stopped before treating the unimplemented query as a handled no-op\n"
+            ),
+        );
+    }
+    panic!(
+        "Maxwell3D::ProcessQueryGet unimplemented query operation {:?}",
+        operation
+    );
+}
+
 // ── Pipeline state enums ────────────────────────────────────────────────────
 
 /// Depth/stencil comparison function. Supports both D3D (1-8) and GL (0x200-0x207) encodings.
@@ -1127,6 +1158,18 @@ impl ShaderStageType {
             4 => Self::Geometry,
             5 => Self::Fragment,
             _ => Self::Invalid,
+        }
+    }
+
+    pub fn as_index(self) -> Option<u32> {
+        match self {
+            Self::VertexA => Some(0),
+            Self::VertexB => Some(1),
+            Self::TessInit => Some(2),
+            Self::Tessellation => Some(3),
+            Self::Geometry => Some(4),
+            Self::Fragment => Some(5),
+            Self::Invalid => None,
         }
     }
 }
@@ -1854,7 +1897,7 @@ impl Default for RasterizerInfo {
     fn default() -> Self {
         Self {
             cull_enable: false,
-            front_face: FrontFace::CCW,
+            front_face: FrontFace::CW,
             cull_face: CullFace::Back,
             polygon_mode_front: PolygonMode::Fill,
             polygon_mode_back: PolygonMode::Fill,
@@ -3128,6 +3171,13 @@ impl Maxwell3D {
         (self.regs[base] & 1) != 0
     }
 
+    /// Port of upstream `regs.IsShaderConfigEnabled(ShaderType)`.
+    pub fn shader_config_enabled(&self, stage: ShaderStageType) -> bool {
+        stage
+            .as_index()
+            .is_some_and(|index| self.is_shader_stage_enabled(index))
+    }
+
     /// GPU virtual base address of the shader program region.
     ///
     /// Upstream: `Maxwell3D::Regs::ProgramRegion::Address()` —
@@ -3671,6 +3721,14 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.alpha_test_ref()
     }
 
+    fn transform_feedback_enabled(&self) -> bool {
+        self.transform_feedback_enabled()
+    }
+
+    fn shader_config_enabled(&self, stage: ShaderStageType) -> bool {
+        self.shader_config_enabled(stage)
+    }
+
     fn program_base_address(&self) -> u64 {
         self.program_base_address()
     }
@@ -3910,8 +3968,17 @@ impl Maxwell3D {
             }
             INVALIDATE_TEXTURE_DATA_CACHE => {
                 let _ = self.with_rasterizer_mut(|rasterizer| {
+                    if std::env::var_os("RUZU_TRACE_GL_FENCE_FLOW").is_some() {
+                        log::info!("Maxwell3D::invalidate_texture_data_cache invalidate begin");
+                    }
                     rasterizer.invalidate_gpu_cache();
+                    if std::env::var_os("RUZU_TRACE_GL_FENCE_FLOW").is_some() {
+                        log::info!("Maxwell3D::invalidate_texture_data_cache wait_idle begin");
+                    }
                     rasterizer.wait_for_idle();
+                    if std::env::var_os("RUZU_TRACE_GL_FENCE_FLOW").is_some() {
+                        log::info!("Maxwell3D::invalidate_texture_data_cache end");
+                    }
                 });
             }
             TILED_CACHE_BARRIER => {
@@ -4495,8 +4562,8 @@ impl Maxwell3D {
                 let gpu_va = self.report_semaphore_address();
                 let payload = self.report_semaphore_payload();
                 let short_query = (query_word >> 28) & 1 != 0;
-                let query_type = (query_word >> 24) & 0xF;
-                let subreport = (query_word >> 16) & 0x3F;
+                let query_type = (query_word >> 23) & 0x1F;
+                let subreport = (query_word >> 5) & 0x7;
                 let mut flags = QueryPropertiesFlags::empty();
                 if !short_query {
                     flags |= QueryPropertiesFlags::HAS_TIMEOUT;
@@ -4546,10 +4613,20 @@ impl Maxwell3D {
                 }
             }
             ReportOperation::Acquire => {
-                log::debug!("Maxwell3D: query_get Acquire (unimplemented)");
+                stop_unimplemented_query_operation(
+                    operation,
+                    query_word,
+                    self.report_semaphore_address(),
+                    self.report_semaphore_payload(),
+                );
             }
             ReportOperation::Trap => {
-                log::debug!("Maxwell3D: query_get Trap (unimplemented)");
+                stop_unimplemented_query_operation(
+                    operation,
+                    query_word,
+                    self.report_semaphore_address(),
+                    self.report_semaphore_payload(),
+                );
             }
         }
     }
@@ -5109,6 +5186,7 @@ mod tests {
         signal_sync_point: Vec<u32>,
         reset_counter: Vec<u32>,
         query_writes: Vec<(u64, Vec<u8>)>,
+        query_calls: Vec<(u64, u32, QueryPropertiesFlags, u32, u32)>,
         bound_uniforms: Vec<(usize, u32, u64, u32)>,
         disabled_uniforms: Vec<(usize, u32)>,
         accelerate_conditional_rendering: bool,
@@ -5170,10 +5248,10 @@ mod tests {
         fn query(
             &mut self,
             gpu_addr: u64,
-            _query_type: u32,
+            query_type: u32,
             flags: QueryPropertiesFlags,
             payload: u32,
-            _subreport: u32,
+            subreport: u32,
         ) {
             let bytes = if flags.contains(QueryPropertiesFlags::HAS_TIMEOUT) {
                 let mut buf = Vec::with_capacity(16);
@@ -5188,6 +5266,11 @@ mod tests {
                 .unwrap()
                 .query_writes
                 .push((gpu_addr, bytes));
+            self.calls
+                .lock()
+                .unwrap()
+                .query_calls
+                .push((gpu_addr, query_type, flags, payload, subreport));
         }
         fn bind_graphics_uniform_buffer(
             &mut self,
@@ -5969,6 +6052,13 @@ mod tests {
         assert_eq!(ri.depth_bias_clamp, 0.01);
     }
 
+    #[test]
+    fn rasterizer_default_front_face_matches_upstream_nvn_default() {
+        let engine = Maxwell3D::new();
+        let ri = engine.rasterizer_info();
+        assert_eq!(ri.front_face, FrontFace::CW);
+    }
+
     // ── Constant buffer tests ────────────────────────────────────────────
 
     #[test]
@@ -6271,6 +6361,25 @@ mod tests {
         assert!(!engine.is_shader_stage_enabled(0));
         assert!(!engine.is_shader_stage_enabled(2));
         assert!(!engine.is_shader_stage_enabled(5));
+    }
+
+    #[test]
+    fn shader_config_enabled_matches_upstream_vertexb_and_enable_bit() {
+        let mut engine = Maxwell3D::new();
+
+        assert!(!engine.shader_config_enabled(ShaderStageType::VertexA));
+        assert!(engine.shader_config_enabled(ShaderStageType::VertexB));
+        assert!(!engine.shader_config_enabled(ShaderStageType::TessInit));
+        assert!(!engine.shader_config_enabled(ShaderStageType::Tessellation));
+
+        let tess_init = (PIPELINE_BASE + 2 * PIPELINE_STRIDE) as usize;
+        let tess = (PIPELINE_BASE + 3 * PIPELINE_STRIDE) as usize;
+        engine.regs[tess_init] = 1 | (2 << 4);
+        engine.regs[tess] = 1 | (3 << 4);
+
+        assert!(engine.shader_config_enabled(ShaderStageType::TessInit));
+        assert!(engine.shader_config_enabled(ShaderStageType::Tessellation));
+        assert!(!engine.shader_config_enabled(ShaderStageType::Invalid));
     }
 
     // ── Color mask tests ────────────────────────────────────────────────
@@ -7205,16 +7314,62 @@ mod tests {
     }
 
     #[test]
-    fn test_report_semaphore_acquire_no_write() {
+    fn test_report_semaphore_query_bitfields_match_upstream_layout() {
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let mut rasterizer = TestRasterizer::new(Arc::clone(&calls));
+        let mut engine = Maxwell3D::new();
+        engine.bind_rasterizer(&mut rasterizer);
+        engine.write_reg(REPORT_SEMAPHORE_BASE, 0);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 1, 0x3400);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 2, 0xCAFE_BABE);
+
+        let report = 0x15;
+        let subreport = 0x5;
+        let query = 0 | (subreport << 5) | (report << 23) | (1 << 28);
+        engine.write_reg(REPORT_SEMAPHORE_TRIGGER, query);
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.query_calls.len(), 1);
+        assert_eq!(
+            calls.query_calls[0],
+            (
+                0x3400,
+                report,
+                QueryPropertiesFlags::IS_A_FENCE,
+                0xCAFE_BABE,
+                subreport
+            )
+        );
+    }
+
+    #[test]
+    fn test_report_semaphore_acquire_stops_like_upstream_unimplemented_msg() {
         let mut engine = Maxwell3D::new();
         engine.write_reg(REPORT_SEMAPHORE_BASE, 0);
         engine.write_reg(REPORT_SEMAPHORE_BASE + 1, 0x4000);
         engine.write_reg(REPORT_SEMAPHORE_BASE + 2, 0xFF);
 
-        // Acquire = operation 1.
-        engine.write_reg(REPORT_SEMAPHORE_TRIGGER, 1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Acquire = operation 1.
+            engine.write_reg(REPORT_SEMAPHORE_TRIGGER, 1);
+        }));
 
-        assert!(engine.pending_semaphore_writes.is_empty());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_report_semaphore_trap_stops_like_upstream_unimplemented_msg() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(REPORT_SEMAPHORE_BASE, 0);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 1, 0x4100);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 2, 0xFF);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Trap = operation 3.
+            engine.write_reg(REPORT_SEMAPHORE_TRIGGER, 3);
+        }));
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -7364,6 +7519,7 @@ mod tests {
             let backing = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
             let start = (addr - 0x2000) as usize;
             output.copy_from_slice(&backing[start..start + output.len()]);
+            true
         }));
 
         let memory_manager = std::sync::Arc::new(parking_lot::Mutex::new(
@@ -7431,6 +7587,7 @@ mod tests {
             let backing = [0xEF, 0xBE, 0xAD, 0xDE];
             let start = (addr - 0x2000) as usize;
             output.copy_from_slice(&backing[start..start + output.len()]);
+            true
         }));
 
         let memory_manager = std::sync::Arc::new(parking_lot::Mutex::new(
@@ -8431,6 +8588,7 @@ mod tests {
             backing[20..24].copy_from_slice(&7u32.to_le_bytes());
             let start = (addr - 0x3000) as usize;
             output.copy_from_slice(&backing[start..start + output.len()]);
+            true
         }));
 
         let memory_manager = std::sync::Arc::new(parking_lot::Mutex::new(

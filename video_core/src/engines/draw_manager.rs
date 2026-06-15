@@ -9,9 +9,9 @@
 
 use crate::dirty_flags::flags as Dirty;
 use crate::engines::maxwell_3d::{
-    ConstBufferBinding, DrawCall, RenderTargetInfo, RtControlInfo, CLEAR_SURFACE, DRAW_BEGIN,
-    DRAW_END, DRAW_INLINE_INDEX, DRAW_TEXTURE_SRC_Y0, IB_BASE, IB_OFF_COUNT, IB_OFF_FIRST,
-    INDEX_BUFFER16_FIRST, INDEX_BUFFER16_SUBSEQUENT, INDEX_BUFFER32_FIRST,
+    ConstBufferBinding, DrawCall, RenderTargetInfo, RtControlInfo, ShaderStageType, CLEAR_SURFACE,
+    DRAW_BEGIN, DRAW_END, DRAW_INLINE_INDEX, DRAW_TEXTURE_SRC_Y0, IB_BASE, IB_OFF_COUNT,
+    IB_OFF_FIRST, INDEX_BUFFER16_FIRST, INDEX_BUFFER16_SUBSEQUENT, INDEX_BUFFER32_FIRST,
     INDEX_BUFFER32_SUBSEQUENT, INDEX_BUFFER8_FIRST, INDEX_BUFFER8_SUBSEQUENT,
     INLINE_INDEX_2X16_EVEN, INLINE_INDEX_4X8_INDEX0, MAX_CB_SLOTS, NUM_SHADER_PROGRAMS,
     NUM_SHADER_STAGES, NUM_VERTEX_ATTRIBS, RT_FORMAT_A8B8G8R8_SRGB, RT_FORMAT_A8B8G8R8_UNORM,
@@ -524,6 +524,18 @@ pub trait Maxwell3DAccess {
         0.0
     }
 
+    /// Read `regs.transform_feedback_enabled != 0`, matching upstream
+    /// `RasterizerOpenGL::BeginTransformFeedback`.
+    fn transform_feedback_enabled(&self) -> bool {
+        false
+    }
+
+    /// Read `regs.IsShaderConfigEnabled(stage)`, matching upstream
+    /// `RasterizerOpenGL::BeginTransformFeedback`.
+    fn shader_config_enabled(&self, stage: ShaderStageType) -> bool {
+        matches!(stage, ShaderStageType::VertexB)
+    }
+
     /// Read shader program region base address.
     fn program_base_address(&self) -> u64;
 
@@ -608,6 +620,7 @@ pub struct Maxwell3DRenderTargets {
     pub render_targets: [RenderTargetInfo; 8],
     pub zeta: crate::engines::maxwell_3d::ZetaInfo,
     pub anti_alias_samples_mode: u32,
+    pub surface_clip: crate::engines::maxwell_3d::SurfaceClipInfo,
 }
 
 #[derive(Debug, Clone)]
@@ -640,6 +653,8 @@ pub struct Maxwell3DDrawRegisters {
     pub alpha_test_enabled: bool,
     pub alpha_test_func: crate::engines::maxwell_3d::ComparisonOp,
     pub alpha_test_ref: f32,
+    pub transform_feedback_enabled: bool,
+    pub shader_config_enabled: [bool; NUM_SHADER_PROGRAMS],
     pub descriptor_sync_regs: crate::texture_cache::texture_cache_base::DescriptorSyncRegs,
     pub window_origin_lower_left: bool,
     pub window_origin_flip_y: bool,
@@ -685,6 +700,8 @@ impl Default for Maxwell3DDrawRegisters {
             alpha_test_enabled: false,
             alpha_test_func: crate::engines::maxwell_3d::ComparisonOp::Always,
             alpha_test_ref: 0.0,
+            transform_feedback_enabled: false,
+            shader_config_enabled: [false, true, false, false, false, false],
             descriptor_sync_regs: Default::default(),
             window_origin_lower_left: false,
             window_origin_flip_y: false,
@@ -712,6 +729,7 @@ impl Maxwell3DDrawRegisters {
                 render_targets: std::array::from_fn(|i| maxwell3d.rt_info(i)),
                 zeta: maxwell3d.zeta_info(),
                 anti_alias_samples_mode: maxwell3d.anti_alias_samples_mode(),
+                surface_clip: maxwell3d.surface_clip_info(),
             },
             cb_bindings: std::array::from_fn(|stage| {
                 std::array::from_fn(|slot| maxwell3d.const_buffer_binding(stage, slot))
@@ -740,6 +758,10 @@ impl Maxwell3DDrawRegisters {
             alpha_test_enabled: maxwell3d.alpha_test_enabled(),
             alpha_test_func: maxwell3d.alpha_test_func(),
             alpha_test_ref: maxwell3d.alpha_test_ref(),
+            transform_feedback_enabled: maxwell3d.transform_feedback_enabled(),
+            shader_config_enabled: std::array::from_fn(|index| {
+                maxwell3d.shader_config_enabled(ShaderStageType::from_raw(index as u32))
+            }),
             descriptor_sync_regs: crate::texture_cache::texture_cache_base::DescriptorSyncRegs {
                 sampler_binding_via_header: matches!(
                     maxwell3d.sampler_binding(),
@@ -856,6 +878,7 @@ impl<'a> Maxwell3DDrawView<'a> {
                 render_targets: std::array::from_fn(|i| maxwell3d.rt_info(i)),
                 zeta: maxwell3d.zeta_info(),
                 anti_alias_samples_mode: maxwell3d.anti_alias_samples_mode(),
+                surface_clip: maxwell3d.surface_clip_info(),
             },
             Maxwell3DDrawSource::Snapshot(registers) => registers.render_targets,
         }
@@ -1040,6 +1063,23 @@ impl<'a> Maxwell3DDrawView<'a> {
         }
     }
 
+    pub fn transform_feedback_enabled(&self) -> bool {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.transform_feedback_enabled(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.transform_feedback_enabled,
+        }
+    }
+
+    pub fn shader_config_enabled(&self, stage: ShaderStageType) -> bool {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.shader_config_enabled(stage),
+            Maxwell3DDrawSource::Snapshot(registers) => stage
+                .as_index()
+                .and_then(|index| registers.shader_config_enabled.get(index as usize).copied())
+                .unwrap_or(false),
+        }
+    }
+
     pub fn descriptor_sync_regs(
         &self,
     ) -> crate::texture_cache::texture_cache_base::DescriptorSyncRegs {
@@ -1173,16 +1213,15 @@ impl<'a> Maxwell3DDrawView<'a> {
     }
 }
 
-#[derive(Clone, Copy)]
 enum Maxwell3DClearSource<'a> {
-    Live(&'a dyn Maxwell3DAccess),
+    Live(&'a mut dyn Maxwell3DAccess),
     Snapshot {
         clear_state: ClearState,
         render_targets: Maxwell3DRenderTargets,
+        dirty_flags: [bool; 256],
     },
 }
 
-#[derive(Clone, Copy)]
 pub struct Maxwell3DClearView<'a> {
     source: Maxwell3DClearSource<'a>,
 }
@@ -1193,63 +1232,105 @@ impl<'a> Maxwell3DClearView<'a> {
             source: Maxwell3DClearSource::Snapshot {
                 clear_state,
                 render_targets,
+                dirty_flags: [false; 256],
             },
         }
     }
 
-    pub fn live(maxwell3d: &'a dyn Maxwell3DAccess) -> Self {
+    #[cfg(test)]
+    pub fn with_dirty_snapshot(
+        clear_state: ClearState,
+        render_targets: Maxwell3DRenderTargets,
+        dirty_flags: [bool; 256],
+    ) -> Self {
+        Self {
+            source: Maxwell3DClearSource::Snapshot {
+                clear_state,
+                render_targets,
+                dirty_flags,
+            },
+        }
+    }
+
+    pub fn live(maxwell3d: &'a mut dyn Maxwell3DAccess) -> Self {
         Self {
             source: Maxwell3DClearSource::Live(maxwell3d),
         }
     }
 
     pub fn clear_state(&self) -> ClearState {
-        match self.source {
+        match &self.source {
             Maxwell3DClearSource::Live(maxwell3d) => ClearState {
                 flags: maxwell3d.clear_surface_flags(),
                 color: maxwell3d.clear_color_rgba(),
                 depth: maxwell3d.clear_depth(),
                 stencil: maxwell3d.clear_stencil(),
             },
-            Maxwell3DClearSource::Snapshot { clear_state, .. } => clear_state,
+            Maxwell3DClearSource::Snapshot { clear_state, .. } => *clear_state,
         }
     }
 
     pub fn render_targets(&self) -> Maxwell3DRenderTargets {
-        match self.source {
+        match &self.source {
             Maxwell3DClearSource::Live(maxwell3d) => Maxwell3DRenderTargets {
                 rt_control: maxwell3d.rt_control_info(),
                 render_targets: std::array::from_fn(|i| maxwell3d.rt_info(i)),
                 zeta: maxwell3d.zeta_info(),
                 anti_alias_samples_mode: maxwell3d.anti_alias_samples_mode(),
+                surface_clip: maxwell3d.surface_clip_info(),
             },
-            Maxwell3DClearSource::Snapshot { render_targets, .. } => render_targets,
+            Maxwell3DClearSource::Snapshot { render_targets, .. } => *render_targets,
+        }
+    }
+
+    pub fn dirty_flags(&self) -> [bool; 256] {
+        match &self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.dirty_flags(),
+            Maxwell3DClearSource::Snapshot { dirty_flags, .. } => *dirty_flags,
+        }
+    }
+
+    pub fn clear_dirty_flag(&mut self, index: u8) {
+        match &mut self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.clear_dirty_flag(index),
+            Maxwell3DClearSource::Snapshot { dirty_flags, .. } => {
+                dirty_flags[index as usize] = false;
+            }
+        }
+    }
+
+    pub fn set_dirty_flag(&mut self, index: u8) {
+        match &mut self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.set_dirty_flag(index),
+            Maxwell3DClearSource::Snapshot { dirty_flags, .. } => {
+                dirty_flags[index as usize] = true;
+            }
         }
     }
 
     pub fn use_scissor(&self) -> bool {
-        match self.source {
+        match &self.source {
             Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.clear_control_use_scissor(),
             Maxwell3DClearSource::Snapshot { .. } => false,
         }
     }
 
     pub fn scissor(&self, index: u32) -> crate::engines::maxwell_3d::ScissorInfo {
-        match self.source {
+        match &self.source {
             Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.scissor_info(index),
             Maxwell3DClearSource::Snapshot { .. } => Default::default(),
         }
     }
 
     pub fn depth_stencil(&self) -> crate::engines::maxwell_3d::DepthStencilInfo {
-        match self.source {
+        match &self.source {
             Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.depth_stencil_info(),
             Maxwell3DClearSource::Snapshot { .. } => Default::default(),
         }
     }
 
     pub fn framebuffer_srgb(&self) -> bool {
-        match self.source {
+        match &self.source {
             Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.framebuffer_srgb(),
             Maxwell3DClearSource::Snapshot { .. } => false,
         }
@@ -2036,6 +2117,21 @@ mod tests {
         assert!(
             view.dirty_flags()[crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORTS as usize]
         );
+    }
+
+    #[test]
+    fn maxwell_draw_view_shader_config_enabled_uses_snapshot() {
+        let draw_state = DrawState::default();
+        let mut registers = Maxwell3DDrawRegisters::default();
+        registers.shader_config_enabled[ShaderStageType::TessInit.as_index().unwrap() as usize] =
+            true;
+
+        let view = Maxwell3DDrawView::with_register_snapshot(&draw_state, registers);
+
+        assert!(view.shader_config_enabled(ShaderStageType::VertexB));
+        assert!(view.shader_config_enabled(ShaderStageType::TessInit));
+        assert!(!view.shader_config_enabled(ShaderStageType::Tessellation));
+        assert!(!view.shader_config_enabled(ShaderStageType::Invalid));
     }
 
     #[test]

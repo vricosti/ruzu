@@ -13,8 +13,62 @@ use super::present_uniforms::{
 };
 use crate::framebuffer_config::{BlendMode, FramebufferConfig};
 use crate::host_shaders::vertex_shaders::OPENGL_PRESENT_VERT;
-use crate::renderer_opengl::RasterizerOpenGL;
+use crate::renderer_opengl::gl_shader_manager::ProgramManagerHandle;
+use crate::renderer_opengl::Device;
 use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
+use std::ffi::c_void;
+use std::sync::OnceLock;
+
+type GlGetNamedBufferParameterui64vNv = unsafe extern "system" fn(
+    buffer: gl::types::GLuint,
+    pname: gl::types::GLenum,
+    params: *mut u64,
+);
+type GlMakeNamedBufferResidentNv =
+    unsafe extern "system" fn(buffer: gl::types::GLuint, access: gl::types::GLenum);
+type GlBufferAddressRangeNv = unsafe extern "system" fn(
+    pname: gl::types::GLenum,
+    index: gl::types::GLuint,
+    address: u64,
+    length: gl::types::GLsizeiptr,
+);
+
+static GL_GET_NAMED_BUFFER_PARAMETER_UI64V_NV: OnceLock<Option<GlGetNamedBufferParameterui64vNv>> =
+    OnceLock::new();
+static GL_MAKE_NAMED_BUFFER_RESIDENT_NV: OnceLock<Option<GlMakeNamedBufferResidentNv>> =
+    OnceLock::new();
+static GL_BUFFER_ADDRESS_RANGE_NV: OnceLock<Option<GlBufferAddressRangeNv>> = OnceLock::new();
+
+const GL_BUFFER_GPU_ADDRESS_NV: u32 = 0x8F1D;
+const GL_VERTEX_ATTRIB_ARRAY_ADDRESS_NV: u32 = 0x8F20;
+
+fn load_optional_gl_function<T, F>(load_fn: &mut F, name: &'static str) -> Option<T>
+where
+    F: FnMut(&'static str) -> *const c_void,
+{
+    let ptr = load_fn(name);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute_copy::<*const c_void, T>(&ptr) })
+    }
+}
+
+pub fn load_extra_functions<F>(load_fn: &mut F)
+where
+    F: FnMut(&'static str) -> *const c_void,
+{
+    let _ = GL_GET_NAMED_BUFFER_PARAMETER_UI64V_NV.set(load_optional_gl_function(
+        load_fn,
+        "glGetNamedBufferParameterui64vNV",
+    ));
+    let _ = GL_MAKE_NAMED_BUFFER_RESIDENT_NV.set(load_optional_gl_function(
+        load_fn,
+        "glMakeNamedBufferResidentNV",
+    ));
+    let _ = GL_BUFFER_ADDRESS_RANGE_NV
+        .set(load_optional_gl_function(load_fn, "glBufferAddressRangeNV"));
+}
 
 fn trace_present_phase(label: &str, layer: Option<usize>, width: u32, height: u32) {
     if std::env::var_os("RUZU_TRACE_PRESENT_PHASES").is_none() {
@@ -208,11 +262,12 @@ fn create_separable_program(source: &str, shader_type: u32) -> u32 {
 ///
 /// Corresponds to `OpenGL::WindowAdaptPass`.
 pub struct WindowAdaptPass {
+    device: *const Device,
     sampler: u32,
     vert_program: u32,
     frag_program: u32,
-    pipeline: u32,
     vertex_buffer: u32,
+    vertex_buffer_address: u64,
     vao: u32,
 }
 
@@ -220,7 +275,7 @@ impl WindowAdaptPass {
     /// Create a new window adapt pass with the given sampler and fragment shader.
     ///
     /// Port of `WindowAdaptPass::WindowAdaptPass()`.
-    pub fn new(sampler: u32, frag_source: &str) -> Self {
+    pub fn new(device: *const Device, sampler: u32, frag_source: &str) -> Self {
         let vert_program = create_separable_program(OPENGL_PRESENT_VERT, gl::VERTEX_SHADER);
         let frag_program = create_separable_program(frag_source, gl::FRAGMENT_SHADER);
         if frag_program != 0 {
@@ -237,28 +292,38 @@ impl WindowAdaptPass {
         // Port of upstream constructor: CreateBuffers, NamedBufferData, vertex attrib setup.
         let mut vertex_buffer: u32 = 0;
         let mut vao: u32 = 0;
-        let mut pipeline: u32 = 0;
+        let mut vertex_buffer_address = 0;
         unsafe {
-            gl::CreateProgramPipelines(1, &mut pipeline);
-            if pipeline != 0 {
-                gl::UseProgramStages(pipeline, gl::VERTEX_SHADER_BIT, vert_program);
-                gl::UseProgramStages(pipeline, gl::FRAGMENT_SHADER_BIT, frag_program);
-                gl::UseProgramStages(
-                    pipeline,
-                    gl::TESS_CONTROL_SHADER_BIT
-                        | gl::TESS_EVALUATION_SHADER_BIT
-                        | gl::GEOMETRY_SHADER_BIT,
-                    0,
-                );
-            }
-
             gl::CreateBuffers(1, &mut vertex_buffer);
-            gl::NamedBufferStorage(
+            gl::NamedBufferData(
                 vertex_buffer,
                 (4 * std::mem::size_of::<ScreenRectVertex>()) as isize,
                 std::ptr::null(),
-                gl::DYNAMIC_STORAGE_BIT,
+                gl::STREAM_DRAW,
             );
+
+            let has_unified_vertex_buffers = device
+                .as_ref()
+                .is_some_and(|device| device.has_vertex_buffer_unified_memory());
+            if has_unified_vertex_buffers {
+                let make_resident = GL_MAKE_NAMED_BUFFER_RESIDENT_NV
+                    .get()
+                    .and_then(|f| *f)
+                    .expect("glMakeNamedBufferResidentNV must be loaded for present bindless VBO");
+                make_resident(vertex_buffer, gl::READ_ONLY);
+
+                let get_address = GL_GET_NAMED_BUFFER_PARAMETER_UI64V_NV
+                    .get()
+                    .and_then(|f| *f)
+                    .expect(
+                        "glGetNamedBufferParameterui64vNV must be loaded for present bindless VBO",
+                    );
+                get_address(
+                    vertex_buffer,
+                    GL_BUFFER_GPU_ADDRESS_NV,
+                    &mut vertex_buffer_address,
+                );
+            }
 
             gl::CreateVertexArrays(1, &mut vao);
             gl::VertexArrayVertexBuffer(
@@ -281,11 +346,12 @@ impl WindowAdaptPass {
         }
 
         Self {
+            device,
             sampler,
             vert_program,
             frag_program,
-            pipeline,
             vertex_buffer,
+            vertex_buffer_address,
             vao,
         }
     }
@@ -306,10 +372,9 @@ impl WindowAdaptPass {
         framebuffers: &[FramebufferConfig],
         layout: &FramebufferLayout,
         invert_y: bool,
-        rasterizer: &mut RasterizerOpenGL,
-        device_memory: Option<&crate::renderer_base::DeviceMemoryReader>,
+        program_manager: &ProgramManagerHandle,
     ) {
-        if self.vert_program == 0 || self.frag_program == 0 || self.pipeline == 0 {
+        if self.vert_program == 0 || self.frag_program == 0 {
             return;
         }
 
@@ -332,14 +397,14 @@ impl WindowAdaptPass {
         for i in 0..layer_count {
             let mut matrix = [0.0f32; 6];
             let mut verts = [ScreenRectVertex::default(); 4];
+            let mut program_manager = program_manager.lock();
             let texture = layers[i].configure_draw(
                 &mut matrix,
                 &mut verts,
                 &framebuffers[i],
                 layout,
                 invert_y,
-                rasterizer,
-                device_memory,
+                &mut program_manager,
             );
             textures.push(texture);
             matrices.push(matrix);
@@ -353,14 +418,12 @@ impl WindowAdaptPass {
         }
 
         // Phase 2: Render all layers.
+        let mut program_manager_guard = program_manager.lock();
+        program_manager_guard.bind_present_programs(self.vert_program, self.frag_program);
         unsafe {
-            const GL_PROGRAM_PIPELINE_BINDING: u32 = 0x825A;
-            let mut old_program = 0;
-            let mut old_pipeline = 0;
-            gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut old_program);
-            gl::GetIntegerv(GL_PROGRAM_PIPELINE_BINDING, &mut old_pipeline);
-            gl::UseProgram(0);
-            gl::BindProgramPipeline(self.pipeline);
+            gl::Disable(gl::FRAMEBUFFER_SRGB);
+            gl::ViewportIndexedf(0, 0.0, 0.0, layout.width as f32, layout.height as f32);
+
             gl::BindVertexArray(self.vao);
             gl::EnableVertexAttribArray(POSITION_LOCATION as u32);
             gl::EnableVertexAttribArray(TEX_COORD_LOCATION as u32);
@@ -370,16 +433,31 @@ impl WindowAdaptPass {
             gl::VertexAttribFormat(TEX_COORD_LOCATION as u32, 2, gl::FLOAT, gl::FALSE, 8);
             gl::VertexAttribBinding(POSITION_LOCATION as u32, 0);
             gl::VertexAttribBinding(TEX_COORD_LOCATION as u32, 0);
-            gl::BindVertexBuffer(
-                0,
-                self.vertex_buffer,
-                0,
-                std::mem::size_of::<ScreenRectVertex>() as i32,
-            );
+            let has_unified_vertex_buffers = self
+                .device
+                .as_ref()
+                .is_some_and(|device| device.has_vertex_buffer_unified_memory());
+            if has_unified_vertex_buffers {
+                gl::BindVertexBuffer(0, 0, 0, std::mem::size_of::<ScreenRectVertex>() as i32);
+                let buffer_address_range = GL_BUFFER_ADDRESS_RANGE_NV
+                    .get()
+                    .and_then(|f| *f)
+                    .expect("glBufferAddressRangeNV must be loaded for present bindless VBO");
+                buffer_address_range(
+                    GL_VERTEX_ATTRIB_ARRAY_ADDRESS_NV,
+                    0,
+                    self.vertex_buffer_address,
+                    std::mem::size_of::<[ScreenRectVertex; 4]>() as isize,
+                );
+            } else {
+                gl::BindVertexBuffer(
+                    0,
+                    self.vertex_buffer,
+                    0,
+                    std::mem::size_of::<ScreenRectVertex>() as i32,
+                );
+            }
             gl::BindSampler(0, self.sampler);
-
-            gl::Disable(gl::FRAMEBUFFER_SRGB);
-            gl::ViewportIndexedf(0, 0.0, 0.0, layout.width as f32, layout.height as f32);
 
             let settings = common::settings::values();
             let bg_red = *settings.bg_red.get_value() as f32 / 255.0;
@@ -460,11 +538,10 @@ impl WindowAdaptPass {
                     gl::GetBooleani_v(gl::COLOR_WRITEMASK, 0, color_mask.as_mut_ptr());
                     let gl_error = gl::GetError();
                     log::info!(
-                        "[PRESENT_DRAW] layer={} vert_program={} frag_program={} pipeline={} texture={} layout={}x{} screen=({},{}..{},{} ) blend={:?} viewport={:?} scissor_enabled={} scissor_box={:?} color_mask={:?} rasterizer_discard={} cull_face={} depth_test={} stencil_test={} matrix={:?} vertices={:?} gl_error=0x{:X}",
+                        "[PRESENT_DRAW] layer={} vert_program={} frag_program={} texture={} layout={}x{} screen=({},{}..{},{} ) blend={:?} viewport={:?} scissor_enabled={} scissor_box={:?} color_mask={:?} rasterizer_discard={} cull_face={} depth_test={} stencil_test={} matrix={:?} vertices={:?} gl_error=0x{:X}",
                         i,
                         self.vert_program,
                         self.frag_program,
-                        self.pipeline,
                         textures[i],
                         layout.width,
                         layout.height,
@@ -489,8 +566,6 @@ impl WindowAdaptPass {
             }
 
             gl::BindVertexArray(0);
-            gl::UseProgram(old_program as u32);
-            gl::BindProgramPipeline(old_pipeline as u32);
         }
     }
 }
@@ -503,9 +578,6 @@ impl Drop for WindowAdaptPass {
             }
             if self.frag_program != 0 {
                 gl::DeleteProgram(self.frag_program);
-            }
-            if self.pipeline != 0 {
-                gl::DeleteProgramPipelines(1, &self.pipeline);
             }
             if self.sampler != 0 {
                 gl::DeleteSamplers(1, &self.sampler);

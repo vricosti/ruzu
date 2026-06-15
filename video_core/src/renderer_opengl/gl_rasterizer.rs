@@ -19,21 +19,28 @@ use std::time::Instant;
 use common::settings;
 
 use super::gl_buffer_cache::BufferCacheParams as OpenGLBufferCacheParams;
+use super::gl_compute_pipeline::ComputePipeline;
 use super::gl_device::Device;
 use super::gl_fence_manager::{Fence, FenceManagerOpenGL};
 use super::gl_query_cache::QueryCache;
 use super::gl_shader_cache::ShaderCache as OpenGLShaderCache;
+use super::gl_shader_manager::{ProgramManager, ProgramManagerHandle};
 use super::gl_state_tracker::{dirty as GlDirty, StateTracker};
-use super::gl_texture_cache::TextureCache as OpenGLTextureCache;
+use super::gl_texture_cache::{RenderTargetDirtyFlagAccess, TextureCache as OpenGLTextureCache};
 use crate::buffer_cache::buffer_cache::BufferCache as CommonBufferCache;
+use crate::buffer_cache::buffer_cache_base::{
+    ObtainBufferOperation, ObtainBufferSynchronize, NULL_BUFFER_ID,
+};
 use crate::buffer_cache::word_manager::DeviceTracker;
 use crate::engines::draw_manager::{
     DrawState, Maxwell3DClearView, Maxwell3DDrawView, Maxwell3DIndirectView,
 };
+use crate::engines::kepler_compute::DispatchCall;
 use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, ComparisonOp, CullFace, DepthMode, DrawCall, FillViaTriangleMode,
-    FrontFace, PolygonMode, StencilFaceInfo, StencilOp,
+    FrontFace, PolygonMode, ShaderStageType, StencilFaceInfo, StencilOp,
 };
+use crate::engines::maxwell_dma::dma;
 use crate::engines::Framebuffer;
 use crate::fence_manager::FenceManager;
 use crate::framebuffer_config::FramebufferConfig;
@@ -43,8 +50,10 @@ use crate::query_cache_top::QueryType as VideoQueryType;
 use crate::rasterizer::SoftwareRasterizer;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
 use crate::renderer_base::GuestMemoryWriter;
+use crate::renderer_opengl::gl_graphics_pipeline::GraphicsTextureImageBindingState;
 use crate::renderer_opengl::present::layer::FramebufferTextureInfo;
 use crate::shader_cache::ShaderCache;
+use crate::texture_cache::types::NULL_IMAGE_ID;
 
 macro_rules! lock_two_reentrant_mutexes {
     ($first_mutex:expr, $second_mutex:expr, $first_guard:ident, $second_guard:ident) => {
@@ -322,6 +331,83 @@ impl crate::buffer_cache::buffer_cache_base::DeviceMemoryAccess for DeviceMemory
 struct DrawStateEngineAdapter {
     draw_state: DrawState,
     registers: crate::engines::draw_manager::Maxwell3DDrawRegisters,
+}
+
+struct ComputeEngineAdapter {
+    dispatch: DispatchCall,
+}
+
+impl ComputeEngineAdapter {
+    fn launch_info(&self) -> crate::buffer_cache::buffer_cache_base::ComputeLaunchInfo {
+        crate::buffer_cache::buffer_cache_base::ComputeLaunchInfo {
+            const_buffer_enable_mask: self.dispatch.qmd.const_buffer_enable_mask,
+            const_buffer_config: self
+                .dispatch
+                .qmd
+                .const_buffers
+                .iter()
+                .map(
+                    |cbuf| crate::buffer_cache::buffer_cache_base::ComputeConstBufferConfig {
+                        address: cbuf.address,
+                        size: cbuf.size,
+                    },
+                )
+                .collect(),
+        }
+    }
+}
+
+impl crate::buffer_cache::buffer_cache_base::EngineState for ComputeEngineAdapter {
+    fn get_index_buffer(&self) -> crate::buffer_cache::buffer_cache_base::IndexBufferRef {
+        crate::buffer_cache::buffer_cache_base::IndexBufferRef::default()
+    }
+
+    fn get_inline_index_draw_indexes(&self) -> &[u8] {
+        &[]
+    }
+
+    fn is_dirty(&self, _flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) -> bool {
+        false
+    }
+
+    fn clear_dirty(&mut self, _flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) {}
+
+    fn get_vertex_stream(
+        &self,
+        _index: u32,
+    ) -> crate::buffer_cache::buffer_cache_base::VertexStreamInfo {
+        crate::buffer_cache::buffer_cache_base::VertexStreamInfo::default()
+    }
+
+    fn get_vertex_stream_limit(
+        &self,
+        _index: u32,
+    ) -> crate::buffer_cache::buffer_cache_base::VertexStreamLimit {
+        crate::buffer_cache::buffer_cache_base::VertexStreamLimit::default()
+    }
+
+    fn is_transform_feedback_enabled(&self) -> bool {
+        false
+    }
+
+    fn get_transform_feedback_buffer(
+        &self,
+        _index: u32,
+    ) -> crate::buffer_cache::buffer_cache_base::TransformFeedbackBufferInfo {
+        crate::buffer_cache::buffer_cache_base::TransformFeedbackBufferInfo::default()
+    }
+
+    fn get_const_buffer(
+        &self,
+        _stage: usize,
+        _cbuf_index: u32,
+    ) -> crate::buffer_cache::buffer_cache_base::ConstBufferInfo {
+        crate::buffer_cache::buffer_cache_base::ConstBufferInfo::default()
+    }
+
+    fn get_compute_launch_info(&self) -> crate::buffer_cache::buffer_cache_base::ComputeLaunchInfo {
+        self.launch_info()
+    }
 }
 
 impl crate::buffer_cache::buffer_cache_base::EngineState for DrawStateEngineAdapter {
@@ -835,6 +921,26 @@ fn polygon_mode_to_gl(mode: PolygonMode) -> u32 {
         PolygonMode::Point => gl::POINT,
         PolygonMode::Line => gl::LINE,
         PolygonMode::Fill => gl::FILL,
+    }
+}
+
+impl RenderTargetDirtyFlagAccess for Maxwell3DDrawView<'_> {
+    fn clear_rt_dirty_flag(&mut self, flag: u8) {
+        self.clear_dirty_flag(flag);
+    }
+
+    fn set_rt_dirty_flag(&mut self, flag: u8) {
+        self.set_dirty_flag(flag);
+    }
+}
+
+impl RenderTargetDirtyFlagAccess for Maxwell3DClearView<'_> {
+    fn clear_rt_dirty_flag(&mut self, flag: u8) {
+        self.clear_dirty_flag(flag);
+    }
+
+    fn set_rt_dirty_flag(&mut self, flag: u8) {
+        self.set_dirty_flag(flag);
     }
 }
 
@@ -1788,6 +1894,12 @@ pub struct RasterizerOpenGL {
     total_draw_count: u64,
     has_written_global_memory: bool,
     buffer_cache: CommonBufferCache<OpenGLBufferCacheParams, OpenGLDeviceTracker>,
+    /// Shared OpenGL program manager reference.
+    ///
+    /// Upstream `RasterizerOpenGL` stores `ProgramManager&`, with the concrete
+    /// manager owned by `RendererOpenGL`.
+    #[allow(dead_code)]
+    program_manager: ProgramManagerHandle,
     texture_cache: OpenGLTextureCache,
     /// Generic region-tracking shader cache (region invalidation, guest address bookkeeping).
     /// Upstream inherits `GL::ShaderCache` from `VideoCommon::ShaderCache`; we keep them
@@ -2891,6 +3003,7 @@ impl RasterizerOpenGL {
         device: &Device,
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
+        program_manager: ProgramManagerHandle,
     ) -> Self {
         let mut transient_vao: u32 = 0;
         unsafe {
@@ -2902,6 +3015,7 @@ impl RasterizerOpenGL {
         // can issue GL calls once channel_state is populated.
         let gl_runtime = super::gl_buffer_cache::BufferCacheRuntime::new(device);
         buffer_cache.set_runtime(Box::new(gl_runtime));
+        let mut state_tracker = Box::new(StateTracker::new());
         Self {
             syncpoints,
             fence_backend: FenceManagerOpenGL::new(),
@@ -2911,11 +3025,17 @@ impl RasterizerOpenGL {
             total_draw_count: 0,
             has_written_global_memory: false,
             buffer_cache,
-            texture_cache: OpenGLTextureCache::new(device_memory.clone(), device),
+            program_manager: program_manager.clone(),
+            texture_cache: OpenGLTextureCache::new(
+                device_memory.clone(),
+                device,
+                program_manager,
+                state_tracker.as_mut(),
+            ),
             shader_cache: ShaderCache::new(device_memory),
             gl_shader_cache: OpenGLShaderCache::new(device),
             query_cache: QueryCache::new(),
-            state_tracker: Box::new(StateTracker::new()),
+            state_tracker,
             has_depth_buffer_float: device.has_depth_buffer_float(),
             has_viewport_swizzle: device.has_viewport_swizzle(),
             has_fill_rectangle: device.has_fill_rectangle(),
@@ -2934,26 +3054,31 @@ impl RasterizerOpenGL {
         let test_device_memory = Arc::new(
             crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
         );
+        let program_manager = ProgramManager::new_shared_for_test();
+        let mut state_tracker = Box::new(StateTracker::new());
         Self {
             syncpoints,
-            fence_backend: FenceManagerOpenGL::new(),
+            fence_backend: FenceManagerOpenGL::new_for_test(),
             fence_manager: FenceManager::new(false),
             frame_count: 0,
             num_queued_commands: 0,
             total_draw_count: 0,
             has_written_global_memory: false,
             buffer_cache: CommonBufferCache::new(&OPENGL_DEVICE_TRACKER),
+            program_manager: program_manager.clone(),
             texture_cache: OpenGLTextureCache::new_with_caps(
                 test_device_memory,
                 true,
                 false,
                 false,
                 false,
+                program_manager,
+                state_tracker.as_mut(),
             ),
             shader_cache: ShaderCache::default(),
             gl_shader_cache: OpenGLShaderCache::new_for_test(),
             query_cache: QueryCache::new(),
-            state_tracker: Box::new(StateTracker::new()),
+            state_tracker,
             has_depth_buffer_float: false,
             has_viewport_swizzle: false,
             has_fill_rectangle: false,
@@ -3010,6 +3135,28 @@ impl RasterizerOpenGL {
         }
     }
 
+    fn make_query_fallback_operation(
+        mm: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
+        gpu_addr: u64,
+        has_timeout: bool,
+        payload: u32,
+        gpu_ticks_getter: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    ) -> Box<dyn FnOnce() + Send> {
+        Box::new(move || {
+            let mm = mm.lock();
+            if has_timeout {
+                let gpu_ticks = gpu_ticks_getter
+                    .as_ref()
+                    .map(|getter| getter())
+                    .unwrap_or(0);
+                mm.write_block_unsafe(gpu_addr + 8, &gpu_ticks.to_le_bytes());
+                mm.write_block_unsafe(gpu_addr, &(payload as u64).to_le_bytes());
+            } else {
+                mm.write_block_unsafe(gpu_addr, &payload.to_le_bytes());
+            }
+        })
+    }
+
     fn query_fallback(
         &mut self,
         gpu_addr: u64,
@@ -3036,40 +3183,17 @@ impl RasterizerOpenGL {
         let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
         let is_fence = flags.contains(QueryPropertiesFlags::IS_A_FENCE);
         let gpu_ticks_getter = self.gpu_ticks_getter.as_ref().cloned();
-        if !is_fence
-            && query_type == crate::query_cache::types::QueryType::Payload as u32
-            && !settings::is_gpu_level_high(&settings::values())
-        {
-            let mm = mm.lock();
-            if has_timeout {
-                let gpu_ticks = gpu_ticks_getter
-                    .as_ref()
-                    .map(|getter| getter())
-                    .unwrap_or(0);
-                mm.write_block_unsafe(gpu_addr + 8, &gpu_ticks.to_le_bytes());
-                mm.write_block_unsafe(gpu_addr, &(payload as u64).to_le_bytes());
-            } else {
-                mm.write_block_unsafe(gpu_addr, &payload.to_le_bytes());
-            }
-            return;
-        }
-        let operation = Box::new(move || {
-            let mm = mm.lock();
-            if has_timeout {
-                let gpu_ticks = gpu_ticks_getter
-                    .as_ref()
-                    .map(|getter| getter())
-                    .unwrap_or(0);
-                mm.write_block_unsafe(gpu_addr + 8, &gpu_ticks.to_le_bytes());
-                mm.write_block_unsafe(gpu_addr, &(payload as u64).to_le_bytes());
-            } else {
-                mm.write_block_unsafe(gpu_addr, &payload.to_le_bytes());
-            }
-        });
+        let operation = Self::make_query_fallback_operation(
+            mm,
+            gpu_addr,
+            has_timeout,
+            payload,
+            gpu_ticks_getter,
+        );
         if is_fence {
             RasterizerInterface::signal_fence(self, operation);
         } else {
-            RasterizerInterface::sync_operation(self, operation);
+            operation();
         }
     }
 
@@ -3661,16 +3785,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         // this above shader-cache lookup/build; upstream does not hold these
         // cache locks while finding the graphics pipeline.
         //
-        // Ruzu's channel `MemoryManager` is behind an extra Rust mutex. Acquire
-        // it before the cache mutexes so descriptor-table cbuf reads don't
-        // deadlock against paths that already hold the memory-manager lock and
-        // then enter buffer/texture cache code. Upstream has no equivalent
-        // `Tegra::MemoryManager` mutex on `gpu_memory->Read<u32>`.
         let cbuf_memory_manager = self.channel_memory_manager.as_ref().cloned();
-        let _lo_chmm = cbuf_memory_manager
-            .as_ref()
-            .map(|_| common::lock_order::guard("channel_mm"));
-        let cbuf_mm_guard = cbuf_memory_manager.as_ref().map(|mm| mm.lock());
         let buffer_mutex: *const _ = &self.buffer_cache.mutex;
         let texture_mutex: *const _ = &self.texture_cache.base.mutex;
         record_gl_draw_stage(draw_seq, 8);
@@ -3687,65 +3802,14 @@ impl RasterizerInterface for RasterizerOpenGL {
         trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_cache_locks", draw_seq);
         let mut trace_any_samples_rt = false;
 
-        // Mirrors upstream `GraphicsPipeline::ConfigureImpl`
-        // (gl_graphics_pipeline.cpp:278-284): the very first thing the
-        // pipeline configure does is `texture_cache.SynchronizeGraphicsDescriptors`
-        // off `maxwell3d->regs`. Ruzu routes this through the draw view so the
-        // backend entry point can move toward upstream's live Maxwell access
-        // without a persistent unsafe engine pointer.
-        self.texture_cache
-            .base
-            .synchronize_graphics_descriptors(draw_view.descriptor_sync_regs());
-        record_gl_draw_stage(draw_seq, 10);
-        trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_descriptor_sync", draw_seq);
-        pipeline.configure(is_indexed);
-        record_gl_draw_stage(draw_seq, 11);
-        trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_pipeline_configure", draw_seq);
         let descriptor_sync_regs = draw_view.descriptor_sync_regs();
-        let uniform_masks = pipeline.enabled_uniform_buffer_masks;
-        let uniform_sizes = pipeline.uniform_buffer_sizes;
 
-        self.buffer_cache
-            .set_uniform_buffers_state(&uniform_masks, &uniform_sizes);
-        self.buffer_cache
-            .set_graphics_base_uniform_bindings(&pipeline.base_uniform_bindings);
-        self.buffer_cache
-            .set_graphics_base_storage_bindings(&pipeline.base_storage_bindings);
-        self.buffer_cache
-            .set_enable_storage_buffers(pipeline.use_storage_buffers);
-        record_gl_draw_stage(draw_seq, 25);
-        trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_base_bindings", draw_seq);
+        let mut graphics_buffers_bound_in_configure = false;
 
-        // Install the engine-state adapter before descriptor configuration.
-        // Upstream `GraphicsPipeline::ConfigureImpl` reads SSBO addresses from
-        // `maxwell3d->state.shader_stages[stage].const_buffers` while walking
-        // storage descriptors; ruzu's buffer cache needs the same cbuf snapshot
-        // before `bind_graphics_storage_buffer` runs.
-        self.buffer_cache
-            .set_engine_state(Box::new(DrawStateEngineAdapter {
-                draw_state: draw_state.clone(),
-                registers: draw_view.registers(),
-            }));
-        record_gl_draw_stage(draw_seq, 14);
-        trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_set_engine_state", draw_seq);
-
-        // Per-stage texture / image descriptor collection — port of the
-        // `config_stage` lambda body in upstream `ConfigureImpl`
-        // (gl_graphics_pipeline.cpp:293-376). For each stage's shader info,
-        // walk `texture_buffer_descriptors`, `image_buffer_descriptors`,
-        // `texture_descriptors`, `image_descriptors`; for each descriptor
-        // read `count` 32-bit TIC handles from its cbuf binding via the
-        // GPU memory reader; push one `ImageViewInOut` per handle.
-        //
-        // The cbuf address comes from the draw-view cbuf snapshot. Handle decode
-        // splits the raw u32 into (tic_id, tsc_id) using `texture_pair` —
-        // when `sampler_binding == ViaHeaderBinding` the two ids collapse.
-        //
-        // Upstream does this unconditionally as part of
-        // `GraphicsPipeline::ConfigureImpl`. Hardened with explicit bounds
-        // checks on every index that could come from shader-info
-        // (uninitialised or out-of-range u32s would otherwise panic via array
-        // indexing and crash through the SIGSEGV handler).
+        // Per-stage descriptor collection delegates to `GraphicsPipeline`,
+        // which owns upstream `ConfigureImpl::config_stage` ordering. The
+        // rasterizer still builds the draw-state adapter and cbuf reader until
+        // the full upstream owner graph is restored.
         {
             record_gl_draw_stage(draw_seq, 15);
             trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_descriptor_walk", draw_seq);
@@ -3766,10 +3830,57 @@ impl RasterizerInterface for RasterizerOpenGL {
             // descriptor counts are runtime-data, not template-parameterised.
             let mut sampler_ids: Vec<crate::texture_cache::types::SamplerId> =
                 Vec::with_capacity(64);
-            let mut has_images = false;
             let cbuf_device_reader = self.device_memory_reader.as_ref().cloned();
 
-            let read_handle = |stage: usize, cbuf_index: u32, offset: u32| -> Option<u32> {
+            if std::env::var_os("RUZU_DUMP_DRAW_CBUFS").is_some() {
+                let pipeline_filter = parse_trace_u64_env("RUZU_DUMP_DRAW_CBUFS_PIPELINE");
+                let rt_addr_filter = parse_trace_u64_env("RUZU_DUMP_DRAW_CBUFS_RT_ADDR");
+                let vec4_count = parse_trace_u64_env("RUZU_DUMP_DRAW_CBUFS_VEC4_COUNT")
+                    .unwrap_or(8)
+                    .min(64) as usize;
+                let rt0_addr = draw_view.render_targets().render_targets[0].address;
+                if pipeline_filter.is_none_or(|target| target == pipeline_handle_after_build as u64)
+                    && rt_addr_filter.is_none_or(|target| target == rt0_addr)
+                {
+                    if let Some(mm_arc) = cbuf_memory_manager.as_ref() {
+                        let mm = mm_arc.lock();
+                        for (stage, stage_bindings) in cb_bindings.iter().enumerate() {
+                            for (slot, binding) in stage_bindings.iter().enumerate() {
+                                if !binding.enabled || binding.address == 0 || binding.size == 0 {
+                                    continue;
+                                }
+                                let words = vec4_count
+                                    .saturating_mul(4)
+                                    .min((binding.size / 4) as usize);
+                                let mut values = Vec::with_capacity(words);
+                                for word in 0..words {
+                                    let addr = binding.address + (word as u64 * 4);
+                                    let mut raw = [0u8; 4];
+                                    if mm.gpu_to_cpu_address(addr).is_some() {
+                                        mm.read_block(addr, &mut raw);
+                                        values.push(u32::from_le_bytes(raw));
+                                    } else {
+                                        values.push(0);
+                                    }
+                                }
+                                log::warn!(
+                                    "[DRAW_CBUF] seq={} pipeline={} rt0_gpu=0x{:X} stage={} slot={} gpu=0x{:X} size={} words={:08X?}",
+                                    draw_seq,
+                                    pipeline_handle_after_build,
+                                    rt0_addr,
+                                    stage,
+                                    slot,
+                                    binding.address,
+                                    binding.size,
+                                    values
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut read_handle = |stage: usize, cbuf_index: u32, offset: u32| -> Option<u32> {
                 if stage >= num_shader_stages {
                     return None;
                 }
@@ -3782,11 +3893,12 @@ impl RasterizerInterface for RasterizerOpenGL {
                     return None;
                 }
                 let addr = binding.address.checked_add(offset as u64)?;
-                let mm = cbuf_mm_guard.as_ref()?;
-                let reader = cbuf_device_reader.as_ref()?;
+                let mm_arc = cbuf_memory_manager.as_ref()?;
+                let _reader = cbuf_device_reader.as_ref()?;
                 let detail = ((cbuf_index as u64) << 32) | offset as u64;
                 record_gl_draw_stage_detail(draw_seq, 51, stage as u64, detail);
                 record_gl_draw_stage_detail(draw_seq, 52, stage as u64, detail);
+                let mm = mm_arc.lock();
                 let address_valid = mm.gpu_to_cpu_address(addr).is_some();
                 record_gl_draw_stage_detail(draw_seq, 53, stage as u64, detail);
                 if !address_valid {
@@ -3800,452 +3912,93 @@ impl RasterizerInterface for RasterizerOpenGL {
                 Some(u32::from_le_bytes(buf))
             };
 
-            // For each descriptor: compute clamped count, then loop. Per-entry
-            // index_offset uses checked u32 arithmetic so a malformed shift_left
-            // can't silently wrap into a wildly wrong cbuf offset.
-            let resolve_handle = |stage: usize,
-                                  cbuf_index: u32,
-                                  cbuf_offset: u32,
-                                  size_shift: u32,
-                                  idx: u32|
-             -> Option<u32> {
-                // `idx << size_shift` — checked shift + checked add.
-                let shift = size_shift.min(31);
-                let index_offset = idx.checked_shl(shift)?;
-                let offset = cbuf_offset.checked_add(index_offset)?;
-                read_handle(stage, cbuf_index, offset)
-            };
-
-            let resolve_texture_handle = |stage: usize,
-                                          has_secondary: bool,
-                                          cbuf_index: u32,
-                                          cbuf_offset: u32,
-                                          shift_left: u32,
-                                          secondary_cbuf_index: u32,
-                                          secondary_cbuf_offset: u32,
-                                          secondary_shift_left: u32,
-                                          size_shift: u32,
-                                          idx: u32|
-             -> Option<u32> {
-                let shift = size_shift.min(31);
-                let index_offset = idx.checked_shl(shift)?;
-                let offset = cbuf_offset.checked_add(index_offset)?;
-                if has_secondary {
-                    let second_offset = secondary_cbuf_offset.checked_add(index_offset)?;
-                    debug_assert!(shift_left < 32);
-                    debug_assert!(secondary_shift_left < 32);
-                    let lhs = read_handle(stage, cbuf_index, offset)? << shift_left;
-                    let rhs = read_handle(stage, secondary_cbuf_index, second_offset)?
-                        << secondary_shift_left;
-                    Some(lhs | rhs)
-                } else {
-                    read_handle(stage, cbuf_index, offset)
-                }
-            };
-
-            for stage in 0..NUM_STAGES.min(num_shader_stages) {
-                record_gl_draw_stage_detail(draw_seq, 32, stage as u64, 0);
-                let Some(info) = pipeline.stage_infos[stage].as_ref() else {
-                    continue;
-                };
-                self.buffer_cache.unbind_graphics_storage_buffers(stage);
-                record_gl_draw_stage_detail(draw_seq, 33, stage as u64, 0);
-                record_gl_draw_stage_detail(
-                    draw_seq,
-                    34,
-                    stage as u64,
-                    info.storage_buffers_descriptors.len() as u64,
-                );
-                if pipeline.use_storage_buffers {
-                    if gl_debug.trace_ssbo_bind && !info.storage_buffers_descriptors.is_empty() {
-                        log::info!(
-                            "[SSBO_CONFIG] pipeline={} stage={} descriptors={} base_binding={}",
-                            pipeline.program_pipeline_handle(),
-                            stage,
-                            info.storage_buffers_descriptors.len(),
-                            pipeline.base_storage_bindings[stage]
-                        );
-                    }
-                    for (ssbo_index, desc) in info.storage_buffers_descriptors.iter().enumerate() {
-                        if desc.count != 1 {
-                            log::warn!(
-                                "RasterizerOpenGL: storage buffer descriptor count {} is not ported",
-                                desc.count
-                            );
-                            continue;
-                        }
-                        if let (Some(mm), Some(reader)) =
-                            (cbuf_mm_guard.as_ref(), cbuf_device_reader.as_ref())
-                        {
-                            self.buffer_cache
-                                .bind_graphics_storage_buffer_with_gpu_reader(
-                                    stage,
-                                    ssbo_index,
-                                    desc.cbuf_index,
-                                    desc.cbuf_offset,
-                                    desc.is_written,
-                                    |gpu_addr| mm.gpu_to_cpu_address(gpu_addr),
-                                    |gpu_addr| mm.get_memory_layout_size(gpu_addr),
-                                    |gpu_addr, out| {
-                                        if mm.gpu_to_cpu_address(gpu_addr).is_none() {
-                                            return false;
-                                        }
-                                        mm.read_block(gpu_addr, out);
-                                        true
-                                    },
-                                );
-                        } else {
-                            self.buffer_cache.bind_graphics_storage_buffer(
-                                stage,
-                                ssbo_index,
-                                desc.cbuf_index,
-                                desc.cbuf_offset,
-                                desc.is_written,
-                            );
-                        }
-                    }
-                }
-                record_gl_draw_stage_detail(draw_seq, 35, stage as u64, 0);
-                if trace_texture_descriptors {
-                    log::warn!(
-                        "[TEX_DESC] stage={} texture_buffers={} image_buffers={} textures={} images={}",
-                        stage,
-                        info.texture_buffer_descriptors.len(),
-                        info.image_buffer_descriptors.len(),
-                        info.texture_descriptors.len(),
-                        info.image_descriptors.len(),
-                    );
-                }
-                // Texture buffer descriptors — handle only (no sampler).
-                record_gl_draw_stage_detail(
-                    draw_seq,
-                    36,
-                    stage as u64,
-                    info.texture_buffer_descriptors.len() as u64,
-                );
-                for desc in &info.texture_buffer_descriptors {
-                    let count = desc.count.min(MAX_DESC_COUNT);
-                    for idx in 0..count {
-                        if let Some(raw) = resolve_texture_handle(
-                            stage,
-                            desc.has_secondary,
-                            desc.cbuf_index,
-                            desc.cbuf_offset,
-                            desc.shift_left,
-                            desc.secondary_cbuf_index,
-                            desc.secondary_cbuf_offset,
-                            desc.secondary_shift_left,
-                            desc.size_shift,
-                            idx,
-                        ) {
-                            let (tic_id, _) =
-                                crate::textures::texture::texture_pair(raw, via_header_index);
-                            views.push(crate::texture_cache::texture_cache_base::ImageViewInOut {
-                                index: tic_id,
-                                blacklist: false,
-                                id: Default::default(),
-                            });
-                        }
-                    }
-                }
-                record_gl_draw_stage_detail(draw_seq, 37, stage as u64, 0);
-                // Image buffer descriptors — blacklist=false, no sampler. Upstream
-                // calls these out separately under `Spec::has_image_buffers`.
-                record_gl_draw_stage_detail(
-                    draw_seq,
-                    38,
-                    stage as u64,
-                    info.image_buffer_descriptors.len() as u64,
-                );
-                for desc in &info.image_buffer_descriptors {
-                    let count = desc.count.min(MAX_DESC_COUNT);
-                    for idx in 0..count {
-                        if let Some(raw) = resolve_handle(
-                            stage,
-                            desc.cbuf_index,
-                            desc.cbuf_offset,
-                            desc.size_shift,
-                            idx,
-                        ) {
-                            let (tic_id, _) =
-                                crate::textures::texture::texture_pair(raw, via_header_index);
-                            views.push(crate::texture_cache::texture_cache_base::ImageViewInOut {
-                                index: tic_id,
-                                blacklist: false,
-                                id: Default::default(),
-                            });
-                        }
-                    }
-                }
-                record_gl_draw_stage_detail(draw_seq, 39, stage as u64, 0);
-                // Sampled texture descriptors. Each handle yields one image-view
-                // and one sampler-id. Per upstream (gl_graphics_pipeline.cpp:489):
-                // `texture_cache.GetSampler(*(samplers_it++))` — the sampler is
-                // resolved from the TSC id alongside the image view from the
-                // TIC id, walking parallel arrays.
-                record_gl_draw_stage_detail(
-                    draw_seq,
-                    40,
-                    stage as u64,
-                    info.texture_descriptors.len() as u64,
-                );
-                for (desc_index, desc) in info.texture_descriptors.iter().enumerate() {
-                    let count = desc.count.min(MAX_DESC_COUNT);
-                    for idx in 0..count {
-                        let packed_desc = ((desc_index as u64) << 32) | idx as u64;
-                        record_gl_draw_stage_detail(draw_seq, 45, stage as u64, packed_desc);
-                        let raw = resolve_texture_handle(
-                            stage,
-                            desc.has_secondary,
-                            desc.cbuf_index,
-                            desc.cbuf_offset,
-                            desc.shift_left,
-                            desc.secondary_cbuf_index,
-                            desc.secondary_cbuf_offset,
-                            desc.secondary_shift_left,
-                            desc.size_shift,
-                            idx,
-                        );
-                        record_gl_draw_stage_detail(draw_seq, 46, stage as u64, packed_desc);
-                        if trace_texture_descriptors {
-                            let binding = cb_bindings.get(stage).and_then(|stage_bindings| {
-                                stage_bindings.get(desc.cbuf_index as usize)
-                            });
-                            log::warn!(
-                                "[TEX_DESC] sampled stage={} idx={} cbuf={} offset=0x{:X} shift={} count={} cbuf_enabled={} cbuf_addr=0x{:X} raw={:?}",
-                                stage,
-                                idx,
-                                desc.cbuf_index,
-                                desc.cbuf_offset,
-                                desc.size_shift,
-                                desc.count,
-                                binding.map(|b| b.enabled).unwrap_or(false),
-                                binding.map(|b| b.address).unwrap_or(0),
-                                raw,
-                            );
-                        }
-                        if let Some(raw) = raw {
-                            let (tic_id, tsc_id) =
-                                crate::textures::texture::texture_pair(raw, via_header_index);
-                            record_gl_draw_stage_detail(draw_seq, 47, stage as u64, packed_desc);
-                            views.push(crate::texture_cache::texture_cache_base::ImageViewInOut {
-                                index: tic_id,
-                                blacklist: false,
-                                id: Default::default(),
-                            });
-                            // Slice 13: resolve the TSC handle → SamplerId via
-                            // the cache's per-index dedup table. Pushed in
-                            // lock-step with the view so the bind loop can
-                            // walk both in parallel. MK8D's TSC table pointer
-                            // is a GPU VA, so read it through the channel
-                            // MemoryManager rather than the Host1x SMMU device
-                            // manager stored in the cache base.
-                            record_gl_draw_stage_detail(draw_seq, 48, stage as u64, packed_desc);
-                            let sampler_id = if let (Some(mm), Some(reader)) =
-                                (cbuf_mm_guard.as_ref(), cbuf_device_reader.as_ref())
-                            {
-                                self.texture_cache
-                                    .base
-                                    .get_graphics_sampler_id_with_gpu_reader(
-                                        tsc_id,
-                                        descriptor_sync_regs.tex_sampler_addr,
-                                        if via_header_index {
-                                            descriptor_sync_regs.tex_header_limit
-                                        } else {
-                                            descriptor_sync_regs.tex_sampler_limit
-                                        },
-                                        |gpu_addr, out| {
-                                            if mm.gpu_to_cpu_address(gpu_addr).is_none() {
-                                                return false;
-                                            }
-                                            mm.read_block(gpu_addr, out);
-                                            true
-                                        },
-                                    )
-                            } else {
-                                self.texture_cache.base.get_graphics_sampler_id(tsc_id)
-                            };
-                            record_gl_draw_stage_detail(draw_seq, 49, stage as u64, packed_desc);
-                            sampler_ids.push(sampler_id);
-                            record_gl_draw_stage_detail(draw_seq, 50, stage as u64, packed_desc);
-                        }
-                    }
-                }
-                record_gl_draw_stage_detail(draw_seq, 41, stage as u64, 0);
-                // Image (storage image) descriptors. Upstream tags
-                // blacklist = desc.is_written so written-to render targets
-                // can be detected and scaled down.
-                record_gl_draw_stage_detail(
-                    draw_seq,
-                    42,
-                    stage as u64,
-                    info.image_descriptors.len() as u64,
-                );
-                for desc in &info.image_descriptors {
-                    has_images = true;
-                    let count = desc.count.min(MAX_DESC_COUNT);
-                    for idx in 0..count {
-                        if let Some(raw) = resolve_handle(
-                            stage,
-                            desc.cbuf_index,
-                            desc.cbuf_offset,
-                            desc.size_shift,
-                            idx,
-                        ) {
-                            let (tic_id, _) =
-                                crate::textures::texture::texture_pair(raw, via_header_index);
-                            views.push(crate::texture_cache::texture_cache_base::ImageViewInOut {
-                                index: tic_id,
-                                blacklist: desc.is_written,
-                                id: Default::default(),
-                            });
-                        }
-                    }
-                }
-                record_gl_draw_stage_detail(draw_seq, 43, stage as u64, 0);
-                record_gl_draw_stage_detail(draw_seq, 44, stage as u64, 0);
-            }
-            record_gl_draw_stage(draw_seq, 16);
-            trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_descriptor_walk", draw_seq);
-            // Mirror upstream `FillGraphicsImageViews<has_images>(views)` from
-            // gl_graphics_pipeline.cpp:380. `has_blacklists = has_images` per
-            // upstream's `Spec::has_images` template parameter.
-            if let (Some(mm), Some(reader)) = (cbuf_mm_guard.as_ref(), cbuf_device_reader.as_ref())
-            {
-                self.texture_cache
-                    .base
-                    .fill_graphics_image_views_with_gpu_reader(
-                        &mut views,
-                        has_images,
-                        &mut |gpu_addr, out| {
-                            if mm.gpu_to_cpu_address(gpu_addr).is_none() {
-                                return false;
-                            }
-                            mm.read_block(gpu_addr, out);
-                            true
-                        },
-                        &mut |gpu_addr, size| {
-                            mm.gpu_to_cpu_address(gpu_addr)
-                                .or_else(|| mm.gpu_to_cpu_address_range(gpu_addr, size))
-                        },
-                    );
-            } else {
-                self.texture_cache
-                    .base
-                    .fill_graphics_image_views(&mut views, has_images);
-            }
-            record_gl_draw_stage(draw_seq, 17);
-            trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_fill_image_views", draw_seq);
-
-            // Upstream `prepare_stage` calls `PrepareImageView` before
-            // binding every sampled image view. Ruzu has already resolved the
-            // view ids here, so prepare the parent image ids through the
-            // OpenGL-backed bridge before materialising GL views.
-            let mut image_ids = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for view in &views {
-                if !view.id.is_valid() {
-                    continue;
-                }
-                let view_base = self.texture_cache.base.slot_image_views.get(view.id);
-                let image_id = view_base.image_id;
-                if image_id.is_valid() && seen.insert(image_id) {
-                    image_ids.push(image_id);
-                }
-            }
-            if let (Some(mm), Some(_reader)) = (cbuf_mm_guard.as_ref(), cbuf_device_reader.as_ref())
-            {
-                for image_id in image_ids {
-                    self.texture_cache.prepare_image_with_gpu_reader(
-                        image_id,
-                        false,
-                        false,
-                        &mut |gpu_addr, out| {
-                            if mm.gpu_to_cpu_address(gpu_addr).is_none() {
-                                return false;
-                            }
-                            mm.read_block(gpu_addr, out);
-                            true
-                        },
-                    );
-                }
-            } else {
-                for image_id in image_ids {
-                    self.texture_cache
-                        .prepare_image_without_gpu_reader(image_id, false, false);
-                }
-            }
-            record_gl_draw_stage(draw_seq, 18);
-            trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_prepare_images", draw_seq);
-
-            // Slice 11: materialise the GL-side `Image` + `ImageView` for every
-            // view-id that `fill_graphics_image_views` produced. Upstream does
-            // this inside `slot_image_views.insert(runtime, info, image_id,
-            // image, slot_images)` because the slot pool stores the backend
-            // type directly; ruzu's base pool stores `ImageViewBase`, so the
-            // GL wrapper lazily mirrors the slots into its HashMaps here.
-            // Required before any future `glBindTextureUnit` step can resolve
-            // a view-id to a real GL texture name.
-            self.texture_cache.materialize_views(&views);
-            record_gl_draw_stage(draw_seq, 19);
-            trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_materialize_views", draw_seq);
-            // Slice 13: materialise the GL `Sampler` objects for the same
-            // batch of sampled-texture descriptors. Mirrors upstream's
-            // `slot_samplers[id]` access in `prepare_stage` — the only
-            // difference is timing (upstream populates lazily inside
-            // FindSampler; ruzu separates id-alloc from backend ctor).
-            self.texture_cache.materialize_samplers(&sampler_ids);
-            record_gl_draw_stage(draw_seq, 20);
-            trace_gl_draw_stall!(
-                "[GL_DRAW_STALL] seq={} after_materialize_samplers",
-                draw_seq
-            );
-
+            let use_stage_gpu_reader =
+                cbuf_memory_manager.is_some() && cbuf_device_reader.is_some();
+            let mm_for_ssbo_addr = cbuf_memory_manager.as_ref().cloned();
+            let mm_for_ssbo_layout = cbuf_memory_manager.as_ref().cloned();
+            let mm_for_ssbo_read = cbuf_memory_manager.as_ref().cloned();
             // Upstream `GraphicsPipeline::ConfigureImpl` performs
             // `FillGraphicsImageViews` before `UpdateRenderTargets`; keep the
             // same ordering so sampled-image alias synchronization observes the
             // source image before a render-target prepare can synchronize stale
             // parent contents back into an aliased child mip.
-            if let Some(mm) = cbuf_mm_guard.as_ref() {
+            if cbuf_memory_manager.as_ref().is_some() {
                 let rt_step = profile_draw_timing.then(Instant::now);
                 let render_targets = draw_view.render_targets();
                 record_gl_draw_stage(draw_seq, 1);
                 trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_rt_prepare", draw_seq);
-                self.texture_cache
-                    .update_render_targets_from_snapshot(&render_targets, |gpu_addr| {
-                        mm.gpu_to_cpu_address(gpu_addr)
-                    });
-                if cbuf_device_reader.is_some() {
-                    self.texture_cache.prepare_render_targets_from_snapshot(
-                        &render_targets,
-                        Some(&mut |gpu_addr, out| {
-                            if mm.gpu_to_cpu_address(gpu_addr).is_none() {
-                                return false;
-                            }
-                            mm.read_block(gpu_addr, out);
-                            true
-                        }),
-                        false,
-                        None,
-                    );
-                } else {
-                    self.texture_cache.prepare_render_targets_from_snapshot(
-                        &render_targets,
-                        None,
-                        false,
-                        None,
-                    );
-                }
+                let dirty_flags = draw_view.dirty_flags();
                 let surface_clip = draw_view.surface_clip();
-                bound_draw_framebuffer = self
-                    .texture_cache
-                    .framebuffer_for_render_targets_from_snapshot(
+                bound_draw_framebuffer = pipeline
+                    .synchronize_then_set_engine_state_and_configure_graphics_framebuffer(
+                        &mut self.texture_cache,
+                        descriptor_sync_regs,
+                        &mut self.buffer_cache,
+                        || {
+                            record_gl_draw_stage(draw_seq, 10);
+                            trace_gl_draw_stall!(
+                                "[GL_DRAW_STALL] seq={} after_descriptor_sync",
+                                draw_seq
+                            );
+                            record_gl_draw_stage(draw_seq, 25);
+                            trace_gl_draw_stall!(
+                                "[GL_DRAW_STALL] seq={} after_base_bindings",
+                                draw_seq
+                            );
+                        },
+                        Box::new(DrawStateEngineAdapter {
+                            draw_state: draw_state.clone(),
+                            registers: draw_view.registers(),
+                        }),
+                        || {
+                            record_gl_draw_stage(draw_seq, 14);
+                            trace_gl_draw_stall!(
+                                "[GL_DRAW_STALL] seq={} after_set_engine_state",
+                                draw_seq
+                            );
+                        },
+                        &mut self.state_tracker,
+                        num_shader_stages,
+                        MAX_DESC_COUNT,
+                        via_header_index,
+                        &mut views,
+                        &mut sampler_ids,
+                        use_stage_gpu_reader,
+                        gl_debug.trace_ssbo_bind,
+                        move |gpu_addr| {
+                            mm_for_ssbo_addr
+                                .as_ref()
+                                .and_then(|mm| mm.lock().gpu_to_cpu_address(gpu_addr))
+                        },
+                        move |gpu_addr| {
+                            mm_for_ssbo_layout
+                                .as_ref()
+                                .map(|mm| mm.lock().get_memory_layout_size(gpu_addr))
+                                .unwrap_or(0)
+                        },
+                        move |gpu_addr, out| {
+                            if let Some(mm) = mm_for_ssbo_read.as_ref() {
+                                mm.lock().read_block(gpu_addr, out);
+                                true
+                            } else {
+                                false
+                            }
+                        },
+                        &mut read_handle,
+                        |detail_stage, detail0, detail1| {
+                            record_gl_draw_stage_detail(draw_seq, detail_stage, detail0, detail1);
+                        },
+                        trace_texture_descriptors,
                         &render_targets,
+                        &dirty_flags,
+                        &mut draw_view,
                         crate::texture_cache::types::Extent2D {
                             width: surface_clip.width,
                             height: surface_clip.height,
                         },
                     );
+                record_gl_draw_stage(draw_seq, 16);
+                trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_descriptor_walk", draw_seq);
                 record_gl_draw_stage(draw_seq, 2);
                 trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_rt_prepare", draw_seq);
                 if trace_draw {
@@ -4259,13 +4012,25 @@ impl RasterizerInterface for RasterizerOpenGL {
                 if let Some(rt_step) = rt_step {
                     profile_rt_us = trace_elapsed_us(rt_step);
                 }
-            } else if gl_debug.trace_rt {
-                log::info!("[RT] miss no_channel_memory_manager");
+            } else {
+                // Upstream has a `gpu_memory` pointer after `SetEngine`.
+                // Preserve the old Rust fallback when the channel memory
+                // bridge is absent, but keep it outside the normal
+                // upstream-shaped pipeline configure path.
+                pipeline.synchronize_graphics_descriptors_then_configure_buffer_cache_state(
+                    &mut self.texture_cache,
+                    descriptor_sync_regs,
+                    &mut self.buffer_cache,
+                );
+                record_gl_draw_stage(draw_seq, 10);
+                trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_descriptor_sync", draw_seq);
+                record_gl_draw_stage(draw_seq, 25);
+                trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_base_bindings", draw_seq);
+                if gl_debug.trace_rt {
+                    log::info!("[RT] miss no_channel_memory_manager");
+                }
             }
             if let Some((framebuffer, width, height)) = bound_draw_framebuffer {
-                unsafe {
-                    gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, framebuffer);
-                }
                 static RT_BIND_SEQ_MIN: OnceLock<Option<u64>> = OnceLock::new();
                 static RT_BIND_SEQ_MAX: OnceLock<Option<u64>> = OnceLock::new();
                 static RT_BIND_TIME_START: OnceLock<Option<u64>> = OnceLock::new();
@@ -4399,24 +4164,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             // `BindGraphicsTextureBuffer`), then walk `texture_descriptors`.
             // Storage-image binding (`info.image_descriptors`) and per-unit
             // sampler binding are deferred to follow-up slices.
-            const MAX_TEXTURES: usize =
-                crate::renderer_opengl::gl_graphics_pipeline::MAX_TEXTURES as usize;
-            const MAX_IMAGES: usize =
-                crate::renderer_opengl::gl_graphics_pipeline::MAX_IMAGES as usize;
-            let mut textures: [u32; MAX_TEXTURES] = [0; MAX_TEXTURES];
-            // Parallel sampler-handle scratch buffer (Slice 13). Upstream uses
-            // `std::array<GLuint, MAX_TEXTURES> gl_samplers` and asserts
-            // `texture_binding == sampler_binding` at the end.
-            let mut gl_samplers: [u32; MAX_TEXTURES] = [0; MAX_TEXTURES];
-            let mut bound_texture_view_ids: [crate::texture_cache::types::ImageViewId;
-                MAX_TEXTURES] = [crate::texture_cache::types::NULL_IMAGE_VIEW_ID; MAX_TEXTURES];
-            // Storage-image handle scratch (Slice 14). Mirrors upstream
-            // `std::array<GLuint, MAX_IMAGES> images`.
-            let mut images: [u32; MAX_IMAGES] = [0; MAX_IMAGES];
-            let mut texture_binding: usize = 0;
-            let mut image_binding: usize = 0;
-            let mut sampler_it: usize = 0;
-            let mut views_it: usize = 0;
+            let mut graphics_bindings = GraphicsTextureImageBindingState::new();
             let trace_texture_bind = common::trace::is_enabled(common::trace::cat::TEXTURE_BIND);
             let trace_texture_bind_addr =
                 common::trace::is_enabled(common::trace::cat::TEXTURE_BIND_ADDR);
@@ -4476,118 +4224,17 @@ impl RasterizerInterface for RasterizerOpenGL {
                     Some(target) => target == pipeline.program_pipeline_handle(),
                     None => true,
                 };
-            for stage in 0..NUM_STAGES.min(num_shader_stages) {
-                let Some(info) = pipeline.stage_infos[stage].as_ref() else {
-                    continue;
-                };
-                // Slice 17: port of upstream bind_stage_info
-                // (gl_graphics_pipeline.cpp:386-420). For texture-buffer and
-                // image-buffer descriptors, feed the view's gpu_addr / size /
-                // format into the buffer cache so its UpdateGraphicsBuffers
-                // pass binds the right TBO. `UnbindGraphicsTextureBuffers`
-                // first to reset stale slots from a prior pipeline.
-                self.buffer_cache.unbind_graphics_texture_buffers(stage);
-                let mut tbo_index: u32 = 0;
-                // Texture buffers come first in the views[] order (Slice 6).
-                for desc in &info.texture_buffer_descriptors {
-                    let count = desc.count.min(MAX_DESC_COUNT);
-                    for _ in 0..count {
-                        if views_it >= views.len() {
-                            break;
-                        }
-                        let view_id = views[views_it].id;
-                        views_it += 1;
-                        if view_id.is_valid() {
-                            let view_base = self
-                                .texture_cache
-                                .base
-                                .slot_image_views
-                                .get(view_id)
-                                .clone();
-                            let internal_format =
-                                super::gl_texture_cache::present_internal_format(view_base.format);
-                            self.buffer_cache.bind_graphics_texture_buffer(
-                                stage,
-                                tbo_index as usize,
-                                view_base.gpu_addr,
-                                view_base.size.width,
-                                internal_format,
-                                false, // is_written: sampled buffers are read-only
-                                false, // is_image: false for texture buffers
-                            );
-                        }
-                        if texture_binding < MAX_TEXTURES {
-                            textures[texture_binding] = 0;
-                            gl_samplers[texture_binding] = 0;
-                            bound_texture_view_ids[texture_binding] = view_id;
-                            texture_binding += 1;
-                        }
-                        tbo_index += 1;
-                    }
-                }
-                // Image buffers follow — same flow, is_image = true.
-                for desc in &info.image_buffer_descriptors {
-                    let count = desc.count.min(MAX_DESC_COUNT);
-                    for _ in 0..count {
-                        if views_it >= views.len() {
-                            break;
-                        }
-                        let view_id = views[views_it].id;
-                        views_it += 1;
-                        if view_id.is_valid() {
-                            let view_base = self
-                                .texture_cache
-                                .base
-                                .slot_image_views
-                                .get(view_id)
-                                .clone();
-                            let internal_format =
-                                super::gl_texture_cache::present_internal_format(view_base.format);
-                            self.buffer_cache.bind_graphics_texture_buffer(
-                                stage,
-                                tbo_index as usize,
-                                view_base.gpu_addr,
-                                view_base.size.width,
-                                internal_format,
-                                desc.is_written,
-                                true,
-                            );
-                        }
-                        if image_binding < MAX_IMAGES {
-                            images[image_binding] = 0;
-                            image_binding += 1;
-                        }
-                        tbo_index += 1;
-                    }
-                }
-
-                for desc in &info.texture_descriptors {
-                    let count = desc.count.min(MAX_DESC_COUNT);
-                    for _ in 0..count {
-                        if views_it >= views.len() || texture_binding >= MAX_TEXTURES {
-                            break;
-                        }
-                        let view_id = views[views_it].id;
-                        views_it += 1;
-                        // `materialize_views` only inserts entries with
-                        // valid view_ids; missing entries → bind 0 so the
-                        // GL state is well-defined (sample produces black /
-                        // undefined).
-                        let (handle, view_supports_aniso) = self
-                            .texture_cache
-                            .get_image_view(view_id)
-                            .map(|iv| {
-                                (
-                                    iv.handle_for_texture_type(desc.texture_type),
-                                    iv.supports_anisotropy(),
-                                )
-                            })
-                            .unwrap_or((0, false));
-                        if trace_texture_bind_addr_for_pipeline {
-                            let (image_id, view_gpu_addr, view_width, view_height) = if view_id
-                                .is_valid()
-                            {
-                                let view = self.texture_cache.base.slot_image_views.get(view_id);
+            let mut texture_buffer_views_it: usize = 0;
+            let pipeline_handle_for_texture_trace = pipeline.program_pipeline_handle();
+            let mut observe_graphics_texture_binding =
+                |binding: &crate::renderer_opengl::gl_graphics_pipeline::SampledTextureBinding,
+                 texture_cache: &OpenGLTextureCache| {
+                    let view_id = binding.view_id;
+                    let handle = binding.handle;
+                    if trace_texture_bind_addr_for_pipeline {
+                        let (image_id, view_gpu_addr, view_width, view_height) =
+                            if view_id.is_valid() {
+                                let view = texture_cache.base.slot_image_views.get(view_id);
                                 (
                                     view.image_id.index as u64,
                                     view.gpu_addr,
@@ -4597,254 +4244,253 @@ impl RasterizerInterface for RasterizerOpenGL {
                             } else {
                                 (u64::MAX, 0, 0, 0)
                             };
-                            if should_trace_texture_bind_address(view_gpu_addr) {
-                                common::trace::emit_raw(
-                                    common::trace::cat::TEXTURE_BIND_ADDR,
-                                    &[
-                                        draw_seq as u64,
-                                        pipeline.program_pipeline_handle() as u64,
-                                        stage as u64,
-                                        texture_binding as u64,
-                                        view_id.index as u64,
-                                        image_id,
-                                        view_gpu_addr,
-                                        view_width,
-                                        view_height,
-                                        handle as u64,
-                                        desc.texture_type as u64,
-                                        desc.is_depth as u64,
-                                        desc.is_multisample as u64,
-                                    ],
-                                );
-                            }
-                        }
-                        if view_id.is_valid() {
-                            let view = self.texture_cache.base.slot_image_views.get(view_id);
-                            if should_skip_draw_sampling_gpu_addr(view.gpu_addr) {
-                                skip_draw_due_to_sampling_addr = true;
-                            }
-                            if should_trace_texture_grid_address(view.gpu_addr, draw_seq) {
-                                unsafe {
-                                    trace_texture_grid_sample(
-                                        draw_seq as u64,
-                                        pipeline.program_pipeline_handle() as u64,
-                                        stage as u64,
-                                        texture_binding as u64,
-                                        view_id.index as u64,
-                                        view.image_id.index as u64,
-                                        view.gpu_addr,
-                                        view.format as u64,
-                                        view.view_type as u64,
-                                        view.swizzle,
-                                        handle,
-                                    );
-                                }
-                            }
-                        }
-                        if trace_texture_bind_for_pipeline {
-                            let mut width = 0i32;
-                            let mut height = 0i32;
-                            let mut depth = 0i32;
-                            let mut sample0 = [0u8; 4];
-                            let mut sample_mid = [0u8; 4];
-                            if handle != 0 {
-                                unsafe {
-                                    gl::GetTextureLevelParameteriv(
-                                        handle,
-                                        0,
-                                        gl::TEXTURE_WIDTH,
-                                        &mut width,
-                                    );
-                                    gl::GetTextureLevelParameteriv(
-                                        handle,
-                                        0,
-                                        gl::TEXTURE_HEIGHT,
-                                        &mut height,
-                                    );
-                                    gl::GetTextureLevelParameteriv(
-                                        handle,
-                                        0,
-                                        gl::TEXTURE_DEPTH,
-                                        &mut depth,
-                                    );
-                                    if width > 0 && height > 0 {
-                                        gl::GetTextureSubImage(
-                                            handle,
-                                            0,
-                                            0,
-                                            0,
-                                            0,
-                                            1,
-                                            1,
-                                            1,
-                                            gl::RGBA,
-                                            gl::UNSIGNED_BYTE,
-                                            4,
-                                            sample0.as_mut_ptr().cast(),
-                                        );
-                                        gl::GetTextureSubImage(
-                                            handle,
-                                            0,
-                                            width / 2,
-                                            height / 2,
-                                            0,
-                                            1,
-                                            1,
-                                            1,
-                                            gl::RGBA,
-                                            gl::UNSIGNED_BYTE,
-                                            4,
-                                            sample_mid.as_mut_ptr().cast(),
-                                        );
-                                    }
-                                }
-                            }
-                            let (view_type, image_id, view_gpu_addr) = if view_id.is_valid() {
-                                let view = self.texture_cache.base.slot_image_views.get(view_id);
-                                (
-                                    view.view_type as u64,
-                                    view.image_id.index as u64,
-                                    view.gpu_addr,
-                                )
-                            } else {
-                                (u64::MAX, u64::MAX, 0)
-                            };
-                            let pack_rgba = |px: [u8; 4]| -> u64 { u32::from_le_bytes(px) as u64 };
+                        if should_trace_texture_bind_address(view_gpu_addr) {
                             common::trace::emit_raw(
-                                common::trace::cat::TEXTURE_BIND,
+                                common::trace::cat::TEXTURE_BIND_ADDR,
                                 &[
                                     draw_seq as u64,
-                                    pipeline.program_pipeline_handle() as u64,
-                                    stage as u64,
-                                    texture_binding as u64,
-                                    desc.texture_type as u64,
+                                    pipeline_handle_for_texture_trace as u64,
+                                    binding.stage as u64,
+                                    binding.texture_binding as u64,
                                     view_id.index as u64,
-                                    view_type,
                                     image_id,
+                                    view_gpu_addr,
+                                    view_width,
+                                    view_height,
                                     handle as u64,
-                                    width.max(0) as u64,
-                                    height.max(0) as u64,
-                                    depth.max(0) as u64,
-                                    pack_rgba(sample0),
-                                    pack_rgba(sample_mid),
+                                    binding.texture_type as u64,
+                                    binding.is_depth as u64,
+                                    binding.is_multisample as u64,
                                 ],
                             );
                         }
-                        textures[texture_binding] = handle;
-                        bound_texture_view_ids[texture_binding] = view_id;
-
-                        // Slice 13/15: parallel sampler resolution with
-                        // anisotropy fallback. Upstream `prepare_stage`
-                        // (gl_graphics_pipeline.cpp:489-493) picks the
-                        // descriptor's added-anisotropy fallback handle when
-                        // the texture format cannot carry the configured
-                        // anisotropy — without the gate, MSAA-resolve or
-                        // single-channel formats would be over-filtered.
-                        let sampler_handle = if sampler_it < sampler_ids.len() {
-                            let sid = sampler_ids[sampler_it];
-                            sampler_it += 1;
-                            self.texture_cache
-                                .get_sampler(sid)
-                                .map(|s| {
-                                    let use_fallback =
-                                        s.has_added_anisotropy() && !view_supports_aniso;
-                                    if use_fallback {
-                                        s.handle_with_default_anisotropy()
-                                    } else {
-                                        s.handle()
-                                    }
-                                })
-                                .unwrap_or(0)
-                        } else {
-                            0
-                        };
-                        gl_samplers[texture_binding] = sampler_handle;
-                        bound_texture_view_ids[texture_binding] = view_id;
-
-                        texture_binding += 1;
                     }
-                }
-                // Storage-image (image-load/store) descriptors — port of
-                // upstream prepare_stage image loop (gl_graphics_pipeline.cpp
-                // :496-509). Each entry resolves to a per-format `storage_view`
-                // handle returned by `ImageView::StorageView(type, format)`.
-                // Writable descriptors should call `MarkModification(image_id)`
-                // upstream — deferred until cache write-tracking is wired.
-                for desc in &info.image_descriptors {
-                    let count = desc.count.min(MAX_DESC_COUNT);
-                    for _ in 0..count {
-                        if views_it >= views.len() || image_binding >= MAX_IMAGES {
-                            break;
-                        }
-                        let view_id = views[views_it].id;
-                        views_it += 1;
-                        // Slice 16: written-to storage images need the
-                        // backing image's modification_tick bumped so the
-                        // cache's download/flush logic knows it diverged
-                        // from the guest copy (upstream:
-                        // gl_graphics_pipeline.cpp:499-501).
-                        if desc.is_written && view_id.is_valid() {
-                            let parent_id = self
-                                .texture_cache
-                                .base
-                                .slot_image_views
-                                .get(view_id)
-                                .image_id;
-                            if parent_id.is_valid() {
-                                self.texture_cache.base.mark_modification_by_id(parent_id);
-                            }
-                        }
-                        let handle = self
-                            .texture_cache
-                            .get_image_view_mut(view_id)
-                            .map(|iv| iv.storage_view(desc.texture_type, desc.format))
-                            .unwrap_or(0);
-                        images[image_binding] = handle;
-                        image_binding += 1;
-                    }
-                }
-                if info.uses_render_area {
-                    let surface_clip = draw_view.surface_clip();
-                    let program = pipeline.source_programs[stage];
-                    if program != 0 {
-                        unsafe {
-                            gl::ProgramUniform4f(
-                                program,
-                                1,
-                                surface_clip.width as f32,
-                                surface_clip.height as f32,
-                                0.0,
-                                0.0,
+                    if view_id.is_valid() {
+                        let view = texture_cache.base.slot_image_views.get(view_id);
+                        if trace_texture_bind_for_pipeline
+                            && std::env::var_os("RUZU_TRACE_TEXTURE_BIND_LOG").is_some()
+                        {
+                            let backend_present = texture_cache.get_image_view(view_id).is_some();
+                            log::warn!(
+                                "[TEXTURE_BIND_LOG] draw_seq={} pipeline={} stage={} unit={} stage_unit={} view_id={} image_id={} gpu=0x{:X} view_type={} fmt={} handle={} tex_type={} backend_present={}",
+                                draw_seq,
+                                pipeline_handle_for_texture_trace,
+                                binding.stage,
+                                binding.texture_binding,
+                                binding.stage_texture_binding,
+                                view_id.index,
+                                view.image_id.index,
+                                view.gpu_addr,
+                                view.view_type as u64,
+                                view.format as u64,
+                                handle,
+                                binding.texture_type,
+                                backend_present,
                             );
                         }
+                        if should_skip_draw_sampling_gpu_addr(view.gpu_addr) {
+                            skip_draw_due_to_sampling_addr = true;
+                        }
+                        if should_trace_texture_grid_address(view.gpu_addr, draw_seq) {
+                            unsafe {
+                                trace_texture_grid_sample(
+                                    draw_seq as u64,
+                                    pipeline_handle_for_texture_trace as u64,
+                                    binding.stage as u64,
+                                    binding.texture_binding as u64,
+                                    view_id.index as u64,
+                                    view.image_id.index as u64,
+                                    view.gpu_addr,
+                                    view.format as u64,
+                                    view.view_type as u64,
+                                    view.swizzle,
+                                    handle,
+                                );
+                            }
+                        }
                     }
-                }
-            }
+                    if trace_texture_bind_for_pipeline {
+                        let mut width = 0i32;
+                        let mut height = 0i32;
+                        let mut depth = 0i32;
+                        let mut sample0 = [0u8; 4];
+                        let mut sample_mid = [0u8; 4];
+                        if handle != 0 {
+                            unsafe {
+                                gl::GetTextureLevelParameteriv(
+                                    handle,
+                                    0,
+                                    gl::TEXTURE_WIDTH,
+                                    &mut width,
+                                );
+                                gl::GetTextureLevelParameteriv(
+                                    handle,
+                                    0,
+                                    gl::TEXTURE_HEIGHT,
+                                    &mut height,
+                                );
+                                gl::GetTextureLevelParameteriv(
+                                    handle,
+                                    0,
+                                    gl::TEXTURE_DEPTH,
+                                    &mut depth,
+                                );
+                                let mut compressed = 0i32;
+                                gl::GetTextureLevelParameteriv(
+                                    handle,
+                                    0,
+                                    gl::TEXTURE_COMPRESSED,
+                                    &mut compressed,
+                                );
+                                if width > 0
+                                    && height > 0
+                                    && compressed == 0
+                                    && !binding.is_depth
+                                    && !binding.is_multisample
+                                {
+                                    gl::GetTextureSubImage(
+                                        handle,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        1,
+                                        1,
+                                        1,
+                                        gl::RGBA,
+                                        gl::UNSIGNED_BYTE,
+                                        4,
+                                        sample0.as_mut_ptr().cast(),
+                                    );
+                                    gl::GetTextureSubImage(
+                                        handle,
+                                        0,
+                                        width / 2,
+                                        height / 2,
+                                        0,
+                                        1,
+                                        1,
+                                        1,
+                                        gl::RGBA,
+                                        gl::UNSIGNED_BYTE,
+                                        4,
+                                        sample_mid.as_mut_ptr().cast(),
+                                    );
+                                }
+                            }
+                        }
+                        let (view_type, image_id, view_gpu_addr) = if view_id.is_valid() {
+                            let view = texture_cache.base.slot_image_views.get(view_id);
+                            (
+                                view.view_type as u64,
+                                view.image_id.index as u64,
+                                view.gpu_addr,
+                            )
+                        } else {
+                            (u64::MAX, u64::MAX, 0)
+                        };
+                        let pack_rgba = |px: [u8; 4]| -> u64 { u32::from_le_bytes(px) as u64 };
+                        common::trace::emit_raw(
+                            common::trace::cat::TEXTURE_BIND,
+                            &[
+                                draw_seq as u64,
+                                pipeline_handle_for_texture_trace as u64,
+                                binding.stage as u64,
+                                binding.texture_binding as u64,
+                                binding.texture_type as u64,
+                                view_id.index as u64,
+                                view_type,
+                                image_id,
+                                handle as u64,
+                                width.max(0) as u64,
+                                height.max(0) as u64,
+                                depth.max(0) as u64,
+                                pack_rgba(sample0),
+                                pack_rgba(sample_mid),
+                            ],
+                        );
+                    }
+                };
             record_gl_draw_stage(draw_seq, 21);
             trace_gl_draw_stall!(
                 "[GL_DRAW_STALL] seq={} after_descriptor_bind_setup",
                 draw_seq
             );
-            if texture_binding != 0 {
-                // Upstream asserts `texture_binding == sampler_binding` and
+            record_gl_draw_stage(draw_seq, 26);
+            trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_uniform_buffers", draw_seq);
+
+            let update_step = profile_draw_timing.then(Instant::now);
+            record_gl_draw_stage(draw_seq, 27);
+            trace_gl_draw_stall!(
+                "[GL_DRAW_STALL] seq={} before_update_graphics_buffers",
+                draw_seq
+            );
+            let bind_step = profile_draw_timing.then(Instant::now);
+            record_gl_draw_stage(draw_seq, 29);
+            trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_bind_host_buffers", draw_seq);
+            if self.transient_vao != 0 {
+                unsafe {
+                    gl::BindVertexArray(self.transient_vao);
+                }
+            }
+            let mut program_manager = self.program_manager.lock();
+            let mut after_buffer_programs = || {
+                record_gl_draw_stage(draw_seq, 28);
+                trace_gl_draw_stall!(
+                    "[GL_DRAW_STALL] seq={} after_update_graphics_buffers",
+                    draw_seq
+                );
+                if trace_draw {
+                    info!(
+                        "[GL_DRAW_PROFILE] update_graphics_buffers_us={}",
+                        update_step
+                            .map(|start| start.elapsed().as_micros())
+                            .unwrap_or(0)
+                    );
+                }
+                if let Some(update_step) = update_step {
+                    profile_update_buffers_us = trace_elapsed_us(update_step);
+                }
+                record_gl_draw_stage(draw_seq, 11);
+                trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_pipeline_configure", draw_seq);
+            };
+            let before_bind_graphics_resources = |graphics_bindings: &crate::renderer_opengl::gl_graphics_pipeline::GraphicsTextureImageBindingState,
+                                                  texture_cache: &OpenGLTextureCache| {
+                record_gl_draw_stage(draw_seq, 30);
+                trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_bind_host_buffers", draw_seq);
+                if trace_draw {
+                    info!(
+                        "[GL_DRAW_PROFILE] bind_host_geometry_buffers_us={}",
+                        bind_step.map(|start| start.elapsed().as_micros()).unwrap_or(0)
+                    );
+                }
+                if let Some(bind_step) = bind_step {
+                    profile_bind_buffers_us = trace_elapsed_us(bind_step);
+                }
+                graphics_buffers_bound_in_configure = true;
+
+                if graphics_bindings.texture_binding != 0 {
+                // Upstream asserts `graphics_bindings.texture_binding == graphics_bindings.sampler_binding` and
                 // batches both. With Slice 13, ruzu now does the same — the
-                // sampler_it / texture_binding lockstep above guarantees
+                // sampler/texture binding lockstep above guarantees
                 // matching counts as long as `materialize_samplers` keeps up.
                 if gl_debug.trace_bind_textures {
                     use std::sync::atomic::{AtomicBool, Ordering};
                     static ONCE: AtomicBool = AtomicBool::new(false);
                     if !ONCE.swap(true, Ordering::Relaxed) {
-                        let non_zero_tex = textures[..texture_binding]
+                        let non_zero_tex = graphics_bindings.textures
+                            [..graphics_bindings.texture_binding]
                             .iter()
                             .filter(|&&h| h != 0)
                             .count();
-                        let non_zero_smp = gl_samplers[..texture_binding]
+                        let non_zero_smp = graphics_bindings.samplers
+                            [..graphics_bindings.texture_binding]
                             .iter()
                             .filter(|&&h| h != 0)
                             .count();
                         log::warn!(
                             "[GL_BIND_TEX] first bind: count={} tex_non_zero={} smp_non_zero={}",
-                            texture_binding,
+                            graphics_bindings.texture_binding,
                             non_zero_tex,
                             non_zero_smp,
                         );
@@ -4868,14 +4514,18 @@ impl RasterizerInterface for RasterizerOpenGL {
                     let dump_addrs =
                         trace_u64_targets_env(&DUMP_ADDRS, "RUZU_DUMP_BOUND_TEXTURES_ADDRS");
                     let dump_matches = dump_pipeline
-                        .is_none_or(|target| target == pipeline.program_pipeline_handle())
+                        .is_none_or(|target| target == pipeline_handle_for_texture_trace)
                         && draw_seq >= dump_seq_min;
                     if dump_matches {
-                        for (unit, &handle) in textures[..texture_binding].iter().enumerate() {
+                        for (unit, &handle) in graphics_bindings.textures
+                            [..graphics_bindings.texture_binding]
+                            .iter()
+                            .enumerate()
+                        {
                             if handle == 0 {
                                 continue;
                             }
-                            let sampler = gl_samplers[unit];
+                            let sampler = graphics_bindings.samplers[unit];
                             let mut width = 0i32;
                             let mut height = 0i32;
                             let mut depth = 0i32;
@@ -4890,7 +4540,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                             let mut sampler_min_lod = 0f32;
                             let mut sampler_max_lod = 0f32;
                             let mut sampler_border = [0f32; 4];
-                            let view_id = bound_texture_view_ids[unit];
+                            let view_id = graphics_bindings.bound_texture_view_ids[unit];
                             let (
                                 view_gpu_addr,
                                 image_gpu_addr,
@@ -4904,8 +4554,8 @@ impl RasterizerInterface for RasterizerOpenGL {
                                 view_flags,
                                 view_size,
                             ) = if view_id.is_valid() {
-                                let view = self.texture_cache.base.slot_image_views.get(view_id);
-                                let image = self.texture_cache.base.slot_images.get(view.image_id);
+                                let view = texture_cache.base.slot_image_views.get(view_id);
+                                let image = texture_cache.base.slot_images.get(view.image_id);
                                 (
                                     view.gpu_addr,
                                     image.gpu_addr,
@@ -5231,49 +4881,62 @@ impl RasterizerInterface for RasterizerOpenGL {
                         }
                     }
                 }
-                // Upstream `GraphicsPipeline::ConfigureImpl` calls
-                // `buffer_cache.UpdateGraphicsBuffers` and
-                // `buffer_cache.BindHostStageBuffers(stage)` before the
-                // final `glBindTextures`. The OpenGL buffer-cache runtime
-                // writes texture-buffer object handles into `textures` via
-                // `SetImagePointers`; without this, texture-buffer descriptors
-                // remain bound as texture 0 and shaders sample black.
-                if let Some(mm) = cbuf_mm_guard.as_ref() {
-                    self.buffer_cache.update_graphics_buffers_with_gpu_resolver(
-                        is_indexed,
-                        |gpu_addr| mm.gpu_to_cpu_address(gpu_addr),
-                        |gpu_addr| mm.is_within_gpu_address_range(gpu_addr),
-                        |gpu_addr, size| mm.max_continuous_range(gpu_addr, size),
-                    );
-                } else {
-                    self.buffer_cache.update_graphics_buffers(is_indexed);
-                }
-                self.buffer_cache
-                    .set_image_pointers(textures.as_mut_ptr(), images.as_mut_ptr());
-                for stage in 0..crate::buffer_cache::buffer_cache_base::NUM_STAGES as usize {
-                    self.buffer_cache.bind_host_stage_buffers(stage);
-                }
-                self.buffer_cache
-                    .set_image_pointers(std::ptr::null_mut(), std::ptr::null_mut());
-                unsafe {
-                    gl::BindTextures(0, texture_binding as i32, textures.as_ptr());
-                    if gl_debug.disable_sampler_bind {
-                        let null_samplers = [0u32; MAX_TEXTURES];
-                        gl::BindSamplers(0, texture_binding as i32, null_samplers.as_ptr());
-                    } else {
-                        gl::BindSamplers(0, texture_binding as i32, gl_samplers.as_ptr());
-                    }
-                }
+            }
+            };
+            if let Some(mm_arc) = cbuf_memory_manager.as_ref() {
+                let mm_for_uniform = Arc::clone(mm_arc);
+                let mm_for_addr = Arc::clone(mm_arc);
+                let mm_for_range = Arc::clone(mm_arc);
+                let mm_for_continuous = Arc::clone(mm_arc);
+                pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources_with_gpu_resolver(
+                    &mut self.buffer_cache,
+                    &mut self.texture_cache,
+                    &mut program_manager,
+                    num_shader_stages,
+                    &views,
+                    &mut texture_buffer_views_it,
+                    MAX_DESC_COUNT,
+                    &cb_bindings,
+                    move |gpu_addr| mm_for_uniform.lock().gpu_to_cpu_address(gpu_addr),
+                    is_indexed,
+                    move |gpu_addr| mm_for_addr.lock().gpu_to_cpu_address(gpu_addr),
+                    move |gpu_addr| mm_for_range.lock().is_within_gpu_address_range(gpu_addr),
+                    move |gpu_addr, size| {
+                        mm_for_continuous
+                            .lock()
+                            .max_continuous_range(gpu_addr, size)
+                    },
+                    &mut graphics_bindings,
+                    &sampler_ids,
+                    draw_view.surface_clip(),
+                    gl_debug.disable_sampler_bind,
+                    &mut after_buffer_programs,
+                    &mut observe_graphics_texture_binding,
+                    before_bind_graphics_resources,
+                );
+            } else {
+                pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources(
+                    &mut self.buffer_cache,
+                    &mut self.texture_cache,
+                    &mut program_manager,
+                    num_shader_stages,
+                    &views,
+                    &mut texture_buffer_views_it,
+                    MAX_DESC_COUNT,
+                    &cb_bindings,
+                    |_| None,
+                    is_indexed,
+                    &mut graphics_bindings,
+                    &sampler_ids,
+                    draw_view.surface_clip(),
+                    gl_debug.disable_sampler_bind,
+                    &mut after_buffer_programs,
+                    &mut observe_graphics_texture_binding,
+                    before_bind_graphics_resources,
+                );
             }
             record_gl_draw_stage(draw_seq, 22);
             trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_bind_textures", draw_seq);
-            if image_binding != 0 {
-                // Slice 14: upstream `glBindImageTextures(0, image_binding,
-                // images.data())` at gl_graphics_pipeline.cpp:557.
-                unsafe {
-                    gl::BindImageTextures(0, image_binding as i32, images.as_ptr());
-                }
-            }
             record_gl_draw_stage(draw_seq, 23);
             trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_bind_images", draw_seq);
             if gl_debug.trace_per_draw_bind {
@@ -5281,9 +4944,9 @@ impl RasterizerInterface for RasterizerOpenGL {
                 let mut samples_far: [[u8; 4]; 4] = [[0; 4]; 4];
                 let mut samples_mid: [[u8; 4]; 4] = [[0; 4]; 4];
                 let mut sizes: [[i32; 2]; 4] = [[0; 2]; 4];
-                let unit_count = texture_binding.min(4);
+                let unit_count = graphics_bindings.texture_binding.min(4);
                 for unit in 0..unit_count {
-                    let tex = textures[unit];
+                    let tex = graphics_bindings.textures[unit];
                     if tex == 0 {
                         continue;
                     }
@@ -5349,7 +5012,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                     summary.push_str(&format!(
                         "u{}=tex{}({}x{})/c{:02X?}/m{:02X?}/f{:02X?}",
                         unit,
-                        textures[unit],
+                        graphics_bindings.textures[unit],
                         sizes[unit][0],
                         sizes[unit][1],
                         samples[unit],
@@ -5412,8 +5075,8 @@ impl RasterizerInterface for RasterizerOpenGL {
                     stencil_test,
                     sample_alpha_to_coverage,
                     rasterizer_discard,
-                    texture_binding,
-                    image_binding,
+                    graphics_bindings.texture_binding,
+                    graphics_bindings.image_binding,
                     summary,
                     ubo_handle,
                     ubo_offset,
@@ -5434,221 +5097,41 @@ impl RasterizerInterface for RasterizerOpenGL {
             profile_configure_us = trace_elapsed_us(step);
         }
 
-        // Partial port of upstream `GraphicsPipeline::ConfigureImpl`
-        // uniform-buffer setup. Upstream derives the enabled cbuf mask from
-        // shader info, not from every Maxwell cbuf currently enabled. This is
-        // required because GL bindings are compacted over the shader's
-        // descriptors: if a shader only declares cbuf3, that cbuf is bound at
-        // binding 0.
-        let cb_bindings = draw_view.cb_bindings();
-        let trace_cbuf_bind_enabled = common::trace::is_enabled(common::trace::cat::CBUF_BIND);
-        let trace_cbuf_bind = trace_cbuf_bind_enabled
-            && should_trace_cbuf_bind(draw_seq, pipeline.program_pipeline_handle());
-        let trace_cbuf_vec4_count = if trace_cbuf_bind {
-            static VEC4_COUNT: OnceLock<Option<u64>> = OnceLock::new();
-            trace_u64_env_cached(&VEC4_COUNT, "RUZU_TRACE_CBUF_VEC4_COUNT")
-                .unwrap_or(3)
-                .clamp(1, 32) as usize
-        } else {
-            0
-        };
-        for stage in 0..uniform_masks.len().min(cb_bindings.len()) {
-            let mut bits = uniform_masks[stage];
-            let mut slot = 0u32;
-            let mut binding_index = 0u32;
-            while bits != 0 {
-                let skip = bits.trailing_zeros();
-                slot += skip;
-                bits >>= skip;
-
-                let binding = cb_bindings[stage][slot as usize];
-                if trace_cbuf_bind {
-                    let used_size = uniform_sizes[stage][slot as usize];
-                    let mut first_words = vec![0u32; trace_cbuf_vec4_count * 4];
-                    if binding.enabled && binding.address != 0 && binding.size != 0 {
-                        if let (Some(mm), Some(reader)) =
-                            (&self.channel_memory_manager, &self.device_memory_reader)
-                        {
-                            let mm = mm.lock();
-                            let read_size =
-                                std::cmp::min(trace_cbuf_vec4_count * 16, binding.size as usize);
-                            let mut bytes = vec![0u8; read_size];
-                            if read_size != 0 {
-                                mm.read_block(binding.address, &mut bytes);
-                                for (index, word) in first_words.iter_mut().enumerate() {
-                                    let start = index * 4;
-                                    if start + 4 <= read_size {
-                                        *word = u32::from_le_bytes([
-                                            bytes[start],
-                                            bytes[start + 1],
-                                            bytes[start + 2],
-                                            bytes[start + 3],
-                                        ]);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    for vec4_index in 0..trace_cbuf_vec4_count {
-                        let base = vec4_index * 4;
-                        common::trace::emit_raw(
-                            common::trace::cat::CBUF_BIND,
-                            &[
-                                self.total_draw_count,
-                                pipeline.program_pipeline_handle() as u64,
-                                stage as u64,
-                                slot as u64,
-                                binding_index as u64,
-                                vec4_index as u64,
-                                binding.address,
-                                binding.size as u64,
-                                used_size as u64,
-                                binding.enabled as u64,
-                                first_words[base] as u64,
-                                first_words[base + 1] as u64,
-                                first_words[base + 2] as u64,
-                                first_words[base + 3] as u64,
-                            ],
-                        );
-                    }
-                }
-                if skip_draw_due_to_sampling_addr
-                    && stage == 4
-                    && slot == 3
-                    && std::env::var_os("RUZU_TRACE_SKIP_DRAW_CBUF").is_some()
-                {
-                    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-                    static COUNT: AtomicU64 = AtomicU64::new(0);
-                    let n = COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-                    if n < 24 || n.is_power_of_two() {
-                        let mut words = [0u32; 8];
-                        if binding.enabled && binding.address != 0 && binding.size != 0 {
-                            if let Some(mm) = cbuf_mm_guard.as_ref() {
-                                let mut bytes = [0u8; 32];
-                                let read_size = bytes.len().min(binding.size as usize);
-                                mm.read_block(binding.address, &mut bytes[..read_size]);
-                                for (index, word) in words.iter_mut().enumerate() {
-                                    let offset = index * 4;
-                                    if offset + 4 <= read_size {
-                                        *word = u32::from_le_bytes([
-                                            bytes[offset],
-                                            bytes[offset + 1],
-                                            bytes[offset + 2],
-                                            bytes[offset + 3],
-                                        ]);
-                                    }
-                                }
-                            }
-                        }
-                        log::warn!(
-                            "[SKIP_DRAW_CBUF] n={} draw_seq={} pipeline={} stage={} slot={} gpu=0x{:X} size={} enabled={} vec0=[{:.6},{:.6},{:.6},{:.6}] vec1=[{:.6},{:.6},{:.6},{:.6}] raw=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]",
-                            n,
-                            draw_seq,
-                            pipeline.program_pipeline_handle(),
-                            stage,
-                            slot,
-                            binding.address,
-                            binding.size,
-                            binding.enabled,
-                            f32::from_bits(words[0]),
-                            f32::from_bits(words[1]),
-                            f32::from_bits(words[2]),
-                            f32::from_bits(words[3]),
-                            f32::from_bits(words[4]),
-                            f32::from_bits(words[5]),
-                            f32::from_bits(words[6]),
-                            f32::from_bits(words[7]),
-                            words[0],
-                            words[1],
-                            words[2],
-                            words[3],
-                            words[4],
-                            words[5],
-                            words[6],
-                            words[7],
-                        );
-                    }
-                }
-                if binding.enabled && binding.address != 0 && binding.size != 0 {
-                    let device_addr = cbuf_mm_guard
-                        .as_ref()
-                        .and_then(|mm| mm.gpu_to_cpu_address(binding.address))
-                        .unwrap_or(binding.address);
-                    self.buffer_cache
-                        .bind_graphics_uniform_buffer_with_device_addr(
-                            stage,
-                            slot,
-                            device_addr,
-                            binding.size,
-                        );
-                } else {
-                    self.buffer_cache
-                        .disable_graphics_uniform_buffer(stage, slot);
-                }
-
-                slot += 1;
-                binding_index += 1;
-                bits >>= 1;
+        if !graphics_buffers_bound_in_configure {
+            let step = profile_draw_timing.then(Instant::now);
+            if let Some(mm_arc) = cbuf_memory_manager.as_ref() {
+                let mm_for_addr = Arc::clone(mm_arc);
+                let mm_for_range = Arc::clone(mm_arc);
+                let mm_for_continuous = Arc::clone(mm_arc);
+                self.buffer_cache.update_graphics_buffers_with_gpu_resolver(
+                    is_indexed,
+                    move |gpu_addr| mm_for_addr.lock().gpu_to_cpu_address(gpu_addr),
+                    move |gpu_addr| mm_for_range.lock().is_within_gpu_address_range(gpu_addr),
+                    move |gpu_addr, size| {
+                        mm_for_continuous
+                            .lock()
+                            .max_continuous_range(gpu_addr, size)
+                    },
+                );
+            } else {
+                self.buffer_cache.update_graphics_buffers(is_indexed);
             }
-        }
-        record_gl_draw_stage(draw_seq, 26);
-        trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_uniform_buffers", draw_seq);
-
-        // Buffer cache: refresh and bind host vertex/index buffers.
-        // Mirrors upstream `RasterizerOpenGL::PrepareDraw`.
-        let step = profile_draw_timing.then(Instant::now);
-        record_gl_draw_stage(draw_seq, 27);
-        trace_gl_draw_stall!(
-            "[GL_DRAW_STALL] seq={} before_update_graphics_buffers",
-            draw_seq
-        );
-        if let Some(mm) = cbuf_mm_guard.as_ref() {
-            self.buffer_cache.update_graphics_buffers_with_gpu_resolver(
-                is_indexed,
-                |gpu_addr| mm.gpu_to_cpu_address(gpu_addr),
-                |gpu_addr| mm.is_within_gpu_address_range(gpu_addr),
-                |gpu_addr, size| mm.max_continuous_range(gpu_addr, size),
-            );
-        } else {
-            self.buffer_cache.update_graphics_buffers(is_indexed);
-        }
-        drop(cbuf_mm_guard);
-        record_gl_draw_stage(draw_seq, 28);
-        trace_gl_draw_stall!(
-            "[GL_DRAW_STALL] seq={} after_update_graphics_buffers",
-            draw_seq
-        );
-        if trace_draw {
-            info!(
-                "[GL_DRAW_PROFILE] update_graphics_buffers_us={}",
-                step.map(|start| start.elapsed().as_micros()).unwrap_or(0)
-            );
-        }
-        if let Some(step) = step {
-            profile_update_buffers_us = trace_elapsed_us(step);
-        }
-        let step = profile_draw_timing.then(Instant::now);
-        record_gl_draw_stage(draw_seq, 29);
-        trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_bind_host_buffers", draw_seq);
-        if self.transient_vao != 0 {
-            unsafe {
-                gl::BindVertexArray(self.transient_vao);
+            if let Some(step) = step {
+                profile_update_buffers_us = trace_elapsed_us(step);
             }
-        }
-        self.buffer_cache.bind_host_geometry_buffers(is_indexed);
-        for stage in 0..crate::buffer_cache::buffer_cache_base::NUM_STAGES as usize {
-            self.buffer_cache.bind_host_stage_buffers(stage);
-        }
-        record_gl_draw_stage(draw_seq, 30);
-        trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_bind_host_buffers", draw_seq);
-        if trace_draw {
-            info!(
-                "[GL_DRAW_PROFILE] bind_host_geometry_buffers_us={}",
-                step.map(|start| start.elapsed().as_micros()).unwrap_or(0)
-            );
-        }
-        if let Some(step) = step {
-            profile_bind_buffers_us = trace_elapsed_us(step);
+            let step = profile_draw_timing.then(Instant::now);
+            if self.transient_vao != 0 {
+                unsafe {
+                    gl::BindVertexArray(self.transient_vao);
+                }
+            }
+            self.buffer_cache.bind_host_geometry_buffers(is_indexed);
+            for stage in 0..crate::buffer_cache::buffer_cache_base::NUM_STAGES as usize {
+                self.buffer_cache.bind_host_stage_buffers(stage);
+            }
+            if let Some(step) = step {
+                profile_bind_buffers_us = trace_elapsed_us(step);
+            }
         }
 
         let primitive_mode = primitive_topology_to_gl(draw_state.topology);
@@ -5812,6 +5295,22 @@ impl RasterizerInterface for RasterizerOpenGL {
             unsafe {
                 gl::GenQueries(1, &mut samples_query);
                 gl::BeginQuery(gl::SAMPLES_PASSED, samples_query);
+            }
+        }
+
+        let transform_feedback_active = can_draw_gl && draw_view.transform_feedback_enabled();
+        if transform_feedback_active {
+            // Upstream `RasterizerOpenGL::BeginTransformFeedback` calls
+            // `GraphicsPipeline::ConfigureTransformFeedback` after `SyncState`
+            // and immediately before issuing the draw.
+            pipeline.configure_transform_feedback();
+            assert!(
+                !draw_view.shader_config_enabled(ShaderStageType::TessInit)
+                    && !draw_view.shader_config_enabled(ShaderStageType::Tessellation),
+                "Unimplemented code!"
+            );
+            unsafe {
+                gl::BeginTransformFeedback(primitive_mode);
             }
         }
 
@@ -6503,20 +6002,89 @@ impl RasterizerInterface for RasterizerOpenGL {
                 }
                 if gl_debug.trace_sampler_dump {
                     let bound_fb_id = bound_draw_framebuffer.map(|(fb, _, _)| fb).unwrap_or(0);
+                    let sampler_rt_filter = parse_trace_u64_env("RUZU_TRACE_SAMPLER_DUMP_RT_ADDR");
+                    let sampler_matches_rt = sampler_rt_filter.is_none_or(|target| {
+                        target == draw_view.render_targets().render_targets[0].address
+                    });
                     unsafe {
-                        for unit in 0..4 {
-                            gl::ActiveTexture(gl::TEXTURE0 + unit);
-                            let mut t2d = 0i32;
-                            gl::GetIntegerv(gl::TEXTURE_BINDING_2D, &mut t2d);
-                            let mut t2da = 0i32;
-                            gl::GetIntegerv(gl::TEXTURE_BINDING_2D_ARRAY, &mut t2da);
-                            let mut sampler = 0i32;
-                            gl::GetIntegerv(gl::SAMPLER_BINDING, &mut sampler);
-                            if t2d != 0 || t2da != 0 {
-                                log::warn!(
-                                    "[SAMPLER] seq={} fb={} unit={} tex_2d={} tex_2d_array={} sampler={}",
-                                    draw_seq, bound_fb_id, unit, t2d, t2da, sampler,
-                                );
+                        if sampler_matches_rt {
+                            for unit in 0..4 {
+                                gl::ActiveTexture(gl::TEXTURE0 + unit);
+                                let mut t2d = 0i32;
+                                gl::GetIntegerv(gl::TEXTURE_BINDING_2D, &mut t2d);
+                                let mut t2da = 0i32;
+                                gl::GetIntegerv(gl::TEXTURE_BINDING_2D_ARRAY, &mut t2da);
+                                let mut sampler = 0i32;
+                                gl::GetIntegerv(gl::SAMPLER_BINDING, &mut sampler);
+                                if t2d != 0 || t2da != 0 {
+                                    let tex = if t2d != 0 { t2d } else { t2da };
+                                    let mut width = 0i32;
+                                    let mut height = 0i32;
+                                    let mut internal_format = 0i32;
+                                    gl::GetTextureLevelParameteriv(
+                                        tex as u32,
+                                        0,
+                                        gl::TEXTURE_WIDTH,
+                                        &mut width,
+                                    );
+                                    gl::GetTextureLevelParameteriv(
+                                        tex as u32,
+                                        0,
+                                        gl::TEXTURE_HEIGHT,
+                                        &mut height,
+                                    );
+                                    gl::GetTextureLevelParameteriv(
+                                        tex as u32,
+                                        0,
+                                        gl::TEXTURE_INTERNAL_FORMAT,
+                                        &mut internal_format,
+                                    );
+                                    let sample_w = width.clamp(0, 16);
+                                    let sample_h = height.clamp(0, 16);
+                                    let mut pixels =
+                                        vec![0u8; (sample_w * sample_h * 4).max(0) as usize];
+                                    if sample_w > 0 && sample_h > 0 {
+                                        gl::GetTextureSubImage(
+                                            tex as u32,
+                                            0,
+                                            0,
+                                            0,
+                                            0,
+                                            sample_w,
+                                            sample_h,
+                                            1,
+                                            gl::RGBA,
+                                            gl::UNSIGNED_BYTE,
+                                            pixels.len() as i32,
+                                            pixels.as_mut_ptr() as *mut _,
+                                        );
+                                    }
+                                    let nonzero = pixels.iter().filter(|&&byte| byte != 0).count();
+                                    let first = pixels
+                                        .chunks_exact(4)
+                                        .next()
+                                        .map(|px| [px[0], px[1], px[2], px[3]])
+                                        .unwrap_or([0, 0, 0, 0]);
+                                    let gl_error = gl::GetError();
+                                    log::warn!(
+                                        "[SAMPLER] seq={} fb={} unit={} tex_2d={} tex_2d_array={} sampler={} size={}x{} ifmt=0x{:X} sample={}x{} nonzero={}/{} first={:02X?} gl_error=0x{:X}",
+                                        draw_seq,
+                                        bound_fb_id,
+                                        unit,
+                                        t2d,
+                                        t2da,
+                                        sampler,
+                                        width,
+                                        height,
+                                        internal_format,
+                                        sample_w,
+                                        sample_h,
+                                        nonzero,
+                                        pixels.len(),
+                                        first,
+                                        gl_error,
+                                    );
+                                }
                             }
                         }
                     }
@@ -6626,64 +6194,45 @@ impl RasterizerInterface for RasterizerOpenGL {
                         num_instances,
                     );
                 } else {
-                unsafe {
-                    let mut any_samples_query = 0u32;
-                    if trace_any_samples {
-                        while gl::GetError() != gl::NO_ERROR {}
-                        gl::GenQueries(1, &mut any_samples_query);
-                        if any_samples_query != 0 {
-                            gl::BeginQuery(gl::SAMPLES_PASSED, any_samples_query);
+                    unsafe {
+                        let mut any_samples_query = 0u32;
+                        if trace_any_samples {
+                            while gl::GetError() != gl::NO_ERROR {}
+                            gl::GenQueries(1, &mut any_samples_query);
+                            if any_samples_query != 0 {
+                                gl::BeginQuery(gl::SAMPLES_PASSED, any_samples_query);
+                            }
                         }
-                    }
-                    gl::BindVertexArray(self.transient_vao);
-                    gl::DrawElementsInstancedBaseVertexBaseInstance(
-                        primitive_mode,
-                        num_vertices as i32,
-                        index_format,
-                        index_offset as *const _,
-                        num_instances as i32,
-                        base_vertex,
-                        base_instance,
-                    );
-                    let mut any_samples = 0u64;
-                    if any_samples_query != 0 {
-                        gl::EndQuery(gl::SAMPLES_PASSED);
-                        gl::GetQueryObjectui64v(
-                            any_samples_query,
-                            gl::QUERY_RESULT,
-                            &mut any_samples,
+                        gl::BindVertexArray(self.transient_vao);
+                        gl::DrawElementsInstancedBaseVertexBaseInstance(
+                            primitive_mode,
+                            num_vertices as i32,
+                            index_format,
+                            index_offset as *const _,
+                            num_instances as i32,
+                            base_vertex,
+                            base_instance,
                         );
-                        gl::DeleteQueries(1, &any_samples_query);
-                    }
-                    let gl_error_after_draw = if trace_any_samples {
-                        gl::GetError()
-                    } else {
-                        gl::NO_ERROR
-                    };
-                    if trace_any_samples {
-                        common::trace::emit_raw(
-                            common::trace::cat::GL_DRAW_STATE,
-                            &[
-                                4,
-                                draw_seq,
-                                pipeline.program_pipeline_handle() as u64,
-                                (any_samples_query != 0) as u64,
-                                (any_samples != 0) as u64,
-                                gl_error_after_draw as u64,
-                                1,
-                                primitive_mode as u64,
-                                num_vertices as u64,
-                                num_instances as u64,
-                            ],
-                        );
-                    }
-                    if trace_any_samples_rt {
-                        if let Some((framebuffer, width, height)) = bound_draw_framebuffer {
-                            let rt0 = draw_view.render_targets().render_targets[0];
+                        let mut any_samples = 0u64;
+                        if any_samples_query != 0 {
+                            gl::EndQuery(gl::SAMPLES_PASSED);
+                            gl::GetQueryObjectui64v(
+                                any_samples_query,
+                                gl::QUERY_RESULT,
+                                &mut any_samples,
+                            );
+                            gl::DeleteQueries(1, &any_samples_query);
+                        }
+                        let gl_error_after_draw = if trace_any_samples {
+                            gl::GetError()
+                        } else {
+                            gl::NO_ERROR
+                        };
+                        if trace_any_samples {
                             common::trace::emit_raw(
-                                common::trace::cat::RT_BIND,
+                                common::trace::cat::GL_DRAW_STATE,
                                 &[
-                                    u64::MAX - 1,
+                                    4,
                                     draw_seq,
                                     pipeline.program_pipeline_handle() as u64,
                                     (any_samples_query != 0) as u64,
@@ -6693,14 +6242,33 @@ impl RasterizerInterface for RasterizerOpenGL {
                                     primitive_mode as u64,
                                     num_vertices as u64,
                                     num_instances as u64,
-                                    ((width as u64) << 32) | height as u64,
-                                    rt0.address,
-                                    framebuffer as u64,
                                 ],
                             );
                         }
+                        if trace_any_samples_rt {
+                            if let Some((framebuffer, width, height)) = bound_draw_framebuffer {
+                                let rt0 = draw_view.render_targets().render_targets[0];
+                                common::trace::emit_raw(
+                                    common::trace::cat::RT_BIND,
+                                    &[
+                                        u64::MAX - 1,
+                                        draw_seq,
+                                        pipeline.program_pipeline_handle() as u64,
+                                        (any_samples_query != 0) as u64,
+                                        (any_samples != 0) as u64,
+                                        gl_error_after_draw as u64,
+                                        1,
+                                        primitive_mode as u64,
+                                        num_vertices as u64,
+                                        num_instances as u64,
+                                        ((width as u64) << 32) | height as u64,
+                                        rt0.address,
+                                        framebuffer as u64,
+                                    ],
+                                );
+                            }
+                        }
                     }
-                }
                 }
             } else {
                 debug!(
@@ -6768,62 +6336,43 @@ impl RasterizerInterface for RasterizerOpenGL {
                         num_instances,
                     );
                 } else {
-                unsafe {
-                    let mut any_samples_query = 0u32;
-                    if trace_any_samples {
-                        while gl::GetError() != gl::NO_ERROR {}
-                        gl::GenQueries(1, &mut any_samples_query);
-                        if any_samples_query != 0 {
-                            gl::BeginQuery(gl::SAMPLES_PASSED, any_samples_query);
+                    unsafe {
+                        let mut any_samples_query = 0u32;
+                        if trace_any_samples {
+                            while gl::GetError() != gl::NO_ERROR {}
+                            gl::GenQueries(1, &mut any_samples_query);
+                            if any_samples_query != 0 {
+                                gl::BeginQuery(gl::SAMPLES_PASSED, any_samples_query);
+                            }
                         }
-                    }
-                    gl::BindVertexArray(self.transient_vao);
-                    gl::DrawArraysInstancedBaseInstance(
-                        primitive_mode,
-                        base_vertex,
-                        num_vertices as i32,
-                        num_instances as i32,
-                        base_instance,
-                    );
-                    let mut any_samples = 0u64;
-                    if any_samples_query != 0 {
-                        gl::EndQuery(gl::SAMPLES_PASSED);
-                        gl::GetQueryObjectui64v(
-                            any_samples_query,
-                            gl::QUERY_RESULT,
-                            &mut any_samples,
+                        gl::BindVertexArray(self.transient_vao);
+                        gl::DrawArraysInstancedBaseInstance(
+                            primitive_mode,
+                            base_vertex,
+                            num_vertices as i32,
+                            num_instances as i32,
+                            base_instance,
                         );
-                        gl::DeleteQueries(1, &any_samples_query);
-                    }
-                    let gl_error_after_draw = if trace_any_samples {
-                        gl::GetError()
-                    } else {
-                        gl::NO_ERROR
-                    };
-                    if trace_any_samples {
-                        common::trace::emit_raw(
-                            common::trace::cat::GL_DRAW_STATE,
-                            &[
-                                4,
-                                draw_seq,
-                                pipeline.program_pipeline_handle() as u64,
-                                (any_samples_query != 0) as u64,
-                                (any_samples != 0) as u64,
-                                gl_error_after_draw as u64,
-                                0,
-                                primitive_mode as u64,
-                                num_vertices as u64,
-                                num_instances as u64,
-                            ],
-                        );
-                    }
-                    if trace_any_samples_rt {
-                        if let Some((framebuffer, width, height)) = bound_draw_framebuffer {
-                            let rt0 = draw_view.render_targets().render_targets[0];
+                        let mut any_samples = 0u64;
+                        if any_samples_query != 0 {
+                            gl::EndQuery(gl::SAMPLES_PASSED);
+                            gl::GetQueryObjectui64v(
+                                any_samples_query,
+                                gl::QUERY_RESULT,
+                                &mut any_samples,
+                            );
+                            gl::DeleteQueries(1, &any_samples_query);
+                        }
+                        let gl_error_after_draw = if trace_any_samples {
+                            gl::GetError()
+                        } else {
+                            gl::NO_ERROR
+                        };
+                        if trace_any_samples {
                             common::trace::emit_raw(
-                                common::trace::cat::RT_BIND,
+                                common::trace::cat::GL_DRAW_STATE,
                                 &[
-                                    u64::MAX - 1,
+                                    4,
                                     draw_seq,
                                     pipeline.program_pipeline_handle() as u64,
                                     (any_samples_query != 0) as u64,
@@ -6833,14 +6382,33 @@ impl RasterizerInterface for RasterizerOpenGL {
                                     primitive_mode as u64,
                                     num_vertices as u64,
                                     num_instances as u64,
-                                    ((width as u64) << 32) | height as u64,
-                                    rt0.address,
-                                    framebuffer as u64,
                                 ],
                             );
                         }
+                        if trace_any_samples_rt {
+                            if let Some((framebuffer, width, height)) = bound_draw_framebuffer {
+                                let rt0 = draw_view.render_targets().render_targets[0];
+                                common::trace::emit_raw(
+                                    common::trace::cat::RT_BIND,
+                                    &[
+                                        u64::MAX - 1,
+                                        draw_seq,
+                                        pipeline.program_pipeline_handle() as u64,
+                                        (any_samples_query != 0) as u64,
+                                        (any_samples != 0) as u64,
+                                        gl_error_after_draw as u64,
+                                        0,
+                                        primitive_mode as u64,
+                                        num_vertices as u64,
+                                        num_instances as u64,
+                                        ((width as u64) << 32) | height as u64,
+                                        rt0.address,
+                                        framebuffer as u64,
+                                    ],
+                                );
+                            }
+                        }
                     }
-                }
                 }
             } else {
                 debug!(
@@ -6848,6 +6416,11 @@ impl RasterizerInterface for RasterizerOpenGL {
                      base_vertex={} base_instance={} — placeholder pipeline, no GL draw",
                     primitive_mode, num_vertices, num_instances, base_vertex, base_instance
                 );
+            }
+        }
+        if transform_feedback_active {
+            unsafe {
+                gl::EndTransformFeedback();
             }
         }
         if let Some(sync_draw_step) = sync_draw_step {
@@ -7222,8 +6795,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         let rt0_addr_for_debug = draw_view.render_targets().render_targets[0].address;
         let rt_dump_elapsed_ms = trace_elapsed_ms();
         let rt_dump_in_time_window = rt_dump_elapsed_ms
-            >= trace_u64_env_cached(&DUMP_RT_TIME_START, "RUZU_DUMP_RT_TIME_START_MS")
-                .unwrap_or(0)
+            >= trace_u64_env_cached(&DUMP_RT_TIME_START, "RUZU_DUMP_RT_TIME_START_MS").unwrap_or(0)
             && rt_dump_elapsed_ms
                 <= trace_u64_env_cached(&DUMP_RT_TIME_END, "RUZU_DUMP_RT_TIME_END_MS")
                     .unwrap_or(u64::MAX);
@@ -7233,9 +6805,9 @@ impl RasterizerInterface for RasterizerOpenGL {
             && rt_dump_in_time_window
             && DUMP_RT_COUNT.load(Ordering::Relaxed)
                 < trace_u64_env_cached(&DUMP_RT_LIMIT, "RUZU_DUMP_RT_LIMIT").unwrap_or(u64::MAX);
-        let should_dump_rt_seq =
-            trace_u64_env_cached(&DUMP_RT_SEQ, "RUZU_DUMP_RT_SEQ") == Some(draw_seq)
-                && rt_dump_in_time_window;
+        let should_dump_rt_seq = trace_u64_env_cached(&DUMP_RT_SEQ, "RUZU_DUMP_RT_SEQ")
+            == Some(draw_seq)
+            && rt_dump_in_time_window;
         let should_trace_summary = if trace_draw_summary {
             static SUMMARY_LIMIT: OnceLock<Option<u64>> = OnceLock::new();
             static SUMMARY_SEQ_MIN: OnceLock<Option<u64>> = OnceLock::new();
@@ -7254,11 +6826,9 @@ impl RasterizerInterface for RasterizerOpenGL {
             let summary_rt_addr =
                 trace_u64_env_cached(&SUMMARY_RT_ADDR, "RUZU_TRACE_DRAW_SUMMARY_RT_ADDR");
             let summary_elapsed_ms = trace_elapsed_ms();
-            let summary_time_start = trace_u64_env_cached(
-                &SUMMARY_TIME_START,
-                "RUZU_TRACE_DRAW_SUMMARY_TIME_START_MS",
-            )
-            .unwrap_or(0);
+            let summary_time_start =
+                trace_u64_env_cached(&SUMMARY_TIME_START, "RUZU_TRACE_DRAW_SUMMARY_TIME_START_MS")
+                    .unwrap_or(0);
             let summary_time_end =
                 trace_u64_env_cached(&SUMMARY_TIME_END, "RUZU_TRACE_DRAW_SUMMARY_TIME_END_MS")
                     .unwrap_or(u64::MAX);
@@ -7456,6 +7026,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         }
         if can_draw_gl && gl_debug.dump_draw_attrs {
             let pipeline_filter = parse_trace_u64_env("RUZU_DUMP_DRAW_ATTRS_PIPELINE");
+            let rt_addr_filter = parse_trace_u64_env("RUZU_DUMP_DRAW_ATTRS_RT_ADDR");
             let seq_min = parse_trace_u64_env("RUZU_DUMP_DRAW_ATTRS_SEQ_MIN").unwrap_or(0);
             let seq_max = parse_trace_u64_env("RUZU_DUMP_DRAW_ATTRS_SEQ_MAX").unwrap_or(u64::MAX);
             let limit = parse_trace_u64_env("RUZU_DUMP_DRAW_ATTRS_LIMIT").unwrap_or(32);
@@ -7465,7 +7036,10 @@ impl RasterizerInterface for RasterizerOpenGL {
             static DRAW_ATTR_DUMP_COUNT: AtomicU64 = AtomicU64::new(0);
             let pipeline_handle = pipeline.program_pipeline_handle() as u64;
             let matches_pipeline = pipeline_filter.is_none_or(|target| target == pipeline_handle);
-            if matches_pipeline && draw_seq >= seq_min && draw_seq <= seq_max {
+            let matches_rt_addr = rt_addr_filter.is_none_or(|target| {
+                target == draw_view.render_targets().render_targets[0].address
+            });
+            if matches_pipeline && matches_rt_addr && draw_seq >= seq_min && draw_seq <= seq_max {
                 let dump_index = DRAW_ATTR_DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
                 if dump_index < limit {
                     if let (Some(mm), Some(reader)) = (
@@ -7883,7 +7457,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         self.tick_gpu_work();
     }
 
-    fn clear(&mut self, clear_view: Maxwell3DClearView<'_>, layer_count: u32) {
+    fn clear(&mut self, mut clear_view: Maxwell3DClearView<'_>, layer_count: u32) {
         // Upstream `RasterizerOpenGL::Clear` starts with
         // `gpu_memory->FlushCaching()`.
         if let Some(mm) = self.channel_memory_manager.as_ref().cloned() {
@@ -7920,18 +7494,14 @@ impl RasterizerInterface for RasterizerOpenGL {
         let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
         let framebuffer = unsafe {
             let _texture_lock = (*texture_cache).base.mutex.lock();
-            (*texture_cache).update_render_targets_from_snapshot(&render_targets, |gpu_addr| {
-                mm.lock().gpu_to_cpu_address(gpu_addr)
-            });
+            let dirty_flags = clear_view.dirty_flags();
             let clear_scissor = clear_view.use_scissor().then(|| clear_view.scissor(0));
-            (*texture_cache).prepare_render_targets_from_snapshot(
+            (*texture_cache).update_render_targets_and_get_framebuffer_from_snapshot(
                 &render_targets,
-                None,
+                &dirty_flags,
+                &mut clear_view,
                 true,
                 clear_scissor,
-            );
-            (*texture_cache).framebuffer_for_render_targets_from_snapshot(
-                &render_targets,
                 crate::texture_cache::types::Extent2D::default(),
             )
         };
@@ -7944,7 +7514,6 @@ impl RasterizerInterface for RasterizerOpenGL {
             }
             return;
         };
-
         unsafe {
             self.state_tracker.bind_framebuffer(framebuffer);
             self.state_tracker.notify_viewport0();
@@ -8043,6 +7612,106 @@ impl RasterizerInterface for RasterizerOpenGL {
         debug!("RasterizerOpenGL::dispatch_compute");
     }
 
+    fn dispatch_compute_with_call(&mut self, dispatch: &DispatchCall) {
+        // Upstream `RasterizerOpenGL::DispatchCompute` starts with
+        // `gpu_memory->FlushCaching()`, then obtains the current compute
+        // pipeline whose `Configure()` synchronizes compute TIC/TSC descriptors.
+        if let Some(mm) = self.channel_memory_manager.as_ref().cloned() {
+            mm.lock().flush_caching();
+        }
+        self.buffer_cache
+            .set_engine_state(Box::new(ComputeEngineAdapter {
+                dispatch: dispatch.clone(),
+            }));
+        let Some(pipeline) = self
+            .gl_shader_cache
+            .current_compute_pipeline_with_shared_cache(&mut self.shader_cache)
+        else {
+            if std::env::var_os("RUZU_TRACE_COMPUTE").is_some() {
+                log::warn!(
+                    "[COMPUTE] skipped: no pipeline grid=({},{},{}) block=({},{},{}) qmd=0x{:X} code=0x{:X}",
+                    dispatch.qmd.grid_dim_x,
+                    dispatch.qmd.grid_dim_y,
+                    dispatch.qmd.grid_dim_z,
+                    dispatch.qmd.block_dim_x,
+                    dispatch.qmd.block_dim_y,
+                    dispatch.qmd.block_dim_z,
+                    dispatch.qmd_address,
+                    dispatch.code_address
+                );
+            }
+            return;
+        };
+        if pipeline.uses_local_memory() {
+            self.program_manager.lock().local_memory_warmup();
+        }
+        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
+            return;
+        };
+        pipeline.set_engine(dispatch.clone(), Arc::clone(&mm));
+        pipeline.configure_resource_state(
+            &mut self.buffer_cache,
+            &mut self.texture_cache,
+            &mut self.program_manager.lock(),
+        );
+        if std::env::var_os("RUZU_TRACE_COMPUTE").is_some() {
+            log::info!(
+                "[COMPUTE] dispatch grid=({},{},{}) block=({},{},{}) qmd=0x{:X} code=0x{:X} src_prog={} asm_prog={} writes_global={} indirect={:?}",
+                dispatch.qmd.grid_dim_x,
+                dispatch.qmd.grid_dim_y,
+                dispatch.qmd.grid_dim_z,
+                dispatch.qmd.block_dim_x,
+                dispatch.qmd.block_dim_y,
+                dispatch.qmd.block_dim_z,
+                dispatch.qmd_address,
+                dispatch.code_address,
+                pipeline.source_program,
+                pipeline.assembly_program,
+                pipeline.writes_global_memory(),
+                dispatch.indirect_compute_address
+            );
+        }
+        if let Some(indirect_address) = dispatch.indirect_compute_address {
+            let (buffer_id, offset) = self.buffer_cache.obtain_buffer(
+                indirect_address,
+                12,
+                ObtainBufferSynchronize::FullSynchronize,
+                ObtainBufferOperation::DiscardWrite,
+            );
+            let handle = self.buffer_cache.get_buffer_gpu_handle(buffer_id);
+            if handle == 0 || buffer_id == NULL_BUFFER_ID {
+                log::warn!(
+                    "RasterizerOpenGL::dispatch_compute indirect skipped: missing GL indirect buffer"
+                );
+                return;
+            }
+            unsafe {
+                gl::BindBuffer(gl::DISPATCH_INDIRECT_BUFFER, handle);
+                gl::DispatchComputeIndirect(offset as isize);
+            }
+            return;
+        }
+        unsafe {
+            gl::DispatchCompute(
+                dispatch.qmd.grid_dim_x,
+                dispatch.qmd.grid_dim_y,
+                dispatch.qmd.grid_dim_z,
+            );
+        }
+        self.num_queued_commands = self.num_queued_commands.saturating_add(1);
+        self.has_written_global_memory |= pipeline.writes_global_memory();
+        debug!(
+            "RasterizerOpenGL::dispatch_compute_with_call grid=({},{},{}) block=({},{},{}) code=0x{:X}",
+            dispatch.qmd.grid_dim_x,
+            dispatch.qmd.grid_dim_y,
+            dispatch.qmd.grid_dim_z,
+            dispatch.qmd.block_dim_x,
+            dispatch.qmd.block_dim_y,
+            dispatch.qmd.block_dim_z,
+            dispatch.code_address
+        );
+    }
+
     fn reset_counter(&mut self, query_type: u32) {
         let Some(mapped_query_type) = maxwell_to_video_core_query(query_type) else {
             return;
@@ -8119,7 +7788,7 @@ impl RasterizerInterface for RasterizerOpenGL {
     fn signal_fence(&mut self, func: Box<dyn FnOnce() + Send>) {
         let this = self as *mut Self;
         let this_for_pop = this as usize;
-        let should_flush_now = self.fence_manager.signal_fence(
+        self.fence_manager.signal_fence(
             func,
             move |is_stubbed| unsafe { (*this).fence_backend.create_fence(is_stubbed) },
             move |fence| unsafe { (*this).fence_backend.queue_fence(fence) },
@@ -8128,11 +7797,9 @@ impl RasterizerInterface for RasterizerOpenGL {
             move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
             move || unsafe { (*this).num_queued_commands != 0 || (*this).should_flush_async() },
             move || unsafe { (*this).commit_async_flushes() },
+            move || unsafe { (*this).flush_commands() },
+            move || unsafe { (*this).invalidate_gpu_cache() },
         );
-        if should_flush_now {
-            self.flush_commands();
-        }
-        self.invalidate_gpu_cache();
     }
 
     fn sync_operation(&mut self, func: Box<dyn FnOnce() + Send>) {
@@ -8180,6 +7847,8 @@ impl RasterizerInterface for RasterizerOpenGL {
             move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
             move || unsafe { (*this).num_queued_commands != 0 || (*this).should_flush_async() },
             move || unsafe { (*this).commit_async_flushes() },
+            move || unsafe { (*this).flush_commands() },
+            move || unsafe { (*this).invalidate_gpu_cache() },
         );
         if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
             log::info!(
@@ -8188,20 +7857,21 @@ impl RasterizerInterface for RasterizerOpenGL {
                 should_flush_now
             );
         }
-        if should_flush_now {
-            self.flush_commands();
-        }
-        self.invalidate_gpu_cache();
     }
 
     fn signal_reference(&mut self) {
         let this = self as *mut Self;
         let this_for_pop = this as usize;
-        self.fence_manager.signal_ordering(
+        self.fence_manager.signal_reference(
+            move |is_stubbed| unsafe { (*this).fence_backend.create_fence(is_stubbed) },
+            move |fence| unsafe { (*this).fence_backend.queue_fence(fence) },
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).fence_backend.is_fence_signaled(fence) },
             move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
-            move || unsafe { (*this).accumulate_buffer_flushes() },
+            move || unsafe { (*this).num_queued_commands != 0 || (*this).should_flush_async() },
+            move || unsafe { (*this).commit_async_flushes() },
+            move || unsafe { (*this).flush_commands() },
+            move || unsafe { (*this).invalidate_gpu_cache() },
         );
     }
 
@@ -8210,12 +7880,19 @@ impl RasterizerInterface for RasterizerOpenGL {
             log::info!("GLRasterizer::release_fences force={}", force,);
         }
         let this = self as *mut Self;
+        let this_for_pop = this as usize;
         self.fence_manager.wait_pending_fences(
             force,
+            move |is_stubbed| unsafe { (*this).fence_backend.create_fence(is_stubbed) },
+            move |fence| unsafe { (*this).fence_backend.queue_fence(fence) },
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).fence_backend.is_fence_signaled(fence) },
             move |fence| unsafe { (*this).fence_backend.wait_fence(fence) },
-            move || unsafe { (*this).pop_async_flushes() },
+            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
+            move || unsafe { (*this).num_queued_commands != 0 || (*this).should_flush_async() },
+            move || unsafe { (*this).commit_async_flushes() },
+            move || unsafe { (*this).flush_commands() },
+            move || unsafe { (*this).invalidate_gpu_cache() },
         );
     }
 
@@ -8364,8 +8041,20 @@ impl RasterizerInterface for RasterizerOpenGL {
     }
 
     fn invalidate_gpu_cache(&mut self) {
+        if std::env::var_os("RUZU_TRACE_GL_FENCE_FLOW").is_some() {
+            log::info!("GLRasterizer::invalidate_gpu_cache begin");
+        }
         if let Some(callback) = &self.invalidate_gpu_cache_callback {
+            if std::env::var_os("RUZU_TRACE_GL_FENCE_FLOW").is_some() {
+                log::info!("GLRasterizer::invalidate_gpu_cache callback begin");
+            }
             callback();
+            if std::env::var_os("RUZU_TRACE_GL_FENCE_FLOW").is_some() {
+                log::info!("GLRasterizer::invalidate_gpu_cache callback end");
+            }
+        }
+        if std::env::var_os("RUZU_TRACE_GL_FENCE_FLOW").is_some() {
+            log::info!("GLRasterizer::invalidate_gpu_cache end");
         }
     }
 
@@ -8398,8 +8087,17 @@ impl RasterizerInterface for RasterizerOpenGL {
     }
 
     fn wait_for_idle(&mut self) {
+        if std::env::var_os("RUZU_TRACE_GL_FENCE_FLOW").is_some() {
+            log::info!("GLRasterizer::wait_for_idle memory_barrier begin");
+        }
         unsafe { gl::MemoryBarrier(gl::ALL_BARRIER_BITS) };
+        if std::env::var_os("RUZU_TRACE_GL_FENCE_FLOW").is_some() {
+            log::info!("GLRasterizer::wait_for_idle signal_reference begin");
+        }
         self.signal_reference();
+        if std::env::var_os("RUZU_TRACE_GL_FENCE_FLOW").is_some() {
+            log::info!("GLRasterizer::wait_for_idle end");
+        }
     }
 
     fn fragment_barrier(&mut self) {
@@ -8452,14 +8150,8 @@ impl RasterizerInterface for RasterizerOpenGL {
         let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
             return false;
         };
-        // Upstream TextureCacheRuntime::BlitFramebuffer mutates these fixed
-        // function states for the Fermi2D blit path and invalidates the state
-        // tracker before doing so.
-        self.state_tracker.notify_scissor0();
-        self.state_tracker.notify_rasterize_enable();
-        self.state_tracker.notify_framebuffer_srgb();
         let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
-        unsafe {
+        let accelerated = unsafe {
             let _texture_lock = (*texture_cache).base.mutex.lock();
             (*texture_cache).blit_image(
                 dst,
@@ -8468,10 +8160,116 @@ impl RasterizerInterface for RasterizerOpenGL {
                 |gpu_addr| mm.lock().gpu_to_cpu_address(gpu_addr),
                 |gpu_addr, out| {
                     let guard = mm.lock();
-                    if guard.gpu_to_cpu_address(gpu_addr).is_none() {
-                        return false;
-                    }
                     guard.read_block(gpu_addr, out);
+                    true
+                },
+            )
+        };
+        accelerated
+    }
+
+    fn accelerate_dma_buffer_copy(
+        &mut self,
+        src_address: u64,
+        dest_address: u64,
+        amount: u64,
+    ) -> bool {
+        unsafe {
+            let buffer_mutex: *const _ = &self.buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            self.buffer_cache
+                .dma_copy(src_address, dest_address, amount)
+        }
+    }
+
+    fn accelerate_dma_buffer_clear(&mut self, dst_address: u64, amount: u64, value: u32) -> bool {
+        unsafe {
+            let buffer_mutex: *const _ = &self.buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            self.buffer_cache.dma_clear(dst_address, amount, value)
+        }
+    }
+
+    fn accelerate_dma_image_to_buffer(
+        &mut self,
+        copy_info: &dma::ImageCopy,
+        src: &dma::ImageOperand,
+        dst: &dma::BufferOperand,
+    ) -> bool {
+        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
+            return false;
+        };
+        unsafe {
+            let buffer_mutex: *const _ = &self.buffer_cache.mutex;
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+
+            let image_id = self.texture_cache.base.dma_image_id(src, false);
+            if image_id == NULL_IMAGE_ID {
+                return false;
+            }
+
+            let buffer_size = dst.pitch.saturating_mul(dst.height);
+            let (buffer_id, offset) = self.buffer_cache.obtain_buffer(
+                dst.address,
+                buffer_size,
+                ObtainBufferSynchronize::FullSynchronize,
+                ObtainBufferOperation::MarkAsWritten,
+            );
+            let buffer_handle = self.buffer_cache.get_buffer_gpu_handle(buffer_id);
+            self.texture_cache.dma_buffer_image_copy(
+                copy_info,
+                dst,
+                src,
+                image_id,
+                buffer_handle,
+                offset as usize,
+                false,
+                &mut |gpu_addr, out| {
+                    mm.lock().read_block(gpu_addr, out);
+                    true
+                },
+            )
+        }
+    }
+
+    fn accelerate_dma_buffer_to_image(
+        &mut self,
+        copy_info: &dma::ImageCopy,
+        src: &dma::BufferOperand,
+        dst: &dma::ImageOperand,
+    ) -> bool {
+        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
+            return false;
+        };
+        unsafe {
+            let buffer_mutex: *const _ = &self.buffer_cache.mutex;
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+
+            let image_id = self.texture_cache.base.dma_image_id(dst, true);
+            if image_id == NULL_IMAGE_ID {
+                return false;
+            }
+
+            let buffer_size = src.pitch.saturating_mul(src.height);
+            let (buffer_id, offset) = self.buffer_cache.obtain_buffer(
+                src.address,
+                buffer_size,
+                ObtainBufferSynchronize::FullSynchronize,
+                ObtainBufferOperation::DoNothing,
+            );
+            let buffer_handle = self.buffer_cache.get_buffer_gpu_handle(buffer_id);
+            self.texture_cache.dma_buffer_image_copy(
+                copy_info,
+                src,
+                dst,
+                image_id,
+                buffer_handle,
+                offset as usize,
+                true,
+                &mut |gpu_addr, out| {
+                    mm.lock().read_block(gpu_addr, out);
                     true
                 },
             )
@@ -8542,9 +8340,9 @@ impl RasterizerInterface for RasterizerOpenGL {
     fn initialize_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
         self.shader_cache.create_channel(channel);
         self.query_cache.create_channel(channel);
+        self.texture_cache.base.create_channel(channel);
         // Upstream `RasterizerOpenGL` also creates per-channel state for the
-        // texture and buffer caches here. Those owners are still partially
-        // reduced in Rust.
+        // buffer cache here. That owner is still partially reduced in Rust.
     }
 
     fn bind_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
@@ -8553,6 +8351,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         }
         self.shader_cache.bind_to_channel(channel.bind_id);
         self.query_cache.bind_to_channel(channel.bind_id);
+        self.texture_cache.base.bind_to_channel(channel.bind_id);
         // Extract the channel's MemoryManager and store it so subsequent
         // draws can build GpuMemoryAccess adapters.
         if let Some(ref mm) = channel.memory_manager {
@@ -8582,18 +8381,111 @@ impl RasterizerInterface for RasterizerOpenGL {
         self.shader_cache.erase_channel(channel_id);
         self.query_cache.erase_channel(channel_id);
         self.channel_memory_manager = None;
+        self.texture_cache.base.clear_channel_gpu_memory();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer_cache::buffer_cache::BufferCache;
+    use crate::buffer_cache::buffer_cache_base::{
+        BufferCacheChannelInfo, BufferCacheParams, GpuMemoryAccess,
+    };
+    use crate::buffer_cache::word_manager::DeviceTracker;
+    use crate::engines::kepler_compute::{QmdConstBuffer, QueueMetaData};
     use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
     use crate::memory_manager::MemoryManager;
     use common::settings;
     use common::settings_enums::GpuAccuracy;
 
-    fn install_query_memory_manager(rast: &mut RasterizerOpenGL) -> Vec<u8> {
+    struct GpuAccuracyGuard {
+        previous: GpuAccuracy,
+    }
+
+    impl GpuAccuracyGuard {
+        fn set(value: GpuAccuracy) -> Self {
+            let mut values = settings::values_mut();
+            let previous = values.current_gpu_accuracy;
+            values.current_gpu_accuracy = value;
+            Self { previous }
+        }
+    }
+
+    impl Drop for GpuAccuracyGuard {
+        fn drop(&mut self) {
+            settings::values_mut().current_gpu_accuracy = self.previous;
+        }
+    }
+
+    #[test]
+    fn render_target_dirty_consumption_matches_update_render_targets_contract() {
+        let draw_state = DrawState::default();
+        let mut registers = crate::engines::draw_manager::Maxwell3DDrawRegisters::default();
+        registers.dirty_flags[GlDirty::RENDER_TARGETS as usize] = true;
+        registers.dirty_flags[crate::dirty_flags::flags::RENDER_TARGET_CONTROL as usize] = true;
+        registers.dirty_flags[crate::dirty_flags::flags::COLOR_BUFFER0 as usize] = true;
+        registers.dirty_flags[crate::dirty_flags::flags::COLOR_BUFFER3 as usize] = true;
+        registers.dirty_flags[crate::dirty_flags::flags::ZETA_BUFFER as usize] = true;
+        let dirty_flags = registers.dirty_flags;
+        let mut draw_view = Maxwell3DDrawView::with_register_snapshot(&draw_state, registers);
+
+        crate::renderer_opengl::gl_texture_cache::consume_render_target_dirty_flags_for_update(
+            &mut draw_view,
+            &dirty_flags,
+            true,
+        );
+
+        let flags = draw_view.dirty_flags();
+        assert!(!flags[GlDirty::RENDER_TARGETS as usize]);
+        assert!(!flags[crate::dirty_flags::flags::RENDER_TARGET_CONTROL as usize]);
+        for index in 0..crate::texture_cache::types::NUM_RT {
+            let color_flag = crate::dirty_flags::flags::COLOR_BUFFER0 + index as u8;
+            assert!(!flags[color_flag as usize]);
+        }
+        assert!(!flags[crate::dirty_flags::flags::ZETA_BUFFER as usize]);
+        assert!(flags[GlDirty::RESCALE_VIEWPORTS as usize]);
+        assert!(flags[GlDirty::RESCALE_SCISSORS as usize]);
+        assert!(flags[crate::dirty_flags::flags::DEPTH_BIAS_GLOBAL as usize]);
+    }
+
+    #[test]
+    fn clear_render_target_dirty_consumption_matches_update_render_targets_contract() {
+        let mut dirty_flags = [false; 256];
+        dirty_flags[GlDirty::RENDER_TARGETS as usize] = true;
+        dirty_flags[crate::dirty_flags::flags::RENDER_TARGET_CONTROL as usize] = true;
+        dirty_flags[crate::dirty_flags::flags::COLOR_BUFFER0 as usize] = true;
+        dirty_flags[crate::dirty_flags::flags::COLOR_BUFFER6 as usize] = true;
+        dirty_flags[crate::dirty_flags::flags::ZETA_BUFFER as usize] = true;
+        let mut clear_view = Maxwell3DClearView::with_dirty_snapshot(
+            crate::engines::draw_manager::ClearState::default(),
+            crate::engines::draw_manager::Maxwell3DRenderTargets::default(),
+            dirty_flags,
+        );
+
+        crate::renderer_opengl::gl_texture_cache::consume_render_target_dirty_flags_for_update(
+            &mut clear_view,
+            &dirty_flags,
+            true,
+        );
+
+        let flags = clear_view.dirty_flags();
+        assert!(!flags[GlDirty::RENDER_TARGETS as usize]);
+        assert!(!flags[crate::dirty_flags::flags::RENDER_TARGET_CONTROL as usize]);
+        for index in 0..crate::texture_cache::types::NUM_RT {
+            let color_flag = crate::dirty_flags::flags::COLOR_BUFFER0 + index as u8;
+            assert!(!flags[color_flag as usize]);
+        }
+        assert!(!flags[crate::dirty_flags::flags::ZETA_BUFFER as usize]);
+        assert!(flags[GlDirty::RESCALE_VIEWPORTS as usize]);
+        assert!(flags[GlDirty::RESCALE_SCISSORS as usize]);
+        assert!(flags[crate::dirty_flags::flags::DEPTH_BIAS_GLOBAL as usize]);
+    }
+
+    fn query_memory_manager() -> (
+        Vec<u8>,
+        Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
+    ) {
         let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
         let mut backing = vec![0u8; 0x10000];
         device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
@@ -8616,6 +8508,11 @@ mod tests {
         );
         mm.map(0x1000, 0x9000_1000, 0x10000, 0, false);
         let mm = Arc::new(parking_lot::Mutex::new(mm));
+        (backing, mm)
+    }
+
+    fn install_query_memory_manager(rast: &mut RasterizerOpenGL) -> Vec<u8> {
+        let (backing, mm) = query_memory_manager();
         let mut channel = crate::control::channel_state::ChannelState::new(1);
         channel.program_id = 0xCAFE;
         channel.memory_manager = Some(Arc::clone(&mm));
@@ -8623,6 +8520,336 @@ mod tests {
         rast.query_cache.create_channel(&channel);
         rast.query_cache.bind_to_channel(channel.bind_id);
         backing
+    }
+
+    struct DummyTracker;
+
+    impl DeviceTracker for DummyTracker {
+        fn update_pages_cached_count(&self, _addr: u64, _size: u64, _delta: i32) {}
+    }
+
+    struct TestParams;
+
+    impl BufferCacheParams for TestParams {
+        const IS_OPENGL: bool = false;
+        const HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS: bool = false;
+        const HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT: bool = true;
+        const NEEDS_BIND_UNIFORM_INDEX: bool = false;
+        const NEEDS_BIND_STORAGE_INDEX: bool = false;
+        const USE_MEMORY_MAPS: bool = false;
+        const SEPARATE_IMAGE_BUFFER_BINDINGS: bool = false;
+        const USE_MEMORY_MAPS_FOR_UPLOADS: bool = false;
+    }
+
+    struct TestGpuMemory;
+
+    impl GpuMemoryAccess for TestGpuMemory {
+        fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
+            Some(0x100000 + gpu_addr)
+        }
+
+        fn read_u64(&self, gpu_addr: u64) -> Option<u64> {
+            match gpu_addr {
+                0x1020 => Some(0x5008),
+                _ => None,
+            }
+        }
+
+        fn read_u32(&self, gpu_addr: u64) -> Option<u32> {
+            match gpu_addr {
+                0x1028 => Some(0x30),
+                _ => None,
+            }
+        }
+
+        fn is_within_gpu_address_range(&self, _gpu_addr: u64) -> bool {
+            true
+        }
+
+        fn max_continuous_range(&self, _gpu_addr: u64, size: u64) -> u64 {
+            size
+        }
+
+        fn get_memory_layout_size(&self, _gpu_addr: u64) -> u64 {
+            0x1000
+        }
+    }
+
+    #[test]
+    fn compute_engine_adapter_exposes_dispatch_cbuf_snapshot() {
+        let mut qmd = QueueMetaData::default();
+        qmd.const_buffer_enable_mask = 0b1010_0101;
+        qmd.const_buffers[0] = QmdConstBuffer {
+            address: 0x1000,
+            size: 0x20,
+        };
+        qmd.const_buffers[3] = QmdConstBuffer {
+            address: 0x3000,
+            size: 0x40,
+        };
+        qmd.const_buffers[7] = QmdConstBuffer {
+            address: 0x7000,
+            size: 0x80,
+        };
+        let dispatch = DispatchCall {
+            qmd,
+            qmd_address: 0,
+            indirect_compute_address: None,
+            code_address: 0,
+            tsc_address: 0,
+            tsc_limit: 0,
+            tic_address: 0,
+            tic_limit: 0,
+            tex_cb_index: 0,
+        };
+
+        let adapter = ComputeEngineAdapter { dispatch };
+        let info = adapter.launch_info();
+
+        assert_eq!(info.const_buffer_enable_mask, 0b1010_0101);
+        assert_eq!(info.const_buffer_config.len(), 8);
+        assert_eq!(info.const_buffer_config[0].address, 0x1000);
+        assert_eq!(info.const_buffer_config[0].size, 0x20);
+        assert_eq!(info.const_buffer_config[3].address, 0x3000);
+        assert_eq!(info.const_buffer_config[3].size, 0x40);
+        assert_eq!(info.const_buffer_config[7].address, 0x7000);
+        assert_eq!(info.const_buffer_config[7].size, 0x80);
+    }
+
+    #[test]
+    fn graphics_configure_buffer_binding_order_matches_upstream() {
+        let source = include_str!("gl_graphics_pipeline.rs");
+        let method = source
+            .find("pub fn configure_buffers_programs_then_prepare_and_bind_graphics_resources")
+            .expect("combined graphics post-framebuffer configure/prepare helper");
+        let next = source[method..]
+            .find("/// Bind the current draw framebuffer")
+            .expect("next method boundary")
+            + method;
+        let body = &source[method..next];
+        let configure_buffers_and_programs = body
+            .find("bind_texture_buffers_uniforms_then_configure_graphics_buffers_and_programs")
+            .expect("graphics texture-buffer/UBO/buffer/program configure");
+        let prepare_stage = body[configure_buffers_and_programs..]
+            .find("prepare_and_bind_graphics_texture_image_arrays(")
+            .expect("prepare_stage after buffer/program configure")
+            + configure_buffers_and_programs;
+        assert!(configure_buffers_and_programs < prepare_stage);
+
+        let prepare_method = source
+            .find("pub fn prepare_and_bind_graphics_texture_image_arrays")
+            .expect("prepare/bulk-bind helper");
+        let prepare_next = source[prepare_method..]
+            .find("/// Update graphics buffers")
+            .expect("next method boundary")
+            + prepare_method;
+        let prepare_body = &source[prepare_method..prepare_next];
+        let reset_image_pointers = prepare_body
+            .find("clear_host_stage_buffer_pointers")
+            .expect("image pointers reset after host stage buffers")
+            + prepare_method;
+        let bind_textures = prepare_body[reset_image_pointers - prepare_method..]
+            .find("bind_graphics_texture_image_arrays")
+            .expect("GL texture/image bind helper after buffer cache host binds")
+            + reset_image_pointers;
+
+        assert!(reset_image_pointers < bind_textures);
+    }
+
+    #[test]
+    fn graphics_texture_buffer_bindings_pass_pixel_format_to_buffer_cache() {
+        let source = include_str!("gl_graphics_pipeline.rs");
+        let method = source
+            .find("pub fn bind_stage_texture_buffer_views")
+            .expect("pipeline-owned texture-buffer binding helper");
+        let first_bind = source
+            .find("buffer_cache.bind_graphics_texture_buffer(")
+            .expect("graphics texture-buffer binding call");
+        let second_bind = source[first_bind + 1..]
+            .find("buffer_cache.bind_graphics_texture_buffer(")
+            .expect("graphics image-buffer binding call")
+            + first_bind
+            + 1;
+        let first_end = source[first_bind..]
+            .find(");")
+            .expect("graphics texture-buffer binding call end")
+            + first_bind;
+        let second_end = source[second_bind..]
+            .find(");")
+            .expect("graphics image-buffer binding call end")
+            + second_bind;
+        let first_call = &source[first_bind..first_end];
+        let second_call = &source[second_bind..second_end];
+
+        assert!(method < first_bind);
+        assert!(first_call.contains("image_view.buffer_size()"));
+        assert!(first_call.contains("image_view.pixel_format() as u32"));
+        assert!(first_call.contains("false"));
+        assert!(second_call.contains("image_view.buffer_size()"));
+        assert!(second_call.contains("image_view.pixel_format() as u32"));
+        assert!(second_call.contains("desc.is_written"));
+        assert!(second_call.contains("true"));
+        assert!(!first_call.contains("present_internal_format"));
+        assert!(!second_call.contains("present_internal_format"));
+        assert!(!first_call.contains("view_base.size.width"));
+        assert!(!second_call.contains("view_base.size.width"));
+
+        let rasterizer = include_str!("gl_rasterizer.rs");
+        assert!(rasterizer.contains(
+            "pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources"
+        ));
+        assert!(!rasterizer.contains(
+            "pipeline.bind_texture_buffers_uniforms_then_configure_graphics_buffers_and_programs"
+        ));
+        assert!(!rasterizer.contains("pipeline.bind_enabled_stage_texture_buffer_views("));
+    }
+
+    #[test]
+    fn graphics_configure_stage_uniforms_match_upstream_source_and_assembly_paths() {
+        let source = include_str!("gl_graphics_pipeline.rs");
+        let method = source
+            .find("pub fn upload_stage_uniforms")
+            .expect("pipeline-owned stage uniform upload helper");
+        let next = source[method..]
+            .find("/// Configure transform feedback")
+            .expect("next method boundary")
+            + method;
+        let body = &source[method..next];
+        let rescaling = source
+            .find("if info.uses_rescaling_uniform")
+            .expect("rescaling uniform block");
+        let texture_mask = source[rescaling..next]
+            .find("f32::from_bits(texture_scaling_mask)")
+            .expect("texture rescaling mask upload")
+            + rescaling;
+        let image_mask = source[rescaling..next]
+            .find("f32::from_bits(image_scaling_mask)")
+            .expect("image rescaling mask upload")
+            + rescaling;
+        let down_factor = source[image_mask..next]
+            .find("texture_cache.is_rescaling_active()")
+            .expect("TextureCache::IsRescaling down-factor guard")
+            + image_mask;
+        let assembly_uniform = source[down_factor..next]
+            .find("program_local_parameter_4f_arb(")
+            .expect("GLASM rescaling uniform upload")
+            + down_factor;
+        let source_uniform = source[assembly_uniform..next]
+            .find("gl::ProgramUniform4f")
+            .expect("GLSL rescaling uniform upload")
+            + assembly_uniform;
+        let render_area = source[source_uniform..]
+            .find("if info.uses_render_area")
+            .expect("render area uniform block")
+            + source_uniform;
+        let render_area_width = source[render_area..next]
+            .find("surface_clip.width as f32")
+            .expect("render area width")
+            + render_area;
+        let render_area_assembly = source[render_area_width..next]
+            .find("program_local_parameter_4f_arb(")
+            .expect("GLASM render-area uniform upload")
+            + render_area_width;
+        let render_area_source = source[render_area_assembly..next]
+            .find("gl::ProgramUniform4f")
+            .expect("GLSL render-area uniform upload")
+            + render_area_assembly;
+
+        assert!(body.contains("stage_infos.get(stage)"));
+        assert!(rescaling < texture_mask);
+        assert!(texture_mask < assembly_uniform);
+        assert!(image_mask < assembly_uniform);
+        assert!(image_mask < down_factor);
+        assert!(down_factor < assembly_uniform);
+        assert!(assembly_uniform < source_uniform);
+        assert!(source_uniform < render_area);
+        assert!(render_area < render_area_width);
+        assert!(render_area < render_area_assembly);
+        assert!(render_area_assembly < render_area_source);
+
+        let rasterizer = include_str!("gl_rasterizer.rs");
+        let rasterizer_runtime = rasterizer
+            .split(
+                "
+#[cfg(test)]
+mod tests",
+            )
+            .next()
+            .unwrap_or(rasterizer);
+        assert!(rasterizer_runtime
+            .contains("pipeline.prepare_enabled_graphics_texture_image_bindings("));
+        assert!(!rasterizer_runtime.contains("pipeline.upload_stage_uniforms("));
+    }
+
+    #[test]
+    fn transform_feedback_configure_order_matches_upstream() {
+        let source = include_str!("gl_rasterizer.rs");
+        let sync_state = source
+            .find("Self::sync_state(")
+            .expect("draw-time SyncState call");
+        let configure_xfb = source[sync_state..]
+            .find("pipeline.configure_transform_feedback()")
+            .expect("transform feedback configured after SyncState")
+            + sync_state;
+        let tessellation_guard = source[configure_xfb..]
+            .find("ShaderStageType::TessInit")
+            .expect("transform feedback tessellation guard after configure")
+            + configure_xfb;
+        let begin_xfb = source[tessellation_guard..]
+            .find("gl::BeginTransformFeedback")
+            .expect("BeginTransformFeedback after configure")
+            + tessellation_guard;
+        let draw_elements = source[begin_xfb..]
+            .find("gl::DrawElementsInstancedBaseVertexBaseInstance")
+            .expect("draw after BeginTransformFeedback")
+            + begin_xfb;
+        let end_xfb = source[draw_elements..]
+            .find("gl::EndTransformFeedback")
+            .expect("EndTransformFeedback after draw")
+            + draw_elements;
+
+        assert!(sync_state < configure_xfb);
+        assert!(configure_xfb < tessellation_guard);
+        assert!(tessellation_guard < begin_xfb);
+        assert!(begin_xfb < draw_elements);
+        assert!(draw_elements < end_xfb);
+    }
+
+    #[test]
+    fn compute_engine_adapter_feeds_compute_storage_buffer_binding() {
+        let mut qmd = QueueMetaData::default();
+        qmd.const_buffer_enable_mask = 1;
+        qmd.const_buffers[0] = QmdConstBuffer {
+            address: 0x1000,
+            size: 0x100,
+        };
+        let dispatch = DispatchCall {
+            qmd,
+            qmd_address: 0,
+            indirect_compute_address: None,
+            code_address: 0,
+            tsc_address: 0,
+            tsc_limit: 0,
+            tic_address: 0,
+            tic_limit: 0,
+            tex_cb_index: 0,
+        };
+
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        cache.channel_state = Some(Box::new(BufferCacheChannelInfo::default()));
+        cache.set_gpu_memory(Box::new(TestGpuMemory));
+        cache.set_engine_state(Box::new(ComputeEngineAdapter { dispatch }));
+
+        cache.bind_compute_storage_buffer(0, 0, 0x20, true);
+
+        let binding = cache
+            .channel_state
+            .as_ref()
+            .unwrap()
+            .compute_storage_buffers[0];
+        assert_eq!(binding.device_addr, 0x105000);
+        assert_eq!(binding.size, 0x38);
     }
 
     #[test]
@@ -8641,34 +8868,53 @@ mod tests {
         assert_eq!(&backing[0..4], &0x1234_5678u32.to_le_bytes());
     }
 
-    #[test]
-    fn signal_reference_does_not_queue_reference_fence() {
-        let syncpoints = Arc::new(SyncpointManager::new());
-        let mut rast = RasterizerOpenGL::new_for_test(syncpoints);
+    #[derive(Clone)]
+    struct TestReferenceFence {
+        stubbed: bool,
+    }
 
-        assert_eq!(rast.fence_manager.queued_fence_count(), 0);
-        assert_eq!(rast.fence_manager.pending_operation_batch_count(), 0);
+    impl crate::fence_manager::FenceBase for TestReferenceFence {
+        fn is_stubbed(&self) -> bool {
+            self.stubbed
+        }
 
-        rast.signal_reference();
-
-        assert_eq!(rast.fence_manager.queued_fence_count(), 0);
-        assert_eq!(rast.fence_manager.pending_operation_batch_count(), 0);
+        fn wait_for_fence(&self) {}
     }
 
     #[test]
-    fn signal_reference_accumulates_buffer_flushes_like_upstream() {
-        let syncpoints = Arc::new(SyncpointManager::new());
-        let mut rast = RasterizerOpenGL::new_for_test(syncpoints);
+    fn signal_reference_queues_reference_fence_like_upstream() {
+        let _gpu_accuracy = GpuAccuracyGuard::set(GpuAccuracy::Normal);
+        let mut manager = crate::fence_manager::FenceManager::<TestReferenceFence>::new(false);
+        let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let invalidated = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        rast.buffer_cache
-            .test_add_uncommitted_gpu_modified_range(0x1000, 0x1000);
-        assert!(rast.buffer_cache.has_uncommitted_flushes());
-        assert!(!rast.buffer_cache.should_wait_async_flushes());
+        assert_eq!(manager.queued_fence_count(), 0);
+        assert_eq!(manager.pending_operation_batch_count(), 0);
 
-        rast.signal_reference();
+        manager.signal_reference(
+            |is_stubbed| TestReferenceFence {
+                stubbed: is_stubbed,
+            },
+            |_| {},
+            || false,
+            |_| true,
+            || {},
+            || false,
+            {
+                let committed = Arc::clone(&committed);
+                move || committed.store(true, std::sync::atomic::Ordering::Relaxed)
+            },
+            || {},
+            {
+                let invalidated = Arc::clone(&invalidated);
+                move || invalidated.store(true, std::sync::atomic::Ordering::Relaxed)
+            },
+        );
 
-        assert!(!rast.buffer_cache.has_uncommitted_flushes());
-        assert!(rast.buffer_cache.should_wait_async_flushes());
+        assert!(committed.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(invalidated.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(manager.queued_fence_count(), 1);
+        assert_eq!(manager.pending_operation_batch_count(), 1);
     }
 
     #[test]
@@ -8702,12 +8948,7 @@ mod tests {
 
     #[test]
     fn signal_fence_executes_callback_immediately_outside_gpu_high_mode() {
-        let previous_gpu_accuracy = {
-            let mut values = settings::values_mut();
-            let previous = values.current_gpu_accuracy;
-            values.current_gpu_accuracy = GpuAccuracy::Normal;
-            previous
-        };
+        let _gpu_accuracy = GpuAccuracyGuard::set(GpuAccuracy::Normal);
         let syncpoints = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerOpenGL::new_for_test(syncpoints);
         let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -8718,8 +8959,6 @@ mod tests {
         }));
 
         assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
-
-        settings::values_mut().current_gpu_accuracy = previous_gpu_accuracy;
     }
 
     #[test]
@@ -8742,18 +8981,16 @@ mod tests {
 
     #[test]
     fn query_has_timeout_payload_fallback_writes_immediately_and_preserves_payload() {
-        let syncpoints = Arc::new(SyncpointManager::new());
-        let mut rast = RasterizerOpenGL::new_for_test(syncpoints);
-        let backing = install_query_memory_manager(&mut rast);
-        rast.set_gpu_ticks_getter(Arc::new(|| 0x0123_4567_89AB_CDEF));
+        let (backing, mm) = query_memory_manager();
+        let _gpu_accuracy = GpuAccuracyGuard::set(GpuAccuracy::High);
 
-        rast.query(
+        RasterizerOpenGL::make_query_fallback_operation(
+            mm,
             0x4000,
-            crate::query_cache::types::QueryType::Payload as u32,
-            QueryPropertiesFlags::HAS_TIMEOUT,
+            true,
             0xABCD_EF01,
-            0,
-        );
+            Some(Arc::new(|| 0x0123_4567_89AB_CDEF)),
+        )();
 
         assert_eq!(&backing[0x3000..0x3008], &0xABCD_EF01u64.to_le_bytes());
         assert_eq!(

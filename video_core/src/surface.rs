@@ -84,6 +84,28 @@ pub const MAX_PIXEL_FORMAT: usize = MAX_DEPTH_STENCIL_FORMAT as usize;
 // Render-target format conversion
 // ---------------------------------------------------------------------------
 
+fn stop_unimplemented_surface_format(kind: &str, format: u32, fallback: PixelFormat) -> ! {
+    #[cfg(not(test))]
+    {
+        let path = std::path::Path::new(".agents/surface_unimplemented_state.md");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            path,
+            format!(
+                "# Surface format conversion unimplemented\n\n\
+                 - kind: {kind}\n\
+                 - format: 0x{format:X}\n\
+                 - upstream_fallback: {fallback:?}\n\
+                 - upstream: surface.cpp reaches UNIMPLEMENTED_MSG before returning the fallback format\n\
+                 - rust: stopped before treating the fallback as an implemented mapping\n"
+            ),
+        );
+    }
+    panic!("Surface::{kind} unimplemented format=0x{format:X} fallback={fallback:?}");
+}
+
 /// Port of `PixelFormatFromRenderTargetFormat` from `surface.cpp`.
 pub fn pixel_format_from_render_target_format(format: u32) -> PixelFormat {
     match format {
@@ -133,13 +155,11 @@ pub fn pixel_format_from_render_target_format(format: u32) -> PixelFormat {
         0xF4 => PixelFormat::R8Snorm,
         0xF5 => PixelFormat::R8Sint,
         0xF6 => PixelFormat::R8Uint,
-        _ => {
-            log::warn!(
-                "PixelFormatFromRenderTargetFormat: unimplemented format=0x{:X}",
-                format
-            );
-            PixelFormat::A8B8G8R8Unorm
-        }
+        _ => stop_unimplemented_surface_format(
+            "PixelFormatFromRenderTargetFormat",
+            format,
+            PixelFormat::A8B8G8R8Unorm,
+        ),
     }
 }
 
@@ -153,13 +173,25 @@ pub fn pixel_format_from_depth_format(format: u32) -> PixelFormat {
         0x17 => PixelFormat::S8Uint,
         0x19 => PixelFormat::D32FloatS8Uint,
         0x15 => PixelFormat::X8D24Unorm,
-        _ => {
-            log::warn!(
-                "PixelFormatFromDepthFormat: unimplemented format=0x{:X}",
-                format
-            );
-            PixelFormat::S8UintD24Unorm
-        }
+        _ => stop_unimplemented_surface_format(
+            "PixelFormatFromDepthFormat",
+            format,
+            PixelFormat::S8UintD24Unorm,
+        ),
+    }
+}
+
+/// Port of `PixelFormatFromGPUPixelFormat` from `surface.cpp`.
+pub fn pixel_format_from_gpu_pixel_format(format: u32) -> PixelFormat {
+    match format {
+        1 | 2 => PixelFormat::A8B8G8R8Unorm,
+        4 => PixelFormat::R5G6B5Unorm,
+        5 => PixelFormat::B8G8R8A8Unorm,
+        _ => stop_unimplemented_surface_format(
+            "PixelFormatFromGPUPixelFormat",
+            format,
+            PixelFormat::A8B8G8R8Unorm,
+        ),
     }
 }
 
@@ -977,21 +1009,125 @@ mod tests {
 
     #[test]
     fn render_target_format_mapping_matches_upstream_surface_cpp() {
-        assert_eq!(
-            pixel_format_from_render_target_format(0xD5),
-            PixelFormat::A8B8G8R8Unorm
-        );
-        assert_eq!(
-            pixel_format_from_render_target_format(0xF9),
-            PixelFormat::A8B8G8R8Unorm
-        );
-        assert_eq!(
-            pixel_format_from_render_target_format(0xCF),
-            PixelFormat::B8G8R8A8Unorm
-        );
-        assert_eq!(
-            pixel_format_from_render_target_format(0xC0),
-            PixelFormat::R32G32B32A32Float
-        );
+        let cases = [
+            (0xC0, PixelFormat::R32G32B32A32Float),
+            (0xC3, PixelFormat::R32G32B32A32Float),
+            (0xC1, PixelFormat::R32G32B32A32Sint),
+            (0xC4, PixelFormat::R32G32B32A32Sint),
+            (0xC2, PixelFormat::R32G32B32A32Uint),
+            (0xC5, PixelFormat::R32G32B32A32Uint),
+            (0xC6, PixelFormat::R16G16B16A16Unorm),
+            (0xC7, PixelFormat::R16G16B16A16Snorm),
+            (0xC8, PixelFormat::R16G16B16A16Sint),
+            (0xC9, PixelFormat::R16G16B16A16Uint),
+            (0xCA, PixelFormat::R16G16B16A16Float),
+            (0xCB, PixelFormat::R32G32Float),
+            (0xCC, PixelFormat::R32G32Sint),
+            (0xCD, PixelFormat::R32G32Uint),
+            (0xCE, PixelFormat::R16G16B16X16Float),
+            (0xCF, PixelFormat::B8G8R8A8Unorm),
+            (0xE6, PixelFormat::B8G8R8A8Unorm),
+            (0xD0, PixelFormat::B8G8R8A8Srgb),
+            (0xE7, PixelFormat::B8G8R8A8Srgb),
+            (0xD1, PixelFormat::A2B10G10R10Unorm),
+            (0xD2, PixelFormat::A2B10G10R10Uint),
+            (0xDF, PixelFormat::A2R10G10B10Unorm),
+            (0xD5, PixelFormat::A8B8G8R8Unorm),
+            (0xF9, PixelFormat::A8B8G8R8Unorm),
+            (0xD6, PixelFormat::A8B8G8R8Srgb),
+            (0xFA, PixelFormat::A8B8G8R8Srgb),
+            (0xD7, PixelFormat::A8B8G8R8Snorm),
+            (0xD8, PixelFormat::A8B8G8R8Sint),
+            (0xD9, PixelFormat::A8B8G8R8Uint),
+            (0xDA, PixelFormat::R16G16Unorm),
+            (0xDB, PixelFormat::R16G16Snorm),
+            (0xDC, PixelFormat::R16G16Sint),
+            (0xDD, PixelFormat::R16G16Uint),
+            (0xDE, PixelFormat::R16G16Float),
+            (0xE0, PixelFormat::B10G11R11Float),
+            (0xE3, PixelFormat::R32Sint),
+            (0xE4, PixelFormat::R32Uint),
+            (0xE5, PixelFormat::R32Float),
+            (0xE8, PixelFormat::R5G6B5Unorm),
+            (0xE9, PixelFormat::A1R5G5B5Unorm),
+            (0xF8, PixelFormat::A1R5G5B5Unorm),
+            (0xEA, PixelFormat::R8G8Unorm),
+            (0xEB, PixelFormat::R8G8Snorm),
+            (0xEC, PixelFormat::R8G8Sint),
+            (0xED, PixelFormat::R8G8Uint),
+            (0xEE, PixelFormat::R16Unorm),
+            (0xEF, PixelFormat::R16Snorm),
+            (0xF0, PixelFormat::R16Sint),
+            (0xF1, PixelFormat::R16Uint),
+            (0xF2, PixelFormat::R16Float),
+            (0xF3, PixelFormat::R8Unorm),
+            (0xF4, PixelFormat::R8Snorm),
+            (0xF5, PixelFormat::R8Sint),
+            (0xF6, PixelFormat::R8Uint),
+        ];
+
+        for (format, expected) in cases {
+            assert_eq!(
+                pixel_format_from_render_target_format(format),
+                expected,
+                "render-target format 0x{format:X}"
+            );
+        }
+    }
+
+    #[test]
+    fn depth_format_mapping_matches_upstream_surface_cpp() {
+        let cases = [
+            (0x14, PixelFormat::S8UintD24Unorm),
+            (0x16, PixelFormat::D24UnormS8Uint),
+            (0x0A, PixelFormat::D32Float),
+            (0x13, PixelFormat::D16Unorm),
+            (0x17, PixelFormat::S8Uint),
+            (0x19, PixelFormat::D32FloatS8Uint),
+            (0x15, PixelFormat::X8D24Unorm),
+        ];
+
+        for (format, expected) in cases {
+            assert_eq!(
+                pixel_format_from_depth_format(format),
+                expected,
+                "depth format 0x{format:X}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_pixel_format_mapping_matches_upstream_surface_cpp() {
+        let cases = [
+            (1, PixelFormat::A8B8G8R8Unorm),
+            (2, PixelFormat::A8B8G8R8Unorm),
+            (4, PixelFormat::R5G6B5Unorm),
+            (5, PixelFormat::B8G8R8A8Unorm),
+        ];
+
+        for (format, expected) in cases {
+            assert_eq!(
+                pixel_format_from_gpu_pixel_format(format),
+                expected,
+                "GPU pixel format {format}"
+            );
+        }
+    }
+
+    #[test]
+    fn unimplemented_surface_format_conversions_stop_like_upstream_unimplemented_msg() {
+        let render_target = std::panic::catch_unwind(|| {
+            pixel_format_from_render_target_format(u32::MAX);
+        });
+        let depth = std::panic::catch_unwind(|| {
+            pixel_format_from_depth_format(u32::MAX);
+        });
+        let gpu = std::panic::catch_unwind(|| {
+            pixel_format_from_gpu_pixel_format(u32::MAX);
+        });
+
+        assert!(render_target.is_err());
+        assert!(depth.is_err());
+        assert!(gpu.is_err());
     }
 }

@@ -8,8 +8,10 @@
 
 use common::ResultCode;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::frontend::emulated_controller::get_simple_npad_button_state;
+use crate::hid_core::{HIDCore, AVAILABLE_CONTROLLERS};
 use crate::hid_result;
 use crate::hid_types::*;
 use crate::hid_util;
@@ -50,6 +52,7 @@ fn trace_npad_update(
 
 /// Main NPad controller resource
 pub struct NPad {
+    hid_core: Option<Arc<parking_lot::Mutex<HIDCore>>>,
     npad_resource: NPadResource,
     vibration: NpadVibration,
     vibration_devices: [NpadVibrationDevice; 2],
@@ -60,6 +63,7 @@ pub struct NPad {
 impl Default for NPad {
     fn default() -> Self {
         Self {
+            hid_core: None,
             npad_resource: NPadResource::new(),
             vibration: NpadVibration::new(),
             vibration_devices: {
@@ -78,6 +82,13 @@ impl Default for NPad {
 impl NPad {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn new_with_hid_core(hid_core: Arc<parking_lot::Mutex<HIDCore>>) -> Self {
+        Self {
+            hid_core: Some(hid_core),
+            ..Self::default()
+        }
     }
 
     /// Port of NPad::Activate().
@@ -266,15 +277,60 @@ impl NPad {
                 continue;
             };
 
-            // ruzu's temporary controller model currently populates only
-            // Player1. The full upstream loop over controller_data[aruid][i]
-            // should replace this once per-NpadId controller state is ported.
-            for entry_index in 0..1 {
+            let controller_states: Vec<_> = if let Some(hid_core) = self.hid_core.as_ref() {
+                let hid_core = hid_core.lock();
+                (0..AVAILABLE_CONTROLLERS)
+                    .map(|entry_index| {
+                        let controller = hid_core.get_emulated_controller_by_index(entry_index);
+                        (
+                            entry_index,
+                            controller.get_npad_id_type(),
+                            controller.get_npad_style_index(false),
+                            controller.is_connected(),
+                            {
+                                let mut buttons = controller.get_npad_buttons();
+                                buttons.raw |= get_simple_npad_button_state().raw;
+                                buttons
+                            },
+                        )
+                    })
+                    .collect()
+            } else {
+                vec![(
+                    0,
+                    NpadIdType::Player1,
+                    NpadStyleIndex::Fullkey,
+                    true,
+                    get_simple_npad_button_state(),
+                )]
+            };
+
+            // Mirror upstream's controller_data[aruid_index][i] loop. ruzu still
+            // lacks the per-aruid controller_data storage, but the runtime path
+            // now consumes HIDCore's EmulatedController state instead of inventing
+            // a local Player1 controller.
+            for (entry_index, npad_id, controller_type, is_connected, button_state) in
+                controller_states
+            {
                 let npad = &mut shared.npad.npad_entry[entry_index].internal_state;
+
+                if controller_type == NpadStyleIndex::None || !is_connected {
+                    continue;
+                }
 
                 // Mirror upstream `NPad::InitNewlyAddedController` for the
                 // Pro Controller (Fullkey) case (npad.cpp:202-215). These
                 // fields are connect-time state upstream, not per-poll state.
+                if !matches!(
+                    controller_type,
+                    NpadStyleIndex::Fullkey
+                        | NpadStyleIndex::NES
+                        | NpadStyleIndex::SNES
+                        | NpadStyleIndex::N64
+                        | NpadStyleIndex::SegaGenesis
+                ) {
+                    continue;
+                }
                 if !npad.style_tag.raw.contains(NpadStyleSet::FULLKEY) {
                     npad.style_tag.raw |= NpadStyleSet::FULLKEY;
                     // device_type.fullkey = bit 0 (upstream `BitField<0,1,s32> fullkey`).
@@ -293,7 +349,7 @@ impl NPad {
                 let prev_sampling = npad.fullkey_lifo.read_current_entry().state.sampling_number;
                 let mut pad_state = NPadGenericState::default();
                 pad_state.connection_status.raw = 0x3;
-                pad_state.npad_buttons = get_simple_npad_button_state();
+                pad_state.npad_buttons = button_state;
                 pad_state.sampling_number = prev_sampling + 1;
                 if std::env::var_os("RUZU_TRACE_NPAD_STATE").is_some()
                     && !pad_state.npad_buttons.raw.is_empty()
@@ -332,6 +388,12 @@ impl NPad {
                 libnx_state.npad_buttons = pad_state.npad_buttons;
                 libnx_state.sampling_number = prev_ext + 1;
                 npad.system_ext_lifo.write_next_entry(libnx_state);
+
+                if !pad_state.npad_buttons.raw.is_empty() {
+                    if let Some(hid_core) = self.hid_core.as_ref() {
+                        hid_core.lock().set_last_active_controller(npad_id);
+                    }
+                }
             }
         }
     }
@@ -453,6 +515,30 @@ impl NPad {
             NpadJoyDeviceType::Left,
             NpadJoyAssignmentMode::Dual,
         );
+        ResultCode::SUCCESS
+    }
+
+    /// Port of upstream `NPad::StartLrAssignmentMode`.
+    pub fn start_lr_assignment_mode(&mut self, aruid: u64) -> ResultCode {
+        let is_enabled = match self.npad_resource.get_lr_assignment_mode(aruid) {
+            Ok(value) => value,
+            Err(e) => return e,
+        };
+        if !is_enabled {
+            return self.npad_resource.set_lr_assignment_mode(aruid, true);
+        }
+        ResultCode::SUCCESS
+    }
+
+    /// Port of upstream `NPad::StopLrAssignmentMode`.
+    pub fn stop_lr_assignment_mode(&mut self, aruid: u64) -> ResultCode {
+        let is_enabled = match self.npad_resource.get_lr_assignment_mode(aruid) {
+            Ok(value) => value,
+            Err(e) => return e,
+        };
+        if is_enabled {
+            return self.npad_resource.set_lr_assignment_mode(aruid, false);
+        }
         ResultCode::SUCCESS
     }
 
@@ -751,7 +837,8 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::NPad;
-    use crate::hid_types::NpadIdType;
+    use crate::hid_core::HIDCore;
+    use crate::hid_types::{NpadIdType, NpadStyleIndex, NpadStyleSet};
     use crate::resources::applet_resource::{AppletResource, AppletResourceHolder};
     use crate::resources::npad::npad_types::{NpadJoyAssignmentMode, NpadJoyDeviceType};
     use crate::resources::shared_memory_holder::KSharedMemoryBacking;
@@ -800,6 +887,78 @@ mod tests {
             shared.npad.npad_entry[0].internal_state.assignment_mode,
             NpadJoyAssignmentMode::Single
         );
+    }
+
+    #[test]
+    fn lr_assignment_mode_start_stop_matches_upstream() {
+        const ARUID: u64 = 0x51;
+
+        let mut npad = NPad::new();
+        assert!(npad.register_applet_resource_user_id(ARUID).is_success());
+        assert!(npad.activate_npad_resource_with_aruid(ARUID).is_success());
+
+        assert_eq!(npad.npad_resource.get_lr_assignment_mode(ARUID), Ok(false));
+        assert!(npad.start_lr_assignment_mode(ARUID).is_success());
+        assert_eq!(npad.npad_resource.get_lr_assignment_mode(ARUID), Ok(true));
+        assert!(npad.start_lr_assignment_mode(ARUID).is_success());
+        assert_eq!(npad.npad_resource.get_lr_assignment_mode(ARUID), Ok(true));
+        assert!(npad.stop_lr_assignment_mode(ARUID).is_success());
+        assert_eq!(npad.npad_resource.get_lr_assignment_mode(ARUID), Ok(false));
+        assert!(npad.stop_lr_assignment_mode(ARUID).is_success());
+        assert_eq!(npad.npad_resource.get_lr_assignment_mode(ARUID), Ok(false));
+    }
+
+    #[test]
+    fn on_update_uses_hid_core_connected_controllers() {
+        const ARUID: u64 = 0x51;
+
+        let mut applet_resource = AppletResource::new();
+        applet_resource.set_shared_memory_backing(Arc::new(TestSharedMemoryBacking));
+        assert!(applet_resource
+            .register_applet_resource_user_id(ARUID, true)
+            .is_success());
+        assert!(applet_resource.create_applet_resource(ARUID).is_success());
+
+        let hid_core = Arc::new(Mutex::new(HIDCore::new()));
+        {
+            let mut hid_core = hid_core.lock();
+            let p1 = hid_core.get_emulated_controller_mut(NpadIdType::Player1);
+            p1.set_npad_style_index(NpadStyleIndex::Fullkey);
+            p1.connect(false);
+
+            let p2 = hid_core.get_emulated_controller_mut(NpadIdType::Player2);
+            p2.set_npad_style_index(NpadStyleIndex::Fullkey);
+            p2.disconnect();
+        }
+
+        let applet_resource = Arc::new(Mutex::new(applet_resource));
+        let mut npad = NPad::new_with_hid_core(hid_core);
+        npad.set_npad_externals(AppletResourceHolder {
+            applet_resource: Some(applet_resource.clone()),
+            handheld_config: None,
+        });
+        assert!(npad.register_applet_resource_user_id(ARUID).is_success());
+        assert!(npad.activate_npad_resource_with_aruid(ARUID).is_success());
+        assert!(npad
+            .set_supported_npad_style_set(ARUID, NpadStyleSet::FULLKEY)
+            .is_success());
+        assert!(npad.activate().is_success());
+        assert!(npad.activate_for_aruid(ARUID).is_success());
+
+        npad.on_update();
+
+        let resource = applet_resource.lock();
+        let shared = resource.get_shared_memory_format(ARUID).unwrap();
+        assert!(shared.npad.npad_entry[0]
+            .internal_state
+            .style_tag
+            .raw
+            .contains(NpadStyleSet::FULLKEY));
+        assert!(!shared.npad.npad_entry[1]
+            .internal_state
+            .style_tag
+            .raw
+            .contains(NpadStyleSet::FULLKEY));
     }
 
     #[test]

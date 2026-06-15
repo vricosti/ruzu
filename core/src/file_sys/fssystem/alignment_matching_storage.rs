@@ -4,7 +4,8 @@
 // Ported from: core/file_sys/fssystem/fssystem_alignment_matching_storage.h
 
 use super::alignment_matching_storage_impl::AlignmentMatchingStorageImpl;
-use crate::file_sys::vfs::vfs_types::VirtualFile;
+use crate::file_sys::vfs::vfs::VfsFile;
+use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 
 pub struct AlignmentMatchingStorage {
     base_storage: VirtualFile,
@@ -65,6 +66,46 @@ impl AlignmentMatchingStorage {
     }
 }
 
+impl VfsFile for AlignmentMatchingStorage {
+    fn get_name(&self) -> String {
+        String::from("AlignmentMatchingStorage")
+    }
+
+    fn get_size(&self) -> usize {
+        self.base_storage.get_size()
+    }
+
+    fn resize(&self, _new_size: usize) -> bool {
+        false
+    }
+
+    fn get_containing_directory(&self) -> Option<VirtualDir> {
+        None
+    }
+
+    fn is_writable(&self) -> bool {
+        self.base_storage.is_writable()
+    }
+
+    fn is_readable(&self) -> bool {
+        self.base_storage.is_readable()
+    }
+
+    fn read(&self, data: &mut [u8], length: usize, offset: usize) -> usize {
+        let actual_len = length.min(data.len());
+        AlignmentMatchingStorage::read(self, &mut data[..actual_len], offset)
+    }
+
+    fn write(&self, data: &[u8], length: usize, offset: usize) -> usize {
+        let actual_len = length.min(data.len());
+        AlignmentMatchingStorage::write(self, &data[..actual_len], offset)
+    }
+
+    fn rename(&self, _new_name: &str) -> bool {
+        false
+    }
+}
+
 pub struct AlignmentMatchingStoragePooledBuffer {
     base_storage: VirtualFile,
     data_align: usize,
@@ -118,6 +159,46 @@ impl AlignmentMatchingStoragePooledBuffer {
             buffer,
             buffer.len(),
         )
+    }
+}
+
+impl VfsFile for AlignmentMatchingStoragePooledBuffer {
+    fn get_name(&self) -> String {
+        String::from("AlignmentMatchingStoragePooledBuffer")
+    }
+
+    fn get_size(&self) -> usize {
+        self.base_storage.get_size()
+    }
+
+    fn resize(&self, _new_size: usize) -> bool {
+        false
+    }
+
+    fn get_containing_directory(&self) -> Option<VirtualDir> {
+        None
+    }
+
+    fn is_writable(&self) -> bool {
+        self.base_storage.is_writable()
+    }
+
+    fn is_readable(&self) -> bool {
+        self.base_storage.is_readable()
+    }
+
+    fn read(&self, data: &mut [u8], length: usize, offset: usize) -> usize {
+        let actual_len = length.min(data.len());
+        AlignmentMatchingStoragePooledBuffer::read(self, &mut data[..actual_len], offset)
+    }
+
+    fn write(&self, data: &[u8], length: usize, offset: usize) -> usize {
+        let actual_len = length.min(data.len());
+        AlignmentMatchingStoragePooledBuffer::write(self, &data[..actual_len], offset)
+    }
+
+    fn rename(&self, _new_name: &str) -> bool {
+        false
     }
 }
 

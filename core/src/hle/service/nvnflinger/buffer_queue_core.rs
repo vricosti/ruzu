@@ -143,6 +143,15 @@ impl BufferQueueCore {
         }
         guard
     }
+
+    pub fn wait_while_allocating_locked<'a>(
+        &self,
+        guard: std::sync::MutexGuard<'a, BufferQueueCoreInner>,
+    ) -> std::sync::MutexGuard<'a, BufferQueueCoreInner> {
+        self.is_allocating_condition
+            .wait_while(guard, |inner| inner.is_allocating)
+            .unwrap()
+    }
 }
 
 pub fn dump_bqp_wait_profile() {
@@ -235,14 +244,36 @@ impl BufferQueueCoreInner {
             _ => false,
         }
     }
+}
 
-    pub fn wait_while_allocating_locked(&self) {
-        // In upstream this waits on is_allocating_condition while is_allocating is true.
-        // Since we hold the mutex via MutexGuard, this would need to use the outer
-        // Condvar. For now we just assert we are not allocating.
-        assert!(
-            !self.is_allocating,
-            "BufferQueueCore: unexpected allocation in progress"
-        );
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn wait_while_allocating_locked_blocks_until_condition_is_signaled() {
+        let core = BufferQueueCore::new();
+        core.mutex.lock().unwrap().is_allocating = true;
+
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let waiter_core = Arc::clone(&core);
+        let waiter = std::thread::spawn(move || {
+            let guard = waiter_core.mutex.lock().unwrap();
+            waiting_tx.send(()).unwrap();
+            let guard = waiter_core.wait_while_allocating_locked(guard);
+            assert!(!guard.is_allocating);
+        });
+
+        waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        {
+            let mut guard = core.mutex.lock().unwrap();
+            guard.is_allocating = false;
+        }
+        core.is_allocating_condition.notify_all();
+
+        waiter.join().unwrap();
     }
 }

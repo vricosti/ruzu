@@ -292,14 +292,19 @@ impl QueryCache {
     }
 
     fn reset_stream(&mut self, query_type: QueryType) {
-        let new_current = if self.legacy.stream(query_type).current.is_some() {
-            Some(self.counter(None, query_type))
-        } else {
-            None
+        let had_current = {
+            let stream = self.legacy.stream_mut(query_type);
+            if let Some(current) = stream.current.take() {
+                current.end_query(self.commands_queued);
+                true
+            } else {
+                false
+            }
         };
-        self.legacy
-            .stream_mut(query_type)
-            .reset_with(self.commands_queued, new_current);
+        let new_current = had_current.then(|| self.counter(None, query_type));
+        let stream = self.legacy.stream_mut(query_type);
+        stream.current = new_current;
+        stream.last = None;
     }
 
     fn disable_stream(&mut self, query_type: QueryType) {
@@ -309,11 +314,16 @@ impl QueryCache {
     }
 
     fn slice_current_stream(&mut self, query_type: QueryType) -> Option<HostCounterHandle> {
-        let dependency = self.legacy.stream(query_type).current.clone();
-        let new_counter = self.counter(dependency, query_type);
-        self.legacy
-            .stream_mut(query_type)
-            .current_with(self.commands_queued, new_counter)
+        let previous = {
+            let stream = self.legacy.stream_mut(query_type);
+            let current = stream.current.take()?;
+            current.end_query(self.commands_queued);
+            stream.last = Some(current);
+            stream.last.clone()
+        };
+        let new_counter = self.counter(previous.clone(), query_type);
+        self.legacy.stream_mut(query_type).current = Some(new_counter);
+        previous
     }
 
     fn flush_and_remove_region(&mut self, addr: u64, size: usize, r#async: bool) {

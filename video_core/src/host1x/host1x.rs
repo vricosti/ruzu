@@ -393,6 +393,17 @@ impl Host1xCoreInterface for Host1x {
         self.syncpoint_manager.wait_host(id, expected_value);
     }
 
+    fn register_guest_action(
+        &self,
+        id: u32,
+        expected_value: u32,
+        action: Box<dyn FnOnce() + Send>,
+    ) -> Option<u64> {
+        self.syncpoint_manager
+            .register_guest_action(id, expected_value, action)
+            .map(|handle| handle.raw())
+    }
+
     fn register_host_action(
         &self,
         id: u32,
@@ -511,6 +522,11 @@ impl Host1xCoreInterface for Host1x {
 #[cfg(test)]
 mod tests {
     use super::{ChannelType, Host1x};
+    use ruzu_core::host1x_core::Host1xCoreInterface;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     fn frame_queue_contains(host1x: &Host1x, fd: i32) -> bool {
         let inner = host1x.frame_queue.inner.lock().unwrap();
@@ -531,5 +547,27 @@ mod tests {
         assert!(frame_queue_contains(&host1x, 9));
         host1x.stop_device(9, ChannelType::Vic);
         assert!(!frame_queue_contains(&host1x, 9));
+    }
+
+    #[test]
+    fn guest_action_bridge_fires_from_guest_counter_only() {
+        let host1x = Host1x::new();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let fired_clone = Arc::clone(&fired);
+
+        let handle = Host1xCoreInterface::register_guest_action(
+            &host1x,
+            1,
+            1,
+            Box::new(move || {
+                fired_clone.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        assert!(handle.is_some());
+        host1x.syncpoint_manager().increment_host(1);
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        host1x.syncpoint_manager().increment_guest(1);
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
     }
 }

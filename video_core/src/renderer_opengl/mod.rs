@@ -52,6 +52,7 @@ pub use gl_blit_screen::BlitScreen;
 pub use gl_device::Device;
 pub use gl_rasterizer::{dump_gl_draw_stall_profile, RasterizerOpenGL};
 pub use gl_shader_cache::dump_shader_pipeline_stall_profile;
+use gl_shader_manager::{ProgramManager, ProgramManagerHandle};
 #[allow(unused_imports)]
 pub use gl_state_tracker::StateTracker;
 
@@ -349,9 +350,16 @@ pub enum OpenGLError {
 /// Owns the device info, state tracker, blit screen pipeline, rasterizer,
 /// graphics context, and base renderer data.
 pub struct RendererOpenGL {
-    device: Device,
+    device: Box<Device>,
     blit_screen: BlitScreen,
-    rasterizer: RasterizerOpenGL,
+    rasterizer: Box<RasterizerOpenGL>,
+    /// Concrete owner of the shared OpenGL program manager.
+    ///
+    /// Upstream declares this before `rasterizer`, but C++ destroys members in
+    /// reverse order. Rust drops fields in declaration order, so this field is
+    /// declared after `rasterizer` to keep the same effective teardown order.
+    #[allow(dead_code)]
+    program_manager: ProgramManagerHandle,
     /// Graphics context for swap buffers / make current.
     /// Upstream: `std::unique_ptr<Core::Frontend::GraphicsContext> context` in RendererBase.
     context: Box<dyn GraphicsContext + Send>,
@@ -368,10 +376,6 @@ pub struct RendererOpenGL {
     capture_renderbuffer: OGLRenderbuffer,
     /// Current framebuffer layout (window size + screen region).
     framebuffer_layout: FramebufferLayout,
-    /// Device memory reader for framebuffer loading.
-    /// Upstream: `Tegra::MaxwellDeviceMemoryManager& device_memory` held in RendererBase.
-    /// Set post-construction via `set_device_memory_reader()`.
-    device_memory: Option<crate::renderer_base::DeviceMemoryReader>,
 }
 
 impl RendererOpenGL {
@@ -394,21 +398,58 @@ impl RendererOpenGL {
 
         // Load GL function pointers
         gl::load_with(&mut load_fn);
+        gl_buffer_cache::load_extra_functions(&mut load_fn);
+        gl_shader_util::load_extra_functions(&mut load_fn);
         gl_rasterizer::load_extra_functions(&mut load_fn);
+        present::window_adapt_pass::load_extra_functions(&mut load_fn);
         StateTracker::load_compat_functions(load_fn);
 
         // Query device capabilities
-        let device = Device::new();
+        let device = Box::new(Device::new());
+        let device_ptr: *const Device = &*device;
 
-        // Initialize blit screen pipeline
-        let blit_screen = BlitScreen::new().map_err(|e| OpenGLError::ShaderCompileFailed(e))?;
+        let program_manager = ProgramManager::new_shared(&device);
+
+        let device_memory_reader: crate::renderer_base::DeviceMemoryReader = {
+            let device_memory = Arc::clone(&device_memory);
+            Arc::new(move |addr, out| {
+                let host_ptr = device_memory.get_pointer(addr);
+                if host_ptr.is_null() {
+                    return false;
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(host_ptr, out.as_mut_ptr(), out.len());
+                }
+                true
+            })
+        };
 
         // Initialize rasterizer with the shared MaxwellDeviceMemoryManager.
         // Upstream stores `StateTracker state_tracker` by value on
         // `RendererOpenGL` and injects a reference into `RasterizerOpenGL`;
         // Rust cannot express member references, so ruzu lets the rasterizer
         // own the tracker directly (see `RasterizerOpenGL::state_tracker_mut`).
-        let rasterizer = RasterizerOpenGL::new(&device, syncpoints, device_memory);
+        let mut rasterizer = Box::new(RasterizerOpenGL::new(
+            &device,
+            syncpoints,
+            device_memory,
+            Arc::clone(&program_manager),
+        ));
+        rasterizer.set_device_memory_reader(Arc::clone(&device_memory_reader));
+        let rasterizer_ptr: *mut RasterizerOpenGL = &mut *rasterizer;
+        let state_tracker_ptr: *mut StateTracker =
+            rasterizer.state_tracker_mut() as *mut StateTracker;
+
+        // Initialize blit screen pipeline after the rasterizer is heap-stable so
+        // present layers can store the same non-owning rasterizer reference as upstream.
+        let blit_screen = BlitScreen::new(
+            Arc::clone(&program_manager),
+            rasterizer_ptr,
+            state_tracker_ptr,
+            device_ptr,
+            Arc::clone(&device_memory_reader),
+        )
+        .map_err(|e| OpenGLError::ShaderCompileFailed(e))?;
 
         // Set up initial GL state (matching zuyu's RendererOpenGL constructor)
         unsafe {
@@ -480,13 +521,13 @@ impl RendererOpenGL {
             device,
             blit_screen,
             rasterizer,
+            program_manager,
             context,
             base_data: RendererBaseData::new(),
             screenshot_framebuffer: OGLFramebuffer::new(),
             capture_framebuffer,
             capture_renderbuffer,
             framebuffer_layout: default_frame_layout(ScreenUndocked::WIDTH, ScreenUndocked::HEIGHT),
-            device_memory: None,
         })
     }
 
@@ -569,13 +610,8 @@ impl RendererOpenGL {
             state_tracker.bind_framebuffer(0);
         }
         let phase_start = if profile { Some(Instant::now()) } else { None };
-        self.blit_screen.draw_screen(
-            framebuffers,
-            &self.framebuffer_layout,
-            &mut self.rasterizer,
-            false,
-            self.device_memory.as_ref(),
-        );
+        self.blit_screen
+            .draw_screen(framebuffers, &self.framebuffer_layout, false);
         if let Some(start) = phase_start {
             PRESENT_DRAW_SCREEN_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
         }
@@ -871,15 +907,7 @@ impl RendererBase for RendererOpenGL {
         self.composite_impl(layers);
     }
 
-    fn set_device_memory_reader(&mut self, reader: crate::renderer_base::DeviceMemoryReader) {
-        if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
-            log::info!("[PRESENT] RendererOpenGL::set_device_memory_reader");
-        }
-        self.rasterizer.set_device_memory_reader(reader.clone());
-        self.device_memory = Some(reader);
-    }
-
-    fn set_shader_cache_gpu_reader(&mut self, reader: crate::renderer_base::DeviceMemoryReader) {
+    fn set_shader_cache_gpu_reader(&mut self, reader: crate::renderer_base::ShaderCacheGpuReader) {
         // The OpenGL shader cache now compiles graphics pipelines through the
         // channel-owned shared shader cache. Keep forwarding this reader to
         // the rasterizer for compatibility paths outside shader compilation.
@@ -957,7 +985,7 @@ impl RendererBase for RendererOpenGL {
         // Safety: We need a raw pointer to the rasterizer for GPU-level access.
         // This matches upstream's ReadRasterizer() returning a raw pointer.
         // Cast through a trait reference to create a wide pointer.
-        let trait_ref: &dyn RasterizerInterface = &self.rasterizer;
+        let trait_ref: &dyn RasterizerInterface = &*self.rasterizer;
         let ptr = trait_ref as *const dyn RasterizerInterface as *mut dyn RasterizerInterface;
         if std::env::var_os("RUZU_TRACE_RASTERIZER_BIND").is_some() {
             log::info!("RendererOpenGL::read_rasterizer rasterizer_ptr={:p}", ptr);

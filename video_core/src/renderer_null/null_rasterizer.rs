@@ -306,6 +306,20 @@ impl RasterizerInterface for RasterizerNull {
 
     fn accelerate_inline_to_memory(&mut self, _address: u64, _copy_size: usize, _memory: &[u8]) {}
 
+    fn accelerate_dma_buffer_copy(
+        &mut self,
+        src_address: u64,
+        dest_address: u64,
+        amount: u64,
+    ) -> bool {
+        self.accelerate_dma
+            .buffer_copy(src_address, dest_address, amount)
+    }
+
+    fn accelerate_dma_buffer_clear(&mut self, dst_address: u64, amount: u64, value: u32) -> bool {
+        self.accelerate_dma.buffer_clear(dst_address, amount, value)
+    }
+
     // ── Channel management ──────────────────────────────────────────────
 
     fn initialize_channel(&mut self, channel: &ChannelState) {

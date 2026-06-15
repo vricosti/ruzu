@@ -58,21 +58,59 @@ pub fn isetp(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let src_a = tv.x(tv.src_a_reg(insn));
     let src_b = tv.decode_src_b(insn, opcode);
 
+    let dest_pred_b = Pred(field(insn, 0, 3) as u8);
+    let dest_pred_a = Pred(field(insn, 3, 3) as u8);
+    let bop_pred = Pred(field(insn, 39, 3) as u8);
+    let neg_bop_pred = bit(insn, 42);
+    let x = bit(insn, 43);
     let cmp_op = field(insn, 49, 3);
     let bool_op = field(insn, 45, 2);
     let is_signed = bit(insn, 48);
-    let pred_idx = field(insn, 39, 3);
-    let pred39 = tv.ir.get_pred(Pred(pred_idx as u8), false);
+    if x {
+        panic!("ISETP.X extended integer compare not implemented");
+    }
+    let pred39 = tv.ir.get_pred(bop_pred, neg_bop_pred);
 
     let cmp_result = int_compare(tv, cmp_op, src_a, src_b, is_signed);
-    let result = combine_pred(tv, cmp_result, pred39, bool_op);
+    let result_a = combine_pred(tv, cmp_result, pred39, bool_op);
+    let not_cmp = tv.ir.logical_not(cmp_result);
+    let result_b = combine_pred(tv, not_cmp, pred39, bool_op);
 
-    let dst_p = tv.dst_pred(insn);
-    tv.ir.set_pred(Pred(dst_p as u8), result);
+    tv.ir.set_pred(dest_pred_a, result_a);
+    tv.ir.set_pred(dest_pred_b, result_b);
+}
 
-    let dst_p2 = field(insn, 3, 3);
-    if dst_p2 != 7 {
-        let neg_result = tv.ir.logical_not(result);
-        tv.ir.set_pred(Pred(dst_p2 as u8), neg_result);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::basic_block::Block;
+    use crate::ir::opcodes::Opcode;
+    use crate::ir::program::Program;
+    use crate::ir::types::ShaderStage;
+
+    #[test]
+    fn isetp_writes_upstream_predicate_destinations_and_negates_bop_pred() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+        let insn = (2u64) // dest_pred_b
+            | (5u64 << 3) // dest_pred_a
+            | (1u64 << 8) // src_reg_a
+            | (4u64 << 39) // bop_pred
+            | (1u64 << 42) // neg_bop_pred
+            | (0u64 << 45) // AND
+            | (2u64 << 49); // Equal
+
+        isetp(&mut tv, insn, MaxwellOpcode::ISETP_reg);
+
+        let block = &tv.ir.program.blocks[0];
+        let set_preds: Vec<_> = block
+            .iter()
+            .filter(|inst| inst.opcode == Opcode::SetPred)
+            .collect();
+        assert_eq!(set_preds.len(), 2);
+        assert_eq!(set_preds[0].args[0], Value::Pred(Pred(5)));
+        assert_eq!(set_preds[1].args[0], Value::Pred(Pred(2)));
+        assert!(block.iter().any(|inst| inst.opcode == Opcode::LogicalNot));
     }
 }

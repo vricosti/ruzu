@@ -1,22 +1,4704 @@
+## 2026-06-15 — core/src/file_sys/fssystem/alignment_matching_storage_impl.rs, core/src/file_sys/fssystem/alignment_matching_storage.rs, core/src/file_sys/fssystem/nca_file_system_driver.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/file_sys/fssystem/fssystem_alignment_matching_storage_impl.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/file_sys/fssystem/fssystem_alignment_matching_storage.h, and /home/vricosti/Dev/emulators/zuyu/src/core/file_sys/fssystem/fssystem_nca_file_system_driver.cpp
+
+### Intentional differences
+- Rust implements upstream `AlignmentMatchingStorage<DataAlign, BufferAlign>` and `AlignmentMatchingStoragePooledBuffer<BufferAlign>` as runtime-parameterized structs because const-generic trait-object construction is not used in the current VFS owner graph.
+- Rust adds `VfsFile` implementations for both alignment storage wrappers so `NcaFileSystemDriver::create_aes_ctr_storage(...)` can return them through the existing `VirtualFile` alias. Upstream inherits from `IStorage`.
+
+### Unintentional differences (to fix)
+- Fixed: `AlignmentMatchingStorageImpl::read(...)` now reads the aligned core portion into the upstream-equivalent `aligned_core_buffer` offset. Rust previously used `buffer_gap` as the destination offset for both branches; for the common `BufferAlign=1` AES-CTR wrapper path this read aligned core bytes at the beginning of the caller buffer instead of after `offset_round_up_difference`, corrupting unaligned NCA reads such as the NPDM.
+- Fixed: AES-CTR NCA storage is wrapped in `AlignmentMatchingStorage<NcaHeader::CtrBlockSize, 1>` like upstream `NcaFileSystemDriver::CreateAesCtrStorage(...)`, instead of exposing bare `AesCtrStorage`.
+
+### Missing items
+- No new missing items for this parity slice. Further NCA storage-layer parity remains subject to separate audit if MK8D still exposes decrypted-content corruption.
+
+### Binary layout verification
+- N/A: VFS storage control flow only. No guest-visible raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `AlignmentMatchingStorageImpl::Read` and `Write` in `fssystem_alignment_matching_storage_impl.cpp`.
+- Re-read upstream `AlignmentMatchingStorage` / `AlignmentMatchingStoragePooledBuffer` wrappers in `fssystem_alignment_matching_storage.h`.
+- Re-read upstream `NcaFileSystemDriver::CreateAesCtrStorage(...)` around the `AlignmentMatchingStorage<NcaHeader::CtrBlockSize, 1>` return.
+- Re-read Rust `AlignmentMatchingStorageImpl::read`, `AlignmentMatchingStorage` VFS wrapper, and `NcaFileSystemDriver::create_aes_ctr_storage(...)` after the edit.
+- Added `read_places_aligned_core_after_offset_gap_like_upstream`.
+- `cargo fmt --all --check`
+- `cargo test -p core read_places_aligned_core_after_offset_gap_like_upstream -- --nocapture`
+- `cargo test -p core alignment_matching_storage -- --nocapture`
+- `cargo check -p core --quiet`
+
+## 2026-06-14 — video_core/src/dma_pusher.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/dma_pusher.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/dma_pusher.h
+
+### Intentional differences
+- Rust keeps `DmaPusher` wired through `Arc<Mutex<MemoryManager>>`, `SystemRef`, and raw owner pointers for the current split owner graph; upstream stores references directly in `DmaPusher`. This does not change the `DispatchCalls` / `Step` ordering audited here.
+- Rust has a `dispatch_calls_with_engine(...)` integration entry point in addition to the upstream-shaped `dispatch_calls(...)`; it now follows the same dispatch-entry subindex reset as upstream.
+- Existing env-gated puller raw-header diagnostics remain Rust-only instrumentation and are inactive unless requested.
+
+### Unintentional differences (to fix)
+- Fixed: `dispatch_calls(...)` and `dispatch_calls_with_engine(...)` now reset `dma_pushbuffer_subindex = 0` before setting `dma_state.is_last_call = true` and stepping the queue, matching upstream `DmaPusher::DispatchCalls()`. The previous Rust state could carry a stale command-list subindex into a new dispatch entry, diverging from upstream PFIFO command-list traversal.
+
+### Missing items
+- No new missing items for this parity slice.
+
+### Binary layout verification
+- N/A: command-list traversal state only. No raw guest-visible struct layout changed.
+
+### Verification
+- Re-read upstream `DmaPusher::DispatchCalls()` / `DmaPusher::Step()` in `dma_pusher.cpp` and `dma_pushbuffer_subindex` ownership in `dma_pusher.h`.
+- Re-read Rust `DmaPusher::{dispatch_calls,dispatch_calls_with_engine,step,step_with_engine}` after the edit.
+- `cargo fmt --all --check`
+- `cargo test -p video_core dispatch_calls_stops_when_system_is_not_powered_on -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- Rust still splits upstream `TextureCache<P>::slot_images` ownership into common `ImageBase` slots plus OpenGL `HashMap<ImageId, Image>` backend objects. Upstream erases/moves the backend image and its views directly inside `TextureCache<P>::DeleteImage`; Rust must therefore verify that a backend object keyed by a reused `ImageId` still belongs to the current `ImageBase`.
+- `OpenGL::Image` now stores a minimal snapshot of the common image identity (`gpu_addr`, `cpu_addr`, format, type, size, resources, layer stride). This is a Rust owner-graph guard only; upstream does not need it because the backend image object is the slot object being erased.
+- `ensure_backend_image_from_base(...)` removes stale OpenGL image/view/framebuffer objects before materializing the current backend image. This keeps lazy materialization paths equivalent to upstream `slot_images[image_id]` access after `DeleteImage` has erased the old slot.
+
+### Unintentional differences (to fix)
+- Fixed: the Rust OpenGL backend could keep an old `Image` in `self.images` when `SlotVector` reused the same `ImageId` for a different `ImageBase`. Subsequent `entry(image_id).or_insert_with(...)` calls then bound/copied the stale GL texture instead of constructing the current image. Upstream cannot hit this because `slot_images.erase(image_id)` destroys the backend image object before the id can be reused.
+- Fixed: the pending backend deletion drain no longer skips deletion only because the common base already has a live slot with the same `ImageId`. With the identity guard in place, deletions run before pending insertions/copies as intended, and lazy materialization recreates the backend object if a later path sees a reused id.
+
+### Missing items
+- The broader common/backend split remains open for future audit; this entry only covers stale OpenGL `Image` reuse after common `ImageId` recycling.
+
+### Binary layout verification
+- N/A: host OpenGL object identity and lifetime only. No guest-visible serialized payload or raw-copied structure changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::DeleteImage`, especially `RemoveFramebuffers(image_view_ids)`, `sentenced_image_view.Push(std::move(slot_image_views[image_view_id]))`, `slot_image_views.erase(...)`, `sentenced_images.Push(std::move(slot_images[image_id]))`, and `slot_images.erase(image_id)`.
+- Re-read Rust OpenGL lazy materialization paths in `ensure_backend_image_from_base`, framebuffer materialization, present materialization, copy paths, and GC download callback after the edit.
+- Added `backend_image_identity_rejects_reused_slot_gpu_addr`.
+- `cargo test -p video_core backend_image_identity_rejects_reused_slot_gpu_addr -- --nocapture`
+- `cargo test -p video_core join_images_queues_backend_deletion_for_ignored_overlap -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust keeps upstream `TextureCache<P>` state split between backend-independent `TextureCacheBase` and OpenGL-owned backend maps. Upstream `DeleteImage` erases `slot_images`, `slot_image_views`, render-target/framebuffer references, and backend image/view objects in one templated owner; Rust queues `PendingBackendDeletion` so the OpenGL wrapper can erase `self.images`, `self.image_views`, and framebuffer mappings before later backend insertions/copies observe a stale `ImageId`.
+- `delete_image_after_backend_cleanup(...)` is an internal Rust bridge used only when the OpenGL wrapper has already removed backend objects. It prevents re-queuing the same backend deletion while preserving the common-cache deletion order.
+- `finish_pending_backend_deletions(...)` skips a queued deletion if `TextureCacheBase` already contains the same `ImageId` again. This protects the Rust split owner graph from deleting a newly inserted backend object after `SlotVector` reuses an id; upstream is not vulnerable to this because backend and common image storage are the same slot object.
+
+### Unintentional differences (to fix)
+- Fixed: `JoinImages` ignored-overlap deletion could remove common `slot_images` state while leaving stale OpenGL backend image/view/framebuffer objects in `gl_texture_cache`. This was not possible upstream because `slot_images` stores the backend image object directly.
+- Fixed after runtime validation: the first Rust bridge version queued deletion by `ImageId` only and could remove a newly reused backend image during the later OpenGL drain. The drain now treats a live base slot as evidence of reuse and leaves the current backend object intact.
+
+### Missing items
+- The broader common/backend split remains a structural difference from upstream. This entry only covers ignored-overlap deletion in the `JoinImages` path; other deletion paths must continue to be audited against upstream `TextureCache<P>::DeleteImage`.
+
+### Binary layout verification
+- N/A: host texture-cache ownership/control-flow only. No guest-visible serialized payload or raw-copied structure changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages` ignored-overlap deletion order and `TextureCache<P>::DeleteImage`.
+- Re-read Rust `TextureCacheBase::delete_image_impl`, `TextureCache::finish_pending_backend_deletions`, and `TextureCache::delete_join_overlap_image`.
+- `cargo test -p video_core join_images_queues_backend_deletion_for_ignored_overlap -- --nocapture`
+- `cargo test -p video_core join_images_inserts_replacement_before_deleting_ignored_overlap_like_upstream -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still splits upstream `TextureCache<P>::JoinImages(...)` across common metadata and the OpenGL backend tail because backend `Image`, `ImageView`, upload, copy, and delayed-destruction ownership live in `renderer_opengl/gl_texture_cache.rs`.
+- The ignored-overlap `GpuModified` stop still records `.agents/texture_cache_unimplemented_state.md` before panicking, preserving the local no-debt state capture requirement while matching upstream's fatal `UNIMPLEMENTED()` behavior.
+
+### Unintentional differences (to fix)
+- Fixed: `TextureCacheBase::join_images(...)` now inserts the replacement image before deleting `join_ignore_textures`, matching upstream. Rust previously deleted ignored overlaps first, which let `SlotVector` reuse the old `ImageId`; with the OpenGL backend split, that could expose stale backend `self.images` entries under the reused id.
+
+### Missing items
+- The broader backend split remains: ignored overlap deletion removes common-cache state inside `TextureCacheBase`, while backend OpenGL object cleanup is owned by the wrapper. The fixed upstream order prevents immediate `ImageId` reuse from observing stale backend objects, but this ownership split still needs an explicit backend deletion hook or further collapse toward upstream.
+
+### Binary layout verification
+- N/A: control-flow/order parity only; no serialized payload or raw-memory layout changed.
+
+### Tests
+- `cargo test -p video_core join_images_inserts_replacement_before_deleting_ignored_overlap_like_upstream -- --nocapture`
+- `cargo test -p video_core join_images_deletes_exact_sparse_gpu_overlap -- --nocapture`
+- `cargo test -p video_core join_images_panics_on_gpu_modified_ignored_overlap_like_upstream -- --nocapture`
+
+## 2026-06-14 — ruzu_cmd/src/main.rs diagnostic SIGUSR2 profile gate
+
+### Intentional differences
+- Rust command-line frontend installs a shared SIGUSR2 profile dumper when diagnostic profile environment variables are present. `RUZU_PROFILE_GPU_THREAD=1` now participates in that same gate so `video_core::gpu_thread::dump_gpu_thread_profile()` is reachable during manual MK8D runs.
+
+### Unintentional differences (to fix)
+- Fixed: `RUZU_PROFILE_GPU_THREAD=1` created GPU-thread counters but did not activate the SIGUSR2 handler path that prints them. This made long-run GPU queue diagnostics silently incomplete.
+
+### Missing items
+- None for this diagnostic gate.
+
+### Binary layout verification
+- N/A: host diagnostic control only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read `ruzu_cmd/src/main.rs` profile-gate setup around the shared SIGUSR2 handler after the edit.
+- `cargo fmt --all --check`
+- `cargo check -p ruzu_cmd --quiet`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-14 — video_core/src/gpu_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/gpu_thread.cpp
+
+### Intentional differences
+- Rust stores the owning `Gpu` raw pointer on `ThreadManager` during `start_thread(...)` so `flush_region(...)` can call `Gpu::{request_flush,tick_gpu,wait_for_sync_operation}`. Upstream reaches the same owner through `system.GPU()`.
+- Rust guards a missing pre-start GPU pointer with a warning and return; upstream assumes the owner graph is initialized. This is a defensive Rust lifecycle check before the upstream-equivalent branch can run.
+
+### Unintentional differences (to fix)
+- Fixed: async + Extreme `ThreadManager::flush_region(...)` now ports upstream `gpu.RequestFlush(addr, size); TickGPU(); gpu.WaitForSyncOperation(fence);`. Rust previously skipped the branch with a comment.
+
+### Missing items
+- None known for `ThreadManager::FlushRegion` after re-reading upstream `gpu_thread.cpp`.
+
+### Binary layout verification
+- N/A: GPU-thread control flow only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `ThreadManager::FlushRegion`, `TickGPU`, `PushCommand`, and `RunThread` in `gpu_thread.cpp`.
+- Re-read Rust `ThreadManager::{start_thread,flush_region,tick_gpu,push_command}` after the edit.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/dma_pusher.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/dma_pusher.cpp
+
+### Intentional differences
+- Rust retains existing env-gated diagnostic logging around dispatch state; upstream has no equivalent diagnostic hook. This has no behavior effect when unset.
+- Rust adds `RUZU_TRACE_PULLER_RAW_HEADERS=1`, gated behind the existing selected-submit trace, to print raw command-list segment summaries and any decoded `SyncpointOperation` headers during the MK8D stall investigation. This has no behavior effect when unset.
+
+### Unintentional differences (to fix)
+- None for this change. Rust previously reset `dma_pushbuffer_subindex` at the start of `dispatch_calls`/`dispatch_calls_with_engine`; upstream `DmaPusher::DispatchCalls` preserves the subindex across dispatch entry and only resets it after the current `CommandList` has been fully consumed. Rust now matches that ownership/lifecycle ordering.
+
+### Missing items
+- Existing DMA pusher parity audit remains open; this entry only covers `dma_pushbuffer_subindex` dispatch-entry lifecycle.
+
+### Binary layout verification
+- N/A: no guest-visible serialized payload or raw copied struct layout changed.
+
+### Verification
+- Re-read upstream `DmaPusher::DispatchCalls` and `DmaPusher::Step`.
+- Re-read Rust `DmaPusher::dispatch_calls`, `dispatch_calls_with_engine`, `step`, and `step_with_engine` after the edit.
+
+## 2026-06-14 — video_core/src/gpu.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.cpp
+
+### Intentional differences
+- Rust calls `settings::update_gpu_accuracy(&mut settings::values_mut())` instead of upstream `Settings::UpdateGPUAccuracy()` because settings are exposed through the Rust `common::settings` API.
+
+### Unintentional differences (to fix)
+- Fixed: `Gpu::start()` now updates `current_gpu_accuracy` before starting the GPU thread, matching upstream `GPU::Impl::Start()`.
+- Fixed: `Gpu::on_command_list_end()` now calls `settings::update_gpu_accuracy(...)` after `rasterizer.release_fences(false)`, matching upstream `GPU::Impl::OnCommandListEnd()`.
+
+### Missing items
+- None known for this `Start` / `OnCommandListEnd` settings-update slice after re-reading upstream `gpu.cpp`.
+
+### Binary layout verification
+- N/A: settings/lifecycle synchronization only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GPU::Impl::Start()` and `GPU::Impl::OnCommandListEnd()` in `gpu.cpp`.
+- Re-read Rust `Gpu::start()` and `Gpu::on_command_list_end()` after the edit.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- Rust factors upstream `TextureMode(...)` plus the `ApplySwizzle(...)` depth/stencil precondition into `depth_stencil_texture_mode(...)` so the selection is testable without a live OpenGL context.
+- Upstream uses `UNIMPLEMENTED_IF(...)` / `ASSERT_MSG(...)`; Rust uses `assert!` / `panic!` with the same fatal intent for unsupported depth-stencil swizzle state.
+
+### Unintentional differences (to fix)
+- Fixed: depth-stencil image-view swizzle now stops when `swizzle[0]` is neither `R` nor `G`, matching upstream `UNIMPLEMENTED_IF(swizzle[0] != SwizzleSource::R && swizzle[0] != SwizzleSource::G)` in `ApplySwizzle(...)`.
+- Fixed: `TextureMode(...)`'s invalid-format fallback is no longer represented as a silent `GL_DEPTH_COMPONENT` return in the Rust helper; it now panics if called with a non-depth-stencil format.
+
+### Missing items
+- None known for the depth-stencil `TextureMode(...)` / `ApplySwizzle(...)` precondition after re-reading upstream `gl_texture_cache.cpp`.
+
+### Binary layout verification
+- N/A: OpenGL texture parameter selection only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureMode(...)`, `Swizzle(...)`, `ConvertGreenRed(...)`, `ConvertA5B5G5R1_UNORM(...)`, and `ApplySwizzle(...)` in `gl_texture_cache.cpp`.
+- Re-read Rust `depth_stencil_texture_mode(...)`, `swizzle(...)`, `convert_green_red(...)`, `convert_a5b5g5r1_unorm(...)`, and `apply_swizzle(...)` after the edit.
+- Added `depth_stencil_texture_mode_matches_upstream_r_g_selection`.
+- Added `depth_stencil_texture_mode_stops_on_unimplemented_first_component_like_upstream`.
+- `cargo fmt --all --check`
+- `cargo test -q -p video_core depth_stencil_texture_mode -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/image_view_base.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/image_view_base.cpp
+
+### Intentional differences
+- Upstream uses `ASSERT_MSG(...)`; Rust uses `assert!` / `assert_eq!` with the same fatal intent for invalid view construction.
+- Rust calls the already-ported `crate::surface::is_view_compatible(image_info.format, info.format, false, true)` wrapper for upstream `VideoCore::Surface::IsViewCompatible(image_info.format, info.format, false, true)`.
+
+### Unintentional differences (to fix)
+- Fixed: `ImageViewBase::new(...)` now rejects image/view format pairs that upstream rejects in `ImageViewBase::ImageViewBase(const ImageViewInfo&, const ImageInfo&, ...)`.
+- Fixed: `ImageViewBase::new_buffer(...)` now asserts that `view_info.view_type == ImageViewType::Buffer`, matching upstream's `ASSERT_MSG(view_info.type == ImageViewType::Buffer, "Expected texture buffer")`.
+
+### Missing items
+- None known for these constructor preconditions after re-reading upstream `image_view_base.cpp`.
+
+### Binary layout verification
+- N/A: constructor validation only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `ImageViewBase::ImageViewBase(...)` overloads in `image_view_base.cpp`.
+- Re-read Rust `ImageViewBase::{new,new_buffer}` after the edit.
+- Added `image_view_base_rejects_incompatible_view_format_like_upstream`.
+- Added `image_view_base_buffer_constructor_rejects_non_buffer_view_like_upstream`.
+- `cargo test -q -p video_core image_view_base_ -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/image_view_base.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/image_view_info.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- Upstream keeps the render-target sentinel on `ImageViewInfo` and passes it directly into `OpenGL::ImageView::ImageView(...)`, where `is_render_target = info.IsRenderTarget()`. Rust stores the swizzle bytes on `ImageViewBase`, so the equivalent sentinel check is exposed as `ImageViewBase::is_render_target()`.
+- The OpenGL backend still materializes image views lazily from `ImageViewBase` because Rust keeps backend `ImageView` objects outside the common slot vector.
+
+### Unintentional differences (to fix)
+- Fixed: `ImageView::from_image_view_info(...)` no longer forces `is_render_target = false`. It now uses `base.is_render_target()`, matching upstream `info.IsRenderTarget()`. Render-target views created through the general materialization path therefore skip sampled-texture swizzle application, as upstream does in `ImageView::MakeView(...)`.
+
+### Missing items
+- Full upstream `ImageView::ImageView(...)` ownership remains split by Rust lazy materialization and map-backed backend storage, as documented by the broader OpenGL texture-cache entries.
+- `ImageViewBase` still stores swizzle bytes as a Rust adaptation; upstream keeps them on `ImageViewInfo` and only copies them into the backend `ImageView` constructor.
+
+### Binary layout verification
+- N/A: host-side OpenGL image-view state only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `ImageViewInfo::IsRenderTarget()` in `image_view_info.cpp`.
+- Re-read upstream `OpenGL::ImageView::ImageView(...)` and `ImageView::MakeView(...)` in `gl_texture_cache.cpp`.
+- Re-read Rust `ImageViewBase::new(...)` and `ImageView::from_image_view_info(...)` after the edit.
+- Added `image_view_info_render_target_sentinel_is_preserved_for_backend_materialization`.
+- `cargo fmt --all --check`
+- `cargo test -q -p video_core image_view_info_render_target_sentinel_is_preserved_for_backend_materialization -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache_base.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Upstream `TextureCache<P>::TryFindFramebufferImageView(...)` is a templated method returning an `ImageView*` plus rescale state. Rust keeps the page-table/image-view selection in `TextureCacheBase::try_find_framebuffer_image_view(...)` and returns `FramebufferImageView { view_id, is_rescaled }`, because backend image-view storage is indexed rather than pointer-owned.
+- Rust factors the upstream framebuffer pixel-format switch into the owner-local helper `framebuffer_config_view_format(...)` so the Android framebuffer format mapping stays next to `try_find_framebuffer_image_view(...)`.
+
+### Unintentional differences (to fix)
+- Fixed: unknown/default Android framebuffer pixel formats now map to `PixelFormat::A8B8G8R8Unorm`, matching upstream's `default: PixelFormat::A8B8G8R8_UNORM`. Rust previously used the generic GPU pixel-format lookup, which could stop on Android framebuffer values that upstream accepts through this dedicated fallback.
+
+### Missing items
+- Upstream still marks `TryFindFramebufferImageView(...)` with `TODO: Properly implement this`; Rust intentionally matches the current upstream behavior rather than inventing a more complete framebuffer search.
+- The broader framebuffer/display path remains split between texture-cache base selection and renderer/OpenGL presentation code.
+
+### Binary layout verification
+- N/A: framebuffer image-view selection and format mapping only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::TryFindFramebufferImageView(...)` in `texture_cache.h`.
+- Re-read Rust `TextureCacheBase::try_find_framebuffer_image_view(...)` and `framebuffer_config_view_format(...)` after the edit.
+- Added `try_find_framebuffer_image_view_unknown_format_uses_upstream_default`.
+- `cargo fmt --all --check`
+- `cargo test -q -p video_core try_find_framebuffer_image_view_unknown_format_uses_upstream_default -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Upstream `TextureCache<P>::FindRenderTargetView(...)` owns `FindOrInsertImage(...)`, backend image construction, and view creation in one templated method. Rust still performs backend completion in `OpenGL::TextureCache` because backend images and upload/copy runtime calls are split from `TextureCacheBase`.
+- Rust implements the upstream local retry loop as `find_or_insert_render_target_image_with_retry(...)`, taking the optional GPU reader by mutable reference so color and zeta target lookups share the same draw/render-target reader bridge.
+
+### Unintentional differences (to fix)
+- Fixed: OpenGL render-target lookup now repeats `FindOrInsertImage` + backend completion while `self.base.has_deleted_images` is raised, matching upstream `FindRenderTargetView(...)`'s `do { has_deleted_images = false; image_id = FindOrInsertImage(...); delete_state |= has_deleted_images; } while (has_deleted_images)` loop.
+- Fixed: the previous OpenGL snapshot path relied only on the outer render-target update loop after backend completion. It now preserves and restores the incoming delete state locally around each color/zeta render-target image lookup, as upstream does before creating/finding the render-target view.
+
+### Missing items
+- Full `FindRenderTargetView(...)` ownership remains split until `FindOrInsertImage`, backend completion, `FindOrEmplaceImageView`, and render-target view materialization live behind one upstream-shaped texture-cache owner.
+- The broader `UpdateRenderTargets(...)` bridge still receives snapshots and caller/bound GPU readers instead of reading live `maxwell3d->regs`, `maxwell3d->dirty.flags`, and `gpu_memory` directly from the texture-cache owner.
+
+### Binary layout verification
+- N/A: render-target retry/order behavior only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::FindRenderTargetView(...)`, `FindColorBuffer(...)`, `FindDepthBuffer(...)`, and `RescaleRenderTargets(...)` in `texture_cache.h`.
+- Re-read Rust `OpenGL::TextureCache::{update_render_targets_from_snapshot,find_or_insert_render_target_image_with_retry}` after the edit.
+- Added `render_target_find_or_insert_retries_after_deleted_images_like_upstream`.
+- `cargo fmt --all --check`
+- `cargo test -q -p video_core render_target_find_or_insert_retries_after_deleted_images_like_upstream -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Upstream `TextureCache<P>::JoinImages(...)` still executes `RefreshContents(new_image, new_image_id)`, rescale, alias/copy/delete, and `RegisterImage(new_image_id)` synchronously inside one templated owner. Rust still drains the backend-owned part through `OpenGL::TextureCache::finish_pending_join_copies_impl(...)` because backend `Image` objects and upload/copy runtime calls do not live in `TextureCacheBase`.
+- When the deferred Rust drain cannot complete `RefreshContents(new_image)` because the provided/bound GPU reader leaves `CPU_MODIFIED` set, Rust now keeps the pending join tail queued instead of continuing. This preserves the upstream ordering contract without pretending the missing refresh completed.
+
+### Unintentional differences (to fix)
+- Fixed: `finish_pending_join_copies_impl(...)` no longer proceeds to rescale, apply alias relations, copy from overlaps, delete superseded images, or register the new image after a failed/deferred `RefreshContents`. It verifies that `CPU_MODIFIED` was cleared, then requeues the current join plus remaining joins in FIFO order if refresh is still pending.
+- Fixed: the reader-less/bound-reader path no longer asserts immediately on a refresh miss for a CPU-modified joined image; it preserves the pending tail for a later upstream-equivalent drain with channel GPU memory.
+
+### Missing items
+- Full upstream `JoinImages(...)` ownership remains split: `RefreshContents`, backend image rescale/copy, overlap deletion, and final registration still happen through the OpenGL wrapper rather than inside one upstream-shaped texture-cache owner.
+- Bad-overlap download interactions and exact descriptor-table/dirty-flag invalidation after rescale remain open as documented by the broader texture-cache entries.
+
+### Binary layout verification
+- N/A: OpenGL texture-cache lifecycle ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages(...)` from the rescale gate through `RefreshContents`, alias/copy/delete, and `RegisterImage(new_image_id)` in `texture_cache.h`.
+- Re-read Rust `OpenGL::TextureCache::finish_pending_join_copies_impl(...)`, `refresh_contents_with_gpu_reader(...)`, and `refresh_contents_with_bound_gpu_reader(...)` after the edit.
+- Added `pending_join_requeue_preserves_fifo_before_new_queue_items`.
+- `cargo fmt --all --check`
+- `cargo test -q -p video_core pending_join_requeue_preserves_fifo_before_new_queue_items -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still splits upstream `TextureCache<P>::FillImageViews(...)` between `TextureCacheBase::fill_image_views(...)` for descriptor/image-view resolution and `OpenGL::TextureCache::{fill_graphics_image_views,fill_compute_image_views}` for backend `ScaleDown(image)` and pending `JoinImages` tails. Upstream owns all of this in one templated texture-cache method.
+- The Rust OpenGL wrapper calls `finish_pending_join_copies()` and `prepare_filled_image_views_without_gpu_reader(...)` after the base descriptor pass because backend image resources and refresh/upload logic do not live inside `TextureCacheBase`.
+
+### Unintentional differences (to fix)
+- Fixed: `OpenGL::TextureCache::fill_graphics_image_views(...)` and `fill_compute_image_views(...)` now retry when backend completion raises `self.base.has_deleted_images` after `finish_pending_join_copies()` / prepare work. Upstream repeats `FillImageViews(...)` while `has_deleted_images || (has_blacklists && has_blacklisted)`.
+- Fixed: the blacklist break condition in both OpenGL wrappers now preserves the upstream combined condition by requiring both `!self.base.has_deleted_images` and `!has_blacklisted` before exiting.
+
+### Missing items
+- Full upstream ownership remains split until backend `Image`, `ImageView`, `ScaleDown`, descriptor resolution, `PrepareImageView`, and `JoinImages` completion live behind one upstream-shaped texture-cache owner.
+- The reader-less prepare fallback remains guarded by the existing no-hidden-debt stop when a CPU-modified image needs `RefreshContents` and no channel GPU memory is bound.
+
+### Binary layout verification
+- N/A: texture-cache descriptor/image-view retry control flow only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::FillImageViews(...)` in `texture_cache.h`.
+- Re-read Rust `TextureCacheBase::fill_image_views(...)` and `OpenGL::TextureCache::{fill_graphics_image_views,fill_compute_image_views}` after the edit.
+- Added `fill_image_view_wrappers_retry_after_backend_deleted_images`.
+- `cargo test -q -p video_core fill_image_view_wrappers_retry_after_backend_deleted_images -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust implements upstream `TextureCache<P>::ForEachSparseSegment(...)` as `TextureCacheBase::sparse_segments_for_image(...)`, returning a temporary `Vec<(GPUVAddr, DAddr, size)>` before callers mutate page tables or device-memory cached counts. This avoids holding the Rust channel `MemoryManager` mutex while mutating `TextureCacheBase`; upstream has no equivalent mutex boundary.
+- Rust passes a static context string to `sparse_segments_for_image(...)` so missing channel memory or missing CPU translation panics identify the owner path. Upstream uses `ASSERT(cpu_addr)` inside `ForEachSparseSegment(...)`.
+
+### Unintentional differences (to fix)
+- Fixed: `TextureCacheBase::track_image(...)` now matches upstream `TextureCache<P>::TrackImage(...)` for sparse images that are not yet registered. Instead of requiring `sparse_views` to exist, it walks `GetSubmappedRange(...)`, resolves each segment with `GpuToCpuAddress(...)`, and calls `UpdatePagesCachedCount(cpu_addr, size, +1)` for every sparse segment.
+- Fixed: `TextureCacheBase::register_image(...)` now reuses the same owner-local sparse segment helper for its sparse map-view creation path, matching upstream's use of `ForEachSparseSegment(...)` in both registration and unregistered tracking.
+
+### Missing items
+- `TextureCacheBase::untrack_image(...)` still follows upstream's stricter sparse path and requires the image to be registered before untracking.
+- Broader sparse texture-cache parity is still incomplete outside this slice: full backend runtime ownership, sparse image deletion interactions, and render-target/alias lifecycle remain covered by existing texture-cache DIFF entries.
+
+### Binary layout verification
+- N/A: texture-cache sparse tracking/page-table behavior only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::ForEachSparseSegment(...)`, `RegisterImage(...)`, `TrackImage(...)`, and `UntrackImage(...)` in `texture_cache.h`.
+- Re-read Rust `TextureCacheBase::{sparse_segments_for_image,register_image,track_image,untrack_image}` after the edit.
+- Added `track_sparse_unregistered_image_uses_submapped_segments_like_upstream`.
+- `cargo test -q -p video_core track_sparse_unregistered_image_uses_submapped_segments_like_upstream -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp and gl_graphics_pipeline.h
+
+### Intentional differences
+- Rust still passes `DescriptorSyncRegs`, a boxed `DrawStateEngineAdapter`, GPU-memory closures, and diagnostic callbacks into `GraphicsPipeline::synchronize_then_set_engine_state_and_configure_graphics_framebuffer(...)` because `GraphicsPipeline` still does not own upstream-equivalent live `Maxwell3D*` and `Tegra::MemoryManager*` members.
+- Rust keeps a fallback `RasterizerOpenGL::draw(...)` path that calls `synchronize_graphics_descriptors_then_configure_buffer_cache_state(...)` when no channel `MemoryManager` is available. Upstream has `gpu_memory` after `SetEngine`; this fallback remains a documented owner-graph gap.
+
+### Unintentional differences (to fix)
+- Fixed: the normal draw path no longer calls `synchronize_graphics_descriptors_then_configure_buffer_cache_state(...)` as a standalone rasterizer-owned step before the descriptor/framebuffer configure bridge. `GraphicsPipeline::synchronize_then_set_engine_state_and_configure_graphics_framebuffer(...)` now owns the adjacent upstream order from `texture_cache.SynchronizeGraphicsDescriptors()` through base buffer-cache state, engine-state installation, enabled-stage descriptor collection, `FillGraphicsImageViews`, `UpdateRenderTargets(false)`, and framebuffer bind.
+- Fixed: source-level parity tests now assert that the normal rasterizer runtime delegates this larger initial `ConfigureImpl` slice through the graphics pipeline owner before the post-framebuffer configure/prepare/bind helper.
+
+### Missing items
+- Full upstream `GraphicsPipeline::SetEngine(...)` parity remains incomplete: `GraphicsPipeline` still does not store live `Maxwell3D` and `gpu_memory` references.
+- Full `GraphicsPipeline::ConfigureImpl(...)` ownership remains incomplete: render-target diagnostics, draw-time tracing, post-framebuffer buffer/program configure, prepare-stage binding, and final bind still compose through later pipeline helpers and callbacks instead of one upstream-shaped method with live members.
+
+### Binary layout verification
+- N/A: OpenGL host-side configure-order/ownership refactor only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::SetEngine(...)` in `gl_graphics_pipeline.h`.
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` from `texture_cache.SynchronizeGraphicsDescriptors()` through base buffer-cache state, `config_stage(...)`, `FillGraphicsImageViews`, `UpdateRenderTargets(false)`, and framebuffer bind in `gl_graphics_pipeline.cpp`.
+- Re-read Rust `GraphicsPipeline::{synchronize_graphics_descriptors_then_configure_buffer_cache_state,set_engine_state_then_configure_graphics_descriptors_and_framebuffer,synchronize_then_set_engine_state_and_configure_graphics_framebuffer}` and the `RasterizerOpenGL::draw(...)` call site after the edit.
+- `cargo test -q -p video_core graphics_pipeline_owns_sync_engine_descriptor_framebuffer_sequence -- --nocapture`
+- `cargo test -q -p video_core graphics_pipeline_owns_engine_state_then_descriptor_framebuffer_sequence -- --nocapture`
+- `cargo test -q -p video_core descriptor_sync_then_buffer_base_state_owns_upstream_initial_configure_sequence -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust keeps `after_buffer_programs` and `before_bind` callbacks inside `GraphicsPipeline::configure_buffers_programs_then_prepare_and_bind_graphics_resources{_with_gpu_resolver}(...)` for existing draw timing, stall tracing, and bound-texture diagnostics. Upstream has no diagnostic callbacks between `BindHostGeometryBuffers`, program binding, `prepare_stage(...)`, and the final `glBind*` calls.
+- Rust still has normal and GPU-resolver variants because the pipeline does not yet own upstream-equivalent live `gpu_memory`; the rasterizer still provides GPU address helpers from the channel `MemoryManager`.
+
+### Unintentional differences (to fix)
+- Fixed: `RasterizerOpenGL::draw(...)` no longer owns the split between `bind_texture_buffers_uniforms_then_configure_graphics_buffers_and_programs{_with_gpu_resolver}(...)` and `prepare_and_bind_graphics_texture_image_arrays(...)`. It now delegates the adjacent upstream post-framebuffer sequence through `GraphicsPipeline::configure_buffers_programs_then_prepare_and_bind_graphics_resources{_with_gpu_resolver}(...)`.
+- Fixed: the pipeline-owned helper now preserves the order `bind_stage_info` texture/image-buffer work, Rust UBO bridge, `UpdateGraphicsBuffers(is_indexed)`, `BindHostGeometryBuffers(is_indexed)`, program bind, `prepare_stage(...)`, host pointer cleanup, diagnostics, and final `glBindTextures` / `glBindSamplers` / `glBindImageTextures`.
+
+### Missing items
+- Full `GraphicsPipeline::ConfigureImpl(...)` ownership remains incomplete: descriptor read handles, memory access, render-target diagnostics, and draw-time tracing still require closures/state built in `RasterizerOpenGL::draw(...)`.
+- Full upstream `GraphicsPipeline::SetEngine(...)` parity remains incomplete: `GraphicsPipeline` still does not store live `Maxwell3D` and `gpu_memory` references, so Rust still has normal/GPU-resolver helper variants.
+
+### Binary layout verification
+- N/A: OpenGL host-side configure-order/ownership refactor only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` from enabled-stage `bind_stage_info(...)` through `UpdateGraphicsBuffers(is_indexed)`, `BindHostGeometryBuffers(is_indexed)`, program binding, `prepare_stage(...)`, and final `glBind*` calls.
+- Re-read Rust `GraphicsPipeline::{bind_texture_buffers_uniforms_then_configure_graphics_buffers_and_programs,prepare_and_bind_graphics_texture_image_arrays,configure_buffers_programs_then_prepare_and_bind_graphics_resources}` and the `RasterizerOpenGL::draw(...)` call site after the edit.
+- `cargo test -q -p video_core post_framebuffer_configure_then_prepare_bind_slice_is_pipeline_owned -- --nocapture`
+- `cargo test -q -p video_core graphics_configure_buffer_binding_order_matches_upstream -- --nocapture`
+- `cargo test -q -p video_core post_framebuffer_buffer_program_configure_slice_is_pipeline_owned -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.h and gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Upstream `GraphicsPipeline::SetEngine(...)` stores live `Maxwell3D*` and `Tegra::MemoryManager*` members, then `ConfigureImpl(...)` reads `maxwell3d->regs`, `maxwell3d->state.shader_stages[...]`, and `gpu_memory` directly. Rust still constructs a boxed `DrawStateEngineAdapter` plus draw-time GPU-memory closures from the rasterizer because the live owner graph has not yet been rebuilt.
+- Rust keeps an `after_engine_state` callback in `set_engine_state_then_configure_graphics_descriptors_and_framebuffer(...)` for existing draw-stage tracing. Upstream has no equivalent diagnostic callback between state installation and descriptor walking.
+
+### Unintentional differences (to fix)
+- Fixed: `RasterizerOpenGL::draw(...)` no longer calls `pipeline.set_graphics_engine_state(...)` as a standalone configure step before descriptor collection. The call is now inside `GraphicsPipeline::set_engine_state_then_configure_graphics_descriptors_and_framebuffer(...)`, immediately before the pipeline-owned descriptor/fill/render-target/framebuffer sequence.
+- Fixed: the Rust configure bridge now owns the adjacent order `engine state visible to BufferCache` -> enabled-stage descriptor/config-stage work -> `FillGraphicsImageViews` -> `UpdateRenderTargets(false)` -> `BindFramebuffer`, reducing another split from upstream `GraphicsPipeline::ConfigureImpl(...)`.
+
+### Missing items
+- Full upstream `GraphicsPipeline::SetEngine(...)` parity remains incomplete: `GraphicsPipeline` still does not store live `Maxwell3D` and `gpu_memory` references.
+- Full `GraphicsPipeline::ConfigureImpl(...)` ownership remains incomplete: descriptor read handles, memory access, diagnostics, buffer/program configure, prepare-stage binding, and final draw-time state are still composed through `RasterizerOpenGL::draw(...)` plus pipeline helpers.
+
+### Binary layout verification
+- N/A: OpenGL host-side configure-order/ownership refactor only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::SetEngine(...)` in `gl_graphics_pipeline.h`.
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` from base buffer-cache state through enabled-stage `config_stage(...)`, `FillGraphicsImageViews`, `UpdateRenderTargets(false)`, and framebuffer bind in `gl_graphics_pipeline.cpp`.
+- Re-read Rust `GraphicsPipeline::{set_graphics_engine_state,configure_graphics_descriptors_then_fill_and_bind_framebuffer,set_engine_state_then_configure_graphics_descriptors_and_framebuffer}` and the `RasterizerOpenGL::draw(...)` call site after the edit.
+- `cargo test -q -p video_core graphics_pipeline_owns_engine_state_then_descriptor_framebuffer_sequence -- --nocapture`
+- `cargo test -q -p video_core graphics_pipeline_owns_graphics_engine_state_install_bridge -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.h and gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Upstream `GraphicsPipeline::SetEngine(...)` stores live `Maxwell3D*` and `Tegra::MemoryManager*` members on the pipeline. Rust still builds a boxed `DrawStateEngineAdapter` from the draw snapshot and installs it on `BufferCache`; this remains a bridge until the pipeline owns upstream-equivalent live engine/memory references.
+- The Rust helper is named `set_graphics_engine_state(...)` rather than `set_engine(...)` because it does not yet store `gpu_memory`/`maxwell3d` on `GraphicsPipeline` and only installs the buffer-cache engine-state adapter needed by the current configure path.
+
+### Unintentional differences (to fix)
+- Fixed: `RasterizerOpenGL::draw(...)` no longer writes the graphics `DrawStateEngineAdapter` directly into `BufferCache`. The configure path now routes that installation through `GraphicsPipeline::set_graphics_engine_state(...)`, making `GraphicsPipeline` the owner-local bridge for the state that later descriptor and buffer binding helpers consume.
+
+### Missing items
+- Full upstream `GraphicsPipeline::SetEngine(...)` parity remains incomplete: `GraphicsPipeline` still does not store live `Maxwell3D` and `gpu_memory` references, so `ConfigureImpl(...)` still receives draw-time register/memory access through snapshots and closures.
+- Full `GraphicsPipeline::ConfigureImpl(...)` ownership remains split; this tranche only moves the engine-state installation bridge, not the larger live owner graph.
+
+### Binary layout verification
+- N/A: host-side ownership bridge only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::SetEngine(...)` in `gl_graphics_pipeline.h` and the beginning of `GraphicsPipeline::ConfigureImpl(...)` in `gl_graphics_pipeline.cpp`.
+- Re-read Rust `GraphicsPipeline::set_graphics_engine_state(...)` and the `RasterizerOpenGL::draw(...)` installation call after the edit.
+- `cargo test -q -p video_core graphics_pipeline_owns_graphics_engine_state_install_bridge -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust still binds graphics UBOs through `bind_graphics_uniform_buffers(...)` using draw-time `ConstBufferBinding` snapshots before `UpdateGraphicsBuffers(...)`. Upstream reads the live Maxwell/channel state through `BufferCache` during `UpdateGraphicsBuffers`; the Rust bridge remains necessary until `GraphicsPipeline` and `BufferCache` own the same live engine-state graph as upstream.
+- Rust keeps normal and GPU-resolver variants of the post-framebuffer configure helper because the draw path still obtains channel `MemoryManager` access through optional Rust closures instead of upstream's direct `gpu_memory` member.
+
+### Unintentional differences (to fix)
+- Fixed: `RasterizerOpenGL::draw(...)` no longer separately owns the post-framebuffer sequence `bind_enabled_stage_texture_buffer_views(...)`, `bind_graphics_uniform_buffers(...)`, and `configure_graphics_buffers_and_bind_programs{_with_gpu_resolver}(...)`. It now delegates this upstream-adjacent order through `GraphicsPipeline::bind_texture_buffers_uniforms_then_configure_graphics_buffers_and_programs{_with_gpu_resolver}(...)`.
+- Fixed: the pipeline-owned helper now keeps enabled-stage texture/image-buffer binding before the Rust UBO bridge and before `UpdateGraphicsBuffers(is_indexed)`, `BindHostGeometryBuffers(is_indexed)`, `WaitForBuild()`, and program-manager binding, matching the upstream `bind_stage_info(...)` then graphics-buffer/program slice before `prepare_stage`.
+
+### Missing items
+- Full `GraphicsPipeline::ConfigureImpl(...)` ownership remains split. Descriptor collection/fill/render-target bind and post-framebuffer buffer/program configure are now pipeline-owned helpers, but engine-state adapter installation, diagnostics, prepare-stage texture/image binding, final bulk binds, and live owner references still do not live in one upstream-shaped method.
+- Exact upstream member ownership remains incomplete until `GraphicsPipeline` stores or receives one upstream-shaped context for `TextureCache`, `BufferCache`, `Tegra::MemoryManager`, `Maxwell3D`, `ProgramManager`, and `StateTracker`.
+
+### Binary layout verification
+- N/A: OpenGL host-side configure-order refactor only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` from enabled-stage `bind_stage_info(...)` through `UpdateGraphicsBuffers(is_indexed)`, `BindHostGeometryBuffers(is_indexed)`, `WaitForBuild()`, and `ProgramManager` binding before `prepare_stage`.
+- Re-read Rust `GraphicsPipeline::{bind_enabled_stage_texture_buffer_views,bind_graphics_uniform_buffers,configure_graphics_buffers_and_bind_programs,bind_texture_buffers_uniforms_then_configure_graphics_buffers_and_programs}` and the `RasterizerOpenGL::draw(...)` call site after the edit.
+- `cargo test -q -p video_core post_framebuffer_buffer_program_configure_slice_is_pipeline_owned -- --nocapture`
+- `cargo test -q -p video_core texture_buffer_binding_is_separated_from_prepare_stage_slots -- --nocapture`
+- `cargo test -q -p video_core bind_enabled_stage_texture_buffer_views_owns_upstream_stage_sequence -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust still routes descriptor-sync Maxwell register state through `DrawView::descriptor_sync_regs()` instead of reading `maxwell3d->regs` directly from `GraphicsPipeline`, because the Rust pipeline does not yet own upstream-equivalent live engine references.
+- Rust keeps `synchronize_graphics_descriptors(...)` and `configure_buffer_cache_state(...)` as smaller helper methods for existing tests and incremental parity review; the main draw path now uses the combined owner-local helper for the upstream-adjacent sequence.
+
+### Unintentional differences (to fix)
+- Fixed: `RasterizerOpenGL::draw(...)` no longer owns `pipeline.synchronize_graphics_descriptors(...)` and `pipeline.configure_buffer_cache_state(...)` as two separate configure steps. It now delegates the upstream order `texture_cache.SynchronizeGraphicsDescriptors()` followed by `SetUniformBuffersState`, `SetBaseUniformBindings`, `SetBaseStorageBindings`, and `SetEnableStorageBuffers` through `GraphicsPipeline::synchronize_graphics_descriptors_then_configure_buffer_cache_state(...)`.
+
+### Missing items
+- Full `GraphicsPipeline::ConfigureImpl(...)` ownership remains split. Engine-state adapter installation, descriptor collection, render-target update/framebuffer bind, UBO binding, texture-buffer binding, graphics-buffer/program binding, prepare-stage texture/image binding, final bulk binds, diagnostics, and live owner references still do not live in one upstream-shaped method.
+- Exact upstream member ownership remains incomplete until `GraphicsPipeline` stores or receives one upstream-shaped context for `TextureCache`, `BufferCache`, `Tegra::MemoryManager`, `Maxwell3D`, `ProgramManager`, and `StateTracker`.
+
+### Binary layout verification
+- N/A: OpenGL host-side configure-order refactor only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` from `texture_cache.SynchronizeGraphicsDescriptors()` through `buffer_cache.runtime.SetEnableStorageBuffers(use_storage_buffers)`.
+- Re-read Rust `GraphicsPipeline::{synchronize_graphics_descriptors,configure_buffer_cache_state,synchronize_graphics_descriptors_then_configure_buffer_cache_state}` and the `RasterizerOpenGL::draw(...)` call site after the edit.
+- `cargo test -q -p video_core descriptor_sync_then_buffer_base_state_owns_upstream_initial_configure_sequence -- --nocapture`
+- `cargo test -q -p video_core synchronize_graphics_descriptors_owns_upstream_first_configure_side_effect -- --nocapture`
+- `cargo test -q -p video_core configure_buffer_cache_state_owns_upstream_base_buffer_state_slice -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust still receives draw-time GPU-memory access, render-target snapshots, dirty flags, and diagnostics as parameters/closures because `GraphicsPipeline` does not yet store upstream-equivalent `TextureCache&`, `BufferCache&`, `Tegra::MemoryManager*`, `Maxwell3D*`, `ProgramManager&`, and `StateTracker&`.
+- The Rust draw path only enters the combined descriptor/fill/render-target bridge when a live channel `MemoryManager` exists. Upstream always has `gpu_memory` on `GraphicsPipeline` after `SetEngine`; this remains part of the larger owner-graph gap rather than a completed parity point.
+
+### Unintentional differences (to fix)
+- Fixed: `RasterizerOpenGL::draw(...)` no longer owns `configure_enabled_stage_texture_image_descriptors(...)` and `fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer(...)` as two separate steps. It now delegates the upstream-adjacent sequence `config_stage` descriptor collection, `FillGraphicsImageViews`, `UpdateRenderTargets(false)`, and `BindFramebuffer` through `GraphicsPipeline::configure_graphics_descriptors_then_fill_and_bind_framebuffer(...)`.
+- Fixed: the sampler-id lookup corresponding to upstream `texture_cache.GetGraphicsSamplerId(handle.second)` now occurs inside the pipeline-owned combined helper through its `OpenGLTextureCache` parameter, instead of being supplied by a rasterizer closure.
+
+### Missing items
+- Full `GraphicsPipeline::ConfigureImpl(...)` ownership remains split. Descriptor sync, base buffer-cache state, engine-state adapter installation, UBO binding, texture-buffer binding, graphics-buffer/program binding, prepare-stage texture/image binding, final bulk binds, diagnostics, and live owner references still do not live in one upstream-shaped method.
+- Exact upstream member ownership remains incomplete until `GraphicsPipeline` stores or receives one upstream-shaped context for `TextureCache`, `BufferCache`, `Tegra::MemoryManager`, `Maxwell3D`, `ProgramManager`, and `StateTracker`.
+
+### Binary layout verification
+- N/A: OpenGL host-side configure-order refactor only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` from `texture_cache.SynchronizeGraphicsDescriptors()` through `texture_cache.FillGraphicsImageViews<Spec::has_images>(...)`, `texture_cache.UpdateRenderTargets(false)`, and `state_tracker.BindFramebuffer(texture_cache.GetFramebuffer()->Handle())`.
+- Re-read Rust `GraphicsPipeline::{configure_enabled_stage_texture_image_descriptors,fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer,configure_graphics_descriptors_then_fill_and_bind_framebuffer}` and the `RasterizerOpenGL::draw(...)` call site after the edit.
+- `cargo test -q -p video_core configure_graphics_descriptors_then_fill_and_bind_framebuffer_owns_upstream_sequence -- --nocapture`
+- `cargo test -q -p video_core fill_then_update_render_targets_and_bind_framebuffer_owns_upstream_sequence -- --nocapture`
+- `cargo test -q -p video_core configure_enabled_stage_texture_image_descriptors_owns_upstream_config_stage_sequence -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust keeps a `before_bind` callback inside `GraphicsPipeline::prepare_and_bind_graphics_texture_image_arrays(...)` for local tracing and bound-texture dump diagnostics. Upstream has no diagnostic block between `prepare_stage(...)` and final `glBind*` calls.
+- Rust still clears the transient host stage buffer/image pointer bridge through `clear_host_stage_buffer_pointers(...)`; upstream does not need this cleanup helper because the pointer lifetime is a local C++ lambda stack detail.
+
+### Unintentional differences (to fix)
+- Fixed: the main draw path no longer calls `prepare_enabled_graphics_texture_image_bindings(...)` and `bind_graphics_texture_image_arrays(...)` as two rasterizer-owned steps. `RasterizerOpenGL::draw(...)` now delegates the upstream-adjacent sequence `prepare_stage` for enabled stages, local cleanup/diagnostics, and final `glBindTextures` / `glBindSamplers` / `glBindImageTextures` through `GraphicsPipeline::prepare_and_bind_graphics_texture_image_arrays(...)`.
+
+### Missing items
+- Full `GraphicsPipeline::ConfigureImpl(...)` ownership remains split. This tranche consolidates prepare-stage plus final bulk-bind ownership, but descriptor collection, render-target update, graphics buffer/program configure, diagnostic callbacks, and live owner references still do not live in one upstream-shaped method.
+- Exact upstream member ownership remains incomplete until `GraphicsPipeline` stores or receives one upstream-shaped context for `TextureCache`, `BufferCache`, `Tegra::MemoryManager`, `Maxwell3D`, `ProgramManager`, and `StateTracker`.
+
+### Binary layout verification
+- N/A: OpenGL host-side binding/order refactor only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` from the `prepare_stage` lambda through the final `glBindTextures`, `glBindSamplers`, and `glBindImageTextures` block.
+- Re-read Rust `GraphicsPipeline::{prepare_enabled_graphics_texture_image_bindings,prepare_and_bind_graphics_texture_image_arrays,bind_graphics_texture_image_arrays}` and the `RasterizerOpenGL::draw(...)` call site after the edit.
+- `cargo test -q -p video_core prepare_and_bind_graphics_texture_image_arrays_owns_upstream_prepare_then_bulk_bind -- --nocapture`
+- `cargo test -q -p video_core prepare_enabled_graphics_texture_image_bindings_owns_upstream_stage_sequence -- --nocapture`
+- `cargo test -q -p video_core bind_graphics_texture_image_arrays_owns_upstream_bulk_binds -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust wraps upstream `GraphicsPipeline::ConfigureImpl(...)` local texture/sampler/image arrays and binding cursors in `GraphicsTextureImageBindingState` instead of declaring raw locals inside one monolithic method. This is an ownership bridge while the full upstream `ConfigureImpl(...)` body still composes through pipeline helpers plus `RasterizerOpenGL::draw(...)`.
+- `bound_texture_view_ids` is an extra Rust diagnostic bridge used to map bound GL texture units back to image-view ids for local tracing. Upstream does not carry this field because it has no equivalent diagnostic path.
+
+### Unintentional differences (to fix)
+- Fixed: `RasterizerOpenGL::draw(...)` no longer directly owns the upstream `textures`, `images`, `gl_samplers`, `texture_binding`, `sampler_binding`, `image_binding`, `views_it`, and `samplers_it` scratch state. Those fields now live in `GraphicsTextureImageBindingState` in `gl_graphics_pipeline.rs`, which is the Rust owner for the corresponding `GraphicsPipeline::ConfigureImpl(...)` slice.
+
+### Missing items
+- Full `GraphicsPipeline::ConfigureImpl(...)` ownership remains split. The transient binding state is now pipeline-owned, but the larger method still needs a single upstream-shaped configure context containing descriptor collection, render-target update, buffer/program configure, prepare-stage loops, final bulk binds, and diagnostics.
+- Exact upstream member ownership remains incomplete until `GraphicsPipeline` stores or receives one upstream-shaped context for `TextureCache`, `BufferCache`, `Tegra::MemoryManager`, `Maxwell3D`, `ProgramManager`, and `StateTracker`.
+
+### Binary layout verification
+- N/A: host OpenGL binding scratch state only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` local declarations for `views_it`, `samplers_it`, `texture_binding`, `image_binding`, `sampler_binding`, `textures`, `images`, and `gl_samplers`.
+- Re-read Rust `GraphicsTextureImageBindingState` and the `RasterizerOpenGL::draw(...)` call sites after the edit.
+- `cargo test -q -p video_core graphics_texture_image_binding_state_owns_upstream_configure_arrays -- --nocapture`
+- `cargo test -q -p video_core bind_graphics_texture_image_arrays_owns_upstream_bulk_binds -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust still passes `OpenGLTextureCache`, `StateTracker`, render-target snapshots, dirty flags, and transient descriptor arrays into `GraphicsPipeline::fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer(...)` because `GraphicsPipeline` does not yet store upstream-equivalent `TextureCache&`, `StateTracker&`, `Maxwell3D*`, and live dirty/register state.
+- Rust keeps backend materialization (`materialize_views` / `materialize_samplers`) adjacent to `FillGraphicsImageViews` inside the helper because OpenGL backend objects still live beside the common texture-cache slots rather than directly in upstream-style `SlotVector<P::ImageView>` / `SlotVector<P::Sampler>` entries.
+
+### Unintentional differences (to fix)
+- Fixed: the main draw path no longer owns the upstream-adjacent sequence `FillGraphicsImageViews`, `UpdateRenderTargets(false)`, and `BindFramebuffer` as separate rasterizer steps. `RasterizerOpenGL::draw(...)` now delegates that sequence to `GraphicsPipeline::fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer(...)`, which preserves the upstream order in one pipeline-owned helper.
+
+### Missing items
+- Full `GraphicsPipeline::ConfigureImpl(...)` ownership remains split. Descriptor collection, image-view fill/render-target update/framebuffer bind, buffer/program configure, prepare-stage texture/image binding, final bulk binds, and diagnostics are closer to upstream but still composed from `RasterizerOpenGL::draw(...)` plus pipeline helpers.
+- Exact upstream member ownership remains incomplete until `GraphicsPipeline` stores or receives one upstream-shaped configure context for `TextureCache`, `BufferCache`, `Tegra::MemoryManager`, `Maxwell3D`, `ProgramManager`, and `StateTracker`.
+
+### Binary layout verification
+- N/A: OpenGL configure ownership/order refactor only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around `texture_cache.FillGraphicsImageViews<Spec::has_images>(...)`, `texture_cache.UpdateRenderTargets(false)`, and `state_tracker.BindFramebuffer(texture_cache.GetFramebuffer()->Handle())`.
+- Re-read Rust `GraphicsPipeline::{fill_and_materialize_graphics_image_views,fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer,update_render_targets_and_bind_framebuffer}` and the `RasterizerOpenGL::draw(...)` call site after the edit.
+- `cargo test -q -p video_core fill_and_materialize_graphics_image_views_owns_upstream_fill_slice -- --nocapture`
+- `cargo test -q -p video_core fill_then_update_render_targets_and_bind_framebuffer_owns_upstream_sequence -- --nocapture`
+- `cargo test -q -p video_core update_render_targets_and_bind_framebuffer_owns_upstream_pair -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/image_base.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/image_base.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Upstream logs and returns/skips for unsupported MSAA image download/upload paths. Rust now records `.agents/texture_cache_unimplemented_state.md` and stops, following the local no-hidden-debt rule that unsupported texture paths must not continue as if implemented.
+- The OpenGL upload guard stops before `mark_refresh_contents_consumed(...)` and `runtime.transition_image_layout(...)`; upstream clears `CpuModified`, tracks the image, transitions layout, and returns after warning. This is intentional local policy to avoid losing the dirty image state when `CanUploadMSAA()` support is missing.
+
+### Unintentional differences (to fix)
+- Fixed: `ImageBase::is_safe_download()` no longer only logs and returns `false` for `info.num_samples > 1`; it records the MSAA download dependency and panics.
+- Fixed: `OpenGL::TextureCache::refresh_contents_with_gpu_reader(...)` no longer consumes `CPU_MODIFIED` / transitions layout after an unsupported MSAA upload; it records the image state and panics before treating the missing upload as complete.
+
+### Missing items
+- Real MSAA download support remains unimplemented.
+- Real MSAA upload support remains unimplemented for runtimes where `TextureCacheRuntime::can_upload_msaa()` is false.
+- Full upstream `RefreshContents` ownership still remains split between common texture cache and OpenGL backend.
+
+### Binary layout verification
+- N/A: unsupported texture upload/download guard only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `ImageBase::IsSafeDownload()` in `image_base.cpp`.
+- Re-read upstream `TextureCache<P>::RefreshContents(...)` in `texture_cache.h`.
+- Re-read Rust `ImageBase::is_safe_download()` and `OpenGL::TextureCache::refresh_contents_with_gpu_reader(...)` after the edit.
+- `cargo test -q -p video_core msaa_download_stops_instead_of_silently_skipping -- --nocapture`
+- `cargo test -q -p video_core refresh_contents_msaa_upload_stops_instead_of_consuming_cpu_modified -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still passes `Maxwell3DRenderTargets` snapshots and external dirty-flag access into `OpenGL::TextureCache` because the texture cache does not yet own upstream-equivalent live `maxwell3d` register/dirty state.
+- Rust keeps `framebuffer_for_render_targets_from_snapshot(...)` separate from the new update/prepare helper, matching upstream's separate `TextureCache<P>::GetFramebuffer()` call after `UpdateRenderTargets(...)` while using the current Rust snapshot bridge.
+
+### Unintentional differences (to fix)
+- Fixed: `OpenGL::TextureCache` now has `update_and_prepare_render_targets_from_snapshot(...)` as the owner-local bridge for upstream `TextureCache<P>::UpdateRenderTargets(bool is_clear)`. The dirty render-target update, rescale dirty side effects, and always-run `PrepareImageView` phase are grouped in one texture-cache method, so the false-dirty path still prepares existing color/depth views before framebuffer lookup instead of only being an incidental step inside the framebuffer helper.
+- Fixed: `update_render_targets_and_get_framebuffer_from_snapshot(...)` now delegates to the update/prepare bridge first, then performs the framebuffer lookup, preserving the upstream call order `UpdateRenderTargets(false)` followed by `GetFramebuffer()`.
+- Verified: the exact upstream dirty write `flags[Dirty::DepthBiasGlobal] = true` is represented by `consume_render_target_dirty_flags_for_update(...)` setting `DEPTH_BIAS_GLOBAL` after a dirty render-target update.
+
+### Missing items
+- Full upstream ownership remains incomplete: `TextureCache` still does not read `maxwell3d->dirty.flags`, `maxwell3d->regs.rt_control`, or `maxwell3d->regs.surface_clip` directly.
+- Full `GraphicsPipeline::ConfigureImpl(...)` ownership remains split; `GraphicsPipeline` still calls this texture-cache bridge through snapshot arguments instead of owning upstream-shaped references to `TextureCache`, `Maxwell3D`, `gpu_memory`, and `StateTracker`.
+
+### Binary layout verification
+- N/A: render-target update/prepare ownership refactor only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::UpdateRenderTargets(bool is_clear)` and `TextureCache<P>::GetFramebuffer()` in `texture_cache.h`.
+- Re-read Rust `OpenGL::TextureCache::{update_and_prepare_render_targets_from_snapshot,update_render_targets_and_get_framebuffer_from_snapshot,prepare_render_targets_from_snapshot}` after the edit.
+- `cargo test -q -p video_core update_and_prepare_render_targets_owns_upstream_update_render_targets_pair -- --nocapture`
+- `cargo test -q -p video_core update_render_targets_and_bind_framebuffer_owns_upstream_pair -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust still keeps both normal and GPU-reader storage-buffer bind helpers because the surrounding `ConfigureImpl` context has not yet moved to one upstream-shaped pipeline owner with live `gpu_memory`.
+
+### Unintentional differences (to fix)
+- Fixed: `GraphicsPipeline::bind_stage_storage_buffers{_with_gpu_reader}(...)` now stops on `desc.count != 1` with an assertion, matching upstream `ASSERT(desc.count == 1)` in the storage-buffer descriptor loop. The previous Rust path logged "not ported" and continued, silently skipping a descriptor shape that upstream treats as invalid.
+
+### Missing items
+- Full `ConfigureImpl(...)` ownership remains split: Rust still invokes the storage-buffer loop through helper calls from a rasterizer-driven configure sequence instead of one pipeline-owned `config_stage` lambda inside an upstream-shaped method.
+
+### Binary layout verification
+- N/A: storage-buffer descriptor validation/order only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` storage-buffer descriptor loop: `UnbindGraphicsStorageBuffers(stage)`, `ASSERT(desc.count == 1)`, then `BindGraphicsStorageBuffer(...)`.
+- Re-read Rust `GraphicsPipeline::{bind_stage_storage_buffers,bind_stage_storage_buffers_with_gpu_reader}` and the source-level ownership test after the edit.
+- `cargo test -q -p video_core bind_stage_storage_buffers_owns_upstream_storage_buffer_loop -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust still passes `ProgramManager` from `RasterizerOpenGL::draw(...)` into `GraphicsPipeline::configure_graphics_buffers_and_bind_programs{_with_gpu_resolver}(...)` instead of storing upstream's `ProgramManager&` directly on `GraphicsPipeline`. This keeps the current Rust ownership graph compiling while moving the `ConfigureImpl` program-bind behavior to the pipeline owner.
+- Rust keeps the older `bind_graphics_programs_for_configure()` / `configure()` compatibility wrapper that directly binds the per-pipeline GL program pipeline. The main graphics draw path no longer uses it for the upstream `ConfigureImpl` buffer/program slice.
+- Rust still keeps separate normal and caller-provided GPU-address-resolver helpers because `GraphicsPipeline` does not yet own upstream's live `gpu_memory` pointer.
+
+### Unintentional differences (to fix)
+- Fixed: the main draw path now routes the upstream sequence `buffer_cache.UpdateGraphicsBuffers(is_indexed)`, `buffer_cache.BindHostGeometryBuffers(is_indexed)`, `WaitForBuild()`, then `program_manager.BindAssemblyPrograms(...)` or `program_manager.BindSourcePrograms(...)` through `GraphicsPipeline::configure_graphics_buffers_and_bind_programs{_with_gpu_resolver}(...)`.
+- Fixed: program binding in this `ConfigureImpl` slice now uses `ProgramManager::bind_assembly_programs(...)` / `ProgramManager::bind_source_programs(...)` instead of the rasterizer-owned direct `pipeline.bind_graphics_programs_for_configure()` step.
+
+### Missing items
+- Full upstream member ownership remains incomplete: Rust `GraphicsPipeline` still does not store upstream-equivalent `TextureCache&`, `BufferCache&`, `Tegra::MemoryManager* gpu_memory`, `Tegra::Engines::Maxwell3D* maxwell3d`, `ProgramManager&`, and `StateTracker&`.
+- Full `GraphicsPipeline::ConfigureImpl(...)` ownership remains split. Descriptor synchronization, buffer/program configure, descriptor collection, framebuffer binding, final texture/sampler/image binding, diagnostics, and remaining draw-time state still compose through `RasterizerOpenGL::draw(...)` plus pipeline helpers instead of one upstream-shaped pipeline method.
+
+### Binary layout verification
+- N/A: OpenGL program-manager ownership/order refactor only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `gl_graphics_pipeline.h` members: `texture_cache`, `buffer_cache`, `gpu_memory`, `maxwell3d`, `program_manager`, and `state_tracker`.
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around `buffer_cache.UpdateGraphicsBuffers(is_indexed)`, `buffer_cache.BindHostGeometryBuffers(is_indexed)`, `WaitForBuild()`, `BindAssemblyPrograms`, and `BindSourcePrograms`.
+- Re-read Rust `GraphicsPipeline::{bind_graphics_programs_for_configure_with_program_manager,configure_graphics_buffers_and_bind_programs,configure_graphics_buffers_and_bind_programs_with_gpu_resolver}` and the `RasterizerOpenGL::draw(...)` call site after the edit.
+- `cargo fmt --all --check`
+- `cargo test -q -p video_core configure_does_not_configure_transform_feedback -- --nocapture`
+- `cargo test -q -p video_core configure_graphics_buffers_owns_upstream_update_then_geometry_bind_slice -- --nocapture`
+- `cargo test -q -p video_core graphics_configure_buffer_binding_order_matches_upstream -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust keeps host-only bound-texture dump/trace diagnostics in `RasterizerOpenGL::draw(...)` before the final bulk bind. Upstream has no equivalent diagnostics; they remain disabled unless the local `RUZU_*` debug flags are enabled.
+- Rust `GraphicsPipeline::bind_graphics_texture_image_arrays(...)` receives slices and explicit binding counts from the current rasterizer-owned configure context, because the full upstream `ConfigureImpl(...)` local arrays still are not owned by one pipeline method.
+
+### Unintentional differences (to fix)
+- Fixed: the final graphics bulk-bind helper now receives the actual `sampler_binding` count and asserts `texture_binding == sampler_binding` before binding textures/samplers, matching upstream `ASSERT(texture_binding == sampler_binding)` immediately before `glBindTextures(...)` / `glBindSamplers(...)`.
+- Fixed: Rust now carries a separate `sampler_binding` counter through the pipeline-owned `prepare_stage` helpers. Texture-buffer descriptors append null sampler slots and sampled-texture descriptors append materialized sampler handles through that counter, matching upstream's separate `texture_binding` / `sampler_binding` local variables instead of reusing `texture_binding` as the sampler count.
+
+### Missing items
+- Full `GraphicsPipeline::ConfigureImpl(...)` ownership is still split. The final bulk-bind GL calls are in the pipeline helper, but `RasterizerOpenGL::draw(...)` still owns the surrounding diagnostic block and still passes arrays/counts into the helper instead of one upstream-shaped `ConfigureImpl(...)` owning the whole sequence.
+
+### Binary layout verification
+- N/A: OpenGL binding invariant only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` final binding block: `ASSERT(texture_binding == sampler_binding)`, then `glBindTextures`, `glBindSamplers`, and `glBindImageTextures`.
+- Re-read Rust `GraphicsPipeline::{prepare_stage_host_buffer_bindings,bind_stage_sampled_textures,bind_graphics_texture_image_arrays}` and the main `RasterizerOpenGL::draw(...)` call site after the edit.
+- Updated `bind_graphics_texture_image_arrays_owns_upstream_bulk_binds` to require the texture/sampler count assertion before the GL calls and to verify the rasterizer passes `sampler_binding`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust `GraphicsPipeline` still does not store upstream `ProgramManager&`, `BufferCache&`, `TextureCache&`, `Maxwell3D*`, and `gpu_memory` references directly. The new helper therefore receives `BufferCache` from `RasterizerOpenGL::draw(...)`, while the program bind still uses the pipeline-owned OpenGL program-pipeline handle instead of routing through upstream `ProgramManager::{BindAssemblyPrograms,BindSourcePrograms}`.
+- Rust keeps separate helpers for the normal buffer-cache path and the caller-provided GPU-address resolver path because the current rasterizer still bridges channel `MemoryManager` access through closures instead of upstream direct `gpu_memory` ownership.
+
+### Unintentional differences (to fix)
+- Fixed: the main graphics draw path no longer calls `pipeline.bind_graphics_programs_for_configure()` as a separate rasterizer-owned step after `configure_graphics_buffers{_with_gpu_resolver}`. Rust now delegates the upstream sequence `UpdateGraphicsBuffers(is_indexed)`, `BindHostGeometryBuffers(is_indexed)`, `WaitForBuild`, and program binding through `GraphicsPipeline::configure_graphics_buffers_and_bind_programs{_with_gpu_resolver}` before `prepare_stage`, moving this `ConfigureImpl` slice under the pipeline owner.
+
+### Missing items
+- Exact upstream program binding ownership remains incomplete because Rust still does not store/use `ProgramManager&` inside `GraphicsPipeline` to choose `BindAssemblyPrograms(assembly_programs, enabled_stages_mask)` vs `BindSourcePrograms(source_programs)` at this point.
+- Full `GraphicsPipeline::ConfigureImpl(...)` ownership remains split: descriptor sync/collection, render-target update, buffer/program configure, prepare-stage loops, final texture/sampler/image binds, and diagnostics still compose through `RasterizerOpenGL::draw(...)` instead of one upstream-shaped pipeline-owned method with live member references.
+
+### Binary layout verification
+- N/A: graphics pipeline ownership/order refactor only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around `buffer_cache.UpdateGraphicsBuffers(is_indexed)`, `buffer_cache.BindHostGeometryBuffers(is_indexed)`, `WaitForBuild`, `ProgramManager` binding, and the following `prepare_stage` setup.
+- Re-read Rust `GraphicsPipeline::{configure_graphics_buffers,configure_graphics_buffers_with_gpu_resolver,bind_graphics_programs_for_configure}` and the main `RasterizerOpenGL::draw(...)` call site after the edit.
+- Updated `configure_graphics_buffers_owns_upstream_update_then_geometry_bind_slice`, `configure_does_not_configure_transform_feedback`, and `graphics_configure_buffer_binding_order_matches_upstream` to enforce the consolidated pipeline-owned buffer/program configure slice.
+
+## 2026-06-14 — video_core/src/surface.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/surface.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.h
+
+### Intentional differences
+- Rust conversion helpers accept raw `u32` format values instead of upstream typed `Tegra::{RenderTargetFormat,DepthFormat}` / Android pixel-format enums, because the surrounding Rust register snapshots still store raw register words. The match values are the upstream enum discriminants from `gpu.h`.
+- Rust stops on unimplemented fallback formats instead of returning upstream's fallback value after `UNIMPLEMENTED_MSG`, following the local no-hidden-debt rule for unsupported format dependencies.
+
+### Unintentional differences (to fix)
+- None known for the implemented `PixelFormatFromRenderTargetFormat`, `PixelFormatFromDepthFormat`, and `PixelFormatFromGPUPixelFormat` mapping tables after re-reading upstream.
+
+### Missing items
+- Full typed register enum ownership remains outside this file; render-target and depth formats still arrive as raw `u32` from the current Rust register snapshots.
+
+### Binary layout verification
+- N/A: format conversion tables only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `Tegra::RenderTargetFormat` and `Tegra::DepthFormat` enum values in `gpu.h`.
+- Re-read upstream `PixelFormatFromRenderTargetFormat`, `PixelFormatFromDepthFormat`, and `PixelFormatFromGPUPixelFormat` in `surface.cpp`.
+- Expanded `render_target_format_mapping_matches_upstream_surface_cpp`, added exhaustive depth-format coverage, and expanded GPU-pixel-format coverage for all upstream implemented cases.
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs and video_core/src/texture_cache/image_info.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/image_info.cpp
+
+### Intentional differences
+- Rust still passes compact `Maxwell3DRenderTargets` / `RenderTargetInfo` / `ZetaInfo` snapshots into `TextureCacheBase::update_render_targets_from_snapshot(...)` instead of reading `maxwell3d->regs` directly inside `TextureCache<P>`. The snapshot fields used here are the current Rust counterpart for the upstream render-target registers.
+
+### Unintentional differences (to fix)
+- Fixed/verified: render-target and zeta image construction now has focused coverage proving that `TextureCacheBase::update_render_targets_from_snapshot(...)` forwards the raw `render_targets.anti_alias_samples_mode` value into `ImageInfo::from_render_target_info(...)` and `ImageInfo::from_zeta_info(...)`. Upstream `TextureCache<P>::UpdateRenderTargets` constructs `ImageInfo(regs.rt[index], regs.anti_alias_samples_mode)` and `ImageInfo(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode)`.
+
+### Missing items
+- Full Maxwell3D register-struct layout parity remains missing; this slice only verifies the MSAA register propagation through the current Rust snapshot owner.
+
+### Binary layout verification
+- FAIL/incomplete for register layout parity: Rust still does not model the full packed upstream `Maxwell3D::Regs` render-target/zeta structures here. N/A for guest-visible serialized payloads because this slice only constructs host texture metadata.
+
+### Verification
+- Re-read upstream `TextureCache<P>::UpdateRenderTargets` around `ImageInfo(regs.rt[index], regs.anti_alias_samples_mode)` and `ImageInfo(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode)`.
+- Re-read upstream `ImageInfo` render-target and zeta constructors in `image_info.cpp`.
+- Re-read Rust `TextureCacheBase::update_render_targets_from_snapshot(...)`, `find_or_insert_render_target_image(...)`, `find_render_target_view_from_image(...)`, `ImageInfo::from_render_target_info(...)`, and `ImageInfo::from_zeta_info(...)`.
+- Added `update_render_targets_from_snapshot_forwards_raw_msaa_mode_to_image_info`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs, video_core/src/renderer_opengl/gl_graphics_pipeline.rs, and video_core/src/renderer_opengl/gl_compute_pipeline.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still has an explicit `materialize_views(...)` bridge because backend OpenGL image-view objects live beside common `ImageViewBase` slots, while upstream stores backend `P::ImageView` objects directly in the texture-cache slot vector.
+
+### Unintentional differences (to fix)
+- Fixed: the unused public `OpenGLTextureCache::materialize_views_with_gpu_reader(...)` bridge was removed after graphics and compute configure paths stopped passing caller-local GPU readers. `materialize_views(...)` now drains deferred join copies through the texture-cache-owned bound channel memory path only.
+
+### Missing items
+- Full backend image-view ownership parity remains incomplete until OpenGL image views are created through the same conceptual slot owner as upstream `TextureCache<P>`.
+
+### Binary layout verification
+- N/A: OpenGL backend image-view materialization bridge only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::VisitImageView`, `PrepareImageView`, and `FillImageViews`; there is no caller-provided GPU-reader overload in upstream.
+- Re-read Rust `OpenGLTextureCache::materialize_views(...)` after the edit.
+- Updated graphics and compute source-level tests to reject a public `materialize_views_with_gpu_reader(...)` wrapper.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_compute_pipeline.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust `ComputePipeline::configure_resource_state(...)` still receives `TextureCache`, `BufferCache`, and `ProgramManager` as explicit parameters instead of storing upstream constructor references to `texture_cache`, `buffer_cache`, and `program_manager` on the pipeline object.
+- Rust still reads compute texture handles through a local `read_u32` closure backed by the channel `MemoryManager`, because ruzu's current compute dispatch bridge snapshots QMD state instead of letting `ComputePipeline` own the exact upstream `kepler_compute`/`gpu_memory` pointer graph.
+- Rust keeps explicit `materialize_views(...)` / `materialize_samplers(...)` calls before compute binding because backend GL objects live in `OpenGLTextureCache` side maps rather than directly inside upstream-style `SlotVector<P::ImageView>` and `SlotVector<P::Sampler>` entries.
+
+### Unintentional differences (to fix)
+- Fixed: compute `FillComputeImageViews` no longer receives a caller-provided GPU-memory reader. Upstream calls `texture_cache.FillComputeImageViews(...)`, and Rust now uses `OpenGLTextureCache::fill_compute_image_views(...)`, whose base descriptor reads use texture-cache-owned `channel_gpu_memory`.
+- Fixed: compute image-view materialization no longer calls `materialize_views_with_gpu_reader(...)` from `ComputePipeline::configure_backend_bindings(...)`. It now uses the normal texture-cache-owned `materialize_views(...)` path.
+- Fixed: the now-unused public `OpenGLTextureCache::fill_compute_image_views_with_gpu_reader(...)` escape hatch was removed, preventing future compute callers from bypassing texture-cache GPU-memory ownership for this upstream slice.
+- Fixed: the now-unused public `OpenGLTextureCache::materialize_views_with_gpu_reader(...)` escape hatch was removed. All graphics/compute descriptor view materialization now drains pending join copies through the texture-cache-owned bound channel memory path.
+
+### Missing items
+- Full upstream `ComputePipeline::Configure(...)` ownership remains split until the pipeline stores or receives one upstream-shaped configure context for `kepler_compute`, `gpu_memory`, `TextureCache`, `BufferCache`, and `ProgramManager`.
+
+### Binary layout verification
+- N/A: compute texture/image view ownership and OpenGL backend materialization only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `ComputePipeline::Configure(...)` around `texture_cache.FillComputeImageViews(std::span(views.data(), views.size()))`, `GetComputeSamplerId`, and the later texture/sampler/image binding loops.
+- Re-read upstream `TextureCache<P>::FillComputeImageViews`, `FillImageViews`, and `GetComputeSamplerId`.
+- Re-read Rust `ComputePipeline::prepare_texture_bindings(...)`, `ComputePipeline::configure_backend_bindings(...)`, `TextureCacheBase::fill_compute_image_views(...)`, and `TextureCacheBase::get_compute_sampler_id(...)`.
+- Added `compute_fill_and_materialize_uses_texture_cache_owned_gpu_memory`.
+- Updated graphics/compute source-level ownership tests to reject a public `materialize_views_with_gpu_reader(...)` wrapper in `gl_texture_cache.rs`.
+- `cargo fmt --all`
+- `cargo fmt --all --check`
+- `cargo test -q -p video_core compute_fill_and_materialize_uses_texture_cache_owned_gpu_memory -- --nocapture`
+- `cargo check -p video_core --quiet`
+- `git diff --check -- DIFF.md video_core/src/renderer_opengl/gl_compute_pipeline.rs video_core/src/renderer_opengl/gl_texture_cache.rs`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs, video_core/src/renderer_opengl/gl_rasterizer.rs, and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust `GraphicsPipeline::fill_and_materialize_graphics_image_views(...)` still receives `OpenGLTextureCache`, the transient `ImageViewInOut` span, sampler IDs, and the `has_images` flag as parameters because ruzu has not yet restored the full upstream `GraphicsPipeline` member graph for `texture_cache`, `buffer_cache`, `maxwell3d`, and `program_manager`.
+- Rust keeps explicit `materialize_views(...)` / `materialize_samplers(...)` calls after `fill_graphics_image_views(...)` because backend GL objects live in `OpenGLTextureCache` side maps rather than directly inside upstream-style `SlotVector<P::ImageView>` and `SlotVector<P::Sampler>` entries.
+
+### Unintentional differences (to fix)
+- Fixed: the graphics draw path no longer constructs a draw-local GPU-memory reader closure and no longer calls `fill_graphics_image_views_with_gpu_reader(...)` / `materialize_views_with_gpu_reader(...)` from `GraphicsPipeline::fill_and_materialize_graphics_image_views(...)`. The upstream path calls `texture_cache.FillGraphicsImageViews<Spec::has_images>(...)`; Rust now uses `OpenGLTextureCache::fill_graphics_image_views(...)`, whose base descriptor reads use texture-cache-owned `channel_gpu_memory`, matching that ownership more closely.
+- Fixed: the now-unused public `OpenGLTextureCache::fill_graphics_image_views_with_gpu_reader(...)` escape hatch was removed, and the graphics `fill_graphics_image_views(...)` wrapper now always runs the texture-cache-owned pending-join and prepare-image path. This prevents future graphics callers from reintroducing draw-local GPU-memory ownership for this upstream slice.
+
+### Missing items
+- Full upstream `GraphicsPipeline::ConfigureImpl(...)` ownership remains split across pipeline helpers plus `RasterizerOpenGL::draw(...)`; the remaining work is to keep moving descriptor collection, render-target update, framebuffer bind, buffer/texture/image bind, and program bind under the pipeline owner with upstream order.
+
+### Binary layout verification
+- N/A: graphics image-view ownership and OpenGL backend materialization only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around `texture_cache.FillGraphicsImageViews<Spec::has_images>(std::span(views.data(), views_index))`.
+- Re-read upstream `TextureCache<P>::FillGraphicsImageViews`, `FillImageViews`, and `VisitImageView`; upstream descriptor reads and `PrepareImageView` are owned by `TextureCache<P>`.
+- Re-read Rust `TextureCacheBase::fill_graphics_image_views(...)`, `visit_image_view(...)`, and `get_graphics_sampler_id(...)`; normal graphics reads use `channel_gpu_memory` when bound.
+- Updated `fill_and_materialize_graphics_image_views_owns_upstream_fill_slice` to require the non-closure texture-cache path, reject rasterizer-local `read_gpu` / turbofish calls, and reject a public graphics `fill_graphics_image_views_with_gpu_reader(...)` wrapper in `gl_texture_cache.rs`.
+- `cargo fmt --all --check`
+- `cargo test -q -p video_core fill_and_materialize_graphics_image_views_owns_upstream_fill_slice -- --nocapture`
+- `cargo check -p video_core --quiet`
+- `git diff --check -- DIFF.md video_core/src/renderer_opengl/gl_graphics_pipeline.rs video_core/src/renderer_opengl/gl_rasterizer.rs video_core/src/renderer_opengl/gl_texture_cache.rs`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust `GraphicsPipeline::bind_graphics_programs_for_configure(...)` currently binds the per-pipeline OpenGL program-pipeline object directly. Upstream routes the same point through `ProgramManager::BindAssemblyPrograms(...)` or `ProgramManager::BindSourcePrograms(...)`; ruzu's program-manager ownership remains split from the partially rebuilt graphics pipeline.
+- `GraphicsPipeline::configure(...)` remains as a compatibility wrapper around the renamed program-bind slice while the full upstream-shaped `ConfigureImpl(...)` body is being rebuilt.
+
+### Unintentional differences (to fix)
+- Fixed: the main draw path no longer calls the ambiguous `pipeline.configure(is_indexed)` for the upstream program-bind point. It now calls `pipeline.bind_graphics_programs_for_configure()` after `BindHostGeometryBuffers` and before `prepare_stage`, making this `ConfigureImpl` slice auditable in its upstream order.
+
+### Missing items
+- Exact upstream program binding ownership is still incomplete because ruzu does not yet store/use `ProgramManager&` inside `GraphicsPipeline` to choose `BindAssemblyPrograms` vs `BindSourcePrograms` at this point.
+- Full `ConfigureImpl(...)` ownership remains split across multiple pipeline helpers and rasterizer diagnostics rather than one pipeline-owned method with upstream member references.
+
+### Binary layout verification
+- N/A: OpenGL program binding ownership/name clarity only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around `WaitForBuild`, `BindAssemblyPrograms`, and `BindSourcePrograms`.
+- Re-read Rust `GraphicsPipeline::bind_graphics_programs_for_configure(...)`, `GraphicsPipeline::configure(...)`, and the `RasterizerOpenGL::draw(...)` call site after the edit.
+- Updated `configure_does_not_configure_transform_feedback`.
+- Updated `graphics_configure_buffer_binding_order_matches_upstream`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -q -p video_core configure_does_not_configure_transform_feedback -- --nocapture`
+- `cargo test -q -p video_core graphics_configure_buffer_binding_order_matches_upstream -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust `GraphicsPipeline::synchronize_graphics_descriptors(...)` receives a `DescriptorSyncRegs` snapshot from `RasterizerOpenGL::draw(...)` because the current Rust pipeline still does not own upstream-equivalent live `maxwell3d->regs`.
+- The helper calls through `OpenGLTextureCache::base` because ruzu still splits the OpenGL texture-cache wrapper from the common `TextureCacheBase` that owns `synchronize_graphics_descriptors(...)`.
+
+### Unintentional differences (to fix)
+- Fixed: the first upstream `GraphicsPipeline::ConfigureImpl(...)` side effect, `texture_cache.SynchronizeGraphicsDescriptors()`, no longer executes directly from `RasterizerOpenGL::draw(...)`. It now lives behind `GraphicsPipeline::synchronize_graphics_descriptors(...)`, preserving the same order before buffer-cache state setup.
+
+### Missing items
+- Full `ConfigureImpl(...)` ownership is still split: descriptor sync now delegates through `GraphicsPipeline`, but the method still receives a snapshot instead of reading live Maxwell registers, and the broader configure body still composes from `RasterizerOpenGL::draw(...)`.
+- Texture-cache ownership remains split between `OpenGLTextureCache` and `TextureCacheBase`, so the helper cannot yet mirror upstream's exact `TextureCache&` member access shape.
+
+### Binary layout verification
+- N/A: descriptor table synchronization ownership only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around the first `texture_cache.SynchronizeGraphicsDescriptors()` call.
+- Re-read Rust `GraphicsPipeline::synchronize_graphics_descriptors(...)` and the `RasterizerOpenGL::draw(...)` call site after the edit.
+- Added `synchronize_graphics_descriptors_owns_upstream_first_configure_side_effect`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -q -p video_core synchronize_graphics_descriptors_owns_upstream_first_configure_side_effect -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust `GraphicsPipeline::configure_enabled_stage_texture_image_descriptors(...)` receives GPU-memory readers, sampler lookup, and draw diagnostic hooks as closures because the current Rust pipeline still does not own upstream-equivalent `gpu_memory`, `TextureCache&`, or live `Maxwell3D` state.
+- Rust keeps the `use_gpu_reader` switch so the existing no-relock storage-buffer path is used only when the channel memory manager and device reader are available. Upstream reaches the same storage-buffer data through its pipeline-owned `gpu_memory` pointer.
+- Rust still keeps descriptor-count bounds via `MAX_DESC_COUNT`; upstream generated `ConfigureImpl` specializations trust generated descriptor metadata.
+
+### Unintentional differences (to fix)
+- Fixed: the enabled-stage loop for upstream `config_stage(N)` no longer lives in `RasterizerOpenGL::draw(...)`. Rust now delegates one call to `GraphicsPipeline::configure_enabled_stage_texture_image_descriptors(...)`, which preserves upstream order per stage: storage-buffer unbind/bind first, then texture-buffer, image-buffer, sampled-texture, and storage-image descriptor collection.
+- Fixed: `RasterizerOpenGL::draw(...)` no longer calls `pipeline.bind_stage_storage_buffers(...)`, `pipeline.bind_stage_storage_buffers_with_gpu_reader(...)`, or `pipeline.collect_stage_texture_image_descriptors(...)` directly for each stage in the main graphics configure path.
+
+### Missing items
+- Full `ConfigureImpl(...)` ownership is still split: descriptor synchronization, image-view fill/materialization, render-target preparation, graphics buffer update/program bind, prepare-stage, final bulk texture/sampler/image binds, and Rust diagnostics still compose from `RasterizerOpenGL::draw(...)` instead of one upstream-shaped pipeline-owned configure method.
+- `GraphicsPipeline` still receives view/sampler arrays and GPU-memory bridges from `RasterizerOpenGL::draw(...)` rather than owning a structured configure context with upstream-equivalent references to `TextureCache`, `BufferCache`, `Maxwell3D`, `gpu_memory`, and diagnostics.
+
+### Binary layout verification
+- N/A: OpenGL descriptor configuration ownership only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around the `config_stage` lambda and the five enabled-stage calls before `FillGraphicsImageViews`.
+- Re-read Rust `GraphicsPipeline::bind_stage_storage_buffers(...)`, `GraphicsPipeline::bind_stage_storage_buffers_with_gpu_reader(...)`, `GraphicsPipeline::collect_stage_texture_image_descriptors(...)`, `GraphicsPipeline::configure_enabled_stage_texture_image_descriptors(...)`, and the `RasterizerOpenGL::draw(...)` call site after the edit.
+- Added `configure_enabled_stage_texture_image_descriptors_owns_upstream_config_stage_sequence`.
+- Updated `bind_stage_storage_buffers_owns_upstream_storage_buffer_loop`.
+- Updated `collect_stage_texture_image_descriptors_owns_upstream_descriptor_walk`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -q -p video_core configure_enabled_stage_texture_image_descriptors_owns_upstream_config_stage_sequence -- --nocapture`
+- `cargo test -q -p video_core bind_stage_storage_buffers_owns_upstream_storage_buffer_loop -- --nocapture`
+- `cargo test -q -p video_core collect_stage_texture_image_descriptors_owns_upstream_descriptor_walk -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust `GraphicsPipeline::bind_enabled_stage_texture_buffer_views(...)` receives `num_shader_stages`, cache references, the materialized `ImageViewInOut` slice, an iterator index, and `MAX_DESC_COUNT` because the current Rust pipeline still does not own one upstream-equivalent generated `ConfigureImpl(...)` specialization context.
+- Rust still keeps descriptor-count bounds via `MAX_DESC_COUNT`. Upstream generated specializations assume shader descriptor metadata is valid and use the generated counts directly.
+
+### Unintentional differences (to fix)
+- Fixed: the enabled-stage loop for the upstream `bind_stage_info(N)` sequence no longer lives in `RasterizerOpenGL::draw(...)`. Rust now delegates one call to `GraphicsPipeline::bind_enabled_stage_texture_buffer_views(...)`, which loops stages in upstream order immediately before graphics buffer update/bind.
+- Fixed: `RasterizerOpenGL::draw(...)` no longer calls `pipeline.bind_stage_texture_buffer_views(...)` directly for each stage in the main graphics configure path.
+
+### Missing items
+- Full `ConfigureImpl(...)` ownership is still split: descriptor collection, render-target preparation, graphics buffer update/program bind, prepare-stage, final bulk texture/sampler/image binds, and Rust diagnostics still compose from `RasterizerOpenGL::draw(...)` instead of one upstream-shaped pipeline-owned configure method.
+- `GraphicsPipeline` still receives view arrays and iterator state from `RasterizerOpenGL::draw(...)` rather than owning a structured configure context with upstream-equivalent references to `TextureCache`, `BufferCache`, `Maxwell3D`, `gpu_memory`, and diagnostics.
+
+### Binary layout verification
+- N/A: OpenGL texture/image-buffer stage-iteration ownership only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around `bind_stage_info` and the five enabled-stage calls before `UpdateGraphicsBuffers(is_indexed)`.
+- Re-read Rust `GraphicsPipeline::bind_stage_texture_buffer_views(...)`, `GraphicsPipeline::bind_enabled_stage_texture_buffer_views(...)`, and the `RasterizerOpenGL::draw(...)` call site after the edit.
+- Added `bind_enabled_stage_texture_buffer_views_owns_upstream_stage_sequence`.
+- Updated `texture_buffer_binding_is_separated_from_prepare_stage_slots`.
+- Updated `graphics_texture_buffer_bindings_pass_pixel_format_to_buffer_cache`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -q -p video_core bind_enabled_stage_texture_buffer_views_owns_upstream_stage_sequence -- --nocapture`
+- `cargo test -q -p video_core texture_buffer_binding_is_separated_from_prepare_stage_slots -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust `GraphicsPipeline::prepare_enabled_graphics_texture_image_bindings(...)` receives `num_shader_stages`, cache references, scratch arrays, iterator state, surface-clip state, and the sampled-texture observer because the current Rust pipeline still does not own one upstream-equivalent `ConfigureImpl(...)` context.
+- Rasterizer-only texture diagnostics remain in `RasterizerOpenGL::draw(...)` as a callback. Upstream has no equivalent tracing/probe block inside `GraphicsPipeline::ConfigureImpl`.
+
+### Unintentional differences (to fix)
+- Fixed: the Rust `prepare_graphics_stage!` macro shell in `RasterizerOpenGL::draw(...)` has been removed for the main graphics configure path. The enabled-stage loop now lives on `GraphicsPipeline::prepare_enabled_graphics_texture_image_bindings(...)`, matching the upstream `if constexpr (Spec::enabled_stages[N]) { prepare_stage(N); }` sequence more closely.
+- Fixed: `RasterizerOpenGL::draw(...)` now delegates stage iteration through one pipeline-owned call after `pipeline.configure(is_indexed)` and before clearing transient host texture/image pointers, instead of owning the stage loop locally.
+
+### Missing items
+- Full `ConfigureImpl(...)` ownership is still split: descriptor collection, render-target preparation, final bulk texture/sampler/image binds, and Rust diagnostics still compose from `RasterizerOpenGL::draw(...)` instead of one upstream-shaped pipeline-owned configure method.
+- `GraphicsPipeline` still receives scratch arrays and iterator state from `RasterizerOpenGL::draw(...)` rather than owning a structured configure context with upstream-equivalent references to `TextureCache`, `BufferCache`, `Maxwell3D`, `gpu_memory`, and diagnostics.
+
+### Binary layout verification
+- N/A: OpenGL stage-iteration ownership only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around the `prepare_stage` lambda and the five enabled-stage calls.
+- Re-read Rust `GraphicsPipeline::prepare_stage_texture_image_bindings(...)`, `GraphicsPipeline::prepare_enabled_graphics_texture_image_bindings(...)`, and the `RasterizerOpenGL::draw(...)` call site after the edit.
+- Added `prepare_enabled_graphics_texture_image_bindings_owns_upstream_stage_sequence`.
+- Updated `prepare_stage_texture_image_bindings_owns_upstream_prepare_stage_body`.
+- Updated `texture_buffer_binding_is_separated_from_prepare_stage_slots`.
+- Updated `bind_stage_sampled_textures_owns_upstream_sampled_texture_loop`.
+- Updated `bind_stage_storage_images_owns_upstream_storage_image_loop`.
+- Updated `graphics_configure_stage_uniforms_match_upstream_source_and_assembly_paths`.
+- Updated `graphics_configure_buffer_binding_order_matches_upstream`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -q -p video_core prepare_stage_texture_image_bindings_owns_upstream_prepare_stage_body -- --nocapture`
+- `cargo test -q -p video_core prepare_enabled_graphics_texture_image_bindings_owns_upstream_stage_sequence -- --nocapture`
+- `cargo test -q -p video_core texture_buffer_binding_is_separated_from_prepare_stage_slots -- --nocapture`
+- `cargo test -q -p video_core bind_stage_sampled_textures_owns_upstream_sampled_texture_loop -- --nocapture`
+- `cargo test -q -p video_core bind_stage_storage_images_owns_upstream_storage_image_loop -- --nocapture`
+- `cargo test -q -p video_core graphics_configure_stage_uniforms_match_upstream_source_and_assembly_paths -- --nocapture`
+- `cargo test -q -p video_core graphics_configure_buffer_binding_order_matches_upstream -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust `RasterizerOpenGL::draw(...)` still keeps a small `prepare_graphics_stage!` macro shell so the existing draw diagnostics and Rust borrow boundaries can stay intact, but the stage preparation body now delegates to `GraphicsPipeline::prepare_stage_texture_image_bindings(...)`.
+- Rust `GraphicsPipeline::prepare_stage_texture_image_bindings(...)` receives the buffer cache, texture cache, scratch arrays, iterator indices, `ImageViewInOut` slice, sampler ids, and diagnostic observer as parameters because `GraphicsPipeline` still does not own the full upstream `ConfigureImpl(...)` local context or live `TextureCache&`/`BufferCache&`/`Maxwell3D*` references.
+- Rust explicitly clears the transient texture/image pointer bridge through `clear_host_stage_buffer_pointers(...)` after the prepare-stage loop. Upstream overwrites these runtime pointers on each stage and does not need a Rust lifetime guard.
+
+### Unintentional differences (to fix)
+- Fixed: `SetImagePointers(&textures[texture_binding], &images[image_binding])` and `BindHostStageBuffers(stage)` no longer run as a later global pass over saved stage offsets. They now execute at the start of each stage prepare pass after `UpdateGraphicsBuffers`, `BindHostGeometryBuffers`, and program binding, matching upstream `GraphicsPipeline::ConfigureImpl`.
+- Fixed: texture/image-buffer slot advancement now happens immediately after the host stage buffer bind and before sampled-texture/storage-image preparation. The Rust code no longer pre-zeroes those texture/image slots before the host bind path writes TBO/image-buffer handles through the runtime pointers.
+- Fixed: `RasterizerOpenGL::draw(...)` no longer carries `stage_texture_pointer_offsets` / `stage_image_pointer_offsets` for the main graphics configure path.
+- Fixed: the sampled-texture loop, storage-image loop, and per-stage uniform upload are no longer called directly from `RasterizerOpenGL::draw(...)`; their upstream `prepare_stage` ordering is now composed inside `GraphicsPipeline::prepare_stage_texture_image_bindings(...)`.
+
+### Missing items
+- Full `ConfigureImpl(...)` ownership is still split: `RasterizerOpenGL::draw(...)` still builds/materializes the descriptor view arrays, runs the stage macro shell, performs the final `glBindTextures`/`glBindSamplers`/`glBindImageTextures`, and owns diagnostics instead of one upstream-shaped `GraphicsPipeline::ConfigureImpl(...)` method.
+- `GraphicsPipeline` still receives scratch arrays and iterator state from `RasterizerOpenGL::draw(...)` rather than owning one structured configure context with upstream-equivalent references to `TextureCache`, `BufferCache`, `Maxwell3D`, `gpu_memory`, and diagnostics.
+
+### Binary layout verification
+- N/A: OpenGL host texture/image pointer ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around `UpdateGraphicsBuffers`, `BindHostGeometryBuffers`, program binding, the full `prepare_stage` lambda, and final bulk texture/image binds.
+- Re-read upstream `BufferCacheRuntime::SetImagePointers(...)` and Rust `BufferCacheRuntime::set_image_pointers(...)` / `bind_texture_buffer(...)` / `bind_image_buffer(...)` to verify host buffer binds write through the current pointers.
+- Re-read Rust `GraphicsPipeline::prepare_stage_host_buffer_bindings(...)`, `GraphicsPipeline::prepare_stage_texture_image_bindings(...)`, and the `RasterizerOpenGL::draw(...)` macro invocation after the edit.
+- Updated `bind_host_stage_buffers_owns_upstream_prepare_stage_buffer_slice`.
+- Added `prepare_stage_texture_image_bindings_owns_upstream_prepare_stage_body`.
+- Updated `texture_buffer_binding_is_separated_from_prepare_stage_slots`.
+- Updated `bind_stage_sampled_textures_owns_upstream_sampled_texture_loop`.
+- Updated `bind_stage_storage_images_owns_upstream_storage_image_loop`.
+- Updated `graphics_configure_stage_uniforms_match_upstream_source_and_assembly_paths`.
+- Updated `graphics_configure_buffer_binding_order_matches_upstream`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -q -p video_core bind_host_stage_buffers_owns_upstream_prepare_stage_buffer_slice -- --nocapture`
+- `cargo test -q -p video_core prepare_stage_texture_image_bindings_owns_upstream_prepare_stage_body -- --nocapture`
+- `cargo test -q -p video_core texture_buffer_binding_is_separated_from_prepare_stage_slots -- --nocapture`
+- `cargo test -q -p video_core bind_stage_sampled_textures_owns_upstream_sampled_texture_loop -- --nocapture`
+- `cargo test -q -p video_core bind_stage_storage_images_owns_upstream_storage_image_loop -- --nocapture`
+- `cargo test -q -p video_core graphics_configure_stage_uniforms_match_upstream_source_and_assembly_paths -- --nocapture`
+- `cargo test -q -p video_core graphics_configure_buffer_binding_order_matches_upstream -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust `GraphicsPipeline::bind_graphics_uniform_buffers(...)` receives draw-time `ConstBufferBinding` snapshots and a `gpu_to_cpu_address` callback because `GraphicsPipeline` still does not own upstream-equivalent live `Maxwell3D`/`gpu_memory` members.
+- Rust explicitly disables an enabled-mask slot when the draw snapshot says the cbuf binding is disabled/zero-sized. This preserves the existing Rust channel-state cleanup behavior for stale UBO slots; upstream reaches equivalent live cbuf state through `BufferCache::UpdateGraphicsBuffers(...)` and generated binding state.
+
+### Unintentional differences (to fix)
+- Fixed: the graphics uniform-buffer binding loop that walks `enabled_uniform_buffer_masks`, reads draw-time cbuf bindings, resolves GPU addresses, and calls `bind_graphics_uniform_buffer_with_device_addr`/`disable_graphics_uniform_buffer` now lives on the `GraphicsPipeline` owner instead of inline in `RasterizerOpenGL::draw(...)`.
+- Fixed: `RasterizerOpenGL::draw(...)` now supplies only the cbuf snapshot and GPU-address bridge through `pipeline.bind_graphics_uniform_buffers(...)`, preserving the existing order before `configure_graphics_buffers(...)`.
+
+### Missing items
+- Full upstream ownership remains split: `GraphicsPipeline` still receives cbuf snapshots and address resolution from `RasterizerOpenGL::draw(...)` rather than reading live `maxwell3d->state.shader_stages` and `gpu_memory` members directly.
+- The broader `ConfigureImpl(...)` sequencing still needs a structured configure context so buffer updates, program bind, `prepare_stage`, host stage buffer pointers, sampled/storage image binding, and final bulk binds execute inside one pipeline-owned method.
+
+### Binary layout verification
+- N/A: graphics uniform-buffer host binding only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around `buffer_cache.UpdateGraphicsBuffers(is_indexed)` and its dependency on graphics uniform-buffer binding state.
+- Re-read Rust `GraphicsPipeline::bind_graphics_uniform_buffers(...)` and the `RasterizerOpenGL::draw(...)` call site after the edit.
+- Added `bind_graphics_uniform_buffers_owns_upstream_ubo_binding_loop`.
+- `cargo test -q -p video_core bind_graphics_uniform_buffers_owns_upstream_ubo_binding_loop -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust still computes `stage_texture_pointer_offsets` / `stage_image_pointer_offsets` in `RasterizerOpenGL::draw(...)` and passes them later to `GraphicsPipeline::bind_host_stage_buffers(...)` because the full `prepare_stage` body is not yet collapsed into one upstream-shaped `GraphicsPipeline::ConfigureImpl(...)` context.
+- Rust keeps the existing `MAX_DESC_COUNT` cap around descriptor counts. Upstream generated `ConfigureImpl` specializations assume descriptor metadata is valid and do not cap these loops.
+- Rust leaves texture/image scratch arrays zero-initialized and advances counters defensively when scratch capacity is exceeded. Upstream uses fixed `std::array` plus generated descriptor counts and asserts elsewhere.
+
+### Unintentional differences (to fix)
+- Fixed: `GraphicsPipeline::bind_stage_texture_buffer_views(...)` now owns only the upstream `bind_stage_info` slice: unbind stage texture buffers, bind texture-buffer descriptors, bind image-buffer descriptors, then advance its private `texture_buffer_it` over sampled/storage-image descriptors. It no longer reserves `textures`, `gl_samplers`, or `images` slots.
+- Fixed: reservation of texture-buffer/image-buffer slots now occurs in the Rust prepare-stage loop before sampled texture and storage-image binding, matching upstream `prepare_stage`: set per-stage texture/image pointer offsets, reserve `num_texture_buffers[stage]` and `num_image_buffers[stage]`, advance `views_it`, then process sampled textures/storage images.
+
+### Missing items
+- Full `prepare_stage` ownership remains split: Rust still computes scratch arrays, pointer offsets, sampled texture binding, storage-image binding, and uniform uploads in a rasterizer-driven sequence instead of one `GraphicsPipeline::ConfigureImpl(...)` method with upstream member ownership.
+- `GraphicsPipeline::bind_host_stage_buffers(...)` still runs after scratch-array construction using saved offsets rather than being interleaved at the very start of each `prepare_stage` iteration. This preserves Rust borrow/lifetime constraints but is still an ownership/order debt to remove in a larger structured configure context.
+
+### Binary layout verification
+- N/A: OpenGL host texture/image buffer binding and scratch-array ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around the `bind_stage_info` lambda and the start of the `prepare_stage` lambda (`SetImagePointers`, `BindHostStageBuffers`, texture/image-buffer counter skips).
+- Re-read Rust `GraphicsPipeline::bind_stage_texture_buffer_views(...)` and the two-stage call sequence in `RasterizerOpenGL::draw(...)` after the edit.
+- Added `texture_buffer_binding_is_separated_from_prepare_stage_slots`.
+- `cargo test -q -p video_core texture_buffer_binding_is_separated_from_prepare_stage_slots -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust `GraphicsPipeline::fill_and_materialize_graphics_image_views(...)` receives `OpenGL::TextureCache`, the collected `views`, `sampler_ids`, `has_images`, and an optional GPU reader as parameters because Rust `GraphicsPipeline` still does not own upstream-equivalent `TextureCache&`/`gpu_memory` members.
+- Rust keeps OpenGL backend materialization (`materialize_views*` and `materialize_samplers`) in the same pipeline-owned helper. Upstream materializes backend image views/samplers lazily through the cache slot types during `FillGraphicsImageViews`/later `slot_samplers` access; Rust's split base/backend cache requires this explicit bridge before binding.
+- Rasterizer draw-stage diagnostics now bracket the combined fill/materialization helper instead of recording separate exact points after fill, view materialization, and sampler materialization. These probes are Rust diagnostics only and have no upstream behavioral equivalent.
+
+### Unintentional differences (to fix)
+- Fixed: the upstream `texture_cache.FillGraphicsImageViews<Spec::has_images>(...)` slice from `GraphicsPipeline::ConfigureImpl` now lives on the Rust `GraphicsPipeline` owner. `RasterizerOpenGL::draw(...)` delegates graphics image-view filling and required OpenGL materialization to `GraphicsPipeline::fill_and_materialize_graphics_image_views(...)`.
+- Fixed: `RasterizerOpenGL::draw(...)` no longer directly calls `fill_graphics_image_views`, `fill_graphics_image_views_with_gpu_reader`, `materialize_views`, `materialize_views_with_gpu_reader`, or `materialize_samplers` for the main graphics configure path.
+
+### Missing items
+- Full `ConfigureImpl(...)` ownership remains split because `RasterizerOpenGL::draw(...)` still supplies the draw-view GPU reader, cbuf descriptor data, texture cache reference, and diagnostics instead of `GraphicsPipeline` owning upstream-equivalent member references.
+- The later texture-buffer binding, sampled texture binding, storage-image binding, render-target update, and bulk texture/sampler/image binds are already represented by pipeline helpers but still compose through a rasterizer-driven configure sequence rather than one upstream-shaped `ConfigureImpl(...)` context.
+
+### Binary layout verification
+- N/A: graphics image-view filling and OpenGL backend materialization only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around `texture_cache.FillGraphicsImageViews<Spec::has_images>(std::span(views.data(), views_index))`.
+- Re-read Rust `GraphicsPipeline::fill_and_materialize_graphics_image_views(...)` and the `RasterizerOpenGL::draw(...)` call site after the edit.
+- Added `fill_and_materialize_graphics_image_views_owns_upstream_fill_slice`.
+- `cargo test -q -p video_core fill_and_materialize_graphics_image_views_owns_upstream_fill_slice -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust `GraphicsPipeline::collect_stage_texture_image_descriptors(...)` receives a `read_handle` callback for cbuf-backed descriptor reads and a `get_graphics_sampler_id` callback for TSC lookup. Upstream reads directly through `maxwell3d->state.shader_stages[stage].const_buffers`, `gpu_memory->Read<u32>`, and `texture_cache.GetGraphicsSamplerId(...)` because `GraphicsPipeline` owns those references.
+- Rust keeps the existing `MAX_DESC_COUNT` cap and checked offset arithmetic around descriptor loops. Upstream uses unsigned C++ arithmetic and generated descriptor metadata assumptions.
+- Rust keeps draw-stall detail probes behind a callback and keeps cbuf address/read diagnostics in `RasterizerOpenGL::draw(...)`; upstream has no equivalent probes.
+
+### Unintentional differences (to fix)
+- Fixed: the texture/image descriptor collection loops from upstream `GraphicsPipeline::ConfigureImpl::config_stage` now live on the Rust `GraphicsPipeline` owner. The moved helper preserves upstream order: texture-buffer descriptors, image-buffer descriptors, sampled texture descriptors with parallel sampler-id collection, then storage-image descriptors with `blacklist = desc.is_written`.
+- Fixed: `RasterizerOpenGL::draw(...)` no longer directly calls `texture_pair(raw, via_header_index)` or owns the `for desc in &info.{texture_buffer_descriptors,image_buffer_descriptors,texture_descriptors,image_descriptors}` loops for the main graphics configure path.
+
+### Missing items
+- Full `ConfigureImpl(...)` ownership remains split because `RasterizerOpenGL::draw(...)` still supplies the draw-view cbuf snapshot, GPU-memory reader, `TextureCache::get_graphics_sampler_id` bridge, and diagnostic callbacks instead of `GraphicsPipeline` owning upstream-equivalent `Maxwell3D*`, `gpu_memory`, and `TextureCache&` members.
+- `FillGraphicsImageViews`, OpenGL image-view materialization, sampler materialization, render-target update, and later bind preparation are still coordinated from `RasterizerOpenGL::draw(...)`.
+
+### Binary layout verification
+- N/A: host-side descriptor collection only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around the `read_handle`, `add_image`, `texture_buffer_descriptors`, `image_buffer_descriptors`, `texture_descriptors`, and `image_descriptors` loops.
+- Re-read Rust `GraphicsPipeline::collect_stage_texture_image_descriptors(...)` and its call site in `RasterizerOpenGL::draw(...)` after the edit.
+- Added `collect_stage_texture_image_descriptors_owns_upstream_descriptor_walk`.
+- `cargo test -q -p video_core collect_stage_texture_image_descriptors_owns_upstream_descriptor_walk -- --nocapture`
+- `cargo test -q -p video_core bind_stage_storage_buffers_owns_upstream_storage_buffer_loop -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust provides both `GraphicsPipeline::bind_stage_storage_buffers(...)` and `bind_stage_storage_buffers_with_gpu_reader(...)`. Upstream reads storage-buffer addresses through `gpu_memory` owned by `GraphicsPipeline`; Rust still receives caller-provided GPU-memory closures so the draw path can reuse the channel memory-manager access pattern without reintroducing the earlier Rust-only lock problem.
+- Rust keeps the `desc.count != 1` non-fatal guard and warning. Upstream asserts `desc.count == 1` in this generated `ConfigureImpl` specialization.
+
+### Unintentional differences (to fix)
+- Fixed: the storage-buffer descriptor binding slice from upstream `GraphicsPipeline::ConfigureImpl::config_stage` now lives on the Rust `GraphicsPipeline` owner. The moved helper preserves upstream order: `UnbindGraphicsStorageBuffers(stage)`, check storage-buffer enable policy, iterate `info.storage_buffers_descriptors`, validate count-one descriptors, and call the graphics storage-buffer bind path with `stage`, `ssbo_index`, `cbuf_index`, `cbuf_offset`, and `is_written`.
+- Fixed: `RasterizerOpenGL::draw(...)` no longer directly calls `self.buffer_cache.unbind_graphics_storage_buffers(stage)`, `self.buffer_cache.bind_graphics_storage_buffer(...)`, or `self.buffer_cache.bind_graphics_storage_buffer_with_gpu_reader(...)` for the main graphics configure path; it delegates this upstream-owned slice to `GraphicsPipeline`.
+
+### Missing items
+- The texture/image descriptor handle-reading loop that fills `views` and `sampler_ids` still lives in `RasterizerOpenGL::draw(...)` because it depends on the current Rust draw-view/cbuf snapshot and texture-cache sampler lookup bridges.
+- Full `ConfigureImpl(...)` ownership remains split until `GraphicsPipeline` owns or receives one structured configure context for live `Maxwell3D`, `gpu_memory`, `TextureCache`, `BufferCache`, and diagnostics.
+
+### Binary layout verification
+- N/A: OpenGL buffer-cache descriptor binding only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around `buffer_cache.UnbindGraphicsStorageBuffers(stage)` and the `info.storage_buffers_descriptors` loop in `config_stage`.
+- Re-read Rust `GraphicsPipeline::bind_stage_storage_buffers(...)`, `GraphicsPipeline::bind_stage_storage_buffers_with_gpu_reader(...)`, and the call site in `RasterizerOpenGL::draw(...)` after the edit.
+- Added `bind_stage_storage_buffers_owns_upstream_storage_buffer_loop`.
+- `cargo fmt --all --check`
+- `cargo test -q -p video_core bind_stage_storage_buffers_owns_upstream_storage_buffer_loop -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust passes `OpenGL::TextureCache` and `SurfaceClipInfo` into `GraphicsPipeline::upload_stage_uniforms(...)` because the Rust `GraphicsPipeline` still does not store upstream-equivalent `TextureCache&` and `Maxwell3D*`/`regs` members.
+- Rust skips `glProgramUniform4f` when `source_programs[stage] == 0`; this preserves the existing Rust guard for not-yet-built/absent GLSL programs. Upstream assumes the selected program handle is valid after `WaitForBuild()`.
+
+### Unintentional differences (to fix)
+- Fixed: the `uses_rescaling_uniform` and `uses_render_area` upload blocks from upstream `GraphicsPipeline::ConfigureImpl::prepare_stage` now live on the Rust `GraphicsPipeline` owner. The moved helper preserves upstream order: bitcast texture/image masks with `f32::from_bits`, choose `down_factor` from texture-cache rescaling state, upload GLASM local parameter index 0 or GLSL uniform location 0, then upload render-area width/height to index/location 1.
+
+### Missing items
+- Full `prepare_stage` ownership remains split because the helper still receives texture cache and surface-clip state as parameters rather than reading upstream member references directly.
+- The surrounding descriptor diagnostics remain in `RasterizerOpenGL::draw(...)`.
+
+### Binary layout verification
+- N/A: OpenGL uniform upload only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around `uses_rescaling_uniform` and `uses_render_area`.
+- Re-read Rust `GraphicsPipeline::upload_stage_uniforms(...)` and the call site in `RasterizerOpenGL::draw(...)` after the edit.
+- Updated `graphics_configure_stage_uniforms_match_upstream_source_and_assembly_paths`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust passes `OpenGL::TextureCache`, the materialized view list, sampler ids, iterator indices, host scratch arrays, and a diagnostic callback into `GraphicsPipeline::bind_stage_sampled_textures(...)` because the Rust `GraphicsPipeline` still does not own upstream-equivalent `TextureCache&`, `ProgramManager&`, `Maxwell3D*`, and `gpu_memory` references.
+- Rasterizer-only probes (`TEXTURE_BIND`, `TEXTURE_BIND_ADDR`, grid sample tracing, and skip-draw by sampled GPU address) remain in `RasterizerOpenGL::draw(...)` through the callback. Upstream has no equivalent diagnostic block inside `GraphicsPipeline::ConfigureImpl`; keeping them outside the helper preserves auditability of the ported binding loop.
+- Rust keeps descriptor-count and slice bounds checks around descriptor iteration. Upstream generated `ConfigureImpl` specializations assume descriptor metadata and arrays are valid.
+
+### Unintentional differences (to fix)
+- Fixed: the sampled-texture descriptor loop from upstream `GraphicsPipeline::ConfigureImpl::prepare_stage` now lives on the Rust `GraphicsPipeline` owner. The helper preserves upstream order: iterate `info.texture_descriptors`, read the next `ImageViewInOut`, resolve `ImageView::Handle(desc.type)`, update the texture rescaling mask, resolve the parallel sampler id, apply the `HasAddedAnisotropy() && !SupportsAnisotropy()` fallback, write the GL sampler handle, then advance texture/stage bindings.
+- Fixed: sampler anisotropy fallback selection moved with the sampled-texture loop instead of remaining inline in `RasterizerOpenGL::draw(...)`.
+
+### Missing items
+- Full `prepare_stage` ownership remains split: render-area/rescaling uniform uploads and Rust diagnostics still execute from `RasterizerOpenGL::draw(...)`.
+- The current helper still receives cache references, sampler ids, and scratch arrays as parameters rather than storing upstream member references on `GraphicsPipeline`.
+
+### Binary layout verification
+- N/A: OpenGL sampled-texture/sampler binding only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around the sampled-texture loop in `prepare_stage`.
+- Re-read Rust `GraphicsPipeline::bind_stage_sampled_textures(...)` and its callback call site in `RasterizerOpenGL::draw(...)` after the edit.
+- Added `bind_stage_sampled_textures_owns_upstream_sampled_texture_loop`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust still passes `OpenGL::TextureCache`, `BufferCache`, the `ImageViewInOut` list, iterator indices, and host scratch arrays into `GraphicsPipeline::bind_stage_texture_buffer_views(...)` because the Rust `GraphicsPipeline` does not yet own upstream-equivalent references to `TextureCache&`, `BufferCache&`, `Maxwell3D*`, and `gpu_memory`.
+- The helper reserves Rust's existing texture/image scratch-array slots while binding texture/image buffers. Upstream splits this across `bind_stage_info` and the later `prepare_stage` pointer/binding counters; the Rust scratch arrays are still shared with the partially rasterizer-owned sampled-texture loop.
+- Rust keeps existing descriptor-count bounds checks. Upstream assumes translated shader descriptor metadata is valid for this generated `ConfigureImpl` specialization.
+
+### Unintentional differences (to fix)
+- Fixed: the texture-buffer/image-buffer descriptor binding slice from upstream `GraphicsPipeline::ConfigureImpl::bind_stage_info` now lives on the Rust `GraphicsPipeline` owner. The moved helper preserves upstream order: `UnbindGraphicsTextureBuffers(stage)`, iterate `texture_buffer_descriptors`, call `BindGraphicsTextureBuffer(..., is_written=false, is_image=false)`, then iterate `image_buffer_descriptors` and call `BindGraphicsTextureBuffer(..., desc.is_written, is_image=true)`.
+- Fixed: the graphics texture/image-buffer path continues passing upstream `ImageView::GpuAddr()`, `ImageView::BufferSize()`, and `ImageView::format` equivalents into the buffer cache after the ownership move.
+
+### Missing items
+- The sampled-texture descriptor loop still lives in `RasterizerOpenGL::draw(...)`; full `prepare_stage` ownership is still split.
+- The current Rust helper still receives cache references and scratch arrays as parameters rather than storing upstream member references on `GraphicsPipeline`.
+
+### Binary layout verification
+- N/A: OpenGL texture-buffer/image-buffer host binding only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around the `bind_stage_info` lambda.
+- Re-read Rust `GraphicsPipeline::bind_stage_texture_buffer_views(...)` and the call site in `RasterizerOpenGL::draw(...)` after the edit.
+- Updated `graphics_texture_buffer_bindings_pass_pixel_format_to_buffer_cache` to verify the pipeline-owned helper contains both texture-buffer and image-buffer `bind_graphics_texture_buffer(...)` calls.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust still passes `OpenGL::TextureCache`, `views`, iterator indices, and the `images` scratch array into `GraphicsPipeline::bind_stage_storage_images(...)` because the surrounding `prepare_stage` body has not yet been moved wholesale into `GraphicsPipeline::ConfigureImpl(...)`.
+- Rust keeps bounds checks and the existing `MAX_DESC_COUNT` guard around descriptor iteration. Upstream asserts/assumes shader descriptor metadata is valid inside the translated pipeline.
+
+### Unintentional differences (to fix)
+- Fixed: the storage-image descriptor loop from upstream `GraphicsPipeline::ConfigureImpl::prepare_stage` now lives on the Rust `GraphicsPipeline` owner. The moved loop preserves upstream ordering: read the next `ImageViewInOut`, call `MarkModification(image_id)` for written descriptors, resolve `ImageView::StorageView(type, format)`, then update the per-stage image rescaling mask.
+
+### Missing items
+- The sampled-texture descriptor loop and texture-buffer/image-buffer binding setup still live in `RasterizerOpenGL::draw(...)`.
+- Full `prepare_stage` ownership still remains split until `GraphicsPipeline` owns or receives a structured context for texture cache, buffer cache, sampler ids, view iterators, uniforms, and diagnostics.
+
+### Binary layout verification
+- N/A: OpenGL storage-image binding and texture-cache modification tracking only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around the `info.image_descriptors` loop in `prepare_stage`.
+- Re-read Rust `GraphicsPipeline::bind_stage_storage_images(...)` and its call site in `RasterizerOpenGL::draw(...)` after the edit.
+- Added `bind_stage_storage_images_owns_upstream_storage_image_loop`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust still collects texture/image/sampler handles in `RasterizerOpenGL::draw(...)` because the surrounding descriptor walk, diagnostics, and current texture-cache ownership have not yet been collapsed into the upstream-shaped `GraphicsPipeline::ConfigureImpl(...)`.
+- `GraphicsPipeline::bind_graphics_texture_image_arrays(...)` accepts `disable_sampler_bind` for the existing `RUZU_DISABLE_SAMPLER_BIND` diagnostic override. Upstream always binds the collected sampler array.
+
+### Unintentional differences (to fix)
+- Fixed: the final graphics texture/sampler/image batch bind slice now lives on the Rust `GraphicsPipeline` owner. `RasterizerOpenGL::draw(...)` no longer directly calls `glBindTextures`, `glBindSamplers`, or `glBindImageTextures` for the main graphics configure path; it delegates to `GraphicsPipeline::bind_graphics_texture_image_arrays(...)`.
+- Fixed ownership ordering matches upstream: bind textures first, bind samplers second, then bind image textures if storage images are present.
+
+### Missing items
+- The descriptor walking that fills `textures`, `gl_samplers`, and `images` still lives in `RasterizerOpenGL::draw(...)` instead of `GraphicsPipeline::ConfigureImpl(...)`.
+- Texture/image/sampler handle materialization still depends on the current split between `OpenGL::TextureCache`, base image-view slots, and rasterizer diagnostics.
+
+### Binary layout verification
+- N/A: OpenGL host texture/sampler/image binding only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around final `glBindTextures`, `glBindSamplers`, and `glBindImageTextures`.
+- Re-read Rust `GraphicsPipeline::bind_graphics_texture_image_arrays(...)` and its call site in `RasterizerOpenGL::draw(...)` after the edit.
+- Added `bind_graphics_texture_image_arrays_owns_upstream_bulk_binds`.
+- Updated `graphics_configure_buffer_binding_order_matches_upstream` to expect the pipeline-owned bulk bind helper.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust passes `OpenGL::TextureCache`, `StateTracker`, render-target snapshots, dirty flags, and fallback size into `GraphicsPipeline::update_render_targets_and_bind_framebuffer(...)` as explicit parameters because the full upstream owner graph (`GraphicsPipeline` holding `TextureCache&`, `StateTracker&`, `Maxwell3D&`, and live `gpu_memory`) is not restored yet.
+- Rust still obtains the framebuffer handle from `OpenGL::TextureCache::update_render_targets_and_get_framebuffer_from_snapshot(...)` rather than directly calling `texture_cache.GetFramebuffer()->Handle()` because the current Rust texture cache keeps render-target update and framebuffer lookup behind one OpenGL wrapper bridge.
+
+### Unintentional differences (to fix)
+- Fixed: the draw framebuffer bind slice now lives on the Rust `GraphicsPipeline` owner and uses `StateTracker::bind_framebuffer(...)`, matching upstream `state_tracker.BindFramebuffer(texture_cache.GetFramebuffer()->Handle())`. The old Rust call directly executed `gl::BindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer)` from `RasterizerOpenGL::draw(...)`, bypassing the state tracker's cached framebuffer state.
+- Fixed: the upstream pair `texture_cache.UpdateRenderTargets(false); state_tracker.BindFramebuffer(texture_cache.GetFramebuffer()->Handle());` is now represented by one Rust `GraphicsPipeline::update_render_targets_and_bind_framebuffer(...)` helper. The rasterizer no longer owns that pair; it only keeps the returned framebuffer tuple for existing diagnostics/readback probes.
+
+### Missing items
+- The render-target update internals remain split inside `OpenGL::TextureCache`/snapshot bridges rather than an upstream-shaped `TextureCache<P>` owner with live `Maxwell3D` and `gpu_memory`.
+- The broader `ConfigureImpl(...)` body still has remaining ownership debt: descriptor walking, texture/image/sampler bind arrays, render-area/rescaling uniform uploads, storage-buffer descriptor binding, and full cache/program/state-tracker member ownership are not yet collapsed into `gl_graphics_pipeline.rs`.
+
+### Binary layout verification
+- N/A: OpenGL state-tracker framebuffer binding only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around `texture_cache.UpdateRenderTargets(false)` and `state_tracker.BindFramebuffer(texture_cache.GetFramebuffer()->Handle())`.
+- Re-read Rust `GraphicsPipeline::update_render_targets_and_bind_framebuffer(...)`, `GraphicsPipeline::bind_draw_framebuffer(...)`, and the call site in `RasterizerOpenGL::draw(...)` after the edit.
+- Added `bind_draw_framebuffer_owns_upstream_state_tracker_bind_slice`.
+- Added `update_render_targets_and_bind_framebuffer_owns_upstream_pair`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust exposes both `GraphicsPipeline::configure_graphics_buffers(...)` and `configure_graphics_buffers_with_gpu_resolver(...)` because the current rasterizer still owns the channel `MemoryManager` mutex/closures needed by `BufferCache::update_graphics_buffers_with_gpu_resolver(...)`. Upstream reaches the same address helpers through `gpu_memory` stored on `GraphicsPipeline`.
+- `RasterizerOpenGL::draw(...)` still binds the transient VAO before calling the pipeline helper. Upstream does not need this Rust/OpenGL compatibility bridge inside `GraphicsPipeline::ConfigureImpl(...)`.
+
+### Unintentional differences (to fix)
+- Fixed: the upstream `GraphicsPipeline::ConfigureImpl(...)` graphics-buffer update slice now lives on the Rust `GraphicsPipeline` owner. Both Rust helper paths preserve upstream order: `UpdateGraphicsBuffers(is_indexed)` then `BindHostGeometryBuffers(is_indexed)`.
+
+### Missing items
+- The broader `ConfigureImpl(...)` ownership mismatch remains: descriptor walking, storage-buffer descriptor binding, image-view filling/materialization, render-target update/framebuffer bind, texture/image/sampler bind arrays, rescaling/render-area uniform uploads, and program bind are still partly driven from `gl_rasterizer.rs`.
+
+### Binary layout verification
+- N/A: OpenGL host buffer-cache update/bind ownership only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around `buffer_cache.UpdateGraphicsBuffers(is_indexed)` and `buffer_cache.BindHostGeometryBuffers(is_indexed)`.
+- Re-read Rust `GraphicsPipeline::configure_graphics_buffers(...)`, `configure_graphics_buffers_with_gpu_resolver(...)`, and the call site in `RasterizerOpenGL::draw(...)` after the edit.
+- Added `configure_graphics_buffers_owns_upstream_update_then_geometry_bind_slice`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust still passes the OpenGL buffer cache and the already-collected texture/image handle arrays into `GraphicsPipeline::bind_host_stage_buffers(...)` because the current Rust owner graph still collects descriptor/image-view data in `RasterizerOpenGL::draw(...)` instead of storing upstream `BufferCache&`, `TextureCache&`, and `ProgramManager&` references on `GraphicsPipeline`.
+- Rust clears `BufferCacheRuntime` image pointers back to null after the per-stage bind loop. Upstream leaves the runtime pointers on the last stage's arrays for the rest of `ConfigureImpl(...)`; the Rust clear keeps no borrowed stack-array pointer alive after returning from the helper.
+
+### Unintentional differences (to fix)
+- Fixed: the upstream `GraphicsPipeline::ConfigureImpl(...)` `prepare_stage` buffer-cache slice now lives on the Rust `GraphicsPipeline` owner. The moved slice preserves upstream ordering: set texture/image output pointers for the stage, then call `BindHostStageBuffers(stage)`.
+
+### Missing items
+- The broader `ConfigureImpl(...)` ownership mismatch remains: descriptor walking, storage-buffer descriptor binding, image-view filling/materialization, render-target update/framebuffer bind, texture/image/sampler bind arrays, rescaling/render-area uniform uploads, graphics buffer update, host geometry-buffer bind, and program bind are still partly driven from `gl_rasterizer.rs`.
+
+### Binary layout verification
+- N/A: OpenGL host buffer binding pointer ownership only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` `prepare_stage` lambda around `buffer_cache.runtime.SetImagePointers(...)` and `buffer_cache.BindHostStageBuffers(stage)`.
+- Re-read Rust `GraphicsPipeline::bind_host_stage_buffers(...)` and the call site in `RasterizerOpenGL::draw(...)` after the edit.
+- Added `bind_host_stage_buffers_owns_upstream_prepare_stage_buffer_slice`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust still passes the OpenGL buffer cache into `GraphicsPipeline::configure_buffer_cache_state(...)` as an explicit parameter because `GraphicsPipeline` does not yet store upstream member references to `BufferCache`, `TextureCache`, `Maxwell3D`, `MemoryManager`, `ProgramManager`, and `StateTracker`.
+
+### Unintentional differences (to fix)
+- Fixed: the upstream `GraphicsPipeline::ConfigureImpl(...)` base buffer-cache state slice now lives on the Rust `GraphicsPipeline` owner instead of directly in `RasterizerOpenGL::draw(...)`. The moved slice preserves upstream order after descriptor synchronization: `SetUniformBuffersState`, base uniform bindings, base storage bindings, and storage-buffer enable state.
+
+### Missing items
+- The broader `ConfigureImpl(...)` ownership mismatch remains: descriptor walking, storage-buffer descriptor binding, image-view filling/materialization, render-target update/framebuffer bind, texture/image/sampler bind arrays, and rescaling/render-area uniform uploads still live in `gl_rasterizer.rs`.
+
+### Binary layout verification
+- N/A: OpenGL pipeline/buffer-cache host state only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` around `texture_cache.SynchronizeGraphicsDescriptors()`, `buffer_cache.SetUniformBuffersState(...)`, `SetBaseUniformBindings(...)`, `SetBaseStorageBindings(...)`, and `SetEnableStorageBuffers(...)`.
+- Re-read Rust `GraphicsPipeline::configure_buffer_cache_state(...)` and the call site in `RasterizerOpenGL::draw(...)`.
+- Added `configure_buffer_cache_state_owns_upstream_base_buffer_state_slice`.
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still splits upstream `TextureCache<P>::JoinImages(...)` between common metadata (`texture_cache.rs`) and the OpenGL backend tail (`gl_texture_cache.rs`) because backend `Image` objects and `Runtime::CopyImage(...)` are owned by the OpenGL wrapper.
+
+### Unintentional differences (to fix)
+- Fixed: common `join_images(...)` no longer applies alias/bad-overlap relations before queuing a backend copy tail. Upstream inserts the new image, handles ignored overlaps, refreshes the new image, rescales siblings/new image, then applies `join_right_aliased_ids`, `join_left_aliased_ids`, and `join_bad_overlap_ids` immediately before copy/delete processing. Rust now queues pending alias/bad-overlap relation data with `alias_relations_applied=false`, letting `OpenGL::TextureCache::finish_pending_join_copies_impl(...)` apply the relations after refresh/rescale and before copies/deletes.
+
+### Missing items
+- Remaining `JoinImages(...)` ownership debt: the backend copy/delete tail is still split across common/OpenGL owners rather than living in one templated texture-cache owner. Bad-overlap download interactions and exact descriptor-table/dirty-flag invalidation after rescale remain tracked by later entries.
+
+### Binary layout verification
+- N/A: texture-cache host metadata and OpenGL backend copy ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages(...)` ordering in `texture_cache.h`.
+- Re-read Rust `TextureCacheBase::join_images(...)` and `OpenGL::TextureCache::finish_pending_join_copies_impl(...)` after the edit.
+- Updated `join_images_defers_pending_alias_relations_until_backend_tail`.
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and types.h
+
+### Intentional differences
+- Rust exposes `find_image_with_caps(...)` so backend wrappers/tests can supply `HasBrokenTextureViewFormats()` and `HasNativeBgr()` equivalents explicitly; upstream reads those flags directly from `runtime` inside `TextureCache<P>::FindImage(...)`.
+
+### Unintentional differences (to fix)
+- Fixed: `find_image_in_cpu_region_with_caps(...)` now ORs `broken_views` with `RelaxedOptions::FORCE_BROKEN_VIEWS`, matching upstream `runtime.HasBrokenTextureViewFormats() || True(options & RelaxedOptions::ForceBrokenViews)`. Previously Rust ignored the force bit and could reuse an image through format-view compatibility when upstream would require an identical format. The fix lives in the CPU-region bounded helper so both translated `find_image_with_caps(...)` and direct CPU-aware callers get the same upstream predicate.
+- The older `FindImage` debt entry about all-slot scanning is stale for the current code: `find_image_with_caps(...)` now translates the requested GPU range and scans `collect_images_in_region(...)`, matching upstream `ForEachImageInRegion(*cpu_addr, CalculateGuestSizeInBytes(info), ...)` for this helper.
+
+### Missing items
+- None known for `FindImage` CPU-region bounding and `ForceBrokenViews` handling after re-reading upstream `TextureCache<P>::FindImage(...)` and `RelaxedOptions`.
+
+### Binary layout verification
+- N/A: texture-cache lookup policy only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::FindImage(...)` in `texture_cache.h`.
+- Re-read upstream `RelaxedOptions` in `types.h`.
+- Re-read Rust `find_image_with_caps(...)` and `find_image_in_cpu_region_with_caps(...)` after the edit.
+- Added `find_image_force_broken_views_disables_compatible_format_reuse`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- Rust still splits backend-independent `ImageViewBase` slots from OpenGL `ImageView` objects, while upstream stores backend `ImageView` objects directly in `slot_image_views`. The added depth-attachment stale-view guard is the Rust-side bridge needed to preserve upstream's "slot view is current" invariant across that split.
+
+### Unintentional differences (to fix)
+- Fixed: `framebuffer_for_render_targets_from_snapshot(...)` now checks depth attachments for stale backend `ImageView` objects before creating/reusing a framebuffer, matching the color attachment path. Rust previously recreated stale color views but reused stale depth views; upstream `TextureCache<P>::GetFramebufferId(...)` passes `&slot_image_views[key.depth_buffer_id]` to `OpenGL::Framebuffer`, so the depth attachment always uses the current backend view.
+
+### Missing items
+- Broader `TextureCache<P>::GetFramebufferId(...)` ownership remains split: Rust still assembles backend framebuffer attachments in `OpenGL::TextureCache` from common `ImageViewBase` plus OpenGL `ImageView` maps, instead of inserting a backend `Framebuffer` directly from one templated texture-cache owner.
+
+### Binary layout verification
+- N/A: OpenGL framebuffer attachment cache only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::GetFramebufferId(...)`; color and depth attachments are looked up directly from `slot_image_views`.
+- Re-read upstream `OpenGL::Framebuffer::Framebuffer(...)`; depth attachment receives the current `ImageView*` and attaches it with `AttachmentType(image_view->format)`.
+- Re-read Rust `TextureCache::framebuffer_for_render_targets_from_snapshot(...)` after the edit.
+- Added `framebuffer_depth_attachment_recreates_stale_backend_view_like_color_attachment`.
+
+## 2026-06-14 — video_core/src/query_cache/query_cache_base.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache/query_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/rasterizer_interface.h
+
+### Intentional differences
+- Rust stores the rasterizer on `QueryCacheBaseImpl` as an erased raw trait-object pointer because the current owner graph cannot keep the upstream `VideoCore::RasterizerInterface&` reference directly. The call site still maps to upstream `impl->rasterizer.ReleaseFences()`.
+
+### Unintentional differences (to fix)
+- Fixed: `QueryCacheBase::request_guest_host_sync(...)` now calls `release_fences(true)`. Rust previously passed `false`, but upstream calls `ReleaseFences()` with no argument and `RasterizerInterface::ReleaseFences(bool force = true)` makes that a forced fence release. This matters for guest/host query synchronization and can affect command-list progress when a query waits on pending GPU work.
+
+### Missing items
+- None for `RequestGuestHostSync(...)` force semantics. Broader query-cache ownership remains split in the existing Rust port, but this method now matches the upstream fence-release contract.
+
+### Binary layout verification
+- N/A: query-cache fence scheduling only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `QueryCacheBase<Traits>::RequestGuestHostSync()` in `query_cache.h`; it calls `impl->rasterizer.ReleaseFences()`.
+- Re-read upstream `RasterizerInterface::ReleaseFences(bool force = true)` in `rasterizer_interface.h`; the default force argument is `true`.
+- Re-read Rust `QueryCacheBase::request_guest_host_sync(...)` after the edit.
+- Updated `segment_writeback_and_unregister_paths_use_bound_owners`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/{gl_texture_cache.rs,gl_rasterizer.rs} vs /home/vricosti/Dev/emulators/zuyu/src/video_core/{renderer_opengl/gl_texture_cache.cpp,renderer_opengl/gl_graphics_pipeline.cpp,texture_cache/image_view_base.cpp}
+
+### Intentional differences
+- Rust keeps backend-independent `ImageViewBase` slots and OpenGL `ImageView` objects in separate maps. The new `ImageView::from_buffer_base(...)` is the OpenGL-side counterpart of upstream's texture-buffer `ImageView` constructor while preserving that current split.
+- Graphics `BindGraphicsTextureBuffer(...)` still executes from `RasterizerOpenGL::draw(...)` until the broader `GraphicsPipeline::ConfigureImpl(...)` ownership split is collapsed.
+
+### Unintentional differences (to fix)
+- Fixed: valid buffer image views are now materialized into OpenGL `ImageView` objects even though their upstream/base `image_id` is `NULL_IMAGE_ID`. Rust previously skipped them in `materialize_views_impl(...)`, so graphics texture-buffer/image-buffer binding could not call the upstream-equivalent `ImageView::BufferSize()`.
+- Fixed: graphics texture-buffer/image-buffer bindings now use `ImageView::buffer_size()` from the backend view. Rust previously passed `ImageViewBase::size.width`, but upstream `ImageView::BufferSize()` is `CalculateGuestSizeInBytes(info)`, i.e. `BytesPerBlock(format) * width` for buffer views.
+
+### Missing items
+- Full buffer-view ownership still remains split between `ImageViewBase` and OpenGL `ImageView`; upstream stores the backend `ImageView` directly in the texture-cache slot vector.
+
+### Binary layout verification
+- N/A: host-side OpenGL buffer-view metadata only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `ImageViewBase::ImageViewBase(const ImageInfo&, const ImageViewInfo&, GPUVAddr)`, OpenGL `ImageView::ImageView(TextureCacheRuntime&, const ImageInfo&, const ImageViewInfo&, GPUVAddr)`, and `GraphicsPipeline::ConfigureImpl(...)` texture-buffer binding.
+- Re-read Rust `ImageViewBase::new_buffer(...)`, `ImageView::from_buffer_base(...)`, `TextureCache::materialize_views_impl(...)`, and `RasterizerOpenGL::draw(...)` after the edit.
+- Added `buffer_image_view_materializes_upstream_buffer_size`.
+- Updated `graphics_texture_buffer_bindings_pass_pixel_format_to_buffer_cache`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/{gl_rasterizer.rs,gl_compute_pipeline.rs,gl_texture_cache.rs} vs /home/vricosti/Dev/emulators/zuyu/src/video_core/{renderer_opengl/gl_graphics_pipeline.cpp,renderer_opengl/gl_compute_pipeline.cpp,renderer_opengl/gl_texture_cache.h,buffer_cache/buffer_cache.h}
+
+### Intentional differences
+- Rust exposes `ImageView::pixel_format()` as an explicit accessor for the `ImageViewBase::format` field, because `ImageView::format()` already returned the backend GL internal format in the current Rust wrapper. Upstream can use `image_view.format` directly through inheritance.
+- The broader `GraphicsPipeline::ConfigureImpl(...)` and `ComputePipeline::Configure(...)` ownership split remains unchanged in this slice.
+
+### Unintentional differences (to fix)
+- Fixed: graphics and compute texture-buffer/image-buffer bindings now pass the upstream `PixelFormat` value to `BufferCache::{BindGraphicsTextureBuffer,BindComputeTextureBuffer}`. Rust previously passed a GL internal format in some paths (`present_internal_format(...)` in graphics, `ImageView::format()` in compute), but the OpenGL buffer cache then calls `MaxwellToGL::GetFormatTuple(format).internal_format` just like upstream `OpenGL::Buffer::View(...)`. Passing a GL enum there could index the PixelFormat table with the wrong value and create invalid texture-buffer views.
+
+### Missing items
+- Full method ownership parity is still missing: the graphics configure body still lives in `gl_rasterizer.rs`, and compute configure still receives cache owners as parameters instead of storing upstream member references.
+
+### Binary layout verification
+- N/A: this changes host-side texture-buffer format plumbing only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `GraphicsPipeline::ConfigureImpl(...)` and `ComputePipeline::Configure(...)`; both pass `image_view.format` from `ImageViewBase` into the buffer cache for texture-buffer/image-buffer bindings.
+- Re-read upstream `BufferCache<P>::Bind*TextureBuffer(...)` and OpenGL `Buffer::View(...)`; the runtime converts `PixelFormat` to GL internal format at buffer-view creation.
+- Re-read Rust `RasterizerOpenGL::draw(...)`, `ComputePipeline::bind_compute_texture_buffer_view(...)`, and `ImageView` after the edit.
+- Added `graphics_texture_buffer_bindings_pass_pixel_format_to_buffer_cache`.
+- Added `compute_texture_buffer_binding_passes_pixel_format_to_buffer_cache`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- The equivalent of upstream `GraphicsPipeline::ConfigureImpl(...)` still lives inside `RasterizerOpenGL::draw(...)` rather than `gl_graphics_pipeline.rs`, because the Rust owner graph has not yet moved live `Maxwell3D`, `TextureCache`, `BufferCache`, and `ProgramManager` references into `GraphicsPipeline`.
+- Rust computes the per-stage rescaling masks while walking the existing rasterizer-side descriptor binding loop. This preserves upstream ordering while the method body remains split.
+
+### Unintentional differences (to fix)
+- Fixed: graphics stages now upload the upstream `uses_rescaling_uniform` data for both GLSL and GLASM paths: texture rescale mask, image rescale mask, current downscale factor, and zero padding. Rust previously skipped this block entirely, so shaders using the rescaling uniform always saw stale/default values.
+- Fixed: `uses_render_area` now supports the GLASM path through `glProgramLocalParameter4fARB(AssemblyStage(stage), 1, ...)`, matching upstream. Rust previously uploaded render-area data only with `glProgramUniform4f(...)` for source GLSL programs.
+
+### Missing items
+- Move the remaining `ConfigureImpl(...)` body into `gl_graphics_pipeline.rs` with the same cache/program/state-tracker member ownership as upstream.
+
+### Binary layout verification
+- N/A: OpenGL shader uniform upload only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `OpenGL::GraphicsPipeline::ConfigureImpl(...)`; `prepare_stage` uploads `uses_rescaling_uniform` via `glProgramLocalParameter4fARB(..., 0, ...)` for GLASM or `glProgramUniform4f(..., 0, ...)` for GLSL, and uploads `uses_render_area` similarly at uniform/local-parameter index 1.
+- Re-read Rust `RasterizerOpenGL::draw(...)` after the edit; per-stage texture/image rescale masks are accumulated while binding sampled textures and storage images, and both source/assembly uniform upload paths are present.
+- Added `graphics_configure_stage_uniforms_match_upstream_source_and_assembly_paths`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- The equivalent of upstream `GraphicsPipeline::ConfigureImpl(...)` still lives inside `RasterizerOpenGL::draw(...)` because ruzu has not yet moved live `Maxwell3D`, `TextureCache`, `BufferCache`, and `ProgramManager` ownership into an upstream-shaped `GraphicsPipeline` owner.
+- Rust records per-stage texture/image pointer offsets during the descriptor walk, then reuses those offsets after program binding. This is a local adaptation of upstream's `prepare_stage` lambda while the method body remains split.
+
+### Unintentional differences (to fix)
+- Fixed: graphics `BufferCacheRuntime::SetImagePointers(...)` is now called per enabled stage with pointers offset to that stage's first texture-buffer/image-buffer binding before `BindHostStageBuffers(stage)`. Rust previously set the pointers once to `textures[0]` / `images[0]` and then bound every stage, so TBO/image-buffer handles for later stages could be written into the wrong slots before the final `glBindTextures` / `glBindImageTextures` batch.
+
+### Missing items
+- Move the remaining `ConfigureImpl(...)` body into `gl_graphics_pipeline.rs` with the same cache/program/state-tracker member ownership as upstream.
+
+### Binary layout verification
+- N/A: OpenGL host binding pointer offsets only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `OpenGL::GraphicsPipeline::ConfigureImpl(...)`; inside `prepare_stage`, upstream calls `buffer_cache.runtime.SetImagePointers(&textures[texture_binding], &images[image_binding])`, then `buffer_cache.BindHostStageBuffers(stage)`, then advances `texture_binding` / `image_binding`.
+- Re-read Rust `RasterizerOpenGL::draw(...)` after the edit; stage-local offsets are captured before each stage's texture/image descriptor loop and passed to `set_image_pointers(...)` immediately before `bind_host_stage_buffers(stage)`.
+- Updated `graphics_configure_buffer_binding_order_matches_upstream`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_compute_pipeline.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp
+
+### Intentional differences
+- Rust still passes `BufferCache`, `TextureCache`, and `ProgramManager` into `ComputePipeline::configure_resource_state(...)` instead of storing upstream constructor references on `ComputePipeline`. This existing owner split is unchanged.
+- `compute_texture_buffer_bind_sequence(...)` remains a Rust-local mechanical helper so the upstream texture-buffer binding order can be tested without an OpenGL context.
+
+### Unintentional differences (to fix)
+- Fixed: the compute texture-buffer binding sequence now matches the current upstream `ComputePipeline::Configure()` exactly: one pass over `texture_buffer_descriptors`, then one pass over `image_buffer_descriptors`, then `UpdateComputeBuffers()`. Rust had an extra second pass over `image_buffer_descriptors`, based on a stale audit entry, which advanced `texbuf_index` past the upstream view sequence.
+
+### Missing items
+- The broader upstream ownership remains split: `ComputePipeline` still does not store the exact upstream `TextureCache&`, `BufferCache&`, `ProgramManager&`, `kepler_compute`, and `gpu_memory` members.
+
+### Binary layout verification
+- N/A: OpenGL host binding order only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `OpenGL::ComputePipeline::Configure()` in `gl_compute_pipeline.cpp`; the texture-buffer binding phase calls `std::ranges::for_each(info.texture_buffer_descriptors, add_buffer)` followed by one `std::ranges::for_each(info.image_buffer_descriptors, add_buffer)`, then `buffer_cache.UpdateComputeBuffers()`.
+- Re-read Rust `ComputePipeline::compute_texture_buffer_bind_sequence(...)` after the edit.
+- Updated `compute_texture_buffer_bind_sequence_matches_upstream_single_image_buffer_pass`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_compute_pipeline.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp
+
+### Intentional differences
+- Rust still passes `BufferCache`, `TextureCache`, and `ProgramManager` into `ComputePipeline::configure_resource_state(...)` instead of storing upstream constructor references on `ComputePipeline`. This owner split is unchanged in this slice.
+- `compute_texture_buffer_bind_sequence(...)` is a Rust-local mechanical helper used to make the upstream descriptor pass order testable without constructing an OpenGL context.
+
+### Unintentional differences (to fix)
+- Superseded by the 2026-06-14 entry above: re-reading the current upstream source shows only one `image_buffer_descriptors` pass in `ComputePipeline::Configure()`. The temporary Rust double-pass change was removed so the binding order is again `texture_buffer_descriptors`, then `image_buffer_descriptors`, then `UpdateComputeBuffers()`.
+
+### Missing items
+- The broader upstream ownership remains split: `ComputePipeline` still does not store the exact upstream `TextureCache&`, `BufferCache&`, `ProgramManager&`, `kepler_compute`, and `gpu_memory` members.
+
+### Binary layout verification
+- N/A: OpenGL host binding order only. No guest-visible raw payload layout changed.
+
+### Verification
+- Superseded: see the later same-date verification entry above for the current upstream comparison and updated single-pass test.
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still exposes snapshot-fed render-target update helpers because the texture cache does not yet own upstream `maxwell3d->regs` / `maxwell3d->dirty.flags` directly.
+- `TextureCacheBase::update_render_targets_from_snapshot(...)` remains the explicit forced-update helper for tests and bridge paths; it sets `Dirty::RenderTargets` and `Dirty::RenderTargetControl` before calling the dirty-aware helper, matching an upstream dirty update.
+
+### Unintentional differences (to fix)
+- Fixed: the dirty-aware common and OpenGL render-target snapshot helpers now return immediately when `Dirty::RenderTargets` is false. Upstream `TextureCache<P>::UpdateRenderTargets(...)` only prepares existing image views in that branch and does not re-read `rt_control`, resize `render_targets.size`, or re-run color/zeta image lookup. Rust no longer lets dirty sub-flags such as `RenderTargetControl` or `ColorBuffer0` mutate render-target metadata when the master render-target dirty flag is clean.
+
+### Missing items
+- Full `UpdateRenderTargets(bool is_clear)` ownership is still split: upstream performs existing-view preparation in the same method even when `Dirty::RenderTargets` is false, while Rust's complete OpenGL entry point calls `prepare_render_targets_from_snapshot(...)` outside the dirty update helper.
+- The broader upstream owner still needs live Maxwell registers, dirty flags, GPU memory, backend image resources, `RescaleRenderTargets(...)`, and `PrepareImageView(...)` under one texture-cache owner.
+
+### Binary layout verification
+- N/A: render-target dirty-control flow only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::UpdateRenderTargets(...)`; the `!flags[Dirty::RenderTargets]` branch prepares current views and returns before `RescaleRenderTargets`, `rt_control` copy, size update, and `Dirty::DepthBiasGlobal`.
+- Re-read Rust `TextureCacheBase::update_render_targets_from_snapshot_with_dirty_flags(...)` and `OpenGL::TextureCache::update_render_targets_from_snapshot(...)` after the edit.
+- Added `update_render_targets_from_snapshot_with_clean_render_targets_preserves_state_like_upstream`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still routes OpenGL render-target updates through `OpenGL::TextureCache::update_render_targets_from_snapshot(...)` with a `Maxwell3DRenderTargets` snapshot and a caller-provided GPU-to-CPU translator, rather than upstream `TextureCache<P>` owning `maxwell3d->regs` and `gpu_memory` directly.
+- `TextureCacheBase::resolve_or_allocate_cpu_addr(...)` is now `pub(crate)` so the OpenGL wrapper can share the same virtual-invalid fallback owner as the common cache while the upstream-shaped owner remains split.
+
+### Unintentional differences (to fix)
+- Fixed: the OpenGL render-target update bridge no longer skips color or zeta render targets when its GPU-to-CPU translator returns `None`. Upstream `FindRenderTargetView(...)` calls `FindOrInsertImage(...)`; on translation failure `InsertImage(...)` allocates a `virtual_invalid_space` fake CPU address. The OpenGL wrapper now uses the common `resolve_or_allocate_cpu_addr(...)` fallback for render-target insertions, matching the upstream fallback path instead of dropping the view.
+
+### Missing items
+- Full `UpdateRenderTargets(...)` ownership remains split between `TextureCacheBase`, `OpenGL::TextureCache`, rasterizer-provided snapshots, and caller-provided memory readers. The long-term parity target is still one upstream-shaped texture-cache owner for live Maxwell registers, dirty flags, GPU memory, backend image resources, `RescaleRenderTargets(...)`, and `PrepareImageView(...)`.
+- The new helper is tested without constructing `TextureCache::default()` because the default OpenGL runtime path loads GL functions; direct wrapper tests still need a GL test context before they can exercise the full method without panicking on unloaded GL entrypoints.
+
+### Binary layout verification
+- N/A: this change affects render-target image/view lookup and fake CPU address fallback only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::UpdateRenderTargets(...)`, `FindColorBuffer(...)`, `FindDepthBuffer(...)`, `FindRenderTargetView(...)`, `FindOrInsertImage(...)`, and `InsertImage(...)` in `texture_cache.h`.
+- Re-read Rust `OpenGL::TextureCache::update_render_targets_from_snapshot(...)`, `resolve_render_target_cpu_addr(...)`, and `TextureCacheBase::resolve_or_allocate_cpu_addr(...)` after the edit.
+- `cargo test -p video_core renderer_opengl::gl_texture_cache::tests::opengl_render_target_cpu_addr_uses_translated_addr_when_available -- --nocapture`
+- `cargo test -p video_core renderer_opengl::gl_texture_cache::tests::opengl_render_target_cpu_addr_uses_virtual_invalid_fallback_on_translation_miss -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still updates render targets from a `Maxwell3DRenderTargets` snapshot and caller-supplied GPU-to-CPU translator because `TextureCacheBase` does not own upstream `maxwell3d->regs` or `gpu_memory` directly.
+- Rust records virtual-invalid ranges in `TextureCacheBase::virtual_invalid_ranges` so later lookups without a live channel memory owner can still use the same fake CPU address. Upstream does not need this table because `gpu_memory` is always owned by `TextureCache<P>`.
+
+### Unintentional differences (to fix)
+- Fixed: `update_render_targets_from_snapshot_with_dirty_flags(...)` no longer clears color or zeta render-target views when the snapshot translator cannot map the GPU address. Upstream `FindColorBuffer(...)` / `FindDepthBuffer(...)` call `FindRenderTargetView(...)`, which calls `FindOrInsertImage(...)`; if `FindImage(...)` cannot translate the GPU range, `InsertImage(...)` allocates a `virtual_invalid_space` fake CPU address. Rust now uses `resolve_or_allocate_cpu_addr(...)` for both color and zeta render targets before insertion, matching that fallback path.
+
+### Missing items
+- Full `UpdateRenderTargets(...)` ownership remains split until `TextureCacheBase`/backend texture cache own upstream-shaped `maxwell3d`, `gpu_memory`, backend runtime image resources, `RescaleRenderTargets(...)`, and `PrepareImageView(...)` in one owner.
+- The snapshot bridge still cannot exactly represent upstream dirty-flag mutation such as `Dirty::DepthBiasGlobal = true` after a full render-target update.
+
+### Binary layout verification
+- N/A: this change affects render-target image/view lookup and fake CPU address fallback only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::UpdateRenderTargets(...)`, `FindColorBuffer(...)`, `FindDepthBuffer(...)`, `FindRenderTargetView(...)`, `FindOrInsertImage(...)`, and `InsertImage(...)` in `texture_cache.h`.
+- Re-read Rust `TextureCacheBase::update_render_targets_from_snapshot_with_dirty_flags(...)` and `resolve_or_allocate_cpu_addr(...)` after the edit.
+- `cargo test -p video_core texture_cache::texture_cache::tests::update_render_targets_from_snapshot_uses_virtual_invalid_fallback_for_color_translation_miss -- --nocapture`
+- `cargo test -p video_core texture_cache::texture_cache::tests::update_render_targets_from_snapshot_uses_virtual_invalid_fallback_for_zeta_translation_miss -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still splits upstream `TextureCache<P>::CreateImageView(...)` between common `TextureCacheBase` logic and backend completion plumbing (`create_image_view_with_gpu_to_cpu`, `backend_completes_join_images`, `pending_backend_insertions`). This is an existing ownership adaptation while renderer backends do not yet own the full upstream template type.
+- Rust uses `expect(...)` for upstream `.value()` on `image.TryFindBase(config.Address())`, preserving fatal behavior while exposing a clearer panic message in tests.
+
+### Unintentional differences (to fix)
+- Fixed: `TextureCacheBase::create_image_view_base(...)` now enforces `base.level == 0` with release-active `assert_eq!`, matching upstream `ASSERT(base.level == 0)` in `TextureCache<P>::CreateImageView(...)`. The previous `debug_assert_eq!` let nonzero mip bases create image views in normal builds.
+
+### Missing items
+- Broader `CreateImageView` / `FindOrInsertImage` parity is still incomplete because Rust has backend-completion paths not present as separate owners in the upstream template implementation.
+- Full backend `slot_image_views.insert(runtime, ...)` ownership parity remains incomplete until OpenGL/Vulkan texture resources are owned and initialized through the same conceptual boundary as upstream.
+
+### Binary layout verification
+- N/A: this change affects cache control flow/assertion behavior only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::CreateImageView(...)` in `texture_cache.h`.
+- Re-read Rust `TextureCacheBase::{create_image_view,create_image_view_with_gpu_to_cpu,create_image_view_base}` after the edit.
+- `cargo test -p video_core texture_cache::texture_cache::tests::create_image_view_panics_when_base_level_is_not_zero_like_upstream -- --nocapture`
+- `cargo test -p video_core texture_cache::texture_cache::tests::create_image_view_panics_when_try_find_base_fails_like_upstream -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/image_info.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/image_info.cpp
+
+### Intentional differences
+- Rust still receives compact `RenderTargetInfo` snapshots instead of upstream `Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig`; full raw register-struct layout parity remains tracked by existing `image_info.rs` entries.
+
+### Unintentional differences (to fix)
+- Fixed: `ImageInfo::from_render_target_info(...)` no longer decodes `msaa_mode` before the pitch-linear render-target return. Upstream `ImageInfo(RenderTargetConfig, MsaaMode)` returns from the pitch-linear branch before assigning `num_samples = NumSamples(msaa_mode)`, so Rust now leaves `num_samples` at the default `1` and does not reject an invalid MSAA bit pattern on that branch.
+- Fixed test debt: `tic_entry_hashes_raw_format_components_like_upstream` incorrectly expected raw TIC component values `{0,0,0,0}` for `A8B8G8R8` to map to `A8B8G8R8Unorm`. Upstream's format table has no `ComponentType` value `0` mapping for that tuple and reaches `UNIMPLEMENTED_MSG`; the test now asserts the Rust stop path instead of the old fallback behavior.
+
+### Missing items
+- Full Maxwell3D render-target/zeta register struct layout parity remains missing because Rust still snapshots only the fields consumed by `ImageInfo`.
+- Continue auditing all render-target callers for exact upstream register bit patterns instead of normalized local values.
+
+### Binary layout verification
+- FAIL/incomplete for register layout parity: this change preserves constructor control-flow parity, but the Rust `RenderTargetInfo` snapshot is still not the upstream raw `Regs::RenderTargetConfig` layout.
+
+### Verification
+- Re-read upstream `ImageInfo::ImageInfo(const Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig&, Tegra::Texture::MsaaMode)` in `image_info.cpp`.
+- Re-read Rust `ImageInfo::from_render_target_info(...)` after the edit.
+- `cargo test -p video_core texture_cache::image_info::tests::render_target_pitch_linear_returns_before_msaa_decode_like_upstream -- --nocapture`
+- `cargo test -p video_core texture_cache::image_info::tests::render_target_invalid_msaa_mode_is_fatal_like_upstream -- --nocapture`
+- `cargo test -p video_core texture_cache::image_info::tests:: -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `git diff --check -- DIFF.md video_core/src/texture_cache/image_info.rs`
+
+## 2026-06-14 — video_core/src/renderer_opengl/present/window_adapt_pass.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/window_adapt_pass.{h,cpp}
+
+### Intentional differences
+- Rust keeps a `vao` member for OpenGL core-profile compatibility, as audited by the existing `WindowAdaptPass` VAO entry. Upstream has no `OGLVertexArray` member and configures the current vertex-array state directly.
+- `trace_present_phase(...)`, `RUZU_TRACE_PRESENT_DRAW`, and `RUZU_PRESENT_FORCE_SOLID` remain opt-in diagnostics; they do not affect the default `DrawToFramebuffer(...)` path.
+
+### Unintentional differences (to fix)
+- Fixed: `WindowAdaptPass::draw_to_framebuffer(...)` now disables `GL_FRAMEBUFFER_SRGB` and configures `glViewportIndexedf(...)` immediately after `ProgramManager::bind_present_programs(...)`, before vertex-attribute/VBO/sampler setup. This matches upstream `WindowAdaptPass::DrawToFramebuffer(...)` ordering.
+
+### Missing items
+- None for the present program/sRGB/viewport ordering after this pass. Broader present VAO and renderer state-owner parity remains tracked by existing entries.
+
+### Binary layout verification
+- N/A: OpenGL host state ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `WindowAdaptPass::DrawToFramebuffer(...)` in `present/window_adapt_pass.cpp`.
+- Re-read Rust `WindowAdaptPass::draw_to_framebuffer(...)` after the edit.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `git diff --check -- DIFF.md video_core/src/renderer_opengl/present/window_adapt_pass.rs`
+
+## 2026-06-14 — video_core/src/renderer_opengl/present/layer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/layer.{h,cpp}
+
+### Intentional differences
+- Rust stores upstream `RasterizerOpenGL& rasterizer` as a non-owning raw pointer because `RendererOpenGL` owns both the boxed rasterizer and the present pipeline. This preserves the upstream member-reference lifetime while fitting Rust's owner graph.
+- Rust stores upstream `Tegra::MaxwellDeviceMemoryManager& device_memory` as `DeviceMemoryReader`, returning `false` when `GetPointer<u8>(framebuffer_addr)` would be null. This preserves the upstream `if (host_ptr) { UnswizzleTexture(...) }` branch while adapting the device-memory manager boundary.
+- `trace_present_layer(...)` and `RUZU_TRACE_PRESENT` remain opt-in diagnostics; they do not change the default present fallback flow.
+
+### Unintentional differences (to fix)
+- Fixed: `Layer::load_fb_to_screen_info(...)` no longer emits an unconditional one-time `info!` log before the CPU framebuffer fallback. Upstream `Layer::LoadFBToScreenInfo(...)` has no such default log; Rust now keeps only opt-in diagnostics.
+
+### Missing items
+- None for `Layer` rasterizer ownership or the default `LoadFBToScreenInfo` diagnostic path after this pass. Broader present VAO / `BlitScreen` state-owner parity remains tracked by existing entries.
+
+### Binary layout verification
+- N/A: OpenGL present diagnostic/ownership adaptation only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `Layer` members in `present/layer.h` and `Layer::LoadFBToScreenInfo(...)` in `present/layer.cpp`.
+- Re-read Rust `Layer::{new,load_fb_to_screen_info}` and `BlitScreen::draw_screen(...)` after the edit.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `git diff --check -- DIFF.md video_core/src/renderer_opengl/present/layer.rs`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still splits upstream `TextureCache<P>::DmaBufferImageCopy(...)` between common descriptor construction (`TextureCacheBase::dma_buffer_image_copy_descriptor`) and OpenGL backend upload/download execution (`OpenGL::TextureCache::dma_buffer_image_copy`) because backend image resources are not owned by the common cache.
+
+### Unintentional differences (to fix)
+- Fixed: OpenGL DMA buffer-to-image upload no longer calls `PrepareImage(image_id, true, false)` twice. Upstream calls `PrepareDmaImage(image_id, image_operand.address, modifies_image)` exactly once before constructing the `BufferImageCopy`; Rust now performs one `prepare_image_with_gpu_reader(...)` call with `is_upload`/`modifies_image` semantics before `UploadMemory` or `DownloadImageIntoBuffer`.
+
+### Missing items
+- Full `DmaBufferImageCopy(...)` / `PrepareDmaImage(...)` ownership remains split until the texture cache has one upstream-shaped owner for common image state, backend image resources, and guest-memory refresh.
+
+### Binary layout verification
+- PASS: no `BufferImageCopy`, DMA operand, or texture payload layout changed. This slice only removes an extra host-side prepare call from the upload path.
+
+### Verification
+- Re-read upstream `TextureCache<P>::DmaBufferImageCopy(...)` and `PrepareDmaImage(...)` in `texture_cache.h`.
+- Re-read Rust `OpenGL::TextureCache::dma_buffer_image_copy(...)` after the edit.
+- `cargo test -p video_core dma_buffer_image_copy_descriptor_matches_upstream_fields -- --nocapture`
+- `cargo test -p video_core test_single_line_pitch_copy_tries_accelerated_buffer_copy_before_fallback -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `git diff --check -- DIFF.md video_core/src/renderer_opengl/gl_texture_cache.rs`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still carries separate `create_image_view(...)` and `create_image_view_with_gpu_to_cpu(...)` paths because the texture cache's upstream `gpu_memory` owner is split between the common cache, OpenGL wrapper, and channel memory bridge. Both paths now use the same virtual-invalid CPU address fallback owned by `TextureCacheBase`.
+
+### Unintentional differences (to fix)
+- Fixed: TIC `CreateImageView` no longer returns `NULL_IMAGE_VIEW_ID` when the base image GPU address cannot be translated to a CPU address in the backend-completion or explicit `gpu_to_cpu` paths. Upstream calls `FindOrInsertImage(info, image_gpu_addr)`; `FindImage(...)` can fail translation, but `InsertImage(...)` then allocates the upstream `virtual_invalid_space` fake CPU address. Rust now follows that fallback before creating the image/view.
+
+### Missing items
+- Full `CreateImageView` / `FindOrInsertImage` ownership remains split until backend completion, `RefreshContents`, and image-view preparation can live behind one upstream-shaped texture-cache owner.
+
+### Binary layout verification
+- PASS: no TIC, image-view, or image payload layout changed. This slice only restores the upstream fallback address-selection path before image/view insertion.
+
+### Verification
+- Re-read upstream `TextureCache<P>::CreateImageView(...)`, `FindOrInsertImage(...)`, and `FindImage(...)` in `texture_cache.h`.
+- Re-read Rust `TextureCacheBase::{create_image_view_with_gpu_to_cpu,create_image_view,resolve_or_allocate_cpu_addr}` after the edit.
+- `cargo test -p video_core create_image_view_with_gpu_to_cpu_uses_virtual_invalid_fallback_like_upstream_insert -- --nocapture`
+- `cargo test -p video_core backend_completed_create_image_view_uses_virtual_invalid_fallback_like_upstream_insert -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `git diff --check -- DIFF.md video_core/src/texture_cache/texture_cache.rs`
+
+## 2026-06-14 — video_core/src/texture_cache/util.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/util.cpp
+
+### Intentional differences
+- Rust records `.agents/texture_util_unimplemented_state.md` before stopping on `FullDownloadCopies(...)` with `tile_width_spacing > 0` outside tests. Upstream uses `UNIMPLEMENTED_IF(info.tile_width_spacing > 0)`; the state file is the local no-hidden-debt handoff requested for unsupported texture download layouts.
+
+### Unintentional differences (to fix)
+- Fixed: `full_download_copies(...)` no longer logs `tile_width_spacing > 0 not fully implemented` and continues to generate copies. It now stops at the same unsupported branch as upstream, preventing spaced-tile download layouts from being treated as valid copy metadata.
+
+### Missing items
+- Implement the exact upstream behavior only if the upstream source later supports `tile_width_spacing > 0` in `FullDownloadCopies(...)`. Current parity is to stop.
+
+### Binary layout verification
+- PASS: no `BufferImageCopy`, `ImageInfo`, or texture payload layout changed. This slice only changes unsupported-path control flow.
+
+### Verification
+- Re-read upstream `FullDownloadCopies(...)` in `util.cpp`.
+- Re-read Rust `stop_unimplemented_full_download_copies_tile_spacing(...)` and `full_download_copies(...)` after the edit.
+- `cargo test -p video_core full_download_copies_tile_width_spacing_is_fatal_like_upstream -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `git diff --check -- DIFF.md video_core/src/texture_cache/util.rs video_core/src/texture_cache/image_info.rs`
+
+## 2026-06-14 — video_core/src/texture_cache/image_info.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/image_info.cpp
+
+### Intentional differences
+- Rust records `.agents/image_info_unimplemented_state.md` before stopping on an unmapped `ByteSizeToFormat(...)` byte-per-pixel value outside tests. Upstream reaches `UNIMPLEMENTED()` before returning `PixelFormat::Invalid`; the state file is the local no-hidden-debt handoff requested for missing DMA image byte-size mappings.
+
+### Unintentional differences (to fix)
+- Fixed: `byte_size_to_format(...)` no longer panics without preserving the unimplemented state. It now stops through a dedicated `ByteSizeToFormat` guard that records the missing `bytes_per_pixel` value, preventing a runtime missing DMA image format from becoming untraceable.
+
+### Missing items
+- Add an exact mapping only if runtime reaches this guard with a byte-per-pixel value that upstream later supports. Until then, the upstream unimplemented contract is preserved.
+- Full Maxwell3D render-target/zeta register struct layout parity remains missing, as documented by the existing `image_info.rs` entry.
+
+### Binary layout verification
+- PASS: no `ImageInfo`, DMA operand, or pixel-format layout changed. This slice only changes the fallback control flow for unknown DMA byte sizes.
+
+### Verification
+- Re-read upstream `ByteSizeToFormat(...)` and `ImageInfo::ImageInfo(const Tegra::DMA::ImageOperand&)` in `image_info.cpp`.
+- Re-read Rust `stop_unimplemented_byte_size_to_format(...)` and `byte_size_to_format(...)` after the edit.
+- `cargo test -p video_core byte_size_to_format_unknown_bpp_is_fatal_like_upstream -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `git diff --check -- DIFF.md video_core/src/texture_cache/image_info.rs`
+
+## 2026-06-14 — video_core/src/surface.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/surface.cpp
+
+### Intentional differences
+- Rust records `.agents/surface_unimplemented_state.md` before stopping on unmapped render-target, depth, or Android GPU pixel format conversions outside tests. Upstream reaches `UNIMPLEMENTED_MSG(...)` before returning a fallback pixel format; the state file is the local no-hidden-debt handoff requested for missing format mappings.
+
+### Unintentional differences (to fix)
+- Fixed: `pixel_format_from_render_target_format(...)`, `pixel_format_from_depth_format(...)`, and `pixel_format_from_gpu_pixel_format(...)` no longer log an unimplemented input and return the upstream fallback as if the mapping were implemented. They now stop at the unmapped-format branch, preserving the upstream unimplemented contract and preventing invalid surface formats from silently becoming RGBA8 or `S8UintD24Unorm`.
+
+### Missing items
+- Add exact mapping entries for any render-target, depth, or Android pixel format that reaches this stop in runtime, after verifying the value against upstream enum definitions.
+
+### Binary layout verification
+- PASS: no `PixelFormat` enum layout, surface block-size table, or descriptor payload changed. This pass only changes fallback control flow after a format conversion switch has no matching case.
+
+### Verification
+- Re-read upstream `PixelFormatFromDepthFormat(...)`, `PixelFormatFromRenderTargetFormat(...)`, and `PixelFormatFromGPUPixelFormat(...)`; all three default branches call `UNIMPLEMENTED_MSG(...)` before returning a fallback.
+- Re-read Rust `pixel_format_from_render_target_format(...)`, `pixel_format_from_depth_format(...)`, `pixel_format_from_gpu_pixel_format(...)`, and `stop_unimplemented_surface_format(...)` after the edit.
+- Updated tests so known mappings still pass and unmapped conversions stop.
+- `cargo test -p video_core surface::tests -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/format_lookup_table.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/format_lookup_table.cpp
+
+### Intentional differences
+- Rust records `.agents/format_lookup_table_unimplemented_state.md` before stopping on an unmapped texture format outside tests. Upstream logs `UNIMPLEMENTED_MSG(...)` before returning `PixelFormat::A8B8G8R8_UNORM`; the state file is the local no-hidden-debt handoff requested for missing texture-format mappings.
+
+### Unintentional differences (to fix)
+- Fixed: `pixel_format_from_texture_info_raw(...)` no longer logs an unmapped texture format and returns `PixelFormat::A8B8G8R8Unorm` as if the mapping were implemented. It now stops at the unmapped-format branch, preserving the upstream unimplemented contract and preventing a bad texture descriptor from silently becoming RGBA8.
+
+### Missing items
+- Add exact table entries for any texture format/component tuple that reaches this stop in runtime, then remove the stop for that specific tuple only after verifying it against upstream.
+
+### Binary layout verification
+- PASS: no texture descriptor or pixel-format enum layout changed. This pass only changes the fallback control flow after the upstream lookup table has no matching hash.
+
+### Verification
+- Re-read upstream `PixelFormatFromTextureInfo(...)`; it switches over the hash table, reaches `UNIMPLEMENTED_MSG(...)` for unmapped tuples, then has a fallback `A8B8G8R8_UNORM` return.
+- Re-read Rust `pixel_format_from_texture_info(...)`, `pixel_format_from_texture_info_raw(...)`, and `stop_unimplemented_texture_format(...)` after the edit.
+- Added `known_texture_format_mapping_still_matches_upstream_table` and `unknown_texture_format_stops_like_upstream_unimplemented_msg`.
+- `cargo test -p video_core texture_cache::format_lookup_table::tests -- --nocapture`
+
+## 2026-06-14 — video_core/src/engines/maxwell_3d.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp
+
+### Intentional differences
+- Rust records `.agents/maxwell_3d_unimplemented_state.md` before stopping on unimplemented `ProcessQueryGet` operations outside tests. Upstream uses `UNIMPLEMENTED_MSG(...)` for `Acquire`, `Trap`, and unknown query operations; the state file is the local no-hidden-debt handoff requested for missing implementation prerequisites.
+- Rust still has a fallback pending-write path for `Release` / `ReportOnly` when no rasterizer is bound, while upstream always calls `rasterizer->Query(...)`. That existing test-only/owner-split fallback is unchanged by this slice.
+
+### Unintentional differences (to fix)
+- Fixed: `ReportOperation::Acquire` and `ReportOperation::Trap` no longer log at debug level and continue as handled no-ops. They now stop like upstream `Maxwell3D::ProcessQueryGet()`, which reaches `UNIMPLEMENTED_MSG("Unimplemented query operation ACQUIRE")` or `UNIMPLEMENTED_MSG("Unimplemented query operation TRAP")`.
+
+### Missing items
+- Implement the real `Acquire` query operation before allowing it to continue. Upstream notes this operation waits for the CPU to write a value matching the current payload.
+- Implement the real `Trap` query operation before allowing it to continue.
+
+### Binary layout verification
+- PASS: no Maxwell3D register layout changed. The query operation bits still come from report semaphore query bits `[1:0]`; this pass only changes unsupported operation control flow.
+
+### Verification
+- Re-read upstream `Maxwell3D::ProcessQueryGet(...)`; `Release` / `ReportOnly` call `rasterizer->Query(...)`, while `Acquire`, `Trap`, and default reach `UNIMPLEMENTED_MSG(...)`.
+- Re-read Rust `ReportOperation::from_raw(...)`, `stop_unimplemented_query_operation(...)`, and `Maxwell3D::process_query_get(...)` after the edit.
+- Replaced the previous Acquire no-op test with fail-fast coverage and added Trap fail-fast coverage.
+- `cargo test -p video_core test_report_semaphore_ -- --nocapture`
+
+## 2026-06-14 — core/src/hle/service/nvnflinger/buffer_queue_producer.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvnflinger/buffer_queue_producer.cpp
+
+### Intentional differences
+- Rust records `.agents/buffer_queue_unimplemented_state.md` before stopping on the unimplemented `Connect` listener path outside tests. Upstream uses `UNIMPLEMENTED_IF_MSG(enable_listener, "Listener is unimplemented!")`; the state file is the local no-hidden-debt handoff requested for missing implementation prerequisites.
+
+### Unintentional differences (to fix)
+- Fixed: `BufferQueueProducer::transact(Connect)` no longer logs `Connect listener is unimplemented` and then continues with `listener=None`. It now stops immediately when `enable_listener` is set, matching upstream `UNIMPLEMENTED_IF_MSG(...)` instead of accepting an unported producer-listener path as implemented.
+
+### Missing items
+- Implement `IProducerListener` parcel/object handling before allowing `Connect` transactions with `enable_listener=true` to complete. Until then this path must remain fail-fast.
+
+### Binary layout verification
+- PASS: no supported Binder payload layout changed. The existing no-listener `Connect` read order remains `bool enable_listener`, `NativeWindowApi api`, `bool producer_controlled_by_app`, matching upstream.
+
+### Verification
+- Re-read upstream `BufferQueueProducer::Transact(...)`; `Connect` reads `enable_listener`, `api`, and `producer_controlled_by_app`, then calls `UNIMPLEMENTED_IF_MSG(enable_listener, "Listener is unimplemented!")` before `Connect(...)`.
+- Re-read Rust `BufferQueueProducer::transact(...)`, `stop_unimplemented_transact(...)`, and `stop_unimplemented_connect_listener(...)` after the edit.
+- Added `connect_listener_transact_panics_like_upstream_unimplemented_if`.
+- `cargo test -p core connect_listener_transact_panics_like_upstream_unimplemented_if -- --nocapture`
+
+## 2026-06-14 — core/src/hle/service/nvnflinger/buffer_queue_consumer.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvnflinger/buffer_queue_consumer.cpp
+
+### Intentional differences
+- Rust records `.agents/buffer_queue_consumer_unimplemented_state.md` before stopping on unsupported `BufferQueueConsumer::transact(...)` paths outside tests. Upstream uses `ASSERT_MSG(false, ...)` for unsupported transaction ids and `UNREACHABLE()` after `AcquireBuffer(...)`; the state file is the local no-hidden-debt guard requested for missing implementation prerequisites.
+
+### Unintentional differences (to fix)
+- Fixed: `AcquireBuffer` transaction no longer calls `acquire_buffer(...)`, logs missing flattening, writes only a status, and continues. It now stops after `acquire_buffer(...)`, matching upstream's `UNREACHABLE()` until `BufferItem` flattening is implemented.
+- Fixed: unsupported and unknown consumer transaction ids no longer return `BadValue` as if they were handled. They now stop like upstream's `ASSERT_MSG(false, "called, code={} flags={}", code, flags)`.
+
+### Missing items
+- `AcquireBuffer` Binder reply still needs a proper `BufferItem` / `GraphicBuffer` flattening implementation before this transaction can complete. Until then it must remain fail-fast to avoid a consumer using an incomplete acquire reply.
+
+### Binary layout verification
+- PASS: no Binder parcel payload layout changed for supported `ReleaseBuffer` and `GetReleasedBuffers`. This pass only prevents unsupported or incomplete consumer transactions from serializing misleading replies.
+
+### Verification
+- Re-read upstream `BufferQueueConsumer::Transact(...)`; `AcquireBuffer` calls `AcquireBuffer(...)` then reaches `UNREACHABLE()`, while every transaction other than `AcquireBuffer`, `ReleaseBuffer`, and `GetReleasedBuffers` reaches `ASSERT_MSG(false, ...)`.
+- Re-read Rust `BufferQueueConsumer::transact(...)` and `stop_unimplemented_transact(...)` after the edit.
+- Added tests for `AcquireBuffer`, unsupported consumer transaction, and unknown transaction fail-fast behavior.
+- `cargo test -p core buffer_queue_consumer -- --nocapture`
+
+## 2026-06-14 — video_core/src/engines/puller.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/puller.cpp
+
+### Intentional differences
+- Rust records `.agents/puller_unimplemented_state.md` before stopping on unsupported puller engine paths outside tests. Upstream uses `UNIMPLEMENTED_MSG(...)` without a state file; the local file is the requested no-hidden-debt handoff for command-list paths that still need implementation.
+- Rust keeps the existing pointer/handle ownership adaptation for `ChannelState`, `DmaPusher`, `MemoryManager`, and `RasterizerInterface`; this slice only changes unsupported-engine control flow.
+
+### Unintentional differences (to fix)
+- Fixed: `Puller::call_engine_method(...)` and `Puller::call_engine_multi_method(...)` no longer log a warning and continue when the bound subchannel engine is unsupported. They now stop like upstream `Puller::CallEngineMethod(...)` / `CallEngineMultiMethod(...)`.
+- Fixed: `Puller::process_bind_method(...)` no longer logs and continues after binding an unsupported engine id. Rust still stores the raw engine id first, matching upstream's `bound_engines[subchannel] = engine_id` before `UNIMPLEMENTED_MSG(...)`, then stops.
+
+### Missing items
+- None for the unsupported-engine stop contract. Broader puller/pusher parity remains tracked by the existing command-list, syncpoint, and engine ownership entries.
+
+### Binary layout verification
+- PASS: no puller register layout changed. The existing `PullerRegs` indices for semaphore/fence fields remain unchanged; this pass only changes unsupported-engine control flow.
+
+### Verification
+- Re-read upstream `Puller::ProcessBindMethod(...)`, `CallEngineMethod(...)`, and `CallEngineMultiMethod(...)`; unsupported engine ids reach `UNIMPLEMENTED_MSG(...)`.
+- Re-read Rust `process_bind_method(...)`, `call_engine_method(...)`, `call_engine_multi_method(...)`, and `stop_unimplemented_engine(...)` after the edit.
+- Added/updated regression tests for unknown bind, unknown method dispatch, and unknown multi-method dispatch.
+- `cargo test -p video_core puller -- --nocapture`
+
+## 2026-06-14 — video_core/src/engines/maxwell_dma.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_dma.cpp
+
+### Intentional differences
+- Rust records `.agents/maxwell_dma_unimplemented_state.md` before stopping on unsupported MaxwellDMA paths outside tests. Upstream uses `ASSERT(...)` / `UNIMPLEMENTED_IF(...)` directly; the local state file is the requested no-hidden-debt handoff for missing implementation prerequisites.
+- Rust still returns `PendingWrite` buffers from CPU fallback paths because the current Rust caller applies DMA writes after `execute_pending(...)`. Upstream writes through `GpuGuestMemoryScoped` inside `MaxwellDMA::Launch(...)`; this ownership split remains documented until the DMA/memory bridge is collapsed.
+
+### Unintentional differences (to fix)
+- Fixed: unsupported MaxwellDMA paths no longer record/log and then silently continue with `None` or an empty pending-write list. They now stop immediately after recording state, matching upstream's fatal `ASSERT` / `UNIMPLEMENTED_IF` contract instead of presenting potentially invalid texture copies as implemented.
+
+### Missing items
+- Full upstream ownership parity for immediate `GpuGuestMemoryScoped` writes remains missing; Rust still stages writes through `PendingWrite`.
+- Broader MaxwellDMA parity remains to audit, especially paths involving remap-enabled blocklinear copies and exact memory-manager cache/flush ownership.
+
+### Binary layout verification
+- N/A: unsupported-path control flow only. No guest-visible register, DMA parameter, or raw payload layout changed.
+
+### Verification
+- Re-read upstream `MaxwellDMA::Launch(...)`, `CopyBlockLinearToPitch(...)`, `CopyPitchToBlockLinear(...)`, and `CopyBlockLinearToBlockLinear(...)`; upstream stops on unsupported data-transfer type, unsupported alignment, unsupported remap/block-size cases, and blocklinear depth constraints.
+- Re-read Rust `MaxwellDMA::execute_pending(...)`, `copy_blocklinear_to_pitch(...)`, `copy_pitch_to_blocklinear(...)`, `copy_blocklinear_to_blocklinear(...)`, and `stop_unimplemented_dma_path(...)` after the edit.
+- Updated MaxwellDMA regression tests that previously expected silent empty writes on unsupported paths to expect the explicit stop.
+- `cargo test -p video_core maxwell_dma -- --nocapture`
+
+## 2026-06-14 — core/src/hle/service/nvnflinger/buffer_queue_producer.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvnflinger/buffer_queue_producer.cpp
+
+### Intentional differences
+- Rust records `.agents/buffer_queue_unimplemented_state.md` before stopping on unsupported `BufferQueueProducer::transact(...)` codes outside tests. Upstream hits `ASSERT_MSG(false, "Unimplemented TransactionId {}", code)` without writing a state file; the file is the local no-debt guard requested for missing implementation prerequisites.
+- Rust keeps direct `detach_next_buffer(...)` and `attach_buffer(...)` methods because upstream declares and implements those methods on `BufferQueueProducer`, but the Binder `Transact` switch does not expose matching transaction cases.
+
+### Unintentional differences (to fix)
+- Fixed: Binder transactions `DetachNextBuffer`, `AttachBuffer`, `AllocateBuffers`, and unknown transaction codes no longer return `BadValue` and continue. They now stop explicitly like upstream's unimplemented `Transact` default path, so a guest-visible dependency cannot be silently treated as handled.
+
+### Missing items
+- None for the unsupported Binder transaction stop contract. Full BufferQueue presentation parity remains tracked by the existing `QueueBuffer` / `SurfaceFlinger` / `NO_LAYERS` entries.
+
+### Binary layout verification
+- PASS: no Binder parcel payload layout changed. The supported `RequestBuffer`, `DequeueBuffer`, `QueueBuffer`, `Query`, `Connect`, `Disconnect`, `DetachBuffer`, `SetBufferCount`, and `SetPreallocatedBuffer` serialization paths were not changed.
+
+### Verification
+- Re-read upstream `BufferQueueProducer::Transact(...)`, `DetachBuffer(...)`, `DetachNextBuffer(...)`, and `AttachBuffer(...)`; upstream exposes `DetachBuffer` in the transaction switch, leaves `DetachNextBuffer` / `AttachBuffer` out of the switch, and asserts on unimplemented transaction ids.
+- Re-read Rust `BufferQueueProducer::transact(...)`, `detach_buffer(...)`, `detach_next_buffer(...)`, and `attach_buffer(...)` after the edit.
+- Added `unimplemented_transact_panics_instead_of_returning_silent_status`.
+- `cargo fmt --all --check`
+- `cargo test -p core unimplemented_transact_panics_instead_of_returning_silent_status -- --nocapture`
+- `cargo test -p core wait_while_allocating_locked_blocks_until_condition_is_signaled -- --nocapture`
+- `cargo check -p core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/{gl_texture_cache.rs,gl_rasterizer.rs} vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still passes a `read_gpu` closure into `OpenGL::TextureCache::dma_buffer_image_copy(...)` instead of reading `gpu_memory` directly from one templated `TextureCache<P>` owner. The closure is built from `RasterizerOpenGL::channel_memory_manager`, matching the upstream channel `gpu_memory->ReadBlock(...)` source while preserving the current Rust owner graph.
+
+### Unintentional differences (to fix)
+- Fixed: OpenGL DMA image/buffer copies no longer call reader-less `PrepareImage` fallback. `RasterizerOpenGL::{accelerate_dma_image_to_buffer,accelerate_dma_buffer_to_image}` now pass a channel-memory reader into `TextureCache::dma_buffer_image_copy(...)`, and that wrapper calls `prepare_image_with_gpu_reader(...)` for the upstream `PrepareImage(...)` steps.
+
+### Missing items
+- Move `DmaBufferImageCopy(...)`, `PrepareDmaImage(...)`, and `PrepareImage(...)` behind one upstream-shaped texture-cache owner once common/backend image upload hooks are available, so the explicit Rust reader closure is no longer needed.
+
+### Binary layout verification
+- N/A: DMA image/buffer prepare path and reader ownership only. `BufferImageCopy` layout was already covered by existing descriptor tests and is unchanged.
+
+### Verification
+- Re-read upstream `TextureCache<P>::DmaBufferImageCopy(...)`, `PrepareDmaImage(...)`, `PrepareImage(...)`, and `RefreshContents(...)`; upstream prepares images through the same texture-cache owner that has `gpu_memory`.
+- Re-read Rust `OpenGL::TextureCache::dma_buffer_image_copy(...)` and `RasterizerOpenGL::{accelerate_dma_image_to_buffer,accelerate_dma_buffer_to_image}` after the edit.
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust records `.agents/texture_cache_unimplemented_state.md` before stopping when a reader-less OpenGL path would need upstream `RefreshContents(image, image_id)`. Upstream has `gpu_memory` in `TextureCache<P>` and can read guest texture bytes directly; the current Rust wrapper may temporarily lack both a caller-supplied reader and bound channel memory.
+- `readerless_refresh_requires_stop(...)` is a local predicate for this split-owner guard. It models the upstream branch condition precisely: `PrepareImage(..., invalidate=false)` requires `RefreshContents(...)` only when the image still has `CpuModified`.
+
+### Unintentional differences (to fix)
+- Fixed: reader-less `PrepareImage` / render-target `PrepareImageView` fallback no longer continues past a `CPU_MODIFIED` image without executing upstream `RefreshContents(...)`. It now records the image state and panics, preventing stale backend texture contents or alias copies from being treated as an implemented path.
+
+### Missing items
+- Move `RefreshContents` / `UploadImageContents` into an upstream-shaped texture-cache owner or backend hook so every `PrepareImage` caller has a valid guest-memory reader and this reader-less stop can be removed.
+
+### Binary layout verification
+- N/A: texture-cache control-flow guard only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::PrepareImage(...)` and `RefreshContents(...)`; when `invalidate` is false, upstream refreshes CPU-modified contents before `SynchronizeAliases(...)`, `MarkModification(...)`, and `lru_cache.Touch(...)`.
+- Re-read Rust `OpenGL::TextureCache::{prepare_image_without_gpu_reader,prepare_render_targets_from_snapshot,prepare_image_with_gpu_reader}` after the edit.
+- Added `readerless_refresh_stop_only_when_refresh_contents_is_required`.
+- `cargo test -p video_core readerless_refresh_stop_only_when_refresh_contents_is_required -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still prepares render-target views through the OpenGL wrapper because backend `PrepareImage` / `RefreshContents` ownership is not yet collapsed into a single upstream-shaped `TextureCache<P>` owner.
+- `render_target_prepare_sequence(...)` is a local mechanical helper for the Rust wrapper split. It preserves upstream `UpdateRenderTargets(...)` slot order and `PrepareImageView(...)` NULL/buffer guard while making that ordering testable without an OpenGL context.
+
+### Unintentional differences (to fix)
+- Fixed: `OpenGL::TextureCache::prepare_render_targets_from_snapshot(...)` no longer sorts and deduplicates render-target image views before preparing them. Upstream `TextureCache<P>::UpdateRenderTargets(...)` calls `PrepareImageView(...)` for color slots 0..7 and then depth, preserving duplicate views and slot order; Rust now follows that sequence.
+
+### Missing items
+- Full `UpdateRenderTargets` / `PrepareImageView` / `PrepareImage` ownership remains split between common texture-cache state and the OpenGL backend wrapper. The broader target is still one upstream-shaped owner once backend image/upload ownership permits it.
+
+### Binary layout verification
+- N/A: render-target prepare ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::UpdateRenderTargets(...)` and `PrepareImageView(...)`; upstream prepares every color slot in index order and then depth, and only skips NULL or buffer image views inside `PrepareImageView(...)`.
+- Re-read Rust `OpenGL::TextureCache::prepare_render_targets_from_snapshot(...)` after the edit.
+- Added `render_target_prepare_sequence_preserves_upstream_slot_order_and_duplicates`.
+- `cargo test -p video_core render_target_prepare_sequence_preserves_upstream_slot_order_and_duplicates -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still computes render-target size from a `Maxwell3DRenderTargets` snapshot because `TextureCacheBase` / `OpenGL::TextureCache` do not yet own upstream `maxwell3d->regs`. Both Rust owners now use wrapping `u32` multiplication to preserve the upstream expression's bit pattern.
+
+### Unintentional differences (to fix)
+- Fixed: render-target size rescale calculation no longer uses `saturating_mul(...)`. Upstream `TextureCache<P>::UpdateRenderTargets(...)` computes `(surface_clip.width * up_scale) >> down_shift` and `(surface_clip.height * up_scale) >> down_shift` in `u32`; Rust now uses `wrapping_mul(...)` in both the common snapshot bridge and the OpenGL wrapper.
+
+### Missing items
+- Full `UpdateRenderTargets` ownership remains split: upstream mutates Maxwell dirty flags (`RescaleViewports`, `RescaleScissors`, `DepthBiasGlobal`) and prepares views inside one texture-cache owner, while Rust still bridges dirty flags and backend preparation through snapshot/OpenGL wrapper paths.
+
+### Binary layout verification
+- N/A: render-target cached extent arithmetic only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::UpdateRenderTargets(...)`; render-target extent uses raw `surface_clip * up_scale` arithmetic before shifting.
+- Re-read Rust `TextureCacheBase::update_render_targets_from_snapshot_with_dirty_flags(...)` and `OpenGL::TextureCache::update_rescaled_render_target_size(...)` after the edit.
+- Added `update_render_targets_size_uses_wrapping_scale_multiply_like_upstream`.
+- `cargo test -p video_core update_render_targets_size_uses_wrapping_scale_multiply_like_upstream -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still names the image-id entry point `mark_modification_by_id(...)` because `TextureCacheBase` cannot overload `MarkModification(ImageId)` and `MarkModification(ImageBase&)` like upstream C++. The method now preserves the upstream `ImageBase&` body semantics.
+
+### Unintentional differences (to fix)
+- Fixed: `TextureCacheBase::mark_modification_by_id(...)` no longer clears `ImageFlagBits::CPU_MODIFIED`. Upstream `TextureCache<P>::MarkModification(ImageBase&)` only sets `GpuModified` and updates `modification_tick`; clearing `CpuModified` belongs to `RefreshContents(...)` or invalidate handling, not to `MarkModification(...)`.
+
+### Missing items
+- Broader `PrepareImage` / `RefreshContents` ownership remains split between the common cache and OpenGL backend wrappers, but `MarkModification(...)` itself now matches the upstream flag/tick contract.
+
+### Binary layout verification
+- N/A: image-cache flags and modification tick only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::MarkModification(ImageBase&)`; it performs `image.flags |= ImageFlagBits::GpuModified` and `image.modification_tick = ++modification_tick` only.
+- Re-read Rust `TextureCacheBase::mark_modification_by_id(...)` after the edit.
+- Added `mark_modification_preserves_cpu_modified_like_upstream`.
+- `cargo test -p video_core mark_modification_preserves_cpu_modified_like_upstream -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust uses an explicit panic message for TIC `CreateImageView` `TryFindBase(...)` failure, while upstream calls `.value()` on the optional returned by `ImageBase::TryFindBase(...)`. Both are fatal paths; the message is local context for the parity stop.
+- `TextureCacheBase::create_image_view_base(...)` is a private Rust helper used only to keep the duplicated common/backend `CreateImageView` bridge paths on the same upstream fatal contract. Upstream does this inline in its single templated `CreateImageView(...)` owner.
+
+### Unintentional differences (to fix)
+- Fixed: TIC `CreateImageView` no longer returns `NULL_IMAGE_VIEW_ID` when `TryFindBase(config.Address())` fails. Both `create_image_view(...)` and `create_image_view_with_gpu_to_cpu(...)` now stop like upstream `TextureCache<P>::CreateImageView(...)`, where `image.TryFindBase(config.Address()).value()` is mandatory before constructing `ImageViewInfo`.
+
+### Missing items
+- The broader `CreateImageView` / `FindOrInsertImage` / backend completion split remains: Rust still has separate common/backend bridge paths and `pending_backend_insertions`, while upstream owns the full sequence inside one templated texture-cache owner.
+
+### Binary layout verification
+- N/A: texture-cache control-flow only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::CreateImageView(...)`; non-buffer TIC views call `FindOrInsertImage(...)`, then `image.TryFindBase(config.Address()).value()`, assert `base.level == 0`, and call `FindOrEmplaceImageView(...)`.
+- Re-read Rust `TextureCacheBase::{create_image_view_with_gpu_to_cpu,create_image_view,create_image_view_base}` after the edit.
+- Added `create_image_view_panics_when_try_find_base_fails_like_upstream`.
+- `cargo test -p video_core create_image_view_panics_when_try_find_base_fails_like_upstream -- --nocapture`
+- `cargo test -p video_core create_image_view_uses_try_find_base_layer -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust uses an explicit panic message for the render-target `TryFindBase(...)` failure, while upstream calls `.value()` on the optional returned by `ImageBase::TryFindBase(...)`. Both are fatal paths; the message is local context for the parity stop.
+
+### Unintentional differences (to fix)
+- Fixed: non-linear render-target view creation no longer returns `NULL_IMAGE_VIEW_ID` when `TryFindBase(gpu_addr)` fails. `TextureCacheBase::find_image_view_from_image_info(...)` now stops like upstream `TextureCache<P>::FindRenderTargetView(...)`, where `image.TryFindBase(gpu_addr).value()` is mandatory before `FindOrEmplaceImageView(...)`.
+
+### Missing items
+- The broader `FindRenderTargetView` owner split remains: Rust still runs `FindOrInsertImage` and backend completion outside a single upstream-shaped method boundary. The delete/retry loop and backend completion ordering are still tracked below.
+
+### Binary layout verification
+- N/A: texture-cache control-flow only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::FindRenderTargetView(...)`; non-linear images call `image.TryFindBase(gpu_addr).value()` before constructing the render-target `ImageViewInfo`.
+- Re-read Rust `TextureCacheBase::find_image_view_from_image_info(...)` after the edit.
+- Added `find_render_target_view_panics_when_try_find_base_fails_like_upstream`.
+- `cargo test -p video_core find_render_target_view_panics_when_try_find_base_fails_like_upstream -- --nocapture`
+- `cargo test -p video_core create_image_view_uses_try_find_base_layer -- --nocapture`
+- `cargo test -p video_core update_render_targets_from_snapshot_registers_presentable_view -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust `find_or_emplace_image_view(...)` takes the view GPU address explicitly because `ImageViewBase::new(...)` stores the address in the backend-independent view; upstream receives only `image_id` and `ImageViewInfo` because the templated runtime constructor can derive/backend-own the same state from `Image&`.
+- TIC `CreateImageView` still applies `Strong` flags after `find_or_emplace_image_view(...)`, matching upstream's caller-specific flag update after `FindOrEmplaceImageView(...)` returns.
+
+### Unintentional differences (to fix)
+- Fixed: TIC `CreateImageView` and render-target image-view creation no longer open-code the `Image::FindView` / `slot_image_views.insert(...)` / `Image::InsertView(...)` sequence. They now call `TextureCacheBase::find_or_emplace_image_view(...)`, matching upstream `TextureCache<P>::FindOrEmplaceImageView(...)` method ownership.
+
+### Missing items
+- `FindRenderTargetView` is still split across the common texture-cache base and the OpenGL backend completion path. The upstream-shaped end state remains one owner that runs `FindOrInsertImage`, any delete/retry loop, backend completion, and `FindOrEmplaceImageView` before exposing the view. The non-linear `TryFindBase(...).value()` fatal behavior is fixed by the 2026-06-14 entry above.
+
+### Binary layout verification
+- N/A: texture-cache image-view ownership only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::CreateImageView(...)`, `FindRenderTargetView(...)`, and `FindOrEmplaceImageView(...)` in `texture_cache.h`.
+- Re-read Rust `TextureCacheBase::{create_image_view_with_gpu_to_cpu,create_image_view,find_image_view_from_image_info,find_or_emplace_image_view}` after the edit.
+- `cargo test -p video_core create_image_view_uses_try_find_base_layer -- --nocapture`
+- `cargo test -p video_core update_render_targets_from_snapshot_registers_presentable_view -- --nocapture`
+- `cargo fmt --all --check`
+
+## 2026-06-14 — video_core/src/texture_cache/{texture_cache.rs,texture_cache_base.rs} and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust records the interrupted runtime state to `.agents/texture_cache_unimplemented_state.md` before stopping on the ignored-overlap `GPU_MODIFIED` branch. Upstream `UNIMPLEMENTED()` aborts without a side file; the state file is the local no-debt guard requested for missing parity prerequisites.
+- `PendingJoinCopies` remains as the current Rust bridge for deferred backend copy/delete work, but its old `ignored_gpu_modified_ids` field and the OpenGL drain helper were removed. Upstream has no corresponding queue because it stops before backend handling for this branch.
+
+### Unintentional differences (to fix)
+- Fixed: `TextureCacheBase::join_images(...)` no longer preserves, queues, downloads, or bad-overlap-links ignored overlaps that are still `GPU_MODIFIED`. It now stops immediately like upstream `TextureCache<P>::JoinImages(...)`, where the ignored-overlap loop calls `UNIMPLEMENTED()` before untracking, unregistering, deleting, refreshing the new image, or registering it.
+
+### Missing items
+- None for the ignored-overlap `GPU_MODIFIED` stop contract. The broader `JoinImages` owner split and pending backend copy/delete tail remain tracked in the existing texture-cache entries below.
+
+### Binary layout verification
+- N/A: texture-cache metadata/control-flow only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages(...)` ignored-overlap loop in `texture_cache.h`; `GpuModified` reaches `UNIMPLEMENTED()` before any deletion or refresh side effect.
+- Re-read Rust `TextureCacheBase::join_images(...)`, `PendingJoinCopies`, and OpenGL `finish_pending_join_copies_impl(...)` after the edit; the matching branch records `.agents/texture_cache_unimplemented_state.md` outside tests and panics immediately, and no ignored-overlap queue/drain remains.
+- Updated regression tests so common and backend-completed join paths both expect the upstream-fatal branch.
+- `cargo test -p video_core join_images_panics_on_gpu_modified_ignored_overlap_like_upstream -- --nocapture`
+- `cargo test -p video_core backend_join_panics_on_gpu_modified_ignored_overlap_like_upstream -- --nocapture`
+- `cargo test -p video_core find_or_insert_result_panics_on_gpu_modified_ignored_overlap_like_upstream -- --nocapture`
+
+## 2026-06-14 — video_core/src/memory_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.{h,cpp}
+
+### Intentional differences
+- Rust keeps `GpuMemoryManager` and the outer `MemoryManager` wrapper split while upstream owns the page tables directly in `Tegra::MemoryManager`. The translated behavior for `GpuToCpuAddress(addr, size)` and `GetSubmappedRange(...)` remains in `video_core/src/memory_manager.rs`.
+
+### Unintentional differences (to fix)
+- Fixed: `gpu_to_cpu_address_range(...)` now computes the upstream `page_last` expression with wrapping unsigned arithmetic. In debug Rust, the previous `addr + size + page_size - 1` expression could panic on high addresses, while upstream C++ `GPUVAddr` arithmetic wraps.
+
+### Missing items
+- None for the audited `GpuToCpuAddress(addr, size)` overflow behavior and `GetSubmappedRange(...)` small-page fallback cases.
+- Broader texture-cache ownership still remains split across the entries below; this pass only verifies the memory-manager range helpers used by `FindImage`, `FindDMAImage`, sparse registration, and TIC validation.
+
+### Binary layout verification
+- N/A: page-table lookup behavior only; no guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t size)` in `memory_manager.cpp`; `page_last` is computed from unsigned address/size arithmetic before scanning pages.
+- Re-read upstream `MemoryManager::GetSubmappedRange(...)` / `GetSubmappedRangeImpl(...)`; big-table free regions fall back through small pages and split segments when device addresses stop being contiguous.
+- Re-read Rust `GpuMemoryManager::{gpu_to_cpu_address_range,get_submapped_range}` after the edit.
+- Added `gpu_to_cpu_address_range_uses_wrapping_page_last_like_upstream`.
+- Added `get_submapped_range_falls_back_to_small_pages_like_upstream`.
+- `cargo test -p video_core gpu_to_cpu_address_range_uses_wrapping_page_last_like_upstream -- --nocapture`
+- `cargo test -p video_core get_submapped_range -- --nocapture`
+- `cargo fmt --all`
+
+## 2026-06-14 — video_core/src/{texture_cache/descriptor_table.rs,texture_cache/util.rs,host1x/gpu_device_memory_manager.rs} vs /home/vricosti/Dev/emulators/zuyu/src/video_core/{texture_cache/util.{h,cpp},memory_manager.{h,cpp}}
+
+### Intentional differences
+- Rust keeps descriptor memory access behind `GpuMemoryReader` because descriptor tables are not owned by upstream's `Tegra::MemoryManager&`. The trait now has `addr_valid` for upstream `GpuToCpuAddress(addr)` and `range_valid` for upstream `GpuToCpuAddress(addr, size)`.
+- Rust implements the size-aware device-memory query in `MaxwellDeviceMemoryManager::smmu_range_has_mapping(...)` instead of `MemoryManager::GpuToCpuAddress(...)` because ruzu's current SMMU owner is `host1x/gpu_device_memory_manager.rs`.
+
+### Unintentional differences (to fix)
+- Fixed: `is_valid_entry(...)` no longer repeats the single-address validation for the second upstream check. It now computes `ImageInfo::from_tic_entry(...)`, calls `calculate_guest_size_in_bytes(...)`, and validates the size-aware address range through `GpuMemoryReader::range_valid(...)`.
+- Fixed before documenting: the new SMMU size-aware helper matches upstream `GpuToCpuAddress(addr, size)` page-scan semantics. It succeeds when any page in `[addr, addr + size)` translates, instead of requiring every byte in the range to be mapped.
+
+### Missing items
+- None for `VideoCommon::IsValidEntry` address/range validation.
+- Broader texture-cache memory-manager ownership still differs from upstream and remains documented in the texture-cache owner entries below.
+
+### Binary layout verification
+- N/A: descriptor validation and SMMU translation checks only; no guest-visible struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `VideoCommon::IsValidEntry(...)` in `texture_cache/util.cpp`; it checks zero address, 40-bit limit, direct `GpuToCpuAddress(address)`, then `ImageInfo{config}` plus `CalculateGuestSizeInBytes(info)` and `GpuToCpuAddress(address, guest_size_bytes)`.
+- Re-read upstream `MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t size)` in `memory_manager.cpp`; it scans pages and returns the first translated page.
+- Re-read Rust `is_valid_entry(...)`, `is_valid_entry_with_range_valid(...)`, `GpuMemoryReader::{addr_valid,range_valid}`, and `MaxwellDeviceMemoryManager::smmu_range_has_mapping(...)` after the edit.
+- Added `is_valid_entry_uses_gpu_memory_reader_range_valid_for_guest_size`.
+- Added `smmu_range_has_mapping_matches_upstream_size_aware_gpu_to_cpu_address`.
+- `cargo test -p video_core is_valid_entry -- --nocapture`
+- `cargo test -p video_core smmu_range_has_mapping_matches_upstream_size_aware_gpu_to_cpu_address -- --nocapture`
+- `cargo fmt --all --check`
+
+## 2026-06-14 — video_core/src/engines/maxwell_dma.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_dma.{h,cpp}
+
+### Intentional differences
+- Rust still executes the multi-line pitch-to-pitch copy through the existing `Engine::execute_pending(...)` / `PendingWrite` bridge instead of upstream's immediate `memory_manager.CopyBlock(...)` calls. The bridge now preserves the upstream source and destination address sequence.
+
+### Unintentional differences (to fix)
+- Fixed: multi-line pitch-to-pitch fallback no longer widens `pitch_in` / `pitch_out` with `max(pitch, line_length)`. Upstream computes each line address as `offset + line * pitch`; Rust now uses the exact register pitches, preserving overlapping source reads or destination writes when the guest supplies a pitch smaller than `line_length_in`.
+
+### Missing items
+- Move MaxwellDMA launch execution out of the `PendingWrite` bridge and back into an upstream-shaped immediate `MemoryManager` owner once command-processor memory ownership permits it.
+- Full raw `Regs` struct layout parity remains incomplete; this pass only fixes the pitch-to-pitch address stepping.
+
+### Binary layout verification
+- N/A for new layout: no guest-visible raw payload changed. Existing register offsets are unchanged.
+
+### Verification
+- Re-read upstream `MaxwellDMA::Launch()` in `maxwell_dma.cpp`; the pitch-to-pitch loop uses `regs.pitch_in` and `regs.pitch_out` directly in `offset + line * pitch`.
+- Re-read Rust `MaxwellDMA::execute_pending(...)` after the edit; `pi` and `po` now come directly from `pitch_in()` / `pitch_out()`, and `dst_span` controls the single bridged `PendingWrite` size.
+- Added `test_dma_pitch_to_pitch_preserves_overlapping_upstream_pitch`.
+- `cargo test -p video_core test_dma_pitch_to_pitch_preserves_overlapping_upstream_pitch -- --nocapture`
+
+## 2026-06-14 — video_core/src/engines/maxwell_dma.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_dma.{h,cpp}
+
+### Intentional differences
+- Rust still executes DMA launches through `Engine::execute_pending(...)` and returns `PendingWrite` objects, while upstream `MaxwellDMA::Launch()` writes immediately through `MemoryManager` / `GpuGuestMemoryScoped`. This pass preserves that existing bridge while tightening release-semaphore ordering inside it.
+- Unsupported DMA helper branches still return `None` and record state instead of silently approximating the path. Completed helper branches return `Some(Vec<PendingWrite>)`, allowing accelerated backend paths with no CPU writeback to still run upstream `ReleaseSemaphore()` behavior.
+
+### Unintentional differences (to fix)
+- Fixed: valid zero-length DMA launches now still execute `release_semaphore()`, matching upstream `MaxwellDMA::Launch()` which reaches `ReleaseSemaphore()` even when the copy loop does no writes.
+- Fixed: valid multi-line launches with `line_count == 0` now still execute `release_semaphore()` before returning no writes.
+- Fixed: accelerated blocklinear/image DMA helper paths that complete through `AccelerateDMAInterface::{ImageToBuffer,BufferToImage}` now release the launch semaphore even though they produce no Rust `PendingWrite` objects. Previously an empty write vector was indistinguishable from an unsupported path.
+
+### Missing items
+- Move MaxwellDMA launch execution out of the `PendingWrite` bridge and back into an upstream-shaped immediate `MemoryManager` owner once command-processor memory ownership permits it.
+- Full raw `Regs` struct layout parity remains incomplete; this pass changes launch completion ordering only.
+
+### Binary layout verification
+- N/A for new layout: no guest-visible raw payload changed. Semaphore register decoding remains the previously audited raw-register bridge.
+
+### Verification
+- Re-read upstream `MaxwellDMA::Launch()` and `MaxwellDMA::ReleaseSemaphore()` in `maxwell_dma.cpp`; `ReleaseSemaphore()` is called after valid launch paths even when the copy produces no CPU-side writes.
+- Re-read Rust `MaxwellDMA::{execute_pending,copy_blocklinear_to_pitch,copy_pitch_to_blocklinear,copy_blocklinear_to_blocklinear,release_semaphore}` after the edit.
+- Added `test_zero_length_valid_launch_still_releases_semaphore` and `test_accelerated_blocklinear_to_pitch_releases_semaphore_without_pending_write`.
+- `cargo test -p video_core maxwell_dma -- --nocapture`
+- `cargo check -p video_core --quiet`
+- `cargo fmt --all`
+
+## 2026-06-14 — video_core/src/gpu.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.cpp
+
+### Intentional differences
+- Rust keeps `Gpu::request_composite(layers)` as the no-fence public entry point and only allocates a request-swap counter for the fenced path after valid fences and Host1x are available. Upstream allocates the counter before the sync operation even when `num_fences == 0`; avoiding an unused zero counter keeps the existing Rust no-fence API from retaining dead entries while preserving the fenced presentation lifetime.
+- Rust still clones immutable `FramebufferConfig` layers into `Send` callbacks instead of capturing references like upstream. This is required by Rust closure lifetime rules and preserves the presented layer contents.
+- Rust ignores negative fence ids before registration. Upstream receives the fence vector from the service layer as-is; Ruzu's Rust NvFence bridge can still carry invalid sentinel ids, so the existing no-fence fallback remains documented until the service boundary is fully audited.
+
+### Unintentional differences (to fix)
+- Fixed: `Gpu` now owns upstream-shaped request-swap bookkeeping through `RequestSwapCounters { free_swap_counters, request_swap_counters }`, matching upstream `GPU::Impl::{free_swap_counters,request_swap_counters,request_swap_mutex}` ownership.
+- Fixed: fenced presentation callbacks now decrement the owner-local request counter and only call `composite_layers(...)` when every registered fence for that request has fired, then return the counter index to the free list.
+
+### Missing items
+- Add a higher-level presentation regression once `Gpu::request_composite_with_fences(...)` can be exercised with a renderer/Host1x test harness instead of a full frontend run.
+
+### Binary layout verification
+- N/A: host-side presentation bookkeeping only; no guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GPU::Impl::RequestComposite(...)` and the `free_swap_counters` / `request_swap_counters` owner fields in `gpu.cpp`.
+- Re-read Rust `Gpu::request_composite_with_fences(...)`, `allocate_request_swap_counter(...)`, and `complete_request_swap_counter(...)` after the edit.
+- Added `request_swap_counter_reuses_freed_counter_after_all_fences_complete`.
+- `cargo fmt --all --check`
+- `cargo test -p video_core request_swap_counter_reuses_freed_counter_after_all_fences_complete -- --nocapture`
+- `cargo test -p video_core guest_action_bridge_fires_from_guest_counter_only -- --nocapture`
+- `cargo check -p video_core --quiet`
+- MK8D runtime check: `screenshots/tmp/mk8d-20260614-0600-request-swap-counters.log` reached fenced presentation callbacks and OpenGL swaps (`waiting fence=112`, `GPU sync callback calling renderer.composite=112`, `SDL_GL_SwapWindow=112`), with no remaining `ruzu-cmd` process after cleanup.
+
+## 2026-06-14 — video_core/src/{texture_cache/texture_cache.rs,renderer_opengl/gl_texture_cache.rs,renderer_opengl/gl_rasterizer.rs} vs /home/vricosti/Dev/emulators/zuyu/src/video_core/{texture_cache/texture_cache_base.h,texture_cache/texture_cache.h,renderer_opengl/gl_rasterizer.{h,cpp}}
+
+### Intentional differences
+- Rust splits upstream `TextureCache<P>` between backend-independent `TextureCacheBase` and the OpenGL wrapper. `DmaImageId`, `FindDMAImage`, and the `BufferImageCopy` field construction now live in `texture_cache.rs`; backend `PrepareImage` plus `Image::{UploadMemory,DownloadMemory}` live in `gl_texture_cache.rs`.
+- OpenGL `RasterizerOpenGL::{accelerate_dma_image_to_buffer,accelerate_dma_buffer_to_image}` implement upstream `AccelerateDMA::DmaBufferImageCopy<IS_IMAGE_UPLOAD>` through the existing rasterizer trait hooks instead of an owned `AccelerateDMA` object.
+- Rust keeps OpenGL async-download storage (`slot_buffer_downloads`, `uncommitted_async_buffers`, `async_buffers`, `async_buffers_death_ring`) in `renderer_opengl/gl_texture_cache.rs` instead of `TextureCacheBase` because the stored buffer type is backend-specific `OpenGL::StagingBufferMap`. Upstream models this through `TextureCache<P>::AsyncBuffer`.
+
+### Unintentional differences (to fix)
+- Fixed: OpenGL `ImageToBuffer` / `BufferToImage` no longer return the default `false`. They now take the buffer-cache and texture-cache mutexes together, call `DmaImageId`, obtain the buffer with `FullSynchronize` and the upstream post operation (`MarkAsWritten` for image-to-buffer, `DoNothing` for buffer-to-image), and issue the OpenGL image/buffer copy.
+- Fixed: `TextureCacheBase::dma_image_id` now ports upstream filtering: candidate lookup through `FindDMAImage`, requiring `GpuModified`, rejecting 3D images, forcing the first download attempt to set `dma_downloaded = true` and return `NULL_IMAGE_ID`, and validating `TryFindBase`.
+- Fixed: `TextureCacheBase::find_dma_image` now ports upstream DMA lookup over the translated CPU/device region, including remap rejection, linear exact pitch/size/view compatibility, blocklinear `IsSubCopy`, and newest `modification_tick` selection.
+- Fixed: `TextureCacheBase::dma_buffer_image_copy_descriptor` now builds upstream `BufferImageCopy` fields, including old-bpp-to-image-bpp coordinate conversion.
+- Fixed: OpenGL image-to-buffer DMA now routes through `TextureCache::download_image_into_buffer(...)`, matching upstream `TextureCache<P>::DownloadImageIntoBuffer(...)`: it records a `BufferDownload`, queues a non-swizzle `PendingDownload`, requests a deferred download staging buffer, and downloads into both the real buffer and staging buffer.
+- Fixed: OpenGL `commit_async_flushes` / `pop_async_flushes` no longer delegate to common stubs. They now preserve upstream async flush behavior for DMA and preemptive render-target swizzle downloads, including 64-byte alignment for swizzle staging segments, reverse-order pop, guest GPU-memory writeback for DMA downloads, and deferred staging-buffer freeing on `tick_frame`.
+
+### Missing items
+- Replace the rasterizer trait-method bridge with a separate Rust `AccelerateDMAInterface` owner only if the rasterizer owner graph can support returning a stable mutable accelerator object without losing upstream lifetime/lock ordering.
+- Common `TextureCacheBase::{commit_async_flushes,pop_async_flushes}` remain non-backend stubs for non-OpenGL callers. OpenGL parity is implemented in `renderer_opengl/gl_texture_cache.rs`; future backend ports must provide their own async-buffer owner instead of using the common stubs.
+
+### Binary layout verification
+- PASS: `BufferImageCopy` already uses `repr(C)` and the new descriptor test verifies every field set by upstream `TextureCache<P>::DmaBufferImageCopy`. No raw guest payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::DmaImageId`, `FindDMAImage`, `PrepareDmaImage`, `DmaBufferImageCopy`, `DownloadImageIntoBuffer`, `CommitAsyncFlushes`, `PopAsyncFlushes`, `TickFrame`, and OpenGL `AccelerateDMA::DmaBufferImageCopy/ImageToBuffer/BufferToImage`.
+- Re-read Rust `TextureCacheBase::{translated_cpu_addr,collect_images_in_region,find_image_in_cpu_region_with_caps,prepare_image}`, OpenGL `TextureCache::{prepare_image_without_gpu_reader,dma_buffer_image_copy,download_image_into_buffer,commit_async_flushes,pop_async_flushes,tick_frame}`, `Image::{upload_memory,download_memory_to_buffer,download_memory_to_buffers}`, and `RasterizerOpenGL` DMA overrides after the edit.
+- Added `dma_image_id_requires_gpu_modified_image`, `dma_image_id_download_first_marks_dma_downloaded_and_returns_null`, `dma_image_id_refuses_3d_images`, and `dma_buffer_image_copy_descriptor_matches_upstream_fields`.
+- `cargo test -p video_core dma_image_id -- --nocapture`
+- `cargo test -p video_core dma_buffer_image_copy_descriptor -- --nocapture`
+- `cargo check -p video_core --quiet`
+- `cargo fmt --all --check`
+- `git diff --check`
+
+## 2026-06-14 — video_core/src/{rasterizer_interface.rs,renderer_null/null_rasterizer.rs,renderer_opengl/gl_rasterizer.rs,engines/maxwell_dma.rs} vs /home/vricosti/Dev/emulators/zuyu/src/video_core/{rasterizer_interface.h,renderer_null/null_rasterizer.{h,cpp},renderer_opengl/gl_rasterizer.{h,cpp},engines/maxwell_dma.{h,cpp}}
+
+### Intentional differences
+- Rust exposes upstream `RasterizerInterface::AccessAccelerateDMA()` as four trait methods (`accelerate_dma_buffer_copy`, `accelerate_dma_buffer_clear`, `accelerate_dma_image_to_buffer`, `accelerate_dma_buffer_to_image`) instead of returning a separate `AccelerateDMAInterface&`. This keeps the call ownership on the rasterizer while fitting the current Rust trait-object graph.
+- OpenGL `BufferCopy` / `BufferClear` use the existing `BufferCache::{dma_copy,dma_clear}` methods under the buffer-cache mutex, matching upstream's `std::scoped_lock lock{buffer_cache.mutex}`. The Rust implementation follows the local raw-pointer mutex pattern already used in `RasterizerOpenGL` to avoid borrow conflicts between the cache field and its mutex.
+- Fixed by later entry: OpenGL `ImageToBuffer` / `BufferToImage` now route through `TextureCacheBase::dma_image_id`, `BufferCache::obtain_buffer`, and the OpenGL texture-cache image/buffer copy wrapper.
+
+### Unintentional differences (to fix)
+- Fixed: MaxwellDMA single-line pitch/pitch copies now call upstream `AccelerateDMAInterface::BufferCopy(...)` before the CPU fallback and skip the fallback only when the accelerator returns `true`.
+- Fixed: MaxwellDMA single-line CONST_A clears now call upstream `AccelerateDMAInterface::BufferClear(...)` before the CPU fallback while still always executing the fallback write, matching upstream's ignored `BufferClear` return value.
+- Fixed: MaxwellDMA multi-line blocklinear-to-pitch and pitch-to-blocklinear paths now construct upstream `DMA::ImageCopy`, `DMA::ImageOperand`, and `DMA::BufferOperand` values and call `ImageToBuffer` / `BufferToImage` before the CPU swizzle fallback.
+- Fixed: `RasterizerNull` now exposes upstream null DMA acceleration behavior through the common rasterizer interface: buffer copy and clear return `true`, image/buffer copies remain `false`.
+- Fixed: `RasterizerOpenGL` now exposes upstream `AccelerateDMA::BufferCopy` and `BufferClear` behavior through the common rasterizer interface by delegating to `BufferCache::dma_copy` and `BufferCache::dma_clear`.
+
+### Missing items
+- Fixed by later entry: OpenGL `AccelerateDMA::DmaBufferImageCopy<IS_IMAGE_UPLOAD>` is now ported through the current Rust texture-cache backend split. Remaining naming/ownership cleanup for `DownloadImageIntoBuffer` is tracked there.
+- Replace the trait-method bridge with a separate Rust `AccelerateDMAInterface` owner only if the rasterizer owner graph can support returning a stable mutable accelerator object without losing upstream lifetime/lock ordering.
+- MaxwellDMA still executes through the Rust `PendingWrite` bridge for CPU fallbacks rather than writing immediately through `MemoryManager`.
+
+### Binary layout verification
+- N/A: interface/call-order change only. Guest-visible DMA operand layout remains represented by the `dma::*` structs already audited in the MaxwellDMA entries below.
+
+### Verification
+- Re-read upstream `AccelerateDMAInterface` in `maxwell_dma.h`, `MaxwellDMA::Launch`, `CopyBlockLinearToPitch`, `CopyPitchToBlockLinear`, OpenGL `AccelerateDMA::{BufferCopy,BufferClear,DmaBufferImageCopy,ImageToBuffer,BufferToImage}`, and null `AccelerateDMA::{BufferCopy,BufferClear}`.
+- Re-read Rust `RasterizerInterface` DMA hooks, `RasterizerNull` DMA overrides, `RasterizerOpenGL` DMA overrides, and MaxwellDMA accelerated-call sites after the edit.
+- Added `test_single_line_pitch_copy_tries_accelerated_buffer_copy_before_fallback`, `test_single_line_const_a_clear_calls_accelerated_buffer_clear_then_fallback`, `test_multi_line_blocklinear_to_pitch_tries_image_to_buffer_before_fallback`, and `test_multi_line_pitch_to_blocklinear_tries_buffer_to_image_before_fallback`.
+- `cargo test -p video_core maxwell_dma -- --nocapture`
+- `cargo check -p video_core --quiet`
+- `cargo fmt --all --check`
+- `git diff --check`
+
+## 2026-06-14 — video_core/src/engines/maxwell_dma.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_dma.{h,cpp}
+
+### Intentional differences
+- Rust still executes MaxwellDMA launches through `Engine::execute_pending(...)` and returns `PendingWrite` buffers, while upstream `MaxwellDMA::Launch()` writes immediately through `MemoryManager` / `GpuGuestMemoryScoped`. The new multi-line blocklinear paths preserve upstream source/destination byte transforms inside that existing command-processor bridge.
+- Rust calls `RasterizerInterface::{flush_region,invalidate_region}` around CPU fallback ranges because the current Rust rasterizer/cache split does not expose upstream `memory_manager.FlushCaching()` directly from this owner.
+
+### Unintentional differences (to fix)
+- Fixed: multi-line blocklinear-to-pitch launches now execute the upstream `CopyBlockLinearToPitch()` fallback: decode `src_params`, apply the upstream `FoldRight(... countr_zero ...)` bpp shift, calculate tiled source size with `CalculateSize(true, ...)`, and call `UnswizzleSubrect(...)` into the pitch-linear destination.
+- Fixed: multi-line pitch-to-blocklinear launches now execute the upstream `CopyPitchToBlockLinear()` fallback: decode `dst_params`, enforce upstream `block_size.width == 0` and `layer == 0` guards, calculate tiled destination size, and call `SwizzleSubrect(...)`.
+- Fixed: multi-line blocklinear-to-blocklinear launches now execute the upstream `CopyBlockLinearToBlockLinear()` fallback by unswizzling into an intermediate pitch buffer and swizzling into the destination tiled image.
+- Fixed: `dst_params` and `src_params` are now decoded at upstream register positions `0x70C` and `0x728` with the same `DMA::Parameters` field order used by `maxwell_dma.h`.
+
+### Missing items
+- Backend `AccelerateDMAInterface::{BufferCopy,BufferClear,ImageToBuffer,BufferToImage}` remains unported in the Rust rasterizer interface, so these MaxwellDMA paths always use the CPU fallback instead of trying the upstream accelerated path first.
+- Move MaxwellDMA launch execution out of the `PendingWrite` bridge and back into an upstream-shaped immediate `MemoryManager` owner once command-processor memory ownership permits it.
+- Full raw `Regs` struct layout parity is still incomplete; this pass adds only the parameter/register decoding needed by the blocklinear DMA paths.
+
+### Binary layout verification
+- Incomplete for full `MaxwellDMA::Regs`: Rust still stores raw register words rather than a `repr(C)` mirror. PASS for newly decoded fields: `dst_params` starts at method `0x1C3` (`0x70C / 4`), `src_params` starts at method `0x1CA` (`0x728 / 4`), and each `DMA::Parameters` field is decoded as six consecutive `u32` words matching upstream `BlockSize,width,height,depth,layer,Origin`.
+
+### Verification
+- Re-read upstream `MaxwellDMA::Launch()`, `CopyBlockLinearToPitch()`, `CopyPitchToBlockLinear()`, `CopyBlockLinearToBlockLinear()`, and the `Regs` register offsets in `maxwell_dma.{h,cpp}`.
+- Re-read Rust `MaxwellDMA::{dst_params,src_params,copy_blocklinear_to_pitch,copy_pitch_to_blocklinear,copy_blocklinear_to_blocklinear,execute_pending}` after the edit.
+- Added `test_multi_line_blocklinear_to_pitch_unswizzles_subrect`, `test_multi_line_pitch_to_blocklinear_swizzles_subrect`, and `test_multi_line_blocklinear_to_blocklinear_deswizzles_then_reswizzles`.
+- `cargo test -p video_core maxwell_dma -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `git diff --check`
+
+## 2026-06-14 — video_core/src/texture_cache/{texture_cache.rs,texture_cache_base.rs} and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still splits upstream `TextureCache<P>::JoinImages(...)` across the common `TextureCacheBase` and `OpenGL::TextureCache::finish_pending_join_copies_impl(...)` because backend `RefreshContents`, `CopyImage`, rescale materialization, and backend image registration are owned by the OpenGL wrapper.
+- `PendingJoinCopies::alias_relations_applied` is a Rust bridge flag for that split. Upstream has no equivalent because it creates alias/overlap relations synchronously inside `JoinImages`.
+
+### Unintentional differences (to fix)
+- Fixed: pending-join alias and bad-overlap relations are now applied immediately after inserting the new image in `TextureCacheBase::join_images(...)`, before the queued backend copy/delete tail. This matches upstream ordering, where `JoinImages` calls `RefreshContents`, rescales, sorts `join_copies_to_do`, then creates `join_alias_indices`/overlap relations before iterating copies.
+- Fixed: `OpenGL::TextureCache::finish_pending_join_copies_impl(...)` no longer reapplies those relations when they were already applied by the common join path, avoiding duplicate alias/overlap edges.
+
+### Missing items
+- Collapse the backend pending-join tail back into an upstream-shaped `TextureCache<P>::JoinImages(...)` owner once backend upload/copy/registration ownership is no longer split.
+
+### Binary layout verification
+- N/A: host texture-cache metadata only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages(...)` in `texture_cache.h`; alias relations are created before `CopyImage`/delete tail and before final `RegisterImage(new_image_id)`.
+- Re-read Rust `TextureCacheBase::join_images(...)`, `PendingJoinCopies`, and `OpenGL::TextureCache::finish_pending_join_copies_impl(...)` after the edit.
+- Added `join_images_applies_pending_alias_relations_before_backend_tail`.
+- `cargo test -p video_core join_images_applies_pending_alias_relations_before_backend_tail -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still updates render targets from a `Maxwell3DRenderTargets` snapshot plus a GPU-to-CPU translation closure instead of reading `maxwell3d->regs`, dirty flags, and `gpu_memory` from one upstream-shaped `TextureCache<P>` owner. This entry only closes the common-base render-target size calculation gap.
+
+### Unintentional differences (to fix)
+- Fixed: `TextureCacheBase::update_render_targets_from_snapshot_with_dirty_flags(...)` now applies `common::settings::resolution_info.{up_scale,down_shift}` to `surface_clip` when `is_rescaling` is active, matching upstream `TextureCache<P>::UpdateRenderTargets(...)`. The Rust base previously stored the raw `surface_clip` size even in rescaled mode, so common callers and tests could observe a framebuffer key size that disagreed with upstream and with the OpenGL wrapper.
+
+### Missing items
+- `RescaleRenderTargets` / `UpdateRenderTargets` ownership remains split between the common base and `OpenGL::TextureCache`; the long-term parity target is still one upstream-shaped texture-cache owner that computes rescale state, prepares image views, and materializes framebuffers in the same method boundary.
+
+### Binary layout verification
+- N/A: host render-target cache metadata only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::UpdateRenderTargets(...)`; upstream sets `up_scale/down_shift` from `Settings::values.resolution_info` only when `is_rescaling` is true before assigning `render_targets.size`.
+- Re-read Rust `TextureCacheBase::update_render_targets_from_snapshot_with_dirty_flags(...)` and `OpenGL::TextureCache::update_rescaled_render_target_size(...)` after the edit.
+- Added `update_render_targets_from_snapshot_scales_render_target_size_when_rescaling`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/{gl_texture_cache.rs,gl_compute_pipeline.rs,gl_rasterizer.rs} vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still keeps the backend `PrepareImageView` body in `OpenGL::TextureCache` because `RefreshContents`, backend upload, alias synchronization, and backend image flags are not owned by the common `TextureCacheBase`.
+- The OpenGL wrappers now expose `fill_graphics_image_views_with_gpu_reader(...)` and `fill_compute_image_views_with_gpu_reader(...)` so runtime graphics/compute paths can preserve upstream ordering with the current Rust owner graph.
+
+### Unintentional differences (to fix)
+- Fixed: graphics and compute runtime paths no longer call `PrepareImageView` as a separate caller-side pass after `Fill*ImageViews`. The OpenGL `fill_*` wrappers now finish pending backend insertions/join tails and prepare filled image views inside the same wrapper loop that handles blacklist rescale retries, matching upstream `TextureCache<P>::VisitImageView(...)` where `PrepareImageView(image_view_id, false, false)` runs before `FillImageViews` returns.
+
+### Missing items
+- Collapse `TextureCacheBase::fill_image_views(...)` and OpenGL `PrepareImageView` into one upstream-shaped `TextureCache<P>` owner once backend image/upload ownership is no longer split.
+
+### Binary layout verification
+- N/A: texture-cache prepare/fill ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::FillGraphicsImageViews(...)`, `FillComputeImageViews(...)`, `FillImageViews(...)`, `VisitImageView(...)`, `PrepareImageView(...)`, and `PrepareImage(...)`; upstream prepares each non-null image view during descriptor filling and before blacklist retry completion.
+- Re-read Rust `OpenGL::TextureCache::{fill_graphics_image_views_impl,fill_compute_image_views_impl,prepare_filled_image_views_with_gpu_reader,prepare_filled_image_views_without_gpu_reader}`, `RasterizerOpenGL::draw(...)`, and `ComputePipeline::configure_resource_state(...)` after the edit.
+- `cargo check -p video_core --quiet`
+- A GL-free unit test was attempted and removed because constructing `OpenGL::TextureCache` calls unloaded GL entrypoints in the unit-test environment; runtime validation still needs an MK8D/OpenGL run.
+
+## 2026-06-14 — video_core/src/texture_cache/{texture_cache.rs,texture_cache_base.rs} and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still splits TIC `CreateImageView` between `TextureCacheBase` slot creation and the OpenGL backend wrapper because backend `Image`, `ImageView`, staging upload, and registration live outside the common base. The new `pending_backend_insertions` queue is a Rust bridge for inserted images that do not need the existing `pending_join_copies` tail.
+
+### Unintentional differences (to fix)
+- Fixed: TIC image-view creation with `backend_completes_join_images` no longer goes through direct `ImageId` helpers that can expose an inserted image before backend completion. `create_image_view_with_gpu_to_cpu(...)` now uses the explicit `FindOrInsertImageResult` path and queues inserted no-join-tail images for backend completion; the OpenGL wrapper drains those insertions before materializing GL views, refreshing CPU contents, scaling, registering the image, and registering image allocation.
+
+### Missing items
+- Collapse `CreateImageView` / `FindOrInsertImage` / `PrepareImageView` into one upstream-shaped texture-cache owner so the Rust-only `pending_backend_insertions` bridge is no longer needed.
+
+### Binary layout verification
+- N/A: texture-cache ownership/completion ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::VisitImageView(...)`, `FindImageView(...)`, `CreateImageView(...)`, and `FindOrInsertImage(...)`; upstream prepares image views only after `FindOrInsertImage` has returned a fully inserted/registered image.
+- Re-read Rust `TextureCacheBase::{create_image_view_with_gpu_to_cpu,create_image_view}` and `OpenGL::TextureCache::{finish_pending_join_copies,finish_pending_join_copies_with_gpu_reader,finish_pending_backend_insertions_impl}` after the edit.
+- `cargo test -p video_core fill_image_views_defers_backend_completion_for_inserted_tic_image -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still reaches `RefreshContents(new_image)` through `OpenGL::TextureCache::finish_pending_join_copies_impl(...)` because backend image upload/staging ownership remains split from `TextureCacheBase`. This entry only tightens the success predicate for the bound-channel reader path.
+
+### Unintentional differences (to fix)
+- Fixed: `refresh_contents_with_bound_gpu_reader(...)` now returns true only after `CPU_MODIFIED` has been cleared from the image. It previously returned true whenever a channel `gpu_memory` was bound, so `JoinImages` could continue past a failed refresh even though upstream `RefreshContents(new_image, new_image_id)` must complete before rescale, alias/copy/delete, and registration.
+
+### Missing items
+- Move `RefreshContents` / `UploadImageContents` into the upstream-shaped texture-cache owner/hook so `JoinImages` does not need an OpenGL-local bound-reader success predicate.
+
+### Binary layout verification
+- N/A: texture-cache refresh success predicate only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages(...)`, `RefreshContents(...)`, and `UploadImageContents(...)`; upstream refreshes the inserted image before continuing through rescale, alias/copy/delete, and final registration.
+- Re-read Rust `OpenGL::TextureCache::{finish_pending_join_copies_impl,refresh_contents_with_bound_gpu_reader,refresh_contents_with_gpu_reader}` after the edit.
+- `cargo test -p video_core refresh_contents_consumed_requires_cpu_modified_to_be_cleared -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Superseded by the 2026-06-14 top entry for `texture_cache.rs`: Rust no longer keeps the `GpuModified` ignored-overlap backend-resolved adaptation. That branch now stops like upstream after recording `.agents/texture_cache_unimplemented_state.md`. This historical entry only describes the non-`GpuModified` ignored-overlap ordering fix.
+
+### Unintentional differences (to fix)
+- Fixed: `TextureCacheBase::join_images(...)` now untracks, unregisters, and deletes non-`GpuModified` ignored overlaps before inserting the replacement image, matching upstream `TextureCache<P>::JoinImages(...)`. Rust previously inserted the new image first, then deleted ignored overlaps, which exposed an insertion/deletion order upstream does not have and prevented local `SlotVector` reuse from matching the upstream sequence.
+
+### Missing items
+- Continue collapsing the backend `JoinImages` tail so `RefreshContents`, backend copy, and final registration all run behind one upstream-shaped texture-cache owner. The ignored-overlap `GpuModified` branch is no longer a backend tail item; it stops like upstream.
+
+### Binary layout verification
+- N/A: texture-cache slot/lifecycle ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages(...)`; `join_ignore_textures` are processed before `slot_images.insert(runtime, new_info, gpu_addr, cpu_addr)`.
+- Re-read Rust `TextureCacheBase::join_images(...)` after the edit; non-`GpuModified` ignored overlaps are now removed before the new image is inserted. The later top entry replaces the old `GpuModified` deferred/preserved adaptation with an upstream-fatal stop.
+- `cargo test -p video_core join_images_ -- --nocapture`
+- Superseded test name/expectation: `backend_join_queues_gpu_modified_ignored_overlap_for_backend_resolution` was replaced by `backend_join_panics_on_gpu_modified_ignored_overlap_like_upstream`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust uses the existing `collect_images_in_region(...)` helper instead of duplicating upstream `ForEachImageInRegion(...)` inline. That helper already walks the same CPU page table, filters `ImageMapView` overlaps, and deduplicates image ids for the current Rust owner.
+
+### Unintentional differences (to fix)
+- Fixed: `TextureCacheBase::is_region_gpu_modified(...)` no longer returns `false` unconditionally. It now checks registered overlapping images and reports `true` when any carries `ImageFlagBits::GPU_MODIFIED`, matching upstream `TextureCache<P>::IsRegionGpuModified(...)`.
+
+### Missing items
+- None known for `IsRegionGpuModified` after this pass. Broader region traversal ownership remains tied to the existing Rust page-table helpers documented in earlier texture-cache entries.
+
+### Binary layout verification
+- N/A: texture-cache dirty-flag query only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::IsRegionGpuModified(...)` and `ForEachImageInRegion(...)`; upstream scans CPU-page-table image maps, filters overlaps, and returns true on the first `GpuModified` image.
+- Re-read Rust `TextureCacheBase::collect_images_in_region(...)` and `is_region_gpu_modified(...)` after the edit.
+- `cargo test -p video_core is_region_gpu_modified_checks_registered_overlapping_images -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- The common Rust `TextureCacheBase::{rescale_render_targets,update_render_targets,blit_image}` methods still cannot own upstream's full backend-dependent bodies because `ScaleUp` / `ScaleDown`, backend `PrepareImageView`, framebuffer/image blits, and render-target image-view materialization are still split into the OpenGL texture-cache wrapper.
+- These common-base methods now fail fast instead of returning `false` or doing nothing. Runtime paths must use the backend OpenGL render-target and Fermi2D wrappers until the upstream-shaped owner is restored.
+
+### Unintentional differences (to fix)
+- Fixed: `TextureCacheBase::rescale_render_targets(...)`, `update_render_targets(...)`, and `blit_image(...)` no longer silently continue through backend-less placeholders. The previous behavior could make a render-target update or Fermi2D blit look handled while skipping upstream's required image preparation, rescale, framebuffer, and backend blit work.
+
+### Missing items
+- Move `RescaleRenderTargets`, `UpdateRenderTargets`, and `BlitImage` behind an upstream-shaped common/backend hook so `TextureCacheBase` can become the real owner instead of guarding these direct common-base calls.
+
+### Binary layout verification
+- N/A: texture-cache control-flow guard only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::RescaleRenderTargets`, `UpdateRenderTargets`, and `BlitImage`; all three require backend image/view/framebuffer or rescale operations before they can report success.
+- Re-read Rust call sites; runtime OpenGL paths use `OpenGL::TextureCache::blit_image(...)` and snapshot render-target wrappers, and the direct common-base methods have no current runtime call sites.
+- `cargo test -p video_core common_ -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- The backend-less Rust `TextureCacheBase::prepare_image(...)` / `refresh_contents(...)` cannot perform upstream `RefreshContents -> UploadImageContents -> SynchronizeAliases` because backend `Image::UploadMemory`, staging buffers, and upload barriers still live in `OpenGL::TextureCache`.
+- These common-base methods now fail fast instead of logging and returning. Runtime OpenGL paths must use `OpenGL::TextureCache::{prepare_image_with_gpu_reader,prepare_image_without_gpu_reader}` so the backend wrapper preserves upstream ordering.
+
+### Unintentional differences (to fix)
+- Fixed: `TextureCacheBase::prepare_image(...)` and `refresh_contents(...)` no longer silently no-op when called without backend ownership. A silent return could expose an image as prepared while skipping upstream's required refresh/alias synchronization.
+
+### Missing items
+- Move `RefreshContents` / `UploadImageContents` behind an upstream-shaped common/backend hook so `TextureCacheBase::prepare_image(...)` can become the real owner again instead of a fail-fast guard.
+
+### Binary layout verification
+- N/A: texture-cache control-flow guard only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::PrepareImage`, `RefreshContents`, and `UploadImageContents`; upstream always refreshes CPU-modified contents and synchronizes aliases before optional modification marking.
+- Re-read Rust OpenGL wrappers `prepare_image_with_gpu_reader(...)` and `prepare_image_without_gpu_reader(...)`; runtime callers already use the backend wrapper, and direct common-base `prepare_image(...)` has no current call sites.
+- `cargo test -p video_core common_prepare_image_rejects_backendless_refresh_path -- --nocapture`
+- `cargo fmt --all --check`
+
+## 2026-06-14 — shader_recompiler/src/frontend/translate/texture_{fetch,gradient,load,mipmap_level,query}.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/texture_{fetch,gradient,load,mipmap_level,query}.cpp
+
+### Intentional differences
+- Rust uses `panic!` for upstream `NotImplementedException` paths in the Maxwell texture translators. This preserves the fail-fast behavior for unsupported ISA forms while using Rust's current error surface.
+
+### Unintentional differences (to fix)
+- None for the re-audited unsupported texture edge cases: `TEX.LC`, `TXD.LC`, `TLD.CL`, 3D-array texture types, `TMML` BA results, and unsupported `TXQ` modes all stop in upstream too.
+
+### Missing items
+- Continue auditing exact no-rewrite/error handling for texture translator paths not covered by this entry.
+
+### Binary layout verification
+- N/A: shader IR translation behavior only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `texture_fetch.cpp`, `texture_gradient.cpp`, `texture_load.cpp`, `texture_mipmap_level.cpp`, and `texture_query.cpp`; each named unsupported path throws `NotImplementedException`.
+- Re-read Rust `texture_fetch.rs`, `texture_gradient.rs`, `texture_load.rs`, `texture_mipmap_level.rs`, and `texture_query.rs`; the corresponding paths use `panic!`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- Rust still owns backend `ImageView` reuse through `ImageView::matches_base_image(...)` because backend views live in `OpenGL::TextureCache::image_views` rather than an upstream `SlotVector<ImageView>` typed exactly like `TextureCache<P>`.
+
+### Unintentional differences (to fix)
+- Fixed: `ImageView::matches_base_image(...)` now compares render-target slice views against the same effective `full_range` that upstream `OpenGL::ImageView::ImageView(...)` stores after seeing `ImageViewFlagBits::Slice`. Rust previously compared the backend view's transformed slice range against raw `ImageViewBase::range`, so a valid 2D slice view of a 3D image could look stale, forcing needless backend view/framebuffer removal.
+
+### Missing items
+- Broader framebuffer ownership is still split between `TextureCacheBase` and `OpenGL::TextureCache`; this pass only fixes the slice-view reuse guard used before framebuffer attachment.
+
+### Binary layout verification
+- N/A: OpenGL backend view-cache metadata only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `OpenGL::ImageView::ImageView(...)` in `gl_texture_cache.cpp`; for `ImageViewFlagBits::Slice`, upstream rewrites `full_range` to `{level, layer=0, levels=1, layers=1}` before `SetupView(Color3D)`.
+- Re-read Rust `ImageView::new_color_2d(...)` and `ImageView::matches_base_image(...)` after the edit; both now use the same `effective_full_range(...)` helper.
+- `cargo test -p video_core image_view_parent_guard_accepts_slice_effective_full_range -- --nocapture`
+- `cargo fmt --all --check`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still passes a `Maxwell3DRenderTargets` snapshot and a GPU-to-CPU translation closure through the current texture-cache/OpenGL bridge instead of reading `maxwell3d->regs` and `gpu_memory` directly from one upstream-shaped owner.
+- The closure now receives both `gpu_addr` and `guest_size` so the OpenGL bridge can perform the same two-step translation that upstream performs inside `FindImage(...)` / `InsertImage(...)`.
+
+### Unintentional differences (to fix)
+- Fixed: render-target discovery now computes `ImageInfo` before translating the render-target GPU address, passes `CalculateGuestSizeInBytes(info)` to the translation callback, and the OpenGL bound-memory bridge resolves `gpu_memory.GpuToCpuAddress(gpu_addr).or_else(|| gpu_memory.GpuToCpuAddress(gpu_addr, guest_size))`. Rust previously used only the start-address translation for render targets, so a partially mapped/sparse target whose first page was not mapped could be dropped even though upstream would find a mapped page within the image range.
+
+### Missing items
+- Broader `TextureCache<P>::UpdateRenderTargets(...)` / `RescaleRenderTargets(...)` ownership remains split between `TextureCacheBase` and `OpenGL::TextureCache`; this pass only fixes the render-target address translation fallback.
+
+### Binary layout verification
+- N/A: host texture-cache address resolution only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::FindImage(...)`, `InsertImage(...)`, `FindColorBuffer(...)`, `FindDepthBuffer(...)`, and `FindRenderTargetView(...)` in `texture_cache.h`; `FindImage` and `InsertImage` first call `GpuToCpuAddress(gpu_addr)` and then fall back to `GpuToCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info))`.
+- Re-read Rust `TextureCacheBase::update_render_targets_from_snapshot_with_dirty_flags(...)` and `OpenGL::TextureCache::update_render_targets_from_snapshot_with_bound_gpu_memory(...)` after the edit.
+- `cargo test -p video_core update_render_targets_from_snapshot_ -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/{format_lookup_table.rs,image_info.rs} vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/{format_lookup_table.cpp,image_info.cpp,samples_helper.h}
+
+### Intentional differences
+- Rust keeps the existing typed `pixel_format_from_texture_info(...)` wrapper for typed call sites and adds `pixel_format_from_texture_info_raw(...)` for TIC bitfield call sites. This avoids constructing invalid Rust enum values while preserving upstream raw-bit hash behavior.
+- Rust uses `panic!` for upstream `ASSERT_MSG(false, "Invalid MSAA mode=...")` fatal paths in `NumSamples`, `NumSamplesX`, and `NumSamplesY`.
+
+### Unintentional differences (to fix)
+- Fixed: `ImageInfo::from_tic_entry(...)` now hashes raw TIC `format` / component bit patterns through `pixel_format_from_texture_info_raw(...)`, matching upstream `PixelFormatFromTextureInfo(...)`. Rust previously decoded invalid component bits through enum fallbacks, which could convert malformed TIC descriptors into a different valid pixel format instead of upstream's hash miss fallback.
+- Fixed: `ImageInfo::from_tic_entry(...)` now stops on invalid TIC MSAA mode bits before computing sample counts. Rust previously mapped invalid MSAA modes to `Msaa1x1`, while upstream asserts in `NumSamples*`.
+
+### Missing items
+- None known for `ImageInfo::from_tic_entry(...)` malformed TIC format/component/MSAA decoding after the later texture-type guard audit. Broader texture-cache/OpenGL backend debts remain tracked in their own entries.
+
+### Binary layout verification
+- N/A: TIC decoding and host texture metadata only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `PixelFormatFromTextureInfo(...)` in `format_lookup_table.cpp`; it hashes raw enum bit patterns and its default logs `UNIMPLEMENTED_MSG` then returns `PixelFormat::A8B8G8R8_UNORM`.
+- Re-read upstream `NumSamples`, `NumSamplesX`, and `NumSamplesY` in `samples_helper.h`; every invalid MSAA mode path asserts before returning fallback `1`.
+- Re-read Rust `pixel_format_from_texture_info_raw(...)` and `ImageInfo::from_tic_entry(...)` after the edit.
+- `cargo test -p video_core texture_cache::image_info::tests:: -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/image_info.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/image_info.cpp
+
+### Intentional differences
+- Rust uses `panic!` / `assert_eq!` for upstream `ASSERT`, `ASSERT_MSG`, and `UNIMPLEMENTED_IF` fatal TIC validation paths.
+- Rust keeps `from_zeta_info(...)` as the real Zeta constructor name because the Rust Maxwell3D register snapshot type is `ZetaInfo`; the old `from_zeta(&(), &(), ...)` compatibility stub had no call sites and was removed.
+
+### Unintentional differences (to fix)
+- Fixed: `ImageInfo::from_tic_entry(...)` no longer silently maps invalid `texture_type` values to `Texture2D`; it now stops like upstream's `ASSERT_MSG(false, "Invalid texture_type=...")`.
+- Fixed: `ImageInfo::from_tic_entry(...)` now stops for non-2D pitch-linear TICs, Texture1D/Texture3D nonzero base layer, Texture1DArray nonzero base layer, Texture2D/Cubemap depth not equal to one, and TextureCubeArray nonzero `load_store_hint`, matching the upstream guards in `ImageInfo::ImageInfo(const TICEntry&)`.
+- Fixed: removed the obsolete `from_zeta(&(), &(), ...)` stub that returned `ImageInfo::default()`; current call sites already use `from_zeta_info(...)`.
+
+### Missing items
+- None known for TIC texture-type switch guards, malformed TIC format/component/MSAA raw decoding, or obsolete Zeta compatibility stubs after the later ImageInfo audits.
+
+### Binary layout verification
+- N/A: host texture metadata validation only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `ImageInfo::ImageInfo(const TICEntry&)` in `image_info.cpp`, especially the texture-type precondition, switch guards, and default invalid-type assertion.
+- Re-read Rust `ImageInfo::from_tic_entry(...)` after the edit and confirmed there are no remaining `from_zeta(...)` call sites.
+- `cargo test -p video_core texture_cache::image_info::tests:: -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still splits the common texture-cache owner (`texture_cache_base.rs`) from the OpenGL backend tail (`gl_texture_cache.rs`). This entry only covers the backend-completed `JoinImages` rescale ordering; the broader owner split remains tracked as existing structural debt.
+- Rust exposes the upstream `ImageCanRescale` decision as `image_can_rescale_base(...)` so the `JoinImages` rescale gate can be tested without constructing an OpenGL context. Runtime ownership remains in the OpenGL texture-cache path.
+
+### Unintentional differences (to fix)
+- Fixed: the OpenGL pending `JoinImages` tail now computes `can_rescale` from the new image metadata plus sibling `ImageCanRescale` / `Rescaled` state, scales sibling images before refreshing the inserted image, refreshes the inserted image, then scales the inserted image. This matches upstream `TextureCache<P>::JoinImages` lines where siblings are scaled before `RefreshContents(new_image, new_image_id)` and the new image is scaled after refresh.
+
+### Missing items
+- The Rust backend still drains a pending join tail after the common insertion path, while upstream performs the whole sequence inside `TextureCache<P>::JoinImages`. This is documented structural debt until the OpenGL backend/common ownership split is collapsed further.
+
+### Binary layout verification
+- N/A: texture-cache host ordering/flags only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages` in `texture_cache.h`, especially the `can_rescale` / `any_rescaled`, sibling `ScaleUp` / `ScaleDown`, `RefreshContents`, and new-image scale ordering.
+- Re-read Rust `finish_pending_join_copies_impl(...)`, `prepare_pending_join_sibling_rescale(...)`, `prepare_pending_join_sibling_rescale_gate(...)`, and `prepare_pending_join_new_image_rescale(...)` after the edit.
+- `cargo test -p video_core pending_join_sibling_rescale_matches_upstream_gate -- --nocapture`
+- `cargo fmt --all --check`
+
+## 2026-06-14 — video_core/src/texture_cache/image_info.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/image_info.cpp
+
+### Intentional differences
+- Rust uses `panic!` for upstream `UNIMPLEMENTED_IF_MSG` / `UNIMPLEMENTED` fatal paths in this constructor/helper slice.
+
+### Unintentional differences (to fix)
+- Fixed: `ImageInfo::from_fermi2d_surface(...)` now stops on `config.layer != 0`, matching upstream `UNIMPLEMENTED_IF_MSG(config.layer != 0, "Surface layer is not zero")`.
+- Fixed: `byte_size_to_format(...)` now stops on unsupported DMA bytes-per-pixel values instead of returning `PixelFormat::Invalid`, matching upstream `ByteSizeToFormat` where the default case calls `UNIMPLEMENTED()` before the fallback return.
+
+### Missing items
+- None known for the Fermi2D nonzero-layer fatal path or DMA byte-size fatal path after this pass.
+
+### Binary layout verification
+- N/A: fatal validation behavior only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `ImageInfo::ImageInfo(const Fermi2D::Surface&)` and `ByteSizeToFormat(...)` in `image_info.cpp`.
+- Re-read Rust `ImageInfo::from_fermi2d_surface(...)` and `byte_size_to_format(...)` after the edit.
+- `cargo test -p video_core texture_cache::image_info::tests:: -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/texture_cache/image_info.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/image_info.cpp
+
+### Intentional differences
+- Rust uses `crate::engines::fermi_2d::Surface` and `TilingMode::BlockLinear(...)` instead of C++ `Fermi2D::Surface` plus the anonymous `block` union member. Field ownership remains the upstream `ImageInfo(const Fermi2D::Surface&)` constructor.
+
+### Unintentional differences (to fix)
+- Fixed: the block-linear `from_fermi2d_surface(...)` branch now sets `rescaleable = block.depth == 0 && size.height > RescaleHeightThreshold` and `downscaleable = size.height > DownscaleHeightThreshold`, matching upstream. Rust previously left both flags at their default `false`, which could make Fermi2D blit/copy image metadata diverge from upstream texture-cache behavior.
+
+### Missing items
+- Fixed by the newer fatal-validation entry above: `config.layer != 0` now stops like upstream `UNIMPLEMENTED_IF_MSG`.
+
+### Binary layout verification
+- N/A: `ImageInfo` host metadata only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `ImageInfo::ImageInfo(const Fermi2D::Surface&)` in `image_info.cpp`.
+- Re-read Rust `ImageInfo::from_fermi2d_surface(...)` after the edit.
+- `cargo test -p video_core texture_cache::image_info::tests:: -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/engines/maxwell_dma.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_dma.h
+
+### Intentional differences
+- Rust places upstream `Tegra::DMA::{Origin,BlockSize,Parameters,ImageOperand,ImageCopy,BufferOperand}` in the local `maxwell_dma::dma` module instead of a C++ namespace. Field ownership remains in the upstream DMA engine file.
+- Rust models C++ bitfield unions as raw `u32` structs with accessor methods (`width`, `height`, `depth`, `gob_height`, `x`, `y`) so bit patterns are preserved without relying on Rust bitfield layout.
+
+### Unintentional differences (to fix)
+- None known for the ported DMA helper structs after this pass.
+
+### Missing items
+- The broader `MaxwellDMA` register block and accelerated DMA image-copy launch paths remain incomplete compared with upstream `maxwell_dma.{h,cpp}`; this entry only ports the DMA operand data structures needed by `ImageInfo`.
+
+### Binary layout verification
+- PASS for behavior-relevant bit patterns: C++ `Origin` and `BlockSize` are 32-bit bitfield unions and Rust stores the same raw `u32` plus accessors. Full `repr(C)` layout parity for `Parameters` / operands is not required yet because these Rust structs are not copied as raw guest payloads.
+
+### Verification
+- Re-read upstream `Tegra::DMA` structs in `maxwell_dma.h`.
+- Re-read Rust `maxwell_dma::dma` module after the edit; field ownership and bit extraction match upstream bitfield positions.
+- `cargo test -p video_core engines::maxwell_dma::tests:: -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/texture_cache/image_info.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/image_info.cpp
+
+### Intentional differences
+- Rust receives `crate::engines::maxwell_dma::dma::ImageOperand` instead of C++ `Tegra::DMA::ImageOperand`; the data structure is now ported in the upstream owner file.
+- Rust uses `TilingMode::BlockLinear(block)` instead of writing through the C++ anonymous `block` union member.
+
+### Unintentional differences (to fix)
+- Fixed: `ImageInfo::from_dma_operand(...)` no longer returns `ImageInfo::default()`. It now mirrors upstream `ImageInfo::ImageInfo(const Tegra::DMA::ImageOperand&)`: byte-size format mapping, 2D/3D type selection from `block_size.depth`, block and size fields, single level/layer resources, layer stride, unaligned layer size, rescaleable, and downscaleable.
+
+### Missing items
+- None known for `ImageInfo::from_dma_operand(...)` after the later TIC/MSAA/assert and compatibility-stub audits.
+
+### Binary layout verification
+- N/A: `ImageInfo` host metadata only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `ByteSizeToFormat(...)` and `ImageInfo::ImageInfo(const Tegra::DMA::ImageOperand&)` in `image_info.cpp`.
+- Re-read Rust `byte_size_to_format(...)` and `ImageInfo::from_dma_operand(...)` after the edit.
+- `cargo test -p video_core texture_cache::image_info::tests:: -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/texture_cache/image_info.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/image_info.cpp
+
+### Intentional differences
+- Rust factors the repeated upstream predicate `is_pitch_linear && !Settings::values.use_reactive_flushing.GetValue()` into the local helper `force_pitch_flush(...)`.
+- Rust keeps decoded `TilingMode` instead of upstream's anonymous union, and Rust enum names (`ImageType::Linear`, `ImageType::E2D`, `ImageType::E3D`) differ from C++ spelling only.
+
+### Unintentional differences (to fix)
+- None known for `forced_flushed` / `dma_downloaded` initialization after this pass. The broader `ImageInfo` constructor parity gaps below remain tracked by older entries.
+
+### Missing items
+- None known for the audited non-DMA `ImageInfo` constructor edge cases after re-reading current `from_tic_entry`, `from_render_target_info`, `from_zeta_info`, and `from_fermi2d_surface` against upstream.
+
+### Binary layout verification
+- N/A: host texture metadata flags only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `ImageInfo::{TICEntry,RenderTargetConfig,Zeta,Fermi2D::Surface}` constructors in `image_info.cpp`; all pitch-linear constructors set `forced_flushed` to pitch-linear AND NOT `use_reactive_flushing`, then copy it to `dma_downloaded`.
+- Re-read Rust `ImageInfo::{from_tic_entry,from_render_target_info,from_zeta_info,from_fermi2d_surface}`; all now use the same predicate through `force_pitch_flush(...)`.
+- Updated `render_target_info_decodes_pitch_linear_layout` to reflect the default Rust setting `use_reactive_flushing=true`.
+- `cargo test -p video_core texture_cache::image_info::tests:: -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `git diff --check`
+
+## 2026-06-14 — video_core/src/engines/maxwell_dma.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_dma.{h,cpp}
+
+### Intentional differences
+- Rust still executes pending DMA work from `Engine::execute_pending(...)` and returns `PendingWrite`, while upstream `MaxwellDMA::Launch()` writes through `MemoryManager` immediately. This is the existing Rust command-processor bridge and remains structural debt.
+- Rust has no `AccelerateDMAInterface::BufferCopy(...)` hook in this owner yet, so the single-line pitch/pitch path always uses the CPU fallback equivalent of upstream's `GpuGuestMemoryScoped` copy.
+- Rust uses `RasterizerInterface::{flush_region,invalidate_region}` around the CPU fallback to preserve the cache intent of upstream `memory_manager.FlushCaching()` with the current texture/cache ownership split.
+
+### Unintentional differences (to fix)
+- Fixed: single-line, non-remap, pitch-kind source to pitch-kind destination MaxwellDMA launches now copy `line_length_in` bytes from `offset_in` to `offset_out`. Rust previously recorded every single-line launch as unsupported and returned no write.
+- Fixed: single-line launches no longer require `line_count != 0`. Upstream's single-line branch ignores `regs.line_count`; Rust previously returned early when `line_count == 0` before reaching the single-line branch.
+- Fixed: single-line layout selection now uses `MemoryManager::GetPageKind(...)` / `IsPitchKind(...)`, matching upstream, instead of launch `src_memory_layout` / `dst_memory_layout` bits.
+
+### Missing items
+- Port single-line remap-constant clear (`remap_enable && dst_x == CONST_A`) including `BufferClear` acceleration and `WriteBlockUnsafe` fallback.
+- Port single-line pitch/blocklinear address conversion paths using upstream `convert_linear_2_blocklinear_addr(...)` and the 16-byte alignment preconditions.
+- Port `AccelerateDMAInterface::{BufferCopy,BufferClear,ImageToBuffer,BufferToImage}` ownership so MaxwellDMA can try backend accelerated paths before CPU fallback.
+- Fixed by later MaxwellDMA entries: release-semaphore behavior is now ported for successful launches, including zero-length and backend-accelerated no-`PendingWrite` completions.
+- Full blocklinear multi-line paths remain tracked by the earlier MaxwellDMA entry.
+
+### Binary layout verification
+- Incomplete: this pass uses already-ported launch bit accessors and `MemoryManager` page-kind state. Full `Regs`, `LaunchDMA`, `RemapConst`, and semaphore raw layout parity is still not represented as upstream-shaped packed structs.
+
+### Verification
+- Re-read upstream `MaxwellDMA::Launch()` single-line branch in `maxwell_dma.cpp`, including remap clear, page-kind selection, pitch/blocklinear branches, `BufferCopy`, and CPU fallback.
+- Re-read upstream `MemoryManager::GetPageKind(...)` and `IsPitchKind(...)` ownership.
+- Re-read Rust `MaxwellDMA::execute_pending(...)`, `page_kind_is_pitch(...)`, and tests after the edit.
+- `cargo test -p video_core maxwell_dma -- --nocapture`
+- `cargo fmt --all --check`
+
+## 2026-06-14 — video_core/src/engines/maxwell_dma.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_dma.{h,cpp}
+
+### Intentional differences
+- Rust still executes this launch from `Engine::execute_pending(...)` and returns a `PendingWrite`, while upstream `MaxwellDMA::Launch()` calls `accelerate.BufferClear(...)` and then `memory_manager.WriteBlockUnsafe(...)` immediately.
+- Rust does not yet expose `AccelerateDMAInterface::BufferClear(...)`; the CPU fallback payload is always produced. The guest-visible write pattern matches upstream's fallback: `line_length_in` little-endian `u32` words filled with `remap_consta_value`.
+- Rust invalidates the destination rasterizer region around the pending write because the current command-processor bridge applies the write later. Upstream writes through `MemoryManager` immediately after the optional accelerated clear.
+
+### Unintentional differences (to fix)
+- Fixed: single-line launches with `remap_enable != 0` and `remap_const.dst_x == CONST_A` now perform the upstream constant clear instead of stopping every remap-enabled launch as unsupported.
+- Fixed: Rust now decodes `RemapConst` fields at upstream offset `0x700` (`remap_consta_value` at method `0x1C0`, `dst_x` / `component_size_minus_one` at method `0x1C2`) and enforces upstream's `component_size_minus_one == 3` assertion for this path.
+
+### Missing items
+- Add the backend `AccelerateDMAInterface::BufferClear(...)` hook before the CPU fallback.
+- Single-line pitch/blocklinear conversion paths using upstream `convert_linear_2_blocklinear_addr(...)` remain unported.
+- Non-CONST_A remap component rewrite behavior is still not audited beyond the upstream single-line raw-copy fallthrough.
+- Fixed by later MaxwellDMA entries: `ReleaseSemaphore()` behavior is now ported after successful DMA launches.
+- Full blocklinear multi-line paths remain tracked by the earlier MaxwellDMA entries.
+
+### Binary layout verification
+- Incomplete: `RemapConst` is still decoded from raw register words rather than represented as the upstream 12-byte struct. Field bit positions and register offsets used in this pass match upstream `ASSERT_REG_POSITION(remap_const, 0x700)` and `RemapConst` bitfields.
+
+### Verification
+- Re-read upstream `MaxwellDMA::Launch()` single-line remap clear branch in `maxwell_dma.cpp`.
+- Re-read upstream `RemapConst` and `ASSERT_REG_POSITION(remap_const, 0x700)` in `maxwell_dma.h`.
+- Re-read Rust `MaxwellDMA::{remap_consta_value,remap_components,remap_dst_x,remap_component_size_minus_one,execute_pending}` after the edit.
+- `cargo test -p video_core maxwell_dma -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `git diff --check`
+
+## 2026-06-14 — video_core/src/engines/maxwell_dma.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_dma.cpp
+
+### Intentional differences
+- Rust still returns `PendingWrite` objects from `Engine::execute_pending(...)`; upstream performs the writes immediately through `GpuGuestMemoryScoped` in `MaxwellDMA::Launch()`.
+- For single-line pitch-to-blocklinear, Rust returns one `PendingWrite` per 16-byte converted destination chunk. This preserves the upstream address sequence while fitting the current command-processor writeback bridge.
+- Unaligned single-line pitch/blocklinear copies still record an unsupported runtime state and stop. Upstream uses `UNIMPLEMENTED_IF` for the same `line_length_in`, `offset_in`, and `offset_out` 16-byte alignment preconditions.
+
+### Unintentional differences (to fix)
+- Fixed: single-line blocklinear-to-pitch launches now use upstream's `convert_linear_2_blocklinear_addr(...)` on each 16-byte source chunk and write contiguous pitch output.
+- Fixed: single-line pitch-to-blocklinear launches now read contiguous pitch input and write each 16-byte chunk to the upstream converted destination address.
+- Fixed: Rust no longer treats every single-line pitch/blocklinear page-kind combination as unsupported when the upstream 16-byte preconditions are satisfied.
+
+### Missing items
+- Add backend `AccelerateDMAInterface::BufferCopy(...)` so single-line pitch/pitch can try the accelerated path before CPU fallback.
+- Add backend `AccelerateDMAInterface::BufferClear(...)` for the CONST_A clear path.
+- Non-CONST_A remap component rewrite behavior is still not audited beyond upstream's current fallthrough.
+- Fixed by later MaxwellDMA entries: `ReleaseSemaphore()` behavior is now ported after successful DMA launches.
+- Full blocklinear multi-line paths remain tracked by the earlier MaxwellDMA entries.
+
+### Binary layout verification
+- N/A for new guest-visible struct layout: this pass only ports the single-line address transform and uses existing raw register accessors. Full `Regs` struct layout remains incomplete as documented in the earlier MaxwellDMA entries.
+
+### Verification
+- Re-read upstream `MaxwellDMA::Launch()` single-line pitch/blocklinear branches in `maxwell_dma.cpp`.
+- Re-read Rust `convert_linear_2_blocklinear_addr(...)` and the single-line page-kind branch in `MaxwellDMA::execute_pending(...)` after the edit.
+- `cargo test -p video_core maxwell_dma -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `git diff --check`
+
+## 2026-06-14 — video_core/src/engines/maxwell_dma.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_dma.{h,cpp}
+
+### Intentional differences
+- Rust calls `release_semaphore()` from successful `Engine::execute_pending(...)` paths before returning `PendingWrite` objects. Upstream calls `ReleaseSemaphore()` after immediate `MemoryManager` writes. This preserves the launch completion ordering inside the current Rust pending-write bridge but is not full structural parity.
+- If no rasterizer is bound, Rust cannot issue the query and the optional raw-pointer bridge no-ops. Upstream assumes `rasterizer` is bound before DMA launch. Runtime channel binding should still provide the rasterizer in normal execution.
+
+### Unintentional differences (to fix)
+- Fixed: successful MaxwellDMA launches now perform upstream `ReleaseSemaphore()` behavior for `RELEASE_ONE_WORD_SEMAPHORE` by issuing a `QueryType::Payload` query with `QueryPropertiesFlags::IS_A_FENCE`.
+- Fixed: `RELEASE_FOUR_WORD_SEMAPHORE` now adds `QueryPropertiesFlags::HAS_TIMEOUT`, matching upstream.
+- Fixed: `Semaphore::PackedGPUVAddr` decoding masks the upper word with `0xff`, matching upstream `PackedGPUVAddr::operator GPUVAddr()`.
+- Fixed: unknown launch semaphore type now stops with a fatal panic instead of being silently ignored.
+
+### Missing items
+- Move MaxwellDMA launch execution out of the `PendingWrite` bridge and back into an upstream-shaped immediate `MemoryManager` owner once command-processor memory ownership permits it.
+- Backend `AccelerateDMAInterface::{BufferCopy,BufferClear,ImageToBuffer,BufferToImage}` remains unported.
+- Full blocklinear multi-line paths remain tracked by the earlier MaxwellDMA entries.
+
+### Binary layout verification
+- Incomplete: semaphore fields are decoded from raw register words at upstream offsets `0x240` / `0x244` / `0x248`, but `Semaphore` is not yet represented as the upstream 12-byte struct. The bit/offset behavior used here matches `ASSERT_REG_POSITION(semaphore, 0x240)` and `PackedGPUVAddr`.
+
+### Verification
+- Re-read upstream `MaxwellDMA::ReleaseSemaphore()` in `maxwell_dma.cpp`.
+- Re-read upstream `Semaphore`, `PackedGPUVAddr`, `LaunchDMA::SemaphoreType`, and `ASSERT_REG_POSITION(semaphore, 0x240)` in `maxwell_dma.h`.
+- Re-read Rust `MaxwellDMA::{semaphore_addr,semaphore_payload,launch_semaphore_type,release_semaphore,execute_pending}` after the edit.
+- `cargo test -p video_core maxwell_dma -- --nocapture`
+- `cargo build --bin ruzu-cmd`
+
+## 2026-06-14 — video_core/src/texture_cache/util.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/util.cpp
+
+### Intentional differences
+- Rust keeps `ImageType::E3D` / `ImageInfo::image_type` naming and `Option` returns in place of upstream `ImageType::e3D` / `std::optional`; the `IsSubCopy` control flow and integer expression now match upstream.
+- Rust uses `assert_ne!(info.layer_stride, 0)` for upstream `ASSERT(info.layer_stride != 0)` in `CalculateGuestSizeInBytes` when a block-linear image has multiple layers.
+- Rust factors upstream `NumBlocksPerLayer(...)` as a private helper because `CalculateUnswizzledSizeBytes(...)` and `CalculateConvertedSizeBytes(...)` both use it.
+
+### Unintentional differences (to fix)
+- None known for `IsSubCopy`, `CalculateGuestSizeInBytes`, `CalculateUnswizzledSizeBytes`, or `CalculateConvertedSizeBytes` after this pass. The broader `JoinImages` / `ResolveOverlap` owner split remains tracked by the texture-cache entries below.
+
+### Missing items
+- Continue completing `JoinImages` / `ResolveOverlap` parity so every alias relationship required by upstream is created before `SynchronizeAliases`.
+
+### Binary layout verification
+- N/A: texture-cache overlap math only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `IsSubCopy(...)` and neighboring `FindSubresource(...)` depth checks in `util.cpp`; upstream uses `existing.size.depth << base->level`.
+- Re-read Rust `is_sub_copy(...)`, `find_subresource(...)`, and `resolve_overlap_right_address_3d(...)`; `is_sub_copy` now uses the same upstream mip-depth expansion as the other 3D overlap helpers.
+- Re-read upstream `CalculateGuestSizeInBytes(...)`; upstream handles `Buffer`, then `Linear` with height divided by default block height, then layered block-linear images as `layer_stride * layers`, otherwise `CalculateLayerSize(info)`.
+- Re-read Rust `calculate_guest_size_in_bytes(...)`; it now follows the same ordering and size formulas.
+- Re-read upstream `CalculateUnswizzledSizeBytes(...)`; upstream uses block-height rows for linear images and `NumBlocksPerLayer(info, DefaultBlockSize(info.format)) * layers * BytesPerBlock(format)` for block-linear images.
+- Re-read upstream `CalculateConvertedSizeBytes(...)`; upstream handles `Buffer`, ASTC recompression, then `NumBlocksPerLayer(info, {1, 1}) * layers * ConvertedBytesPerBlock(format)`.
+- Re-read Rust `calculate_unswizzled_size_bytes(...)` and `calculate_converted_size_bytes(...)`; both now use the upstream formulas.
+- Added `is_sub_copy_3d_uses_upstream_mip_depth_expansion`.
+- Added `calculate_guest_size_uses_layer_stride_for_layered_images`.
+- Added `calculate_guest_size_linear_uses_block_height_rows`.
+- Added `calculate_unswizzled_size_linear_uses_block_height_rows`.
+- Added `calculate_converted_size_uses_converted_bytes_per_texel`.
+- `cargo test -p video_core is_sub_copy_3d_uses_upstream_mip_depth_expansion -- --nocapture`
+- `cargo test -p video_core texture_cache::util::tests:: -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `git diff --check`
+- `cargo build --bin ruzu-cmd`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still exposes `FindOrInsertImageResult` for the current common/OpenGL split. OpenGL callers must inspect `needs_backend_completion` / `queued_join_tail` and finish `RefreshContents`, rescale, copy/delete, registration, and image-allocation registration before treating the returned `ImageId` as upstream-complete.
+- Direct common helpers that only return `ImageId` now assert when `backend_completes_join_images` is enabled. This prevents new backend-owning call sites from bypassing the explicit completion contract and observing an inserted image before upstream `JoinImages` would have finished.
+
+### Unintentional differences (to fix)
+- The completion contract is still split between `TextureCacheBase` and `OpenGL::TextureCache`; upstream `TextureCache<P>::FindOrInsertImage(...)` returns only after `InsertImage(...)` / `JoinImages(...)` have fully completed in one owner.
+
+### Missing items
+- Collapse backend completion into one upstream-shaped texture-cache owner/hook so `FindOrInsertImage` no longer needs a Rust-only result contract or direct-helper guards.
+
+### Binary layout verification
+- N/A: texture-cache ownership/API guard only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::FindOrInsertImage(...)` and `TextureCache<P>::InsertImage(...)`; upstream returns `ImageId` only after `JoinImages(...)` and image-allocation registration.
+- Re-read Rust `TextureCacheBase::{find_or_insert_image,insert_image,find_or_insert_image_from_info,find_or_insert_image_from_info_with_options,find_or_insert_image_from_info_with_options_result}` and OpenGL callers that use the explicit result path.
+- Added `backend_completed_join_rejects_direct_find_or_insert_helper`.
+- Added `backend_completed_join_keeps_explicit_result_path_available`.
+- `cargo fmt --all --check`
+- `cargo test -p video_core backend_completed_join_ -- --nocapture`
+- `cargo check -p video_core --quiet`
+- `git diff --check`
+- `cargo build --bin ruzu-cmd`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust keeps OpenGL `RefreshContents` in `OpenGL::TextureCache::refresh_contents_with_gpu_reader(...)` because backend `Image::UploadMemory`, staging buffers, async decode, and upload barriers still live in the OpenGL texture-cache owner rather than the common `TextureCacheBase`.
+- Upstream clears `ImageFlagBits::CpuModified` before upload because `TextureCache<P>` owns a valid `gpu_memory` reader. Rust's reader is caller-provided or channel-bound; if that reader cannot supply guest bytes, the OpenGL bridge now restores the retry state (`CPU_MODIFIED` set, `TRACKED` clear) instead of making a failed upload look clean.
+
+### Unintentional differences (to fix)
+- `RefreshContents`, `UploadImageContents`, async decode queueing, staging upload, and `runtime.InsertUploadMemoryBarrier()` remain split out of the common `TextureCache<P>` owner.
+
+### Missing items
+- Collapse `RefreshContents` / `UploadImageContents` into the upstream-shaped texture-cache owner once backend `Image` resources and channel `gpu_memory` ownership are no longer split across common/OpenGL wrappers.
+
+### Binary layout verification
+- N/A: texture-cache dirty/track state only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::RefreshContents(...)` and `TextureCache<P>::UploadImageContents(...)` in `texture_cache.h`.
+- Re-read Rust `OpenGL::TextureCache::refresh_contents_with_gpu_reader(...)` and `upload_image_contents_with_gpu_reader(...)`.
+- Fixed failed read/upload handling so a missing Rust GPU reader does not consume `CPU_MODIFIED` or track the image before contents are uploaded.
+- Added `refresh_contents_retry_state_preserves_cpu_modified_and_untracked_state`.
+- `cargo fmt --all --check`
+- `cargo test -p video_core refresh_contents_retry_state_preserves_cpu_modified_and_untracked_state -- --nocapture`
+- `cargo check -p video_core --quiet`
+- `git diff --check`
+- `cargo build --bin ruzu-cmd`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still uses `update_render_targets_from_snapshot_with_dirty_flags(...)` as a bridge because the current draw path snapshots `Maxwell3D` render-target registers instead of letting `TextureCache` own a live upstream-shaped `maxwell3d` pointer.
+- Rust keeps optional `RUZU_TRACE_RT` logging around GPU-to-CPU translation misses; upstream has no equivalent diagnostic output.
+
+### Unintentional differences (to fix)
+- Broader `TextureCache<P>::UpdateRenderTargets(...)` / `RescaleRenderTargets(...)` ownership remains split between the common texture cache and OpenGL-specific framebuffer preparation instead of living in one upstream-shaped owner.
+
+### Missing items
+- None for the zeta translation-miss clearing behavior fixed in this pass.
+- Still need to finish the broader render-target update ownership split tracked by earlier texture-cache entries.
+
+### Binary layout verification
+- N/A: render-target image-view binding state only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::RescaleRenderTargets(...)`, `TextureCache<P>::UpdateRenderTargets(...)`, and `TextureCache<P>::BindRenderTarget(...)` in `texture_cache.h`.
+- Re-read Rust `TextureCacheBase::update_render_targets_from_snapshot_with_dirty_flags(...)` after the edit.
+- Fixed zeta/depth translation miss handling so `depth_buffer_id` is cleared regardless of `RUZU_TRACE_RT`, matching upstream `BindRenderTarget(&render_targets.depth_buffer_id, FindDepthBuffer())` when `FindDepthBuffer()` returns a null view.
+- Added `update_render_targets_from_snapshot_clears_depth_on_zeta_translation_miss_without_trace`.
+- `cargo fmt --all --check`
+- `cargo test -p video_core update_render_targets_from_snapshot_clears_depth_on_zeta_translation_miss_without_trace -- --nocapture`
+- `cargo check -p video_core --quiet`
+- `git diff --check`
+- `cargo build --bin ruzu-cmd`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_rasterizer.rs, video_core/src/renderer_opengl/gl_graphics_pipeline.rs, video_core/src/engines/draw_manager.rs, video_core/src/engines/maxwell_3d.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.{h,cpp}
+
+### Intentional differences
+- `RasterizerOpenGL::draw(...)` now owns the Rust bridge for upstream `RasterizerOpenGL::BeginTransformFeedback(...)` / `EndTransformFeedback(...)`: it checks the draw view's `transform_feedback_enabled` snapshot, calls `GraphicsPipeline::configure_transform_feedback()` after `sync_state(...)`, emits `glBeginTransformFeedback(...)` immediately before the draw, and emits `glEndTransformFeedback()` after the draw.
+- Rust exposes `regs.transform_feedback_enabled != 0` through `Maxwell3DAccess` / `Maxwell3DDrawView` because the current draw path uses a live-or-snapshot Maxwell view instead of upstream's direct `maxwell3d->regs` pointer inside `RasterizerOpenGL`.
+- Rust exposes upstream `regs.IsShaderConfigEnabled(ShaderType)` through `Maxwell3D::shader_config_enabled(...)`, `Maxwell3DAccess`, and `Maxwell3DDrawView` so the transform-feedback tessellation assertion reads the same pipeline enable bits from either live Maxwell state or a draw snapshot. `VertexB` keeps upstream's always-enabled rule.
+- `GraphicsPipeline::configure_transform_feedback()` remains the Rust counterpart to upstream `GraphicsPipeline::ConfigureTransformFeedback() const`; the call now lives at the upstream rasterizer boundary instead of inside `GraphicsPipeline::configure(...)`.
+
+### Unintentional differences (to fix)
+- Full `RasterizerOpenGL::PrepareDraw(...)` method ownership remains split: ruzu still performs the prepare/draw sequence inside `RasterizerOpenGL::draw(...)` rather than a dedicated `PrepareDraw` helper with `BeginTransformFeedback(...)` / `EndTransformFeedback(...)` methods.
+
+### Missing items
+- Split the transform-feedback begin/end bridge into dedicated Rust methods when the broader `PrepareDraw(...)` ownership is rebuilt.
+
+### Binary layout verification
+- N/A: OpenGL draw-call ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `RasterizerOpenGL::PrepareDraw`, `RasterizerOpenGL::BeginTransformFeedback`, and `RasterizerOpenGL::EndTransformFeedback` in `gl_rasterizer.cpp`.
+- Re-read upstream `Maxwell3D::Regs::IsShaderConfigEnabled(...)` in `maxwell_3d.h`.
+- Re-read upstream `GraphicsPipeline::Configure`, `GraphicsPipeline::ConfigureTransformFeedback`, and `GraphicsPipeline::ConfigureTransformFeedbackImpl` in `gl_graphics_pipeline.h/cpp`.
+- Re-read Rust `RasterizerOpenGL::draw(...)`, `GraphicsPipeline::{configure,configure_transform_feedback}`, `Maxwell3DAccess`, `Maxwell3DDrawRegisters`, `Maxwell3DDrawView`, and `Maxwell3D`'s trait implementation after the edit.
+- Added `configure_does_not_configure_transform_feedback`.
+- Added `transform_feedback_configure_order_matches_upstream`.
+- Added `shader_config_enabled_matches_upstream_vertexb_and_enable_bit`.
+- Added `maxwell_draw_view_shader_config_enabled_uses_snapshot`.
+- `cargo fmt --all --check`
+- `cargo test -p video_core configure_does_not_configure_transform_feedback -- --nocapture`
+- `cargo test -p video_core shader_config_enabled_matches_upstream_vertexb_and_enable_bit -- --nocapture`
+- `cargo test -p video_core maxwell_draw_view_shader_config_enabled_uses_snapshot -- --nocapture`
+- `cargo test -p video_core transform_feedback_configure_order_matches_upstream -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- The equivalent of upstream `GraphicsPipeline::ConfigureImpl(...)` still lives inside `RasterizerOpenGL::draw(...)` because ruzu has not yet moved live `Maxwell3D`, `TextureCache`, `BufferCache`, and `ProgramManager` ownership into an upstream-shaped `GraphicsPipeline` owner. Within that current owner, the buffer-cache/program-bind ordering now mirrors the upstream sequence for this slice.
+- Rust uses closure-based GPU-address readers around the channel `MemoryManager` mutex, while upstream reads through raw `gpu_memory` pointers owned by `GraphicsPipeline`.
+
+### Unintentional differences (to fix)
+- `GraphicsPipeline::ConfigureImpl(...)` ownership remains split: descriptor collection, render-target update, framebuffer bind, program bind, buffer-cache update/bind, and texture/image binding still execute from `gl_rasterizer.rs` instead of `gl_graphics_pipeline.rs`.
+
+### Missing items
+- Move the remaining `ConfigureImpl(...)` body into `gl_graphics_pipeline.rs` with the same cache/program/state-tracker member ownership as upstream.
+- Restore an upstream-shaped home for any still-useful disabled-by-default CBUF diagnostics; the late post-texture UBO mutation/trace block was removed because upstream has no second UBO binding pass after `glBindTextures`.
+
+### Binary layout verification
+- N/A: OpenGL host buffer/texture binding order only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `OpenGL::GraphicsPipeline::ConfigureImpl(...)` in `gl_graphics_pipeline.cpp`: `BindGraphicsUniformBuffer` state is established before `UpdateGraphicsBuffers`; `BindHostGeometryBuffers` happens before `ProgramManager::BindSourcePrograms(...)` / `BindAssemblyPrograms(...)`; `SetImagePointers` wraps `BindHostStageBuffers`; and only then does upstream call `glBindTextures` / `glBindSamplers` / `glBindImageTextures`.
+- Re-read Rust `RasterizerOpenGL::draw(...)` after the edit: UBO channel-state writes now happen before `update_graphics_buffers_with_gpu_resolver(...)`; `bind_host_geometry_buffers(...)` now happens before `pipeline.configure(is_indexed)` program binding; `set_image_pointers(...)` and `bind_host_stage_buffers(...)` run before the final texture/image bind calls; the old second UBO/update/bind path after the descriptor block is gone.
+- Updated `graphics_configure_buffer_binding_order_matches_upstream`.
+- `cargo test -p video_core graphics_configure_buffer_binding_order_matches_upstream -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo build --bin ruzu-cmd`
+- MK8D runtime probe via `/tmp/ruzu-run.sh` wrote `screenshots/tmp/mk8d-20260614-graphics-configure-order.log` and present PPMs under `screenshots/tmp`; no `ruzu-cmd` process remained after timeout cleanup. `AccelerateDisplay` continued to hit valid present textures, but the dumped source/present readbacks stayed RGB-black (`PRESENT_DISPLAY_PPM ... rgb_nonzero=0`, `PRESENT_READBACK ... rgb=0 ... gl_error=0x0`). This confirms the remaining visual failure is still before final present, likely in render-target/texture-cache/pipeline content generation rather than SDL swap or blit-screen presentation.
+- Follow-up MK8D runtime probe after moving `pipeline.configure(is_indexed)` to the upstream program-bind point wrote `screenshots/tmp/mk8d-20260614-program-bind-order.log`; no `ruzu-cmd` process remained after timeout cleanup. Present textures still read back RGB-black (`PRESENT_DISPLAY_PPM ... rgb_nonzero=0`, `PRESENT_READBACK ... rgb=0 ... gl_error=0x0`), so the remaining symptom is not caused solely by the earlier Rust program-bind order.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_blit_screen.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_blit_screen.cpp
+
+### Intentional differences
+- Rust stores non-owning `RasterizerOpenGL`, `StateTracker`, and `Device` references as raw pointers because `RendererOpenGL` owns those members and Rust cannot model the same C++ reference-member graph directly.
+- Rust maps the frontend `PresentFilters` enum through `to_opengl_scaling_filter(...)` before creating the `WindowAdaptPass`; upstream already uses the OpenGL present filter enum from settings.
+- `GL_ALPHA_TEST` is declared locally as `0x0BC0` because the generated `gl` crate does not expose the compatibility enum, while upstream calls `glDisable(GL_ALPHA_TEST)` in the present-state reset sequence.
+
+### Unintentional differences (to fix)
+- `WindowAdaptPass` still owns and binds a Rust-created VAO for present draws. Upstream configures the current vertex array state directly in `WindowAdaptPass::DrawToFramebuffer`; Rust currently keeps the VAO adaptation to satisfy core-profile OpenGL requirements and to isolate present attributes from guest vertex-array state.
+
+### Missing items
+- Audit whether the present VAO adaptation can be moved into the same state-tracker ownership boundary as upstream `NotifyScreenDrawVertexArray()` instead of living as a separate `WindowAdaptPass` member.
+
+### Binary layout verification
+- N/A: host OpenGL present-state reset only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `BlitScreen::DrawScreen` in `gl_blit_screen.cpp`.
+- Re-read Rust `BlitScreen::draw_screen` in `gl_blit_screen.rs`.
+- Added `alpha_test_enum_matches_upstream_compatibility_constant`.
+- `cargo test -p video_core alpha_test_enum_matches_upstream_compatibility_constant -- --nocapture`
+- `cargo check -p video_core --quiet`
+- `cargo build --bin ruzu-cmd`
+- MK8D runtime probe via `/tmp/ruzu-run.sh` wrote `screenshots/tmp/mk8d-20260614-023607-present-alpha-test.log`; no `ruzu-cmd` process remained after timeout cleanup. The present backbuffer remained black with `PRESENT_READBACK ... rgb=0 ... gl_error=0x0`, so this parity fix did not resolve the active visual symptom.
+- Follow-up MK8D source-texture probe wrote `screenshots/tmp/mk8d-20260614-023742-present-source-texture.log` plus source/backbuffer PPMs under `screenshots/tmp`. `AccelerateDisplay` returned valid textures, but `PRESENT_DISPLAY_PPM` reported `rgb_nonzero=0` / all-black source textures. This points the remaining black-screen symptom back to render-target/texture-cache content generation rather than the final `WindowAdaptPass` quad.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `framebuffer_for_render_targets_from_snapshot(...)` remains the Rust OpenGL-backed bridge for upstream `TextureCache<P>::GetFramebuffer()` / `GetFramebufferId(...)` while ruzu still splits common render-target metadata from OpenGL framebuffer objects.
+- Framebuffer attachment selection now uses the same nullable image-view guard as upstream `GetFramebufferId`: `NULL_IMAGE_VIEW_ID` and invalid ids are treated as absent attachments, matching upstream's `id ? &slot_image_views[id] : nullptr` / `key.depth_buffer_id ? ... : nullptr`.
+- Color and depth/stencil attachments now share the same Rust helper for upstream `AttachTexture(...)`: non-slice views attach the default handle with `glNamedFramebufferTexture`, slice views use the `Color3D` handle, and mono-layer slices attach with `glNamedFramebufferTextureLayer`. This fixes the previous depth-only divergence where sliced depth targets were always attached as whole textures.
+
+### Unintentional differences (to fix)
+- The broader framebuffer owner is still split: upstream inserts the backend framebuffer through `slot_framebuffers.insert(runtime, color_buffers, depth_buffer, key)` directly from the templated texture-cache owner, while Rust assembles OpenGL handles in `OpenGL::TextureCache` from common `ImageViewBase` plus backend `ImageView` maps.
+
+### Missing items
+- Continue collapsing `TextureCache<P>::GetFramebufferId` ownership so common framebuffer keys and backend framebuffer allocation live behind one upstream-shaped owner instead of the current common/OpenGL bridge.
+
+### Binary layout verification
+- N/A: framebuffer attachment sentinel handling only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::GetFramebuffer` and `TextureCache<P>::GetFramebufferId` in `texture_cache.h`, plus OpenGL `AttachTexture` / `Framebuffer::Framebuffer` in `gl_texture_cache.cpp`.
+- Re-read Rust `OpenGL::TextureCache::framebuffer_for_render_targets_from_snapshot` and sentinel helper usage.
+- `cargo test -p video_core framebuffer_attachment_view_id_matches_upstream_nullable_view_guard -- --nocapture`
+- `cargo test -p video_core framebuffer_attachment_mode_matches_upstream_attach_texture -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `OpenGL::TextureCache::update_render_targets_from_snapshot(...)` still receives `Maxwell3DRenderTargets` and a dirty-flag snapshot instead of reading `maxwell3d->regs` / `maxwell3d->dirty.flags` directly. Within that bridge, render-target rebind selection now follows upstream `TextureCache<P>::RescaleRenderTargets`: `Dirty::RenderTargetControl` forces all color slots plus zeta, otherwise only `Dirty::ColorBufferN` / `Dirty::ZetaBuffer` cause `FindColorBuffer` / `FindDepthBuffer`-equivalent work.
+- `TextureCacheBase::update_render_targets_from_snapshot_with_dirty_flags(...)` now mirrors the same backend-independent rebind selection for tests and common callers. The older `update_render_targets_from_snapshot(...)` wrapper intentionally forces `Dirty::RenderTargetControl` so existing snapshot-only callers keep their prior full-refresh semantics.
+- Rust represents upstream dirty-flag mutation by deriving mutable local rebind flags from the snapshot and clearing those local flags after the first lookup pass. This preserves upstream's `do { ... } while (has_deleted_images)` behavior where a retry checks current render-target ids without repeating already-consumed dirty rebinds.
+- If `InvalidateScale(...)` / image deletion raises `has_deleted_images` during the render-target rescale pass, Rust now marks all local color and depth rebind flags before retrying. This mirrors upstream `InvalidateScale(Image&)`, which sets `Dirty::RenderTargets`, `Dirty::ZetaBuffer`, and all `Dirty::ColorBuffer0 + rt` flags before the `RescaleRenderTargets` loop repeats.
+- `BindRenderTarget` is represented by `bind_color_render_target(...)` / `bind_depth_render_target(...)` in both the OpenGL wrapper and common base helper because Rust cannot borrow the owner and a render-target slot exactly like C++ pointer parameters. The behavior matches the upstream short-circuit and queues `PendingDownload { is_swizzle: true, async_buffer_id: 0, object_id: image_id }` when the newly-bound view has `PREEMTIVE_DOWNLOAD`.
+
+### Unintentional differences (to fix)
+- Full `UpdateRenderTargets(bool is_clear)` ownership is still split: the OpenGL texture-cache bridge receives register and dirty snapshots from `RasterizerOpenGL` instead of owning the live Maxwell3D register/dirty state like upstream.
+- `TextureCacheBase::update_render_targets_from_snapshot_with_dirty_flags(...)` remains backend-less and snapshot-fed. It mirrors render-target rebind selection, but not the full upstream `UpdateRenderTargets` lifecycle because `PrepareImageView`, backend image materialization, rescale backend work, and framebuffer lookup still live across separate Rust owners.
+
+### Missing items
+- Move live Maxwell3D register/dirty access into a single upstream-shaped texture-cache owner so the bridge no longer needs snapshots.
+- Continue collapsing the common/OpenGL texture-cache split so render-target insertion, `FindRenderTargetView`, `JoinImages`, `BindRenderTarget`, `PrepareImageView`, and framebuffer lookup live behind one owner rather than a Rust backend bridge.
+
+### Binary layout verification
+- N/A: render-target dirty/rebind control flow only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::RescaleRenderTargets`, `TextureCache<P>::UpdateRenderTargets`, `TextureCache<P>::InvalidateScale`, and `TextureCache<P>::BindRenderTarget` in `texture_cache.h`.
+- Re-read Rust `OpenGL::TextureCache::update_render_targets_from_snapshot`, `TextureCacheBase::update_render_targets_from_snapshot_with_dirty_flags`, render-target prepare/framebuffer bridge, and dirty-flag consumption helper.
+- `cargo test -p video_core render_target_rebind -- --nocapture`
+- `cargo test -p video_core update_render_targets_from_snapshot -- --nocapture`
+- `cargo test -p video_core bind_same_preemptive_render_target_view_has_no_download -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_compute_pipeline.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.{h,cpp} and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- `ComputePipeline` now stores the current compute engine state through `set_engine(...)` before configure, matching upstream `ComputePipeline::SetEngine(KeplerCompute*, MemoryManager*)` ownership more closely.
+- Rust stores a `DispatchCall` snapshot instead of a raw `KeplerCompute*` because ruzu's compute engine callback already captures the launch-boundary QMD/register state before the engine mutates again. This preserves the upstream data source for `Configure` while avoiding a long-lived mutable engine pointer inside the shader-cache pipeline.
+- Rust stores the channel GPU memory as `Arc<parking_lot::Mutex<MemoryManager>>` instead of upstream's raw `Tegra::MemoryManager*`; `Configure` now reads descriptor handles and refresh/materialization bytes from that stored member instead of caller-provided closures.
+
+### Unintentional differences (to fix)
+- `ComputePipeline::configure_resource_state(...)` still receives `TextureCache`, `BufferCache`, and `ProgramManager` parameters because ruzu's shader-cache pipeline does not yet store upstream's constructor-owned references to those caches.
+- The stored compute engine is a launch snapshot, not a live `KeplerCompute*`; if future compute code needs engine state that is not captured in `DispatchCall`, the snapshot must be extended or the owner graph must move closer to upstream.
+
+### Missing items
+- Move `TextureCache`, `BufferCache`, and `ProgramManager` ownership into `ComputePipeline` construction or an equivalent upstream-shaped owner so configure no longer needs those parameters.
+- Continue collapsing the common/OpenGL texture-cache split so `FillComputeImageViews`, `PrepareImageView`, `RefreshContents`, backend image-view materialization, and compute binding run under one owner.
+
+### Binary layout verification
+- N/A: compute pipeline ownership/control-flow only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `ComputePipeline` member declarations, constructor signature, `SetEngine`, and `Configure` in `gl_compute_pipeline.{h,cpp}`.
+- Re-read upstream `RasterizerOpenGL::DispatchCompute` call flow that sets the current compute pipeline engine before configure.
+- Re-read Rust `ComputePipeline::{set_engine,configure_resource_state}` and `RasterizerOpenGL::dispatch_compute_with_call`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core set_engine_replaces_current_compute_engine_state -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_compute_pipeline.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `ComputePipeline::configure_resource_state(...)` now passes the channel GPU-memory reader through the compute image-view phase. After `FillComputeImageViews`, Rust explicitly calls `OpenGL::TextureCache::prepare_filled_image_views_with_gpu_reader(...)`, mirroring upstream `TextureCache<P>::VisitImageView -> PrepareImageView(view, false, false)` before compute texture/image binding.
+- `ComputePipeline::configure_backend_bindings(...)` now materializes compute views through `materialize_views_with_gpu_reader(...)` so deferred `JoinImages` backend copies are drained with the same channel `gpu_memory` reader that upstream `ComputePipeline::Configure` owns through `SetEngine(... gpu_memory_)`.
+- The reader is still passed from `RasterizerOpenGL::dispatch_compute_with_call(...)` because ruzu's `ComputePipeline` does not yet store upstream's `Tegra::MemoryManager* gpu_memory` member.
+
+### Unintentional differences (to fix)
+- `ComputePipeline` still receives `TextureCache`, `BufferCache`, `ProgramManager`, `DispatchCall`, and GPU-memory reader parameters at configure time instead of storing upstream's references/pointers as members.
+- `OpenGL::TextureCache::prepare_filled_image_views_with_gpu_reader(...)` is a Rust bridge around `PrepareImageView`; upstream calls `PrepareImageView` directly inside templated `TextureCache<P>::VisitImageView`.
+
+### Missing items
+- Move the compute `gpu_memory` ownership closer to upstream `ComputePipeline::SetEngine(...)` so `Configure` no longer needs caller-provided reader closures.
+- Collapse the remaining common/backend texture-cache split so `VisitImageView`, `PrepareImageView`, `RefreshContents`, and backend `ImageView` materialization live behind one upstream-shaped owner.
+
+### Binary layout verification
+- N/A: compute texture-cache binding/order only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `OpenGL::ComputePipeline::Configure` and `ComputePipeline::SetEngine` in `gl_compute_pipeline.{h,cpp}`.
+- Re-read upstream `TextureCache<P>::FillComputeImageViews`, `FillImageViews`, `VisitImageView`, `PrepareImageView`, and `PrepareImage` in `texture_cache.h`.
+- Re-read Rust `ComputePipeline::{configure_resource_state,configure_backend_bindings}`, `RasterizerOpenGL::dispatch_compute_with_call`, and `OpenGL::TextureCache::{fill_compute_image_views,prepare_filled_image_views_with_gpu_reader,materialize_views_with_gpu_reader}`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core preparable_image_id_for_filled_view_matches_prepare_image_view_guard -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `FindOrInsertImageResult` now carries `needs_backend_completion` and `queued_join_tail`. This makes the Rust common/backend split explicit at the same boundary where upstream `TextureCache<P>::InsertImage -> JoinImages` completes `RefreshContents`, rescale, copy/delete, `RegisterImage`, and image-allocation registration before returning an `ImageId`.
+- OpenGL insertion wrappers no longer inspect `TextureCacheBase::pending_join_copies` directly to infer what happened. They consume the explicit result contract: queued join tails drain through `finish_pending_join_copies_with_gpu_reader(...)`, while no-tail backend-owned insertions run `finish_inserted_image_without_join_tail(...)`.
+
+### Unintentional differences (to fix)
+- The split still exists: upstream has no externally visible `needs_backend_completion` state because backend image/runtime resources and common metadata live in one templated `TextureCache<P>` owner.
+- Backend-less `TextureCacheBase` can still return an inserted image without running OpenGL `RefreshContents` / rescale work; this remains limited to base/test paths and should disappear when the backend hook becomes the only runtime insertion path.
+
+### Missing items
+- Collapse the backend completion contract into a single upstream-shaped owner/hook so callers receive an `ImageId` only after `JoinImages` is fully complete.
+- Continue moving `RefreshContents`, rescale, alias/bad-overlap relations, copies, delete/unregister, and registration behind that owner for every insertion path.
+
+### Binary layout verification
+- N/A: texture-cache insertion ownership contract only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::InsertImage` and `TextureCache<P>::JoinImages`; upstream calls `JoinImages`, then registers the image allocation only after `JoinImages` has refreshed contents, applied rescale/relations, copied/deleted overlaps, and registered the new image.
+- Re-read Rust `TextureCacheBase::{find_or_insert_image_from_info_with_options_result,join_images,register_image_alloc}` and OpenGL `TextureCache::{find_or_insert_image_from_info_with_options_and_finish,update_render_targets_from_snapshot,finish_pending_join_copies_with_gpu_reader,finish_inserted_image_without_join_tail}`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core find_or_insert_result -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- `OpenGL::TextureCache::update_render_targets_and_get_framebuffer_from_snapshot(...)` now owns the Rust bridge for upstream `TextureCache<P>::UpdateRenderTargets(bool is_clear)` followed by `TextureCache<P>::GetFramebuffer()`: dirty render-target refresh, dirty-flag side effects, render-target `PrepareImageView` equivalent, and framebuffer lookup are behind one texture-cache entry point.
+- Rust still receives `Maxwell3DRenderTargets` and a dirty-flag snapshot from `RasterizerOpenGL` because the texture cache does not yet own upstream's `maxwell3d` pointer. The mutation interface is narrowed to `RenderTargetDirtyFlagAccess` so draw/clear do not each duplicate the update contract.
+
+### Unintentional differences (to fix)
+- Register reads and the source dirty-flag array are still supplied by `RasterizerOpenGL`; upstream `TextureCache<P>::UpdateRenderTargets` reads `maxwell3d->regs` and `maxwell3d->dirty.flags` directly.
+- `RasterizerOpenGL::draw(...)` still owns other pieces of upstream `GraphicsPipeline::ConfigureImpl(...)` around descriptor collection and texture/image binding before the render-target bridge is called.
+
+### Missing items
+- Move the live Maxwell3D register/dirty owner into the texture-cache bridge, or provide an equivalent upstream-shaped owner, so `UpdateRenderTargets` no longer accepts snapshots.
+- Continue collapsing the `JoinImages`/`RefreshContents` backend tail so render-target images cannot be observed before backend completion.
+
+### Binary layout verification
+- N/A: render-target ownership and control-flow parity only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::UpdateRenderTargets`, `TextureCache<P>::GetFramebuffer`, `TextureCache<P>::GetFramebufferId`, and `RasterizerOpenGL::PrepareDraw` / `Clear` call flow.
+- Re-read Rust `OpenGL::TextureCache::{update_render_targets_and_get_framebuffer_from_snapshot,update_render_targets_from_snapshot_with_bound_gpu_memory,prepare_render_targets_from_snapshot,framebuffer_for_render_targets_from_snapshot}` and `RasterizerOpenGL::{draw,clear}`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core dirty_consumption_matches_update_render_targets_contract -- --nocapture`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `finish_pending_join_copies_impl(...)` still exists because ruzu splits upstream `TextureCache<P>::JoinImages(...)` between common metadata and OpenGL backend images. Upstream refreshes the newly inserted image synchronously inside `JoinImages` through its always-owned `gpu_memory`.
+- The Rust OpenGL join tail no longer defers a CPU-modified inserted image when no reader is passed and no channel `gpu_memory` is bound. That state now fails explicitly with the inserted `ImageId`/GPU address, matching the upstream assumption that `RefreshContents(new_image)` has a valid `gpu_memory` owner instead of leaving `pending_join_copies` queued indefinitely.
+
+### Unintentional differences (to fix)
+- `RefreshContents(new_image)` is still reached through an OpenGL wrapper rather than the same owner that runs `JoinImages`. Upstream has no explicit pending-join queue or reader-selection branch.
+
+### Missing items
+- Collapse the OpenGL pending-join tail into an upstream-shaped texture-cache owner/hook so inserted images cannot exist in a partially completed state.
+- Add direct regression coverage for the OpenGL pending-join CPU-modified refresh path once backend image/staging construction can run without a live GL context.
+
+### Binary layout verification
+- N/A: texture-cache join-tail control flow only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages` and `TextureCache<P>::RefreshContents`; `JoinImages` calls `RefreshContents(new_image, new_image_id)` synchronously before rescale, alias/copy/delete handling, and `RegisterImage(new_image_id)`.
+- Re-read Rust `finish_pending_join_copies_impl` and `refresh_contents_with_bound_gpu_reader`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Superseded by the 2026-06-14 top entry for `texture_cache.rs`: Rust no longer keeps the OpenGL data-preserving adaptation for ignored overlaps that still have `ImageFlagBits::GpuModified`. The common `JoinImages` owner records `.agents/texture_cache_unimplemented_state.md` and stops immediately like upstream.
+- This historical entry removed an older indefinite-defer fallback, but its download/writeback adaptation is no longer active.
+
+### Unintentional differences (to fix)
+- Fixed by the 2026-06-14 top entry for `texture_cache.rs`: Rust now reaches the upstream-fatal decision synchronously inside `TextureCacheBase::join_images(...)`, before the OpenGL wrapper can download/write back the ignored overlap.
+
+### Missing items
+- Add an OpenGL runtime regression if this upstream-fatal branch is ever intentionally replaced by a real upstream policy instead of `UNIMPLEMENTED()`.
+
+### Binary layout verification
+- N/A: texture-cache join-tail control flow only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages` ignored-overlap loop and confirmed `GpuModified` uses `UNIMPLEMENTED()` before `UntrackImage`, `UnregisterImage`, `DeleteImage`, and `RefreshContents(new_image)`.
+- Re-read Rust `finish_pending_join_copies_impl`, `finish_ignored_gpu_modified_overlap`, `download_image_to_host_staging`, and `TextureCacheBase::write_downloaded_image`; this historical ignored-overlap helper was later removed when the common `JoinImages` owner was changed to stop like upstream before OpenGL tail handling.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_rasterizer.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still snapshots Maxwell3D render-target registers in `gl_rasterizer.rs` and calls OpenGL `TextureCache::update_render_targets_from_snapshot_with_bound_gpu_memory(...)` because ruzu does not yet store `Maxwell3D*` inside the texture-cache owner like upstream `TextureCache<P>`.
+- The dirty-flag mutation remains in `gl_rasterizer.rs` for now, but it now mirrors the upstream `UpdateRenderTargets` side effects: render-target/color/zeta dirty bits are consumed for the resolved snapshot, rescale viewport/scissor bits are set when the rescale state changes, and `DepthBiasGlobal` is always dirtied after a render-target update.
+
+### Unintentional differences (to fix)
+- `UpdateRenderTargets` ownership is still split: upstream owns register reads, dirty-flag consumption, rescale, prepare, size update, and `DepthBiasGlobal` dirtiness inside one `TextureCache<P>::UpdateRenderTargets(bool is_clear)` method. Rust still has `gl_rasterizer.rs` coordinate the dirty snapshot and calls into `gl_texture_cache.rs`.
+
+### Missing items
+- Move render-target dirty-flag ownership closer to the texture-cache update owner once the Rust cache has an upstream-shaped Maxwell3D/state dependency.
+- Continue auditing exact `RescaleRenderTargets` looping and `render_targets.size` update ordering after this dirty-flag side effect is aligned.
+
+### Binary layout verification
+- N/A: renderer dirty-flag state only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::UpdateRenderTargets`; after preparing targets and computing scaled size, it sets `flags[Dirty::DepthBiasGlobal] = true`.
+- Re-read Rust `consume_render_target_dirty_flags_impl`, draw render-target update, and clear render-target update paths.
+- Extended `render_target_dirty_consumption_matches_update_render_targets_contract` and `clear_render_target_dirty_consumption_matches_update_render_targets_contract` to assert `DEPTH_BIAS_GLOBAL` is dirtied.
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- The OpenGL texture cache still uses an explicit `backend_completes_join_images` split because ruzu separates common `TextureCacheBase` slots from OpenGL backend image resources, while upstream `TextureCache<P>` owns `Runtime`, backend `Image`, and registration in the same template owner.
+- With that split enabled, common no-tail insertion no longer registers the new image or image allocation before backend completion. OpenGL `finish_inserted_image_without_join_tail(...)` performs `RefreshContents`, backend flag setup, `ScaleDown`, and then `register_completed_join_image(...)`, preserving the upstream `JoinImages` no-copy ordering before `RegisterImage`.
+- Tail insertions still drain through `finish_pending_join_copies_impl(...)`, which refreshes the new image, prepares rescale state, applies alias/bad-overlap relations, copies/deletes superseded images, and registers/allocation-registers the new image only after that tail finishes.
+
+### Unintentional differences (to fix)
+- The completion contract is still split between `TextureCacheBase` and the OpenGL wrapper. Upstream has no public intermediate state where callers can receive an inserted `ImageId` before the backend tail finishes.
+- Backend-less/base construction can still use the immediate-registration path because it has no runtime image resources. That is acceptable for focused base tests, but not the final upstream-shaped owner graph.
+
+### Missing items
+- Collapse `JoinImages` completion into one upstream-shaped owner/hook so callers cannot forget backend completion and no public API exposes a partially finished inserted image.
+- Continue auditing the ignored-overlap GPU-modified branch and download/writeback/delete ordering.
+- Continue reducing render-target snapshot ownership so `UpdateRenderTargets` owns register reads, dirty-flag consumption, and prepare/refresh ordering like upstream.
+
+### Binary layout verification
+- N/A: texture-cache ownership/order only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::FindOrInsertImage`, `InsertImage`, and `JoinImages`; upstream calls `RefreshContents`, rescale, relation/copy/delete handling, then `RegisterImage(new_image_id)` and returns to `InsertImage` for `image_allocs_table` insertion.
+- Re-read Rust `TextureCacheBase::{find_or_insert_image_from_info_with_options_result,join_images,register_image_alloc}` and OpenGL `TextureCache::{find_or_insert_image_from_info_with_options_and_finish,finish_inserted_image_without_join_tail,finish_pending_join_copies_impl,register_completed_join_image}`.
+- Existing regression `backend_completed_join_defers_registration_and_alloc_until_finish` proves OpenGL/backend-completing mode leaves no-tail inserted images unregistered/unallocated until backend completion explicitly registers them.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `prepare_render_targets_from_snapshot(...)` remains an OpenGL wrapper around upstream `TextureCache<P>::UpdateRenderTargets` / `PrepareImageView` because ruzu currently splits backend `Image` objects from common `ImageBase` slots. The prepared-view filtering now follows upstream's sentinel checks before dereferencing the view slot.
+- The upstream sentinel predicate is represented by the local `is_real_image_view_id(...)` helper so the render-target preparation path can be regression-tested without constructing an OpenGL texture cache.
+
+### Unintentional differences (to fix)
+- None for null render-target view preparation after this change. Rust no longer treats `NULL_IMAGE_VIEW_ID` (`SlotId { index: 0 }`) as a real render-target view just because `SlotId::is_valid()` returns true. This matches upstream checks such as `view_id != NULL_IMAGE_VIEW_ID && view_id != ImageViewId{}` before preparing or rescale-checking a render-target view.
+
+### Missing items
+- Broader render-target ownership drift remains: register reads and dirty-flag consumption still happen outside a single upstream-shaped `TextureCache<P>::UpdateRenderTargets(bool is_clear)` owner.
+- None for the null render-target view sentinel filter. Broader render-target ownership drift remains tracked above.
+
+### Binary layout verification
+- N/A: render-target view sentinel filtering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::RescaleRenderTargets`, `TextureCache<P>::UpdateRenderTargets`, and `TextureCache<P>::PrepareImageView` call sites.
+- Re-read Rust `TextureCache::prepare_render_targets_from_snapshot` and `is_full_clear_for_view`.
+- Added `real_image_view_id_rejects_null_and_invalid_sentinels`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/present/layer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/layer.{h,cpp}
+
+### Intentional differences
+- Rust keeps trace-only diagnostics around `LoadFBToScreenInfo` for present texture debugging. They do not alter the upstream ordering: compute framebuffer address, try `AccelerateDisplay`, initialize `FramebufferTextureInfo`, read device memory if available, then upload the permanent framebuffer texture.
+
+### Unintentional differences (to fix)
+- None for the zero-address fallback path after this change. Rust no longer returns early when `framebuffer.address + framebuffer.offset == 0`; it follows upstream by continuing through `GetPointer`/device-memory read semantics and still issuing `glTextureSubImage2D` with the existing `gl_framebuffer_data`.
+
+### Missing items
+- Broader `Layer` parity still needs a full re-audit outside this slice, especially diagnostic-only code and any remaining Rust-local present tracing.
+
+### Binary layout verification
+- N/A: OpenGL host present upload path only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `Layer::LoadFBToScreenInfo` and `Layer::ConfigureFramebufferTexture`.
+- Re-read Rust `Layer::load_fb_to_screen_info` and removed the Rust-only zero-framebuffer early return.
+
+## 2026-06-14 — video_core/src/renderer_opengl/present/window_adapt_pass.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/window_adapt_pass.{h,cpp}
+
+### Intentional differences
+- The remaining Rust `WindowAdaptPass::vao` is kept as an OpenGL profile compatibility adaptation. Upstream does not store an `OGLVertexArray` in `WindowAdaptPass` and configures vertex attributes directly; ruzu's SDL frontend can request an OpenGL core-profile context on macOS, where `glVertexAttribFormat`, `glVertexAttribBinding`, and `glBindVertexBuffer` require a non-zero VAO. The VAO owns no guest-visible state and only scopes the present-pass vertex attribute setup.
+
+### Unintentional differences (to fix)
+- None known for the present `WindowAdaptPass` program binding, VBO allocation, `Device&` ownership, and unified-vertex-buffer branch after re-reading upstream. Older entries that mention the local present pipeline or `glNamedBufferStorage` are superseded by the two 2026-06-14 `WindowAdaptPass` entries above.
+
+### Missing items
+- None for the present VAO audit. Broader renderer context-profile parity remains frontend/platform-owned, not `WindowAdaptPass`-owned.
+
+### Binary layout verification
+- N/A: OpenGL host present state only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `RendererOpenGL` and `WindowAdaptPass` for VAO ownership and found no upstream VAO owner.
+- Re-read ruzu SDL OpenGL context creation; macOS uses `SDL_GL_CONTEXT_PROFILE_CORE`, while other platforms request compatibility profile.
+- Re-read ruzu rasterizer VAO usage; ruzu already uses a transient VAO to satisfy core-profile draw requirements.
+
+## 2026-06-14 — video_core/src/renderer_opengl/present/window_adapt_pass.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/window_adapt_pass.{h,cpp}
+
+### Intentional differences
+- Removed the Rust-local `WindowAdaptPass::pipeline` member and its `glCreateProgramPipelines` / `glUseProgramStages` / `glDeleteProgramPipelines` lifecycle. Presentation programs are now bound only through `ProgramManager::bind_present_programs(...)`, matching upstream `program_manager.BindPresentPrograms(vert.handle, frag.handle)`.
+- Changed the present vertex buffer allocation from `glNamedBufferStorage(..., GL_DYNAMIC_STORAGE_BIT)` to `glNamedBufferData(..., GL_STREAM_DRAW)`, matching upstream `glNamedBufferData(vertex_buffer.handle, sizeof(ScreenRectVertex) * 4, nullptr, GL_STREAM_DRAW)`.
+
+### Unintentional differences (to fix)
+- Rust still stores and binds a `vao` for the present vertex attributes, while upstream `WindowAdaptPass` has no `OGLVertexArray` member and configures vertex attributes directly in `DrawToFramebuffer`. This may be a Rust/OpenGL-core compatibility bridge, but it still needs a dedicated parity audit before being treated as intentional.
+
+### Missing items
+- Audit whether the present VAO should move to a renderer/global OpenGL state owner or be removed safely under ruzu's context/profile assumptions.
+
+### Binary layout verification
+- N/A: OpenGL host present state only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `WindowAdaptPass` member declarations and constructor/`DrawToFramebuffer` body.
+- Re-read Rust `WindowAdaptPass::{new,draw_to_framebuffer,Drop}` and verified no local present pipeline remains.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/mod.rs, video_core/src/renderer_opengl/gl_blit_screen.rs, video_core/src/renderer_opengl/present/filters.rs, and video_core/src/renderer_opengl/present/window_adapt_pass.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_blit_screen.{h,cpp} and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/window_adapt_pass.{h,cpp}
+
+### Intentional differences
+- `RendererOpenGL` now stores `Device` in a `Box<Device>` so `BlitScreen` and `WindowAdaptPass` can hold stable non-owning pointers corresponding to upstream `Device&` / `const Device&`.
+- `BlitScreen` now stores upstream-shaped non-owning `StateTracker` and `Device` pointers in addition to the existing rasterizer and device-memory dependencies. `DrawScreen` notifies state through the stored `state_tracker` member instead of reaching it through the rasterizer.
+- `WindowAdaptPass` now stores the upstream `Device` dependency and mirrors the `HasVertexBufferUnifiedMemory()` branch: present VBOs are made resident and use `glBufferAddressRangeNV(GL_VERTEX_ATTRIB_ARRAY_ADDRESS_NV, ...)` when the device reports NV unified vertex buffers; otherwise the existing `glBindVertexBuffer` path remains.
+- Rust loads the three NV entrypoints used by this present path from `present/window_adapt_pass.rs`. This duplicates the local loader shape already used by `gl_buffer_cache.rs` because upstream calls the GL functions directly from the owning implementation file.
+
+### Unintentional differences (to fix)
+- Fixed by later `WindowAdaptPass` entries: the Rust-local present program pipeline was removed, and presentation programs are now bound through `ProgramManager::bind_present_programs(...)`.
+- Fixed by later `WindowAdaptPass` entries: Rust now uses `glNamedBufferData(..., GL_STREAM_DRAW)` for the present vertex buffer, matching upstream.
+
+### Missing items
+- None for program/VBO ownership after the later `WindowAdaptPass` audit. The remaining VAO adaptation is documented separately as an OpenGL context-profile compatibility difference.
+
+### Binary layout verification
+- N/A: OpenGL host present state only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `BlitScreen` constructor/member declarations and `DrawScreen` / `CreateWindowAdapt`.
+- Re-read upstream `WindowAdaptPass` constructor/member declarations and `DrawToFramebuffer`, including the unified-vertex-buffer branch.
+- Re-read Rust `RendererOpenGL::new`, `BlitScreen::{new,draw_screen,create_window_adapt}`, present filter factories, and `WindowAdaptPass::{new,draw_to_framebuffer}`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo check --bin ruzu-cmd --quiet`
+
+## 2026-06-14 — video_core/src/renderer_base.rs, video_core/src/renderer_opengl/mod.rs, video_core/src/renderer_opengl/gl_blit_screen.rs, and video_core/src/renderer_opengl/present/layer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_blit_screen.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/layer.h
+
+### Intentional differences
+- Removed the Rust-only `RendererBase::set_device_memory_reader(...)` hook and the OpenGL present setters on `RendererOpenGL`, `BlitScreen`, and `Layer`. The present/device-memory dependency is now constructor-owned for `RendererOpenGL::new -> BlitScreen::new -> Layer::new`, matching upstream's stable `Tegra::MaxwellDeviceMemoryManager& device_memory` members instead of allowing a post-construction replacement.
+- `RasterizerOpenGL::set_device_memory_reader(...)` remains as a Rust-local initialization helper called from `RendererOpenGL::new` to install the buffer-cache `DeviceMemoryAccessAdapter`. It is no longer exposed through `RendererBase` and no longer mutates present layers after construction.
+
+### Unintentional differences (to fix)
+- `BlitScreen` still lacks upstream's explicit stored `StateTracker& state_tracker` and `Device& device` members. State notifications currently go through the stored rasterizer pointer, and `Device` is not yet needed by the Rust `WindowAdaptPass` construction path.
+
+### Missing items
+- Add upstream-shaped `StateTracker&` / `Device&` ownership to `BlitScreen` if subsequent present parity work needs direct access instead of reaching state tracker through the rasterizer.
+- Continue replacing remaining non-present users of `Gpu::read_guest_memory(...)` / `DeviceMemoryReader` with their upstream owners where documented in older entries.
+
+### Binary layout verification
+- N/A: renderer ownership/interface only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `BlitScreen` and `Layer` member declarations in `gl_blit_screen.h` and `present/layer.h`; neither exposes a post-construction device-memory setter.
+- Re-read Rust `RendererBase`, `RendererOpenGL::new`, `RendererOpenGL`'s `RendererBase` impl, `BlitScreen::new`, and `Layer::new`.
+- `rg -n "set_device_memory_reader\\(" -S video_core/src DIFF.md`
+
+## 2026-06-14 — video_core/src/renderer_opengl/mod.rs, video_core/src/renderer_opengl/gl_blit_screen.rs, video_core/src/renderer_opengl/present/window_adapt_pass.rs, and video_core/src/renderer_opengl/present/layer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_blit_screen.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/layer.{h,cpp}
+
+### Intentional differences
+- `Layer` now stores a non-owning rasterizer pointer corresponding to upstream `RasterizerOpenGL& rasterizer`, and `Layer::{configure_draw,prepare_render_target,load_fb_to_screen_info}` no longer receive `RasterizerOpenGL` as a per-call argument. `LoadFBToScreenInfo` now reaches `AccelerateDisplay` through the stored member like upstream.
+- `BlitScreen` now stores the same non-owning rasterizer pointer corresponding to upstream `BlitScreen::rasterizer`, and `draw_screen(...)` no longer accepts a rasterizer argument. State-tracker notifications still run through this stored rasterizer before final presentation setup.
+- `RendererOpenGL` now owns `RasterizerOpenGL` in a `Box` so the non-owning pointers stored by `BlitScreen` and `Layer` stay heap-stable even if the renderer object is moved. This is the Rust representation of upstream member references.
+- `unsafe impl Send` on `BlitScreen` and `Layer` documents the local owner contract: the raw pointer is non-owning, points to the boxed rasterizer owned by the same `RendererOpenGL`, and is used on the renderer thread.
+
+### Unintentional differences (to fix)
+- `BlitScreen` still lacks upstream's stored `StateTracker& state_tracker` and `Device& device` members. Rust continues to access state tracker through the stored rasterizer pointer and does not need `Device` in the current present constructor path.
+- `RendererOpenGL::set_device_memory_reader(...)` still exists as a Rust trait compatibility hook even though upstream's present dependencies are constructor-owned.
+
+### Missing items
+- Continue narrowing/removing `RendererOpenGL::set_device_memory_reader(...)` once remaining Rust compatibility paths no longer need to swap present/device-memory readers after construction.
+- If future present code needs direct device queries, add the upstream-shaped `Device&` ownership to `BlitScreen` instead of using external helpers.
+
+### Binary layout verification
+- N/A: presentation ownership only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `BlitScreen` member declarations and constructor signature in `gl_blit_screen.h`.
+- Re-read upstream `Layer` member declarations, constructor, `ConfigureDraw`, `PrepareRenderTarget`, and `LoadFBToScreenInfo`.
+- Re-read Rust `RendererOpenGL::new`, `RendererOpenGL::composite_impl`, `BlitScreen::{new,draw_screen}`, `WindowAdaptPass::draw_to_framebuffer`, and `Layer::{new,configure_draw,prepare_render_target,load_fb_to_screen_info}`.
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/gpu.rs and video_core/src/engines/maxwell_3d.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_base.h
+
+### Intentional differences
+- `Gpu::set_guest_memory_reader(...)` now only installs the Rust compatibility reader used by `Gpu::read_guest_memory(...)`. It no longer forwards that reader into the renderer as a present/device-memory replacement.
+- This preserves the upstream presentation ownership shape: OpenGL present receives its `Tegra::MaxwellDeviceMemoryManager&` through renderer construction, while `GPU::Impl::BindRenderer(...)` only stores the renderer, reads the rasterizer, and binds Host1x/rasterizer interfaces. Upstream `RendererBase` has no post-construction device-memory setter that can replace `Layer::device_memory`.
+- Added `guest_memory_reader_preserves_success_status` so the Rust callback bridge keeps the mapped/unmapped success result instead of turning a failed read into a successful zero-filled read.
+- Existing `Maxwell3D` tests that install a `Gpu` guest-memory reader now return `true` after filling the buffer, preserving their old mapped-memory intent under the new bool-returning reader contract.
+
+### Unintentional differences (to fix)
+- The guest-memory compatibility bridge itself remains Rust-only because `video_core::Gpu` still lacks the exact upstream direct `Core::System&`/memory owner graph for all legacy callers.
+- `RendererOpenGL::set_device_memory_reader(...)` still exists for trait compatibility, but the normal `Gpu::set_guest_memory_reader(...)` path no longer calls it. Future review should remove or narrow that setter once no tests or non-OpenGL stubs require it.
+
+### Missing items
+- Continue replacing remaining `Gpu::read_guest_memory(...)` callback users with the upstream owners already documented elsewhere (`MemoryManager&`, `Core::Memory::Memory&`, or `MaxwellDeviceMemoryManager&` depending on the call site).
+
+### Binary layout verification
+- N/A: renderer/device-memory ownership only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `GPU::Impl::BindRenderer`, `GPU::BindRenderer`, and `RendererBase` declarations to confirm no post-construction device-memory reader replacement exists.
+- Re-read Rust `Gpu::{bind_renderer,set_guest_memory_reader,read_guest_memory}` and `RendererOpenGL::set_device_memory_reader`.
+- `cargo test -p video_core guest_memory_reader_preserves_success_status -- --nocapture`
+- `cargo check -p video_core --quiet`
+- `cargo check --bin ruzu-cmd --quiet`
+
+## 2026-06-14 — video_core/src/renderer_base.rs, video_core/src/renderer_opengl/mod.rs, video_core/src/renderer_opengl/present/layer.rs, video_core/src/gpu.rs, and ruzu_cmd/src/main.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/layer.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/device_memory_manager.inc
+
+### Intentional differences
+- `DeviceMemoryReader` now returns a success flag so present fallback can distinguish mapped from unmapped backing memory. `RendererOpenGL::new` builds its reader from `MaxwellDeviceMemoryManager::get_pointer(...)`, returns `false` when that pointer is null, and copies from the host pointer otherwise, matching upstream `device_memory.GetPointer<u8>(framebuffer_addr)`.
+- `Layer::load_fb_to_screen_info(...)` now only unswizzles when the reader reports mapped memory, then still uploads `gl_framebuffer_data` afterward. This matches upstream `Layer::LoadFBToScreenInfo`, where `UnswizzleTexture(...)` is inside `if (host_ptr)` and `glTextureSubImage2D(...)` runs after the branch.
+- `ruzu_cmd` propagates read success/failure through the guest-memory reader so compatibility users can preserve the same mapped/unmapped distinction as far as the current Rust bridge can express.
+- `ShaderCacheGpuReader` remains a void callback because shader GPU-VA fetches do not own the present fallback `GetPointer` contract.
+
+### Unintentional differences (to fix)
+- `Layer` still receives `RasterizerOpenGL` per call instead of owning upstream `RasterizerOpenGL& rasterizer`.
+
+### Missing items
+- Move, or equivalently model, the `RasterizerOpenGL&` ownership in `Layer`.
+- Add a direct `LoadFBToScreenInfo` regression once the present upload/unswizzle path can be tested without a live OpenGL context.
+
+### Binary layout verification
+- N/A: presentation framebuffer fallback control flow only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `Layer::LoadFBToScreenInfo`, `DeviceMemoryManager<Traits>::GetPointer`, and the `MaxwellDeviceMemoryManager::GetPointer<u8>` instantiation.
+- Re-read Rust `MaxwellDeviceMemoryManager::get_pointer`, `RendererOpenGL::new`, `DeviceMemoryReader`, `Layer::load_fb_to_screen_info`, `Gpu::read_guest_memory`, and the `ruzu_cmd` guest-memory reader closure.
+- `cargo check -p video_core --quiet`
+- `cargo check --bin ruzu-cmd --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_blit_screen.rs, video_core/src/renderer_opengl/present/window_adapt_pass.rs, video_core/src/renderer_opengl/present/layer.rs, and video_core/src/renderer_opengl/mod.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_blit_screen.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_blit_screen.h, /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/layer.cpp, and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/layer.h
+
+### Intentional differences
+- Rust `BlitScreen` now owns a non-optional `DeviceMemoryReader` and constructs each present `Layer` with that reader, matching upstream's constructor-owned `Tegra::MaxwellDeviceMemoryManager& device_memory` dependency on `BlitScreen` and `Layer`.
+- `WindowAdaptPass::draw_to_framebuffer(...)`, `Layer::configure_draw(...)`, `Layer::prepare_render_target(...)`, and `Layer::load_fb_to_screen_info(...)` no longer accept an optional per-call device-memory reader. This removes the Rust-only no-device-memory present state that upstream cannot represent.
+- `RendererOpenGL::set_device_memory_reader(...)` still updates `BlitScreen` and existing `Layer` instances because ruzu's renderer interface can replace the reader after construction. Upstream does not need this setter; it has a stable constructor reference. This keeps the Rust interface compatible while preserving a non-optional presentation dependency.
+
+### Unintentional differences (to fix)
+- Fixed by later present entries: `Layer` now stores a non-owning rasterizer pointer corresponding to upstream `RasterizerOpenGL& rasterizer`, so `LoadFBToScreenInfo` no longer receives the rasterizer per call.
+- Fixed by the later `DeviceMemoryReader` success-flag entry: Rust's present CPU fallback now distinguishes the upstream `device_memory.GetPointer<u8>(framebuffer_addr) == nullptr` case. `Layer::load_fb_to_screen_info(...)` unswizzles only when the reader reports mapped memory, then uploads the current `gl_framebuffer_data` afterward like upstream.
+
+### Missing items
+- Add a direct `LoadFBToScreenInfo` regression once the present upload/unswizzle path can be tested without a live OpenGL context.
+
+### Binary layout verification
+- N/A: presentation ownership and framebuffer fallback control flow only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `BlitScreen::{BlitScreen,DrawScreen}`, `Layer::{Layer,ConfigureDraw,PrepareRenderTarget,LoadFBToScreenInfo}`, and the corresponding member declarations in `gl_blit_screen.h` / `present/layer.h`.
+- Re-read Rust `RendererOpenGL::{new,set_device_memory_reader,composite_impl}`, `BlitScreen::{new,set_device_memory_reader,draw_screen}`, `WindowAdaptPass::draw_to_framebuffer`, and `Layer::{new,set_device_memory_reader,configure_draw,prepare_render_target,load_fb_to_screen_info}`.
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/mod.rs, video_core/src/renderer_opengl/gl_blit_screen.rs, and video_core/src/renderer_opengl/present/layer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_blit_screen.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_blit_screen.h, /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/layer.cpp, and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/layer.h
+
+### Intentional differences
+- Upstream constructs `BlitScreen` with a constructor-time `Tegra::MaxwellDeviceMemoryManager&` and passes that same dependency to its present `Layer`. Rust now creates the present/device-memory reader from `RendererOpenGL::new`'s `Arc<MaxwellDeviceMemoryManager>` immediately, stores it in `RendererOpenGL::device_memory`, and injects it into `RasterizerOpenGL` before any normal presentation path can run.
+- Rust still threads `Option<&DeviceMemoryReader>` through `BlitScreen::draw_screen -> WindowAdaptPass::draw_to_framebuffer -> Layer::configure_draw` instead of storing a borrowed `MaxwellDeviceMemoryManager` inside `BlitScreen`/`Layer`. This preserves the current Rust owner graph while ensuring the constructor path has the same non-late device-memory dependency as upstream.
+
+### Unintentional differences (to fix)
+- Fixed by later present entries: `BlitScreen::draw_screen` and `Layer` no longer accept an optional per-call reader; the present device-memory dependency is constructor-owned and non-optional.
+- Fixed by the later `DeviceMemoryReader` success-flag entry: the reader is now built from `MaxwellDeviceMemoryManager::get_pointer(...)` and reports false when upstream `GetPointer` would be null, preserving the no-unswizzle branch before upload.
+
+### Missing items
+- Add a direct present fallback regression test once the OpenGL upload path has a GL-less seam or test harness that can validate `LoadFBToScreenInfo` without a live context.
+
+### Binary layout verification
+- N/A: renderer/presentation dependency ownership only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `BlitScreen::BlitScreen`, `BlitScreen::DrawScreen`, `Layer::Layer`, `Layer::ConfigureDraw`, `Layer::ConfigureFramebufferTexture`, and `Layer::LoadFBToScreenInfo`.
+- Re-read Rust `RendererOpenGL::new`, `BlitScreen::draw_screen`, `WindowAdaptPass::draw_to_framebuffer`, `Layer::configure_draw`, `Layer::configure_framebuffer_texture`, and `Layer::load_fb_to_screen_info`.
+- Runtime probe before this change: MK8D ran for 75 seconds via `/tmp/ruzu-run.sh` with logs in `screenshots/tmp/mk8d-20260614-004620-join-runtime.log`; the process was terminated by `timeout`, and the trace did not show the ignored-GPU-modified join path blocking presentation.
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core opengl_scaling_filter_maps_present_filters -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache_base.rs, video_core/src/texture_cache/texture_cache.rs, and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/common/assert.h
+
+### Intentional differences
+- Superseded by the 2026-06-14 top entry for `texture_cache.rs`: `TextureCacheBase::join_images(...)` now stops immediately on ignored overlaps that still have `ImageFlagBits::GpuModified`, matching upstream `UNIMPLEMENTED()`. It records `.agents/texture_cache_unimplemented_state.md` before panicking.
+- This historical entry described a now-removed OpenGL runtime adaptation that queued `PendingJoinCopies::ignored_gpu_modified_ids` and attempted download/writeback. That field and queue drain were later removed.
+
+### Unintentional differences (to fix)
+- Fixed by the 2026-06-14 top entry for `texture_cache.rs`: Rust no longer defers or resolves the GPU-modified ignored-overlap case; it stops at the common `JoinImages` owner before OpenGL pending-tail handling.
+
+### Missing items
+- Continue auditing the remaining bad-overlap and download ordering paths, especially cases that still expose a partially completed `ImageId`.
+- Continue reducing render-target ownership drift so `UpdateRenderTargets` owns register reads, dirty-flag consumption, and prepare/refresh ordering like upstream.
+
+### Binary layout verification
+- N/A: texture-cache ownership and runtime image download ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages` around `join_ignore_textures`, `UNIMPLEMENTED()`, `UntrackImage`, `UnregisterImage`, `DeleteImage`, `RefreshContents`, and rescale/copy/delete tail ordering.
+- Re-read upstream `common/assert.h` to confirm `UNIMPLEMENTED()` is assertion-fatal.
+- Re-read Rust `TextureCacheBase::join_images`, `PendingJoinCopies`, OpenGL `TextureCache::finish_pending_join_copies_impl`, and `finish_ignored_gpu_modified_overlap`; this historical verification is superseded for the `GpuModified` ignored-overlap branch by the top 2026-06-14 texture-cache entry, and the helper was later removed.
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache_base.rs, video_core/src/texture_cache/texture_cache.rs, and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `TextureCacheBase` now has an explicit `backend_completes_join_images` mode. Standalone/base tests keep the old backend-less behavior, while OpenGL enables the mode so the common cache does not call `RegisterImage(new_image_id)` before the OpenGL wrapper has completed the upstream `JoinImages` backend tail.
+- In OpenGL mode, `find_or_insert_image_from_info_with_options_result(...)` no longer performs `register_image_alloc(...)` immediately after `join_images(...)`. The OpenGL wrapper now calls `register_completed_join_image(...)` after `RefreshContents(new_image)`, new-image scale up/down, alias/copy/delete handling, and `RegisterImage(new_image_id)`, matching upstream ordering more closely.
+- The Rust hook remains explicit because upstream `TextureCache<P>` owns `Runtime`, backend `Image`, and registration in one template owner, while ruzu still splits common `TextureCacheBase` from the OpenGL backend tables.
+
+### Unintentional differences (to fix)
+- The backend completion hook is still OpenGL-specific. Other backend or base call paths that need runtime image resources must either opt into the same completion contract or be moved under a single upstream-shaped texture-cache owner.
+- `FindOrInsertImage` still exposes an inserted `ImageId` before OpenGL completes it internally, although the audited wrapper paths immediately finish it before creating/preparing views. The final parity shape should avoid this intermediate state in the public owner API entirely.
+
+### Missing items
+- Collapse `JoinImages` completion into one owner/hook so callers cannot forget to run the backend tail.
+- Continue bad-overlap download/resolve parity, especially the upstream `GpuModified` ignored-overlap `UNIMPLEMENTED()` branch and exact download/delete ordering.
+- Continue reducing render-target snapshot ownership so `UpdateRenderTargets` owns dirty-flag consumption and register reads like upstream.
+
+### Binary layout verification
+- N/A: texture-cache ownership/order only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::InsertImage` and `TextureCache<P>::JoinImages` around `RefreshContents`, new-image rescale, alias/copy/delete tail, `RegisterImage(new_image_id)`, and `image_allocs_table` insertion.
+- Re-read Rust `TextureCacheBase::{find_or_insert_image_from_info_with_options_result,join_images,register_image_alloc}`, `TextureCacheBase::backend_completes_join_images`, and OpenGL `TextureCache::{finish_inserted_image_without_join_tail,finish_pending_join_copies_impl,register_completed_join_image}`.
+- Added `backend_completed_join_defers_registration_and_alloc_until_finish`.
+- `cargo test -p video_core backend_completed_join_defers_registration_and_alloc_until_finish -- --nocapture`
+- `cargo check -p video_core --quiet`
+- `cargo fmt --all --check`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `TextureCacheBase::find_or_insert_image_from_info_with_options_result(...)` now returns both the `ImageId` and whether the call inserted a new image. This exposes the same control-flow distinction upstream has structurally between `FindImage(...)` and `InsertImage(...)`, while keeping the existing `find_or_insert_image_from_info*` APIs compatible for current callers.
+- OpenGL insertion wrappers use the `inserted` bit to finish a newly inserted image even when `JoinImages` produced no copy/delete tail: `RefreshContents(new_image)` runs through the cache-bound/backend reader, then the new image is scaled down before the caller creates or prepares views. This ports the no-copy branch of upstream `InsertImage -> JoinImages`, where `RefreshContents(new_image)` and `ScaleDown(new_image)` still run before `RegisterImage(new_image_id)`.
+- The common base still registers no-tail images before the OpenGL backend can scale them because backend images/runtime resources are not owned by `TextureCacheBase`. The OpenGL wrapper now immediately performs the missing backend-visible refresh/scale step for the audited wrapper-owned insertion paths.
+
+### Unintentional differences (to fix)
+- Exact upstream registration ordering is still split for no-tail insertions: upstream registers after backend refresh/scale, while Rust common registration may happen before the OpenGL wrapper finishes backend image state.
+- Insertion paths that bypass the OpenGL wrapper can still observe the common no-tail registration without backend refresh/scale. The long-term fix remains a single upstream-shaped owner/hook around `FindOrInsertImage`/`JoinImages`.
+
+### Missing items
+- Move common image registration for backend-owned images behind the same backend hook so no-tail and tail insertions both complete `RefreshContents`, rescale, relations/copies, deletion, and registration in upstream order.
+- Continue porting bad-overlap download/resolve behavior and removing insertion paths that expose partially finished images.
+
+### Binary layout verification
+- N/A: texture-cache insertion ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::FindOrInsertImage`, `TextureCache<P>::InsertImage`, and `TextureCache<P>::JoinImages` around `RefreshContents`, source/new-image scaling, copy/delete tail, and `RegisterImage`.
+- Re-read Rust `TextureCacheBase::{find_or_insert_image_from_info_with_options_result,find_or_insert_image_from_info_with_options,join_images}` and OpenGL `TextureCache::{find_or_insert_image_from_info_with_options_and_finish,finish_inserted_image_without_join_tail,update_render_targets_from_snapshot}`.
+- Added `find_or_insert_result_reports_inserted_only_for_new_image`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- `OpenGL::TextureCache::update_render_targets_from_snapshot_with_bound_gpu_memory(...)` now owns the normal render-target GPU-VA translation and guest-memory read source through `TextureCacheBase::channel_gpu_memory`. This moves the draw/clear render-target path closer to upstream `TextureCache<P>`, where `gpu_memory` is a texture-cache-owned dependency used by `FindOrInsertImage`, `RefreshContents`, and the `JoinImages` tail.
+- `RasterizerOpenGL::draw(...)` and `clear(...)` now call that bound texture-cache wrapper and pass `None` to `prepare_render_targets_from_snapshot(...)`, allowing `PrepareImage` / `RefreshContents` to use the cache-bound reader instead of draw/clear-local closures in the normal channel-bound path.
+- If `TextureCacheBase::channel_gpu_memory` is unexpectedly absent while `RasterizerOpenGL` still has a channel memory manager, the render-target update now fails fast. Upstream should not hit this state because `RasterizerOpenGL::BindChannel` binds the texture cache before draw/clear work; Rust now treats the mismatch as a channel-binding bug instead of rebuilding local reader closures.
+
+### Unintentional differences (to fix)
+- Render-target register snapshots are still passed from `RasterizerOpenGL` because Rust `TextureCache` does not yet own `maxwell3d->regs` / `maxwell3d->dirty.flags` like upstream `TextureCache<P>`.
+- `update_render_targets_from_snapshot_with_bound_gpu_memory(...)` still returns `Option<bool>` because the wrapper is also callable from tests or future non-bound setup code. The draw/clear runtime path now requires `Some`, matching upstream's assumption that texture cache has a live `gpu_memory`.
+
+### Missing items
+- Move `UpdateRenderTargets` dirty-flag consumption and render-target register reads into one owner so draw/clear do not coordinate `Dirty::RenderTargets` externally.
+- Add a direct channel-bind regression for the OpenGL texture-cache wrapper once the test harness can instantiate the OpenGL `TextureCache` without full backend GL state.
+- Continue moving the remaining `JoinImages` backend/runtime tail behind a single upstream-shaped owner/hook.
+
+### Binary layout verification
+- N/A: texture-cache owner/read-source ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::UpdateRenderTargets`, `TextureCache<P>::FindOrInsertImage`, `TextureCache<P>::RefreshContents`, and `RasterizerOpenGL::Draw` / `Clear` call flow.
+- Re-read Rust `OpenGL::TextureCache::{update_render_targets_from_snapshot_with_bound_gpu_memory,update_render_targets_from_snapshot,prepare_render_targets_from_snapshot}`, `TextureCacheBase::channel_gpu_memory`, and `RasterizerOpenGL::{draw,clear}`.
+- `cargo check -p video_core --quiet`
+- `cargo fmt --all --check`
+
+## 2026-06-14 — video_core/src/engines/draw_manager.rs, video_core/src/renderer_opengl/gl_rasterizer.rs, and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `RasterizerOpenGL::draw(...)` now preserves upstream `TextureCache<P>::UpdateRenderTargets(false)` fast-path behavior for the graphics draw path: if `Dirty::RenderTargets` is clear, Rust skips render-target rediscovery and only runs the existing `prepare_render_targets_from_snapshot(...)` pass over the current `RenderTargets` views.
+- When `Dirty::RenderTargets` is set, the draw path calls OpenGL `update_render_targets_from_snapshot(...)`, consumes `Dirty::RenderTargets`, conditionally consumes `Dirty::RenderTargetControl`, `Dirty::ColorBuffer0..7`, and `Dirty::ZetaBuffer` with the same force semantics as upstream `RescaleRenderTargets`, and marks `Dirty::RescaleViewports` / `Dirty::RescaleScissors` when the rescale state changes.
+- `Maxwell3DClearView` now carries mutable dirty-flag access for the live Maxwell3D owner. `RasterizerOpenGL::clear(...)` uses it to mirror upstream `RasterizerOpenGL::Clear -> texture_cache.UpdateRenderTargets(true)`: if `Dirty::RenderTargets` is clear, it skips render-target rediscovery and only prepares current views as clear targets; if set, it consumes the same render-target dirty flags as the draw path.
+- `OpenGL::TextureCache::update_render_targets_from_snapshot(...)` returns whether `is_rescaling` changed so the caller can mirror upstream `UpdateRenderTargets` dirty-flag side effects without moving dirty-flag ownership into the OpenGL texture-cache wrapper.
+
+### Unintentional differences (to fix)
+- Dirty-flag ownership is still split between `Maxwell3DDrawView` / `Maxwell3DClearView` and OpenGL call sites rather than living inside one upstream-shaped `TextureCache<P>::UpdateRenderTargets` owner.
+
+### Missing items
+- Continue reducing the snapshot bridge so render-target register reads, dirty-flag consumption, rescale side effects, and prepare happen in one upstream-shaped owner.
+
+### Binary layout verification
+- N/A: render-target dirty-flag ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `RasterizerOpenGL::Clear`, `TextureCache<P>::UpdateRenderTargets`, and `TextureCache<P>::RescaleRenderTargets`.
+- Re-read Rust `Maxwell3DClearView`, `RasterizerOpenGL::{draw,clear}`, `consume_render_target_dirty_flags`, `consume_clear_render_target_dirty_flags`, `OpenGL::TextureCache::update_render_targets_from_snapshot`, and `prepare_render_targets_from_snapshot`.
+- Added `render_target_dirty_consumption_matches_update_render_targets_contract` and `clear_render_target_dirty_consumption_matches_update_render_targets_contract`.
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still uses `Maxwell3DRenderTargets` snapshots because `TextureCacheBase` does not own `maxwell3d->regs` directly. The color render-target discovery loop now preserves upstream `FindColorBuffer(index)` behavior by leaving slots at or past `rt_control.count` as `NULL_IMAGE_VIEW_ID`.
+- The same guard is duplicated in the OpenGL wrapper-owned render-target loop so the backend `PendingJoinCopies` hook remains at the upstream `FindRenderTargetView` boundary without reviving stale out-of-count color attachments.
+
+### Unintentional differences (to fix)
+- `TextureCacheBase::update_render_targets_from_snapshot(...)` and `OpenGL::TextureCache::update_render_targets_from_snapshot(...)` still rebuild render-target state from snapshots rather than consuming/clearing upstream dirty flags (`Dirty::RenderTargets`, `Dirty::RenderTargetControl`, `Dirty::ColorBufferN`, `Dirty::ZetaBuffer`) in the same owner.
+
+### Missing items
+- Port the exact render-target dirty-flag ownership and fast path where upstream `UpdateRenderTargets(false)` only prepares existing image views when `Dirty::RenderTargets` is clear.
+
+### Binary layout verification
+- N/A: render-target view selection only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::RescaleRenderTargets`, `TextureCache<P>::UpdateRenderTargets`, and `TextureCache<P>::FindColorBuffer`.
+- Re-read Rust `TextureCacheBase::update_render_targets_from_snapshot` and `OpenGL::TextureCache::update_render_targets_from_snapshot`.
+- Added `update_render_targets_from_snapshot_ignores_slots_past_rt_control_count`.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `OpenGL::TextureCache::update_render_targets_from_snapshot(...)` now owns the render-target image/view update loop instead of delegating that part to `TextureCacheBase::update_render_targets_from_snapshot(...)`. The wrapper resolves each color/depth image through `TextureCacheBase::find_or_insert_image_from_info(...)`, immediately drains `PendingJoinCopies` with the available channel GPU reader, and only then calls `find_render_target_view_from_image(...)` / `find_image_view_from_image_info(...)`.
+- This fixes the previous Rust-only intermediate state where `TextureCacheBase::update_render_targets_from_snapshot(...)` created render-target `ImageViewBase` records before the OpenGL backend could run the deferred `JoinImages` tail. Upstream `TextureCache<P>::FindRenderTargetView(...)` calls `FindOrInsertImage(...)`, and `JoinImages(...)` completes synchronously before the render-target view is created or found.
+- `TextureCacheBase::update_render_targets_from_snapshot(...)` remains as the backend-independent/test bridge for now. OpenGL uses its wrapper-owned version because `RefreshContents`, rescale, and copy/delete backend work still require OpenGL runtime resources.
+
+### Unintentional differences (to fix)
+- The broader split remains: render-target insertion now has the upstream-shaped hook boundary, but common `TextureCacheBase::join_images(...)` can still expose an unregistered intermediate `new_image_id` to callers that do not have an immediate backend owner hook.
+- OpenGL still duplicates the snapshot render-target loop because the common base layer is not yet generic over backend `Runtime`/`Image` resources. The upstream end state is still one `TextureCache<P>` owner.
+
+### Missing items
+- Move the full `JoinImages` backend/runtime tail behind a single upstream-shaped owner/hook for all insertion paths, not only sampled descriptors, render targets, and blits.
+- Move live channel GPU memory ownership into the texture-cache owner shape so `RefreshContents(new_image)` does not depend on draw/clear-local closures.
+- Port the remaining bad-overlap download interactions and exact post-rescale descriptor/dirty-flag invalidation ordering.
+
+### Binary layout verification
+- N/A: render-target image/view creation order only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::RescaleRenderTargets`, `TextureCache<P>::FindRenderTargetView`, `TextureCache<P>::FindOrInsertImage`, and `TextureCache<P>::JoinImages`.
+- Re-read Rust `OpenGL::TextureCache::update_render_targets_from_snapshot`, `TextureCacheBase::{update_render_targets_from_snapshot,find_or_insert_image_from_info,find_render_target_view_from_image,find_image_view_from_image_info}`, and `OpenGL::TextureCache::finish_pending_join_copies_with_gpu_reader`.
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `OpenGL::TextureCache::update_render_targets_from_snapshot(...)` now accepts an optional channel GPU reader and drains `PendingJoinCopies` immediately after `TextureCacheBase::update_render_targets_from_snapshot(...)` resolves render-target image/view ids, before `rescale_current_render_targets(...)` inspects image flags or creates/scales backend images. Upstream `TextureCache<P>::RescaleRenderTargets(...)` calls `FindColorBuffer` / `FindDepthBuffer`; those call `FindRenderTargetView`, and any `JoinImages` tail completes synchronously before `check_rescale(...)` observes the image.
+- `RasterizerOpenGL::draw(...)` and `clear(...)` pass `MemoryManager::read_block` into this render-target update step. This is still Rust-local reader plumbing, but it gives the earlier drain the same guest-memory source that upstream's texture-cache-owned `gpu_memory` would use for `RefreshContents(new_image)`.
+
+### Unintentional differences (to fix)
+- `TextureCacheBase::update_render_targets_from_snapshot(...)` still creates base `ImageView` records before the OpenGL backend drain can run, because the backend-independent base layer cannot execute runtime `RefreshContents`, rescale, or copy/delete work by itself. Upstream has no such intermediate state: `JoinImages` completes inside `FindOrInsertImage` before `FindRenderTargetView` creates or finds the view.
+- The broader `PendingJoinCopies` split remains: render-target update now drains earlier, but common `JoinImages` can still return a `new_image_id` before backend work completes in paths without an immediate OpenGL owner hook.
+
+### Missing items
+- Move the `JoinImages` backend/runtime tail behind an upstream-shaped owner/hook so `FindRenderTargetView`, descriptor image-view creation, blits, and generic insertion all observe a fully refreshed/copied/registered image.
+- Move the live channel GPU memory owner into the texture-cache owner shape so `RefreshContents` does not depend on draw/clear closures.
+- Port the remaining bad-overlap download interactions and exact post-rescale descriptor/dirty-flag invalidation ordering tracked by older texture-cache entries.
+
+### Binary layout verification
+- N/A: render-target texture-cache ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::RescaleRenderTargets`, `TextureCache<P>::UpdateRenderTargets`, `TextureCache<P>::FindRenderTargetView`, and `TextureCache<P>::JoinImages`.
+- Re-read Rust `TextureCacheBase::update_render_targets_from_snapshot`, `OpenGL::TextureCache::{update_render_targets_from_snapshot,finish_pending_join_copies_with_gpu_reader,rescale_current_render_targets,prepare_render_targets_from_snapshot}`, and `RasterizerOpenGL::{draw,clear}`.
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `RasterizerOpenGL::draw(...)` now passes the channel `MemoryManager::read_block` closure into sampled-image `prepare_image_with_gpu_reader(...)`, sampled-view `materialize_views_with_gpu_reader(...)`, and render-target `prepare_render_targets_from_snapshot(...)` when the channel memory manager is available. Upstream `TextureCache<P>` owns a live `gpu_memory` member, so `PrepareImageView`, `PrepareImage`, `RefreshContents`, and the `JoinImages` tail never need caller-local reader plumbing.
+- The Rust call sites still clone the channel `Arc<Mutex<MemoryManager>>` per reader closure instead of storing a direct `gpu_memory` reference in the texture cache. This preserves Rust's current ownership model while matching upstream's read source for the audited draw path.
+
+### Unintentional differences (to fix)
+- The broader owner split remains: upstream `TextureCache<P>::JoinImages(...)` refreshes, rescales, copies, unregisters/deletes, and registers before returning the new image id. Rust still relies on OpenGL drain points because common `TextureCacheBase` does not own backend image/runtime resources.
+- `OpenGL::RasterizerOpenGL::draw(...)` still owns pieces of upstream `OpenGL::GraphicsPipeline::ConfigureImpl(...)`, including descriptor collection, image-view materialization, render-target update, framebuffer bind, and texture/image binding. This entry only fixes the channel GPU-reader source used by those steps.
+
+### Missing items
+- Move the live channel GPU memory owner into the texture-cache owner shape, or provide an equivalent backend hook, so `JoinImages` and `PrepareImage` do not depend on draw-local closures.
+- Continue reducing `PendingJoinCopies` so the copy/delete/register tail cannot expose an intermediate image id before backend work completes.
+- Port the remaining bad-overlap download interactions and exact post-rescale descriptor/dirty-flag invalidation ordering tracked by the older texture-cache entries.
+
+### Binary layout verification
+- N/A: OpenGL texture-cache read-source and ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `OpenGL::GraphicsPipeline::ConfigureImpl`, `TextureCache<P>::UpdateRenderTargets`, `TextureCache<P>::FindRenderTargetView`, `TextureCache<P>::PrepareImageView`, and `TextureCache<P>::JoinImages`.
+- Re-read Rust `RasterizerOpenGL::draw`, `OpenGL::TextureCache::{prepare_image_with_gpu_reader,materialize_views_with_gpu_reader,prepare_render_targets_from_snapshot,finish_pending_join_copies_with_gpu_reader}`, and `TextureCacheBase::update_render_targets_from_snapshot`.
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h, /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp, and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp
+
+### Intentional differences
+- `OpenGL::TextureCache::fill_graphics_image_views(...)` and `fill_compute_image_views(...)` now drain pending `JoinImages` backend copies immediately after the common base descriptor pass returns and before backend blacklist `ScaleDown(...)` or later materialization/binding can use the view ids. This is a Rust owner-graph adaptation: upstream has no explicit drain method because `TextureCache<P>::JoinImages(...)` performs the runtime/backend tail synchronously before `FindOrInsertImage` returns to `CreateImageView` / `VisitImageView`.
+- The drain belongs in the OpenGL texture-cache wrapper, not in `RasterizerOpenGL::draw(...)` or `ComputePipeline::Configure(...)`, because upstream `FillImageViews<...>` owns the `VisitImageView` -> `FindImageView` -> `CreateImageView` path and immediately runs `PrepareImageView` before the graphics/compute pipeline binds the resulting views.
+
+### Unintentional differences (to fix)
+- The broader split remains: the common `TextureCacheBase::{find_or_insert_image,find_or_insert_image_from_info_with_options,join_images}` APIs can still return a new image id with pending backend work. This pass fixes the audited graphics and compute descriptor-fill paths, not every insertion path.
+
+### Missing items
+- Move the remaining `JoinImages` backend/runtime tail behind a single upstream-shaped owner or hook so callers do not need to remember explicit drain points.
+- Audit render-target update paths for the same “prepare/use before pending join tail” exposure.
+- Port the remaining bad-overlap download/resolve behavior and exact post-rescale invalidation ordering.
+
+### Binary layout verification
+- N/A: OpenGL texture-cache/rasterizer ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::FindImageView`, `TextureCache<P>::CreateImageView`, `TextureCache<P>::FindOrInsertImage`, `TextureCache<P>::JoinImages`, and `OpenGL::GraphicsPipeline::ConfigureImpl` around `FillGraphicsImageViews` / `UpdateRenderTargets`.
+- Re-read upstream `TextureCache<P>::FillComputeImageViews`, `TextureCache<P>::FillImageViews`, and `OpenGL::ComputePipeline::Configure`.
+- Re-read Rust `TextureCacheBase::{fill_graphics_image_views,fill_compute_image_views,visit_image_view,find_image_view,create_image_view,join_images}`, `OpenGL::TextureCache::{fill_graphics_image_views,fill_compute_image_views,finish_pending_join_copies,materialize_views_impl,prepare_image_without_gpu_reader}`, `RasterizerOpenGL::draw`, and `ComputePipeline::{prepare_texture_bindings,configure_backend_bindings}`.
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core fill_compute_image_views_uses_channel_gpu_memory_for_tic_reads -- --nocapture`
+- `cargo test -p video_core join_images -- --nocapture`
+- `cargo fmt --all --check`
+- `git diff --check`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache_base.rs, video_core/src/texture_cache/texture_cache.rs, and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `PendingJoinCopies` now carries the `join_left_aliased_ids`, `join_right_aliased_ids`, and `join_bad_overlap_ids` relation lists across the Rust common/backend split. Upstream keeps these vectors in one `TextureCache<P>::JoinImages(...)` stack frame; Rust must preserve them until the OpenGL backend tail reaches the equivalent point.
+- `TextureCacheBase::apply_join_relations(...)` owns the upstream alias/bad-overlap mutation block. `TextureCacheBase::join_images(...)` calls it immediately only when no backend copy tail is pending; otherwise `OpenGL::TextureCache::finish_pending_join_copies_impl(...)` calls it after `RefreshContents` and pending rescale preparation, then before the copy/delete loop. This matches upstream ordering: refresh, rescale, sort/carry copies, add alias/bad-overlap relations, then copy/unregister/delete/register.
+- The focused alias test constructs the child image at the parent image's computed mip offset. This mirrors upstream `ImageBase::TryFindBase(...)` expectations for a mip subresource instead of using the parent base address for both images.
+
+### Unintentional differences (to fix)
+- The broader owner split remains: `TextureCacheBase::JoinImages(...)` can still return the new image id before the OpenGL backend tail runs in paths that do not immediately drain `PendingJoinCopies`.
+- `apply_join_relations(...)` is a Rust extraction of the upstream inline block. It preserves ownership better than duplicating the block in OpenGL, but the upstream-shaped end state is still a single templated owner or equivalent backend hook around the whole `JoinImages` tail.
+
+### Missing items
+- Move the remaining `JoinImages` backend/runtime tail behind one upstream-shaped owner/hook so all insertion paths complete `RefreshContents`, rescale, alias/bad-overlap relations, copies, delete/unregister, and final registration before exposing the new image.
+- Port the remaining bad-overlap download/resolve behavior and exact post-rescale invalidation ordering.
+
+### Binary layout verification
+- N/A: texture-cache host alias metadata and OpenGL backend ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages` around `RefreshContents`, rescale, sorted `join_copies_to_do`, alias/bad-overlap relation insertion, copy loop, delete/unregister, and final `RegisterImage`.
+- Re-read Rust `TextureCacheBase::join_images`, `TextureCacheBase::apply_join_relations`, `PendingJoinCopies`, `OpenGL::TextureCache::finish_pending_join_copies_impl`, and `ImageBase::{try_find_base,add_image_alias}`.
+- `cargo test -p video_core pending_join_relations_apply_aliases_at_backend_tail_boundary -- --nocapture`
+- `cargo test -p video_core join_images -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache_base.rs, video_core/src/texture_cache/texture_cache.rs, video_core/src/renderer_opengl/gl_texture_cache.rs, and video_core/src/delayed_destruction_ring.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h
+
+### Intentional differences
+- `TextureCacheBase` already owns upstream counterparts for `sentenced_images` and `sentenced_image_view`; OpenGL `TextureCache::tick_frame(...)` ticks those common rings, then its backend framebuffer ring, async decode, runtime tick, and finally the base frame counter. This preserves upstream `TextureCache<P>::TickFrame` ordering while backend framebuffer objects remain OpenGL-owned.
+- `DelayedDestructionRing::retained_len(...)` is compiled only for tests and exists solely to verify deferred destruction retention/release behavior without exposing runtime state.
+
+### Unintentional differences (to fix)
+- None known for common image/image-view delayed-destruction ownership after re-reading upstream `TextureCache<P>::DeleteImage` and `TextureCache<P>::TickFrame`.
+
+### Missing items
+- None for common `sentenced_images` / `sentenced_image_view` storage and ticking. Full owner unification for backend images/framebuffers remains tracked by the broader texture-cache owner split entries.
+
+### Binary layout verification
+- N/A: host lifetime queues only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::TickFrame`, `TextureCache<P>::DeleteImage`, and `texture_cache_base.h` delayed-destruction members.
+- Re-read Rust `TextureCacheBase::{sentenced_images,sentenced_image_view,tick_delayed_destruction_rings,tick_frame}`, OpenGL `TextureCache::tick_frame`, and `DelayedDestructionRing`.
+- `cargo test -p video_core delete_image_removes_view_references_and_framebuffers -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `OpenGL::TextureCache::materialize_views_impl(...)` now drains queued `PendingJoinCopies` before creating backend `ImageView` objects. This moves the Rust split-owner path closer to upstream `TextureCache<P>::JoinImages`, where `RefreshContents`, rescale, `CopyImage`, unregister/delete, and final registration happen before the new image can be observed by a sampled view.
+- `base_image_view_exists(...)` guards the post-drain materialization loop because the deferred tail can delete overlaps and their views before the caller's stale `ImageViewInOut` array is consumed. Upstream does not need this guard because the join tail is synchronous and the caller never receives stale view ids from an unfinished join.
+- `OpenGL::TextureCache::find_or_insert_image_from_info_with_options_and_finish(...)` wraps the Fermi2D/blit image insertion sites so each `TextureCacheBase::find_or_insert_image_from_info_with_options(...)` call is immediately followed by the OpenGL `PendingJoinCopies` tail when a GPU reader is available. This reduces the remaining exposure window in `GetBlitImages`/`BlitImage`: source/destination image ids are no longer carried through the blit setup with a pending join tail when the backend has enough context to complete upstream's `RefreshContents`, rescale, copy, unregister/delete, and register sequence.
+
+### Unintentional differences (to fix)
+- The broader split remains: `TextureCacheBase::JoinImages(...)` still returns the new image id before the OpenGL backend tail runs for non-OpenGL or reader-less paths. This pass prevents sampled backend views and the audited Fermi2D/blit path from using newly inserted images before the tail has had an upstream-equivalent drain opportunity.
+
+### Missing items
+- Move the `JoinImages` backend/runtime tail into a single upstream-shaped owner, or add an equivalent backend hook so the common insertion path cannot expose an intermediate image id.
+- Port the remaining bad-overlap download/resolve path and exact post-rescale invalidation ordering.
+
+### Binary layout verification
+- N/A: OpenGL backend view materialization order only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages` tail ordering: `RefreshContents`, rescale, alias/bad-overlap bookkeeping, sorted copy loop, unregister/delete, and register.
+- Re-read upstream `TextureCache<P>::GetBlitImages` / blit setup region around source/destination `FindImage`/`InsertImage` usage.
+- Re-read Rust `TextureCacheBase::join_images`, `OpenGL::TextureCache::{finish_pending_join_copies_impl,materialize_views_impl,copy_image,prepare_pending_join_rescale,blit_image}`, and `SlotVector::get` panic behavior for freed view slots.
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core join_images_deletes_exact_sparse_gpu_overlap -- --nocapture`
+- Superseded test name/expectation: `join_images_preserves_gpu_modified_ignored_overlap_as_bad_overlap` was replaced by the upstream-fatal ignored-overlap tests in the 2026-06-14 top `texture_cache.rs` entry.
+- `cargo test -p video_core join_images_records_incompatible_overlaps -- --nocapture`
+- `cargo fmt --all --check`
+- `git diff --check`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache_base.rs, video_core/src/texture_cache/texture_cache.rs, and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `TextureCacheBase::mark_render_targets_dirty(...)` centralizes the upstream dirty-flag writes used by both `TextureCache<P>::DeleteImage` and `TextureCache<P>::InvalidateScale`: `Dirty::RenderTargets`, `Dirty::ZetaBuffer`, and `Dirty::ColorBuffer0 + rt` for all eight render targets.
+- Rust reaches the live `Maxwell3D` through the per-channel `ChannelInfo::maxwell3d` non-owning pointer captured by `ChannelSetupCaches`, matching upstream's `maxwell3d->dirty.flags` owner while using the existing `Maxwell3DAccess::set_dirty_flag(...)` trait method instead of directly exposing private engine fields.
+- OpenGL `TextureCache::invalidate_scale(...)` calls the same base helper before removing render-target/depth image-view references, matching upstream `InvalidateScale` ordering.
+
+### Unintentional differences (to fix)
+- None known for the `DeleteImage` / `InvalidateScale` dirty render-target flag writes after re-reading upstream. Broader texture-cache owner split remains tracked separately.
+
+### Missing items
+- None identified for this dirty-flag slice. The earlier `OnGPUASRegister` call-boundary debt is fixed by the following texture-cache GPU page-table storage entry.
+
+### Binary layout verification
+- N/A: host dirty-flag state only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::DeleteImage` and `TextureCache<P>::InvalidateScale`.
+- Re-read Rust `TextureCacheBase::mark_render_targets_dirty`, `TextureCacheBase::delete_image`, OpenGL `TextureCache::invalidate_scale`, `ChannelInfo::from_channel_state`, and `Maxwell3DAccess::{set_dirty_flag,dirty_flags,clear_dirty_flag}`.
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core delete_image_marks_maxwell_render_targets_dirty -- --nocapture`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `TextureCacheBase::insert_image(...)` now rejects sparse images before CPU-address resolution when no channel `MemoryManager` is bound. Upstream never needs a sparse fake-address fallback here because `TextureCache<P>` owns a live `gpu_memory`, and sparse registration later calls `ForEachSparseSegment(...)`, which directly uses `gpu_memory->GetSubmappedRange(...)` and asserts every sparse segment has a CPU address.
+- The Rust guard runs before `resolve_or_allocate_cpu_addr(...)`, `join_images(...)`, image-slot insertion, map-view insertion, or `virtual_invalid_space` advancement. This preserves the upstream dependency instead of creating partial sparse state that cannot be registered with upstream-equivalent segment maps.
+
+### Unintentional differences (to fix)
+- None known for the sparse-without-channel-memory precondition after re-reading upstream `InsertImage`, `JoinImages`, `RegisterImage`, and `ForEachSparseSegment`. The broader channel binding/order parity remains tracked in the GPU channel binding entries.
+
+### Missing items
+- None for sparse fake-address fallback behavior: no such fallback exists upstream. If a runtime path reaches this assertion, the missing dependency is the caller/channel binding order, not texture-cache sparse address emulation.
+
+### Binary layout verification
+- N/A: texture-cache host address/indexing precondition only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::ForEachSparseSegment`, `TextureCache<P>::RegisterImage`, and the sparse branch in `TextureCache<P>::TrackImage`.
+- Re-read Rust `TextureCacheBase::{insert_image,join_images,resolve_or_allocate_cpu_addr,rebase_virtual_invalid_images}` and `sparse_insert_without_channel_memory_does_not_allocate_virtual_state`.
+- `cargo test -p video_core sparse_insert_without_channel_memory_does_not_allocate_virtual_state -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache_base.rs and video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust stores per-channel GPU page-table references as `gpu_page_table_index` / `sparse_page_table_index` into `TextureCacheBase::gpu_page_table_storage` instead of raw pointers. This preserves upstream ownership: two `TextureCacheGPUMap` entries are allocated per registered GPU address-space, and channels sharing the same `MemoryManager::get_id()` share the same dense/sparse texture page tables.
+- `ChannelSetupCaches::create_channel_with_on_gpu_as_register(...)` now exposes the upstream virtual `OnGPUASRegister(map_id)` call point inside `CreateChannel`, exactly when a new GPU address-space is inserted. `TextureCacheBase::create_channel(...)` uses that hook to append/resize the two dense/sparse `TextureCacheGPUMap` entries for the new storage id before channel page-table indices are assigned.
+- After the hook, `TextureCacheBase::create_channel(...)` resolves the channel bind ID, looks up the address-space storage id, and assigns dense/sparse page-table indices using `storage_id * 2` and `storage_id * 2 + 1`, matching upstream `channel_state->gpu_page_table = &gpu_page_table_storage[*storage_id * 2]` and sparse `+ 1`.
+- `current_gpu_page_table_index(...)` is a Rust helper for the upstream `channel_state->gpu_page_table` / `channel_state->sparse_page_table` pointer dereference used by registration and lookup paths.
+
+### Unintentional differences (to fix)
+- Fixed: upstream `OnGPUASRegister` is now represented by `ChannelSetupCaches::create_channel_with_on_gpu_as_register(...)`, and `TextureCacheBase` allocates the two page-table maps at the same address-space-registration boundary instead of resizing only after `ChannelSetupCaches` returns.
+
+### Missing items
+- Fixed by the later 2026-06-13 texture-cache Maxwell3D dirty render-target flags entry.
+
+### Binary layout verification
+- N/A: texture-cache page-table ownership only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `ChannelSetupCaches<P>::CreateChannel`, `TextureCache<P>::CreateChannel`, `TextureCache<P>::OnGPUASRegister`, `TextureCache<P>::ForEachImageInRegionGPU`, and `TextureCache<P>::ForEachSparseImageInRegion`.
+- Re-read Rust `ChannelSetupCaches::{create_channel,create_channel_with_on_gpu_as_register}`, `TextureCacheBase::{create_channel,current_gpu_page_table_index,collect_images_in_gpu_region}`, `TextureCacheBase::register_image`, and `TextureCacheBase::unregister_image`.
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core gpu_page_table_storage_is_shared_per_address_space -- --nocapture`
+- `cargo test -p video_core create_channel_runs_gpu_as_register_once_per_address_space -- --nocapture`
+
+## 2026-06-13 — video_core/src/control/channel_state_cache.rs, video_core/src/texture_cache/texture_cache_base.rs, video_core/src/texture_cache/texture_cache.rs, video_core/src/renderer_opengl/gl_rasterizer.rs, and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/control/channel_state_cache.{h,inc}, /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h, and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `TextureCacheBase` now owns a `ChannelSetupCaches<TextureCacheChannelInfo>` counterpart and `TextureCacheChannelInfo` now carries upstream `ChannelInfo` state. OpenGL rasterizer channel creation/binding now calls `texture_cache.base.create_channel(...)` / `bind_to_channel(...)`, matching upstream `RasterizerOpenGL::{InitializeChannel,BindChannel}` edges for texture cache state.
+- Current descriptor-table, image-view, sampler, and GPU page-table operations now resolve through the bound texture-cache channel when one exists, while retaining the old inline `channel_state` only as a reduced-construction fallback for unit tests without a real `ChannelState`.
+- `DeleteImage`, `RemoveImageViewReferences`, and OpenGL `InvalidateScale` now iterate all active texture-cache channels and invalidate/remove `graphics_image_view_ids`, `compute_image_view_ids`, descriptor tables, and `image_views`, matching upstream `for (size_t c : active_channel_ids) { auto& channel_info = channel_storage[c]; ... }`.
+- `ChannelSetupCaches` exposes current, by-bind-id, and active-channel mutable accessors instead of exposing its storage fields directly. This is a Rust borrow-checker adaptation over upstream protected `channel_storage` / `channel_map` member access.
+
+### Unintentional differences (to fix)
+- Fixed by the later 2026-06-13 texture-cache GPU page-table storage entry: Rust now stores two `TextureCacheGPUMap` entries per GPU address-space and channel states hold indices into that shared storage instead of boxed per-channel maps.
+- Fixed by the later 2026-06-13 texture-cache Maxwell3D dirty render-target flags entry.
+
+### Missing items
+- Fixed by the later 2026-06-13 texture-cache GPU page-table storage entry.
+- Fixed by the later 2026-06-13 texture-cache Maxwell3D dirty render-target flags entry.
+
+### Binary layout verification
+- N/A: texture-cache channel ownership and descriptor-cache invalidation only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `ChannelSetupCaches<P>::CreateChannel`, `TextureCache<P>::CreateChannel`, `TextureCache<P>::DeleteImage`, `TextureCache<P>::RemoveImageViewReferences`, and `TextureCache<P>::InvalidateScale`.
+- Re-read Rust `ChannelSetupCaches`, `TextureCacheChannelInfo`, `TextureCacheBase::{create_channel,bind_to_channel,current_channel_state_mut,for_each_active_channel_state_mut}`, `TextureCacheBase::delete_image`, and OpenGL `TextureCache::invalidate_scale`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core delete_image_invalidates_all_active_channel_image_views -- --nocapture`
+- `cargo test -p video_core invalidate_scale_shared_tail_invalidates_all_active_channel_image_views -- --nocapture`
+- `cargo test -p video_core delete_image_removes_view_references_and_framebuffers -- --nocapture`
+- `cargo test -p video_core texture_cache::texture_cache::tests -- --nocapture`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `TextureCacheBase::delete_image(...)` now invalidates the current Rust channel's `graphics_image_view_ids` and `compute_image_view_ids` with `CORRUPT_ID` in addition to invalidating the graphics/compute descriptor tables. This ports the upstream `DeleteImage` validation-side cache invalidation for the channel owner currently represented in ruzu.
+
+### Unintentional differences (to fix)
+- Fixed by the later 2026-06-13 texture-cache channel-storage entry: ruzu now iterates active texture-cache channels for `DeleteImage`/`RemoveImageViewReferences`/`InvalidateScale` descriptor invalidation and image-view cache removal.
+- Fixed by the later 2026-06-13 texture-cache Maxwell3D dirty render-target flags entry.
+
+### Missing items
+- Fixed by the later 2026-06-13 texture-cache channel-storage entry for active-channel descriptor invalidation/removal, and by the later texture-cache GPU page-table storage entry for exact address-space-shared table ownership.
+- Fixed by the later 2026-06-13 texture-cache Maxwell3D dirty render-target flags entry.
+
+### Binary layout verification
+- N/A: texture-cache descriptor-cache invalidation only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::DeleteImage`, `TextureCache<P>::InvalidateScale`, and `TextureCache<P>::RemoveImageViewReferences`.
+- Re-read Rust `TextureCacheBase::delete_image` and OpenGL `TextureCache::invalidate_scale`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core delete_image_removes_view_references_and_framebuffers -- --nocapture`
+- `cargo test -p video_core join_images_deletes_exact_sparse_gpu_overlap -- --nocapture`
+- `git diff --check`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust calls OpenGL-owned `ensure_backend_image`, `scale_up_image`, and `scale_down_image` from `TextureCache::synchronize_aliases(...)` because backend `Image` storage is split from `TextureCacheBase`. The control flow now matches upstream `TextureCache<P>::SynchronizeAliases`: detect whether the target or any newer alias is rescaled, run `ImageCanRescale`, scale the destination image up or down before copying, sort aliases by modification tick, then scale each alias consistently before `CopyImage`.
+- Rust checks `settings::values().resolution_info.active` through the existing settings accessor instead of upstream's global `Settings::values.resolution_info.active`; the active/inactive branch matches upstream.
+
+### Unintentional differences (to fix)
+- Exact templated ownership is still split: upstream owns common image state and backend image resources in one `TextureCache<P>`, while Rust keeps common images in `TextureCacheBase` and OpenGL images in `OpenGL::TextureCache`.
+
+### Missing items
+- Complete the broader `JoinImages` / `ResolveOverlap` parity tracked by the older texture-cache entries so every upstream alias relationship is registered before `SynchronizeAliases` runs.
+- Move the full common/backend texture-cache owner shape closer to upstream so rescale and alias synchronization no longer need OpenGL wrapper calls around a backend-independent base cache.
+
+### Binary layout verification
+- N/A: OpenGL texture-cache alias/rescale synchronization only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::SynchronizeAliases`, `TextureCache<P>::PrepareImage`, and `TextureCache<P>::CopyImage`.
+- Re-read Rust `TextureCache::synchronize_aliases`, `TextureCache::{image_can_rescale,scale_up_image,scale_down_image}`, and `TextureCache::copy_image`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core texture_cache -- --nocapture`
+- `git diff --check`
+- MK8D smoke via `/tmp/ruzu-run.sh` wrote `screenshots/tmp/mk8d-20260613-230401-alias-rescale.log`; reached `AccelerateDisplay hit`, `SDL_GL_SwapWindow`, and no `panic`, `not implemented`, `unimplemented`, or `GL API Error` markers were found in the checked log lines. No `ruzu-cmd` process remained after timeout cleanup.
+
+## 2026-06-13 — video_core/src/renderer_opengl/present/layer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/layer.cpp
+
+### Intentional differences
+- Rust reads `common::settings::values().resolution_info` at each AA viewport/pass-creation site instead of using upstream's global `Settings::values.resolution_info` expression directly. The selected values and `ScaleUp` formulas match upstream `ResolutionScalingInfo::ScaleUp`.
+
+### Unintentional differences (to fix)
+- None known for OpenGL presentation AA viewport/pass sizing after re-reading upstream `Layer::ConfigureDraw`, `Layer::CreateFXAA`, `Layer::CreateSMAA`, and `ResolutionScalingInfo::ScaleUp`.
+
+### Missing items
+- None identified for the OpenGL FXAA/SMAA/FSR presentation filter sizing and shader/resource creation slice after this pass. Broader GPU/texture parity debt remains elsewhere in this file and must continue to be audited.
+
+### Binary layout verification
+- N/A: OpenGL host viewport/scissor/pass texture sizing only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `present/layer.cpp` around `ConfigureDraw`, `CreateFXAA`, and `CreateSMAA`.
+- Re-read upstream `common/settings.h::ResolutionScalingInfo::ScaleUp` and Rust `common/src/settings.rs::ResolutionScalingInfo::{scale_up_i32,scale_up_u32}`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core opengl_scaling_filter_maps_present_filters -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/present/fsr.rs, video_core/src/renderer_opengl/present/layer.rs, and video_core/src/host_shaders/glsl_includes.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/fsr.cpp, fsr.h, present/layer.cpp, and generated host shader includes
+
+### Intentional differences
+- Rust stores OpenGL program, sampler, framebuffer, and texture handles as raw `u32` fields instead of upstream `OGLProgram`, `OGLSampler`, `OGLFramebuffer`, and `OGLTexture` RAII wrappers; `Drop` releases them explicitly. The constructor and draw call order match upstream for this slice.
+- Rust exposes FidelityFX include bodies as `FFX_A_H` and `FFX_FSR1_H` through `host_shaders/glsl_includes.rs` using local shader assets `ffx_a.h` and `ffx_fsr1.h`. Upstream consumes generated C++ headers `ffx_a_h.h` and `ffx_fsr1_h.h`; the GLSL include text is the same dependency needed by `ReplaceInclude`.
+- Rust uploads FSR uniforms with `gl::ProgramUniform4uiv(..., 4, easu_con.as_ptr())` and `gl::ProgramUniform4uiv(..., 1, rcas_con.as_ptr())`, using GL's vector counts for a 4-element `uvec4 constants[4]` and 1-element RCAS constant. Upstream source passes `sizeof(easu_con)` / `sizeof(rcas_con)` in that count slot; Rust keeps the intended uniform payload size without reading beyond the local arrays.
+
+### Unintentional differences (to fix)
+- None known for OpenGL FSR shader include replacement, shader creation, vertex uniform setup, sampler/framebuffer/texture creation, EASU/RCAS constant generation, crop-aware draw control flow, or layer crop reset after re-reading upstream `FSR::FSR`, `FSR::Draw`, and the FSR branch in `Layer::ConfigureDraw`.
+
+### Missing items
+- Fixed by later entry: OpenGL presentation AA viewport/pass sizing now uses Rust `ResolutionScalingInfo::{scale_up_i32,scale_up_u32}` at the same conceptual sites as upstream `Settings::values.resolution_info.ScaleUp(...)`.
+
+### Binary layout verification
+- N/A: OpenGL host presentation pass and shader source assets only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `present/fsr.cpp`, `present/fsr.h`, `present/layer.cpp`, `video_core/fsr.h`, generated `ffx_a_h.h` / `ffx_fsr1_h.h`, and FidelityFX `ffx_a.h` / `ffx_fsr1.h`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core opengl_scaling_filter_maps_present_filters -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/present/smaa.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/smaa.cpp and smaa.h
+
+### Intentional differences
+- Rust stores OpenGL program, texture, sampler, and framebuffer handles as raw `u32` fields instead of upstream `OGLProgram`, `OGLTexture`, `OGLSampler`, and `OGLFramebuffer` RAII wrappers; `Drop` releases them explicitly. The constructor and draw call order match upstream for this slice.
+- Rust uses `smaa_shader(...)` as the counterpart to upstream's local `SmaaShader` lambda. It applies `replace_include(..., "opengl_smaa.glsl", OPENGL_SMAA_GLSL)` and then calls `create_program_from_source(...)`, matching upstream `ReplaceInclude` plus `CreateProgram`.
+- Rust references embedded `smaa_area_tex.bin` and `smaa_search_tex.bin` through the existing `smaa_area_tex.rs` and `smaa_search_tex.rs` modules instead of carrying the large byte arrays inline in this file. The dimensions, GL formats, and upload calls match upstream `smaa_area_tex.h` / `smaa_search_tex.h`.
+
+### Unintentional differences (to fix)
+- None known for SMAA shader creation, area/search lookup texture upload, intermediate texture allocation, and three-pass draw control flow after re-reading upstream `SMAA::SMAA` and `SMAA::Draw`.
+
+### Missing items
+- Fixed by later entries: `fsr.rs` now compiles its OpenGL shader programs, ports FidelityFX include replacement, uploads EASU/RCAS constants, and consumes the crop rectangle from `Layer::configure_draw(...)`; OpenGL AA viewport/pass sizing now uses `ResolutionScalingInfo::scale_up_*`.
+
+### Binary layout verification
+- N/A: OpenGL host presentation pass only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `present/smaa.cpp`, `present/smaa.h`, `present/util.h`, `smaa_area_tex.h`, and `smaa_search_tex.h`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core opengl_scaling_filter_maps_present_filters -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/present/fxaa.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/fxaa.cpp and fxaa.h
+
+### Intentional differences
+- Rust stores OpenGL program, sampler, framebuffer, and texture handles as raw `u32` fields instead of upstream `OGLProgram`, `OGLSampler`, `OGLFramebuffer`, and `OGLTexture` RAII wrappers; `Drop` releases them explicitly. Creation order and GL calls match upstream for this slice.
+- Rust uses shared `gl_shader_util::create_program_from_source(...)` and embedded shader constants `host_shaders::{FXAA_VERT, FXAA_FRAG}` as the counterpart to upstream `CreateProgram(HostShaders::FXAA_*, ...)`.
+
+### Unintentional differences (to fix)
+- None known for FXAA shader creation and draw control flow after re-reading upstream `FXAA::FXAA` and `FXAA::Draw`.
+
+### Missing items
+- Fixed by later entries: `smaa.rs` now compiles its six shader programs and uploads the upstream area/search lookup textures; `fsr.rs` now compiles its OpenGL shader programs and uploads its EASU/RCAS constants; OpenGL AA viewport/pass sizing now uses `ResolutionScalingInfo::scale_up_*`.
+
+### Binary layout verification
+- N/A: OpenGL host presentation pass only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `present/fxaa.cpp`, `present/fxaa.h`, and `present/util.h`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core opengl_scaling_filter_maps_present_filters -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_blit_screen.rs and video_core/src/renderer_opengl/present/layer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_blit_screen.cpp, gl_blit_screen.h, present/layer.cpp, and present/layer.h
+
+### Intentional differences
+- `BlitScreen` stores `&'static PresentFilters` and initializes it with `PRESENT_FILTERS_FOR_DISPLAY` instead of receiving `const PresentFilters& filters` from the renderer constructor. The owner and call sites now match upstream conceptually: `CreateWindowAdapt` and newly created `Layer` instances consume the same filter selector instead of calling global presentation settings directly.
+- `Layer::configure_draw(...)` now follows upstream's local filter decision order: prepare render target, normalize crop, apply anti-aliasing branch, disable scissor, then apply FSR branch before producing the final matrix and vertices. `BlitScreen` now owns the shared `ProgramManagerHandle` and threads it through `WindowAdaptPass` into `Layer` and the FXAA/SMAA/FSR draw calls, matching upstream's `ProgramManager&` dependency conceptually while preserving Rust's shared-owner graph.
+- `WindowAdaptPass::draw_to_framebuffer(...)` now binds its final window-adapt vertex/fragment programs through `ProgramManager::bind_present_programs(...)` instead of binding its private pipeline directly. This matches upstream `WindowAdaptPass::DrawToFramebuffer(program_manager, ...)` for present program ownership; the current Rust `pipeline` field remains as legacy allocation state until the constructor is reduced to the upstream `OGLProgram`/`OGLBuffer` owner set.
+- Rust's FSR branch resets the crop only when the FSR pass returns a different output texture. Upstream always resets after `FSR::Draw(...)`; Rust keeps this guard because the current FSR shader programs are still zero until the pass constructor is fully ported, so the no-op path must not accidentally reinterpret cropped framebuffer coordinates as a full texture.
+
+### Unintentional differences (to fix)
+- Fixed by later entries: FXAA and SMAA now compile their upstream shader programs, SMAA uploads its upstream area/search lookup textures, FSR now compiles its OpenGL shader programs, expands FidelityFX includes, configures EASU/RCAS constants, consumes crop-aware draw inputs, and AA viewport/pass sizing now uses `ResolutionScalingInfo::scale_up_*`.
+
+### Missing items
+- None identified for this OpenGL presentation filter ownership/control-flow slice after the later FXAA/SMAA/FSR and AA sizing entries. Broader GPU/texture parity debt remains elsewhere in this file and must continue to be audited.
+
+### Binary layout verification
+- N/A: presentation filter ownership/control-flow only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `OpenGL::BlitScreen::{BlitScreen,DrawScreen,CreateWindowAdapt}`, `WindowAdaptPass::DrawToFramebuffer`, `ProgramManager::BindPresentPrograms`, and `OpenGL::Layer::{Layer,ConfigureDraw,CreateFXAA,CreateSMAA}`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core opengl_scaling_filter_maps_present_filters -- --nocapture`
+
+## 2026-06-13 — video_core/src/surface.rs, video_core/src/texture_cache/texture_cache_base.rs, and video_core/src/renderer_opengl/present/layer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/surface.cpp, surface.h, texture_cache/texture_cache.h, and renderer_opengl/present/layer.cpp
+
+### Intentional differences
+- `pixel_format_from_gpu_pixel_format(...)` takes the raw Android pixel-format `u32` carried by ruzu's `FramebufferConfig::pixel_format` wrapper instead of upstream's `Service::android::PixelFormat` enum. The mapping and fallback values match upstream `VideoCore::Surface::PixelFormatFromGPUPixelFormat`.
+- OpenGL `Layer::load_fb_to_screen_info(...)` and `configure_framebuffer_texture(...)` now compute framebuffer bytes-per-pixel through `surface::pixel_format_from_gpu_pixel_format(...)` plus `surface::bytes_per_block(...)`, matching upstream's `PixelFormatFromGPUPixelFormat(framebuffer.pixel_format)` / `BytesPerBlock(pixel_format)` ownership instead of local raw-value matches.
+- `TextureCacheBase::try_find_framebuffer_image_view(...)` now uses the same common GPU pixel-format helper for the presentable image-view format selected by upstream `TextureCache<P>::TryFindFramebufferImageView`. This keeps the accelerated `RasterizerOpenGL::AccelerateDisplay` path and the fallback CPU upload path on the same upstream mapping.
+
+### Unintentional differences (to fix)
+- None identified for Android GPU pixel-format mapping after re-reading upstream `surface.cpp`, `TextureCache<P>::TryFindFramebufferImageView`, and `renderer_opengl/present/layer.cpp`.
+
+### Missing items
+- Fixed by later entries: OpenGL presentation FXAA/SMAA/FSR filter passes now compile their upstream shader programs, create/upload their resources, and use upstream-equivalent viewport/pass sizing. This older entry only fixed framebuffer pixel-format mapping and bytes-per-pixel ownership for the fallback CPU presentation upload path.
+
+### Binary layout verification
+- N/A: framebuffer pixel-format mapping, presentable image-view format selection, and host upload sizing only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `VideoCore::Surface::PixelFormatFromGPUPixelFormat`, `BytesPerBlock`, `TextureCache<P>::TryFindFramebufferImageView`, `OpenGL::RasterizerOpenGL::AccelerateDisplay`, `OpenGL::Layer::LoadFBToScreenInfo`, and `OpenGL::Layer::ConfigureFramebufferTexture`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core gpu_pixel_format_mapping_matches_upstream_surface_cpp -- --nocapture`
+- `cargo test -p video_core try_find_framebuffer_image_view_emplaces_display_specific_view -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.h and gl_rasterizer.cpp
+
+### Intentional differences
+- Rust keeps the `QueryFallback` write body in the private helper `make_query_fallback_operation(...)` so the raw guest-memory write behavior can be unit-tested without constructing an OpenGL context. The helper stays in the upstream-equivalent `gl_rasterizer.rs` owner and is a mechanical extraction of the upstream lambda body.
+- Rust uses `Arc<Mutex<MemoryManager>>`, `write_block_unsafe(...)`, and a test-injected GPU tick getter instead of upstream's captured `gpu_memory` pointer and `gpu.GetTicks()`. The written values and ordering match upstream.
+- `ProgramManager::new_shared_for_test()` is test-only and creates a zero pipeline so existing `RasterizerOpenGL::new_for_test()` users do not call OpenGL without a GL context.
+
+### Unintentional differences (to fix)
+- Fixed: non-fence `QueryFallback` operations were routed through `RasterizerInterface::sync_operation(...)` in GPU High mode. Upstream calls the fallback lambda immediately for every non-fence query and only uses `SignalFence(...)` when `IsAFence` is set.
+- Fixed: the fallback `Payload + HasTimeout` path is now covered by a test that runs while `GpuAccuracy::High` is active and verifies the payload and timestamp writes happen immediately.
+
+### Missing items
+- The broader MK8D no-frame regression is still under validation. Previous traces showed `NvdrvSyncpointManager::is_fence_signalled id=1 value=2 -> false`, no `BQP::queue_buffer`, and repeated `NO_LAYERS`; this query fallback fix must be validated by a fresh MK8D run.
+- Mapped/query-cache parity for query types that do have `MaxwellToVideoCoreQuery(...)` mappings remains separate from this fallback entry.
+
+### Binary layout verification
+- PASS: `QueryFallback` writes `u64` timestamp at `gpu_addr + 8`, `u64` payload at `gpu_addr` for `HasTimeout`, and `u32` payload at `gpu_addr` otherwise, matching upstream raw write sizes and order.
+
+### Verification
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.h` around `QueryFallback`.
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp` around `RasterizerOpenGL::Query` and `RasterizerOpenGL::QueryFallback`.
+- `cargo test -p video_core query_has_timeout_payload_fallback_writes_immediately_and_preserves_payload -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `git diff --check`
+
+## 2026-06-13 — video_core/src/engines/puller.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/puller.h and puller.cpp
+
+### Intentional differences
+- Rust stores the rasterizer behind `RasterizerHandle` and requires an explicit `force: bool` argument for `release_fences(...)`; upstream declares `RasterizerInterface::ReleaseFences(bool force = true)`. Calls that are written as `rasterizer->ReleaseFences()` upstream are therefore ported as `release_fences(true)`.
+- Rust keeps the existing pointer/`Arc<Mutex<MemoryManager>>` ownership adaptation for GPU/channel/memory state. The method ownership remains in the upstream-equivalent Puller file.
+
+### Unintentional differences (to fix)
+- Fixed: `ProcessSemaphoreTriggerMethod` acquire retry paths and `ProcessSemaphoreAcquire` previously called `release_fences(false)`. Upstream calls `ReleaseFences()` with the default `force = true`, so Rust now calls `release_fences(true)` in those paths.
+
+### Missing items
+- The broader MK8D no-frame regression is still under verification. Previous traces showed submit#2 waiting on syncpoint value 2 with host value 1 and no `BQP::queue_buffer`; this Puller fix must be validated by relaunching MK8D.
+- A focused unit test for the semaphore retry loop is not kept because the method intentionally waits until guest memory changes; the direct fence acquire force behavior is covered by `fence_acquire_forces_fence_release`.
+
+### Binary layout verification
+- PASS: Puller register indices still match upstream `ASSERT_REG_POSITION` values documented in `PullerRegs`; no guest-visible raw struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/puller.h` around `Regs`, `FenceAction`, and `GpuSemaphoreOperation`.
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/puller.cpp` around `ProcessFenceActionMethod`, `ProcessSemaphoreTriggerMethod`, and `ProcessSemaphoreAcquire`.
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/video_core/rasterizer_interface.h` for `ReleaseFences(bool force = true)`.
+- `cargo fmt --all --check`
+- `cargo test -p video_core fence_acquire_forces_fence_release -- --nocapture`
+- `cargo check -p video_core --quiet`
+- `git diff --check`
+
+## 2026-06-13 — video_core/src/engines/maxwell_3d.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h and maxwell_3d.cpp
+
+### Intentional differences
+- Rust keeps Maxwell3D registers in the existing flat register array and decodes the `ReportSemaphore::query` bitfields locally in `process_query_get()`. The owner remains the upstream-equivalent Maxwell3D engine file/method, and the decoded fields now match upstream `Regs::ReportSemaphore::query`.
+
+### Unintentional differences (to fix)
+- None known for `ReportSemaphore::query.report` and `ReportSemaphore::query.sub_report` extraction after this fix. Upstream uses `BitField<23, 5, Report>` and `BitField<5, 3, u32>`; Rust now decodes `(query_word >> 23) & 0x1F` and `(query_word >> 5) & 0x7`.
+
+### Missing items
+- Broader `ProcessQueryGet` parity is still not fully closed: Rust keeps the existing fallback path for cases where no rasterizer is bound, while upstream always routes through `rasterizer->Query(...)` for Release and ReportOnly.
+- The current MK8D no-frame regression remains unresolved. Latest traces show the app reaches `dequeue_buffer` / `request_buffer` but does not reach `BQP::queue_buffer`; syncpoint submit#2 waits for value 2 while host value remains 1.
+
+### Binary layout verification
+- N/A: this change corrects register bitfield decoding only. No guest-visible raw struct or serialized payload layout changed.
+
+### Verification
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` around `Regs::ReportSemaphore::query`.
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp` around `Maxwell3D::ProcessQueryGet`.
+- `cargo fmt --all --check`
+- `cargo test -p video_core test_report_semaphore_query_bitfields_match_upstream_layout -- --nocapture`
+- `cargo test -p video_core report_semaphore -- --nocapture`
+- `cargo check -p video_core --quiet`
+- `git diff --check`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_device.rs, video_core/src/renderer_opengl/gl_shader_cache.rs, and video_core/src/renderer_opengl/gl_compute_pipeline.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_device.cpp, gl_shader_cache.cpp, and gl_compute_pipeline.cpp
+
+### Intentional differences
+- `Device` now stores the effective `ShaderBackend` selected from settings and applies the same GLASM support fallback to GLSL as upstream `Device::Device()`. Rust keeps the enum in `common::settings_enums::ShaderBackend`, but the selected backend is now owned by the OpenGL device as upstream does.
+- `ShaderCache::create_compute_pipeline_from_environment(...)` now mirrors upstream `ShaderCache::CreateComputePipeline(...)` backend selection for compute shaders: GLSL emits GLSL source, GLASM emits assembly source when `use_assembly_shaders` is true, and SPIR-V emits `Vec<u32>` code after `ConvertLegacyToGeneric`.
+- `ComputePipeline::new_with_backend_state(...)` receives a local `ComputeProgramBackend` snapshot because the current Rust constructor is still decoupled from the full upstream `Device&` / cache owner graph. The behavior matches the upstream constructor switch over `device.GetShaderBackend()`.
+
+### Unintentional differences (to fix)
+- Fixed by later entries: SPIR-V compute program creation now loads/calls `glSpecializeShader(shader, "main", 0, nullptr, nullptr)` through `gl_shader_util::create_program_from_spirv(...)`.
+- Fixed by later entries: GLASM compute program creation now loads/calls upstream's `glGenProgramsARB` and `glNamedProgramStringEXT` entrypoints.
+- Fixed by later entries: the GLASM bindless storage-buffer path now exposes and calls `glProgramLocalParametersI4uivNV` from the OpenGL buffer-cache runtime.
+
+### Missing items
+- Recheck graphics-pipeline backend parity separately; this entry only covers the compute pipeline path.
+
+### Binary layout verification
+- N/A: OpenGL shader backend selection and program creation only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `gl_device.cpp`, `gl_shader_cache.cpp`, `gl_compute_pipeline.cpp`, and `gl_shader_util.cpp` around shader-backend selection, compute pipeline emission, and program creation.
+- Focused checks run before this entry: `cargo test -p video_core compute_pipeline -- --nocapture`, `cargo test -p video_core async_wait_pending_fences_force_signals_drain_fence_and_waits_for_callback -- --nocapture`, and `cargo check -p video_core`.
+
+## 2026-06-13 — video_core/src/fence_manager.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/fence_manager.h
+
+### Intentional differences
+- Rust still injects `CreateFence`, `QueueFence`, `ShouldWait`, `ShouldFlush`, `CommitAsyncFlushes`, `PopAsyncFlushes`, and backend wait/signaled checks as closures because the Rust `FenceManager<F>` does not directly own the rasterizer, GPU, texture cache, buffer cache, and query cache references that upstream stores through the CRTP traits. The method body now preserves the upstream lifecycle for both async and non-async paths.
+- `RasterizerOpenGL::release_fences(...)` passes the same OpenGL backend callbacks already used by `signal_fence(...)` into `wait_pending_fences(...)`; this keeps OpenGL ownership in the rasterizer/fence-manager bridge while allowing the generic owner to run the upstream async drain-fence sequence.
+
+### Unintentional differences (to fix)
+- None known for the `WaitPendingFences(force=true)` async drain-fence behavior after re-reading upstream `FenceManager::WaitPendingFences` and `FenceManager::SignalFence`.
+
+### Missing items
+- Broader fence-manager owner parity remains tracked by older entries: the Rust generic manager still receives owners as callbacks instead of storing the full upstream owner graph directly.
+
+### Binary layout verification
+- N/A: fence scheduling/lifecycle only. No guest-visible raw struct or serialized payload layout changed.
+
+### Verification
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/video_core/fence_manager.h`, especially `SignalFence` and `WaitPendingFences`.
+- `cargo fmt --all --check`
+- `cargo test -p video_core async_wait_pending_fences_force_signals_drain_fence_and_waits_for_callback -- --nocapture`
+- `cargo test -p video_core stubbed_fence_still_runs_async_flush_waiter_path -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — core/src/hle/service/nvnflinger/buffer_queue_producer.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvnflinger/buffer_queue_producer.cpp and .h
+
+### Intentional differences
+- Rust `AttachBuffer` receives `Option<Arc<GraphicBuffer>>` and returns `(StatusCode, slot)` instead of writing through C++ out-pointers. The method body preserves upstream ownership and slot-state ordering.
+- Rust keeps `AttachBuffer` and `DetachNextBuffer` as direct methods only; upstream declares/implements these methods but does not expose matching `Transact` switch cases in `BufferQueueProducer::Transact`, so no new guest parcel format was invented.
+
+### Unintentional differences (to fix)
+- Fixed: `BufferQueueCoreInner::wait_while_allocating_locked()` asserted when `is_allocating` was true. Rust now owns this as `BufferQueueCore::wait_while_allocating_locked(guard)` and waits on `is_allocating_condition` while releasing/reacquiring the mutex, matching upstream `BufferQueueCore::WaitWhileAllocatingLocked()`.
+
+### Missing items
+- None known for `BufferQueueProducer::{DetachBuffer,DetachNextBuffer,AttachBuffer,Disconnect}` after re-reading upstream.
+- The broader `buffer_queue_producer` test filter still has existing failures outside this wait fix: event-handle unwraps in wait-event tests plus behavior mismatches in second dequeue / queue-buffer tests. Those need separate parity passes and are not proven fixed by this entry.
+
+### Binary layout verification
+- PASS: no guest-visible parcel or raw struct layout changed. `DetachBuffer` now uses the existing upstream transaction path; `AttachBuffer`/`DetachNextBuffer` are method-level parity only because upstream does not parcel them in this switch.
+
+### Verification
+- Re-read upstream `BufferQueueProducer::{DetachBuffer,DetachNextBuffer,AttachBuffer,Disconnect,Transact}` and `BufferQueueCore::{FreeBufferLocked,WaitForDequeueCondition}`.
+- Re-read upstream `BufferQueueCore::WaitWhileAllocatingLocked` and `BufferQueueCore` condition-variable ownership.
+- Added `wait_while_allocating_locked_blocks_until_condition_is_signaled` to prove Rust waits while `is_allocating` is true and resumes after `notify_all`.
+- `cargo test -p core wait_while_allocating_locked_blocks_until_condition_is_signaled -- --nocapture`
+- `cargo test -p core detach_buffer_requires_request_buffer_and_frees_requested_slot -- --nocapture`
+- `cargo test -p core detach_next_buffer_returns_oldest_free_graphic_buffer -- --nocapture`
+- `cargo test -p core attach_buffer_places_buffer_in_dequeued_requested_slot -- --nocapture`
+- `cargo test -p core disconnect_after_abandon_is_noop_success -- --nocapture`
+- `cargo test -p core buffer_queue_producer -- --nocapture` failed: 12 passed, 5 failed (`dequeue_buffer_requires_explicit_buffer_count_for_second_dequeue`, `get_native_handle_returns_persistent_buffer_wait_event`, `disconnect_signals_buffer_wait_event`, `queue_buffer_marks_core_as_having_queued_buffers`, `set_preallocated_buffer_signals_wait_event_and_updates_defaults`).
+- `cargo fmt --all --check`
+- `cargo check -p core --quiet`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_shader_cache.rs, video_core/src/renderer_opengl/gl_rasterizer.rs, video_core/src/renderer_opengl/gl_compute_pipeline.rs, and video_core/src/shader_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- `OpenGL::ShaderCache::current_compute_pipeline_with_shared_cache(...)` now ports the runtime shape of upstream `ShaderCache::CurrentComputePipeline`: query `VideoCommon::ShaderCache::ComputeShader`, build `ComputePipelineKey` from `shader->unique_hash`, `qmd.shared_alloc`, and QMD block dimensions, reuse `compute_cache` hits, and create/insert a pipeline on misses.
+- Rust reconstructs `ComputeEnvironment` through the composed shared `ShaderCache` owner (`current_kepler_compute` / `current_gpu_memory`) instead of direct inherited `kepler_compute` / `gpu_memory` members. This follows the existing Rust split between generic shader tracking and OpenGL pipeline ownership.
+- `RasterizerOpenGL::dispatch_compute_with_call(...)` now follows the upstream ordering through resource configuration: `FlushCaching`, get current compute pipeline, optional `ProgramManager::local_memory_warmup`, installed compute `EngineState`, and `ComputePipeline::configure_resource_state(...)`.
+- `ComputePipeline::new_with_backend_state(...)` lets the OpenGL shader cache pass the device-derived backend capability snapshot already owned by `ShaderCache::new(device)`. This avoids adding an incomplete `Device&` ownership edge while keeping constructor metadata derived from the same capability values.
+
+### Unintentional differences (to fix)
+- Fixed by later entries: `ComputePipeline::new_with_backend_state(...)` now compiles/stores real GLSL, GLASM, and SPIR-V compute program handles.
+- Fixed by later entries: runtime compute dispatch now executes direct and indirect OpenGL dispatch paths and increments `num_queued_commands` on the direct path.
+- Fixed by later entries: `ComputePipeline::configure_resource_state(...)` now ports the post-`FillComputeImageViews` texture-buffer, sampled-texture, sampler, storage-image, rescaling-uniform, and host-buffer binding phase.
+- The exact upstream ownership of backend code emission remains incomplete: Rust still routes through the existing shared shader-cache/recompiler bridge rather than a literal `ShaderCache::CreateComputePipeline` backend switch that owns GLSL/GLASM/SPIR-V emission and worker construction exactly like upstream.
+
+### Missing items
+- Port the remaining backend switch in `ShaderCache::CreateComputePipeline`: GLASM and SPIR-V emission, plus async/strict-context worker construction when that owner graph exists.
+
+### Binary layout verification
+- PASS: no guest-visible payload layout changed. `ComputePipelineKey` field selection now matches upstream `CurrentComputePipeline`; host-side shader/pipeline cache state only.
+
+### Tests
+- Re-read upstream `ShaderCache::CurrentComputePipeline`, both `CreateComputePipeline` overloads, `RasterizerOpenGL::DispatchCompute`, and `ComputePipeline` constructor/configure ordering.
+- `cargo fmt --all --check`
+- `cargo test -p video_core compute_pipeline_key_matches_upstream_current_compute_pipeline_fields -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_rasterizer.rs and video_core/src/buffer_cache/buffer_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp
+
+### Intentional differences
+- `RasterizerOpenGL::dispatch_compute_with_call(...)` now installs a compute-specific `EngineState` snapshot before the compute pipeline resource state can bind storage buffers. `ComputeEngineAdapter` exposes `DispatchCall.qmd.const_buffer_enable_mask` and all eight QMD const-buffer configs as `ComputeLaunchInfo`, matching upstream `kepler_compute->launch_description`.
+- With that adapter installed, existing `BufferCache::bind_compute_storage_buffer(...)` can resolve `cbuf.address + cbuf_offset` and then run the upstream-style `StorageBufferBinding` path instead of preserving masks with `NULL_BINDING`.
+- Rust uses a dispatch snapshot rather than a persistent `KeplerCompute*` because the current rasterizer entry point receives `DispatchCall` from `KeplerCompute::execute_pending`. This is the same temporary ownership adaptation already used for compute descriptor synchronization.
+
+### Unintentional differences (to fix)
+- The real OpenGL dispatch path still does not obtain a shader-cache `ComputePipeline`, so the newly installed compute `EngineState` is only consumed once the pipeline configure path is actually called from dispatch.
+- `DrawStateEngineAdapter::get_compute_launch_info()` remains a default stub by design; draw and compute now have separate adapters, but code paths must continue installing the correct adapter before using the buffer cache.
+
+### Missing items
+- Port/route compute shader-cache creation and dispatch pipeline selection, then call `ComputePipeline::configure_resource_state(...)` with this installed compute engine state.
+- Port the remaining post-`FillComputeImageViews` OpenGL binding phase.
+
+### Binary layout verification
+- PASS: no guest-visible payload changed. QMD const-buffer address/size values are copied into host-side `ComputeLaunchInfo` without reinterpretation.
+
+### Tests
+- Re-read upstream `ComputePipeline::Configure` storage-buffer bind setup and ruzu `BufferCache::bind_compute_storage_buffer` / `storage_buffer_binding`.
+- `cargo fmt --all`
+- `cargo test -p video_core compute_engine_adapter_exposes_dispatch_cbuf_snapshot -- --nocapture`
+- `cargo test -p video_core compute_engine_adapter_feeds_compute_storage_buffer_binding -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_compute_pipeline.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp
+
+### Intentional differences
+- `ComputePipeline::configure_resource_state(...)` now ports the front half of upstream `ComputePipeline::Configure` in the same owner and order: `SetComputeUniformBufferState`, `UnbindComputeStorageBuffers`, per-descriptor `BindComputeStorageBuffer` with `ASSERT(desc.count == 1)` semantics, `SynchronizeComputeDescriptors`, and the existing QMD texture/sampler/image descriptor preparation through `FillComputeImageViews`.
+- `ComputePipeline::prepare_texture_bindings_for_dispatch(...)` consumes the pipeline-owned `self.info`, removing the older need for callers to pass `Shader::Info` into the descriptor walker once they have a real pipeline instance.
+- The method remains parameterized over Rust's `BufferCache<P, DT>` because ruzu stores the templated upstream `BufferCache&` as a generic Rust cache rather than a C++ reference member.
+
+### Unintentional differences (to fix)
+- The real OpenGL dispatch path still does not call `ComputePipeline::configure_resource_state(...)` because `ShaderCache::CreateComputePipeline` / `current_compute_pipeline` remain stubs and no runtime `ComputePipeline` instance is selected for dispatch.
+- `BufferCache::BindComputeStorageBuffer` still needs a compute `EngineState` with the launch cbuf snapshot to resolve real SSBO addresses. Without that state it preserves masks but stores `NULL_BINDING`.
+- The post-`FillComputeImageViews` phase is still missing from `ComputePipeline`: program-manager bind, `UnbindComputeTextureBuffers`, per-view `BindComputeTextureBuffer`, `UpdateComputeBuffers`, `SetImagePointers`, `BindHostComputeBuffers`, sampled texture/sampler GL handles, image storage handles, rescaling uniforms, and `glBindTextures` / `glBindSamplers` / `glBindImageTextures`.
+
+### Missing items
+- Port/route compute shader-cache creation so dispatch obtains a real `ComputePipeline` and calls `configure_resource_state(...)`.
+- Install a compute launch `EngineState` on `BufferCache` before compute `BindComputeStorageBuffer`.
+- Port the post-image-view bind phase of upstream `ComputePipeline::Configure`.
+
+### Binary layout verification
+- PASS: no guest-visible payload changed. This slice mutates host-side cache masks, descriptor state, and image-view preparation only.
+
+### Tests
+- Re-read upstream `ComputePipeline::Configure` front half and ruzu `BufferCache::{SetComputeUniformBufferState,UnbindComputeStorageBuffers,BindComputeStorageBuffer}`.
+- `cargo fmt --all`
+- `cargo test -p video_core configure_buffer_state_follows_upstream_compute_order -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_compute_pipeline.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.h
+
+### Intentional differences
+- `ComputePipeline` now owns a cloned `Shader::Info` (`shader_recompiler::shader_info::Info`) like upstream's `Shader::Info info` member, and `new_with_info(...)` derives constructor metadata from it instead of leaving those fields zeroed.
+- `ComputePipeline::info_state(...)` ports the constructor metadata slice from upstream: copy the first `VideoCommon::ComputeUniformBufferSizes` entries from `constant_buffer_used_sizes`, count texture-buffer and image-buffer descriptors with `Shader::NumDescriptors`, assert total sampled textures/images fit `MAX_TEXTURES`/`MAX_IMAGES`, derive `use_storage_buffers` from the GLASM path and `Device::GetMaxGLASMStorageBufferBlocks`, gate `writes_global_memory` on written storage descriptors only when storage buffers cannot be used, and copy `uses_local_memory`.
+- Rust keeps the existing `new(...)` compatibility constructor by passing `Info::default()` into `new_with_info(...)` until `ShaderCache::CreateComputePipeline` is fully ported and can supply the translated compute shader `Info`.
+
+### Unintentional differences (to fix)
+- The constructor still does not create GLSL/GLASM/SPIR-V OpenGL programs from `code` / `code_v`, so `source_program` and `assembly_program` remain zero after construction.
+- `ComputePipeline` still does not own upstream's `TextureCache&`, `BufferCache&`, `ProgramManager&`, `kepler_compute`, and `gpu_memory` members, so `Configure` cannot yet consume the stored `info` through the real runtime bind path.
+- The `force_context_flush`/`built_fence` constructor branch is still not ported; Rust keeps `is_built = true` for the current synchronous placeholder path.
+
+### Missing items
+- Port `ShaderCache::CreateComputePipeline` enough to translate compute shaders and call `ComputePipeline::new_with_info(...)` with real `Info`, code, and code_v.
+- Store the remaining upstream cache/engine owners on `ComputePipeline`, then move the real `Configure` path from descriptor preparation into buffer-cache, texture/sampler/image GL binding, rescaling uniforms, and program-manager binds.
+
+### Binary layout verification
+- PASS: no guest-visible payload changed. This slice only copies host shader metadata and descriptor counts.
+
+### Tests
+- Re-read upstream OpenGL `ComputePipeline` members in `gl_compute_pipeline.h` and constructor body in `gl_compute_pipeline.cpp`.
+- `cargo fmt --all`
+- `cargo test -p video_core compute_pipeline_info_state_matches_upstream_constructor_metadata -- --nocapture`
+- `cargo test -p video_core collect_texture_handles_follows_upstream_compute_order_and_pairs -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_compute_pipeline.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.h
+
+### Intentional differences
+- `ComputePipeline::collect_texture_handles(...)` now ports the handle-collection half of upstream `ComputePipeline::Configure`: it reads QMD constant-buffer handles, preserves upstream texture-buffer -> image-buffer -> sampled-texture -> storage-image view ordering, handles secondary texture descriptors, splits handles through `TexturePair`, records sampled-texture TSC indices, and marks written storage images as blacklisted.
+- `ComputePipeline::prepare_texture_bindings(...)` resolves compute sampler ids through `TextureCacheBase::get_compute_sampler_id(...)` and calls the OpenGL `TextureCache::fill_compute_image_views(...)` wrapper, matching upstream's `GetComputeSamplerId` / `FillComputeImageViews` ownership for this slice.
+- Rust passes an explicit `DispatchCall` snapshot and `read_u32` closure because `ComputePipeline` still does not store upstream's `kepler_compute` / `gpu_memory` pointers. This is the same temporary ownership adaptation tracked for descriptor synchronization.
+
+### Unintentional differences (to fix)
+- Full OpenGL `ComputePipeline::Configure` still does not own `BufferCache`, `TextureCache`, `ProgramManager`, `Shader::Info`, `kepler_compute`, and `gpu_memory` as upstream members, so the new collection/binding helper is not yet called by the real dispatch path.
+- Texture-buffer GL binding, sampled texture/sampler GL binding, image GL binding, rescaling uniforms, and buffer-cache update/bind ordering are still missing from the runtime compute configure path.
+
+### Missing items
+- Store shader `Info` and the upstream cache owners on `ComputePipeline`, then call `prepare_texture_bindings(...)` from the real `configure` path.
+- Port the post-`FillComputeImageViews` bind phase: `BindComputeTextureBuffer`, `UpdateComputeBuffers`, `SetImagePointers`, `BindHostComputeBuffers`, texture/sampler/image GL handle arrays, rescaling masks, and `glBindTextures` / `glBindSamplers` / `glBindImageTextures`.
+
+### Binary layout verification
+- PASS: no guest-visible payload changed. Handles remain raw u32 values read from QMD constant-buffer GPU addresses.
+
+### Tests
+- Re-read upstream OpenGL `ComputePipeline::Configure`, `ComputePipeline` members in `gl_compute_pipeline.h`, and `Tegra::Texture::TexturePair`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo test -p video_core collect_texture_handles_follows_upstream_compute_order_and_pairs -- --nocapture`
+- `cargo test -p video_core descriptor_sync_regs_come_from_dispatch_call -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs and video_core/src/texture_cache/texture_cache_base.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `TextureCacheBase::synchronize_compute_descriptors(...)` now ports upstream `TextureCache<P>::SynchronizeComputeDescriptors`: it receives a KeplerCompute snapshot, chooses `tsc_limit = tic_limit` when `linked_tsc` is set, synchronizes compute TSC/TIC descriptor tables, and resizes `compute_sampler_ids` / `compute_image_view_ids` with `CORRUPT_ID`.
+- Rust passes `ComputeDescriptorSyncRegs` instead of reading `kepler_compute` directly because `TextureCacheBase` does not own a KeplerCompute pointer; this matches the existing graphics descriptor snapshot pattern.
+- `KeplerCompute::execute_pending(...)` now forwards the recorded `DispatchCall` to `RasterizerInterface::dispatch_compute_with_call(...)`, and OpenGL delegates descriptor synchronization to `ComputePipeline::synchronize_texture_descriptors(...)`. This moves ownership closer to upstream `ComputePipeline::Configure` without re-entering `KeplerCompute` mutably while it is already calling the rasterizer.
+- `OpenGL::TextureCache::fill_compute_image_views(...)` now owns the backend `ScaleDown(image)` blacklist loop for compute image views, matching upstream `TextureCache<P>::FillComputeImageViews -> FillImageViews<true>`.
+- `ComputePipeline::prepare_texture_bindings(...)` now owns the QMD/cbuf handle collection, compute sampler-id resolution, and call into `OpenGL::TextureCache::fill_compute_image_views(...)` for the future real configure path.
+
+### Unintentional differences (to fix)
+- Full OpenGL `ComputePipeline::Configure` is still not ported: runtime dispatch still does not materialize/bind GL textures, bind samplers, bind images, or bind texture buffers. The current rasterizer dispatch path only delegates descriptor synchronization to the compute-pipeline owner because `ComputePipeline` still does not store upstream's cache/engine pointers.
+
+### Missing items
+- Port OpenGL `ComputePipeline::Configure` texture/sampler/image binding so synchronized compute descriptors are consumed by dispatch.
+- Call `ComputePipeline::prepare_texture_bindings(...)` from the real compute configure path after shader-info ownership is ported.
+
+### Binary layout verification
+- PASS: no guest-visible payload changed; TIC/TSC descriptors remain raw 32-byte entries.
+
+### Tests
+- Re-read upstream `TextureCache<P>::SynchronizeComputeDescriptors`, `TextureCache<P>::FillComputeImageViews`, OpenGL `RasterizerOpenGL::DispatchCompute`, and OpenGL `ComputePipeline::Configure`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo test -p video_core compute_descriptor_sync_regs_come_from_dispatch_call -- --nocapture`
+- `cargo test -p video_core synchronize_compute_descriptors -- --nocapture`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs and video_core/src/texture_cache/texture_cache_base.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h
+
+### Intentional differences
+- `TextureCacheBase::visit_image_view(...)` now reads compute TIC descriptors through the bound channel `gpu_memory` when available, matching upstream `DescriptorTable<TICEntry> compute_image_table{gpu_memory}` ownership. The reduced `device_memory` reader remains only as fallback construction when no channel is bound.
+- `TextureCacheBase::get_compute_sampler_id(...)` now ports upstream `TextureCache<P>::GetComputeSamplerId`: range-check `compute_sampler_table`, read the TSC descriptor, reuse the cached id when unchanged, and call `FindSampler` on new/changed descriptors. It uses the same bound channel `gpu_memory` source as graphics sampler lookup.
+- `TextureCacheChannelInfo` comments now describe the current descriptor-table ownership instead of the old pre-reader stub state.
+
+### Unintentional differences (to fix)
+- None known for compute TIC/TSC descriptor-read ownership after this slice; compute descriptor synchronization is tracked in the newer 2026-06-13 entry above.
+
+### Missing items
+- Port OpenGL `ComputePipeline::Configure` texture/sampler/image binding so the newly ported compute descriptor reads are consumed by dispatch.
+- Call the OpenGL compute image-view wrapper from `ComputePipeline::Configure` once descriptor collection is ported.
+
+### Binary layout verification
+- PASS: TIC/TSC descriptors remain raw `#[repr(C)]` `[u64; 4]` values read from guest GPU memory; no guest-visible payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::FillComputeImageViews`, `TextureCache<P>::GetComputeSamplerId`, `TextureCache<P>::SynchronizeComputeDescriptors`, and `TextureCacheChannelInfo` descriptor-table members.
+- Re-read upstream OpenGL `ComputePipeline::Configure` to confirm this slice only prepares descriptor resolution; the full compute binding path remains missing in ruzu.
+- `cargo fmt --all --check`
+- `cargo test -p video_core fill_compute_image_views_uses_channel_gpu_memory_for_tic_reads -- --nocapture`
+- `cargo test -p video_core get_compute_sampler_id_uses_channel_gpu_memory_for_tsc_reads -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs, video_core/src/renderer_opengl/gl_rasterizer.rs, and video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `OpenGL::TextureCache::fill_graphics_image_views(...)` now owns the backend part of upstream `TextureCache<P>::FillImageViews`: after the base TIC/image-view pass, blacklisted image views run `ScaleDown(image)` and reset `image.scale_rating = 0`, then repeat while any scale-down happened.
+- `TextureCacheBase::fill_image_views(...)` still owns descriptor-table traversal and image-view id resolution. The `ScaleDown` side effect lives in the OpenGL wrapper because ruzu splits upstream's templated `P::Image` from the backend-independent base slot.
+
+### Unintentional differences (to fix)
+- None known for the OpenGL graphics-image blacklist scale-down behavior after re-reading upstream `TextureCache<P>::FillImageViews`, `TextureCache<P>::ScaleDown`, and OpenGL `Image::ScaleDown`.
+
+### Missing items
+- The same blacklist scale-down hook is still absent from non-OpenGL/reduced construction paths until those paths have a backend image owner equivalent to upstream `P::Image`.
+
+### Binary layout verification
+- N/A: texture-cache rescale control flow only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::FillImageViews`, `TextureCache<P>::ScaleDown`, and OpenGL `Image::ScaleDown`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs, video_core/src/renderer_opengl/gl_rasterizer.rs, and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- The OpenGL draw path no longer passes ad hoc GPU-read closures into `FillGraphicsImageViews`, graphics TSC `GetGraphicsSamplerId`, sampled-image `PrepareImage`, view materialisation join-drain, or render-target `PrepareImage` calls. Those steps now use the texture cache's bound channel `gpu_memory`, matching upstream `TextureCache<P>::gpu_memory` ownership for descriptor-table reads, `PrepareImage`, `RefreshContents`, and `UploadImageContents`.
+- `TextureCacheBase::{fill_graphics_image_views,get_graphics_sampler_id}` now prefer `channel_gpu_memory` for TIC/TSC descriptor reads and GPU-address validation; the old `device_memory` path remains only as a reduced-construction fallback when no channel is bound.
+
+### Unintentional differences (to fix)
+- None known for the OpenGL draw-path TIC/TSC descriptor synchronization source after re-reading upstream `TextureCache<P>::FillGraphicsImageViews`, `TextureCache<P>::VisitImageView`, and `TextureCache<P>::GetGraphicsSamplerId`.
+
+### Missing items
+- None known for the OpenGL draw-path TIC/TSC descriptor synchronization source after removing the explicit reader bridge helpers.
+
+### Binary layout verification
+- N/A: texture-cache call ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::PrepareImage`, `TextureCache<P>::RefreshContents`, `TextureCache<P>::UploadImageContents`, `TextureCache<P>::FillGraphicsImageViews`, `TextureCache<P>::VisitImageView`, `TextureCache<P>::GetGraphicsSamplerId`, and OpenGL `GraphicsPipeline::ConfigureImpl` ordering.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `OpenGL::TextureCache::finish_pending_join_copies_impl(...)` now refreshes CPU-modified joined images through the bound channel `gpu_memory` when no caller-supplied GPU reader is present. This matches upstream `TextureCache<P>::JoinImages` / `RefreshContents` ownership more closely: upstream `RefreshContents(new_image, new_image_id)` reads through the texture cache's `gpu_memory` member, not through an ad hoc call-site reader.
+- The method still keeps the explicit reader path for Rust call sites that already supply one, and falls back to deferring only when both reader sources are unavailable.
+
+### Unintentional differences (to fix)
+- None known for this join-image refresh source after re-reading upstream `TextureCache<P>::RefreshContents`, `TextureCache<P>::UploadImageContents`, and the `JoinImages` call to `RefreshContents(new_image, new_image_id)`.
+
+### Missing items
+- The broader `RefreshContents` / `UploadImageContents` ownership debt remains: these methods still live in the OpenGL wrapper because backend image upload and staging ownership are split from `TextureCacheBase`.
+
+### Binary layout verification
+- N/A: texture-cache control flow only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::RefreshContents`, `TextureCache<P>::UploadImageContents`, and the `JoinImages` refresh point.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs, video_core/src/texture_cache/texture_cache_base.rs, and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h
+
+### Intentional differences
+- `TextureCacheBase` now owns `LeastRecentlyUsedCache<ImageId, i64>` in the same conceptual slot as upstream `Common::LeastRecentlyUsedCache<LRUItemParams> lru_cache`; `RegisterImage` inserts into it, `UnregisterImage` frees it, and OpenGL `PrepareImage` paths call `touch_image(...)`, matching upstream `lru_cache.Touch(image.lru_index, frame_tick)`.
+- `TextureCacheBase::run_garbage_collector(...)` now ports upstream's two-pass memory-pressure policy: normal/high/aggressive mode selection, age thresholds `50/25/10`, iteration limits `10/20/40`, `IS_DECODING` and non-aggressive `COSTLY_LOAD` skips, safe-download gating, unregister, and delete ordering.
+- OpenGL `TextureCache::tick_frame(...)` now supplies `TextureCacheBase::run_garbage_collector_with_downloader(...)` with the backend download body for the `must_download` GC path: `TextureCacheRuntime::download_staging_buffer(...)`, `Image::download_memory_to_staging(...)`, `TextureCacheRuntime::finish()`, then common swizzle/writeback.
+- OpenGL `Image::download_memory_to_buffer(...)` / `download_memory_to_staging(...)` now mirror upstream `Image::DownloadMemory` over `BufferImageCopy`: `GL_PIXEL_PACK_BUFFER`, `PACK_ALIGNMENT`, cached `PACK_ROW_LENGTH` / `PACK_IMAGE_HEIGHT`, `glGetTextureSubImage` or `glGetCompressedTextureSubImage`, and the staging-map overload.
+- `TextureCacheBase::run_garbage_collector(...)` keeps the old callback-backed download only as the backend-independent fallback used by non-OpenGL/test construction; production OpenGL GC no longer uses the stored `image_downloader` callback.
+- `TextureCacheBase::write_downloaded_image(...)` now prefers the channel `gpu_memory` owner and writes through `write_block_unsafe(image.gpu_addr, ...)`, matching upstream `SwizzleImage(*gpu_memory, image.gpu_addr, ...)` for production GC and CPU-read texture download writeback. The `GuestMemoryWriter` path remains only as a fallback for backend-independent/test construction without a bound channel.
+- `util::swizzle_image(...)` now mirrors upstream `SwizzlePitchLinearImage(...)`: it asserts the same single-level/single-layer/depth-one shape, uses `copy.image_extent.width * BytesPerBlock` for row length, reads source rows at `copy.buffer_offset + line * info.pitch`, preserves C++ signed-to-unsigned offset bit patterns, and writes guest rows at `image_offset.x * bytes_per_block + (image_offset.y + line) * info.pitch`.
+- `util::swizzle_image(...)` now mirrors upstream `SwizzleBlockLinearImage(...)` for full-image `FullDownloadCopies(...)` copies: it computes `CalculateLevelSizes`, `CalculateLevelBytes(level)`, `AlignLayerSize`, `subresource_size`, swizzles each layer independently, writes each layer to `gpu_addr + guest_offset` instead of using the host staging `buffer_offset` as a guest offset, and rejects offset/partial rectangles with the same `UNIMPLEMENTED_IF` contract as upstream.
+- `TextureCacheBase` now owns `sentenced_images` and `sentenced_image_view` as `DelayedDestructionRing<_, TICKS_TO_DESTROY>` counterparts. `DeleteImage(..., immediate_delete=false)` and OpenGL `InvalidateScale` move image/image-view base objects into those rings with `SlotVector::take(...)`, matching upstream's `sentenced_* .Push(std::move(...)); erase(...)` ownership pattern for the ported base resources.
+- OpenGL framebuffers now use `TextureCacheBase::framebuffers` as the upstream `RenderTargets -> FramebufferId` key map for draw render targets, Fermi2D framebuffer blits, and the remaining compatibility render-target helper; concrete GL framebuffer objects live in `OpenGL::TextureCache::slot_framebuffers`.
+- OpenGL now owns `sentenced_framebuffers: DelayedDestructionRing<TextureCacheFramebuffer, TICKS_TO_DESTROY>` and moves removed framebuffer objects into it when image views are invalidated or when common GC/delete logic removes base framebuffer keys.
+- OpenGL `TextureCache::tick_frame(...)` now runs the memory-pressure GC, reconciles framebuffer ids removed by common GC, ticks the delayed image/image-view/framebuffer destruction rings, then runs async decode/runtime/common frame ticking, matching upstream `TextureCache<P>::TickFrame` ordering for the ported parts.
+
+### Unintentional differences (to fix)
+- Upstream `TextureCache<P>` owns `slot_framebuffers` and `sentenced_framebuffers` in the same templated common object; Rust still splits the concrete GL framebuffer slot/ring into `OpenGL::TextureCache` because `TextureCacheBase` is backend-independent.
+
+### Missing items
+- Move `slot_framebuffers`/`sentenced_framebuffers` into the exact templated owner shape if/when `TextureCacheBase` becomes generic over backend resources rather than split from OpenGL.
+- Remove the backend-independent `GuestMemoryWriter` texture-download fallback once every non-OpenGL/test construction binds a channel `gpu_memory` owner.
+
+### Binary layout verification
+- N/A: host texture-cache ownership and lifecycle only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::RunGarbageCollector`, `TextureCache<P>::TickFrame`, `TextureCache<P>::RegisterImage`, `TextureCache<P>::UnregisterImage`, `TextureCache<P>::DeleteImage`, `TextureCache<P>::PrepareImage`, `TextureCache<P>::GetFramebufferId`, `TextureCache<P>::RenderTargetFromImage`, `TextureCache<P>::BlitImage`, and `TextureCache<P>::RemoveFramebuffers`.
+- Re-read upstream `TextureCache<P>::InvalidateScale`, `TextureCache<P>::DownloadMemory`, OpenGL `TextureCacheRuntime::{DownloadStagingBuffer,Finish}`, OpenGL `Image::DownloadMemory`, `texture_cache_base.h` `slot_framebuffers`/`sentenced_*` members, `video_core/delayed_destruction_ring.h`, and OpenGL `Framebuffer`.
+- Re-read upstream `SwizzleImage`, `SwizzlePitchLinearImage`, `SwizzleBlockLinearImage`, and `Tegra::MemoryManager::WriteBlockUnsafe` while moving production texture download writeback to channel `gpu_memory`.
+- Re-read upstream `SwizzleBlockLinearImage`, `CalculateLevelSizes`, `CalculateLevelBytes`, and `AlignLayerSize` while fixing full-image block-linear writeback offsets.
+- Re-read upstream `SwizzlePitchLinearImage` while fixing pitch-linear writeback source stride and assertions.
+- Re-read upstream `SwizzlePitchLinearImage`, `SwizzleBlockLinearImage`, and `common/assert.h` while making swizzle assertions release-active and keeping block-linear offset rectangles hard-unimplemented like upstream.
+- `cargo fmt --all`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core write_downloaded_image_prefers_channel_gpu_memory -- --nocapture`
+- `cargo test -p video_core swizzle_image_pitch_linear_writes_rows_to_guest -- --nocapture`
+- `cargo test -p video_core swizzle_image_pitch_linear_preserves_signed_unsigned_offset_bits -- --nocapture`
+- `cargo test -p video_core swizzle_image_block_linear_uses_guest_level_offsets_and_layer_stride -- --nocapture`
+- `cargo test -p video_core swizzle_image_block_linear_rejects_offset_rectangles_like_upstream -- --nocapture`
+- `cargo test -p video_core run_garbage_collector -- --nocapture`
+- `cargo test -p video_core delete_image_removes_view_references_and_framebuffers -- --nocapture`
+- `cargo test -p video_core gl_staging_buffer_pool -- --nocapture`
+
+## 2026-06-13 — `video_core/src/renderer_opengl/gl_texture_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h`
+
+### Intentional differences
+- `OpenGLTextureCache::copy_image_direct_raw(...)` still attempts upstream `TextureCacheRuntime::CopyImage(...)` first with `glCopyImageSubData`. If Mesa rejects a byte-compatible compressed/raw alias copy, Rust now falls back to a backend-local byte copy: raw `R32G32B32A32Uint` is read/written with `glGetTextureSubImage`/`glTextureSubImage3D`, and compressed BC/ASTC data is read/written with `glGetCompressedTextureSubImage`/`glCompressedTextureSubImage3D`.
+- The raw/compressed fallback is intentionally guarded to equal byte sizes only, e.g. `BC3` 16-byte blocks with `R32G32B32A32_UINT` 16-byte texels. This preserves alias-copy byte semantics rather than inventing a format conversion.
+- For one-side-compressed aliases, Rust interprets `ImageCopy::extent` the same way upstream `ImageBase::TryFindBase(...)` constructs it: compressed dimensions are already reduced to block units before the copy is emitted, so the fallback expands only the compressed GL rectangle by the block width/height while keeping the raw rectangle in texels.
+
+### Unintentional differences (to fix)
+- Upstream currently has no explicit fallback after `glCopyImageSubData`; this Rust path compensates for observed Mesa `GL_INVALID_VALUE` on MK8D small-mip compressed/raw aliases. Keep it narrow unless another driver/API path proves broader handling is required.
+
+### Missing items
+- No shader-based general raw/compressed conversion fallback is implemented. That is intentionally not added here because the observed alias copies are byte-compatible copies, not semantic pixel conversions.
+
+### Binary layout verification
+- PASS: fallback copies exact byte buffers only. The accepted raw/compressed pairs require `surface::bytes_per_block(compressed) == surface::bytes_per_block(raw)`.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::CopyImage`, `CopyImageMSAA`, `CanImageBeCopied`, and `EmulateCopyImage`.
+- Re-read upstream `ImageBase::TryFindBase` alias copy-size construction for compressed/non-compressed pairs.
+- `cargo test -p video_core raw_compressed_copy_fallback -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo build --release --bin ruzu-cmd` pending after this entry.
+
 ## 2026-06-13 — `core/src/memory/memory.rs`, `video_core/src/texture_cache/texture_cache_base.rs`, `video_core/src/renderer_opengl/gl_texture_cache.rs`, and `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/memory.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`
 
 ### Intentional differences
-- `Memory::handle_rasterizer_download(...)` calls the core-facing `GpuCore::on_cpu_read(device_addr, size)` bridge directly instead of upstream's cached `gpu_device_memory->ApplyOpOnPointer(...)` plus per-host-core `rasterizer_read_areas`. The guest-visible ordering is preserved for scalar `Read<T>`, `ReadBlock`, checked read-block adaptation, cache invalidation, and `CopyBlock` through `ReadBlock`; the per-core area cache remains a performance/owner-graph gap.
+- `Memory::handle_rasterizer_download(...)` now follows upstream's host-pointer path for production construction: it obtains `GetPointerImpl(vaddr)`, asks the Host1x device-memory bridge to apply the operation to every SMMU/device alias of that host pointer, and runs the upstream-style per-host-core `rasterizer_read_areas` coverage predicate before calling the core-facing `GpuCore::on_cpu_read(device_addr, size)` bridge. Rust wraps each per-core cached area in a `Mutex` because `Memory` cache/download methods take `&self`; the lock is released before entering the GPU bridge and reacquired to store the returned area, preserving the upstream coverage predicate without holding a memory-internal lock across backend code.
+- If `System` has no Host1x owner or the Host1x bridge finds no alias, `Memory::handle_rasterizer_download(...)` falls back to the page-table `backing_addr` device address. This keeps reduced unit-test construction usable; production Host1x construction uses the upstream-shaped alias fan-out path.
 - `TextureCacheBase::get_flush_area(...)` owns the backend-independent `TextureCache<P>::GetFlushArea(...)` logic: CPU-region image scan, GPU-modified filtering, area expansion over image CPU ranges, image-view `PREEMTIVE_DOWNLOAD` marking, and `ImageInfo::forced_flushed` update. `OpenGLTextureCache::get_flush_area(...)` is a thin wrapper because ruzu splits upstream's templated common/backend cache storage.
 - `RasterizerOpenGL::get_flush_area(...)` now consults texture cache first, then buffer cache, then returns the default preemptive aligned area, matching upstream `RasterizerOpenGL::GetFlushArea(...)` ordering.
 
 ### Unintentional differences (to fix)
-- `Memory::handle_rasterizer_download(...)` does not yet cache per-core downloaded areas like upstream `rasterizer_read_areas`, so repeated CPU reads of the same GPU-modified region can call into `Gpu::on_cpu_read(...)` more often than upstream.
 - The OpenGL wrapper for texture `get_flush_area(...)` exists only because ruzu stores backend-independent texture state in `TextureCacheBase` and backend GL objects in `OpenGLTextureCache`; upstream owns both under one `TextureCache<P>` template instance.
 
 ### Missing items
-- Add the upstream-style per-host-core `rasterizer_read_areas` fast path once `Memory` owns the same stable GPU device-memory bridge as upstream.
+- Remove the reduced-construction `backing_addr` fallback in `Memory::handle_rasterizer_download(...)` if all tests and non-OpenGL construction grow a Host1x SMMU owner.
 
 ### Binary layout verification
 - N/A: CPU/GPU cache-coherency path only. No guest-visible raw payload layout changed.
 
 ### Tests
 - Re-read upstream `Memory::Impl::Read<T>`, `Memory::Impl::ReadBlockImpl`, `Memory::Impl::CopyBlock`, `Memory::Impl::InvalidateDataCache`, and `Memory::Impl::HandleRasterizerDownload`.
+- Re-read upstream `Memory::Impl::InvalidateDataCache` and `Memory::Impl::HandleRasterizerDownload` again for the per-host-core `rasterizer_read_areas` cache update.
+- Re-read upstream `Memory::Impl::HandleRasterizerDownload`, ruzu `Host1xCoreInterface::smmu_apply_op_on_host_pointer`, and video_core `MaxwellDeviceMemoryManager::smmu_apply_op_on_host_pointer` while replacing the production `current_physical_address(...)` shortcut with Host1x alias fan-out.
+- `cargo test -p core rasterizer_download_skips_reads_covered_by_current_core_area -- --nocapture`
+- `cargo test -p core rasterizer_download_ -- --nocapture`
 - Re-read upstream `RasterizerOpenGL::GetFlushArea`, `TextureCache<P>::GetFlushArea`, `BufferCache<P>::GetFlushArea`, and `GPU::Impl::OnCPURead`.
 - `cargo test -p video_core get_flush_area_marks_gpu_modified_image_views_preemptive -- --nocapture`
 - `cargo check -p core`
@@ -1591,20 +6273,18 @@
 
 ### Intentional differences
 - `TextureCache::prepare_image_with_gpu_reader` now calls an OpenGL-owned `synchronize_aliases(image_id)` immediately after `refresh_contents_with_gpu_reader`, matching upstream `TextureCache<P>::PrepareImage` ordering (`RefreshContents` then `SynchronizeAliases`, before `MarkModification`).
-- `TextureCache::prepare_image_without_gpu_reader` preserves the backend-local part of upstream `PrepareImage` when the draw path lacks a guest-memory reader: it still runs `SynchronizeAliases` before sampled image views are materialized or bound. Rust still cannot perform `RefreshContents` in this fallback because the common cache does not own the OpenGL upload path.
+- `TextureCache::prepare_image_without_gpu_reader` preserves the backend-local part of upstream `PrepareImage` when the draw path lacks a guest-memory reader and `RefreshContents` would be a no-op: it runs `SynchronizeAliases` before sampled image views are materialized or bound only when the image is not still `CPU_MODIFIED`.
 - `TextureCache::prepare_render_targets_from_snapshot` also calls the OpenGL-owned `synchronize_aliases(image_id)` in the reader-less non-invalidate path before `mark_modification_by_id`, preserving upstream `PrepareImage(image_id, true, false)` ordering when render-target preparation has no guest-memory reader available.
 - Ported upstream `SynchronizeAliases` tick/flag propagation and modification-tick sorting for registered `aliased_images`. Rust clones the alias copy list before copying so the borrow model stays safe while preserving the upstream source/destination ordering.
 - Ported upstream OpenGL `MakeCopyOrigin`, `MakeCopyRegion`, and the direct `TextureCacheRuntime::CopyImage` path through `glCopyImageSubData` for ordinary same-format, same-sample-count texture aliases.
 - Added env-gated `RUZU_TRACE_ALIAS_SYNC=1` logging for alias-copy skips and GL copy errors. Upstream has no equivalent diagnostic hook; default execution is unchanged.
 
 ### Unintentional differences (to fix)
-- Upstream handles resolution scaling around alias copies by calling `ScaleUp` / `ScaleDown` on the involved images before copying. Ruzu now adjusts `ImageCopy` offsets/extents for already-rescaled same-format direct copies, but the OpenGL `Image::ScaleUp` / `Image::ScaleDown` texture-blit implementation is still stubbed.
-- Upstream `PrepareImage` always performs `RefreshContents` before `SynchronizeAliases`. Ruzu's reader-less fallback can only perform alias synchronization; CPU-modified texture upload still requires the `prepare_image_with_gpu_reader` path.
-- Upstream routes MSAA copies, BGR/BC4 emulated copies, and reinterpret/format-conversion copies through runtime helpers. Ruzu currently skips different sample-count and different-format alias copies.
+- Upstream `PrepareImage` always performs `RefreshContents` before `SynchronizeAliases`. Ruzu's reader-less fallback skips alias synchronization when the image is still `CPU_MODIFIED`, because CPU-modified texture upload still requires the `prepare_image_with_gpu_reader` path.
+- Upstream routes all copy policy through `TextureCacheRuntime`. Rust now covers direct copies, MSAA copies, BGR/format conversion via `FormatConversionPass`, BC4 3D emulated copies through `UtilShaders::copy_bc4`, and the S8D24 post-conversion component swap through `UtilShaders::convert_s8d24`.
 - Ruzu still depends on registered `aliased_images`; if the image insertion path failed to create aliases because `JoinImages` / `ResolveOverlap` parity is incomplete, this synchronization has no aliases to process.
 
 ### Missing items
-- Port full `TextureCache<P>::CopyImage` policy including MSAA copy shader path and reinterpret/format-conversion fallback.
 - Complete `JoinImages` / `ResolveOverlap` parity so all upstream alias relationships are registered before `SynchronizeAliases` runs.
 
 ### Binary layout verification
@@ -1616,6 +6296,25 @@
 - `cargo test -p video_core inline_upload_linear_uses_constructor_memory_manager_owner_without_guest_writer -- --nocapture`
 - `cargo test -p video_core data_register_writes_through_memory_manager -- --nocapture`
 - `cargo test -p video_core memory_manager -- --nocapture`
+
+## 2026-06-13 — video_core/src/texture_cache/{texture_cache.rs,texture_cache_base.rs} vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/{texture_cache.h,texture_cache_base.h}
+
+### Intentional differences
+- Rust stores per-channel GPU page tables as owned `Box<TextureCacheGPUMap>` values in `TextureCacheChannelInfo` instead of upstream raw pointers supplied by `ChannelInfo`, preserving the same table ownership while avoiding dangling pointer state.
+- Rust stores the channel `MemoryManager` as `Arc<parking_lot::Mutex<MemoryManager>>` on `TextureCacheBase`, while upstream reaches the same owner through `channel_state->gpu_memory`.
+- `JoinImages` still queues the backend copy/delete tail through `pending_join_copies` because `TextureCacheBase` has no backend `Runtime::CopyImage` object. The sparse GPU overlap check and sparse image classification now run at the corresponding upstream points before registration.
+
+### Unintentional differences (to fix)
+- None for the sparse GPU page-table and sparse-segment registration slice after re-checking upstream `JoinImages`, `ForEachSparseSegment`, `RegisterImage`, and `UnregisterImage`.
+
+### Missing items
+- None for this slice.
+
+### Binary layout verification
+- N/A: texture-cache page-table ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo test -p video_core texture_cache::texture_cache::tests::`
 
 ## 2026-06-05 — video_core/src/renderer_opengl/gl_rasterizer.rs and common/src/trace.example.toml vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
 
@@ -1686,14 +6385,14 @@
 
 ### Intentional differences
 - `TextureCacheBase::find_or_insert_image_from_info_with_options(...)` is a Rust CPU-address-aware counterpart of upstream `FindOrInsertImage(info, gpu_addr, options)`. Upstream translates through its live `gpu_memory`; the Rust OpenGL Fermi2D caller already has the translated CPU address from its channel memory manager.
-- `OpenGLTextureCache::blit_image` still owns the OpenGL framebuffer-blit body directly instead of routing through an upstream-shaped `TextureCacheRuntime`, because the runtime owner split is not ported yet.
+- `OpenGLTextureCache::blit_image` still owns the OpenGL view/FBO materialization bridge because the common Rust texture-cache layer cannot yet call backend framebuffer helpers directly.
 
 ### Unintentional differences (to fix)
-- Upstream handles rescaled source/destination images (`ImageCanRescale`, `ScaleUp`, `ScaleDown`, resolution scaling). Ruzu still does not rescale Fermi2D blit regions.
+- None known for the Fermi2D `BlitImage` rescale/region slice after re-reading upstream `TextureCache<P>::BlitImage`; Rust now calls `PrepareImage`, applies `ImageCanRescale` / `ScaleUp` / `ScaleDown`, handles resolve downscaling, and scales source/destination regions before the OpenGL framebuffer blit.
 
 ### Missing items
 - Port the full common `TextureCache<P>::BlitImage` ownership once backend hooks can call OpenGL upload/framebuffer operations without duplicating lifecycle in `gl_texture_cache.rs`.
-- Move the remaining OpenGL-specific Fermi2D runtime operations into an upstream-shaped `TextureCacheRuntime` owner.
+- Exact `StateTracker&` ownership for `TextureCacheRuntime::BlitFramebuffer` remains represented by rasterizer-side invalidation before entering the texture-cache blit, because ruzu cannot yet store the upstream direct reference without self-referential ownership.
 
 ### Binary layout verification
 - N/A: OpenGL texture-cache image selection and host-side framebuffer blit behavior only. No guest-visible raw payload layout changed.
@@ -3663,6 +8362,20 @@
 
 ### Binary layout verification
 - PASS: this change did not modify raw serialized/thread-context payload layout.
+
+## 2026-06-14 — core/src/hle/kernel/k_thread.rs vs zuyu/src/core/hle/kernel/k_thread.h / k_thread.cpp
+
+### Intentional differences
+- `notify_priority_change` forwards thread properties to `GlobalSchedulerContext::on_thread_priority_changed` instead of passing a `KThread*`; this preserves upstream scheduler notification semantics without re-locking the Rust `KThread`.
+
+### Unintentional differences (to fix)
+- `RestorePriority` is still not a full upstream chain walk. Upstream removes/reinserts a thread from the owner lock tree and condition-variable tree while propagating inherited priority through lock owners; Rust still computes local inherited priority only.
+
+### Missing items
+- Full upstream-equivalent `RestorePriority(KernelCore&, KThread*)` propagation through lock-owner chains.
+
+### Binary layout verification
+- PASS: scheduler notification control-flow change only; no raw serialized/thread-context layout affected.
 
 ## 2026-03-28 — core/src/hle/kernel/k_condition_variable.rs vs zuyu/src/core/hle/kernel/k_condition_variable.cpp
 
@@ -12056,21 +16769,22 @@
 ## 2026-05-13 — `video_core/src/texture_cache/texture_cache_base.rs` and `video_core/src/texture_cache/util.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.{h}` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/util.{h,cpp}`
 
 ### Intentional differences
-- Rust adds `GuestMemoryWriter` and `ImageDownloader` callbacks to stand in for upstream `Tegra::MemoryManager&`, `Runtime::DownloadStagingBuffer`, and backend `Image::DownloadMemory`. This keeps method ownership in `TextureCacheBase` while the Rust port lacks the upstream `TextureCache<P>` template storage of backend `Image`.
+- Rust adds `GuestMemoryWriter` and `ImageDownloader` callbacks to stand in for upstream `Tegra::MemoryManager&`, `Runtime::DownloadStagingBuffer`, and backend `Image::DownloadMemory` in backend-independent/test construction. Current OpenGL production download and GC paths use `TextureCacheRuntime::download_staging_buffer(...)` and backend `Image::download_memory_to_staging(...)` directly; the remaining writer bridge is tracked in the newer 2026-06-13 texture-cache GC entry.
 - `util::swizzle_image` accepts an already translated CPU/device base address and a writer callback. Upstream accepts a GPU VA plus `Tegra::MemoryManager&`; the Rust adaptation is required because the renderer-side writer installed from `ruzu_cmd` writes CPU/device addresses.
 - `TextureCacheBase::download_memory` follows the upstream high-level order: collect overlapping images, filter `IsSafeDownload`, clear `GpuModified`, sort by `modification_tick`, call backend download, then swizzle/write to guest memory.
+- Pitch-linear `swizzle_image` now follows upstream `SwizzlePitchLinearImage` row addressing, release-active single-subresource assertions, and signed-to-unsigned offset bit patterns.
+- Block-linear `swizzle_image` now follows upstream full-image download writeback offsets: host staging `buffer_offset` is only the source offset, guest writes use `CalculateLevelBytes(level)` plus `AlignLayerSize(...)` per layer, and offset/partial rectangles assert as the upstream `UNIMPLEMENTED_IF` contract.
 
 ### Unintentional differences (to fix)
-- Block-linear `swizzle_image` handles full-image style copies with the existing decoder helper, but it is not yet a line-by-line port of upstream `SwizzleBlockLinearImage` for arbitrary subresource offsets.
+- None known for the currently ported `SwizzleImage` pitch-linear and block-linear writeback contract after re-reading upstream `util.cpp`.
 
 ### Missing items
-- Port `SwizzlePitchLinearImage` and `SwizzleBlockLinearImage` literally from upstream `util.cpp`.
-- Replace the callback-based backend download with Rust storage that mirrors upstream `TextureCache<P>` ownership of backend `Image`.
-- Wire OpenGL `Image::download_memory` into `TextureCacheBase::set_image_downloader` once backend image slots exist.
+- Replace the remaining callback-backed non-OpenGL/test fallback with Rust storage that mirrors upstream `TextureCache<P>` ownership of backend `Image`.
 
 ### Binary layout verification
 - N/A: no guest-visible struct layout changed.
 - PASS: `cargo test -p video_core texture_cache::util::tests::swizzle_image_pitch_linear_writes_rows_to_guest --lib`.
+- PASS: `cargo test -p video_core swizzle_image_block_linear_uses_guest_level_offsets_and_layer_stride -- --nocapture`.
 - PASS: `cargo build --release --bin ruzu-cmd`.
 - MK8D verification: `RUZU_TRACE_TEXTURE_DOWNLOAD=1` produced no download events during the 12s presentation run, confirming this path is not hit before presentation in the current MK8D boot.
 
@@ -12679,7 +17393,9 @@
 - `RUZU_TRACE_PRESENT_ALIASES` is env-gated diagnostic output only.
 
 ### Missing items
-- Full `FindRenderTargetView` parity is still incomplete: delete/retry loop, `TryFindBase`, true `FindOrEmplaceImageView` helper ownership, alias/overlap registration through `JoinImages`, and backend runtime interactions remain incomplete.
+- Full `FindRenderTargetView` parity is still incomplete: delete/retry loop, alias/overlap registration through `JoinImages`, and backend runtime interactions remain incomplete.
+- Fixed by the 2026-06-14 `texture_cache.rs` entry: non-linear `TryFindBase` failure now stops like upstream instead of returning `NULL_IMAGE_VIEW_ID`.
+- Fixed by the 2026-06-14 `texture_cache.rs` entry: true `FindOrEmplaceImageView` helper ownership is now represented by `TextureCacheBase::find_or_emplace_image_view(...)` and used by TIC/render-target view creation.
 
 ### Binary layout verification
 - N/A: Rust `RenderTargetInfo` is an internal snapshot, not raw-copied guest/host ABI. Upstream `RenderTargetConfig` raw register layout was verified by field offsets from `maxwell_3d.h`; Rust captures the corresponding words individually.
@@ -12707,7 +17423,7 @@
 - Rust register ownership is still partial and uses explicit method constants for the currently implemented early-renderer subset; upstream owns the full `Regs` packed layout with `LaunchDMA`, remap, semaphore, and block-linear parameter fields.
 
 ### Missing items
-- Port upstream `LaunchDMA` bitfield decoding and branch structure exactly, including multiline vs single-line handling, remap clear, semaphore release, and memory-layout assertions.
+- Fixed by later MaxwellDMA entries for the active launch paths: `LaunchDMA` branch decoding, single-line handling, remap clear, semaphore release, and memory-layout checks have been ported incrementally. Remaining debt is raw `Regs` struct layout parity and the command-processor `PendingWrite` bridge.
 - Add Rust `AccelerateDMAInterface` parity and wire OpenGL buffer-cache / texture-cache implementations for `BufferCopy`, `BufferClear`, `ImageToBuffer`, and `BufferToImage`.
 - Port block-linear to pitch, pitch to block-linear, and block-linear to block-linear paths with upstream `CalculateSize`, `UnswizzleSubrect`, `SwizzleSubrect`, and remap handling.
 - Replace the raw transmuted rasterizer pointer bridge with the same lifetime/ownership model used by the command-processor engine bindings once that subsystem is ported structurally.
@@ -12880,14 +17596,14 @@
 
 ### Intentional differences
 - Added env-gated `RUZU_DUMP_PRESENT_TEXTURE` readback in `AccelerateDisplay` to checksum the GL texture selected for presentation. Upstream has no equivalent diagnostic; it is disabled by default and does not alter normal presentation.
-- Rust now prepares sampled image views before `update_render_targets_from_snapshot(...)` and binds the current draw framebuffer immediately after, matching upstream's `texture_cache.FillGraphicsImageViews(...); texture_cache.UpdateRenderTargets(false); state_tracker.BindFramebuffer(texture_cache.GetFramebuffer()->Handle())` ordering. The OpenGL framebuffer helper is keyed by the full `RenderTargets` tuple and attaches color plus depth/stencil targets, but it still lives as a Rust-side backend bridge rather than upstream's base-cache `slot_framebuffers` owner.
+- Rust now prepares sampled image views before `update_render_targets_from_snapshot(...)` and binds the current draw framebuffer immediately after, matching upstream's `texture_cache.FillGraphicsImageViews(...); texture_cache.UpdateRenderTargets(false); state_tracker.BindFramebuffer(texture_cache.GetFramebuffer()->Handle())` ordering. The OpenGL framebuffer helper is keyed by the full `RenderTargets` tuple, attaches color plus depth/stencil targets, and now stores the GL object in an OpenGL-side `slot_framebuffers` while `TextureCacheBase::framebuffers` owns the upstream-shaped key map.
 
 ### Unintentional differences (to fix)
-- Rust still lacks the upstream full `TextureCache<P>::GetFramebuffer()` owner model: framebuffer lifecycle is not yet owned by base-cache `slot_framebuffers`, dependency scanning is still incomplete, and rescale metadata/lifecycle is only partially represented.
+- Rust still lacks the exact upstream full `TextureCache<P>::GetFramebuffer()` owner model: concrete framebuffer lifecycle is split into the OpenGL wrapper rather than the templated common cache, and rescale metadata/lifecycle is only partially represented.
 
 ### Missing items
 - Port full `RasterizerOpenGL::PrepareDraw` / `GraphicsPipeline::ConfigureImpl` ownership around render-target updates, `StateTracker::BindFramebuffer`, and descriptor/buffer binding order.
-- Move the current `RenderTargets` framebuffer bridge into upstream-faithful base-cache `TextureCache<P>::GetFramebufferId(RenderTargets)` / `slot_framebuffers` ownership.
+- Finish retiring legacy framebuffer helper paths so all draw/clear framebuffer lookup goes through the upstream-shaped `RenderTargets -> FramebufferId` map and GL `slot_framebuffers` owner.
 
 ### Binary layout verification
 - N/A: OpenGL state binding and diagnostics only; no guest-visible raw struct or serialized payload layout changed.
@@ -12963,7 +17679,8 @@
 - Rust keeps Maxwell texture instruction lowering split across separate `texture_*` Rust files with Rust enum dispatch instead of upstream visitor methods, but the active translators now cover bound/bindless handles, swizzled forms, offsets, sparse predicates, array/cube typing, and result masks for the ported texture families.
 
 ### Missing items
-- Complete per-instruction upstream parity for the remaining texture edge cases still represented by panic paths: `LC`/lod-clamp forms, 3D-array texture types, `TLD.CL`, `TMML` BA results, unsupported `TXQ` modes, and exact upstream no-rewrite/error handling.
+- Re-audited on 2026-06-14: the named panic paths `TEX.LC`, `TXD.LC`, `TLD.CL`, 3D-array texture types, `TMML` BA results, and unsupported `TXQ` modes all correspond to upstream `NotImplementedException` paths in the matching texture translator files, so they are not Rust-only parity debt.
+- Continue auditing exact upstream no-rewrite/error handling and any texture translator panic not backed by an upstream `NotImplementedException`.
 
 ### Binary layout verification
 - N/A: shader instruction translation only; no guest-visible raw struct or serialized payload layout changed.
@@ -12971,32 +17688,32 @@
 ## 2026-05-15 — `video_core/src/renderer_opengl/gl_rasterizer.rs`, `video_core/src/texture_cache/texture_cache.rs`, and `video_core/src/texture_cache/texture_cache_base.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h`
 
 ### Intentional differences
-- Rust `gl_rasterizer.rs` performs the current graphics descriptor fill/bind bridge directly under `RUZU_TEXTURE_CACHE_FILL=1`; upstream does this in `GraphicsPipeline::ConfigureImpl`/`prepare_stage` with backend template ownership.
+- Rust `gl_rasterizer.rs` still performs the current graphics descriptor fill/bind bridge directly; upstream does this in `GraphicsPipeline::ConfigureImpl`/`prepare_stage` with backend template ownership. The old `RUZU_TEXTURE_CACHE_FILL` gate is gone.
 - `get_graphics_sampler_id_with_gpu_reader` lives next to upstream-owned `GetGraphicsSamplerId` logic but accepts a caller-provided GPU-VA reader. This is a Rust ownership bridge because the current cache base stores Host1x SMMU device memory while MK8D's graphics cbuf/TSC table addresses are channel GPU virtual addresses.
 - Env-gated diagnostics (`RUZU_TRACE_TEXTURE_DESCRIPTORS`, `RUZU_TRACE_TSC_READ`, `RUZU_TRACE_BIND_TEXTURES`) are local debugging additions and are inert when unset.
 
 ### Missing items
 - Move descriptor fill/bind ownership out of `gl_rasterizer.rs` into the upstream-corresponding graphics pipeline/texture-cache structure once the Rust backend types can mirror C++ templates more closely.
-- Reserve upstream null image and null image-view slots with backend-equivalent objects; only the sampler null slot is currently aligned.
-- Remove the `RUZU_TEXTURE_CACHE_FILL` gate after the descriptor path is fully upstream-faithful and no longer partial.
+- Move descriptor fill/bind ownership out of `gl_rasterizer.rs` into the upstream-corresponding graphics pipeline/texture-cache structure once the Rust backend types can mirror C++ templates more closely.
 
 ### Binary layout verification
 - PASS: `TscEntry` remains `repr(C)` and 0x20 bytes; TSC reads use `size_of::<TscEntry>()` and `read_unaligned`, matching raw descriptor-table semantics.
 - PASS: the null sampler descriptor initializes the same upstream fields (`min_filter`, `mag_filter`, `mipmap_filter`, `cubemap_anisotropy`) before insertion into slot 0.
+- PASS: null image and null image-view ids are reserved at slot index 0 before any real insertion.
 
 ## 2026-05-15 — `video_core/src/texture_cache/descriptor_table.rs`, `video_core/src/texture_cache/texture_cache.rs`, `video_core/src/texture_cache/texture_cache_base.rs`, `video_core/src/texture_cache/util.rs`, `video_core/src/renderer_opengl/gl_rasterizer.rs`, and `video_core/src/renderer_opengl/gl_texture_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/descriptor_table.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/util.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp`
 
 ### Intentional differences
 - `DescriptorTable::read_with` is a Rust-only overload of upstream `DescriptorTable::Read`. It preserves descriptor-table ownership and behavior but lets current ruzu call sites supply the channel `MemoryManager` GPU-VA reader explicitly, because the Rust cache base does not yet store the same live `Tegra::MemoryManager&` reference that upstream `TextureCacheChannelInfo` owns.
 - `fill_graphics_image_views_with_gpu_reader` mirrors upstream `FillGraphicsImageViews`/`VisitImageView` but is limited to the graphics path and takes explicit reader/address-valid callbacks. This is a bridge until the channel memory-manager ownership is made upstream-faithful inside `TextureCacheChannelInfo`.
-- `TextureCache::refresh_contents_with_gpu_reader` uploads through a temporary OpenGL PBO and existing `Image::upload_memory`. Upstream uses `runtime.UploadStagingBuffer`, `UploadImageContents`, conversion helpers, async decode, and richer alias synchronization. The temporary PBO keeps behavior functional without pretending the staging runtime is ported.
+- `TextureCache::refresh_contents_with_gpu_reader` uploads through temporary OpenGL PBOs. For upstream `ACCELERATED_UPLOAD` ASTC GPU decode, Rust now reads guest ASTC bytes into the PBO and dispatches `UtilShaders::astc_decode`; other paths still use CPU unswizzle/convert plus existing `Image::upload_memory`. Upstream owns this through `runtime.UploadStagingBuffer`, `UploadImageContents`, and richer alias/staging lifecycle.
 - Env-gated `RUZU_TRACE_TEXTURE_UPLOAD` diagnostics report prepare/upload/read-miss decisions, with optional `RUZU_TRACE_TEXTURE_UPLOAD_ADDRS` filtering for targeted guest GPU addresses. Upstream has different logging/profiling infrastructure; runtime behavior is unchanged when the env var is unset.
 
 ### Missing items
 - Move the channel GPU-VA reader into `TextureCacheChannelInfo`/descriptor-table ownership instead of passing closures from `gl_rasterizer.rs`; upstream stores the memory manager reference in the descriptor table itself.
-- Port full upstream `PrepareImageView`, `PrepareImage`, `RefreshContents`, `UploadImageContents`, `SynchronizeAliases`, converted/accelerated upload paths, async ASTC decode, sparse image handling, rescale handling, and runtime staging-buffer management.
-- `unswizzle_image` currently covers the direct linear and block-linear full-image path used by the current smoke. It still needs line-by-line parity for all copy rectangles, conversion formats, per-subresource edge cases, accelerated uploads, and exact staging-buffer layout.
-- Descriptor/bind ownership remains under the partial `RUZU_TEXTURE_CACHE_FILL` bridge in `gl_rasterizer.rs`; upstream performs this in graphics pipeline `prepare_stage`.
+- Port full upstream `PrepareImageView`, `PrepareImage`, `RefreshContents`, `UploadImageContents`, `SynchronizeAliases`, converted upload paths, async ASTC decode, sparse image handling, rescale handling, and runtime staging-buffer management.
+- `unswizzle_image` currently covers the direct linear and block-linear full-image path used by the current smoke. It still needs line-by-line parity for all copy rectangles, conversion formats, per-subresource edge cases, non-ASTC accelerated uploads if upstream re-enables them, and exact staging-buffer layout.
+- Descriptor/bind ownership remains in `gl_rasterizer.rs`; upstream performs this in graphics pipeline `prepare_stage`.
 
 ### Binary layout verification
 - PASS: `TicEntry`/`TscEntry` remain raw 0x20-byte descriptor payloads; descriptor-table reads use `size_of::<T>()` and unaligned raw copy, matching upstream `ReadBlockUnsafe`.
@@ -15025,14 +19742,14 @@ The following still panic because upstream either also throws NotImplementedExce
 ## 2026-05-25 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
 
 ### Intentional differences
-- Added a Rust `render_target_framebuffers: HashMap<RenderTargets, TextureCacheFramebuffer>` side cache so draw FBO lookup can be keyed by the full upstream `RenderTargets` tuple instead of only the first color render-target view. This mirrors upstream `TextureCache<P>::GetFramebufferId(render_targets)` while preserving ruzu's current split backend-cache storage.
+- Draw FBO lookup is keyed by the full upstream `RenderTargets` tuple instead of only the first color render-target view. The current port uses `TextureCacheBase::framebuffers: HashMap<RenderTargets, FramebufferId>` plus OpenGL `slot_framebuffers`, mirroring upstream `TextureCache<P>::GetFramebufferId(render_targets)` while preserving ruzu's split backend-cache storage.
 - `RasterizerOpenGL::draw` now asks the texture cache for a framebuffer from the full `Maxwell3DRenderTargets` snapshot and `surface_clip` size. Upstream gets the same values through live `maxwell3d->regs` in `UpdateRenderTargets`.
 
 ### Unintentional differences (to fix)
 - Ruzu still does not clear Maxwell dirty flags per upstream `UpdateRenderTargets`; it consumes draw snapshots and leaves dirty-flag lifecycle outside the texture cache.
 
 ### Missing items
-- Full upstream framebuffer lifecycle: rescale metadata, dependency scanning equivalent to upstream `RemoveFramebuffers`, and slot-framebuffer ownership in the base texture cache.
+- Full upstream framebuffer lifecycle: exact rescale metadata/lifecycle and eventual templated common ownership of concrete framebuffer objects.
 - Full `UpdateRenderTargets` structural port using live Maxwell dirty flags rather than draw-time snapshots.
 
 ### Binary layout verification
@@ -15246,15 +19963,13 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Intentional differences
 - `samples_helper.rs` still carries a local `MsaaMode` copy because that file already documented this as a temporary Rust dependency break; this slice corrects its discriminants to match upstream `Tegra::Texture::MsaaMode` and adds `from_raw` for TIC decoding.
 - `ImageInfo::from_tic_entry` still defaults invalid `msaa_mode` bits to `Msaa1x1` instead of asserting. Upstream asserts on invalid enum values through `NumSamples`; ruzu keeps the existing malformed-descriptor tolerance used elsewhere in the TIC path.
-- `forced_flushed` / `dma_downloaded` remain defaulted because `Settings::values.use_reactive_flushing` is still not threaded into this constructor.
+- Fixed by the 2026-06-14 `image_info.rs` entry: `forced_flushed` / `dma_downloaded` now use the upstream predicate `is_pitch_linear && !Settings::values.use_reactive_flushing`.
 
 ### Unintentional differences (to fix)
-- The broader texture-cache path still lacks upstream `TryFindBase` / subresource lookup; even with correct `layer_stride`, `create_image_view` currently falls back to `base.layer = 0` for views.
+- Fixed by the following 2026-05-25 `texture_cache.rs` entry: `TextureCacheBase::create_image_view` now uses `ImageBase::try_find_base(descriptor.address())` and passes the resolved `base.layer` to `ImageViewInfo::from_tic_entry`.
 
 ### Missing items
 - Replace duplicated `samples_helper::MsaaMode` with the canonical `textures::texture::MsaaMode` once the module dependency can be untangled without moving upstream-owned helper logic.
-- Wire `Settings::values.use_reactive_flushing` equivalent into `ImageInfo::from_tic_entry` for `forced_flushed` / `dma_downloaded` parity.
-- Port real `ImageBase::TryFindBase` usage in `TextureCacheBase::create_image_view` so base-layer and mip-offset resolution can consume the newly-correct `layer_stride` metadata.
 
 ### Binary layout verification
 - N/A: this changes decoded texture-cache metadata only. `TICEntry` raw layout is unchanged.
@@ -15268,15 +19983,14 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Intentional differences
 - `TextureCacheBase::create_image_view` now consumes `ImageBase::try_find_base(descriptor.address())` and passes the resolved `base.layer` to `ImageViewInfo::from_tic_entry`, matching upstream `TextureCache<P>::CreateImageView` after `FindOrInsertImage`.
-- If `try_find_base` fails, ruzu returns `NULL_IMAGE_VIEW_ID` instead of panicking on upstream's `.value()`. This preserves the emulator's existing malformed-descriptor tolerance while keeping the successful path upstream-faithful.
+- Fixed by the 2026-06-14 top entry for `texture_cache.rs`: if `try_find_base` fails, TIC `CreateImageView` now stops like upstream's `.value()` instead of returning `NULL_IMAGE_VIEW_ID`.
 - The base image address is still computed as `descriptor.address() - base_layer * info.layer_stride`, matching upstream's `image_gpu_addr` calculation. This relies on the newly ported `ImageInfo::from_tic_entry` layer-stride decode.
 
 ### Unintentional differences (to fix)
 - `FindOrInsertImage` remains materially simpler than upstream: compatibility search, relaxed options, alias joins, image allocation table insertion, sparse image behavior, and LRU interactions are still incomplete.
-- `create_image_view` directly creates and inserts `ImageViewBase` instead of routing through a complete `FindOrEmplaceImageView` helper.
+- Fixed by the 2026-06-14 `FindOrEmplaceImageView` entry: `create_image_view` now routes through `TextureCacheBase::find_or_emplace_image_view(...)` instead of directly creating and inserting `ImageViewBase`.
 
 ### Missing items
-- Full upstream `FindOrEmplaceImageView` ownership and helper structure.
 - Full upstream `FindOrInsertImage` alias/overlap/lifetime machinery.
 - Proper `GpuToCpuAddress` bridge remains missing for image registration outside render-target paths, as documented in the previous texture-cache entry.
 
@@ -16259,18 +20973,18 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Intentional differences
 - Ruzu keeps descriptor configuration in `RasterizerOpenGL::draw` rather than fully inside `GraphicsPipeline::ConfigureImpl` because the long-term live `Maxwell3D` access model is still in progress. The storage-buffer descriptor loop mirrors upstream ordering within the existing Rust configure slice: unbind stage storage buffers, iterate `info.storage_buffers_descriptors`, and call `bind_graphics_storage_buffer` before host stage buffers are bound.
-- `BufferCacheRuntime::bind_storage_buffer` receives a GL buffer handle explicitly, matching the existing Rust uniform-buffer runtime signature. Upstream receives a `Buffer&` and obtains `buffer.Handle()` internally; Rust's runtime trait does not own the slot buffer table.
+- `BufferCacheRuntime::bind_storage_buffer` and `bind_compute_storage_buffer` now receive a mutable `BufferBase` so the OpenGL runtime can mirror upstream `Buffer&` ownership for `Handle()`, `HostGpuAddr()`, and `MakeResident(...)`. Rust still stores OpenGL buffer state on the shared `BufferBase` because the slot vector is not backend-parameterized.
 - Added env-gated `RUZU_TRACE_SSBO_BIND` diagnostics for storage-buffer descriptor/config/bind decisions. Disabled by default; used only to distinguish descriptor-generation bugs from runtime binding bugs.
 
 ### Unintentional differences (to fix)
 - Upstream `GraphicsPipeline::ConfigureImpl` owns storage, texture, image, and buffer descriptor configuration in one method selected by `ConfigureFunc(stage_infos, enabled_stages_mask)`. Ruzu still splits this across `gl_rasterizer.rs` and `buffer_cache.rs`, so method ownership parity is not complete.
-- Upstream handles the GLASM bindless SSBO path through `glProgramLocalParametersI4uivNV` when real storage buffers cannot be used. Ruzu currently implements only the GLSL `GL_SHADER_STORAGE_BUFFER` path and logs/skips the bindless path.
+- Fixed: the GLASM bindless SSBO path now builds the upstream `BindlessSSBO { address, length, padding }`, makes the buffer resident with read-only/read-write access, and calls `glProgramLocalParametersI4uivNV` when real storage buffers cannot be used.
 - Runtime diagnostics showed a drawn MK8D pipeline with one storage-buffer descriptor (`[SSBO_CONFIG] pipeline=36 stage=0 descriptors=1`) but no successful `[SSBO_BIND]` in that run. The remaining issue is resolving the storage-buffer binding to a non-null slot consistently, not GLSL descriptor emission.
 
 ### Missing items
 - Move the remaining descriptor configure logic toward an upstream-owned `GraphicsPipeline::ConfigureImpl` equivalent once `RasterizerOpenGL` has the live Maxwell access needed by AGENTS.md's long-term architecture.
 - Port compute storage-buffer runtime binding parity if compute shaders begin relying on GLSL SSBOs in tested titles.
-- Complete the bindless GLASM storage-buffer path or explicitly gate it behind unsupported assembly-shader mode.
+- Runtime-test the GLASM bindless storage-buffer path on an NVIDIA/GLASM-capable driver once a title or targeted harness exercises `use_storage_buffers == false`.
 
 ### Binary layout verification
 - N/A: OpenGL host descriptor binding and runtime state only. No guest-visible raw payload layout changed.
@@ -17416,24 +22130,23 @@ The following still panic because upstream either also throws NotImplementedExce
 ## 2026-06-11 — `video_core/src/texture_cache/texture_cache.rs` and `video_core/src/texture_cache/texture_cache_base.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h`
 
 ### Intentional differences
-- `TextureCacheBase::remove_image_view_references(...)` currently applies to the active Rust `channel_state` only. Upstream scans `active_channel_ids` and removes each deleted `ImageViewId` from every `channel_storage[c].image_views`; ruzu does not yet have upstream-shaped multi-channel `ChannelSetupCaches` ownership in the common texture cache.
-- `TextureCacheBase::remove_framebuffers(...)` now scans framebuffer keys by full `RenderTargets` membership, matching upstream's dependency test shape, but Rust still stores only the base cache id and leaves backend delayed destruction to the current OpenGL-side object caches until `slot_framebuffers` / `sentenced_framebuffers` ownership is ported.
+- Fixed by the later 2026-06-13 texture-cache channel-storage entry: `TextureCacheBase::remove_image_view_references(...)` now scans active texture-cache channels and removes deleted `ImageViewId` values from every active channel's `image_views`, matching upstream's `active_channel_ids` / `channel_storage[c]` loop for this slice.
+- `TextureCacheBase::remove_framebuffers(...)` now scans framebuffer keys by full `RenderTargets` membership, matching upstream's dependency test shape. OpenGL now stores the matching concrete framebuffer objects in `slot_framebuffers` and defers removed objects through `sentenced_framebuffers`; the remaining difference is that those backend objects still live in the OpenGL wrapper instead of a templated common cache.
 - `TextureCacheBase::JoinImages(...)` now ports the upstream CPU-region overlap scan, `ResolveOverlap`/`IsSubresource` classification, alias creation, bad-overlap bookkeeping, and final `RegisterImage` call in the common cache. Because Rust splits common texture-cache state from OpenGL backend images, the upstream immediate copy/delete tail is queued as `PendingJoinCopies` and drained by `OpenGLTextureCache::finish_pending_join_copies(...)` at both backend materialization boundaries that can expose a newly-created image to GL: texture-view materialization and render-target setup.
 - `OpenGLTextureCache::copy_image_direct(...)` no longer rejects copies solely because `Surface::GetFormatType` differs. Upstream `TextureCacheRuntime::CopyImage` calls `glCopyImageSubData` directly for non-MSAA copies and relies on GL/runtime compatibility rather than a host-side type gate.
 
 ### Unintentional differences (to fix)
-- `TextureCacheBase::delete_image(...)` still cannot mark Maxwell3D dirty flags for render targets, zeta, and color buffers because the common Rust cache does not own a live `Maxwell3D*` equivalent.
-- Deleted image-view references are not yet purged across all active channels because common texture-cache channel storage is still collapsed to the current Rust channel state.
-- Framebuffer deletion does not yet push base framebuffer objects to an upstream-equivalent delayed-destruction queue.
-- `TextureCacheBase::JoinImages(...)` still does not run the upstream sparse-image GPU-region scan (`ForEachSparseImageInRegion`) because ruzu's common cache does not yet carry the same channel GPU-memory id / sparse-view lookup ownership.
-- `TextureCacheBase::JoinImages(...)` still does not refresh guest contents or rescale sibling images before insertion because those operations remain backend/runtime-owned in ruzu. The OpenGL wrapper now copies GPU-modified overlap contents and unregisters/deletes copied non-alias overlaps, but it does not yet port `CopyImageMSAA`, `ReinterpretImage`, `EmulateCopyImage`, or the rescale-aware copy branches.
+- Fixed by the later 2026-06-13 texture-cache Maxwell3D dirty render-target flags entry.
+- Fixed by later texture-cache entries: deleted image-view references and descriptor caches are now invalidated across active texture-cache channels, and exact address-space-shared GPU page-table storage is now allocated at the upstream `OnGPUASRegister` boundary.
+- Framebuffer deletion for the OpenGL path now pushes removed GL framebuffer objects to `sentenced_framebuffers`; the remaining gap is exact templated common ownership.
+- Fixed by later texture-cache entries/current code: `TextureCacheBase::JoinImages(...)` now scans the per-channel sparse GPU page table through `collect_images_in_gpu_region(gpu_addr, size_bytes, true)`, matching upstream's `ForEachSparseImageInRegion(...)` purpose for the current single-channel owner shape. This is covered by `join_images_deletes_exact_sparse_gpu_overlap`.
+- `TextureCacheBase::JoinImages(...)` still cannot refresh guest contents synchronously before insertion because that operation remains backend/runtime-owned in ruzu. The OpenGL wrapper now refreshes through caller-supplied GPU readers, handles sibling/new-image rescale, copies GPU-modified overlap contents through the same `CopyImage` policy used by alias synchronization, and unregisters/deletes copied non-alias overlaps.
 - `PendingJoinCopies` is a Rust ownership adaptation caused by split common/backend storage. Upstream does this work synchronously inside one templated `TextureCache<P>::JoinImages(...)` body.
 
 ### Missing items
-- Port upstream `active_channel_ids` / `channel_storage` ownership for common texture-cache channel state.
-- Port upstream base framebuffer slot ownership and `sentenced_framebuffers` delayed destruction.
-- Wire Maxwell3D dirty render-target flag updates into `delete_image(...)` once the live engine ownership model is available.
-- Port the remaining backend/runtime-owned `JoinImages` tail: `RefreshContents`, `ImageCanRescale`, `ScaleUp`/`ScaleDown`, sorted `join_copies_to_do`, `CopyImageMSAA`, `ReinterpretImage`, and `EmulateCopyImage`.
+- Fixed by later texture-cache entries for active-channel descriptor invalidation/removal, Maxwell3D dirty render-target flags, and exact address-space-shared GPU page-table ownership.
+- Revisit exact templated common ownership for `slot_framebuffers` / `sentenced_framebuffers` if `TextureCacheBase` becomes generic over backend objects.
+- Port the remaining backend/runtime-owned `JoinImages` tail into a single upstream-shaped owner: synchronous `RefreshContents`, bad-overlap download interactions, exact descriptor-table/dirty-flag invalidation after rescale, and delete/register ordering without exposing intermediate image ids.
 
 ### Binary layout verification
 - N/A: texture-cache host ownership/state only. No guest-visible raw payload layout changed.
@@ -17632,7 +22345,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - MK8D texture `0x5218D0000` still samples red after this change because the copied mip source `0x521984000` is itself uploaded from guest bytes `80 ff ff ff`; the next divergence to isolate is whether that guest content should have been downloaded from an overlapping GPU image before upload, or overwritten by a later render-target operation.
 
 ### Missing items
-- Port the remaining upstream `JoinImages(...)`/overlap lifecycle in one owner or an equivalent backend hook sequence: `RefreshContents`, rescale, sorted copy execution, `CopyImageMSAA`, reinterpret/emulated copies, bad-overlap download interactions, and delete/register ordering without exposing intermediate states.
+- Port the remaining upstream `JoinImages(...)`/overlap lifecycle in one owner or an equivalent backend hook sequence: synchronous `RefreshContents`, bad-overlap download interactions, exact descriptor-table/dirty-flag invalidation after rescale, and delete/register ordering without exposing intermediate states.
 
 ### Binary layout verification
 - N/A: texture-cache host metadata only. No guest-visible raw payload layout changed.
@@ -17854,6 +22567,26 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Binary layout verification
 - N/A: OpenGL device policy only. No guest-visible raw payload layout changed.
 
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- Upstream `TextureCacheRuntime::CopyImage` dispatches `glCopyImageSubData` directly for every direct-copy region. Rust still tries that direct path first, but adds a backend-local fallback when the driver returns `GL_INVALID_VALUE` for compressed textures whose requested pixel region is smaller than a compression block or touches a partial mip edge. The fallback is limited to matching compressed block-layout families (for example BC1 unorm/sRGB or ASTC 8x5 unorm/sRGB), preserving raw compressed-block copy semantics by reading the source block with `glGetCompressedTextureSubImage` and writing it with destination-edge dimensions through `glCompressedTextureSubImage3D`.
+- `RUZU_TRACE_COPY_IMAGE_INVALID` remains an opt-in diagnostic for logging direct-copy failures and whether the compressed-block fallback handled them. It is inactive by default and does not change copy behavior.
+
+### Unintentional differences (to fix)
+- None known for this compressed sub-block copy fallback after re-reading upstream `TextureCacheRuntime::CopyImage`, `CanImageBeCopied`, and `EmulateCopyImage`.
+
+### Missing items
+- Broader OpenGL utility-shader parity gaps remain documented in later entries: accelerated upload lifecycle wiring is still not fully ported. `UtilShaders::CopyBC4`, `ConvertS8D24`, and the ASTC/block-linear/pitch upload shader programs are now wired at the utility-shader layer.
+
+### Binary layout verification
+- N/A: OpenGL host texture copy behavior only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo test -p video_core compressed_block_copy_rect -- --nocapture`
+- `cargo test -p video_core compressed_ -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+
 ## 2026-06-12 — core/src/hle/service/hid/hid_server.rs and common/src/trace.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hid/hid_server.cpp
 
 ### Intentional differences
@@ -17922,4 +22655,1827 @@ The following still panic because upstream either also throws NotImplementedExce
 - PASS: query report writes preserve upstream raw payload sizes (`u32` short report, `u64 payload + u64 timestamp` long report). No Rust struct layout is serialized here.
 
 ### Tests
+- `cargo check -p video_core`
+
+## 2026-06-13 — video_core/src/texture_cache/util.rs, video_core/src/texture_cache/texture_cache.rs, video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/util.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h, /home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.cpp
+
+### Intentional differences
+- `is_valid_entry_with_range_valid` exposes the upstream `GpuToCpuAddress(address, guest_size_bytes)` fallback as a Rust closure-taking helper so callers that own a channel `MemoryManager` can supply range-aware validation while older single-address call sites keep using `is_valid_entry_with_addr_valid`.
+- OpenGL rasterizer GPU-reader closures now delegate directly to `MemoryManager::read_block`, matching upstream `ReadBlock` ownership for sparse/reserved page walking and zero fill, instead of pre-rejecting when `GpuToCpuAddress(gpu_addr)` has no start-page mapping.
+
+### Unintentional differences (to fix)
+- None known for the validated TIC entry/rasterizer GPU-reader slice after re-reading the upstream files listed above.
+
+### Missing items
+- Broader MK8D overexposure/present-color parity remains under investigation; the OpenGL 10-bit format table was checked against upstream and was not changed in this slice.
+
+### Binary layout verification
+- N/A: no guest-visible raw struct layout changed. TIC validation and GPU read dispatch behavior only.
+
+### Tests
+- `cargo test -p video_core texture_cache::util::tests::is_valid_entry_accepts_size_aware_range_like_upstream`
+- `cargo test -p video_core texture_cache::texture_cache::tests::`
+- `cargo test -p video_core texture_cache::util::tests::`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/util_shaders.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/util_shaders.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/util_shaders.h
+
+### Intentional differences
+- Rust now routes `UtilShaders` through `TextureCacheRuntime` and the shared renderer/rasterizer `ProgramManagerHandle`; this supersedes the earlier direct `TextureCache` ownership while preserving the same `CopyImageMSAA` dispatch responsibility.
+- Rust compiles the embedded GLSL source strings with `gl_shader_util::create_program_from_source`; upstream compiles generated host-shader headers with `MakeProgram(...)`.
+
+### Unintentional differences (to fix)
+- None known for the `CopyImageMSAA` dispatch slice after re-reading upstream `TextureCacheRuntime::CopyImageMSAA` and `UtilShaders::CopyMSAA`.
+
+### Missing items
+- Accelerated upload lifecycle wiring is now represented by `TextureCacheRuntime::accelerate_image_upload`; remaining debt is the broader common/backend owner placement tracked in the later runtime/staging entry. `UtilShaders::CopyBC4` is wired for the OpenGL emulated-copy path, `UtilShaders::ConvertS8D24` is wired for the post-format-conversion component swap, and the ASTC/block-linear/pitch upload utility programs are compiled with upstream-shaped dispatch uniforms.
+- Resolution scaling around `TextureCache<P>::JoinImages` still has broader owner-placement and deferred-backend-execution parity gaps, but Rust now has OpenGL `Image::scale_up`/`scale_down` and `TextureCache::ScaleUp`/`ScaleDown` counterparts.
+
+### Binary layout verification
+- N/A: OpenGL shader dispatch behavior only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo fmt --all`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-13 — video_core/src/engines/draw_manager.rs, video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust snapshots Maxwell3D render-target register state through `Maxwell3DRenderTargets` instead of storing a direct `maxwell3d` pointer in `TextureCacheBase`. The snapshot now includes `surface_clip`, preserving the upstream `UpdateRenderTargets` owner data without changing Rust ownership.
+
+### Unintentional differences (to fix)
+- None known for the `UpdateRenderTargets` `render_targets.size` slice after re-reading upstream `TextureCache<P>::UpdateRenderTargets`.
+
+### Missing items
+- Upstream `RescaleRenderTargets`, `ImageCanRescale`, `ScaleUp`, and `ScaleDown` now have Rust counterparts, but the full upstream dirty-flag ownership around resolution scaling and blacklisted texture views is still incomplete.
+
+### Binary layout verification
+- N/A: render-target snapshot and cache key behavior only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo fmt --all --check`
+- `cargo test -p video_core update_render_targets_from_snapshot_registers_presentable_view -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust now stores upstream `TextureCacheRuntime::rescale_draw_fbos` / `rescale_read_fbos` on `OpenGL::TextureCacheRuntime`, creates them only when `resolution_info.active` is true, and destroys them from `TextureCacheRuntime::Drop`, matching upstream `TextureCacheRuntime::TextureCacheRuntime` / destructor ownership.
+- Rust `TextureCache::new` now constructs the production `TextureCacheRuntime` once and passes it into the cache, rather than creating a capability-default runtime and replacing it. Test/default construction still uses `TextureCacheRuntime::new_with_caps`.
+- Rust `Image::scale_up` / `scale_down` take the corresponding `ImageBase` as an explicit parameter instead of inheriting from it like upstream `OpenGL::Image : ImageBase`.
+- Upstream `OpenGL::Image::Scale(...)` calls `state_tracker.NotifyViewport0()` / `NotifyScissor0()` directly after its internal `glBlitNamedFramebuffer` loop. Rust now routes that side effect through `TextureCacheRuntime::notify_rescale_blit_state_changed()` immediately after backend `Image::scale_up` / `scale_down`, using the runtime-owned `StateTracker` pointer.
+- Rust `update_render_targets_from_snapshot` reruns the snapshot bridge while `has_deleted_images` is raised by rescale invalidation, instead of upstream rerunning `FindColorBuffer` / `FindDepthBuffer` through Maxwell dirty flags. This preserves the upstream `RescaleRenderTargets` loop ordering while ruzu still receives render-target registers as a draw snapshot.
+- Rust `invalidate_scale` keeps backend GL image-view/framebuffer deletion in `OpenGL::TextureCache`, while base image-view reference removal and descriptor/image-view-id invalidation now go through `TextureCacheBase::{remove_image_view_references,invalidate_channel_image_views}`. Those helpers iterate all active texture-cache channels, matching upstream `active_channel_ids`.
+- Rust updates `render_targets.is_rescaled` and scaled `render_targets.size` in the OpenGL snapshot bridge after the rescale decision. Upstream also marks `Dirty::RescaleViewports`, `Dirty::RescaleScissors`, and `Dirty::DepthBiasGlobal`; ruzu still lacks the exact Maxwell3D dirty-flag owner for those common flags, but backend GL viewport/scissor invalidation after `Image::Scale(...)` is now represented through the runtime-owned state tracker.
+
+### Unintentional differences (to fix)
+- Upstream `TextureCache<P>::UpdateRenderTargets` is skipped entirely when `Dirty::RenderTargets` is false and only prepares existing views. Rust has no Maxwell dirty-flag owner in `OpenGL::TextureCache`, so the snapshot bridge re-resolves render-target views on each draw/clear call.
+- Upstream dirty-flag side effects from `InvalidateScale` (`RenderTargets`, `ZetaBuffer`, each `ColorBuffer`, common rescale viewport/scissor flags, depth-bias) are not represented literally because ruzu does not yet store Maxwell3D dirty flags inside the texture cache.
+
+### Missing items
+- Fixed by the later 2026-06-13 texture-cache channel-storage entry and the shared-tail helper split: `InvalidateScale` now removes image-view references and invalidates descriptor/image-view-id caches across all active texture-cache channels.
+- Move the snapshot bridge back toward upstream `TextureCache<P>::UpdateRenderTargets` ownership once the Rust texture cache owns Maxwell3D dirty flags and live register access.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::TextureCacheRuntime`, `TextureCacheRuntime::~TextureCacheRuntime`, `Image::Scale`, `Image::ScaleUp`, and `Image::ScaleDown`.
+- Re-read upstream `TextureCache<P>::InvalidateScale` active-channel invalidation tail and Rust `TextureCacheBase::{remove_image_view_references,invalidate_channel_image_views}` / OpenGL `TextureCache::invalidate_scale`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core invalidate_scale_shared_tail_invalidates_all_active_channel_image_views -- --nocapture`
+- `cargo test -p video_core texture_cache::texture_cache::tests::update_render_targets_from_snapshot_registers_presentable_view -- --nocapture`
+
+### Binary layout verification
+- N/A: OpenGL image scaling and framebuffer blit behavior only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo fmt --all --check`
+- `cargo test -p video_core present_internal_format_matches_basic_surface_formats -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+- `cargo check -p video_core`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Upstream `TextureCache<P>::JoinImages` owns the full templated runtime tail synchronously. Rust still splits common image metadata from OpenGL backend images, so `TextureCacheBase::JoinImages` queues `PendingJoinCopies` and `OpenGL::TextureCache::finish_pending_join_copies` drains the backend work once GL images exist.
+- The new Rust `prepare_pending_join_rescale` helper ports the backend-owned part of upstream `JoinImages`: compute `can_rescale` from `new_info.rescaleable`, sibling `ImageCanRescale`, and sibling `Rescaled` flags; scale siblings up/down before copy; scale the new image up/down; and pass the matching `up_scale/down_shift` to `make_shrink_image_copies`.
+- `OpenGLTextureCache::materialize_views_with_gpu_reader` and `prepare_render_targets_from_snapshot` now carry the channel GPU reader into `finish_pending_join_copies`, so draw/render-target drains perform `RefreshContents(new_image)` before rescale and copy when the same reader that upstream `TextureCache<P>` would use is available.
+- `RasterizerOpenGL::draw` and `RasterizerOpenGL::clear` now pass `MemoryManager::read_block` into image prepare/materialization/render-target prepare whenever the channel memory manager exists, even if the optional generic `DeviceMemoryReader` handle is absent. This matches upstream's texture cache use of the live channel `gpu_memory` owner more closely than the previous reader-less fallback.
+- Reader-less `finish_pending_join_copies` no longer drains a join whose new image is still `CpuModified`; it leaves the join queued, preserving FIFO order, until a later draw/render-target/clear path can run upstream-equivalent `RefreshContents(new_image)` with a GPU reader. Reader-less drains are still allowed when `RefreshContents` would be a no-op because the image is not CPU-modified.
+- For joins with pending backend copies, Rust now delays `RegisterImage(new_image_id)` until `finish_pending_join_copies` has refreshed, rescaled, copied from GPU-modified overlaps, unregistered/deleted superseded overlaps, and is about to return. Joins without pending backend copies still register in `TextureCacheBase::JoinImages`.
+
+### Unintentional differences (to fix)
+- Upstream calls `RefreshContents(new_image, new_image_id)` inside `JoinImages`, before any caller can observe the new image. Rust still cannot do that synchronously inside `TextureCacheBase::JoinImages`; if no channel GPU reader is available and the new image remains CPU-modified, Rust defers the backend tail rather than running an upload-less copy/delete sequence.
+- Upstream executes the copy/delete tail before returning from `JoinImages`; Rust still exposes `new_image_id` to its immediate caller before the deferred OpenGL tail runs, although registration in CPU/GPU page tables is now delayed until after that tail for pending-copy joins.
+
+### Missing items
+- Complete upstream-equivalent `RefreshContents(new_image)` ordering inside the `JoinImages` owner instead of relying on deferred backend drains with caller-supplied GPU readers.
+- Remove or tighten the `PendingJoinCopies` split further so `JoinImages` cannot expose the unregistered intermediate image id before backend copies/deletes complete.
+- Remaining upstream `JoinImages` runtime branches not covered by this slice: bad-overlap download interactions and exact descriptor-table/dirty-flag invalidation after rescale.
+
+### Binary layout verification
+- N/A: OpenGL texture-cache lifecycle/copy ordering only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo fmt --all --check`
+- `cargo check -p video_core`
+- `cargo test -p video_core join_images -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/util_shaders.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/util_shaders.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- Rust `UtilShaders::convert_s8d24` takes the destination OpenGL texture handle directly instead of an `Image&`, because ruzu stores backend image metadata in `OpenGL::TextureCache` and passes GL object names into utility helpers. The binding, uniform, dispatch dimensions, and call site mirror upstream `UtilShaders::ConvertS8D24`.
+- Rust logs and skips unsupported layered copies where upstream uses `ASSERT`; this matches the existing Rust utility-shader pattern for non-fatal release builds while preserving the accepted upstream copy shape.
+
+### Unintentional differences (to fix)
+- None known for the S8D24 component-swap slice after re-reading upstream `FormatConversionPass::ConvertImage` and `UtilShaders::ConvertS8D24`.
+
+### Missing items
+- Broader accelerated upload lifecycle wiring remains separate: ASTC `ACCELERATED_UPLOAD` now reaches `UtilShaders::astc_decode`, but the upstream runtime/staging owner split, non-ASTC accelerated upload branches currently disabled upstream, and async ASTC decode are still not fully ported.
+- Broader `TextureCache<P>::JoinImages` owner/order parity remains open as documented above.
+
+### Binary layout verification
+- N/A: OpenGL compute shader dispatch only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `FormatConversionPass::ConvertImage` and `UtilShaders::ConvertS8D24`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core worker_ -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/{mod.rs,gl_rasterizer.rs,gl_shader_manager.rs,gl_texture_cache.rs,util_shaders.rs} vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/{renderer_opengl.h,renderer_opengl.cpp,gl_rasterizer.h,gl_rasterizer.cpp,gl_shader_manager.h,gl_shader_manager.cpp,gl_texture_cache.h,gl_texture_cache.cpp,util_shaders.h,util_shaders.cpp}
+
+### Intentional differences
+- Rust `RendererOpenGL` owns the shared OpenGL `ProgramManagerHandle`, passes it to `RasterizerOpenGL`, then to `TextureCacheRuntime` and `UtilShaders`, matching upstream's effective owner graph (`RendererOpenGL::program_manager` -> `RasterizerOpenGL&` -> `TextureCacheRuntime` -> `UtilShaders`). Rust uses `Arc<parking_lot::Mutex<ProgramManager>>` instead of C++ references because the Rust renderer/rasterizer/texture-cache structs own their fields by value.
+- Rust declares the `RendererOpenGL::program_manager` field after `rasterizer` so Rust drop order preserves upstream's effective C++ teardown order: rasterizer-owned texture utilities are destroyed before the shared program manager.
+- Rust `UtilShaders` compiles the ASTC decoder, block-linear 2D/3D unswizzle, and pitch unswizzle compute programs directly from embedded host-shader strings with `create_program_from_source`, matching upstream's `MakeProgram(...)` responsibility. Utility dispatches now bind through the shared `ProgramManager::bind_compute_program`, run `local_memory_warmup` for ASTC decode, and call `restore_guest_compute` after compute dispatches.
+- Rust upload helpers take a destination texture handle, staging buffer handle/offset/size, `ImageInfo`, and `SwizzleParameters` instead of upstream `Image&` plus `StagingBufferMap&`. The shader bindings, uniforms, workgroup division, swizzle-table binding, and image formats mirror upstream `ASTCDecode`, `BlockLinearUpload2D`, `BlockLinearUpload3D`, and `PitchUpload`.
+- Rust logs and skips the same assertion-only ASTC preconditions (`origin == 0`, `destination == 0`, ASTC 16-byte blocks) instead of aborting in release builds, following the existing Rust utility-shader pattern.
+
+### Unintentional differences (to fix)
+- None known for the shared `ProgramManager` ownership and utility-shader bind/restore slice after re-reading upstream `RendererOpenGL`, `RasterizerOpenGL`, `TextureCacheRuntime`, `UtilShaders`, and `ProgramManager`.
+
+### Missing items
+- The broader upload lifecycle now calls `TextureCacheRuntime::accelerate_image_upload` when upstream `CanBeAccelerated` would set `ACCELERATED_UPLOAD`, and image classification now sets `ASYNCHRONOUS_DECODE` when upstream `CanBeDecodedAsync` is true. `UploadImageContents` is split into `OpenGL::TextureCache::upload_image_contents_with_gpu_reader`; it remains in the OpenGL wrapper rather than the common template because ruzu's common texture cache cannot yet call backend `Image::UploadMemory`.
+
+### Binary layout verification
+- N/A: OpenGL compute shader dispatch only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `RendererOpenGL::{program_manager,rasterizer}` member ownership and constructor, `RasterizerOpenGL::{program_manager,texture_cache_runtime,texture_cache}` member ownership and constructor, `TextureCacheRuntime::TextureCacheRuntime`, `UtilShaders::UtilShaders`, `ASTCDecode`, `BlockLinearUpload2D`, `BlockLinearUpload3D`, `PitchUpload`, and `StoreFormat`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core store_format_mapping -- --nocapture`
+- `cargo test -p video_core astc_upload_flags_follow_upstream_policy -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs, video_core/src/renderer_opengl/gl_staging_buffer_pool.rs, video_core/src/texture_cache/texture_cache_base.rs, video_core/src/textures/workers.rs, and video_core/src/renderer_opengl/util_shaders.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h, /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h, /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_staging_buffer_pool.cpp, and /home/vricosti/Dev/emulators/zuyu/src/video_core/textures/workers.cpp
+
+### Intentional differences
+- Rust keeps the `RefreshContents` / `UploadImageContents` methods on the OpenGL texture-cache wrapper because ruzu's common cache cannot yet call backend `Image::UploadMemory`, but the responsibilities are now split like upstream: `refresh_contents_with_gpu_reader` handles CPU-modified gating, tracking, async decode, staging allocation, and the upload memory barrier; `upload_image_contents_with_gpu_reader` handles accelerated upload, converted CPU decode upload, and raw unswizzle upload. Upload staging goes through `TextureCacheRuntime::upload_staging_buffer`, the existing OpenGL `StagingBufferPool`, and `StagingBufferMap`. The ASTC accelerated-upload branch follows upstream ordering: set `ACCELERATED_UPLOAD` when `CanBeAccelerated` is true, read raw guest bytes into a staging map, build `FullUploadSwizzles`, dispatch `UtilShaders::astc_decode`, then return to `RefreshContents` for `TextureCacheRuntime::insert_upload_memory_barrier`.
+- Rust `StagingBufferMap` now exposes mapped-span helpers, explicit flush, and creates the upload fence on drop, matching upstream `StagingBufferMap::~StagingBufferMap` / `StagingBuffers::RequestMap` ownership without duplicating staging state inside `gl_texture_cache.rs`.
+- Rust ports upstream `QueueAsyncDecode` / `TickAsyncDecode` inside the OpenGL texture-cache wrapper because that is the current owner of `Image::UploadMemory`; the queue state itself remains in `TextureCacheBase::async_decodes` with the upstream `AsyncDecodeContext` shape. The dedicated worker is `ThreadWorker::new_named(1, "TextureDecoder")`, matching upstream's one-thread `texture_decode_worker`.
+- Rust `AsyncDecodeContext` uses `Arc<AsyncDecodeContext>` plus a mutex-protected output payload instead of upstream `unique_ptr` plus a raw pointer captured by the worker lambda. This preserves the same lifetime contract without exposing an unsafe pointer to a Rust thread.
+- Rust `TextureCacheRuntime` owns `UtilShaders`, receives the shared renderer/rasterizer `ProgramManagerHandle`, and `TextureCacheRuntime::accelerate_image_upload` now dispatches ASTC, block-linear 2D/3D, and pitch accelerated upload branches through the same image-type switch as upstream `TextureCacheRuntime::AccelerateImageUpload`.
+
+### Unintentional differences (to fix)
+- None known for this upload staging / async decode / accelerated upload ownership slice after the shared `ProgramManagerHandle` is threaded from `RendererOpenGL` through `RasterizerOpenGL` into `TextureCacheRuntime` and `UtilShaders`.
+
+### Missing items
+- Move `RefreshContents` / `UploadImageContents` ownership back into the common texture-cache layer once that layer can call backend image upload hooks without duplicating OpenGL lifecycle.
+
+### Binary layout verification
+- N/A: OpenGL upload staging and compute dispatch only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `CanBeAccelerated`, `CanBeDecodedAsync`, `TextureCache<P>::RefreshContents`, `TextureCache<P>::UploadImageContents`, `TextureCache<P>::QueueAsyncDecode`, `TextureCache<P>::TickAsyncDecode`, `AsyncDecodeContext`, `TextureCacheRuntime::UploadStagingBuffer`, `StagingBufferMap`, `TextureCacheRuntime::AccelerateImageUpload`, `UtilShaders::*`, and `ProgramManager::{BindComputeProgram,LocalMemoryWarmup,RestoreGuestCompute}`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core gl_staging_buffer_pool -- --nocapture`
+- `cargo test -p video_core gl_staging_buffer_pool -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs, video_core/src/texture_cache/texture_cache_base.rs, and video_core/src/textures/workers.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h, /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h, and /home/vricosti/Dev/emulators/zuyu/src/video_core/textures/workers.cpp
+
+### Intentional differences
+- Rust factors upstream `OpenGL::Image::Image` flag classification into `TextureCache::apply_backend_image_flags`, because backend image flags are applied lazily when the split OpenGL wrapper materializes or prepares an image. The classification priority now matches upstream: `CanBeDecodedAsync` sets `ASYNCHRONOUS_DECODE`; otherwise `CanBeAccelerated` sets `ACCELERATED_UPLOAD`; converted formats still set `CONVERTED | COSTLY_LOAD`.
+- Rust queues `ASYNCHRONOUS_DECODE` images after `RefreshContents` clears `CPU_MODIFIED` and tracks the image, runs `UnswizzleImage` before queueing, decodes with `ConvertImage` on the dedicated one-thread `TextureDecoder` worker, and uploads completed decode output from `TextureCache::tick_frame` before advancing the common frame tick. That matches upstream `RefreshContents -> QueueAsyncDecode` and `TickFrame -> TickAsyncDecode` ordering within ruzu's current OpenGL wrapper split.
+- Rust uses mutex-protected decode output inside `Arc<AsyncDecodeContext>` rather than upstream's raw pointer capture from a `unique_ptr`; this is a Rust lifetime adaptation, not a behavioral divergence.
+
+### Unintentional differences (to fix)
+- None known for the image classification and async decode queue/tick lifecycle after re-reading upstream `OpenGL::Image::Image`, `TextureCache<P>::RefreshContents`, `QueueAsyncDecode`, and `TickAsyncDecode`.
+
+### Missing items
+- The broader runtime/staging owner split remains tracked above: Rust now routes upload staging through `TextureCacheRuntime::upload_staging_buffer`, `StagingBufferPool`, and `StagingBufferMap`, and utility upload dispatch uses the shared renderer/rasterizer `ProgramManagerHandle`. The remaining debt is moving `RefreshContents` / `UploadImageContents` ownership back into the common layer once backend upload hooks are available.
+
+### Binary layout verification
+- N/A: image flag classification only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `CanBeDecodedAsync`, `OpenGL::Image::Image`, `TextureCache<P>::RefreshContents`, `QueueAsyncDecode`, and `TickAsyncDecode`.
+- `cargo test -p video_core astc_upload_flags_follow_upstream_policy -- --nocapture`
+- `cargo test -p video_core worker_ -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Superseded by the 2026-06-14 top entry for `texture_cache.rs`: Rust no longer preserves ignored `GpuModified` overlaps as bad overlaps. It now records `.agents/texture_cache_unimplemented_state.md` and stops like upstream `UNIMPLEMENTED()`.
+- This historical entry removed an older silent data-loss path, but its bad-overlap preservation strategy is no longer active.
+
+### Unintentional differences (to fix)
+- Fixed by the 2026-06-14 top entry for `texture_cache.rs`: the ignored `GpuModified` overlap branch now follows upstream's fatal stop instead of preserving the image as a bad overlap.
+
+### Missing items
+- Continue reducing the broader `PendingJoinCopies` split so `JoinImages` can execute the copy/delete/register tail synchronously.
+
+### Binary layout verification
+- N/A: texture-cache overlap lifecycle only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::JoinImages` around `join_ignore_textures`.
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- Rust now stores the upstream null texture owners (`null_image_1d_array`, `null_image_cube_array`, `null_image_3d`) and null texture-view owners (`null_image_view_1d`, `null_image_view_2d`, `null_image_view_2d_array`, `null_image_view_cube`) as a single `[u32; 7]` on `OpenGL::TextureCacheRuntime`; `TextureCacheRuntime::Drop` deletes those GL texture names. This preserves the upstream runtime ownership while using raw GL handles instead of C++ `OGLTexture` / `OGLTextureView` RAII wrappers.
+- Rust keeps `TextureCacheRuntime::new_with_caps(...)` for tests/default construction and passes `has_debugging_tool_attached` explicitly instead of holding a `const Device&`; production construction still derives the value from `Device::has_debugging_tool_attached()`.
+- `ImageView` constructors still receive a copied `[u32; NUM_TEXTURE_TYPES]` rather than a `TextureCacheRuntime&`, because Rust image views do not store a runtime reference. The copied source is now `TextureCacheRuntime::null_image_views`, matching upstream data ownership.
+
+### Unintentional differences (to fix)
+- None known for the null-image ownership slice after re-reading upstream `TextureCacheRuntime::TextureCacheRuntime`, `TextureCacheRuntime::~TextureCacheRuntime`, `ImageView::ImageView(TextureCacheRuntime&, ...)`, and the runtime member declarations.
+
+### Missing items
+- Broader runtime parity remains tracked separately: exact external `StagingBufferPool&`, `const Device&`, and backend `Image&` ownership still differ from upstream `TextureCacheRuntime`.
+
+### Binary layout verification
+- N/A: OpenGL host texture handles and image-view default bindings only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::TextureCacheRuntime`, `TextureCacheRuntime::~TextureCacheRuntime`, `ImageView::ImageView(TextureCacheRuntime&, ...)`, and `gl_texture_cache.h` runtime member declarations.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache_base.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- Rust now configures OpenGL texture-cache memory budgets with the upstream `HAS_DEVICE_MEMORY_INFO` constructor branch. `TextureCacheBase::configure_device_memory_budget(...)` mirrors upstream's `device_local_memory`, `min_spacing_expected`, `min_spacing_critical`, `mem_threshold`, `min_vacancy_expected`, `min_vacancy_critical`, `expected_memory`, `critical_memory`, and `minimum_memory` formula.
+- `OpenGL::TextureCache::new_with_runtime(...)` calls that budget helper with `TextureCacheRuntime::get_device_local_memory()`, matching OpenGL `TextureCacheParams::HAS_DEVICE_MEMORY_INFO = true`.
+- `OpenGL::TextureCache::tick_frame(...)` now applies upstream's first `TickFrame` step: when the runtime can report memory usage, replace the cache estimate with `TextureCacheRuntime::get_device_memory_usage()` before async decode/runtime/common ticking.
+
+### Unintentional differences (to fix)
+- Rust now runs the ported LRU/memory-pressure portion of upstream `RunGarbageCollector()` from OpenGL `tick_frame(...)`; OpenGL framebuffers now have a delayed-destruction ring, while exact runtime/image download hooks are still tracked in the newer 2026-06-13 GC parity entry.
+
+### Missing items
+- Exact templated ownership for delayed destruction remains tracked in the newer 2026-06-13 GC parity entry; the OpenGL render-target framebuffer path now ticks `sentenced_framebuffers`.
+
+### Binary layout verification
+- N/A: host memory-budget accounting and frame lifecycle only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::TextureCache`, `TextureCache<P>::TickFrame`, `TextureCache<P>::RunGarbageCollector`, and OpenGL `TextureCacheParams::HAS_DEVICE_MEMORY_INFO`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core configure_device_memory_budget_matches_upstream_formula -- --nocapture`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust `TextureCacheBase::check_feedback_loop(...)` now ports the upstream `TextureCache<P>::CheckFeedbackLoop` scan over sampled `ImageViewInOut` entries, current color render-target image views, and the depth render target. It returns the backend-independent `requires_barrier` boolean instead of directly calling `runtime.BarrierFeedbackLoop()` because ruzu's common cache does not own the OpenGL runtime reference.
+- Null image-view ids are skipped explicitly (`NULL_IMAGE_VIEW_ID`) to preserve upstream's `if (!view.id) continue` / `if (ct_view_id)` semantics with Rust `SlotId(0)`.
+- No new OpenGL draw-path call was added in this slice: upstream `gl_graphics_pipeline.cpp::ConfigureImpl` in the compared tree calls `FillGraphicsImageViews` and `UpdateRenderTargets`, but does not call `CheckFeedbackLoop` there.
+
+### Unintentional differences (to fix)
+- If an upstream call site for `CheckFeedbackLoop` is restored or found in another backend path, ruzu still needs the wrapper-level call that maps `requires_barrier` to `TextureCacheRuntime::barrier_feedback_loop()`.
+
+### Missing items
+- None known for the backend-independent feedback-loop detection predicate after re-reading upstream `TextureCache<P>::CheckFeedbackLoop`.
+
+### Binary layout verification
+- N/A: texture-cache image-view comparison only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::CheckFeedbackLoop` and OpenGL `gl_graphics_pipeline.cpp::ConfigureImpl` ordering.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core check_feedback_loop -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Reader-less `OpenGL::TextureCache::{prepare_image_without_gpu_reader,prepare_render_targets_from_snapshot}` first try the bound channel `gpu_memory` and route through `prepare_image_with_gpu_reader`, restoring upstream `PrepareImage` order (`RefreshContents`, `SynchronizeAliases`, optional `MarkModification`) when a channel is bound.
+- If no channel GPU memory is available, the fallback still calls `SynchronizeAliases` only when `RefreshContents` would be a no-op (`CPU_MODIFIED` is not set). Upstream always executes `RefreshContents` before `SynchronizeAliases`; without any GPU reader, Rust cannot upload CPU-modified guest contents, so copying backend aliases in that state could propagate stale texture data.
+
+### Unintentional differences (to fix)
+- CPU-modified images in paths that have neither a caller-supplied GPU reader nor a bound channel GPU memory still cannot complete upstream `RefreshContents`; they wait for a later path with GPU memory access to upload contents before alias synchronization can safely run.
+
+### Missing items
+- Move `RefreshContents` / `UploadImageContents` ownership into a common/backend hook shape so every `PrepareImage` caller executes the upstream refresh-before-alias order directly, instead of relying on OpenGL wrapper fallbacks.
+
+### Binary layout verification
+- N/A: OpenGL texture-cache ordering guard only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::PrepareImage`, `TextureCache<P>::RefreshContents`, and `TextureCache<P>::UploadImageContents`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- Rust now stores `FormatConversionPass` on `OpenGL::TextureCacheRuntime`, matching upstream `TextureCacheRuntime::format_conversion_pass` ownership and teardown with the runtime.
+- Rust `FormatConversionPass::new()` does not take `UtilShaders&` because the current Rust conversion implementation only owns the intermediate PBO path. The upstream-shaped owner is now correct; the missing utility-shader reference is not needed by the currently ported body.
+
+### Unintentional differences (to fix)
+- None known for the `FormatConversionPass` ownership slice after re-reading upstream `TextureCacheRuntime::TextureCacheRuntime`, `TextureCacheRuntime::ReinterpretImage`, `TextureCacheRuntime::EmulateCopyImage`, and the runtime member declarations.
+
+### Missing items
+- The exact upstream constructor dependency `FormatConversionPass(UtilShaders&)` remains unnecessary in Rust until the conversion pass uses utility-shader helpers directly.
+
+### Binary layout verification
+- N/A: OpenGL host PBO ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `FormatConversionPass`, `TextureCacheRuntime::TextureCacheRuntime`, `TextureCacheRuntime::ReinterpretImage`, `TextureCacheRuntime::EmulateCopyImage`, and `gl_texture_cache.h` runtime member declarations.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core texture_cache::texture_cache::tests::update_render_targets_from_snapshot_registers_presentable_view -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/gl_staging_buffer_pool.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_staging_buffer_pool.cpp
+
+### Intentional differences
+- Rust `TextureCacheRuntime` now exposes `upload_staging_buffer`, `download_staging_buffer`, and `free_deferred_staging_buffer`, matching upstream `TextureCacheRuntime::{UploadStagingBuffer,DownloadStagingBuffer,FreeDeferredStagingBuffer}` delegation to `StagingBufferPool`.
+- Rust still owns `StagingBufferPool` by value inside `TextureCacheRuntime` rather than storing the upstream external `StagingBufferPool&`, because the current Rust renderer/rasterizer construction does not yet have a separate shared staging-pool owner.
+
+### Unintentional differences (to fix)
+- None known for the runtime staging API slice after re-reading upstream `TextureCacheRuntime::{UploadStagingBuffer,DownloadStagingBuffer,FreeDeferredStagingBuffer}` and `StagingBufferPool::{RequestUploadBuffer,RequestDownloadBuffer,FreeDeferredStagingBuffer}`.
+
+### Missing items
+- Exact external `StagingBufferPool&` lifetime parity remains part of the broader renderer/rasterizer owner graph audit.
+
+### Binary layout verification
+- N/A: OpenGL host staging-buffer ownership and delegation only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::{UploadStagingBuffer,DownloadStagingBuffer,FreeDeferredStagingBuffer}` and `StagingBufferPool::{RequestUploadBuffer,RequestDownloadBuffer,FreeDeferredStagingBuffer}`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core gl_staging_buffer_pool -- --nocapture`
+- Superseded test name/expectation: `join_images_preserves_gpu_modified_ignored_overlap_as_bad_overlap` was replaced by the upstream-fatal ignored-overlap tests in the 2026-06-14 top `texture_cache.rs` entry.
+- `cargo test -p video_core join_images -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- Rust now routes the OpenGL Fermi2D blit body through `TextureCacheRuntime::blit_framebuffer`, matching upstream `TextureCacheRuntime::BlitFramebuffer` ownership for `glEnable(GL_FRAMEBUFFER_SRGB)`, `glDisable(GL_RASTERIZER_DISCARD)`, `glDisablei(GL_SCISSOR_TEST, 0)`, filter selection, and `glBlitNamedFramebuffer`.
+- Rust passes raw framebuffer handles and buffer-bit masks instead of upstream `Framebuffer*` because ruzu's framebuffer cache is still owned by `OpenGL::TextureCache`; the runtime body receives the same data that upstream reads through `Framebuffer::{Handle,BufferBits}`.
+- Rust now stores the upstream `StateTracker&` dependency as a non-null pointer inside `TextureCacheRuntime`; `TextureCacheRuntime::blit_framebuffer` performs `notify_scissor0`, `notify_rasterize_enable`, and `notify_framebuffer_srgb` before mutating the fixed-function GL state, matching upstream ordering. Standalone/default test construction keeps a boxed tracker alive inside `TextureCache` for the same pointer lifetime.
+
+### Unintentional differences (to fix)
+- None known for the runtime Fermi2D GL blit body after re-reading upstream `TextureCacheRuntime::BlitFramebuffer`.
+
+### Missing items
+- Move the full common `TextureCache<P>::BlitImage` ownership out of the OpenGL wrapper once backend hooks can materialize framebuffers without duplicating lifecycle.
+
+### Binary layout verification
+- N/A: OpenGL host framebuffer state only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::BlitFramebuffer` and `TextureCache<P>::BlitImage`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core blit_image -- --nocapture` (0 tests matched; compile-only evidence for this filter)
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- Rust no longer defers `Image::Scale(...)` viewport/scissor invalidation through `OpenGL::TextureCache::rescale_touched_viewport_scissor` and `RasterizerOpenGL`. `TextureCacheRuntime::notify_rescale_blit_state_changed()` now invalidates `StateTracker` immediately after backend scale-up/scale-down calls, matching upstream `Image::Scale(...)` ownership and order more closely.
+- Rust keeps the notification just outside `Image::scale(...)` rather than storing a runtime pointer inside each `Image`, because backend images are still owned by `OpenGL::TextureCache`; the call is still adjacent to the scale blit and happens before `invalidate_scale(...)`, matching the upstream side-effect point.
+
+### Unintentional differences (to fix)
+- None known for the rescale viewport/scissor state-tracker invalidation slice after re-reading upstream `OpenGL::Image::Scale`.
+
+### Missing items
+- Exact upstream `Image` ownership of `TextureCacheRuntime* runtime` remains pending until backend image construction/lifetime mirrors upstream more closely.
+
+### Binary layout verification
+- N/A: OpenGL host state-tracker invalidation only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `OpenGL::Image::Scale`, `ScaleUp`, and `ScaleDown`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h, and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Rust represents upstream `TextureCacheRuntime::state_tracker` (`StateTracker&`) as `NonNull<StateTracker>` because `RasterizerOpenGL` owns the tracker allocation by `Box<StateTracker>`. The pointer remains stable when the box is moved into the rasterizer, and the texture cache drops before the boxed tracker under the current field order.
+- Rust `TextureCache::default()` owns a private boxed tracker solely to keep standalone test/fallback construction sound; production construction passes the rasterizer-owned tracker, matching upstream renderer/rasterizer ownership more closely than the previous rasterizer-side pre-invalidation.
+
+### Unintentional differences (to fix)
+- None known for the `StateTracker&` runtime ownership slice after re-reading upstream `TextureCacheRuntime::{TextureCacheRuntime,BlitFramebuffer}` and `RasterizerOpenGL::AccelerateSurfaceCopy`.
+
+### Missing items
+- The full common `TextureCache<P>::BlitImage` ownership is still split through `OpenGL::TextureCache` until backend framebuffer hooks can be represented without duplicating lifecycle.
+
+### Binary layout verification
+- N/A: OpenGL host state-tracker reference ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::TextureCacheRuntime`, `TextureCacheRuntime::BlitFramebuffer`, `gl_texture_cache.h` runtime members, and `RasterizerOpenGL::AccelerateSurfaceCopy`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core blit_image -- --nocapture` (0 tests matched; compile-only evidence for this filter)
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- Rust `TextureCacheRuntime` now stores the upstream device-derived runtime capability values for `CanReportMemoryUsage()` and `HasNativeASTC()` at construction time. Production construction passes `Device::can_report_memory()` and `Device::has_astc()`, matching upstream's `device.CanReportMemoryUsage()` / `device.HasASTC()` source instead of re-querying OpenGL extensions inside `HasNativeASTC()`.
+- Rust test/default construction passes explicit capability booleans because it does not own an upstream `const Device&`; this keeps the same capability source as the surrounding `TextureCache::new_with_caps(...)` test fixture.
+
+### Unintentional differences (to fix)
+- Rust still stores capability snapshots instead of upstream's `const Device& device` reference on `TextureCacheRuntime`. The observed runtime behavior for memory reporting and ASTC support now follows the same device-derived values, but exact reference ownership remains part of broader renderer/device owner parity.
+
+### Missing items
+- None known for the runtime memory/ASTC capability slice after re-reading upstream `TextureCacheRuntime::{TextureCacheRuntime,GetDeviceMemoryUsage,CanReportMemoryUsage,HasNativeASTC}`.
+
+### Binary layout verification
+- N/A: OpenGL runtime capability state only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::{TextureCacheRuntime,GetDeviceMemoryUsage,CanReportMemoryUsage,HasNativeASTC}` and the runtime member declaration.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core astc_upload_flags_follow_upstream_policy -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- Rust now stores `format_properties: [HashMap<u32, FormatProperties>; 3]` on `TextureCacheRuntime`, matching upstream `std::array<std::unordered_map<GLenum, FormatProperties>, 3> format_properties`.
+- Rust populates that table during `TextureCacheRuntime` construction by querying `GL_IMAGE_COMPATIBILITY_CLASS`, `GL_IMAGE_FORMAT_COMPATIBILITY_TYPE`, and `GL_TEXTURE_COMPRESSED` for upstream's three targets (`GL_TEXTURE_1D_ARRAY`, `GL_TEXTURE_2D_ARRAY`, `GL_TEXTURE_3D`) over `MaxwellToGL::FORMAT_TABLE`.
+- Rust `TextureCacheRuntime::format_info(...)` maps `ImageType::{E1D,E2D,Linear,E3D}` to the same table indices as upstream `TextureCacheRuntime::FormatInfo`.
+
+### Unintentional differences (to fix)
+- None known for the `FormatInfo` ownership/table-construction slice after re-reading upstream `TextureCacheRuntime::TextureCacheRuntime` and `TextureCacheRuntime::FormatInfo`.
+
+### Missing items
+- The broader accelerated-upload compatibility path after upstream's currently disabled `return false` remains intentionally inactive; if that branch is restored, it should consume `TextureCacheRuntime::format_info(...)` instead of reintroducing ad hoc format checks.
+
+### Binary layout verification
+- N/A: OpenGL host format-capability cache only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::TextureCacheRuntime`, `TextureCacheRuntime::FormatInfo`, and `gl_texture_cache.h` runtime member declarations.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- Rust now owns `can_image_be_copied`, `reinterpret_image`, and the GL bodies of `emulate_copy_image` on `TextureCacheRuntime`, matching upstream `TextureCacheRuntime::{CanImageBeCopied,ReinterpretImage,EmulateCopyImage}` ownership.
+- Rust runtime methods receive raw GL handles, GL target/format/type values, and `ImageInfo` references instead of upstream `Image&`, because ruzu's OpenGL image table still belongs to `OpenGL::TextureCache`. The runtime receives the same data upstream reads through `Image::{Handle,GlFormat,GlType,info}`.
+- Upstream `FormatConversionPass::ConvertImage` owns the S8D24 post-conversion component swap through its `UtilShaders&`. Rust keeps `FormatConversionPass` independent of `UtilShaders`, so `TextureCacheRuntime::reinterpret_image` performs the same `convert_s8d24` call immediately after `format_conversion_pass.convert_image`.
+
+### Unintentional differences (to fix)
+- None known for the runtime copy-policy slice after re-reading upstream `TextureCacheRuntime::{CanImageBeCopied,ReinterpretImage,EmulateCopyImage}` and `FormatConversionPass::ConvertImage`.
+
+### Missing items
+- Exact upstream `Image&` signatures can only be restored after backend image ownership moves closer to the runtime/common texture-cache owner graph.
+- Exact `FormatConversionPass(UtilShaders&)` construction remains pending until the Rust pass can own the S8D24 utility-shader call directly.
+
+### Binary layout verification
+- N/A: OpenGL host copy policy and framebuffer/image handles only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCacheRuntime::{CanImageBeCopied,ReinterpretImage,EmulateCopyImage}` and `FormatConversionPass::ConvertImage`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core astc_upload_flags_follow_upstream_policy -- --nocapture`
+- `cargo test -p video_core s8d24 -- --nocapture` (0 tests matched; compile-only evidence for this filter)
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- Rust now exposes OpenGL runtime counterparts for upstream `TextureCacheRuntime::{TransitionImageLayout,TickFrame,BarrierFeedbackLoop}`. They are no-ops like upstream's OpenGL backend; `transition_image_layout` receives `&ImageBase` instead of upstream `Image&` because ruzu's backend image table is still split from the common image owner.
+- `TextureCache::tick_frame` now calls `runtime.tick_frame()` between async decode ticking and the common frame tick. Upstream calls `runtime.TickFrame()` before incrementing `frame_tick`; Rust keeps the existing async-decode ordering from the current OpenGL wrapper split, then preserves the runtime/common tick relationship.
+- `refresh_contents_with_gpu_reader` now includes the upstream MSAA upload guard (`num_samples > 1 && !runtime.CanUploadMSAA()`), logs the same unsupported condition, calls the OpenGL no-op transition hook, and returns. Since OpenGL `can_upload_msaa()` is true, this is behavior-preserving today.
+
+### Unintentional differences (to fix)
+- None known for the OpenGL runtime no-op hook and MSAA guard slice after re-reading upstream `TextureCache<P>::TickFrame`, `TextureCache<P>::RefreshContents`, and `TextureCacheRuntime::{TransitionImageLayout,TickFrame,BarrierFeedbackLoop}`.
+
+### Missing items
+- Fixed by the later 2026-06-13 delayed-destruction entry: Rust now stores common `sentenced_images` / `sentenced_image_view` rings on `TextureCacheBase` and OpenGL ticks them before async decode/runtime/base frame advance in upstream order.
+- Backend `Image&` ownership remains split, so `transition_image_layout` cannot yet take the exact upstream OpenGL `Image&` type.
+
+### Binary layout verification
+- N/A: OpenGL runtime no-op hooks and frame lifecycle only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::TickFrame`, `TextureCache<P>::RefreshContents`, and `TextureCacheRuntime::{TransitionImageLayout,TickFrame,BarrierFeedbackLoop}`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — core/src/hle/kernel/k_readable_event.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_readable_event.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_readable_event.h
+
+### Intentional differences
+- `KReadableEvent::is_signaled()` keeps upstream's scheduler-lock contract as an opt-in `RUZU_DIAG` diagnostic instead of a fatal `debug_assert!`. Upstream `KReadableEvent::IsSignaled()` asserts `KScheduler::IsSchedulerLockedByCurrentThread(m_kernel)` unconditionally; Rust temporarily allows the read because the current `MultiWait`/service host fallback can still poll readable events outside the scheduler lock and otherwise aborts MK8D before GPU parity testing can run.
+- Rust reads `is_signaled` from `AtomicBool` rather than upstream's plain `bool m_is_signaled`, matching the existing Rust ownership adaptation where wait code may inspect the flag without taking the `Arc<Mutex<KReadableEvent>>` object lock while the scheduler lock is held.
+
+### Unintentional differences (to fix)
+- The upstream scheduler-lock invariant is still violated by the Rust host wait path. The real fix belongs in the `MultiWait::WaitAny` / `ServerManager::WaitSignaled` ownership path so readable events are selected under the same scheduler-lock contract as upstream, not in `KReadableEvent` itself.
+
+### Missing items
+- Replace the remaining Rust-local `try_wait_any_local()` fallback that can call readable-event `is_signaled()` outside scheduler lock with an upstream-faithful kernel-backed `MultiWait::WaitAny` path.
+
+### Binary layout verification
+- N/A: `KReadableEvent` is a host kernel object and is not serialized as a guest-visible raw payload.
+
+### Tests
+- Re-read upstream `KReadableEvent::{IsSignaled,Signal,Clear,Reset,Destroy}` and the `KReadableEvent` class declaration.
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_compute_pipeline.rs, video_core/src/renderer_opengl/gl_texture_cache.rs, and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.h
+
+### Intentional differences
+- `ComputePipeline::configure_resource_state(...)` now continues beyond `FillComputeImageViews` and ports the upstream compute binding phase in the same order: materialize backend views/samplers, wait for build, bind the compute program through `ProgramManager`, unbind/bind compute texture buffers, update/bind compute buffers with `SetImagePointers`, collect sampled texture handles and sampler handles, collect storage-image handles, upload GLSL rescaling uniforms, and call `glBindTextures`, `glBindSamplers`, and `glBindImageTextures`.
+- Rust passes `ProgramManager`, `TextureCache`, and `BufferCache` into `configure_resource_state(...)` instead of storing upstream member references on `ComputePipeline`. This preserves the current Rust owner graph while moving the method body closer to upstream `ComputePipeline::Configure`.
+- `OpenGL::TextureCache` exposes `image_view_gpu_addr`, `mark_view_image_modified`, and `image_view_is_rescaling` as owner-local wrappers for upstream `ImageView::GpuAddr()`, `texture_cache.MarkModification(image_view.image_id)`, and `texture_cache.IsRescaling(image_view)`. Rust splits backend `ImageView` from base `ImageViewBase`, so these wrappers keep the cross-slot access inside the texture-cache owner.
+- GLASM rescaling-uniform upload now uses loaded `glProgramLocalParameter4fARB(GL_COMPUTE_PROGRAM_NV, 0, ...)`, matching upstream. The GLSL path uses `glProgramUniform4f`, matching upstream for source-program pipelines.
+
+### Unintentional differences (to fix)
+- Fixed by later entries: `ComputePipeline::new_with_backend_state(...)` now compiles/stores real GLSL, GLASM, and SPIR-V compute program handles through `CreateProgram` / `CompileProgram` equivalents.
+- Fixed by later entries: `RasterizerOpenGL::dispatch_compute_with_call(...)` now executes direct `glDispatchCompute`, indirect `glDispatchComputeIndirect`, and increments `num_queued_commands` on the direct path.
+- GLASM/SPIR-V backend parity remains incomplete for runtime validation on an NVIDIA/GLASM-capable driver; the bindless storage-buffer and rescaling-uniform upload paths now match upstream structurally.
+
+### Missing items
+- Runtime-test the GLASM bindless storage-buffer path on an NVIDIA/GLASM-capable driver.
+
+### Binary layout verification
+- PASS: no guest-visible raw payload changed. This slice only binds host OpenGL program/texture/sampler/image/buffer state from already-decoded QMD and shader metadata.
+
+### Tests
+- Re-read upstream `ComputePipeline::Configure`, `ComputePipeline` members in `gl_compute_pipeline.h`, and `ImageView::{GpuAddr,BufferSize,StorageView}` in `gl_texture_cache.h`.
+- Re-read upstream `ComputePipeline::Configure` around `glProgramLocalParameter4fARB(GL_COMPUTE_PROGRAM_NV, 0, ...)`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core compute_pipeline -- --nocapture`
+
+## 2026-06-13 — video_core/src/engines/kepler_compute.rs, video_core/src/renderer_opengl/gl_compute_pipeline.rs, and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_compute_pipeline.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- `ComputePipeline::new_with_backend_state` now mirrors upstream GLSL `ComputePipeline` construction by compiling the translated compute shader with `CreateProgram(..., GL_COMPUTE_SHADER)` and storing the resulting `source_program`. Rust still passes backend capability state into the constructor rather than storing upstream member references for texture cache, buffer cache, and program manager.
+- `DispatchCall` now carries `indirect_compute_address` so the rasterizer can make the same direct-vs-indirect decision as upstream `kepler_compute->GetIndirectComputeAddress()` after `pipeline->Configure()`. Rust snapshots this value before `KeplerCompute::execute_pending` clears the owner-local `indirect_compute`, preserving upstream launch-time state across the callback boundary.
+- `RasterizerOpenGL::dispatch_compute_with_call` now ports the final upstream execution order after configure: indirect dispatch obtains a 12-byte buffer with `FullSynchronize` / `DiscardWrite`, binds `GL_DISPATCH_INDIRECT_BUFFER`, calls `glDispatchComputeIndirect`, and returns; direct dispatch calls `glDispatchCompute(qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z)`, increments `num_queued_commands`, then applies `has_written_global_memory`.
+- Rust skips the indirect GL call if `BufferCache::obtain_buffer` returns the null/missing GL buffer. Upstream assumes `ObtainBuffer` returns a valid backend buffer; ruzu's buffer cache can still return `NULL_BUFFER_ID` when GPU-to-CPU address translation fails, so the guard prevents an invalid OpenGL indirect dispatch while keeping the missing dependency visible in logs.
+
+### Unintentional differences (to fix)
+- Fixed by later entries: SPIR-V compute program creation now calls the loaded `CreateProgram(code_v, GL_COMPUTE_SHADER)` equivalent through `create_program_from_spirv(...)`.
+- Fixed by later entries: GLASM compute program creation now calls loaded ARB/NV assembly-program entrypoints through `compile_assembly_program(...)`.
+- Indirect compute dispatch is guarded when `ObtainBuffer` cannot produce a GL handle. The upstream path does not have that guard; the remaining parity fix belongs in buffer-cache address translation/backing buffer materialization so the guard stops triggering.
+
+### Missing items
+- Runtime-test the GLASM bindless storage-buffer path on an NVIDIA/GLASM-capable driver.
+- Add runtime regression coverage for indirect compute once buffer-cache `ObtainBuffer` can reliably materialize a non-null GL buffer from the indirect GPU address.
+
+### Binary layout verification
+- PASS: no guest-visible raw payload layout changed. `DispatchCall` is a host-side Rust launch snapshot; QMD decoding and raw QMD word layout were not changed.
+
+### Tests
+- Re-read upstream `ComputePipeline::ComputePipeline`, `ComputePipeline::Configure`, and `RasterizerOpenGL::DispatchCompute`.
+- `cargo fmt --all --check`
+- `git diff --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core compute_pipeline -- --nocapture`
+- `cargo test -p video_core compute_engine_adapter -- --nocapture`
+
+## 2026-06-13 — video_core/src/gpu.rs, video_core/src/host1x/host1x.rs, and core/src/host1x_core.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/syncpoint_manager.{h,cpp}
+
+### Intentional differences
+- Rust keeps `Host1xCoreInterface` as the cross-crate bridge between `core` and `video_core`, so `RegisterGuestAction` is exposed as `register_guest_action(...)` on that bridge instead of directly naming `Tegra::Host1x::SyncpointManager` from `core`. The owner of the actual counter/action storage remains `video_core::host1x::syncpoint_manager::SyncpointManager`, matching upstream Host1x ownership.
+- `Gpu::request_composite_with_fences(...)` still clones `layers` into Rust closures instead of capturing references like upstream. This is required by Rust closure lifetime/`Send` constraints and preserves upstream behavior because the captured framebuffer configs are immutable presentation inputs.
+
+### Unintentional differences (to fix)
+- The previous Rust path registered presentation fence callbacks with `register_host_action`, while upstream `GPU::Impl::RequestComposite` uses `syncpoint_manager.RegisterGuestAction(fences[i].id, fences[i].value, executer)`. This is now fixed: presentation waits on guest syncpoints, so composition can proceed when the guest fence reaches its target even if the host counter is not the one being advanced for the presented buffer.
+- Fixed by the 2026-06-14 `video_core/src/gpu.rs vs gpu.cpp` entry above: `GPU::RequestComposite` now has owner-local `request_swap_counters` / `free_swap_counters` bookkeeping instead of an `AtomicUsize remaining` per request.
+
+### Missing items
+- Add a higher-level presentation regression once the renderer/GPU-thread test harness can run `Gpu::request_composite_with_fences(...)` without a full frontend context.
+
+### Binary layout verification
+- PASS: no guest-visible raw payload changed. The only interface addition is a host-side callback registration bridge for Host1x guest syncpoints.
+
+### Tests
+- Re-read upstream `GPU::Impl::RequestComposite` and Host1x `SyncpointManager::{RegisterGuestAction,RegisterHostAction,IncrementGuest,IncrementHost}`.
+- `cargo fmt --all --check`
+- `cargo test -p video_core guest_action_bridge_fires_from_guest_counter_only -- --nocapture`
+- `cargo check -p core -p video_core --quiet`
+- `git diff --check`
+- MK8D runtime check: `screenshots/tmp/mk8d-2026-06-13-guest-composite-fence.log`
+
+## 2026-06-13 — video_core/src/texture_cache/texture_cache.rs and video_core/src/texture_cache/texture_cache_base.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust `TextureCacheBase::insert_image(...)` now resolves CPU/device addresses in the upstream `TextureCache<P>::InsertImage` order: `GpuToCpuAddress(gpu_addr)`, then `GpuToCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info))`, then a virtual-invalid fake CPU address based on `~(1ULL << 40) + virtual_invalid_space`.
+- Rust stores upstream `virtual_invalid_space` on `TextureCacheBase` instead of the C++ template owner. The owner remains the Rust counterpart of `TextureCache<P>`, and the field advances by `Common::AlignUp(size, 32)` like upstream.
+- Paths without a channel `MemoryManager` still cannot perform real GPU-to-CPU translation, so they immediately take the upstream fake-address fallback. This is stricter than the previous `cpu_addr = gpu_addr` placeholder and avoids indexing untranslatable images into normal CPU pages.
+- Rust rebases dense images from fake CPU ranges when `set_channel_gpu_memory(...)` later receives a live channel `MemoryManager`. Upstream has `gpu_memory` available inside `TextureCache<P>::InsertImage`; ruzu can bind the channel memory after some cache objects already exist, so this Rust-only repair unregisters, updates `cpu_addr`, and re-registers the same image to restore upstream-equivalent CPU page-table indexing.
+- Rust `RegisterImage` now always inserts a fresh dense `ImageMapView`, matching upstream `slot_map_views.insert(...)`. `UnregisterImage` clears the dense `map_view_id` after erasing the slot so Rust does not retain a stale slot id when the rebase path registers the same image again.
+- Rust keeps a `virtual_invalid_ranges` table keyed by `(gpu_addr, guest_size)` so pre-channel-memory paths can still resolve the same fake CPU range for repeated `FindImage` calls without falling back to a global slot scan. Upstream does not need this table because `gpu_memory` is already available in `TextureCache<P>::FindImage`; in ruzu it preserves the upstream region-bounded lookup invariant while handling the current bind ordering.
+
+### Unintentional differences (to fix)
+- Fixed: `TextureCacheBase::find_image(...)` no longer performs a generic direct slot scan. It now mirrors upstream by translating the requested GPU range through the live channel `MemoryManager`, returning no image on translation failure, and narrowing candidates through the CPU page table with `find_image_in_cpu_region_with_caps(...)`.
+- Fixed: when no channel memory is bound yet, repeated lookups for a previously inserted fake CPU range use `virtual_invalid_ranges` and still narrow through the CPU page table instead of scanning all images.
+- Fixed by later entry: sparse image insertion now fails before virtual-invalid allocation or image-slot mutation when channel memory is missing, matching upstream's requirement that sparse segment resolution has a live `gpu_memory`.
+
+### Missing items
+- None for sparse fake-address fallback behavior after the later sparse precondition entry. Sparse images still require live channel GPU memory before registration, matching upstream's dependency on `ForEachSparseSegment`; if a runtime path hits that precondition, fix the caller/channel binding order.
+
+### Binary layout verification
+- N/A: texture-cache host address indexing only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `TextureCache<P>::FindImage`, `TextureCache<P>::InsertImage`, `TextureCache<P>::JoinImages`, and `ForEachImageInRegion`.
+- `cargo fmt --all --check`
+- `cargo test -p video_core insert_image_uses_virtual_invalid_cpu_space_when_untranslated -- --nocapture`
+- `cargo test -p video_core set_channel_gpu_memory_rebases_virtual_invalid_images -- --nocapture`
+- `cargo test -p video_core find_image_uses_translated_cpu_region_and_rejects_unmapped_gpu_addr -- --nocapture`
+- `cargo test -p video_core find_or_insert_reuses_stable_virtual_invalid_range_without_channel_memory -- --nocapture`
+- `cargo test -p video_core texture_cache::texture_cache::tests -- --nocapture`
+- `cargo fmt --all`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-13 — video_core/src/gpu.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/control/channel_state.cpp
+
+### Intentional differences
+- Rust `VideoGpuChannelHandle::bind_memory_manager(...)` now records the channel `MemoryManager` immediately, but only calls `RasterizerInterface::bind_channel(...)` if the channel has already been initialized. If the address space arrives first, `init_channel(...)` binds the rasterizer after `rasterizer.initialize_channel(...)` has created the per-channel cache state.
+- Upstream reaches the same dependency through a different owner graph: `GPU::Impl::InitAddressSpace` binds the rasterizer to the `MemoryManager`, `ChannelState::BindRasterizer` propagates the rasterizer to the channel engines and memory manager, and `RasterizerOpenGL::BindChannel` switches texture/buffer caches to that channel.
+- The Rust bridge reuses existing `RasterizerInterface::bind_channel(...)` because ruzu currently stores channel memory on `ChannelState` and propagates it to `TextureCacheBase::set_channel_gpu_memory(...)` from the rasterizer's channel-bind path. This keeps the memory dependency owned by `gpu.rs`/rasterizer channel binding instead of adding texture-cache special cases.
+
+### Unintentional differences (to fix)
+- Fixed: channel address-space binding previously only stored `ChannelState::memory_manager` and waited for a later GPU channel bind before the rasterizer/texture cache saw it. That allowed `TextureCacheBase::find_image(...)` to run without a live channel `MemoryManager`, while upstream texture cache paths expect `gpu_memory` to be available for `GpuToCpuAddress(...)`.
+- Fixed: the first Rust bridge attempt called `bind_channel(...)` before `rasterizer.initialize_channel(...)`, causing `ChannelStateCache::bind_to_channel` to panic on an unknown channel id. The current order defers cache binding until per-channel cache state exists.
+- `VideoGpuChannelHandle::bind_memory_manager(...)` still performs a Rust-specific bridge call instead of mirroring upstream's exact `InitAddressSpace` / `BindRasterizer` split. A fuller structural port would introduce the upstream address-space initialization ownership boundary explicitly.
+
+### Missing items
+- Port the upstream `InitAddressSpace` owner boundary more directly if future review requires exact channel/address-space lifecycle structure instead of the current Rust bridge.
+
+### Binary layout verification
+- N/A: this change only affects host-side channel/rasterizer binding order. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `GPU::Impl::{InitAddressSpace,InitChannel,BindChannel}`, `ChannelState::BindRasterizer`, and `RasterizerOpenGL::BindChannel`.
+- `cargo test -p video_core bind_memory_manager_defers_rasterizer_bind_until_channel_initialized -- --nocapture`
+- `cargo test -p video_core init_channel_binds_rasterizer_and_initializes_channel -- --nocapture`
+- `cargo test -p video_core texture_cache::texture_cache::tests -- --nocapture`
+- `cargo check -p video_core --quiet`
+- `cargo fmt --all --check`
+- `git diff --check`
+- MK8D runtime check: `screenshots/tmp/mk8d-2026-06-13-channel-memory-deferred-bind.log` (`timeout` exit 137, `COMPOSING=290`, no real panic/abort, no remaining `ruzu-cmd` process).
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_shader_util.rs, video_core/src/renderer_opengl/gl_shader_manager.rs, and video_core/src/renderer_opengl/mod.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_util.cpp and gl_shader_util.h
+
+### Intentional differences
+- Rust now loads the optional OpenGL entry points used by upstream shader utilities from the existing renderer `load_fn`: `glSpecializeShader`, `glGenProgramsARB`, `glNamedProgramStringEXT`, `glBindProgramARB`, and `glProgramLocalParameter4fARB`. This mirrors the upstream GLAD-provided entrypoints while keeping ruzu's generated `gl` crate bindings unchanged.
+- `create_program_from_spirv(...)` now calls loaded `glSpecializeShader(shader, "main", 0, nullptr, nullptr)` immediately after `glShaderBinary`, matching upstream `OpenGL::CreateProgram(std::span<const u32>, GLenum)`.
+- `compile_assembly_program(...)` now calls loaded `glGenProgramsARB` and `glNamedProgramStringEXT(..., GL_PROGRAM_FORMAT_ASCII_ARB, ...)`, matching upstream `OpenGL::CompileProgram(std::string_view, GLenum)`.
+- `ProgramManager::bind_compute_assembly_program(...)` now calls loaded `glBindProgramARB(GL_COMPUTE_PROGRAM_NV, program)`, and `ProgramManager::bind_assembly_programs(...)` now mirrors upstream `BindAssemblyPrograms(...)` changed-mask handling by enabling/disabling the corresponding `ASSEMBLY_PROGRAM_ENUMS` stage and binding each changed stage with `glBindProgramARB`.
+- `ComputePipeline::configure_backend_bindings(...)` now uses loaded `glProgramLocalParameter4fARB(GL_COMPUTE_PROGRAM_NV, 0, ...)` for GLASM rescaling uniforms, matching upstream `ComputePipeline::Configure`.
+- If a selected backend requires one of these extension entrypoints but the driver/loader does not provide it, Rust panics at the missing dependency instead of returning program 0 and continuing with hidden shader debt. This follows the user's no-debt rule for missing implementation dependencies.
+- Rust maps upstream `LOG_CRITICAL` for GLASM program errors to `log::error!` because the Rust `log` facade has no critical severity; the `renderer_debug` gate, error-string handling, and source dump behavior now match upstream.
+
+### Unintentional differences (to fix)
+- None identified in this pass. Re-read upstream `gl_shader_util.cpp`; Rust now gates GLSL/SPIR-V shader compile logging, separable-program link logging, and GLASM `GL_PROGRAM_ERROR_STRING_NV` inspection behind `renderer_debug`, matching upstream. GLASM error logging also dumps the assembly source, matching upstream's critical-error path.
+
+### Missing items
+- Add an integration/runtime check on an NVIDIA/GLASM-capable driver to prove the loaded ARB/NV entrypoints are present and the compute GLASM path creates non-zero programs.
+
+### Binary layout verification
+- N/A: OpenGL shader program creation/binding only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `OpenGL::CreateProgram(std::string_view, GLenum)`, `OpenGL::CreateProgram(std::span<const u32>, GLenum)`, and `OpenGL::CompileProgram(std::string_view, GLenum)`.
+- Re-read upstream `ProgramManager::BindComputeAssemblyProgram` and `ProgramManager::BindAssemblyPrograms`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core compute_pipeline -- --nocapture`
+- `cargo test -p video_core compute_pipeline_key_hash -- --nocapture`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_buffer_cache.rs, video_core/src/buffer_cache/buffer_base.rs, video_core/src/buffer_cache/buffer_cache.rs, video_core/src/buffer_cache/buffer_cache_base.rs, and video_core/src/renderer_opengl/mod.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_buffer_cache.cpp and gl_buffer_cache.h
+
+### Intentional differences
+- Rust stores OpenGL buffer handle, bindless GPU address, and current residency access on shared `BufferBase` instead of a backend-specific `OpenGL::Buffer` subclass because the current slot vector is not parameterized by backend buffer type. The runtime interface now receives `&mut BufferBase` for storage-buffer binds so ownership is closer to upstream `BufferCacheRuntime::BindStorageBuffer(..., Buffer& buffer, ...)` and `BindComputeStorageBuffer(..., Buffer& buffer, ...)`.
+- `BufferCacheRuntime::initialize_backend_buffer(...)` is a Rust interface hook corresponding to upstream `OpenGL::Buffer::Buffer(runtime, ...)`; it queries `GL_BUFFER_GPU_ADDRESS_NV` with `glGetNamedBufferParameterui64vNV` when unified vertex/buffer addressing is available.
+- OpenGL NV extension entrypoints are loaded by `gl_buffer_cache::load_extra_functions(...)` from the renderer's GL loader, matching upstream's GLAD-provided calls while keeping the generated `gl` crate unchanged.
+
+### Unintentional differences (to fix)
+- None known for the GLASM bindless storage-buffer bind path after re-reading upstream `BufferCacheRuntime::{BindStorageBuffer,BindComputeStorageBuffer}`, `OpenGL::Buffer::{Buffer,MakeResident,HostGpuAddr}`, and `BufferCache<P>::BindHostComputeStorageBuffers`.
+
+### Missing items
+- Runtime validation on an NVIDIA/GLASM-capable driver is still required to prove `glGetNamedBufferParameterui64vNV`, `glMakeNamedBufferResidentNV`, `glMakeNamedBufferNonResidentNV`, and `glProgramLocalParametersI4uivNV` are present and exercised in the GLASM bindless path.
+- Broader graphics-pipeline method ownership remains separate: some descriptor configuration still lives in `RasterizerOpenGL::draw(...)` rather than an upstream-owned `GraphicsPipeline::ConfigureImpl(...)` equivalent.
+
+### Binary layout verification
+- PASS: `BindlessSSBO` remains `#[repr(C)]` with `u64 address`, `i32 length`, and `i32 padding`, matching upstream's 16-byte `GLuint[4]` payload passed to `glProgramLocalParametersI4uivNV`.
+
+### Tests
+- Re-read upstream `gl_buffer_cache.cpp` around `BindlessSSBO`, `PROGRAM_LUT`, `Buffer::Buffer`, `Buffer::MakeResident`, `BufferCacheRuntime::BindStorageBuffer`, and `BufferCacheRuntime::BindComputeStorageBuffer`.
+- Re-read upstream `gl_buffer_cache.h` around `Buffer::{MakeResident,HostGpuAddr}` and `BufferCacheRuntime::{SetEnableStorageBuffers,SetImagePointers}`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core gl_buffer_cache -- --nocapture`
+- `cargo test -p video_core compute_pipeline -- --nocapture`
+- `git diff --check`
+
+## 2026-06-13 — video_core/src/buffer_cache/buffer_base.rs and video_core/src/buffer_cache/buffer_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_buffer_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/buffer_cache/buffer_cache.h
+
+### Intentional differences
+- Rust exposes upstream `OpenGL::Buffer::ImmediateDownload` as `BufferBase::immediate_download(...)` because this port currently stores the backend OpenGL handle on `BufferBase`, next to the existing `ImmediateUpload` counterpart. Exact `OpenGL::Buffer` ownership can be restored only after the buffer slot vector is backend-typed like upstream.
+
+### Unintentional differences (to fix)
+- Fixed: the non-memory-map `BufferCache<P>::InlineMemoryImplementation` path now calls `buffer.immediate_upload(buffer.offset(dest_address), inlined_buffer[..copy_size])`, matching upstream `buffer.ImmediateUpload(buffer.Offset(dest_address), inlined_buffer.first(copy_size))`.
+- Fixed: the non-memory-map `BufferCache<P>::DownloadBufferMemory` path now calls `buffer.immediate_download(copy.src_offset, immediate_buffer)` before writing the bytes back through `device_memory.write_block_unsafe(...)`. Previously Rust wrote the temporary immediate buffer without filling it from GL, unlike upstream `buffer.ImmediateDownload(...)`.
+
+### Missing items
+- None known for the immediate upload/download fallbacks after re-reading upstream `OpenGL::Buffer::{ImmediateUpload,ImmediateDownload}`, `BufferCache<P>::InlineMemoryImplementation`, and `BufferCache<P>::DownloadBufferMemory`.
+
+### Binary layout verification
+- N/A: host OpenGL buffer transfer only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `OpenGL::Buffer::{ImmediateUpload,ImmediateDownload}` in `gl_buffer_cache.cpp`.
+- Re-read upstream `BufferCache<P>::InlineMemoryImplementation` non-memory-map fallback in `buffer_cache.h`.
+- Re-read upstream `BufferCache<P>::DownloadBufferMemory` immediate fallback in `buffer_cache.h`.
+- Added `BufferBase` null-buffer no-op coverage for immediate upload/download.
+- `cargo fmt --all --check`
+- `cargo test -p video_core immediate_upload_download_noop_for_null_buffer -- --nocapture`
+- `cargo check -p video_core --quiet`
+- `git diff --check`
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_buffer_cache.rs, video_core/src/renderer_opengl/gl_staging_buffer_pool.rs, video_core/src/buffer_cache/buffer_cache.rs, and video_core/src/buffer_cache/buffer_cache_base.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_buffer_cache.cpp, gl_buffer_cache.h, gl_staging_buffer_pool.cpp, gl_staging_buffer_pool.h, and /home/vricosti/Dev/emulators/zuyu/src/video_core/buffer_cache/buffer_cache.h
+
+### Intentional differences
+- Rust `StagingBufferRef` is backend-agnostic and now carries both the existing generic `BufferId` and a backend-native `gpu_handle`. Upstream OpenGL returns `StagingBufferMap` directly from `BufferCacheRuntime::{UploadStagingBuffer,DownloadStagingBuffer}` with a `GLuint buffer`; Rust needs the explicit handle because `BufferCacheRuntime` does not own the generic slot vector and staging buffers are not slot-vector `BufferBase` objects.
+- Rust exposes `StagingBufferMap::into_raw_parts()` plus `StagingBufferPool::free_deferred_staging_buffer_by_index(...)` so `gl_buffer_cache.rs` can move the OpenGL mapping into the generic `StagingBufferRef` without running the original `StagingBufferMap` destructor early. This preserves the upstream lifecycle where the staging map destructor fences upload buffers.
+- `StagingBufferRef::host(...)` remains as a host-backed fallback for non-OpenGL tests; OpenGL runtime paths now use persistent mapped GL staging buffers from `StagingBufferPool`.
+
+### Unintentional differences (to fix)
+- Fixed: `BufferCacheRuntime::UploadStagingBuffer` and `DownloadStagingBuffer` in OpenGL previously returned a host `Vec<u8>` and invalid buffer id, so buffer-cache copy paths had no real GL staging source/destination. They now request the upstream-owned `StagingBufferPool` maps and pass the GL buffer handle to `CopyBuffer`.
+- Fixed: `BufferCache<P>::MappedUploadMemory`, `DownloadBufferMemory`, and `InlineMemoryImplementation` now read/write through `StagingBufferRef::{mapped_span,mapped_span_mut}` and copy between real GL handles, matching upstream staging-buffer ownership.
+- Fixed: `BufferCache<P>::CommitAsyncFlushesHigh` now stores normalized async download copies with `src_offset = buffer.CpuAddr() + copy.src_offset`, matching upstream before `PopAsyncBuffers`.
+- Fixed: `BufferCache<P>::PopAsyncBuffers` was a stub that dropped pending downloads without writing staging data back to device memory. It now writes mapped staging data through `device_memory.WriteBlockUnsafe`, subtracts `async_downloads`, clears corresponding `gpu_modified_ranges`, and frees the deferred staging allocation.
+- Fixed: `async_downloads` now uses `OverlapRangeSet`, matching upstream `Common::OverlapRangeSet<DAddr>`, so overlapping async download ranges retain their reference count until each pop subtracts one overlap. `ClearDownload` now calls `delete_all`, matching upstream `async_downloads.DeleteAll(...)`.
+
+### Missing items
+- The Rust generic staging handle stores GL sync pointers in `buffer_cache_base.rs`; a stricter structural port would keep OpenGL-specific destruction entirely inside an OpenGL-owned wrapper once the runtime interface can return backend-associated staging types.
+- Runtime validation with MK8D on 2026-06-13 did not show a staging-path panic or missing GL handle, but the display still becomes blank. The active symptom in `screenshots/tmp/mk8d-20260613-214358-staging-overlap-ruzu.log` is `SF_COMPOSE ... NO_LAYERS` repeated for display 3 after only one visible `COMPOSING display_id=0 layers=1`, with only sparse BufferQueue activity. The next parity slice should therefore move to VI/NVNFlinger/BufferQueue presentation ownership before treating this as only a texture-cache rendering bug.
+- Follow-up runtime probes `screenshots/tmp/mk8d-20260613-214839-binder-bqp.log` and `screenshots/tmp/mk8d-20260613-215252-syncpoint-puller.log` narrowed the blank-screen path further: the BufferQueue receives `Connect`, three `SetPreallocatedBuffer` calls, `DequeueBuffer`, and `RequestBuffer`, but no `QueueBuffer` before timeout. The first GPU fence submit reaches `GLRasterizer::signal_sync_point id=1` and increments host syncpoint 1 to 1. The second frame submit advances nvdrv max to 2 using `increment_value` and pushes 11 command lists, but the log does not reach a puller/rasterizer syncpoint increment before `nvhost_ctrl` waits on fence `{id=1,value=2}`. The next parity slice should therefore inspect `video_core::{gpu_thread,dma_pusher,scheduler,puller}` command-list execution against upstream before returning to VI/NVNFlinger or texture-cache presentation.
+
+### Binary layout verification
+- N/A: staging-buffer handles and OpenGL copy paths are host-side only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `OpenGL::BufferCacheRuntime::{UploadStagingBuffer,DownloadStagingBuffer,FreeDeferredStagingBuffer,CopyBuffer,ClearBuffer}`.
+- Re-read upstream `OpenGL::StagingBufferMap`, `StagingBuffers::{RequestMap,RequestBuffer,FindBuffer,FreeDeferredStagingBuffer}`, and `StagingBufferPool`.
+- Re-read upstream `BufferCache<P>::{CommitAsyncFlushesHigh,PopAsyncBuffers,MappedUploadMemory,DownloadBufferMemory,InlineMemoryImplementation}`.
+- Re-read upstream `Common::OverlapRangeSet::{Add,Subtract,DeleteAll,ForEachInRange}`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p common range_set -- --nocapture`
+- `cargo test -p video_core gl_buffer_cache -- --nocapture`
+- `cargo test -p video_core buffer_cache::buffer_cache::tests -- --nocapture` failed in existing GL-context-less coverage at `test_create_and_find_buffer` with `gl function was not loaded`; 17 sibling tests passed before the harness failure.
+- MK8D runtime probe via `/tmp/ruzu-run.sh` with `RUST_LOG=info RUZU_DUMP_DIR=screenshots/tmp cargo run --bin ruzu-cmd -- -g ...` wrote `screenshots/tmp/mk8d-20260613-214358-staging-overlap-ruzu.log`; no `ruzu-cmd` process remained after the timeout/cleanup check.
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp and gl_rasterizer.h
+
+### Intentional differences
+- Rust `RasterizerOpenGL::draw(...)` must access `Tegra::MemoryManager` through `Arc<parking_lot::Mutex<MemoryManager>>`, while upstream `RasterizerOpenGL::Draw(...)` reads `gpu_memory` directly without a host-side `MemoryManager` mutex.
+- Rust now locks that `MemoryManager` only around each cbuf, descriptor, render-target resolver, or buffer resolver access. This preserves the upstream ownership intent better than a draw-wide Rust mutex guard because upstream does not hold a `Tegra::MemoryManager` lock while entering texture-cache, buffer-cache, or render-target update paths.
+
+### Unintentional differences (to fix)
+- Fixed: Rust previously held the channel `MemoryManager` mutex across a large part of `RasterizerOpenGL::draw(...)`, including texture-cache and buffer-cache setup. Those downstream paths can also resolve GPU addresses through the same channel memory manager, so the first real Maxwell3D draw could self-deadlock at `DRAW_END` before the GPU pusher reached the synthetic syncpoint increment command list. Upstream has no equivalent draw-wide `MemoryManager` lock.
+
+### Missing items
+- Runtime validation confirmed MK8D no longer stops at submit #2 `DRAW_END`: after rebuilding `ruzu-cmd`, submit #2 continued into later command lists and `BufferQueueProducer::QueueBuffer` appeared. Remaining visual issues should be treated as downstream texture/render-target/presentation parity, not the earlier draw-wide `MemoryManager` lock.
+
+### Binary layout verification
+- N/A: host-side lock lifetime only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `OpenGL::RasterizerOpenGL::Draw(...)` and the Rust `RasterizerOpenGL::draw(...)` call sites that resolve cbuf descriptors, render targets, and buffer bindings.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core query_has_timeout_payload_fallback_writes_immediately_and_preserves_payload -- --nocapture`
+- `cargo build --bin ruzu-cmd`
+- MK8D runtime probe via `/tmp/ruzu-run.sh` wrote `screenshots/tmp/mk8d-20260613-221156-draw-lock-fix-rebuilt.log`; submit #2 advanced past `DRAW_END`, later submits were processed, `BQP::queue_buffer slot=0` appeared, and no `ruzu-cmd` process remained after timeout cleanup.
+
+## 2026-06-13 — video_core/src/renderer_opengl/gl_buffer_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_buffer_cache.cpp and gl_buffer_cache.h
+
+### Intentional differences
+- `BufferCacheRuntime::clear_buffer(...)` now calls `glClearNamedBufferSubData(..., GL_R32UI, ..., GL_RED_INTEGER, GL_UNSIGNED_INT, ...)`. The local upstream source passes `GL_RED`, but runtime validation showed the driver rejects that combination with `GL_INVALID_OPERATION in glClearNamedBufferSubData(integer vs non-integer)`. The behavioral intent is still the upstream `u32` clear; `GL_RED_INTEGER` is the spec-valid external format for the integer internal format `GL_R32UI`.
+
+### Unintentional differences (to fix)
+- Fixed: the Rust OpenGL clear path previously mirrored upstream's `GL_RED` literal and therefore failed on the current driver, leaving buffer clears ineffective and polluting the GL error queue. That also caused misleading `TEXTURE_VIEW_CREATE err=0x502` logs immediately after the failed clear.
+
+### Missing items
+- None known for the `ClearBuffer` call after the `GL_RED_INTEGER` runtime validation. If a stricter upstream rebase later changes the local C++ source to `GL_RED_INTEGER`, this intentional divergence should be removed from the audit trail.
+
+### Binary layout verification
+- N/A: OpenGL host-side buffer clear only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `OpenGL::BufferCacheRuntime::ClearBuffer(...)` in `gl_buffer_cache.cpp`.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo test -p video_core immediate_upload_download_noop_for_null_buffer -- --nocapture`
+- `cargo build --bin ruzu-cmd`
+- MK8D runtime probe via `/tmp/ruzu-run.sh` wrote `screenshots/tmp/mk8d-20260613-221550-red-integer-clear.log`; targeted log search found no `GL API Error`, no `TEXTURE_VIEW_CREATE`, no `panic`, no `not implemented`, and no `unimplemented`. The test process was terminated after timeout cleanup.
+# [2026-06-14] — video_core/src/renderer_opengl/gl_shader_manager.rs vs video_core/renderer_opengl/gl_shader_manager.cpp
+
+## Intent
+
+Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` after MK8D present traces showed `AccelerateDisplay` returning valid OpenGL textures while `WindowAdaptPass::DrawToFramebuffer()` left the backbuffer black.
+
+## Intentional differences
+
+- Rust stores bare `GLuint` handles instead of upstream `OGLPipeline`/`OGLProgram` wrappers; ownership is handled by `Drop`.
+
+## Unintentional differences fixed
+
+- Fixed: Rust previously only reset `current_stage_mask` and left a comment where upstream loops over `ASSEMBLY_PROGRAM_ENUMS` and calls `glDisable(program_type)`. The present path now disables the same GLASM vertex/tessellation/geometry/fragment program enables before binding the GLSL present pipeline, preventing stale guest assembly state from overriding or interfering with the present draw.
+- Fixed: Rust `ProgramManager::BindPipeline()` previously skipped `glBindProgramPipeline(self.pipeline)` when its local `is_pipeline_bound` cache said the manager pipeline was already bound. That cache is not authoritative in current Rust because `GraphicsPipeline::configure()` can bind a per-guest pipeline directly, outside `ProgramManager`. `BindPipeline()` now always binds the manager pipeline before present/source draws, restoring the effective upstream invariant that `ProgramManager` owns the active program-pipeline binding.
+
+## Missing items
+
+- Remaining structural debt: route guest graphics pipeline binding through the same ownership boundary as upstream instead of compensating for direct external binds inside `ProgramManager::BindPipeline()`.
+
+## Binary layout verification
+
+- N/A: OpenGL state-management method, no serialized payload.
+
+## 2026-06-14 — video_core/src/engines/maxwell_dma.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_dma.{h,cpp}
+
+### Intentional differences
+- Rust still executes MaxwellDMA work from `Engine::execute_pending(...)` and returns `PendingWrite` objects for the command processor to apply, while upstream `MaxwellDMA::Launch()` executes immediately through `MemoryManager` / `GpuGuestMemoryScoped`. This is existing Rust command-processor plumbing, not upstream structure parity.
+- Rust records unsupported runtime MaxwellDMA launch state in `.agents/maxwell_dma_unimplemented_state.md` outside test builds. Upstream uses `ASSERT` / `UNIMPLEMENTED_IF`; the Rust state file is a local no-debt guard so unsupported paths stop instead of being approximated.
+
+### Unintentional differences (to fix)
+- Fixed: Rust previously ignored upstream `LaunchDMA::{data_transfer_type,multi_line_enable,src_memory_layout,dst_memory_layout,remap_enable}` and ran the pitch-linear fallback for every pending launch. That could make blocklinear or remap launches look handled while copying bytes with the wrong layout.
+
+### Missing items
+- Fixed by later MaxwellDMA entries for current Rust ownership: `CopyBlockLinearToPitch`, `CopyPitchToBlockLinear`, and `CopyBlockLinearToBlockLinear` fallbacks are ported, and `ImageToBuffer` / `BufferToImage` accelerated completions now release semaphores correctly. Remaining debt is exact owner shape around `AccelerateDMAInterface`.
+- Fixed by later MaxwellDMA entries: single-line launch behavior now covers page-kind based pitch/blocklinear handling, remap-enabled CONST_A clear, and semaphore release.
+- Replace the local `PendingWrite` execution bridge with a closer upstream-owned launch path once command-processor memory access allows direct `MemoryManager` writes without losing current Rust scheduling semantics.
+
+### Binary layout verification
+- FAIL/incomplete: `LaunchDMA`, `RemapConst`, and the full `Regs` block are still decoded from raw register words instead of represented as full upstream-shaped packed payloads. Bit positions used in this slice match upstream `LaunchDMA` bitfields, but full struct-layout parity remains missing.
+
+### Tests
+- Re-read upstream `maxwell_dma.h` `LaunchDMA` bitfield layout and register positions.
+- Re-read upstream `MaxwellDMA::Launch`, `CopyBlockLinearToPitch`, `CopyPitchToBlockLinear`, and `CopyBlockLinearToBlockLinear`.
+- `cargo test -p video_core maxwell_dma -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/image_info.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/image_info.cpp
+
+### Intentional differences
+- Rust receives compact `RenderTargetInfo` / `ZetaInfo` snapshots instead of the exact upstream `Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig`, `Regs::Zeta`, and `Regs::ZetaSize` register objects. Constructor ownership remains in `ImageInfo`, but raw register-struct layout parity is still incomplete.
+- Rust uses `panic!` / `assert!` for upstream `ASSERT` and invalid-enum fatal paths in the render-target and zeta constructors.
+
+### Unintentional differences (to fix)
+- Fixed: `ImageInfo::from_render_target_info(...)` and `ImageInfo::from_zeta_info(...)` no longer map invalid MSAA mode values to `Msaa1x1`; they now stop like upstream `NumSamples(msaa_mode)`.
+- Fixed: pitch-linear render-target and zeta constructors now require `dim_control == DefineArraySize`, matching upstream assertions before constructing linear images.
+- Fixed: the zeta 3D constructor now requires `ZetaSize::DimensionControl::ArraySizeIsOne`, matching upstream's `ASSERT(zt_size.dim_control == ArraySizeIsOne)`.
+- Fixed: render-target/zeta `array_pitch * 4` and zeta pitch byte calculation now use wrapping `u32` multiplication semantics instead of saturating or debug-overflow-prone Rust arithmetic.
+- Fixed: 2D render-target/zeta layer counts now preserve zero depth/layer bit patterns instead of forcing a minimum layer count of one.
+
+### Missing items
+- Full Maxwell3D render-target/zeta register struct layout parity remains missing because Rust still snapshots only the fields consumed by `ImageInfo`.
+- Continue auditing whether all callers pass the exact upstream MSAA register value rather than a normalized local value.
+
+### Binary layout verification
+- FAIL/incomplete for register layout parity: the Rust snapshot structs are not raw upstream register layouts. N/A for guest-visible serialized payloads because this change only constructs host texture metadata.
+
+### Verification
+- Re-read upstream `ImageInfo::ImageInfo(const Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig&, Tegra::Texture::MsaaMode)` in `image_info.cpp`.
+- Re-read upstream `ImageInfo::ImageInfo(const Tegra::Engines::Maxwell3D::Regs::Zeta&, const Tegra::Engines::Maxwell3D::Regs::ZetaSize&, Tegra::Texture::MsaaMode)` in `image_info.cpp`.
+- Re-read Rust `ImageInfo::from_render_target_info(...)` and `ImageInfo::from_zeta_info(...)` after the edit.
+- `cargo test -p video_core texture_cache::image_info::tests:: -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `git diff --check`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust `visit_image_view(...)` resolves a TIC descriptor when the descriptor table reports `is_new == false` but the matching cached `ImageViewId` is still invalid or `CORRUPT_ID`. Upstream `VisitImageView(...)` only resolves on `is_new`; the Rust guard is required because the Rust shader environment can probe the shared descriptor table for texture types before `FillImageViews(...)` populates the image-view id cache. The guard mirrors the existing Rust sampler-id recovery path and prevents a `CORRUPT_ID` from flowing into OpenGL texture binding as handle zero.
+
+### Unintentional differences (to fix)
+- Fixed: sampled texture descriptors whose TIC had already been read by a shader descriptor probe could keep `graphics_image_view_ids[index] == CORRUPT_ID`, causing `glBindTextures` to bind texture handle 0. MK8D then rendered the final backbuffer pass (`pipeline=5`) with a null source texture and presented black frames.
+
+### Missing items
+- Audit whether Rust shader-environment descriptor probing should use a separate owner or explicitly avoid mutating the texture-cache descriptor table, closer to upstream ownership.
+
+### Binary layout verification
+- N/A: descriptor-cache control-flow fix; no guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `DescriptorTable::Read(...)` in `texture_cache/descriptor_table.h`.
+- Re-read upstream `TextureCache<P>::FillImageViews(...)` and `TextureCache<P>::VisitImageView(...)` in `texture_cache.h`.
+- Re-read Rust `DescriptorTable::read_with(...)` and `TextureCacheBase::visit_image_view(...)` after the edit.
+- `cargo test -p video_core fill_image_views_resolves_corrupt_cached_id_after_descriptor_probe -- --nocapture`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust keeps a fallback inline `TextureCacheChannelInfo` (`self.channel_state`) for reduced tests that construct `TextureCacheBase` without creating/binding a channel. Upstream stores `channel_state` as the active channel pointer from `ChannelSetupCaches<TextureCacheChannelInfo>`. Runtime paths must use `current_channel_state(_mut)` so the Rust fallback remains test-only.
+- Rust `SynchronizeGraphicsDescriptors(...)` / `SynchronizeComputeDescriptors(...)` receive register snapshots from the caller instead of reading `maxwell3d->regs` / `kepler_compute->regs` directly, preserving the existing Rust borrowing boundary.
+- Env-gated diagnostic logging remains under `RUZU_TRACE_DESCRIPTOR_SYNC` / `RUZU_TRACE_VISIT_RESULT` for the MK8D texture investigation. It has no behavior effect when unset.
+
+### Unintentional differences (to fix)
+- Fixed: descriptor synchronization and sampler descriptor reads wrote/read `self.channel_state`, while image-view resolution used `current_channel_state(_mut)`. With a real bound channel, `SynchronizeGraphicsDescriptors(...)` resized the fallback table but `FillGraphicsImageViews(...)` read the active channel table, whose TIC limit stayed `0`. MK8D TIC indices 798-808 were rejected, producing `NULL_IMAGE_VIEW_ID` and OpenGL texture handle 0 for the final prompt/backbuffer pass.
+- Fixed: graphics and compute sampler descriptor reads now use the same active channel state as their limit checks and cached sampler-id updates.
+
+### Missing items
+- The fallback inline channel remains a Rust-only test accommodation. Longer-term structural parity would remove it once all tests construct/bind channels like runtime.
+- Other existing edits in this file are outside this entry's scope and remain covered by their own DIFF entries or later audits.
+
+### Binary layout verification
+- N/A: descriptor-cache ownership/control-flow fix; no guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `TextureCache<P>::GetImageView(u32)`, `FillGraphicsImageViews(...)`, `FillComputeImageViews(...)`, `GetGraphicsSamplerId(...)`, `GetComputeSamplerId(...)`, `SynchronizeGraphicsDescriptors(...)`, and `SynchronizeComputeDescriptors(...)` in `texture_cache.h`.
+- Re-read Rust `TextureCacheBase::visit_image_view(...)`, `synchronize_graphics_descriptors(...)`, `synchronize_compute_descriptors(...)`, `get_graphics_sampler_id(...)`, and `get_compute_sampler_id(...)` after the edit.
+- `cargo fmt --all`
+- `cargo test -p video_core synchronize_ -- --nocapture`
+- `cargo build --bin ruzu-cmd`
+- MK8D runtime probe via `/tmp/ruzu-run.sh` wrote `screenshots/tmp/mk8d-20260614-134315-current-channel-fix.log`; TIC indices 798-808 resolved to non-zero image view ids, OpenGL binds had non-zero handles with `backend_present=true`, `rejected limit=0` disappeared, and the process was stopped by `timeout` with no remaining `ruzu-cmd` instance.
+
+## 2026-06-14 — video_core/src/fence_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/fence_manager.h
+
+### Intentional differences
+- Rust passes backend-specific `flush_commands` and `invalidate_gpu_cache` callbacks into `FenceManager::signal_fence(...)` instead of storing a direct `RasterizerInterface&` inside the generic manager. This preserves Rust ownership while keeping the upstream ordering inside the fence manager.
+- Rust stores pending fence operations together with their fence object in one queue entry, while upstream stores `pending_operations` and `fences` as parallel queues. The release order remains one operation batch per fence.
+
+### Unintentional differences (to fix)
+- Fixed: async-capable Rust `FenceManager::signal_fence(...)` notified the fence thread before the caller performed `flush_commands()`. Upstream queues the fence, pushes it, flushes commands if needed, then unlocks/notifies. The Rust ordering could let the fence thread wait on an OpenGL fence before the queued commands were flushed, matching the MK8D freeze after the title animation.
+- Fixed: `signal_sync_point(...)`, `signal_reference(...)`, and forced async `wait_pending_fences(...)` now route through the same upstream-shaped flush/invalidate ordering.
+
+### Missing items
+- Full CRTP ownership parity is intentionally not ported; Rust still uses callback injection for backend operations.
+- Vulkan rasterizer remains structurally reduced, but its `signal_fence(...)` call now follows the same generic manager ordering.
+
+### Binary layout verification
+- N/A: host-side fence scheduling/control-flow fix; no guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `FenceManager::SignalFence`, `SignalSyncPoint`, `SignalReference`, `WaitPendingFences`, `TryReleasePendingFences`, and `ReleaseThreadFunc` in `video_core/fence_manager.h`.
+- Re-read Rust `FenceManager::signal_fence`, `signal_sync_point`, `signal_reference`, `wait_pending_fences`, `try_release_pending_fences`, and `release_thread_func` after the edit.
+- `cargo fmt --all`
+- `cargo test -p video_core fence_manager -- --nocapture`
+
+## 2026-06-14 — core/src/hle/kernel/svc/svc_synchronization.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_synchronization.cpp
+
+### Intentional differences
+- Rust keeps env-gated diagnostic logging around `svc::WaitSynchronization` for MK8D wait-wedge investigation. This has no behavior effect when unset.
+- Fixed diagnostic targeting only: replaced the hardcoded `tid=73|102` filter with `RUZU_TRACE_WAITSYNC_TID=<tid>[,<tid>...]`, because MK8D thread ids vary between runs.
+
+### Unintentional differences (to fix)
+- None in this diagnostic-only edit.
+
+### Missing items
+- Existing `WaitSynchronization` parity audit remains open for waiter notification ordering and scheduler-lock ownership; this entry does not claim the subsystem is complete.
+
+### Binary layout verification
+- N/A: diagnostic logging only; no guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `WaitSynchronization` in `svc_synchronization.cpp`.
+- Re-read Rust `wait_synchronization(...)` after the edit.
+
+## 2026-06-14 — core/src/hle/service/nvdrv/devices/nvhost_ctrl.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp
+
+### Intentional differences
+- Rust stores the upstream `NvEventsLock()` protected state in two mutexes (`events_mask` and `events`) instead of one combined lock. This preserves the existing Rust ownership split, but all paths that need both locks must acquire them in a single consistent order.
+- Existing env-gated event-wait diagnostics and fallback tracing remain local instrumentation for the MK8D syncpoint investigation.
+
+### Unintentional differences (to fix)
+- Fixed: `IocCtrlEventWait(...)` acquired `events` before `events_mask`, while event register/unregister/free paths acquire `events_mask` before `events`. Upstream uses one `NvEventsLock()` for this state, so Rust's mixed order could deadlock concurrent nvhost-ctrl event ioctls. `IocCtrlEventWait(...)` now uses `events_mask -> events`.
+
+### Missing items
+- Existing non-upstream `wait_host_stalled(...)` fallback behavior remains to audit separately; this entry only fixes lock ordering around the upstream event-table critical section.
+
+### Binary layout verification
+- N/A: host-side lock ordering fix; no guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `nvhost_ctrl::IocCtrlEventWait`, `IocCtrlEventRegister`, `IocCtrlEventUnregister`, `IocCtrlEventUnregisterBatch`, and `IocCtrlClearEventWait`.
+- Re-read Rust `ioc_ctrl_event_wait(...)` and event register/unregister paths after the edit.
+- `cargo check -p core`
+
+## 2026-06-14 — core/src/hle/service/nvdrv/devices/nvhost_gpu.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
+
+### Intentional differences
+- Rust keeps env-gated submit/syncpoint diagnostics around `SubmitGPFIFOImpl(...)` for MK8D title-screen investigation. `RUZU_TRACE_SUBMIT_AFTER=<fence_value>` only expands existing `[SP_TRACE]` logging after the requested fence value and has no behavior effect.
+
+### Unintentional differences (to fix)
+- None in this diagnostic-only edit.
+
+### Missing items
+- Existing `nvhost_gpu` stub warnings (`AllocGPFIFOEx2`, `AllocateObjectContext`, `SetErrorNotifier`) still need a separate upstream-parity audit; this entry does not claim the device is complete.
+
+### Binary layout verification
+- N/A: diagnostic logging only; no guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `nvhost_gpu::SubmitGPFIFOImpl(...)` and Rust `submit_gpfifo_impl(...)` after the edit.
+- `cargo fmt --all`
+
+## 2026-06-14 — video_core/src/buffer_cache/buffer_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/buffer_cache/buffer_cache.h
+
+### Intentional differences
+- Rust stores `StagingBufferRef` in `VecDeque<Option<StagingBufferRef>>`, matching upstream's `std::deque<std::optional<Async_Buffer>>` behavior while using the existing Rust staging-buffer wrapper.
+- Rust still routes backend staging allocation/free through the existing `BufferCacheRuntime` trait instead of upstream's template runtime object.
+
+### Unintentional differences (to fix)
+- Fixed: `BufferCache::should_wait_async_flushes()` checked `committed_gpu_modified_ranges` directly. Upstream checks whether the committed async-buffer queue has a real buffer at the front. Rust now has an `async_buffers` queue and only waits when its front entry is `Some`.
+- Fixed: `commit_async_flushes_high()` did not enqueue an empty async-buffer entry when there were no committed ranges or no downloads. Upstream always pushes `std::nullopt` for these batches so fence-release popping stays aligned with committed operations.
+- Fixed: `pop_async_buffers()` consumed `async_buffers_death_ring` as if it were the pending async-buffer queue. Upstream consumes `async_buffers`, then moves completed real buffers into `async_buffers_death_ring` for deferred free on a later frame.
+
+### Missing items
+- The generic texture-cache base still has reduced async-download behavior, but OpenGL uses `renderer_opengl/gl_texture_cache.rs`, which already owns its backend async-buffer queue. A separate texture-cache audit remains needed before claiming the subsystem complete.
+
+### Binary layout verification
+- N/A: host-side cache/fence queue control flow; no guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `BufferCache<P>::ShouldWaitAsyncFlushes`, `CommitAsyncFlushesHigh`, `CommitAsyncFlushes`, `PopAsyncFlushes`, and `PopAsyncBuffers` in `video_core/buffer_cache/buffer_cache.h`.
+- Re-read Rust `should_wait_async_flushes`, `commit_async_flushes_high`, `commit_async_flushes`, `pop_async_flushes`, and `pop_async_buffers` after the edit.
+- `cargo fmt --all`
+- `cargo test -p video_core buffer_cache::buffer_cache::tests::test_accumulate_flushes --lib`
+- `cargo check -p video_core`
+
+## 2026-06-14 — video_core/src/fence_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/fence_manager.h
+
+### Intentional differences
+- Rust keeps env-gated diagnostic logging under `RUZU_TRACE_GL_FENCE_FLOW=1` to trace `SignalFence`, `SignalSyncPoint`, pending-fence release, and async release-thread progress during the MK8D title-screen stall investigation. This has no behavior effect when unset.
+- Rust carries a host-only `trace_id` in pending fences so a queued fence can be correlated with its later release in logs.
+
+### Unintentional differences (to fix)
+- None in this diagnostic-only edit.
+
+### Missing items
+- Existing `FenceManager` parity audit remains open for previously modified flush/invalidate callback threading and async wait behavior; this entry does not claim the subsystem is complete.
+
+### Binary layout verification
+- N/A: host-only fence manager diagnostics; no guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `FenceManager::{SignalOrdering,SignalFence,SignalSyncPoint,WaitPendingFences,TryReleasePendingFences,ReleaseThreadFunc}` in `video_core/fence_manager.h`.
+- Re-read Rust `FenceManager` diagnostic insertion points after the edit.
+- `cargo fmt --all --check`
+- `cargo test -p video_core fence_manager -- --nocapture --test-threads=1`
+
+## 2026-06-14 — video_core/src/engines/maxwell_3d.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp
+
+### Intentional differences
+- Rust keeps env-gated diagnostic logging under `RUZU_TRACE_GL_FENCE_FLOW=1` around the upstream `invalidate_texture_data_cache` path to distinguish `InvalidateGPUCache`, `WaitForIdle`, and return-to-command-stream progress during the MK8D stall investigation. This has no behavior effect when unset.
+
+### Unintentional differences (to fix)
+- None in this diagnostic-only edit.
+
+### Missing items
+- Existing Maxwell3D parity audit remains open; this entry only covers the diagnostic inserted around the already-ported method branch.
+
+### Binary layout verification
+- N/A: diagnostic logging only; no guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `Maxwell3D::ProcessMethodCall` cases for `invalidate_texture_data_cache` and `sync_info`.
+- Re-read Rust `process_method_call` after the edit.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Rust keeps env-gated diagnostic logging under `RUZU_TRACE_GL_FENCE_FLOW=1` around `invalidate_gpu_cache` and `wait_for_idle` to localize the MK8D syncpoint stall. This has no behavior effect when unset.
+
+### Unintentional differences (to fix)
+- None in this diagnostic-only edit.
+
+### Missing items
+- Existing OpenGL rasterizer parity audit remains open; this entry only covers diagnostic probes around already-ported methods.
+
+### Binary layout verification
+- N/A: diagnostic logging only; no guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `RasterizerOpenGL::{InvalidateGPUCache,WaitForIdle}`.
+- Re-read Rust `invalidate_gpu_cache` and `wait_for_idle` after the edit.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — core/src/hle/service/nvdrv/devices/nvhost_gpu.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
+
+### Intentional differences
+- Rust keeps env-gated diagnostic logging under `RUZU_TRACE_GPU_SUBMIT=1` in `SubmitGPFIFOImpl` to print flags, computed increment, input/output fences, and command-list sizes for MK8D submit/max-vs-host divergence. This has no behavior effect when unset.
+
+### Unintentional differences (to fix)
+- None in this diagnostic-only edit.
+
+### Missing items
+- Existing `nvhost_gpu` stub warnings (`AllocGPFIFOEx2`, `AllocateObjectContext`, `SetErrorNotifier`) still need a separate upstream-parity audit; this entry does not claim the device is complete.
+
+### Binary layout verification
+- N/A: diagnostic logging only; no guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `nvhost_gpu::SubmitGPFIFOImpl`.
+- Re-read Rust `submit_gpfifo_impl` after the edit.
+
+## 2026-06-14 — video_core/src/dma_pusher.rs and video_core/src/control/scheduler.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/dma_pusher.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/control/scheduler.cpp
+
+### Intentional differences
+- Rust adds an env-gated diagnostic selector `RUZU_TRACE_PULLER_SUBMIT_RANGE=start:end` for the existing puller submit trace, so late MK8D submits can be inspected without logging every earlier submit. This has no behavior effect when unset.
+- Rust scheduler checks this diagnostic selector before setting `ACTIVE_SUBMIT_IDX`; upstream has no equivalent diagnostic hook.
+
+### Unintentional differences (to fix)
+- None in this diagnostic-only edit.
+
+### Missing items
+- Existing DMA pusher and scheduler parity audits remain open; this entry only covers the trace-window diagnostic.
+
+### Binary layout verification
+- N/A: diagnostic logging only; no guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `DmaPusher::DispatchCalls`, `DmaPusher::Step`, and `Scheduler::Push`.
+- Re-read Rust `DmaPusher` trace gate and `Scheduler::push` after the edit.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust adds env-gated diagnostic logging under `RUZU_TRACE_GL_PIPELINE_STALL=1` around the already-ported `GraphicsPipeline::ConfigureImpl` slices: descriptor collection, image-view fill/materialization, render-target update, and framebuffer bind. This has no behavior effect when unset and exists only to localize the MK8D idle-cinematic stall.
+
+### Unintentional differences (to fix)
+- None in this diagnostic-only edit.
+
+### Missing items
+- Existing graphics-pipeline parity audit remains open; this entry only covers diagnostic probes around existing Rust bridge methods.
+
+### Binary layout verification
+- N/A: diagnostic logging only; no guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `RasterizerOpenGL::PrepareDraw` call sequence and Rust `GraphicsPipeline` configure bridge around descriptor/render-target ordering.
+- Re-read Rust `gl_graphics_pipeline.rs` after the edit.
+- `cargo fmt --all --check`
+
+## 2026-06-14 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust adds env-gated diagnostic logging under `RUZU_TRACE_TEXTURE_FILL_STALL=1` around the already-ported `TextureCache<P>::FillImageViews` / `VisitImageView` flow. This has no behavior effect when unset and exists only to distinguish retry-loop, TIC-read, and image-view-creation stalls during the MK8D idle-cinematic investigation.
+
+### Unintentional differences (to fix)
+- None in this diagnostic-only edit.
+
+### Missing items
+- Existing texture-cache parity audit remains open; this entry only covers diagnostic probes around existing descriptor/image-view resolution methods.
+
+### Binary layout verification
+- N/A: diagnostic logging only; no guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `TextureCache<P>::FillGraphicsImageViews`, `FillImageViews`, and `VisitImageView`.
+- Re-read Rust `fill_graphics_image_views`, `fill_image_views`, and `visit_image_view` after the edit.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust adds env-gated diagnostic logging under `RUZU_TRACE_GL_TEXTURE_CACHE_STALL=1` around the OpenGL wrapper for `TextureCache<P>::FillGraphicsImageViews`, including backend insertion and pending join-copy drains. This has no behavior effect when unset and exists only to localize the MK8D idle-cinematic stall after base descriptor resolution returns.
+
+### Unintentional differences (to fix)
+- None in this diagnostic-only edit.
+
+### Missing items
+- Existing OpenGL texture-cache parity audit remains open; this entry only covers diagnostic probes around the backend wrapper.
+
+### Binary layout verification
+- N/A: diagnostic logging only; no guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `TextureCache<P>::FillImageViews`, `PrepareImageView`, and join-copy drain context.
+- Re-read Rust `fill_graphics_image_views`, `finish_pending_join_copies`, and pending backend/join-copy helpers after the edit.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust keeps env-gated `RUZU_TRACE_GL_TEXTURE_CACHE_STALL=1` diagnostics around `RefreshContents` / `UploadImageContents` stages so the MK8D idle-cinematic stall can be localized. This has no behavior effect when unset.
+- Rust still stops on unsupported MSAA upload through `stop_unimplemented_msaa_upload` instead of silently logging and transitioning layout; this follows the local no-debt policy for unimplemented behavior and records state before panic.
+- Rust exposes a `GpuReaderPair` for OpenGL texture-cache refreshes because the Rust texture cache stores `MemoryManager` behind a mutex and explicit reader closures are used where upstream directly owns `gpu_memory`. This preserves upstream behavior in bound refresh paths: accelerated upload uses the safe `ReadBlock` equivalent, while normal upload and join/render-target backend completion use the unsafe-read equivalent matching `GpuGuestMemory<UnsafeRead>`.
+- Rust's explicit-reader API still falls back to the safe reader when a caller can only provide one closure. Current bound-channel paths used by `PrepareImage`, `RefreshContents`, `UpdateRenderTargets`, pending backend insertions, and pending join-copy refreshes provide both readers.
+
+### Unintentional differences (to fix)
+- None for the `CpuModified` lifecycle fixed in this entry.
+
+### Missing items
+- Existing OpenGL texture-cache parity audit remains open; this entry covers the `TextureCache<P>::RefreshContents` CPU-modified consumption order, the `UploadImageContents` safe-vs-unsafe reader split, the `FindRenderTargetView` / `JoinImages` backend-completion reader used by MK8D, and additional diagnostics only.
+
+### Binary layout verification
+- N/A: this change affects texture-cache lifecycle and diagnostics, not a guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `TextureCache<P>::RefreshContents`, `TextureCache<P>::UploadImageContents`, `TextureCache<P>::QueueAsyncDecode`, `TextureCache<P>::FindRenderTargetView`, `TextureCache<P>::JoinImages`, `TextureCache<P>::PrepareImage`, and `TextureCache<P>::UpdateRenderTargets`.
+- Re-read Rust `refresh_contents_with_gpu_readers`, `upload_image_contents_with_gpu_reader`, pending backend insertion / join-copy helpers, and `update_render_targets_from_snapshot_with_bound_gpu_memory` after the edit.
+- `cargo fmt --all --check`
+- `cargo check -p video_core --quiet`
+- `cargo build --release --bin ruzu-cmd`
+- MK8D run `screenshots/tmp/mk8d-rt-unsafe-local-20260614-182832/run.log` reached draw sequence ~323960 before the scripted timeout and no longer stopped at the earlier `id=149` or `id=285` read points.
+
+## 2026-06-14 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- Rust groups `ImageViewType::E2DArray | E2D | Rect` in one match arm and explicitly checks `E2DArray` to apply `flat_range.extent.layers = 1`; upstream uses `[[fallthrough]]` from the `e2DArray` case into the shared `e2D` / `Rect` body. The resulting ownership and operation order match upstream.
+
+### Unintentional differences (to fix)
+- None for the `ImageViewFlagBits::Slice` constructor branch fixed in this entry.
+
+### Missing items
+- Existing OpenGL texture-cache parity audit remains open. This entry covers only the per-view `SetupView` selection in the image-backed `ImageView` constructor.
+
+### Binary layout verification
+- N/A: this change affects OpenGL texture-view materialization, not a guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `ImageView::ImageView(TextureCacheRuntime&, const VideoCommon::ImageViewInfo&, ImageId, Image&, const SlotVector<Image>&)` in `gl_texture_cache.cpp`, including the `e2DArray` fallthrough and `ImageViewFlagBits::Slice` branch.
+- Re-read Rust `ImageView::from_image_view_info` after the edit and confirmed `SLICE` views now assert single-level range, replace `full_range` with the effective slice range, and create a `Color3D` view instead of `Color2D` / `ColorArray2D`.
+
+## 2026-06-14 — video_core/src/texture_cache/util.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/util.cpp
+
+### Intentional differences
+- Rust `unswizzle_image` still receives the guest-layout `input` slice from its caller instead of calling `gpu_memory.ReadBlockUnsafe(gpu_addr, ...)` internally. This preserves the existing Rust API boundary while matching upstream's staging-buffer layout and `UnswizzleTexture` arguments.
+- Rust bounds-checks source and destination slices before calling `unswizzle_texture`; upstream relies on `span::subspan` plus caller-sized buffers and asserts.
+
+### Unintentional differences (to fix)
+- None for the block-linear full-image `UnswizzleImage` upload path fixed in this entry.
+
+### Missing items
+- Broader texture-cache parity remains open. This entry covers the `UnswizzleImage` block-linear level/layer traversal only; other texture-cache upload/download copy rectangle paths still need their own audits.
+
+### Binary layout verification
+- N/A: texture staging-copy math only. The new regression verifies that layered block-linear uploads read each layer from the upstream `AlignLayerSize(...)` guest stride before writing the linear host staging buffer.
+
+### Verification
+- Re-read upstream `UnswizzleImage`, `NumBlocks`, `GobSize`, `StrideAlignment`, `CalculateLevelSizes`, `CalculateLevelBytes`, and `AlignLayerSize`.
+- Re-read Rust `unswizzle_image`, `calculate_level_stride_alignment`, `stride_alignment_gob`, and `align_layer_size` after the edit.
+- `cargo test -p video_core unswizzle_image_ -- --nocapture`
+- `cargo fmt --all --check`
+
+## 2026-06-14 — audio_core/src/sink/sink_stream.rs + audio_core/src/sink/null_sink.rs vs /home/vricosti/Dev/emulators/zuyu/src/audio_core/sink/sink_stream.cpp + /home/vricosti/Dev/emulators/zuyu/src/audio_core/sink/null_sink.h
+
+### Intentional differences
+- Rust adds `ReleaseSync::realtime_pacing` and enables it only for `NullSink` render streams. This keeps the null sink silent like upstream `NullSinkStreamImpl::AppendBuffer`, but forces `WaitFreeSpace` to sleep for the 5 ms audio period after the render stream starts. Without a real backend callback and with discarded buffers, ruzu was signaling the audio rendered event at about 16 kHz during MK8D, far above the expected 5 ms render cadence.
+- The pacing hook is hosted in `sink_stream.rs` because `AudioRenderer::Main` waits through the shared `ReleaseSync` without holding the `SinkStream` lock; `null_sink.rs` owns enabling the behavior for the null render stream.
+
+### Unintentional differences (to fix)
+- None for the null-renderer pacing fix.
+
+### Missing items
+- Broader audio renderer timing parity still needs runtime validation with a real host backend. This entry covers the null-sink path requested for MK8D runs only.
+
+### Binary layout verification
+- N/A: host sink scheduling only; no guest-visible serialized payload.
+
+### Verification
+- Re-read upstream `SinkStream::WaitFreeSpace`, `SinkStream::AppendBuffer`, `NullSinkStreamImpl::AppendBuffer`, `NullSink::AcquireSinkStream`, and `ADSP::AudioRenderer::CreateSinkStreams`.
+- Re-read Rust `ReleaseSync::wait_free_space_with_stop`, `SinkStream::set_ring_size`, `SinkStream::start`, `NullSink::acquire_sink_stream`, and `ADSP::AudioRenderer::create_sink_streams`.
+- Pre-fix MK8D profile with `RUZU_AUDIO_SINK=null RUZU_PROFILE_AUDIO_EVENT=1 RUZU_PROFILE_SYSMGR_RATE=1`: `screenshots/tmp/mk8d-audio-rate-20260614-231357/run.log` reported about 16,218 audio rendered-event fires per second.
+- `cargo fmt --all --check`
+- `cargo check -p audio_core --quiet`
+
+## 2026-06-14 — core/src/hle/kernel/svc_dispatch.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc.cpp
+
+### Intentional differences
+- None for the AArch32 unsafe-physical-memory dispatch fix.
+
+### Unintentional differences (to fix)
+- None for this entry. Rust AArch32 dispatch no longer returns synthetic success for `SvcId::MapPhysicalMemoryUnsafe`, `SvcId::UnmapPhysicalMemoryUnsafe`, or `SvcId::SetUnsafeLimit`; it now calls the owning `svc_physical_memory.rs` functions, matching upstream ownership and returning `ResultNotImplemented` for the upstream `UNIMPLEMENTED()` paths.
+
+### Missing items
+- Upstream `MapPhysicalMemoryUnsafe`, `UnmapPhysicalMemoryUnsafe`, and `SetUnsafeLimit` bodies remain unimplemented in `svc_physical_memory.cpp`; Rust keeps the same not-implemented behavior. This entry only removes the dispatcher-level fake success that let MK8D continue with a page-table range still marked `Free`.
+
+### Binary layout verification
+- N/A: SVC dispatch behavior only.
+
+### Verification
+- Re-read upstream `svc.cpp` wrappers for `MapPhysicalMemoryUnsafe64From32`, `UnmapPhysicalMemoryUnsafe64From32`, and `SetUnsafeLimit64From32`.
+- Re-read upstream `svc_physical_memory.cpp` implementations and confirmed they call `UNIMPLEMENTED()` / throw `ResultNotImplemented`.
+- Re-read Rust `svc_dispatch.rs` AArch32 arms and `svc_physical_memory.rs` stubs after the edit.
+- `cargo fmt --all --check`
+- `cargo check -p core --quiet`
+
+## 2026-06-14 — core/src/hle/service/server_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.h
+
+### Intentional differences
+- Rust drains `pending_registrations` and ensures kernel port registration immediately before `link_deferred()`. This is a Rust owner-graph bridge for the existing pending-registration queue and named-port process registration; upstream can register directly into the intrusive lists before `LinkDeferred()`.
+- Rust keeps a fallback `wakeup_event.wait_timeout(...)` path only for the defensive case where `SystemRef::kernel()` is unavailable. Normal MK8D service threads now use `MultiWait::wait_any(kernel)` like upstream.
+- Rust re-links the wakeup holder after clearing it inside `consume_wakeup_holder(...)` because `wait_any()` returns a holder that has been removed from the Rust wait list. Upstream clears the event and continues because its `MultiWaitHolder`/intrusive-list mechanics preserve the expected holder lifetime around `WaitAny`.
+
+### Unintentional differences (to fix)
+- Fixed: `ServerManager::wait_signaled()` no longer preselects a ready holder via `MultiWait::try_wait_any_local()` before calling `MultiWait::wait_any(kernel)`. Upstream `ServerManager::WaitSignaled()` always holds `m_selection_mutex`, calls `LinkDeferred()`, checks `m_stop_source`, then waits through `m_multi_wait.WaitAny(m_system.Kernel())`. The previous Rust shortcut could select wakeup/session/port holders outside the upstream kernel wait ordering.
+
+### Missing items
+- Broader `ServerManager` parity remains open: Rust still has the pending-registration queue, additional explicit process registration bridge, and shared-owner adaptations around sessions/ports. This entry covers only the `WaitSignaled` selection-order fix.
+
+### Binary layout verification
+- N/A: host service-manager synchronization only. No guest-visible serialized payload or raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `ServerManager::WaitSignaled()`, `LinkDeferred()`, and `WaitAndProcessImpl()` in `server_manager.cpp`, plus the `m_selection_mutex`, `m_deferred_list`, `m_multi_wait`, and holder members in `server_manager.h`.
+- Re-read Rust `ServerManager::wait_signaled()`, `link_deferred()`, and `wait_and_process_impl()` after the edit.
+- `cargo fmt --all --check`
+- `cargo check -p core --quiet`
+
+## 2026-06-15 — core/src/file_sys/fssystem/aes_ctr_storage.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/file_sys/fssystem/fssystem_aes_ctr_storage.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/file_sys/fssystem/fssystem_aes_ctr_storage.h
+
+### Intentional differences
+- Rust creates a fresh `AesCipher` inside each `read_at()` / `write_at()` operation before setting the IV. Upstream stores `mutable std::optional<AESCipher<...>> m_cipher` and mutates it in `const Read()` without taking a lock. A shared mutable cipher cannot be represented safely behind `Arc<dyn VfsFile + Send + Sync>` without synchronization; the local cipher preserves the same key, IV, counter, and transcode behavior while avoiding a Rust-only global decrypt mutex.
+- Rust keeps the existing unaligned `VfsFile::read()` adapter that reads the aligned backing range and copies the requested subspan. Upstream `AesCtrStorage::Read()` asserts block-aligned size/offset, and higher layers are expected to provide aligned requests.
+
+### Unintentional differences (to fix)
+- Fixed: `AesCtrStorage` no longer stores `Mutex<AesCipher>` and no longer serializes all AES-CTR decrypt/encrypt operations for a shared storage object. Upstream `AesCtrStorage::Read()` performs no lock around `m_base_storage->Read`, `SetIV`, or `Transcode`; the previous Rust mutex could make concurrent MK8D content streaming materially slower than upstream.
+- Fixed: stale comments claiming AES-CTR currently read/wrote without encryption were removed; the Rust implementation already decrypts/encrypts and now documents that behavior accurately.
+
+### Missing items
+- Exact upstream ownership of a reusable mutable cipher member is not reproduced because it would require unsafe shared mutation under Rust's `Send + Sync` VFS trait object. This entry covers the AES-CTR read/write behavior and the removal of the Rust-only serialization point.
+
+### Binary layout verification
+- N/A: host filesystem storage/decryption path only. No guest-visible serialized payload or raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `AesCtrStorage::MakeIv`, constructor, `Read`, `Write`, and `GetSize`, plus the header member ownership for `m_base_storage`, `m_key`, `m_iv`, and `m_cipher`.
+- Re-read Rust `AesCtrStorage::{new,make_iv,read_at,write_at,VfsFile::read}` after the edit.
+- Added `aes_ctr_write_then_read_round_trips_block_aligned_data`.
+- `cargo fmt --all --check`
+- `cargo test -p core aes_ctr_write_then_read_round_trips_block_aligned_data -- --nocapture`
+- `cargo check -p core --quiet`
+
+## 2026-06-15 — core/src/hle/service/filesystem/fsp/fs_i_storage.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/fsp/fs_i_storage.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/fsp/fs_i_storage.h
+
+### Intentional differences
+- Rust keeps an env-gated diagnostic hook `RUZU_ISTORAGE_SCAN_U32_VALUE` inside `IStorage::read_handler()`. Upstream has no equivalent. When enabled, Rust scans the temporary read buffer for requested u32 values and logs the storage offset, guest output-buffer address, buffer offset, backend identity, and guest thread context. The hook is inactive by default and does not alter the bytes returned to the guest.
+
+### Unintentional differences (to fix)
+- None for this entry. The business behavior remains the existing Rust `IStorage::Read` path: validate non-negative offset/length, read from the backend into a temporary out buffer, then copy it to the guest write buffer.
+
+### Missing items
+- Exact upstream `OutBuffer<BufferAttr_HipcMapAlias | BufferAttr_HipcMapTransferAllowsNonSecure>` ownership is still represented through Rust `HLERequestContext` buffer descriptors rather than C++ CMIF type wrappers.
+
+### Binary layout verification
+- N/A: diagnostic logging only. No guest-visible serialized payload or raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `IStorage::Read` and `IStorage::GetSize` in `fs_i_storage.cpp`, plus the command table in `fs_i_storage.h`.
+- Re-read Rust `IStorage::read`, `read_handler`, and `HLERequestContext::write_buffer`/`write_buffer_b`/`write_buffer_c` after the edit to confirm the diagnostic computes the same output buffer choice as `write_buffer`.
+- `cargo fmt --all --check`
+- `cargo check -p core --quiet`
+
+## 2026-06-15 — core/src/file_sys/fssystem/nca_file_system_driver.rs + core/src/file_sys/fssystem/alignment_matching_storage.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/file_sys/fssystem/fssystem_nca_file_system_driver.cpp + /home/vricosti/Dev/emulators/zuyu/src/core/file_sys/fssystem/fssystem_alignment_matching_storage.h
+
+### Intentional differences
+- Rust exposes `AlignmentMatchingStorage` and `AlignmentMatchingStoragePooledBuffer` through the `VfsFile` trait so they can be composed in the same storage graph as upstream `VirtualFile`. Upstream gets this through inheritance from `IStorage`; Rust needs an explicit trait impl.
+- Rust `AlignmentMatchingStorage::new(base, data_align, buffer_align)` remains runtime-parameterized rather than using C++ template parameters. The NCA AES-CTR path now passes `NcaHeader::CTR_BLOCK_SIZE` and buffer alignment `1`, matching upstream `AlignmentMatchingStorage<NcaHeader::CtrBlockSize, 1>`.
+
+### Unintentional differences (to fix)
+- Fixed: Rust `NcaFileSystemDriver` no longer returns bare `AesCtrStorage` for AES-CTR NCA file systems. Upstream `CreateAesCtrStorage()` always wraps the AES-CTR storage in alignment matching storage before returning it.
+
+### Missing items
+- Rust still does not model upstream `AlignmentStorageRequirement` in the active AES-CTR branch; the in-tree enum is currently unused. The fixed path covers the observed upstream `AlignmentMatchingStorage<NcaHeader::CtrBlockSize, 1>` return shape for the normal AES-CTR storage.
+
+### Binary layout verification
+- N/A: host filesystem storage-composition change only. No guest-visible raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `NcaFileSystemDriver::CreateAesCtrStorage()` and confirmed the returned `VirtualFile` is the aligned wrapper, not bare `AesCtrStorage`.
+- Re-read upstream `AlignmentMatchingStorage<NcaHeader::CtrBlockSize, 1>::Read/Write/GetSize` in `fssystem_alignment_matching_storage.h` and `AlignmentMatchingStorageImpl::Read/Write` in `.cpp`.
+- Re-read Rust `NcaFileSystemDriver::open_storage_impl`, `AlignmentMatchingStorage::{read,write}`, and the new `VfsFile` impls after the edit.
+- `cargo fmt --all --check`
+- `cargo test -p core alignment_matching_storage -- --nocapture`
+- `cargo test -p core aes_ctr_write_then_read_round_trips_block_aligned_data -- --nocapture`
+- `cargo check -p core --quiet`
+
+## 2026-06-15 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Rust has an env-gated diagnostic hook `RUZU_DUMP_DRAW_CBUFS` in the OpenGL draw path. Upstream has no equivalent. When enabled, Rust logs constant-buffer GPU addresses, sizes, and the first configurable number of u32 words for matching draws, with optional filters `RUZU_DUMP_DRAW_CBUFS_PIPELINE`, `RUZU_DUMP_DRAW_CBUFS_RT_ADDR`, and `RUZU_DUMP_DRAW_CBUFS_VEC4_COUNT`.
+- The hook is inactive by default and does not alter draw state, bound buffers, render targets, shader programs, or guest-visible memory.
+
+### Unintentional differences (to fix)
+- None for this diagnostic entry. The draw synchronization and submit path remains the existing Rust port; this entry only records additional opt-in logging used to investigate MK8D prompt rendering.
+
+### Missing items
+- No upstream diagnostic equivalent exists. The underlying OpenGL rasterizer parity remains tracked by the existing `gl_rasterizer.rs` entries.
+
+### Binary layout verification
+- N/A: logging only. No guest-visible serialized payload or raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `RasterizerOpenGL::Draw`/draw-state synchronization region in `gl_rasterizer.cpp`, including color mask and blend synchronization while investigating the MK8D `Press L + R` render target.
+- Re-read Rust `gl_rasterizer.rs` around the diagnostic placement after `SetupDraw`/constant-buffer descriptor availability to confirm the hook is read-only and default-off.
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-15 — video_core/src/renderer_opengl/gl_buffer_cache.rs + video_core/src/buffer_cache/buffer_cache.rs + video_core/src/buffer_cache/buffer_cache_base.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_buffer_cache.cpp
+
+### Intentional differences
+- Rust still stores backend OpenGL buffer object state (`gpu_handle`, `host_gpu_addr`, residency access) on shared `BufferBase`, while upstream stores it on `OpenGL::Buffer`. The `BindVertexBuffers` runtime entry now receives the `SlotVector<BufferBase>` so it can recover the upstream-equivalent buffer objects from `HostBindings::buffer_ids`.
+- Rust loads `glBufferAddressRangeNV` through the existing dynamic NV function-loader pattern used for `glGetNamedBufferParameterui64vNV`, `glMakeNamedBufferResidentNV`, and `glProgramLocalParametersI4uivNV`. Upstream calls the GLAD symbol directly.
+
+### Unintentional differences (to fix)
+- Fixed: Rust `BufferCacheRuntime::bind_vertex_buffers` no longer ignores the upstream `has_unified_vertex_buffers` branch. When unified vertex buffers are active, it now makes each buffer resident, calls `glBufferAddressRangeNV(GL_VERTEX_ATTRIB_ARRAY_ADDRESS_NV, ...)`, and binds zero buffer names with the recorded strides, matching upstream `BufferCacheRuntime::BindVertexBuffers`.
+
+### Missing items
+- No missing items for this method slice. Single-buffer `BindVertexBuffer` remains represented by the batched `BindVertexBuffers` path used by the current Rust draw flow.
+
+### Binary layout verification
+- N/A: OpenGL host binding state only. No guest-visible raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `BufferCacheRuntime::BindVertexBuffers` and `BufferCacheRuntime::BindStorageBuffer` in `gl_buffer_cache.cpp`, plus `BufferCache<P>::BindHostGeometryBuffers` call context.
+- Re-read Rust `bind_host_geometry_buffers`, `BufferCacheRuntime::initialize_backend_buffer`, `make_buffer_resident`, and `bind_vertex_buffers` after the edit to confirm the unified and non-unified branches follow upstream ordering.
+- `cargo fmt`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-15 — shader_recompiler/src/frontend/translate/integer_set_predicate.rs + shader_recompiler/src/frontend/translate/floating_point_set_predicate.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/integer_set_predicate.cpp + /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_set_predicate.cpp
+
+### Intentional differences
+- Rust keeps the translated `ISETP` and `FSETP` helpers in separate `.rs` files under `frontend/translate`, matching the existing Rust module split for Maxwell instruction translators.
+- Rust now panics on `ISETP.X` instead of silently using the non-extended compare path. Upstream implements `IsetpCompare(..., x)` through `ExtendedIntegerCompare`; Rust does not yet have that parity path. This is intentionally fatal to avoid hidden shader debt.
+
+### Unintentional differences (to fix)
+- Fixed: Rust `ISETP` and `FSETP` wrote the primary result to a generic `dst_pred` helper and the negated result to bits `3..5`. Upstream writes `result_a` to `dest_pred_a` at bits `3..5` and `result_b` to `dest_pred_b` at bits `0..2`.
+- Fixed: Rust ignored `neg_bop_pred` at bit `42` for the boolean-combine predicate. Upstream passes this bit to `GetPred(..., neg_bop_pred != 0)`.
+
+### Missing items
+- `ISETP.X` / `ExtendedIntegerCompare` remains missing and is now an explicit fatal path.
+- `FSETP` still uses the existing Rust FP compare helper; this entry only verifies destination predicate ownership and `neg_bop_pred` parity.
+
+### Binary layout verification
+- N/A: shader IR translation behavior only. No guest-visible raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `ISETP` in `integer_set_predicate.cpp` and `FSETP` in `floating_point_set_predicate.cpp`, including the bitfield ownership for `dest_pred_a`, `dest_pred_b`, `bop_pred`, `neg_bop_pred`, and `ISETP.X`.
+- Re-read Rust `integer_set_predicate.rs` and `floating_point_set_predicate.rs` after the edit to confirm the same destination predicate ownership and negated predicate read.
+- `cargo fmt`
+- `cargo test -p shader_recompiler writes_upstream_predicate_destinations -- --nocapture`
+
+## 2026-06-15 — shader_recompiler/src/frontend/control_flow.rs + shader_recompiler/src/frontend/structured_control_flow.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/control_flow.cpp + /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
+
+### Intentional differences
+- Rust still uses the existing simplified flat CFG and syntax-list structurer rather than upstream's object-pool `CFG`, per-block `Stack`, and intrusive-list `GotoPass`. This is not considered complete parity; it is retained only because the full stack-retention experiment exposed invalid GLSL syntax in other shaders.
+- Rust represents upstream `GotoPass::EliminateAsConditional` for the common forward conditional branch case by carrying an inverted condition marker into `materialize_syntax_conditions`, so blocks between a forward branch and its label are emitted under `if (!goto_cond)`.
+
+### Unintentional differences (to fix)
+- Fixed partially: Rust now records branch targets for stack-token terminators `SYNC`, `BRK`, and `CONT`, and connects conditional terminators to both the popped stack target and the fall-through block. Previously these terminators only fell through, losing the upstream `Stack::Pop(Token)` target entirely.
+- Still wrong: Rust mutates one global analysis stack while discovering block starts. Upstream stores stack state per block/path and `Stack::Pop` returns both a target and a path-local stack with the token removed. The Rust global truncation loses `SSY` tokens needed by conditional fall-through paths; preserving them globally improves the MK8D prompt shader IR but breaks other shaders because the simplified SCF pass emits invalid nested syntax.
+- Still wrong: Rust `structure_cfg` does not port upstream `GotoPass` transforms (`EliminateAsConditional`, `EliminateAsLoop`, `MoveOutward`, `MoveInward`, `Lift`, `IndirectlyRelated` handling). This is the next required parity slice for MK8D title/prompt rendering.
+
+### Missing items
+- Full upstream `Flow::CFG` label/block worklist with path-local stack propagation.
+- Full upstream `GotoPass` and `TranslatePass` statement-tree conversion.
+- Proper handling for unreachable/post-return blocks produced by stack-token control flow.
+
+### Binary layout verification
+- N/A: shader control-flow analysis only. No guest-visible serialized payload or raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `Stack::{Push,Pop,Peek,Remove}`, `OpcodeToken`, `AnalyzeBranch`, and `AnalyzeCondInst` in `control_flow.cpp`.
+- Re-read upstream `GotoPass` entry points and `EliminateAsConditional` behavior in `structured_control_flow.cpp`.
+- Re-read Rust `build_cfg`, `structure_cfg`, and `materialize_syntax_conditions` after the edit.
+- `cargo fmt`
+- `cargo test -p shader_recompiler sync_uses_matching_ssy_stack_target -- --nocapture`
+- `cargo test -p shader_recompiler conditional_forward_branch_bodies_use_inverted_condition -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+- MK8D idle run with null audio wrote dumps under `screenshots/tmp/mk8d-idle-title-20260615-025230`; it reaches the title image, but the prompt render target at `0x51FC90000` is still `510x80` white with alpha zero, so this slice is not sufficient to fix `Press L + R`.
+
+## 2026-06-15 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Extended the existing env-gated `RUZU_TRACE_TEXTURE_BIND_LOG` diagnostic to include `draw_seq` in each texture bind log line. Upstream has no equivalent environment-gated texture-bind log; this remains disabled unless `RUZU_TRACE_TEXTURE_BIND_LOG` is set and does not alter GL state or rendering behavior.
+
+### Unintentional differences (to fix)
+- None introduced. The default path and all GL calls are unchanged when the diagnostic is disabled.
+
+### Missing items
+- No missing production item for this diagnostic slice. The MK8D black/overexposed cinematic root cause remains under investigation.
+
+### Binary layout verification
+- N/A: host-side diagnostic logging only. No guest-visible serialized payload or raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `RasterizerOpenGL::SyncState` and the surrounding OpenGL rasterizer ownership in `gl_rasterizer.cpp`.
+- Re-read Rust texture binding diagnostic block in `RasterizerOpenGL::draw` after the edit.
+- `cargo fmt -- video_core/src/renderer_opengl/gl_rasterizer.rs`
+- `cargo check -p video_core`
+
+## 2026-06-15 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust keeps OpenGL backend upload/readback work in `renderer_opengl/gl_texture_cache.rs`, while upstream expresses the backend-specialized `TextureCache<P>::RefreshContents` template in `texture_cache.h`. This follows the existing Rust crate split between backend-independent texture-cache metadata and the OpenGL runtime.
+
+### Unintentional differences (to fix)
+- Fixed: Rust had a `debug_assert!` requiring a CPU-modified image to be untracked after `mark_refresh_contents_consumed`. Upstream `RefreshContents` clears `ImageFlagBits::CpuModified` and immediately calls `TrackImage(image, image_id)`, so an image may be tracked before the upload path continues.
+
+### Missing items
+- No missing items for this `RefreshContents` flag-order slice. Other OpenGL texture-cache parity gaps remain tracked by existing DIFF.md entries and `.agents/texture_cache_unimplemented_state.md` when fatal unsupported paths are hit.
+
+### Binary layout verification
+- N/A: host texture-cache flags only. No guest-visible serialized payload or raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::RefreshContents`, `TrackImage`, `UntrackImage`, `WriteMemory`, and `PrepareImage` in `texture_cache.h`.
+- Re-read Rust `refresh_contents_with_gpu_readers`, `mark_refresh_contents_consumed`, `write_memory`, and `prepare_image_with_gpu_readers` after the edit.
+- `cargo fmt -- video_core/src/renderer_opengl/gl_texture_cache.rs`
+- `cargo test -p video_core refresh_contents_consumed_tracks_after_clearing_cpu_modified_like_upstream -- --nocapture`
+
+## 2026-06-15 — video_core/src/renderer_opengl/gl_buffer_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_buffer_cache.cpp
+
+### Intentional differences
+- Rust keeps opt-in `RUZU_DUMP_SSBO_BIND*` diagnostics around `BufferCacheRuntime::bind_storage_buffer`. Upstream has no equivalent debug environment controls; this is local investigation instrumentation for MK8D prompt SSBO contents and is inactive unless explicitly enabled.
+- Rust accepts decimal or `0x` hex values for `RUZU_DUMP_SSBO_BIND_LIMIT`, `RUZU_DUMP_SSBO_BIND_OFFSET`, and `RUZU_DUMP_SSBO_BIND_BYTES`, matching the existing ruzu debug-env style in adjacent OpenGL code.
+
+### Unintentional differences (to fix)
+- None introduced. The default diagnostic behavior remains the previous `RUZU_DUMP_SSBO_BIND` limit of 16 dumps and 0x80 bytes per dump.
+
+### Missing items
+- No missing items for this diagnostic slice. It does not complete or alter upstream storage-buffer binding parity.
+
+### Binary layout verification
+- N/A: debug-only host readback/logging. No guest-visible raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `BufferCacheRuntime::BindStorageBuffer` in `gl_buffer_cache.cpp`.
+- Re-read Rust `BufferCacheRuntime::bind_storage_buffer` after the edit to confirm GL binding behavior is unchanged when diagnostics are disabled.
+- Added focused `parse_env_u64_accepts_decimal_and_hex` test.
+
+## 2026-06-15 — shader_recompiler/src/frontend/structured_control_flow.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/control_flow.cpp + /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
+
+### Intentional differences
+- Rust still uses the simplified flat `CfgBlock` structurer rather than upstream's full `GotoPass`/`TranslatePass` statement tree. This entry only ports the predicated-`EXIT` shape needed to keep fall-through code guarded.
+- Rust emits a direct `SyntaxNode::If { cond } -> Return -> EndIf` for predicated `EXIT`. Upstream creates a conditional/virtual CFG block in `AnalyzeCondInst`, then `TranslatePass` emits a return block through the statement tree.
+
+### Unintentional differences (to fix)
+- Fixed: Rust previously kept a predicated `EXIT` block and then continued linearly, so instructions after `EXIT pred` executed unconditionally. Upstream splits predicated `EXIT` into an exit branch and a fall-through label; Rust now emits `if (exit_condition) return;` before continuing to the fall-through block.
+
+### Missing items
+- Full upstream `GotoPass`/`TranslatePass` parity is still missing for complex goto lifting, loop shaping, break handling, and return-block epilogue topology.
+
+### Binary layout verification
+- N/A: shader structured-control-flow emission only. No guest-visible serialized payload or raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `CFG::AnalyzeEXIT` and `CFG::AnalyzeCondInst` in `control_flow.cpp`.
+- Re-read upstream `TranslatePass::Visit(... StatementType::If ...)` and `StatementType::Return` handling in `structured_control_flow.cpp`.
+- Re-read Rust `structure_cfg` and `materialize_syntax_conditions` after the edit.
+- `cargo test -p shader_recompiler conditional_exit_does_not_emit_flat_return -- --nocapture`
+- `cargo test -p shader_recompiler structured_control_flow -- --nocapture`
+- `cargo fmt -- shader_recompiler/src/frontend/structured_control_flow.rs`
+- `cargo build --release --bin ruzu-cmd`
+- MK8D null-audio run through `/tmp/ruzu-run.sh` wrote dumps under `screenshots/tmp/mk8d-cond-exit-present-20260615-044754`; pipeline 36 GLSL now emits `out_attr1.z=word10`, then `if(exit_condition){ return; }`, so the later `-(word10)-1` path no longer executes for the `L/R` glyph instances. Presented frames `2120..2300` reach the title prompt and no longer show the invalid `z0` glyphs in place of `L/R`.
+
+## 2026-06-15 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Rust keeps opt-in `RUZU_TRACE_TEXTURE_BIND_LOG` diagnostics in the OpenGL draw path. Upstream has no equivalent environment-controlled human-readable texture-bind logging; this is local MK8D investigation instrumentation and is inactive by default.
+- The human-readable texture-bind log now follows the same draw-sequence and pipeline filter as the existing `TEXTURE_BIND` raw trace. This keeps diagnostic output bounded without changing normal rendering behavior.
+
+### Unintentional differences (to fix)
+- None introduced. The OpenGL texture binding order and handles are unchanged when diagnostics are disabled.
+
+### Missing items
+- No missing items for this diagnostic slice. OpenGL rasterizer parity gaps remain tracked by existing DIFF.md entries as they are proven.
+
+### Binary layout verification
+- N/A: debug-only host logging. No guest-visible serialized payload or raw-copied struct layout changed.
+
+### Verification
+- Re-read Rust texture binding trace setup and `observe_graphics_texture_binding` in `gl_rasterizer.rs`.
+- Re-read upstream `RasterizerOpenGL::Draw` texture preparation ownership in `gl_rasterizer.cpp` and `gl_graphics_pipeline.cpp`; upstream has no matching diagnostic hook.
+- `cargo fmt -- video_core/src/renderer_opengl/gl_rasterizer.rs`
+- `cargo check -p video_core`
+
+## 2026-06-15 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp + /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust keeps a local raw-compressed copy fallback for OpenGL copies such as `Bc3Unorm` <-> `R32G32B32A32Uint`. Upstream's OpenGL runtime does not have this explicit fallback in `TextureCacheRuntime::CopyImage`; this is an adaptation for GL-driver-invalid raw/compressed transfer shapes observed in MK8D.
+- For raw-compressed pairs accepted by `raw_compressed_copy_fallback_format`, Rust now performs the fallback before calling `glCopyImageSubData`. This avoids deliberately issuing a GL-invalid copy and then recovering from the debug callback/error state.
+
+### Unintentional differences (to fix)
+- Fixed: Rust's compressed-block fallback lookup used `compressed_copy_fallback_format(dst_format, dst_format)` internally. It now compares `dst_format` and `src_format`, matching the fallback decision made before the copy loop.
+- Fixed: Rust previously called `glCopyImageSubData` first for raw-compressed fallback pairs, producing `GL_INVALID_VALUE` for MK8D copies like `Bc3Unorm` <-> `R32G32B32A32Uint` 1x1 block transfers. Rust now handles those known pairs directly through the implemented fallback path.
+
+### Missing items
+- Full upstream-equivalent copy policy remains broader than this slice. Any future raw/compressed pair not accepted by `raw_compressed_copy_fallback_format` still needs a proven implementation rather than a silent approximation.
+
+### Binary layout verification
+- N/A: host OpenGL texture transfer path only. No guest-visible serialized payload or raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `TextureCacheRuntime::CopyImage`, `CanImageBeCopied`, and `TextureCache<P>::CopyImage`.
+- Re-read Rust `copy_image`, `copy_image_direct_raw`, `copy_compressed_block_fallback`, and `copy_raw_compressed_block_fallback` after the edit.
+- `cargo fmt -- video_core/src/renderer_opengl/gl_texture_cache.rs`
+- `cargo test -p video_core raw_compressed_copy_fallback -- --nocapture`
+
+## 2026-06-15 — video_core/src/renderer_opengl/gl_query_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache.h + /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_query_cache.cpp
+
+### Intentional differences
+- Rust keeps the upstream `CounterStreamBase`/`QueryCacheLegacy` ownership model through Rust structs and handles rather than C++ templates/inheritance. The stream state still belongs to the OpenGL query cache counterpart.
+
+### Unintentional differences (to fix)
+- Fixed: Rust `slice_current_stream` previously constructed the replacement `HostCounter` before ending the current one, so `HostCounter::new` called `glBeginQuery` while the same GL target was still active. Upstream `CounterStreamBase::Current()` calls `current->EndQuery()`, moves it to `last`, and only then calls `cache.Counter(last, type)`.
+- Fixed: Rust `reset_stream` previously created the replacement counter before ending the current stream counter. Upstream `CounterStreamBase::Reset()` ends the current query before immediately starting the replacement query.
+
+### Missing items
+- No missing item for this query stream ordering slice. Broader query cache parity remains limited to already documented Rust adaptations around async jobs, handle storage, and test scaffolding.
+
+### Binary layout verification
+- N/A: OpenGL host query lifetime only. No guest-visible raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `CounterStreamBase::Reset()` and `CounterStreamBase::Current()` in `query_cache.h`.
+- Re-read upstream `HostCounter::HostCounter()` and `HostCounter::EndQuery()` in `gl_query_cache.cpp`.
+- Re-read Rust `reset_stream`, `slice_current_stream`, `HostCounter::new`, and `HostCounter::end_query` after the edit.
+- `cargo fmt -- video_core/src/renderer_opengl/gl_query_cache.rs`
+- `cargo test -p video_core renderer_opengl::gl_query_cache -- --nocapture`
+- `cargo check -p video_core`
+- `cargo build --release --bin ruzu-cmd`
+- MK8D null-audio run through `/tmp/ruzu-run.sh` wrote dumps under `screenshots/tmp/mk8d-visual-after-queryfix-20260615-065745`; `present_2400`/`present_3000`/`present_3600` are non-black title/prompt frames, `present_4200`/`present_6000`/`present_7200` are black fade/cinematic-transition frames. The prior `GL_INVALID_OPERATION in glBeginQuery{Indexed}` no longer appears in the filtered log.
+
+## 2026-06-15 — video_core/src/host1x/vic.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/vic.cpp + /home/vricosti/Dev/emulators/zuyu/src/video_core/cdma_pusher.cpp
+
+### Intentional differences
+- Rust keeps the existing `VicRegisters` storage as a flat `[u32; VIC_NUM_REGS]` plus accessors instead of upstream's anonymous C++ struct/union register layout. Constants such as `VIC_REG_CONFIG_STRUCT_OFFSET` still use upstream byte offsets divided by 4.
+- Rust bounds-checks the register array write before storing `arg`; upstream writes `regs.reg_array[method]` directly. The CDMA method source is expected to be valid, and the bounds check only prevents host memory corruption on malformed input.
+
+### Unintentional differences (to fix)
+- Fixed: Rust `Vic::process_method` previously divided the CDMA method by 4 before writing `regs.reg_array`. Upstream `CDmaPusher::ExecuteCommand` passes a method index to `Vic::ProcessMethod`, and upstream `Vic::ProcessMethod` writes `regs.reg_array[method]`. Rust now stores at `regs.reg_array[method]`.
+- Fixed: Rust `VicMethod` previously stored upstream byte offsets (`0x300`, `0x708`, etc.) while `Vic::process_method` compared against the raw CDMA method index. Upstream compares `method * sizeof(u32)` against byte-offset enum values. Rust now stores `VicMethod` values as register indices (`byte_offset / 4`), matching the method representation already used by CDMA and by the `VIC_REG_*` constants.
+
+### Missing items
+- No missing item for this method-index ownership slice. Broader VIC pixel-format/SIMD/FFmpeg parity remains limited by already documented Rust adaptations and must be audited separately if implicated by MK8D cinematic output.
+
+### Binary layout verification
+- N/A for this edit: the guest-visible VIC config structs were not changed. The register-index convention was verified against upstream CDMA/VIC call ownership.
+
+### Verification
+- Re-read upstream `CDmaPusher::ProcessEntries`, `CDmaPusher::ExecuteCommand`, and `Vic::ProcessMethod`.
+- Re-read Rust `CDmaPusherInner::execute_command`, `VicMethod`, and `Vic::process_method` after the edit.
+- `cargo fmt -- video_core/src/host1x/vic.rs`
+- `cargo test -p video_core process_method_uses_cdma_method_index_like_upstream -- --nocapture`
+- MK8D null-audio run through `/tmp/ruzu-run.sh` wrote dumps under `screenshots/tmp/mk8d-vic-method-index-20260615-071738` after the first register-write fix but before the `VicMethod` enum-index fix; prompt frames stayed visible and cinematic frames stayed black. A post-enum-fix MK8D validation run is still required.
+
+## 2026-06-15 — hid_core/src/resources/npad/npad.rs and core/src/hle/service/hid/hid_server.rs vs /home/vricosti/Dev/emulators/zuyu/src/hid_core/resources/npad/npad.cpp + /home/vricosti/Dev/emulators/zuyu/src/hid_core/resources/npad/npad.h + /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hid/hid_server.cpp
+
+### Intentional differences
+- Rust keeps `ResultCode` and IPC `Result` conversion split between `hid_core` and `core`, while upstream returns `Result` through both `IHidServer` and `NPad`. The ownership boundary now matches upstream: the service handler delegates LR-assignment state changes to `NPad`, and `NPad` owns the idempotent get-before-set behavior.
+
+### Unintentional differences (to fix)
+- Fixed: `IHidServer::StartLrAssignmentMode` and `StopLrAssignmentMode` previously wrote `npad_resource.SetLrAssignmentMode` directly and always returned success. Upstream delegates to `NPad::{Start,Stop}LrAssignmentMode`, which first calls `GetLrAssignmentMode`, only writes when the state changes, and propagates lookup errors.
+
+### Missing items
+- `NPad::SetNpadMode` remains a known incomplete parity area: Rust still lacks upstream controller ownership needed for JoyConDual split/merge (`controller_data`, `DisconnectNpad`, `UpdateControllerAt`, and `HidCore::GetFirstDisconnectedNpadId`). This is still relevant to MK8D prompt/controller-assignment behavior and must not be considered complete.
+
+### Binary layout verification
+- N/A: HID controller-assignment state and IPC result flow only. No raw guest-visible struct layout changed.
+
+### Verification
+- Re-read upstream `NPad::StartLrAssignmentMode`, `NPad::StopLrAssignmentMode`, and declarations in `npad.h`.
+- Re-read upstream `IHidServer::StartLrAssignmentMode` and `IHidServer::StopLrAssignmentMode`.
+- Re-read Rust `NPad::{start_lr_assignment_mode,stop_lr_assignment_mode}` and the two HID service handlers after the edit.
+- `cargo fmt -- hid_core/src/resources/npad/npad.rs core/src/hle/service/hid/hid_server.rs`
+- `cargo test -p hid_core lr_assignment_mode_start_stop_matches_upstream -- --nocapture`
+- `cargo check -p core`
+
+## 2026-06-15 — hid_core/src/resources/npad/npad.rs + hid_core/src/resource_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/hid_core/resources/npad/npad.h + /home/vricosti/Dev/emulators/zuyu/src/hid_core/resources/npad/npad.cpp
+
+### Intentional differences
+- Rust stores `HIDCore` in `NPad` as `Option<Arc<parking_lot::Mutex<HIDCore>>>` so unit tests can keep using `NPad::new()` without constructing a full resource manager. The runtime path uses `NPad::new_with_hid_core(...)`, matching upstream ownership where `NPad` is constructed with `Core::HID::HIDCore&`.
+- Rust still uses the existing simple/scripted button input shim as a stand-in for upstream input-device callbacks. The shim is ORed into the `EmulatedController` button state rather than replacing controller ownership.
+
+### Unintentional differences (to fix)
+- Fixed: `NPad::on_update` previously populated only `npad_entry[0]` as a synthetic always-connected Fullkey controller. Upstream iterates `controller_data[aruid_index][i]`, checks each controller's `GetNpadStyleIndex()` and `IsConnected()`, and skips disconnected entries. Rust now iterates the 10 `HIDCore` emulated controllers in runtime builds and skips disconnected/None entries.
+
+### Missing items
+- Rust still lacks upstream's full `controller_data[aruid][npad]` storage, callback registration/deletion, per-controller `is_active`, per-controller cached `npad_pad_state`/`npad_libnx_state`/`npad_trigger_state`, and `RequestPadStateUpdate`.
+- Only the Fullkey-like `OnUpdate` branch is represented by this slice. Handheld, JoyconDual, JoyconLeft, JoyconRight, GameCube trigger, Palma, and full AbstractPad integration remain missing.
+- `InitNewlyAddedController`, `UpdateControllerAt`, `DisconnectNpad`, and full JoyCon split/merge `SetNpadMode` parity remain incomplete.
+
+### Binary layout verification
+- PASS for this slice: no NPad shared-memory struct layout changed. The edit changes which existing shared-memory slots are written, not the raw layout of `NpadInternalState` or LIFO payloads.
+
+### Verification
+- Re-read upstream `NPad` constructor declaration and `controller_data` field in `npad.h`.
+- Re-read upstream `NPad::NPad` and `NPad::OnUpdate` in `npad.cpp`.
+- Re-read Rust `NPad::{new_with_hid_core,on_update}` and `ResourceManager::initialize_ahid_sampler` after the edit.
+- `cargo fmt -- hid_core/src/resources/npad/npad.rs hid_core/src/resource_manager.rs`
+- `cargo test -p hid_core on_update_uses_hid_core_connected_controllers -- --nocapture`
+- `cargo check -p core`
+
+## 2026-06-15 — video_core/src/buffer_cache/buffer_cache.rs + video_core/src/buffer_cache/buffer_cache_base.rs + video_core/src/renderer_opengl/gl_buffer_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/buffer_cache/buffer_cache.h + /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_buffer_cache.h + /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_buffer_cache.cpp
+
+### Intentional differences
+- Rust trait `BufferCacheRuntime::bind_mapped_uniform_buffer` takes the UBO bytes and returns `bool` instead of returning a mutable span. This keeps the runtime-owned stream-buffer write and `glBindBufferRange` in the OpenGL-owned file while avoiding a borrowed mapped-span lifetime through the generic trait.
+- Rust implements the GLSL fast-uniform path with `gl::BindBufferRange` and `gl::NamedBufferSubData`. The assembly-shader NV path remains constrained by the existing Rust renderer behavior, where `bind_uniform_buffer` already skips assembly UBO binding.
+
+### Unintentional differences (to fix)
+- Fixed: Rust previously exposed `bind_mapped_uniform_buffer` as an unused `Option<Vec<u8>>` default that the caller only checked with `is_some()`. Upstream requests a mapped stream-buffer span, copies guest UBO data into it, and binds that stream buffer. Rust now owns `StreamBuffer` in `BufferCacheRuntime`, copies the UBO bytes into the mapped ring, and binds it with `glBindBufferRange`.
+- Fixed: Rust previously called `push_fast_uniform_buffer` without binding the fast UBO when the current binding was not already the fast buffer or when the size changed. Upstream performs that conditional bind before pushing. Rust now mirrors that ordering.
+- Fixed: Rust previously left `push_fast_uniform_buffer`/`bind_fast_uniform_buffer` as trait no-ops for OpenGL. Rust now creates/destroys `fast_uniforms` and implements the GLSL fast UBO upload path.
+- Fixed: Rust previously missed upstream's OpenGL copy-bind dirty marker for non-zero uniform offsets when `SupportsNonZeroUniformOffset()` is false. Rust now re-dirties that UBO index in the same condition.
+
+### Missing items
+- The NV assembly-shader UBO copy-buffer path (`copy_uniforms`, `copy_compute_uniforms`, and `glBindBufferRangeNV`/`glProgramBufferParametersIuivNV` exact behavior) is still not represented in Rust. This is not the active MK8D path on this test machine, but it remains a renderer parity item tied to the broader GLASM backend.
+
+### Binary layout verification
+- N/A: this slice changes host OpenGL buffer ownership and binding/upload ordering only. No guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `BufferCache<P>::BindHostGraphicsUniformBuffer` in `buffer_cache.h`.
+- Re-read upstream `OpenGL::BufferCacheRuntime::{BindFastUniformBuffer,PushFastUniformBuffer,BindMappedUniformBuffer}` in `gl_buffer_cache.h`.
+- Re-read upstream `BufferCacheRuntime::BufferCacheRuntime` in `gl_buffer_cache.cpp`.
+- Re-read Rust `bind_host_graphics_uniform_buffer`, the `BufferCacheRuntime` trait methods, and OpenGL `BufferCacheRuntime` after the edit.
+- `cargo fmt -- video_core/src/buffer_cache/buffer_cache.rs video_core/src/buffer_cache/buffer_cache_base.rs video_core/src/renderer_opengl/gl_buffer_cache.rs`
+- `cargo check -p video_core`
+- `cargo test -p video_core renderer_opengl::gl_buffer_cache::tests::mapped_uniform_stream_buffer_owns_upstream_fast_ubo_path`
+- MK8D run through `/tmp/ruzu-run.sh` without `RUZU_UBO_FORCE_REFRESH`, audio active, wrote dumps under `screenshots/tmp/mk8d-stream-ubo-final-20260615-194825`. Present PPMs 3000..3800 were non-black (`black=0.0528%`, mean RGB `(134,116,114)`), and async `PRESENT_TEXTURE` traces stayed at `rgb_nonzero=64`, matching the previous force-refresh diagnostic without requiring the force-refresh workaround.
+
+## 2026-06-15 — shader_recompiler/src/backend/glsl/glsl_emit_context.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/glsl_emit_context.cpp
+
+### Intentional differences
+- Rust keeps GLSL header construction in `EmitContext::setup_extensions(program)` rather than C++ `EmitContext::SetupExtensions()`, matching the existing Rust file organization.
+
+### Unintentional differences (to fix)
+- Fixed: Rust did not emit `#extension GL_EXT_texture_shadow_lod : enable` when `program.info.uses_shadow_lod` and `profile.support_gl_texture_shadow_lod` were both true. Upstream emits that extension under the same guard. Without it, MK8D cinematic shaders failed to compile on `textureLod(sampler2DArrayShadow, vec4, float)`.
+
+### Missing items
+- Other upstream GLSL extension guards in `SetupExtensions()` still need a broader audit against Rust `setup_extensions`; this slice fixes only the confirmed shadow-lod cinematic failure.
+
+### Binary layout verification
+- N/A: shader header emission only.
+
+### Verification
+- Re-read upstream `EmitContext::SetupExtensions()` in `glsl_emit_context.cpp`.
+- Re-read Rust `EmitContext::setup_extensions()` after the edit.
+- `cargo fmt -- shader_recompiler/src/backend/glsl/glsl_emit_context.rs`
+- `cargo test -p shader_recompiler backend::glsl::glsl_emit_context::tests::shadow_lod_extension_header_matches_upstream_guard`
+- `cargo check -p shader_recompiler`
+
+## 2026-06-15 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Rust has opt-in async trace instrumentation for MK8D render-target/source attribution. This diagnostic code has no upstream equivalent and is guarded by `RUZU_TRACE_TEXTURE_BIND_RING`.
+- The sampled-texture diagnostic now skips `glGetTextureSubImage(... RGBA ...)` for compressed, depth, or multisample textures. This avoids GL debug spam from the diagnostic probe and does not affect rendering or upstream-owned rasterizer behavior.
+
+### Unintentional differences (to fix)
+- None introduced by this slice. This is diagnostic-only instrumentation.
+
+### Missing items
+- No upstream rendering behavior was ported in this slice.
+
+### Binary layout verification
+- N/A: host-only OpenGL trace instrumentation; no guest-visible data layout changed.
+
+### Verification
+- Re-read upstream `gl_rasterizer.cpp` ownership/header area to confirm the probe has no upstream behavior counterpart.
+- Re-read Rust `observe_graphics_texture_binding` after the edit.
+- `cargo fmt -- video_core/src/renderer_opengl/gl_rasterizer.rs`
+- `cargo check -p video_core`
+
+## 2026-06-15 — video_core/src/renderer_opengl/gl_rasterizer.rs + video_core/src/renderer_opengl/gl_fence_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp + /home/vricosti/Dev/emulators/zuyu/src/video_core/fence_manager.h
+
+### Intentional differences
+- `FenceManagerOpenGL::new_for_test()` forces stubbed fences only in Rust unit tests, because those tests run without a loaded OpenGL context. Runtime `FenceManagerOpenGL::new()` still creates real backend fences when upstream would.
+
+### Unintentional differences (to fix)
+- Fixed: Rust `RasterizerOpenGL::signal_reference()` called `FenceManager::signal_ordering()`, which only released old fences and accumulated flushes. Upstream `RasterizerOpenGL::WaitForIdle()` calls `SignalReference()`, and upstream `FenceManager::SignalReference()` calls `SignalFence(do_nothing)`, queuing a backend fence and running the same flush/invalidate ordering as other fences. Rust now calls `FenceManager::signal_reference()` with the OpenGL backend callbacks.
+
+### Missing items
+- No remaining missing item identified in this `SignalReference` slice.
+
+### Binary layout verification
+- N/A: host OpenGL fence ordering only; no guest-visible raw payload layout changed.
+
+### Verification
+- Re-read upstream `RasterizerOpenGL::WaitForIdle()` in `gl_rasterizer.cpp`.
+- Re-read upstream `FenceManager::{SignalOrdering,SignalReference,SignalFence}` in `fence_manager.h`.
+- Re-read Rust `RasterizerOpenGL::{wait_for_idle,signal_reference}` and `FenceManager::signal_reference` after the edit.
+- `cargo fmt -- video_core/src/renderer_opengl/gl_rasterizer.rs video_core/src/renderer_opengl/gl_fence_manager.rs`
+- `cargo test -p video_core signal_reference -- --nocapture`
 - `cargo check -p video_core`

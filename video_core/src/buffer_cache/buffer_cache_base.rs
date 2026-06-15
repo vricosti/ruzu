@@ -8,7 +8,10 @@
 //! and type definitions) and `buffer_cache.rs` (method implementations).
 
 use common::slot_vector::SlotId;
+use common::slot_vector::SlotVector;
 use common::types::VAddr;
+
+use super::buffer_base::BufferBase;
 
 // ---------------------------------------------------------------------------
 // Re-export BufferId
@@ -373,10 +376,100 @@ impl Default for OverlapResult {
 pub struct StagingBufferRef {
     /// Opaque buffer handle (backend interprets this as a buffer ID for copy operations).
     pub buffer: BufferId,
+    /// Backend-native buffer handle used by runtimes whose staging buffers do not
+    /// live in the generic slot vector.
+    pub gpu_handle: u32,
     /// Offset within the staging buffer.
     pub offset: u64,
-    /// Mapped host-visible memory span for CPU access.
-    pub mapped_span: Vec<u8>,
+    /// Index in the backend staging allocation pool.
+    pub index: usize,
+    mapped_ptr: *mut u8,
+    mapped_size: usize,
+    sync: *mut gl::types::GLsync,
+    host_mapping: Option<Vec<u8>>,
+}
+
+impl StagingBufferRef {
+    /// Host-backed fallback used by non-GL test runtimes.
+    pub fn host(size: usize) -> Self {
+        let mut host_mapping = vec![0u8; size];
+        let mapped_ptr = host_mapping.as_mut_ptr();
+        Self {
+            buffer: BufferId::invalid(),
+            gpu_handle: 0,
+            offset: 0,
+            index: usize::MAX,
+            mapped_ptr,
+            mapped_size: size,
+            sync: std::ptr::null_mut(),
+            host_mapping: Some(host_mapping),
+        }
+    }
+
+    /// Backend-backed mapping. The caller owns the lifetime contract for
+    /// `mapped_ptr` and `sync`, matching upstream `StagingBufferMap`.
+    pub unsafe fn from_mapped_backend(
+        buffer: BufferId,
+        gpu_handle: u32,
+        offset: u64,
+        index: usize,
+        mapped_ptr: *mut u8,
+        mapped_size: usize,
+        sync: *mut gl::types::GLsync,
+    ) -> Self {
+        Self {
+            buffer,
+            gpu_handle,
+            offset,
+            index,
+            mapped_ptr,
+            mapped_size,
+            sync,
+            host_mapping: None,
+        }
+    }
+
+    pub fn mapped_span(&self) -> &[u8] {
+        if let Some(host_mapping) = &self.host_mapping {
+            return host_mapping;
+        }
+        if self.mapped_size == 0 {
+            return &[];
+        }
+        assert!(
+            !self.mapped_ptr.is_null(),
+            "staging buffer has a non-zero mapped size but no mapped pointer"
+        );
+        unsafe { std::slice::from_raw_parts(self.mapped_ptr, self.mapped_size) }
+    }
+
+    pub fn mapped_span_mut(&mut self) -> &mut [u8] {
+        if let Some(host_mapping) = &mut self.host_mapping {
+            return host_mapping;
+        }
+        if self.mapped_size == 0 {
+            return &mut [];
+        }
+        assert!(
+            !self.mapped_ptr.is_null(),
+            "staging buffer has a non-zero mapped size but no mapped pointer"
+        );
+        unsafe { std::slice::from_raw_parts_mut(self.mapped_ptr, self.mapped_size) }
+    }
+}
+
+impl Drop for StagingBufferRef {
+    fn drop(&mut self) {
+        if self.sync.is_null() {
+            return;
+        }
+        unsafe {
+            if !(*self.sync).is_null() {
+                gl::DeleteSync(*self.sync);
+            }
+            *self.sync = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +485,13 @@ pub struct StagingBufferRef {
 /// Method signatures are derived from the union of methods called on `runtime`
 /// in upstream `buffer_cache.h` (template method implementations).
 pub trait BufferCacheRuntime {
+    /// Initialize backend-specific buffer state after the backend handle is
+    /// created.
+    ///
+    /// Upstream OpenGL performs this in `OpenGL::Buffer::Buffer(runtime, ...)`,
+    /// including bindless GPU-address discovery.
+    fn initialize_backend_buffer(&mut self, _buffer: &mut BufferBase) {}
+
     // -- Frame lifecycle --
 
     /// Called once per frame to allow the runtime to reclaim resources.
@@ -464,7 +564,9 @@ pub trait BufferCacheRuntime {
     fn copy_buffer(
         &mut self,
         dst_buffer: BufferId,
+        dst_gpu_handle: u32,
         src_buffer: BufferId,
+        src_gpu_handle: u32,
         copies: &[BufferCopy],
         barrier: bool,
         can_reorder_upload: bool,
@@ -473,7 +575,14 @@ pub trait BufferCacheRuntime {
     /// Clear a buffer region to a uniform value.
     ///
     /// Upstream: `Runtime::ClearBuffer(buffer, offset, size, value)`
-    fn clear_buffer(&mut self, buffer: BufferId, offset: u32, size: u64, value: u32);
+    fn clear_buffer(
+        &mut self,
+        buffer: BufferId,
+        gpu_handle: u32,
+        offset: u32,
+        size: u64,
+        value: u32,
+    );
 
     // -- Index buffer binding --
 
@@ -498,9 +607,13 @@ pub trait BufferCacheRuntime {
     /// Bind vertex buffers collected in `HostBindings`.
     ///
     /// Upstream: `Runtime::BindVertexBuffers(host_bindings)`.
-    /// `gpu_handles` provides the per-binding GPU buffer names in the same
-    /// order as `bindings.buffer_ids`.
-    fn bind_vertex_buffers(&mut self, bindings: &HostBindings, gpu_handles: &[u32]);
+    /// `buffers` provides the backend buffer objects referenced by
+    /// `bindings.buffer_ids`, matching upstream's `HostBindings<Buffer>`.
+    fn bind_vertex_buffers(
+        &mut self,
+        bindings: &HostBindings,
+        buffers: &mut SlotVector<BufferBase>,
+    );
 
     // -- Uniform buffer binding (graphics) --
 
@@ -554,8 +667,7 @@ pub trait BufferCacheRuntime {
         &mut self,
         stage: usize,
         binding_index: u32,
-        buffer: BufferId,
-        gpu_handle: u32,
+        buffer: &mut BufferBase,
         offset: u32,
         size: u32,
         is_written: bool,
@@ -613,8 +725,7 @@ pub trait BufferCacheRuntime {
     fn bind_compute_storage_buffer(
         &mut self,
         binding_index: u32,
-        buffer: BufferId,
-        gpu_handle: u32,
+        buffer: &mut BufferBase,
         offset: u32,
         size: u32,
         is_written: bool,
@@ -646,16 +757,16 @@ pub trait BufferCacheRuntime {
     /// Upstream (OpenGL): `Runtime::PushFastUniformBuffer(stage, binding_index, data)`
     fn push_fast_uniform_buffer(&mut self, _stage: usize, _binding_index: u32, _data: &[u8]) {}
 
-    /// Bind a mapped uniform buffer, returning a host-visible span to write into.
+    /// Bind a mapped uniform buffer and copy uniform data into it.
     ///
     /// Upstream (OpenGL): `Runtime::BindMappedUniformBuffer(stage, binding_index, size)`
     fn bind_mapped_uniform_buffer(
         &mut self,
         _stage: usize,
         _binding_index: u32,
-        _size: u32,
-    ) -> Option<Vec<u8>> {
-        None
+        _data: &[u8],
+    ) -> bool {
+        false
     }
 }
 

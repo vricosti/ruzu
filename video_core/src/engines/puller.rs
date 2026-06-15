@@ -381,6 +381,63 @@ impl Puller {
         self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
     }
 
+    fn stop_unimplemented_engine(
+        &self,
+        caller: &str,
+        engine: EngineID,
+        subchannel: u32,
+        method: u32,
+        argument: Option<u32>,
+        amount: Option<u32>,
+        methods_pending: Option<u32>,
+    ) -> ! {
+        #[cfg(not(test))]
+        {
+            let path = std::path::Path::new(".agents/puller_unimplemented_state.md");
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let entry = format!(
+                "\n## Puller unsupported engine path\n\
+                 - caller: {}\n\
+                 - upstream: video_core/engines/puller.cpp uses UNIMPLEMENTED_MSG for unsupported engine dispatch\n\
+                 - engine: 0x{:04X}\n\
+                 - subchannel: {}\n\
+                 - method: 0x{:X}\n\
+                 - argument: {}\n\
+                 - amount: {}\n\
+                 - methods_pending: {}\n",
+                caller,
+                engine.raw(),
+                subchannel,
+                method,
+                argument
+                    .map(|value| format!("0x{value:X}"))
+                    .unwrap_or_else(|| "n/a".to_string()),
+                amount
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                methods_pending
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+            );
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut file| {
+                    use std::io::Write;
+                    file.write_all(entry.as_bytes())
+                });
+        }
+        panic!(
+            "{} unsupported engine 0x{:04X} on subchannel {}",
+            caller,
+            engine.raw(),
+            subchannel
+        );
+    }
+
     pub fn channel_state_ptr(&self) -> *mut ChannelState {
         self.channel_state
     }
@@ -562,7 +619,6 @@ impl Puller {
     pub fn call_engine_method(&mut self, method_call: &MethodCall) {
         let engine = self.bound_engines[method_call.subchannel as usize];
 
-        let channel_state = unsafe { &mut *self.channel_state };
         let trace_idx = PULLER_ENGINE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
         if should_trace_dma_flow() && trace_idx < 96 {
             log::info!(
@@ -583,6 +639,7 @@ impl Puller {
         }
         match engine {
             EngineID::MaxwellB => {
+                let channel_state = unsafe { &mut *self.channel_state };
                 if let Some(engine) = channel_state.maxwell_3d.as_mut() {
                     engine.call_method(
                         method_call.method,
@@ -602,6 +659,7 @@ impl Puller {
                 }
             }
             EngineID::KeplerInlineToMemoryB => {
+                let channel_state = unsafe { &mut *self.channel_state };
                 if let Some(engine) = channel_state.kepler_memory.as_mut() {
                     engine.call_method(
                         method_call.method,
@@ -611,6 +669,7 @@ impl Puller {
                 }
             }
             EngineID::FermiTwodA => {
+                let channel_state = unsafe { &mut *self.channel_state };
                 if let Some(engine) = channel_state.fermi_2d.as_mut() {
                     engine.call_method(
                         method_call.method,
@@ -620,6 +679,7 @@ impl Puller {
                 }
             }
             EngineID::KeplerComputeB => {
+                let channel_state = unsafe { &mut *self.channel_state };
                 if let Some(engine) = channel_state.kepler_compute.as_mut() {
                     engine.call_method(
                         method_call.method,
@@ -629,6 +689,7 @@ impl Puller {
                 }
             }
             EngineID::MaxwellDmaCopyA => {
+                let channel_state = unsafe { &mut *self.channel_state };
                 if let Some(engine) = channel_state.maxwell_dma.as_mut() {
                     engine.call_method(
                         method_call.method,
@@ -638,9 +699,14 @@ impl Puller {
                 }
             }
             _ => {
-                log::warn!(
-                    "Puller::call_engine_method: unimplemented engine 0x{:04X}",
-                    engine.raw()
+                self.stop_unimplemented_engine(
+                    "Puller::CallEngineMethod",
+                    engine,
+                    method_call.subchannel,
+                    method_call.method,
+                    Some(method_call.argument),
+                    None,
+                    Some(method_call.method_count),
                 );
             }
         }
@@ -659,37 +725,46 @@ impl Puller {
     ) {
         let engine = self.bound_engines[subchannel as usize];
 
-        let channel_state = unsafe { &mut *self.channel_state };
         match engine {
             EngineID::MaxwellB => {
+                let channel_state = unsafe { &mut *self.channel_state };
                 if let Some(engine) = channel_state.maxwell_3d.as_mut() {
                     engine.call_multi_method(method, base_start, amount, methods_pending);
                 }
             }
             EngineID::KeplerInlineToMemoryB => {
+                let channel_state = unsafe { &mut *self.channel_state };
                 if let Some(engine) = channel_state.kepler_memory.as_mut() {
                     engine.call_multi_method(method, base_start, amount, methods_pending);
                 }
             }
             EngineID::FermiTwodA => {
+                let channel_state = unsafe { &mut *self.channel_state };
                 if let Some(engine) = channel_state.fermi_2d.as_mut() {
                     engine.call_multi_method(method, base_start, amount, methods_pending);
                 }
             }
             EngineID::KeplerComputeB => {
+                let channel_state = unsafe { &mut *self.channel_state };
                 if let Some(engine) = channel_state.kepler_compute.as_mut() {
                     engine.call_multi_method(method, base_start, amount, methods_pending);
                 }
             }
             EngineID::MaxwellDmaCopyA => {
+                let channel_state = unsafe { &mut *self.channel_state };
                 if let Some(engine) = channel_state.maxwell_dma.as_mut() {
                     engine.call_multi_method(method, base_start, amount, methods_pending);
                 }
             }
             _ => {
-                log::warn!(
-                    "Puller::call_engine_multi_method: unimplemented engine 0x{:04X}",
-                    engine.raw()
+                self.stop_unimplemented_engine(
+                    "Puller::CallEngineMultiMethod",
+                    engine,
+                    subchannel,
+                    method,
+                    None,
+                    Some(amount),
+                    Some(methods_pending),
                 );
             }
         }
@@ -789,7 +864,15 @@ impl Puller {
                 }
             }
             _ => {
-                log::error!("Unimplemented engine {:04X}", method_call.argument);
+                self.stop_unimplemented_engine(
+                    "Puller::ProcessBindMethod",
+                    eid,
+                    method_call.subchannel,
+                    method_call.method,
+                    Some(method_call.argument),
+                    None,
+                    Some(method_call.method_count),
+                );
             }
         }
     }
@@ -899,7 +982,7 @@ impl Puller {
                 if !retry {
                     break;
                 }
-                self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(false));
+                self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(true));
             }
         }
     }
@@ -914,7 +997,7 @@ impl Puller {
         while word != value {
             self.regs.set_acquire_active(1);
             self.regs.set_acquire_value(value);
-            self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(false));
+            self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(true));
             word = self.read_gpu_u32(addr);
             // TODO(kemathe73) figure out how to do the acquire_timeout
             self.regs.set_acquire_mode(0);
@@ -1132,37 +1215,39 @@ mod tests {
     }
 
     #[test]
-    fn bound_engines_store_raw_values_like_upstream_array() {
+    fn unknown_bind_engine_stores_raw_value_then_stops_like_upstream() {
         let mut puller = Puller::default();
 
         assert_eq!(puller.bound_engines[0].raw(), 0);
 
-        puller.process_bind_method(&MethodCall::new(
-            BufferMethods::BindObject as u32,
-            0x1234,
-            2,
-            1,
-        ));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            puller.process_bind_method(&MethodCall::new(
+                BufferMethods::BindObject as u32,
+                0x1234,
+                2,
+                1,
+            ));
+        }));
 
+        assert!(result.is_err());
         assert_eq!(puller.bound_engines[2].raw(), 0x1234);
     }
 
     #[test]
-    fn semaphore_trigger_acquire_gequal_updates_acquire_registers_before_wait() {
+    #[should_panic(expected = "Puller::CallEngineMethod unsupported engine")]
+    fn unknown_engine_method_stops_like_upstream() {
         let mut puller = Puller::default();
-        let fake = Box::new(FakeRasterizer::default());
-        let releases = fake.release_fence_calls.clone();
-        let raw: *const dyn RasterizerInterface = Box::leak(fake);
-        puller.bind_rasterizer(unsafe { &*raw });
-        puller.regs.reg_array[0x06] = 2;
-        puller.regs.reg_array[0x07] = GpuSemaphoreOperation::AcquireGequal as u32;
+        puller.bound_engines[3] = EngineID::from_raw(0x1234);
 
-        puller.process_semaphore_trigger_method();
+        puller.call_engine_method(&MethodCall::new(0x40, 0xCAFE_BABE, 3, 1));
+    }
 
-        assert_eq!(puller.regs.acquire_source(), 1);
-        assert_eq!(puller.regs.acquire_value(), 2);
-        assert_eq!(puller.regs.acquire_active(), 1);
-        assert_eq!(puller.regs.acquire_mode(), 1);
-        assert_eq!(*releases.lock().unwrap(), vec![false]);
+    #[test]
+    #[should_panic(expected = "Puller::CallEngineMultiMethod unsupported engine")]
+    fn unknown_engine_multi_method_stops_like_upstream() {
+        let mut puller = Puller::default();
+        puller.bound_engines[4] = EngineID::from_raw(0x1234);
+
+        puller.call_engine_multi_method(0x40, 4, &[0xCAFE_BABE], 1, 1);
     }
 }

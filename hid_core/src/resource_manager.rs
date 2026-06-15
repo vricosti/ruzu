@@ -869,7 +869,12 @@ impl ResourceManager {
         self.debug_mouse = Some(Arc::new(Mutex::new(DebugMouse::new())));
         self.keyboard = Some(Arc::new(Mutex::new(Keyboard::new())));
         self.unique_pad = Some(Arc::new(Mutex::new(UniquePad::new())));
-        self.npad = Some(Arc::new(Mutex::new(NPad::new())));
+        self.npad = Some(Arc::new(Mutex::new(NPad::new_with_hid_core(
+            self.hid_core
+                .as_ref()
+                .expect("ResourceManager requires HIDCore")
+                .clone(),
+        ))));
         self.home_button = Some(Arc::new(Mutex::new(HomeButton::new())));
         self.sleep_button = Some(Arc::new(Mutex::new(SleepButton::new())));
         self.capture_button = Some(Arc::new(Mutex::new(CaptureButton::new())));

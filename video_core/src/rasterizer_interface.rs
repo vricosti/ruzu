@@ -10,6 +10,8 @@
 use crate::control::channel_state::ChannelState;
 use crate::engines::draw_manager::{Maxwell3DClearView, Maxwell3DDrawView, Maxwell3DIndirectView};
 use crate::engines::fermi_2d::{Config as Fermi2DConfig, Surface as Fermi2DSurface};
+use crate::engines::kepler_compute::DispatchCall;
+use crate::engines::maxwell_dma::dma;
 use crate::query_cache::types::QueryPropertiesFlags;
 
 /// Shader loading callback stages.
@@ -113,6 +115,17 @@ pub trait RasterizerInterface {
 
     /// Dispatch a compute shader invocation.
     fn dispatch_compute(&mut self);
+
+    /// Dispatch a compute shader invocation with the KeplerCompute state captured
+    /// at the launch boundary.
+    ///
+    /// Upstream `RasterizerOpenGL::DispatchCompute` reads the currently bound
+    /// `KeplerCompute` owner directly. Rust passes the already-recorded dispatch
+    /// snapshot to avoid re-entering `KeplerCompute` mutably while it is calling
+    /// into the rasterizer.
+    fn dispatch_compute_with_call(&mut self, _dispatch: &DispatchCall) {
+        self.dispatch_compute();
+    }
 
     // ── Queries ──────────────────────────────────────────────────────────
 
@@ -228,6 +241,46 @@ pub trait RasterizerInterface {
         _src: &Fermi2DSurface,
         _dst: &Fermi2DSurface,
         _copy_config: &Fermi2DConfig,
+    ) -> bool {
+        false
+    }
+
+    /// Access upstream `AccelerateDMAInterface::BufferCopy`.
+    fn accelerate_dma_buffer_copy(
+        &mut self,
+        _src_address: u64,
+        _dest_address: u64,
+        _amount: u64,
+    ) -> bool {
+        false
+    }
+
+    /// Access upstream `AccelerateDMAInterface::BufferClear`.
+    fn accelerate_dma_buffer_clear(
+        &mut self,
+        _dst_address: u64,
+        _amount: u64,
+        _value: u32,
+    ) -> bool {
+        false
+    }
+
+    /// Access upstream `AccelerateDMAInterface::ImageToBuffer`.
+    fn accelerate_dma_image_to_buffer(
+        &mut self,
+        _copy_info: &dma::ImageCopy,
+        _src: &dma::ImageOperand,
+        _dst: &dma::BufferOperand,
+    ) -> bool {
+        false
+    }
+
+    /// Access upstream `AccelerateDMAInterface::BufferToImage`.
+    fn accelerate_dma_buffer_to_image(
+        &mut self,
+        _copy_info: &dma::ImageCopy,
+        _src: &dma::BufferOperand,
+        _dst: &dma::ImageOperand,
     ) -> bool {
         false
     }

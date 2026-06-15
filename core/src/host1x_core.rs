@@ -25,6 +25,12 @@ pub trait Host1xCoreInterface: Any + Send + Sync {
     fn as_any(&self) -> &(dyn Any + Send + Sync);
     fn get_host_syncpoint_value(&self, id: u32) -> u32;
     fn wait_host(&self, id: u32, expected_value: u32);
+    fn register_guest_action(
+        &self,
+        id: u32,
+        expected_value: u32,
+        action: Box<dyn FnOnce() + Send>,
+    ) -> Option<u64>;
     fn register_host_action(
         &self,
         id: u32,

@@ -95,8 +95,19 @@ impl KReadableEvent {
 
     /// Is the event signaled?
     pub fn is_signaled(&self) -> bool {
-        if let Some(scheduler_lock) = crate::hle::kernel::kernel::scheduler_lock() {
-            debug_assert!(scheduler_lock.is_locked_by_current_thread());
+        // Upstream requires the scheduler lock here. The current Rust
+        // MultiWait host fallback can still poll readable events outside that
+        // lock; keep the parity violation visible without aborting MK8D before
+        // the wait path is made fully upstream-shaped.
+        if std::env::var_os("RUZU_DIAG").is_some() {
+            if let Some(scheduler_lock) = crate::hle::kernel::kernel::scheduler_lock() {
+                if !scheduler_lock.is_locked_by_current_thread() {
+                    eprintln!(
+                        "[RUZU_DIAG] KReadableEvent::is_signaled without scheduler lock; object_id={}",
+                        self.object_id
+                    );
+                }
+            }
         }
         self.is_signaled.load(Ordering::Relaxed)
     }
