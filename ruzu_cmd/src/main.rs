@@ -458,6 +458,7 @@ fn main() {
     let want_vsync_profile = std::env::var_os("RUZU_PROFILE_VSYNC").is_some();
     let want_present_profile = std::env::var_os("RUZU_PROFILE_PRESENT").is_some();
     let want_submit_gpfifo_profile = std::env::var_os("RUZU_PROFILE_SUBMIT_GPFIFO").is_some();
+    let want_gpu_thread_profile = std::env::var_os("RUZU_PROFILE_GPU_THREAD").is_some();
     let want_gl_draw_stall_profile = std::env::var_os("RUZU_PROFILE_GL_DRAW_STALL").is_some();
     let want_shader_pipeline_stall_profile =
         std::env::var_os("RUZU_PROFILE_SHADER_PIPELINE_STALL").is_some();
@@ -491,6 +492,7 @@ fn main() {
         || want_vsync_profile
         || want_present_profile
         || want_submit_gpfifo_profile
+        || want_gpu_thread_profile
         || want_gl_draw_stall_profile
         || want_shader_pipeline_stall_profile
         || want_refresh_stages_stall_profile
@@ -1013,28 +1015,32 @@ fn main() {
                             );
                         }
                     }
-                    return;
+                    return true;
                 }
             }
             if let Some(memory) = sys.memory_shared() {
                 // Mutex-free read — see `memory_raw` above.
                 let m = unsafe { &*memory_raw_of(&memory_raw_reader, &memory) };
-                if !m.read_block(addr, output) {
-                    let dm = sys.device_memory();
-                    let base = ruzu_core::device_memory::dram_memory_map::BASE;
-                    if addr >= base {
-                        let offset = (addr - base) as usize;
-                        let backing = dm.buffer.backing_base_pointer();
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                backing.add(offset),
-                                output.as_mut_ptr(),
-                                output.len(),
-                            );
-                        }
+                if m.read_block(addr, output) {
+                    return true;
+                }
+
+                let dm = sys.device_memory();
+                let base = ruzu_core::device_memory::dram_memory_map::BASE;
+                if addr >= base {
+                    let offset = (addr - base) as usize;
+                    let backing = dm.buffer.backing_base_pointer();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            backing.add(offset),
+                            output.as_mut_ptr(),
+                            output.len(),
+                        );
                     }
+                    return true;
                 }
             }
+            false
         }));
         let system_ref2 = ruzu_core::core::SystemRef::from_ref(&system);
         // RUZU_TRACE_GPU_WRITE_VADDR=0xADDR — on each callback invocation

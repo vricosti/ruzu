@@ -7,12 +7,18 @@
 //! This is the final stage of the OpenGL rendering pipeline.
 
 use crate::framebuffer_config::FramebufferConfig;
+use crate::present::{PresentFilters, PRESENT_FILTERS_FOR_DISPLAY};
 use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 
+use super::gl_shader_manager::ProgramManagerHandle;
+use super::gl_state_tracker::StateTracker;
 use super::present::filters::{self, ScalingFilter};
 use super::present::layer::Layer;
 use super::present::window_adapt_pass::WindowAdaptPass;
-use super::RasterizerOpenGL;
+use super::{Device, RasterizerOpenGL};
+use crate::renderer_base::DeviceMemoryReader;
+
+const GL_ALPHA_TEST: u32 = 0x0BC0;
 
 fn to_opengl_scaling_filter(filter: crate::present::ScalingFilter) -> ScalingFilter {
     match filter {
@@ -29,18 +35,44 @@ fn to_opengl_scaling_filter(filter: crate::present::ScalingFilter) -> ScalingFil
 ///
 /// Corresponds to zuyu's `BlitScreen` class.
 pub struct BlitScreen {
+    filters: &'static PresentFilters,
+    program_manager: ProgramManagerHandle,
+    /// Upstream stores `RasterizerOpenGL& rasterizer` on `BlitScreen`.
+    rasterizer: *mut RasterizerOpenGL,
+    /// Upstream stores `StateTracker& state_tracker` on `BlitScreen`.
+    state_tracker: *mut StateTracker,
+    /// Upstream stores `Device& device` on `BlitScreen`.
+    device: *const Device,
+    device_memory: DeviceMemoryReader,
     current_window_adapt: Option<ScalingFilter>,
     window_adapt: Option<WindowAdaptPass>,
     layers: Vec<Layer>,
 }
 
+// Safety: `BlitScreen` is owned by `RendererOpenGL`. The raw rasterizer pointer
+// and the raw state/device pointers are non-owning references to boxed members
+// stored in that same renderer, and present work uses them on the renderer thread.
+unsafe impl Send for BlitScreen {}
+
 impl BlitScreen {
     /// Create a new BlitScreen.
     ///
     /// Port of `BlitScreen::BlitScreen()`.
-    pub fn new() -> Result<Self, String> {
+    pub fn new(
+        program_manager: ProgramManagerHandle,
+        rasterizer: *mut RasterizerOpenGL,
+        state_tracker: *mut StateTracker,
+        device: *const Device,
+        device_memory: DeviceMemoryReader,
+    ) -> Result<Self, String> {
         log::info!("BlitScreen: OpenGL blit pipeline created");
         Ok(Self {
+            filters: &PRESENT_FILTERS_FOR_DISPLAY,
+            program_manager,
+            rasterizer,
+            state_tracker,
+            device,
+            device_memory,
             current_window_adapt: None,
             window_adapt: None,
             layers: Vec::new(),
@@ -54,15 +86,15 @@ impl BlitScreen {
         &mut self,
         framebuffers: &[FramebufferConfig],
         layout: &FramebufferLayout,
-        rasterizer: &mut RasterizerOpenGL,
         invert_y: bool,
-        device_memory: Option<&crate::renderer_base::DeviceMemoryReader>,
     ) {
         // Notify state tracker about state changes we're about to make.
         // Port of the state_tracker.Notify*() calls in upstream DrawScreen.
-        // Scoped so the rasterizer borrow ends before window_adapt reuses it.
-        {
-            let state_tracker = rasterizer.state_tracker_mut();
+        unsafe {
+            let state_tracker = self
+                .state_tracker
+                .as_mut()
+                .expect("OpenGL BlitScreen state tracker pointer must remain valid");
             state_tracker.notify_screen_draw_vertex_array();
             state_tracker.notify_polygon_modes();
             state_tracker.notify_viewport0();
@@ -90,8 +122,9 @@ impl BlitScreen {
             gl::Disable(gl::STENCIL_TEST);
             gl::Disable(gl::POLYGON_OFFSET_FILL);
             gl::Disable(gl::RASTERIZER_DISCARD);
-            // GL_ALPHA_TEST not available in core profile via gl crate constant,
-            // but upstream calls glDisable(GL_ALPHA_TEST). Safe to skip in core profile.
+            // GL_ALPHA_TEST is a compatibility enum omitted by the generated `gl`
+            // crate, but upstream still disables it before present draws.
+            gl::Disable(GL_ALPHA_TEST);
             gl::Disablei(gl::BLEND, 0);
             gl::PolygonMode(gl::FRONT_AND_BACK, gl::FILL);
             gl::CullFace(gl::BACK);
@@ -102,7 +135,11 @@ impl BlitScreen {
 
         // Ensure we have enough Layer instances.
         while self.layers.len() < framebuffers.len() {
-            self.layers.push(Layer::new());
+            self.layers.push(Layer::new(
+                self.rasterizer,
+                self.device_memory.clone(),
+                self.filters,
+            ));
         }
 
         self.create_window_adapt();
@@ -112,8 +149,7 @@ impl BlitScreen {
                 framebuffers,
                 layout,
                 invert_y,
-                rasterizer,
-                device_memory,
+                &self.program_manager,
             );
         }
     }
@@ -122,14 +158,14 @@ impl BlitScreen {
     ///
     /// Port of `BlitScreen::CreateWindowAdapt()`.
     fn create_window_adapt(&mut self) {
-        let desired = to_opengl_scaling_filter(crate::present::get_scaling_filter());
+        let desired = to_opengl_scaling_filter((self.filters.get_scaling_filter)());
 
         if self.window_adapt.is_some() && self.current_window_adapt == Some(desired) {
             return;
         }
 
         self.current_window_adapt = Some(desired);
-        self.window_adapt = Some(filters::make_filter(desired));
+        self.window_adapt = Some(filters::make_filter(desired, self.device));
     }
 }
 
@@ -163,5 +199,10 @@ mod tests {
             to_opengl_scaling_filter(crate::present::ScalingFilter::Fsr),
             ScalingFilter::Fsr
         );
+    }
+
+    #[test]
+    fn alpha_test_enum_matches_upstream_compatibility_constant() {
+        assert_eq!(GL_ALPHA_TEST, 0x0BC0);
     }
 }

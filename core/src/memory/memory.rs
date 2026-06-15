@@ -2787,6 +2787,15 @@ mod rasterizer_download_tests {
 
         fn wait_host(&self, _id: u32, _expected_value: u32) {}
 
+        fn register_guest_action(
+            &self,
+            _id: u32,
+            _expected_value: u32,
+            _action: Box<dyn FnOnce() + Send>,
+        ) -> Option<u64> {
+            None
+        }
+
         fn register_host_action(
             &self,
             _id: u32,

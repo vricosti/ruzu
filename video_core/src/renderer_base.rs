@@ -41,8 +41,10 @@ impl Default for RendererSettings {
 
 /// Callback for reading guest GPU memory by address.
 /// Upstream: `Tegra::MaxwellDeviceMemoryManager& device_memory`.
-/// In Rust, we use a shared callback since Memory is behind locks.
-pub type DeviceMemoryReader = std::sync::Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>;
+/// Returns whether the requested range was fully mapped, matching the
+/// `GetPointer(...) != nullptr` distinction used by upstream present fallback.
+pub type DeviceMemoryReader = std::sync::Arc<dyn Fn(u64, &mut [u8]) -> bool + Send + Sync>;
+pub type ShaderCacheGpuReader = std::sync::Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>;
 pub type GuestMemoryWriter = std::sync::Arc<dyn Fn(u64, &[u8]) + Send + Sync>;
 pub type GpuTicksGetter = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
 pub type GpuTickCallback = std::sync::Arc<dyn Fn() + Send + Sync>;
@@ -80,15 +82,9 @@ pub trait RendererBase: Send {
     /// Returns true if a screenshot is being processed.
     fn is_screenshot_pending(&self) -> bool;
 
-    /// Set the device memory reader for framebuffer loading.
-    /// Upstream passes `device_memory` in the constructor; in Rust we set it
-    /// post-construction since the GPU creates the renderer before memory is wired.
-    fn set_device_memory_reader(&mut self, _reader: DeviceMemoryReader) {}
-
     /// Install a *GPU virtual address* reader on the renderer's shader cache.
     ///
-    /// Unlike `set_device_memory_reader` (which takes raw guest CPU/device
-    /// addresses), this reader's first argument is a **GPU virtual address**
+    /// This reader's first argument is a **GPU virtual address**
     /// — i.e. it has already been resolved through `MemoryManager`'s page
     /// table. The OpenGL renderer forwards this into its shader cache so
     /// the recompiler can fetch Maxwell shader bytecode at the addresses
@@ -96,7 +92,7 @@ pub trait RendererBase: Send {
     ///
     /// Default impl is a no-op for renderers that do not yet have a
     /// shader cache (Null, current Vulkan stub).
-    fn set_shader_cache_gpu_reader(&mut self, _reader: DeviceMemoryReader) {}
+    fn set_shader_cache_gpu_reader(&mut self, _reader: ShaderCacheGpuReader) {}
 
     /// Install the guest memory writer used by rasterizer-side query/semaphore writes.
     fn set_guest_memory_writer(&mut self, _writer: GuestMemoryWriter) {}

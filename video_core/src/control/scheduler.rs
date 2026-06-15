@@ -82,10 +82,12 @@ impl Scheduler {
             .expect("Scheduler::push: dma_pusher not initialized");
         dma_pusher.push(entries);
 
-        let traced_idx = if let Some(limit) = crate::dma_pusher::puller_trace_submits_limit() {
+        let traced_idx = if crate::dma_pusher::puller_trace_submits_limit().is_some()
+            || std::env::var_os("RUZU_TRACE_PULLER_SUBMIT_RANGE").is_some()
+        {
             let idx = crate::dma_pusher::CURRENT_SUBMIT_INDEX
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if idx < limit {
+            if crate::dma_pusher::should_trace_submit_idx(idx) {
                 let lists = dma_pusher.dma_pushbuffer_len();
                 log::info!(
                     "[PULLER_TRACE] === SUBMIT #{} channel={} bind_id={} pending_lists={} ===",

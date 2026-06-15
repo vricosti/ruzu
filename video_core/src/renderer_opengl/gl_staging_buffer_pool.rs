@@ -37,6 +37,15 @@ pub struct StagingBufferMap {
     sync: *mut gl::types::GLsync,
 }
 
+pub struct StagingBufferRawParts {
+    pub mapped_ptr: *mut u8,
+    pub mapped_size: usize,
+    pub offset: usize,
+    pub buffer: u32,
+    pub index: usize,
+    pub sync: *mut gl::types::GLsync,
+}
+
 impl StagingBufferMap {
     pub fn mapped_span_mut(&mut self) -> &mut [u8] {
         if self.mapped_size == 0 {
@@ -64,6 +73,18 @@ impl StagingBufferMap {
                 self.offset as isize,
                 self.mapped_size as isize,
             );
+        }
+    }
+
+    pub fn into_raw_parts(self) -> StagingBufferRawParts {
+        let map = std::mem::ManuallyDrop::new(self);
+        StagingBufferRawParts {
+            mapped_ptr: map.mapped_ptr,
+            mapped_size: map.mapped_size,
+            offset: map.offset,
+            buffer: map.buffer,
+            index: map.index,
+            sync: map.sync,
         }
     }
 }
@@ -450,6 +471,10 @@ impl StagingBufferPool {
     pub fn free_deferred_staging_buffer(&mut self, buffer: &StagingBufferMap) {
         self.download_buffers
             .free_deferred_staging_buffer(buffer.index);
+    }
+
+    pub fn free_deferred_staging_buffer_by_index(&mut self, index: usize) {
+        self.download_buffers.free_deferred_staging_buffer(index);
     }
 }
 

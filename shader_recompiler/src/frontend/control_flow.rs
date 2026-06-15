@@ -69,7 +69,7 @@ pub struct CfgBlock {
 }
 
 /// Convergence stack entry — tracks SSY/PBK/PCNT push points.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StackEntry {
     /// Type of stack push (SSY, PBK, PCNT).
     kind: StackKind,
@@ -137,6 +137,20 @@ pub fn build_cfg(instructions: &[u64]) -> Vec<CfgBlock> {
                 block_starts.insert(target);
             }
             Some(MaxwellOpcode::SYNC) | Some(MaxwellOpcode::BRK) | Some(MaxwellOpcode::CONT) => {
+                let kind = match opcode {
+                    Some(MaxwellOpcode::SYNC) => StackKind::Ssy,
+                    Some(MaxwellOpcode::BRK) => StackKind::Pbk,
+                    Some(MaxwellOpcode::CONT) => StackKind::Pcnt,
+                    _ => unreachable!(),
+                };
+                if let Some(pos) = stack.iter().rposition(|entry| entry.kind == kind) {
+                    let target = stack[pos].target;
+                    block_starts.insert(target);
+                    let cond = decode_predicate(insn);
+                    if cond.is_always() {
+                        stack.truncate(pos);
+                    }
+                }
                 block_starts.insert(pc + 1);
             }
             Some(MaxwellOpcode::EXIT) | Some(MaxwellOpcode::KIL) => {
@@ -220,13 +234,64 @@ pub fn build_cfg(instructions: &[u64]) -> Vec<CfgBlock> {
     }
 
     // Phase 3: Link blocks (resolve branch targets to block indices).
+    //
+    // Upstream stores a convergence stack on each pending label. A SYNC/BRK/CONT
+    // pop only applies to the taken branch target; a conditional fall-through
+    // keeps the pre-pop stack. The first boundary pass above only discovers
+    // possible block starts, so this phase propagates stacks through the flat
+    // block graph and resolves stack-token targets from each block's entry
+    // stack instead of a single global linear stack.
     let block_start_to_index: std::collections::HashMap<u32, usize> = blocks
         .iter()
         .enumerate()
         .map(|(i, b)| (b.begin, i))
         .collect();
 
-    for i in 0..blocks.len() {
+    let mut entry_stacks: Vec<Option<Vec<StackEntry>>> = vec![None; blocks.len()];
+    let mut worklist = std::collections::VecDeque::new();
+    entry_stacks[0] = Some(Vec::new());
+    worklist.push_back(0usize);
+
+    while let Some(i) = worklist.pop_front() {
+        let Some(entry_stack) = entry_stacks[i].clone() else {
+            continue;
+        };
+        blocks[i].stack_depth = entry_stack.len() as u32;
+        blocks[i].branch_true = None;
+        blocks[i].branch_false = None;
+
+        let mut block_stack = entry_stack;
+        for pc in blocks[i].begin..blocks[i].end {
+            let insn = instructions[pc as usize];
+            match maxwell_opcodes::decode_opcode(insn) {
+                Some(MaxwellOpcode::SSY) => {
+                    let offset = decode_branch_offset(insn);
+                    let target = (pc as i32 + offset + 1) as u32;
+                    block_stack.push(StackEntry {
+                        kind: StackKind::Ssy,
+                        target,
+                    });
+                }
+                Some(MaxwellOpcode::PBK) => {
+                    let offset = decode_branch_offset(insn);
+                    let target = (pc as i32 + offset + 1) as u32;
+                    block_stack.push(StackEntry {
+                        kind: StackKind::Pbk,
+                        target,
+                    });
+                }
+                Some(MaxwellOpcode::PCNT) => {
+                    let offset = decode_branch_offset(insn);
+                    let target = (pc as i32 + offset + 1) as u32;
+                    block_stack.push(StackEntry {
+                        kind: StackKind::Pcnt,
+                        target,
+                    });
+                }
+                _ => {}
+            }
+        }
+
         let last_pc = blocks[i].end - 1;
         let last_insn = instructions[last_pc as usize];
         let last_opcode = maxwell_opcodes::decode_opcode(last_insn);
@@ -236,10 +301,53 @@ pub fn build_cfg(instructions: &[u64]) -> Vec<CfgBlock> {
                 let offset = decode_branch_offset(last_insn);
                 let target = (last_pc as i32 + offset + 1) as u32;
                 blocks[i].branch_true = block_start_to_index.get(&target).copied();
+                if let Some(target_index) = blocks[i].branch_true {
+                    propagate_stack(&mut entry_stacks, &mut worklist, target_index, &block_stack);
+                }
                 // Fall-through for conditional branch
                 if !blocks[i].cond.is_always() {
                     let next = blocks[i].end;
                     blocks[i].branch_false = block_start_to_index.get(&next).copied();
+                    if let Some(target_index) = blocks[i].branch_false {
+                        propagate_stack(
+                            &mut entry_stacks,
+                            &mut worklist,
+                            target_index,
+                            &block_stack,
+                        );
+                    }
+                }
+            }
+            Some(MaxwellOpcode::SYNC) | Some(MaxwellOpcode::BRK) | Some(MaxwellOpcode::CONT) => {
+                let kind = match last_opcode {
+                    Some(MaxwellOpcode::SYNC) => StackKind::Ssy,
+                    Some(MaxwellOpcode::BRK) => StackKind::Pbk,
+                    Some(MaxwellOpcode::CONT) => StackKind::Pcnt,
+                    _ => unreachable!(),
+                };
+                let popped = pop_stack_token(&block_stack, kind);
+                if let Some((target, target_stack)) = popped.as_ref() {
+                    blocks[i].branch_true = block_start_to_index.get(target).copied();
+                    if let Some(target_index) = blocks[i].branch_true {
+                        propagate_stack(
+                            &mut entry_stacks,
+                            &mut worklist,
+                            target_index,
+                            target_stack,
+                        );
+                    }
+                }
+                if !blocks[i].cond.is_always() {
+                    let next = blocks[i].end;
+                    blocks[i].branch_false = block_start_to_index.get(&next).copied();
+                    if let Some(target_index) = blocks[i].branch_false {
+                        propagate_stack(
+                            &mut entry_stacks,
+                            &mut worklist,
+                            target_index,
+                            &block_stack,
+                        );
+                    }
                 }
             }
             Some(MaxwellOpcode::EXIT) | Some(MaxwellOpcode::KIL) | Some(MaxwellOpcode::RET) => {
@@ -247,17 +355,53 @@ pub fn build_cfg(instructions: &[u64]) -> Vec<CfgBlock> {
                 if !blocks[i].cond.is_always() {
                     let next = blocks[i].end;
                     blocks[i].branch_false = block_start_to_index.get(&next).copied();
+                    if let Some(target_index) = blocks[i].branch_false {
+                        propagate_stack(
+                            &mut entry_stacks,
+                            &mut worklist,
+                            target_index,
+                            &block_stack,
+                        );
+                    }
                 }
             }
             _ => {
                 // Fall through to next block.
                 let next = blocks[i].end;
                 blocks[i].branch_true = block_start_to_index.get(&next).copied();
+                if let Some(target_index) = blocks[i].branch_true {
+                    propagate_stack(&mut entry_stacks, &mut worklist, target_index, &block_stack);
+                }
             }
         }
     }
 
     blocks
+}
+
+fn propagate_stack(
+    entry_stacks: &mut [Option<Vec<StackEntry>>],
+    worklist: &mut std::collections::VecDeque<usize>,
+    target_index: usize,
+    stack: &[StackEntry],
+) {
+    match &entry_stacks[target_index] {
+        Some(existing) if existing == stack => {}
+        Some(_) => {
+            // Upstream AddLabel is keyed by address; if different paths reach the
+            // same label with different stacks, the first label owns the stack.
+        }
+        None => {
+            entry_stacks[target_index] = Some(stack.to_vec());
+            worklist.push_back(target_index);
+        }
+    }
+}
+
+fn pop_stack_token(stack: &[StackEntry], kind: StackKind) -> Option<(u32, Vec<StackEntry>)> {
+    let pos = stack.iter().rposition(|entry| entry.kind == kind)?;
+    let target = stack[pos].target;
+    Some((target, stack[..pos].to_vec()))
 }
 
 /// Decode the branch offset from a branch instruction (BRA, SSY, PBK, PCNT).
@@ -304,5 +448,51 @@ mod tests {
         assert_eq!(cfg[0].end_class, EndClass::Kill);
         assert_eq!(cfg[0].cond.pred, 2);
         assert!(cfg[0].cond.negated);
+    }
+
+    #[test]
+    fn sync_uses_matching_ssy_stack_target() {
+        let ssy_to_13 = 0xe290_0000_0600_0000u64;
+        let sync_p0 = 0xf0f8_0000_0000_000fu64;
+        let nop = 0x50b0_0000_0007_0f00u64;
+        let mut words = vec![nop; 14];
+        words[0] = ssy_to_13;
+        words[1] = sync_p0;
+
+        let cfg = build_cfg(&words);
+        let sync_block = cfg
+            .iter()
+            .find(|block| block.begin == 0 && block.end == 2)
+            .expect("SSY/SYNC should remain in the first block");
+        let true_target = sync_block.branch_true.expect("SYNC true target");
+        let false_target = sync_block.branch_false.expect("SYNC false target");
+
+        assert_eq!(cfg[true_target].begin, 13);
+        assert_eq!(cfg[false_target].begin, 2);
+        assert_eq!(sync_block.cond.pred, 0);
+        assert!(!sync_block.cond.negated);
+    }
+
+    #[test]
+    fn conditional_sync_preserves_stack_for_fallthrough_path() {
+        let ssy_to_13 = 0xe290_0000_0600_0000u64;
+        let sync_p0 = 0xf0f8_0000_0000_000fu64;
+        let sync_pt = 0xf0f8_0000_0007_000fu64;
+        let nop = 0x50b0_0000_0007_0f00u64;
+        let mut words = vec![nop; 14];
+        words[0] = ssy_to_13;
+        words[1] = sync_p0;
+        words[3] = sync_pt;
+
+        let cfg = build_cfg(&words);
+        let second_sync = cfg
+            .iter()
+            .find(|block| block.begin == 2 && block.end == 4)
+            .expect("fallthrough path should reach the second SYNC block");
+        let true_target = second_sync.branch_true.expect("second SYNC true target");
+
+        assert_eq!(cfg[true_target].begin, 13);
+        assert!(second_sync.branch_false.is_none());
+        assert!(second_sync.cond.is_always());
     }
 }

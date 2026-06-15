@@ -5,7 +5,7 @@
 //!
 //! OpenGL program manager — manages binding of shader programs and assembly programs.
 
-use super::gl_shader_util::create_program_from_source;
+use super::gl_shader_util::{bind_assembly_program, create_program_from_source};
 use crate::host_shaders::compute_shaders::OPENGL_LMEM_WARMUP_COMP;
 use std::sync::Arc;
 
@@ -100,6 +100,19 @@ impl ProgramManager {
         )))
     }
 
+    #[cfg(test)]
+    pub fn new_shared_for_test() -> ProgramManagerHandle {
+        Arc::new(parking_lot::Mutex::new(Self {
+            pipeline: 0,
+            is_pipeline_bound: false,
+            is_compute_bound: false,
+            current_stage_mask: 0,
+            current_programs: [0; NUM_STAGES],
+            current_assembly_compute_program: 0,
+            lmem_warmup_program: 0,
+        }))
+    }
+
     /// Bind a compute program (GLSL/SPIR-V).
     ///
     /// Corresponds to `ProgramManager::BindComputeProgram()`.
@@ -116,7 +129,8 @@ impl ProgramManager {
     pub fn bind_compute_assembly_program(&mut self, program: u32) {
         if self.current_assembly_compute_program != program {
             self.current_assembly_compute_program = program;
-            // glBindProgramARB(GL_COMPUTE_PROGRAM_NV, program) — NV extension
+            const GL_COMPUTE_PROGRAM_NV: u32 = 0x90FB;
+            bind_assembly_program(GL_COMPUTE_PROGRAM_NV, program);
         }
         self.unbind_pipeline();
     }
@@ -167,7 +181,11 @@ impl ProgramManager {
 
         if self.current_stage_mask != 0 {
             self.current_stage_mask = 0;
-            // Disable all assembly stages
+            for program_type in ASSEMBLY_PROGRAM_ENUMS {
+                unsafe {
+                    gl::Disable(program_type);
+                }
+            }
         }
         self.bind_pipeline();
     }
@@ -182,15 +200,20 @@ impl ProgramManager {
         if changed_mask != 0 {
             for stage in 0..NUM_STAGES {
                 if ((changed_mask >> stage) & 1) != 0 {
-                    // Enable/disable assembly stage via NV extension
-                    let _ = ASSEMBLY_PROGRAM_ENUMS[stage];
+                    unsafe {
+                        if ((stage_mask >> stage) & 1) != 0 {
+                            gl::Enable(ASSEMBLY_PROGRAM_ENUMS[stage]);
+                        } else {
+                            gl::Disable(ASSEMBLY_PROGRAM_ENUMS[stage]);
+                        }
+                    }
                 }
             }
         }
         for stage in 0..NUM_STAGES {
             if self.current_programs[stage] != programs[stage] {
                 self.current_programs[stage] = programs[stage];
-                // glBindProgramARB(ASSEMBLY_PROGRAM_ENUMS[stage], programs[stage])
+                bind_assembly_program(ASSEMBLY_PROGRAM_ENUMS[stage], programs[stage]);
             }
         }
         self.unbind_pipeline();
@@ -212,11 +235,9 @@ impl ProgramManager {
     }
 
     fn bind_pipeline(&mut self) {
-        if !self.is_pipeline_bound {
-            self.is_pipeline_bound = true;
-            unsafe {
-                gl::BindProgramPipeline(self.pipeline);
-            }
+        self.is_pipeline_bound = true;
+        unsafe {
+            gl::BindProgramPipeline(self.pipeline);
         }
         self.unbind_compute();
     }

@@ -1,6 +1,12 @@
 // Embedded GLSL includes (.glsl) from upstream host_shaders/
 // Maps to: /home/vricosti/shared/zuyu/src/video_core/host_shaders/
 
+/// Upstream: `host_shaders/ffx_a.h`
+pub const FFX_A_H: &str = include_str!("ffx_a.h");
+
+/// Upstream: `host_shaders/ffx_fsr1.h`
+pub const FFX_FSR1_H: &str = include_str!("ffx_fsr1.h");
+
 /// Upstream: `host_shaders/opengl_smaa.glsl`
 pub const OPENGL_SMAA_GLSL: &str = r#"// SPDX-FileCopyrightText: 2013 Jorge Jimenez (jorge@iryoku.com)
 // SPDX-FileCopyrightText: 2013 Jose I. Echevarria (joseignacioechevarria@gmail.com)

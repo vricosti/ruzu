@@ -723,23 +723,31 @@ pub const VIC_REG_OUTPUT_SURFACE_CHROMA_V: usize = 0x728 / 4;
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VicMethod {
-    Execute = 0x300,
-    SetControlParams = 0x704,
-    SetConfigStructOffset = 0x708,
-    SetOutputSurfaceLumaOffset = 0x720,
-    SetOutputSurfaceChromaOffset = 0x724,
-    SetOutputSurfaceChromaUnusedOffset = 0x728,
+    Execute = VIC_REG_EXECUTE as u32,
+    SetControlParams = VIC_REG_CONTROL_PARAMS as u32,
+    SetConfigStructOffset = VIC_REG_CONFIG_STRUCT_OFFSET as u32,
+    SetOutputSurfaceLumaOffset = VIC_REG_OUTPUT_SURFACE_LUMA as u32,
+    SetOutputSurfaceChromaOffset = VIC_REG_OUTPUT_SURFACE_CHROMA_U as u32,
+    SetOutputSurfaceChromaUnusedOffset = VIC_REG_OUTPUT_SURFACE_CHROMA_V as u32,
 }
 
 impl VicMethod {
     pub fn from_u32(value: u32) -> Option<Self> {
         match value {
-            0x300 => Some(Self::Execute),
-            0x704 => Some(Self::SetControlParams),
-            0x708 => Some(Self::SetConfigStructOffset),
-            0x720 => Some(Self::SetOutputSurfaceLumaOffset),
-            0x724 => Some(Self::SetOutputSurfaceChromaOffset),
-            0x728 => Some(Self::SetOutputSurfaceChromaUnusedOffset),
+            value if value == VIC_REG_EXECUTE as u32 => Some(Self::Execute),
+            value if value == VIC_REG_CONTROL_PARAMS as u32 => Some(Self::SetControlParams),
+            value if value == VIC_REG_CONFIG_STRUCT_OFFSET as u32 => {
+                Some(Self::SetConfigStructOffset)
+            }
+            value if value == VIC_REG_OUTPUT_SURFACE_LUMA as u32 => {
+                Some(Self::SetOutputSurfaceLumaOffset)
+            }
+            value if value == VIC_REG_OUTPUT_SURFACE_CHROMA_U as u32 => {
+                Some(Self::SetOutputSurfaceChromaOffset)
+            }
+            value if value == VIC_REG_OUTPUT_SURFACE_CHROMA_V as u32 => {
+                Some(Self::SetOutputSurfaceChromaUnusedOffset)
+            }
             _ => None,
         }
     }
@@ -793,9 +801,9 @@ impl Vic {
     ///
     /// Port of `Vic::ProcessMethod`.
     pub fn process_method(&mut self, method: u32, arg: u32) {
-        let word_offset = (method / 4) as usize;
-        if word_offset < VIC_NUM_REGS {
-            self.regs.reg_array[word_offset] = arg;
+        let method_index = method as usize;
+        if method_index < VIC_NUM_REGS {
+            self.regs.reg_array[method_index] = arg;
         }
 
         if method == VicMethod::Execute as u32 {
@@ -1618,5 +1626,22 @@ mod tests {
         assert_eq!(slot.source_rect_right(), 110);
         assert_eq!(slot.dest_rect_left(), 30);
         assert_eq!(slot.dest_rect_bottom(), 240);
+    }
+
+    #[test]
+    fn process_method_uses_cdma_method_index_like_upstream() {
+        let memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let queue = Arc::new(FrameQueue::new());
+        let mut vic = Vic::new(4, 0, queue, memory);
+
+        vic.process_method(VIC_REG_CONFIG_STRUCT_OFFSET as u32, 0x1234);
+
+        assert_eq!(vic.regs.reg_array[VIC_REG_CONFIG_STRUCT_OFFSET], 0x1234);
+        assert_eq!(vic.config_struct_address(), 0x1234 << 8);
+        assert_eq!(
+            VicMethod::from_u32(VIC_REG_EXECUTE as u32),
+            Some(VicMethod::Execute)
+        );
+        assert_eq!(VicMethod::from_u32(0x300), None);
     }
 }

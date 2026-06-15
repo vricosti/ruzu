@@ -61,11 +61,18 @@ fn structure_region(
             EndClass::Exit => {
                 syntax.push(SyntaxNode::Block(block_idx));
                 if !block.cond.is_always() {
-                    // Predicated EXIT requires upstream's GotoPass/TranslatePass
-                    // merge/epilogue topology. This flat SCF pass cannot place
-                    // the guarded return safely: emitting it inline can cut off
-                    // later blocks that finish gl_Position/output writes.
-                    // Keep the block and fall through until the full SCF port.
+                    // Upstream `AnalyzeCondInst` splits a predicated EXIT into
+                    // an exit branch and a fallthrough label. Preserve that
+                    // control-flow shape here so instructions after the EXIT do
+                    // not execute when the predicate takes the exit path.
+                    let merge = block.branch_false.unwrap_or(i + 1) as u32;
+                    syntax.push(SyntaxNode::If {
+                        cond: Value::ImmU1(true),
+                        body: block_idx,
+                        merge,
+                    });
+                    syntax.push(SyntaxNode::Return);
+                    syntax.push(SyntaxNode::EndIf { merge });
                     i += 1;
                     continue;
                 }
@@ -93,14 +100,11 @@ fn structure_region(
                             // Forward branch → If/Then
                             let merge = true_target as u32;
                             syntax.push(SyntaxNode::Block(block_idx));
-                            // Upstream applies `!cond` inside the full
-                            // `GotoPass::EliminateAsConditional` tree
-                            // transform. This simplified flat-CFG structurer
-                            // does not yet model that tree, so carrying the
-                            // raw branch condition is the behavior that
-                            // matches the generated block order here.
+                            // Upstream `GotoPass::EliminateAsConditional`
+                            // moves the statements between a forward goto and
+                            // its label under `if (!goto_cond)`.
                             syntax.push(SyntaxNode::If {
-                                cond: Value::ImmU1(true),
+                                cond: Value::ImmU1(false),
                                 body: (i + 1) as u32,
                                 merge,
                             });
@@ -206,6 +210,9 @@ mod tests {
             syntax.as_slice(),
             [
                 SyntaxNode::Block(0),
+                SyntaxNode::If { .. },
+                SyntaxNode::Return,
+                SyntaxNode::EndIf { merge: 1 },
                 SyntaxNode::Block(1),
                 SyntaxNode::Return
             ]
@@ -219,6 +226,41 @@ mod tests {
         assert!(matches!(
             syntax.as_slice(),
             [SyntaxNode::Block(0), SyntaxNode::Return]
+        ));
+    }
+
+    #[test]
+    fn conditional_forward_branch_bodies_use_inverted_condition() {
+        let mut branch = block(
+            EndClass::Branch,
+            Condition {
+                pred: 0,
+                negated: false,
+            },
+        );
+        branch.branch_true = Some(2);
+        branch.branch_false = Some(1);
+
+        let syntax = structure_cfg(&[
+            branch,
+            block(EndClass::Branch, Condition::always()),
+            block(EndClass::Return, Condition::always()),
+        ]);
+
+        assert!(matches!(
+            syntax.as_slice(),
+            [
+                SyntaxNode::Block(0),
+                SyntaxNode::If {
+                    cond: Value::ImmU1(false),
+                    body: 1,
+                    merge: 2,
+                },
+                SyntaxNode::Block(1),
+                SyntaxNode::EndIf { merge: 2 },
+                SyntaxNode::Block(2),
+                SyntaxNode::Return,
+            ]
         ));
     }
 }

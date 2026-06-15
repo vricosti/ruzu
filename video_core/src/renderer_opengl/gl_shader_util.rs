@@ -5,7 +5,103 @@
 //!
 //! OpenGL shader compilation utilities.
 
-use std::ffi::CString;
+use std::ffi::{c_void, CString};
+use std::sync::OnceLock;
+
+type GlSpecializeShader = unsafe extern "system" fn(
+    shader: gl::types::GLuint,
+    p_entry_point: *const gl::types::GLchar,
+    num_specialization_constants: gl::types::GLuint,
+    p_constant_index: *const gl::types::GLuint,
+    p_constant_value: *const gl::types::GLuint,
+);
+type GlGenProgramsArb =
+    unsafe extern "system" fn(n: gl::types::GLsizei, programs: *mut gl::types::GLuint);
+type GlNamedProgramStringExt = unsafe extern "system" fn(
+    program: gl::types::GLuint,
+    target: gl::types::GLenum,
+    format: gl::types::GLenum,
+    len: gl::types::GLsizei,
+    string: *const c_void,
+);
+type GlBindProgramArb =
+    unsafe extern "system" fn(target: gl::types::GLenum, program: gl::types::GLuint);
+type GlProgramLocalParameter4fArb = unsafe extern "system" fn(
+    target: gl::types::GLenum,
+    index: gl::types::GLuint,
+    x: gl::types::GLfloat,
+    y: gl::types::GLfloat,
+    z: gl::types::GLfloat,
+    w: gl::types::GLfloat,
+);
+
+static GL_SPECIALIZE_SHADER: OnceLock<Option<GlSpecializeShader>> = OnceLock::new();
+static GL_GEN_PROGRAMS_ARB: OnceLock<Option<GlGenProgramsArb>> = OnceLock::new();
+static GL_NAMED_PROGRAM_STRING_EXT: OnceLock<Option<GlNamedProgramStringExt>> = OnceLock::new();
+static GL_BIND_PROGRAM_ARB: OnceLock<Option<GlBindProgramArb>> = OnceLock::new();
+static GL_PROGRAM_LOCAL_PARAMETER_4F_ARB: OnceLock<Option<GlProgramLocalParameter4fArb>> =
+    OnceLock::new();
+
+const GL_PROGRAM_FORMAT_ASCII_ARB: u32 = 0x8875;
+const GL_PROGRAM_ERROR_STRING_NV: u32 = 0x8874;
+
+fn renderer_debug_enabled() -> bool {
+    *common::settings::values().renderer_debug.get_value()
+}
+
+fn load_optional_gl_function<T, F>(load_fn: &mut F, name: &'static str) -> Option<T>
+where
+    F: FnMut(&'static str) -> *const c_void,
+{
+    let ptr = load_fn(name);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute_copy::<*const c_void, T>(&ptr) })
+    }
+}
+
+/// Load optional OpenGL entry points used by upstream shader utilities but not
+/// emitted by the generated `gl` bindings.
+pub fn load_extra_functions<F>(load_fn: &mut F)
+where
+    F: FnMut(&'static str) -> *const c_void,
+{
+    let _ = GL_SPECIALIZE_SHADER.set(load_optional_gl_function(load_fn, "glSpecializeShader"));
+    let _ = GL_GEN_PROGRAMS_ARB.set(load_optional_gl_function(load_fn, "glGenProgramsARB"));
+    let _ = GL_NAMED_PROGRAM_STRING_EXT.set(load_optional_gl_function(
+        load_fn,
+        "glNamedProgramStringEXT",
+    ));
+    let _ = GL_BIND_PROGRAM_ARB.set(load_optional_gl_function(load_fn, "glBindProgramARB"));
+    let _ = GL_PROGRAM_LOCAL_PARAMETER_4F_ARB.set(load_optional_gl_function(
+        load_fn,
+        "glProgramLocalParameter4fARB",
+    ));
+}
+
+pub fn bind_assembly_program(target: u32, program: u32) {
+    if let Some(bind_program) = GL_BIND_PROGRAM_ARB.get().and_then(|f| *f) {
+        unsafe {
+            bind_program(target, program);
+        }
+    } else {
+        log::warn!(
+            "glBindProgramARB is unavailable; cannot bind assembly program {}",
+            program
+        );
+    }
+}
+
+pub fn program_local_parameter_4f_arb(target: u32, index: u32, x: f32, y: f32, z: f32, w: f32) {
+    let program_local_parameter = GL_PROGRAM_LOCAL_PARAMETER_4F_ARB
+        .get()
+        .and_then(|f| *f)
+        .expect("glProgramLocalParameter4fARB must be loaded for GLASM shader uniforms");
+    unsafe {
+        program_local_parameter(target, index, x, y, z, w);
+    }
+}
 
 /// Compile and link a separable program from GLSL source code.
 ///
@@ -19,8 +115,9 @@ pub fn create_program_from_source(code: &str, stage: u32) -> u32 {
         gl::ShaderSource(shader, 1, &code_ptr, &length);
         gl::CompileShader(shader);
 
-        // Check compilation in debug builds
-        log_shader(shader);
+        if renderer_debug_enabled() {
+            log_shader(shader, Some(code));
+        }
 
         let program = link_separable_program(shader);
         gl::DeleteShader(shader);
@@ -45,12 +142,21 @@ pub fn create_program_from_spirv(code: &[u32], stage: u32) -> u32 {
             (code.len() * std::mem::size_of::<u32>()) as gl::types::GLsizei,
         );
 
-        // glSpecializeShader is GL 4.6 / ARB_gl_spirv — may not be in all gl crate builds.
-        // Use the function pointer directly if available.
-        // For now, this is a placeholder that will need the correct extension binding.
-        // gl::SpecializeShader(shader, main_str.as_ptr(), 0, std::ptr::null(), std::ptr::null());
+        let main = CString::new("main").unwrap();
+        GL_SPECIALIZE_SHADER
+            .get()
+            .and_then(|f| *f)
+            .expect("glSpecializeShader must be loaded for SPIR-V shader programs")(
+            shader,
+            main.as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
 
-        log_shader(shader);
+        if renderer_debug_enabled() {
+            log_shader(shader, None);
+        }
 
         let program = link_separable_program(shader);
         gl::DeleteShader(shader);
@@ -62,19 +168,45 @@ pub fn create_program_from_spirv(code: &[u32], stage: u32) -> u32 {
 ///
 /// Corresponds to `OpenGL::CompileProgram(std::string_view code, GLenum target)`.
 ///
-/// Upstream uses `glGenProgramsARB` and `glNamedProgramStringEXT` which are
-/// NV_gpu_program5 / EXT_direct_state_access extensions. The `gl` crate does not
-/// expose these entry points because they are vendor-specific ARB/NV extensions
-/// not part of core OpenGL. Implementing this requires either:
-///   1. Using `gl::GetProcAddress` to load the function pointers at runtime, or
-///   2. Using a different GL bindings crate that exposes ARB/NV extensions.
-/// Until one of those approaches is wired up, this returns 0 (no program).
-/// Assembly shaders are only used when `Device::use_assembly_shaders()` is true
-/// (NVIDIA-only path), so this does not block AMD/Intel rendering.
-pub fn compile_assembly_program(_code: &str, _target: u32) -> u32 {
-    // glGenProgramsARB + glNamedProgramStringEXT — NV extension
-    // Not available in the base gl crate; requires runtime function pointer loading.
-    0
+pub fn compile_assembly_program(code: &str, target: u32) -> u32 {
+    let gen_programs = GL_GEN_PROGRAMS_ARB
+        .get()
+        .and_then(|f| *f)
+        .expect("glGenProgramsARB must be loaded for GLASM shader programs");
+    let named_program_string = GL_NAMED_PROGRAM_STRING_EXT
+        .get()
+        .and_then(|f| *f)
+        .expect("glNamedProgramStringEXT must be loaded for GLASM shader programs");
+
+    let mut program = 0;
+    unsafe {
+        gen_programs(1, &mut program);
+        named_program_string(
+            program,
+            target,
+            GL_PROGRAM_FORMAT_ASCII_ARB,
+            code.len() as gl::types::GLsizei,
+            code.as_ptr() as *const c_void,
+        );
+
+        if renderer_debug_enabled() {
+            let err = gl::GetString(GL_PROGRAM_ERROR_STRING_NV);
+            if !err.is_null() {
+                let err = std::ffi::CStr::from_ptr(err as *const i8);
+                if !err.to_bytes().is_empty() {
+                    let err = err.to_string_lossy();
+                    if err.contains("error") {
+                        log::error!("\n{}", err);
+                        log::info!("\n{}", code);
+                    } else {
+                        log::warn!("\n{}", err);
+                    }
+                }
+            }
+        }
+    }
+
+    program
 }
 
 /// Link a shader into a separable program.
@@ -86,7 +218,10 @@ fn link_separable_program(shader: u32) -> u32 {
         gl::LinkProgram(program);
         gl::DetachShader(program, shader);
 
-        // Check link status in debug
+        if !renderer_debug_enabled() {
+            return program;
+        }
+
         let mut link_status: gl::types::GLint = 0;
         gl::GetProgramiv(program, gl::LINK_STATUS, &mut link_status);
         if link_status == gl::FALSE as i32 {
@@ -109,10 +244,14 @@ fn link_separable_program(shader: u32) -> u32 {
 }
 
 /// Log shader compilation errors/warnings.
-fn log_shader(shader: u32) {
+fn log_shader(shader: u32, code: Option<&str>) {
     unsafe {
         let mut status: gl::types::GLint = 0;
         gl::GetShaderiv(shader, gl::COMPILE_STATUS, &mut status);
+        if status == gl::FALSE as i32 {
+            log::error!("Failed to build shader");
+        }
+
         let mut log_length: gl::types::GLint = 0;
         gl::GetShaderiv(shader, gl::INFO_LOG_LENGTH, &mut log_length);
         if log_length > 0 {
@@ -125,9 +264,14 @@ fn log_shader(shader: u32) {
             );
             let msg = String::from_utf8_lossy(&log);
             if status == gl::FALSE as i32 {
-                log::error!("Shader compile error: {}", msg);
+                log::error!("{}", msg);
+                if let Some(code) = code {
+                    if !code.is_empty() {
+                        log::info!("\n{}", code);
+                    }
+                }
             } else {
-                log::warn!("Shader compile warning: {}", msg);
+                log::warn!("{}", msg);
             }
         }
     }

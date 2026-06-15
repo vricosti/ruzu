@@ -61,6 +61,12 @@ impl ImageViewBase {
         image_id: ImageId,
         addr: GPUVAddr,
     ) -> Self {
+        assert!(
+            crate::surface::is_view_compatible(image_info.format, info.format, false, true),
+            "Image view format {:?} is incompatible with image format {:?}",
+            info.format,
+            image_info.format
+        );
         let level = info.range.base.level as u32;
         let mut flags = ImageViewFlagBits::empty();
         if image_info.forced_flushed {
@@ -91,6 +97,11 @@ impl ImageViewBase {
     ///
     /// Port of `ImageViewBase::ImageViewBase(const ImageInfo&, const ImageViewInfo&, GPUVAddr)`.
     pub fn new_buffer(info: &ImageInfo, view_info: &ImageViewInfo, addr: GPUVAddr) -> Self {
+        assert_eq!(
+            view_info.view_type,
+            ImageViewType::Buffer,
+            "Expected texture buffer"
+        );
         Self {
             image_id: NULL_IMAGE_ID,
             gpu_addr: addr,
@@ -146,6 +157,15 @@ impl ImageViewBase {
         self.view_type == ImageViewType::Buffer
     }
 
+    /// Whether this view was created from a render-target `ImageViewInfo`.
+    ///
+    /// Upstream stores this state only on `ImageViewInfo::IsRenderTarget()`;
+    /// Rust keeps the source swizzle bytes on `ImageViewBase`, so the same
+    /// sentinel check lives here for backend materialisation.
+    pub fn is_render_target(&self) -> bool {
+        self.swizzle == [u8::MAX; 4]
+    }
+
     /// Whether this view supports anisotropic filtering.
     ///
     /// Port of `ImageViewBase::SupportsAnisotropy`.
@@ -197,5 +217,45 @@ impl ImageViewBase {
                 | PixelFormat::S8UintD24Unorm
                 | PixelFormat::D32FloatS8Uint
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::texture_cache::format_lookup_table::PixelFormat;
+    use common::slot_vector::SlotId;
+
+    #[test]
+    #[should_panic(expected = "Image view format")]
+    fn image_view_base_rejects_incompatible_view_format_like_upstream() {
+        let image_info = ImageInfo {
+            format: PixelFormat::R8Unorm,
+            image_type: ImageType::E2D,
+            ..ImageInfo::default()
+        };
+        let view_info = ImageViewInfo {
+            format: PixelFormat::R32G32B32A32Float,
+            view_type: ImageViewType::E2D,
+            ..ImageViewInfo::default()
+        };
+
+        let _ = ImageViewBase::new(&view_info, &image_info, SlotId { index: 1 }, 0x1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "Expected texture buffer")]
+    fn image_view_base_buffer_constructor_rejects_non_buffer_view_like_upstream() {
+        let image_info = ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            ..ImageInfo::default()
+        };
+        let view_info = ImageViewInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            view_type: ImageViewType::E2D,
+            ..ImageViewInfo::default()
+        };
+
+        let _ = ImageViewBase::new_buffer(&image_info, &view_info, 0x1000);
     }
 }

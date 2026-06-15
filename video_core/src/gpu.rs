@@ -164,6 +164,7 @@ pub struct Gpu {
     current_sync_fence: AtomicU64,
     last_sync_fence: Mutex<u64>,
     sync_request_cv: Condvar,
+    request_swap_counters: Mutex<RequestSwapCounters>,
 
     // Channel management
     new_channel_id: Mutex<i32>,
@@ -194,10 +195,16 @@ pub struct Gpu {
     /// Owner-local bridge for GPU VA command fetches that still need core guest memory access.
     /// This is a temporary Rust adaptation until `video_core::MemoryManager` owns the same
     /// backing memory integration as upstream.
-    guest_memory_reader: Mutex<Option<Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>>>,
+    guest_memory_reader: Mutex<Option<crate::renderer_base::DeviceMemoryReader>>,
     guest_memory_writer: Mutex<Option<Arc<dyn Fn(u64, &[u8]) + Send + Sync>>>,
     /// Upstream owner: `Core::System& system`.
     system: Mutex<SystemRef>,
+}
+
+#[derive(Default)]
+struct RequestSwapCounters {
+    free_swap_counters: VecDeque<usize>,
+    request_swap_counters: VecDeque<usize>,
 }
 
 impl Gpu {
@@ -211,6 +218,7 @@ impl Gpu {
             current_sync_fence: AtomicU64::new(0),
             last_sync_fence: Mutex::new(0),
             sync_request_cv: Condvar::new(),
+            request_swap_counters: Mutex::new(RequestSwapCounters::default()),
             new_channel_id: Mutex::new(1),
             bound_channel: Mutex::new(-1),
             renderer: Mutex::new(None),
@@ -343,19 +351,14 @@ impl Gpu {
         *self.rasterizer.lock().unwrap()
     }
 
-    pub fn set_guest_memory_reader(&self, reader: Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>) {
+    pub fn set_guest_memory_reader(&self, reader: crate::renderer_base::DeviceMemoryReader) {
         if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
             log::info!("[PRESENT] GPU::set_guest_memory_reader");
         }
-        // Also propagate to the renderer for framebuffer display.
-        if let Some(ref mut renderer) = *self.renderer.lock().unwrap() {
-            if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
-                log::info!("[PRESENT] GPU propagating device_memory_reader to renderer");
-            }
-            renderer.set_device_memory_reader(reader.clone());
-        } else if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
-            log::info!("[PRESENT] GPU has no renderer while setting guest_memory_reader");
-        }
+        // This is a guest/device-memory bridge for GPU command and compatibility paths.
+        // The OpenGL present path owns its upstream-shaped MaxwellDeviceMemoryManager
+        // reader from RendererOpenGL::new; replacing it here would make
+        // Layer::LoadFBToScreenInfo diverge from device_memory.GetPointer(...).
         *self.guest_memory_reader.lock().unwrap() = Some(reader);
     }
 
@@ -390,8 +393,7 @@ impl Gpu {
         let Some(reader) = self.guest_memory_reader.lock().unwrap().clone() else {
             return false;
         };
-        reader(addr, output);
-        true
+        reader(addr, output)
     }
 
     pub(crate) fn host1x_device_memory_manager(
@@ -571,7 +573,7 @@ impl Gpu {
         if let Some(rasterizer) = self.rasterizer_handle() {
             unsafe { rasterizer.as_mut() }.release_fences(false);
         }
-        // Upstream also does Settings::UpdateGPUAccuracy().
+        settings::update_gpu_accuracy(&mut settings::values_mut());
     }
 
     /// Request a host GPU memory flush from the CPU.
@@ -674,6 +676,8 @@ impl Gpu {
     /// Upstream: `GPU::Impl::Start()` calls `Settings::UpdateGPUAccuracy()`
     /// then `gpu_thread.StartThread(*renderer, renderer->Context(), *scheduler)`.
     pub fn start(&self) {
+        settings::update_gpu_accuracy(&mut settings::values_mut());
+
         // Initialize scheduler if not already done.
         if self.scheduler.lock().unwrap().is_none() {
             self.init_scheduler();
@@ -823,8 +827,8 @@ impl Gpu {
     /// Matches upstream `GPU::Impl::RequestComposite(layers, fences)`:
     /// queues fence registration as a sync operation, signals the GPU thread
     /// via TickGPU, then waits for registration. If fences are present,
-    /// composition runs from the host1x syncpoint callback once every fence
-    /// has reached its target value.
+    /// composition runs from the Host1x guest-syncpoint callback once every
+    /// fence has reached its target value.
     pub fn request_composite(&self, layers: Vec<FramebufferConfig>) {
         if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
             log::info!("[PRESENT] GPU::request_composite layers={}", layers.len());
@@ -883,9 +887,8 @@ impl Gpu {
                 return;
             };
 
-            let remaining = Arc::new(AtomicUsize::new(valid_fences.len()));
+            let current_request_counter = gpu.allocate_request_swap_counter(valid_fences.len());
             for fence in valid_fences {
-                let remaining = Arc::clone(&remaining);
                 let layers = layers.clone();
                 if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
                     log::info!(
@@ -894,12 +897,12 @@ impl Gpu {
                         fence.value
                     );
                 }
-                host1x.register_host_action(
+                host1x.register_guest_action(
                     fence.id as u32,
                     fence.value,
                     Box::new(move || {
-                        if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                            let gpu = unsafe { &*(gpu_addr as *const Gpu) };
+                        let gpu = unsafe { &*(gpu_addr as *const Gpu) };
+                        if gpu.complete_request_swap_counter(current_request_counter) {
                             gpu.composite_layers(&layers);
                         }
                     }),
@@ -908,6 +911,34 @@ impl Gpu {
         }));
         self.gpu_thread.lock().unwrap().tick_gpu();
         self.wait_for_sync_operation(wait_fence);
+    }
+
+    fn allocate_request_swap_counter(&self, num_fences: usize) -> usize {
+        let mut counters = self.request_swap_counters.lock().unwrap();
+        if let Some(index) = counters.free_swap_counters.pop_front() {
+            counters.request_swap_counters[index] = num_fences;
+            index
+        } else {
+            let index = counters.request_swap_counters.len();
+            counters.request_swap_counters.push_back(num_fences);
+            index
+        }
+    }
+
+    fn complete_request_swap_counter(&self, index: usize) -> bool {
+        let mut counters = self.request_swap_counters.lock().unwrap();
+        let Some(counter) = counters.request_swap_counters.get_mut(index) else {
+            return false;
+        };
+        if *counter == 0 {
+            return false;
+        }
+        *counter -= 1;
+        if *counter != 0 {
+            return false;
+        }
+        counters.free_swap_counters.push_back(index);
+        true
     }
 
     /// Get the applet capture buffer.
@@ -945,6 +976,13 @@ impl GpuChannelHandle for VideoGpuChannelHandle {
             .expect("GPU memory manager handle must come from video_core::gpu::Gpu");
         let mut channel_state = self.channel_state.lock();
         channel_state.memory_manager = Some(Arc::clone(&memory_manager.memory_manager));
+        if channel_state.initialized {
+            let gpu = unsafe { &*self.gpu };
+            if let Some(rasterizer) = gpu.rasterizer_handle() {
+                let rasterizer = unsafe { rasterizer.as_mut() };
+                rasterizer.bind_channel(&channel_state);
+            }
+        }
     }
 
     fn init_channel(&self, program_id: u64) {
@@ -964,6 +1002,9 @@ impl GpuChannelHandle for VideoGpuChannelHandle {
             let rasterizer = unsafe { rasterizer.as_mut() };
             channel_state.bind_rasterizer(rasterizer);
             rasterizer.initialize_channel(&channel_state);
+            if channel_state.memory_manager.is_some() {
+                rasterizer.bind_channel(&channel_state);
+            }
         }
     }
 
@@ -1280,6 +1321,32 @@ mod tests {
     }
 
     #[test]
+    fn guest_memory_reader_preserves_success_status() {
+        let gpu = Gpu::new(false, false);
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let calls_for_reader = Arc::clone(&calls);
+
+        gpu.set_guest_memory_reader(Arc::new(move |addr, output| {
+            calls_for_reader.lock().unwrap().push((addr, output.len()));
+            if addr == 0x1000 {
+                output.copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+                true
+            } else {
+                false
+            }
+        }));
+
+        let mut mapped = [0; 4];
+        assert!(gpu.read_guest_memory(0x1000, &mut mapped));
+        assert_eq!(mapped, [0x11, 0x22, 0x33, 0x44]);
+
+        let mut unmapped = [0xaa; 4];
+        assert!(!gpu.read_guest_memory(0x2000, &mut unmapped));
+        assert_eq!(unmapped, [0xaa; 4]);
+        assert_eq!(*calls.lock().unwrap(), vec![(0x1000, 4), (0x2000, 4)]);
+    }
+
+    #[test]
     fn init_channel_binds_rasterizer_and_initializes_channel() {
         let gpu = Gpu::new(false, false);
         let channel_state = gpu.create_channel(7);
@@ -1313,7 +1380,7 @@ mod tests {
             .lock()
             .has_bound_rasterizer());
         assert_eq!(*initialized_channels.lock().unwrap(), vec![7]);
-        assert!(bound_channels.lock().unwrap().is_empty());
+        assert_eq!(*bound_channels.lock().unwrap(), vec![7]);
 
         unsafe {
             drop(Box::from_raw(rasterizer_ptr));
@@ -1337,6 +1404,65 @@ mod tests {
         gpu.bind_channel(7);
         gpu.bind_channel(7);
 
+        assert_eq!(*bound_channels.lock().unwrap(), vec![7]);
+
+        unsafe {
+            drop(Box::from_raw(rasterizer_ptr));
+        }
+    }
+
+    #[test]
+    fn request_swap_counter_reuses_freed_counter_after_all_fences_complete() {
+        let gpu = Gpu::new(false, false);
+
+        let first = gpu.allocate_request_swap_counter(2);
+        assert!(!gpu.complete_request_swap_counter(first));
+        assert!(gpu.complete_request_swap_counter(first));
+
+        let second = gpu.allocate_request_swap_counter(1);
+        assert_eq!(second, first);
+        assert!(gpu.complete_request_swap_counter(second));
+
+        let counters = gpu.request_swap_counters.lock().unwrap();
+        assert_eq!(counters.request_swap_counters.len(), 1);
+        assert_eq!(counters.free_swap_counters.front().copied(), Some(first));
+    }
+
+    #[test]
+    fn bind_memory_manager_defers_rasterizer_bind_until_channel_initialized() {
+        let gpu = Gpu::new(false, false);
+        let channel_state = gpu.create_channel(7);
+
+        let initialized_channels = Arc::new(StdMutex::new(Vec::new()));
+        let bound_channels = Arc::new(StdMutex::new(Vec::new()));
+        let rasterizer = Box::new(FakeRasterizer {
+            initialized_channels: initialized_channels.clone(),
+            bound_channels: bound_channels.clone(),
+        });
+        let rasterizer_ptr: *mut FakeRasterizer = Box::into_raw(rasterizer);
+        *gpu.rasterizer.lock().unwrap() =
+            Some(RasterizerHandle::from_ref(unsafe { &*rasterizer_ptr }));
+
+        let channel_handle = VideoGpuChannelHandle {
+            gpu: &gpu as *const Gpu,
+            bind_id: 7,
+            channel_state: channel_state.clone(),
+        };
+        let memory_handle =
+            Arc::new(VideoGpuMemoryManagerHandle {
+                memory_manager: Arc::new(parking_lot::Mutex::new(
+                    MemoryManager::new_with_geometry(1, 32, 0x1_0000_0000, 16, 12),
+                )),
+            });
+
+        channel_handle.bind_memory_manager(memory_handle);
+
+        assert!(channel_state.lock().memory_manager.is_some());
+        assert!(bound_channels.lock().unwrap().is_empty());
+
+        channel_handle.init_channel(0x1234);
+
+        assert_eq!(*initialized_channels.lock().unwrap(), vec![7]);
         assert_eq!(*bound_channels.lock().unwrap(), vec![7]);
 
         unsafe {

@@ -1104,49 +1104,10 @@ impl ServerManager {
                 return None;
             }
 
-            if let Some(selected) = self.multi_wait.try_wait_any_local() {
-                self.trace_ipc("try_wait_selected");
-                unsafe {
-                    (*selected).unlink_from_multi_wait();
-                }
-                if self.is_wakeup_holder(selected) {
-                    self.consume_wakeup_holder(selected);
+            if let Some(kernel) = self.system.get().kernel() {
+                let Some(selected) = self.multi_wait.wait_any(kernel) else {
                     continue;
-                }
-                return Some(selected);
-            }
-
-            let is_guest_core = !self.system.is_null()
-                && self
-                    .system
-                    .get()
-                    .kernel()
-                    .is_some_and(|k| k.is_current_thread_guest_core());
-
-            if is_guest_core {
-                if let Some(kernel) = self.system.get().kernel() {
-                    if let Some(selected) = self.multi_wait.wait_any(kernel) {
-                        unsafe {
-                            (*selected).unlink_from_multi_wait();
-                        }
-                        if self.is_wakeup_holder(selected) {
-                            self.consume_wakeup_holder(selected);
-                            continue;
-                        }
-                        return Some(selected);
-                    }
-                }
-                let signaled = self.wakeup_event.wait_timeout(Duration::from_millis(100));
-                self.loop_stats.idle_timeouts += 1;
-                self.log_loop_stats_if_needed("guest_core_idle_timeout");
-                if signaled {
-                    continue;
-                }
-                return None;
-            }
-
-            if let Some(selected) = self.multi_wait.try_wait_any_local() {
-                self.trace_ipc("host_try_wait_selected");
+                };
                 unsafe {
                     (*selected).unlink_from_multi_wait();
                 }
@@ -1159,7 +1120,7 @@ impl ServerManager {
 
             let signaled = self.wakeup_event.wait_timeout(Duration::from_millis(100));
             self.loop_stats.idle_timeouts += 1;
-            self.log_loop_stats_if_needed("idle_timeout");
+            self.log_loop_stats_if_needed("missing_kernel_idle_timeout");
             if signaled {
                 continue;
             }

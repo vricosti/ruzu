@@ -88,19 +88,44 @@ unsafe impl Sync for GLInnerFence {}
 /// OpenGL fence manager.
 ///
 /// Corresponds to `OpenGL::FenceManagerOpenGL`.
-pub struct FenceManagerOpenGL;
+pub struct FenceManagerOpenGL {
+    #[cfg(test)]
+    force_stubbed_fences: bool,
+}
 
 impl FenceManagerOpenGL {
     /// Create a new fence manager.
     pub fn new() -> Self {
-        Self
+        Self {
+            #[cfg(test)]
+            force_stubbed_fences: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self {
+            force_stubbed_fences: true,
+        }
     }
 
     /// Create a new fence.
     ///
     /// Corresponds to `FenceManagerOpenGL::CreateFence()`.
     pub fn create_fence(&self, is_stubbed: bool) -> Fence {
-        Arc::new(std::sync::Mutex::new(GLInnerFence::new(is_stubbed)))
+        Arc::new(std::sync::Mutex::new(GLInnerFence::new(
+            is_stubbed || cfg!(test) && self.force_stubbed_for_test(),
+        )))
+    }
+
+    #[cfg(test)]
+    fn force_stubbed_for_test(&self) -> bool {
+        self.force_stubbed_fences
+    }
+
+    #[cfg(not(test))]
+    fn force_stubbed_for_test(&self) -> bool {
+        false
     }
 
     /// Queue a fence.

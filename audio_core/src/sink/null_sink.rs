@@ -71,6 +71,9 @@ impl Sink for NullSink {
         stream.set_device_volume(self.device_volume);
         stream.set_system_volume(self.system_volume);
         stream.set_discard_buffers(self.discard_stream_buffers);
+        if stream_type == StreamType::Render {
+            stream.set_realtime_pacing(true);
+        }
         let handle = new_stream_handle(stream);
         self.streams.push(StreamEntry {
             name: name.to_string(),

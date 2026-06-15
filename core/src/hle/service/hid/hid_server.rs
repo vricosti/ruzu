@@ -2000,13 +2000,13 @@ impl IHidServer {
         log::debug!("IHidServer::StartLrAssignmentMode called, aruid={}", aruid);
 
         let rm = server.resource_manager.lock();
-        if let Some(ref npad) = rm.get_npad() {
-            npad.lock()
-                .npad_resource_mut()
-                .set_lr_assignment_mode(aruid, true);
-        }
+        let result = if let Some(ref npad) = rm.get_npad() {
+            to_ipc_result(npad.lock().start_lr_assignment_mode(aruid))
+        } else {
+            RESULT_SUCCESS
+        };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     // cmd 127: StopLrAssignmentMode
@@ -2017,13 +2017,13 @@ impl IHidServer {
         log::debug!("IHidServer::StopLrAssignmentMode called, aruid={}", aruid);
 
         let rm = server.resource_manager.lock();
-        if let Some(ref npad) = rm.get_npad() {
-            npad.lock()
-                .npad_resource_mut()
-                .set_lr_assignment_mode(aruid, false);
-        }
+        let result = if let Some(ref npad) = rm.get_npad() {
+            to_ipc_result(npad.lock().stop_lr_assignment_mode(aruid))
+        } else {
+            RESULT_SUCCESS
+        };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     // cmd 128: SetNpadHandheldActivationMode

@@ -5,16 +5,22 @@
 //!
 //! OpenGL compute pipeline management -- compiles and configures compute shaders.
 
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::buffer_cache::buffer_cache::BufferCache;
 use crate::buffer_cache::buffer_cache_base::BufferCacheParams;
 use crate::buffer_cache::word_manager::DeviceTracker;
 use crate::engines::kepler_compute::{DispatchCall, QueueMetaData};
+use crate::memory_manager::MemoryManager;
 use crate::texture_cache::texture_cache_base::{ComputeDescriptorSyncRegs, ImageViewInOut};
 use crate::texture_cache::types::SamplerId;
 use crate::textures::texture::texture_pair;
 
+use super::gl_shader_manager::ProgramManager;
+use super::gl_shader_util::{
+    compile_assembly_program, create_program_from_source, create_program_from_spirv,
+    program_local_parameter_4f_arb,
+};
 use super::gl_texture_cache::TextureCache;
 use shader_recompiler::shader_info::{
     num_descriptors, ImageBufferDescriptor, ImageDescriptor, Info, TextureBufferDescriptor,
@@ -26,6 +32,14 @@ pub const MAX_TEXTURES: u32 = 64;
 
 /// Maximum number of images bound to a compute pipeline.
 pub const MAX_IMAGES: u32 = 16;
+const GL_COMPUTE_PROGRAM_NV: u32 = 0x90FB;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComputeProgramBackend {
+    Glsl,
+    Glasm,
+    SpirV,
+}
 
 /// Key used to identify a unique compute pipeline configuration.
 ///
@@ -91,6 +105,13 @@ struct ComputePipelineInfoState {
     uses_local_memory: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComputeTextureBufferBind {
+    index: usize,
+    is_written: bool,
+    is_image: bool,
+}
+
 /// OpenGL compute pipeline.
 ///
 /// Corresponds to `OpenGL::ComputePipeline`.
@@ -115,6 +136,16 @@ pub struct ComputePipeline {
     pub writes_global_memory: bool,
     /// Whether local memory is used.
     pub uses_local_memory: bool,
+
+    /// Launch-boundary compute engine state.
+    ///
+    /// Upstream stores `Tegra::Engines::KeplerCompute* kepler_compute`; ruzu
+    /// stores the immutable dispatch snapshot produced by the engine callback.
+    kepler_compute: Option<DispatchCall>,
+    /// Channel GPU memory used by `ComputePipeline::Configure`.
+    ///
+    /// Upstream stores this as `Tegra::MemoryManager* gpu_memory`.
+    gpu_memory: Option<Arc<parking_lot::Mutex<MemoryManager>>>,
 
     // Build synchronization
     built_mutex: Mutex<bool>,
@@ -152,7 +183,14 @@ impl ComputePipeline {
             info,
             _code,
             _code_v,
-            device.use_assembly_shaders(),
+            if device.use_assembly_shaders() {
+                ComputeProgramBackend::Glasm
+            } else {
+                match device.shader_backend() {
+                    common::settings_enums::ShaderBackend::SpirV => ComputeProgramBackend::SpirV,
+                    _ => ComputeProgramBackend::Glsl,
+                }
+            },
             device.max_glasm_storage_buffer_blocks(),
             _force_context_flush,
         )
@@ -166,25 +204,51 @@ impl ComputePipeline {
         info: Info,
         _code: &str,
         _code_v: &[u32],
-        use_assembly_shaders: bool,
+        backend: ComputeProgramBackend,
         max_glasm_storage_buffer_blocks: u32,
         _force_context_flush: bool,
     ) -> Self {
-        // Full implementation would compile `_code` / `_code_v` into
-        // source_program or assembly_program. This slice ports selection and
-        // shader-info ownership so resource configuration can consume `info`.
+        let use_assembly_shaders = backend == ComputeProgramBackend::Glasm;
         let state = Self::info_state(&info, use_assembly_shaders, max_glasm_storage_buffer_blocks);
+        let (source_program, assembly_program) = match backend {
+            ComputeProgramBackend::Glsl => {
+                let program = if !_code.is_empty() {
+                    create_program_from_source(_code, gl::COMPUTE_SHADER)
+                } else {
+                    0
+                };
+                (program, 0)
+            }
+            ComputeProgramBackend::Glasm => {
+                let program = if !_code.is_empty() {
+                    compile_assembly_program(_code, GL_COMPUTE_PROGRAM_NV)
+                } else {
+                    0
+                };
+                (0, program)
+            }
+            ComputeProgramBackend::SpirV => {
+                let program = if !_code_v.is_empty() {
+                    create_program_from_spirv(_code_v, gl::COMPUTE_SHADER)
+                } else {
+                    0
+                };
+                (program, 0)
+            }
+        };
 
         Self {
             info,
-            source_program: 0,
-            assembly_program: 0,
+            source_program,
+            assembly_program,
             uniform_buffer_sizes: state.uniform_buffer_sizes,
             num_texture_buffers: state.num_texture_buffers,
             num_image_buffers: state.num_image_buffers,
             use_storage_buffers: state.use_storage_buffers,
             writes_global_memory: state.writes_global_memory,
             uses_local_memory: state.uses_local_memory,
+            kepler_compute: None,
+            gpu_memory: None,
             built_mutex: Mutex::new(false),
             built_condvar: Condvar::new(),
             built_fence: 0,
@@ -205,6 +269,8 @@ impl ComputePipeline {
             use_storage_buffers: state.use_storage_buffers,
             writes_global_memory: state.writes_global_memory,
             uses_local_memory: state.uses_local_memory,
+            kepler_compute: None,
+            gpu_memory: None,
             built_mutex: Mutex::new(false),
             built_condvar: Condvar::new(),
             built_fence: 0,
@@ -232,6 +298,16 @@ impl ComputePipeline {
             }
         }
         // Full implementation requires buffer_cache and texture_cache integration
+    }
+
+    /// Port of upstream `ComputePipeline::SetEngine`.
+    pub fn set_engine(
+        &mut self,
+        kepler_compute: DispatchCall,
+        gpu_memory: Arc<parking_lot::Mutex<MemoryManager>>,
+    ) {
+        self.kepler_compute = Some(kepler_compute);
+        self.gpu_memory = Some(gpu_memory);
     }
 
     /// Port of the `texture_cache.SynchronizeComputeDescriptors()` step at the
@@ -385,19 +461,37 @@ impl ComputePipeline {
     /// synchronization, QMD handle collection, sampler-id resolution, and
     /// backend image-view preparation.
     pub fn configure_resource_state<P, DT>(
-        &self,
+        &mut self,
         buffer_cache: &mut BufferCache<P, DT>,
         texture_cache: &mut TextureCache,
-        dispatch: &DispatchCall,
-        read_u32: impl FnMut(u64) -> u32,
+        program_manager: &mut ProgramManager,
     ) -> ComputeTextureBindings
     where
         P: BufferCacheParams,
         DT: DeviceTracker,
     {
+        let dispatch = self
+            .kepler_compute
+            .as_ref()
+            .expect("ComputePipeline::Configure requires SetEngine first")
+            .clone();
+        let gpu_memory = self
+            .gpu_memory
+            .as_ref()
+            .expect("ComputePipeline::Configure requires GPU memory from SetEngine")
+            .clone();
         self.configure_buffer_state(buffer_cache);
-        Self::synchronize_texture_descriptors(texture_cache, dispatch);
-        self.prepare_texture_bindings_for_dispatch(texture_cache, dispatch, read_u32)
+        Self::synchronize_texture_descriptors(texture_cache, &dispatch);
+        let bindings = self.prepare_texture_bindings_for_dispatch(texture_cache, &dispatch, {
+            let gpu_memory = Arc::clone(&gpu_memory);
+            move |gpu_addr| {
+                let mut buf = [0u8; 4];
+                gpu_memory.lock().read_block(gpu_addr, &mut buf);
+                u32::from_le_bytes(buf)
+            }
+        });
+        self.configure_backend_bindings(buffer_cache, texture_cache, program_manager, &bindings);
+        bindings
     }
 
     pub fn prepare_texture_bindings_for_dispatch(
@@ -431,6 +525,226 @@ impl ComputePipeline {
                 desc.is_written,
             );
         }
+    }
+
+    fn configure_backend_bindings<P, DT>(
+        &mut self,
+        buffer_cache: &mut BufferCache<P, DT>,
+        texture_cache: &mut TextureCache,
+        program_manager: &mut ProgramManager,
+        bindings: &ComputeTextureBindings,
+    ) where
+        P: BufferCacheParams,
+        DT: DeviceTracker,
+    {
+        texture_cache.materialize_views(&bindings.views);
+        texture_cache.materialize_samplers(&bindings.samplers);
+
+        self.wait_for_build();
+        if self.assembly_program != 0 {
+            program_manager.bind_compute_assembly_program(self.assembly_program);
+        } else {
+            program_manager.bind_compute_program(self.source_program);
+        }
+
+        let mut textures = [0u32; MAX_TEXTURES as usize];
+        let mut images = [0u32; MAX_IMAGES as usize];
+        let mut gl_samplers = [0u32; MAX_TEXTURES as usize];
+
+        buffer_cache.unbind_compute_texture_buffers();
+        for bind in Self::compute_texture_buffer_bind_sequence(&self.info) {
+            self.bind_compute_texture_buffer_view(
+                buffer_cache,
+                texture_cache,
+                bindings,
+                bind.index,
+                bind.is_written,
+                bind.is_image,
+            );
+        }
+
+        buffer_cache.update_compute_buffers();
+        buffer_cache.set_enable_storage_buffers(self.use_storage_buffers);
+        buffer_cache.set_image_pointers(textures.as_mut_ptr(), images.as_mut_ptr());
+        buffer_cache.bind_host_compute_buffers();
+        buffer_cache.set_image_pointers(std::ptr::null_mut(), std::ptr::null_mut());
+
+        let mut views_index = (self.num_texture_buffers + self.num_image_buffers) as usize;
+        let mut sampler_index = 0usize;
+        let mut sampler_binding = 0usize;
+        let mut texture_binding = self.num_texture_buffers as usize;
+        let mut image_binding = self.num_image_buffers as usize;
+        let mut texture_scaling_mask = 0u32;
+
+        for desc in &self.info.texture_buffer_descriptors {
+            for _ in 0..desc.count {
+                if sampler_binding < gl_samplers.len() {
+                    gl_samplers[sampler_binding] = 0;
+                }
+                sampler_binding += 1;
+            }
+        }
+
+        for desc in &self.info.texture_descriptors {
+            for _ in 0..desc.count {
+                let view_id = bindings
+                    .views
+                    .get(views_index)
+                    .map(|view| view.id)
+                    .unwrap_or_default();
+                if let Some(image_view) = texture_cache.get_image_view(view_id) {
+                    if texture_binding < textures.len() {
+                        textures[texture_binding] = image_view.handle(desc.texture_type as usize);
+                    }
+                    if texture_cache.image_view_is_rescaling(view_id) && texture_binding < 32 {
+                        texture_scaling_mask |= 1u32 << texture_binding;
+                    }
+                }
+                views_index += 1;
+                texture_binding += 1;
+
+                let sampler = bindings.samplers.get(sampler_index).copied();
+                let sampler_handle = sampler
+                    .and_then(|id| texture_cache.get_sampler(id))
+                    .map(|sampler| {
+                        let use_fallback = sampler.has_added_anisotropy()
+                            && texture_cache
+                                .get_image_view(view_id)
+                                .is_some_and(|view| !view.supports_anisotropy());
+                        if use_fallback {
+                            sampler.handle_with_default_anisotropy()
+                        } else {
+                            sampler.handle()
+                        }
+                    })
+                    .unwrap_or(0);
+                if sampler_binding < gl_samplers.len() {
+                    gl_samplers[sampler_binding] = sampler_handle;
+                }
+                sampler_binding += 1;
+                sampler_index += 1;
+            }
+        }
+
+        let mut image_scaling_mask = 0u32;
+        for desc in &self.info.image_descriptors {
+            for _ in 0..desc.count {
+                let view_id = bindings
+                    .views
+                    .get(views_index)
+                    .map(|view| view.id)
+                    .unwrap_or_default();
+                if desc.is_written {
+                    texture_cache.mark_view_image_modified(view_id);
+                }
+                if let Some(image_view) = texture_cache.get_image_view_mut(view_id) {
+                    if image_binding < images.len() {
+                        images[image_binding] =
+                            image_view.storage_view(desc.texture_type, desc.format);
+                    }
+                }
+                if texture_cache.image_view_is_rescaling(view_id) && image_binding < 32 {
+                    image_scaling_mask |= 1u32 << image_binding;
+                }
+                views_index += 1;
+                image_binding += 1;
+            }
+        }
+
+        if self.info.uses_rescaling_uniform {
+            let texture_mask = f32::from_bits(texture_scaling_mask);
+            let image_mask = f32::from_bits(image_scaling_mask);
+            if self.assembly_program != 0 {
+                program_local_parameter_4f_arb(
+                    GL_COMPUTE_PROGRAM_NV,
+                    0,
+                    texture_mask,
+                    image_mask,
+                    0.0,
+                    0.0,
+                );
+            } else if self.source_program != 0 {
+                unsafe {
+                    gl::ProgramUniform4f(
+                        self.source_program,
+                        0,
+                        texture_mask,
+                        image_mask,
+                        0.0,
+                        0.0,
+                    );
+                }
+            }
+        }
+
+        unsafe {
+            if texture_binding != 0 {
+                assert_eq!(
+                    texture_binding, sampler_binding,
+                    "compute texture and sampler bindings diverged"
+                );
+                gl::BindTextures(0, texture_binding as i32, textures.as_ptr());
+                gl::BindSamplers(0, sampler_binding as i32, gl_samplers.as_ptr());
+            }
+            if image_binding != 0 {
+                gl::BindImageTextures(0, image_binding as i32, images.as_ptr());
+            }
+        }
+    }
+
+    fn compute_texture_buffer_bind_sequence(info: &Info) -> Vec<ComputeTextureBufferBind> {
+        let mut sequence = Vec::new();
+        let mut texbuf_index = 0usize;
+        for desc in &info.texture_buffer_descriptors {
+            for _ in 0..desc.count {
+                sequence.push(ComputeTextureBufferBind {
+                    index: texbuf_index,
+                    is_written: false,
+                    is_image: false,
+                });
+                texbuf_index += 1;
+            }
+        }
+        for desc in &info.image_buffer_descriptors {
+            for _ in 0..desc.count {
+                sequence.push(ComputeTextureBufferBind {
+                    index: texbuf_index,
+                    is_written: desc.is_written,
+                    is_image: true,
+                });
+                texbuf_index += 1;
+            }
+        }
+        sequence
+    }
+
+    fn bind_compute_texture_buffer_view<P, DT>(
+        &self,
+        buffer_cache: &mut BufferCache<P, DT>,
+        texture_cache: &TextureCache,
+        bindings: &ComputeTextureBindings,
+        texbuf_index: usize,
+        is_written: bool,
+        is_image: bool,
+    ) where
+        P: BufferCacheParams,
+        DT: DeviceTracker,
+    {
+        let Some(view_id) = bindings.views.get(texbuf_index).map(|view| view.id) else {
+            return;
+        };
+        let Some(image_view) = texture_cache.get_image_view(view_id) else {
+            return;
+        };
+        let gpu_addr = texture_cache.image_view_gpu_addr(view_id).unwrap_or(0);
+        buffer_cache.bind_compute_texture_buffer(
+            texbuf_index,
+            gpu_addr,
+            image_view.buffer_size(),
+            image_view.pixel_format() as u32,
+            is_written,
+            is_image,
+        );
     }
 
     fn read_texture_handle(
@@ -723,12 +1037,63 @@ mod tests {
     }
 
     #[test]
+    fn set_engine_replaces_current_compute_engine_state() {
+        let first_memory = Arc::new(parking_lot::Mutex::new(MemoryManager::new(0)));
+        let second_memory = Arc::new(parking_lot::Mutex::new(MemoryManager::new(1)));
+        let base_dispatch = DispatchCall {
+            qmd: QueueMetaData::default(),
+            qmd_address: 0,
+            indirect_compute_address: None,
+            code_address: 0,
+            tsc_address: 0,
+            tsc_limit: 0,
+            tic_address: 0,
+            tic_limit: 0,
+            tex_cb_index: 0,
+        };
+        let mut first = DispatchCall {
+            qmd_address: 0x1000,
+            ..base_dispatch.clone()
+        };
+        first.qmd.linked_tsc = false;
+        let mut second = DispatchCall {
+            qmd_address: 0x2000,
+            ..base_dispatch
+        };
+        second.qmd.linked_tsc = true;
+
+        let mut pipeline = ComputePipeline::new_for_test(Info::default(), false, 0);
+        pipeline.set_engine(first, Arc::clone(&first_memory));
+        assert_eq!(
+            pipeline.kepler_compute.as_ref().unwrap().qmd_address,
+            0x1000
+        );
+        assert!(!pipeline.kepler_compute.as_ref().unwrap().qmd.linked_tsc);
+        assert!(Arc::ptr_eq(
+            pipeline.gpu_memory.as_ref().unwrap(),
+            &first_memory
+        ));
+
+        pipeline.set_engine(second, Arc::clone(&second_memory));
+        assert_eq!(
+            pipeline.kepler_compute.as_ref().unwrap().qmd_address,
+            0x2000
+        );
+        assert!(pipeline.kepler_compute.as_ref().unwrap().qmd.linked_tsc);
+        assert!(Arc::ptr_eq(
+            pipeline.gpu_memory.as_ref().unwrap(),
+            &second_memory
+        ));
+    }
+
+    #[test]
     fn descriptor_sync_regs_come_from_dispatch_call() {
         let mut qmd = QueueMetaData::default();
         qmd.linked_tsc = true;
         let dispatch = DispatchCall {
             qmd,
             qmd_address: 0x1000,
+            indirect_compute_address: None,
             code_address: 0x2000,
             tsc_address: 0x3000,
             tsc_limit: 1,
@@ -884,6 +1249,124 @@ mod tests {
     }
 
     #[test]
+    fn compute_texture_buffer_bind_sequence_matches_upstream_single_image_buffer_pass() {
+        let mut info = Info::default();
+        info.texture_buffer_descriptors
+            .push(TextureBufferDescriptor {
+                has_secondary: false,
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                shift_left: 0,
+                secondary_cbuf_index: 0,
+                secondary_cbuf_offset: 0,
+                secondary_shift_left: 0,
+                count: 2,
+                size_shift: 2,
+            });
+        info.image_buffer_descriptors.push(ImageBufferDescriptor {
+            format: ImageFormat::R32Uint,
+            is_written: true,
+            is_read: true,
+            is_integer: true,
+            cbuf_index: 0,
+            cbuf_offset: 8,
+            count: 1,
+            size_shift: 2,
+        });
+        info.image_buffer_descriptors.push(ImageBufferDescriptor {
+            format: ImageFormat::R32Uint,
+            is_written: false,
+            is_read: true,
+            is_integer: true,
+            cbuf_index: 0,
+            cbuf_offset: 12,
+            count: 2,
+            size_shift: 2,
+        });
+
+        let sequence = ComputePipeline::compute_texture_buffer_bind_sequence(&info);
+
+        assert_eq!(
+            sequence,
+            vec![
+                ComputeTextureBufferBind {
+                    index: 0,
+                    is_written: false,
+                    is_image: false,
+                },
+                ComputeTextureBufferBind {
+                    index: 1,
+                    is_written: false,
+                    is_image: false,
+                },
+                ComputeTextureBufferBind {
+                    index: 2,
+                    is_written: true,
+                    is_image: true,
+                },
+                ComputeTextureBufferBind {
+                    index: 3,
+                    is_written: false,
+                    is_image: true,
+                },
+                ComputeTextureBufferBind {
+                    index: 4,
+                    is_written: false,
+                    is_image: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn compute_texture_buffer_binding_passes_pixel_format_to_buffer_cache() {
+        let source = include_str!("gl_compute_pipeline.rs");
+        let bind = source
+            .find("buffer_cache.bind_compute_texture_buffer(")
+            .expect("compute texture-buffer binding call");
+        let end = source[bind..]
+            .find(");")
+            .expect("compute texture-buffer binding call end")
+            + bind;
+        let call = &source[bind..end];
+
+        assert!(call.contains("image_view.pixel_format() as u32"));
+        assert!(!call.contains("image_view.format()"));
+    }
+
+    #[test]
+    fn compute_fill_and_materialize_uses_texture_cache_owned_gpu_memory() {
+        let source = include_str!("gl_compute_pipeline.rs");
+        let prepare = source
+            .find("pub fn prepare_texture_bindings(")
+            .expect("prepare_texture_bindings");
+        let prepare_end = source[prepare..]
+            .find("pub(crate) fn collect_texture_handles")
+            .expect("prepare_texture_bindings end")
+            + prepare;
+        let prepare_body = &source[prepare..prepare_end];
+        assert!(prepare_body.contains("texture_cache.fill_compute_image_views(&mut handles.views)"));
+        assert!(!prepare_body.contains("fill_compute_image_views_with_gpu_reader"));
+        assert!(!prepare_body.contains("read_gpu"));
+
+        let configure_backend = source
+            .find("fn configure_backend_bindings")
+            .expect("configure_backend_bindings");
+        let configure_backend_end = source[configure_backend..]
+            .find("fn compute_texture_buffer_bind_sequence")
+            .expect("configure_backend_bindings end")
+            + configure_backend;
+        let configure_body = &source[configure_backend..configure_backend_end];
+        assert!(configure_body.contains("texture_cache.materialize_views(&bindings.views)"));
+        assert!(!configure_body.contains("materialize_views_with_gpu_reader"));
+        assert!(!configure_body.contains("read_gpu"));
+
+        let texture_cache = include_str!("gl_texture_cache.rs");
+        assert!(!texture_cache.contains("pub fn fill_compute_image_views_with_gpu_reader"));
+        assert!(!texture_cache.contains("pub fn materialize_views_with_gpu_reader"));
+    }
+
+    #[test]
     fn collect_texture_handles_follows_upstream_compute_order_and_pairs() {
         let mut info = Info::default();
         info.texture_buffer_descriptors
@@ -948,6 +1431,7 @@ mod tests {
         let dispatch = DispatchCall {
             qmd,
             qmd_address: 0,
+            indirect_compute_address: None,
             code_address: 0,
             tsc_address: 0,
             tsc_limit: 0,
