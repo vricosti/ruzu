@@ -24480,6 +24480,31 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo test -p video_core signal_reference -- --nocapture`
 - `cargo check -p video_core`
 
+## 2026-06-16 — shader_recompiler/src/frontend/translate/floating_point_set_predicate.rs + shader_recompiler/src/ir/emitter.rs + shader_recompiler/src/backend/spirv/*.rs vs shader_recompiler/frontend/maxwell/translate/impl/floating_point_set_predicate.cpp + common_funcs.cpp
+
+### Intentional differences
+- Rust keeps `FSETP` as a free `fsetp()` translator function rather than three `TranslatorVisitor::FSETP_*` methods. The opcode dispatcher already passes the decoded `MaxwellOpcode`, and ownership remains in the matching Rust file for upstream `floating_point_set_predicate.cpp`.
+- Rust now exposes `fp_unord_less_than_equal_32()` and `fp_unord_greater_than_equal_32()` in `ir/emitter.rs` because the opcodes already existed and GLSL/GLASM already had emission paths. This is the Rust counterpart for upstream `FloatingPointCompare(..., ordered=false)` on `LEU` and `GEU`.
+- Rust now routes SPIR-V unordered `<`, `>`, `<=`, and `>=` through the matching `OpFUnord*` instructions. The previous `<`/`>` fallback to ordered SPIR-V was not upstream-faithful and was fixed as a prerequisite for using unordered `LEU`/`GEU` from `FSETP`.
+- Rust panics on invalid `BooleanOp` values, matching upstream `PredicateCombine()` throwing `NotImplementedException`. `FPCompareOp` also panics on impossible out-of-range values for consistency with upstream `FloatingPointCompare()` default handling.
+
+### Unintentional differences (to fix)
+- Upstream reads FSETP bit 47 (`ftz`) and passes it through `IR::FpControl` as `FmzMode::FTZ`. Rust still emits comparison opcodes without `FpControl` flags. Fully fixing this requires adding comparison-with-control emitter helpers and backend handling for comparison opcode flags.
+
+### Missing items
+- `FpControl` propagation for FSETP floating-point comparisons (`ftz` bit 47).
+- Equivalent audit/fix pass for sibling floating-point compare translators that still approximate unordered `LEU`/`GEU`.
+
+### Binary layout verification
+- PASS: no guest-visible raw binary payload layout is involved; this changes shader IR opcode selection and backend SPIR-V emission only.
+
+### Verification
+- Re-read upstream `floating_point_set_predicate.cpp`.
+- Re-read upstream `PredicateCombine()` and `FloatingPointCompare()` in `common_funcs.cpp`.
+- `cargo fmt -p shader_recompiler`
+- `cargo test -p shader_recompiler fsetp -- --nocapture`
+- `cargo check -p shader_recompiler`
+
 ## 2026-06-15 — common/src/logging/backend.rs + ruzu_cmd/src/main.rs vs common/logging/backend.cpp + yuzu_cmd/yuzu.cpp
 
 ### Intentional differences

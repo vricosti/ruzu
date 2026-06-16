@@ -30,14 +30,14 @@ fn fp_compare(tv: &mut TranslatorVisitor, cmp: u32, a: Value, b: Value) -> Value
             let nan_b = tv.ir.fp_is_nan_32(b);
             tv.ir.logical_or(nan_a, nan_b)
         }
-        9 => tv.ir.fp_unord_less_than_32(a, b),     // LTU
-        10 => tv.ir.fp_unord_equal_32(a, b),        // EQU
-        11 => tv.ir.fp_unord_less_than_32(a, b),    // LEU (approximation)
-        12 => tv.ir.fp_unord_greater_than_32(a, b), // GTU
-        13 => tv.ir.fp_unord_not_equal_32(a, b),    // NEU
-        14 => tv.ir.fp_unord_greater_than_32(a, b), // GEU (approximation)
-        15 => tv.ir.imm_u1(true),                   // T (true)
-        _ => tv.ir.imm_u1(false),
+        9 => tv.ir.fp_unord_less_than_32(a, b),        // LTU
+        10 => tv.ir.fp_unord_equal_32(a, b),           // EQU
+        11 => tv.ir.fp_unord_less_than_equal_32(a, b), // LEU
+        12 => tv.ir.fp_unord_greater_than_32(a, b),    // GTU
+        13 => tv.ir.fp_unord_not_equal_32(a, b),       // NEU
+        14 => tv.ir.fp_unord_greater_than_equal_32(a, b), // GEU
+        15 => tv.ir.imm_u1(true),                      // T (true)
+        _ => panic!("Invalid FP compare op {}", cmp),
     }
 }
 
@@ -47,7 +47,7 @@ fn combine_pred(tv: &mut TranslatorVisitor, result: Value, pred: Value, bool_op:
         0 => tv.ir.logical_and(result, pred), // AND
         1 => tv.ir.logical_or(result, pred),  // OR
         2 => tv.ir.logical_xor(result, pred), // XOR
-        _ => result,
+        _ => panic!("Invalid FSETP boolean op {}", bool_op),
     }
 }
 
@@ -112,5 +112,39 @@ mod tests {
         assert_eq!(set_preds[0].args[0], Value::Pred(Pred(6)));
         assert_eq!(set_preds[1].args[0], Value::Pred(Pred(1)));
         assert!(block.iter().any(|inst| inst.opcode == Opcode::LogicalNot));
+    }
+
+    #[test]
+    fn fsetp_uses_unordered_less_greater_equal_opcodes() {
+        for (cmp, expected) in [
+            (11u64, Opcode::FPUnordLessThanEqual32),
+            (14u64, Opcode::FPUnordGreaterThanEqual32),
+        ] {
+            let mut program = Program::new(ShaderStage::VertexB);
+            program.blocks.push(Block::new());
+            let mut tv = TranslatorVisitor::new(&mut program, 0);
+            let insn = (1u64 << 8) | (1u64 << 39) | (0u64 << 45) | (cmp << 48);
+
+            fsetp(&mut tv, insn, MaxwellOpcode::FSETP_reg);
+
+            let block = &tv.ir.program.blocks[0];
+            assert!(
+                block.iter().any(|inst| inst.opcode == expected),
+                "missing {:?} for cmp {}",
+                expected,
+                cmp
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid FSETP boolean op 3")]
+    fn fsetp_rejects_invalid_boolean_op_like_upstream() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+        let insn = (1u64 << 8) | (1u64 << 39) | (3u64 << 45) | (2u64 << 48);
+
+        fsetp(&mut tv, insn, MaxwellOpcode::FSETP_reg);
     }
 }
