@@ -317,6 +317,34 @@ pub fn emit_fp_unord_not_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) 
         .unwrap()
 }
 
+/// FPUnordLessThan32: `OpFUnordLessThan`.
+pub fn emit_fp_unord_less_than_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    ctx.builder
+        .f_unord_less_than(ctx.bool_type, None, a, b)
+        .unwrap()
+}
+
+/// FPUnordGreaterThan32: `OpFUnordGreaterThan`.
+pub fn emit_fp_unord_greater_than_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    ctx.builder
+        .f_unord_greater_than(ctx.bool_type, None, a, b)
+        .unwrap()
+}
+
+/// FPUnordLessThanEqual32: `OpFUnordLessThanEqual`.
+pub fn emit_fp_unord_less_than_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    ctx.builder
+        .f_unord_less_than_equal(ctx.bool_type, None, a, b)
+        .unwrap()
+}
+
+/// FPUnordGreaterThanEqual32: `OpFUnordGreaterThanEqual`.
+pub fn emit_fp_unord_greater_than_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    ctx.builder
+        .f_unord_greater_than_equal(ctx.bool_type, None, a, b)
+        .unwrap()
+}
+
 /// FPIsNan32: `OpIsNan`.
 pub fn emit_fp_is_nan_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     ctx.builder.is_nan(ctx.bool_type, None, value).unwrap()

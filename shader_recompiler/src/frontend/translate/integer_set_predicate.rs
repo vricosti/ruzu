@@ -10,6 +10,7 @@ use crate::ir::value::{Pred, Value};
 /// Integer comparison.
 fn int_compare(tv: &mut TranslatorVisitor, cmp: u32, a: Value, b: Value, is_signed: bool) -> Value {
     match cmp {
+        0 => tv.ir.imm_u1(false),
         1 => {
             if is_signed {
                 tv.ir.s_less_than(a, b)
@@ -40,7 +41,8 @@ fn int_compare(tv: &mut TranslatorVisitor, cmp: u32, a: Value, b: Value, is_sign
                 tv.ir.u_greater_than_equal(a, b)
             }
         }
-        _ => tv.ir.imm_u1(false),
+        7 => tv.ir.imm_u1(true),
+        _ => panic!("Invalid integer compare op {}", cmp),
     }
 }
 
@@ -50,7 +52,7 @@ fn combine_pred(tv: &mut TranslatorVisitor, result: Value, pred: Value, bool_op:
         0 => tv.ir.logical_and(result, pred), // AND
         1 => tv.ir.logical_or(result, pred),  // OR
         2 => tv.ir.logical_xor(result, pred), // XOR
-        _ => result,
+        _ => panic!("Invalid ISETP boolean op {}", bool_op),
     }
 }
 
@@ -112,5 +114,48 @@ mod tests {
         assert_eq!(set_preds[0].args[0], Value::Pred(Pred(5)));
         assert_eq!(set_preds[1].args[0], Value::Pred(Pred(2)));
         assert!(block.iter().any(|inst| inst.opcode == Opcode::LogicalNot));
+    }
+
+    #[test]
+    fn isetp_compare_true_sets_constant_true_like_upstream() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+        let result = int_compare(
+            &mut tv,
+            7,
+            Value::ImmU32(0x1234_5678),
+            Value::ImmU32(0x9abc_def0),
+            false,
+        );
+
+        assert_eq!(result.imm_u1(), true);
+    }
+
+    #[test]
+    fn isetp_compare_false_sets_constant_false_like_upstream() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+        let result = int_compare(
+            &mut tv,
+            0,
+            Value::ImmU32(0x1234_5678),
+            Value::ImmU32(0x9abc_def0),
+            false,
+        );
+
+        assert_eq!(result.imm_u1(), false);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid ISETP boolean op 3")]
+    fn isetp_rejects_invalid_boolean_op_like_upstream() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+        let insn = (1u64 << 8) | (1u64 << 39) | (3u64 << 45) | (2u64 << 49);
+
+        isetp(&mut tv, insn, MaxwellOpcode::ISETP_reg);
     }
 }

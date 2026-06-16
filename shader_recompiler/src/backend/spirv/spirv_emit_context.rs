@@ -745,14 +745,29 @@ impl SpirvEmitContext {
             Opcode::FPUnordLessThan32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
-                // Use FPOrdLessThan for now (unord variant falls back)
-                let id = super::emit_spirv_floating_point::emit_fp_ord_less_than_32(self, a, b);
+                let id = super::emit_spirv_floating_point::emit_fp_unord_less_than_32(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::FPUnordGreaterThan32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
-                let id = super::emit_spirv_floating_point::emit_fp_ord_greater_than_32(self, a, b);
+                let id =
+                    super::emit_spirv_floating_point::emit_fp_unord_greater_than_32(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPUnordLessThanEqual32 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id =
+                    super::emit_spirv_floating_point::emit_fp_unord_less_than_equal_32(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPUnordGreaterThanEqual32 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_unord_greater_than_equal_32(
+                    self, a, b,
+                );
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::FPIsNan32 => {

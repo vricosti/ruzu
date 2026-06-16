@@ -24480,6 +24480,61 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo test -p video_core signal_reference -- --nocapture`
 - `cargo check -p video_core`
 
+## 2026-06-16 — shader_recompiler/src/frontend/translate/floating_point_set_predicate.rs + shader_recompiler/src/ir/emitter.rs + shader_recompiler/src/backend/spirv/*.rs vs shader_recompiler/frontend/maxwell/translate/impl/floating_point_set_predicate.cpp + common_funcs.cpp
+
+### Intentional differences
+- Rust keeps `FSETP` as a free `fsetp()` translator function rather than three `TranslatorVisitor::FSETP_*` methods. The opcode dispatcher already passes the decoded `MaxwellOpcode`, and ownership remains in the matching Rust file for upstream `floating_point_set_predicate.cpp`.
+- Rust now exposes `fp_unord_less_than_equal_32()` and `fp_unord_greater_than_equal_32()` in `ir/emitter.rs` because the opcodes already existed and GLSL/GLASM already had emission paths. This is the Rust counterpart for upstream `FloatingPointCompare(..., ordered=false)` on `LEU` and `GEU`.
+- Rust now routes SPIR-V unordered `<`, `>`, `<=`, and `>=` through the matching `OpFUnord*` instructions. The previous `<`/`>` fallback to ordered SPIR-V was not upstream-faithful and was fixed as a prerequisite for using unordered `LEU`/`GEU` from `FSETP`.
+- Rust now exposes FP32 comparison `*_with_control()` emitter helpers so `FSETP` can attach upstream `IR::FpControl` flags to compare instructions. The existing non-control helpers remain for call sites that map to upstream's default `FpControl{}`.
+- Rust now reads FSETP bit 47 (`ftz`) and stores it as `FpControl { fmz_mode: FmzMode::FTZ }` on the comparison instruction, or `FmzMode::None` when the bit is clear. Upstream backends do not consume `fmz_mode` in compare emission either; the parity requirement here is preserving the IR flag.
+- Rust panics on invalid `BooleanOp` values, matching upstream `PredicateCombine()` throwing `NotImplementedException`. `FPCompareOp` also panics on impossible out-of-range values for consistency with upstream `FloatingPointCompare()` default handling.
+
+### Unintentional differences (to fix)
+- No remaining unintentional difference identified in this `FSETP` compare-control slice.
+
+### Missing items
+- Equivalent audit/fix pass for sibling floating-point compare translators that still approximate unordered `LEU`/`GEU`.
+
+### Binary layout verification
+- PASS: no guest-visible raw binary payload layout is involved; this changes shader IR opcode selection and backend SPIR-V emission only.
+
+### Verification
+- Re-read upstream `floating_point_set_predicate.cpp`.
+- Re-read upstream `PredicateCombine()` and `FloatingPointCompare()` in `common_funcs.cpp`.
+- Re-read upstream `IREmitter::{FPEqual,FPNotEqual,FPLessThan,FPGreaterThan,FPLessThanEqual,FPGreaterThanEqual}` to verify comparisons carry `Flags{control}`.
+- Re-read upstream GLSL/SPIR-V compare emitters to confirm they do not apply `fmz_mode` during compare emission.
+- Re-checked GLSL `FPOrdLessThanEqual32` and SPIR-V `OpFOrdLessThanEqual` emission: ordered comparisons are false for NaN, so unordered `LEU`/`GEU` selection remains required.
+- `cargo fmt -p shader_recompiler`
+- `cargo test -p shader_recompiler fsetp -- --nocapture`
+- `cargo check -p shader_recompiler`
+
+## 2026-06-16 — shader_recompiler/src/frontend/translate/integer_set_predicate.rs vs shader_recompiler/frontend/maxwell/translate/impl/integer_set_predicate.cpp + common_funcs.cpp
+
+### Intentional differences
+- Rust keeps `ISETP` as a free `isetp()` translator function rather than `TranslatorVisitor::ISETP_reg/cbuf/imm` methods. The opcode dispatcher passes `MaxwellOpcode`, and ownership remains in the matching Rust file for upstream `integer_set_predicate.cpp`.
+- Rust panics on invalid `BooleanOp` and impossible out-of-range integer compare values, matching upstream `PredicateCombine()` / `IntegerCompare()` throwing `NotImplementedException`.
+
+### Unintentional differences (to fix)
+- Fixed: Rust treated `cmp_op=7` (`CompareOp::True`) as false through the default arm. Upstream `IntegerCompare()` returns `ir.Imm1(true)`.
+- Fixed: Rust treated `cmp_op=0` (`CompareOp::False`) through the same default arm. It returned the right value by accident, but the ownership was not explicit and made `True` impossible to represent correctly.
+- Fixed: Rust silently returned the comparison result for invalid `bool_op=3`; upstream throws from `PredicateCombine()`.
+
+### Missing items
+- `ISETP.X` still panics as unimplemented. Upstream routes this through `ExtendedIntegerCompare()`.
+- Shared `IntegerCompare` / `PredicateCombine` ownership still differs from upstream `common_funcs.cpp`; this should be consolidated with the planned shared compare-helper tranche.
+
+### Binary layout verification
+- PASS: no guest-visible raw binary payload layout is involved; this changes shader IR predicate comparison selection only.
+
+### Verification
+- Re-read upstream `integer_set_predicate.cpp`.
+- Re-read upstream `IntegerCompare()`, `ExtendedIntegerCompare()`, and `PredicateCombine()` in `common_funcs.cpp`.
+- `cargo fmt -p shader_recompiler`
+- `cargo test -p shader_recompiler isetp -- --nocapture`
+- `cargo test -p shader_recompiler fsetp -- --nocapture`
+- `cargo check -p shader_recompiler`
+
 ## 2026-06-15 — common/src/logging/backend.rs + ruzu_cmd/src/main.rs vs common/logging/backend.cpp + yuzu_cmd/yuzu.cpp
 
 ### Intentional differences
