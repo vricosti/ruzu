@@ -24486,13 +24486,14 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust keeps `FSETP` as a free `fsetp()` translator function rather than three `TranslatorVisitor::FSETP_*` methods. The opcode dispatcher already passes the decoded `MaxwellOpcode`, and ownership remains in the matching Rust file for upstream `floating_point_set_predicate.cpp`.
 - Rust now exposes `fp_unord_less_than_equal_32()` and `fp_unord_greater_than_equal_32()` in `ir/emitter.rs` because the opcodes already existed and GLSL/GLASM already had emission paths. This is the Rust counterpart for upstream `FloatingPointCompare(..., ordered=false)` on `LEU` and `GEU`.
 - Rust now routes SPIR-V unordered `<`, `>`, `<=`, and `>=` through the matching `OpFUnord*` instructions. The previous `<`/`>` fallback to ordered SPIR-V was not upstream-faithful and was fixed as a prerequisite for using unordered `LEU`/`GEU` from `FSETP`.
+- Rust now exposes FP32 comparison `*_with_control()` emitter helpers so `FSETP` can attach upstream `IR::FpControl` flags to compare instructions. The existing non-control helpers remain for call sites that map to upstream's default `FpControl{}`.
+- Rust now reads FSETP bit 47 (`ftz`) and stores it as `FpControl { fmz_mode: FmzMode::FTZ }` on the comparison instruction, or `FmzMode::None` when the bit is clear. Upstream backends do not consume `fmz_mode` in compare emission either; the parity requirement here is preserving the IR flag.
 - Rust panics on invalid `BooleanOp` values, matching upstream `PredicateCombine()` throwing `NotImplementedException`. `FPCompareOp` also panics on impossible out-of-range values for consistency with upstream `FloatingPointCompare()` default handling.
 
 ### Unintentional differences (to fix)
-- Upstream reads FSETP bit 47 (`ftz`) and passes it through `IR::FpControl` as `FmzMode::FTZ`. Rust still emits comparison opcodes without `FpControl` flags. Fully fixing this requires adding comparison-with-control emitter helpers and backend handling for comparison opcode flags.
+- No remaining unintentional difference identified in this `FSETP` compare-control slice.
 
 ### Missing items
-- `FpControl` propagation for FSETP floating-point comparisons (`ftz` bit 47).
 - Equivalent audit/fix pass for sibling floating-point compare translators that still approximate unordered `LEU`/`GEU`.
 
 ### Binary layout verification
@@ -24501,6 +24502,8 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Verification
 - Re-read upstream `floating_point_set_predicate.cpp`.
 - Re-read upstream `PredicateCombine()` and `FloatingPointCompare()` in `common_funcs.cpp`.
+- Re-read upstream `IREmitter::{FPEqual,FPNotEqual,FPLessThan,FPGreaterThan,FPLessThanEqual,FPGreaterThanEqual}` to verify comparisons carry `Flags{control}`.
+- Re-read upstream GLSL/SPIR-V compare emitters to confirm they do not apply `fmz_mode` during compare emission.
 - Re-checked GLSL `FPOrdLessThanEqual32` and SPIR-V `OpFOrdLessThanEqual` emission: ordered comparisons are false for NaN, so unordered `LEU`/`GEU` selection remains required.
 - `cargo fmt -p shader_recompiler`
 - `cargo test -p shader_recompiler fsetp -- --nocapture`
