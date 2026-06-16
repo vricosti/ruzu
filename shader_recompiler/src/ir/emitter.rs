@@ -467,40 +467,204 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::FPOrdEqual32, vec![a, b]))
     }
 
+    pub fn fp_ord_equal_32_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPOrdEqual32,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_ord_not_equal_32(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPOrdNotEqual32, vec![a, b]))
+    }
+
+    pub fn fp_ord_not_equal_32_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPOrdNotEqual32,
+            vec![a, b],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_ord_less_than_32(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPOrdLessThan32, vec![a, b]))
     }
 
+    pub fn fp_ord_less_than_32_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPOrdLessThan32,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_ord_greater_than_32(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPOrdGreaterThan32, vec![a, b]))
+    }
+
+    pub fn fp_ord_greater_than_32_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPOrdGreaterThan32,
+            vec![a, b],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_ord_less_than_equal_32(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPOrdLessThanEqual32, vec![a, b]))
     }
 
+    pub fn fp_ord_less_than_equal_32_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPOrdLessThanEqual32,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_ord_greater_than_equal_32(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPOrdGreaterThanEqual32, vec![a, b]))
+    }
+
+    pub fn fp_ord_greater_than_equal_32_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPOrdGreaterThanEqual32,
+            vec![a, b],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_unord_equal_32(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPUnordEqual32, vec![a, b]))
     }
 
+    pub fn fp_unord_equal_32_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPUnordEqual32,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_unord_not_equal_32(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPUnordNotEqual32, vec![a, b]))
+    }
+
+    pub fn fp_unord_not_equal_32_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPUnordNotEqual32,
+            vec![a, b],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_unord_less_than_32(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPUnordLessThan32, vec![a, b]))
     }
 
+    pub fn fp_unord_less_than_32_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPUnordLessThan32,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_unord_greater_than_32(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPUnordGreaterThan32, vec![a, b]))
+    }
+
+    pub fn fp_unord_greater_than_32_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPUnordGreaterThan32,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
+    pub fn fp_unord_less_than_equal_32(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPUnordLessThanEqual32, vec![a, b]))
+    }
+
+    pub fn fp_unord_less_than_equal_32_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPUnordLessThanEqual32,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
+    pub fn fp_unord_greater_than_equal_32(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPUnordGreaterThanEqual32, vec![a, b]))
+    }
+
+    pub fn fp_unord_greater_than_equal_32_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPUnordGreaterThanEqual32,
+            vec![a, b],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_is_nan_32(&mut self, a: Value) -> Value {
