@@ -24501,7 +24501,34 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Verification
 - Re-read upstream `floating_point_set_predicate.cpp`.
 - Re-read upstream `PredicateCombine()` and `FloatingPointCompare()` in `common_funcs.cpp`.
+- Re-checked GLSL `FPOrdLessThanEqual32` and SPIR-V `OpFOrdLessThanEqual` emission: ordered comparisons are false for NaN, so unordered `LEU`/`GEU` selection remains required.
 - `cargo fmt -p shader_recompiler`
+- `cargo test -p shader_recompiler fsetp -- --nocapture`
+- `cargo check -p shader_recompiler`
+
+## 2026-06-16 — shader_recompiler/src/frontend/translate/integer_set_predicate.rs vs shader_recompiler/frontend/maxwell/translate/impl/integer_set_predicate.cpp + common_funcs.cpp
+
+### Intentional differences
+- Rust keeps `ISETP` as a free `isetp()` translator function rather than `TranslatorVisitor::ISETP_reg/cbuf/imm` methods. The opcode dispatcher passes `MaxwellOpcode`, and ownership remains in the matching Rust file for upstream `integer_set_predicate.cpp`.
+- Rust panics on invalid `BooleanOp` and impossible out-of-range integer compare values, matching upstream `PredicateCombine()` / `IntegerCompare()` throwing `NotImplementedException`.
+
+### Unintentional differences (to fix)
+- Fixed: Rust treated `cmp_op=7` (`CompareOp::True`) as false through the default arm. Upstream `IntegerCompare()` returns `ir.Imm1(true)`.
+- Fixed: Rust treated `cmp_op=0` (`CompareOp::False`) through the same default arm. It returned the right value by accident, but the ownership was not explicit and made `True` impossible to represent correctly.
+- Fixed: Rust silently returned the comparison result for invalid `bool_op=3`; upstream throws from `PredicateCombine()`.
+
+### Missing items
+- `ISETP.X` still panics as unimplemented. Upstream routes this through `ExtendedIntegerCompare()`.
+- Shared `IntegerCompare` / `PredicateCombine` ownership still differs from upstream `common_funcs.cpp`; this should be consolidated with the planned shared compare-helper tranche.
+
+### Binary layout verification
+- PASS: no guest-visible raw binary payload layout is involved; this changes shader IR predicate comparison selection only.
+
+### Verification
+- Re-read upstream `integer_set_predicate.cpp`.
+- Re-read upstream `IntegerCompare()`, `ExtendedIntegerCompare()`, and `PredicateCombine()` in `common_funcs.cpp`.
+- `cargo fmt -p shader_recompiler`
+- `cargo test -p shader_recompiler isetp -- --nocapture`
 - `cargo test -p shader_recompiler fsetp -- --nocapture`
 - `cargo check -p shader_recompiler`
 
