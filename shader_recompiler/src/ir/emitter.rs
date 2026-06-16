@@ -503,6 +503,14 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::FPUnordGreaterThan32, vec![a, b]))
     }
 
+    pub fn fp_unord_less_than_equal_32(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPUnordLessThanEqual32, vec![a, b]))
+    }
+
+    pub fn fp_unord_greater_than_equal_32(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPUnordGreaterThanEqual32, vec![a, b]))
+    }
+
     pub fn fp_is_nan_32(&mut self, a: Value) -> Value {
         self.emit(Inst::new(Opcode::FPIsNan32, vec![a]))
     }
