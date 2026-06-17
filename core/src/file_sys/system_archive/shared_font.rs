@@ -23,7 +23,7 @@ const EXPECTED_MAGIC: u32 = 0x36F81A1E;
 
 /// Expected result value for BFTTF encryption.
 /// Matches upstream `EXPECTED_RESULT`.
-const EXPECTED_RESULT: u32 = 0xCAFE;
+const EXPECTED_RESULT: u32 = 0x7F9A0218;
 
 /// Pack font data into BFTTF format matching upstream `PackBFTTF`.
 ///
@@ -195,5 +195,25 @@ mod tests {
         // 16 bytes input = 4 words. Output = (4 + 2) * 4 = 24 bytes.
         let file = pack_bfttf(&[0u8; 16], "test.bfttf");
         assert_eq!(file.get_size(), 24);
+    }
+
+    #[test]
+    fn test_pack_bfttf_round_trips_through_platform_decrypt() {
+        let input = &font_standard::FONT_STANDARD[..0x40];
+        let file = pack_bfttf(input, "test.bfttf");
+        let data = file.read_all_bytes();
+        let words: Vec<u32> = data
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]).swap_bytes())
+            .collect();
+        let mut output = vec![0u8; input.len()];
+
+        assert!(
+            crate::hle::service::ns::platform_service_manager::decrypt_shared_font_to_ttf(
+                &words,
+                &mut output
+            )
+        );
+        assert_eq!(output, input);
     }
 }

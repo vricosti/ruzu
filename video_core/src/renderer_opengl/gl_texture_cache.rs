@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use common::settings;
@@ -346,6 +346,34 @@ fn parse_u64_env_list(name: &str) -> Option<Vec<u64>> {
     (!targets.is_empty()).then_some(targets)
 }
 
+fn parse_u64_env(name: &str) -> Option<u64> {
+    let value = std::env::var(name).ok()?;
+    let value = value.trim();
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse::<u64>().ok()
+    }
+}
+
+fn should_trace_present_path_cache(cpu_addr: u64) -> bool {
+    let Some(target) = parse_u64_env("RUZU_TRACE_PRESENT_PATH_ADDR") else {
+        return false;
+    };
+    if target != cpu_addr {
+        return false;
+    }
+    static PRESENT_PATH_CACHE_COUNT: AtomicU64 = AtomicU64::new(0);
+    let every = parse_u64_env("RUZU_TRACE_PRESENT_PATH_EVERY")
+        .unwrap_or(1)
+        .max(1);
+    let count = PRESENT_PATH_CACHE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    count % every == 0
+}
+
 fn scale_up_image_copies(copies: &[ImageCopy], both_2d: bool) -> Vec<ImageCopy> {
     let resolution = settings::values().resolution_info.clone();
     copies
@@ -411,6 +439,19 @@ fn should_trace_texture_cache_address(gpu_addr: u64) -> bool {
         return false;
     };
     targets.is_empty() || targets.contains(&gpu_addr)
+}
+
+fn should_trace_texture_cache_gpu_region(gpu_addr: u64, size: u64) -> bool {
+    let Some(targets) = texture_cache_trace_targets() else {
+        return false;
+    };
+    if targets.is_empty() {
+        return true;
+    }
+    let end = gpu_addr.saturating_add(size);
+    targets
+        .iter()
+        .any(|&target| gpu_addr <= target && target < end)
 }
 
 fn texture_cache_cpu_trace_targets() -> Option<&'static [u64]> {
@@ -2291,10 +2332,31 @@ impl Image {
             debug_assert!(false, "Image::scale_up called for linear image");
             return false;
         }
+        let trace_scale =
+            should_trace_texture_cache_gpu_region(base.gpu_addr, base.guest_size_bytes as u64);
+        if trace_scale {
+            log::warn!(
+                "[IMAGE_SCALE] action=scale_up_enter gpu=0x{:X} cpu=0x{:X} texture={} current_texture={} upscaled_backup={} flags={:?} ignore={}",
+                base.gpu_addr,
+                base.cpu_addr,
+                self.texture,
+                self.current_texture,
+                self.upscaled_backup,
+                base.flags,
+                ignore,
+            );
+        }
         base.flags.insert(ImageFlagBits::RESCALED);
         base.has_scaled = true;
         if ignore {
             self.current_texture = self.upscaled_backup;
+            if trace_scale {
+                log::warn!(
+                    "[IMAGE_SCALE] action=scale_up_ignore gpu=0x{:X} current_texture={}",
+                    base.gpu_addr,
+                    self.current_texture,
+                );
+            }
             return true;
         }
         self.scale(base, rescale_read_fbos, rescale_draw_fbos, true);
@@ -2317,9 +2379,30 @@ impl Image {
         if !base.flags.contains(ImageFlagBits::RESCALED) {
             return false;
         }
+        let trace_scale =
+            should_trace_texture_cache_gpu_region(base.gpu_addr, base.guest_size_bytes as u64);
+        if trace_scale {
+            log::warn!(
+                "[IMAGE_SCALE] action=scale_down_enter gpu=0x{:X} cpu=0x{:X} texture={} current_texture={} upscaled_backup={} flags={:?} ignore={}",
+                base.gpu_addr,
+                base.cpu_addr,
+                self.texture,
+                self.current_texture,
+                self.upscaled_backup,
+                base.flags,
+                ignore,
+            );
+        }
         base.flags.remove(ImageFlagBits::RESCALED);
         if ignore {
             self.current_texture = self.texture;
+            if trace_scale {
+                log::warn!(
+                    "[IMAGE_SCALE] action=scale_down_ignore gpu=0x{:X} current_texture={}",
+                    base.gpu_addr,
+                    self.current_texture,
+                );
+            }
             return true;
         }
         self.scale(base, rescale_read_fbos, rescale_draw_fbos, false);
@@ -2401,6 +2484,13 @@ impl Image {
         } else {
             self.texture
         };
+        let trace_scale =
+            should_trace_texture_cache_gpu_region(base.gpu_addr, base.guest_size_bytes as u64);
+        let before_sample = if trace_scale {
+            unsafe { sample_present_texture(src_handle, src_width, src_height) }
+        } else {
+            (0, 0, 0, 0)
+        };
         let read_fbo = rescale_read_fbos[fbo_index];
         let draw_fbo = rescale_draw_fbos[fbo_index];
         if read_fbo == 0 || draw_fbo == 0 {
@@ -2439,7 +2529,29 @@ impl Image {
                 }
             }
         }
+        let after_sample = if trace_scale {
+            unsafe { sample_present_texture(dst_handle, dst_width, dst_height) }
+        } else {
+            (0, 0, 0, 0)
+        };
         self.current_texture = dst_handle;
+        if trace_scale {
+            log::warn!(
+                "[IMAGE_SCALE] action={} gpu=0x{:X} cpu=0x{:X} src_handle={} dst_handle={} current_texture={} src={}x{} dst={}x{} before={:?} after={:?}",
+                if up_scale { "scale_up" } else { "scale_down" },
+                base.gpu_addr,
+                base.cpu_addr,
+                src_handle,
+                dst_handle,
+                self.current_texture,
+                src_width,
+                src_height,
+                dst_width,
+                dst_height,
+                before_sample,
+                after_sample,
+            );
+        }
     }
 }
 
@@ -5691,8 +5803,13 @@ impl TextureCache {
 
         let dst_base = self.base.slot_images[dst_id].clone();
         let src_base = self.base.slot_images[src_id].clone();
-        let trace_copy = should_trace_texture_cache_address(dst_base.gpu_addr)
-            || should_trace_texture_cache_address(src_base.gpu_addr);
+        let trace_copy = should_trace_texture_cache_gpu_region(
+            dst_base.gpu_addr,
+            dst_base.guest_size_bytes as u64,
+        ) || should_trace_texture_cache_gpu_region(
+            src_base.gpu_addr,
+            src_base.guest_size_bytes as u64,
+        );
         let src_rescaled = src_base.flags.contains(ImageFlagBits::RESCALED);
         let dst_rescaled = dst_base.flags.contains(ImageFlagBits::RESCALED);
         if src_rescaled != dst_rescaled {
@@ -7698,6 +7815,13 @@ impl TextureCache {
         let src_addr = src.address();
         let mut dst_info = ImageInfo::from_fermi2d_surface(dst);
         let mut src_info = ImageInfo::from_fermi2d_surface(src);
+        let trace_target_blit = should_trace_texture_cache_gpu_region(
+            src_addr,
+            crate::texture_cache::util::calculate_guest_size_in_bytes(&src_info) as u64,
+        ) || should_trace_texture_cache_gpu_region(
+            dst_addr,
+            crate::texture_cache::util::calculate_guest_size_in_bytes(&dst_info) as u64,
+        );
         let can_be_depth_blit = dst_info.format == src_info.format
             && copy.filter == crate::engines::fermi_2d::Filter::Point;
         let try_options = if can_be_depth_blit {
@@ -7707,13 +7831,13 @@ impl TextureCache {
         };
 
         let Some(src_cpu_addr) = gpu_to_cpu(src_addr) else {
-            if std::env::var_os("RUZU_TRACE_FERMI2D_BLIT").is_some() {
+            if std::env::var_os("RUZU_TRACE_FERMI2D_BLIT").is_some() || trace_target_blit {
                 log::info!("[FERMI2D_BLIT] miss src_translate gpu=0x{:X}", src_addr);
             }
             return false;
         };
         let Some(dst_cpu_addr) = gpu_to_cpu(dst_addr) else {
-            if std::env::var_os("RUZU_TRACE_FERMI2D_BLIT").is_some() {
+            if std::env::var_os("RUZU_TRACE_FERMI2D_BLIT").is_some() || trace_target_blit {
                 log::info!("[FERMI2D_BLIT] miss dst_translate gpu=0x{:X}", dst_addr);
             }
             return false;
@@ -7964,6 +8088,27 @@ impl TextureCache {
             return false;
         };
 
+        let src_handle = self
+            .images
+            .get(&src_id)
+            .map(|image| image.current_texture)
+            .unwrap_or(0);
+        let dst_handle = self
+            .images
+            .get(&dst_id)
+            .map(|image| image.current_texture)
+            .unwrap_or(0);
+        let before_src_sample = if trace_target_blit {
+            unsafe { sample_present_texture(src_handle, src_info.size.width, src_info.size.height) }
+        } else {
+            (0, 0, 0, 0)
+        };
+        let before_dst_sample = if trace_target_blit {
+            unsafe { sample_present_texture(dst_handle, dst_info.size.width, dst_info.size.height) }
+        } else {
+            (0, 0, 0, 0)
+        };
+
         let (src_samples_x, src_samples_y) = crate::texture_cache::samples_helper::samples_log2(
             self.base.slot_images[src_id].info.num_samples as i32,
         );
@@ -8009,17 +8154,32 @@ impl TextureCache {
         );
         self.base.mark_modification_by_id(dst_id);
 
-        if std::env::var_os("RUZU_TRACE_FERMI2D_BLIT").is_some() {
+        let after_dst_sample = if trace_target_blit {
+            unsafe { sample_present_texture(dst_handle, dst_info.size.width, dst_info.size.height) }
+        } else {
+            (0, 0, 0, 0)
+        };
+
+        if std::env::var_os("RUZU_TRACE_FERMI2D_BLIT").is_some() || trace_target_blit {
             log::info!(
-                "[FERMI2D_BLIT] accelerated src=0x{:X}/0x{:X} dst=0x{:X}/0x{:X} {}x{} -> {}x{}",
+                "[FERMI2D_BLIT] accelerated src=0x{:X}/0x{:X} id={} handle={} dst=0x{:X}/0x{:X} id={} handle={} {}x{} -> {}x{} src_region={:?} dst_region={:?} before_src={:?} before_dst={:?} after_dst={:?}",
                 src_addr,
                 src_cpu_addr,
+                src_id.index,
+                src_handle,
                 dst_addr,
                 dst_cpu_addr,
+                dst_id.index,
+                dst_handle,
                 src_info.size.width,
                 src_info.size.height,
                 dst_info.size.width,
-                dst_info.size.height
+                dst_info.size.height,
+                src_region,
+                dst_region,
+                before_src_sample,
+                before_dst_sample,
+                after_dst_sample,
             );
         }
         true
@@ -8323,6 +8483,25 @@ impl TextureCache {
         });
         trace_image_view_event(4, view_id, &view, backend_image, Some(backend_view));
         let display_texture = backend_view.handle_for_texture_type(TextureType::Color2D);
+        if should_trace_present_path_cache(cpu_addr) {
+            let image = &self.base.slot_images[image_id];
+            log::info!(
+                "[PRESENT_PATH] addr=0x{:X} path=cache_view image={} view={} gpu=0x{:X} cpu=0x{:X} fmt={:?} size={}x{} flags={:?} tick={} texture={} original_texture={} current_texture={}",
+                cpu_addr,
+                image_id.index,
+                view_id.index,
+                image.gpu_addr,
+                image.cpu_addr,
+                image.info.format,
+                image.info.size.width,
+                image.info.size.height,
+                image.flags,
+                image.modification_tick,
+                display_texture,
+                original_texture,
+                current_texture,
+            );
+        }
         if display_texture == 0 {
             return None;
         }

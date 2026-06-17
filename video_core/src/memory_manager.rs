@@ -17,7 +17,7 @@ use crate::invalidation_accumulator::InvalidationAccumulator;
 use crate::pte_kind::PteKind;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // ── Constants ───────────────────────────────────────────────────────────
@@ -34,6 +34,126 @@ const CONTINUOUS_BITS: usize = 64;
 /// Device page size (4 KB) — matches upstream Core::DEVICE_PAGESIZE.
 const DEVICE_PAGE_SIZE: u64 = 1 << 12;
 const DEVICE_PAGE_MASK: u64 = DEVICE_PAGE_SIZE - 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CbufWatchRange {
+    stage: usize,
+    slot: usize,
+    address: u64,
+    size: u64,
+}
+
+static CBUF_WATCH_RANGES: parking_lot::Mutex<Vec<CbufWatchRange>> =
+    parking_lot::const_mutex(Vec::new());
+static CBUF_WATCH_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub fn register_cbuf_write_watch(stage: usize, slot: usize, address: u64, size: u32) {
+    if std::env::var_os("RUZU_TRACE_CBUF_WRITES").is_none() {
+        return;
+    }
+    if size == 0 || address == 0 {
+        return;
+    }
+
+    let watch = CbufWatchRange {
+        stage,
+        slot,
+        address,
+        size: size as u64,
+    };
+    let mut ranges = CBUF_WATCH_RANGES.lock();
+    if ranges.contains(&watch) {
+        return;
+    }
+    ranges.push(watch);
+    if ranges.len() > 512 {
+        ranges.remove(0);
+    }
+    log::info!(
+        "[CBUF_WATCH_BIND] stage={} slot={} addr=0x{:X} size=0x{:X} ranges={}",
+        stage,
+        slot,
+        address,
+        size,
+        ranges.len()
+    );
+}
+
+fn trace_cbuf_watch_write(source: &str, gpu_dest: u64, input: &[u8]) {
+    if std::env::var_os("RUZU_TRACE_CBUF_WRITES").is_none() || input.is_empty() {
+        return;
+    }
+    let write_end = gpu_dest.saturating_add(input.len() as u64);
+    let ranges = CBUF_WATCH_RANGES.lock();
+    let mut hit = None;
+    for range in ranges.iter() {
+        let range_end = range.address.saturating_add(range.size);
+        let overlap_start = gpu_dest.max(range.address);
+        let overlap_end = write_end.min(range_end);
+        if overlap_start < overlap_end {
+            hit = Some((*range, overlap_start, overlap_end));
+            break;
+        }
+    }
+    drop(ranges);
+
+    let Some((range, overlap_start, overlap_end)) = hit else {
+        return;
+    };
+
+    let limit = std::env::var("RUZU_TRACE_CBUF_WRITE_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2000);
+    let count = CBUF_WATCH_WRITE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if limit != 0 && count > limit {
+        return;
+    }
+
+    let overlap_offset = overlap_start.saturating_sub(gpu_dest) as usize;
+    let overlap_len = overlap_end.saturating_sub(overlap_start) as usize;
+    let overlap = &input[overlap_offset..overlap_offset + overlap_len];
+    let mut checksum = 0u64;
+    let mut nonzero_words = 0usize;
+    let mut nan_words = 0usize;
+    let mut first_nan = None;
+    for (word_index, chunk) in overlap.chunks_exact(4).enumerate() {
+        let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        checksum = checksum.wrapping_mul(16777619) ^ value as u64;
+        if value != 0 {
+            nonzero_words += 1;
+        }
+        if (value & 0x7F80_0000) == 0x7F80_0000 && (value & 0x007F_FFFF) != 0 {
+            nan_words += 1;
+            first_nan.get_or_insert((word_index, value));
+        }
+    }
+    let mut first_words = [0u32; 4];
+    for (index, chunk) in overlap.chunks_exact(4).take(4).enumerate() {
+        first_words[index] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+
+    log::warn!(
+        "[CBUF_WATCH_WRITE] source={} hit={} stage={} slot={} watch=0x{:X}..0x{:X} write=0x{:X}..0x{:X} overlap=0x{:X}..0x{:X} size={} overlap_size={} nonzero_words={} nan_words={} first_nan={:?} first_words={:08X?} checksum=0x{:X}",
+        source,
+        count,
+        range.stage,
+        range.slot,
+        range.address,
+        range.address.saturating_add(range.size),
+        gpu_dest,
+        write_end,
+        overlap_start,
+        overlap_end,
+        input.len(),
+        overlap_len,
+        nonzero_words,
+        nan_words,
+        first_nan,
+        first_words,
+        checksum
+    );
+}
 
 // ── Entry type ──────────────────────────────────────────────────────────
 
@@ -1128,6 +1248,7 @@ impl GpuMemoryManager {
 
     /// Upstream: `MemoryManager::WriteBlock(gpu_dest, input, size)`.
     pub fn write_block(&self, gpu_dest: u64, input: &[u8]) -> bool {
+        trace_cbuf_watch_write("MemoryManager::write_block", gpu_dest, input);
         self.write_block_impl_safe(gpu_dest, input, &mut |addr, data| {
             self.device_memory.smmu_write_block_unsafe(addr, data);
         });
@@ -1136,6 +1257,7 @@ impl GpuMemoryManager {
 
     /// Upstream: `MemoryManager::WriteBlockUnsafe(gpu_dest, input, size)`.
     pub fn write_block_unsafe(&self, gpu_dest: u64, input: &[u8]) -> bool {
+        trace_cbuf_watch_write("MemoryManager::write_block_unsafe", gpu_dest, input);
         let trace = std::env::var_os("RUZU_GPU_VA_TRACE").is_some();
         self.write_block_impl(gpu_dest, input, &mut |addr, data| {
             if trace {
@@ -1168,6 +1290,7 @@ impl GpuMemoryManager {
     pub fn copy_block(&mut self, gpu_dest: u64, gpu_src: u64, size: u64) -> bool {
         let mut tmp = vec![0u8; size as usize];
         self.read_block(gpu_src, &mut tmp);
+        trace_cbuf_watch_write("MemoryManager::copy_block", gpu_dest, &tmp);
         self.write_block(gpu_dest, &tmp);
         self.flush_region(gpu_dest, size);
         true
@@ -1831,12 +1954,50 @@ impl MemoryManager {
         self.id
     }
 
+    pub fn device_memory(&self) -> &Arc<MaxwellDeviceMemoryManager> {
+        &self.device_memory
+    }
+
     pub fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
         self.inner.gpu_to_cpu_address(gpu_addr)
     }
 
     pub fn gpu_to_cpu_address_range(&self, gpu_addr: u64, size: u64) -> Option<u64> {
         self.inner.gpu_to_cpu_address_range(gpu_addr, size)
+    }
+
+    pub fn register_cbuf_write_watch(&self, stage: usize, slot: usize, gpu_addr: u64, size: u32) {
+        register_cbuf_write_watch(stage, slot, gpu_addr, size);
+        if let Some(device_addr) = self.gpu_to_cpu_address_range(gpu_addr, size as u64) {
+            if let Some(backing) = self.device_memory.smmu_cpu_backing_for_address(device_addr) {
+                log::info!(
+                    "[CBUF_GUEST_BACKING] stage={} slot={} gpu=0x{:X} dev=0x{:X} asid={} guest=0x{:X} size=0x{:X}",
+                    stage,
+                    slot,
+                    gpu_addr,
+                    device_addr,
+                    backing.asid(),
+                    backing.virtual_address(),
+                    size
+                );
+            } else {
+                log::info!(
+                    "[CBUF_GUEST_BACKING] stage={} slot={} gpu=0x{:X} dev=0x{:X} asid=None guest=None size=0x{:X}",
+                    stage,
+                    slot,
+                    gpu_addr,
+                    device_addr,
+                    size
+                );
+            }
+            crate::host1x::gpu_device_memory_manager::register_cbuf_device_write_watch(
+                stage,
+                slot,
+                gpu_addr,
+                device_addr,
+                size,
+            );
+        }
     }
 
     pub fn is_continuous_range(&self, gpu_addr: u64, size: u64) -> bool {

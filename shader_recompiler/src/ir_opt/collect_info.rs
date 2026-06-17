@@ -11,9 +11,10 @@
 
 use crate::ir::opcodes::Opcode;
 use crate::ir::program::{CbufDescriptor, Program, TexDescriptor};
-use crate::ir::types::Type;
+use crate::ir::types::{TextureInstInfo, Type};
 use crate::ir::value::{Attribute, Value};
 use crate::program_header::{PixelImap, ProgramHeader};
+use crate::shader_info::TextureType;
 
 fn cbuf_type_bit(opcode: Opcode) -> u32 {
     match opcode {
@@ -164,17 +165,58 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                 }
 
                 // Texture access
-                Opcode::ImageSampleImplicitLod
-                | Opcode::ImageSampleExplicitLod
-                | Opcode::ImageSampleDrefImplicitLod
-                | Opcode::ImageSampleDrefExplicitLod
+                Opcode::BindlessImageSampleImplicitLod
+                | Opcode::BindlessImageSampleExplicitLod
+                | Opcode::BindlessImageSampleDrefImplicitLod
+                | Opcode::BindlessImageSampleDrefExplicitLod
+                | Opcode::BindlessImageGather
+                | Opcode::BindlessImageGatherDref
+                | Opcode::BindlessImageFetch
+                | Opcode::BindlessImageQueryDimensions
+                | Opcode::BindlessImageQueryLod
+                | Opcode::BindlessImageGradient
+                | Opcode::BoundImageSampleImplicitLod
+                | Opcode::BoundImageSampleExplicitLod
+                | Opcode::BoundImageSampleDrefImplicitLod
+                | Opcode::BoundImageSampleDrefExplicitLod
+                | Opcode::BoundImageGather
+                | Opcode::BoundImageGatherDref
+                | Opcode::BoundImageFetch
+                | Opcode::BoundImageQueryDimensions
+                | Opcode::BoundImageQueryLod
+                | Opcode::BoundImageGradient
                 | Opcode::ImageFetch
                 | Opcode::ImageQueryDimensions
+                | Opcode::ImageGradient
                 | Opcode::ImageGather
                 | Opcode::ImageGatherDref => {
                     if let Some(&Value::ImmU32(idx)) = inst.args.first() {
                         tex_set.insert(idx);
                     }
+                    let flags = TextureInstInfo::from_u32(inst.flags);
+                    let ty = TextureType::from_u8(flags.texture_type);
+                    program.info.uses_sampled_1d |=
+                        ty == TextureType::Color1D || ty == TextureType::ColorArray1D;
+                    program.info.uses_sparse_residency |= inst
+                        .get_associated_pseudo(Opcode::GetSparseFromOp)
+                        .is_some();
+                }
+                Opcode::ImageSampleImplicitLod
+                | Opcode::ImageSampleExplicitLod
+                | Opcode::ImageSampleDrefImplicitLod
+                | Opcode::ImageSampleDrefExplicitLod
+                | Opcode::ImageQueryLod => {
+                    if let Some(&Value::ImmU32(idx)) = inst.args.first() {
+                        tex_set.insert(idx);
+                    }
+                    let flags = TextureInstInfo::from_u32(inst.flags);
+                    let ty = TextureType::from_u8(flags.texture_type);
+                    program.info.uses_sampled_1d |=
+                        ty == TextureType::Color1D || ty == TextureType::ColorArray1D;
+                    program.info.uses_shadow_lod |= flags.is_depth;
+                    program.info.uses_sparse_residency |= inst
+                        .get_associated_pseudo(Opcode::GetSparseFromOp)
+                        .is_some();
                 }
 
                 // Local memory
@@ -379,9 +421,10 @@ mod tests {
     use crate::ir::instruction::Inst;
     use crate::ir::opcodes::Opcode;
     use crate::ir::program::Program;
-    use crate::ir::types::ShaderStage;
+    use crate::ir::types::{ShaderStage, TextureInstInfo};
     use crate::ir::value::{Attribute, Value};
     use crate::program_header::ProgramHeader;
+    use crate::shader_info::TextureType;
 
     #[test]
     fn collect_info_header_sets_fragment_indexed_generic_loads() {
@@ -420,6 +463,34 @@ mod tests {
 
         assert!(program.info.uses_atomic_s32_min);
         assert!(program.info.uses_atomic_s32_max);
+    }
+
+    #[test]
+    fn collect_info_marks_depth_texture_samples_as_shadow_lod_users() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let flags = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::ColorArray2D as u8,
+            is_depth: true,
+            ..Default::default()
+        };
+        program.block_mut(0).append_inst(Inst::with_flags(
+            Opcode::ImageSampleDrefExplicitLod,
+            vec![
+                Value::ImmU32(3),
+                Value::ImmU32(0),
+                Value::ImmU32(0),
+                Value::ImmU32(0),
+            ],
+            flags.to_u32(),
+        ));
+
+        super::collect_shader_info_pass(&mut program);
+
+        assert!(program.info.uses_shadow_lod);
+        assert_eq!(program.info.texture_descriptors.len(), 1);
+        assert_eq!(program.info.texture_descriptors[0].cbuf_index, 3);
     }
 
     #[test]
