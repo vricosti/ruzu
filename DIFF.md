@@ -1,3 +1,47 @@
+## 2026-06-17 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Added env-gated diagnostic logging for the OpenGL backend present view materialization under `RUZU_TRACE_PRESENT_PATH_ADDR` / `RUZU_TRACE_PRESENT_PATH_EVERY`: logs the selected `image_id`, `view_id`, GPU/CPU address, format, flags, modification tick, and GL texture handles for the framebuffer image chosen by `TryFindFramebufferImageView`. This is inactive unless requested and does not change image selection.
+
+### Unintentional differences (to fix)
+- None introduced by this diagnostic slice.
+
+### Missing items
+- None for this diagnostic slice.
+
+### Binary layout verification
+- PASS: no serialized or raw-copied payload layout changed.
+
+## 2026-06-17 — video_core/src/renderer_opengl/present/layer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/layer.cpp
+
+### Intentional differences
+- Added env-gated diagnostic logging for `Layer::LoadFBToScreenInfo` under `RUZU_TRACE_PRESENT_PATH_ADDR` / `RUZU_TRACE_PRESENT_PATH_EVERY`: logs whether present used the accelerated texture-cache path or CPU-memory fallback, and summarizes sampled tiled/linear bytes. This is behavior-preserving and inactive unless requested.
+
+### Unintentional differences (to fix)
+- None introduced by this diagnostic slice.
+
+### Missing items
+- None for this diagnostic slice.
+
+### Binary layout verification
+- PASS: no serialized or raw-copied payload layout changed.
+
+## 2026-06-17 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Added env-gated diagnostic logging for `RasterizerOpenGL::accelerate_display` under `RUZU_TRACE_PRESENT_PATH_ADDR` / `RUZU_TRACE_PRESENT_PATH_EVERY`: logs targeted texture-cache hit/miss metadata for the presented framebuffer address. This mirrors existing diagnostic-only present probes and is inactive unless requested.
+- Added env-gated diagnostic `[RT_PROBE]` readbacks immediately before and after indexed/non-indexed OpenGL draw calls under `RUZU_TRACE_RT_PROBE_ADDR` with time/limit filters. This is behavior-preserving and only samples the currently bound render target when explicitly enabled.
+- Extended the same env-gated `[RT_PROBE]` diagnostic to color clears and added `[RT_CLEAR]` metadata for targeted clears. This only observes GL framebuffer contents around upstream-equivalent `glClearBufferfv` calls when explicitly enabled.
+
+### Unintentional differences (to fix)
+- None introduced by this diagnostic slice.
+
+### Missing items
+- None for this diagnostic slice.
+
+### Binary layout verification
+- PASS: no serialized or raw-copied payload layout changed.
+
 ## 2026-06-15 — core/src/file_sys/fssystem/alignment_matching_storage_impl.rs, core/src/file_sys/fssystem/alignment_matching_storage.rs, core/src/file_sys/fssystem/nca_file_system_driver.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/file_sys/fssystem/fssystem_alignment_matching_storage_impl.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/file_sys/fssystem/fssystem_alignment_matching_storage.h, and /home/vricosti/Dev/emulators/zuyu/src/core/file_sys/fssystem/fssystem_nca_file_system_driver.cpp
 
 ### Intentional differences
@@ -24560,3 +24604,269 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `yuzu_cmd/yuzu.cpp` logging initialization.
 - `cargo test -p common logging::backend::tests -- --nocapture`
 - `cargo check -p ruzu_cmd`
+
+## 2026-06-17 — video_core/src/engines/maxwell_3d.rs vs video_core/engines/maxwell_3d.cpp
+
+### Intentional differences
+- Rust adds env-gated diagnostic `RUZU_TRACE_CBUF_BIND_NAN` in `process_cb_bind`. When enabled, it reads up to 0x10000 bytes from sampled bound constant buffers and logs `[CBUF_BIND_SCAN]` summaries for IEEE-754 NaN words. `RUZU_TRACE_CBUF_BIND_SCAN_EVERY` throttles scans, and `RUZU_TRACE_CBUF_BIND_NAN_VERBOSE` opt-in logs individual `[CBUF_BIND_NAN]` words. Upstream only binds the uniform buffer; this diagnostic is temporary and disabled by default.
+- The scan uses `read_block_unsafe` to avoid introducing a cache flush in the diagnostic path. This keeps the normal disabled path identical and limits enabled-path side effects while still exposing memory contents visible through the GMMU/device memory path.
+
+### Unintentional differences (to fix)
+- None introduced in the default path; the diagnostic is inactive unless `RUZU_TRACE_CBUF_BIND_NAN` is set.
+
+### Missing items
+- No upstream method is missing in this slice. This is instrumentation for the MK8D cinematic black-frame investigation.
+
+### Binary layout verification
+- PASS: no guest-visible raw binary payload layout changed; only diagnostic reads/logging were added.
+
+### Verification
+- Re-read upstream `Maxwell3D::ProcessCBBind`, `ProcessCBMultiData`, and `ProcessCBData` in `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp`.
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-17 — video_core/src/renderer_opengl/present/window_adapt_pass.rs vs video_core/renderer_opengl/present/window_adapt_pass.cpp
+
+### Intentional differences
+- Rust adds env-gated diagnostic `RUZU_TRACE_PRESENT_TEXTURE_SAMPLE`. When enabled, `WindowAdaptPass::draw_to_framebuffer` samples configured layer textures through a temporary read framebuffer and logs `[PRESENT_TEXTURE_SAMPLE]` with texture size, source framebuffer metadata, nonzero pixel counts, RGBA sums, checksums, framebuffer status, and GL error state. `RUZU_TRACE_PRESENT_TEXTURE_SAMPLE_EVERY` throttles this probe. Upstream proceeds directly from `ConfigureDraw` to the final present draw.
+- Existing `RUZU_TRACE_PRESENT_PHASES` and `RUZU_TRACE_PRESENT_DRAW` remain disabled by default and continue to instrument the final framebuffer/present state only when requested. `RUZU_TRACE_PRESENT_PHASES_EVERY` throttles the framebuffer sampling probe.
+
+### Unintentional differences (to fix)
+- None introduced in the default path; the texture probe is inactive unless `RUZU_TRACE_PRESENT_TEXTURE_SAMPLE` is set.
+
+### Missing items
+- No upstream present behavior is missing in this slice. This is instrumentation for determining whether MK8D cinematic black frames are already black in the layer texture or become black during final present composition.
+
+### Binary layout verification
+- PASS: no guest-visible raw binary payload layout changed; only OpenGL diagnostic framebuffer reads/logging were added.
+
+### Verification
+- Re-read upstream `WindowAdaptPass::DrawToFramebuffer` in `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/window_adapt_pass.cpp`.
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-17 — video_core/src/memory_manager.rs + video_core/src/engines/maxwell_3d.rs vs video_core/memory_manager.cpp + video_core/engines/maxwell_3d.cpp
+
+### Intentional differences
+- Rust adds env-gated diagnostic `RUZU_TRACE_CBUF_WRITES`. When enabled, `Maxwell3D::process_cb_bind` registers watched cbuf ranges for stage 0/4 slot 1, and `MemoryManager::{write_block,write_block_unsafe,copy_block}` logs `[CBUF_WATCH_WRITE]` when a GPU-VA write intersects those ranges. Upstream has no such watchlist; this is temporary instrumentation for the MK8D cinematic black-frame investigation.
+- `RUZU_TRACE_CBUF_WRITE_LIMIT` caps emitted write-hit lines. This keeps the diagnostic usable without changing the disabled/default path.
+
+### Unintentional differences (to fix)
+- None introduced in the default path; the watchlist and write-hit logging are inactive unless `RUZU_TRACE_CBUF_WRITES` is set.
+
+### Missing items
+- The watchlist only covers writes that flow through `video_core::MemoryManager` GPU-VA write APIs. Direct CPU-side mapped stores outside this path would still need a lower-level device-memory or guest-memory trap if this probe produces no hit.
+
+### Binary layout verification
+- PASS: no guest-visible raw binary payload layout changed; only diagnostic range registration and logging were added.
+
+### Verification
+- Re-read upstream `Maxwell3D::ProcessCBBind` in `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp`.
+- Re-read Rust `MemoryManager::{write_block,write_block_unsafe,copy_block}` ownership against the upstream write API shape.
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-17 — video_core/src/host1x/gpu_device_memory_manager.rs + video_core/src/memory_manager.rs + video_core/src/engines/maxwell_3d.rs vs video_core/host1x/gpu_device_memory_manager.cpp + video_core/memory_manager.cpp + video_core/engines/maxwell_3d.cpp
+
+### Intentional differences
+- Rust adds env-gated diagnostic `RUZU_TRACE_CBUF_DEVICE_WRITES`. When enabled, `Maxwell3D::process_cb_bind` registers stage 0/4 slot 1 cbuf ranges through the bound `MemoryManager`, which records both the GPU virtual range and the translated device-address range. `MaxwellDeviceMemoryManager::{write_u8,write_u16,write_u32,write_u64,smmu_write_block_unsafe}` logs `[CBUF_DEVICE_WATCH_WRITE]` when a device-address write intersects those translated ranges. Upstream has no such watchlist; this is temporary instrumentation for the MK8D cinematic black-frame investigation.
+- `RUZU_TRACE_CBUF_DEVICE_WRITE_LIMIT` caps emitted write-hit lines. This keeps the diagnostic usable without changing the disabled/default path.
+
+### Unintentional differences (to fix)
+- None introduced in the default path; the watchlist and write-hit logging are inactive unless `RUZU_TRACE_CBUF_DEVICE_WRITES` is set.
+
+### Missing items
+- This still does not trap raw CPU stores that write directly through mapped guest-memory pointers without calling `MaxwellDeviceMemoryManager` write helpers. If the device watch also produces no hit while cbuf bind scans still observe NaNs, the next owner to instrument is the core guest-memory CPU write/rasterizer-notification path.
+
+### Binary layout verification
+- PASS: no guest-visible raw binary payload layout changed; only diagnostic range registration and logging were added.
+
+### Verification
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/gpu_device_memory_manager.h`.
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/gpu_device_memory_manager.cpp`.
+- Re-read upstream `MemoryManager::GpuToCpuAddress` in `/home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.cpp`.
+- Re-read upstream `Maxwell3D::ProcessCBBind` in `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp`.
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-17 — video_core/src/gpu.rs + video_core/src/host1x/gpu_device_memory_manager.rs vs video_core/gpu.cpp + video_core/host1x/gpu_device_memory_manager.cpp
+
+### Intentional differences
+- Rust extends the temporary `RUZU_TRACE_CBUF_DEVICE_WRITES` diagnostic with `[CBUF_DEVICE_WATCH_RANGE]` logging from `Gpu::on_cpu_write`. Upstream `GPU::Impl::OnCPUWrite` directly forwards to `rasterizer->OnCPUWrite(addr, size)`; Rust logs only when the CPU-notified device-address range intersects a watched cbuf range, then preserves the normal forwarding behavior.
+- The range-only hook records device-address overlap even when the CPU write path does not expose the written payload at the video_core layer. This is needed to distinguish direct CPU/JIT stores from device-memory API writes in the MK8D cinematic black-frame investigation.
+
+### Unintentional differences (to fix)
+- None introduced in the default path; the hook is inactive unless `RUZU_TRACE_CBUF_DEVICE_WRITES` is set.
+
+### Missing items
+- If this range-only CPU notification hits, a follow-up core-memory/JIT-side payload trace by guest VA is still required to identify the exact instruction/value producer.
+
+### Binary layout verification
+- PASS: no guest-visible raw binary payload layout changed; only diagnostic logging was added.
+
+### Verification
+- Re-read upstream `GPU::Impl::OnCPUWrite` and `GPU::OnCPUWrite` in `/home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.cpp`.
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/gpu_device_memory_manager.cpp`.
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-17 — video_core/src/host1x/gpu_device_memory_manager.rs + video_core/src/memory_manager.rs + video_core/src/engines/maxwell_3d.rs vs video_core/host1x/gpu_device_memory_manager.cpp + video_core/memory_manager.cpp + video_core/engines/maxwell_3d.cpp
+
+### Intentional differences
+- Rust extends the temporary cbuf diagnostic with SMMU CPU-backing attribution. `MaxwellDeviceMemoryManager::smmu_cpu_backing_for_address` exposes the ASID and guest VA recorded by the existing SMMU map table, `MemoryManager::register_cbuf_write_watch` logs `[CBUF_GUEST_BACKING]`, and `Maxwell3D::trace_cbuf_bind_nan` logs `first_nan_guest` for the first NaN word in a scanned cbuf. Upstream has no such diagnostics.
+- Rust exposes `MemoryManager::device_memory()` and read-only `CpuBacking` accessors so the diagnostic can keep ownership aligned with the existing Host1x device-memory owner rather than duplicating SMMU state.
+
+### Unintentional differences (to fix)
+- None introduced in the default path; the diagnostic is inactive unless `RUZU_TRACE_CBUF_BIND_NAN` / `RUZU_TRACE_CBUF_DEVICE_WRITES` are set.
+
+### Missing items
+- This only identifies the first NaN word per sampled cbuf. Full attribution of every NaN word would require verbose mode or a dedicated batch dump.
+
+### Binary layout verification
+- PASS: no guest-visible raw binary payload layout changed; only diagnostic reads/logging were added.
+
+### Verification
+- Re-read upstream `Tegra::MemoryManager` ownership and `GpuToCpuAddress` declarations in `/home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.h`.
+- Re-read upstream `Core::DeviceMemoryManager` instantiation in `/home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/gpu_device_memory_manager.cpp`.
+- Re-read upstream `Maxwell3D::ProcessCBBind` in `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp`.
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-17 — externals/rdynarmic/src/frontend/a32/{decoder.rs,translate/mod.rs,translate/vfp.rs} + externals/rdynarmic/src/tests_a32_fuzz.rs vs externals/dynarmic/src/dynarmic/frontend/A32/{decoder/vfp.inc,translate/impl/vfp.cpp}
+
+### Intentional differences
+- Rust hand-encodes the focused A32 VFP differential-test programs in `tests_a32_fuzz.rs` instead of using Dynarmic's generated decoder tables. The encodings were checked against upstream `decoder/vfp.inc` for `VFMA/VFMS/VFNMA/VFNMS` and `VMOV` core-register transfer forms.
+- Rust adds explicit decoder regression tests for the F32 and F64 scalar VFPv4 fused multiply-accumulate opcodes. These are not upstream tests, but they enforce upstream `vfp.inc` ownership and prevent the opcodes from falling back to generic `CDP/MCR/MRC` decode again.
+- The tests tolerate only the known default-NaN sign delta (`0xffc00000` vs `0x7fc00000` for F32, `0xfff8000000000000` vs `0x7ff8000000000000` for F64). Finite, zero, infinity, and all other NaN payload/class differences remain hard mismatches.
+- The F32/F64 test pools are deliberately bounded so the external oracle test remains practical while still covering finite fused math, signed zero, infinity invalid-operation default NaNs, and F32 qNaN propagation.
+
+### Unintentional differences (to fix)
+- None in the VFMA/VFMS/VFNMA/VFNMS decoder or translator path. Rust now matches upstream VFPv4 scalar fused multiply-accumulate ownership and semantics: `FPMulAdd(d,n,m)`, `FPMulSub(d,n,m)`, `FPMulAdd(FPNeg(d),n,m)`, and `FPMulSub(FPNeg(d),n,m)`.
+- The broader backend default-NaN sign mismatch remains a known FP parity issue outside this slice.
+
+### Missing items
+- No missing scalar VFPv4 fused multiply-accumulate items in this slice.
+
+### Binary layout verification
+- PASS: no raw guest-visible binary structure layout changed; this ports instruction decode/translation and adds differential tests only.
+
+### Verification
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A32/decoder/vfp.inc`.
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A32/translate/impl/vfp.cpp`.
+- `cargo fmt -p rdynarmic`
+- `timeout 120 cargo test -p rdynarmic --release test_decode_vfp_v4_fused_mac -- --nocapture` — PASS, F32 and F64 VFPv4 fused-MAC opcodes decode to dedicated VFP IDs.
+- `timeout 180 cargo test -p rdynarmic --release fuzz_vfp_scalar_f32_fused_mac -- --nocapture` — PASS, 0/2916 hard mismatches, 530 tolerated default-NaN-sign-only differences.
+- `timeout 180 cargo test -p rdynarmic --release fuzz_vfp_scalar_f64_fused_mac -- --nocapture` — PASS, 0/2048 hard mismatches, 336 tolerated default-NaN-sign-only differences.
+- `timeout 220 cargo test -p rdynarmic --release fuzz_vfp_scalar_f32_decoded_ops -- --nocapture` — PASS, 0/4374 hard mismatches, 348 tolerated default-NaN-sign-only differences.
+
+## 2026-06-17 — shader_recompiler/src/ir_opt/collect_info.rs vs shader_recompiler/ir_opt/collect_shader_info_pass.cpp
+
+### Intentional differences
+- Rust keeps the existing `tex_set` reconstruction for immediate texture descriptors in the env-less pass. This is a Rust-port compatibility path around the same scan; the upstream-relevant texture side effects now match the C++ groups.
+
+### Unintentional differences (to fix)
+- None introduced. Rust now mirrors upstream's texture-info collection for `BindlessImage*`, `BoundImage*`, `ImageGather`, `ImageFetch`, `ImageQueryDimensions`, `ImageGradient`, `ImageSample*`, and `ImageQueryLod`, including `uses_sampled_1d`, `uses_sparse_residency`, and `uses_shadow_lod` for depth samples.
+
+### Missing items
+- No missing texture-info side effects in this slice.
+
+### Binary layout verification
+- PASS: no raw guest-visible binary payload layout changed; this only updates shader metadata collection and a unit test.
+
+### Verification
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp`, especially the texture opcode groups at `BindlessImageSampleImplicitLod` through `ImageQueryLod`.
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/glsl_emit_context.cpp` and confirmed `GL_EXT_texture_shadow_lod` is emitted from `info.uses_shadow_lod && profile.support_gl_texture_shadow_lod`.
+- `cargo fmt -p shader_recompiler`
+- `cargo test -p shader_recompiler --release ir_opt::collect_info -- --nocapture` — PASS, including `collect_info_marks_depth_texture_samples_as_shadow_lod_users`.
+
+## 2026-06-17 — video_core/src/buffer_cache/memory_tracker_base.rs vs video_core/buffer_cache/memory_tracker_base.h
+
+### Intentional differences
+- Rust keeps the existing out-of-range guard for invalid device addresses above the 34-bit tracked range, because the C++ `std::array` access would be undefined behavior while Rust would otherwise panic. This entry extends that diagnostic with an env-gated `RUZU_TRACE_MEMTRACK_OOR_BT=1` backtrace to identify the caller that supplied the invalid address.
+
+### Unintentional differences (to fix)
+- None introduced in the default path; the backtrace is inactive unless `RUZU_TRACE_MEMTRACK_OOR_BT` is set.
+
+### Missing items
+- The producer of intermittent device addresses above `SMMU_VA_LIMIT` is still not identified because the instrumented MK8D rerun did not reproduce `[MEMTRACK_OOR]`.
+
+### Binary layout verification
+- PASS: no guest-visible raw binary payload layout changed; only diagnostic logging was added.
+
+### Verification
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/video_core/buffer_cache/memory_tracker_base.h`, especially `IteratePages` and `ForEachDownloadRangeAndClear`.
+- `cargo fmt -- video_core/src/buffer_cache/memory_tracker_base.rs`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-17 — video_core/src/host1x/syncpoint_manager.rs vs video_core/host1x/syncpoint_manager.cpp
+
+### Intentional differences
+- Rust adds env-gated stderr tracing for `RUZU_TRACE_SYNCPOINT_AFTER=N` around host1x syncpoint action registration, host/guest increments, and host/guest waits. This is diagnostic-only and mirrors the same upstream-owned methods: `Register*Action`, `Increment*`, and `Wait*`.
+
+### Unintentional differences (to fix)
+- None introduced in the default path; output is inactive unless `RUZU_TRACE_SYNCPOINT_AFTER` is set.
+
+### Missing items
+- No host1x syncpoint behavior was changed. The MK8D trace showed host increments reaching each armed target and `WaitHost` fallback completing.
+
+### Binary layout verification
+- PASS: no guest-visible raw binary payload layout changed; only diagnostic logging was added.
+
+### Verification
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/syncpoint_manager.cpp`, especially `Increment`, `Wait`, and action firing order.
+- `cargo fmt -- video_core/src/host1x/syncpoint_manager.rs`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-17 — core/src/hle/service/nvdrv/devices/nvhost_ctrl.rs vs core/hle/service/nvdrv/devices/nvhost_ctrl.cpp
+
+### Intentional differences
+- Rust adds env-gated stderr tracing for `RUZU_TRACE_SYNCPOINT_AFTER=N` around `IocCtrlEventWait` begin/signalled/armed/fallback states. This is diagnostic-only and stays in the upstream-owned `nvhost_ctrl` method.
+
+### Unintentional differences (to fix)
+- None introduced in the default path; output is inactive unless `RUZU_TRACE_SYNCPOINT_AFTER` is set.
+
+### Missing items
+- No `IocCtrlEventWait` behavior was changed. The MK8D trace showed the suspected cinematic wait was transient: host actions were armed, host syncpoints incremented to the target, and fallback `WaitHost` calls completed.
+
+### Binary layout verification
+- PASS: no guest-visible raw binary payload layout changed; only diagnostic logging was added.
+
+### Verification
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp`, especially `IocCtrlEventWait` and the `check_failing` fallback.
+- `cargo fmt -- core/src/hle/service/nvdrv/devices/nvhost_ctrl.rs`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-17 — core/src/file_sys/system_archive/shared_font.rs vs core/file_sys/system_archive/shared_font.cpp
+
+### Intentional differences
+- Rust keeps native `Vec<u8>` / `VectorVfsFile` construction instead of the C++ `std::array` template helper, while preserving the same `PackBFTTF` ownership and byte transform.
+
+### Unintentional differences (to fix)
+- None remain in this slice. Rust now uses upstream's `EXPECTED_RESULT = 0x7f9a0218` for synthetic BFTTF encryption. The previous `0xCAFE` key produced archives that passed the magic check but decrypted to corrupt shared-font payloads.
+
+### Missing items
+- No missing shared-font archive files in this slice.
+
+### Binary layout verification
+- PASS: `pack_bfttf` still emits `[swap32(EXPECTED_MAGIC), encrypted_size, encrypted_payload...]`; the new regression test decrypts the synthetic archive through `platform_service_manager::decrypt_shared_font_to_ttf` and verifies the original bytes are recovered.
+
+### Verification
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/core/file_sys/system_archive/shared_font.cpp`, especially `PackBFTTF`.
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ns/platform_service_manager.cpp`, especially `EXPECTED_RESULT`, `EXPECTED_MAGIC`, and `EncryptSharedFont`.
+- `cargo fmt -- core/src/file_sys/system_archive/shared_font.rs`
+- `timeout 180 cargo test -p core --release file_sys::system_archive::shared_font -- --nocapture` — PASS, 6/6 tests.
+
+## 2026-06-17 — video_core/src/renderer_opengl/gl_rasterizer.rs vs video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Rust extends the existing env-gated `[SAMPLER]` diagnostic hook with `RUZU_TRACE_SAMPLER_DUMP_TIME_START_MS`, `RUZU_TRACE_SAMPLER_DUMP_TIME_END_MS`, `RUZU_TRACE_SAMPLER_DUMP_SEQ_MIN`, `RUZU_TRACE_SAMPLER_DUMP_SEQ_MAX`, `RUZU_TRACE_SAMPLER_DUMP_PIPELINE`, and `RUZU_TRACE_SAMPLER_DUMP_LIMIT`. It also reports each bound texture target separately (`2D` and `2D_ARRAY`) plus first/center samples. This is diagnostic-only and inactive unless `RUZU_TRACE_SAMPLER_DUMP` is set.
+- Rust emits env-gated `[RT_PROBE]` lines at warning severity instead of info severity so the probe can be captured with the default `*:Warning` filter without enabling all service `Info` logs. The probe remains inactive unless `RUZU_TRACE_RT_PROBE_ADDR` is set.
+
+### Unintentional differences (to fix)
+- None introduced in the default rendering path; the new filters only reduce diagnostic readbacks when the hook is explicitly enabled.
+
+### Missing items
+- No upstream rendering behavior was ported or changed in this slice.
+
+### Binary layout verification
+- PASS: no guest-visible raw binary payload layout changed; only OpenGL state/readback logging was gated more narrowly.
+
+### Verification
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.h`, especially `RasterizerOpenGL` ownership.
+- Re-read upstream `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`, especially `Draw`, `PrepareDraw`, and state sync ownership around the draw path.
+- `cargo fmt -- video_core/src/renderer_opengl/gl_rasterizer.rs`
+- `cargo build --release --bin ruzu-cmd` — PASS, warnings only.

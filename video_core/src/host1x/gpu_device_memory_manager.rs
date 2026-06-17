@@ -32,6 +32,185 @@ pub const PAGE_SIZE: u64 = 1 << PAGE_BITS;
 /// Device address type (matches upstream `DAddr`).
 pub type DAddr = u64;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CbufDeviceWatchRange {
+    stage: usize,
+    slot: usize,
+    gpu_address: u64,
+    device_address: DAddr,
+    size: u64,
+}
+
+static CBUF_DEVICE_WATCH_RANGES: parking_lot::Mutex<Vec<CbufDeviceWatchRange>> =
+    parking_lot::const_mutex(Vec::new());
+static CBUF_DEVICE_WATCH_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub fn register_cbuf_device_write_watch(
+    stage: usize,
+    slot: usize,
+    gpu_address: u64,
+    device_address: DAddr,
+    size: u32,
+) {
+    if std::env::var_os("RUZU_TRACE_CBUF_DEVICE_WRITES").is_none() || size == 0 {
+        return;
+    }
+
+    let watch = CbufDeviceWatchRange {
+        stage,
+        slot,
+        gpu_address,
+        device_address,
+        size: size as u64,
+    };
+    let mut ranges = CBUF_DEVICE_WATCH_RANGES.lock();
+    if ranges.contains(&watch) {
+        return;
+    }
+    ranges.push(watch);
+    if ranges.len() > 512 {
+        ranges.remove(0);
+    }
+    log::info!(
+        "[CBUF_DEVICE_WATCH_BIND] stage={} slot={} gpu=0x{:X} dev=0x{:X} size=0x{:X} ranges={}",
+        stage,
+        slot,
+        gpu_address,
+        device_address,
+        size,
+        ranges.len()
+    );
+}
+
+fn trace_cbuf_device_watch_write(source: &str, d_address: DAddr, input: &[u8]) {
+    if std::env::var_os("RUZU_TRACE_CBUF_DEVICE_WRITES").is_none() || input.is_empty() {
+        return;
+    }
+
+    let write_end = d_address.saturating_add(input.len() as u64);
+    let ranges = CBUF_DEVICE_WATCH_RANGES.lock();
+    let mut hit = None;
+    for range in ranges.iter() {
+        let range_end = range.device_address.saturating_add(range.size);
+        let overlap_start = d_address.max(range.device_address);
+        let overlap_end = write_end.min(range_end);
+        if overlap_start < overlap_end {
+            hit = Some((*range, overlap_start, overlap_end));
+            break;
+        }
+    }
+    drop(ranges);
+
+    let Some((range, overlap_start, overlap_end)) = hit else {
+        return;
+    };
+
+    let limit = std::env::var("RUZU_TRACE_CBUF_DEVICE_WRITE_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2000);
+    let count = CBUF_DEVICE_WATCH_WRITE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if limit != 0 && count > limit {
+        return;
+    }
+
+    let overlap_offset = overlap_start.saturating_sub(d_address) as usize;
+    let overlap_len = overlap_end.saturating_sub(overlap_start) as usize;
+    let overlap = &input[overlap_offset..overlap_offset + overlap_len];
+    let mut checksum = 0u64;
+    let mut nonzero_words = 0usize;
+    let mut nan_words = 0usize;
+    let mut first_nan = None;
+    for (word_index, chunk) in overlap.chunks_exact(4).enumerate() {
+        let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        checksum = checksum.wrapping_mul(16777619) ^ value as u64;
+        if value != 0 {
+            nonzero_words += 1;
+        }
+        if (value & 0x7F80_0000) == 0x7F80_0000 && (value & 0x007F_FFFF) != 0 {
+            nan_words += 1;
+            first_nan.get_or_insert((word_index, value));
+        }
+    }
+
+    let mut first_words = [0u32; 4];
+    for (index, chunk) in overlap.chunks_exact(4).take(4).enumerate() {
+        first_words[index] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+
+    log::warn!(
+        "[CBUF_DEVICE_WATCH_WRITE] source={} hit={} stage={} slot={} gpu=0x{:X} dev_watch=0x{:X}..0x{:X} write=0x{:X}..0x{:X} overlap=0x{:X}..0x{:X} size={} overlap_size={} nonzero_words={} nan_words={} first_nan={:?} first_words={:08X?} checksum=0x{:X}",
+        source,
+        count,
+        range.stage,
+        range.slot,
+        range.gpu_address,
+        range.device_address,
+        range.device_address.saturating_add(range.size),
+        d_address,
+        write_end,
+        overlap_start,
+        overlap_end,
+        input.len(),
+        overlap_len,
+        nonzero_words,
+        nan_words,
+        first_nan,
+        first_words,
+        checksum
+    );
+}
+
+pub fn trace_cbuf_device_watch_range(source: &str, d_address: DAddr, size: u64) {
+    if std::env::var_os("RUZU_TRACE_CBUF_DEVICE_WRITES").is_none() || size == 0 {
+        return;
+    }
+
+    let write_end = d_address.saturating_add(size);
+    let ranges = CBUF_DEVICE_WATCH_RANGES.lock();
+    let mut hit = None;
+    for range in ranges.iter() {
+        let range_end = range.device_address.saturating_add(range.size);
+        let overlap_start = d_address.max(range.device_address);
+        let overlap_end = write_end.min(range_end);
+        if overlap_start < overlap_end {
+            hit = Some((*range, overlap_start, overlap_end));
+            break;
+        }
+    }
+    drop(ranges);
+
+    let Some((range, overlap_start, overlap_end)) = hit else {
+        return;
+    };
+
+    let limit = std::env::var("RUZU_TRACE_CBUF_DEVICE_WRITE_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2000);
+    let count = CBUF_DEVICE_WATCH_WRITE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if limit != 0 && count > limit {
+        return;
+    }
+
+    log::warn!(
+        "[CBUF_DEVICE_WATCH_RANGE] source={} hit={} stage={} slot={} gpu=0x{:X} dev_watch=0x{:X}..0x{:X} write=0x{:X}..0x{:X} overlap=0x{:X}..0x{:X} size={} overlap_size={}",
+        source,
+        count,
+        range.stage,
+        range.slot,
+        range.gpu_address,
+        range.device_address,
+        range.device_address.saturating_add(range.size),
+        d_address,
+        write_end,
+        overlap_start,
+        overlap_end,
+        size,
+        overlap_end.saturating_sub(overlap_start)
+    );
+}
+
 /// Fallback callback signature for `MaxwellDeviceMethods::MarkRegionCaching`.
 /// `(address, size, caching)`. The upstream inline method forwards through
 /// `Core::Memory::Memory::RasterizerMarkRegionCached(address, size, caching)`;
@@ -260,9 +439,19 @@ struct SmmuRegisteredProcesses {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CpuBacking {
+pub struct CpuBacking {
     asid: u32,
     virtual_address: u64,
+}
+
+impl CpuBacking {
+    pub fn asid(&self) -> u32 {
+        self.asid
+    }
+
+    pub fn virtual_address(&self) -> u64 {
+        self.virtual_address
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -675,6 +864,7 @@ impl MaxwellDeviceMemoryManager {
     /// this typed write does not call `InvalidateRegion`; block writes own that
     /// side effect.
     pub fn write_u8(&self, addr: DAddr, data: u8) {
+        trace_cbuf_device_watch_write("write_u8", addr, &[data]);
         let ptr = self.get_pointer_mut(addr);
         if ptr.is_null() {
             return;
@@ -683,6 +873,7 @@ impl MaxwellDeviceMemoryManager {
     }
 
     pub fn write_u16(&self, addr: DAddr, data: u16) {
+        trace_cbuf_device_watch_write("write_u16", addr, &data.to_le_bytes());
         let ptr = self.get_pointer_mut(addr);
         if ptr.is_null() {
             return;
@@ -691,6 +882,7 @@ impl MaxwellDeviceMemoryManager {
     }
 
     pub fn write_u32(&self, addr: DAddr, data: u32) {
+        trace_cbuf_device_watch_write("write_u32", addr, &data.to_le_bytes());
         let ptr = self.get_pointer_mut(addr);
         if ptr.is_null() {
             return;
@@ -699,6 +891,7 @@ impl MaxwellDeviceMemoryManager {
     }
 
     pub fn write_u64(&self, addr: DAddr, data: u64) {
+        trace_cbuf_device_watch_write("write_u64", addr, &data.to_le_bytes());
         let ptr = self.get_pointer_mut(addr);
         if ptr.is_null() {
             return;
@@ -1247,6 +1440,19 @@ impl MaxwellDeviceMemoryManager {
             })
     }
 
+    pub fn smmu_cpu_backing_for_address(&self, d_address: DAddr) -> Option<CpuBacking> {
+        let device_page = d_address >> SMMU_PAGE_BITS;
+        let page_offset = d_address & (SMMU_PAGE_SIZE - 1);
+        self.smmu_cpu_backing
+            .lock()
+            .unwrap()
+            .get(&device_page)
+            .map(|backing| CpuBacking {
+                asid: backing.asid,
+                virtual_address: backing.virtual_address.wrapping_add(page_offset),
+            })
+    }
+
     fn smmu_registered_memory(&self, asid: u32) -> Option<Arc<Mutex<Memory>>> {
         self.smmu_registered_processes.lock().unwrap().get(asid)
     }
@@ -1454,6 +1660,7 @@ impl MaxwellDeviceMemoryManager {
         if data.is_empty() {
             return true;
         }
+        trace_cbuf_device_watch_write("smmu_write_block_unsafe", d_address, data);
         self.smmu_walk_block(
             d_address,
             data.len(),

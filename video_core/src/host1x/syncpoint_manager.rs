@@ -230,6 +230,12 @@ impl SyncpointManager {
                 expected_value,
                 self.syncpoints_guest[syncpoint_id as usize].load(Ordering::Acquire)
             );
+            eprintln!(
+                "[HOST1X_SP] register_guest id={} expected={} current={}",
+                syncpoint_id,
+                expected_value,
+                self.syncpoints_guest[syncpoint_id as usize].load(Ordering::Acquire)
+            );
         }
         self.register_action(
             &self.syncpoints_guest[syncpoint_id as usize],
@@ -251,6 +257,14 @@ impl SyncpointManager {
                 "Host1xSyncpointManager::register_host_action id={} expected={}",
                 syncpoint_id,
                 expected_value
+            );
+        }
+        if should_log_syncpoint_value(expected_value) {
+            eprintln!(
+                "[HOST1X_SP] register_host id={} expected={} current={}",
+                syncpoint_id,
+                expected_value,
+                self.syncpoints_host[syncpoint_id as usize].load(Ordering::Acquire)
             );
         }
         self.register_action(
@@ -280,6 +294,12 @@ impl SyncpointManager {
                 syncpoint_id,
                 before
             );
+            eprintln!(
+                "[HOST1X_SP] increment_guest id={} before={} after={}",
+                syncpoint_id,
+                before,
+                before + 1
+            );
         }
         self.increment(
             &self.syncpoints_guest[syncpoint_id as usize],
@@ -295,6 +315,12 @@ impl SyncpointManager {
                 "Host1xSyncpointManager::increment_host id={} before={}",
                 syncpoint_id,
                 before
+            );
+            eprintln!(
+                "[HOST1X_SP] increment_host id={} before={} after={}",
+                syncpoint_id,
+                before,
+                before + 1
             );
         }
         self.increment(
@@ -409,6 +435,15 @@ impl SyncpointManager {
     ) {
         let current = syncpoint.load(Ordering::Acquire);
         trace_syncpoint(4, is_guest, storage_idx, expected_value, current, 0);
+        if should_log_syncpoint_value(expected_value) || should_log_syncpoint_value(current) {
+            eprintln!(
+                "[HOST1X_SP] wait_{} id={} expected={} current={}",
+                if is_guest { "guest" } else { "host" },
+                storage_idx,
+                expected_value,
+                current
+            );
+        }
         if current >= expected_value {
             trace_syncpoint(5, is_guest, storage_idx, expected_value, current, 0);
             return;
@@ -426,6 +461,15 @@ impl SyncpointManager {
             syncpoint.load(Ordering::Acquire),
             0,
         );
+        if should_log_syncpoint_value(expected_value) {
+            eprintln!(
+                "[HOST1X_SP] wait_{} done id={} expected={} current={}",
+                if is_guest { "guest" } else { "host" },
+                storage_idx,
+                expected_value,
+                syncpoint.load(Ordering::Acquire)
+            );
+        }
     }
 }
 

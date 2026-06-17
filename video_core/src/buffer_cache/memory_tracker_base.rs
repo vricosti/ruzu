@@ -8,6 +8,7 @@
 //! and is lazily allocated from a pooled free-list.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::types::VAddr;
 
@@ -37,6 +38,40 @@ const MANAGER_POOL_SIZE: usize = 32;
 
 /// Number of words each manager needs on the stack.
 const WORDS_STACK_NEEDED: usize = (HIGHER_PAGE_SIZE as usize) / (BYTES_PER_WORD as usize);
+
+/// Diagnostic: how many out-of-range tracker queries have been logged so far.
+/// Upstream indexes a `std::array<Manager*, NUM_HIGH_PAGES>` with the raw page
+/// index (silent UB if the device address exceeds the 16 GiB device address
+/// space). ruzu's bounds-checked `Vec` would panic instead, so we detect and
+/// log the offending (address, size) once to surface the real bug — a device
+/// address above `SMMU_VA_LIMIT` (2^34) must never reach the buffer cache.
+static OOR_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns true if `page_index` is within the tracked address space. When it is
+/// not, logs the offending query (rate-limited) so the bad address source can be
+/// traced. Out-of-range pages are skipped rather than crashing the GPU thread.
+#[cold]
+#[inline(never)]
+fn report_out_of_range(cpu_address: VAddr, size: u64, page_index: usize) {
+    if OOR_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+        log::warn!(
+            "[MEMTRACK_OOR] device address out of tracked range: addr=0x{:X} size=0x{:X} \
+             page_index={} (NUM_HIGH_PAGES={}); address exceeds SMMU_VA_LIMIT (2^{}). \
+             Skipping page to avoid crash — the producer of this address is the real bug.",
+            cpu_address,
+            size,
+            page_index,
+            NUM_HIGH_PAGES,
+            MAX_CPU_PAGE_BITS
+        );
+        if std::env::var_os("RUZU_TRACE_MEMTRACK_OOR_BT").is_some() {
+            eprintln!(
+                "[MEMTRACK_OOR_BT] addr=0x{cpu_address:X} size=0x{size:X} page_index={page_index}\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // MemoryTrackerBase<DT>
@@ -278,6 +313,11 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
         while remaining_size > 0 {
             let copy_amount = ((HIGHER_PAGE_SIZE - page_offset) as usize).min(remaining_size);
 
+            if page_index >= NUM_HIGH_PAGES {
+                report_out_of_range(cpu_address, size, page_index);
+                break;
+            }
+
             if let Some(loc) = self.top_tier[page_index] {
                 let mgr = Self::get_manager_mut(&mut self.manager_pool, loc);
                 match func(mgr, page_offset, copy_amount as u64) {
@@ -319,6 +359,11 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
 
         while remaining_size > 0 {
             let copy_amount = ((HIGHER_PAGE_SIZE - page_offset) as usize).min(remaining_size);
+
+            if page_index >= NUM_HIGH_PAGES {
+                report_out_of_range(cpu_address, size, page_index);
+                break;
+            }
 
             let mut execute =
                 |mgr: &WordManager<DT, WORDS_STACK_NEEDED>, begin: &mut u64, end: &mut u64| {
@@ -419,5 +464,39 @@ mod tests {
 
         // GPU-modified should be false initially
         assert!(!mem_tracker.is_region_gpu_modified(0x1000, 0x1000));
+    }
+
+    /// Regression: a device address beyond the tracked address space
+    /// (`>= NUM_HIGH_PAGES * HIGHER_PAGE_SIZE`, i.e. above `SMMU_VA_LIMIT`)
+    /// must not panic the GPU thread. Upstream indexes a fixed `std::array`
+    /// (silent UB); ruzu's bounds-checked `Vec` would panic, so the iteration
+    /// guards skip out-of-range pages instead. Observed in MK8D: a buffer with
+    /// device address ~24 GiB reached `for_each_download_range_and_clear`.
+    #[test]
+    fn test_out_of_range_address_does_not_panic() {
+        let tracker = DummyTracker;
+        let mut mem_tracker = MemoryTrackerBase::new(&tracker);
+
+        // page_index = oor_addr >> HIGHER_PAGE_BITS = NUM_HIGH_PAGES + 1689,
+        // which previously indexed past the 4096-entry top tier and panicked.
+        let oor_addr: VAddr = (5785u64) << HIGHER_PAGE_BITS;
+
+        // iterate_pairs path (read-only query): must return "not modified",
+        // not panic.
+        assert!(!mem_tracker.is_region_gpu_modified(oor_addr, 0x1000));
+        assert!(!mem_tracker.is_region_cpu_modified(oor_addr, 0x1000));
+
+        // iterate_pages path (download): func must simply never be called for
+        // the out-of-range range, and the call must not panic.
+        let mut hit = 0u32;
+        mem_tracker.for_each_download_range_and_clear(oor_addr, 0x4000, &mut |_, _| {
+            hit += 1;
+        });
+        assert_eq!(hit, 0);
+
+        // A range that STRADDLES the boundary must still process its in-range
+        // portion without panicking on the overflow pages.
+        let near_limit: VAddr = ((NUM_HIGH_PAGES as u64) - 1) << HIGHER_PAGE_BITS;
+        assert!(!mem_tracker.is_region_gpu_modified(near_limit, HIGHER_PAGE_SIZE * 4));
     }
 }
