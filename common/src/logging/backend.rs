@@ -293,7 +293,12 @@ fn rust_log_to_filter(value: &str) -> Option<String> {
 fn env_flag_enabled(key: &str, default: bool) -> bool {
     std::env::var(key)
         .ok()
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "False" | "FALSE" | "off" | "OFF"))
+        .map(|value| {
+            !matches!(
+                value.as_str(),
+                "0" | "false" | "False" | "FALSE" | "off" | "OFF"
+            )
+        })
         .unwrap_or(default)
 }
 

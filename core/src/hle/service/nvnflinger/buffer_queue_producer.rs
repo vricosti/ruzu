@@ -554,11 +554,11 @@ impl BufferQueueProducer {
             out_slot,
             return_flags.raw()
         ));
-        log::info!(
-            "[BQP_DEQUEUE_RET] slot={} flags=0x{:X}",
-            out_slot,
-            return_flags.raw()
-        );
+        // log::info!(
+        //     "[BQP_DEQUEUE_RET] slot={} flags=0x{:X}",
+        //     out_slot,
+        //     return_flags.raw()
+        // );
         trace_bqp_ring(&[
             2,
             bqp_seq,

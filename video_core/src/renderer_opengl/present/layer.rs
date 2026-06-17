@@ -17,8 +17,37 @@ use crate::renderer_base::DeviceMemoryReader;
 use crate::renderer_opengl::gl_shader_manager::ProgramManager;
 use crate::renderer_opengl::RasterizerOpenGL;
 use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const PRESENT_LAYER_SENTINEL: u64 = u64::MAX;
+static PRESENT_PATH_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn parse_trace_u64_env(name: &str) -> Option<u64> {
+    let value = std::env::var(name).ok()?;
+    let value = value.trim();
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse::<u64>().ok()
+    }
+}
+
+fn should_trace_present_path(framebuffer_addr: u64) -> bool {
+    let Some(target) = parse_trace_u64_env("RUZU_TRACE_PRESENT_PATH_ADDR") else {
+        return false;
+    };
+    if target != framebuffer_addr {
+        return false;
+    }
+    let every = parse_trace_u64_env("RUZU_TRACE_PRESENT_PATH_EVERY")
+        .unwrap_or(1)
+        .max(1);
+    let count = PRESENT_PATH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    count % every == 0
+}
 
 fn trace_present_layer(stage: u64, framebuffer: &FramebufferConfig, gpu_addr: u64, aux: &[u64]) {
     if !common::trace::is_enabled(common::trace::cat::PRESENT_TEXTURE) {
@@ -312,6 +341,21 @@ impl Layer {
         if let Some(info) =
             rasterizer.accelerate_display(framebuffer, framebuffer_addr, framebuffer.stride)
         {
+            if should_trace_present_path(framebuffer_addr) {
+                log::info!(
+                    "[PRESENT_PATH] addr=0x{:X} path=accelerate texture={} size={}x{} scaled={}x{} fb={}x{} stride={} fmt=0x{:X}",
+                    framebuffer_addr,
+                    info.display_texture,
+                    info.width,
+                    info.height,
+                    info.scaled_width,
+                    info.scaled_height,
+                    framebuffer.width,
+                    framebuffer.height,
+                    framebuffer.stride,
+                    framebuffer.pixel_format.0,
+                );
+            }
             trace_present_layer(
                 2,
                 framebuffer,
@@ -347,6 +391,23 @@ impl Layer {
         // Read tiled framebuffer data from GPU memory.
         let mut tiled_data = vec![0u8; size_in_bytes];
         let host_ptr_available = (self.device_memory)(framebuffer_addr, &mut tiled_data);
+        let trace_present_path = should_trace_present_path(framebuffer_addr);
+        if trace_present_path {
+            let sample = &tiled_data[..tiled_data.len().min(4096)];
+            let nonzero = sample.iter().filter(|&&byte| byte != 0).count();
+            let checksum = sample
+                .iter()
+                .fold(0u64, |acc, &byte| acc.wrapping_mul(16777619) ^ byte as u64);
+            log::info!(
+                "[PRESENT_PATH] addr=0x{:X} path=cpu_read ok={} tiled_size={} sample={} nonzero={} checksum=0x{:X}",
+                framebuffer_addr,
+                host_ptr_available,
+                size_in_bytes,
+                sample.len(),
+                nonzero,
+                checksum,
+            );
+        }
 
         if host_ptr_available {
             // Unswizzle from Tegra block-linear to linear layout.
@@ -365,6 +426,27 @@ impl Layer {
                 0, // block_depth
                 1, // stride_alignment
             );
+            if trace_present_path {
+                let sample = &self.gl_framebuffer_data[..linear_size.min(4096)];
+                let nonzero = sample.iter().filter(|&&byte| byte != 0).count();
+                let checksum = sample
+                    .iter()
+                    .fold(0u64, |acc, &byte| acc.wrapping_mul(16777619) ^ byte as u64);
+                let first_rgba = self
+                    .gl_framebuffer_data
+                    .get(0..4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                    .unwrap_or(0);
+                log::info!(
+                    "[PRESENT_PATH] addr=0x{:X} path=cpu_unswizzle linear_size={} sample={} nonzero={} checksum=0x{:X} first_rgba=0x{:08X}",
+                    framebuffer_addr,
+                    linear_size,
+                    sample.len(),
+                    nonzero,
+                    checksum,
+                    first_rgba,
+                );
+            }
 
             if common::trace::is_enabled(common::trace::cat::PRESENT_TEXTURE) {
                 let sample = &self.gl_framebuffer_data[..linear_size.min(4096)];

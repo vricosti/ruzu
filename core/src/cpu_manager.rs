@@ -758,22 +758,22 @@ impl CpuManager {
                             svc_args[2],
                         );
                         if svc_num == 0x1c {
-                            log::trace!(
-                                "multi_core_run_guest_thread: tid={} WaitProcessWideKeyAtomic args addr=0x{:X} key=0x{:X} tag=0x{:08X} timeout_lo=0x{:08X} timeout_hi=0x{:08X}",
-                                current_thread_id,
-                                svc_args[0] as u32,
-                                svc_args[1] as u32,
-                                svc_args[2] as u32,
-                                svc_args[3] as u32,
-                                svc_args[4] as u32,
-                            );
+                            // log::trace!(
+                            //     "multi_core_run_guest_thread: tid={} WaitProcessWideKeyAtomic args addr=0x{:X} key=0x{:X} tag=0x{:08X} timeout_lo=0x{:08X} timeout_hi=0x{:08X}",
+                            //     current_thread_id,
+                            //     svc_args[0] as u32,
+                            //     svc_args[1] as u32,
+                            //     svc_args[2] as u32,
+                            //     svc_args[3] as u32,
+                            //     svc_args[4] as u32,
+                            // );
                         } else if svc_num == 0x1d {
-                            log::trace!(
-                                "multi_core_run_guest_thread: tid={} SignalProcessWideKey args key=0x{:X} count={}",
-                                current_thread_id,
-                                svc_args[0] as u32,
-                                svc_args[1] as i32,
-                            );
+                            // log::trace!(
+                            //     "multi_core_run_guest_thread: tid={} SignalProcessWideKey args key=0x{:X} count={}",
+                            //     current_thread_id,
+                            //     svc_args[0] as u32,
+                            //     svc_args[1] as i32,
+                            // );
                         }
                     }
                     // Record guest PC + LR + SP at SVC entry for SIGUSR1

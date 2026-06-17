@@ -179,6 +179,14 @@ impl NvHostCtrl {
         std::env::var_os("RUZU_TRACE_NVHOST_CTRL_WAIT").is_some()
     }
 
+    fn should_stderr_event_wait(value: u32) -> bool {
+        std::env::var("RUZU_TRACE_SYNCPOINT_AFTER")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(|threshold| value >= threshold)
+            .unwrap_or(false)
+    }
+
     fn trace_ioctl(command: Ioctl, stage: &str) {
         if Self::should_trace_event_wait() {
             log::info!(
@@ -403,6 +411,16 @@ impl NvHostCtrl {
             params.timeout,
             is_allocation
         );
+        if Self::should_stderr_event_wait(params.fence.value) {
+            eprintln!(
+                "[NVHOST_CTRL_WAIT] begin syncpt_id={} target={} timeout={} allocation={} value_raw=0x{:08X}",
+                params.fence.id,
+                params.fence.value,
+                params.timeout,
+                is_allocation,
+                params.value.raw
+            );
+        }
 
         let fence_id = params.fence.id as u32;
         let existing_event_id = params.value.raw;
@@ -453,6 +471,12 @@ impl NvHostCtrl {
                 params.fence.value,
             );
             reset_non_allocation_fails(self);
+            if Self::should_stderr_event_wait(params.fence.value) {
+                eprintln!(
+                    "[NVHOST_CTRL_WAIT] signalled-immediate syncpt_id={} target={} value_raw=0x{:08X}",
+                    fence_id, params.fence.value, params.value.raw
+                );
+            }
             return NvResult::Success;
         }
 
@@ -475,6 +499,12 @@ impl NvHostCtrl {
                 params.fence.value,
             );
             reset_non_allocation_fails(self);
+            if Self::should_stderr_event_wait(params.fence.value) {
+                eprintln!(
+                    "[NVHOST_CTRL_WAIT] signalled-after-update syncpt_id={} target={} value_raw=0x{:08X}",
+                    fence_id, params.fence.value, params.value.raw
+                );
+            }
             return NvResult::Success;
         }
 
@@ -534,6 +564,12 @@ impl NvHostCtrl {
                     events[slot as usize].fails = 0;
                     self.wait_host_stalled(fence_id, target_value);
                     params.value.raw = target_value;
+                    if Self::should_stderr_event_wait(target_value) {
+                        eprintln!(
+                            "[NVHOST_CTRL_WAIT] fallback-timeout0-success slot={} syncpt_id={} target={} value_raw=0x{:08X}",
+                            slot, fence_id, target_value, params.value.raw
+                        );
+                    }
                     if Self::should_trace_event_wait() {
                         log::info!(
                             "nvhost_ctrl::IocCtrlEventWait timeout=0 fallback-success slot={} syncpt_id={} target={} value_raw_out=0x{:08X}",
@@ -603,6 +639,12 @@ impl NvHostCtrl {
                     events[slot as usize].fails = 0;
                     self.wait_host_stalled(fence_id, target_value);
                     params.value.raw = target_value;
+                    if Self::should_stderr_event_wait(target_value) {
+                        eprintln!(
+                            "[NVHOST_CTRL_WAIT] fallback-wait-success slot={} syncpt_id={} target={} value_raw=0x{:08X}",
+                            slot, fence_id, target_value, params.value.raw
+                        );
+                    }
                     if Self::should_trace_event_wait() {
                         log::info!(
                             "nvhost_ctrl::IocCtrlEventWait wait-fallback-success slot={} syncpt_id={} target={} value_raw_out=0x{:08X}",
@@ -669,6 +711,12 @@ impl NvHostCtrl {
                             fence_id,
                             target_value,
                             params.value.raw
+                        );
+                    }
+                    if Self::should_stderr_event_wait(target_value) {
+                        eprintln!(
+                            "[NVHOST_CTRL_WAIT] armed slot={} syncpt_id={} target={} value_raw=0x{:08X}",
+                            slot, fence_id, target_value, params.value.raw
                         );
                     }
 
