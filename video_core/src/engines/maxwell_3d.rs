@@ -9,7 +9,7 @@
 //! Register writes are stored in a flat array and side-effect methods (clear,
 //! draw begin/end) are triggered on specific register writes.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -36,6 +36,7 @@ struct Maxwell3DPtr(*mut Maxwell3D);
 unsafe impl Send for Maxwell3DPtr {}
 
 static MAXWELL3D_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static CBUF_BIND_SCAN_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn should_trace_dma_flow() -> bool {
     use std::sync::OnceLock;
@@ -4089,6 +4090,26 @@ impl Maxwell3D {
 
         let copy_size = data.len() as u32 * 4;
         let address = buffer_address.wrapping_add(offset as u64);
+
+        // Diagnostic (env-gated, behavior-preserving): detect when the guest
+        // pushes NaN-patterned float words through the inline constant-buffer
+        // upload. If a NaN-valued vertex transform cbuf is observed at draw
+        // time but no NaN word is logged here, the NaN was produced elsewhere
+        // (CPU-written memory, DMA, or compute) rather than the pushbuffer.
+        if std::env::var_os("RUZU_TRACE_CBDATA_NAN").is_some() {
+            for (i, value) in data.iter().enumerate() {
+                // IEEE-754 f32 NaN: exponent all ones, mantissa nonzero.
+                if (value & 0x7F80_0000) == 0x7F80_0000 && (value & 0x007F_FFFF) != 0 {
+                    log::warn!(
+                        "[CBDATA_NAN] cbuf addr=0x{:X} word_off=0x{:X} raw=0x{:08X}",
+                        address.wrapping_add(i as u64 * 4),
+                        offset + i as u32 * 4,
+                        value
+                    );
+                }
+            }
+        }
+
         if let Some(memory_manager) = self.memory_manager.as_ref().cloned() {
             let mut bytes = Vec::with_capacity(copy_size as usize);
             for value in data {
@@ -4100,6 +4121,107 @@ impl Maxwell3D {
 
         // Increment the current buffer position.
         self.regs[cb_base + 3] = offset.wrapping_add(copy_size);
+    }
+
+    fn trace_cbuf_bind_nan(&self, stage_index: usize, slot: usize, address: u64, size: u32) {
+        if std::env::var_os("RUZU_TRACE_CBUF_BIND_NAN").is_none() {
+            return;
+        }
+        let scan_count = CBUF_BIND_SCAN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        let scan_every = std::env::var("RUZU_TRACE_CBUF_BIND_SCAN_EVERY")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1)
+            .max(1);
+        if scan_count % scan_every != 0 {
+            return;
+        }
+
+        let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
+            log::warn!(
+                "[CBUF_BIND_SCAN] stage={} slot={} addr=0x{:X} size=0x{:X} skipped=no_memory_manager",
+                stage_index,
+                slot,
+                address,
+                size
+            );
+            return;
+        };
+
+        let scan_size = size.min(0x1_0000) as usize;
+        if scan_size < 4 {
+            log::info!(
+                "[CBUF_BIND_SCAN] stage={} slot={} addr=0x{:X} size=0x{:X} scan=0x{:X} nan_words=0",
+                stage_index,
+                slot,
+                address,
+                size,
+                scan_size
+            );
+            return;
+        }
+
+        let mut bytes = vec![0u8; scan_size];
+        let read_ok = memory_manager.lock().read_block_unsafe(address, &mut bytes);
+        let mut nan_words = 0usize;
+        let mut first_nan = None;
+        let mut checksum = 0u64;
+        let mut nonzero_words = 0usize;
+        let verbose_nan_words = std::env::var_os("RUZU_TRACE_CBUF_BIND_NAN_VERBOSE").is_some();
+
+        for (word_index, chunk) in bytes.chunks_exact(4).enumerate() {
+            let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            checksum = checksum.wrapping_mul(16777619) ^ value as u64;
+            if value != 0 {
+                nonzero_words += 1;
+            }
+            if (value & 0x7F80_0000) == 0x7F80_0000 && (value & 0x007F_FFFF) != 0 {
+                nan_words += 1;
+                first_nan.get_or_insert((word_index, value));
+                if verbose_nan_words {
+                    log::warn!(
+                        "[CBUF_BIND_NAN] stage={} slot={} addr=0x{:X} word_off=0x{:X} raw=0x{:08X}",
+                        stage_index,
+                        slot,
+                        address.wrapping_add(word_index as u64 * 4),
+                        word_index * 4,
+                        value
+                    );
+                }
+            }
+        }
+
+        let first_nan_guest = first_nan.and_then(|(word_index, value)| {
+            let gpu_nan_addr = address.wrapping_add(word_index as u64 * 4);
+            let memory_manager = self.memory_manager.as_ref()?;
+            let memory_manager = memory_manager.lock();
+            let device_addr = memory_manager.gpu_to_cpu_address(gpu_nan_addr)?;
+            let backing = memory_manager
+                .device_memory()
+                .smmu_cpu_backing_for_address(device_addr)?;
+            Some((
+                gpu_nan_addr,
+                device_addr,
+                backing.asid(),
+                backing.virtual_address(),
+                value,
+            ))
+        });
+
+        log::info!(
+            "[CBUF_BIND_SCAN] stage={} slot={} addr=0x{:X} size=0x{:X} scan=0x{:X} read_ok={} nonzero_words={} nan_words={} first_nan={:?} first_nan_guest={:?} checksum=0x{:X}",
+            stage_index,
+            slot,
+            address,
+            size,
+            scan_size,
+            read_ok,
+            nonzero_words,
+            nan_words,
+            first_nan,
+            first_nan_guest,
+            checksum
+        );
     }
 
     /// Handle CB_BIND trigger for a shader stage. Matches upstream `ProcessCBBind`.
@@ -4138,6 +4260,17 @@ impl Maxwell3D {
                 address,
                 size
             );
+            self.trace_cbuf_bind_nan(stage_index, slot, address, size);
+            if (stage_index == 0 || stage_index == 4) && slot == 1 {
+                if let Some(memory_manager) = self.memory_manager.as_ref() {
+                    memory_manager.lock().register_cbuf_write_watch(
+                        stage_index,
+                        slot,
+                        address,
+                        size,
+                    );
+                }
+            }
             let _ = self.with_rasterizer_mut(|rasterizer| {
                 rasterizer.bind_graphics_uniform_buffer(stage_index, slot as u32, address, size)
             });

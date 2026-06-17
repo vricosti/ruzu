@@ -17,6 +17,7 @@ use crate::renderer_opengl::gl_shader_manager::ProgramManagerHandle;
 use crate::renderer_opengl::Device;
 use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 type GlGetNamedBufferParameterui64vNv = unsafe extern "system" fn(
@@ -38,9 +39,21 @@ static GL_GET_NAMED_BUFFER_PARAMETER_UI64V_NV: OnceLock<Option<GlGetNamedBufferP
 static GL_MAKE_NAMED_BUFFER_RESIDENT_NV: OnceLock<Option<GlMakeNamedBufferResidentNv>> =
     OnceLock::new();
 static GL_BUFFER_ADDRESS_RANGE_NV: OnceLock<Option<GlBufferAddressRangeNv>> = OnceLock::new();
+static PRESENT_PHASE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PRESENT_TEXTURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 const GL_BUFFER_GPU_ADDRESS_NV: u32 = 0x8F1D;
 const GL_VERTEX_ATTRIB_ARRAY_ADDRESS_NV: u32 = 0x8F20;
+
+fn trace_every(env_name: &str, counter: &AtomicU64) -> bool {
+    let every = std::env::var(env_name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    count % every == 0
+}
 
 fn load_optional_gl_function<T, F>(load_fn: &mut F, name: &'static str) -> Option<T>
 where
@@ -72,6 +85,12 @@ where
 
 fn trace_present_phase(label: &str, layer: Option<usize>, width: u32, height: u32) {
     if std::env::var_os("RUZU_TRACE_PRESENT_PHASES").is_none() {
+        return;
+    }
+    if !trace_every(
+        "RUZU_TRACE_PRESENT_PHASES_EVERY",
+        &PRESENT_PHASE_TRACE_COUNT,
+    ) {
         return;
     }
 
@@ -159,6 +178,153 @@ fn trace_present_phase(label: &str, layer: Option<usize>, width: u32, height: u3
             height,
             sample_width,
             sample_height,
+            summaries.join("; "),
+            gl_error
+        );
+    }
+}
+
+fn trace_present_texture(label: &str, layer: usize, texture: u32, framebuffer: &FramebufferConfig) {
+    if std::env::var_os("RUZU_TRACE_PRESENT_TEXTURE_SAMPLE").is_none() {
+        return;
+    }
+    if !trace_every(
+        "RUZU_TRACE_PRESENT_TEXTURE_SAMPLE_EVERY",
+        &PRESENT_TEXTURE_TRACE_COUNT,
+    ) {
+        return;
+    }
+    if texture == 0 {
+        log::warn!(
+            "[PRESENT_TEXTURE_SAMPLE] label={} layer={} texture=0 fb_addr=0x{:X}",
+            label,
+            layer,
+            framebuffer.address.wrapping_add(framebuffer.offset as u64)
+        );
+        return;
+    }
+
+    unsafe {
+        let mut tex_width = 0;
+        let mut tex_height = 0;
+        let mut tex_internal_format = 0;
+        gl::GetTextureLevelParameteriv(texture, 0, gl::TEXTURE_WIDTH, &mut tex_width);
+        gl::GetTextureLevelParameteriv(texture, 0, gl::TEXTURE_HEIGHT, &mut tex_height);
+        gl::GetTextureLevelParameteriv(
+            texture,
+            0,
+            gl::TEXTURE_INTERNAL_FORMAT,
+            &mut tex_internal_format,
+        );
+
+        if tex_width <= 0 || tex_height <= 0 {
+            log::warn!(
+                "[PRESENT_TEXTURE_SAMPLE] label={} layer={} texture={} invalid_size={}x{} gl_error=0x{:X}",
+                label,
+                layer,
+                texture,
+                tex_width,
+                tex_height,
+                gl::GetError()
+            );
+            return;
+        }
+
+        let sample_width = (tex_width as u32).min(32) as i32;
+        let sample_height = (tex_height as u32).min(32) as i32;
+        let max_x = (tex_width - sample_width).max(0);
+        let max_y = (tex_height - sample_height).max(0);
+        let origins = [
+            (0, 0),
+            (max_x / 2, max_y / 2),
+            (max_x, max_y),
+            (0, max_y),
+            (max_x, 0),
+        ];
+
+        let mut old_read_fb = 0;
+        let mut old_draw_fb = 0;
+        let mut old_pack_buffer = 0;
+        let mut old_pack_alignment = 0;
+        let mut old_pack_row_length = 0;
+        let mut old_read_buffer = 0;
+        gl::GetIntegerv(gl::READ_FRAMEBUFFER_BINDING, &mut old_read_fb);
+        gl::GetIntegerv(gl::DRAW_FRAMEBUFFER_BINDING, &mut old_draw_fb);
+        gl::GetIntegerv(gl::PIXEL_PACK_BUFFER_BINDING, &mut old_pack_buffer);
+        gl::GetIntegerv(gl::PACK_ALIGNMENT, &mut old_pack_alignment);
+        gl::GetIntegerv(gl::PACK_ROW_LENGTH, &mut old_pack_row_length);
+        gl::GetIntegerv(gl::READ_BUFFER, &mut old_read_buffer);
+
+        let mut sample_fb = 0;
+        gl::CreateFramebuffers(1, &mut sample_fb);
+        gl::NamedFramebufferTexture(sample_fb, gl::COLOR_ATTACHMENT0, texture, 0);
+        gl::BindFramebuffer(gl::READ_FRAMEBUFFER, sample_fb);
+        gl::ReadBuffer(gl::COLOR_ATTACHMENT0);
+        gl::BindBuffer(gl::PIXEL_PACK_BUFFER, 0);
+        gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
+        gl::PixelStorei(gl::PACK_ROW_LENGTH, 0);
+
+        let fb_status = gl::CheckNamedFramebufferStatus(sample_fb, gl::READ_FRAMEBUFFER);
+        let mut summaries = Vec::with_capacity(origins.len());
+        let mut gl_error = gl::GetError();
+        if fb_status == gl::FRAMEBUFFER_COMPLETE {
+            for (origin_x, origin_y) in origins {
+                let mut pixels = vec![0u8; (sample_width * sample_height * 4) as usize];
+                gl::ReadPixels(
+                    origin_x,
+                    origin_y,
+                    sample_width,
+                    sample_height,
+                    gl::RGBA,
+                    gl::UNSIGNED_BYTE,
+                    pixels.as_mut_ptr() as *mut _,
+                );
+                gl_error |= gl::GetError();
+
+                let mut rgb_nonzero = 0usize;
+                let mut alpha_nonzero = 0usize;
+                let mut rgba_sum = [0u64; 4];
+                for px in pixels.chunks_exact(4) {
+                    rgb_nonzero += px[0..3].iter().filter(|&&byte| byte != 0).count();
+                    alpha_nonzero += usize::from(px[3] != 0);
+                    for component in 0..4 {
+                        rgba_sum[component] += px[component] as u64;
+                    }
+                }
+                let checksum = pixels
+                    .iter()
+                    .fold(0u64, |acc, &byte| acc.wrapping_mul(16777619) ^ byte as u64);
+                summaries.push(format!(
+                    "@{},{} rgb={} a={} sum={:?} crc=0x{:X}",
+                    origin_x, origin_y, rgb_nonzero, alpha_nonzero, rgba_sum, checksum
+                ));
+            }
+        }
+
+        gl::BindFramebuffer(gl::READ_FRAMEBUFFER, old_read_fb as u32);
+        gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, old_draw_fb as u32);
+        gl::ReadBuffer(old_read_buffer as u32);
+        gl::BindBuffer(gl::PIXEL_PACK_BUFFER, old_pack_buffer as u32);
+        gl::PixelStorei(gl::PACK_ALIGNMENT, old_pack_alignment);
+        gl::PixelStorei(gl::PACK_ROW_LENGTH, old_pack_row_length);
+        gl::DeleteFramebuffers(1, &sample_fb);
+
+        log::info!(
+            "[PRESENT_TEXTURE_SAMPLE] label={} layer={} texture={} tex={}x{} internal=0x{:X} fb_addr=0x{:X} fb={}x{} stride={} format=0x{:X} sample={}x{} status=0x{:X} regions=[{}] gl_error=0x{:X}",
+            label,
+            layer,
+            texture,
+            tex_width,
+            tex_height,
+            tex_internal_format,
+            framebuffer.address.wrapping_add(framebuffer.offset as u64),
+            framebuffer.width,
+            framebuffer.height,
+            framebuffer.stride,
+            framebuffer.pixel_format.0,
+            sample_width,
+            sample_height,
+            fb_status,
             summaries.join("; "),
             gl_error
         );
@@ -407,6 +573,7 @@ impl WindowAdaptPass {
                 &mut program_manager,
             );
             textures.push(texture);
+            trace_present_texture("after_configure_draw", i, texture, &framebuffers[i]);
             matrices.push(matrix);
             vertices.push(verts);
         }
