@@ -2,6 +2,14 @@
 
 STRICT MODE ON
 
+## Git Commit Policy (MANDATORY)
+
+ALWAYS ask the user for explicit confirmation BEFORE running `git commit` (or
+`git push`, `git merge`), in BOTH the parent `ruzu` repo AND the `rdynarmic`/
+`rxbyak` submodules. Never commit on your own initiative — present what would be
+committed (files + proposed message) and wait for the user to approve. This
+applies even when the work is complete and tests pass.
+
 ## Purpose
 
 This document defines how a ChatGPT/Codex-style agent must port C++ code from `/home/vricosti/shared/zuyu/src/` into `/home/vricosti/shared/ruzu/`.
