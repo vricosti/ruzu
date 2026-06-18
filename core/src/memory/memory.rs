@@ -1250,7 +1250,9 @@ impl Memory {
                     );
                 }
             }
-            if std::env::var_os("RUZU_TRACE_UNMAPPED_GUEST").is_some() && vaddr < 0x1000 {
+            if std::env::var_os("RUZU_TRACE_UNMAPPED_GUEST").is_some()
+                && (vaddr < 0x1000 || (vaddr >> 32) == 0xffff_ffff)
+            {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static SHOWN: AtomicU32 = AtomicU32::new(0);
                 let n = SHOWN.fetch_add(1, Ordering::Relaxed);
