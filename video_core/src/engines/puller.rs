@@ -381,7 +381,7 @@ impl Puller {
         self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
     }
 
-    fn stop_unimplemented_engine(
+    fn log_unimplemented_engine(
         &self,
         caller: &str,
         engine: EngineID,
@@ -390,7 +390,7 @@ impl Puller {
         argument: Option<u32>,
         amount: Option<u32>,
         methods_pending: Option<u32>,
-    ) -> ! {
+    ) {
         #[cfg(not(test))]
         {
             let path = std::path::Path::new(".agents/puller_unimplemented_state.md");
@@ -430,7 +430,7 @@ impl Puller {
                     file.write_all(entry.as_bytes())
                 });
         }
-        panic!(
+        log::error!(
             "{} unsupported engine 0x{:04X} on subchannel {}",
             caller,
             engine.raw(),
@@ -699,7 +699,7 @@ impl Puller {
                 }
             }
             _ => {
-                self.stop_unimplemented_engine(
+                self.log_unimplemented_engine(
                     "Puller::CallEngineMethod",
                     engine,
                     method_call.subchannel,
@@ -757,7 +757,7 @@ impl Puller {
                 }
             }
             _ => {
-                self.stop_unimplemented_engine(
+                self.log_unimplemented_engine(
                     "Puller::CallEngineMultiMethod",
                     engine,
                     subchannel,
@@ -864,7 +864,7 @@ impl Puller {
                 }
             }
             _ => {
-                self.stop_unimplemented_engine(
+                self.log_unimplemented_engine(
                     "Puller::ProcessBindMethod",
                     eid,
                     method_call.subchannel,
@@ -1215,27 +1215,23 @@ mod tests {
     }
 
     #[test]
-    fn unknown_bind_engine_stores_raw_value_then_stops_like_upstream() {
+    fn unknown_bind_engine_stores_raw_value_then_logs_like_upstream_without_debug_asserts() {
         let mut puller = Puller::default();
 
         assert_eq!(puller.bound_engines[0].raw(), 0);
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            puller.process_bind_method(&MethodCall::new(
-                BufferMethods::BindObject as u32,
-                0x1234,
-                2,
-                1,
-            ));
-        }));
+        puller.process_bind_method(&MethodCall::new(
+            BufferMethods::BindObject as u32,
+            0x1234,
+            2,
+            1,
+        ));
 
-        assert!(result.is_err());
         assert_eq!(puller.bound_engines[2].raw(), 0x1234);
     }
 
     #[test]
-    #[should_panic(expected = "Puller::CallEngineMethod unsupported engine")]
-    fn unknown_engine_method_stops_like_upstream() {
+    fn unknown_engine_method_logs_like_upstream_without_debug_asserts() {
         let mut puller = Puller::default();
         puller.bound_engines[3] = EngineID::from_raw(0x1234);
 
@@ -1243,8 +1239,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Puller::CallEngineMultiMethod unsupported engine")]
-    fn unknown_engine_multi_method_stops_like_upstream() {
+    fn unknown_engine_multi_method_logs_like_upstream_without_debug_asserts() {
         let mut puller = Puller::default();
         puller.bound_engines[4] = EngineID::from_raw(0x1234);
 
