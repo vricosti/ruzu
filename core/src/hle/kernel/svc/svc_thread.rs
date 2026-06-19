@@ -761,17 +761,50 @@ pub fn sleep_thread(system: &System, ns: i64) {
 }
 
 /// Gets the thread context.
-pub fn get_thread_context3(
-    _system: &System,
-    out_context: u64,
-    thread_handle: Handle,
-) -> ResultCode {
+pub fn get_thread_context3(system: &System, out_context: u64, thread_handle: Handle) -> ResultCode {
     log::debug!(
         "svc::GetThreadContext3 called, out_context=0x{:08X}, thread_handle=0x{:X}",
         out_context,
         thread_handle
     );
-    RESULT_NOT_IMPLEMENTED
+
+    let Some(current_thread) = system.current_thread() else {
+        return RESULT_INVALID_HANDLE;
+    };
+    let Some(thread) = resolve_thread_handle(system, thread_handle) else {
+        return RESULT_INVALID_HANDLE;
+    };
+
+    if std::sync::Arc::ptr_eq(&thread, &current_thread) {
+        return RESULT_BUSY;
+    }
+
+    let mut context = crate::hle::kernel::k_thread::ThreadContext::default();
+    let result = thread.lock().unwrap().get_thread_context3(&mut context);
+    let result = ResultCode::new(result);
+    if result.is_error() {
+        return result;
+    }
+
+    let context_bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&context as *const crate::hle::kernel::k_thread::ThreadContext).cast::<u8>(),
+            std::mem::size_of::<crate::hle::kernel::svc_types::ThreadContext>(),
+        )
+    };
+
+    let Some(memory) = system.get_svc_memory() else {
+        return RESULT_INVALID_POINTER;
+    };
+    if !memory
+        .lock()
+        .unwrap()
+        .write_block(out_context, context_bytes)
+    {
+        return RESULT_INVALID_POINTER;
+    }
+
+    RESULT_SUCCESS
 }
 
 /// Gets the priority for the specified thread.

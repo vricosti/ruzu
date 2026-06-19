@@ -4,10 +4,10 @@
 //!
 //! KThreadQueue and KThreadQueueWithoutEndWait: thread wait queue abstractions.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use super::k_hardware_timer::KHardwareTimer;
-use super::k_thread::KThread;
+use super::k_thread::{KThread, KThreadLock};
 
 /// Base KThreadQueue holding a reference to the kernel and an optional hardware timer.
 /// Matches upstream `KThreadQueue` (k_thread_queue.h).
@@ -18,6 +18,7 @@ pub struct KThreadQueue {
     pub end_wait_allowed: bool,
     pub notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, u64, u32) -> bool>,
     pub cancel_wait_impl: Option<fn(&mut KThread)>,
+    pub pinned_wait_owner: Option<Weak<KThreadLock>>,
 }
 
 impl KThreadQueue {
@@ -27,6 +28,7 @@ impl KThreadQueue {
             end_wait_allowed: true,
             notify_available_impl: None,
             cancel_wait_impl: None,
+            pinned_wait_owner: None,
         }
     }
 
@@ -39,6 +41,7 @@ impl KThreadQueue {
             end_wait_allowed: true,
             notify_available_impl,
             cancel_wait_impl,
+            pinned_wait_owner: None,
         }
     }
 
@@ -51,6 +54,7 @@ impl KThreadQueue {
             end_wait_allowed: false,
             notify_available_impl,
             cancel_wait_impl,
+            pinned_wait_owner: None,
         }
     }
 
@@ -130,6 +134,14 @@ impl KThreadQueue {
     }
 
     pub fn cancel_wait(&self, thread: &mut KThread, wait_result: u32, cancel_timer_task: bool) {
+        if let Some(owner) = self.pinned_wait_owner.as_ref().and_then(Weak::upgrade) {
+            owner
+                .lock()
+                .unwrap()
+                .pinned_waiter_list
+                .retain(|thread_id| *thread_id != thread.get_thread_id());
+        }
+
         if let Some(cancel_impl) = self.cancel_wait_impl {
             cancel_impl(thread);
         }
@@ -173,6 +185,7 @@ impl KThreadQueueWithoutEndWait {
                 end_wait_allowed: false,
                 notify_available_impl: None,
                 cancel_wait_impl: None,
+                pinned_wait_owner: None,
             },
         }
     }
