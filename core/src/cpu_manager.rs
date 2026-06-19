@@ -146,25 +146,56 @@ fn should_trace_core_dispatch(core_index: usize) -> bool {
         .any(|c| c == core_index)
 }
 
-/// Emit one `[CORE_DISPATCH]` line tagged with the dispatch-loop phase and the
-/// guest thread the loop is currently running. Lightweight (single
-/// `eprintln!`); gated by `RUZU_TRACE_CORE_DISPATCH`. Used to diagnose the
-/// MK8D wedge where tid=99's wakes take ~1 second despite end_wait firing
-/// promptly — we want to see, per core, when the JIT inner-loop exits and
-/// when reschedule actually swaps threads.
+/// Emit one dispatch-loop event tagged with the phase and guest thread.
+/// Gated by `RUZU_TRACE_CORE_DISPATCH` and routed through the async trace
+/// ring so hot scheduler diagnostics do not serialize on stderr.
 fn trace_core_dispatch(
     core_index: usize,
     phase: &str,
     thread: &Arc<crate::hle::kernel::k_thread::KThreadLock>,
 ) {
-    if !should_trace_core_dispatch(core_index) {
+    if !should_trace_core_dispatch(core_index)
+        || !common::trace::is_enabled(common::trace::cat::SCHED_STATE)
+    {
         return;
     }
-    let tid = thread.lock().ok().map(|t| t.get_thread_id()).unwrap_or(0);
-    let t = crate::hle::kernel::trace_format::elapsed_secs();
-    eprintln!(
-        "[{:>10.6}] [CORE_DISPATCH] core={} phase={} fiber_tid={}",
-        t, core_index, phase, tid
+    static CORE_DISPATCH_TRACE_COUNT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let n = CORE_DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n >= 512 && !n.is_multiple_of(10_000) {
+        return;
+    }
+    let phase_id = match phase {
+        "pre_inner stale_interrupt" => 1,
+        "enter_inner_loop" => 2,
+        "exit_inner_loop" => 3,
+        "after_handle_interrupt" => 4,
+        "after_reschedule" => 5,
+        _ => 0,
+    };
+    let (tid, current_core, active_core, raw_state) = thread
+        .lock()
+        .ok()
+        .map(|t| {
+            (
+                t.get_thread_id(),
+                t.get_current_core(),
+                t.get_active_core(),
+                t.get_raw_state().bits(),
+            )
+        })
+        .unwrap_or((0, -1, -1, 0));
+    common::trace::emit_raw(
+        common::trace::cat::SCHED_STATE,
+        &[
+            14,
+            phase_id,
+            core_index as u64,
+            tid,
+            current_core as u32 as u64,
+            active_core as u32 as u64,
+            raw_state as u64,
+        ],
     );
 }
 
@@ -981,6 +1012,64 @@ impl CpuManager {
                             } else {
                                 "Breakpoint"
                             };
+                            static A64_EXCEPTION_CTX_BUDGET: AtomicU32 = AtomicU32::new(0);
+                            if common::trace::is_enabled(common::trace::cat::A64_EXCEPTION_CTX)
+                                && A64_EXCEPTION_CTX_BUDGET.fetch_add(1, Ordering::Relaxed) < 32
+                            {
+                                let reason_id = if prefetch_abort {
+                                    1
+                                } else if data_abort {
+                                    2
+                                } else {
+                                    0
+                                };
+                                common::trace::emit_raw(
+                                    common::trace::cat::A64_EXCEPTION_CTX,
+                                    &[
+                                        0,
+                                        reason_id,
+                                        core_index as u64,
+                                        current_thread_id,
+                                        tc.pc,
+                                        tc.lr,
+                                        tc.sp,
+                                        tc.r[0],
+                                        tc.r[8],
+                                        tc.r[19],
+                                        tc.r[20],
+                                        tc.r[21],
+                                        tc.r[23],
+                                        tc.r[24],
+                                    ],
+                                );
+                                let dump_base = tc.r[19].wrapping_add(0x50);
+                                let qwords = {
+                                    let system_ref = kernel.system();
+                                    if system_ref.is_null() {
+                                        None
+                                    } else if let Some(memory) = system_ref.get().memory_shared() {
+                                        let mem = memory.lock().unwrap();
+                                        if mem.is_valid_virtual_address_range(dump_base, 0x20) {
+                                            Some([
+                                                mem.read_64(dump_base),
+                                                mem.read_64(dump_base + 8),
+                                                mem.read_64(dump_base + 16),
+                                                mem.read_64(dump_base + 24),
+                                            ])
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                };
+                                if let Some(qwords) = qwords {
+                                    common::trace::emit_raw(
+                                        common::trace::cat::A64_EXCEPTION_CTX,
+                                        &[1, dump_base, qwords[0], qwords[1], qwords[2], qwords[3]],
+                                    );
+                                }
+                            }
                             if zero_pc_break_loop
                                 && std::env::var_os("RUZU_DUMP_NULL_PC_CONTEXT").is_some()
                             {

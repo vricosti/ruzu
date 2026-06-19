@@ -61,6 +61,20 @@ fn should_trace_end_wait() -> bool {
     std::env::var_os("RUZU_TRACE_END_WAIT").is_some()
 }
 
+/// Mirrors upstream anonymous `ThreadQueueImplForKThreadSetProperty` in
+/// `k_thread.cpp`: the queue carries ownership of the target thread's pinned
+/// waiter list so `CancelWait` can remove a cancelled waiter before delegating
+/// to base `KThreadQueue::CancelWait`.
+fn thread_queue_for_k_thread_set_property(owner: &Arc<KThreadLock>) -> KThreadQueue {
+    KThreadQueue {
+        hardware_timer: None,
+        end_wait_allowed: true,
+        notify_available_impl: None,
+        cancel_wait_impl: None,
+        pinned_wait_owner: Some(Arc::downgrade(owner)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Enums matching upstream k_thread.h
 // ---------------------------------------------------------------------------
@@ -420,6 +434,10 @@ impl LockWithPriorityInheritanceInfo {
         self.tree.iter().next().copied()
     }
 
+    pub fn waiter_keys(&self) -> Vec<LockWaiterKey> {
+        self.tree.iter().copied().collect()
+    }
+
     pub fn get_address_key(&self) -> KProcessAddress {
         self.address_key
     }
@@ -521,6 +539,9 @@ pub struct KThread {
     /// We store (owner_thread_id, address_key, is_kernel_address_key) so we
     /// can find the lock info on the owner thread.
     pub waiting_lock_info: Option<WaitingLockRef>,
+    /// Upstream: `WaiterList m_pinned_waiter_list`.
+    /// Threads waiting for this thread to unpin are stored by guest thread id.
+    pub pinned_waiter_list: Vec<u64>,
 
     pub address_key_value: u32,
     pub suspend_request_flags: u32,
@@ -646,6 +667,7 @@ impl KThread {
             wait_queue: None,
             held_lock_info_list: Vec::new(),
             waiting_lock_info: None,
+            pinned_waiter_list: Vec::new(),
             address_key_value: 0,
             suspend_request_flags: 0,
             suspend_allowed_flags: ThreadState::SUSPEND_FLAG_MASK.bits() as u32,
@@ -939,6 +961,47 @@ impl KThread {
 
     pub fn get_suspend_flags(&self) -> u32 {
         self.suspend_allowed_flags & self.suspend_request_flags
+    }
+
+    /// Get the user thread context for `svcGetThreadContext3`.
+    ///
+    /// Upstream: `KThread::GetThreadContext3` in `k_thread.cpp`.
+    pub fn get_thread_context3(&self, out: &mut ThreadContext) -> u32 {
+        let _sl = if self.scheduler_lock_ptr != 0 {
+            Some(KScopedSchedulerLock::new(unsafe {
+                &*(self.scheduler_lock_ptr
+                    as *const super::k_scheduler_lock::KAbstractSchedulerLock)
+            }))
+        } else {
+            None
+        };
+
+        if !self.is_suspend_requested_type(SuspendType::Thread) {
+            return RESULT_INVALID_STATE.get_inner_value();
+        }
+
+        if !self.is_termination_requested() {
+            *out = self.thread_context.clone();
+
+            // Upstream masks away mode bits, interrupt bits, IL bit, and other
+            // reserved bits before copying the context to userspace.
+            const EL0_AARCH64_PSR_MASK: u32 = 0xF000_0000;
+            const EL0_AARCH32_PSR_MASK: u32 = 0xFE0F_FE20;
+
+            let is_64bit = self
+                .parent
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .map(|parent| parent.lock().unwrap().is_64bit())
+                .unwrap_or(true);
+            if is_64bit {
+                out.pstate &= EL0_AARCH64_PSR_MASK;
+            } else {
+                out.pstate &= EL0_AARCH32_PSR_MASK;
+            }
+        }
+
+        RESULT_SUCCESS.get_inner_value()
     }
 
     pub fn is_suspended(&self) -> bool {
@@ -2862,7 +2925,34 @@ impl KThread {
             self.update_state();
         }
 
-        // Upstream: resume pinned waiter list threads.
+        // Resume any threads that began waiting on us while we were pinned.
+        // Upstream drains `m_pinned_waiter_list` and calls EndWait(ResultSuccess).
+        let waiter_ids = std::mem::take(&mut self.pinned_waiter_list);
+        for waiter_id in waiter_ids {
+            if waiter_id == self.thread_id {
+                self.end_wait(RESULT_SUCCESS.get_inner_value());
+                continue;
+            }
+
+            let waiter = self
+                .parent
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .and_then(|parent| parent.lock().unwrap().get_thread_by_thread_id(waiter_id))
+                .or_else(|| {
+                    self.global_scheduler_context
+                        .as_ref()
+                        .and_then(Weak::upgrade)
+                        .and_then(|gsc| gsc.lock().unwrap().get_thread_by_thread_id(waiter_id))
+                });
+
+            if let Some(waiter) = waiter {
+                waiter
+                    .lock()
+                    .unwrap()
+                    .end_wait(RESULT_SUCCESS.get_inner_value());
+            }
+        }
     }
 
     /// Wait cancel.
@@ -3015,33 +3105,97 @@ impl KThread {
     /// Set the thread's activity (pause/resume).
     /// Matches upstream `KThread::SetActivity()`.
     pub fn set_activity(&mut self, activity: u32) -> u32 {
-        let result = match activity {
-            0 => {
-                if !self.is_suspend_requested_type(SuspendType::Thread) {
-                    return RESULT_INVALID_STATE.get_inner_value();
-                }
-                self.resume(SuspendType::Thread);
-                RESULT_SUCCESS.get_inner_value()
-            }
-            1 => {
-                let cur_state = self.get_state();
-                if cur_state != ThreadState::WAITING && cur_state != ThreadState::RUNNABLE {
-                    return RESULT_INVALID_STATE.get_inner_value();
-                }
-                if self.is_suspend_requested_type(SuspendType::Thread) {
-                    return RESULT_INVALID_STATE.get_inner_value();
-                }
-                self.request_suspend(SuspendType::Thread);
-                RESULT_SUCCESS.get_inner_value()
-            }
-            _ => RESULT_INVALID_STATE.get_inner_value(),
-        };
+        {
+            let _scheduler_lock =
+                super::kernel::scheduler_lock().map(|lock| KScopedSchedulerLock::new(lock));
 
-        if result == RESULT_SUCCESS.get_inner_value() {
-            self.request_schedule();
+            match activity {
+                0 => {
+                    if !self.is_suspend_requested_type(SuspendType::Thread) {
+                        return RESULT_INVALID_STATE.get_inner_value();
+                    }
+                    self.resume(SuspendType::Thread);
+                }
+                1 => {
+                    let cur_state = self.get_state();
+                    if cur_state != ThreadState::WAITING && cur_state != ThreadState::RUNNABLE {
+                        return RESULT_INVALID_STATE.get_inner_value();
+                    }
+                    if self.is_suspend_requested_type(SuspendType::Thread) {
+                        return RESULT_INVALID_STATE.get_inner_value();
+                    }
+                    self.request_suspend(SuspendType::Thread);
+                }
+                _ => return RESULT_INVALID_STATE.get_inner_value(),
+            }
         }
 
-        result
+        // If the thread is now paused, update the pinned waiter list.
+        // Matches upstream `KThread::SetActivity()` second block: while the
+        // target remains current on any core, wait for it to unpin if pinned,
+        // otherwise retry until it stops being current.
+        if activity == 1 {
+            let self_arc = self.self_reference.as_ref().and_then(Weak::upgrade);
+            loop {
+                let mut thread_is_current = false;
+
+                {
+                    let _scheduler_lock =
+                        super::kernel::scheduler_lock().map(|lock| KScopedSchedulerLock::new(lock));
+
+                    if self.is_termination_requested() {
+                        return RESULT_SUCCESS.get_inner_value();
+                    }
+
+                    if self.stack_parameters.is_pinned {
+                        let current_terminating =
+                            super::kernel::with_current_thread_fast_mut(|thread| {
+                                thread.is_termination_requested()
+                            })
+                            .unwrap_or(false);
+                        if current_terminating {
+                            return RESULT_TERMINATION_REQUESTED.get_inner_value();
+                        }
+
+                        if let (Some(waiter_id), Some(owner)) = (
+                            super::kernel::get_current_thread_id_fast(),
+                            self_arc.as_ref(),
+                        ) {
+                            self.pinned_waiter_list.push(waiter_id);
+
+                            let wait_queue = thread_queue_for_k_thread_set_property(owner);
+                            if waiter_id == self.thread_id {
+                                self.begin_wait_with_queue(wait_queue);
+                            } else if let Some(current_thread) =
+                                super::kernel::get_current_thread_pointer()
+                            {
+                                current_thread
+                                    .lock()
+                                    .unwrap()
+                                    .begin_wait_with_queue(wait_queue);
+                            }
+                        }
+                    } else if let Some(kernel) = super::kernel::get_kernel_ref() {
+                        for core_id in 0..NUM_CPU_CORES as usize {
+                            let is_current = kernel.scheduler(core_id).and_then(|scheduler| {
+                                scheduler.lock().unwrap().get_scheduler_current_thread_id()
+                            }) == Some(self.thread_id);
+                            if is_current {
+                                thread_is_current = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if !thread_is_current {
+                    break;
+                }
+            }
+        }
+
+        self.request_schedule();
+        RESULT_SUCCESS.get_inner_value()
     }
 
     /// Sleep for the given timeout.
@@ -3133,69 +3287,152 @@ impl KThread {
     pub fn set_core_mask(&mut self, cpu_core_id: i32, affinity_mask: u64) -> u32 {
         debug_assert!(affinity_mask != 0);
 
-        let mut core_id = cpu_core_id;
-        if core_id != crate::hle::kernel::svc_types::IDEAL_CORE_NO_UPDATE {
-            self.virtual_ideal_core_id = core_id;
-        } else {
-            core_id = self.virtual_ideal_core_id;
-            if ((1u64 << core_id) & affinity_mask) == 0 {
-                return RESULT_INVALID_COMBINATION.get_inner_value();
+        let physical_affinity_mask_for_waiters;
+
+        {
+            let _scheduler_lock =
+                super::kernel::scheduler_lock().map(|lock| KScopedSchedulerLock::new(lock));
+
+            let mut core_id = cpu_core_id;
+            if core_id != crate::hle::kernel::svc_types::IDEAL_CORE_NO_UPDATE {
+                self.virtual_ideal_core_id = core_id;
+            } else {
+                core_id = self.virtual_ideal_core_id;
+                if ((1u64 << core_id) & affinity_mask) == 0 {
+                    return RESULT_INVALID_COMBINATION.get_inner_value();
+                }
+            }
+
+            self.virtual_affinity_mask = affinity_mask;
+
+            if core_id >= 0 {
+                core_id =
+                    crate::hardware_properties::VIRTUAL_TO_PHYSICAL_CORE_MAP[core_id as usize];
+            }
+
+            let physical_affinity_mask =
+                crate::hardware_properties::convert_virtual_core_mask_to_physical(affinity_mask);
+            physical_affinity_mask_for_waiters = physical_affinity_mask;
+
+            if self.num_core_migration_disables == 0 {
+                let old_mask = self.physical_affinity_mask.clone();
+                let old_active_core = self.get_active_core();
+
+                self.physical_ideal_core_id = core_id;
+                self.physical_affinity_mask
+                    .set_affinity_mask(physical_affinity_mask);
+
+                if self.physical_affinity_mask.get_affinity_mask() != old_mask.get_affinity_mask() {
+                    if old_active_core >= 0
+                        && (self.physical_affinity_mask.get_affinity_mask()
+                            & (1u64 << old_active_core))
+                            == 0
+                    {
+                        let new_core = if self.physical_ideal_core_id >= 0 {
+                            self.physical_ideal_core_id
+                        } else {
+                            let mask = self.physical_affinity_mask.get_affinity_mask();
+                            (63 - mask.leading_zeros()) as i32
+                        };
+                        self.set_active_core(new_core);
+                    }
+
+                    if self.get_state() == ThreadState::RUNNABLE {
+                        if let Some(gsc) = self
+                            .global_scheduler_context
+                            .as_ref()
+                            .and_then(Weak::upgrade)
+                        {
+                            gsc.lock().unwrap().on_thread_affinity_changed(
+                                self.thread_id,
+                                old_active_core,
+                                old_mask.get_affinity_mask(),
+                                self.get_active_core(),
+                                self.physical_affinity_mask.get_affinity_mask(),
+                                self.priority,
+                                self.is_dummy_thread(),
+                            );
+                        }
+                    }
+                }
+            } else {
+                self.original_physical_ideal_core_id = core_id;
+                self.original_physical_affinity_mask
+                    .set_affinity_mask(physical_affinity_mask);
             }
         }
 
-        self.virtual_affinity_mask = affinity_mask;
+        // Update the pinned waiter list.
+        // Upstream retries while this thread is currently running on a core no
+        // longer allowed by the new mask. If it is pinned, the current thread
+        // waits on this thread's pinned waiter list until `Unpin()` resumes it.
+        let self_arc = self.self_reference.as_ref().and_then(Weak::upgrade);
+        loop {
+            let mut retry_update = false;
 
-        if core_id >= 0 {
-            core_id = crate::hardware_properties::VIRTUAL_TO_PHYSICAL_CORE_MAP[core_id as usize];
-        }
+            {
+                let _scheduler_lock =
+                    super::kernel::scheduler_lock().map(|lock| KScopedSchedulerLock::new(lock));
 
-        let physical_affinity_mask =
-            crate::hardware_properties::convert_virtual_core_mask_to_physical(affinity_mask);
-
-        if self.num_core_migration_disables == 0 {
-            let old_mask = self.physical_affinity_mask.clone();
-            let old_active_core = self.get_active_core();
-
-            self.physical_ideal_core_id = core_id;
-            self.physical_affinity_mask
-                .set_affinity_mask(physical_affinity_mask);
-
-            if self.physical_affinity_mask.get_affinity_mask() != old_mask.get_affinity_mask() {
-                if old_active_core >= 0
-                    && (self.physical_affinity_mask.get_affinity_mask() & (1u64 << old_active_core))
-                        == 0
-                {
-                    let new_core = if self.physical_ideal_core_id >= 0 {
-                        self.physical_ideal_core_id
-                    } else {
-                        let mask = self.physical_affinity_mask.get_affinity_mask();
-                        (63 - mask.leading_zeros()) as i32
-                    };
-                    self.set_active_core(new_core);
+                if self.is_termination_requested() {
+                    return RESULT_SUCCESS.get_inner_value();
                 }
 
-                if self.get_state() == ThreadState::RUNNABLE {
-                    if let Some(gsc) = self
-                        .global_scheduler_context
-                        .as_ref()
-                        .and_then(Weak::upgrade)
-                    {
-                        gsc.lock().unwrap().on_thread_affinity_changed(
-                            self.thread_id,
-                            old_active_core,
-                            old_mask.get_affinity_mask(),
-                            self.get_active_core(),
-                            self.physical_affinity_mask.get_affinity_mask(),
-                            self.priority,
-                            self.is_dummy_thread(),
-                        );
+                let mut current_core_for_thread = None;
+                if let Some(kernel) = super::kernel::get_kernel_ref() {
+                    for core_id in 0..NUM_CPU_CORES as usize {
+                        let is_current = kernel.scheduler(core_id).and_then(|scheduler| {
+                            scheduler.lock().unwrap().get_scheduler_current_thread_id()
+                        }) == Some(self.thread_id);
+                        if is_current {
+                            current_core_for_thread = Some(core_id as i32);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(thread_core) = current_core_for_thread {
+                    let is_allowed =
+                        (physical_affinity_mask_for_waiters & (1u64 << thread_core)) != 0;
+                    if !is_allowed {
+                        if self.stack_parameters.is_pinned {
+                            let current_terminating =
+                                super::kernel::with_current_thread_fast_mut(|thread| {
+                                    thread.is_termination_requested()
+                                })
+                                .unwrap_or(false);
+                            if current_terminating {
+                                return RESULT_TERMINATION_REQUESTED.get_inner_value();
+                            }
+
+                            if let (Some(waiter_id), Some(owner)) = (
+                                super::kernel::get_current_thread_id_fast(),
+                                self_arc.as_ref(),
+                            ) {
+                                self.pinned_waiter_list.push(waiter_id);
+
+                                let wait_queue = thread_queue_for_k_thread_set_property(owner);
+                                if waiter_id == self.thread_id {
+                                    self.begin_wait_with_queue(wait_queue);
+                                } else if let Some(current_thread) =
+                                    super::kernel::get_current_thread_pointer()
+                                {
+                                    current_thread
+                                        .lock()
+                                        .unwrap()
+                                        .begin_wait_with_queue(wait_queue);
+                                }
+                            }
+                        } else {
+                            retry_update = true;
+                        }
                     }
                 }
             }
-        } else {
-            self.original_physical_ideal_core_id = core_id;
-            self.original_physical_affinity_mask
-                .set_affinity_mask(physical_affinity_mask);
+
+            if !retry_update {
+                break;
+            }
         }
 
         RESULT_SUCCESS.get_inner_value()
@@ -4021,26 +4258,75 @@ mod tests {
     fn test_core_mask_change_requests_schedule_via_thread_scheduler() {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
+        scheduler.lock().unwrap().global_scheduler_context = Some(gsc.clone());
         process.lock().unwrap().attach_scheduler(&scheduler);
 
         let mut thread = KThread::new();
         thread.thread_id = 1;
         thread.parent = Some(Arc::downgrade(&process));
         thread.scheduler = Some(Arc::downgrade(&scheduler));
+        thread.global_scheduler_context = Some(Arc::downgrade(&gsc));
         thread.virtual_ideal_core_id = 0;
         thread.virtual_affinity_mask = 0x1;
-        scheduler
-            .lock()
+        thread.set_state(ThreadState::RUNNABLE);
+        gsc.lock()
             .unwrap()
-            .state
-            .needs_scheduling
+            .m_scheduler_update_needed
             .store(false, Ordering::Relaxed);
 
         assert_eq!(
             thread.set_core_mask(1, 0x2),
             RESULT_SUCCESS.get_inner_value()
         );
-        assert!(scheduler.lock().unwrap().needs_scheduling());
+        assert!(gsc
+            .lock()
+            .unwrap()
+            .m_scheduler_update_needed
+            .load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn unpin_resumes_threads_in_pinned_waiter_list() {
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let owner = Arc::new(KThreadLock::new(KThread::new()));
+        let waiter = Arc::new(KThreadLock::new(KThread::new()));
+
+        {
+            let mut owner_guard = owner.lock().unwrap();
+            owner_guard.thread_id = 1;
+            owner_guard.object_id = 1;
+            owner_guard.parent = Some(Arc::downgrade(&process));
+            owner_guard.stack_parameters.is_pinned = true;
+            owner_guard.num_core_migration_disables = 1;
+            owner_guard.physical_ideal_core_id = 0;
+            owner_guard.physical_affinity_mask.set_affinity_mask(0x1);
+            owner_guard.original_physical_ideal_core_id = 0;
+            owner_guard
+                .original_physical_affinity_mask
+                .set_affinity_mask(0x1);
+            owner_guard.pinned_waiter_list.push(2);
+        }
+        {
+            let mut waiter_guard = waiter.lock().unwrap();
+            waiter_guard.thread_id = 2;
+            waiter_guard.object_id = 2;
+            waiter_guard.parent = Some(Arc::downgrade(&process));
+            waiter_guard.begin_wait_with_queue(thread_queue_for_k_thread_set_property(&owner));
+            assert_eq!(waiter_guard.get_state(), ThreadState::WAITING);
+        }
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.register_thread_object(owner.clone());
+            process_guard.register_thread_object(waiter.clone());
+        }
+
+        owner.lock().unwrap().unpin();
+
+        assert!(owner.lock().unwrap().pinned_waiter_list.is_empty());
+        let waiter_guard = waiter.lock().unwrap();
+        assert_eq!(waiter_guard.get_state(), ThreadState::RUNNABLE);
+        assert_eq!(waiter_guard.wait_result, RESULT_SUCCESS.get_inner_value());
     }
 
     #[test]

@@ -273,6 +273,114 @@ impl KPerCoreQueue {
         self.get_front(core).is_none()
     }
 
+    /// Remove every root-reachable occurrence of `member_id` from this per-core
+    /// list.
+    ///
+    /// Upstream's intrusive `KThread::QueueEntry` makes duplicate membership
+    /// impossible: a thread has one entry object per core. The Rust port uses
+    /// thread ids as links, so a doubled transition can leave the same id
+    /// reachable more than once while only one `QueueEntry` stores links. Rebuild
+    /// the root-visible list without that id instead of trusting the stale member
+    /// entry.
+    pub fn remove_all_matching(
+        &mut self,
+        core: i32,
+        member_id: u64,
+        entries: &mut EntryMap,
+    ) -> bool {
+        let c = core as usize;
+        let mut kept = Vec::new();
+        let mut seen = Vec::new();
+        let mut current = self.roots[c].get_next();
+        let old_tail = self.roots[c].get_prev();
+        let limit = entries.len().saturating_add(1);
+
+        for _ in 0..limit {
+            let Some(id) = current else {
+                break;
+            };
+            if seen.contains(&id) {
+                break;
+            }
+            seen.push(id);
+
+            current = entries.get(&id).and_then(|e| e[c].get_next());
+            if id != member_id {
+                kept.push(id);
+            }
+        }
+
+        for (&id, per_core) in entries.iter() {
+            if id == member_id || kept.contains(&id) {
+                continue;
+            }
+            let entry = &per_core[c];
+            if old_tail == Some(id)
+                || entry.get_prev() == Some(member_id)
+                || entry.get_next() == Some(member_id)
+            {
+                kept.push(id);
+            }
+        }
+
+        self.roots[c].set_next(kept.first().copied());
+        self.roots[c].set_prev(kept.last().copied());
+
+        for (idx, &id) in kept.iter().enumerate() {
+            if let Some(e) = entries.get_mut(&id) {
+                e[c].set_prev(idx.checked_sub(1).and_then(|prev| kept.get(prev)).copied());
+                e[c].set_next(kept.get(idx + 1).copied());
+            }
+        }
+
+        if let Some(e) = entries.get_mut(&member_id) {
+            e[c].set_prev(None);
+            e[c].set_next(None);
+        }
+
+        self.get_front(core).is_none()
+    }
+
+    /// Remove `member_id` only when it is the root-visible front element.
+    ///
+    /// This is a Rust-port repair path for split-brain queue state: if the
+    /// cached thread properties are already gone, the member's stored links may
+    /// no longer describe this list. Trust the root, not the stale member entry.
+    pub fn remove_front_matching(
+        &mut self,
+        core: i32,
+        member_id: u64,
+        entries: &mut EntryMap,
+    ) -> bool {
+        let c = core as usize;
+        if self.roots[c].get_next() != Some(member_id) {
+            return false;
+        }
+
+        let tail_id = self.roots[c].get_prev().filter(|&tail| tail != member_id);
+        let next_id = entries
+            .get(&member_id)
+            .and_then(|e| e[c].get_next())
+            .filter(|&next| next != member_id)
+            .or(tail_id);
+
+        self.roots[c].set_next(next_id);
+        if let Some(nid) = next_id {
+            if let Some(ne) = entries.get_mut(&nid) {
+                ne[c].set_prev(None);
+            }
+        } else {
+            self.roots[c].set_prev(None);
+        }
+
+        if let Some(e) = entries.get_mut(&member_id) {
+            e[c].set_prev(None);
+            e[c].set_next(None);
+        }
+
+        self.get_front(core).is_none()
+    }
+
     pub fn get_front(&self, core: i32) -> Option<u64> {
         self.roots[core as usize].get_next()
     }
@@ -334,6 +442,34 @@ impl KPriorityQueueImpl {
 
         if self.queues[priority as usize].remove(core, member_id, entries) {
             self.available_priorities[core as usize].clear_bit(priority);
+        }
+    }
+
+    pub fn remove_scheduled_front_without_props(
+        &mut self,
+        core: i32,
+        member_id: u64,
+        entries: &mut EntryMap,
+    ) -> bool {
+        debug_assert!(is_valid_core(core));
+        for priority in HIGHEST_PRIORITY..=LOWEST_PRIORITY {
+            if self.queues[priority as usize].get_front(core) == Some(member_id) {
+                if self.queues[priority as usize].remove_front_matching(core, member_id, entries) {
+                    self.available_priorities[core as usize].clear_bit(priority);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn remove_all_member(&mut self, member_id: u64, entries: &mut EntryMap) {
+        for priority in HIGHEST_PRIORITY..=LOWEST_PRIORITY {
+            for core in 0..NUM_CORES as i32 {
+                if self.queues[priority as usize].remove_all_matching(core, member_id, entries) {
+                    self.available_priorities[core as usize].clear_bit(priority);
+                }
+            }
         }
     }
 
@@ -597,6 +733,17 @@ impl KPriorityQueue {
         }
     }
 
+    fn purge_member_from_all_queues(&mut self, member_id: u64) {
+        let Self {
+            scheduled_queue,
+            suggested_queue,
+            entries,
+            ..
+        } = self;
+        scheduled_queue.remove_all_member(member_id, entries);
+        suggested_queue.remove_all_member(member_id, entries);
+    }
+
     // -- Public mutators (properties passed directly) --
 
     /// Push a thread to the back of its queues (scheduled for active core, suggested for others).
@@ -621,6 +768,7 @@ impl KPriorityQueue {
                 existing.affinity,
             );
         }
+        self.purge_member_from_all_queues(member_id);
         ensure_entry(&mut self.entries, member_id);
         self.thread_props.insert(
             member_id,
@@ -657,6 +805,7 @@ impl KPriorityQueue {
                 existing.affinity,
             );
         }
+        self.purge_member_from_all_queues(member_id);
         ensure_entry(&mut self.entries, member_id);
         self.thread_props.insert(
             member_id,
@@ -691,9 +840,21 @@ impl KPriorityQueue {
                 (priority, active_core, affinity)
             };
         self.remove_impl(priority, member_id, active_core, affinity);
+        self.purge_member_from_all_queues(member_id);
         // Keep entries around (they'll be reused on next push).
         // Remove props since thread is no longer in PQ.
         self.thread_props.remove(&member_id);
+    }
+
+    /// Remove a stale scheduled-queue head when the Rust-side property cache
+    /// has already been dropped. Upstream's intrusive queue cannot observe this
+    /// split-brain state; it is specific to the non-intrusive Rust port.
+    pub fn remove_scheduled_front_without_props(&mut self, core: i32, member_id: u64) -> bool {
+        self.scheduled_queue.remove_scheduled_front_without_props(
+            core,
+            member_id,
+            &mut self.entries,
+        )
     }
 
     pub fn move_to_scheduled_front(
@@ -988,5 +1149,39 @@ mod tests {
             assert!(pq.get_scheduled_front(core).is_none());
             assert!(pq.get_suggested_front(core).is_none());
         }
+    }
+
+    #[test]
+    fn test_remove_purges_duplicate_root_reachable_membership() {
+        let mut pq = KPriorityQueue::new();
+        pq.push_back(100, 16, 3, 0b1000, false, None);
+        pq.push_back(200, 16, 3, 0b1000, false, None);
+
+        // Force the Rust-only corruption observed in ANIMUS: the same thread id
+        // is visible twice in one queue, but only one QueueEntry stores links.
+        pq.scheduled_queue.push_back(16, 3, 100, &mut pq.entries);
+
+        pq.remove(100, 16, 3, 0b1000, false);
+
+        assert_eq!(pq.get_scheduled_front(3), Some(200));
+        assert_eq!(pq.get_scheduled_next(3, 200, 16), None);
+    }
+
+    #[test]
+    fn test_remove_scheduled_front_without_props_ignores_stale_member_links() {
+        let mut pq = KPriorityQueue::new();
+        pq.push_back(89, 59, 2, 0b0100, false, None);
+        pq.push_back(90, 59, 2, 0b0100, false, None);
+        assert_eq!(pq.get_scheduled_front(2), Some(89));
+
+        // Reproduce the Rust-only split-brain state seen in ANIMUS: the
+        // scheduled queue root still names 89 as front, but the per-member
+        // links and property cache no longer describe that membership.
+        pq.thread_props.remove(&89);
+        pq.entries.get_mut(&89).unwrap()[2].set_prev(Some(90));
+        pq.entries.get_mut(&89).unwrap()[2].set_next(None);
+
+        assert!(pq.remove_scheduled_front_without_props(2, 89));
+        assert_eq!(pq.get_scheduled_front(2), Some(90));
     }
 }

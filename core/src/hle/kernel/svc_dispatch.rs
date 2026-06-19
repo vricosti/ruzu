@@ -731,7 +731,12 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::GetThreadContext3) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_thread::get_thread_context3(
+                system,
+                get_arg32(args, 0) as u64,
+                get_arg32(args, 1),
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::GetThreadList) => {
             // IN: out=arg32[1], max=arg32[2], debug=arg32[3]; OUT: ret=arg32[0], count=arg32[1]
@@ -1534,8 +1539,36 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
                 svc_processor::get_current_processor_number(system) as u64,
             );
         }
+        Some(SvcId::SetThreadActivity) => {
+            let result = match get_arg64(args, 1) as u32 {
+                0 => svc_activity::set_thread_activity(
+                    system,
+                    get_arg64(args, 0) as u32,
+                    crate::hle::kernel::svc::svc_types::ThreadActivity::Runnable,
+                ),
+                1 => svc_activity::set_thread_activity(
+                    system,
+                    get_arg64(args, 0) as u32,
+                    crate::hle::kernel::svc::svc_types::ThreadActivity::Paused,
+                ),
+                _ => crate::hle::kernel::svc::svc_results::RESULT_INVALID_ENUM_VALUE,
+            };
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::GetThreadContext3) => {
+            let result = svc_thread::get_thread_context3(
+                system,
+                get_arg64(args, 0),
+                get_arg64(args, 1) as u32,
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
         Some(SvcId::CloseHandle) => {
             let result = svc_synchronization::close_handle(system, get_arg64(args, 0) as u32);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::ResetSignal) => {
+            let result = svc_synchronization::reset_signal(system, get_arg64(args, 0) as u32);
             set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::GetSystemTick) => {
@@ -1864,7 +1897,7 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                                 use crate::arm::arm_interface::ThreadContext;
                                 let mut ctx = ThreadContext::default();
                                 jit.get_context(&mut ctx);
-                                (ctx.r[15] as u32, ctx.r[14] as u32)
+                                (ctx.pc, ctx.lr)
                             } else {
                                 (0, 0)
                             }
@@ -2219,7 +2252,7 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                     use crate::arm::arm_interface::ThreadContext;
                     let mut ctx = ThreadContext::default();
                     jit.get_context(&mut ctx);
-                    (ctx.r[15] as u32, ctx.r[14] as u32)
+                    (ctx.pc, ctx.lr)
                 } else {
                     (0, 0)
                 }

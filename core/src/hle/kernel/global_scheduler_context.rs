@@ -397,6 +397,62 @@ impl GlobalSchedulerContext {
         self.m_priority_queue.get_scheduled_front(core)
     }
 
+    /// Rust-port integrity guard for `KPriorityQueue::GetScheduledFront`.
+    ///
+    /// Upstream uses intrusive entries owned by `KThread`; if every state
+    /// transition calls `KScheduler::OnThreadStateChanged`, scheduled queues
+    /// contain only `ThreadState::Runnable` threads. The Rust port stores queue
+    /// nodes and cached thread properties inside `KPriorityQueue`, so a missed
+    /// removal can leave a stale thread id at the front and stall a core. Keep
+    /// the upstream observable contract at the read boundary: the scheduler
+    /// never selects a non-runnable queue head.
+    pub fn get_scheduled_front_runnable(&mut self, core: i32) -> Option<u64> {
+        loop {
+            let thread_id = self.m_priority_queue.get_scheduled_front(core)?;
+            let is_runnable = self
+                .get_thread_by_thread_id(thread_id)
+                .map(|thread| thread.lock().unwrap().get_raw_state() == ThreadState::RUNNABLE)
+                .unwrap_or(false);
+            if is_runnable {
+                return Some(thread_id);
+            }
+
+            let Some(props) = self.m_priority_queue.get_thread_props(thread_id).cloned() else {
+                log::warn!(
+                    "[PQ_STALE] core={} tid={} missing thread props at scheduled front",
+                    core,
+                    thread_id
+                );
+                if !self
+                    .m_priority_queue
+                    .remove_scheduled_front_without_props(core, thread_id)
+                {
+                    return None;
+                }
+                self.m_scheduler_update_needed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                continue;
+            };
+            log::warn!(
+                "[PQ_STALE] core={} tid={} non-runnable scheduled front, removing prio={} active_core={} affinity=0x{:x}",
+                core,
+                thread_id,
+                props.priority,
+                props.active_core,
+                props.affinity
+            );
+            self.m_priority_queue.remove(
+                thread_id,
+                props.priority,
+                props.active_core,
+                props.affinity,
+                props.is_dummy,
+            );
+            self.m_scheduler_update_needed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     pub fn move_to_scheduled_back(
         &mut self,
         thread_id: u64,
