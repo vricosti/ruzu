@@ -523,7 +523,6 @@ impl KAddressArbiter {
             return early_return;
         }
 
-        Self::wait_for_current_thread(current_thread);
         ResultCode::new(current_thread.lock().unwrap().get_wait_result())
     }
 
@@ -593,7 +592,6 @@ impl KAddressArbiter {
             return early_return;
         }
 
-        Self::wait_for_current_thread(current_thread);
         ResultCode::new(current_thread.lock().unwrap().get_wait_result())
     }
 
@@ -610,36 +608,6 @@ impl KAddressArbiter {
         let mut thread = current_thread.lock().unwrap();
         thread.begin_wait_with_queue(wait_queue);
         thread.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::Arbitration);
-    }
-
-    /// Wait for the current guest fiber to resume (after EndWait fires on
-    /// this thread). Mirrors the same fiber busy-wait helper used by condvar.
-    fn wait_for_current_thread(current_thread: &Arc<KThreadLock>) {
-        let scheduler = super::kernel::get_kernel_ref()
-            .and_then(|kernel| kernel.current_scheduler().cloned())
-            .or_else(|| {
-                current_thread
-                    .lock()
-                    .unwrap()
-                    .scheduler
-                    .as_ref()
-                    .and_then(|scheduler| scheduler.upgrade())
-            });
-
-        while current_thread.lock().unwrap().get_state() == super::k_thread::ThreadState::WAITING {
-            if let Some(scheduler) = scheduler.as_ref() {
-                scheduler.lock().unwrap().request_schedule();
-                let sched_ptr = {
-                    let mut guard = scheduler.lock().unwrap();
-                    &mut *guard as *mut super::k_scheduler::KScheduler
-                };
-                unsafe {
-                    super::k_scheduler::KScheduler::reschedule_current_core_raw(sched_ptr);
-                }
-            } else {
-                std::thread::yield_now();
-            }
-        }
     }
 }
 

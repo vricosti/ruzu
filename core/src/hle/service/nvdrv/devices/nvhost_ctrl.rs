@@ -236,6 +236,36 @@ impl NvHostCtrl {
         );
     }
 
+    fn trace_event_record(
+        stage: u64,
+        slot: u32,
+        value_raw: u32,
+        syncpoint_id: u32,
+        assigned_value: u32,
+        status: u32,
+        object_id: u64,
+    ) {
+        if !common::trace::is_enabled(common::trace::cat::NVHOST_CTRL_WAIT) {
+            return;
+        }
+
+        common::trace::emit_raw(
+            common::trace::cat::NVHOST_CTRL_WAIT,
+            &[
+                stage,
+                syncpoint_id as u64,
+                assigned_value as u64,
+                0,
+                0,
+                slot as u64,
+                value_raw as u64,
+                status as u64,
+                object_id,
+                assigned_value as u64,
+            ],
+        );
+    }
+
     fn bytes_to_cstr(bytes: &[u8]) -> String {
         let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         String::from_utf8_lossy(&bytes[..len]).into_owned()
@@ -289,6 +319,20 @@ impl NvHostCtrl {
         event.wait_handle = None;
         event.owner = None;
         *mask |= 1u64 << event_id;
+        let object_id = event
+            .readable_event
+            .as_ref()
+            .map(|readable_event| readable_event.lock().unwrap().object_id)
+            .unwrap_or(0);
+        Self::trace_event_record(
+            11,
+            event_id,
+            event_id,
+            event.assigned_syncpt,
+            event.assigned_value,
+            event.status.load(Ordering::Acquire),
+            object_id,
+        );
     }
 
     fn free_nv_event(&self, events: &mut [InternalEvent], mask: &mut u64, event_id: u32) {
@@ -309,13 +353,33 @@ impl NvHostCtrl {
     }
 
     fn signal_event_from_slot(events: &Arc<Mutex<Vec<InternalEvent>>>, slot: u32) {
-        let readable_event = {
+        let (readable_event, assigned_syncpt, assigned_value, status) = {
             let events_guard = events.lock().unwrap();
-            events_guard[slot as usize].readable_event.clone()
+            let event = &events_guard[slot as usize];
+            (
+                event.readable_event.clone(),
+                event.assigned_syncpt,
+                event.assigned_value,
+                event.status.load(Ordering::Acquire),
+            )
         };
 
         if let Some(readable_event) = readable_event {
-            readable_event.lock().unwrap().signal_from_host();
+            let object_id = {
+                let mut readable_event = readable_event.lock().unwrap();
+                let object_id = readable_event.object_id;
+                readable_event.signal_from_host();
+                object_id
+            };
+            Self::trace_event_record(
+                12,
+                slot,
+                slot,
+                assigned_syncpt,
+                assigned_value,
+                status,
+                object_id,
+            );
         }
     }
 
@@ -1168,9 +1232,32 @@ impl NvDevice for NvHostCtrl {
         let events = self.events.lock().unwrap();
         let event = &events[slot as usize];
         if event.registered && event.assigned_syncpt == syncpoint_id {
+            let object_id = event
+                .readable_event
+                .as_ref()
+                .map(|readable_event| readable_event.lock().unwrap().object_id)
+                .unwrap_or(0);
+            Self::trace_event_record(
+                13,
+                slot,
+                event_id,
+                syncpoint_id,
+                event.assigned_value,
+                event.status.load(Ordering::Acquire),
+                object_id,
+            );
             return event.readable_event.clone();
         }
 
+        Self::trace_event_record(
+            14,
+            slot,
+            event_id,
+            syncpoint_id,
+            event.assigned_value,
+            event.status.load(Ordering::Acquire),
+            0,
+        );
         log::error!("Slot:{}, SyncpointID:{}, requested", slot, syncpoint_id);
         None
     }

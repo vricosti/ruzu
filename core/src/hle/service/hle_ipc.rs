@@ -2329,6 +2329,43 @@ mod tests {
     }
 
     #[test]
+    fn cmif_out_array_write_back_zeroes_buffer_even_when_count_is_zero() {
+        let fixture = MappedTestMemory::new(0x3000, 0x1000);
+        let memory = fixture.memory.clone();
+
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        process
+            .lock()
+            .unwrap()
+            .page_table
+            .set_memory(memory.clone());
+
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+
+        memory.lock().unwrap().write_block(0x3000, &[0xFF; 16]);
+
+        let mut ctx = HLERequestContext::new_with_thread(thread, 0x2000);
+        ctx.buffer_b_descriptors = vec![ipc::BufferDescriptorABW {
+            size_bits_0_31: 16,
+            address_bits_0_31: 0x3000,
+            raw_word2: 0,
+        }];
+
+        let mut out_storage = crate::hle::service::cmif_serialization::CmifOutArrayBuffer::<
+            u64,
+            { crate::hle::service::cmif_types::buffer_attr::BufferAttr_HipcAutoSelect },
+        >::from_ctx(&ctx, 0);
+        let mut out = out_storage.as_out_array();
+        out[0] = 0;
+        out_storage.write_back(&ctx, 0, 0);
+
+        let mut out_bytes = [0xFFu8; 16];
+        memory.lock().unwrap().read_block(0x3000, &mut out_bytes);
+        assert_eq!(out_bytes, [0; 16]);
+    }
+
+    #[test]
     fn create_session_for_service_queues_server_manager_registration() {
         let mut process = KProcess::new();
         process.initialize_handle_table();

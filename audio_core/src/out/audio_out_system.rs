@@ -197,7 +197,31 @@ impl System {
     }
 
     pub fn append_buffer(&self, buffer: AudioOutBuffer, tag: u64) -> bool {
+        trace_audio_out_buffer(
+            1,
+            self.session_id,
+            self.get_state(),
+            tag,
+            buffer.size,
+            buffer.samples,
+            self.buffers.get_total_buffer_count(),
+            0,
+            self.session.get_played_sample_count(),
+            0,
+        );
         if self.buffers.get_total_buffer_count() == BUFFER_COUNT {
+            trace_audio_out_buffer(
+                2,
+                self.session_id,
+                self.get_state(),
+                tag,
+                buffer.size,
+                buffer.samples,
+                self.buffers.get_total_buffer_count(),
+                0,
+                self.session.get_played_sample_count(),
+                0,
+            );
             return false;
         }
         let timestamp = self.buffers.get_next_timestamp();
@@ -211,6 +235,18 @@ impl System {
             size: buffer.size,
         });
         self.register_buffers();
+        trace_audio_out_buffer(
+            2,
+            self.session_id,
+            self.get_state(),
+            tag,
+            buffer.size,
+            buffer.samples,
+            self.buffers.get_total_buffer_count(),
+            0,
+            self.session.get_played_sample_count(),
+            1,
+        );
         true
     }
 
@@ -218,6 +254,18 @@ impl System {
         if self.get_state() == State::Started {
             let mut registered_buffers = Vec::new();
             self.buffers.register_buffers(&mut registered_buffers);
+            trace_audio_out_buffer(
+                3,
+                self.session_id,
+                self.get_state(),
+                0,
+                0,
+                0,
+                registered_buffers.len() as u32,
+                0,
+                self.session.get_played_sample_count(),
+                0,
+            );
             self.session.append_buffers(&registered_buffers);
         }
     }
@@ -233,13 +281,38 @@ impl System {
         let signal = self
             .buffers
             .release_buffers(current_time, &self.session, false);
+        trace_audio_out_buffer(
+            4,
+            self.session_id,
+            self.get_state(),
+            0,
+            0,
+            0,
+            self.buffers.get_total_buffer_count(),
+            u64::from(signal) as u32,
+            self.session.get_played_sample_count(),
+            0,
+        );
         if signal {
             self.buffer_event.store(true, Ordering::SeqCst);
         }
     }
 
     pub fn get_released_buffers(&self, tags: &mut [u64]) -> u32 {
-        self.buffers.get_released_buffers(tags)
+        let released = self.buffers.get_released_buffers(tags);
+        trace_audio_out_buffer(
+            5,
+            self.session_id,
+            self.get_state(),
+            tags.first().copied().unwrap_or(0),
+            0,
+            0,
+            self.buffers.get_total_buffer_count(),
+            released,
+            self.session.get_played_sample_count(),
+            0,
+        );
+        released
     }
 
     pub fn flush_audio_out_buffers(&self) -> bool {
@@ -303,6 +376,40 @@ impl System {
     }
     pub fn get_played_sample_count(&self) -> u64 {
         self.session.get_played_sample_count()
+    }
+}
+
+fn trace_audio_out_buffer(
+    stage: u64,
+    session_id: usize,
+    state: State,
+    tag: u64,
+    size: u64,
+    samples: u64,
+    total_or_registered: u32,
+    released_or_signal: u32,
+    queue_or_played: u64,
+    result: u64,
+) {
+    if common::trace::is_enabled(common::trace::cat::AUDIO_OUT_BUFFER) {
+        common::trace::emit_raw(
+            common::trace::cat::AUDIO_OUT_BUFFER,
+            &[
+                stage,
+                session_id as u64,
+                match state {
+                    State::Started => 1,
+                    State::Stopped => 0,
+                },
+                tag,
+                size,
+                samples,
+                total_or_registered as u64,
+                released_or_signal as u64,
+                queue_or_played,
+                result,
+            ],
+        );
     }
 }
 

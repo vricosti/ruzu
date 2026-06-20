@@ -19,7 +19,6 @@ use super::k_class_token;
 use super::k_port::KPort;
 use super::k_process::{KProcess, ProcessLock};
 use super::k_readable_event::KReadableEvent;
-use super::k_scheduler::KScheduler;
 use super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep;
 use super::k_server_session::KServerSession;
 use super::k_thread::{KThread, KThreadLock};
@@ -583,7 +582,7 @@ pub unsafe fn notify_waiters_on_state(
 pub fn wait(
     process: &Arc<ProcessLock>,
     current_thread: &Arc<KThreadLock>,
-    _scheduler: &Arc<Mutex<KScheduler>>,
+    _scheduler: &Arc<Mutex<super::k_scheduler::KScheduler>>,
     out_index: &mut i32,
     object_ids: Vec<u64>,
     timeout_ns: i64,
@@ -687,23 +686,24 @@ pub fn wait(
             guard.synced_index = -1;
             guard.wait_result = crate::hle::result::RESULT_SUCCESS.get_inner_value();
             guard.set_cancellable();
-            guard.set_wait_reason_for_debugging(
-                super::k_thread::ThreadWaitReasonForDebugging::Synchronization,
-            );
 
             let mut wait_queue = ThreadQueueImplForKSynchronizationObjectWait::queue();
             if let Some(timer) = timer {
                 wait_queue.set_hardware_timer(timer);
             }
             guard.begin_wait_with_queue(wait_queue);
+            guard.set_wait_reason_for_debugging(
+                super::k_thread::ThreadWaitReasonForDebugging::Synchronization,
+            );
         }
 
         crate::hle::result::RESULT_SUCCESS
     };
-    // KScopedSchedulerLockAndSleep drops here → fiber switch. When the
-    // waiter resumes, sync_wait_context has been cleared by the notify
-    // callback and synced_index holds the fired index.
-
+    // KScopedSchedulerLockAndSleep drops here. Upstream returns to the
+    // physical-core scheduler naturally after BeginWait. In ruzu, the
+    // CPU-manager post-SVC path observes ThreadState::WAITING and performs
+    // the core handoff; spinning here would change the scheduler's current
+    // thread while leaving this host core stuck inside the old SVC.
     let thread = current_thread.lock().unwrap();
     *out_index = thread.get_synced_index();
     ResultCode::new(thread.get_wait_result())

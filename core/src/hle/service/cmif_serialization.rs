@@ -412,13 +412,12 @@ impl<T: Copy + Default, const A: i32> CmifOutArrayBuffer<T, A> {
         Buffer::from_slice(self.storage.as_mut_slice())
     }
 
-    pub fn write_back(&self, ctx: &HLERequestContext, index: usize, count: usize) {
-        let count = count.min(self.storage.len());
-        if count == 0 {
+    pub fn write_back(&self, ctx: &HLERequestContext, index: usize, _count: usize) {
+        if self.storage.is_empty() {
             return;
         }
 
-        let byte_len = count * std::mem::size_of::<T>();
+        let byte_len = self.storage.len() * std::mem::size_of::<T>();
         let bytes =
             unsafe { std::slice::from_raw_parts(self.storage.as_ptr() as *const u8, byte_len) };
         ctx.write_buffer(bytes, index);

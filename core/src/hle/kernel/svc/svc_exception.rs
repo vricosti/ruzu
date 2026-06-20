@@ -180,6 +180,100 @@ pub fn break64_from_32(system: &System, reason: u32, arg: u32, size: u32, args: 
 
 /// Upstream `Break64` wrapper.
 pub fn break64(system: &System, reason: u32, arg: u64, size: u64) {
+    if common::trace::is_enabled(common::trace::cat::A64_BREAK_CTX) {
+        let core = system
+            .kernel()
+            .map(|kernel| kernel.current_physical_core_index() as usize)
+            .unwrap_or(0);
+        let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+        let pc = crate::hle::kernel::kernel::GUEST_PC
+            .get(core)
+            .map(|value| value.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(0);
+        let lr = crate::hle::kernel::kernel::GUEST_LR
+            .get(core)
+            .map(|value| value.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(0);
+        let sp = crate::hle::kernel::kernel::GUEST_SP
+            .get(core)
+            .map(|value| value.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(0);
+        common::trace::emit_raw(
+            common::trace::cat::A64_BREAK_CTX,
+            &[
+                0,
+                reason as u64,
+                core as u64,
+                tid,
+                pc,
+                lr,
+                sp,
+                arg,
+                size,
+                reason as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        if let Some(memory) = system.get_svc_memory() {
+            let memory = memory.lock().unwrap();
+            for offset in (0..0x100).step_by(0x20) {
+                let base = sp + offset;
+                common::trace::emit_raw(
+                    common::trace::cat::A64_BREAK_CTX,
+                    &[
+                        1,
+                        base,
+                        memory.read_64(base),
+                        memory.read_64(base + 8),
+                        memory.read_64(base + 16),
+                        memory.read_64(base + 24),
+                    ],
+                );
+            }
+            if arg != 0 {
+                for offset in (0..0x80).step_by(0x20) {
+                    let base = arg + offset;
+                    if memory.is_valid_virtual_address_range(base, 0x20) {
+                        let values = [
+                            memory.read_64(base),
+                            memory.read_64(base + 8),
+                            memory.read_64(base + 16),
+                            memory.read_64(base + 24),
+                        ];
+                        common::trace::emit_raw(
+                            common::trace::cat::A64_BREAK_CTX,
+                            &[2, base, values[0], values[1], values[2], values[3]],
+                        );
+                        for &ptr in &values {
+                            if ptr == 0 || !memory.is_valid_virtual_address_range(ptr, 1) {
+                                continue;
+                            }
+                            let mut raw = [0u64; 4];
+                            let mut len = 0usize;
+                            for index in 0..32usize {
+                                if !memory.is_valid_virtual_address_range(ptr + index as u64, 1) {
+                                    break;
+                                }
+                                let byte = memory.read_8(ptr + index as u64);
+                                raw[index / 8] |= (byte as u64) << ((index % 8) * 8);
+                                len += 1;
+                                if byte == 0 {
+                                    break;
+                                }
+                            }
+                            common::trace::emit_raw(
+                                common::trace::cat::A64_BREAK_CTX,
+                                &[3, ptr, len as u64, raw[0], raw[1], raw[2], raw[3]],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
     dump_a64_break_context(system, arg, size);
     log::error!(
         "!!! svcBreak(reason={:#x}, info1={:#x}, info2={:#x}) - GAME ABORTED !!!",
