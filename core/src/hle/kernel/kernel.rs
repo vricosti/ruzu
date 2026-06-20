@@ -972,7 +972,11 @@ fn dump_thread_state(kernel: &KernelCore) {
                     match memory.try_lock() {
                         Ok(m) => {
                             for i in 0..STACK_WORDS {
-                                stack_words.push(m.read_32(sp + (i as u64) * 4));
+                                let addr = sp + (i as u64) * 4;
+                                if !m.is_valid_virtual_address_range(addr, 4) {
+                                    break;
+                                }
+                                stack_words.push(m.read_32(addr));
                             }
                         }
                         Err(_) => {
@@ -985,14 +989,17 @@ fn dump_thread_state(kernel: &KernelCore) {
                     }
                 } else {
                     let mem = guard.process_memory.read().unwrap();
-                    let len = (STACK_WORDS as u64) * 4;
-                    if !mem.is_valid_range(*sp, len as usize) {
-                        eprintln!("[DUMP]   core={} sp=0x{:X}: stack not mapped", core_id, sp);
-                        continue;
-                    }
                     for i in 0..STACK_WORDS {
-                        stack_words.push(mem.read_32(sp + (i as u64) * 4));
+                        let addr = sp + (i as u64) * 4;
+                        if !mem.is_valid_range(addr, 4) {
+                            break;
+                        }
+                        stack_words.push(mem.read_32(addr));
                     }
+                }
+                if stack_words.is_empty() {
+                    eprintln!("[DUMP]   core={} sp=0x{:X}: stack not mapped", core_id, sp);
+                    continue;
                 }
                 eprint!("[DUMP]   core={} stack@0x{:X}:", core_id, sp);
                 for (i, w) in stack_words.iter().enumerate() {

@@ -457,7 +457,7 @@ impl CoreData {
         }
 
         if age == Age::All {
-            let random = mii_util::get_random_value::<u64>(0, 9) as i32;
+            let random = mii_util::get_random_value_max::<u64>(10) as i32;
             if random >= 8 {
                 age = Age::Old;
             } else if random >= 4 {
@@ -468,7 +468,7 @@ impl CoreData {
         }
 
         if race == Race::All {
-            let random = mii_util::get_random_value::<u64>(0, 9) as i32;
+            let random = mii_util::get_random_value_max::<u64>(10) as i32;
             if random >= 8 {
                 race = Race::Black;
             } else if random >= 4 {
@@ -493,7 +493,7 @@ impl CoreData {
 
         let mut axis_y: u32 = 0;
         if gender == Gender::Female && age == Age::Young {
-            axis_y = mii_util::get_random_value::<u64>(0, 2) as u32;
+            axis_y = mii_util::get_random_value_max::<u64>(3) as u32;
         }
 
         let index: usize = 3 * (age as usize) + 9 * (gender as usize) + (race as usize);
@@ -514,40 +514,34 @@ impl CoreData {
         let glasses_type_info = &raw_data::RANDOM_MII_GLASS_TYPE[age as usize];
 
         self.data.set_faceline_type(
-            faceline_type_info.values[mii_util::get_random_value::<u64>(
-                0,
-                faceline_type_info.values_count as u64 - 1,
+            faceline_type_info.values[mii_util::get_random_value_max::<u64>(
+                faceline_type_info.values_count as u64,
             ) as usize],
         );
         self.data.set_faceline_color(
-            faceline_color_info.values[mii_util::get_random_value::<u64>(
-                0,
-                faceline_color_info.values_count as u64 - 1,
+            faceline_color_info.values[mii_util::get_random_value_max::<u64>(
+                faceline_color_info.values_count as u64,
             ) as usize],
         );
         self.data.set_faceline_wrinkle(
-            faceline_wrinkle_info.values[mii_util::get_random_value::<u64>(
-                0,
-                faceline_wrinkle_info.values_count as u64 - 1,
+            faceline_wrinkle_info.values[mii_util::get_random_value_max::<u64>(
+                faceline_wrinkle_info.values_count as u64,
             ) as usize],
         );
         self.data.set_faceline_makeup(
-            faceline_makeup_info.values[mii_util::get_random_value::<u64>(
-                0,
-                faceline_makeup_info.values_count as u64 - 1,
+            faceline_makeup_info.values[mii_util::get_random_value_max::<u64>(
+                faceline_makeup_info.values_count as u64,
             ) as usize],
         );
 
         self.data.set_hair_type(
-            hair_type_info.values[mii_util::get_random_value::<u64>(
-                0,
-                hair_type_info.values_count as u64 - 1,
+            hair_type_info.values[mii_util::get_random_value_max::<u64>(
+                hair_type_info.values_count as u64,
             ) as usize],
         );
         self.set_hair_color(raw_data::get_hair_color_from_ver3(
-            hair_color_info.values[mii_util::get_random_value::<u64>(
-                0,
-                hair_color_info.values_count as u64 - 1,
+            hair_color_info.values[mii_util::get_random_value_max::<u64>(
+                hair_color_info.values_count as u64,
             ) as usize],
         ) as u32);
         self.set_hair_flip(unsafe {
@@ -555,10 +549,8 @@ impl CoreData {
         });
 
         self.data.set_eye_type(
-            eye_type_info.values[mii_util::get_random_value::<u64>(
-                0,
-                eye_type_info.values_count as u64 - 1,
-            ) as usize],
+            eye_type_info.values
+                [mii_util::get_random_value_max::<u64>(eye_type_info.values_count as u64) as usize],
         );
 
         let eye_rotate_1: usize = if gender != Gender::Male { 4 } else { 2 };
@@ -569,9 +561,8 @@ impl CoreData {
             32i32 - (raw_data::EYE_ROTATE_LOOKUP[self.data.eye_type() as usize] as i32);
 
         self.set_eye_color(raw_data::get_eye_color_from_ver3(
-            eye_color_info.values[mii_util::get_random_value::<u64>(
-                0,
-                eye_color_info.values_count as u64 - 1,
+            eye_color_info.values[mii_util::get_random_value_max::<u64>(
+                eye_color_info.values_count as u64,
             ) as usize],
         ) as u32);
         self.set_eye_scale(4);
@@ -581,9 +572,8 @@ impl CoreData {
         self.set_eye_y((axis_y + 12) as u8);
 
         self.data.set_eyebrow_type(
-            eyebrow_type_info.values[mii_util::get_random_value::<u64>(
-                0,
-                eyebrow_type_info.values_count as u64 - 1,
+            eyebrow_type_info.values[mii_util::get_random_value_max::<u64>(
+                eyebrow_type_info.values_count as u64,
             ) as usize],
         );
 
@@ -602,24 +592,22 @@ impl CoreData {
         self.set_eyebrow_y((axis_y + eyebrow_y_val) as u8);
 
         self.data.set_nose_type(
-            nose_type_info.values[mii_util::get_random_value::<u64>(
-                0,
-                nose_type_info.values_count as u64 - 1,
+            nose_type_info.values[mii_util::get_random_value_max::<u64>(
+                nose_type_info.values_count as u64,
             ) as usize],
         );
         self.set_nose_scale(if gender == Gender::Female { 3 } else { 4 });
         self.set_nose_y((axis_y + 9) as u8);
 
         let mouth_color_val: i32 = if gender == Gender::Female {
-            mii_util::get_random_value::<u64>(0, 3) as i32
+            mii_util::get_random_value_max::<u64>(4) as i32
         } else {
             0
         };
 
         self.data.set_mouth_type(
-            mouth_type_info.values[mii_util::get_random_value::<u64>(
-                0,
-                mouth_type_info.values_count as u64 - 1,
+            mouth_type_info.values[mii_util::get_random_value_max::<u64>(
+                mouth_type_info.values_count as u64,
             ) as usize],
         );
         self.set_mouth_color(raw_data::get_mouth_color_from_ver3(mouth_color_val as u32) as u32);
@@ -632,7 +620,7 @@ impl CoreData {
 
         if gender == Gender::Male
             && age != Age::Young
-            && (mii_util::get_random_value::<u64>(0, 9) as i32) < 2
+            && (mii_util::get_random_value_max::<u64>(10) as i32) < 2
         {
             let mustache_and_beard_flag = BeardAndMustacheFlag::from_bits_truncate(
                 mii_util::get_random_value::<u64>(0, BeardAndMustacheFlag::ALL.bits() as u64)
@@ -669,7 +657,7 @@ impl CoreData {
             self.set_mustache_y((axis_y + 10) as u8);
         }
 
-        let glasses_type_start = mii_util::get_random_value::<u64>(0, 99) as usize;
+        let glasses_type_start = mii_util::get_random_value_max::<u64>(100) as usize;
         let mut glasses_type: u8 = 0;
         while glasses_type_start < glasses_type_info.values[glasses_type as usize] as usize {
             glasses_type += 1;
