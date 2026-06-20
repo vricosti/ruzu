@@ -774,6 +774,47 @@ impl KPriorityQueue {
         }
     }
 
+    fn remove_all_expected_impl(
+        &mut self,
+        priority: i32,
+        member_id: u64,
+        active_core: i32,
+        affinity_mask: u64,
+    ) {
+        debug_assert!(is_valid_priority(priority));
+
+        let Self {
+            scheduled_queue,
+            suggested_queue,
+            entries,
+            thread_props,
+        } = self;
+        let mut affinity = affinity_mask;
+        if active_core >= 0 {
+            if scheduled_queue.queues[priority as usize].remove_all_matching(
+                active_core,
+                member_id,
+                entries,
+                thread_props,
+            ) {
+                scheduled_queue.available_priorities[active_core as usize].clear_bit(priority);
+            }
+            clear_affinity_bit(&mut affinity, active_core);
+        }
+
+        while affinity != 0 {
+            let core = get_next_core(&mut affinity);
+            if suggested_queue.queues[priority as usize].remove_all_matching(
+                core,
+                member_id,
+                entries,
+                thread_props,
+            ) {
+                suggested_queue.available_priorities[core as usize].clear_bit(priority);
+            }
+        }
+    }
+
     fn purge_member_from_all_queues(&mut self, member_id: u64) {
         let Self {
             scheduled_queue,
@@ -809,7 +850,6 @@ impl KPriorityQueue {
                 existing.affinity,
             );
         }
-        self.purge_member_from_all_queues(member_id);
         ensure_entry(&mut self.entries, member_id);
         self.thread_props.insert(
             member_id,
@@ -846,7 +886,6 @@ impl KPriorityQueue {
                 existing.affinity,
             );
         }
-        self.purge_member_from_all_queues(member_id);
         ensure_entry(&mut self.entries, member_id);
         self.thread_props.insert(
             member_id,
@@ -881,7 +920,7 @@ impl KPriorityQueue {
                 (priority, active_core, affinity)
             };
         self.remove_impl(priority, member_id, active_core, affinity);
-        self.purge_member_from_all_queues(member_id);
+        self.remove_all_expected_impl(priority, member_id, active_core, affinity);
         // Keep entries around (they'll be reused on next push).
         // Remove props since thread is no longer in PQ.
         self.thread_props.remove(&member_id);
@@ -1054,11 +1093,6 @@ impl KPriorityQueue {
                 thread_props,
             } = self;
             if prev_core >= 0 {
-                // Upstream has one intrusive QueueEntry per (thread, core), so
-                // ChangeCore's Remove() eliminates the only scheduled
-                // membership. Rust stores ids in links; if earlier repair paths
-                // left the same id root-visible more than once, remove every
-                // occurrence or the thread can be scheduled on both cores.
                 if scheduled_queue.queues[priority as usize].remove_all_matching(
                     prev_core,
                     member_id,
