@@ -83,6 +83,10 @@ pub mod cat {
     pub const HEAP: u16 = 5;
     /// Per-tid SVC tracer. args = [t_ns, tid, core, svc_name_id, pc, lr, a0, a1, a2, a3]
     pub const TID_SVC: u16 = 6;
+    /// Userspace mutex priority-inheritance handoff. args =
+    /// [stage, tid, addr, handle, tag, test_tag, owner_tid, next_tid, has_waiters, next_value,
+    ///  result, owner_obj_id, waiter_count, extra]
+    pub const LOCK_PI: u16 = 55;
     /// JIT memory read watchpoint. args = [core, tid, pc, lr, vaddr, size, value_lo, value_hi]
     pub const WATCH_READ: u16 = 7;
     /// JIT memory write watchpoint. Same layout as WATCH_READ.
@@ -91,6 +95,35 @@ pub mod cat {
     pub const STLEX: u16 = 9;
     /// Single-cell unmapped JIT write. args = [tid, pc, lr, vaddr, size, value_lo, value_hi]
     pub const UNMAPPED_WRITE: u16 = 10;
+    /// Single-cell unmapped JIT read. args =
+    /// [core, pc, lr, vaddr, size, x0, x8, x9, x19, x20, x21, x22, x25]
+    pub const UNMAPPED_READ: u16 = 53;
+    /// AArch64 exception context. args =
+    /// stage=0 [stage, reason_id, core, tid, pc, lr, sp, x0, x8, x19, x20, x21, x23, x24]
+    /// stage=1 [stage, base, qword0, qword1, qword2, qword3]
+    /// stage=7 [stage, core, tid, x9, x10, x11, x12, x13, x14, x15, x18, x22, x25, x26]
+    /// stage=8 [stage, reg_index, base, qword0, qword1, qword2, qword3]
+    /// stage=9 [stage, core, tid, x27, x28]
+    pub const A64_EXCEPTION_CTX: u16 = 54;
+    /// svcBreak AArch64 context. Kept separate from A64_EXCEPTION_CTX so
+    /// abort diagnostics do not enable the high-volume JIT exception stream.
+    /// stage=0 [stage, reason, core, tid, pc, lr, sp, info1, info2]
+    /// stage=1 [stage, base, qword0, qword1, qword2, qword3]
+    pub const A64_BREAK_CTX: u16 = 56;
+    /// svcSetThreadCoreMask lifecycle. args =
+    /// [stage, caller_tid, target_tid, handle, core_id, affinity_mask, state, active_core,
+    ///  current_core, result, is_pinned, waiter_count]
+    pub const THREAD_CORE_MASK: u16 = 57;
+    /// svcCreateThread lifecycle. args =
+    /// [stage, caller_tid, entry_point, arg, stack_bottom, priority, requested_core, effective_core,
+    ///  process_core_mask, result, out_handle, extra]
+    pub const CREATE_THREAD: u16 = 58;
+    /// SVC return-value match. args =
+    /// [target_result, tid, core, svc_name_id, pc, lr, a0, a1, a2, a3, ret0, ret1, ret2, ret3]
+    pub const SVC_ERRVAL: u16 = 60;
+    /// SendSyncRequest enter/exit. args =
+    /// [stage(0=enter,1=exit), guest_tid, handle, cmd, cmd_type, result, service_name_id]
+    pub const SSR_IPC: u16 = 61;
     /// BL/PLT scan hit. args = [pc, target, kind_id, cond]
     /// kind_id: 0=B, 1=BL, 2=BLX
     pub const BL_HIT: u16 = 11;
@@ -290,6 +323,10 @@ pub mod cat {
     /// HID NPad service command attribution. args =
     /// [cmd, result, aruid, arg0, arg1, out0, out1, out2]
     pub const HID_NPAD: u16 = 52;
+    /// AudioOut buffer lifecycle attribution. args =
+    /// [stage, session_id, state, tag, size, samples, total_or_registered, released_or_signal,
+    ///  queue_or_played, result]
+    pub const AUDIO_OUT_BUFFER: u16 = 59;
 }
 
 fn service_registry() -> &'static Mutex<Vec<String>> {
@@ -447,13 +484,21 @@ pub struct Config {
     pub svc_ipc_progress_trace: bool,
     pub binder_txn_trace: bool,
     pub bqp_trace: bool,
+    pub ssr_ipc_trace: bool,
     pub gpu_va_trace: bool,
     pub heap_trace: bool,
     pub tid_svc_trace: bool,
     pub tid_svc_pc: bool,
+    pub lock_pi_trace: bool,
     pub watch_read_write: bool,
     pub stlex_trace: bool,
     pub unmapped_write_trace: bool,
+    pub unmapped_read_trace: bool,
+    pub a64_exception_trace: bool,
+    pub a64_break_trace: bool,
+    pub thread_core_mask_trace: bool,
+    pub create_thread_trace: bool,
+    pub svc_errval_trace: bool,
     pub bl_hit_trace: bool,
     pub ipc_handle_out: bool,
     pub ipc_domain_out: bool,
@@ -472,6 +517,7 @@ pub struct Config {
     pub image_view_trace: bool,
     pub present_texture_trace: bool,
     pub audio_device_sink_trace: bool,
+    pub audio_out_buffer_trace: bool,
     pub audio_voice_trace: bool,
     pub host1x_video_trace: bool,
     pub host1x_syncpoint_trace: bool,
@@ -512,13 +558,21 @@ impl Default for Config {
             svc_ipc_progress_trace: false,
             binder_txn_trace: false,
             bqp_trace: false,
+            ssr_ipc_trace: false,
             gpu_va_trace: false,
             heap_trace: false,
             tid_svc_trace: false,
             tid_svc_pc: false,
+            lock_pi_trace: false,
             watch_read_write: false,
             stlex_trace: false,
             unmapped_write_trace: false,
+            unmapped_read_trace: false,
+            a64_exception_trace: false,
+            a64_break_trace: false,
+            thread_core_mask_trace: false,
+            create_thread_trace: false,
+            svc_errval_trace: false,
             bl_hit_trace: false,
             ipc_handle_out: false,
             ipc_domain_out: false,
@@ -537,6 +591,7 @@ impl Default for Config {
             image_view_trace: false,
             present_texture_trace: false,
             audio_device_sink_trace: false,
+            audio_out_buffer_trace: false,
             audio_voice_trace: false,
             host1x_video_trace: false,
             host1x_syncpoint_trace: false,
@@ -572,12 +627,20 @@ impl Config {
             || self.svc_ipc_progress_trace
             || self.binder_txn_trace
             || self.bqp_trace
+            || self.ssr_ipc_trace
             || self.gpu_va_trace
             || self.heap_trace
             || self.tid_svc_trace
+            || self.lock_pi_trace
             || self.watch_read_write
             || self.stlex_trace
             || self.unmapped_write_trace
+            || self.unmapped_read_trace
+            || self.a64_exception_trace
+            || self.a64_break_trace
+            || self.thread_core_mask_trace
+            || self.create_thread_trace
+            || self.svc_errval_trace
             || self.bl_hit_trace
             || self.ipc_handle_out
             || self.ipc_domain_out
@@ -596,6 +659,7 @@ impl Config {
             || self.image_view_trace
             || self.present_texture_trace
             || self.audio_device_sink_trace
+            || self.audio_out_buffer_trace
             || self.audio_voice_trace
             || self.host1x_video_trace
             || self.host1x_syncpoint_trace
@@ -701,13 +765,27 @@ fn build_config() -> Config {
         ),
         binder_txn_trace: get_bool("nvnflinger", "binder", "RUZU_TRACE_BINDER_TXN_RING", false),
         bqp_trace: get_bool("nvnflinger", "bqp", "RUZU_TRACE_BQP_RING", false),
+        ssr_ipc_trace: get_bool("svc", "ssr_ipc", "RUZU_DUMP_SSR", false),
         gpu_va_trace: get_bool("nvdrv", "gpu_va_trace", "RUZU_TRACE_GPU_VA", false),
         heap_trace: get_bool("svc", "heap_trace", "RUZU_TRACE_HEAP", false),
         tid_svc_trace: get_bool("svc", "tid_svc", "RUZU_TRACE_TID_SVC", false),
         tid_svc_pc: get_bool("svc", "tid_svc_pc", "RUZU_TRACE_TID_SVC_PC", false),
+        lock_pi_trace: get_bool("svc", "lock_pi", "RUZU_TRACE_LOCK_PI", false),
         watch_read_write: get_bool("jit", "watch_read_write", "RUZU_WATCH_ENABLED", false),
         stlex_trace: get_bool("jit", "stlex", "RUZU_TRACE_STLEX", false),
         unmapped_write_trace: get_bool("jit", "unmapped_write", "RUZU_TRACE_UNMAPPED_WRITE", false),
+        unmapped_read_trace: get_bool("jit", "unmapped_read", "RUZU_TRACE_UNMAPPED_READ", false),
+        a64_exception_trace: get_bool("jit", "a64_exception", "RUZU_TRACE_A64_EXCEPTION", false),
+        a64_break_trace: get_bool("jit", "a64_break", "RUZU_TRACE_A64_BREAK", false),
+        thread_core_mask_trace: get_bool(
+            "svc",
+            "thread_core_mask",
+            "RUZU_TRACE_THREAD_CORE_MASK",
+            false,
+        ),
+        create_thread_trace: get_bool("svc", "create_thread", "RUZU_TRACE_CREATE_THREAD", false),
+        svc_errval_trace: get_bool("svc", "errval", "RUZU_TRACE_SVC_ERRVAL", false)
+            || env_set("RUZU_TRACE_INVALID_HANDLE_SVC"),
         bl_hit_trace: get_bool("jit", "bl_hit", "RUZU_TRACE_BL_HIT", false),
         ipc_handle_out: get_bool("ipc", "handle_out", "RUZU_IPC_HANDLE_OUT", false),
         ipc_domain_out: get_bool("ipc", "domain_out", "RUZU_IPC_DOMAIN_OUT", false),
@@ -759,6 +837,12 @@ fn build_config() -> Config {
             "audio",
             "device_sink",
             "RUZU_TRACE_AUDIO_DEVICE_SINK",
+            false,
+        ),
+        audio_out_buffer_trace: get_bool(
+            "audio",
+            "out_buffer",
+            "RUZU_TRACE_AUDIO_OUT_BUFFER",
             false,
         ),
         audio_voice_trace: get_bool("audio", "voice", "RUZU_TRACE_AUDIO_VOICE", false),
@@ -857,14 +941,22 @@ pub fn is_enabled(category: u16) -> bool {
         cat::IPC_INVALID => c.ipc_invalid_trace,
         cat::IPC_REPLY_WAKE => c.ipc_reply_wake_trace,
         cat::SVC_IPC_PROGRESS => c.svc_ipc_progress_trace,
+        cat::SSR_IPC => c.ssr_ipc_trace,
         cat::BINDER_TXN => c.binder_txn_trace,
         cat::BQP => c.bqp_trace,
         cat::GPU_VA_MAP | cat::GPU_VA_UNMAP => c.gpu_va_trace,
         cat::HEAP => c.heap_trace,
         cat::TID_SVC => c.tid_svc_trace,
+        cat::LOCK_PI => c.lock_pi_trace,
         cat::WATCH_READ | cat::WATCH_WRITE => c.watch_read_write,
         cat::STLEX => c.stlex_trace,
         cat::UNMAPPED_WRITE => c.unmapped_write_trace,
+        cat::UNMAPPED_READ => c.unmapped_read_trace,
+        cat::A64_EXCEPTION_CTX => c.a64_exception_trace,
+        cat::A64_BREAK_CTX => c.a64_break_trace,
+        cat::THREAD_CORE_MASK => c.thread_core_mask_trace,
+        cat::CREATE_THREAD => c.create_thread_trace,
+        cat::SVC_ERRVAL => c.svc_errval_trace,
         cat::BL_HIT => c.bl_hit_trace,
         cat::IPC_HANDLE_OUT => c.ipc_handle_out,
         cat::IPC_DOMAIN_OUT => c.ipc_domain_out,
@@ -885,6 +977,7 @@ pub fn is_enabled(category: u16) -> bool {
         cat::IMAGE_VIEW => c.image_view_trace,
         cat::PRESENT_TEXTURE => c.present_texture_trace,
         cat::AUDIO_DEVICE_SINK => c.audio_device_sink_trace,
+        cat::AUDIO_OUT_BUFFER => c.audio_out_buffer_trace,
         cat::AUDIO_VOICE => c.audio_voice_trace,
         cat::HOST1X_VIDEO => c.host1x_video_trace,
         cat::HOST1X_SYNCPOINT => c.host1x_syncpoint_trace,
@@ -1036,6 +1129,16 @@ fn format_into(out: &mut String, rec: &LogRecord) {
             out.pop(); // trailing space
             out.push('\n');
         }
+        cat::SSR_IPC => {
+            // args = [stage(0=enter,1=exit), guest_tid, handle, cmd, cmd_type, result, service_name_id]
+            let stage = if rec.args[0] == 0 { "ENTER" } else { "EXIT" };
+            let svc = service_name(rec.args[6] as u16);
+            let _ = writeln!(
+                out,
+                "[SSR] tid={} handle={:#x} service={} cmd={} cmd_type={} result={:#x} {}",
+                rec.args[1], rec.args[2], svc, rec.args[3], rec.args[4], rec.args[5], stage
+            );
+        }
         cat::IPC_REQUEST => {
             let svc = service_name(rec.args[1] as u16);
             let _ = write!(
@@ -1112,10 +1215,10 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 "[TID_SVC] t_ns={} tid={} core={} svc={}",
                 rec.args[0], rec.args[1], rec.args[2], name
             );
-            let pc = rec.args[4] as u32;
-            let lr = rec.args[5] as u32;
+            let pc = rec.args[4];
+            let lr = rec.args[5];
             if pc != 0 || lr != 0 {
-                let _ = write!(out, " pc=0x{:08X} lr=0x{:08X}", pc, lr);
+                let _ = write!(out, " pc=0x{:016X} lr=0x{:016X}", pc, lr);
             }
             let _ = writeln!(
                 out,
@@ -1123,14 +1226,160 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 rec.args[6], rec.args[7], rec.args[8], rec.args[9]
             );
         }
+        cat::SVC_ERRVAL => {
+            // args = [target_result, tid, core, svc_name_id, pc, lr, a0, a1, a2, a3, ret0, ret1, ret2, ret3]
+            let name = svc_name(rec.args[3] as u16);
+            let _ = writeln!(
+                out,
+                "[SVC_ERRVAL] target=0x{:X} tid={} core={} svc={} pc=0x{:016X} lr=0x{:016X} args=[0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}] ret=[0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}]",
+                rec.args[0],
+                rec.args[1],
+                rec.args[2],
+                name,
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
+                rec.args[10],
+                rec.args[11],
+                rec.args[12],
+                rec.args[13],
+            );
+        }
+        cat::THREAD_CORE_MASK => {
+            let stage = match rec.args[0] {
+                1 => "enter",
+                2 => "resolved",
+                3 => "return",
+                4 => "set_begin",
+                5 => "wait_retry",
+                6 => "wait_pinned",
+                7 => "set_end",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                out,
+                "[THREAD_CORE_MASK] stage={} caller_tid={} target_tid={} handle=0x{:X} core_id={} affinity=0x{:X} state=0x{:X} active_core={} current_core={} result=0x{:X} pinned={} waiters={}",
+                stage,
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4] as i32,
+                rec.args[5],
+                rec.args[6],
+                rec.args[7] as i32,
+                rec.args[8] as i32,
+                rec.args[9],
+                rec.args[10],
+                rec.args[11],
+            );
+        }
+        cat::CREATE_THREAD => {
+            let stage = match rec.args[0] {
+                1 => "enter",
+                2 => "invalid_core",
+                3 => "invalid_priority",
+                4 => "limit_reached",
+                5 => "init_fail",
+                6 => "handle_table_fail",
+                7 => "success",
+                8 => "out_of_handles",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                out,
+                "[CREATE_THREAD] stage={} caller_tid={} entry=0x{:016X} arg=0x{:016X} stack=0x{:016X} priority={} requested_core={} effective_core={} process_core_mask=0x{:X} result=0x{:X} out_handle=0x{:X} extra=0x{:X}",
+                stage,
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5] as i32,
+                rec.args[6] as i32,
+                rec.args[7] as i32,
+                rec.args[8],
+                rec.args[9],
+                rec.args[10],
+                rec.args[11],
+            );
+        }
+        cat::LOCK_PI => {
+            let stage = match rec.args[0] {
+                1 => "wait_enter",
+                2 => "wait_no_wait",
+                3 => "wait_owner",
+                4 => "wait_sleep",
+                5 => "signal_enter",
+                6 => "signal_next",
+                7 => "signal_write",
+                8 => "signal_wake",
+                9 => "cv_wait_next",
+                10 => "cv_wait_write_key",
+                11 => "cv_wait_write_addr",
+                12 => "cv_wait_enqueue",
+                13 => "cv_signal_update",
+                14 => "cv_signal_immediate",
+                15 => "cv_signal_requeue",
+                16 => "cv_signal_invalid",
+                17 => "wait_self_owner",
+                18 => "wait_zero_tag_tls",
+                19 => "wait_tag_tls_mismatch",
+                20 => "svc_wait_enter",
+                21 => "svc_wait_return",
+                22 => "svc_lock_handles",
+                23 => "wait_tag_ctx",
+                _ => "unknown",
+            };
+            if rec.args[0] == 23 {
+                let _ = writeln!(
+                    out,
+                    "[LOCK_PI] stage={} tid={} addr=0x{:X} handle=0x{:X} tag=0x{:X} tls_handle=0x{:X} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x20=0x{:016X} jit_tpidrro=0x{:016X}",
+                    stage,
+                    rec.args[1],
+                    rec.args[2],
+                    rec.args[3],
+                    rec.args[4],
+                    rec.args[5],
+                    rec.args[6],
+                    rec.args[7],
+                    rec.args[8],
+                    rec.args[9],
+                    rec.args[10],
+                    rec.args[11],
+                    rec.args[12],
+                    rec.args[13],
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "[LOCK_PI] stage={} tid={} addr=0x{:X} handle=0x{:X} tag=0x{:X} test_tag=0x{:X} owner_tid={} next_tid={} has_waiters={} next_value=0x{:X} result=0x{:X} owner_obj={} waiter_count={} extra=0x{:X}",
+                    stage,
+                    rec.args[1],
+                    rec.args[2],
+                    rec.args[3],
+                    rec.args[4],
+                    rec.args[5],
+                    rec.args[6],
+                    rec.args[7],
+                    rec.args[8],
+                    rec.args[9],
+                    rec.args[10],
+                    rec.args[11],
+                    rec.args[12],
+                    rec.args[13],
+                );
+            }
+        }
         cat::WATCH_READ => {
             let _ = writeln!(
                 out,
-                "[WATCH_READ ] core={} tid={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:016X}{:016X}",
+                "[WATCH_READ ] core={} tid={} pc=0x{:016X} lr=0x{:016X} vaddr=0x{:X} size={} value=0x{:016X}{:016X}",
                 rec.args[0] as i32,
                 rec.args[1],
-                rec.args[2] as u32,
-                rec.args[3] as u32,
+                rec.args[2],
+                rec.args[3],
                 rec.args[4],
                 rec.args[5],
                 rec.args[7],
@@ -1140,11 +1389,11 @@ fn format_into(out: &mut String, rec: &LogRecord) {
         cat::WATCH_WRITE => {
             let _ = writeln!(
                 out,
-                "[WATCH_WRITE] core={} tid={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:016X}{:016X}",
+                "[WATCH_WRITE] core={} tid={} pc=0x{:016X} lr=0x{:016X} vaddr=0x{:X} size={} value=0x{:016X}{:016X}",
                 rec.args[0] as i32,
                 rec.args[1],
-                rec.args[2] as u32,
-                rec.args[3] as u32,
+                rec.args[2],
+                rec.args[3],
                 rec.args[4],
                 rec.args[5],
                 rec.args[7],
@@ -1165,16 +1414,260 @@ fn format_into(out: &mut String, rec: &LogRecord) {
         cat::UNMAPPED_WRITE => {
             let _ = writeln!(
                 out,
-                "[UNMAPPED_WRITE] tid={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:016X}{:016X}",
+                "[UNMAPPED_WRITE] tid={} pc=0x{:016X} lr=0x{:016X} vaddr=0x{:X} size={} value=0x{:016X}{:016X}",
                 rec.args[0],
-                rec.args[1] as u32,
-                rec.args[2] as u32,
+                rec.args[1],
+                rec.args[2],
                 rec.args[3],
                 rec.args[4],
                 rec.args[6],
                 rec.args[5],
             );
         }
+        cat::UNMAPPED_READ => {
+            let _ = writeln!(
+                out,
+                "[UNMAPPED_READ ] core={} tid={} pc=0x{:016X} lr=0x{:016X} vaddr=0x{:X} size={} x0=0x{:016X} x8=0x{:016X} x9=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X}",
+                rec.args[0] as i32,
+                rec.tid,
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
+                rec.args[10],
+                rec.args[11],
+                rec.args[12],
+            );
+        }
+        cat::A64_EXCEPTION_CTX => match rec.args[0] {
+            0 => {
+                let reason = match rec.args[1] {
+                    1 => "PrefetchAbort",
+                    2 => "DataAbort",
+                    3 => "UndefinedInstruction",
+                    _ => "Other",
+                };
+                let _ = writeln!(
+                    out,
+                    "[A64_EXCEPTION] reason={} core={} tid={} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} x0=0x{:016X} x8=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x23=0x{:016X} x24=0x{:016X}",
+                    reason,
+                    rec.args[2],
+                    rec.args[3],
+                    rec.args[4],
+                    rec.args[5],
+                    rec.args[6],
+                    rec.args[7],
+                    rec.args[8],
+                    rec.args[9],
+                    rec.args[10],
+                    rec.args[11],
+                    rec.args[12],
+                    rec.args[13],
+                );
+            }
+            1 => {
+                let _ = writeln!(
+                    out,
+                    "[A64_EXCEPTION_MEM] base=0x{:016X} q0=0x{:016X} q1=0x{:016X} q2=0x{:016X} q3=0x{:016X}",
+                    rec.args[1], rec.args[2], rec.args[3], rec.args[4], rec.args[5],
+                );
+            }
+            2 | 3 => {
+                let stage = if rec.args[0] == 2 {
+                    "CONTEXT_SAVE"
+                } else {
+                    "CONTEXT_LOAD"
+                };
+                let _ = writeln!(
+                    out,
+                    "[A64_{}] core={} tid={} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} x0=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x29=0x{:016X}",
+                    stage,
+                    rec.args[1],
+                    rec.args[2],
+                    rec.args[3],
+                    rec.args[4],
+                    rec.args[5],
+                    rec.args[6],
+                    rec.args[7],
+                    rec.args[8],
+                    rec.args[9],
+                    rec.args[10],
+                );
+            }
+            6 => {
+                let _ = writeln!(
+                    out,
+                    "[A64_EXCEPTION_REGS] core={} tid={} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x4=0x{:016X} x5=0x{:016X} x6=0x{:016X} x7=0x{:016X} x8=0x{:016X} x16=0x{:016X} x17=0x{:016X} x29=0x{:016X}",
+                    rec.args[1],
+                    rec.args[2],
+                    rec.args[3],
+                    rec.args[4],
+                    rec.args[5],
+                    rec.args[6],
+                    rec.args[7],
+                    rec.args[8],
+                    rec.args[9],
+                    rec.args[10],
+                    rec.args[11],
+                    rec.args[12],
+                    rec.args[13],
+                );
+            }
+            7 => {
+                let _ = writeln!(
+                    out,
+                    "[A64_EXCEPTION_REGS2] core={} tid={} x9=0x{:016X} x10=0x{:016X} x11=0x{:016X} x12=0x{:016X} x13=0x{:016X} x14=0x{:016X} x15=0x{:016X} x18=0x{:016X} x22=0x{:016X} x25=0x{:016X} x26=0x{:016X}",
+                    rec.args[1],
+                    rec.args[2],
+                    rec.args[3],
+                    rec.args[4],
+                    rec.args[5],
+                    rec.args[6],
+                    rec.args[7],
+                    rec.args[8],
+                    rec.args[9],
+                    rec.args[10],
+                    rec.args[11],
+                    rec.args[12],
+                    rec.args[13],
+                );
+            }
+            8 => {
+                if rec.args[1] == u64::MAX {
+                    let _ = writeln!(
+                        out,
+                        "[A64_EXCEPTION_PTR] base=0x{:016X} q0=0x{:016X} q1=0x{:016X} q2=0x{:016X} q3=0x{:016X}",
+                        rec.args[2],
+                        rec.args[3],
+                        rec.args[4],
+                        rec.args[5],
+                        rec.args[6],
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "[A64_EXCEPTION_PTR] x{}=0x{:016X} q0=0x{:016X} q1=0x{:016X} q2=0x{:016X} q3=0x{:016X}",
+                        rec.args[1],
+                        rec.args[2],
+                        rec.args[3],
+                        rec.args[4],
+                        rec.args[5],
+                        rec.args[6],
+                    );
+                }
+            }
+            9 => {
+                let _ = writeln!(
+                    out,
+                    "[A64_EXCEPTION_REGS3] core={} tid={} x27=0x{:016X} x28=0x{:016X}",
+                    rec.args[1], rec.args[2], rec.args[3], rec.args[4],
+                );
+            }
+            4 => {
+                let _ = writeln!(
+                    out,
+                    "[A64_FALLBACK] core={} tid={} pc=0x{:016X} instr=0x{:08X} count={} jit_pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} x0=0x{:016X} x8=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x23=0x{:016X}",
+                    rec.args[1],
+                    rec.tid,
+                    rec.args[2],
+                    rec.args[3] as u32,
+                    rec.args[4],
+                    rec.args[5],
+                    rec.args[6],
+                    rec.args[7],
+                    rec.args[8],
+                    rec.args[9],
+                    rec.args[10],
+                    rec.args[11],
+                    rec.args[12],
+                    rec.args[13],
+                );
+            }
+            5 => {
+                let _ = writeln!(
+                    out,
+                    "[A64_NULL_FETCH] core={} tid={} fetch=0x{:016X} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x4=0x{:016X} x5=0x{:016X} x19=0x{:016X} x20=0x{:016X}",
+                    rec.args[1],
+                    rec.tid,
+                    rec.args[2],
+                    rec.args[3],
+                    rec.args[4],
+                    rec.args[5],
+                    rec.args[6],
+                    rec.args[7],
+                    rec.args[8],
+                    rec.args[9],
+                    rec.args[10],
+                    rec.args[11],
+                    rec.args[12],
+                    rec.args[13],
+                );
+            }
+            _ => {
+                let _ = writeln!(out, "[A64_EXCEPTION] stage={}", rec.args[0]);
+            }
+        },
+        cat::A64_BREAK_CTX => match rec.args[0] {
+            0 => {
+                let _ = writeln!(
+                    out,
+                    "[A64_BREAK] reason=0x{:X} core={} tid={} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} info1=0x{:016X} info2=0x{:016X}",
+                    rec.args[1],
+                    rec.args[2],
+                    rec.args[3],
+                    rec.args[4],
+                    rec.args[5],
+                    rec.args[6],
+                    rec.args[7],
+                    rec.args[8],
+                );
+            }
+            1 => {
+                let _ = writeln!(
+                    out,
+                    "[A64_BREAK_STACK] base=0x{:016X} q0=0x{:016X} q1=0x{:016X} q2=0x{:016X} q3=0x{:016X}",
+                    rec.args[1], rec.args[2], rec.args[3], rec.args[4], rec.args[5],
+                );
+            }
+            2 => {
+                let _ = writeln!(
+                    out,
+                    "[A64_BREAK_INFO] base=0x{:016X} q0=0x{:016X} q1=0x{:016X} q2=0x{:016X} q3=0x{:016X}",
+                    rec.args[1], rec.args[2], rec.args[3], rec.args[4], rec.args[5],
+                );
+            }
+            3 => {
+                let mut bytes = [0u8; 32];
+                for (chunk_index, value) in rec.args[3..7].iter().enumerate() {
+                    let raw = value.to_le_bytes();
+                    bytes[chunk_index * 8..chunk_index * 8 + 8].copy_from_slice(&raw);
+                }
+                let len = (rec.args[2] as usize).min(bytes.len());
+                let mut hex = String::new();
+                let mut ascii = String::new();
+                for &byte in &bytes[..len] {
+                    let _ = write!(hex, "{:02X}", byte);
+                    ascii.push(if byte.is_ascii_graphic() || byte == b' ' {
+                        byte as char
+                    } else {
+                        '.'
+                    });
+                }
+                let _ = writeln!(
+                    out,
+                    "[A64_BREAK_PTR] ptr=0x{:016X} len={} hex={} ascii=\"{}\"",
+                    rec.args[1], len, hex, ascii,
+                );
+            }
+            _ => {
+                let _ = writeln!(out, "[A64_BREAK] stage={}", rec.args[0]);
+            }
+        },
         cat::BL_HIT => {
             let kind = match rec.args[2] {
                 1 => "BL ",
@@ -1350,6 +1843,10 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 8 => "armed",
                 9 => "bad-parameter",
                 10 => "busy",
+                11 => "event-create",
+                12 => "event-signal-host",
+                13 => "query-hit",
+                14 => "query-miss",
                 _ => "unknown",
             };
             let result = match rec.args[7] {
@@ -1359,20 +1856,34 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 3 => "busy",
                 _ => "unknown",
             };
-            let _ = writeln!(
-                out,
-                "[NVHOST_CTRL_WAIT] stage={} syncpt_id={} threshold={} timeout={} is_allocation={} slot={} value_raw=0x{:08X} result={} min_value={} target={}",
-                stage,
-                rec.args[1],
-                rec.args[2],
-                rec.args[3] as u32,
-                rec.args[4] != 0,
-                rec.args[5],
-                rec.args[6] as u32,
-                result,
-                rec.args[8],
-                rec.args[9],
-            );
+            if (11..=14).contains(&rec.args[0]) {
+                let _ = writeln!(
+                    out,
+                    "[NVHOST_CTRL_WAIT] stage={} syncpt_id={} assigned_value={} slot={} value_raw=0x{:08X} event_status={} object_id=0x{:X}",
+                    stage,
+                    rec.args[1],
+                    rec.args[2],
+                    rec.args[5],
+                    rec.args[6] as u32,
+                    rec.args[7],
+                    rec.args[8],
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "[NVHOST_CTRL_WAIT] stage={} syncpt_id={} threshold={} timeout={} is_allocation={} slot={} value_raw=0x{:08X} result={} min_value={} target={}",
+                    stage,
+                    rec.args[1],
+                    rec.args[2],
+                    rec.args[3] as u32,
+                    rec.args[4] != 0,
+                    rec.args[5],
+                    rec.args[6] as u32,
+                    result,
+                    rec.args[8],
+                    rec.args[9],
+                );
+            }
         }
         cat::SCHED_STATE => {
             let top = |idx: usize| -> String {
@@ -1448,6 +1959,114 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                         top(2),
                         rec.args[3],
                         rec.args[4] as i32,
+                    );
+                }
+                8..=13 => {
+                    let stage = match rec.args[0] {
+                        8 => "yield_to_switch_before",
+                        9 => "yield_to_switch_after",
+                        10 => "try_lock_target_before",
+                        11 => "try_lock_target_after",
+                        12 => "yield_to_thread_before",
+                        13 => "yield_to_thread_after",
+                        _ => unreachable!(),
+                    };
+                    let _ = writeln!(
+                        out,
+                        "[SCHED_STATE] stage={} cur={} target={} core={} target_active={} target_current={} target_prio={} has_ctx={} needs={}",
+                        stage,
+                        top(1),
+                        top(2),
+                        rec.args[3] as i32,
+                        rec.args[4] as i32,
+                        rec.args[5] as i32,
+                        rec.args[6] as i32,
+                        rec.args[7] != 0,
+                        rec.args[8] != 0,
+                    );
+                    if rec.args.len() > 9 {
+                        let _ = writeln!(
+                            out,
+                            "[SCHED_STATE] stage={}_ctx target_host=0x{:016X}",
+                            stage, rec.args[9]
+                        );
+                    }
+                }
+                14 => {
+                    let phase = match rec.args[1] {
+                        1 => "pre_inner_stale_interrupt",
+                        2 => "enter_inner_loop",
+                        3 => "exit_inner_loop",
+                        4 => "after_handle_interrupt",
+                        5 => "after_reschedule",
+                        _ => "unknown",
+                    };
+                    let _ = writeln!(
+                        out,
+                        "[SCHED_STATE] stage=core_dispatch phase={} core={} tid={} thread_current={} thread_active={} raw_state=0x{:X}",
+                        phase,
+                        rec.args[2],
+                        rec.args[3],
+                        rec.args[4] as i32,
+                        rec.args[5] as i32,
+                        rec.args[6],
+                    );
+                }
+                15 => {
+                    let _ = writeln!(
+                        out,
+                        "[SCHED_STATE] stage=apply_wait_result tid={} result=0x{:X} pc=0x{:016X} sp=0x{:016X} old_r0=0x{:016X} old_r1=0x{:016X} raw_state=0x{:X} has_wait_queue={} wait_reason={} x19=0x{:016X}",
+                        rec.args[1],
+                        rec.args[2],
+                        rec.args[3],
+                        rec.args[4],
+                        rec.args[5],
+                        rec.args[6],
+                        rec.args[7],
+                        rec.args[8] != 0,
+                        rec.args[9],
+                        rec.args[10],
+                    );
+                }
+                16 => {
+                    let _ = writeln!(
+                        out,
+                        "[SCHED_STATE] stage=reload tid={} core={} pc=0x{:016X} sp=0x{:016X} r0=0x{:016X} r1=0x{:016X} lr=0x{:016X} tls=0x{:016X} jit_tpidrro=0x{:016X}",
+                        rec.args[1],
+                        rec.args[2],
+                        rec.args[3],
+                        rec.args[4],
+                        rec.args[5],
+                        rec.args[6],
+                        rec.args[7],
+                        rec.args[8],
+                        rec.args[9],
+                    );
+                }
+                17 => {
+                    let owner_core = if rec.args[5] == u64::MAX {
+                        "None".to_string()
+                    } else {
+                        rec.args[5].to_string()
+                    };
+                    let scheduler_current = if rec.args[8] == u64::MAX {
+                        "None".to_string()
+                    } else {
+                        rec.args[8].to_string()
+                    };
+                    let _ = writeln!(
+                        out,
+                        "[SCHED_STATE] stage=thread_core_mismatch kind={} tid={} ptr=0x{:016X} entering_core={} owner_core={} thread_current={} thread_active={} scheduler_current={} thread_host=0x{:016X} scheduler_host=0x{:016X}",
+                        rec.args[1],
+                        rec.args[2],
+                        rec.args[3],
+                        rec.args[4],
+                        owner_core,
+                        rec.args[6] as i32,
+                        rec.args[7] as i32,
+                        scheduler_current,
+                        rec.args.get(9).copied().unwrap_or(0),
+                        rec.args.get(10).copied().unwrap_or(0),
                     );
                 }
                 _ => {
@@ -1632,6 +2251,45 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                     rec.args.get(3).copied().unwrap_or(0),
                 );
             }
+            7 => {
+                let _ = writeln!(
+                    out,
+                    "[BQP] stage=request_buffer seq={} slot={} tid={}",
+                    rec.args[1],
+                    rec.args[2] as i32,
+                    rec.args.get(3).copied().unwrap_or(0),
+                );
+            }
+            20 => {
+                let _ = writeln!(
+                    out,
+                    "[BQP] stage=signal_wait_event seq={} readable_event={} was_signaled={} tid={}",
+                    rec.args[1],
+                    rec.args[2],
+                    rec.args[3] != 0,
+                    rec.args.get(4).copied().unwrap_or(0),
+                );
+            }
+            21 => {
+                let _ = writeln!(
+                    out,
+                    "[BQP] stage=get_native_handle seq={} readable_event={} tid={}",
+                    rec.args[1],
+                    rec.args[2],
+                    rec.args.get(3).copied().unwrap_or(0),
+                );
+            }
+            22 => {
+                let _ = writeln!(
+                    out,
+                    "[BQP] stage=register_wait_event seq={} event={} readable_event={} signaled={} tid={}",
+                    rec.args[1],
+                    rec.args[2],
+                    rec.args[3],
+                    rec.args[4] != 0,
+                    rec.args.get(5).copied().unwrap_or(0),
+                );
+            }
             _ => {
                 let _ = writeln!(
                     out,
@@ -1646,21 +2304,43 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 1 => "enter",
                 2 => "reply",
                 3 => "missing_binder",
+                4 => "reply_words",
                 _ => "unknown",
             };
             let status = rec.args.get(7).copied().unwrap_or(0) as i32;
-            let _ = writeln!(
-                out,
-                "[BINDER_TXN] stage={} seq={} id={} txn={} flags=0x{:X} in_len={} out_len={} status={}",
-                stage,
-                rec.args[1],
-                rec.args[2] as i32,
-                rec.args[3],
-                rec.args[4],
-                rec.args[5],
-                rec.args[6],
-                status,
-            );
+            if rec.args[0] == 4 {
+                let _ = writeln!(
+                    out,
+                    "[BINDER_TXN] stage={} seq={} id={} txn={} off=0x{:X} w0={:08X} w1={:08X} w2={:08X} w3={:08X} w4={:08X} w5={:08X} w6={:08X} w7={:08X} w8={:08X}",
+                    stage,
+                    rec.args[1],
+                    rec.args[2] as i32,
+                    rec.args[3],
+                    rec.args[4],
+                    rec.args[5] as u32,
+                    rec.args[6] as u32,
+                    rec.args[7] as u32,
+                    rec.args[8] as u32,
+                    rec.args[9] as u32,
+                    rec.args[10] as u32,
+                    rec.args[11] as u32,
+                    rec.args[12] as u32,
+                    rec.args[13] as u32,
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "[BINDER_TXN] stage={} seq={} id={} txn={} flags=0x{:X} in_len={} out_len={} status={}",
+                    stage,
+                    rec.args[1],
+                    rec.args[2] as i32,
+                    rec.args[3],
+                    rec.args[4],
+                    rec.args[5],
+                    rec.args[6],
+                    status,
+                );
+            }
         }
         cat::TEXTURE_BIND => {
             let texture_type = match rec.args[4] {
@@ -2372,6 +3052,30 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 first0,
                 first1,
                 first2,
+            );
+        }
+        cat::AUDIO_OUT_BUFFER => {
+            let stage = match rec.args[0] {
+                1 => "append_enter",
+                2 => "append_result",
+                3 => "register",
+                4 => "release",
+                5 => "get_released",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                out,
+                "[AUDIO_OUT_BUFFER] stage={} session={} state={} tag=0x{:X} size={} samples=0x{:X} total_or_registered={} released_or_signal={} queue_or_played={} result={}",
+                stage,
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
             );
         }
         cat::AUDIO_VOICE => {

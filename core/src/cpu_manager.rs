@@ -88,9 +88,17 @@ impl RunningGuestThreadGuard {
                 .lock()
                 .unwrap();
             if let Some(owner_core) = running.insert(thread_id, core_index) {
-                eprintln!(
-                    "[THREAD_CONCURRENCY] tid={} ptr=0x{:X} already_running_core={} entering_core={}",
-                    thread_id, thread_ptr, owner_core, core_index
+                trace_thread_core_mismatch(
+                    1,
+                    thread_id,
+                    thread_ptr,
+                    core_index,
+                    Some(owner_core),
+                    -1,
+                    -1,
+                    None,
+                    0,
+                    0,
                 );
             }
         }
@@ -146,26 +154,103 @@ fn should_trace_core_dispatch(core_index: usize) -> bool {
         .any(|c| c == core_index)
 }
 
-/// Emit one `[CORE_DISPATCH]` line tagged with the dispatch-loop phase and the
-/// guest thread the loop is currently running. Lightweight (single
-/// `eprintln!`); gated by `RUZU_TRACE_CORE_DISPATCH`. Used to diagnose the
-/// MK8D wedge where tid=99's wakes take ~1 second despite end_wait firing
-/// promptly — we want to see, per core, when the JIT inner-loop exits and
-/// when reschedule actually swaps threads.
+/// Emit one dispatch-loop event tagged with the phase and guest thread.
+/// Gated by `RUZU_TRACE_CORE_DISPATCH` and routed through the async trace
+/// ring so hot scheduler diagnostics do not serialize on stderr.
 fn trace_core_dispatch(
     core_index: usize,
     phase: &str,
     thread: &Arc<crate::hle::kernel::k_thread::KThreadLock>,
 ) {
-    if !should_trace_core_dispatch(core_index) {
+    if !should_trace_core_dispatch(core_index)
+        || !common::trace::is_enabled(common::trace::cat::SCHED_STATE)
+    {
         return;
     }
-    let tid = thread.lock().ok().map(|t| t.get_thread_id()).unwrap_or(0);
-    let t = crate::hle::kernel::trace_format::elapsed_secs();
-    eprintln!(
-        "[{:>10.6}] [CORE_DISPATCH] core={} phase={} fiber_tid={}",
-        t, core_index, phase, tid
+    static CORE_DISPATCH_TRACE_COUNT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let n = CORE_DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n >= 512 && !n.is_multiple_of(10_000) {
+        return;
+    }
+    let phase_id = match phase {
+        "pre_inner stale_interrupt" => 1,
+        "enter_inner_loop" => 2,
+        "exit_inner_loop" => 3,
+        "after_handle_interrupt" => 4,
+        "after_reschedule" => 5,
+        _ => 0,
+    };
+    let (tid, current_core, active_core, raw_state) = thread
+        .lock()
+        .ok()
+        .map(|t| {
+            (
+                t.get_thread_id(),
+                t.get_current_core(),
+                t.get_active_core(),
+                t.get_raw_state().bits(),
+            )
+        })
+        .unwrap_or((0, -1, -1, 0));
+    common::trace::emit_raw(
+        common::trace::cat::SCHED_STATE,
+        &[
+            14,
+            phase_id,
+            core_index as u64,
+            tid,
+            current_core as u32 as u64,
+            active_core as u32 as u64,
+            raw_state as u64,
+        ],
     );
+}
+
+fn trace_thread_core_mismatch(
+    stage: u64,
+    thread_id: u64,
+    thread_ptr: usize,
+    entering_core: usize,
+    owner_core: Option<usize>,
+    thread_current_core: i32,
+    thread_active_core: i32,
+    scheduler_current: Option<u64>,
+    thread_host_context: u64,
+    scheduler_host_context: u64,
+) {
+    if common::trace::is_enabled(common::trace::cat::SCHED_STATE) {
+        common::trace::emit_raw(
+            common::trace::cat::SCHED_STATE,
+            &[
+                17,
+                stage,
+                thread_id,
+                thread_ptr as u64,
+                entering_core as u64,
+                owner_core.map(|core| core as u64).unwrap_or(u64::MAX),
+                thread_current_core as u32 as u64,
+                thread_active_core as u32 as u64,
+                scheduler_current.unwrap_or(u64::MAX),
+                thread_host_context,
+                scheduler_host_context,
+            ],
+        );
+    } else {
+        log::warn!(
+            "[THREAD_CORE_MISMATCH] stage={} tid={} ptr=0x{:X} entering_core={} owner_core={:?} thread_current_core={} thread_active_core={} scheduler_current={:?} thread_host=0x{:X} scheduler_host=0x{:X}",
+            stage,
+            thread_id,
+            thread_ptr,
+            entering_core,
+            owner_core,
+            thread_current_core,
+            thread_active_core,
+            scheduler_current,
+            thread_host_context,
+            scheduler_host_context,
+        );
+    }
 }
 
 impl CpuManager {
@@ -345,6 +430,36 @@ impl CpuManager {
         }
     }
 
+    /// Force a scheduling handoff without relying on `needs_scheduling`.
+    ///
+    /// Used when the currently executing guest fiber already knows it must not
+    /// continue, e.g. after a blocking SVC or when the scheduler current thread
+    /// has changed underneath this fiber. The normal interrupt path still uses
+    /// `schedule_raw_if_needed`.
+    fn force_reschedule_current_core_raw(kernel: &KernelCore) {
+        if let Some(scheduler_arc) = kernel.current_scheduler() {
+            let sched_ptr = {
+                let guard = scheduler_arc.lock().unwrap();
+                &*guard as *const super::hle::kernel::k_scheduler::KScheduler
+                    as *mut super::hle::kernel::k_scheduler::KScheduler
+            }; // Mutex guard dropped here
+               // Safety: core OS thread; scheduler Arc keeps pointer valid; cooperative fibers.
+            unsafe {
+                super::hle::kernel::k_scheduler::KScheduler::reschedule_current_core_raw(sched_ptr);
+            }
+        }
+    }
+
+    fn scheduler_current_thread(kernel: &KernelCore) -> Option<Arc<KThreadLock>> {
+        let scheduler_arc = kernel.current_scheduler()?;
+        let thread = scheduler_arc
+            .lock()
+            .unwrap()
+            .get_scheduler_current_thread()?;
+        super::hle::kernel::kernel::set_current_emu_thread(Some(&thread));
+        Some(thread)
+    }
+
     /// Guest thread activation function.
     ///
     /// Upstream: `CpuManager::GuestActivate()` (cpu_manager.cpp:168-175).
@@ -493,6 +608,12 @@ impl CpuManager {
     /// handling interrupts between runs.
     pub fn multi_core_run_guest_thread(kernel: &KernelCore) {
         // Upstream: auto* thread = Kernel::GetCurrentThreadPointer(kernel);
+        //
+        // This function is the entry point of a guest KThread fiber. The
+        // KThread is therefore a property of this fiber, not of the current
+        // scheduler slot. Keep it stable for the fiber lifetime like upstream;
+        // the scheduler updates the thread-local current thread before
+        // yielding to a different KThread fiber.
         let thread_arc = match super::hle::kernel::kernel::get_current_thread_pointer() {
             Some(thread) => thread,
             None => return,
@@ -590,6 +711,7 @@ impl CpuManager {
             Self::shutdown_if_requested(kernel);
             // Upstream: RequestScheduleOnInterrupt → ScheduleOnInterrupt → fiber yield.
             // Done outside any Mutex lock to avoid deadlock (see reschedule_current_core_raw).
+            super::hle::kernel::kernel::set_current_emu_thread(Some(&thread_arc));
             Self::reschedule_current_core_raw(kernel);
             trace_core_dispatch(physical_core.core_index(), "after_reschedule", &thread_arc);
         }
@@ -627,6 +749,10 @@ impl CpuManager {
             Some(scheduler) => scheduler.clone(),
             None => return,
         };
+        let scheduler_current_thread = scheduler.lock().unwrap().get_scheduler_current_thread();
+        let scheduler_current = scheduler_current_thread
+            .as_ref()
+            .map(|thread| thread.lock().unwrap().get_thread_id());
 
         // Safety: The JIT is owned by the process which lives as long as the thread.
         // We hold the raw pointer only for the duration of this call.
@@ -647,23 +773,110 @@ impl CpuManager {
             } else {
                 (0, 0, 0)
             };
+        let stable_thread_id = if trace_thread_concurrency {
+            thread_id_for_guard
+        } else {
+            thread_arc.lock().unwrap().get_thread_id()
+        };
+        if scheduler_current != Some(stable_thread_id) {
+            let n = THREAD_SCHED_MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 200 || n % 1000 == 0 {
+                let (thread_current_core, thread_active_core, thread_host_context) = {
+                    let thread = thread_arc.lock().unwrap();
+                    (
+                        thread.get_current_core(),
+                        thread.get_active_core(),
+                        thread
+                            .get_host_context()
+                            .map(|ctx| Arc::as_ptr(ctx) as usize as u64)
+                            .unwrap_or(0),
+                    )
+                };
+                let scheduler_host_context = scheduler_current_thread
+                    .as_ref()
+                    .and_then(|thread| {
+                        thread
+                            .lock()
+                            .unwrap()
+                            .get_host_context()
+                            .map(|ctx| Arc::as_ptr(ctx) as usize as u64)
+                    })
+                    .unwrap_or(0);
+                trace_thread_core_mismatch(
+                    3,
+                    stable_thread_id,
+                    thread_ptr as usize,
+                    core_index,
+                    None,
+                    thread_current_core,
+                    thread_active_core,
+                    scheduler_current,
+                    thread_host_context,
+                    scheduler_host_context,
+                );
+            }
+            super::hle::kernel::kernel::set_current_emu_thread(Some(thread_arc));
+            Self::force_reschedule_current_core_raw(kernel);
+            if common::trace::is_enabled(common::trace::cat::SCHED_STATE) {
+                let scheduler_current_after_thread =
+                    scheduler.lock().unwrap().get_scheduler_current_thread();
+                let scheduler_current_after = scheduler_current_after_thread
+                    .as_ref()
+                    .map(|thread| thread.lock().unwrap().get_thread_id());
+                let (thread_current_core, thread_active_core, thread_host_context) = {
+                    let thread = thread_arc.lock().unwrap();
+                    (
+                        thread.get_current_core(),
+                        thread.get_active_core(),
+                        thread
+                            .get_host_context()
+                            .map(|ctx| Arc::as_ptr(ctx) as usize as u64)
+                            .unwrap_or(0),
+                    )
+                };
+                let scheduler_host_context = scheduler_current_after_thread
+                    .as_ref()
+                    .and_then(|thread| {
+                        thread
+                            .lock()
+                            .unwrap()
+                            .get_host_context()
+                            .map(|ctx| Arc::as_ptr(ctx) as usize as u64)
+                    })
+                    .unwrap_or(0);
+                trace_thread_core_mismatch(
+                    4,
+                    stable_thread_id,
+                    thread_ptr as usize,
+                    core_index,
+                    None,
+                    thread_current_core,
+                    thread_active_core,
+                    scheduler_current_after,
+                    thread_host_context,
+                    scheduler_host_context,
+                );
+            }
+            return;
+        }
         if trace_thread_concurrency {
-            let scheduler_current = scheduler.lock().unwrap().get_scheduler_current_thread_id();
             let mismatch = scheduler_current != Some(thread_id_for_guard)
                 || thread_current_core != core_index as i32
                 || (thread_active_core >= 0 && thread_active_core != core_index as i32);
             if mismatch {
                 let n = THREAD_SCHED_MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n % 1000 == 0 {
-                    eprintln!(
-                        "[THREAD_SCHED_MISMATCH] n={} tid={} ptr=0x{:X} entering_core={} scheduler_current={:?} thread_current_core={} thread_active_core={}",
-                        n,
+                    trace_thread_core_mismatch(
+                        2,
                         thread_id_for_guard,
                         thread_ptr as usize,
                         core_index,
-                        scheduler_current,
+                        None,
                         thread_current_core,
-                        thread_active_core
+                        thread_active_core,
+                        scheduler_current,
+                        0,
+                        0,
                     );
                 }
             }
@@ -816,7 +1029,8 @@ impl CpuManager {
                             system,
                         );
                         if !continue_thread {
-                            Self::reschedule_current_core_raw(kernel);
+                            super::hle::kernel::kernel::set_current_emu_thread(Some(thread_arc));
+                            Self::force_reschedule_current_core_raw(kernel);
                             return;
                         }
                         let (switched_scheduler_thread, needs_scheduling) = {
@@ -842,7 +1056,8 @@ impl CpuManager {
                                 current_thread_blocked,
                                 needs_scheduling,
                             );
-                            Self::reschedule_current_core_raw(kernel);
+                            super::hle::kernel::kernel::set_current_emu_thread(Some(thread_arc));
+                            Self::force_reschedule_current_core_raw(kernel);
                             return;
                         }
                         if switched_scheduler_thread || needs_scheduling {
@@ -856,7 +1071,14 @@ impl CpuManager {
                                 needs_scheduling,
                             );
                             if std::env::var_os("RUZU_DISABLE_POST_SVC_RESCHEDULE").is_none() {
-                                Self::reschedule_current_core_raw(kernel);
+                                super::hle::kernel::kernel::set_current_emu_thread(Some(
+                                    thread_arc,
+                                ));
+                                if switched_scheduler_thread {
+                                    Self::force_reschedule_current_core_raw(kernel);
+                                } else {
+                                    Self::reschedule_current_core_raw(kernel);
+                                }
                                 return;
                             }
                         }
@@ -902,7 +1124,7 @@ impl CpuManager {
                             let n = SPIN_COUNT.fetch_add(1, Ordering::Relaxed);
                             // Throttle: log first 200, then every 1000th.
                             if n < 200 || n % 1000 == 0 {
-                                eprintln!(
+                                log::warn!(
                                     "[SPIN] n={} tid={} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} x21=0x{:X} x22=0x{:X} x7=0x{:X} x18=0x{:X} x20=0x{:X} halt={:?}",
                                     n, cur_tid,
                                     _spin_pc.pc, _spin_pc.lr, _spin_pc.sp,
@@ -981,6 +1203,167 @@ impl CpuManager {
                             } else {
                                 "Breakpoint"
                             };
+                            static A64_EXCEPTION_CTX_BUDGET: AtomicU32 = AtomicU32::new(0);
+                            if common::trace::is_enabled(common::trace::cat::A64_EXCEPTION_CTX)
+                                && A64_EXCEPTION_CTX_BUDGET.fetch_add(1, Ordering::Relaxed) < 32
+                            {
+                                let reason_id = if prefetch_abort {
+                                    1
+                                } else if data_abort {
+                                    2
+                                } else {
+                                    0
+                                };
+                                common::trace::emit_raw(
+                                    common::trace::cat::A64_EXCEPTION_CTX,
+                                    &[
+                                        0,
+                                        reason_id,
+                                        core_index as u64,
+                                        current_thread_id,
+                                        tc.pc,
+                                        tc.lr,
+                                        tc.sp,
+                                        tc.r[0],
+                                        tc.r[8],
+                                        tc.r[19],
+                                        tc.r[20],
+                                        tc.r[21],
+                                        tc.r[23],
+                                        tc.r[24],
+                                    ],
+                                );
+                                common::trace::emit_raw(
+                                    common::trace::cat::A64_EXCEPTION_CTX,
+                                    &[
+                                        6,
+                                        core_index as u64,
+                                        current_thread_id,
+                                        tc.r[1],
+                                        tc.r[2],
+                                        tc.r[3],
+                                        tc.r[4],
+                                        tc.r[5],
+                                        tc.r[6],
+                                        tc.r[7],
+                                        tc.r[8],
+                                        tc.r[16],
+                                        tc.r[17],
+                                        tc.fp,
+                                    ],
+                                );
+                                common::trace::emit_raw(
+                                    common::trace::cat::A64_EXCEPTION_CTX,
+                                    &[
+                                        7,
+                                        core_index as u64,
+                                        current_thread_id,
+                                        tc.r[9],
+                                        tc.r[10],
+                                        tc.r[11],
+                                        tc.r[12],
+                                        tc.r[13],
+                                        tc.r[14],
+                                        tc.r[15],
+                                        tc.r[18],
+                                        tc.r[22],
+                                        tc.r[25],
+                                        tc.r[26],
+                                    ],
+                                );
+                                common::trace::emit_raw(
+                                    common::trace::cat::A64_EXCEPTION_CTX,
+                                    &[9, core_index as u64, current_thread_id, tc.r[27], tc.r[28]],
+                                );
+                                let dump_base = tc.r[19].wrapping_add(0x50);
+                                let qwords = {
+                                    let system_ref = kernel.system();
+                                    if system_ref.is_null() {
+                                        None
+                                    } else if let Some(memory) = system_ref.get().memory_shared() {
+                                        let mem = memory.lock().unwrap();
+                                        if mem.is_valid_virtual_address_range(dump_base, 0x20) {
+                                            Some([
+                                                mem.read_64(dump_base),
+                                                mem.read_64(dump_base + 8),
+                                                mem.read_64(dump_base + 16),
+                                                mem.read_64(dump_base + 24),
+                                            ])
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                };
+                                if let Some(qwords) = qwords {
+                                    common::trace::emit_raw(
+                                        common::trace::cat::A64_EXCEPTION_CTX,
+                                        &[1, dump_base, qwords[0], qwords[1], qwords[2], qwords[3]],
+                                    );
+                                }
+                                {
+                                    let system_ref = kernel.system();
+                                    if !system_ref.is_null() {
+                                        if let Some(memory) = system_ref.get().memory_shared() {
+                                            let mem = memory.lock().unwrap();
+                                            for &reg_index in &[
+                                                0usize, 1, 8, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+                                                28,
+                                            ] {
+                                                let base = if reg_index == 29 {
+                                                    tc.fp
+                                                } else {
+                                                    tc.r[reg_index]
+                                                };
+                                                if base < 0x10000 {
+                                                    continue;
+                                                }
+                                                if !mem.is_valid_virtual_address_range(base, 0x20) {
+                                                    continue;
+                                                }
+                                                common::trace::emit_raw(
+                                                    common::trace::cat::A64_EXCEPTION_CTX,
+                                                    &[
+                                                        8,
+                                                        reg_index as u64,
+                                                        base,
+                                                        mem.read_64(base),
+                                                        mem.read_64(base + 8),
+                                                        mem.read_64(base + 16),
+                                                        mem.read_64(base + 24),
+                                                    ],
+                                                );
+                                            }
+                                            for &base in &[
+                                                tc.r[19].wrapping_add(0x50),
+                                                tc.r[20].wrapping_add(0x10),
+                                                tc.r[20].wrapping_add(0x18),
+                                                tc.r[27].wrapping_add(0x1d0),
+                                            ] {
+                                                if base < 0x10000
+                                                    || !mem
+                                                        .is_valid_virtual_address_range(base, 0x20)
+                                                {
+                                                    continue;
+                                                }
+                                                common::trace::emit_raw(
+                                                    common::trace::cat::A64_EXCEPTION_CTX,
+                                                    &[
+                                                        8,
+                                                        u64::MAX,
+                                                        base,
+                                                        mem.read_64(base),
+                                                        mem.read_64(base + 8),
+                                                        mem.read_64(base + 16),
+                                                        mem.read_64(base + 24),
+                                                    ],
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if zero_pc_break_loop
                                 && std::env::var_os("RUZU_DUMP_NULL_PC_CONTEXT").is_some()
                             {
@@ -1092,6 +1475,69 @@ impl CpuManager {
                                                 first_words
                                             );
                                         }
+                                    }
+                                }
+                            }
+                            if std::env::var_os("RUZU_DUMP_ABORT").is_some() {
+                                use std::fmt::Write as _;
+                                let system_ref = kernel.system();
+                                if !system_ref.is_null() {
+                                    if let Some(memory) = system_ref.get().memory_shared() {
+                                        let mem = memory.lock().unwrap();
+                                        let mut regs = String::new();
+                                        for i in 0..29 {
+                                            let _ = write!(regs, " x{}=0x{:016X}", i, tc.r[i]);
+                                        }
+                                        let _ = write!(
+                                            regs,
+                                            " x29=0x{:016X} x30=0x{:016X}",
+                                            tc.fp, tc.lr
+                                        );
+                                        log::error!(
+                                            "[ABORT_REGS] tid={} faultpc=0x{:016X} sp=0x{:016X}{}",
+                                            current_thread_id,
+                                            tc.pc,
+                                            tc.sp,
+                                            regs
+                                        );
+                                        let mut hit = String::new();
+                                        for i in 0..29 {
+                                            if tc.r[i] == tc.pc {
+                                                let _ = write!(hit, " x{}", i);
+                                            }
+                                        }
+                                        if tc.fp == tc.pc {
+                                            let _ = write!(hit, " x29");
+                                        }
+                                        if tc.lr == tc.pc {
+                                            let _ = write!(hit, " x30");
+                                        }
+                                        log::error!(
+                                            "[ABORT_TARGET_REG] faultpc held by:{}",
+                                            if hit.is_empty() {
+                                                " <none>".to_string()
+                                            } else {
+                                                hit
+                                            }
+                                        );
+                                        let base = tc.lr.wrapping_sub(20);
+                                        let mut code = String::new();
+                                        for i in 0..10u64 {
+                                            let a = base.wrapping_add(i * 4);
+                                            let w = if mem.is_valid_virtual_address_range(a, 4) {
+                                                mem.read_32(a)
+                                            } else {
+                                                0xDEAD_DEAD
+                                            };
+                                            let mark = if a == tc.lr.wrapping_sub(4) {
+                                                " <-- call site (lr-4)"
+                                            } else {
+                                                ""
+                                            };
+                                            let _ =
+                                                write!(code, "\n  0x{:016X}: {:08X}{}", a, w, mark);
+                                        }
+                                        log::error!("[ABORT_CODE]{}", code);
                                     }
                                 }
                             }
@@ -1212,7 +1658,12 @@ impl CpuManager {
     fn multi_core_run_idle_thread(kernel: &KernelCore) {
         // Upstream: kernel.CurrentScheduler()->OnThreadStart();
         // OnThreadStart calls EnableDispatch — ensure dispatch_count is 1 first.
-        if let Some(thread_arc) = super::hle::kernel::kernel::get_current_thread_pointer() {
+        let idle_thread_arc = match super::hle::kernel::kernel::get_current_thread_pointer() {
+            Some(thread) => thread,
+            None => return,
+        };
+        {
+            let thread_arc = &idle_thread_arc;
             let mut t = thread_arc.lock().unwrap();
             if t.get_disable_dispatch_count() == 0 {
                 t.disable_dispatch();
@@ -1225,16 +1676,19 @@ impl CpuManager {
 
         loop {
             Self::shutdown_if_requested(kernel);
+            super::hle::kernel::kernel::set_current_emu_thread(Some(&idle_thread_arc));
             let physical_core = kernel.current_physical_core();
             if !physical_core.is_interrupted() {
                 physical_core.idle();
             }
 
+            super::hle::kernel::kernel::set_current_emu_thread(Some(&idle_thread_arc));
             Self::handle_interrupt(kernel);
             Self::shutdown_if_requested(kernel);
             // Upstream: RequestScheduleOnInterrupt → ScheduleOnInterrupt → Schedule →
             // ScheduleImpl (fiber yield).  We do the fiber switch here, outside of any
             // Mutex lock, to avoid the scheduler Mutex being held across the yield.
+            super::hle::kernel::kernel::set_current_emu_thread(Some(&idle_thread_arc));
             Self::reschedule_current_core_raw(kernel);
         }
     }

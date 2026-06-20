@@ -165,6 +165,27 @@ impl PhysicalCore {
             .capture_guest_context(thread_context);
     }
 
+    fn write_svc_return_registers_if_runnable(
+        &self,
+        jit: &mut dyn ArmInterface,
+        current_thread: &Arc<KThreadLock>,
+        svc_num: u32,
+        svc_args: &SvcArgs,
+    ) {
+        let current_thread_blocked = {
+            let thread = current_thread.lock().unwrap();
+            thread.get_raw_state() != super::k_thread::ThreadState::RUNNABLE
+        };
+        if current_thread_blocked {
+            log::trace!(
+                "dispatch_supervisor_call: svc=0x{:x} blocked current thread; deferring SVC return registers until wake",
+                svc_num
+            );
+        } else {
+            jit.set_svc_arguments(svc_args);
+        }
+    }
+
     pub fn dispatch_supervisor_call(
         &self,
         jit: &mut dyn ArmInterface,
@@ -187,7 +208,7 @@ impl PhysicalCore {
             scheduler.lock().unwrap().request_schedule();
             return false;
         }
-        jit.set_svc_arguments(svc_args);
+        self.write_svc_return_registers_if_runnable(jit, current_thread, svc_num, svc_args);
         log::trace!(
             "dispatch_supervisor_call: before handoff (svc=0x{:x})",
             svc_num
@@ -199,7 +220,7 @@ impl PhysicalCore {
             "dispatch_supervisor_call: after handoff (svc=0x{:x})",
             svc_num
         );
-        false
+        true
     }
 
     pub fn run_loop<FSvc, FHalt>(
@@ -334,6 +355,7 @@ impl PhysicalCore {
             };
             jit.set_context(arm_ctx);
             jit.set_tpidrro_el0(thread.get_tls_address().get());
+            trace_wrapper_context_event(3, self.m_core_index, thread, arm_ctx);
             log::info!(
                 "PhysicalCore::load_context: core={} r15/PC=0x{:X} r13/SP=0x{:X} ctx.pc=0x{:X} ctx.sp=0x{:X}",
                 self.m_core_index, k_ctx.r[15], k_ctx.r[13], k_ctx.pc, k_ctx.sp,
@@ -368,6 +390,7 @@ impl PhysicalCore {
                     as *mut crate::arm::arm_interface::ThreadContext)
             };
             jit.get_context(arm_ctx);
+            trace_wrapper_context_event(2, self.m_core_index, thread, arm_ctx);
             if arm_ctx.pc == 0 && std::env::var_os("RUZU_TRACE_ZERO_PC_SAVE").is_some() {
                 let n = ZERO_PC_SAVE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if n < 64 || n.is_multiple_of(1024) {
@@ -537,7 +560,7 @@ impl PhysicalCore {
             let running_tid = current_thread
                 .map(|p| unsafe { (*p).get_thread_id() })
                 .unwrap_or(0);
-            eprintln!(
+            log::warn!(
                 "[{:>10.6}] [IPI] target_core={} running_tid={} running_jit={}",
                 t,
                 self.m_core_index,
@@ -593,6 +616,42 @@ impl PhysicalCore {
         jit.set_context(thread_context);
         jit.set_tpidrro_el0(thread.get_tls_address().get());
     }
+}
+
+fn trace_wrapper_context_event(
+    stage: u64,
+    core_index: usize,
+    thread: &KThread,
+    ctx: &crate::arm::arm_interface::ThreadContext,
+) {
+    if !common::trace::is_enabled(common::trace::cat::A64_EXCEPTION_CTX) {
+        return;
+    }
+    if !is_animus_sdk_thread_wrapper_context(ctx.pc, ctx.lr) {
+        return;
+    }
+    common::trace::emit_raw(
+        common::trace::cat::A64_EXCEPTION_CTX,
+        &[
+            stage,
+            core_index as u64,
+            thread.get_thread_id(),
+            ctx.pc,
+            ctx.lr,
+            ctx.sp,
+            ctx.r[0],
+            ctx.r[19],
+            ctx.r[20],
+            ctx.r[21],
+            ctx.fp,
+        ],
+    );
+}
+
+fn is_animus_sdk_thread_wrapper_context(pc: u64, lr: u64) -> bool {
+    const WRAPPER_START: u64 = 0x8467_74D0;
+    const WRAPPER_END: u64 = 0x8467_7544;
+    (WRAPPER_START..WRAPPER_END).contains(&pc) || (WRAPPER_START..WRAPPER_END).contains(&lr)
 }
 
 #[cfg(test)]
@@ -895,7 +954,27 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_supervisor_call_returns_false_after_non_exit_svc_handoff() {
+    fn blocked_svc_defers_return_register_write_until_wake() {
+        let (physical_core, _process, _scheduler, current_thread, _system) = test_context();
+        let mut jit = TestArmInterface::new(VecDeque::new());
+        let svc_args: SvcArgs = [0x7201; 8];
+
+        current_thread
+            .lock()
+            .unwrap()
+            .set_state(ThreadState::WAITING);
+        physical_core.write_svc_return_registers_if_runnable(
+            &mut jit,
+            &current_thread,
+            SvcId::WaitProcessWideKeyAtomic as u32,
+            &svc_args,
+        );
+
+        assert_eq!(jit.set_svc_arguments_count, 0);
+    }
+
+    #[test]
+    fn dispatch_supervisor_call_returns_true_after_non_exit_svc_handoff() {
         let (physical_core, process, scheduler, current_thread, system) = test_context();
         let mut thread_context = ThreadContext::default();
         let mut jit = TestArmInterface::new(VecDeque::new());
@@ -924,7 +1003,7 @@ mod tests {
         );
         crate::hle::kernel::kernel::set_current_emu_thread(None);
 
-        assert!(!continue_thread);
+        assert!(continue_thread);
         assert_eq!(jit.set_svc_arguments_count, 1);
         assert_eq!(
             current_thread.lock().unwrap().thread_context.r[15],

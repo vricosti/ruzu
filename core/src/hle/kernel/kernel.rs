@@ -208,15 +208,12 @@ pub static GUEST_SP: [std::sync::atomic::AtomicU64; hardware_properties::NUM_CPU
     std::sync::atomic::AtomicU64::new(0),
 ];
 
-/// Per-core snapshot of ARM32 general-purpose registers r0..r11 (12 words).
-/// r12 is IP (intra-call scratch), r13 is SP (in GUEST_SP), r14 is LR
-/// (in GUEST_LR), r15 is PC (in GUEST_PC). We skip r12 because it's
-/// volatile; interesting values live in r4..r11 (callee-saved) and r0..r3
-/// (arg regs at call site). Updated alongside GUEST_{PC,LR,SP}.
-pub static GUEST_REGS: [[std::sync::atomic::AtomicU32; 12];
+/// Per-core snapshot of guest general-purpose registers. AArch32 uses the
+/// low words; AArch64 uses x0..x28. Updated alongside GUEST_{PC,LR,SP}.
+pub static GUEST_REGS: [[std::sync::atomic::AtomicU64; 29];
     hardware_properties::NUM_CPU_CORES as usize] = {
-    const NEW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    const ROW: [std::sync::atomic::AtomicU32; 12] = [NEW; 12];
+    const NEW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    const ROW: [std::sync::atomic::AtomicU64; 29] = [NEW; 29];
     [ROW, ROW, ROW, ROW]
 };
 
@@ -362,7 +359,7 @@ pub fn record_guest_full(core_id: usize, pc: u64, lr: u64, sp: u64, regs: &[u64]
     GUEST_LR[core_id].store(lr, Ordering::Release);
     GUEST_SP[core_id].store(sp, Ordering::Release);
     for (i, slot) in GUEST_REGS[core_id].iter().enumerate() {
-        let v = regs.get(i).copied().unwrap_or(0) as u32;
+        let v = regs.get(i).copied().unwrap_or(0);
         slot.store(v, Ordering::Release);
     }
 }
@@ -440,6 +437,11 @@ fn dump_thread_state(kernel: &KernelCore) {
     crate::hle::kernel::svc_dispatch::dump_svc_ring_profile();
     crate::hle::kernel::svc_dispatch::dump_svc_summary_profile();
     crate::hle::kernel::svc::svc_memory_history::dump("sigusr1_thread_dump");
+    crate::hle::service::nvnflinger::buffer_queue_core::dump_bqp_wait_profile();
+    crate::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
+    crate::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
+    crate::hle::service::nvnflinger::hos_binder_driver::dump_binder_txn_profile();
+    crate::hle::service::nvnflinger::diagnostics::dump("sigusr1_thread_dump");
     // Who holds each coarse lock right now + the full observed nesting graph
     // (RUZU_LOCK_ORDER=1).
     common::lock_order::dump_owners();
@@ -472,25 +474,40 @@ fn dump_thread_state(kernel: &KernelCore) {
                 "[DUMP] core={} is_interrupted={} in_svc={{tid={}, imm=0x{:X}}} last_guest_pc=0x{:X} last_guest_lr=0x{:X} last_guest_sp=0x{:X}",
                 core_id, interrupted, svc_tid, svc_num, last_pc, last_lr, last_sp,
             );
-            // r0..r11 snapshot — surfaces live values of object pointers
-            // (r4..r11 are callee-saved; spin-loop base pointer typically
-            // lives in one of them) and arg regs at the SVC call site.
-            let regs: [u32; 12] =
+            let regs: [u64; 29] =
                 std::array::from_fn(|i| GUEST_REGS[core_id][i].load(Ordering::Acquire));
             eprintln!(
-                "[DUMP]        regs r0-r3:  {:08X} {:08X} {:08X} {:08X}",
+                "[DUMP]        regs x0-x3:   {:016X} {:016X} {:016X} {:016X}",
                 regs[0], regs[1], regs[2], regs[3],
             );
             eprintln!(
-                "[DUMP]        regs r4-r7:  {:08X} {:08X} {:08X} {:08X}",
+                "[DUMP]        regs x4-x7:   {:016X} {:016X} {:016X} {:016X}",
                 regs[4], regs[5], regs[6], regs[7],
             );
             eprintln!(
-                "[DUMP]        regs r8-r11: {:08X} {:08X} {:08X} {:08X}",
+                "[DUMP]        regs x8-x11:  {:016X} {:016X} {:016X} {:016X}",
                 regs[8], regs[9], regs[10], regs[11],
             );
+            eprintln!(
+                "[DUMP]        regs x12-x18: {:016X} {:016X} {:016X} {:016X} {:016X} {:016X} {:016X}",
+                regs[12], regs[13], regs[14], regs[15], regs[16], regs[17], regs[18],
+            );
+            eprintln!(
+                "[DUMP]        regs x19-x24: {:016X} {:016X} {:016X} {:016X} {:016X} {:016X}",
+                regs[19], regs[20], regs[21], regs[22], regs[23], regs[24],
+            );
+            eprintln!(
+                "[DUMP]        regs x25-x28: {:016X} {:016X} {:016X} {:016X}",
+                regs[25], regs[26], regs[27], regs[28],
+            );
             if svc_num == 0x21 && regs[1] != 0 && regs[2] != 0 {
-                svc21_messages_to_dump.push((core_id, svc_tid, regs[0], regs[1], regs[2]));
+                svc21_messages_to_dump.push((
+                    core_id,
+                    svc_tid,
+                    regs[0] as u32,
+                    regs[1] as u32,
+                    regs[2] as u32,
+                ));
             }
             if last_sp != 0 {
                 stacks_to_dump.push((core_id, last_sp));
@@ -591,19 +608,49 @@ fn dump_thread_state(kernel: &KernelCore) {
             if let (Some(a), Some(l)) = (it.next(), it.next()) {
                 if let (Some(addr), Some(len)) = (parse_u64_auto(a), parse_u64_auto(l)) {
                     let nwords = ((len as usize) / 4).min(64);
-                    // Read guest memory directly via the fastmem arena (host base
-                    // + guest vaddr) — no KProcess lock, which is held continuously
-                    // by the kernel CV-wait during a wedge.
+                    // Prefer the fastmem arena (host base + guest vaddr). If
+                    // it is not registered, fall back to the page-table memory
+                    // handle used by the stack dumper below.
                     let fb = common::fastmem_registry::base();
-                    if fb == 0 {
-                        eprintln!("[DUMP] MEM 0x{:08X} <no-fastmem-base>", addr);
-                    } else {
+                    if fb != 0 {
                         let mut w = vec![0u32; nwords];
                         for (i, slot) in w.iter_mut().enumerate() {
                             let host = (fb as u64 + addr + (i as u64) * 4) as *const u32;
                             *slot = unsafe { std::ptr::read_volatile(host) };
                         }
                         eprintln!("[DUMP] MEM 0x{:08X} ({} words) = {:08X?}", addr, nwords, w);
+                    } else {
+                        match process_arc.try_lock() {
+                            Ok(process_guard) => {
+                                if let Some(memory) =
+                                    process_guard.page_table.get_base().m_memory.as_ref()
+                                {
+                                    match memory.try_lock() {
+                                        Ok(m) => {
+                                            let mut w = vec![0u32; nwords];
+                                            for (i, slot) in w.iter_mut().enumerate() {
+                                                *slot = m.read_32(addr + (i as u64) * 4);
+                                            }
+                                            eprintln!(
+                                                "[DUMP] MEM 0x{:08X} ({} words,page_table) = {:08X?}",
+                                                addr, nwords, w
+                                            );
+                                        }
+                                        Err(_) => {
+                                            eprintln!(
+                                                "[DUMP] MEM 0x{:08X} <guest-memory-lock-busy>",
+                                                addr
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    eprintln!("[DUMP] MEM 0x{:08X} <no-memory-source>", addr);
+                                }
+                            }
+                            Err(_) => {
+                                eprintln!("[DUMP] MEM 0x{:08X} <process-lock-busy>", addr);
+                            }
+                        }
                     }
                 }
             }
@@ -925,7 +972,11 @@ fn dump_thread_state(kernel: &KernelCore) {
                     match memory.try_lock() {
                         Ok(m) => {
                             for i in 0..STACK_WORDS {
-                                stack_words.push(m.read_32(sp + (i as u64) * 4));
+                                let addr = sp + (i as u64) * 4;
+                                if !m.is_valid_virtual_address_range(addr, 4) {
+                                    break;
+                                }
+                                stack_words.push(m.read_32(addr));
                             }
                         }
                         Err(_) => {
@@ -938,14 +989,17 @@ fn dump_thread_state(kernel: &KernelCore) {
                     }
                 } else {
                     let mem = guard.process_memory.read().unwrap();
-                    let len = (STACK_WORDS as u64) * 4;
-                    if !mem.is_valid_range(*sp, len as usize) {
-                        eprintln!("[DUMP]   core={} sp=0x{:X}: stack not mapped", core_id, sp);
-                        continue;
-                    }
                     for i in 0..STACK_WORDS {
-                        stack_words.push(mem.read_32(sp + (i as u64) * 4));
+                        let addr = sp + (i as u64) * 4;
+                        if !mem.is_valid_range(addr, 4) {
+                            break;
+                        }
+                        stack_words.push(mem.read_32(addr));
                     }
+                }
+                if stack_words.is_empty() {
+                    eprintln!("[DUMP]   core={} sp=0x{:X}: stack not mapped", core_id, sp);
+                    continue;
                 }
                 eprint!("[DUMP]   core={} stack@0x{:X}:", core_id, sp);
                 for (i, w) in stack_words.iter().enumerate() {
@@ -1120,13 +1174,14 @@ fn dump_thread_state(kernel: &KernelCore) {
             let addr_key_val = t.get_address_key_value();
             let cv_key = t.get_condition_variable_key();
             let waiting_lock = t.get_waiting_lock_info().is_some();
+            let lock_owner_tid = t.get_lock_owner_thread_id();
             let pc = t.thread_context.pc as u32;
             let lr = t.thread_context.lr as u32;
             let sp = t.thread_context.sp as u32;
             eprintln!(
                 "[DUMP]   tid={} type={:?} state={:?} prio={} core={} active_core={} wait={:?} \
                  addr_key=0x{:X} addr_key_val=0x{:X} cv_key=0x{:X} \
-                 waiting_lock={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
+                 waiting_lock={} lock_owner_tid={:?} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
                 tid,
                 thread_type,
                 state,
@@ -1138,6 +1193,7 @@ fn dump_thread_state(kernel: &KernelCore) {
                 addr_key_val,
                 cv_key,
                 waiting_lock,
+                lock_owner_tid,
                 pc,
                 lr,
                 sp,

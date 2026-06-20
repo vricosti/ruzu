@@ -161,6 +161,24 @@ fn trace_cbuf_device_watch_write(source: &str, d_address: DAddr, input: &[u8]) {
     );
 }
 
+fn trace_smmu_read_compare_target() -> Option<DAddr> {
+    static TARGET: std::sync::OnceLock<Option<DAddr>> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        std::env::var("RUZU_TRACE_SMMU_READ_COMPARE")
+            .ok()
+            .and_then(|value| {
+                let value = value.trim();
+                let digits = value
+                    .strip_prefix("0x")
+                    .or_else(|| value.strip_prefix("0X"))
+                    .unwrap_or(value);
+                u64::from_str_radix(digits, 16)
+                    .ok()
+                    .or_else(|| value.parse::<u64>().ok())
+            })
+    })
+}
+
 pub fn trace_cbuf_device_watch_range(source: &str, d_address: DAddr, size: u64) {
     if std::env::var_os("RUZU_TRACE_CBUF_DEVICE_WRITES").is_none() || size == 0 {
         return;
@@ -1616,7 +1634,7 @@ impl MaxwellDeviceMemoryManager {
         }
         let output_len = output.len();
         let output_ptr = output.as_mut_ptr();
-        self.smmu_walk_block(
+        let all_mapped = self.smmu_walk_block(
             d_address,
             output_len,
             |current_daddr, out_off, copy_amount| {
@@ -1637,7 +1655,43 @@ impl MaxwellDeviceMemoryManager {
                     copy_amount,
                 );
             },
-        )
+        );
+
+        if let Some(target) = trace_smmu_read_compare_target() {
+            let read_end = d_address.saturating_add(output_len as u64);
+            if d_address <= target && target.saturating_add(4) <= read_end {
+                let out_off = (target - d_address) as usize;
+                let device_value = u32::from_le_bytes(
+                    output[out_off..out_off + 4]
+                        .try_into()
+                        .expect("smmu compare output slice is 4 bytes"),
+                );
+                let cpu_backing = self.smmu_cpu_backing_for_address(target);
+                let cpu_value = cpu_backing.and_then(|backing| {
+                    self.smmu_registered_memory(backing.asid())
+                        .and_then(|memory| {
+                            let memory = memory.lock().unwrap();
+                            memory
+                                .is_valid_virtual_address_range(backing.virtual_address(), 4)
+                                .then(|| memory.read_32(backing.virtual_address()))
+                        })
+                });
+                log::warn!(
+                    "[SMMU_READ_COMPARE] daddr=0x{:X} size=0x{:X} target=0x{:X} all_mapped={} device_value=0x{:08X} cpu_backing={:?} cpu_value={}",
+                    d_address,
+                    output_len,
+                    target,
+                    all_mapped,
+                    device_value,
+                    cpu_backing,
+                    cpu_value
+                        .map(|value| format!("0x{value:08X}"))
+                        .unwrap_or_else(|| "<none>".to_string())
+                );
+            }
+        }
+
+        all_mapped
     }
 
     /// Write `data.len()` bytes from `data` to a device address and invalidate

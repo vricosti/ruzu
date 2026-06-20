@@ -53,7 +53,7 @@ fn encode_trace_tid(thread_id: Option<u64>) -> u64 {
     thread_id.unwrap_or(u64::MAX)
 }
 
-fn trace_tid_filter_matches(thread_id: Option<u64>) -> bool {
+pub(crate) fn trace_tid_filter_matches(thread_id: Option<u64>) -> bool {
     let Some(thread_id) = thread_id else {
         return false;
     };
@@ -77,6 +77,100 @@ fn trace_tid_filter_matches(thread_id: Option<u64>) -> bool {
             .or_else(|| value.parse::<u64>().ok());
         parsed.is_some_and(|tid| tid == thread_id)
     })
+}
+
+fn should_log_sched_pick_for(ids: &[Option<u64>]) -> bool {
+    std::env::var_os("RUZU_TRACE_SCHED_PICK").is_some()
+        && ids.iter().copied().any(trace_tid_filter_matches)
+}
+
+fn trace_sched_fiber_event(
+    stage: u64,
+    core_id: i32,
+    cur_thread_id: Option<u64>,
+    target_thread: Option<&Arc<KThreadLock>>,
+    has_host_context: bool,
+    needs_scheduling: bool,
+) {
+    let target_info = target_thread.map(|thread| {
+        let guard = thread.lock().unwrap();
+        (
+            guard.get_thread_id(),
+            guard.get_active_core(),
+            guard.get_current_core(),
+            guard.get_priority(),
+            guard
+                .get_host_context()
+                .map(|ctx| Arc::as_ptr(ctx) as usize as u64)
+                .unwrap_or(0),
+        )
+    });
+    let target_id = target_info.map(|(id, _, _, _, _)| id);
+    if !common::trace::is_enabled(common::trace::cat::SCHED_STATE)
+        || !(trace_tid_filter_matches(cur_thread_id) || trace_tid_filter_matches(target_id))
+    {
+        return;
+    }
+    let (target_id, active_core, current_core, priority, target_host_context) =
+        target_info.unwrap_or((u64::MAX, -1, -1, 0, 0));
+    common::trace::emit_raw(
+        common::trace::cat::SCHED_STATE,
+        &[
+            stage,
+            encode_trace_tid(cur_thread_id),
+            encode_trace_tid(Some(target_id)),
+            core_id as u32 as u64,
+            active_core as u32 as u64,
+            current_core as u32 as u64,
+            priority as u32 as u64,
+            has_host_context as u64,
+            needs_scheduling as u64,
+            target_host_context,
+        ],
+    );
+}
+
+fn scheduled_front_with_pinned_thread(
+    gsc: &mut super::global_scheduler_context::GlobalSchedulerContext,
+    core_id: i32,
+) -> Option<u64> {
+    let mut top_thread_id = gsc
+        .get_scheduled_front_runnable(core_id)
+        .or_else(|| gsc.recover_scheduled_front_from_runnable(core_id));
+
+    // Upstream UpdateHighestPriorityThreadsImpl: if the top thread's
+    // process has a pinned thread for this core, prefer that pinned thread
+    // unless the normal top thread has kernel waiters.
+    if let Some(top_id) = top_thread_id {
+        let pinned_id = gsc.get_thread_by_thread_id(top_id).and_then(|top_thread| {
+            let top_guard = top_thread.lock().unwrap();
+            if top_guard.get_num_kernel_waiters() != 0 {
+                return None;
+            }
+            let parent = top_guard.parent.as_ref().and_then(|w| w.upgrade())?;
+            drop(top_guard);
+
+            parent.lock().unwrap().get_pinned_thread(core_id)
+        });
+
+        if let Some(pinned_id) = pinned_id {
+            if pinned_id != top_id {
+                let pinned_is_runnable = gsc
+                    .get_thread_by_thread_id(pinned_id)
+                    .map(|pinned_thread| {
+                        pinned_thread.lock().unwrap().get_raw_state() == ThreadState::RUNNABLE
+                    })
+                    .unwrap_or(false);
+                top_thread_id = if pinned_is_runnable {
+                    Some(pinned_id)
+                } else {
+                    None
+                };
+            }
+        }
+    }
+
+    top_thread_id
 }
 
 pub fn record_start_thread_sched_attempt(
@@ -287,6 +381,29 @@ mod tests {
     }
 
     #[test]
+    fn late_scheduler_update_ignores_stale_captured_highest_thread() {
+        let stale_thread = Arc::new(KThreadLock::new(KThread::new()));
+        stale_thread.lock().unwrap().thread_id = 75;
+
+        let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
+        gsc.lock().unwrap().add_thread(Arc::clone(&stale_thread));
+
+        let mut scheduler = KScheduler::new(0);
+        scheduler.global_scheduler_context = Some(gsc);
+        scheduler.state.highest_priority_thread_id = None;
+        scheduler.switch_highest_priority_thread = Some(Arc::downgrade(&stale_thread));
+
+        assert!(scheduler
+            .switch_highest_priority_thread
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some());
+        assert!(scheduler
+            .resolve_highest_priority_thread_from_state()
+            .is_none());
+    }
+
+    #[test]
     fn switch_thread_impl_uses_idle_thread_without_gsc_membership() {
         let current_thread = Arc::new(KThreadLock::new(KThread::new()));
         current_thread.lock().unwrap().thread_id = 42;
@@ -300,7 +417,7 @@ mod tests {
         scheduler.idle_thread = Some(Arc::downgrade(&idle_thread));
         scheduler.idle_thread_id = Some(7);
 
-        scheduler.switch_thread_impl(7);
+        scheduler.switch_thread_impl(None, 7);
 
         assert_eq!(scheduler.current_thread_id, Some(7));
         let resolved = scheduler
@@ -309,6 +426,80 @@ mod tests {
             .and_then(Weak::upgrade)
             .unwrap();
         assert!(Arc::ptr_eq(&resolved, &idle_thread));
+    }
+
+    #[test]
+    fn switch_thread_impl_preserves_previous_thread_current_core() {
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut guard = current_thread.lock().unwrap();
+            guard.thread_id = 42;
+            guard.set_current_core(1);
+        }
+
+        let next_thread = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut guard = next_thread.lock().unwrap();
+            guard.thread_id = 43;
+            guard.set_current_core(-1);
+        }
+
+        let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
+        gsc.lock().unwrap().add_thread(Arc::clone(&next_thread));
+
+        let mut scheduler = KScheduler::new(1);
+        scheduler.global_scheduler_context = Some(gsc);
+        scheduler.current_thread = Some(Arc::downgrade(&current_thread));
+        scheduler.current_thread_id = Some(42);
+
+        scheduler.switch_thread_impl(None, 43);
+
+        assert_eq!(current_thread.lock().unwrap().get_current_core(), 1);
+        assert_eq!(next_thread.lock().unwrap().get_current_core(), 1);
+    }
+
+    #[test]
+    fn schedule_impl_fiber_fast_path_repairs_stale_current_thread_id() {
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut guard = current_thread.lock().unwrap();
+            guard.thread_id = 75;
+            guard.set_current_core(0);
+            guard.set_active_core(0);
+        }
+
+        let stale_thread = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut guard = stale_thread.lock().unwrap();
+            guard.thread_id = 104;
+            guard.set_current_core(0);
+            guard.set_active_core(0);
+        }
+
+        let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
+        gsc.lock().unwrap().add_thread(Arc::clone(&current_thread));
+
+        let mut scheduler = KScheduler::new(0);
+        scheduler.global_scheduler_context = Some(gsc);
+        scheduler.current_thread = Some(Arc::downgrade(&stale_thread));
+        scheduler.current_thread_id = Some(104);
+        scheduler.state.highest_priority_thread_id = Some(75);
+        scheduler
+            .state
+            .needs_scheduling
+            .store(true, Ordering::Relaxed);
+
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&current_thread));
+        scheduler.schedule_impl_fiber();
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
+
+        assert_eq!(scheduler.current_thread_id, Some(75));
+        let resolved = scheduler
+            .current_thread
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .unwrap();
+        assert!(Arc::ptr_eq(&resolved, &current_thread));
     }
 
     #[test]
@@ -325,6 +516,18 @@ mod tests {
     #[test]
     fn update_highest_priority_threads_impl_migrates_suggested_thread_to_idle_core() {
         let mut gsc = GlobalSchedulerContext::new();
+        let migrated = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut guard = migrated.lock().unwrap();
+            guard.thread_id = 1;
+            guard.object_id = 1;
+            guard.priority = 10;
+            guard.core_id = 0;
+            guard.physical_affinity_mask.set_affinity_mask(0b0011);
+            guard.set_state(ThreadState::RUNNABLE);
+        }
+        gsc.add_thread(Arc::clone(&migrated));
+
         gsc.m_priority_queue
             .push_back(1, 10, 0, 0b0011, false, None);
         gsc.m_priority_queue
@@ -338,10 +541,58 @@ mod tests {
         let (cores_needing_scheduling, migrations) =
             KScheduler::update_highest_priority_threads_impl(&mut schedulers, &mut gsc);
 
-        assert_eq!(migrations, vec![(1, 1)]);
-        assert_eq!(schedulers[0].state.highest_priority_thread_id, Some(1));
+        assert!(migrations.is_empty());
+        assert_eq!(migrated.lock().unwrap().get_active_core(), 1);
+        assert_eq!(
+            gsc.m_priority_queue
+                .get_thread_props(1)
+                .map(|props| props.active_core),
+            Some(1)
+        );
+        assert_eq!(schedulers[0].state.highest_priority_thread_id, Some(2));
         assert_eq!(schedulers[1].state.highest_priority_thread_id, Some(1));
         assert_ne!(cores_needing_scheduling & (1 << 1), 0);
+    }
+
+    #[test]
+    fn scheduled_front_prefers_runnable_pinned_thread_like_upstream() {
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let top = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut guard = top.lock().unwrap();
+            guard.thread_id = 1;
+            guard.object_id = 1;
+            guard.priority = 30;
+            guard.core_id = 2;
+            guard.parent = Some(Arc::downgrade(&process));
+            guard.set_state(ThreadState::RUNNABLE);
+        }
+
+        let pinned = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut guard = pinned.lock().unwrap();
+            guard.thread_id = 2;
+            guard.object_id = 2;
+            guard.priority = 44;
+            guard.core_id = 2;
+            guard.parent = Some(Arc::downgrade(&process));
+            guard.set_state(ThreadState::RUNNABLE);
+        }
+
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.register_thread_object(Arc::clone(&top));
+            process_guard.register_thread_object(Arc::clone(&pinned));
+            process_guard.pinned_threads[2] = Some(2);
+        }
+
+        let mut gsc = GlobalSchedulerContext::new();
+        gsc.add_thread(Arc::clone(&top));
+        gsc.add_thread(Arc::clone(&pinned));
+        gsc.m_priority_queue
+            .push_back(1, 30, 2, 0b0100, false, None);
+
+        assert_eq!(scheduled_front_with_pinned_thread(&mut gsc, 2), Some(2));
     }
 
     #[test]
@@ -462,6 +713,52 @@ pub struct KScheduler {
 }
 
 impl KScheduler {
+    /// Refresh this core's selected thread directly from the global priority
+    /// queue. Rust cannot hold the scheduler mutex across the fiber switch, so
+    /// the raw scheduling entry points perform the upstream
+    /// UpdateHighestPriorityThreads/EnableScheduling handoff in two steps.
+    unsafe fn refresh_highest_from_priority_queue_raw(sched: *mut KScheduler) {
+        if let Some(gsc_arc) = &(*sched).global_scheduler_context {
+            let mut gsc = gsc_arc.lock().unwrap();
+            let core_id = (*sched).core_id;
+            let pq_top = scheduled_front_with_pinned_thread(&mut gsc, core_id);
+            let prev = (*sched).state.highest_priority_thread_id;
+            if should_log_sched_pick_for(&[(*sched).current_thread_id, prev, pq_top]) {
+                log::warn!(
+                    "[SCHED_PICK] refresh core={} cur={:?} prev_highest={:?} pq_top={:?} needs_before={}",
+                    core_id,
+                    (*sched).current_thread_id,
+                    prev,
+                    pq_top,
+                    (*sched).state.needs_scheduling.load(Ordering::Relaxed),
+                );
+            }
+            if pq_top != prev {
+                (*sched).state.highest_priority_thread_id = pq_top;
+                (*sched)
+                    .state
+                    .needs_scheduling
+                    .store(true, Ordering::Relaxed);
+            }
+            if pq_top.is_some() && pq_top != (*sched).current_thread_id {
+                (*sched)
+                    .state
+                    .needs_scheduling
+                    .store(true, Ordering::Relaxed);
+            }
+            if pq_top == (*sched).current_thread_id && !(*sched).state.interrupt_task_runnable {
+                // Upstream `ScheduleImpl()` consumes `needs_scheduling` before
+                // returning when `highest_priority_thread == cur_thread`.
+                // Mirror that fast return after the Rust raw entry point has
+                // refreshed `highest` from the GSC.
+                (*sched)
+                    .state
+                    .needs_scheduling
+                    .store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
     fn resolve_thread_for_switch(&self, next_thread_id: u64) -> Option<Arc<KThreadLock>> {
         if self.idle_thread_id == Some(next_thread_id) {
             if let Some(idle_thread) = self.idle_thread.as_ref().and_then(Weak::upgrade) {
@@ -472,6 +769,18 @@ impl KScheduler {
         self.global_scheduler_context
             .as_ref()
             .and_then(|gsc| gsc.lock().unwrap().get_thread_by_thread_id(next_thread_id))
+    }
+
+    fn current_thread_for_scheduler_core(&self) -> Option<Arc<KThreadLock>> {
+        let tls_thread = super::kernel::get_current_thread_pointer();
+        if let Some(thread) = tls_thread {
+            let belongs_to_core = thread.lock().unwrap().get_current_core() == self.core_id;
+            if belongs_to_core {
+                return Some(thread);
+            }
+        }
+
+        self.current_thread.as_ref().and_then(Weak::upgrade)
     }
 
     fn try_lock_thread_context(thread: &Arc<KThreadLock>) -> bool {
@@ -682,29 +991,10 @@ impl KScheduler {
         // UpdateHighestPriorityThreads + EnableScheduling. Our port can't do
         // that atomically, so we read the PQ per-core instead of relying on
         // the global update callback.
-        if let Some(gsc_arc) = &(*sched).global_scheduler_context {
-            let gsc = gsc_arc.lock().unwrap();
-            let core_id = (*sched).core_id;
-            let pq_top = gsc.m_priority_queue.get_scheduled_front(core_id);
-            let prev = (*sched).state.highest_priority_thread_id;
-            if pq_top != prev {
-                (*sched).state.highest_priority_thread_id = pq_top;
-                (*sched)
-                    .state
-                    .needs_scheduling
-                    .store(true, Ordering::Relaxed);
-            }
-            // Also check if current thread is no longer the highest — need reschedule.
-            if pq_top.is_some() && pq_top != (*sched).current_thread_id {
-                (*sched)
-                    .state
-                    .needs_scheduling
-                    .store(true, Ordering::Relaxed);
-            }
-        }
+        Self::refresh_highest_from_priority_queue_raw(sched);
 
         if (*sched).state.needs_scheduling.load(Ordering::SeqCst) {
-            let cur_thread = super::kernel::get_current_thread_pointer();
+            let cur_thread = (*sched).current_thread_for_scheduler_core();
             if let Some(thread) = &cur_thread {
                 thread.lock().unwrap().disable_dispatch();
             }
@@ -726,7 +1016,7 @@ impl KScheduler {
     /// # Safety
     /// Same requirements as `schedule_raw_if_needed`.
     pub unsafe fn reschedule_current_core_raw(sched: *mut KScheduler) {
-        if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
+        if let Some(cur_thread) = (*sched).current_thread_for_scheduler_core() {
             let mut cur_thread = cur_thread.lock().unwrap();
             if cur_thread.get_disable_dispatch_count() > 0 {
                 cur_thread.enable_dispatch();
@@ -741,12 +1031,19 @@ impl KScheduler {
             if let Some(f) = update_fn {
                 f();
             }
+
+            (*sched)
+                .state
+                .needs_scheduling
+                .store(true, Ordering::SeqCst);
+            Self::refresh_highest_from_priority_queue_raw(sched);
+        } else {
+            (*sched)
+                .state
+                .needs_scheduling
+                .store(true, Ordering::SeqCst);
         }
 
-        (*sched)
-            .state
-            .needs_scheduling
-            .store(true, Ordering::SeqCst);
         (*sched).reschedule_current_core_impl();
     }
 
@@ -790,7 +1087,7 @@ impl KScheduler {
         //   Common::Fiber::YieldTo(thread->GetHostContext(), *m_switch_fiber);
         //   GetCurrentThread(m_kernel).EnableDispatch();
 
-        let cur_thread = super::kernel::get_current_thread_pointer();
+        let cur_thread = self.current_thread_for_scheduler_core();
         if let Some(ref cur_thread) = cur_thread {
             self.ensure_switch_fiber();
             cur_thread.lock().unwrap().disable_dispatch();
@@ -865,6 +1162,25 @@ impl KScheduler {
             };
             jit.set_context(arm_ctx);
             jit.set_tpidrro_el0(thread_guard.get_tls_address().get());
+            if common::trace::is_enabled(common::trace::cat::SCHED_STATE)
+                && trace_tid_filter_matches(Some(thread_guard.get_thread_id()))
+            {
+                common::trace::emit_raw(
+                    common::trace::cat::SCHED_STATE,
+                    &[
+                        16,
+                        thread_guard.get_thread_id(),
+                        self.core_id as u32 as u64,
+                        k_ctx.pc,
+                        k_ctx.sp,
+                        k_ctx.r[0],
+                        k_ctx.r[1],
+                        k_ctx.lr,
+                        thread_guard.get_tls_address().get(),
+                        jit.get_tpidrro_el0(),
+                    ],
+                );
+            }
             log::trace!(
                 "KScheduler::Reload: core={} r15/PC=0x{:X} r13/SP=0x{:X}",
                 self.core_id,
@@ -965,7 +1281,7 @@ impl KScheduler {
         //     GetCurrentThread(m_kernel).EnableDispatch();
         // }
         if self.state.needs_scheduling.load(Ordering::SeqCst) {
-            let cur_thread = super::kernel::get_current_thread_pointer();
+            let cur_thread = self.current_thread_for_scheduler_core();
             if let Some(thread) = &cur_thread {
                 thread.lock().unwrap().disable_dispatch();
             }
@@ -1087,9 +1403,10 @@ impl KScheduler {
 
     /// Matches upstream `KScheduler::UpdateHighestPriorityThreadsImpl(kernel)`.
     ///
-    /// Returns (cores_needing_scheduling, migrations) where migrations is a list
-    /// of (thread_id, new_core) pairs. The caller must update KThread.core_id
-    /// for each migration AFTER releasing the GSC lock.
+    /// Returns (cores_needing_scheduling, migrations). Migrations are applied
+    /// immediately when the target KThread lock can be acquired, matching
+    /// upstream's SetActiveCore-before-ChangeCore ordering. The returned list
+    /// remains for older callers and should normally be empty.
     pub fn update_highest_priority_threads_impl(
         schedulers: &mut [std::sync::MutexGuard<'_, KScheduler>],
         gsc: &mut super::global_scheduler_context::GlobalSchedulerContext,
@@ -1104,43 +1421,11 @@ impl KScheduler {
         let mut idle_cores = 0u64;
         let mut top_threads: [Option<u64>; crate::hardware_properties::NUM_CPU_CORES as usize] =
             [None; crate::hardware_properties::NUM_CPU_CORES as usize];
-        let mut migrations: Vec<(u64, i32)> = Vec::new();
+        let migrations: Vec<(u64, i32)> = Vec::new();
 
         // Select top thread per core from PQ.
         for core_id in 0..NUM_CPU_CORES as usize {
-            let mut top_thread_id = gsc.m_priority_queue.get_scheduled_front(core_id as i32);
-
-            // Upstream: if the top thread's process has a pinned thread for this
-            // core, prefer it unless the normal top thread has kernel waiters.
-            if let Some(top_id) = top_thread_id {
-                let pinned_id = gsc.get_thread_by_thread_id(top_id).and_then(|top_thread| {
-                    let top_guard = top_thread.lock().unwrap();
-                    if top_guard.get_num_kernel_waiters() != 0 {
-                        return None;
-                    }
-                    let parent = top_guard.parent.as_ref().and_then(|w| w.upgrade())?;
-                    drop(top_guard);
-
-                    parent.lock().unwrap().get_pinned_thread(core_id as i32)
-                });
-
-                if let Some(pinned_id) = pinned_id {
-                    if pinned_id != top_id {
-                        let pinned_is_runnable = gsc
-                            .get_thread_by_thread_id(pinned_id)
-                            .map(|pinned_thread| {
-                                pinned_thread.lock().unwrap().get_raw_state()
-                                    == ThreadState::RUNNABLE
-                            })
-                            .unwrap_or(false);
-                        if pinned_is_runnable {
-                            top_thread_id = Some(pinned_id);
-                        } else {
-                            top_thread_id = None;
-                        }
-                    }
-                }
-            }
+            let top_thread_id = scheduled_front_with_pinned_thread(gsc, core_id as i32);
 
             if top_thread_id.is_none() {
                 idle_cores |= 1u64 << core_id;
@@ -1200,7 +1485,15 @@ impl KScheduler {
                             }
                         }
 
-                        migrations.push((suggested_id, core_id as i32));
+                        let Some(suggested_thread) = gsc.get_thread_by_thread_id(suggested_id)
+                        else {
+                            break;
+                        };
+                        let Ok(mut suggested_thread) = suggested_thread.try_lock() else {
+                            break;
+                        };
+                        suggested_thread.set_active_core(core_id as i32);
+                        drop(suggested_thread);
                         gsc.m_priority_queue.change_core(
                             suggested_core,
                             suggested_id,
@@ -1209,6 +1502,7 @@ impl KScheduler {
                             suggested_props.is_dummy,
                             false,
                         );
+                        gsc.m_priority_queue.increment_scheduled_count(suggested_id);
                         top_threads[core_id] = Some(suggested_id);
                         if core_id < schedulers.len() {
                             let (mask, _prev_id) = schedulers[core_id]
@@ -1268,7 +1562,16 @@ impl KScheduler {
                             cores_needing_scheduling |= mask;
                         }
 
-                        migrations.push((candidate_thread_id, core_id as i32));
+                        let Some(candidate_thread) =
+                            gsc.get_thread_by_thread_id(candidate_thread_id)
+                        else {
+                            continue;
+                        };
+                        let Ok(mut candidate_thread) = candidate_thread.try_lock() else {
+                            continue;
+                        };
+                        candidate_thread.set_active_core(core_id as i32);
+                        drop(candidate_thread);
                         gsc.m_priority_queue.change_core(
                             candidate_core,
                             candidate_thread_id,
@@ -1277,6 +1580,8 @@ impl KScheduler {
                             candidate_props.is_dummy,
                             false,
                         );
+                        gsc.m_priority_queue
+                            .increment_scheduled_count(candidate_thread_id);
                         top_threads[core_id] = Some(candidate_thread_id);
                         if core_id < schedulers.len() {
                             let (mask, _prev_id) = schedulers[core_id]
@@ -1540,8 +1845,6 @@ impl KScheduler {
     pub fn wake_signaled_synchronization_threads(&mut self, process: &Arc<ProcessLock>) -> bool {
         let mut process = process.lock().unwrap();
         let mut woke_any = false;
-        let mut woke_ids = Vec::new();
-
         for thread_id in &process.thread_list {
             let Some(thread) = process.get_thread_by_thread_id(*thread_id) else {
                 continue;
@@ -1568,18 +1871,11 @@ impl KScheduler {
                 continue;
             };
 
-            let tid = thread.get_thread_id();
             thread.complete_synchronization_wait(
                 synced_index,
                 crate::hle::result::RESULT_SUCCESS.get_inner_value(),
             );
-            woke_ids.push(tid);
             woke_any = true;
-        }
-
-        // Push woken threads to PQ (they're now RUNNABLE).
-        for tid in woke_ids {
-            process.push_back_to_priority_queue(tid);
         }
 
         if woke_any {
@@ -1660,8 +1956,8 @@ impl KScheduler {
     fn select_next_thread_from_pq(&mut self, process: &Arc<ProcessLock>) -> Option<u64> {
         let process_guard = process.lock().unwrap();
         let gsc = process_guard.global_scheduler_context.as_ref()?;
-        let gsc_guard = gsc.lock().unwrap();
-        let next_thread_id = gsc_guard.get_scheduled_front(self.core_id)?;
+        let mut gsc_guard = gsc.lock().unwrap();
+        let next_thread_id = gsc_guard.get_scheduled_front_runnable(self.core_id)?;
 
         // Handle yield: if the current thread yielded, try the next one.
         if let Some(yielded) = self.yielded_thread_id {
@@ -1715,7 +2011,7 @@ impl KScheduler {
         // Switch to the target thread.
         let next_id = target.or(self.idle_thread_id);
         if let Some(next_id) = next_id {
-            self.switch_thread_impl(next_id);
+            self.switch_thread_impl(None, next_id);
         }
     }
 
@@ -1726,7 +2022,12 @@ impl KScheduler {
         self.state.needs_scheduling.store(false, Ordering::Relaxed);
         std::sync::atomic::fence(Ordering::SeqCst);
 
-        let cur_thread = self.current_thread.as_ref().and_then(Weak::upgrade);
+        // Upstream `ScheduleImpl()` reads `GetCurrentThreadPointer(kernel)`,
+        // i.e. the thread attached to the currently executing host fiber. Do
+        // not use `self.current_thread` here: if scheduler bookkeeping drifts,
+        // the `highest == current` fast path would return without yielding to
+        // the runnable fiber that should actually run.
+        let cur_thread = self.current_thread_for_scheduler_core();
         let highest = self.state.highest_priority_thread_id;
         let cur_thread_id = cur_thread
             .as_ref()
@@ -1743,6 +2044,17 @@ impl KScheduler {
         let target_id = target
             .as_ref()
             .map(|thread| thread.lock().unwrap().get_thread_id());
+        if should_log_sched_pick_for(&[cur_thread_id, highest, target_id]) {
+            log::warn!(
+                "[SCHED_PICK] impl core={} cur={:?} highest={:?} target={:?} interrupt={} needs={}",
+                self.core_id,
+                cur_thread_id,
+                highest,
+                target_id,
+                self.state.interrupt_task_runnable,
+                self.state.needs_scheduling.load(Ordering::Relaxed),
+            );
+        }
         if common::trace::is_enabled(common::trace::cat::SCHED_STATE)
             && (trace_tid_filter_matches(cur_thread_id)
                 || trace_tid_filter_matches(highest)
@@ -1791,6 +2103,18 @@ impl KScheduler {
         // If same as current, nothing to do.
         if let (Some(ref cur), Some(ref tgt)) = (&cur_thread, &target) {
             if Arc::ptr_eq(cur, tgt) {
+                // Upstream's scheduler current cannot drift away from the
+                // fiber-local current thread. In Rust, TLS/fiber handoff can
+                // recover a correct current thread while `self.current_thread`
+                // still names an older scheduled slot. Repair that bookkeeping
+                // before taking the fast path, otherwise CpuManager will see a
+                // permanent scheduler_current != running_fiber mismatch.
+                let cur_id = cur.lock().unwrap().get_thread_id();
+                if self.current_thread_id != Some(cur_id) {
+                    self.current_thread_id = Some(cur_id);
+                    self.current_thread = Some(Arc::downgrade(cur));
+                    super::kernel::set_current_emu_thread(Some(cur));
+                }
                 std::sync::atomic::fence(Ordering::SeqCst);
                 return;
             }
@@ -1825,8 +2149,30 @@ impl KScheduler {
         // even when highest is null (the switch fiber handles it by falling
         // through to the idle thread).
         if let (Some(ref from_ctx), Some(ref switch_fiber)) = (&yield_from, &self.switch_fiber) {
+            trace_sched_fiber_event(
+                8,
+                self.core_id,
+                cur_thread_id,
+                target.as_ref(),
+                true,
+                self.state.needs_scheduling.load(Ordering::Relaxed),
+            );
             Fiber::yield_to(Arc::downgrade(from_ctx), switch_fiber);
+            trace_sched_fiber_event(
+                9,
+                self.core_id,
+                cur_thread_id,
+                target.as_ref(),
+                true,
+                self.state.needs_scheduling.load(Ordering::Relaxed),
+            );
         }
+    }
+
+    fn resolve_highest_priority_thread_from_state(&self) -> Option<Arc<KThreadLock>> {
+        let id = self.state.highest_priority_thread_id?;
+        let gsc = self.global_scheduler_context.as_ref()?;
+        gsc.lock().unwrap().get_thread_by_thread_id(id)
     }
 
     /// Matches upstream `KScheduler::ScheduleImplFiber()` (k_scheduler.cpp:420-494).
@@ -1849,6 +2195,11 @@ impl KScheduler {
         }
 
         let cur_thread = self.switch_cur_thread.as_ref().and_then(Weak::upgrade);
+        // Upstream starts with m_switch_highest_priority_thread captured by
+        // ScheduleImpl(), and only refreshes m_state.highest_priority_thread
+        // after a retry. Keeping that handoff exact matters for fibers: the
+        // switch fiber must resume the thread selected for the yield that just
+        // transferred control here.
         let mut highest_priority_thread = self
             .switch_highest_priority_thread
             .as_ref()
@@ -1874,15 +2225,7 @@ impl KScheduler {
                 self.state.needs_scheduling.store(false, Ordering::Relaxed);
                 std::sync::atomic::fence(Ordering::SeqCst);
 
-                highest_priority_thread = if let Some(id) = self.state.highest_priority_thread_id {
-                    if let Some(ref gsc) = self.global_scheduler_context {
-                        gsc.lock().unwrap().get_thread_by_thread_id(id)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                highest_priority_thread = self.resolve_highest_priority_thread_from_state();
             }
             need_retry = false;
 
@@ -1897,6 +2240,29 @@ impl KScheduler {
                 continue;
             };
 
+            let loop_cur_id = cur_thread
+                .as_ref()
+                .map(|thread| thread.lock().unwrap().get_thread_id());
+            let hpt_id_for_trace = Some(hpt.lock().unwrap().get_thread_id());
+            if should_log_sched_pick_for(&[loop_cur_id, hpt_id_for_trace]) {
+                log::warn!(
+                    "[SCHED_PICK] loop core={} cur={:?} hpt={:?} retry={} hpt_has_ctx={} needs={}",
+                    self.core_id,
+                    loop_cur_id,
+                    hpt_id_for_trace,
+                    need_retry,
+                    hpt.lock().unwrap().get_host_context().is_some(),
+                    self.state.needs_scheduling.load(Ordering::Relaxed),
+                );
+            }
+            trace_sched_fiber_event(
+                10,
+                self.core_id,
+                loop_cur_id,
+                Some(hpt),
+                hpt.lock().unwrap().get_host_context().is_some(),
+                self.state.needs_scheduling.load(Ordering::Relaxed),
+            );
             // Try to lock the highest priority thread's context_guard.
             loop {
                 if Self::try_lock_thread_context(hpt) {
@@ -1911,10 +2277,20 @@ impl KScheduler {
             if need_retry {
                 continue;
             }
+            trace_sched_fiber_event(
+                11,
+                self.core_id,
+                cur_thread
+                    .as_ref()
+                    .map(|thread| thread.lock().unwrap().get_thread_id()),
+                Some(hpt),
+                hpt.lock().unwrap().get_host_context().is_some(),
+                self.state.needs_scheduling.load(Ordering::Relaxed),
+            );
 
             // Switch to the highest priority thread.
             let hpt_id = hpt.lock().unwrap().thread_id;
-            self.switch_thread_impl(hpt_id);
+            self.switch_thread_impl(cur_thread.as_ref(), hpt_id);
 
             // Check if we need scheduling again. If so, unlock and retry.
             if self.state.needs_scheduling.load(Ordering::SeqCst) {
@@ -1947,7 +2323,27 @@ impl KScheduler {
                         self.core_id,
                         hpt_id
                     );
+                    trace_sched_fiber_event(
+                        12,
+                        self.core_id,
+                        cur_thread
+                            .as_ref()
+                            .map(|thread| thread.lock().unwrap().get_thread_id()),
+                        Some(hpt),
+                        true,
+                        self.state.needs_scheduling.load(Ordering::Relaxed),
+                    );
                     Fiber::yield_to(Arc::downgrade(switch_fiber), ctx);
+                    trace_sched_fiber_event(
+                        13,
+                        self.core_id,
+                        cur_thread
+                            .as_ref()
+                            .map(|thread| thread.lock().unwrap().get_thread_id()),
+                        Some(hpt),
+                        true,
+                        self.state.needs_scheduling.load(Ordering::Relaxed),
+                    );
                 } else {
                     log::warn!(
                         "schedule_impl_fiber_loop: thread {} has no host_context",
@@ -1960,15 +2356,50 @@ impl KScheduler {
 
     /// Matches upstream `KScheduler::SwitchThread(KThread* next_thread)`.
     /// Updates CPU time tracking, previous thread, current thread.
-    fn switch_thread_impl(&mut self, next_thread_id: u64) {
-        let cur_thread_id = self.current_thread_id;
+    fn switch_thread_impl(
+        &mut self,
+        switch_cur_thread: Option<&Arc<KThreadLock>>,
+        next_thread_id: u64,
+    ) {
+        // Upstream `ScheduleImpl()` captures `m_switch_cur_thread` before
+        // yielding to the scheduler fiber, and `SwitchThread()` accounts CPU
+        // time/prev-thread against that same current thread. Rust fibers share
+        // OS-thread TLS, so recomputing the current thread here can observe a
+        // stale TLS value from another resumed fiber. Prefer the captured
+        // switch current when the scheduler fiber has one.
+        let cur_thread = switch_cur_thread
+            .cloned()
+            .or_else(|| self.current_thread_for_scheduler_core());
+        let cur_thread_id = cur_thread
+            .as_ref()
+            .map(|thread| thread.lock().unwrap().get_thread_id());
 
+        if should_log_sched_pick_for(&[cur_thread_id, Some(next_thread_id)]) {
+            log::warn!(
+                "[SCHED_PICK] switch core={} cur={:?} next={} prev={:?}",
+                self.core_id,
+                cur_thread_id,
+                next_thread_id,
+                self.state.prev_thread_id,
+            );
+        }
         log::trace!(
             "switch_thread_impl: cur={:?} next={} has_gsc={}",
             cur_thread_id,
             next_thread_id,
             self.global_scheduler_context.is_some()
         );
+
+        // Upstream `KScheduler::SwitchThread` first marks the target thread as
+        // resident on this scheduler's core, then returns early if the target
+        // is already current. Keep that order: a previous switch away may have
+        // cleared ruzu's Rust-only `current_core` marker.
+        if let Some(next) = self.resolve_thread_for_switch(next_thread_id) {
+            let mut next_guard = next.lock().unwrap();
+            if next_guard.get_current_core() != self.core_id {
+                next_guard.set_current_core(self.core_id);
+            }
+        }
 
         // If same thread, nothing to do.
         if Some(next_thread_id) == cur_thread_id {
@@ -2007,12 +2438,12 @@ impl KScheduler {
         self.last_context_switch_time = cur_tick;
 
         // Add CPU time to current thread.
-        if let Some(ref cur) = self.current_thread.as_ref().and_then(Weak::upgrade) {
+        if let Some(ref cur) = cur_thread {
             cur.lock().unwrap().add_cpu_time(self.core_id, tick_diff);
         }
 
         // Update previous thread.
-        if let Some(ref cur) = self.current_thread.as_ref().and_then(Weak::upgrade) {
+        if let Some(ref cur) = cur_thread {
             let cur_guard = cur.lock().unwrap();
             if !cur_guard.is_termination_requested() && cur_guard.get_active_core() == self.core_id
             {
@@ -2025,13 +2456,6 @@ impl KScheduler {
         // Set the new current thread.
         self.current_thread_id = Some(next_thread_id);
         if let Some(next) = self.resolve_thread_for_switch(next_thread_id) {
-            // Ensure the thread is on our core.
-            {
-                let mut next_guard = next.lock().unwrap();
-                if next_guard.get_current_core() != self.core_id {
-                    next_guard.set_current_core(self.core_id);
-                }
-            }
             // Upstream: SetCurrentThread(m_kernel, next_thread);
             super::kernel::set_current_emu_thread(Some(&next));
             self.current_thread = Some(Arc::downgrade(&next));

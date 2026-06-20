@@ -160,13 +160,16 @@ impl BufferQueueProducer {
     }
 
     fn signal_buffer_wait_event(&self) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNT: AtomicU64 = AtomicU64::new(0);
-        let n = COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 16 || n.is_power_of_two() {
-            log::info!("[BQP_SIGNAL] #{} signal_buffer_wait_event fired", n);
-        }
-        self.buffer_wait_event().signal();
+        let event = self.buffer_wait_event();
+        let readable_object_id = event.kernel_object_id().unwrap_or(0);
+        trace_bqp_ring(&[
+            20,
+            next_bqp_seq(),
+            readable_object_id,
+            u64::from(event.is_signaled()),
+            current_bqp_tid(),
+        ]);
+        event.signal();
     }
 
     fn wait_for_free_slot_then_relock<'a>(
@@ -277,6 +280,7 @@ impl BufferQueueProducer {
     pub fn request_buffer(&self, slot: i32) -> (Status, Option<Arc<GraphicBuffer>>) {
         record_bqp_event(BqpEvent::RequestBuffer);
         super::diagnostics::record_bqp("request_buffer", [slot as i64 as u64, 0, 0, 0, 0, 0]);
+        trace_bqp_ring(&[7, next_bqp_seq(), slot as i64 as u64, current_bqp_tid()]);
         trace_bqp(format_args!("BQP::request_buffer slot={}", slot));
         let mut inner = self.core.mutex.lock().unwrap();
         if inner.is_abandoned {
@@ -1418,7 +1422,13 @@ impl IBinder for BufferQueueProducer {
     }
 
     fn get_native_handle(&self, _type_id: u32) -> Option<Arc<Mutex<KReadableEvent>>> {
-        self.buffer_wait_event().readable_event()
+        let readable_event = self.buffer_wait_event().readable_event();
+        let readable_object_id = readable_event
+            .as_ref()
+            .map(|event| event.lock().unwrap().object_id)
+            .unwrap_or(0);
+        trace_bqp_ring(&[21, next_bqp_seq(), readable_object_id, current_bqp_tid()]);
+        readable_event
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1462,10 +1472,22 @@ impl IBinder for BufferQueueProducer {
             }
             event.attach_kernel_event_owner(
                 event_owner,
-                readable_event,
+                Arc::clone(&readable_event),
                 Arc::clone(&process),
                 Arc::clone(&scheduler),
             );
+            trace_bqp_ring(&[
+                22,
+                next_bqp_seq(),
+                event_object_id,
+                readable_event_object_id,
+                readable_event
+                    .lock()
+                    .unwrap()
+                    .is_signaled
+                    .load(Ordering::Relaxed) as u64,
+                current_bqp_tid(),
+            ]);
         }
     }
 }

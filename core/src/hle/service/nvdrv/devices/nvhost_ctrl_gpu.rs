@@ -54,6 +54,13 @@ pub struct IoctlGpuCharacteristics {
     pub gr_compbit_store_base_hw: u64,
 }
 const _: () = assert!(std::mem::size_of::<IoctlGpuCharacteristics>() == 160);
+const _: () = assert!(std::mem::offset_of!(IoctlGpuCharacteristics, twod_class) == 0x58);
+const _: () = assert!(std::mem::offset_of!(IoctlGpuCharacteristics, threed_class) == 0x5C);
+const _: () = assert!(std::mem::offset_of!(IoctlGpuCharacteristics, compute_class) == 0x60);
+const _: () = assert!(std::mem::offset_of!(IoctlGpuCharacteristics, gpfifo_class) == 0x64);
+const _: () =
+    assert!(std::mem::offset_of!(IoctlGpuCharacteristics, inline_to_memory_class) == 0x68);
+const _: () = assert!(std::mem::offset_of!(IoctlGpuCharacteristics, dma_copy_class) == 0x6C);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -207,6 +214,19 @@ impl NvHostCtrlGpu {
         Self::fill_gpu_characteristics(&mut params.gc);
         params.gpu_characteristics_buf_size = 0xA0;
         params.gpu_characteristics_buf_addr = 0xdeadbeef;
+        if std::env::var_os("RUZU_TRACE_NVHOST_CTRL_GPU_CHAR").is_some() {
+            log::info!(
+                "[NVHOST_CTRL_GPU_CHAR] size=0x{:X} addr=0x{:X} twod=0x{:04X} threed=0x{:04X} compute=0x{:04X} gpfifo=0x{:04X} inline=0x{:04X} dma=0x{:04X}",
+                params.gpu_characteristics_buf_size,
+                params.gpu_characteristics_buf_addr,
+                params.gc.twod_class,
+                params.gc.threed_class,
+                params.gc.compute_class,
+                params.gc.gpfifo_class,
+                params.gc.inline_to_memory_class,
+                params.gc.dma_copy_class
+            );
+        }
         NvResult::Success
     }
 

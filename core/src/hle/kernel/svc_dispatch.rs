@@ -731,7 +731,12 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::GetThreadContext3) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_thread::get_thread_context3(
+                system,
+                get_arg32(args, 0) as u64,
+                get_arg32(args, 1),
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::GetThreadList) => {
             // IN: out=arg32[1], max=arg32[2], debug=arg32[3]; OUT: ret=arg32[0], count=arg32[1]
@@ -1534,8 +1539,36 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
                 svc_processor::get_current_processor_number(system) as u64,
             );
         }
+        Some(SvcId::SetThreadActivity) => {
+            let result = match get_arg64(args, 1) as u32 {
+                0 => svc_activity::set_thread_activity(
+                    system,
+                    get_arg64(args, 0) as u32,
+                    crate::hle::kernel::svc::svc_types::ThreadActivity::Runnable,
+                ),
+                1 => svc_activity::set_thread_activity(
+                    system,
+                    get_arg64(args, 0) as u32,
+                    crate::hle::kernel::svc::svc_types::ThreadActivity::Paused,
+                ),
+                _ => crate::hle::kernel::svc::svc_results::RESULT_INVALID_ENUM_VALUE,
+            };
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::GetThreadContext3) => {
+            let result = svc_thread::get_thread_context3(
+                system,
+                get_arg64(args, 0),
+                get_arg64(args, 1) as u32,
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
         Some(SvcId::CloseHandle) => {
             let result = svc_synchronization::close_handle(system, get_arg64(args, 0) as u32);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::ResetSignal) => {
+            let result = svc_synchronization::reset_signal(system, get_arg64(args, 0) as u32);
             set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::GetSystemTick) => {
@@ -1864,7 +1897,7 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                                 use crate::arm::arm_interface::ThreadContext;
                                 let mut ctx = ThreadContext::default();
                                 jit.get_context(&mut ctx);
-                                (ctx.r[15] as u32, ctx.r[14] as u32)
+                                (ctx.pc, ctx.lr)
                             } else {
                                 (0, 0)
                             }
@@ -2089,17 +2122,20 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
         }
     }
 
-    // RUZU_TRACE_SVC_ERRVAL=0xNNNN — eprintln (level-independent) every SVC
-    // whose returned r0 equals the given result code. Used to find which SVC
-    // returns ResultInvalidHandle (0xE401) right before MK8D's boot-time
-    // SetTerminateResult + svcBreak abort (task #123). Entry args are
-    // captured in `args` (the caller's copy is untouched by the handler;
-    // `dispatch_args` carries the post-call values).
+    // RUZU_TRACE_SVC_ERRVAL=0xNNNN — non-blocking ring trace for every SVC
+    // whose returned r0 equals the requested result code. `RUZU_TRACE_INVALID_HANDLE_SVC`
+    // is a convenience alias for ResultInvalidHandle (0xE401).
     {
         fn svc_errval_target() -> Option<u64> {
             use std::sync::OnceLock;
             static CACHED: OnceLock<Option<u64>> = OnceLock::new();
             *CACHED.get_or_init(|| {
+                if std::env::var_os("RUZU_TRACE_INVALID_HANDLE_SVC").is_some() {
+                    return Some(
+                        crate::hle::kernel::svc::svc_results::RESULT_INVALID_HANDLE
+                            .get_inner_value() as u64,
+                    );
+                }
                 std::env::var("RUZU_TRACE_SVC_ERRVAL").ok().and_then(|s| {
                     let s = s.trim();
                     let s = s
@@ -2123,16 +2159,50 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                     dispatch_args[0],
                 );
             }
-            if dispatch_args[0] == target {
-                eprintln!(
-                    "[SVC_ERRVAL] tid={} core={} svc=0x{:02X} ret0=0x{:X} args_in=[0x{:X},0x{:X},0x{:X},0x{:X}] args_out=[0x{:X},0x{:X},0x{:X},0x{:X}]",
-                    tid, core_id, imm,
-                    dispatch_args[0],
-                    args[0], args[1], args[2], args[3],
-                    dispatch_args[1], dispatch_args[2],
-                    dispatch_args[3], dispatch_args[4]
+            if dispatch_args[0] == target
+                && common::trace::is_enabled(common::trace::cat::SVC_ERRVAL)
+            {
+                let (pc, lr) = if let Some(kernel) = system.kernel() {
+                    let core_index = kernel.current_physical_core_index() as usize;
+                    if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
+                        let process = process_arc.lock().unwrap();
+                        if let Some(jit) = process.get_arm_interface(core_index) {
+                            use crate::arm::arm_interface::ThreadContext;
+                            let mut ctx = ThreadContext::default();
+                            jit.get_context(&mut ctx);
+                            (ctx.pc, ctx.lr)
+                        } else {
+                            (0, 0)
+                        }
+                    } else {
+                        (0, 0)
+                    }
+                } else {
+                    (0, 0)
+                };
+                let name = SvcId::from_u32(imm)
+                    .map(|id| format!("{:?}", id))
+                    .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
+                let name_id = common::trace::intern_svc_name(&name);
+                common::trace::emit_raw(
+                    common::trace::cat::SVC_ERRVAL,
+                    &[
+                        target,
+                        tid.max(0) as u64,
+                        core_id as u64,
+                        name_id as u64,
+                        pc,
+                        lr,
+                        args[0],
+                        args[1],
+                        args[2],
+                        args[3],
+                        dispatch_args[0],
+                        dispatch_args[1],
+                        dispatch_args[2],
+                        dispatch_args[3],
+                    ],
                 );
-                super::handle_forensics::dump_for_handle(args[0]);
             }
         }
     }
@@ -2200,51 +2270,6 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                 dispatch_args[3],
             );
         }
-    }
-
-    fn trace_invalid_handle_svc_enabled() -> bool {
-        use std::sync::OnceLock;
-        static CACHED: OnceLock<bool> = OnceLock::new();
-        *CACHED.get_or_init(|| std::env::var_os("RUZU_TRACE_INVALID_HANDLE_SVC").is_some())
-    }
-    if trace_invalid_handle_svc_enabled()
-        && dispatch_args[0]
-            == crate::hle::kernel::svc::svc_results::RESULT_INVALID_HANDLE.get_inner_value() as u64
-    {
-        let (pc, lr) = if let Some(kernel) = system.kernel() {
-            let core_index = kernel.current_physical_core_index() as usize;
-            if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
-                let process = process_arc.lock().unwrap();
-                if let Some(jit) = process.get_arm_interface(core_index) {
-                    use crate::arm::arm_interface::ThreadContext;
-                    let mut ctx = ThreadContext::default();
-                    jit.get_context(&mut ctx);
-                    (ctx.r[15] as u32, ctx.r[14] as u32)
-                } else {
-                    (0, 0)
-                }
-            } else {
-                (0, 0)
-            }
-        } else {
-            (0, 0)
-        };
-        let name = SvcId::from_u32(imm)
-            .map(|id| format!("{:?}", id))
-            .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
-        log::warn!(
-            "[INVALID_HANDLE_SVC] tid={} core={} svc={} imm=0x{:02X} pc=0x{:08X} lr=0x{:08X} ret=[0x{:X},0x{:X},0x{:X},0x{:X}]",
-            tid,
-            core_id,
-            name,
-            imm,
-            pc,
-            lr,
-            dispatch_args[0],
-            dispatch_args[1],
-            dispatch_args[2],
-            dispatch_args[3],
-        );
     }
 
     if let Some(kernel) = system.kernel() {

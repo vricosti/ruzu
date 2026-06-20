@@ -15,6 +15,25 @@ fn should_trace_sync_debug() -> bool {
     std::env::var_os("RUZU_TRACE_SYNC").is_some()
 }
 
+fn lock_trace_target() -> Option<u64> {
+    use std::sync::OnceLock;
+    static TARGET: OnceLock<Option<u64>> = OnceLock::new();
+    *TARGET.get_or_init(|| {
+        let raw = std::env::var("RUZU_TRACE_LOCK_ADDR").ok()?;
+        let trimmed = raw.trim();
+        let trimmed = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        u64::from_str_radix(trimmed, 16).ok()
+    })
+}
+
+fn should_trace_lock_pi_addr(address: u64) -> bool {
+    common::trace::is_enabled(common::trace::cat::LOCK_PI)
+        && lock_trace_target().map_or(true, |target| target == address)
+}
+
 fn should_trace_sync_backtrace_once(tid: u64) -> bool {
     static DID_TRACE_TID73_LOCK: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -104,6 +123,203 @@ pub fn arbitrate_lock(
     let Some(current_thread) = system.current_thread() else {
         return RESULT_INVALID_HANDLE;
     };
+    if should_trace_lock_pi_addr(address) {
+        let (tid, tls_base, tpidr_el0) = {
+            let thread = current_thread.lock().unwrap();
+            (
+                thread.get_thread_id(),
+                thread.get_tls_address().get(),
+                thread.get_tpidr_el0(),
+            )
+        };
+        let (thread_type, tls_handle) = {
+            let process = system.current_process_arc().lock().unwrap();
+            let is_64bit = process.is_64bit();
+            process
+                .get_memory()
+                .map(|memory| {
+                    let memory = memory.lock().unwrap();
+                    if is_64bit {
+                        let thread_type =
+                            if memory.is_valid_virtual_address_range(tls_base + 0x1f8, 8) {
+                                memory.read_64(tls_base + 0x1f8)
+                            } else {
+                                0
+                            };
+                        let tls_handle = if thread_type != 0
+                            && memory.is_valid_virtual_address_range(thread_type + 0x1b0, 4)
+                        {
+                            memory.read_32(thread_type + 0x1b0)
+                        } else {
+                            0
+                        };
+                        (thread_type, tls_handle)
+                    } else {
+                        let thread_type =
+                            if memory.is_valid_virtual_address_range(tls_base + 0x1fc, 4) {
+                                memory.read_32(tls_base + 0x1fc) as u64
+                            } else {
+                                0
+                            };
+                        let tls_handle = if thread_type != 0
+                            && memory.is_valid_virtual_address_range(thread_type + 0x26, 2)
+                        {
+                            let version = memory.read_16(thread_type + 0x26);
+                            let handle_addr = if version == 1 {
+                                thread_type + 0xe4
+                            } else {
+                                thread_type + 0xe8
+                            };
+                            if memory.is_valid_virtual_address_range(handle_addr, 4) {
+                                memory.read_32(handle_addr)
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        (thread_type, tls_handle)
+                    }
+                })
+                .unwrap_or((0, 0))
+        };
+        let (owner_tid, tag_tid, current_handle, owner_object_id, tag_object_id) = {
+            let process = system.current_process_arc().lock().unwrap();
+            let owner_object_id = process.handle_table.get_object(thread_handle);
+            let owner_tid = owner_object_id
+                .and_then(|object_id| process.get_thread_by_object_id(object_id))
+                .map(|thread| thread.lock().unwrap().get_thread_id())
+                .unwrap_or(0);
+            let tag_object_id = process.handle_table.get_object(tag as Handle);
+            let tag_tid = tag_object_id
+                .and_then(|object_id| process.get_thread_by_object_id(object_id))
+                .map(|thread| thread.lock().unwrap().get_thread_id())
+                .unwrap_or(0);
+            let current_handle = process
+                .handle_table
+                .entry_infos
+                .iter()
+                .enumerate()
+                .find_map(|(index, info)| {
+                    let linear_id = unsafe { info.linear_id };
+                    if linear_id == 0 {
+                        return None;
+                    }
+                    let candidate =
+                        crate::hle::kernel::k_handle_table::encode_handle(index as u16, linear_id);
+                    let object_id = process.handle_table.get_object(candidate)?;
+                    let thread = process.get_thread_by_object_id(object_id)?;
+                    (thread.lock().unwrap().get_thread_id() == tid).then_some(candidate)
+                })
+                .unwrap_or(0);
+            (
+                owner_tid,
+                tag_tid,
+                current_handle,
+                owner_object_id.unwrap_or(0),
+                tag_object_id.unwrap_or(0),
+            )
+        };
+        common::trace::emit_raw(
+            common::trace::cat::LOCK_PI,
+            &[
+                22,
+                tid,
+                address,
+                thread_handle as u64,
+                tag as u64,
+                tls_handle as u64,
+                owner_tid,
+                tag_tid,
+                current_handle as u64,
+                tpidr_el0,
+                RESULT_SUCCESS.get_inner_value() as u64,
+                owner_object_id,
+                tag_object_id,
+                tls_base,
+            ],
+        );
+        if tag == 0 {
+            common::trace::emit_raw(
+                common::trace::cat::LOCK_PI,
+                &[
+                    18,
+                    tid,
+                    address,
+                    thread_handle as u64,
+                    tag as u64,
+                    tls_handle as u64,
+                    thread_type,
+                    tls_base,
+                    0,
+                    tpidr_el0,
+                    RESULT_SUCCESS.get_inner_value() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            );
+        } else if tls_handle != 0 && tag != tls_handle {
+            let (pc, lr, sp, x0, x1, x2, x20, jit_tpidrro) = {
+                let core_index = current_thread.lock().unwrap().get_current_core().max(0) as usize;
+                let process = system.current_process_arc().lock().unwrap();
+                if let Some(cpu) = process.get_arm_interface(core_index) {
+                    let mut ctx = crate::arm::arm_interface::ThreadContext::default();
+                    cpu.get_context(&mut ctx);
+                    (
+                        ctx.pc,
+                        ctx.lr,
+                        ctx.sp,
+                        ctx.r[0],
+                        ctx.r[1],
+                        ctx.r[2],
+                        ctx.r[20],
+                        cpu.get_tpidrro_el0(),
+                    )
+                } else {
+                    (0, 0, 0, 0, 0, 0, 0, 0)
+                }
+            };
+            common::trace::emit_raw(
+                common::trace::cat::LOCK_PI,
+                &[
+                    19,
+                    tid,
+                    address,
+                    thread_handle as u64,
+                    tag as u64,
+                    tls_handle as u64,
+                    thread_type,
+                    tls_base,
+                    0,
+                    tpidr_el0,
+                    RESULT_SUCCESS.get_inner_value() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            );
+            common::trace::emit_raw(
+                common::trace::cat::LOCK_PI,
+                &[
+                    23,
+                    tid,
+                    address,
+                    thread_handle as u64,
+                    tag as u64,
+                    tls_handle as u64,
+                    pc,
+                    lr,
+                    sp,
+                    x0,
+                    x1,
+                    x2,
+                    x20,
+                    jit_tpidrro,
+                ],
+            );
+        }
+    }
 
     let result = KConditionVariable::wait_for_address(
         system.current_process_arc(),
