@@ -1009,8 +1009,9 @@ fn send_sync_request_impl(
     context.set_service_manager(service_manager);
 
     let trace_svc_ipc = std::env::var_os("RUZU_TRACE_SVC_IPC").is_some();
+    let dump_ssr = std::env::var_os("RUZU_DUMP_SSR").is_some();
     let trace_handler_context =
-        (log::log_enabled!(log::Level::Trace) || trace_svc_ipc).then(|| {
+        (log::log_enabled!(log::Level::Trace) || trace_svc_ipc || dump_ssr).then(|| {
             let manager = request_manager.lock().unwrap();
             let handler_name = manager
                 .session_handler()
@@ -1029,6 +1030,21 @@ fn send_sync_request_impl(
             is_domain,
             context.get_command(),
         );
+        if dump_ssr {
+            let svc_id = common::trace::intern_service(session_handler_name);
+            common::trace::emit(
+                common::trace::cat::SSR_IPC,
+                &[
+                    0, // stage: enter
+                    system.current_thread_id().unwrap_or(0),
+                    session_handle as u64,
+                    context.get_command() as u64,
+                    context.get_command_type() as u64,
+                    0, // result: n/a on enter
+                    svc_id as u64,
+                ],
+            );
+        }
     }
     // Env-gated SVC-level trace: every SendSyncRequest with ASCII-decoded
     // request TLS preview. Useful when an IPC is suspected lost between libnx
@@ -1198,6 +1214,12 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
         None
     };
 
+    let dump_ssr = std::env::var_os("RUZU_DUMP_SSR").is_some();
+    let ssr_tid = if dump_ssr {
+        system.current_thread_id().unwrap_or(0)
+    } else {
+        0
+    };
     let result = if std::env::var_os("RUZU_PROFILE_IPC").is_some() {
         // `RUZU_PROFILE_IPC=1` — measure wall-clock time per SendSyncRequest
         // and dump a per-handle histogram (count, total_us, avg_us, max_us)
@@ -1214,6 +1236,21 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
     if let Some(req) = diff_capture_req {
         let rsp = read_tls_bytes(system, tls_address, 256);
         record_ipc_diff(session_handle, &req, &rsp, result);
+    }
+
+    if dump_ssr {
+        common::trace::emit(
+            common::trace::cat::SSR_IPC,
+            &[
+                1, // stage: exit
+                ssr_tid,
+                session_handle as u64,
+                0, // cmd: n/a on exit
+                0, // cmd_type: n/a on exit
+                result.get_inner_value() as u64,
+                0, // service_name_id: n/a on exit
+            ],
+        );
     }
 
     yield_after_inline_ipc_if_requested(system);
