@@ -130,6 +130,9 @@ pub trait ArmInterface: Send {
     fn get_context(&self, ctx: &mut ThreadContext);
     fn set_context(&mut self, ctx: &ThreadContext);
     fn set_tpidrro_el0(&mut self, value: u64);
+    fn get_tpidrro_el0(&self) -> u64 {
+        0
+    }
 
     fn get_svc_arguments(&self, args: &mut [u64; 8]);
     fn set_svc_arguments(&mut self, args: &[u64; 8]);

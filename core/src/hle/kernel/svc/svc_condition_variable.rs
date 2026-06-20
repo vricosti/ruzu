@@ -9,6 +9,52 @@ use crate::hle::kernel::k_memory_layout::is_kernel_address;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::result::ResultCode;
 
+fn trace_lock_addr_target() -> Option<u64> {
+    let raw = std::env::var("RUZU_TRACE_LOCK_ADDR").ok()?;
+    let trimmed = raw.trim();
+    let trimmed = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    u64::from_str_radix(trimmed, 16).ok()
+}
+
+fn should_trace_wait_process_wide_key(address: u64, cv_key: u64) -> bool {
+    common::trace::is_enabled(common::trace::cat::LOCK_PI)
+        && trace_lock_addr_target().map_or(true, |target| target == address || target == cv_key)
+}
+
+fn trace_wait_process_wide_key(
+    stage: u64,
+    tid: u64,
+    core: u64,
+    address: u64,
+    cv_key: u64,
+    tag: u32,
+    timeout_ns: i64,
+    result: ResultCode,
+) {
+    common::trace::emit_raw(
+        common::trace::cat::LOCK_PI,
+        &[
+            stage,
+            tid,
+            address,
+            0,
+            tag as u64,
+            0,
+            core,
+            cv_key,
+            0,
+            timeout_ns as u64,
+            result.get_inner_value() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+}
+
 /// Wait process wide key atomic.
 pub fn wait_process_wide_key_atomic(
     system: &System,
@@ -21,43 +67,70 @@ pub fn wait_process_wide_key_atomic(
         "svc::WaitProcessWideKeyAtomic called address=0x{:X}, cv_key=0x{:X}, tag=0x{:08X}, timeout_ns={}",
         address, cv_key, tag, timeout_ns
     );
-    log::info!(
+    let entry_tid = system.current_thread_id().unwrap_or(0);
+    let entry_core = system
+        .kernel()
+        .map(|kernel| kernel.current_physical_core_index() as u64)
+        .unwrap_or(0);
+    log::trace!(
         "WaitProcessWideKeyAtomic tid={} core={} address=0x{:X} cv_key=0x{:X} tag=0x{:08X} timeout_ns={}",
-        system.current_thread_id().unwrap_or(0),
-        system
-            .kernel()
-            .map(|kernel| kernel.current_physical_core_index())
-            .unwrap_or(0),
+        entry_tid,
+        entry_core,
         address,
         cv_key,
         tag,
         timeout_ns
     );
+    let trace_wait = should_trace_wait_process_wide_key(address, cv_key);
+    if trace_wait {
+        trace_wait_process_wide_key(
+            20,
+            entry_tid,
+            entry_core,
+            address,
+            cv_key,
+            tag,
+            timeout_ns,
+            crate::hle::result::RESULT_SUCCESS,
+        );
+    }
 
     // Validate input.
     if is_kernel_address(address as usize) {
+        if trace_wait {
+            trace_wait_process_wide_key(
+                21,
+                entry_tid,
+                entry_core,
+                address,
+                cv_key,
+                tag,
+                timeout_ns,
+                RESULT_INVALID_CURRENT_MEMORY,
+            );
+        }
         return RESULT_INVALID_CURRENT_MEMORY;
     }
     if address % 4 != 0 {
+        if trace_wait {
+            trace_wait_process_wide_key(
+                21,
+                entry_tid,
+                entry_core,
+                address,
+                cv_key,
+                tag,
+                timeout_ns,
+                RESULT_INVALID_ADDRESS,
+            );
+        }
         return RESULT_INVALID_ADDRESS;
     }
 
     // Convert timeout from nanoseconds to ticks.
     // Upstream: kernel.HardwareTimer().GetTick() + offset_tick + 2
     let timeout: i64 = if timeout_ns > 0 {
-        // DEBUG EXPERIMENT (RUZU_CV_TIMEOUT_MULT=N): scale the timed-CV-wait
-        // timeout. Tests the hypothesis that ruzu's wakeup latency makes timed
-        // waits spuriously TIME OUT where they should be SIGNALED, breaking the
-        // MK8D tid=75/82/83 handshake. If MK8D progresses past the wedge with a
-        // large multiplier, the root is timing/latency (not a data divergence).
-        // Gated/reversible — no effect when unset.
-        let offset_tick = match std::env::var("RUZU_CV_TIMEOUT_MULT")
-            .ok()
-            .and_then(|s| s.trim().parse::<i64>().ok())
-        {
-            Some(mult) if mult > 1 => timeout_ns.saturating_mul(mult),
-            _ => timeout_ns,
-        };
+        let offset_tick = timeout_ns;
         if offset_tick > 0 {
             let hardware_tick = system
                 .kernel()
@@ -77,6 +150,18 @@ pub fn wait_process_wide_key_atomic(
     };
 
     let Some(current_thread) = system.current_thread() else {
+        if trace_wait {
+            trace_wait_process_wide_key(
+                21,
+                entry_tid,
+                entry_core,
+                address,
+                cv_key,
+                tag,
+                timeout_ns,
+                RESULT_INVALID_HANDLE,
+            );
+        }
         return RESULT_INVALID_HANDLE;
     };
 
@@ -97,6 +182,18 @@ pub fn wait_process_wide_key_atomic(
         aligned_cv_key,
         result
     );
+    if trace_wait {
+        trace_wait_process_wide_key(
+            21,
+            entry_tid,
+            entry_core,
+            address,
+            aligned_cv_key,
+            tag,
+            timeout_ns,
+            ResultCode::new(result),
+        );
+    }
 
     ResultCode::new(result)
 }
@@ -108,7 +205,7 @@ pub fn signal_process_wide_key(system: &System, cv_key: u64, count: i32) {
         cv_key,
         count
     );
-    log::info!(
+    log::trace!(
         "SignalProcessWideKey tid={} core={} cv_key=0x{:X} count={}",
         system.current_thread_id().unwrap_or(0),
         system

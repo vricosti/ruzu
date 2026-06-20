@@ -369,23 +369,34 @@ impl MacroEngine {
             return;
         }
 
-        let mut mid_method = None;
-        let code_for_compile = if let Some(code) = self.uploaded_macro_code.get(&method) {
-            code.clone()
+        let mid_method = if !self.uploaded_macro_code.contains_key(&method) {
+            self.uploaded_macro_code
+                .iter()
+                .find_map(|(&method_base, code)| {
+                    (method >= method_base && (method - method_base) < code.len() as u32)
+                        .then_some(method_base)
+                })
         } else {
-            for (&method_base, code) in &self.uploaded_macro_code {
-                if method >= method_base && (method - method_base) < code.len() as u32 {
-                    mid_method = Some(method_base);
-                    break;
-                }
-            }
-            let method_base = mid_method.expect("Macro was not uploaded");
+            None
+        };
+        if !self.uploaded_macro_code.contains_key(&method) && mid_method.is_none() {
+            panic!("Macro 0x{method:x} was not uploaded");
+        }
+
+        let code_for_compile = if let Some(method_base) = mid_method {
             let macro_cached = self
                 .uploaded_macro_code
                 .get(&method_base)
                 .expect("mid_method base must exist");
             let rebased_method = (method - method_base) as usize;
-            macro_cached[rebased_method..].to_vec()
+            let code = macro_cached[rebased_method..].to_vec();
+            self.uploaded_macro_code.insert(method, code.clone());
+            code
+        } else {
+            self.uploaded_macro_code
+                .get(&method)
+                .expect("method existence checked above")
+                .clone()
         };
         let hash = hash_macro_code(&code_for_compile);
         if method == 0x14F || std::env::var_os("RUZU_TRACE_MACRO_FLOW").is_some() {
@@ -403,7 +414,7 @@ impl MacroEngine {
                 .take(8)
                 .map(|w| format!("0x{:08X},", w))
                 .collect();
-            eprintln!(
+            log::info!(
                 "[MACRO_HASH] method=0x{:X} len={} hash=0x{:016X} first8=[{}]",
                 method,
                 code_for_compile.len(),
@@ -519,10 +530,9 @@ mod tests {
     fn macro_engine_clear_code() {
         let mut engine = MacroEngine::new();
         engine.add_code(0x100, 0xDEADBEEF);
-        engine.add_code(0x101, 0xCAFEBABE);
+        engine.add_code(0x100, 0xCAFEBABE);
         engine.clear_code(0x100);
         assert!(!engine.uploaded_macro_code.contains_key(&0x100));
-        assert!(engine.uploaded_macro_code.contains_key(&0x101));
     }
 
     #[test]
@@ -549,6 +559,32 @@ mod tests {
         );
 
         assert_eq!(&*captured.lock().unwrap(), &[0x22222222, 0x33333333]);
+    }
+
+    #[test]
+    fn macro_engine_execute_uses_exact_method_blob_without_contiguous_merge() {
+        let mut engine = MacroEngine::new();
+        engine.add_code(0x100, 0x11111111);
+        engine.add_code(0x101, 0x22222222);
+        engine.add_code(0x102, 0x33333333);
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_compile = std::sync::Arc::clone(&captured);
+        engine.execute(
+            0x100,
+            &[0],
+            || {},
+            move |code| {
+                *captured_compile.lock().unwrap() = code.to_vec();
+                struct NoopMacro;
+                impl CachedMacro for NoopMacro {
+                    fn execute(&mut self, _parameters: &[u32], _method: u32) {}
+                }
+                Box::new(NoopMacro)
+            },
+        );
+
+        assert_eq!(&*captured.lock().unwrap(), &[0x11111111]);
     }
 
     #[test]

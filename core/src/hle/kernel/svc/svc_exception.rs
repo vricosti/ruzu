@@ -180,6 +180,101 @@ pub fn break64_from_32(system: &System, reason: u32, arg: u32, size: u32, args: 
 
 /// Upstream `Break64` wrapper.
 pub fn break64(system: &System, reason: u32, arg: u64, size: u64) {
+    if common::trace::is_enabled(common::trace::cat::A64_BREAK_CTX) {
+        let core = system
+            .kernel()
+            .map(|kernel| kernel.current_physical_core_index() as usize)
+            .unwrap_or(0);
+        let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+        let pc = crate::hle::kernel::kernel::GUEST_PC
+            .get(core)
+            .map(|value| value.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(0);
+        let lr = crate::hle::kernel::kernel::GUEST_LR
+            .get(core)
+            .map(|value| value.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(0);
+        let sp = crate::hle::kernel::kernel::GUEST_SP
+            .get(core)
+            .map(|value| value.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(0);
+        common::trace::emit_raw(
+            common::trace::cat::A64_BREAK_CTX,
+            &[
+                0,
+                reason as u64,
+                core as u64,
+                tid,
+                pc,
+                lr,
+                sp,
+                arg,
+                size,
+                reason as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        if let Some(memory) = system.get_svc_memory() {
+            let memory = memory.lock().unwrap();
+            for offset in (0..0x100).step_by(0x20) {
+                let base = sp + offset;
+                common::trace::emit_raw(
+                    common::trace::cat::A64_BREAK_CTX,
+                    &[
+                        1,
+                        base,
+                        memory.read_64(base),
+                        memory.read_64(base + 8),
+                        memory.read_64(base + 16),
+                        memory.read_64(base + 24),
+                    ],
+                );
+            }
+            if arg != 0 {
+                for offset in (0..0x80).step_by(0x20) {
+                    let base = arg + offset;
+                    if memory.is_valid_virtual_address_range(base, 0x20) {
+                        let values = [
+                            memory.read_64(base),
+                            memory.read_64(base + 8),
+                            memory.read_64(base + 16),
+                            memory.read_64(base + 24),
+                        ];
+                        common::trace::emit_raw(
+                            common::trace::cat::A64_BREAK_CTX,
+                            &[2, base, values[0], values[1], values[2], values[3]],
+                        );
+                        for &ptr in &values {
+                            if ptr == 0 || !memory.is_valid_virtual_address_range(ptr, 1) {
+                                continue;
+                            }
+                            let mut raw = [0u64; 4];
+                            let mut len = 0usize;
+                            for index in 0..32usize {
+                                if !memory.is_valid_virtual_address_range(ptr + index as u64, 1) {
+                                    break;
+                                }
+                                let byte = memory.read_8(ptr + index as u64);
+                                raw[index / 8] |= (byte as u64) << ((index % 8) * 8);
+                                len += 1;
+                                if byte == 0 {
+                                    break;
+                                }
+                            }
+                            common::trace::emit_raw(
+                                common::trace::cat::A64_BREAK_CTX,
+                                &[3, ptr, len as u64, raw[0], raw[1], raw[2], raw[3]],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    dump_a64_break_context(system, arg, size);
     log::error!(
         "!!! svcBreak(reason={:#x}, info1={:#x}, info2={:#x}) - GAME ABORTED !!!",
         reason,
@@ -187,6 +282,133 @@ pub fn break64(system: &System, reason: u32, arg: u64, size: u64) {
         size
     );
     break_execution(system, reason, arg, size);
+}
+
+fn dump_a64_break_context(system: &System, info1: u64, info2: u64) {
+    if std::env::var_os("RUZU_DUMP_BREAK_STACK").is_none() {
+        return;
+    }
+
+    let Some(kernel) = system.kernel() else {
+        return;
+    };
+    let core_index = kernel.current_physical_core_index() as usize;
+    let Some(process_arc) = system.current_process_arc.as_ref().cloned() else {
+        return;
+    };
+    let process = process_arc.lock().unwrap();
+    let Some(jit) = process.get_arm_interface(core_index) else {
+        return;
+    };
+
+    let mut ctx = crate::arm::arm_interface::ThreadContext::default();
+    jit.get_context(&mut ctx);
+    log::error!("=== A64 GUEST REGISTER DUMP AT BREAK ===");
+    log::error!(
+        "  break_pc=0x{:016X} break_lr=0x{:016X} break_sp=0x{:016X} break_fp=0x{:016X} core={}",
+        ctx.pc,
+        ctx.lr,
+        ctx.sp,
+        ctx.fp,
+        core_index
+    );
+    for index in 0..8 {
+        log::error!("  x{:2} = 0x{:016X}", index, ctx.r[index]);
+    }
+    for index in 19..=28 {
+        log::error!("  x{:2} = 0x{:016X}", index, ctx.r[index]);
+    }
+
+    let backtrace = crate::arm::debug::get_backtrace_from_context(&process, &ctx);
+    for (index, entry) in backtrace.iter().enumerate().take(32) {
+        log::error!(
+            "  break_bt[{}] addr=0x{:016X} orig=0x{:016X} module={} name={} offset=0x{:X}",
+            index,
+            entry.address,
+            entry.original_address,
+            entry.module,
+            entry.name,
+            entry.offset,
+        );
+    }
+
+    if info1 != 0 && info2 > 0 && info2 < 0x200 {
+        let len = info2 as usize;
+        let memory = process.get_shared_memory();
+        let mem = memory.read().unwrap();
+        if mem.is_valid_range(info1, len) {
+            let mut hexdump = String::new();
+            for index in 0..len {
+                let byte = mem.read_8(info1 + index as u64);
+                hexdump.push_str(&format!("{:02X} ", byte));
+            }
+            log::error!("  break_debug_buffer={}", hexdump.trim_end());
+        }
+    }
+
+    dump_a64_stack_scan(&process, ctx.sp);
+}
+
+fn dump_a64_stack_scan(process: &crate::hle::kernel::k_process::KProcess, sp: u64) {
+    const STACK_SCAN_BYTES: usize = 0x400;
+    const STACK_DUMP_BYTES: usize = 0x100;
+
+    let memory = process.get_shared_memory();
+    let mem = memory.read().unwrap();
+    if !mem.is_valid_range(sp, 8) {
+        log::error!("  break_stack: sp=0x{:016X} is not mapped", sp);
+        return;
+    }
+
+    let dump_len = (0..STACK_DUMP_BYTES)
+        .step_by(8)
+        .take_while(|offset| mem.is_valid_range(sp + *offset as u64, 8))
+        .count()
+        * 8;
+    log::error!(
+        "  break_stack_qwords sp=0x{:016X} dump_len=0x{:X}",
+        sp,
+        dump_len
+    );
+    for offset in (0..dump_len).step_by(0x20) {
+        let mut values = [0u64; 4];
+        for (index, value) in values.iter_mut().enumerate() {
+            let addr = sp + offset as u64 + (index as u64 * 8);
+            if mem.is_valid_range(addr, 8) {
+                *value = mem.read_64(addr);
+            }
+        }
+        log::error!(
+            "  stack[+0x{:03X}] {:016X} {:016X} {:016X} {:016X}",
+            offset,
+            values[0],
+            values[1],
+            values[2],
+            values[3]
+        );
+    }
+
+    for offset in (0..STACK_SCAN_BYTES).step_by(8) {
+        let addr = sp + offset as u64;
+        if !mem.is_valid_range(addr, 8) {
+            break;
+        }
+        let value = mem.read_64(addr);
+        if looks_like_animus_code_address(value) {
+            log::error!(
+                "  stack_code_candidate sp+0x{:03X}=0x{:016X}",
+                offset,
+                value
+            );
+        }
+    }
+}
+
+fn looks_like_animus_code_address(value: u64) -> bool {
+    // ANIMUS' executable NSOs observed in this investigation are mapped in
+    // the 0x8000_0000..0x8520_0000 region. Keep the check deliberately broad
+    // so this diagnostic still works across ASLR-disabled local runs.
+    (0x8000_0000..0x8600_0000).contains(&value)
 }
 
 fn dump_a32_break_context(system: &System, info1: u64, info2: u64, args: &[u64]) {

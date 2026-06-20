@@ -100,6 +100,14 @@ pub fn get_random_value<T: Into<u64> + TryFrom<u64> + Copy>(min: T, max: T) -> T
     T::try_from(val).unwrap_or(min)
 }
 
+/// Generate a random value in [0, max].
+///
+/// Matches upstream `MiiUtil::GetRandomValue(T max)`, which forwards to the
+/// two-argument overload with an inclusive upper bound.
+pub fn get_random_value_max<T: Into<u64> + TryFrom<u64> + Copy + Default>(max: T) -> T {
+    get_random_value(T::default(), max)
+}
+
 /// Check if a font region is valid for the given text.
 /// Upstream always returns true (TODO: check against font tables).
 pub fn is_font_region_valid(_font: super::mii_types::FontRegion, _text: &[u16]) -> bool {

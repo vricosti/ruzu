@@ -61,15 +61,22 @@ pub fn dump(reason: &str) {
         return;
     };
     let history = history.lock().unwrap();
-    eprintln!(
+    log::info!(
         "[NVNFLINGER_HISTORY] reason={} events={}",
         reason,
         history.len()
     );
     for event in history.iter() {
-        eprintln!(
+        log::info!(
             "[NVNFLINGER_HISTORY] #{:05} {} a=0x{:X} b=0x{:X} c=0x{:X} d=0x{:X} e=0x{:X} f=0x{:X}",
-            event.sequence, event.kind, event.a, event.b, event.c, event.d, event.e, event.f,
+            event.sequence,
+            event.kind,
+            event.a,
+            event.b,
+            event.c,
+            event.d,
+            event.e,
+            event.f,
         );
     }
 }

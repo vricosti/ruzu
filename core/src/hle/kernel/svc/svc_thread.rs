@@ -241,6 +241,88 @@ fn resolve_current_thread(system: &System) -> Option<Arc<KThreadLock>> {
     system.current_thread()
 }
 
+fn trace_thread_core_mask(
+    stage: u64,
+    caller_tid: u64,
+    target: Option<&Arc<KThreadLock>>,
+    handle: Handle,
+    core_id: i32,
+    affinity_mask: u64,
+    result: ResultCode,
+) {
+    if !common::trace::is_enabled(common::trace::cat::THREAD_CORE_MASK) {
+        return;
+    }
+    let (target_tid, state, active_core, current_core, pinned, waiter_count) =
+        if let Some(thread) = target {
+            let thread = thread.lock().unwrap();
+            (
+                thread.get_thread_id(),
+                thread.get_raw_state().bits() as u64,
+                thread.get_active_core() as u64,
+                thread.get_current_core() as u64,
+                thread.stack_parameters.is_pinned as u64,
+                thread.pinned_waiter_list.len() as u64,
+            )
+        } else {
+            (0, 0, u64::MAX, u64::MAX, 0, 0)
+        };
+    common::trace::emit_raw(
+        common::trace::cat::THREAD_CORE_MASK,
+        &[
+            stage,
+            caller_tid,
+            target_tid,
+            handle as u64,
+            core_id as u32 as u64,
+            affinity_mask,
+            state,
+            active_core,
+            current_core,
+            result.get_inner_value() as u64,
+            pinned,
+            waiter_count,
+        ],
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_create_thread(
+    stage: u64,
+    caller_tid: u64,
+    entry_point: u64,
+    arg: u64,
+    stack_bottom: u64,
+    priority: i32,
+    requested_core_id: i32,
+    effective_core_id: i32,
+    process_core_mask: u64,
+    result: ResultCode,
+    out_handle: Handle,
+    extra: u64,
+) {
+    if !common::trace::is_enabled(common::trace::cat::CREATE_THREAD) {
+        return;
+    }
+    common::trace::emit_raw(
+        common::trace::cat::CREATE_THREAD,
+        &[
+            stage,
+            caller_tid,
+            entry_point,
+            arg,
+            stack_bottom,
+            priority as u32 as u64,
+            requested_core_id as u32 as u64,
+            effective_core_id as u32 as u64,
+            process_core_mask,
+            result.get_inner_value() as u64,
+            out_handle as u64,
+            extra,
+        ],
+    );
+}
+
 /// Creates a new thread.
 pub fn create_thread(
     system: &System,
@@ -252,6 +334,21 @@ pub fn create_thread(
     mut core_id: i32,
 ) -> ResultCode {
     let requested_core_id = core_id;
+    let caller_tid = system.current_thread_id().unwrap_or(0);
+    trace_create_thread(
+        1,
+        caller_tid,
+        entry_point,
+        arg,
+        stack_bottom,
+        priority,
+        requested_core_id,
+        core_id,
+        0,
+        RESULT_SUCCESS,
+        0,
+        0,
+    );
     log::debug!(
         "svc::CreateThread called entry=0x{:08X}, arg=0x{:08X}, stack=0x{:08X}, prio={}, core={}",
         entry_point,
@@ -293,17 +390,74 @@ pub fn create_thread(
         if core_id == IDEAL_CORE_USE_PROCESS_VALUE {
             core_id = process.get_ideal_core_id();
         }
+        let process_core_mask = process.get_core_mask();
 
         if !is_valid_virtual_core_id(core_id) {
+            trace_create_thread(
+                2,
+                caller_tid,
+                entry_point,
+                arg,
+                stack_bottom,
+                priority,
+                requested_core_id,
+                core_id,
+                process_core_mask,
+                RESULT_INVALID_CORE_ID,
+                0,
+                0,
+            );
             return RESULT_INVALID_CORE_ID;
         }
-        if ((1u64 << core_id) & process.get_core_mask()) == 0 {
+        if ((1u64 << core_id) & process_core_mask) == 0 {
+            trace_create_thread(
+                2,
+                caller_tid,
+                entry_point,
+                arg,
+                stack_bottom,
+                priority,
+                requested_core_id,
+                core_id,
+                process_core_mask,
+                RESULT_INVALID_CORE_ID,
+                0,
+                1,
+            );
             return RESULT_INVALID_CORE_ID;
         }
         if !(HIGHEST_THREAD_PRIORITY..=LOWEST_THREAD_PRIORITY).contains(&priority) {
+            trace_create_thread(
+                3,
+                caller_tid,
+                entry_point,
+                arg,
+                stack_bottom,
+                priority,
+                requested_core_id,
+                core_id,
+                process_core_mask,
+                RESULT_INVALID_PRIORITY,
+                0,
+                0,
+            );
             return RESULT_INVALID_PRIORITY;
         }
         if !process.check_thread_priority(priority) {
+            trace_create_thread(
+                3,
+                caller_tid,
+                entry_point,
+                arg,
+                stack_bottom,
+                priority,
+                requested_core_id,
+                core_id,
+                process_core_mask,
+                RESULT_INVALID_PRIORITY,
+                0,
+                1,
+            );
             return RESULT_INVALID_PRIORITY;
         }
 
@@ -330,11 +484,26 @@ pub fn create_thread(
         )
     };
     if !thread_reservation.succeeded() {
+        trace_create_thread(
+            4,
+            caller_tid,
+            entry_point,
+            arg,
+            stack_bottom,
+            priority,
+            requested_core_id,
+            core_id,
+            0,
+            RESULT_LIMIT_REACHED,
+            0,
+            0,
+        );
         return RESULT_LIMIT_REACHED;
     }
 
     let object_id = system.kernel().unwrap().create_new_object_id() as u64;
     let thread_id = system.kernel().unwrap().create_new_thread_id();
+    let process_is_64bit = current_process.lock().unwrap().is_64bit();
 
     // Create the guest thread fiber entry — matches upstream
     // `system.GetCpuManager().GetGuestThreadFunc()`.
@@ -369,10 +538,24 @@ pub fn create_thread(
             &current_process,
             thread_id,
             object_id,
-            system.runtime_is_64bit(),
+            process_is_64bit,
             guest_thread_func,
         );
         if result != RESULT_SUCCESS.get_inner_value() {
+            trace_create_thread(
+                5,
+                caller_tid,
+                entry_point,
+                arg,
+                stack_bottom,
+                priority,
+                requested_core_id,
+                core_id,
+                0,
+                ResultCode::new(result),
+                0,
+                thread_id,
+            );
             return ResultCode::new(result);
         }
     }
@@ -405,6 +588,20 @@ pub fn create_thread(
     let handle_table_result = process.ensure_handle_table_initialized();
     if handle_table_result != RESULT_SUCCESS.get_inner_value() {
         let _ = process.delete_thread_local_region(thread_tls_address);
+        trace_create_thread(
+            6,
+            caller_tid,
+            entry_point,
+            arg,
+            stack_bottom,
+            priority,
+            requested_core_id,
+            core_id,
+            process.get_core_mask(),
+            ResultCode::new(handle_table_result),
+            0,
+            thread_id,
+        );
         return ResultCode::new(handle_table_result);
     }
 
@@ -442,11 +639,39 @@ pub fn create_thread(
                     thread_id, parent_tid, entry_point, stack_bottom, priority, core_id
                 );
             }
+            trace_create_thread(
+                7,
+                caller_tid,
+                entry_point,
+                arg,
+                stack_bottom,
+                priority,
+                requested_core_id,
+                core_id,
+                process.get_core_mask(),
+                RESULT_SUCCESS,
+                handle,
+                thread_id,
+            );
             RESULT_SUCCESS
         }
         Err(_) => {
             process.unregister_thread_object_by_object_id(object_id);
             let _ = process.delete_thread_local_region(thread_tls_address);
+            trace_create_thread(
+                8,
+                caller_tid,
+                entry_point,
+                arg,
+                stack_bottom,
+                priority,
+                requested_core_id,
+                core_id,
+                process.get_core_mask(),
+                RESULT_OUT_OF_HANDLES,
+                0,
+                thread_id,
+            );
             RESULT_OUT_OF_HANDLES
         }
     }
@@ -761,17 +986,50 @@ pub fn sleep_thread(system: &System, ns: i64) {
 }
 
 /// Gets the thread context.
-pub fn get_thread_context3(
-    _system: &System,
-    out_context: u64,
-    thread_handle: Handle,
-) -> ResultCode {
+pub fn get_thread_context3(system: &System, out_context: u64, thread_handle: Handle) -> ResultCode {
     log::debug!(
         "svc::GetThreadContext3 called, out_context=0x{:08X}, thread_handle=0x{:X}",
         out_context,
         thread_handle
     );
-    RESULT_NOT_IMPLEMENTED
+
+    let Some(current_thread) = system.current_thread() else {
+        return RESULT_INVALID_HANDLE;
+    };
+    let Some(thread) = resolve_thread_handle(system, thread_handle) else {
+        return RESULT_INVALID_HANDLE;
+    };
+
+    if std::sync::Arc::ptr_eq(&thread, &current_thread) {
+        return RESULT_BUSY;
+    }
+
+    let mut context = crate::hle::kernel::k_thread::ThreadContext::default();
+    let result = thread.lock().unwrap().get_thread_context3(&mut context);
+    let result = ResultCode::new(result);
+    if result.is_error() {
+        return result;
+    }
+
+    let context_bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&context as *const crate::hle::kernel::k_thread::ThreadContext).cast::<u8>(),
+            std::mem::size_of::<crate::hle::kernel::svc_types::ThreadContext>(),
+        )
+    };
+
+    let Some(memory) = system.get_svc_memory() else {
+        return RESULT_INVALID_POINTER;
+    };
+    if !memory
+        .lock()
+        .unwrap()
+        .write_block(out_context, context_bytes)
+    {
+        return RESULT_INVALID_POINTER;
+    }
+
+    RESULT_SUCCESS
 }
 
 /// Gets the priority for the specified thread.
@@ -790,17 +1048,33 @@ pub fn set_thread_priority(system: &System, thread_handle: Handle, priority: i32
         return RESULT_INVALID_PRIORITY;
     }
 
-    {
-        let process = system.current_process_arc().lock().unwrap();
-        if !process.check_thread_priority(priority) {
-            return RESULT_INVALID_PRIORITY;
-        }
+    let scheduler_lock = super::super::kernel::scheduler_lock()
+        .expect("scheduler_lock must exist - kernel not initialized?");
+    let _scheduler_guard =
+        super::super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
+
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
+    if !process.check_thread_priority(priority) {
+        return RESULT_INVALID_PRIORITY;
     }
 
-    let Some(thread) = resolve_thread_handle(system, thread_handle) else {
-        return RESULT_INVALID_HANDLE;
+    let thread_id = if thread_handle == PseudoHandle::CurrentThread as Handle {
+        let Some(thread) = system.current_thread() else {
+            return RESULT_INVALID_HANDLE;
+        };
+        thread.lock().unwrap().get_thread_id()
+    } else {
+        let Some(object_id) = process.handle_table.get_object(thread_handle) else {
+            return RESULT_INVALID_HANDLE;
+        };
+        let Some(thread) = process.get_thread_by_object_id(object_id) else {
+            return RESULT_INVALID_HANDLE;
+        };
+        thread.lock().unwrap().get_thread_id()
     };
-    thread.lock().unwrap().set_base_priority(priority);
+
+    KThread::set_base_priority_with_process(&mut process, thread_id, priority);
     RESULT_SUCCESS
 }
 
@@ -851,6 +1125,16 @@ pub fn set_thread_core_mask(
     mut core_id: i32,
     mut affinity_mask: u64,
 ) -> ResultCode {
+    let caller_tid = system.current_thread_id().unwrap_or(0);
+    trace_thread_core_mask(
+        1,
+        caller_tid,
+        None,
+        thread_handle,
+        core_id,
+        affinity_mask,
+        RESULT_SUCCESS,
+    );
     let process = system.current_process_arc().lock().unwrap();
     if core_id == IDEAL_CORE_USE_PROCESS_VALUE {
         core_id = process.get_ideal_core_id();
@@ -874,9 +1158,36 @@ pub fn set_thread_core_mask(
     drop(process);
 
     let Some(thread) = resolve_thread_handle(system, thread_handle) else {
+        trace_thread_core_mask(
+            3,
+            caller_tid,
+            None,
+            thread_handle,
+            core_id,
+            affinity_mask,
+            RESULT_INVALID_HANDLE,
+        );
         return RESULT_INVALID_HANDLE;
     };
+    trace_thread_core_mask(
+        2,
+        caller_tid,
+        Some(&thread),
+        thread_handle,
+        core_id,
+        affinity_mask,
+        RESULT_SUCCESS,
+    );
     let result = ResultCode::new(thread.lock().unwrap().set_core_mask(core_id, affinity_mask));
+    trace_thread_core_mask(
+        3,
+        caller_tid,
+        Some(&thread),
+        thread_handle,
+        core_id,
+        affinity_mask,
+        result,
+    );
     result
 }
 

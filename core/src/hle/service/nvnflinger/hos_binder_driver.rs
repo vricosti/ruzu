@@ -232,6 +232,38 @@ impl IHosBinderDriver {
                         0,
                     ],
                 );
+                if transaction_id == 1 {
+                    for (chunk_index, chunk) in parcel_reply.chunks(36).take(12).enumerate() {
+                        let mut words = [0u64; 9];
+                        for (word_index, word) in words.iter_mut().enumerate() {
+                            let byte_offset = word_index * std::mem::size_of::<u32>();
+                            if byte_offset + std::mem::size_of::<u32>() <= chunk.len() {
+                                let mut bytes = [0u8; 4];
+                                bytes.copy_from_slice(&chunk[byte_offset..byte_offset + 4]);
+                                *word = u32::from_le_bytes(bytes) as u64;
+                            }
+                        }
+                        common::trace::emit_raw(
+                            common::trace::cat::BINDER_TXN,
+                            &[
+                                4,
+                                seq,
+                                id as i64 as u64,
+                                transaction_id as u64,
+                                (chunk_index * 36) as u64,
+                                words[0],
+                                words[1],
+                                words[2],
+                                words[3],
+                                words[4],
+                                words[5],
+                                words[6],
+                                words[7],
+                                words[8],
+                            ],
+                        );
+                    }
+                }
             }
             // For txn=1 (RequestBuffer) dump up to 400 bytes; the GraphicBuffer
             // payload is ~380 bytes and we want to byte-diff against zuyu.
