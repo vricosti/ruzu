@@ -2703,8 +2703,26 @@ impl KThread {
             let _ = process.decrement_running_thread_count();
         }
 
-        // Perform termination under (simulated) scheduler lock.
+        // Perform termination under the scheduler lock.
+        //
+        // Upstream `KThread::Exit()` wraps UpdateState + StartTermination + the
+        // `KWorkerTaskManager::AddTask(Exit)` in a single `KScopedSchedulerLock`.
+        // The recursive scheduler lock MUST be held across the whole block: the
+        // cooperative fiber scheduler only performs a context switch when the
+        // outermost scheduler lock is released. Without this outer lock,
+        // `start_termination()`'s inner `set_state(TERMINATED)` is the outermost
+        // holder, so its release switches the fiber away from this (now
+        // non-runnable) thread *before* the FinishTermination worker task is
+        // queued. The task is then never registered, the thread's
+        // synchronization object is never signaled, and any thread joining it
+        // (`svcWaitSynchronization` on the thread handle) blocks forever. Holding
+        // the lock here defers the switch until after the task is queued.
         {
+            let scheduler_lock = super::kernel::scheduler_lock();
+            let _scheduler_guard = scheduler_lock
+                .as_ref()
+                .map(|lock| super::k_scheduler_lock::KScopedSchedulerLock::new(lock));
+
             // Disallow all suspension.
             self.suspend_allowed_flags = 0;
             self.update_state();

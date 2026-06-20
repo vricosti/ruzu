@@ -121,6 +121,9 @@ pub mod cat {
     /// SVC return-value match. args =
     /// [target_result, tid, core, svc_name_id, pc, lr, a0, a1, a2, a3, ret0, ret1, ret2, ret3]
     pub const SVC_ERRVAL: u16 = 60;
+    /// SendSyncRequest enter/exit. args =
+    /// [stage(0=enter,1=exit), guest_tid, handle, cmd, cmd_type, result, service_name_id]
+    pub const SSR_IPC: u16 = 61;
     /// BL/PLT scan hit. args = [pc, target, kind_id, cond]
     /// kind_id: 0=B, 1=BL, 2=BLX
     pub const BL_HIT: u16 = 11;
@@ -481,6 +484,7 @@ pub struct Config {
     pub svc_ipc_progress_trace: bool,
     pub binder_txn_trace: bool,
     pub bqp_trace: bool,
+    pub ssr_ipc_trace: bool,
     pub gpu_va_trace: bool,
     pub heap_trace: bool,
     pub tid_svc_trace: bool,
@@ -554,6 +558,7 @@ impl Default for Config {
             svc_ipc_progress_trace: false,
             binder_txn_trace: false,
             bqp_trace: false,
+            ssr_ipc_trace: false,
             gpu_va_trace: false,
             heap_trace: false,
             tid_svc_trace: false,
@@ -622,6 +627,7 @@ impl Config {
             || self.svc_ipc_progress_trace
             || self.binder_txn_trace
             || self.bqp_trace
+            || self.ssr_ipc_trace
             || self.gpu_va_trace
             || self.heap_trace
             || self.tid_svc_trace
@@ -759,6 +765,7 @@ fn build_config() -> Config {
         ),
         binder_txn_trace: get_bool("nvnflinger", "binder", "RUZU_TRACE_BINDER_TXN_RING", false),
         bqp_trace: get_bool("nvnflinger", "bqp", "RUZU_TRACE_BQP_RING", false),
+        ssr_ipc_trace: get_bool("svc", "ssr_ipc", "RUZU_DUMP_SSR", false),
         gpu_va_trace: get_bool("nvdrv", "gpu_va_trace", "RUZU_TRACE_GPU_VA", false),
         heap_trace: get_bool("svc", "heap_trace", "RUZU_TRACE_HEAP", false),
         tid_svc_trace: get_bool("svc", "tid_svc", "RUZU_TRACE_TID_SVC", false),
@@ -934,6 +941,7 @@ pub fn is_enabled(category: u16) -> bool {
         cat::IPC_INVALID => c.ipc_invalid_trace,
         cat::IPC_REPLY_WAKE => c.ipc_reply_wake_trace,
         cat::SVC_IPC_PROGRESS => c.svc_ipc_progress_trace,
+        cat::SSR_IPC => c.ssr_ipc_trace,
         cat::BINDER_TXN => c.binder_txn_trace,
         cat::BQP => c.bqp_trace,
         cat::GPU_VA_MAP | cat::GPU_VA_UNMAP => c.gpu_va_trace,
@@ -1120,6 +1128,16 @@ fn format_into(out: &mut String, rec: &LogRecord) {
             }
             out.pop(); // trailing space
             out.push('\n');
+        }
+        cat::SSR_IPC => {
+            // args = [stage(0=enter,1=exit), guest_tid, handle, cmd, cmd_type, result, service_name_id]
+            let stage = if rec.args[0] == 0 { "ENTER" } else { "EXIT" };
+            let svc = service_name(rec.args[6] as u16);
+            let _ = writeln!(
+                out,
+                "[SSR] tid={} handle={:#x} service={} cmd={} cmd_type={} result={:#x} {}",
+                rec.args[1], rec.args[2], svc, rec.args[3], rec.args[4], rec.args[5], stage
+            );
         }
         cat::IPC_REQUEST => {
             let svc = service_name(rec.args[1] as u16);
