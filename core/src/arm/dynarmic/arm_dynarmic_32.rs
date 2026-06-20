@@ -2781,6 +2781,10 @@ impl ArmInterface for ArmDynarmic32 {
         }
     }
 
+    fn get_tpidrro_el0(&self) -> u64 {
+        self.cp15_uro as u64
+    }
+
     fn get_svc_arguments(&self, args: &mut [u64; 8]) {
         let jit = match self.jit.as_ref() {
             Some(jit) => jit,

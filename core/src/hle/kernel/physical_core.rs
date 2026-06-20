@@ -165,6 +165,27 @@ impl PhysicalCore {
             .capture_guest_context(thread_context);
     }
 
+    fn write_svc_return_registers_if_runnable(
+        &self,
+        jit: &mut dyn ArmInterface,
+        current_thread: &Arc<KThreadLock>,
+        svc_num: u32,
+        svc_args: &SvcArgs,
+    ) {
+        let current_thread_blocked = {
+            let thread = current_thread.lock().unwrap();
+            thread.get_raw_state() != super::k_thread::ThreadState::RUNNABLE
+        };
+        if current_thread_blocked {
+            log::trace!(
+                "dispatch_supervisor_call: svc=0x{:x} blocked current thread; deferring SVC return registers until wake",
+                svc_num
+            );
+        } else {
+            jit.set_svc_arguments(svc_args);
+        }
+    }
+
     pub fn dispatch_supervisor_call(
         &self,
         jit: &mut dyn ArmInterface,
@@ -187,7 +208,7 @@ impl PhysicalCore {
             scheduler.lock().unwrap().request_schedule();
             return false;
         }
-        jit.set_svc_arguments(svc_args);
+        self.write_svc_return_registers_if_runnable(jit, current_thread, svc_num, svc_args);
         log::trace!(
             "dispatch_supervisor_call: before handoff (svc=0x{:x})",
             svc_num
@@ -539,7 +560,7 @@ impl PhysicalCore {
             let running_tid = current_thread
                 .map(|p| unsafe { (*p).get_thread_id() })
                 .unwrap_or(0);
-            eprintln!(
+            log::warn!(
                 "[{:>10.6}] [IPI] target_core={} running_tid={} running_jit={}",
                 t,
                 self.m_core_index,
@@ -930,6 +951,26 @@ mod tests {
             current_thread.lock().unwrap().get_state(),
             ThreadState::TERMINATED
         );
+    }
+
+    #[test]
+    fn blocked_svc_defers_return_register_write_until_wake() {
+        let (physical_core, _process, _scheduler, current_thread, _system) = test_context();
+        let mut jit = TestArmInterface::new(VecDeque::new());
+        let svc_args: SvcArgs = [0x7201; 8];
+
+        current_thread
+            .lock()
+            .unwrap()
+            .set_state(ThreadState::WAITING);
+        physical_core.write_svc_return_registers_if_runnable(
+            &mut jit,
+            &current_thread,
+            SvcId::WaitProcessWideKeyAtomic as u32,
+            &svc_args,
+        );
+
+        assert_eq!(jit.set_svc_arguments_count, 0);
     }
 
     #[test]

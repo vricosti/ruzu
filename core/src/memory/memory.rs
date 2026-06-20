@@ -156,6 +156,87 @@ fn check_block_watch(kind: &str, dest_addr: u64, src: &[u8]) {
     );
 }
 
+fn trace_unmapped_guest_access(kind: &str, vaddr: u64, bits: usize) {
+    if let Ok(after_ms) = std::env::var("RUZU_TRACE_UNMAPPED_GUEST_AFTER_MS") {
+        if let Ok(after_ms) = after_ms.parse::<u128>() {
+            use std::sync::OnceLock;
+            static START: OnceLock<std::time::Instant> = OnceLock::new();
+            if START
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_millis()
+                < after_ms
+            {
+                return;
+            }
+        }
+    }
+
+    let trace_all = std::env::var_os("RUZU_TRACE_UNMAPPED_GUEST_ALL").is_some();
+    let trace_suspicious = std::env::var_os("RUZU_TRACE_UNMAPPED_GUEST").is_some()
+        && (vaddr < 0x1000 || (vaddr >> 32) == 0xffff_ffff);
+    if !trace_all && !trace_suspicious {
+        return;
+    }
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SHOWN: AtomicU32 = AtomicU32::new(0);
+    let n = SHOWN.fetch_add(1, Ordering::Relaxed);
+    if n >= 64 {
+        return;
+    }
+
+    let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+    let (core, regs) = crate::hle::kernel::kernel::with_current_thread_fast_mut(|t| {
+        (
+            t.get_current_core().max(0) as usize,
+            [
+                t.thread_context.r[0],
+                t.thread_context.r[1],
+                t.thread_context.r[2],
+                t.thread_context.r[3],
+                t.thread_context.r[4],
+                t.thread_context.r[5],
+                t.thread_context.r[6],
+                t.thread_context.r[7],
+                t.thread_context.fp,
+                t.thread_context.sp,
+                t.thread_context.lr,
+            ],
+        )
+    })
+    .unwrap_or((usize::MAX, [0; 11]));
+    let (pc, lr) = if core < crate::hle::kernel::kernel::GUEST_PC.len() {
+        (
+            crate::hle::kernel::kernel::GUEST_PC[core].load(Ordering::Acquire),
+            crate::hle::kernel::kernel::GUEST_LR[core].load(Ordering::Acquire),
+        )
+    } else {
+        (0, 0)
+    };
+    log::error!(
+        "[UNMAPPED_GUEST_{kind}] #{} tid={} core={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} bits={} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} fp=0x{:08X} sp=0x{:08X} ctx_lr=0x{:08X}",
+        n,
+        tid,
+        core,
+        pc,
+        lr,
+        vaddr,
+        bits,
+        regs[0],
+        regs[1],
+        regs[2],
+        regs[3],
+        regs[4],
+        regs[5],
+        regs[6],
+        regs[7],
+        regs[8],
+        regs[9],
+        regs[10],
+    );
+}
+
 /// RUZU_TRACE_GET_POINTER_PAGE=0xPAGEVADDR — log every get_pointer*
 /// call whose returned guest vaddr lies in the same 4 KB page as
 /// PAGEVADDR. Includes a backtrace so we can identify the HLE caller
@@ -1286,8 +1367,8 @@ impl Memory {
                     } else {
                         (0, 0)
                     };
-                    eprintln!(
-                        "[UNMAPPED_GUEST] #{} tid={} core={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} bits={} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} fp=0x{:08X} sp=0x{:08X} ctx_lr=0x{:08X}",
+                    log::error!(
+                        "[UNMAPPED_GUEST_READ] #{} tid={} core={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} bits={} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} fp=0x{:08X} sp=0x{:08X} ctx_lr=0x{:08X}",
                         n,
                         tid,
                         core,
@@ -1403,6 +1484,7 @@ impl Memory {
 
         let ptr = self.get_pointer_impl(vaddr);
         if ptr.is_null() {
+            trace_unmapped_guest_access("WRITE", vaddr, std::mem::size_of::<T>() * 8);
             log::error!(
                 "Unmapped Write{} @ {:#018x}",
                 std::mem::size_of::<T>() * 8,
@@ -2428,6 +2510,7 @@ impl Memory {
     pub fn write_exclusive_8(&self, vaddr: u64, value: u8, expected: u8) -> bool {
         let ptr = self.get_pointer_impl(vaddr);
         if ptr.is_null() {
+            trace_unmapped_guest_access("EXCLUSIVE_WRITE", vaddr, 8);
             log::error!("Unmapped WriteExclusive8 @ {:#018x}", vaddr);
             return true;
         }
@@ -2449,6 +2532,7 @@ impl Memory {
     pub fn write_exclusive_16(&self, vaddr: u64, value: u16, expected: u16) -> bool {
         let ptr = self.get_pointer_impl(vaddr);
         if ptr.is_null() {
+            trace_unmapped_guest_access("EXCLUSIVE_WRITE", vaddr, 16);
             log::error!("Unmapped WriteExclusive16 @ {:#018x}", vaddr);
             return true;
         }
@@ -2470,6 +2554,7 @@ impl Memory {
     pub fn write_exclusive_32(&self, vaddr: u64, value: u32, expected: u32) -> bool {
         let ptr = self.get_pointer_impl(vaddr);
         if ptr.is_null() {
+            trace_unmapped_guest_access("EXCLUSIVE_WRITE", vaddr, 32);
             log::error!("Unmapped WriteExclusive32 @ {:#018x}", vaddr);
             return true;
         }
@@ -2491,6 +2576,7 @@ impl Memory {
     pub fn write_exclusive_64(&self, vaddr: u64, value: u64, expected: u64) -> bool {
         let ptr = self.get_pointer_impl(vaddr);
         if ptr.is_null() {
+            trace_unmapped_guest_access("EXCLUSIVE_WRITE", vaddr, 64);
             log::error!("Unmapped WriteExclusive64 @ {:#018x}", vaddr);
             return true;
         }
@@ -2528,6 +2614,7 @@ impl Memory {
     ) -> bool {
         let ptr = self.get_pointer_impl(vaddr);
         if ptr.is_null() {
+            trace_unmapped_guest_access("EXCLUSIVE_WRITE", vaddr, 128);
             log::error!("Unmapped WriteExclusive128 @ {:#018x}", vaddr);
             return true;
         }

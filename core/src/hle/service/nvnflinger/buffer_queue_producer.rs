@@ -280,6 +280,7 @@ impl BufferQueueProducer {
     pub fn request_buffer(&self, slot: i32) -> (Status, Option<Arc<GraphicBuffer>>) {
         record_bqp_event(BqpEvent::RequestBuffer);
         super::diagnostics::record_bqp("request_buffer", [slot as i64 as u64, 0, 0, 0, 0, 0]);
+        trace_bqp_ring(&[7, next_bqp_seq(), slot as i64 as u64, current_bqp_tid()]);
         trace_bqp(format_args!("BQP::request_buffer slot={}", slot));
         let mut inner = self.core.mutex.lock().unwrap();
         if inner.is_abandoned {

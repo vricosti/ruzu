@@ -1,4 +1,64 @@
 
+### core/src/hle/kernel/k_thread.rs + svc/svc_thread.rs
+
+### Intentional differences
+- `KThread::set_base_priority_with_process(...)` is a Rust owner-graph bridge for upstream `KThread::SetBasePriority(s32)`: upstream can take `KScopedSchedulerLock` and call `RestorePriority(kernel, this)` from the raw `KThread*`; Rust resolves the registered process thread by `thread_id` so `restore_priority_with_process(...)` can re-enter the process thread table without holding the target thread mutex.
+- `KThread::set_base_priority(...)` remains as a local fallback for tests and early setup paths that do not have a registered process-backed thread object yet. It now recomputes the effective priority from held PI locks instead of discarding inherited priority.
+
+### Unintentional differences (fixed)
+- Fixed: `svc::SetThreadPriority` now takes the scheduler lock, resolves the target thread under the current process, updates `base_priority`, and runs the full priority-restoration chain. Rust previously called `thread.set_base_priority(...)` directly, which wrote `priority = base_priority` and could discard an inherited waiter priority.
+- Fixed: local `KThread::set_base_priority(...)` no longer notifies/reorders based on `old_priority != base_priority`; it compares the old and recomputed effective priorities, matching upstream's `RestorePriority` decision point.
+
+### Verification
+- Re-read upstream `core/hle/kernel/k_thread.cpp` (`KThread::SetBasePriority`, `KThread::RestorePriority`) and `core/hle/kernel/svc/svc_thread.cpp` (`SetThreadPriority`).
+- `cargo check -p core`
+- `cargo test -p core set_base_priority_with_process_preserves_inherited_priority -- --nocapture`
+- `cargo test -p core restore_priority_walks_waiting_lock_owner_chain -- --nocapture`
+- `cargo test -p core condition_variable_waiters_reorder_on_priority_change -- --nocapture`
+
+### Intentional differences
+- `KThread::apply_wait_result_to_context()` remains a Rust-only bridge for the cooperative fiber scheduler: when a waiting thread is woken off-core, the saved guest context may need `x0/x1` populated before `Reload`. Upstream stores only `m_wait_result` in `KThreadQueue::EndWait/CancelWait` because the original guest fiber resumes through the SVC wrapper.
+
+### Unintentional differences (fixed)
+- Fixed: the Rust bridge no longer applies the default wait result to a never-started user-thread context (`LR=0`, `R0=argument`). ANIMUS exposed this as the SDK thread trampoline receiving `0x7201` (`ResultNoSynchronizationObject`) instead of its startup argument and then branching through a null function pointer.
+
+### Verification
+- Re-read upstream `core/hle/kernel/k_thread.cpp`, `core/hle/kernel/k_thread.h`, and `core/hle/kernel/k_condition_variable.cpp`.
+- `cargo build --release --bin ruzu-cmd`
+- `cargo test -p core --release create_and_start_thread_registers_kernel_objects -- --nocapture`
+- `cargo test -p core --release signal_to_address -- --nocapture`
+- `cargo test -p core --release wait_for_address -- --nocapture` currently exposes a pre-existing unit-harness gap: direct calls to `KConditionVariable::wait_for_address()` can return before the test's signaling thread runs, unlike upstream fiber suspension.
+
+### Intentional differences
+- `RUZU_TRACE_A64_NULL_FETCH` now emits through the async trace drain (`A64_EXCEPTION_CTX`) instead of writing directly with `eprintln!`. This is diagnostic-only and inactive unless requested.
+
+### Unintentional differences (fixed)
+- Fixed: `svc::CreateThread` now passes the owning process `is_64bit()` flag into `KThread::initialize_user_thread...`, matching upstream `KThread::Initialize(...)` which checks `m_parent->Is64Bit()`. The previous Rust path used `System::runtime_is_64bit()`, which can be stale relative to the current process and can initialize an AArch64 user thread with the AArch32 register layout.
+- Fixed: `KThread::reset_thread_context32(...)` no longer writes the AArch64 `pc`/`sp` fields. Upstream `ResetThreadContext32(...)` only initializes `r[15]` and `r[13]`; keeping `pc`/`sp` clear makes wrong-mode context initialization visible instead of partially masking it.
+
+### Verification
+- Re-read upstream `core/hle/kernel/svc/svc_thread.cpp`, `core/hle/kernel/k_thread.cpp`, and `core/arm/dynarmic/arm_dynarmic_64.cpp`.
+- `cargo test -p core --release create_and_start_thread_registers_kernel_objects -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+
+### Intentional differences
+- `KPerCoreQueue::remove` now verifies that the Rust queue entry is actually linked in the requested per-core list before unlinking it. Upstream's intrusive `KThread::QueueEntry` ownership makes this precondition implicit; the Rust `thread_id -> QueueEntry` storage can retain an entry for a different queue/core after repair paths, so an unlinked entry must be a no-op rather than clearing the queue root.
+
+### Unintentional differences (fixed)
+- Fixed: removing an unlinked `thread_id` with `prev=None,next=None` could be misread as removing the sole element of a per-core queue and could clear another runnable thread from the scheduled front. ANIMUS exposed this as repeated `PQ_RECOVER` for a runnable thread that had just been reinserted.
+
+### Verification
+- `cargo test -p core k_priority_queue::tests::remove_unlinked_entry_does_not_clear_queue_root -- --nocapture`
+- `cargo test -p core k_priority_queue::tests::test_change_core -- --nocapture`
+- `cargo test -p core k_scheduler::tests::update_highest_priority_threads_impl_migrates_suggested_thread_to_idle_core -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+
+### Intentional differences
+- Rust runs a late `UpdateHighestPriorityThreads` inside `KScheduler::schedule_impl_fiber_loop` to compensate for the split scheduler-lock/fiber ownership. After that late update, the fiber loop resolves the target from refreshed `highest_priority_thread_id` instead of using the pre-update captured `switch_highest_priority_thread`; upstream captures after scheduler-lock unlock has already updated the state.
+
+### Unintentional differences (fixed)
+- Fixed: a thread that left `Runnable` could remain as the captured fiber target even after the late Rust scheduler update removed it from the per-core highest-priority slot. ANIMUS exposed this as the scheduler switching back to a just-blocked graphics/service thread while the PQ front was already empty.
+
 ### Intentional differences
 - Added env-gated diagnostic logging for the OpenGL backend present view materialization under `RUZU_TRACE_PRESENT_PATH_ADDR` / `RUZU_TRACE_PRESENT_PATH_EVERY`: logs the selected `image_id`, `view_id`, GPU/CPU address, format, flags, modification tick, and GL texture handles for the framebuffer image chosen by `TryFindFramebufferImageView`. This is inactive unless requested and does not change image selection.
 
@@ -80,8 +140,6 @@
 - Rust retains existing env-gated diagnostic logging around dispatch state; upstream has no equivalent diagnostic hook. This has no behavior effect when unset.
 - Rust adds `RUZU_TRACE_PULLER_RAW_HEADERS=1`, gated behind the existing selected-submit trace, to print raw command-list segment summaries and any decoded `SyncpointOperation` headers during the MK8D stall investigation. This has no behavior effect when unset.
 
-### Unintentional differences (to fix)
-- None for this change. Rust previously reset `dma_pushbuffer_subindex` at the start of `dispatch_calls`/`dispatch_calls_with_engine`; upstream `DmaPusher::DispatchCalls` preserves the subindex across dispatch entry and only resets it after the current `CommandList` has been fully consumed. Rust now matches that ownership/lifecycle ordering.
 
 ### Missing items
 - Existing DMA pusher parity audit remains open; this entry only covers `dma_pushbuffer_subindex` dispatch-entry lifecycle.
@@ -683,8 +741,6 @@
 ### Unintentional differences (to fix)
 - Fixed: `QueryCacheBase::request_guest_host_sync(...)` now calls `release_fences(true)`. Rust previously passed `false`, but upstream calls `ReleaseFences()` with no argument and `RasterizerInterface::ReleaseFences(bool force = true)` makes that a forced fence release. This matters for guest/host query synchronization and can affect command-list progress when a query waits on pending GPU work.
 
-### Missing items
-- None for `RequestGuestHostSync(...)` force semantics. Broader query-cache ownership remains split in the existing Rust port, but this method now matches the upstream fence-release contract.
 
 ### Intentional differences
 - Rust keeps backend-independent `ImageViewBase` slots and OpenGL `ImageView` objects in separate maps. The new `ImageView::from_buffer_base(...)` is the OpenGL-side counterpart of upstream's texture-buffer `ImageView` constructor while preserving that current split.
@@ -810,8 +866,6 @@
 ### Unintentional differences (to fix)
 - Fixed: `WindowAdaptPass::draw_to_framebuffer(...)` now disables `GL_FRAMEBUFFER_SRGB` and configures `glViewportIndexedf(...)` immediately after `ProgramManager::bind_present_programs(...)`, before vertex-attribute/VBO/sampler setup. This matches upstream `WindowAdaptPass::DrawToFramebuffer(...)` ordering.
 
-### Missing items
-- None for the present program/sRGB/viewport ordering after this pass. Broader present VAO and renderer state-owner parity remains tracked by existing entries.
 
 ### Intentional differences
 - Rust stores upstream `RasterizerOpenGL& rasterizer` as a non-owning raw pointer because `RendererOpenGL` owns both the boxed rasterizer and the present pipeline. This preserves the upstream member-reference lifetime while fitting Rust's owner graph.
@@ -821,8 +875,6 @@
 ### Unintentional differences (to fix)
 - Fixed: `Layer::load_fb_to_screen_info(...)` no longer emits an unconditional one-time `info!` log before the CPU framebuffer fallback. Upstream `Layer::LoadFBToScreenInfo(...)` has no such default log; Rust now keeps only opt-in diagnostics.
 
-### Missing items
-- None for `Layer` rasterizer ownership or the default `LoadFBToScreenInfo` diagnostic path after this pass. Broader present VAO / `BlitScreen` state-owner parity remains tracked by existing entries.
 
 ### Intentional differences
 - Rust still splits upstream `TextureCache<P>::DmaBufferImageCopy(...)` between common descriptor construction (`TextureCacheBase::dma_buffer_image_copy_descriptor`) and OpenGL backend upload/download execution (`OpenGL::TextureCache::dma_buffer_image_copy`) because backend image resources are not owned by the common cache.
@@ -917,8 +969,6 @@
 - Fixed: `Puller::call_engine_method(...)` and `Puller::call_engine_multi_method(...)` no longer log a warning and continue when the bound subchannel engine is unsupported. They now stop like upstream `Puller::CallEngineMethod(...)` / `CallEngineMultiMethod(...)`.
 - Fixed: `Puller::process_bind_method(...)` no longer logs and continues after binding an unsupported engine id. Rust still stores the raw engine id first, matching upstream's `bound_engines[subchannel] = engine_id` before `UNIMPLEMENTED_MSG(...)`, then stops.
 
-### Missing items
-- None for the unsupported-engine stop contract. Broader puller/pusher parity remains tracked by the existing command-list, syncpoint, and engine ownership entries.
 
 ### Intentional differences
 - Rust records `.agents/maxwell_dma_unimplemented_state.md` before stopping on unsupported MaxwellDMA paths outside tests. Upstream uses `ASSERT(...)` / `UNIMPLEMENTED_IF(...)` directly; the local state file is the requested no-hidden-debt handoff for missing implementation prerequisites.
@@ -938,8 +988,6 @@
 ### Unintentional differences (to fix)
 - Fixed: Binder transactions `DetachNextBuffer`, `AttachBuffer`, `AllocateBuffers`, and unknown transaction codes no longer return `BadValue` and continue. They now stop explicitly like upstream's unimplemented `Transact` default path, so a guest-visible dependency cannot be silently treated as handled.
 
-### Missing items
-- None for the unsupported Binder transaction stop contract. Full BufferQueue presentation parity remains tracked by the existing `QueueBuffer` / `SurfaceFlinger` / `NO_LAYERS` entries.
 
 ### Intentional differences
 - Rust still passes a `read_gpu` closure into `OpenGL::TextureCache::dma_buffer_image_copy(...)` instead of reading `gpu_memory` directly from one templated `TextureCache<P>` owner. The closure is built from `RasterizerOpenGL::channel_memory_manager`, matching the upstream channel `gpu_memory->ReadBlock(...)` source while preserving the current Rust owner graph.
@@ -1024,8 +1072,6 @@
 ### Unintentional differences (to fix)
 - Fixed: `TextureCacheBase::join_images(...)` no longer preserves, queues, downloads, or bad-overlap-links ignored overlaps that are still `GPU_MODIFIED`. It now stops immediately like upstream `TextureCache<P>::JoinImages(...)`, where the ignored-overlap loop calls `UNIMPLEMENTED()` before untracking, unregistering, deleting, refreshing the new image, or registering it.
 
-### Missing items
-- None for the ignored-overlap `GPU_MODIFIED` stop contract. The broader `JoinImages` owner split and pending backend copy/delete tail remain tracked in the existing texture-cache entries below.
 
 ### Intentional differences
 - Rust keeps `GpuMemoryManager` and the outer `MemoryManager` wrapper split while upstream owns the page tables directly in `Tegra::MemoryManager`. The translated behavior for `GpuToCpuAddress(addr, size)` and `GetSubmappedRange(...)` remains in `video_core/src/memory_manager.rs`.
@@ -1034,7 +1080,6 @@
 - Fixed: `gpu_to_cpu_address_range(...)` now computes the upstream `page_last` expression with wrapping unsigned arithmetic. In debug Rust, the previous `addr + size + page_size - 1` expression could panic on high addresses, while upstream C++ `GPUVAddr` arithmetic wraps.
 
 ### Missing items
-- None for the audited `GpuToCpuAddress(addr, size)` overflow behavior and `GetSubmappedRange(...)` small-page fallback cases.
 - Broader texture-cache ownership still remains split across the entries below; this pass only verifies the memory-manager range helpers used by `FindImage`, `FindDMAImage`, sparse registration, and TIC validation.
 
 ### Intentional differences
@@ -1046,7 +1091,6 @@
 - Fixed before documenting: the new SMMU size-aware helper matches upstream `GpuToCpuAddress(addr, size)` page-scan semantics. It succeeds when any page in `[addr, addr + size)` translates, instead of requiring every byte in the range to be mapped.
 
 ### Missing items
-- None for `VideoCommon::IsValidEntry` address/range validation.
 - Broader texture-cache memory-manager ownership still differs from upstream and remains documented in the texture-cache owner entries below.
 
 ### Intentional differences
@@ -1219,8 +1263,6 @@
 ### Intentional differences
 - Rust uses `panic!` for upstream `NotImplementedException` paths in the Maxwell texture translators. This preserves the fail-fast behavior for unsupported ISA forms while using Rust's current error surface.
 
-### Unintentional differences (to fix)
-- None for the re-audited unsupported texture edge cases: `TEX.LC`, `TXD.LC`, `TLD.CL`, 3D-array texture types, `TMML` BA results, and unsupported `TXQ` modes all stop in upstream too.
 
 ### Missing items
 - Continue auditing exact no-rewrite/error handling for texture translator paths not covered by this entry.
@@ -1412,7 +1454,6 @@
 - Broader `TextureCache<P>::UpdateRenderTargets(...)` / `RescaleRenderTargets(...)` ownership remains split between the common texture cache and OpenGL-specific framebuffer preparation instead of living in one upstream-shaped owner.
 
 ### Missing items
-- None for the zeta translation-miss clearing behavior fixed in this pass.
 - Still need to finish the broader render-target update ownership split tracked by earlier texture-cache entries.
 
 ### Intentional differences
@@ -1575,18 +1616,13 @@
 - `prepare_render_targets_from_snapshot(...)` remains an OpenGL wrapper around upstream `TextureCache<P>::UpdateRenderTargets` / `PrepareImageView` because ruzu currently splits backend `Image` objects from common `ImageBase` slots. The prepared-view filtering now follows upstream's sentinel checks before dereferencing the view slot.
 - The upstream sentinel predicate is represented by the local `is_real_image_view_id(...)` helper so the render-target preparation path can be regression-tested without constructing an OpenGL texture cache.
 
-### Unintentional differences (to fix)
-- None for null render-target view preparation after this change. Rust no longer treats `NULL_IMAGE_VIEW_ID` (`SlotId { index: 0 }`) as a real render-target view just because `SlotId::is_valid()` returns true. This matches upstream checks such as `view_id != NULL_IMAGE_VIEW_ID && view_id != ImageViewId{}` before preparing or rescale-checking a render-target view.
 
 ### Missing items
 - Broader render-target ownership drift remains: register reads and dirty-flag consumption still happen outside a single upstream-shaped `TextureCache<P>::UpdateRenderTargets(bool is_clear)` owner.
-- None for the null render-target view sentinel filter. Broader render-target ownership drift remains tracked above.
 
 ### Intentional differences
 - Rust keeps trace-only diagnostics around `LoadFBToScreenInfo` for present texture debugging. They do not alter the upstream ordering: compute framebuffer address, try `AccelerateDisplay`, initialize `FramebufferTextureInfo`, read device memory if available, then upload the permanent framebuffer texture.
 
-### Unintentional differences (to fix)
-- None for the zero-address fallback path after this change. Rust no longer returns early when `framebuffer.address + framebuffer.offset == 0`; it follows upstream by continuing through `GetPointer`/device-memory read semantics and still issuing `glTextureSubImage2D` with the existing `gl_framebuffer_data`.
 
 ### Missing items
 - Broader `Layer` parity still needs a full re-audit outside this slice, especially diagnostic-only code and any remaining Rust-local present tracing.
@@ -1597,8 +1633,6 @@
 ### Unintentional differences (to fix)
 - Older entries that mention the local present pipeline or `glNamedBufferStorage` are superseded by the two 2026-06-14 `WindowAdaptPass` entries above.
 
-### Missing items
-- None for the present VAO audit. Broader renderer context-profile parity remains frontend/platform-owned, not `WindowAdaptPass`-owned.
 
 ### Intentional differences
 - Removed the Rust-local `WindowAdaptPass::pipeline` member and its `glCreateProgramPipelines` / `glUseProgramStages` / `glDeleteProgramPipelines` lifecycle. Presentation programs are now bound only through `ProgramManager::bind_present_programs(...)`, matching upstream `program_manager.BindPresentPrograms(vert.handle, frag.handle)`.
@@ -1620,8 +1654,6 @@
 - Fixed by later `WindowAdaptPass` entries: the Rust-local present program pipeline was removed, and presentation programs are now bound through `ProgramManager::bind_present_programs(...)`.
 - Fixed by later `WindowAdaptPass` entries: Rust now uses `glNamedBufferData(..., GL_STREAM_DRAW)` for the present vertex buffer, matching upstream.
 
-### Missing items
-- None for program/VBO ownership after the later `WindowAdaptPass` audit. The remaining VAO adaptation is documented separately as an OpenGL context-profile compatibility difference.
 
 ### Intentional differences
 - Removed the Rust-only `RendererBase::set_device_memory_reader(...)` hook and the OpenGL present setters on `RendererOpenGL`, `BlitScreen`, and `Layer`. The present/device-memory dependency is now constructor-owned for `RendererOpenGL::new -> BlitScreen::new -> Layer::new`, matching upstream's stable `Tegra::MaxwellDeviceMemoryManager& device_memory` members instead of allowing a post-construction replacement.
@@ -1840,8 +1872,6 @@
 - `TextureCacheBase` already owns upstream counterparts for `sentenced_images` and `sentenced_image_view`; OpenGL `TextureCache::tick_frame(...)` ticks those common rings, then its backend framebuffer ring, async decode, runtime tick, and finally the base frame counter. This preserves upstream `TextureCache<P>::TickFrame` ordering while backend framebuffer objects remain OpenGL-owned.
 - `DelayedDestructionRing::retained_len(...)` is compiled only for tests and exists solely to verify deferred destruction retention/release behavior without exposing runtime state.
 
-### Missing items
-- None for common `sentenced_images` / `sentenced_image_view` storage and ticking. Full owner unification for backend images/framebuffers remains tracked by the broader texture-cache owner split entries.
 
 ### Intentional differences
 - `OpenGL::TextureCache::materialize_views_impl(...)` now drains queued `PendingJoinCopies` before creating backend `ImageView` objects. This moves the Rust split-owner path closer to upstream `TextureCache<P>::JoinImages`, where `RefreshContents`, rescale, `CopyImage`, unregister/delete, and final registration happen before the new image can be observed by a sampled view.
@@ -1860,8 +1890,6 @@
 - Rust reaches the live `Maxwell3D` through the per-channel `ChannelInfo::maxwell3d` non-owning pointer captured by `ChannelSetupCaches`, matching upstream's `maxwell3d->dirty.flags` owner while using the existing `Maxwell3DAccess::set_dirty_flag(...)` trait method instead of directly exposing private engine fields.
 - OpenGL `TextureCache::invalidate_scale(...)` calls the same base helper before removing render-target/depth image-view references, matching upstream `InvalidateScale` ordering.
 
-### Missing items
-- None identified for this dirty-flag slice. The earlier `OnGPUASRegister` call-boundary debt is fixed by the following texture-cache GPU page-table storage entry.
 
 ### Intentional differences
 - `TextureCacheBase::insert_image(...)` now rejects sparse images before CPU-address resolution when no channel `MemoryManager` is bound. Upstream never needs a sparse fake-address fallback here because `TextureCache<P>` owns a live `gpu_memory`, and sparse registration later calls `ForEachSparseSegment(...)`, which directly uses `gpu_memory->GetSubmappedRange(...)` and asserts every sparse segment has a CPU address.
@@ -1870,8 +1898,6 @@
 ### Unintentional differences (to fix)
 - The broader channel binding/order parity remains tracked in the GPU channel binding entries.
 
-### Missing items
-- None for sparse fake-address fallback behavior: no such fallback exists upstream. If a runtime path reaches this assertion, the missing dependency is the caller/channel binding order, not texture-cache sparse address emulation.
 
 ### Intentional differences
 - Rust stores per-channel GPU page-table references as `gpu_page_table_index` / `sparse_page_table_index` into `TextureCacheBase::gpu_page_table_storage` instead of raw pointers. This preserves upstream ownership: two `TextureCacheGPUMap` entries are allocated per registered GPU address-space, and channels sharing the same `MemoryManager::get_id()` share the same dense/sparse texture page tables.
@@ -1924,8 +1950,6 @@
 ### Intentional differences
 - Rust reads `common::settings::values().resolution_info` at each AA viewport/pass-creation site instead of using upstream's global `Settings::values.resolution_info` expression directly. The selected values and `ScaleUp` formulas match upstream `ResolutionScalingInfo::ScaleUp`.
 
-### Missing items
-- None identified for the OpenGL FXAA/SMAA/FSR presentation filter sizing and shader/resource creation slice after this pass. Broader GPU/texture parity debt remains elsewhere in this file and must continue to be audited.
 
 ### Intentional differences
 - Rust stores OpenGL program, sampler, framebuffer, and texture handles as raw `u32` fields instead of upstream `OGLProgram`, `OGLSampler`, `OGLFramebuffer`, and `OGLTexture` RAII wrappers; `Drop` releases them explicitly. The constructor and draw call order match upstream for this slice.
@@ -1959,16 +1983,12 @@
 ### Unintentional differences (to fix)
 - Fixed by later entries: FXAA and SMAA now compile their upstream shader programs, SMAA uploads its upstream area/search lookup textures, FSR now compiles its OpenGL shader programs, expands FidelityFX includes, configures EASU/RCAS constants, consumes crop-aware draw inputs, and AA viewport/pass sizing now uses `ResolutionScalingInfo::scale_up_*`.
 
-### Missing items
-- None identified for this OpenGL presentation filter ownership/control-flow slice after the later FXAA/SMAA/FSR and AA sizing entries. Broader GPU/texture parity debt remains elsewhere in this file and must continue to be audited.
 
 ### Intentional differences
 - `pixel_format_from_gpu_pixel_format(...)` takes the raw Android pixel-format `u32` carried by ruzu's `FramebufferConfig::pixel_format` wrapper instead of upstream's `Service::android::PixelFormat` enum. The mapping and fallback values match upstream `VideoCore::Surface::PixelFormatFromGPUPixelFormat`.
 - OpenGL `Layer::load_fb_to_screen_info(...)` and `configure_framebuffer_texture(...)` now compute framebuffer bytes-per-pixel through `surface::pixel_format_from_gpu_pixel_format(...)` plus `surface::bytes_per_block(...)`, matching upstream's `PixelFormatFromGPUPixelFormat(framebuffer.pixel_format)` / `BytesPerBlock(pixel_format)` ownership instead of local raw-value matches.
 - `TextureCacheBase::try_find_framebuffer_image_view(...)` now uses the same common GPU pixel-format helper for the presentable image-view format selected by upstream `TextureCache<P>::TryFindFramebufferImageView`. This keeps the accelerated `RasterizerOpenGL::AccelerateDisplay` path and the fallback CPU upload path on the same upstream mapping.
 
-### Unintentional differences (to fix)
-- None identified for Android GPU pixel-format mapping after re-reading upstream `surface.cpp`, `TextureCache<P>::TryFindFramebufferImageView`, and `renderer_opengl/present/layer.cpp`.
 
 ### Missing items
 - Fixed by later entries: OpenGL presentation FXAA/SMAA/FSR filter passes now compile their upstream shader programs, create/upload their resources, and use upstream-equivalent viewport/pass sizing. This older entry only fixed framebuffer pixel-format mapping and bytes-per-pixel ownership for the fallback CPU presentation upload path.
@@ -2193,8 +2213,6 @@
 - Rust keeps the existing `HLERequestContext::write_buffer` copy/clamp API instead of upstream's typed `OutArray<u32, BufferAttr_HipcMapAlias>` spans; `GetSharedFontInOrderOfPriority` now computes its element count from the three guest output buffer sizes before writing, preserving upstream's `min(6, codes.size, offsets.size, sizes.size, region_count)` behavior.
 - Rust still caches a lazily-created `Arc<KSharedMemory>` plus object id for the font shared memory, but `GetSharedMemoryNativeHandle` now returns that object id through `push_copy_object_id`, so copy-handle creation is performed by the IPC response layer as in upstream `OutCopyHandle<KSharedMemory>`.
 
-### Unintentional differences (to fix)
-- None identified in this slice after re-reading `GetSharedFontInOrderOfPriority`.
 
 ### Missing items
 - The shared-font native handle path still uses ruzu's lazy `KSharedMemory` ownership adaptation instead of upstream's `kernel.GetFontSharedMem()` singleton.
@@ -2202,8 +2220,6 @@
 ### Intentional differences
 - `svc_shared_memory::create_shared_memory(...)` logs a Rust warning before returning `RESULT_NOT_IMPLEMENTED`; upstream uses `UNIMPLEMENTED()` before throwing `ResultNotImplemented`. The guest-visible result and zero output handle match upstream.
 
-### Unintentional differences (to fix)
-- None identified in this slice after routing the AArch32 `CreateSharedMemory` dispatch through `svc_shared_memory::create_shared_memory(...)`.
 
 ### Missing items
 - AArch64 `CreateSharedMemory` dispatch is still not audited in this pass because MK8D v0 is AArch32 and the observed NVN allocation path reaches `CreateSharedMemory64From32`.
@@ -2305,8 +2321,6 @@
 ### Unintentional differences (to fix)
 - This slice only changes manager ownership timing. Existing service implementation/stub gaps in NIM, BTM, Fatal, and Friend remain unchanged.
 
-### Missing items
-- None identified for the audited NIM named-service registration slice after re-reading upstream `NIM::LoopProcess`.
 
 ### Intentional differences
 - `EUPLD::loop_process(...)` and `LBL::loop_process(...)` now construct `ServerManager` through `ServerManager::new_shared(...)` before named-service registration and enter the loop through `ServerManager::run_server_shared(...)`. This preserves the existing Rust factories/stubs while matching upstream's stable `std::unique_ptr<ServerManager>` before `RegisterNamedService(...)` ownership shape.
@@ -2332,11 +2346,7 @@
 - USB now instantiates concrete Rust `ServiceFramework` services for the same service classes and named-service registrations as upstream `usb.cpp`: `IDsRootSession`, `IClientRootSession`, `IPdManager`, `IPdCradleManager`, `IPmMainService`, plus the nested `IDsInterface`, `IClientEpSession`, `IClientIfSession`, `IPdSession`, and `IPdCradleSession` classes. `IPdManager::OpenSession` and `IPdCradleManager::OpenCradleSession` return IPC interfaces like upstream.
 - USB uses a local macro only for the repeated mechanical `SessionRequestHandler`/`ServiceFramework` trait implementations. Handler tables, service names, and class ownership remain in `usb.rs`, the upstream counterpart of `usb.cpp`.
 
-### Unintentional differences (to fix)
-- None identified for the audited PCV, USB, NGC, and BtDrv service implementation slices after re-reading their upstream files.
 
-### Missing items
-- None identified for the audited PCV, USB, NGC, and BtDrv service implementation slices after re-reading upstream `pcv.cpp`, `usb.cpp`, `ngc.cpp`, and `btdrv.cpp`.
 
 ### Intentional differences
 - `JIT::loop_process(...)`, `PlayReport::loop_process(...)`, and `NPNS::loop_process(...)` now construct `ServerManager` through `ServerManager::new_shared(...)` before named-service registration and enter the loop through `ServerManager::run_server_shared(...)`. This preserves the existing Rust factories/stubs while matching upstream's stable `std::unique_ptr<ServerManager>` before `RegisterNamedService(...)` ownership shape.
@@ -2353,11 +2363,7 @@
 - `LR`, `NCM`, `ILocationResolver`, `IRegisteredLocationResolver`, and `IAddOnContentLocationResolver` now instantiate concrete Rust `ServiceFramework` services with the same service names and command tables as upstream `ncm.cpp`.
 - Registrations are performed under short `Mutex<ServerManager>` scopes because Rust stores the final manager in an `Arc<Mutex<_>>`; upstream has direct unique-pointer ownership and therefore no equivalent lock.
 
-### Unintentional differences (to fix)
-- None identified for the audited MIG, MNPP_APP, and NCM service implementation slices after re-reading upstream `mig.cpp`, `mnpp_app.cpp`, and `ncm.cpp`.
 
-### Missing items
-- None identified for the audited MIG, MNPP_APP, and NCM service implementation slices after re-reading upstream `mig.cpp`, `mnpp_app.cpp`, and `ncm.cpp`.
 
 ### Intentional differences
 - `BPC::loop_process(...)`, `GRC::loop_process(...)`, and `MM::loop_process(...)` now construct `ServerManager` through `ServerManager::new_shared(...)` before named-service registration and enter the loop through `ServerManager::run_server_shared(...)`. This preserves the existing Rust factories/stubs while matching upstream's stable `std::unique_ptr<ServerManager>` before `RegisterNamedService(...)` ownership shape.
@@ -2398,7 +2404,6 @@
 - `SM::loop_process(...)` and `AM::loop_process(...)` now use the shared-owner path before `ManageNamedPort("sm:")` / `RegisterNamedService("applet*")`. The Rust-only `setup_sm_for_test(...)` fixture helper also uses `new_shared(...)`, so test-created `sm:` ownership no longer exercises the legacy pending-owner bridge.
 - `FileSystem::register_services(...)`, `HID::loop_process(...)`, `NS::loop_process(...)`, `Set::loop_process(...)`, `Mii::loop_process(...)`, and `Glue::loop_process(...)` now register their named services through an already-bound shared manager, matching the upstream `std::make_unique<ServerManager>(system)` before `RegisterNamedService(...)` pattern for these MK8D-critical service groups.
 
-### Unintentional differences (to fix)
 
 ### Intentional differences
 - Rust `Nvmemp` uses the existing `ServiceFramework` command-table path with `None` handlers for commands `0: Open` and `1: GetAruid`. Upstream registers the same two commands and both bodies are `UNIMPLEMENTED()`, so the Rust table preserves command ownership without adding non-upstream behavior.
@@ -2467,7 +2472,6 @@
 - `ServerManager::new_shared(...)` / `run_server_shared(...)` now provide the upstream-shaped construction path where the final Rust owner exists before service registration. `Nvnflinger::LoopProcess` uses this path for `"dispdrv"` so `IHOSBinderDriver` ownership is live at `RegisterNamedService` time instead of being republished after `KernelCore::run_server(...)`.
 - `SessionRequestManager` stores the owning manager as `Weak<Mutex<ServerManager>>` instead of a strong `Arc`. Upstream stores `Service::ServerManager&`, which is non-owning; Rust upgrades the weak owner only at call sites that need the manager object. The pending-registration queue and wakeup event remain strong endpoint handles because they are the Rust host-thread registration bridge.
 
-### Unintentional differences (to fix)
 
 ### Intentional differences
 - Ported upstream `MaxwellToOutputTopology(...)` and wired the OpenGL graphics pipeline to generate a passthrough geometry shader when a previous stage requires layer emulation and no real geometry shader is present. This matches upstream's `layer_source_program != nullptr && index == Geometry && key.unique_hashes[index] == 0` trigger and uses the same points/line-strip/triangle-strip topology mapping.
@@ -2490,8 +2494,6 @@
 ### Unintentional differences (to fix)
 - No generator-local behavioral difference identified in this slice. The remaining OpenGL staging differences are tracked in the `gl_shader_cache.rs` entry above.
 
-### Missing items
-- None for `GenerateGeometryPassthrough(...)` itself in this slice.
 
 ### Intentional differences
 - Ported upstream `Optimization::PositionPass(Environment&, IR::Program&)`: the pass now runs only for `VertexB` when `ReadViewportTransformState()` is false, sets `program.info.uses_render_area`, and rewrites `PositionX`/`PositionY` `SetAttribute` values through `FPFma(value, FPRecip(RenderAreaWidth/Height) * 2.0, -1.0)`.
@@ -2567,8 +2569,6 @@
 - The reduced address-only OpenGL graphics-pipeline path (`current_graphics_pipeline`, `current_graphics_pipeline_slow_path`, `create_graphics_pipeline`, `pending_program_addresses`, and the stored callback reader) was removed from `gl_shader_cache.rs`. Runtime and tests now use `current_graphics_pipeline_with_shared_cache(...)` or explicit `GraphicsEnvironments`, which refresh stages through the shared `ShaderCache` and compiles from `GraphicsEnvironment` owners, matching upstream `ShaderCache::CreateGraphicsPipeline() -> GetGraphicsEnvironments(...)`.
 - `RasterizerOpenGL::set_gpu_memory_reader(...)` still accepts the renderer bridge callback for compatibility paths outside OpenGL shader compilation. The OpenGL shader cache no longer stores or consumes this callback.
 
-### Unintentional differences (to fix)
-- None identified for the removed OpenGL address-only fallback path.
 
 ### Missing items
 - Port the fuller upstream `CreateGraphicsPipeline(..., envs, ...)` object flow so Rust no longer emits per-stage GLSL directly from cached code slices.
@@ -2623,11 +2623,7 @@
 - `KMemoryBlockManagerUpdateAllocator::new(...)` returns `(allocator, result_code)` instead of upstream's constructor with `Result* out_result`, preserving the same success / `ResultOutOfResource` contract without an out-parameter.
 - Rust stores pre-reserved nodes as `[Option<Box<KMemoryBlock>>; 2]` and an `Arc<KMemoryBlockSlabManager>` owner instead of upstream raw `KMemoryBlock*` slots and `KMemoryBlockSlabManager*`. The slot/index lifecycle matches upstream: `m_index = MaxBlocks - num_blocks`, `Allocate()` swaps out the current slot, `Free()` either returns to a free slot or the slab, and `Drop` returns unused slots.
 
-### Unintentional differences (to fix)
-- None identified for the audited `KMemoryBlockManagerUpdateAllocator` construction and slot lifecycle slice.
 
-### Missing items
-- None identified for the audited allocator invariant slice.
 
 ### Intentional differences
 - `NVDRV::QueryEvent` now follows upstream's successful response ownership path more closely: when `Module::QueryEvent(...)` returns `NvResult::Success` and a readable event, Rust registers the readable event object in the caller process and pushes the object id through `ResponseBuilder::push_copy_object_id(...)`. Final client-handle allocation remains deferred to `HLERequestContext::write_to_outgoing_command_buffer(...)`, matching upstream `rb.PushCopyObjects(readable_event)` followed by `handle_table.Add(object)` during IPC write-back.
@@ -2704,8 +2700,6 @@
 ### Unintentional differences (to fix)
 - Rust still represents process handles as opaque `u64` object IDs in `KHandleTable` and resolves them through `KernelCore::get_process_by_id(...)`; upstream stores typed `KAutoObject*` entries and retrieves `KProcess` directly through `GetObjectWithoutPseudoHandle<KProcess>`.
 
-### Missing items
-- None identified for the audited page-table traversal/IPC setup slice.
 
 ### Intentional differences
 - Rust `WriteBufferB/C` now routes through `Memory::write_block(...)`, matching upstream `memory.WriteBlock(...)`. Rust `Memory::write_block(...)` follows the translated host-pointer page walk and rasterizer write side effects rather than the older page-table physical-backing shortcut.
@@ -2724,8 +2718,6 @@
 - `KProcess::run(...)` aligns `stack_size` to `PageSize` before reserving/mapping stack pages, matching upstream `KProcess::Run`. The Rust method is still invoked through the exclusive `ProcessLock` owner rather than taking `m_state_lock` around the whole bootstrap; a literal `KScopedLightLock` guard in this path currently interacts badly with ruzu's host/current-thread lock model, while `CreateThread` uses the upstream state-lock guard where concurrent user-thread creation can occur.
 - Three direct `SleepThread` unit tests remain ignored because they require a fully kernel-owned current-core/scheduler fixture. The runtime SVC path is unchanged by this test-only annotation.
 
-### Unintentional differences (to fix)
-- None identified for the audited `CreateThread` state-lock/user-stack ownership slice.
 
 ### Missing items
 - Build a full scheduler/current-core test fixture for direct `SleepThread` yield/sleep tests so those ignored tests can be re-enabled without local scheduler shortcuts.
@@ -2735,40 +2727,24 @@
 - Rust reaches upstream `std::shared_ptr<Tegra::MemoryManager> gmmu` through the existing `GpuMemoryManagerHandle` trait object because `core` cannot name the concrete `video_core::MemoryManager` type.
 - Env-gated `GPU_VA_MAP` / `GPU_VA_UNMAP` trace-ring emission mirrors the existing Rust diagnostic system. It is disabled by default and does not change ioctl payloads or results.
 
-### Unintentional differences (to fix)
-- None identified for the audited `FreeMappingLocked` / `UnmapBuffer` / `FreeSpace` size and operation-order slice.
 
-### Missing items
-- None identified for the audited `nvhost_as_gpu` address-space serialization, `FreeMappingLocked`, `UnmapBuffer`, and `FreeSpace` slice.
 
 ### Intentional differences
 - Rust keeps the page table as `VirtualBuffer<PageInfo>` / `VirtualBuffer<u64>` fields like upstream but exposes the mapping helper as `PageTable::map_pages(...)` for reduced tests in addition to the runtime `Memory::map_pages(...)` owner path. Both now store `backing_addr[page] = target - (page << PAGE_BITS)` and recover physical addresses by adding the queried virtual address, matching upstream `MapPages(...)` and `PageTable::GetPhysicalAddress(...)`.
 
-### Unintentional differences (to fix)
-- None identified for the audited `backing_addr` / `GetPhysicalAddress` storage contract.
 
-### Missing items
-- None for this physical-address recovery slice.
 
 ### Intentional differences
 - `ScopedKernelForTest` is a Rust-only `#[cfg(test)]` harness owner that installs a minimal `KernelCore` in `KERNEL_PTR` without running `KernelCore::initialize()`. This lets unit tests exercise upstream-shaped `KPageTableBase::SetHeapSize` / `KMemoryManager::AllocateAndOpen` / `KMemoryBlockManagerUpdateAllocator` paths while avoiding runtime scheduler/core startup in native tests.
 - `svc_synchronization` transfer-memory tests now call `System::initialize()` and `KProcess::create_memory(&system)` so the process page table owns a real `Core::Memory::Memory` bridge before `SetHeapSize`, matching upstream's process-owned `m_memory` dependency.
 
-### Unintentional differences (to fix)
-- None for the audited native-test fixture setup slice.
 
-### Missing items
-- None for this test-harness prerequisite slice.
 
 ### Intentional differences
 - `System::new_for_test()` uses Rust-only `setup_sm_for_test(...)` to register `sm:`, publish the matching `ServiceOwnership`, and keep the returned `ServerManager` alive without entering upstream's blocking `ServerManager::RunServer(...)` loop. The helper now constructs the manager through `ServerManager::new_shared(...)`, matching runtime SM's stable-owner-before-registration setup while still skipping the blocking loop for tests.
 - `KernelCore::track_server_manager_for_test(...)` is a narrow Rust harness owner hook so the weak service-ownership reference created during non-blocking test setup remains upgradeable. Upstream has no equivalent because its test harness is not built around Rust `Weak<ServerManager>` ownership.
 
-### Unintentional differences (to fix)
-- None for runtime `LoopProcess`; this entry covers test-harness setup only.
 
-### Missing items
-- None for the audited non-blocking `sm:` test setup slice.
 
 ### Intentional differences
 - Rust native unit tests now import the current lock wrapper aliases (`KThreadLock`, `ProcessLock`) and moved helper types (`KPort`, `Event`, ioctl payload structs) from their actual Rust owner modules. Upstream does not have these Rust test modules; this is test-harness wiring only and does not change runtime kernel/service behavior.
@@ -2777,18 +2753,12 @@
 - Older Rust tests that still expected `KProcess::read_block/write_block` now compile through a `#[cfg(test)]` compatibility bridge. It uses the upstream-shaped `Core::Memory::Memory` owner when the process page table has one and falls back to `ProcessMemoryData` only for reduced native fixtures that construct bare `KProcess` objects. This is test-only and does not expose the old helper in runtime builds.
 - Rust `KServerSession`, `KSessionRequest`, and `KHardwareTimer` tests now use current owner wrappers (`ProcessLock`, `KThreadLock`, `Arc<CoreTiming>`) instead of stale `Arc<Mutex<_>>` wrappers.
 
-### Unintentional differences (to fix)
-- None for runtime behavior in this slice.
 
-### Missing items
-- None for the currently targeted core lib-test harness cleanup slice.
 
 ### Intentional differences
 - Rust still stores the upstream `Tegra::MemoryManager&` owner behind `Arc<parking_lot::Mutex<MemoryManager>>` because the broader channel/engine owner graph is not yet a literal C++ reference graph.
 - Test-only reduced fixtures may still install `GpuMemoryReader` callbacks, but runtime graphics shader environments, compute shader environments, and Maxwell3D owner-backed reads/writes use the stored `MemoryManager` / `MaxwellDeviceMemoryManager` path directly. This matches upstream's `GenericEnvironment{Tegra::MemoryManager&}`, `ComputeEnvironment(..., Tegra::MemoryManager& ...)`, and `gpu_memory->ReadBlock(...)` dependency direction more closely without adding unsafe references.
 
-### Unintentional differences (to fix)
-- None identified for the audited production graphics/compute shader-environment memory-owner construction slice.
 
 ### Missing items
 - Continue the later shader-environment branch work: replace nullable runtime memory-owner state with constructors that require an upstream-shaped `MemoryManager` owner wherever possible.
@@ -2796,18 +2766,12 @@
 ### Intentional differences
 - Rust represents upstream `enum class PTEKind : u8` as a transparent `PteKind(u8)` newtype with owner-local associated constants instead of a Rust enum. This is intentional because upstream callsites use `static_cast<Tegra::PTEKind>(params.kind)` and `kind_map` stores the resulting raw byte; a Rust enum with gaps cannot safely represent unknown/non-listed raw values.
 
-### Unintentional differences (to fix)
-- None identified for the audited `PTEKind` raw-value storage slice.
 
-### Missing items
-- None identified for the audited `PTEKind` raw-value storage slice.
 
 ### Intentional differences
 - Rust keeps env-gated `NVHOST_CTRL_WAIT` trace-ring records and optional `RUZU_TRACE_NVHOST_CTRL_WAIT` logs around `IocCtrlEventWait`. Upstream uses normal logging only; the Rust diagnostics are disabled by default and do not alter guest-visible ioctl results.
 - Rust stores NV event objects through `Arc<Mutex<KReadableEvent>>`/`EventInterface` instead of upstream raw `Kernel::KEvent*`; the wait/register/clear/free ownership still remains in the matching `nvhost_ctrl.rs` owner.
 
-### Unintentional differences (to fix)
-- None identified for the `IocCtrlEventWait` event-fail lifecycle slice after comparing against upstream's `must_unmark_fail` / `SCOPE_EXIT` ordering.
 
 ### Missing items
 - Continue auditing `nvhost_ctrl` wait timing against upstream runtime traces if MK8D still returns `NvResult::Timeout` where zuyu's `UpdateMin` observes host syncpoint progress.
@@ -2832,8 +2796,6 @@
 ### Missing items
 - Finish the host-thread IPC lifecycle audit so the remaining services can use the upstream-shaped ServerManager path by default, then remove the inline fallback and service-specific routing knobs.
 
-### Intentional differences
-- None identified for the local `KProcess::Initialize` ASLR policy: ruzu now follows the local zuyu reference, which forces `enable_aslr = false` before `m_page_table.Initialize(...)` in both process-initialization paths. This replaces the previous env-only `RUZU_DISABLE_ASLR` behavior for process page-table layout.
 
 ### Unintentional differences (to fix)
 - The surrounding process object model still uses Rust side registries for several kernel object lifetimes instead of upstream `KAutoObject` ownership through `KHandleTable`.
@@ -2866,11 +2828,7 @@
 - Rust stores the channel `MemoryManager` as `Arc<parking_lot::Mutex<MemoryManager>>` on `TextureCacheBase`, while upstream reaches the same owner through `channel_state->gpu_memory`.
 - `JoinImages` still queues the backend copy/delete tail through `pending_join_copies` because `TextureCacheBase` has no backend `Runtime::CopyImage` object. The sparse GPU overlap check and sparse image classification now run at the corresponding upstream points before registration.
 
-### Unintentional differences (to fix)
-- None for the sparse GPU page-table and sparse-segment registration slice after re-checking upstream `JoinImages`, `ForEachSparseSegment`, `RegisterImage`, and `UnregisterImage`.
 
-### Missing items
-- None for this slice.
 
 ### Intentional differences
 - Added diagnostic-only `CBUF_BIND` sequence/time filters (`RUZU_TRACE_CBUF_BIND_SEQ_MIN/MAX`, `RUZU_TRACE_CBUF_BIND_TIME_START_MS/END_MS`) and cached `RUZU_TRACE_CBUF_VEC4_COUNT` parsing. Upstream has no equivalent trace-ring hook; default rendering behavior is unchanged because the path is gated by `[opengl].cbuf_bind = true`.
@@ -2945,8 +2903,6 @@
 - Runtime `Host1x` construction now uses `Host1x::new_with_system(SystemRef::from_ref(system))` from the subsystem factory, matching upstream `Host1x::Host1x(Core::System&)` ownership. The ownerless `Host1x::new()` / `Default` helpers are compiled only for reduced tests, while `Host1x::system_ref()` is the Rust counterpart of upstream `Host1x::System()`.
 - `Host1x::start_device` / `stop_device` now leave `FrameQueue` open/close ownership with the concrete devices, matching upstream `Host1x::StartDevice` and `Host1x::StopDevice`: `Nvdec::new` opens the queue, `Nvdec::drop` does not close it, and `Vic::drop` closes it.
 
-### Unintentional differences (to fix)
-- None identified for this audited Host1x SMMU compressed-physical mapping and device lifecycle slice.
 
 ### Missing items
 - Continue the broader owner-graph audit tracked in later entries: reduced ownerless fixtures are now test-only, while runtime Host1x/NvMap/device-memory construction must use owner-backed constructors.
@@ -3500,11 +3456,7 @@
 - Host1x/SMMU-backed non-heap pin/unmap goes through the core-facing Host1x bridge (`smmu_map_with_cpu_backing`, `smmu_unmap`, `smmu_free`) rather than a direct `Tegra::Host1x::Host1x&`, because the Rust `core` crate cannot store the concrete video_core Host1x type directly.
 - Rust gives `NvMap` access to session preallocation through a shared `ContainerSessionStore` rather than upstream's literal `Container& core` member. This avoids a Rust self-reference cycle while preserving owner placement in `core/nvmap.rs`: `pin_handle` decides between `session->mapper->Map(...)` and the non-heap SMMU fallback, and forced unmap reaches the same session mapper from `NvMap`.
 
-### Unintentional differences (to fix)
-- None identified for the owner-local `PinHandle(..., true)` low-area pin path after comparing against upstream's `host1x.Allocator().Allocate(...)` / `host1x.GMMU().Map(...)` and `UnmapHandle` ordering.
 
-### Missing items
-- None in this older owner-local `PinHandle` slice; the newer 2026-06-05 `NvMap` entry tracks the current safe `ContainerSessionStore` adaptation and remaining Host1x/device-memory table work.
 
 ### Intentional differences
 - Rust keeps `read_struct` / `write_struct` helpers in this file instead of upstream `WrapFixed(...)` templates. This is a mechanical IPC adaptation while preserving ioctl ownership in `devices/nvmap.rs`.
@@ -3889,8 +3841,6 @@
 ### Intentional differences
 - The owner file remains responsible for nvmap device ioctl behavior. Host1x-backed SMMU/GMMU lifecycle details are now tracked by the newer `core/src/hle/service/nvdrv/core/nvmap.rs`, `core/src/host1x_core.rs`, `video_core/src/host1x/host1x.rs`, and `video_core/src/host1x/gpu_device_memory_manager.rs` entries.
 
-### Missing items
-- None in this older device-ioctl slice; continue auditing the newer `NvCore::NvMap` / Host1x device-memory entries for remaining owner-reference and compressed-table parity work.
 
 ### Intentional differences
 - Rust keeps a local `signal_syncpoint(id)` helper in this owner file for synchronous compatibility paths. Upstream only refreshes `counter_min` through `UpdateMin()` / Host1x progress; the helper is not used by the upstream-shaped host-action path.
@@ -3906,8 +3856,6 @@
 - Rust reaches upstream `Tegra::MemoryManager` behavior through the cross-crate `GpuMemoryManagerHandle` bridge instead of constructing the concrete video-core owner type directly in this file.
 - Rust stores `Allocation::mappings` as `Vec<Arc<Mapping>>` instead of upstream `std::list<std::shared_ptr<Mapping>>`. This preserves insertion order and shared ownership with `mapping_map`; `FreeSpace` now stops on a stale mapping like upstream `FreeMappingLocked(mapping_map.at(...))`, while `UnmapBuffer` still returns success for missing mappings like upstream's caught `std::out_of_range` path.
 
-### Missing items
-- None identified for the audited VA-region and mapping-owner behavior slice.
 
 ### Intentional differences
 - Rust still has partial symbolication and module discovery in this owner file; `find_modules()` remains a placeholder because page-table based module walking is not fully wired yet.
@@ -3957,16 +3905,12 @@
 - Rust adds opaque bridge implementations (`GpuChannelHandle`, `GpuMemoryManagerHandle`) in this owner file because upstream can hand around `shared_ptr<ChannelState>` and `shared_ptr<MemoryManager>` directly, while Rust must hide those concrete types from `core`.
 - The bridge still constructs the memory-manager object through `GpuCoreInterface` because `core` and `video_core` remain split crates, unlike the monolithic upstream tree.
 
-### Missing items
-- None identified for the audited bridge surface: `VideoGpuMemoryManagerHandle` forwards `Map`, `MapSparse`, `Unmap`, and rasterizer binding into the current video-core `MemoryManager`. Remaining differences are owner-shape adaptations (`Arc<Mutex<MemoryManager>>` and cross-crate type erasure), not missing `nvhost_as_gpu` GMMU calls.
 
 ### Intentional differences
 - Rust stores the `gmmu` field as an opaque `GpuMemoryManagerHandle` bridge instead of upstream's concrete `std::shared_ptr<Tegra::MemoryManager>` because `core` cannot depend directly on the concrete `video_core::memory_manager::MemoryManager` type. The bridge forwards `Map`, `MapSparse`, `Unmap`, channel binding, and `GPU::InitAddressSpace(...)` ownership into video_core.
 - `AllocAsEx` now allocates the upstream-equivalent owner object, and the bridge now forwards `MapBufferEx` / `Remap` / sparse allocation teardown into `gmmu->Map(...)` / `MapSparse(...)` / `Unmap(...)`.
 - `GPU::InitAddressSpace(...)` now binds the renderer rasterizer to the concrete video_core `MemoryManager` behind the bridge, preserving upstream rasterizer invalidation/unmap callbacks without exposing the concrete type through the `core` crate boundary.
 
-### Missing items
-- None identified for this older `nvhost_as_gpu` GMMU bridge slice after re-reading upstream `nvhost_as_gpu.cpp` and current `GpuMemoryManagerHandle`: sparse reservations, remaps, unmaps, `BindChannel`, and `InitAddressSpace` rasterizer binding are forwarded to the current upstream-shaped video_core `MemoryManager`. Remaining `MemoryManager` owner-shape work is tracked in the dedicated `memory_manager.rs` and Host1x/device-memory entries.
 
 ### Intentional differences
 - Event destruction still uses the local no-op `EventInterface::free_event(...)` placeholder because the full upstream service-context close path is not present yet.
@@ -3986,8 +3930,6 @@
 - `MemoryManager::copy_block` uses a temporary Rust `Vec<u8>` instead of upstream `GpuGuestMemoryScoped<SafeReadWrite>`, but preserves the observable ordering: read source GPU VA, write destination GPU VA, then `FlushRegion(gpu_dest, size)`.
 - `MaxwellDeviceMemoryManager::smmu_write_block_unsafe` now mirrors upstream `DeviceMemoryManager<Traits>::WriteBlockUnsafe` by writing mapped bytes without invoking the invalidate callback. `MemoryManager::write_block_unsafe` uses that path for GPU query/result writebacks.
 
-### Missing items
-- None identified for the audited runtime constructor-owner slice. Reduced fixture-only constructors remain test-only adaptations; broader storage-shape differences are tracked in the newer owner-graph entry.
 
 ### Intentional differences
 - `GpuContext` is a Rust compatibility context with no direct upstream C++ owner file. Its engine construction now shares one owner-backed `MemoryManager` across Maxwell3D, KeplerCompute, Fermi2D, and MaxwellDMA, matching upstream `ChannelState::Init`'s `std::make_unique<Engine>(..., *memory_manager)` dependency direction more closely than the previous separate/ownerless compatibility managers.
@@ -4073,8 +4015,6 @@
 ### Missing items
 - remaining direct host1x/system integrations still owned elsewhere
 
-### Intentional differences
-- None identified for the report-semaphore fallback write path in current code: runtime writes route through the stored `MemoryManager` owner when present. Ownerless reduced fixtures remain local test adaptations.
 
 ### Missing items
 - Continue the broader ownership split cleanup tracked by newer entries; this older report-semaphore slice no longer carries a distinct writer-callback gap.
@@ -5005,8 +4945,6 @@
 ### Unintentional differences (to fix)
 - Several older page-table update call sites still use simplified lock/update scopes even though Rust now has local counterparts for `KScopedLightLock`, `KScopedLightLockPair`, `KScopedPageTableUpdater`, and `KMemoryBlockManagerUpdateAllocator`.
 
-### Missing items
-- None identified for the audited IPC client setup failure-cleanup slice.
 
 ### Intentional differences
 - Rust still wraps scheduler/core owners in `Arc<Mutex<...>>` and splits some helper logic across `cpu_manager.rs` and `physical_core.rs`, while upstream keeps these as direct object references. Ownership for the guest-thread loop remains in `cpu_manager.rs`.
@@ -5496,8 +5434,6 @@
 - Rust stores upstream `std::shared_ptr<Mapping>` ownership as `Arc<Mapping>` inside the same owner file. `mapping_map` and `Allocation.mappings` now share the same mapping object, preserving the upstream ownership topology while adapting to Rust smart pointers.
 - Rust still keeps the upstream single device mutex plus several inner `Mutex` fields (`vm`, `mapping_map`, `allocation_map`, `gmmu`) to satisfy borrow and aliasing rules. The outer owner mutex serializes the same AS entrypoints as upstream before touching the VM/allocation/mapping/GMMU state; the inner locks are not used to weaken the upstream operation ordering.
 
-### Unintentional differences (to fix)
-- None identified for the audited `Allocation` / `mapping_map` ownership slice.
 
 ### Intentional differences
 - Rust still cannot use the upstream intrusive red-black tree node embedded in `KThread`, so this file stores the wait tree as `BTreeSet<ConditionVariableThreadKey>` plus a `by_thread_id` index for mechanical erase-by-thread-id operations. The ownership remains in `k_condition_variable.rs`, matching the upstream file owner.
@@ -6222,8 +6158,6 @@
 - Rust parent engines pass the current upload `Registers` view into `process_exec` / `process_data_*` instead of storing upstream's literal `Registers&` field in `State`.
 - Reduced ownerless construction through `State::new()` / `Default for State` and late owner injection through `State::bind_memory_manager(...)` are compiled only for tests; runtime construction goes through `State::new_with_memory_manager(...)`, matching upstream's constructor-owned `MemoryManager&` direction.
 
-### Unintentional differences (to fix)
-- None identified for the audited runtime parent-engine construction slice. `State::new()` / `Default for State` are test-only and only `new_with_memory_manager(...)` is exposed as the normal runtime constructor.
 
 ### Missing items
 - Reduced fixture-only ownerless construction still exists inside the owner file for tests; upstream runtime construction requires `MemoryManager&`.
@@ -6233,8 +6167,6 @@
 - Rust forwards the bound rasterizer into `upload_state.bind_rasterizer(...)`, matching upstream `Upload::State::BindRasterizer`, but uses `RasterizerHandle` rather than storing a raw pointer directly.
 - Reduced owner injection through `Maxwell3D::set_memory_manager(...)` is compiled only for tests; runtime parent-engine construction must use `Maxwell3D::new_with_memory_manager(...)`, matching upstream's constructor-owned `MemoryManager&` direction.
 
-### Unintentional differences (to fix)
-- None identified for the audited runtime `Maxwell3D` upload-memory owner construction slice.
 
 ### Intentional differences
 - Rust constructs `upload_state` with the same `MemoryManager` owner supplied to `KeplerMemory` and forwards `BindRasterizer` into `Upload::State`, but represents those owner edges with safe Rust handles rather than C++ references/pointers.
@@ -6974,8 +6906,6 @@
 ### Intentional differences
 - Rust ports upstream `Core::DeviceMemoryManager<MaxwellDeviceTraits>` behavior directly in `gpu_device_memory_manager.rs` instead of wrapping the literal C++ template backend. This preserves the upstream owner file and method responsibilities while adapting storage to Rust `Arc`/`Mutex` ownership.
 
-### Missing items
-- None in this older placeholder-surface slice; current compressed-physical table, typed read/write, pointer lookup, and cached-page behavior are tracked by the newer Host1x SMMU / `MemoryManager` entries.
 
 ### Intentional differences
 - Rust `RasterizerVulkan` still only wires the query-cache channel edge from this file. The upstream channel sequence for texture cache, buffer cache, pipeline cache, and state tracker still remains unported here because those owners are not yet all available with matching Rust APIs.
@@ -7249,8 +7179,6 @@
 ### Intentional differences
 - Rust still uses explicit composition (`current_graphics_pipeline_with_shared_cache(&mut SharedShaderCache)`) instead of literal inheritance from the shared shader-cache owner. The live key population still happens in the matching OpenGL owner file.
 
-### Unintentional differences (to fix)
-- None identified for the audited live key fields in this slice.
 
 ### Missing items
 - `RasterizerOpenGL` / `ShaderCache` ownership is still reduced: Rust reaches the draw-manager topology through `Maxwell3D::draw_manager_topology()` instead of the literal upstream `maxwell3d->draw_manager->GetDrawState().topology` pointer graph.
@@ -9392,11 +9320,7 @@ Investigation focused on a "specific frame number" was misdirected. The real que
 - Rust currently batches registered-owner cache ranges into a temporary vector and drops its `ScopedRangeLock` before invoking `Memory::rasterizer_mark_region_cached`. Upstream calls `MarkRegionCaching` inline while holding its range/counter guard, but upstream does not also take ruzu's `Mutex<Memory>`. The Rust ordering avoids a host-side ABBA while preserving the externally visible cache/uncache transitions.
 - `UpdatePagesCachedCount` now extracts CPU backing from the SMMU metadata recorded by `smmu_map_with_cpu_backing`, including ASID discontinuity and null-vpage batch release behavior. When an ASID has a registered process `Memory` owner, Rust calls `Memory::rasterizer_mark_region_cached(...)` directly; pages without a registered owner no-op in runtime builds like upstream.
 
-### Unintentional differences (to fix)
-- None identified for the audited `UpdatePagesCachedCount` / `Memory::RasterizerMarkRegionCached` cache-counter and fastmem-protection slice.
 
-### Missing items
-- None identified for the audited `UpdatePagesCachedCount` / `Memory::RasterizerMarkRegionCached` cache-counter and fastmem-protection slice.
 
 ### Intentional differences
 - Rust still passes a `Maxwell3DAccess` trait object into `DrawManager` methods instead of storing the raw `Maxwell3D*` member used upstream. This is the current safe Rust ownership adaptation for the render-engine rework.
@@ -10076,8 +10000,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - `HeapMapper::IsInBounds`, `Map`, `Unmap`, and subrange address derivation now use wrapping `VAddr` / `DAddr` arithmetic for upstream unsigned expression parity (`start + size`, `m_vaddress + m_size`, `start - m_vaddress`) instead of Rust debug-overflow panics.
 - `NvMap` reaches the active session mapper through a shared `ContainerSessionStore` instead of upstream's literal `Container& core`. This keeps the preallocated-heap decision and forced heap unmap inside `NvMap::pin_handle` / `NvMap::free_handle`, matching upstream method ownership without introducing an unsafe Rust self-reference cycle.
 
-### Unintentional differences (to fix)
-- None identified for the currently audited `NvMap` session-state ownership slice. `ContainerSessionStore` is a narrow safe Rust view of upstream `ContainerImpl::sessions`, and runtime `NvMap` construction still flows through `Container`.
 
 ### Missing items
 - Continue the broader Host1x/GPU owner-graph cleanup tracked in later entries: Host1x/GPU/rasterizer ownership still crosses safe Rust bridge traits instead of upstream direct references, and `UpdatePagesCachedCount` still keeps a documented fallback callback for pages without ASID CPU-backing metadata or partial test construction. The `MemoryManager::*_with_callback` guest-memory walkers are now explicit `#[cfg(test)]` reduced-fixture helpers, not runtime owner paths.
@@ -10086,8 +10008,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Added `common::address_space::FlatAllocator64` as the Rust counterpart for upstream `Common::FlatAllocator<DAddr, 0, 34>` used by `DeviceMemoryManagerAllocator<MaxwellDeviceTraits>`. `FlatAllocator` and `FlatAllocator64` are now aliases over the same generic bool-backed `FlatAllocatorBool<VaType>`, matching the upstream `FlatAllocator<VaType, UnmappedVa, AddressSpaceBits>` shape for the `PaType=bool` instantiations currently used by ruzu.
 - `MaxwellDeviceMemoryManager::smmu_allocate/free` now use the 64-bit allocator with upstream `first_address = 1 << YUZU_PAGEBITS` and a 34-bit VA limit. This removes the previous 32-bit allocator cap while preserving the upstream linear-allocation-before-reuse behavior.
 
-### Unintentional differences (to fix)
-- None identified for the audited bool-backed `FlatAllocator<u32, 0, 32>` / `FlatAllocator<DAddr, 0, 34>` instantiations.
 
 ### Missing items
 - Generalize the broader Rust `FlatAddressSpaceMap` port if future upstream users require non-bool `PaType`, `PaContigSplit=true`, or `ExtraBlockInfo` instantiations. This entry only covers the allocator variants used by current Host1x SMMU/GMMU paths.
@@ -10114,11 +10034,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - `GpuContext::flush` now reads GPFIFO pushbuffers through its owner-backed `GpuMemoryManager::read_block(...)` instead of accepting a caller-supplied CPU guest-memory reader. The remaining explicit `*_with_callback` APIs on `MemoryManager` / `GpuMemoryManager` are compiled only for reduced tests.
 - `engine_upload::State` receives the current parent upload `Registers` view at each operation instead of storing upstream's literal `Registers&`. Upstream parent engines construct `upload_state{memory_manager, regs.upload}` from fields that live inside the same parent engine object; copying that shape directly in Rust would require a self-referential parent-engine field or unsafe raw pointer. The Rust call shape still reads the current parent register values for `ProcessExec`, `ProcessData`, and `ExecTargetAddress`, preserving the behavior while keeping the register owner in the parent engine.
 
-### Unintentional differences (to fix)
-- None identified for the audited runtime upload-state owner slice.
 
-### Missing items
-- None identified for the audited runtime upload-state owner/register-view slice.
 
 ### Intentional differences
 - Ruzu uses rdynarmic as a Rust port of upstream Dynarmic. The fix is applied in the external rdynarmic crate rather than under `ruzu/`, because the bug is in A32 VFP instruction classification before IR emission.
@@ -10715,7 +10631,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - `UnmapPhysicalMemory` keeps the upstream strict validation that the requested range contains only `Normal`/attribute-none blocks or `Free` blocks before unmapping the `Normal` subranges.
 - `MapPhysicalMemory` and `UnmapPhysicalMemory` acquire `m_map_physical_memory_lock` and `m_general_lock` at the audited upstream scopes. `KScopedPageTableUpdater` is now scoped to the upstream map/unmap update blocks, and the local rollback helper receives the updater `PageLinkedList` instead of issuing rollback `Operate(...)` calls without the updater page-list.
 
-### Unintentional differences (to fix)
 
 ### Intentional differences
 - Added `RUZU_EXIT_ON_NULL_PC=1`, a Rust-only diagnostic escape hatch for MK8D runs that reach the known null-PC guest fatal path. When the env var is set and `BreakLoopNullPc` is detected, ruzu exits with code `101` after logging the existing context instead of leaving the host window alive with a suspended guest thread. This is inactive by default and is only test harness behavior.
@@ -10727,12 +10642,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - `NvMap::pin_handle` / `unmap_mapped_handle` reach upstream's concrete `host1x.MemoryManager()`, `host1x.Allocator()`, and `host1x.GMMU()` operations through `Host1xCoreInterface` because `core` cannot depend on the concrete `video_core::host1x::Host1x` type. The bridge is narrow and method-specific: SMMU allocate/map/unmap/free, low-area GMMU map/unmap, and process-ASID registration stay implemented by `video_core::host1x::Host1x`, while `NvMap` retains upstream method ownership for deciding when to call them.
 - Reduced `Container::new()` / `NvMap::new()` fixtures cannot construct upstream's mandatory `Host1x&`. Rust stores an explicit invalid ASID for ownerless `Container` sessions and `ContainerSessionStore::session_asid(...)` refuses to expose it, so reduced no-Host1x `NvMap` pins return `0` and leave `d_address`/`pins` unchanged instead of fabricating ASID 0 or a device address from the CPU address. Runtime `Container` construction still supplies Host1x like upstream.
 
-### Unintentional differences (to fix)
-- None identified for the `Container& core` usage slice after re-reading upstream `NvMap::PinHandle`, `NvMap::UnmapHandle`, and `ContainerImpl`: Rust's `ContainerSessionStore` carries the same session mapper/ASID state used by these methods without adding a self-reference cycle.
-- None identified for the `Tegra::Host1x::Host1x&` usage slice in `NvMap::PinHandle` / `UnmapHandle`: Rust's Host1x bridge carries the same owner operations used by these methods without moving the nvmap lifecycle decisions out of `core/nvmap.rs`.
 
-### Missing items
-- None identified for the audited `NvMap::PinHandle` / `UnmapHandle` Host1x owner-reference slice. Remaining Host1x/device-memory table parity is tracked in the `gpu_device_memory_manager.rs`, `host1x.rs`, and `memory_manager.rs` entries.
 
 ### Intentional differences
 - Added `RUZU_TRACE_WRITE_BLOCK_AT=0x...` coverage to the Rust HLE output-buffer path. Upstream has no equivalent diagnostic; it is inactive by default and only emits when the selected output-buffer range covers the requested guest virtual address.
@@ -10741,8 +10651,6 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Unintentional differences (to fix)
 - Upstream has no HLE output-buffer write attribution hook. Keep `RUZU_TRACE_WRITE_BLOCK_AT` strictly env-gated and remove it if it starts affecting runtime structure or ownership.
 
-### Missing items
-- None for the diagnostic hook.
 
 ### Intentional differences
 - Rust still has an explicit `push_interface_response` helper inside `storage.rs` because the CMIF `Out<SharedPointer<T>>` declarative serializer is not fully ported. The helper now delegates object emission to `ResponseBuilder::push_ipc_interface`, preserving upstream's `PushIpcInterface` ownership and late handle-table translation.
@@ -10768,8 +10676,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Added diagnostic `RUZU_DISABLE_HOST1X_INVALIDATE_BIND=1` to isolate this new ownership edge during MK8D runtime testing. Upstream has no such knob; default behavior remains the upstream-equivalent binding.
 - `GPU::bind_renderer` reaches `host1x.GMMU().BindRasterizer(rasterizer)` through a downcast from the core-facing `Host1xCoreInterface` to the concrete `video_core::host1x::Host1x`. This preserves upstream behavior without exposing the concrete video-core type through the `core` crate interface.
 
-### Unintentional differences (to fix)
-- None identified for the audited renderer-binding slice. The Rust callback/bridge represents upstream's `DeviceMemoryManager::BindInterface(DeviceInterface*)` invalidation edge without moving Host1x ownership out of `video_core`.
 
 ### Missing items
 - Continue reducing the remaining owner-graph adapters once `Gpu`, `Host1x`, `MemoryManager`, and rasterizer lifetimes can carry upstream-style direct owners without unsafe self-reference cycles.
@@ -10818,11 +10724,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - `WaitSynchronization` copies the user handle array through the process-owned `Memory` bridge, matching upstream `GetCurrentMemory(kernel).ReadBlock(user_handles, handles.data(), sizeof(Handle) * num_handles)`.
 - Rust uses `Memory::read_block_checked_quiet(...)` for the block copy so invalid host mappings return `ResultInvalidPointer` without diagnostic spam. There is no legacy `process_memory` fallback in this SVC path.
 
-### Unintentional differences (to fix)
-- None for the audited handle-array copy path.
 
-### Missing items
-- None for the audited handle-array copy path.
 
 ### Intentional differences
 - `IStorage::new` has an env-gated diagnostic `RUZU_TRACE_ISTORAGE_OPEN=1` that logs backend name/path/size. Upstream has no constructor diagnostic; normal behavior is unchanged unless the variable is set.
@@ -10867,8 +10769,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Added disabled-by-default MK8D attribution diagnostics for `nvmap::IocCreate` / `IocAlloc`: `RUZU_TRACE_NVMAP_CALLER`, `RUZU_TRACE_NVMAP_STACK`, `RUZU_TRACE_NVMAP_STACK_FRAMES`, `RUZU_TRACE_NVMAP_STACK_POINTERS`, `RUZU_TRACE_NVMAP_STACK_CODE`, and `RUZU_TRACE_NVMAP_STACK_HANDLE`. Upstream has no equivalent host diagnostic; normal ioctl behavior and guest-visible payloads are unchanged unless the env vars are enabled.
 - Registered the verified MK8D `subsdk0` load base in `bases.json` (`0x01512000`) after byte-pattern matching runtime PCs `0x0151FC2C` / `0x0151FC94` to `subsdk0` `.text` offsets `0xDC2C` / `0xDC94`. This is investigation metadata only.
 
-### Unintentional differences (to fix)
-- None identified in this diagnostic slice.
 
 ### Intentional differences
 - `KPageGroup` still stores blocks in `Vec<KBlockInfo>` instead of upstream's `KBlockInfoManager` intrusive allocation. This keeps the same block ordering/concatenation behavior in safe Rust, but it is not allocator-ownership parity.
@@ -10887,8 +10787,6 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Unintentional differences (to fix)
 - The full raw `SendReply`/`SendMessage` translation path still uses local `Vec<u32>` mirrors and explicit final flushes instead of upstream's direct `dst_msg_ptr` / `src_msg_ptr` `MessageBuffer` views for every operation. Receive/exchange mapping direction is now covered, but the broader direct-pointer transport shape is still not fully upstream-identical.
 
-### Missing items
-- None identified in this HLE reply-routing slice. The broader non-HLE direct-pointer transport differences remain tracked in the existing `KServerSession` message-buffer entries above.
 
 ### Intentional differences
 - `HLERequestContext::write_guest_memory(...)` now uses `Memory::write_block_no_rasterizer_checked(...)` for IPC out-buffer copies. Upstream `HLERequestContext::WriteBufferB/C` calls `memory.WriteBlock(...)`; in ruzu, the checked no-rasterizer path is the existing Rust adaptation for HLE IPC output buffers, avoiding rasterizer notification while the global `Memory` mutex is held.
@@ -10896,17 +10794,11 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Unintentional differences (to fix)
 - Rust still returns copied `Vec<u8>` data for `ReadBuffer*` instead of upstream's span-returning zero-copy `ReadBuffer*` methods because the memory bridge is behind `Arc<Mutex<Memory>>`.
 
-### Missing items
-- None identified in this HLE IPC buffer descriptor slice.
 
 ### Intentional differences
 - `SVC_IPC_PROGRESS` text formatting now prints both the symbolic stage name and the numeric stage id (`stage=name(id)`). This is diagnostic-only and keeps unknown temporary stages attributable in ring-buffer dumps without changing trace payload emission.
 
-### Unintentional differences (to fix)
-- None identified; this only affects host-side human-readable trace formatting.
 
-### Missing items
-- None.
 
 ### Intentional differences
 - Fixed by the later 2026-06-13 texture-cache channel-storage entry: `TextureCacheBase::remove_image_view_references(...)` now scans active texture-cache channels and removes deleted `ImageViewId` values from every active channel's `image_views`, matching upstream's `active_channel_ids` / `channel_storage[c]` loop for this slice.
@@ -10951,8 +10843,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - `RUZU_PROFILE_IPC_PHASES=1` records disabled-by-default reply counters around sync/async reply wake paths. Upstream has no equivalent profiler; the counters are host diagnostics only and do not alter reply behavior.
 - `KServerSession::send_reply_hle_unlocked(...)` remains a Rust mutex-boundary adaptation for host-thread `ServerManager` dispatch. It computes the reply under the session mutex, drops that mutex, then takes the scheduler lock and calls `KThread::end_wait(...)`, avoiding the Rust `Mutex<KServerSession>` vs scheduler-lock ABBA while preserving upstream's `SendReplyHLE -> EndWait` ordering at the kernel-state boundary.
 
-### Unintentional differences (to fix)
-- None identified for the audited sync reply wake decision: both `send_reply_with_message(...)` and `send_reply_hle_unlocked(...)` now call `KThread::end_wait(client_result)` for non-terminating sync clients without an extra wait-reason guard, matching upstream `KServerSession::SendReply(..., is_hle)` plus upstream `KThread::EndWait` no-op behavior when the target thread is not waiting.
 
 ### Missing items
 - Continue reducing the split between `send_reply_with_message(...)` and `send_reply_hle_unlocked(...)` once `KServerSession` no longer needs a broad Rust mutex around state that upstream protects with lighter-weight kernel locks.
@@ -10964,8 +10854,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - `RasterizerOpenGL::draw(...)` now installs the pipeline uniform-buffer state, base uniform bindings, base storage bindings, and storage-buffer enable flag before descriptor walking, matching upstream `GraphicsPipeline::ConfigureImpl(...)` ordering before `BindGraphicsStorageBuffer(...)` and image descriptor collection. The code still lives in the rasterizer while ruzu lacks upstream's `GraphicsPipeline` ownership of the caches.
 - `RasterizerOpenGL::draw(...)` returns before cache locks, descriptor binding, render-target preparation, and framebuffer binding when the placeholder Rust `GraphicsPipeline` has no compiled GL programs after the lazy build attempt. This preserves upstream `PrepareDraw(...)` behavior where `CurrentGraphicsPipeline()` returning null exits before cache/FBO state is touched.
 
-### Unintentional differences (to fix)
-- None identified for the diagnostic hook: it does not change the selected image view, GL texture handle, dimensions, scaling, or returned `FramebufferTextureInfo`.
 
 ### Intentional differences
 - `TextureCacheBase::fill_graphics_image_views_with_gpu_reader(...)` receives a caller-provided `gpu_to_cpu(gpu_addr, size)` closure because ruzu's common texture cache still does not own the live channel `Tegra::MemoryManager*` that upstream `TextureCache<P>` reads directly through `gpu_memory`. The OpenGL rasterizer supplies the same channel memory manager used for descriptor reads.
@@ -10989,14 +10877,10 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Unintentional differences (to fix)
 - `HLERequestContext::write_guest_memory(...)` still reaches guest memory through an optional `Arc<Mutex<Memory>>` stored in the request context. Upstream request contexts carry the process memory owner directly through `KServerSession::ReceiveRequest(...)`; ruzu's broader IPC memory ownership should still be simplified when the server-thread path is fully upstream-shaped.
 
-### Missing items
-- None identified for `GetPointerFromDebugMemory`, `GetPointerFromRasterizerCachedMemory`, scalar reads/writes, `ReadBlock`, and `WriteBlock` rasterizer-notification parity in this slice.
 
 ### Intentional differences
 - Rust keeps the same helper ownership in `texture_cache/util.rs`, with Rust naming and enum casing only.
 
-### Unintentional differences (to fix)
-- None identified for the `ResolveOverlapRightAddress3D` and `FindSubresource` mip-depth checks after this pass.
 
 ### Missing items
 - Broader texture-cache util parity outside the overlap/subresource helpers remains governed by existing DIFF.md entries.
@@ -11058,8 +10942,6 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Intentional differences
 - Added env-gated diagnostic tracing for exact guest-memory write values via `RUZU_TRACE_MEMORY_W_VALUE`. It is inactive by default and exists only to attribute MK8D's bad `nvmap::IocAlloc` guest address payload (`0x068B0000` vs yuzu's mapped `0x680xxxxx` region) across `write_8/16/32/64` and block-copy paths.
 
-### Unintentional differences (to fix)
-- None from this diagnostic slice.
 
 ### Missing items
 - Remove or keep quarantined behind diagnostics once the bad-address writer is identified.
@@ -11067,20 +10949,12 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Intentional differences
 - Rust implements `std::hash::Hash` by feeding upstream `UUID::Hash()` into the active Rust hasher, because Rust hash tables do not expose the same direct `size_t` hasher contract as C++ `std::hash<Common::UUID>`.
 
-### Unintentional differences (to fix)
-- None found in this pass.
 
-### Missing items
-- None found in this pass.
 
 ### Intentional differences
 - `MakeCreateId` returns a `u128` transport value in Rust callers but now obtains it from `common::UUID::make_random_rfc4122_v4()`, matching upstream `Common::UUID::MakeRandomRFC4122V4()` while preserving raw little-endian UUID bytes at StoreData boundaries.
 
-### Unintentional differences (to fix)
-- None found in this pass.
 
-### Missing items
-- None found in this pass.
 
 ### Intentional differences
 - Added env-gated ring-trace coverage for scalar Mii commands (`IsUpdated`, `GetCount`, `SetInterfaceVersion`, `IsFullDatabase`) so MK8D's early Mii command sequence can be compared against upstream without old synchronous `eprintln` perturbation.
@@ -11097,7 +10971,6 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Intentional differences
 - `RUZU_DUMP_NULL_PC_CONTEXT` also dumps `svc_memory_history`: Rust-only diagnostic hook for MK8D null-PC/page-table investigation. It is env-gated and inactive by default, so guest-visible behavior is unchanged.
 
-### Unintentional differences (to fix)
 
 ### Intentional differences
 - Ruzu keeps the pre-page-table A32 fastmem path as the default and gates the upstream-shaped page-table fastmem path behind `RUZU_A32_PAGE_TABLE_FASTMEM=1`. Upstream passes both `page_table->pointers.data()` and `fastmem_arena` into Dynarmic, but the current rdynarmic A32 page-table fastmem path makes MK8D stop submitting active audio voices at the title transition. Keeping the stable path as default avoids a runtime regression while preserving an opt-in validation path.
@@ -11150,14 +11023,10 @@ The following still panic because upstream either also throws NotImplementedExce
 - `StaticService` now uses its live `TimeManager` owner for `IsStandardUserSystemClockAutomaticCorrectionEnabled`, `SetStandardUserSystemClockAutomaticCorrectionEnabled`, `IsStandardNetworkSystemClockAccuracySufficient`, `GetStandardUserSystemClockAutomaticCorrectionUpdatedTime`, `CalculateMonotonicSystemClockBaseTimePoint`, `GetClockSnapshot`, and `GetClockSnapshotFromSystemClockContext`. The older local snapshot fields remain only as reduced-fixture fallback for `StaticService::new(...)`, while production `with_time_manager(...)` follows upstream's `m_time`/clock-core references.
 - `StandardSteadyClockCore::get_current_uptime_ns()` is a Rust helper exposing the same converted CoreTiming uptime that upstream `StaticService::CalculateMonotonicSystemClockBaseTimePoint` reads via `m_system.CoreTiming().GetClockTicks()` and `ConvertToTimeSpan(...)`.
 
-### Missing items
-- None for this slice.
 
 ### Intentional differences
 - `RasterizerOpenGL::query_fallback(...)` captures the bound channel `MemoryManager` through Rust's `Arc<Mutex<...>>` ownership instead of upstream's direct `gpu_memory` pointer, but the query payload/timestamp write behavior and fence/sync dispatch now match upstream.
 
-### Unintentional differences (to fix)
-- None for the `QueryFallback` fence vs non-fence dispatch path audited in this pass.
 
 ### Missing items
 - Broader OpenGL query-cache ownership parity remains tracked by existing query-cache entries.
@@ -11432,8 +11301,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Fixed: when no channel memory is bound yet, repeated lookups for a previously inserted fake CPU range use `virtual_invalid_ranges` and still narrow through the CPU page table instead of scanning all images.
 - Fixed by later entry: sparse image insertion now fails before virtual-invalid allocation or image-slot mutation when channel memory is missing, matching upstream's requirement that sparse segment resolution has a live `gpu_memory`.
 
-### Missing items
-- None for sparse fake-address fallback behavior after the later sparse precondition entry. Sparse images still require live channel GPU memory before registration, matching upstream's dependency on `ForEachSparseSegment`; if a runtime path hits that precondition, fix the caller/channel binding order.
 
 ### Intentional differences
 - Rust `VideoGpuChannelHandle::bind_memory_manager(...)` now records the channel `MemoryManager` immediately, but only calls `RasterizerInterface::bind_channel(...)` if the channel has already been initialized. If the address space arrives first, `init_channel(...)` binds the rasterizer after `rasterizer.initialize_channel(...)` has created the per-channel cache state.
@@ -11457,8 +11324,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - If a selected backend requires one of these extension entrypoints but the driver/loader does not provide it, Rust panics at the missing dependency instead of returning program 0 and continuing with hidden shader debt. This follows the user's no-debt rule for missing implementation dependencies.
 - Rust maps upstream `LOG_CRITICAL` for GLASM program errors to `log::error!` because the Rust `log` facade has no critical severity; the `renderer_debug` gate, error-string handling, and source dump behavior now match upstream.
 
-### Unintentional differences (to fix)
-- None identified in this pass. Re-read upstream `gl_shader_util.cpp`; Rust now gates GLSL/SPIR-V shader compile logging, separable-program link logging, and GLASM `GL_PROGRAM_ERROR_STRING_NV` inspection behind `renderer_debug`, matching upstream. GLASM error logging also dumps the assembly source, matching upstream's critical-error path.
 
 ### Missing items
 - Add an integration/runtime check on an NVIDIA/GLASM-capable driver to prove the loaded ARB/NV entrypoints are present and the compute GLASM path creates non-zero programs.
@@ -11598,8 +11463,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust keeps env-gated diagnostic logging around `svc::WaitSynchronization` for MK8D wait-wedge investigation. This has no behavior effect when unset.
 - Fixed diagnostic targeting only: replaced the hardcoded `tid=73|102` filter with `RUZU_TRACE_WAITSYNC_TID=<tid>[,<tid>...]`, because MK8D thread ids vary between runs.
 
-### Unintentional differences (to fix)
-- None in this diagnostic-only edit.
 
 ### Missing items
 - Existing `WaitSynchronization` parity audit remains open for waiter notification ordering and scheduler-lock ownership; this entry does not claim the subsystem is complete.
@@ -11617,8 +11480,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Rust keeps env-gated submit/syncpoint diagnostics around `SubmitGPFIFOImpl(...)` for MK8D title-screen investigation. `RUZU_TRACE_SUBMIT_AFTER=<fence_value>` only expands existing `[SP_TRACE]` logging after the requested fence value and has no behavior effect.
 
-### Unintentional differences (to fix)
-- None in this diagnostic-only edit.
 
 ### Missing items
 - Existing `nvhost_gpu` stub warnings (`AllocGPFIFOEx2`, `AllocateObjectContext`, `SetErrorNotifier`) still need a separate upstream-parity audit; this entry does not claim the device is complete.
@@ -11639,8 +11500,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust keeps env-gated diagnostic logging under `RUZU_TRACE_GL_FENCE_FLOW=1` to trace `SignalFence`, `SignalSyncPoint`, pending-fence release, and async release-thread progress during the MK8D title-screen stall investigation. This has no behavior effect when unset.
 - Rust carries a host-only `trace_id` in pending fences so a queued fence can be correlated with its later release in logs.
 
-### Unintentional differences (to fix)
-- None in this diagnostic-only edit.
 
 ### Missing items
 - Existing `FenceManager` parity audit remains open for previously modified flush/invalidate callback threading and async wait behavior; this entry does not claim the subsystem is complete.
@@ -11648,8 +11507,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Rust keeps env-gated diagnostic logging under `RUZU_TRACE_GL_FENCE_FLOW=1` around the upstream `invalidate_texture_data_cache` path to distinguish `InvalidateGPUCache`, `WaitForIdle`, and return-to-command-stream progress during the MK8D stall investigation. This has no behavior effect when unset.
 
-### Unintentional differences (to fix)
-- None in this diagnostic-only edit.
 
 ### Missing items
 - Existing Maxwell3D parity audit remains open; this entry only covers the diagnostic inserted around the already-ported method branch.
@@ -11657,8 +11514,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Rust keeps env-gated diagnostic logging under `RUZU_TRACE_GL_FENCE_FLOW=1` around `invalidate_gpu_cache` and `wait_for_idle` to localize the MK8D syncpoint stall. This has no behavior effect when unset.
 
-### Unintentional differences (to fix)
-- None in this diagnostic-only edit.
 
 ### Missing items
 - Existing OpenGL rasterizer parity audit remains open; this entry only covers diagnostic probes around already-ported methods.
@@ -11666,8 +11521,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Rust keeps env-gated diagnostic logging under `RUZU_TRACE_GPU_SUBMIT=1` in `SubmitGPFIFOImpl` to print flags, computed increment, input/output fences, and command-list sizes for MK8D submit/max-vs-host divergence. This has no behavior effect when unset.
 
-### Unintentional differences (to fix)
-- None in this diagnostic-only edit.
 
 ### Missing items
 - Existing `nvhost_gpu` stub warnings (`AllocGPFIFOEx2`, `AllocateObjectContext`, `SetErrorNotifier`) still need a separate upstream-parity audit; this entry does not claim the device is complete.
@@ -11676,8 +11529,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust adds an env-gated diagnostic selector `RUZU_TRACE_PULLER_SUBMIT_RANGE=start:end` for the existing puller submit trace, so late MK8D submits can be inspected without logging every earlier submit. This has no behavior effect when unset.
 - Rust scheduler checks this diagnostic selector before setting `ACTIVE_SUBMIT_IDX`; upstream has no equivalent diagnostic hook.
 
-### Unintentional differences (to fix)
-- None in this diagnostic-only edit.
 
 ### Missing items
 - Existing DMA pusher and scheduler parity audits remain open; this entry only covers the trace-window diagnostic.
@@ -11685,8 +11536,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Rust adds env-gated diagnostic logging under `RUZU_TRACE_GL_PIPELINE_STALL=1` around the already-ported `GraphicsPipeline::ConfigureImpl` slices: descriptor collection, image-view fill/materialization, render-target update, and framebuffer bind. This has no behavior effect when unset and exists only to localize the MK8D idle-cinematic stall.
 
-### Unintentional differences (to fix)
-- None in this diagnostic-only edit.
 
 ### Missing items
 - Existing graphics-pipeline parity audit remains open; this entry only covers diagnostic probes around existing Rust bridge methods.
@@ -11694,8 +11543,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Rust adds env-gated diagnostic logging under `RUZU_TRACE_TEXTURE_FILL_STALL=1` around the already-ported `TextureCache<P>::FillImageViews` / `VisitImageView` flow. This has no behavior effect when unset and exists only to distinguish retry-loop, TIC-read, and image-view-creation stalls during the MK8D idle-cinematic investigation.
 
-### Unintentional differences (to fix)
-- None in this diagnostic-only edit.
 
 ### Missing items
 - Existing texture-cache parity audit remains open; this entry only covers diagnostic probes around existing descriptor/image-view resolution methods.
@@ -11703,8 +11550,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Rust adds env-gated diagnostic logging under `RUZU_TRACE_GL_TEXTURE_CACHE_STALL=1` around the OpenGL wrapper for `TextureCache<P>::FillGraphicsImageViews`, including backend insertion and pending join-copy drains. This has no behavior effect when unset and exists only to localize the MK8D idle-cinematic stall after base descriptor resolution returns.
 
-### Unintentional differences (to fix)
-- None in this diagnostic-only edit.
 
 ### Missing items
 - Existing OpenGL texture-cache parity audit remains open; this entry only covers diagnostic probes around the backend wrapper.
@@ -11715,8 +11560,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust exposes a `GpuReaderPair` for OpenGL texture-cache refreshes because the Rust texture cache stores `MemoryManager` behind a mutex and explicit reader closures are used where upstream directly owns `gpu_memory`. This preserves upstream behavior in bound refresh paths: accelerated upload uses the safe `ReadBlock` equivalent, while normal upload and join/render-target backend completion use the unsafe-read equivalent matching `GpuGuestMemory<UnsafeRead>`.
 - Rust's explicit-reader API still falls back to the safe reader when a caller can only provide one closure. Current bound-channel paths used by `PrepareImage`, `RefreshContents`, `UpdateRenderTargets`, pending backend insertions, and pending join-copy refreshes provide both readers.
 
-### Unintentional differences (to fix)
-- None for the `CpuModified` lifecycle fixed in this entry.
 
 ### Missing items
 - Existing OpenGL texture-cache parity audit remains open; this entry covers the `TextureCache<P>::RefreshContents` CPU-modified consumption order, the `UploadImageContents` safe-vs-unsafe reader split, the `FindRenderTargetView` / `JoinImages` backend-completion reader used by MK8D, and additional diagnostics only.
@@ -11724,8 +11567,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Rust groups `ImageViewType::E2DArray | E2D | Rect` in one match arm and explicitly checks `E2DArray` to apply `flat_range.extent.layers = 1`; upstream uses `[[fallthrough]]` from the `e2DArray` case into the shared `e2D` / `Rect` body. The resulting ownership and operation order match upstream.
 
-### Unintentional differences (to fix)
-- None for the `ImageViewFlagBits::Slice` constructor branch fixed in this entry.
 
 ### Missing items
 - Existing OpenGL texture-cache parity audit remains open. This entry covers only the per-view `SetupView` selection in the image-backed `ImageView` constructor.
@@ -11734,8 +11575,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust `unswizzle_image` still receives the guest-layout `input` slice from its caller instead of calling `gpu_memory.ReadBlockUnsafe(gpu_addr, ...)` internally. This preserves the existing Rust API boundary while matching upstream's staging-buffer layout and `UnswizzleTexture` arguments.
 - Rust bounds-checks source and destination slices before calling `unswizzle_texture`; upstream relies on `span::subspan` plus caller-sized buffers and asserts.
 
-### Unintentional differences (to fix)
-- None for the block-linear full-image `UnswizzleImage` upload path fixed in this entry.
 
 ### Missing items
 - Broader texture-cache parity remains open. This entry covers the `UnswizzleImage` block-linear level/layer traversal only; other texture-cache upload/download copy rectangle paths still need their own audits.
@@ -11744,17 +11583,11 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust adds `ReleaseSync::realtime_pacing` and enables it only for `NullSink` render streams. This keeps the null sink silent like upstream `NullSinkStreamImpl::AppendBuffer`, but forces `WaitFreeSpace` to sleep for the 5 ms audio period after the render stream starts. Without a real backend callback and with discarded buffers, ruzu was signaling the audio rendered event at about 16 kHz during MK8D, far above the expected 5 ms render cadence.
 - The pacing hook is hosted in `sink_stream.rs` because `AudioRenderer::Main` waits through the shared `ReleaseSync` without holding the `SinkStream` lock; `null_sink.rs` owns enabling the behavior for the null render stream.
 
-### Unintentional differences (to fix)
-- None for the null-renderer pacing fix.
 
 ### Missing items
 - Broader audio renderer timing parity still needs runtime validation with a real host backend. This entry covers the null-sink path requested for MK8D runs only.
 
-### Intentional differences
-- None for the AArch32 unsafe-physical-memory dispatch fix.
 
-### Unintentional differences (to fix)
-- None for this entry. Rust AArch32 dispatch no longer returns synthetic success for `SvcId::MapPhysicalMemoryUnsafe`, `SvcId::UnmapPhysicalMemoryUnsafe`, or `SvcId::SetUnsafeLimit`; it now calls the owning `svc_physical_memory.rs` functions, matching upstream ownership and returning `ResultNotImplemented` for the upstream `UNIMPLEMENTED()` paths.
 
 ### Missing items
 - Upstream `MapPhysicalMemoryUnsafe`, `UnmapPhysicalMemoryUnsafe`, and `SetUnsafeLimit` bodies remain unimplemented in `svc_physical_memory.cpp`; Rust keeps the same not-implemented behavior. This entry only removes the dispatcher-level fake success that let MK8D continue with a page-table range still marked `Free`.
@@ -11784,8 +11617,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Rust keeps an env-gated diagnostic hook `RUZU_ISTORAGE_SCAN_U32_VALUE` inside `IStorage::read_handler()`. Upstream has no equivalent. When enabled, Rust scans the temporary read buffer for requested u32 values and logs the storage offset, guest output-buffer address, buffer offset, backend identity, and guest thread context. The hook is inactive by default and does not alter the bytes returned to the guest.
 
-### Unintentional differences (to fix)
-- None for this entry. The business behavior remains the existing Rust `IStorage::Read` path: validate non-negative offset/length, read from the backend into a temporary out buffer, then copy it to the guest write buffer.
 
 ### Missing items
 - Exact upstream `OutBuffer<BufferAttr_HipcMapAlias | BufferAttr_HipcMapTransferAllowsNonSecure>` ownership is still represented through Rust `HLERequestContext` buffer descriptors rather than C++ CMIF type wrappers.
@@ -11804,7 +11635,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust has an env-gated diagnostic hook `RUZU_DUMP_DRAW_CBUFS` in the OpenGL draw path. Upstream has no equivalent. When enabled, Rust logs constant-buffer GPU addresses, sizes, and the first configurable number of u32 words for matching draws, with optional filters `RUZU_DUMP_DRAW_CBUFS_PIPELINE`, `RUZU_DUMP_DRAW_CBUFS_RT_ADDR`, and `RUZU_DUMP_DRAW_CBUFS_VEC4_COUNT`.
 - The hook is inactive by default and does not alter draw state, bound buffers, render targets, shader programs, or guest-visible memory.
 
-### Unintentional differences (to fix)
 
 ### Missing items
 - No upstream diagnostic equivalent exists. The underlying OpenGL rasterizer parity remains tracked by the existing `gl_rasterizer.rs` entries.
@@ -12045,7 +11875,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - The F32/F64 test pools are deliberately bounded so the external oracle test remains practical while still covering finite fused math, signed zero, infinity invalid-operation default NaNs, and F32 qNaN propagation.
 
 ### Unintentional differences (to fix)
-- None in the VFMA/VFMS/VFNMA/VFNMS decoder or translator path. Rust now matches upstream VFPv4 scalar fused multiply-accumulate ownership and semantics: `FPMulAdd(d,n,m)`, `FPMulSub(d,n,m)`, `FPMulAdd(FPNeg(d),n,m)`, and `FPMulSub(FPNeg(d),n,m)`.
 - The broader backend default-NaN sign mismatch remains a known FP parity issue outside this slice.
 
 ### Intentional differences
@@ -12072,8 +11901,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Rust keeps native `Vec<u8>` / `VectorVfsFile` construction instead of the C++ `std::array` template helper, while preserving the same `PackBFTTF` ownership and byte transform.
 
-### Unintentional differences (to fix)
-- None remain in this slice. Rust now uses upstream's `EXPECTED_RESULT = 0x7f9a0218` for synthetic BFTTF encryption. The previous `0xCAFE` key produced archives that passed the magic check but decrypted to corrupt shared-font payloads.
 
 ### Intentional differences
 - Rust extends the existing env-gated `[SAMPLER]` diagnostic hook with `RUZU_TRACE_SAMPLER_DUMP_TIME_START_MS`, `RUZU_TRACE_SAMPLER_DUMP_TIME_END_MS`, `RUZU_TRACE_SAMPLER_DUMP_SEQ_MIN`, `RUZU_TRACE_SAMPLER_DUMP_SEQ_MAX`, `RUZU_TRACE_SAMPLER_DUMP_PIPELINE`, and `RUZU_TRACE_SAMPLER_DUMP_LIMIT`. It also reports each bound texture target separately (`2D` and `2D_ARRAY`) plus first/center samples. This is diagnostic-only and inactive unless `RUZU_TRACE_SAMPLER_DUMP` is set.
@@ -12085,11 +11912,7 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Rust still routes through rdynarmic's existing IR builder API; no structural ownership change.
 
-### Unintentional differences (to fix)
-- None remain in this slice. `EXTR` now matches upstream operand ordering: upstream passes `Rm` as the low operand and `Rn` as the high operand to `ExtractRegister`; Rust now does the same.
 
-### Missing items
-- None for `EXTR` in this slice. Other bitfield instructions remain subject to their own upstream-parity entries.
 
 ### Binary layout verification
 - PASS: translator-only IR emission; no serialized ABI layout changed.
@@ -12116,8 +11939,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust logs unsupported engine dispatch with `log::error!` and continues. This matches upstream's default behavior because `UNIMPLEMENTED_MSG` calls `ASSERT_MSG`, and `assert_fail_impl()` only crashes when debug asserts are enabled.
 - Rust keeps the existing project-local `.agents/puller_unimplemented_state.md` diagnostic append in non-test builds; it is diagnostic-only and does not alter command processing.
 
-### Unintentional differences (to fix)
-- None remain in this slice. The previous Rust panic on unsupported engine dispatch was stricter than upstream's default path and is removed.
 
 ### Missing items
 - No new engine support was added. Unknown engine IDs are still logged as unsupported, matching upstream's `UNIMPLEMENTED_MSG` path.
@@ -12132,8 +11953,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust represents upstream's intrusive `LockWithPriorityInheritanceInfo*` waiter back-pointer as `WaitingLockRef { owner_thread_id, owner_thread_ptr, address_key, is_kernel_address_key }`. When `RemoveWaiterByKey` transfers the lock-info object to the next owner, Rust now explicitly rewrites the remaining waiters' owner reference; upstream gets this automatically because each waiter stores a pointer to the same lock-info object and `AddHeldLock` updates that object's owner.
 - `LockWithPriorityInheritanceInfo::waiter_keys()` exposes a copied list of waiter keys so `KConditionVariable` can update the Rust-side owner references during transfer. This is a mechanical Rust adaptation of upstream's intrusive tree traversal/identity model.
 
-### Unintentional differences (to fix)
-- None remain in this slice. The previous Rust transfer moved the lock-info to the next owner but left remaining waiters' `WaitingLockRef::owner_thread_id` pointing at the old owner, unlike upstream's mutable lock-info pointer semantics.
 
 ### Missing items
 - Existing broader condition-variable test setup still has a scheduler-lock singleton dependency; this slice adds a focused regression for the transfer invariant but does not redesign the test harness.
@@ -12141,14 +11960,8 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Binary layout verification
 - PASS: kernel waiter bookkeeping only; no raw guest-visible struct layout or serialized payload changed.
 
-### Intentional differences
-- None in this slice.
 
-### Unintentional differences (to fix)
-- None remain in this slice. Removed the non-upstream `RUZU_CV_TIMEOUT_MULT` timeout-scaling experiment so timeout conversion again follows upstream literally: positive `timeout_ns` becomes `HardwareTimer().GetTick() + timeout_ns + 2`, with overflow falling back to `i64::MAX`.
 
-### Missing items
-- None for `WaitProcessWideKeyAtomic` timeout conversion in this slice.
 
 ### Binary layout verification
 - PASS: SVC control-flow/timer calculation only; no serialized payload or ABI layout changed.
@@ -12168,8 +11981,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - The upstream anonymous `ThreadQueueImplForKThreadSetProperty` is represented by `thread_queue_for_k_thread_set_property()` in `k_thread.rs`; `KThreadQueue` carries a weak owner reference only so its base `cancel_wait` path can remove the waiter from the target thread's pinned waiter list before completing cancellation.
 - The regression test checks the upstream-owned notification boundary (`GlobalSchedulerContext::m_scheduler_update_needed`) instead of a local `KScheduler::needs_scheduling()` flag, because the standalone test harness has no real scheduler-lock callbacks.
 
-### Unintentional differences (to fix)
-- None remain in this slice. Rust now ports the second upstream `SetCoreMask` block: it checks whether the target thread is still scheduler-current on a disallowed core, waits on the target's pinned waiter list when pinned, and retries when unpinned/current until the scheduler observes the thread no longer current.
 
 ### Binary layout verification
 - PASS: scheduler/waiter state only; no guest-visible raw-copied payload layout changed.
@@ -12301,7 +12112,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Ported the single/double FP multiply-by-indexed-element subset used by ANIMUS (`FMLA_elt_4`, `FMLS_elt_4`, `FMUL_elt_4`, `FMULX_elt_4`) into the matching Rust-owned file. Rust uses `DecodedInst` field extraction and existing IR builder names; behavior and reserved-value checks match upstream `FPMultiplyByElement`.
 
 ### Missing items
-- None for the A64 instruction IDs currently decoded and dispatched by Rust in this owner: `FMLA_elt_4`, `FMLS_elt_4`, `FMUL_elt_4`, and `FMULX_elt_4`.
 - Broader upstream coverage is a decoder/frontend expansion, not hidden debt in this slice: Rust does not yet define or dispatch IDs for upstream's integer by-element, dot-product, long multiply, complex multiply, or half-precision FP by-element methods in this file.
 
 ### Binary layout verification
@@ -12311,8 +12121,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Added the Rust counterpart file and moved `ST1/2/3/4`, `LD1/2/3/4`, and `LD1R/2R/3R/4R` single-structure handlers out of `simd.rs` fallback stubs into their upstream-owned module.
 - Rust uses the existing `base_address`, `mem_read`, `mem_write`, and `v_scalar_read/write` helpers instead of upstream `V`/`Mem` overloads. Decode control flow, index/scale derivation, replicate handling, writeback behavior, and unallocated checks follow upstream `SharedDecodeAndOperation`.
 
-### Missing items
-- None for the upstream methods present in `load_store_single_structure.cpp`.
 
 ### Binary layout verification
 - PASS: translator-only IR emission; no serialized ABI layout changed.
@@ -12320,8 +12128,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Added `FADDP_vec_2` in the existing Rust `simd_three_same.rs`, matching upstream's `sz && !Q` reserved-value rule and using `FPVectorPairedAdd` for full-width vectors or `FPVectorPairedAddLower` for the lower 64-bit form.
 
-### Missing items
-- None for `FADDP_vec_2`, the only method ported in this slice. Other upstream `simd_three_same.cpp` methods are outside this verified slice and must get their own DIFF entries when their decoder/visitor IDs are ported.
 
 ### Binary layout verification
 - PASS: translator-only IR emission; no serialized ABI layout changed.
@@ -12329,8 +12135,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Added `FABD_2` in the existing Rust scalar three-same module, matching upstream `FPAbs(FPSub(Vn, Vm))` for scalar single/double.
 
-### Missing items
-- None for `FABD_2`, the only method ported in this slice. Other upstream `simd_scalar_three_same.cpp` methods are outside this verified slice and must get their own DIFF entries when their decoder/visitor IDs are ported.
 
 ### Binary layout verification
 - PASS: translator-only IR emission; no serialized ABI layout changed.
@@ -12338,8 +12142,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Added `FCMLE_4` and `FCMLT_4` in the existing Rust two-register misc module. Rust synthesizes the upstream zero comparisons via reversed greater/greater-equal IR (`0 >= operand`, `0 > operand`) because the current IR exposes FP greater predicates directly.
 
-### Missing items
-- None for `FCMLE_4` and `FCMLT_4`, the only methods ported in this slice. Other upstream `simd_two_register_misc.cpp` methods are outside this verified slice and must get their own DIFF entries when their decoder/visitor IDs are ported.
 
 ### Binary layout verification
 - PASS: translator-only IR emission; no serialized ABI layout changed.
@@ -12362,3 +12164,183 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Binary layout verification
 - PASS: trace formatting only; no guest ABI or serialized payload layout changed.
+
+### Intentional differences
+- Removed stale Rust-side priority-queue pushes/removes from `KThread` wait-cancel, termination, recursive waiter cancel, and scheduler sync-wakeup polling paths after those paths already transition thread state through `KThread::set_state` / `KThreadQueue::base_end_wait`.
+- Upstream ownership is centralized in `KScheduler::OnThreadStateChanged`; the Rust owner is `GlobalSchedulerContext::on_thread_state_changed`, called from `KThread::notify_state_transition` with the thread properties already captured under the thread lock.
+- Kept explicit `KProcess::push_back_to_priority_queue*` helpers for initialization/test fallback paths where no state transition fires.
+
+### Unintentional differences (to fix)
+- Residual early ANIMUS `PQ_STALE` events remain: 18 in `/tmp/ruzu_animus_sched_pq_1781907886.log`, mostly missing cached props for threads 85-100 plus two non-runnable stale fronts. This is much smaller than the prior sustained flood, but not fully eliminated.
+- ANIMUS still reports two early `PrefetchAbort pc=0x4` events in the same run. The main display later composes a layer, so this is no longer the same total `NO_LAYERS` failure, but the abort path still needs a separate root-cause pass.
+
+### Missing items
+- The Rust fallback `get_scheduled_front_runnable` guard remains in place until all remaining stale PQ-front causes are eliminated.
+
+### Binary layout verification
+- PASS: scheduler/thread bookkeeping only; no guest-visible raw-copied payload layout changed.
+
+### Verification
+- `cargo check -p core --quiet`
+- `cargo build --release --bin ruzu-cmd`
+- `cargo test -p core wait_cancel_pushes_runnable_thread_through_state_change_handler -- --nocapture`
+- `cargo test -p core test_wait_cancel_resumes_cancellable_waiting_thread -- --nocapture`
+- `cargo test -p core unpin_resumes_threads_in_pinned_waiter_list -- --nocapture`
+- ANIMUS 45s run `/tmp/ruzu_animus_sched_pq_1781907886.log`: `COMPOSING display_id=0 layers=1` appears 209 times after startup; `NO_LAYERS display_id=0` is limited to startup; residual `PQ_STALE` count is 18 and residual `PrefetchAbort` count is 2.
+### Intentional differences
+- `UpdateHighestPriorityThreadsImpl` applies `KThread::active_core` immediately when a migrated thread's lock is available, then updates `KPriorityQueue::ChangeCore`. Upstream does `SetActiveCore(core_id)` directly before `ChangeCore(...)` under the scheduler lock; Rust cannot hold arbitrary `KThread` mutexes across every scheduler/fiber path, so a locked target is left for a later scheduler pass instead of moving the PQ first and leaving `KThread.active_core` stale.
+
+### Unintentional differences (fixed)
+- Fixed a scheduler migration window where `KPriorityQueue` could move a runnable thread to a new core while `KThread.active_core` still reported the old core via deferred `pending_active_core_updates`. ANIMUS traces showed the same thread selected on one core while still marked current on another. The migration path now keeps `KThread.active_core` and cached PQ props in sync and increments the scheduled count like upstream.
+
+## core/src/hle/kernel/k_scheduler.rs vs core/hle/kernel/k_scheduler.cpp
+
+### Intentional differences
+- `schedule_raw_if_needed` and `reschedule_current_core_raw` refresh this core's highest-priority thread directly from `GlobalSchedulerContext` before entering the fiber switch. Upstream performs `UpdateHighestPriorityThreads` and `EnableScheduling` atomically while dropping `KScopedSchedulerLock`; Rust cannot hold the scheduler mutex across a fiber yield, so this keeps the same ordering in the split raw entry points.
+
+### Behavioral parity verified
+- The raw scheduler entry points now consume `needs_scheduling` when the refreshed priority-queue top is already the current thread and no interrupt task is runnable, matching upstream `KScheduler::ScheduleImpl()` clearing `needs_scheduling` before its `highest_priority_thread == cur_thread` fast return.
+- `reschedule_current_core_raw` sets the pending schedule request before the priority-queue refresh, so the refresh can still clear a trivially satisfied interrupt schedule. This matches upstream `RequestScheduleOnInterrupt() -> ScheduleOnInterrupt() -> ScheduleImpl()` behavior after `KInterruptManager::HandleInterrupt`.
+- ANIMUS run `/tmp/ruzu_animus_after_sched_refresh_1781936779.log` no longer stalls at `SetThreadCoreMask`: `tid=82` continues through `SignalProcessWideKey`, `WaitSynchronization`, `ArbitrateLock`, and `SendSyncRequest`. The nvnflinger path reaches `BQP stage=dequeue_enter`, `dequeue_return`, and `request_buffer`, which the prior black-screen run never reached.
+
+### Remaining investigation
+- ANIMUS now reaches a later userspace mutex/PI divergence on `addr=0x2105400048`; trace `/tmp/ruzu_animus_lockpi2_1781936899.trace` shows `wait_tag_tls_mismatch` before `tid=85` executes `svcBreak`. This is separate from the scheduler fast-return bug fixed here.
+
+### Binary layout verification
+- Scheduler bookkeeping only; no guest raw-copied payload or serialized ABI layout changed.
+
+### Verification
+- `cargo build --release --bin ruzu-cmd`
+- `cargo test -p core --release switch_thread_impl_preserves_previous_thread_current_core -- --nocapture`
+
+## core/src/hle/kernel/k_thread.rs vs core/hle/kernel/k_thread.cpp + core/hle/kernel/k_scheduler.cpp
+
+### Unintentional differences (fixed)
+- `KThread::notify_priority_change` now mirrors upstream `KThread::RestorePriority` plus `KScheduler::OnThreadPriorityChanged`: priority changes still notify the scheduler from the thread-owned priority path, but the priority queue is only changed while the thread raw state is `Runnable`.
+- The `ChangePriority` `is_running` argument is now derived from the current emulation thread id. The previous Rust code passed `true` for any runnable thread, but upstream passes `thread == GetCurrentThreadPointer(kernel)`.
+
+### Behavioral parity verified
+- A waiting thread whose priority changes is no longer reinserted into `KPriorityQueue`; this prevents PI updates on blocked mutex waiters from creating stale scheduled fronts.
+- A runnable thread priority change still requests scheduler work.
+
+### Binary layout verification
+- Scheduler/thread bookkeeping only; no guest raw-copied payload or serialized ABI layout changed.
+
+### Verification
+- `cargo test -p core priority_change -- --nocapture`
+
+## core/src/hle/kernel/k_condition_variable.rs vs core/hle/kernel/k_condition_variable.cpp + core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h
+
+### Unintentional differences (fixed)
+- Removed the Rust-only `wait_for_current_thread` busy-wait from `KConditionVariable::Wait` and `KConditionVariable::WaitForAddress`. Upstream returns from these functions through the scheduler/fiber boundary after `BeginWait`; spinning inside the SVC handler leaves the host core stuck in the old SVC and prevents the CPU-manager post-SVC scheduler handoff.
+- The wait setup order still mirrors upstream: update lock/tag state, insert condition-variable or lock waiter state, set the hardware timer when present, call `BeginWait`, drop the scoped scheduler/sleep guard, then return `KThread::GetWaitResult()`. The Rust-specific deferral of SVC return registers is owned by `PhysicalCore`, not by this file.
+
+### Behavioral parity verified
+- ANIMUS/yuzu comparison showed `WaitProcessWideKeyAtomic(0x210628C49C, 0x210628C4A0, 0x1601D9, -1)` must not publish the default `0x7201` result to guest registers immediately after enqueue.
+- ANIMUS/yuzu comparison also showed the SDK uses rapid `ArbitrateLock` / `ArbitrateUnlock` handoff on `0x2105400048`; `WaitForAddress` now arms the lock wait without trying to run the scheduler from inside the handler.
+
+### Binary layout verification
+- Scheduler/wait bookkeeping only; no guest raw-copied payload or serialized ABI layout changed.
+
+### Verification
+- `cargo test -p core wait_condition_variable -- --nocapture`
+- `cargo test -p core wait_locked_returns -- --nocapture`
+- `cargo test -p core wait_for_address -- --nocapture`
+
+## core/src/hle/kernel/k_address_arbiter.rs vs core/hle/kernel/k_address_arbiter.cpp
+
+### Unintentional differences (fixed)
+- Removed the Rust-only `wait_for_current_thread` busy-wait from `WaitIfLessThan` and `WaitIfEqual`. Upstream arms the address-arbiter wait with `BeginWait`, exits the scheduler-lock/sleep scope, and returns `cur_thread->GetWaitResult()` through the scheduler/fiber path; the Rust handler must not spin the host core while the guest thread is `Waiting`.
+
+### Binary layout verification
+- Scheduler/wait bookkeeping only; no guest raw-copied payload or serialized ABI layout changed.
+
+## core/src/hle/kernel/physical_core.rs vs core/cpu_manager.cpp + core/arm/arm_interface.h
+
+### Intentional differences
+- Rust has an explicit `write_svc_return_registers_if_runnable` guard before calling `ArmInterface::set_svc_arguments`. Upstream can set SVC return registers directly because the guest thread resumes through host fibers after the kernel wait completes; ruzu saves guest contexts cooperatively, so a blocking SVC must defer writing return registers while `KThread` is `Waiting`.
+
+### Unintentional differences (fixed)
+- Blocking SVCs no longer write the provisional `svc_args[0]` value into guest `r0/x0` when the handler has just put the current thread into `Waiting`. This prevents `WaitProcessWideKeyAtomic` / `ArbitrateLock` from publishing the default wait result (`0x7201`) before `EndWait`, timeout, cancellation, or termination writes the real result into the saved thread context.
+
+### Behavioral parity verified
+- `KThread::base_end_wait` / synchronization wake paths still own the final wait result and `KThread::apply_wait_result_to_context` copies it into guest `r0/x0` when the blocked thread is resumed.
+- ANIMUS run `/tmp/ruzu_animus_defer_svc_1781939647.log` no longer shows cores stuck inside SVC handlers (`in_svc={tid=0, imm=0x0}` in the SIGUSR1 dump) and reaches `SF_COMPOSE #8192 COMPOSING display_id=0 layers=1`.
+
+### Binary layout verification
+- CPU scheduling/register handoff only; no guest raw-copied payload or serialized ABI layout changed.
+
+### Verification
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- `cargo test -p core wait_for_address -- --nocapture`
+- `cargo test -p core wait_condition_variable -- --nocapture`
+- `cargo test -p core wait_locked_returns_only_after_signal -- --nocapture`
+- `cargo test -p core blocked_svc_defers_return_register_write_until_wake -- --nocapture`
+
+## core/src/hle/service/cmif_serialization.rs vs core/hle/service/cmif_serialization.h
+
+### Unintentional differences (fixed)
+- `CmifOutArrayBuffer::write_back` now writes the full zero-initialized out-buffer storage back to guest memory, matching upstream `WriteOutArgument` for `ArgumentType::OutBuffer`. The previous Rust code wrote only `count` elements and skipped the write entirely when `count == 0`, leaving stale guest bytes visible to calls such as `GetReleasedAudioOutBuffersAuto`.
+
+### Behavioral parity verified
+- Upstream allocates the temporary out buffer from `ctx.GetWriteBufferSize(...)`, default-initializes it, and writes `buffer.size()` bytes back when the write buffer exists. The Rust storage is already sized from `ctx.get_write_buffer_size(...)`; the write-back path now preserves that same whole-buffer contract.
+- ANIMUS no longer recycles stale zero-sized AudioOut descriptors after `GetReleasedAudioOutBuffersAuto` returns zero released buffers; subsequent appends keep the original 4096-byte buffer descriptors.
+
+### Binary layout verification
+- PASS: this changes only the number of bytes copied from the existing typed out-buffer storage. The guest-visible byte layout remains the raw `T` array layout used by the CMIF buffer descriptor.
+
+### Verification
+- `cargo test -p core cmif_out_array_write_back_zeroes_buffer_even_when_count_is_zero -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+
+## video_core macro upload/execution parity
+
+### Unintentional differences (fixed)
+- `Maxwell3D::ProcessMethodCall` handles `LOAD_MME_INSTRUCTION` with `macro_engine->AddCode(regs.load_mme.instruction_ptr, argument)`, matching yuzu. The previous Rust change incorrectly routed this path through `ProcessMacroUpload` and auto-incremented the instruction pointer.
+- `MacroEngine::Execute` now matches yuzu's uploaded-code ownership: exact-method execution compiles `uploaded_macro_code[method]`; mid-method execution finds an existing blob containing the requested method, copies the suffix into `uploaded_macro_code[method]`, then hashes/compiles that suffix.
+- Removed the Rust-only `macro_starts`/delay-slot reconstruction heuristic. Upstream has no macro-start boundary set in `MacroEngine`; macro code length comes from the vector stored for the uploaded method.
+
+### Behavioral parity verified
+- Re-read yuzu `maxwell_3d.cpp` and `macro.cpp`: `ProcessMacroUpload` exists, but the normal `ProcessMethodCall(load_mme.instruction)` case does not call it.
+- Tests now assert that same-pointer uploads append to one blob, exact-method execution does not merge adjacent method keys, and mid-method execution copies the upstream suffix.
+
+### Binary layout verification
+- Macro upload/cache bookkeeping only; no guest raw-copied payload or serialized ABI layout changed.
+
+### Verification
+- `cargo test -p video_core --release macro_engine_ -- --nocapture`
+- `cargo test -p video_core --release maxwell_3d::tests::test_load_mme_upload -- --nocapture`
+- `cargo test -p video_core --release maxwell_3d::tests::test_macro -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+
+## kernel thread wait-reason parity
+
+### Unintentional differences (fixed)
+- `KThread::set_state` now clears `ThreadWaitReasonForDebugging` before committing the base-state transition, matching upstream `KThread::SetState`.
+- `KSynchronizationObject::wait` now sets the `Synchronization` wait reason after `begin_wait_with_queue`, matching upstream `KSynchronizationObject::Wait`.
+
+### Behavioral parity verified
+- Upstream `KThread::BeginWait` calls `SetState(ThreadState::Waiting)`, and `SetState` clears the debug wait reason. Wait owners that need a reason set it after `BeginWait`; `KSynchronizationObject::Wait` does this for `Synchronization`.
+- MK8D SIGUSR1 dumps were showing `RUNNABLE wait=Sleep` / `RUNNABLE wait=Synchronization`; this was stale debug wait-reason state, not proof that the raw scheduler state still carried a wait.
+
+### Binary layout verification
+- Thread debug/scheduler bookkeeping only; no guest raw-copied payload or serialized ABI layout changed.
+
+### Verification
+- `cargo test -p core --release set_state_clears_wait_reason_like_upstream -- --nocapture`
+- `cargo test -p core --release wait_synchronization -- --nocapture`
+- `cargo test -p core --release state_change_remove_increments_process_scheduled_count_after_props_are_removed -- --nocapture`
+- `cargo test -p core --release recover_scheduled_front_reinserts_runnable_thread_missing_from_queue -- --nocapture`
+
+## core/src/hle/kernel/svc/svc_lock.rs diagnostic parity
+
+### Unintentional differences (fixed)
+- The `RUZU_TRACE_LOCK_PI` diagnostic no longer performs unchecked TLS thread-type reads. For AArch64 it reads the nnsdk thread-type pointer from `TLS+0x1f8`; for AArch32 it reads it from `TLS+0x1fc`, matching `core/src/arm/debug.rs`. All diagnostic-only reads are range-checked before calling `Memory::read_*`.
+
+### Behavioral parity verified
+- Re-read yuzu `svc_lock.cpp`: `ArbitrateLock` itself only validates arguments and forwards to `KConditionVariable::WaitForAddress`; this change is diagnostic-only and leaves the SVC behavior unchanged.
+- MK8D LOCK_PI run `/tmp/ruzu_mk8d_lockcv_clean3_1781974103.log` shows `UNMAPPED=0`, confirming the previous `Unmapped Read32 @ ...1b0` flood was produced by the diagnostic path.
+
+### Binary layout verification
+- Diagnostic memory reads only; no guest raw-copied payload or serialized ABI layout changed.

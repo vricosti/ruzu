@@ -17,6 +17,14 @@ use super::k_thread::{KThread, KThreadLock, ThreadState, ThreadType};
 
 static TRACE_GSC_STATE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+fn increment_process_scheduled_count(
+    counter: Option<&std::sync::Arc<std::sync::atomic::AtomicI64>>,
+) {
+    if let Some(counter) = counter {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn should_trace_sched_state(thread_id: u64) -> bool {
     let Some(raw) = std::env::var_os("RUZU_TRACE_SCHED_STATE") else {
         return false;
@@ -229,12 +237,17 @@ impl GlobalSchedulerContext {
         );
 
         if old_state == ThreadState::RUNNABLE {
+            let process_schedule_count = self
+                .m_priority_queue
+                .get_thread_props(thread_id)
+                .and_then(|props| props.process_schedule_count.clone())
+                .or(process_schedule_count);
             // Was runnable, now not — remove from PQ.
             self.m_priority_queue
                 .remove(thread_id, priority, active_core, affinity, is_dummy);
-            self.m_priority_queue.increment_scheduled_count(thread_id);
+            increment_process_scheduled_count(process_schedule_count.as_ref());
             self.m_scheduler_update_needed
-                .store(true, std::sync::atomic::Ordering::Release);
+                .store(true, Ordering::Release);
 
             if is_dummy {
                 self.unregister_dummy_thread_for_wakeup(thread_id);
@@ -273,7 +286,7 @@ impl GlobalSchedulerContext {
             );
             self.m_priority_queue.increment_scheduled_count(thread_id);
             self.m_scheduler_update_needed
-                .store(true, std::sync::atomic::Ordering::Release);
+                .store(true, Ordering::Release);
 
             if is_dummy {
                 self.register_dummy_thread_for_wakeup(thread_id);
@@ -317,6 +330,10 @@ impl GlobalSchedulerContext {
         is_dummy: bool,
         _member_id: u64,
     ) {
+        let process_schedule_count = self
+            .m_priority_queue
+            .get_thread_props(_member_id)
+            .and_then(|props| props.process_schedule_count.clone());
         self.m_priority_queue.change_priority(
             old_priority,
             is_running,
@@ -326,8 +343,9 @@ impl GlobalSchedulerContext {
             affinity,
             is_dummy,
         );
+        increment_process_scheduled_count(process_schedule_count.as_ref());
         self.m_scheduler_update_needed
-            .store(true, std::sync::atomic::Ordering::Release);
+            .store(true, Ordering::Release);
     }
 
     /// Called when a thread's affinity mask changes while it is Runnable.
@@ -394,6 +412,81 @@ impl GlobalSchedulerContext {
     }
 
     pub fn get_scheduled_front(&self, core: i32) -> Option<u64> {
+        self.m_priority_queue.get_scheduled_front(core)
+    }
+
+    /// Rust storage recovery for the upstream invariant that every Runnable
+    /// thread is present in `m_priority_queue`.
+    ///
+    /// Upstream stores intrusive scheduler entries in `KThread` and updates
+    /// them centrally from `KScheduler::OnThreadStateChanged`. The Rust port's
+    /// detached queue storage can miss a wake path or keep a stale property
+    /// record while the root-visible list is empty; when that happens,
+    /// `UpdateHighestPriorityThreads` would mark a core idle despite a
+    /// Runnable thread in the GSC thread list. Reinsert the best Runnable
+    /// candidate for this core before returning an empty front.
+    pub fn recover_scheduled_front_from_runnable(&mut self, core: i32) -> Option<u64> {
+        let mut best: Option<(
+            u64,
+            i32,
+            i32,
+            u64,
+            bool,
+            Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
+        )> = None;
+        for thread in self.get_thread_list() {
+            let thread = thread.lock().unwrap();
+            if thread.get_raw_state() != ThreadState::RUNNABLE {
+                continue;
+            }
+            let affinity = thread.physical_affinity_mask.get_affinity_mask();
+            if (affinity & (1u64 << core)) == 0 {
+                continue;
+            }
+            let active_core = thread.get_active_core();
+            if active_core >= 0 && active_core != core {
+                continue;
+            }
+            let thread_id = thread.get_thread_id();
+            let priority = thread.get_priority();
+            let is_dummy = thread.is_dummy_thread();
+            let process_schedule_count = thread.process_schedule_count.clone();
+            let replace = best
+                .as_ref()
+                .map(|(_, best_priority, _, _, _, _)| priority < *best_priority)
+                .unwrap_or(true);
+            if replace {
+                best = Some((
+                    thread_id,
+                    priority,
+                    active_core,
+                    affinity,
+                    is_dummy,
+                    process_schedule_count,
+                ));
+            }
+        }
+
+        let (thread_id, priority, active_core, affinity, is_dummy, process_schedule_count) = best?;
+        log::warn!(
+            "[PQ_RECOVER] core={} tid={} prio={} active_core={} affinity=0x{:x}",
+            core,
+            thread_id,
+            priority,
+            active_core,
+            affinity
+        );
+        self.m_priority_queue.push_back(
+            thread_id,
+            priority,
+            active_core,
+            affinity,
+            is_dummy,
+            process_schedule_count,
+        );
+        self.m_priority_queue.increment_scheduled_count(thread_id);
+        self.m_scheduler_update_needed
+            .store(true, std::sync::atomic::Ordering::Release);
         self.m_priority_queue.get_scheduled_front(core)
     }
 
@@ -556,10 +649,11 @@ impl Default for GlobalSchedulerContext {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use super::GlobalSchedulerContext;
-    use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock, ThreadState};
 
     #[test]
     fn get_thread_by_thread_id_does_not_need_thread_mutex() {
@@ -590,5 +684,121 @@ mod tests {
             &gsc.get_thread_by_thread_id(0x20).unwrap(),
             &survivor
         ));
+    }
+
+    #[test]
+    fn state_change_remove_increments_process_scheduled_count_after_props_are_removed() {
+        let mut gsc = GlobalSchedulerContext::new();
+        let scheduled_count = Arc::new(AtomicI64::new(0));
+
+        gsc.on_thread_state_changed(
+            100,
+            ThreadState::WAITING,
+            ThreadState::RUNNABLE,
+            44,
+            2,
+            0b0100,
+            false,
+            Some(Arc::clone(&scheduled_count)),
+        );
+        assert_eq!(scheduled_count.load(Ordering::Relaxed), 1);
+
+        gsc.on_thread_state_changed(
+            100,
+            ThreadState::RUNNABLE,
+            ThreadState::WAITING,
+            44,
+            2,
+            0b0100,
+            false,
+            None,
+        );
+
+        assert_eq!(scheduled_count.load(Ordering::Relaxed), 2);
+        assert!(gsc.m_priority_queue.get_thread_props(100).is_none());
+    }
+
+    #[test]
+    fn runnable_priority_change_increments_process_scheduled_count() {
+        let mut gsc = GlobalSchedulerContext::new();
+        let scheduled_count = Arc::new(AtomicI64::new(0));
+
+        gsc.on_thread_state_changed(
+            100,
+            ThreadState::WAITING,
+            ThreadState::RUNNABLE,
+            44,
+            2,
+            0b0100,
+            false,
+            Some(Arc::clone(&scheduled_count)),
+        );
+        gsc.on_thread_priority_changed(100, 44, 29, 2, 0b0100, false, false, 100);
+
+        assert_eq!(scheduled_count.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            gsc.m_priority_queue.get_thread_props(100).unwrap().priority,
+            29
+        );
+    }
+
+    #[test]
+    fn recover_scheduled_front_reinserts_runnable_thread_missing_from_queue() {
+        let mut gsc = GlobalSchedulerContext::new();
+        let scheduled_count = Arc::new(AtomicI64::new(0));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut guard = thread.lock().unwrap();
+            guard.thread_id = 0x52;
+            guard.priority = 21;
+            guard.core_id = 2;
+            guard.physical_affinity_mask.set_affinity_mask(0b0100);
+            guard.process_schedule_count = Some(Arc::clone(&scheduled_count));
+            guard.set_state(ThreadState::RUNNABLE);
+        }
+        gsc.add_thread(Arc::clone(&thread));
+
+        assert_eq!(gsc.get_scheduled_front(2), None);
+        assert_eq!(gsc.recover_scheduled_front_from_runnable(2), Some(0x52));
+        assert_eq!(gsc.get_scheduled_front(2), Some(0x52));
+        assert_eq!(scheduled_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn recover_scheduled_front_repairs_props_without_visible_root() {
+        let mut gsc = GlobalSchedulerContext::new();
+        let scheduled_count = Arc::new(AtomicI64::new(0));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut guard = thread.lock().unwrap();
+            guard.thread_id = 0x52;
+            guard.priority = 21;
+            guard.core_id = 2;
+            guard.physical_affinity_mask.set_affinity_mask(0b0100);
+            guard.process_schedule_count = Some(Arc::clone(&scheduled_count));
+            guard.set_state(ThreadState::RUNNABLE);
+        }
+        gsc.add_thread(Arc::clone(&thread));
+        gsc.m_priority_queue.push_back(
+            0x52,
+            21,
+            1,
+            0b0100,
+            false,
+            Some(Arc::clone(&scheduled_count)),
+        );
+
+        assert!(gsc.m_priority_queue.get_thread_props(0x52).is_some());
+        assert_eq!(gsc.get_scheduled_front(2), None);
+        assert_eq!(gsc.recover_scheduled_front_from_runnable(2), Some(0x52));
+        assert_eq!(gsc.get_scheduled_front(2), Some(0x52));
+        assert_eq!(
+            gsc.m_priority_queue
+                .get_thread_props(0x52)
+                .unwrap()
+                .active_core,
+            2
+        );
+        assert_eq!(scheduled_count.load(Ordering::Relaxed), 1);
     }
 }

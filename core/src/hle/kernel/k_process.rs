@@ -60,7 +60,9 @@ use super::k_thread_local_page::{KThreadLocalPage, PAGE_SIZE as THREAD_LOCAL_PAG
 use super::k_typed_address::KProcessAddress;
 use super::k_worker_task_manager::{KWorkerTaskManager, WorkerType};
 use super::svc_common::Handle;
-use super::svc_types::{CreateProcessFlag, ProcessActivity, ADDRESS_SPACE_MASK};
+use super::svc_types::{
+    CreateProcessFlag, ProcessActivity, ADDRESS_SPACE_MASK, THREAD_LOCAL_REGION_SIZE,
+};
 use crate::file_sys::program_metadata::{PoolPartition, ProgramAddressSpaceType, ProgramMetadata};
 use crate::hardware_properties::NUM_CPU_CORES;
 use crate::hle::kernel::svc::svc_results;
@@ -1935,9 +1937,10 @@ impl KProcess {
         if is_real {
             if let Some(plr) = self.create_thread_local_region() {
                 self.plr_address = plr;
-                // Zero the PLR in guest memory (Svc::ThreadLocalRegionSize = 0x200).
-                // create_thread_local_region already zeroes the full TLS page
-                // in DeviceMemory, so the PLR region is already zero.
+                if let Some(memory) = self.get_memory() {
+                    let zero_plr = [0u8; THREAD_LOCAL_REGION_SIZE];
+                    memory.lock().unwrap().write_block(plr.get(), &zero_plr);
+                }
             }
         }
 

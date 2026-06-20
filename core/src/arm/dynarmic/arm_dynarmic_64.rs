@@ -353,6 +353,57 @@ fn watch_write_64(cb: &DynarmicCallbacks64, vaddr: u64, size: u64, value: u128) 
     );
 }
 
+#[inline(always)]
+fn trace_unmapped_write_64(cb: &DynarmicCallbacks64, vaddr: u64, size: u64, value: u128) {
+    if !common::trace::is_enabled(common::trace::cat::UNMAPPED_WRITE) {
+        return;
+    }
+
+    let valid = if let Some(ref cm) = cb.core_memory {
+        cm.lock()
+            .unwrap()
+            .is_valid_virtual_address_range(vaddr, size)
+    } else {
+        cb.memory
+            .read()
+            .unwrap()
+            .is_valid_range(vaddr, size as usize)
+    };
+    if valid {
+        return;
+    }
+
+    if let Ok(spec) = std::env::var("RUZU_TRACE_UNMAPPED_WRITE_ADDR") {
+        if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
+            let end = vaddr.saturating_add(size);
+            if !(vaddr <= target && target < end) {
+                return;
+            }
+        }
+    }
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::OnceLock;
+    static LIMIT: OnceLock<u32> = OnceLock::new();
+    static SHOWN: AtomicU32 = AtomicU32::new(0);
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("RUZU_TRACE_UNMAPPED_WRITE_LIMIT")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(64)
+    });
+    if SHOWN.fetch_add(1, Ordering::Relaxed) >= limit {
+        return;
+    }
+
+    let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+    let (pc, lr, _, _, _, _, _, _, _, _, _, _, _, _) = cb.watch_context();
+    common::trace::emit_raw(
+        common::trace::cat::UNMAPPED_WRITE,
+        &[tid, pc, lr, vaddr, size, value as u64, (value >> 64) as u64],
+    );
+}
+
 /// Translate rdynarmic's HaltReason to core's HaltReason.
 ///
 /// rdynarmic uses its own compact halt reason bits:
@@ -615,33 +666,39 @@ impl DynarmicCallbacks64 {
 
 impl UserCallbacks for DynarmicCallbacks64 {
     fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
-        if vaddr == 0 && std::env::var_os("RUZU_TRACE_A64_NULL_FETCH").is_some() {
+        if vaddr == 0
+            && std::env::var_os("RUZU_TRACE_A64_NULL_FETCH").is_some()
+            && common::trace::is_enabled(common::trace::cat::A64_EXCEPTION_CTX)
+        {
             if let Some(pc_ptr) = self.jit_pc_ptr {
                 let jit_state_ptr = unsafe {
                     (pc_ptr as *const u8).sub(A64JitState::offset_of_pc()) as *const A64JitState
                 };
                 let jit_state = unsafe { &*jit_state_ptr };
-                eprintln!(
-                    "[A64_NULL_FETCH] fetch=0x0000000000000000 pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} \
-x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x4=0x{:016X} x5=0x{:016X} \
-x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X}",
-                    jit_state.pc,
-                    jit_state.reg[30],
-                    jit_state.sp,
-                    jit_state.reg[0],
-                    jit_state.reg[1],
-                    jit_state.reg[2],
-                    jit_state.reg[3],
-                    jit_state.reg[4],
-                    jit_state.reg[5],
-                    jit_state.reg[19],
-                    jit_state.reg[20],
-                    jit_state.reg[21],
-                    jit_state.reg[22],
-                    jit_state.reg[25],
+                common::trace::emit_raw(
+                    common::trace::cat::A64_EXCEPTION_CTX,
+                    &[
+                        5,
+                        self.core_index as u64,
+                        vaddr,
+                        jit_state.pc,
+                        jit_state.reg[30],
+                        jit_state.sp,
+                        jit_state.reg[0],
+                        jit_state.reg[1],
+                        jit_state.reg[2],
+                        jit_state.reg[3],
+                        jit_state.reg[4],
+                        jit_state.reg[5],
+                        jit_state.reg[19],
+                        jit_state.reg[20],
+                    ],
                 );
             } else {
-                eprintln!("[A64_NULL_FETCH] fetch=0x0000000000000000 jit_state=<unavailable>");
+                common::trace::emit_raw(
+                    common::trace::cat::A64_EXCEPTION_CTX,
+                    &[5, self.core_index as u64, vaddr],
+                );
             }
         }
         // Upstream: returns std::nullopt if IsValidVirtualAddressRange fails.
@@ -1103,6 +1160,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         if !self.check_memory_access(vaddr, 1) {
             return;
         }
+        trace_unmapped_write_64(self, vaddr, 1, value as u128);
         if let Ok(spec) = std::env::var("RUZU_TRACE_W_AT_VADDR") {
             if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
                 if vaddr == target {
@@ -1158,6 +1216,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         if !self.check_memory_access(vaddr, 2) {
             return;
         }
+        trace_unmapped_write_64(self, vaddr, 2, value as u128);
         if let Ok(spec) = std::env::var("RUZU_TRACE_W_AT_VADDR") {
             if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
                 if vaddr == target || vaddr + 1 == target {
@@ -1187,20 +1246,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         if !self.check_memory_access(vaddr, 4) {
             return;
         }
-        if common::trace::is_enabled(common::trace::cat::UNMAPPED_WRITE) {
-            let valid = if let Some(ref cm) = self.core_memory {
-                cm.lock().unwrap().is_valid_virtual_address_range(vaddr, 4)
-            } else {
-                self.memory.read().unwrap().is_valid_range(vaddr, 4)
-            };
-            if !valid {
-                let (pc, lr, _, _, _, _, _, _, _, _, _, _, _, _) = self.watch_context();
-                common::trace::emit_raw(
-                    common::trace::cat::UNMAPPED_WRITE,
-                    &[0, pc, lr, vaddr, 4, value as u64, 0],
-                );
-            }
-        }
+        trace_unmapped_write_64(self, vaddr, 4, value as u128);
         if let Ok(spec) = std::env::var("RUZU_TRACE_W_AT_VADDR") {
             if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
                 if vaddr <= target && target < vaddr + 4 {
@@ -1278,6 +1324,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         if !self.check_memory_access(vaddr, 8) {
             return;
         }
+        trace_unmapped_write_64(self, vaddr, 8, value as u128);
         // RUZU_COUNT_W64_BY_CORE_AT_VADDR=0xVADDR — atomic per-core counter
         // for slow-path W64 writes targeting the specified vaddr. Used to
         // identify which emulator cores write to a tracked memory location.
@@ -1742,7 +1789,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
                 true
             };
         if let Some(line) = trace_line {
-            eprintln!("{line} success={success}");
+            log::warn!("{line} success={success}");
         }
         if success {
             if let Some(target) = std::env::var("RUZU_TRACE_EXCLUSIVE32_ADDR")
@@ -1772,7 +1819,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
                                     as *const A64JitState
                             };
                             let s = unsafe { &*jit_state_ptr };
-                            eprintln!(
+                            log::warn!(
                                 "[CAS32_LOCK_STATE_BAD #{}] core={} target=0x{:016X} op={} value=0x{:08X} expected=0x{:08X} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} x19=0x{:016X} x20=0x{:016X}",
                                 n,
                                 self.core_index,
@@ -2372,6 +2419,13 @@ impl ArmInterface for ArmDynarmic64 {
         if let Some(jit) = self.jit.as_mut() {
             jit.set_tpidrro_el0(value);
         }
+    }
+
+    fn get_tpidrro_el0(&self) -> u64 {
+        self.jit
+            .as_ref()
+            .map(|jit| jit.get_tpidrro_el0())
+            .unwrap_or(self.tpidrro_el0)
     }
 
     fn get_svc_arguments(&self, args: &mut [u64; 8]) {

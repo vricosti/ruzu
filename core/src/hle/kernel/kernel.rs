@@ -437,6 +437,11 @@ fn dump_thread_state(kernel: &KernelCore) {
     crate::hle::kernel::svc_dispatch::dump_svc_ring_profile();
     crate::hle::kernel::svc_dispatch::dump_svc_summary_profile();
     crate::hle::kernel::svc::svc_memory_history::dump("sigusr1_thread_dump");
+    crate::hle::service::nvnflinger::buffer_queue_core::dump_bqp_wait_profile();
+    crate::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
+    crate::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
+    crate::hle::service::nvnflinger::hos_binder_driver::dump_binder_txn_profile();
+    crate::hle::service::nvnflinger::diagnostics::dump("sigusr1_thread_dump");
     // Who holds each coarse lock right now + the full observed nesting graph
     // (RUZU_LOCK_ORDER=1).
     common::lock_order::dump_owners();
