@@ -601,30 +601,41 @@ impl Memory {
                             // (HostMemory virtual base) lives for the program lifetime,
                             // so its pointer never dangles.
                             let _ = pt_ptr; // keep the capture (silences unused warning)
+                            // SEGV-safe read: on Linux uses process_vm_readv which returns
+                            // EFAULT cleanly for PROT_NONE pages. On macOS falls back to a
+                            // direct volatile copy (no equivalent of process_vm_readv).
+                            #[cfg(target_os = "linux")]
                             let self_pid = unsafe { libc::getpid() };
-                            // Reads `dst.len()` bytes from `addr` in our own address
-                            // space via the kernel-bridged process_vm_readv path. Returns
-                            // None if the read fails (e.g. PROT_NONE page).
                             let try_read_safe = |addr: *const u8, dst: &mut [u8]| -> bool {
-                                let local_iov = libc::iovec {
-                                    iov_base: dst.as_mut_ptr() as *mut libc::c_void,
-                                    iov_len: dst.len(),
-                                };
-                                let remote_iov = libc::iovec {
-                                    iov_base: addr as *mut libc::c_void,
-                                    iov_len: dst.len(),
-                                };
-                                let n = unsafe {
-                                    libc::process_vm_readv(
-                                        self_pid,
-                                        &local_iov as *const _,
-                                        1,
-                                        &remote_iov as *const _,
-                                        1,
-                                        0,
-                                    )
-                                };
-                                n == dst.len() as isize
+                                #[cfg(target_os = "linux")]
+                                {
+                                    let local_iov = libc::iovec {
+                                        iov_base: dst.as_mut_ptr() as *mut libc::c_void,
+                                        iov_len: dst.len(),
+                                    };
+                                    let remote_iov = libc::iovec {
+                                        iov_base: addr as *mut libc::c_void,
+                                        iov_len: dst.len(),
+                                    };
+                                    let n = unsafe {
+                                        libc::process_vm_readv(
+                                            self_pid,
+                                            &local_iov as *const _,
+                                            1,
+                                            &remote_iov as *const _,
+                                            1,
+                                            0,
+                                        )
+                                    };
+                                    n == dst.len() as isize
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(addr, dst.as_mut_ptr(), dst.len());
+                                    }
+                                    true
+                                }
                             };
                             loop {
                                 if sleep_us > 0 {
@@ -1721,6 +1732,7 @@ impl Memory {
             return false;
         }
 
+        #[cfg(target_os = "linux")]
         let self_pid = unsafe { libc::getpid() };
         let mut remaining = size;
         let mut offset = 0usize;
@@ -1739,28 +1751,19 @@ impl Memory {
                 if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
                     self.handle_rasterizer_write(vaddr, copy_amount);
                 }
-                let local_iov = libc::iovec {
-                    iov_base: src[offset..].as_ptr() as *mut libc::c_void,
-                    iov_len: copy_amount,
-                };
-                let remote_iov = libc::iovec {
-                    iov_base: ptr as *mut libc::c_void,
-                    iov_len: copy_amount,
-                };
-                let mut written = unsafe {
-                    libc::process_vm_writev(
-                        self_pid,
-                        &local_iov as *const _,
-                        1,
-                        &remote_iov as *const _,
-                        1,
-                        0,
-                    )
-                };
-                if written != copy_amount as isize
-                    && self.invalidate_separate_heap(ptr as *const u8)
-                {
-                    written = unsafe {
+                // On Linux: SEGV-safe write via process_vm_writev (EFAULT on PROT_NONE).
+                // On macOS: no equivalent; fall back to direct copy.
+                #[cfg(target_os = "linux")]
+                let written = {
+                    let local_iov = libc::iovec {
+                        iov_base: src[offset..].as_ptr() as *mut libc::c_void,
+                        iov_len: copy_amount,
+                    };
+                    let remote_iov = libc::iovec {
+                        iov_base: ptr as *mut libc::c_void,
+                        iov_len: copy_amount,
+                    };
+                    let mut w = unsafe {
                         libc::process_vm_writev(
                             self_pid,
                             &local_iov as *const _,
@@ -1770,7 +1773,33 @@ impl Memory {
                             0,
                         )
                     };
-                }
+                    if w != copy_amount as isize
+                        && self.invalidate_separate_heap(ptr as *const u8)
+                    {
+                        w = unsafe {
+                            libc::process_vm_writev(
+                                self_pid,
+                                &local_iov as *const _,
+                                1,
+                                &remote_iov as *const _,
+                                1,
+                                0,
+                            )
+                        };
+                    }
+                    w
+                };
+                #[cfg(not(target_os = "linux"))]
+                let written = {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src[offset..].as_ptr(),
+                            ptr,
+                            copy_amount,
+                        );
+                    }
+                    copy_amount as isize
+                };
                 if written != copy_amount as isize {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static CHECKED_WRITE_FAILURES: AtomicU32 = AtomicU32::new(0);
@@ -1966,28 +1995,44 @@ impl Memory {
             return false;
         }
 
+        #[cfg(target_os = "linux")]
         let self_pid = unsafe { libc::getpid() };
+
+        // SEGV-safe read helper: uses process_vm_readv on Linux (returns EFAULT
+        // for PROT_NONE pages), falls back to direct copy on macOS.
+        let vm_read = |src_ptr: *const u8, dst: &mut [u8]| -> isize {
+            #[cfg(target_os = "linux")]
+            {
+                let local_iov = libc::iovec {
+                    iov_base: dst.as_mut_ptr() as *mut libc::c_void,
+                    iov_len: dst.len(),
+                };
+                let remote_iov = libc::iovec {
+                    iov_base: src_ptr as *mut libc::c_void,
+                    iov_len: dst.len(),
+                };
+                unsafe {
+                    libc::process_vm_readv(
+                        self_pid,
+                        &local_iov as *const _,
+                        1,
+                        &remote_iov as *const _,
+                        1,
+                        0,
+                    )
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                unsafe { std::ptr::copy_nonoverlapping(src_ptr, dst.as_mut_ptr(), dst.len()) };
+                dst.len() as isize
+            }
+        };
+
         let first_ptr = self.get_pointer_impl(src_addr);
         if !first_ptr.is_null() {
             self.handle_rasterizer_download_for_read_range(src_addr, size);
-            let local_iov = libc::iovec {
-                iov_base: dest.as_mut_ptr() as *mut libc::c_void,
-                iov_len: size,
-            };
-            let remote_iov = libc::iovec {
-                iov_base: first_ptr as *mut libc::c_void,
-                iov_len: size,
-            };
-            let read = unsafe {
-                libc::process_vm_readv(
-                    self_pid,
-                    &local_iov as *const _,
-                    1,
-                    &remote_iov as *const _,
-                    1,
-                    0,
-                )
-            };
+            let read = vm_read(first_ptr as *const u8, dest);
             if read == size as isize {
                 return true;
             }
@@ -2021,24 +2066,7 @@ impl Memory {
                 if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
                     self.handle_rasterizer_download(vaddr, copy_amount);
                 }
-                let local_iov = libc::iovec {
-                    iov_base: dest[offset..].as_mut_ptr() as *mut libc::c_void,
-                    iov_len: copy_amount,
-                };
-                let remote_iov = libc::iovec {
-                    iov_base: ptr as *mut libc::c_void,
-                    iov_len: copy_amount,
-                };
-                let read = unsafe {
-                    libc::process_vm_readv(
-                        self_pid,
-                        &local_iov as *const _,
-                        1,
-                        &remote_iov as *const _,
-                        1,
-                        0,
-                    )
-                };
+                let read = vm_read(ptr as *const u8, &mut dest[offset..offset + copy_amount]);
                 if read != copy_amount as isize {
                     if log_errors {
                         log::error!(
