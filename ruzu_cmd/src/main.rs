@@ -220,13 +220,12 @@ fn on_status_message_received(msg_type: u32, nickname: &str) {
 /// 8. system.Run()  — starts CPU threads in background
 /// 9. while (emu_window->IsOpen()) { emu_window->WaitEvent(); }
 /// 10. system.Pause(), system.ShutdownMainProcess()
-/// Global atomic holding the fastmem-arena base pointer for the SIGILL
-/// handler to compute host VAs. Set once at process init by reading
-/// `/proc/self/maps` lazily, or via `RUZU_DUMP_FASTMEM_VAS` env var.
+// ── SIGILL trace — Linux x86_64 only (uses /proc/self/maps + ucontext gregs) ──
+#[cfg(target_os = "linux")]
 static FASTMEM_BASE_FOR_SIGILL: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Parsed list of guest vaddrs to dump from the SIGILL handler (env-var-driven).
+#[cfg(target_os = "linux")]
 static DUMP_FASTMEM_VAS: std::sync::LazyLock<Vec<u64>> = std::sync::LazyLock::new(|| {
     std::env::var("RUZU_DUMP_FASTMEM_VAS")
         .ok()
@@ -238,9 +237,7 @@ static DUMP_FASTMEM_VAS: std::sync::LazyLock<Vec<u64>> = std::sync::LazyLock::ne
         .unwrap_or_default()
 });
 
-/// Auto-detect fastmem arena base from /proc/self/maps. Best-effort; uses
-/// the largest anonymous rw-p mapping > 100 GB. Populates
-/// `FASTMEM_BASE_FOR_SIGILL` for the SIGILL handler.
+#[cfg(target_os = "linux")]
 fn detect_fastmem_base_for_sigill() {
     let maps = match std::fs::read_to_string("/proc/self/maps") {
         Ok(s) => s,
@@ -274,9 +271,8 @@ fn detect_fastmem_base_for_sigill() {
     }
 }
 
-/// SIGILL handler — installed when RUZU_SIGILL_TRACE=1.
-/// Prints faulting RIP and exits, so per-inst-check UD2 traps can be
-/// localized to a specific JIT-emitted location.
+/// SIGILL handler — installed when RUZU_SIGILL_TRACE=1. Linux x86_64 only.
+#[cfg(target_os = "linux")]
 extern "C" fn ruzu_sigill_handler(
     _sig: sdl2::libc::c_int,
     _info: *mut libc::siginfo_t,
@@ -574,6 +570,7 @@ fn main() {
         }
     }
 
+    #[cfg(target_os = "linux")]
     if std::env::var_os("RUZU_SIGILL_TRACE").is_some() {
         unsafe {
             let mut sa: sdl2::libc::sigaction = std::mem::zeroed();
@@ -676,7 +673,8 @@ fn main() {
     if std::env::var_os("RUZU_ALLOW_PTRACER").is_some() {
         // PR_SET_PTRACER (0x59616d61, "Yama") with PR_SET_PTRACER_ANY (-1)
         // tells YAMA to permit any process to ptrace this one. Avoids
-        // ptrace_scope=1 restriction without requiring sudo.
+        // ptrace_scope=1 restriction without requiring sudo. Linux-only.
+        #[cfg(target_os = "linux")]
         unsafe {
             let rc = libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0);
             log::info!(

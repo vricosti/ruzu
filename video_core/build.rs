@@ -2,12 +2,17 @@ fn main() {
     println!("cargo:rerun-if-changed=src/host1x/ffmpeg/ffmpeg_shim.c");
     println!("cargo:rerun-if-changed=src/textures/bcn_shim.cpp");
 
-    const ZUYU_STB_DIR: &str = "/home/vricosti/Dev/emulators/zuyu/externals/stb";
-    const ZUYU_BC_DECODER_DIR: &str = "/home/vricosti/Dev/emulators/zuyu/externals/bc_decoder";
-    println!("cargo:rerun-if-changed={ZUYU_STB_DIR}/stb_dxt.cpp");
-    println!("cargo:rerun-if-changed={ZUYU_STB_DIR}/stb_dxt.h");
-    println!("cargo:rerun-if-changed={ZUYU_BC_DECODER_DIR}/bc_decoder.cpp");
-    println!("cargo:rerun-if-changed={ZUYU_BC_DECODER_DIR}/bc_decoder.h");
+    let zuyu_base = std::env::var("ZUYU_DIR").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/vricosti".to_string());
+        format!("{}/Dev/emulators/zuyu", home)
+    });
+    let zuyu_stb_dir = format!("{}/externals/stb", zuyu_base);
+    let zuyu_bc_decoder_dir = format!("{}/externals/bc_decoder", zuyu_base);
+
+    println!("cargo:rerun-if-changed={zuyu_stb_dir}/stb_dxt.cpp");
+    println!("cargo:rerun-if-changed={zuyu_stb_dir}/stb_dxt.h");
+    println!("cargo:rerun-if-changed={zuyu_bc_decoder_dir}/bc_decoder.cpp");
+    println!("cargo:rerun-if-changed={zuyu_bc_decoder_dir}/bc_decoder.h");
 
     let avcodec = pkg_config::Config::new()
         .probe("libavcodec")
@@ -31,10 +36,10 @@ fn main() {
     let mut bcn_build = cc::Build::new();
     bcn_build.cpp(true);
     bcn_build.file("src/textures/bcn_shim.cpp");
-    bcn_build.file(format!("{ZUYU_STB_DIR}/stb_dxt.cpp"));
-    bcn_build.file(format!("{ZUYU_BC_DECODER_DIR}/bc_decoder.cpp"));
-    bcn_build.include(ZUYU_STB_DIR);
-    bcn_build.include(ZUYU_BC_DECODER_DIR);
+    bcn_build.file(format!("{zuyu_stb_dir}/stb_dxt.cpp"));
+    bcn_build.file(format!("{zuyu_bc_decoder_dir}/bc_decoder.cpp"));
+    bcn_build.include(&zuyu_stb_dir);
+    bcn_build.include(&zuyu_bc_decoder_dir);
     bcn_build.warnings(false);
     bcn_build.compile("ruzu_video_core_bcn_shim");
 }
