@@ -54,7 +54,22 @@ fn owners() -> &'static Mutex<Owners> {
 }
 
 fn host_tid() -> i64 {
-    unsafe { libc::syscall(libc::SYS_gettid) as i64 }
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::syscall(libc::SYS_gettid) as i64 }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        unsafe {
+            let mut tid: u64 = 0;
+            libc::pthread_threadid_np(libc::pthread_self(), &mut tid);
+            tid as i64
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        0
+    }
 }
 
 // ── Per-object wait-for graph ───────────────────────────────────────────────

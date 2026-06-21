@@ -1080,6 +1080,7 @@ fn dump_thread_state(kernel: &KernelCore) {
             // invoke the SIGURG handler (libc::backtrace -> fd 2) which prints
             // its Rust stack. glibc backtrace is async-signal-safe.
             eprintln!("[DUMP] Triggering SIGURG backtrace on every worker thread...");
+            #[cfg(target_os = "linux")]
             if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
                 for ent in entries.flatten() {
                     let Ok(tid_str) = ent.file_name().into_string() else {
@@ -1112,6 +1113,7 @@ fn dump_thread_state(kernel: &KernelCore) {
                 }
             }
             eprintln!("[DUMP] Host threads currently blocked in futex:");
+            #[cfg(target_os = "linux")]
             if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
                 for ent in entries.flatten() {
                     let Ok(tid_str) = ent.file_name().into_string() else {
@@ -1222,6 +1224,7 @@ fn dump_thread_state(kernel: &KernelCore) {
     // in SVC 0x21 while its host fiber is stuck in the handler).
     if std::env::var_os("RUZU_DUMP_HOST_BT").is_some() {
         eprintln!("[DUMP] RUZU_DUMP_HOST_BT: SIGURG backtrace on every worker thread...");
+        #[cfg(target_os = "linux")]
         if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
             for ent in entries.flatten() {
                 let Ok(tid_str) = ent.file_name().into_string() else {
