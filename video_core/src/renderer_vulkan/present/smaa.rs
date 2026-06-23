@@ -9,6 +9,16 @@ use ash::vk;
 
 use super::anti_alias_pass::AntiAliasPass;
 use super::util;
+use crate::host_shaders::spirv_shaders::{
+    SMAA_BLENDING_WEIGHT_CALCULATION_FRAG_SPV, SMAA_BLENDING_WEIGHT_CALCULATION_VERT_SPV,
+    SMAA_EDGE_DETECTION_FRAG_SPV, SMAA_EDGE_DETECTION_VERT_SPV,
+    SMAA_NEIGHBORHOOD_BLENDING_FRAG_SPV, SMAA_NEIGHBORHOOD_BLENDING_VERT_SPV,
+};
+use crate::renderer_vulkan::scheduler::Scheduler;
+use crate::renderer_vulkan::shader_util::build_shader;
+use crate::smaa_area_tex::{AREATEX_HEIGHT, AREATEX_WIDTH, AREA_TEX_BYTES};
+use crate::smaa_search_tex::{SEARCHTEX_HEIGHT, SEARCHTEX_WIDTH, SEARCH_TEX_BYTES};
+use crate::vulkan_common::vulkan_memory_allocator::{MappedBuffer, MemoryAllocator, MemoryUsage};
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -74,6 +84,8 @@ pub struct Smaa {
     dynamic_images: Vec<SmaaImages>,
     static_images: [vk::Image; MAX_STATIC_IMAGE],
     static_image_views: [vk::ImageView; MAX_STATIC_IMAGE],
+    area_upload_buffer: MappedBuffer,
+    search_upload_buffer: MappedBuffer,
 
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layouts: [vk::DescriptorSetLayout; MAX_SMAA_STAGE],
@@ -86,25 +98,118 @@ pub struct Smaa {
 }
 
 impl Smaa {
+    fn create_static_upload_buffer(allocator: &MemoryAllocator, bytes: &[u8]) -> MappedBuffer {
+        let ci = vk::BufferCreateInfo::builder()
+            .size(bytes.len() as vk::DeviceSize)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .build();
+        let mut buffer = allocator
+            .create_mapped_buffer(&ci, MemoryUsage::Upload)
+            .expect("Failed to create SMAA static texture upload buffer");
+        buffer.mapped_slice_mut()[..bytes.len()].copy_from_slice(bytes);
+        buffer.flush();
+        buffer
+    }
+
+    fn upload_static_image(
+        device: &ash::Device,
+        cmdbuf: vk::CommandBuffer,
+        buffer: vk::Buffer,
+        image: vk::Image,
+        extent: vk::Extent2D,
+    ) {
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let upload_barrier = vk::ImageMemoryBarrier::builder()
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(range)
+            .build();
+        let shader_read_barrier = vk::ImageMemoryBarrier::builder()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(range)
+            .build();
+        let copy = vk::BufferImageCopy::builder()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .image_extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })
+            .build();
+
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmdbuf,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[upload_barrier],
+            );
+            device.cmd_copy_buffer_to_image(
+                cmdbuf,
+                buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[copy],
+            );
+            device.cmd_pipeline_barrier(
+                cmdbuf,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[shader_read_barrier],
+            );
+        }
+    }
+
     /// Port of `SMAA::SMAA`.
     pub fn new(
         device: ash::Device,
-        allocator: &vk::DeviceMemory,
+        allocator: &MemoryAllocator,
         extent: vk::Extent2D,
         image_count: usize,
     ) -> Self {
         let image_count_u32 = image_count as u32;
 
         // Create static images (area + search textures)
-        // Area texture dimensions from smaa_area_tex.h: AREATEX_WIDTH=160, AREATEX_HEIGHT=560
         let area_extent = vk::Extent2D {
-            width: 160,
-            height: 560,
+            width: AREATEX_WIDTH,
+            height: AREATEX_HEIGHT,
         };
-        // Search texture dimensions from smaa_search_tex.h: SEARCHTEX_WIDTH=64, SEARCHTEX_HEIGHT=16
         let search_extent = vk::Extent2D {
-            width: 64,
-            height: 16,
+            width: SEARCHTEX_WIDTH,
+            height: SEARCHTEX_HEIGHT,
         };
 
         let area_image =
@@ -118,6 +223,8 @@ impl Smaa {
 
         let static_images = [area_image, search_image];
         let static_image_views = [area_view, search_view];
+        let area_upload_buffer = Self::create_static_upload_buffer(allocator, AREA_TEX_BYTES);
+        let search_upload_buffer = Self::create_static_upload_buffer(allocator, SEARCH_TEX_BYTES);
 
         // Create dynamic images
         let mut dynamic_images = Vec::with_capacity(image_count);
@@ -201,9 +308,22 @@ impl Smaa {
         // Create sampler
         let sampler = util::create_wrapped_sampler(&device, vk::Filter::LINEAR);
 
-        // Shaders (null placeholders - actual SPV data from host_shaders)
-        let vertex_shaders = [vk::ShaderModule::null(); MAX_SMAA_STAGE];
-        let fragment_shaders = [vk::ShaderModule::null(); MAX_SMAA_STAGE];
+        let vertex_shaders = [
+            build_shader(&device, SMAA_EDGE_DETECTION_VERT_SPV)
+                .expect("Failed to build smaa_edge_detection.vert"),
+            build_shader(&device, SMAA_BLENDING_WEIGHT_CALCULATION_VERT_SPV)
+                .expect("Failed to build smaa_blending_weight_calculation.vert"),
+            build_shader(&device, SMAA_NEIGHBORHOOD_BLENDING_VERT_SPV)
+                .expect("Failed to build smaa_neighborhood_blending.vert"),
+        ];
+        let fragment_shaders = [
+            build_shader(&device, SMAA_EDGE_DETECTION_FRAG_SPV)
+                .expect("Failed to build smaa_edge_detection.frag"),
+            build_shader(&device, SMAA_BLENDING_WEIGHT_CALCULATION_FRAG_SPV)
+                .expect("Failed to build smaa_blending_weight_calculation.frag"),
+            build_shader(&device, SMAA_NEIGHBORHOOD_BLENDING_FRAG_SPV)
+                .expect("Failed to build smaa_neighborhood_blending.frag"),
+        ];
 
         // Descriptor pool: 6 descriptors, 3 descriptor sets per image
         let descriptor_pool = util::create_wrapped_descriptor_pool(
@@ -273,6 +393,8 @@ impl Smaa {
             dynamic_images,
             static_images,
             static_image_views,
+            area_upload_buffer,
+            search_upload_buffer,
             descriptor_pool,
             descriptor_set_layouts,
             pipeline_layouts,
@@ -344,18 +466,50 @@ impl Smaa {
     }
 
     /// Port of `SMAA::UploadImages`.
-    fn upload_images(&mut self, cmdbuf: vk::CommandBuffer) {
+    fn upload_images(&mut self, scheduler: &mut Scheduler) {
         if self.images_ready {
             return;
         }
 
-        // Static images would be uploaded via staging buffer here (area/search textures).
-        // For now, clear dynamic images.
-        for imgs in &self.dynamic_images {
-            for i in 0..MAX_DYNAMIC_IMAGE {
-                util::clear_color_image(&self.device, cmdbuf, imgs.images[i]);
+        let device = self.device.clone();
+        let area_buffer = self.area_upload_buffer.buffer();
+        let search_buffer = self.search_upload_buffer.buffer();
+        let area_image = self.static_images[StaticImageType::Area as usize];
+        let search_image = self.static_images[StaticImageType::Search as usize];
+        let dynamic_images: Vec<[vk::Image; MAX_DYNAMIC_IMAGE]> = self
+            .dynamic_images
+            .iter()
+            .map(|images| images.images)
+            .collect();
+
+        scheduler.record(move |cmdbuf| {
+            Self::upload_static_image(
+                &device,
+                cmdbuf,
+                area_buffer,
+                area_image,
+                vk::Extent2D {
+                    width: AREATEX_WIDTH,
+                    height: AREATEX_HEIGHT,
+                },
+            );
+            Self::upload_static_image(
+                &device,
+                cmdbuf,
+                search_buffer,
+                search_image,
+                vk::Extent2D {
+                    width: SEARCHTEX_WIDTH,
+                    height: SEARCHTEX_HEIGHT,
+                },
+            );
+            for images in dynamic_images {
+                for image in images {
+                    util::clear_color_image(&device, cmdbuf, image);
+                }
             }
-        }
+        });
+        scheduler.finish();
 
         self.images_ready = true;
     }
@@ -368,42 +522,230 @@ impl AntiAliasPass for Smaa {
     /// and neighborhood blending. Swaps the image/view pointers to the output.
     fn draw(
         &mut self,
+        scheduler: &mut Scheduler,
         image_index: usize,
         inout_image: &mut vk::Image,
         inout_image_view: &mut vk::ImageView,
     ) {
         let images = &self.dynamic_images[image_index];
 
-        let _input_image = *inout_image;
-        let _output_image = images.images[DynamicImageType::Output as usize];
-        let _edges_image = images.images[DynamicImageType::Edges as usize];
-        let _blend_image = images.images[DynamicImageType::Blend as usize];
+        let input_image = *inout_image;
+        let output_image = images.images[DynamicImageType::Output as usize];
+        let output_image_view = images.image_views[DynamicImageType::Output as usize];
+        let edges_image = images.images[DynamicImageType::Edges as usize];
+        let blend_image = images.images[DynamicImageType::Blend as usize];
 
-        let _edge_detection_ds = images.descriptor_sets[SmaaStage::EdgeDetection as usize];
-        let _blending_weight_ds =
+        let edge_detection_ds = images.descriptor_sets[SmaaStage::EdgeDetection as usize];
+        let blending_weight_ds =
             images.descriptor_sets[SmaaStage::BlendingWeightCalculation as usize];
-        let _neighborhood_ds = images.descriptor_sets[SmaaStage::NeighborhoodBlending as usize];
+        let neighborhood_ds = images.descriptor_sets[SmaaStage::NeighborhoodBlending as usize];
 
-        let _edge_fb = images.framebuffers[SmaaStage::EdgeDetection as usize];
-        let _blend_fb = images.framebuffers[SmaaStage::BlendingWeightCalculation as usize];
-        let _neighborhood_fb = images.framebuffers[SmaaStage::NeighborhoodBlending as usize];
+        let edge_fb = images.framebuffers[SmaaStage::EdgeDetection as usize];
+        let blend_fb = images.framebuffers[SmaaStage::BlendingWeightCalculation as usize];
+        let neighborhood_fb = images.framebuffers[SmaaStage::NeighborhoodBlending as usize];
+        let renderpasses = self.renderpasses;
+        let pipelines = self.pipelines;
+        let pipeline_layouts = self.pipeline_layouts;
+        let extent = self.extent;
 
+        self.upload_images(scheduler);
         self.update_descriptor_sets(*inout_image_view, image_index);
 
-        // NOTE: actual command recording requires a scheduler/command buffer.
-        // The three-pass sequence would be:
-        // Pass 1: Edge detection
-        //   - Transition input + edges to GENERAL
-        //   - BeginRenderPass(edge), BindPipeline, BindDescriptorSets, Draw(3,1,0,0), EndRenderPass
-        // Pass 2: Blending weight calculation
-        //   - Transition edges + blend to GENERAL
-        //   - BeginRenderPass(blend), BindPipeline, BindDescriptorSets, Draw(3,1,0,0), EndRenderPass
-        // Pass 3: Neighborhood blending
-        //   - Transition blend + output to GENERAL
-        //   - BeginRenderPass(neighborhood), BindPipeline, BindDescriptorSets, Draw(3,1,0,0), EndRenderPass
-        //   - Transition output to GENERAL
+        scheduler.request_outside_renderpass();
+        let device = self.device.clone();
+        scheduler.record(move |cmdbuf| unsafe {
+            util::transition_image_layout(
+                &device,
+                cmdbuf,
+                input_image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+            );
+            util::transition_image_layout(
+                &device,
+                cmdbuf,
+                edges_image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+            );
+            util::begin_render_pass(
+                &device,
+                cmdbuf,
+                renderpasses[SmaaStage::EdgeDetection as usize],
+                edge_fb,
+                extent,
+            );
+            device.cmd_bind_pipeline(
+                cmdbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipelines[SmaaStage::EdgeDetection as usize],
+            );
+            device.cmd_bind_descriptor_sets(
+                cmdbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_layouts[SmaaStage::EdgeDetection as usize],
+                0,
+                &[edge_detection_ds],
+                &[],
+            );
+            device.cmd_draw(cmdbuf, 3, 1, 0, 0);
+            device.cmd_end_render_pass(cmdbuf);
 
-        *inout_image = images.images[DynamicImageType::Output as usize];
-        *inout_image_view = images.image_views[DynamicImageType::Output as usize];
+            util::transition_image_layout(
+                &device,
+                cmdbuf,
+                edges_image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+            );
+            util::transition_image_layout(
+                &device,
+                cmdbuf,
+                blend_image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+            );
+            util::begin_render_pass(
+                &device,
+                cmdbuf,
+                renderpasses[SmaaStage::BlendingWeightCalculation as usize],
+                blend_fb,
+                extent,
+            );
+            device.cmd_bind_pipeline(
+                cmdbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipelines[SmaaStage::BlendingWeightCalculation as usize],
+            );
+            device.cmd_bind_descriptor_sets(
+                cmdbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_layouts[SmaaStage::BlendingWeightCalculation as usize],
+                0,
+                &[blending_weight_ds],
+                &[],
+            );
+            device.cmd_draw(cmdbuf, 3, 1, 0, 0);
+            device.cmd_end_render_pass(cmdbuf);
+
+            util::transition_image_layout(
+                &device,
+                cmdbuf,
+                blend_image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+            );
+            util::transition_image_layout(
+                &device,
+                cmdbuf,
+                output_image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+            );
+            util::begin_render_pass(
+                &device,
+                cmdbuf,
+                renderpasses[SmaaStage::NeighborhoodBlending as usize],
+                neighborhood_fb,
+                extent,
+            );
+            device.cmd_bind_pipeline(
+                cmdbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipelines[SmaaStage::NeighborhoodBlending as usize],
+            );
+            device.cmd_bind_descriptor_sets(
+                cmdbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_layouts[SmaaStage::NeighborhoodBlending as usize],
+                0,
+                &[neighborhood_ds],
+                &[],
+            );
+            device.cmd_draw(cmdbuf, 3, 1, 0, 0);
+            device.cmd_end_render_pass(cmdbuf);
+            util::transition_image_layout(
+                &device,
+                cmdbuf,
+                output_image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+            );
+        });
+
+        *inout_image = output_image;
+        *inout_image_view = output_image_view;
+    }
+}
+
+impl Drop for Smaa {
+    fn drop(&mut self) {
+        unsafe {
+            for images in &mut self.dynamic_images {
+                for framebuffer in &mut images.framebuffers {
+                    if *framebuffer != vk::Framebuffer::null() {
+                        self.device.destroy_framebuffer(*framebuffer, None);
+                        *framebuffer = vk::Framebuffer::null();
+                    }
+                }
+                for image_view in &mut images.image_views {
+                    if *image_view != vk::ImageView::null() {
+                        self.device.destroy_image_view(*image_view, None);
+                        *image_view = vk::ImageView::null();
+                    }
+                }
+            }
+            for image_view in &mut self.static_image_views {
+                if *image_view != vk::ImageView::null() {
+                    self.device.destroy_image_view(*image_view, None);
+                    *image_view = vk::ImageView::null();
+                }
+            }
+            if self.sampler != vk::Sampler::null() {
+                self.device.destroy_sampler(self.sampler, None);
+                self.sampler = vk::Sampler::null();
+            }
+            for renderpass in &mut self.renderpasses {
+                if *renderpass != vk::RenderPass::null() {
+                    self.device.destroy_render_pass(*renderpass, None);
+                    *renderpass = vk::RenderPass::null();
+                }
+            }
+            for pipeline in &mut self.pipelines {
+                if *pipeline != vk::Pipeline::null() {
+                    self.device.destroy_pipeline(*pipeline, None);
+                    *pipeline = vk::Pipeline::null();
+                }
+            }
+            for layout in &mut self.pipeline_layouts {
+                if *layout != vk::PipelineLayout::null() {
+                    self.device.destroy_pipeline_layout(*layout, None);
+                    *layout = vk::PipelineLayout::null();
+                }
+            }
+            for layout in &mut self.descriptor_set_layouts {
+                if *layout != vk::DescriptorSetLayout::null() {
+                    self.device.destroy_descriptor_set_layout(*layout, None);
+                    *layout = vk::DescriptorSetLayout::null();
+                }
+            }
+            if self.descriptor_pool != vk::DescriptorPool::null() {
+                self.device
+                    .destroy_descriptor_pool(self.descriptor_pool, None);
+                self.descriptor_pool = vk::DescriptorPool::null();
+            }
+            for shader in &mut self.fragment_shaders {
+                if *shader != vk::ShaderModule::null() {
+                    self.device.destroy_shader_module(*shader, None);
+                    *shader = vk::ShaderModule::null();
+                }
+            }
+            for shader in &mut self.vertex_shaders {
+                if *shader != vk::ShaderModule::null() {
+                    self.device.destroy_shader_module(*shader, None);
+                    *shader = vk::ShaderModule::null();
+                }
+            }
+        }
     }
 }

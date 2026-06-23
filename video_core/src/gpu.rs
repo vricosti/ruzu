@@ -956,8 +956,8 @@ impl Gpu {
         let gpu_addr = self as *const Gpu as usize;
         let wait_fence = self.request_sync_operation(Box::new(move || {
             let gpu = unsafe { &*(gpu_addr as *const Gpu) };
-            let renderer_guard = gpu.renderer.lock().unwrap();
-            if let Some(ref renderer) = *renderer_guard {
+            let mut renderer_guard = gpu.renderer.lock().unwrap();
+            if let Some(ref mut renderer) = *renderer_guard {
                 *result_clone.lock().unwrap() = renderer.get_applet_capture_buffer();
             }
         }));
@@ -968,8 +968,13 @@ impl Gpu {
 
     /// Renderer frame end notification.
     pub fn renderer_frame_end_notify(&self) {
-        // NOTE: Full implementation calls system.GetPerfStats().EndGameFrame().
-        // Stubbed until perf stats integration is complete.
+        let system = self.system_ref();
+        if system.is_null() {
+            return;
+        }
+        if let Some(stats) = system.get().get_perf_stats() {
+            stats.end_game_frame();
+        }
     }
 }
 
@@ -1504,5 +1509,20 @@ mod tests {
         settings::values_mut()
             .use_fast_gpu_time
             .set_value(previous_fast_gpu_time);
+    }
+
+    #[test]
+    fn renderer_frame_end_notify_updates_perf_stats_game_frames() {
+        let mut system = ruzu_core::core::System::new();
+        system.init_perf_stats(0x0100_0000_0000_0000);
+
+        let gpu = Gpu::new(false, false);
+        gpu.set_system_ref(ruzu_core::core::SystemRef::from_ref(&system));
+
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        gpu.renderer_frame_end_notify();
+
+        let results = system.get_and_reset_perf_stats();
+        assert!(results.average_game_fps > 0.0);
     }
 }

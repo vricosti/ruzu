@@ -8,6 +8,15 @@
 use ash::vk;
 
 use super::util;
+use crate::fsr::{fsr_easu_con_offset, fsr_rcas_con};
+use crate::host_shaders::spirv_shaders::{
+    VULKAN_FIDELITYFX_FSR_EASU_FP16_FRAG_SPV, VULKAN_FIDELITYFX_FSR_EASU_FP32_FRAG_SPV,
+    VULKAN_FIDELITYFX_FSR_RCAS_FP16_FRAG_SPV, VULKAN_FIDELITYFX_FSR_RCAS_FP32_FRAG_SPV,
+    VULKAN_FIDELITYFX_FSR_VERT_SPV,
+};
+use crate::renderer_vulkan::scheduler::Scheduler;
+use crate::renderer_vulkan::shader_util::build_shader;
+use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
 
 // ---------------------------------------------------------------------------
 // FSR stage enum
@@ -69,9 +78,10 @@ impl Fsr {
     /// Port of `FSR::FSR`.
     pub fn new(
         device: ash::Device,
-        allocator: &vk::DeviceMemory,
+        allocator: &MemoryAllocator,
         image_count: usize,
         extent: vk::Extent2D,
+        supports_float16: bool,
     ) -> Self {
         // Create images
         let mut dynamic_images = Vec::with_capacity(image_count);
@@ -132,10 +142,27 @@ impl Fsr {
         // Create sampler (bilinear)
         let sampler = util::create_bilinear_sampler(&device);
 
-        // Shaders would come from host_shaders; null placeholders for now
-        let vert_shader = vk::ShaderModule::null();
-        let easu_shader = vk::ShaderModule::null();
-        let rcas_shader = vk::ShaderModule::null();
+        let vert_shader = build_shader(&device, VULKAN_FIDELITYFX_FSR_VERT_SPV)
+            .expect("Failed to build vulkan_fidelityfx_fsr.vert");
+        let (easu_spv, rcas_spv, easu_name, rcas_name) = if supports_float16 {
+            (
+                VULKAN_FIDELITYFX_FSR_EASU_FP16_FRAG_SPV,
+                VULKAN_FIDELITYFX_FSR_RCAS_FP16_FRAG_SPV,
+                "vulkan_fidelityfx_fsr_easu_fp16.frag",
+                "vulkan_fidelityfx_fsr_rcas_fp16.frag",
+            )
+        } else {
+            (
+                VULKAN_FIDELITYFX_FSR_EASU_FP32_FRAG_SPV,
+                VULKAN_FIDELITYFX_FSR_RCAS_FP32_FRAG_SPV,
+                "vulkan_fidelityfx_fsr_easu_fp32.frag",
+                "vulkan_fidelityfx_fsr_rcas_fp32.frag",
+            )
+        };
+        let easu_shader = build_shader(&device, easu_spv)
+            .unwrap_or_else(|_| panic!("Failed to build {easu_name}"));
+        let rcas_shader = build_shader(&device, rcas_spv)
+            .unwrap_or_else(|_| panic!("Failed to build {rcas_name}"));
 
         // Descriptor pool: 2 descriptors, 2 sets per image
         let image_count_u32 = image_count as u32;
@@ -240,15 +267,21 @@ impl Fsr {
     }
 
     /// Port of `FSR::UploadImages`.
-    fn upload_images(&mut self, cmdbuf: vk::CommandBuffer) {
+    fn upload_images(&mut self, scheduler: &mut Scheduler) {
         if self.images_ready {
             return;
         }
 
-        for imgs in &self.dynamic_images {
-            util::clear_color_image(&self.device, cmdbuf, imgs.images[FsrStage::Easu as usize]);
-            util::clear_color_image(&self.device, cmdbuf, imgs.images[FsrStage::Rcas as usize]);
-        }
+        let images: Vec<[vk::Image; MAX_FSR_STAGE]> =
+            self.dynamic_images.iter().map(|imgs| imgs.images).collect();
+        let device = self.device.clone();
+        scheduler.record(move |cmdbuf| {
+            for image in images {
+                util::clear_color_image(&device, cmdbuf, image[FsrStage::Easu as usize]);
+                util::clear_color_image(&device, cmdbuf, image[FsrStage::Rcas as usize]);
+            }
+        });
+        scheduler.finish();
 
         self.images_ready = true;
     }
@@ -259,49 +292,217 @@ impl Fsr {
     /// output image view.
     pub fn draw(
         &mut self,
+        scheduler: &mut Scheduler,
         image_index: usize,
-        _source_image: vk::Image,
+        source_image: vk::Image,
         source_image_view: vk::ImageView,
         input_image_extent: vk::Extent2D,
         crop_rect: [f32; 4], // [left, top, right, bottom]
     ) -> vk::ImageView {
         let images = &self.dynamic_images[image_index];
 
-        let _easu_image = images.images[FsrStage::Easu as usize];
-        let _rcas_image = images.images[FsrStage::Rcas as usize];
-        let _easu_descriptor_set = images.descriptor_sets[FsrStage::Easu as usize];
-        let _rcas_descriptor_set = images.descriptor_sets[FsrStage::Rcas as usize];
-        let _easu_framebuffer = images.framebuffers[FsrStage::Easu as usize];
-        let _rcas_framebuffer = images.framebuffers[FsrStage::Rcas as usize];
-        let _easu_pipeline = self.easu_pipeline;
-        let _rcas_pipeline = self.rcas_pipeline;
-        let _pipeline_layout = self.pipeline_layout;
-        let _renderpass = self.renderpass;
-        let _extent = self.extent;
+        let easu_image = images.images[FsrStage::Easu as usize];
+        let rcas_image = images.images[FsrStage::Rcas as usize];
+        let easu_descriptor_set = images.descriptor_sets[FsrStage::Easu as usize];
+        let rcas_descriptor_set = images.descriptor_sets[FsrStage::Rcas as usize];
+        let easu_framebuffer = images.framebuffers[FsrStage::Easu as usize];
+        let rcas_framebuffer = images.framebuffers[FsrStage::Rcas as usize];
+        let easu_pipeline = self.easu_pipeline;
+        let rcas_pipeline = self.rcas_pipeline;
+        let pipeline_layout = self.pipeline_layout;
+        let renderpass = self.renderpass;
+        let extent = self.extent;
+        let output_view = images.image_views[FsrStage::Rcas as usize];
 
         // Compute push constants
         let input_image_width = input_image_extent.width as f32;
         let input_image_height = input_image_extent.height as f32;
-        let _output_image_width = self.extent.width as f32;
-        let _output_image_height = self.extent.height as f32;
-        let _viewport_width = (crop_rect[2] - crop_rect[0]) * input_image_width;
-        let _viewport_x = crop_rect[0] * input_image_width;
-        let _viewport_height = (crop_rect[3] - crop_rect[1]) * input_image_height;
-        let _viewport_y = crop_rect[1] * input_image_height;
+        let output_image_width = self.extent.width as f32;
+        let output_image_height = self.extent.height as f32;
+        let viewport_width = (crop_rect[2] - crop_rect[0]) * input_image_width;
+        let viewport_x = crop_rect[0] * input_image_width;
+        let viewport_height = (crop_rect[3] - crop_rect[1]) * input_image_height;
+        let viewport_y = crop_rect[1] * input_image_height;
 
-        let _easu_con: PushConstants = [0u32; 16];
-        let _rcas_con: PushConstants = [0u32; 16];
-        // FsrEasuConOffset and FsrRcasCon would populate these;
-        // they depend on the FSR algorithm implementation in fsr.rs (top-level)
+        let mut easu_con: PushConstants = [0u32; 16];
+        let mut rcas_con: PushConstants = [0u32; 16];
+        let (con0, rest) = easu_con.split_at_mut(4);
+        let (con1, rest) = rest.split_at_mut(4);
+        let (con2, con3) = rest.split_at_mut(4);
+        fsr_easu_con_offset(
+            con0.try_into().unwrap(),
+            con1.try_into().unwrap(),
+            con2.try_into().unwrap(),
+            con3.try_into().unwrap(),
+            viewport_width,
+            viewport_height,
+            input_image_width,
+            input_image_height,
+            output_image_width,
+            output_image_height,
+            viewport_x,
+            viewport_y,
+        );
+        let sharpening =
+            (*common::settings::values().fsr_sharpening_slider.get_value() as f32) / 100.0;
+        let (rcas_con0, _) = rcas_con.split_at_mut(4);
+        fsr_rcas_con(rcas_con0.try_into().unwrap(), sharpening);
 
+        self.upload_images(scheduler);
         self.update_descriptor_sets(source_image_view, image_index);
 
-        // NOTE: actual command recording requires a scheduler/command buffer.
-        // The draw sequence would be:
-        // 1. TransitionImageLayout for source, easu, rcas
-        // 2. EASU pass: bind pipeline, descriptor sets, push constants, draw(3,1,0,0)
-        // 3. RCAS pass: bind pipeline, descriptor sets, push constants, draw(3,1,0,0)
+        scheduler.request_outside_renderpass();
+        let device = self.device.clone();
+        scheduler.record(move |cmdbuf| unsafe {
+            util::transition_image_layout(
+                &device,
+                cmdbuf,
+                source_image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+            );
+            util::transition_image_layout(
+                &device,
+                cmdbuf,
+                easu_image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+            );
+            util::begin_render_pass(&device, cmdbuf, renderpass, easu_framebuffer, extent);
+            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, easu_pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmdbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_layout,
+                0,
+                &[easu_descriptor_set],
+                &[],
+            );
+            let easu_bytes = std::slice::from_raw_parts(
+                easu_con.as_ptr() as *const u8,
+                std::mem::size_of::<PushConstants>(),
+            );
+            device.cmd_push_constants(
+                cmdbuf,
+                pipeline_layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                easu_bytes,
+            );
+            device.cmd_draw(cmdbuf, 3, 1, 0, 0);
+            device.cmd_end_render_pass(cmdbuf);
 
-        images.image_views[FsrStage::Rcas as usize]
+            util::transition_image_layout(
+                &device,
+                cmdbuf,
+                easu_image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+            );
+            util::transition_image_layout(
+                &device,
+                cmdbuf,
+                rcas_image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+            );
+            util::begin_render_pass(&device, cmdbuf, renderpass, rcas_framebuffer, extent);
+            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, rcas_pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmdbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_layout,
+                0,
+                &[rcas_descriptor_set],
+                &[],
+            );
+            let rcas_bytes = std::slice::from_raw_parts(
+                rcas_con.as_ptr() as *const u8,
+                std::mem::size_of::<PushConstants>(),
+            );
+            device.cmd_push_constants(
+                cmdbuf,
+                pipeline_layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                rcas_bytes,
+            );
+            device.cmd_draw(cmdbuf, 3, 1, 0, 0);
+            device.cmd_end_render_pass(cmdbuf);
+
+            util::transition_image_layout(
+                &device,
+                cmdbuf,
+                rcas_image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+            );
+        });
+
+        output_view
+    }
+}
+
+impl Drop for Fsr {
+    fn drop(&mut self) {
+        unsafe {
+            for images in &mut self.dynamic_images {
+                for framebuffer in &mut images.framebuffers {
+                    if *framebuffer != vk::Framebuffer::null() {
+                        self.device.destroy_framebuffer(*framebuffer, None);
+                        *framebuffer = vk::Framebuffer::null();
+                    }
+                }
+                for image_view in &mut images.image_views {
+                    if *image_view != vk::ImageView::null() {
+                        self.device.destroy_image_view(*image_view, None);
+                        *image_view = vk::ImageView::null();
+                    }
+                }
+            }
+            if self.sampler != vk::Sampler::null() {
+                self.device.destroy_sampler(self.sampler, None);
+                self.sampler = vk::Sampler::null();
+            }
+            if self.renderpass != vk::RenderPass::null() {
+                self.device.destroy_render_pass(self.renderpass, None);
+                self.renderpass = vk::RenderPass::null();
+            }
+            if self.rcas_pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.rcas_pipeline, None);
+                self.rcas_pipeline = vk::Pipeline::null();
+            }
+            if self.easu_pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.easu_pipeline, None);
+                self.easu_pipeline = vk::Pipeline::null();
+            }
+            if self.pipeline_layout != vk::PipelineLayout::null() {
+                self.device
+                    .destroy_pipeline_layout(self.pipeline_layout, None);
+                self.pipeline_layout = vk::PipelineLayout::null();
+            }
+            if self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
+                self.device
+                    .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+                self.descriptor_set_layout = vk::DescriptorSetLayout::null();
+            }
+            if self.descriptor_pool != vk::DescriptorPool::null() {
+                self.device
+                    .destroy_descriptor_pool(self.descriptor_pool, None);
+                self.descriptor_pool = vk::DescriptorPool::null();
+            }
+            if self.rcas_shader != vk::ShaderModule::null() {
+                self.device.destroy_shader_module(self.rcas_shader, None);
+                self.rcas_shader = vk::ShaderModule::null();
+            }
+            if self.easu_shader != vk::ShaderModule::null() {
+                self.device.destroy_shader_module(self.easu_shader, None);
+                self.easu_shader = vk::ShaderModule::null();
+            }
+            if self.vert_shader != vk::ShaderModule::null() {
+                self.device.destroy_shader_module(self.vert_shader, None);
+                self.vert_shader = vk::ShaderModule::null();
+            }
+        }
     }
 }

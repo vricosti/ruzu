@@ -62,7 +62,7 @@ pub trait RendererBase: Send {
     fn composite(&mut self, layers: &[FramebufferConfig]);
 
     /// Get the tiled applet layer capture buffer.
-    fn get_applet_capture_buffer(&self) -> Vec<u8>;
+    fn get_applet_capture_buffer(&mut self) -> Vec<u8>;
 
     /// Get the rasterizer interface.
     fn read_rasterizer(&self) -> *mut dyn crate::rasterizer_interface::RasterizerInterface;

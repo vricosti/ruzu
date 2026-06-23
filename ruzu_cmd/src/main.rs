@@ -35,6 +35,16 @@ use emu_window::{
 };
 use sdl_config::SdlConfig;
 
+#[cfg(target_os = "macos")]
+fn default_renderer_backend() -> String {
+    "vulkan".to_string()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_renderer_backend() -> String {
+    "opengl".to_string()
+}
+
 // ---------------------------------------------------------------------------
 // CLI argument definitions
 // ---------------------------------------------------------------------------
@@ -94,7 +104,7 @@ struct Args {
         short = 'r',
         long = "renderer",
         value_name = "BACKEND",
-        default_value = "opengl"
+        default_value_t = default_renderer_backend()
     )]
     renderer: String,
 
@@ -759,8 +769,12 @@ fn main() {
         "vulkan" | "vk" | "1" => "vulkan",
         "null" | "2" => "null",
         other => {
-            log::warn!("Unknown renderer '{}', defaulting to opengl", other);
-            "opengl"
+            #[cfg(target_os = "macos")]
+            let fallback = "vulkan";
+            #[cfg(not(target_os = "macos"))]
+            let fallback = "opengl";
+            log::warn!("Unknown renderer '{}', defaulting to {}", other, fallback);
+            fallback
         }
     };
     log::info!("Renderer backend: {}", renderer_backend);
@@ -825,6 +839,10 @@ fn main() {
         EmuWindow::Gl(w) => w.raw_window() as usize,
         EmuWindow::Vk(w) => w.raw_window() as usize,
         EmuWindow::Null(w) => w.raw_window() as usize,
+    };
+    let vulkan_window_info = match &emu_window {
+        EmuWindow::Vk(w) => Some((w.window_info().clone(), w.drawable_size(), w.shown_state())),
+        _ => None,
     };
     let renderer_backend_str = renderer_backend.to_string();
 
@@ -954,10 +972,49 @@ fn main() {
                     Box::new(renderer)
                 }
                 "vulkan" => {
-                    log::warn!("Vulkan renderer not yet implemented, falling back to null");
-                    Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
-                        syncpoints.clone(),
-                    ))
+                    let Some((window_info, drawable_size, shown_state)) =
+                        vulkan_window_info.as_ref()
+                    else {
+                        log::error!("Vulkan renderer selected without Vulkan window info");
+                        std::process::exit(1);
+                    };
+                    let Some(host1x_core) = system.host1x_core() else {
+                        log::error!("Vulkan renderer selected before Host1x initialization");
+                        std::process::exit(1);
+                    };
+                    let Some(host1x) = host1x_core
+                        .as_any()
+                        .downcast_ref::<video_core::host1x::host1x::Host1x>()
+                    else {
+                        log::error!("Vulkan renderer could not resolve Host1x memory manager");
+                        std::process::exit(1);
+                    };
+                    let device_memory = std::sync::Arc::clone(host1x.memory_manager());
+                    // Upstream calls render_window.OnFrameDisplayed() from RendererVulkan::Composite
+                    // via SCOPE_EXIT. SDL's current Rust frontend does not override the default
+                    // no-op hook, so pass an explicit no-op until renderer construction owns
+                    // an EmuWindow reference.
+                    let frame_displayed_notify = Arc::new(|| {});
+                    let frame_end_notify = Arc::new(move || unsafe {
+                        let gpu_ref = &*(gpu_ptr as *const video_core::gpu::Gpu);
+                        gpu_ref.renderer_frame_end_notify();
+                    });
+                    Box::new(
+                        video_core::renderer_vulkan::renderer_vulkan::RendererVulkan::new(
+                            system.telemetry_session_mut(),
+                            window_info,
+                            *drawable_size,
+                            Arc::clone(shown_state),
+                            frame_displayed_notify,
+                            frame_end_notify,
+                            syncpoints.clone(),
+                            device_memory,
+                        )
+                        .unwrap_or_else(|e| {
+                            log::error!("Failed to create Vulkan renderer: {}", e);
+                            std::process::exit(1);
+                        }),
+                    )
                 }
                 _ => Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
                     syncpoints.clone(),

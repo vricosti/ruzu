@@ -103,7 +103,7 @@ impl RendererBase for RendererNull {
         self.composite_impl(layers);
     }
 
-    fn get_applet_capture_buffer(&self) -> Vec<u8> {
+    fn get_applet_capture_buffer(&mut self) -> Vec<u8> {
         RendererNull::get_applet_capture_buffer(self)
     }
 

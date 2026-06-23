@@ -24,6 +24,19 @@ use ash::vk;
 pub fn open_library() -> Result<ash::Entry, VulkanError> {
     log::debug!("Looking for a Vulkan library");
 
+    #[cfg(target_os = "macos")]
+    {
+        return open_library_macos();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        return open_library_default();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_library_default() -> Result<ash::Entry, VulkanError> {
     // ash::Entry::load() will dlopen libvulkan.so / vulkan-1.dll / etc.
     // This matches the C++ behavior of dynamically loading the Vulkan library.
     match unsafe { ash::Entry::load() } {
@@ -36,6 +49,131 @@ pub fn open_library() -> Result<ash::Entry, VulkanError> {
             Err(VulkanError::new(vk::Result::ERROR_INITIALIZATION_FAILED))
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn open_library_macos() -> Result<ash::Entry, VulkanError> {
+    use std::path::PathBuf;
+
+    let mut library_paths = Vec::<PathBuf>::new();
+
+    // Upstream first allows an explicit Vulkan loader override.
+    if let Some(path) = std::env::var_os("LIBVULKAN_PATH").filter(|path| !path.is_empty()) {
+        library_paths.push(PathBuf::from(path));
+    }
+
+    // Upstream app bundle lookup:
+    // Common::FS::GetBundleDirectory() / Contents/Frameworks/libvulkan.1.dylib
+    // Common::FS::GetBundleDirectory() / Contents/Frameworks/libMoltenVK.dylib
+    if let Some(bundle_dir) = bundle_directory() {
+        library_paths.push(bundle_dir.join("Contents/Frameworks/libvulkan.1.dylib"));
+        library_paths.push(bundle_dir.join("Contents/Frameworks/libMoltenVK.dylib"));
+    }
+
+    // Non-bundled ruzu-cmd development fallback on macOS.
+    library_paths.extend([
+        PathBuf::from("/opt/homebrew/lib/libvulkan.1.dylib"),
+        PathBuf::from("/opt/homebrew/lib/libvulkan.dylib"),
+        PathBuf::from("/opt/homebrew/lib/libMoltenVK.dylib"),
+        PathBuf::from("/usr/local/lib/libvulkan.1.dylib"),
+        PathBuf::from("/usr/local/lib/libvulkan.dylib"),
+        PathBuf::from("/usr/local/lib/libMoltenVK.dylib"),
+    ]);
+    library_paths.extend(moltenvk_derived_data_paths());
+    library_paths.extend(android_sdk_vulkan_paths());
+
+    let mut errors = Vec::<String>::new();
+    for library_path in library_paths {
+        if !library_path.exists() {
+            continue;
+        }
+        log::debug!("Trying Vulkan library: {}", library_path.display());
+        match unsafe { ash::Entry::load_from(library_path.as_os_str()) } {
+            Ok(entry) => {
+                log::info!("Vulkan library loaded from {}", library_path.display());
+                return Ok(entry);
+            }
+            Err(err) => {
+                errors.push(format!("{}: {}", library_path.display(), err));
+            }
+        }
+    }
+
+    match unsafe { ash::Entry::load() } {
+        Ok(entry) => {
+            log::debug!("Vulkan library loaded through ash default loader");
+            Ok(entry)
+        }
+        Err(err) => {
+            if errors.is_empty() {
+                log::error!("Failed to load Vulkan library: {}", err);
+            } else {
+                log::error!(
+                    "Failed to load Vulkan library: {}; explicit attempts: {}",
+                    err,
+                    errors.join("; ")
+                );
+            }
+            Err(VulkanError::new(vk::Result::ERROR_INITIALIZATION_FAILED))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn bundle_directory() -> Option<std::path::PathBuf> {
+    let exe_path = std::env::current_exe().ok()?;
+    let mut path = exe_path.as_path();
+    while let Some(parent) = path.parent() {
+        if parent
+            .extension()
+            .is_some_and(|extension| extension == "app")
+        {
+            return Some(parent.to_path_buf());
+        }
+        path = parent;
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn moltenvk_derived_data_paths() -> Vec<std::path::PathBuf> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let derived_data = std::path::PathBuf::from(home).join("Library/Developer/Xcode/DerivedData");
+    let Ok(entries) = std::fs::read_dir(derived_data) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("MoltenVKPackaging-"))
+        })
+        .map(|path| path.join("Build/Products/Release/libMoltenVK.dylib"))
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn android_sdk_vulkan_paths() -> Vec<std::path::PathBuf> {
+    let sdk_root = std::env::var_os("ANDROID_HOME")
+        .or_else(|| std::env::var_os("ANDROID_SDK_ROOT"))
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join("Library/Android/sdk"))
+        });
+    let Some(sdk_root) = sdk_root else {
+        return Vec::new();
+    };
+    let vulkan_dir = sdk_root.join("emulator/lib64/vulkan");
+    vec![
+        vulkan_dir.join("libMoltenVK.dylib"),
+        vulkan_dir.join("libvulkan.dylib"),
+    ]
 }
 
 #[cfg(test)]

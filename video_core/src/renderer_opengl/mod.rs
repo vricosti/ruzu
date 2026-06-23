@@ -926,7 +926,7 @@ impl RendererBase for RendererOpenGL {
         self.rasterizer.set_gpu_tick_callback(callback);
     }
 
-    fn get_applet_capture_buffer(&self) -> Vec<u8> {
+    fn get_applet_capture_buffer(&mut self) -> Vec<u8> {
         // Port of `RendererOpenGL::GetAppletCaptureBuffer()`.
         // Full implementation reads from capture_framebuffer via glReadPixels,
         // then swizzles from linear to tiled format via Tegra::Texture::SwizzleTexture.

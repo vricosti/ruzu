@@ -8,6 +8,10 @@
 
 use ash::vk;
 
+use crate::host_shaders::spirv_shaders::VULKAN_PRESENT_VERT_SPV;
+use crate::renderer_vulkan::scheduler::Scheduler;
+use crate::renderer_vulkan::shader_util::build_shader;
+
 use super::present_push_constants::PresentPushConstants;
 use super::util;
 
@@ -64,8 +68,8 @@ impl WindowAdaptPass {
                 .expect("Failed to create WindowAdaptPass pipeline layout")
         };
 
-        // Create vertex shader (placeholder - actual SPV from host_shaders)
-        let vertex_shader = vk::ShaderModule::null();
+        let vertex_shader = build_shader(&device, VULKAN_PRESENT_VERT_SPV)
+            .expect("Failed to build vulkan_present.vert");
 
         // Create render pass
         let render_pass =
@@ -118,14 +122,18 @@ impl WindowAdaptPass {
         self.render_pass
     }
 
+    /// Port access to the sampler owned by `WindowAdaptPass`.
+    pub fn get_sampler(&self) -> vk::Sampler {
+        self.sampler
+    }
+
     /// Port of `WindowAdaptPass::Draw`.
     ///
     /// Composites one or more layers into the destination frame. Each layer
     /// has its own push constants, descriptor set, and blending mode.
     pub fn draw(
         &self,
-        _device: &ash::Device,
-        cmdbuf: vk::CommandBuffer,
+        scheduler: &mut Scheduler,
         push_constants_list: &[PresentPushConstants],
         descriptor_sets: &[vk::DescriptorSet],
         blend_modes: &[BlendMode],
@@ -135,7 +143,6 @@ impl WindowAdaptPass {
     ) {
         let layer_count = push_constants_list.len();
 
-        // Select pipeline per layer
         let graphics_pipelines: Vec<vk::Pipeline> = blend_modes
             .iter()
             .map(|mode| match mode {
@@ -144,18 +151,15 @@ impl WindowAdaptPass {
                 BlendMode::Coverage => self.coverage_pipeline,
             })
             .collect();
+        let device = self.device.clone();
+        let render_pass = self.render_pass;
+        let pipeline_layout = self.pipeline_layout;
+        let push_constants = push_constants_list.to_vec();
+        let descriptor_sets = descriptor_sets.to_vec();
 
-        unsafe {
-            // Begin render pass
-            util::begin_render_pass(
-                &self.device,
-                cmdbuf,
-                self.render_pass,
-                dst_framebuffer,
-                render_area,
-            );
+        scheduler.record(move |cmdbuf| unsafe {
+            util::begin_render_pass(&device, cmdbuf, render_pass, dst_framebuffer, render_area);
 
-            // Clear with background color
             let clear_attachment = vk::ClearAttachment {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 color_attachment: 0,
@@ -171,42 +175,87 @@ impl WindowAdaptPass {
                 base_array_layer: 0,
                 layer_count: 1,
             };
-            self.device
-                .cmd_clear_attachments(cmdbuf, &[clear_attachment], &[clear_rect]);
+            device.cmd_clear_attachments(cmdbuf, &[clear_attachment], &[clear_rect]);
 
-            // Draw each layer
             for i in 0..layer_count {
-                self.device.cmd_bind_pipeline(
+                device.cmd_bind_pipeline(
                     cmdbuf,
                     vk::PipelineBindPoint::GRAPHICS,
                     graphics_pipelines[i],
                 );
 
                 let constants_bytes: &[u8] = std::slice::from_raw_parts(
-                    &push_constants_list[i] as *const PresentPushConstants as *const u8,
+                    &push_constants[i] as *const PresentPushConstants as *const u8,
                     std::mem::size_of::<PresentPushConstants>(),
                 );
-                self.device.cmd_push_constants(
+                device.cmd_push_constants(
                     cmdbuf,
-                    self.pipeline_layout,
+                    pipeline_layout,
                     vk::ShaderStageFlags::VERTEX,
                     0,
                     constants_bytes,
                 );
 
-                self.device.cmd_bind_descriptor_sets(
+                device.cmd_bind_descriptor_sets(
                     cmdbuf,
                     vk::PipelineBindPoint::GRAPHICS,
-                    self.pipeline_layout,
+                    pipeline_layout,
                     0,
                     &[descriptor_sets[i]],
                     &[],
                 );
 
-                self.device.cmd_draw(cmdbuf, 4, 1, 0, 0);
+                device.cmd_draw(cmdbuf, 4, 1, 0, 0);
             }
 
-            self.device.cmd_end_render_pass(cmdbuf);
+            device.cmd_end_render_pass(cmdbuf);
+        });
+    }
+}
+
+impl Drop for WindowAdaptPass {
+    fn drop(&mut self) {
+        unsafe {
+            if self.coverage_pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.coverage_pipeline, None);
+                self.coverage_pipeline = vk::Pipeline::null();
+            }
+            if self.premultiplied_pipeline != vk::Pipeline::null() {
+                self.device
+                    .destroy_pipeline(self.premultiplied_pipeline, None);
+                self.premultiplied_pipeline = vk::Pipeline::null();
+            }
+            if self.opaque_pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.opaque_pipeline, None);
+                self.opaque_pipeline = vk::Pipeline::null();
+            }
+            if self.render_pass != vk::RenderPass::null() {
+                self.device.destroy_render_pass(self.render_pass, None);
+                self.render_pass = vk::RenderPass::null();
+            }
+            if self.fragment_shader != vk::ShaderModule::null() {
+                self.device
+                    .destroy_shader_module(self.fragment_shader, None);
+                self.fragment_shader = vk::ShaderModule::null();
+            }
+            if self.vertex_shader != vk::ShaderModule::null() {
+                self.device.destroy_shader_module(self.vertex_shader, None);
+                self.vertex_shader = vk::ShaderModule::null();
+            }
+            if self.sampler != vk::Sampler::null() {
+                self.device.destroy_sampler(self.sampler, None);
+                self.sampler = vk::Sampler::null();
+            }
+            if self.pipeline_layout != vk::PipelineLayout::null() {
+                self.device
+                    .destroy_pipeline_layout(self.pipeline_layout, None);
+                self.pipeline_layout = vk::PipelineLayout::null();
+            }
+            if self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
+                self.device
+                    .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+                self.descriptor_set_layout = vk::DescriptorSetLayout::null();
+            }
         }
     }
 }
