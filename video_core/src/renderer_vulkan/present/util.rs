@@ -10,17 +10,35 @@
 
 use ash::vk;
 
+use crate::vulkan_common::vulkan_memory_allocator::{MemoryAllocator, MemoryUsage};
+
 // ---------------------------------------------------------------------------
 // Buffer / Image creation
 // ---------------------------------------------------------------------------
+
+/// Port of `CreateWrappedBuffer`.
+pub fn create_wrapped_buffer(
+    allocator: &MemoryAllocator,
+    size: vk::DeviceSize,
+    usage: MemoryUsage,
+) -> vk::Buffer {
+    let buffer_ci = vk::BufferCreateInfo::builder()
+        .size(size)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .build();
+    allocator
+        .create_buffer(&buffer_ci, usage)
+        .expect("Failed to create wrapped buffer")
+}
 
 /// Port of `CreateWrappedImage`.
 ///
 /// Creates a 2D image suitable for presentation (transfer dst + storage +
 /// sampled + color attachment).
 pub fn create_wrapped_image(
-    device: &ash::Device,
-    allocator: &vk::DeviceMemory, // placeholder — real impl needs MemoryAllocator
+    _device: &ash::Device,
+    allocator: &MemoryAllocator,
     dimensions: vk::Extent2D,
     format: vk::Format,
 ) -> vk::Image {
@@ -46,11 +64,9 @@ pub fn create_wrapped_image(
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .build();
 
-    unsafe {
-        device
-            .create_image(&image_ci, None)
-            .expect("Failed to create wrapped image")
-    }
+    allocator
+        .create_image(&image_ci)
+        .expect("Failed to create wrapped image")
 }
 
 /// Port of `TransitionImageLayout`.

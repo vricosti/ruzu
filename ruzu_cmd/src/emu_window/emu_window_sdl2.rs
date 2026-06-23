@@ -13,6 +13,8 @@
 
 use sdl2::sys as sdl;
 use std::ffi::CStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use hid_core::frontend::emulated_controller::set_simple_npad_button;
 use hid_core::hid_types::{KeyboardKeyIndex, NpadButton};
@@ -37,6 +39,9 @@ pub struct EmuWindowSdl2 {
     /// Whether the window is shown (not minimized).
     /// Maps to C++ `is_shown`.
     pub is_shown: bool,
+
+    /// Shared visibility flag used by render backends running on the GPU thread.
+    pub shown_state: Arc<AtomicBool>,
 
     /// Tracks when the title bar was last updated (SDL ticks).
     /// Maps to C++ `last_time`.
@@ -77,6 +82,7 @@ impl EmuWindowSdl2 {
         EmuWindowSdl2 {
             is_open: true,
             is_shown: true,
+            shown_state: Arc::new(AtomicBool::new(true)),
             last_time: 0,
             render_window: std::ptr::null_mut(),
         }
@@ -94,6 +100,10 @@ impl EmuWindowSdl2 {
     /// Maps to C++ `EmuWindow_SDL2::IsShown`.
     pub fn is_shown(&self) -> bool {
         self.is_shown
+    }
+
+    pub fn shown_state(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shown_state)
     }
 
     /// Waits for and dispatches the next SDL event.
@@ -175,10 +185,12 @@ impl EmuWindowSdl2 {
                     }
                     x if x == SDL_WINDOWEVENT_MINIMIZED as u32 => {
                         self.is_shown = false;
+                        self.shown_state.store(false, Ordering::Relaxed);
                         self.on_resize();
                     }
                     x if x == SDL_WINDOWEVENT_EXPOSED as u32 => {
                         self.is_shown = true;
+                        self.shown_state.store(true, Ordering::Relaxed);
                         self.on_resize();
                     }
                     x if x == SDL_WINDOWEVENT_CLOSE as u32 => {

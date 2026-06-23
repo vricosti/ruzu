@@ -9,6 +9,16 @@
 
 use ash::vk;
 
+use crate::host_shaders::spirv_shaders::{
+    BLIT_COLOR_FLOAT_FRAG_SPV, CONVERT_ABGR8_TO_D24S8_FRAG_SPV, CONVERT_ABGR8_TO_D32F_FRAG_SPV,
+    CONVERT_D24S8_TO_ABGR8_FRAG_SPV, CONVERT_D32F_TO_ABGR8_FRAG_SPV,
+    CONVERT_DEPTH_TO_FLOAT_FRAG_SPV, CONVERT_FLOAT_TO_DEPTH_FRAG_SPV,
+    CONVERT_S8D24_TO_ABGR8_FRAG_SPV, FULL_SCREEN_TRIANGLE_VERT_SPV,
+    VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV, VULKAN_COLOR_CLEAR_FRAG_SPV, VULKAN_COLOR_CLEAR_VERT_SPV,
+    VULKAN_DEPTHSTENCIL_CLEAR_FRAG_SPV,
+};
+use crate::renderer_vulkan::shader_util::build_shader;
+
 // ---------------------------------------------------------------------------
 // Push constants (file-local, matching upstream anonymous namespace)
 // ---------------------------------------------------------------------------
@@ -226,7 +236,7 @@ impl BlitImageHelper {
 
         // Create one-texture pipeline layout with push constants
         let push_range = vk::PushConstantRange {
-            stage_flags: vk::ShaderStageFlags::FRAGMENT,
+            stage_flags: vk::ShaderStageFlags::VERTEX,
             offset: 0,
             size: std::mem::size_of::<PushConstants>() as u32,
         };
@@ -272,8 +282,13 @@ impl BlitImageHelper {
         let linear_sampler_ci = vk::SamplerCreateInfo::builder()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
-            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .compare_op(vk::CompareOp::NEVER)
+            .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE)
+            .unnormalized_coordinates(true)
             .build();
         let linear_sampler = unsafe {
             device
@@ -284,8 +299,13 @@ impl BlitImageHelper {
         let nearest_sampler_ci = vk::SamplerCreateInfo::builder()
             .mag_filter(vk::Filter::NEAREST)
             .min_filter(vk::Filter::NEAREST)
-            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .compare_op(vk::CompareOp::NEVER)
+            .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE)
+            .unnormalized_coordinates(true)
             .build();
         let nearest_sampler = unsafe {
             device
@@ -293,7 +313,33 @@ impl BlitImageHelper {
                 .expect("Failed to create nearest sampler")
         };
 
-        // Shader modules are null placeholders; actual SPV comes from host_shaders
+        let full_screen_vert = build_shader(&device, FULL_SCREEN_TRIANGLE_VERT_SPV)
+            .expect("Failed to build full_screen_triangle.vert");
+        let blit_color_to_color_frag = build_shader(&device, BLIT_COLOR_FLOAT_FRAG_SPV)
+            .expect("Failed to build blit_color_float.frag");
+        let blit_depth_stencil_frag = build_shader(&device, VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV)
+            .expect("Failed to build vulkan_blit_depth_stencil.frag");
+        let clear_color_vert = build_shader(&device, VULKAN_COLOR_CLEAR_VERT_SPV)
+            .expect("Failed to build vulkan_color_clear.vert");
+        let clear_color_frag = build_shader(&device, VULKAN_COLOR_CLEAR_FRAG_SPV)
+            .expect("Failed to build vulkan_color_clear.frag");
+        let clear_stencil_frag = build_shader(&device, VULKAN_DEPTHSTENCIL_CLEAR_FRAG_SPV)
+            .expect("Failed to build vulkan_depthstencil_clear.frag");
+        let convert_depth_to_float_frag = build_shader(&device, CONVERT_DEPTH_TO_FLOAT_FRAG_SPV)
+            .expect("Failed to build convert_depth_to_float.frag");
+        let convert_float_to_depth_frag = build_shader(&device, CONVERT_FLOAT_TO_DEPTH_FRAG_SPV)
+            .expect("Failed to build convert_float_to_depth.frag");
+        let convert_abgr8_to_d24s8_frag = build_shader(&device, CONVERT_ABGR8_TO_D24S8_FRAG_SPV)
+            .expect("Failed to build convert_abgr8_to_d24s8.frag");
+        let convert_abgr8_to_d32f_frag = build_shader(&device, CONVERT_ABGR8_TO_D32F_FRAG_SPV)
+            .expect("Failed to build convert_abgr8_to_d32f.frag");
+        let convert_d32f_to_abgr8_frag = build_shader(&device, CONVERT_D32F_TO_ABGR8_FRAG_SPV)
+            .expect("Failed to build convert_d32f_to_abgr8.frag");
+        let convert_d24s8_to_abgr8_frag = build_shader(&device, CONVERT_D24S8_TO_ABGR8_FRAG_SPV)
+            .expect("Failed to build convert_d24s8_to_abgr8.frag");
+        let convert_s8d24_to_abgr8_frag = build_shader(&device, CONVERT_S8D24_TO_ABGR8_FRAG_SPV)
+            .expect("Failed to build convert_s8d24_to_abgr8.frag");
+
         BlitImageHelper {
             device,
             one_texture_set_layout,
@@ -301,19 +347,19 @@ impl BlitImageHelper {
             one_texture_pipeline_layout,
             two_textures_pipeline_layout,
             clear_color_pipeline_layout,
-            full_screen_vert: vk::ShaderModule::null(),
-            blit_color_to_color_frag: vk::ShaderModule::null(),
-            blit_depth_stencil_frag: vk::ShaderModule::null(),
-            clear_color_vert: vk::ShaderModule::null(),
-            clear_color_frag: vk::ShaderModule::null(),
-            clear_stencil_frag: vk::ShaderModule::null(),
-            convert_depth_to_float_frag: vk::ShaderModule::null(),
-            convert_float_to_depth_frag: vk::ShaderModule::null(),
-            convert_abgr8_to_d24s8_frag: vk::ShaderModule::null(),
-            convert_abgr8_to_d32f_frag: vk::ShaderModule::null(),
-            convert_d32f_to_abgr8_frag: vk::ShaderModule::null(),
-            convert_d24s8_to_abgr8_frag: vk::ShaderModule::null(),
-            convert_s8d24_to_abgr8_frag: vk::ShaderModule::null(),
+            full_screen_vert,
+            blit_color_to_color_frag,
+            blit_depth_stencil_frag,
+            clear_color_vert,
+            clear_color_frag,
+            clear_stencil_frag,
+            convert_depth_to_float_frag,
+            convert_float_to_depth_frag,
+            convert_abgr8_to_d24s8_frag,
+            convert_abgr8_to_d32f_frag,
+            convert_d32f_to_abgr8_frag,
+            convert_d24s8_to_abgr8_frag,
+            convert_s8d24_to_abgr8_frag,
             linear_sampler,
             nearest_sampler,
             blit_color_keys: Vec::new(),
@@ -561,5 +607,96 @@ impl BlitImageHelper {
         self.clear_stencil_keys.push(*key);
         self.clear_stencil_pipelines.push(pipeline);
         pipeline
+    }
+}
+
+impl Drop for BlitImageHelper {
+    fn drop(&mut self) {
+        unsafe {
+            for pipeline in self
+                .blit_color_pipelines
+                .iter_mut()
+                .chain(self.blit_depth_stencil_pipelines.iter_mut())
+                .chain(self.clear_color_pipelines.iter_mut())
+                .chain(self.clear_stencil_pipelines.iter_mut())
+            {
+                if *pipeline != vk::Pipeline::null() {
+                    self.device.destroy_pipeline(*pipeline, None);
+                    *pipeline = vk::Pipeline::null();
+                }
+            }
+
+            for pipeline in [
+                &mut self.convert_d32_to_r32_pipeline,
+                &mut self.convert_r32_to_d32_pipeline,
+                &mut self.convert_d16_to_r16_pipeline,
+                &mut self.convert_r16_to_d16_pipeline,
+                &mut self.convert_abgr8_to_d24s8_pipeline,
+                &mut self.convert_abgr8_to_d32f_pipeline,
+                &mut self.convert_d32f_to_abgr8_pipeline,
+                &mut self.convert_d24s8_to_abgr8_pipeline,
+                &mut self.convert_s8d24_to_abgr8_pipeline,
+            ] {
+                if *pipeline != vk::Pipeline::null() {
+                    self.device.destroy_pipeline(*pipeline, None);
+                    *pipeline = vk::Pipeline::null();
+                }
+            }
+
+            for shader in [
+                &mut self.full_screen_vert,
+                &mut self.blit_color_to_color_frag,
+                &mut self.blit_depth_stencil_frag,
+                &mut self.clear_color_vert,
+                &mut self.clear_color_frag,
+                &mut self.clear_stencil_frag,
+                &mut self.convert_depth_to_float_frag,
+                &mut self.convert_float_to_depth_frag,
+                &mut self.convert_abgr8_to_d24s8_frag,
+                &mut self.convert_abgr8_to_d32f_frag,
+                &mut self.convert_d32f_to_abgr8_frag,
+                &mut self.convert_d24s8_to_abgr8_frag,
+                &mut self.convert_s8d24_to_abgr8_frag,
+            ] {
+                if *shader != vk::ShaderModule::null() {
+                    self.device.destroy_shader_module(*shader, None);
+                    *shader = vk::ShaderModule::null();
+                }
+            }
+
+            if self.linear_sampler != vk::Sampler::null() {
+                self.device.destroy_sampler(self.linear_sampler, None);
+                self.linear_sampler = vk::Sampler::null();
+            }
+            if self.nearest_sampler != vk::Sampler::null() {
+                self.device.destroy_sampler(self.nearest_sampler, None);
+                self.nearest_sampler = vk::Sampler::null();
+            }
+            if self.clear_color_pipeline_layout != vk::PipelineLayout::null() {
+                self.device
+                    .destroy_pipeline_layout(self.clear_color_pipeline_layout, None);
+                self.clear_color_pipeline_layout = vk::PipelineLayout::null();
+            }
+            if self.two_textures_pipeline_layout != vk::PipelineLayout::null() {
+                self.device
+                    .destroy_pipeline_layout(self.two_textures_pipeline_layout, None);
+                self.two_textures_pipeline_layout = vk::PipelineLayout::null();
+            }
+            if self.one_texture_pipeline_layout != vk::PipelineLayout::null() {
+                self.device
+                    .destroy_pipeline_layout(self.one_texture_pipeline_layout, None);
+                self.one_texture_pipeline_layout = vk::PipelineLayout::null();
+            }
+            if self.two_textures_set_layout != vk::DescriptorSetLayout::null() {
+                self.device
+                    .destroy_descriptor_set_layout(self.two_textures_set_layout, None);
+                self.two_textures_set_layout = vk::DescriptorSetLayout::null();
+            }
+            if self.one_texture_set_layout != vk::DescriptorSetLayout::null() {
+                self.device
+                    .destroy_descriptor_set_layout(self.one_texture_set_layout, None);
+                self.one_texture_set_layout = vk::DescriptorSetLayout::null();
+            }
+        }
     }
 }

@@ -347,41 +347,6 @@ This document exists because earlier progress proved that a crate can be "substa
 </progress_reporting>
 
 <multi_agent_coordination>
-  Multiple AI agents may work on this repository and may launch ruzu in
-  parallel. Runtime launches MUST be serialized with the shared `flock`
-  wrapper below so that one agent waits while another agent owns a running
-  ruzu instance.
-
-  <runtime_lock>
-    Shared lock path: `/tmp/ruzu.lock`
-    Shared status path: `/tmp/ruzu.status`
-    Wrapper path: `/tmp/ruzu-run.sh`
-
-    All agents MUST launch ruzu through:
-
-    ```bash
-    /tmp/ruzu-run.sh <command to run ruzu>
-    ```
-
-    Example:
-
-    ```bash
-    /tmp/ruzu-run.sh cargo run --bin ruzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
-    ```
-
-    If `/tmp/ruzu-run.sh` is missing, create it with `flock` semantics before
-    launching ruzu. The second invocation MUST block until the first releases
-    the lock. `flock` is required because the lock is released automatically
-    if the owning process exits or crashes.
-  </runtime_lock>
-
-  <process_ownership>
-    Do NOT kill, interrupt, attach to, or otherwise control a ruzu process
-    launched by another AI agent unless the user explicitly authorizes it.
-    If another agent owns the lock or already has ruzu running, wait through
-    `/tmp/ruzu-run.sh` or report that the launch is queued.
-  </process_ownership>
-
   <branching>
     Before making repository modifications in `ruzu` or any submodule, Codex
     MUST create or switch to the single shared development branch `codex-dev`.
@@ -473,12 +438,12 @@ This document exists because earlier progress proved that a crate can be "substa
 Manual test with Mario Kart 8 Deluxe (AArch32, title ID `0100152000022000`):
 
 ```bash
-/tmp/ruzu-run.sh cargo run --bin ruzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+cargo run --bin ruzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
 ```
 
 With debug logging:
 ```bash
-RUST_LOG=info /tmp/ruzu-run.sh cargo run --bin ruzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+RUST_LOG=info cargo run --bin ruzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
 ```
 
 With isolated data directories:
@@ -486,7 +451,7 @@ With isolated data directories:
 env XDG_DATA_HOME=/tmp/ruzu-data \
     XDG_CACHE_HOME=/tmp/ruzu-cache \
     XDG_CONFIG_HOME=/tmp/ruzu-config \
-    RUST_LOG=info /tmp/ruzu-run.sh cargo run --bin ruzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+    RUST_LOG=info cargo run --bin ruzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
 ```
 
 </testing_commands>

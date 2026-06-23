@@ -66,8 +66,9 @@ use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, ComparisonOp, CullFace, DrawCall, FrontFace, PrimitiveTopology,
 };
 use crate::engines::Framebuffer;
+use crate::framebuffer_config::FramebufferConfig;
+use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
-use crate::syncpoint::SyncpointManager;
 use shader_recompiler::{PipelineCache as ShaderPipelineCache, Profile};
 
 use buffer_cache::BufferCache;
@@ -791,6 +792,19 @@ impl RasterizerVulkan {
         );
         Ok(())
     }
+
+    /// Port-facing entry point for upstream `RasterizerVulkan::AccelerateDisplay`.
+    ///
+    /// The texture-cache lookup body is still unported in this active rasterizer
+    /// owner, so callers fall back to the raw framebuffer upload path.
+    pub fn accelerate_display(
+        &mut self,
+        _config: &FramebufferConfig,
+        _framebuffer_addr: u64,
+        _pixel_stride: u32,
+    ) -> Option<blit_screen::FramebufferTextureInfo> {
+        None
+    }
 }
 
 impl RasterizerInterface for RasterizerVulkan {
@@ -875,7 +889,8 @@ impl RasterizerInterface for RasterizerVulkan {
     }
 
     fn signal_sync_point(&mut self, id: u32) {
-        self.syncpoints.increment(id);
+        self.syncpoints.increment_guest(id);
+        self.syncpoints.increment_host(id);
     }
 
     fn signal_reference(&mut self) {}

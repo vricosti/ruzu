@@ -7,26 +7,21 @@
 //! and a window adaptation pass.
 
 use ash::vk;
+use std::sync::Arc;
 
+use crate::framebuffer_config::{BlendMode as FramebufferBlendMode, FramebufferConfig};
+use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+use crate::present::{PresentFilters, ScalingFilter};
+use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
+
+use super::present::filters;
 use super::present::layer::Layer;
-use super::present::window_adapt_pass::WindowAdaptPass;
+use super::present::present_push_constants::PresentPushConstants;
+use super::present::window_adapt_pass::{BlendMode, WindowAdaptPass};
 use super::present_manager::{Frame, PresentManager};
-
-// ---------------------------------------------------------------------------
-// ScalingFilter (matching upstream Settings::ScalingFilter)
-// ---------------------------------------------------------------------------
-
-/// Port of `Settings::ScalingFilter`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum ScalingFilter {
-    NearestNeighbor = 0,
-    Bilinear = 1,
-    Bicubic = 2,
-    Gaussian = 3,
-    ScaleForce = 4,
-    Fsr = 5,
-}
+use super::scheduler::Scheduler;
+use super::RasterizerVulkan;
+use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 
 // ---------------------------------------------------------------------------
 // FramebufferTextureInfo
@@ -45,6 +40,24 @@ pub struct FramebufferTextureInfo {
     pub scaled_height: u32,
 }
 
+/// Non-owning draw target matching the fields used from upstream `Frame*`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BlitFrame {
+    pub width: u32,
+    pub height: u32,
+    pub framebuffer: vk::Framebuffer,
+}
+
+impl From<&Frame> for BlitFrame {
+    fn from(frame: &Frame) -> Self {
+        Self {
+            width: frame.width,
+            height: frame.height,
+            framebuffer: frame.framebuffer,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BlitScreen
 // ---------------------------------------------------------------------------
@@ -61,11 +74,17 @@ pub struct BlitScreen {
     scaling_filter: Option<ScalingFilter>,
     window_adapt: Option<WindowAdaptPass>,
     layers: Vec<Layer>,
+    filters: &'static PresentFilters,
+    supports_float16: bool,
 }
 
 impl BlitScreen {
     /// Port of `BlitScreen::BlitScreen`.
-    pub fn new(device: ash::Device) -> Self {
+    pub fn new(
+        device: ash::Device,
+        filters: &'static PresentFilters,
+        supports_float16: bool,
+    ) -> Self {
         BlitScreen {
             device,
             image_count: 1,
@@ -74,7 +93,81 @@ impl BlitScreen {
             scaling_filter: None,
             window_adapt: None,
             layers: Vec::new(),
+            filters,
+            supports_float16,
         }
+    }
+
+    /// Port of `BlitScreen::DrawToFrame` for present-manager frames.
+    pub fn draw_to_present_frame(
+        &mut self,
+        rasterizer: &mut RasterizerVulkan,
+        scheduler: &mut Scheduler,
+        present_manager: &mut PresentManager,
+        allocator: &MemoryAllocator,
+        device_memory: &Arc<MaxwellDeviceMemoryManager>,
+        frame_index: usize,
+        framebuffers: &[FramebufferConfig],
+        layout: &FramebufferLayout,
+        current_swapchain_image_count: usize,
+        current_swapchain_view_format: vk::Format,
+    ) {
+        let mut resource_update_required = false;
+        let mut presentation_recreate_required = false;
+        let current_scaling_filter = self.current_scaling_filter();
+
+        if self.window_adapt.is_none() || self.scaling_filter != Some(current_scaling_filter) {
+            resource_update_required = true;
+        }
+
+        let old_count = self.image_count;
+        self.image_count = current_swapchain_image_count;
+        if old_count != current_swapchain_image_count {
+            resource_update_required = true;
+        }
+
+        let old_format = self.swapchain_view_format;
+        self.swapchain_view_format = current_swapchain_view_format;
+        let frame_width = present_manager.frame(frame_index).width;
+        let frame_height = present_manager.frame(frame_index).height;
+        if old_format != current_swapchain_view_format
+            || layout.width != frame_width
+            || layout.height != frame_height
+        {
+            resource_update_required = true;
+            presentation_recreate_required = true;
+        }
+
+        if resource_update_required {
+            self.wait_idle(scheduler, present_manager);
+            self.set_window_adapt_pass();
+
+            if presentation_recreate_required {
+                if let Some(ref window_adapt) = self.window_adapt {
+                    present_manager.recreate_frame_by_index(
+                        frame_index,
+                        layout.width,
+                        layout.height,
+                        self.swapchain_view_format,
+                        window_adapt.get_render_pass(),
+                    );
+                }
+            }
+        }
+
+        let frame = BlitFrame::from(present_manager.frame(frame_index));
+        self.draw_to_frame(
+            rasterizer,
+            scheduler,
+            present_manager,
+            allocator,
+            device_memory,
+            frame,
+            framebuffers,
+            layout,
+            current_swapchain_image_count,
+            current_swapchain_view_format,
+        );
     }
 
     /// Port of `BlitScreen::DrawToFrame`.
@@ -83,16 +176,20 @@ impl BlitScreen {
     /// recreating resources as needed when the swapchain format/size changes.
     pub fn draw_to_frame(
         &mut self,
-        frame: &mut Frame,
+        rasterizer: &mut RasterizerVulkan,
+        scheduler: &mut Scheduler,
         present_manager: &PresentManager,
+        allocator: &MemoryAllocator,
+        device_memory: &Arc<MaxwellDeviceMemoryManager>,
+        frame: BlitFrame,
+        framebuffers: &[FramebufferConfig],
+        layout: &FramebufferLayout,
         current_swapchain_image_count: usize,
         current_swapchain_view_format: vk::Format,
-        layout_width: u32,
-        layout_height: u32,
-        current_scaling_filter: ScalingFilter,
     ) {
         let mut resource_update_required = false;
         let mut presentation_recreate_required = false;
+        let current_scaling_filter = self.current_scaling_filter();
 
         // Check if scaling filter changed
         if self.window_adapt.is_none() || self.scaling_filter != Some(current_scaling_filter) {
@@ -110,33 +207,85 @@ impl BlitScreen {
         let old_format = self.swapchain_view_format;
         self.swapchain_view_format = current_swapchain_view_format;
         if old_format != current_swapchain_view_format
-            || layout_width != frame.width
-            || layout_height != frame.height
+            || layout.width != frame.width
+            || layout.height != frame.height
         {
             resource_update_required = true;
             presentation_recreate_required = true;
         }
 
         if resource_update_required {
-            // Wait idle
-            present_manager.wait_present();
-            // NOTE: scheduler.Finish() and device.WaitIdle() would be called here
+            self.wait_idle(scheduler, present_manager);
 
             // Update window adapt pass
-            self.set_window_adapt_pass(current_scaling_filter);
+            self.set_window_adapt_pass();
 
             // Recreate frame if needed
             if presentation_recreate_required {
-                if let Some(ref window_adapt) = self.window_adapt {
-                    present_manager.recreate_frame(
-                        frame,
-                        layout_width,
-                        layout_height,
-                        self.swapchain_view_format,
-                        window_adapt.get_render_pass(),
-                    );
-                }
+                log::debug!(
+                    "BlitScreen target frame dimensions changed from {}x{} to {}x{}",
+                    frame.width,
+                    frame.height,
+                    layout.width,
+                    layout.height
+                );
             }
+        }
+
+        if let Some(ref window_adapt) = self.window_adapt {
+            let window_size = vk::Extent2D {
+                width: layout.screen.get_width(),
+                height: layout.screen.get_height(),
+            };
+            while self.layers.len() < framebuffers.len() {
+                self.layers.push(Layer::new(
+                    self.device.clone(),
+                    self.image_count,
+                    window_size,
+                    window_adapt.get_descriptor_set_layout(),
+                    self.filters,
+                    allocator,
+                    self.supports_float16,
+                ));
+            }
+        }
+
+        if let Some(ref window_adapt) = self.window_adapt {
+            let render_area = vk::Extent2D {
+                width: layout.width,
+                height: layout.height,
+            };
+            let layer_count = framebuffers.len();
+            let mut push_constants = vec![PresentPushConstants::default(); layer_count];
+            let mut descriptor_sets = vec![vk::DescriptorSet::null(); layer_count];
+            let mut blend_modes = Vec::with_capacity(layer_count);
+            let sampler = window_adapt.get_sampler();
+
+            for i in 0..layer_count {
+                blend_modes.push(to_window_blend_mode(framebuffers[i].blending));
+                self.layers[i].configure_draw_from_framebuffer(
+                    &mut push_constants[i],
+                    &mut descriptor_sets[i],
+                    rasterizer,
+                    scheduler,
+                    allocator,
+                    device_memory.as_ref(),
+                    sampler,
+                    self.image_index,
+                    &framebuffers[i],
+                    layout,
+                );
+            }
+
+            window_adapt.draw(
+                scheduler,
+                &push_constants,
+                &descriptor_sets,
+                &blend_modes,
+                frame.framebuffer,
+                render_area,
+                [0.0, 0.0, 0.0, 1.0],
+            );
         }
 
         // Advance image index
@@ -149,20 +298,22 @@ impl BlitScreen {
     /// Port of `BlitScreen::CreateFramebuffer`.
     pub fn create_framebuffer(
         &mut self,
+        scheduler: &mut Scheduler,
+        present_manager: &PresentManager,
         image_view: vk::ImageView,
         current_view_format: vk::Format,
         layout_width: u32,
         layout_height: u32,
-        scaling_filter: ScalingFilter,
     ) -> vk::Framebuffer {
         let format_updated = self.swapchain_view_format != current_view_format;
         self.swapchain_view_format = current_view_format;
 
         if self.window_adapt.is_none()
-            || self.scaling_filter != Some(scaling_filter)
+            || self.scaling_filter != Some(self.current_scaling_filter())
             || format_updated
         {
-            self.set_window_adapt_pass(scaling_filter);
+            self.wait_idle(scheduler, present_manager);
+            self.set_window_adapt_pass();
         }
 
         let render_pass = self
@@ -182,38 +333,45 @@ impl BlitScreen {
     // --- Private ---
 
     /// Port of `BlitScreen::SetWindowAdaptPass`.
-    fn set_window_adapt_pass(&mut self, filter: ScalingFilter) {
+    fn set_window_adapt_pass(&mut self) {
         self.layers.clear();
+        let filter = self.current_scaling_filter();
         self.scaling_filter = Some(filter);
 
-        // Create the appropriate sampler for the scaling filter
-        let sampler_filter = match filter {
-            ScalingFilter::NearestNeighbor => vk::Filter::NEAREST,
-            _ => vk::Filter::LINEAR,
-        };
+        self.window_adapt = Some(match filter {
+            ScalingFilter::NearestNeighbor => {
+                filters::make_nearest_neighbor(&self.device, self.swapchain_view_format)
+            }
+            ScalingFilter::Bicubic => {
+                filters::make_bicubic(&self.device, self.swapchain_view_format)
+            }
+            ScalingFilter::Gaussian => {
+                filters::make_gaussian(&self.device, self.swapchain_view_format)
+            }
+            ScalingFilter::ScaleForce => filters::make_scale_force(
+                &self.device,
+                self.swapchain_view_format,
+                self.supports_float16,
+            ),
+            ScalingFilter::Fsr | ScalingFilter::Bilinear => {
+                filters::make_bilinear(&self.device, self.swapchain_view_format)
+            }
+        });
+    }
 
-        let sampler_ci = vk::SamplerCreateInfo::builder()
-            .mag_filter(sampler_filter)
-            .min_filter(sampler_filter)
-            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
-            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
-            .border_color(vk::BorderColor::FLOAT_OPAQUE_BLACK)
-            .build();
-        let sampler = unsafe {
+    fn current_scaling_filter(&self) -> ScalingFilter {
+        (self.filters.get_scaling_filter)()
+    }
+
+    /// Port of `BlitScreen::WaitIdle`.
+    fn wait_idle(&self, scheduler: &mut Scheduler, present_manager: &PresentManager) {
+        present_manager.wait_present();
+        scheduler.finish();
+        unsafe {
             self.device
-                .create_sampler(&sampler_ci, None)
-                .expect("Failed to create blit screen sampler")
+                .device_wait_idle()
+                .expect("Failed to wait for Vulkan device idle");
         };
-
-        // Fragment shader would come from host_shaders based on filter type
-        let fragment_shader = vk::ShaderModule::null();
-
-        self.window_adapt = Some(WindowAdaptPass::new(
-            self.device.clone(),
-            self.swapchain_view_format,
-            sampler,
-            fragment_shader,
-        ));
     }
 
     /// Port of `BlitScreen::CreateFramebuffer` (private overload).
@@ -237,5 +395,13 @@ impl BlitScreen {
                 .create_framebuffer(&fb_ci, None)
                 .expect("Failed to create blit screen framebuffer")
         }
+    }
+}
+
+fn to_window_blend_mode(mode: FramebufferBlendMode) -> BlendMode {
+    match mode {
+        FramebufferBlendMode::Opaque => BlendMode::Opaque,
+        FramebufferBlendMode::Premultiplied => BlendMode::Premultiplied,
+        FramebufferBlendMode::Coverage => BlendMode::Coverage,
     }
 }

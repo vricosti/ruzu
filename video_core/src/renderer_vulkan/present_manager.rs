@@ -10,6 +10,8 @@ use std::sync::{Condvar, Mutex};
 
 use ash::vk;
 
+use super::swapchain::Swapchain;
+
 // ---------------------------------------------------------------------------
 // Helper functions (port of anonymous namespace)
 // ---------------------------------------------------------------------------
@@ -85,6 +87,7 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub image: vk::Image,
+    pub image_memory: vk::DeviceMemory,
     pub image_view: vk::ImageView,
     pub framebuffer: vk::Framebuffer,
     pub cmdbuf: vk::CommandBuffer,
@@ -98,6 +101,7 @@ impl Default for Frame {
             width: 0,
             height: 0,
             image: vk::Image::null(),
+            image_memory: vk::DeviceMemory::null(),
             image_view: vk::ImageView::null(),
             framebuffer: vk::Framebuffer::null(),
             cmdbuf: vk::CommandBuffer::null(),
@@ -117,6 +121,8 @@ impl Default for Frame {
 /// present thread that copies rendered frames to the swapchain.
 pub struct PresentManager {
     device: ash::Device,
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
+    frame_image_format: vk::Format,
     cmdpool: vk::CommandPool,
     frames: Vec<Frame>,
     present_queue: Mutex<VecDeque<usize>>,
@@ -137,6 +143,8 @@ impl PresentManager {
     /// Port of `PresentManager::PresentManager`.
     pub fn new(
         device: ash::Device,
+        memory_properties: vk::PhysicalDeviceMemoryProperties,
+        frame_image_format: vk::Format,
         graphics_family: u32,
         image_count: usize,
         blit_supported: bool,
@@ -194,6 +202,7 @@ impl PresentManager {
                 width: 0,
                 height: 0,
                 image: vk::Image::null(),
+                image_memory: vk::DeviceMemory::null(),
                 image_view: vk::ImageView::null(),
                 framebuffer: vk::Framebuffer::null(),
                 cmdbuf: cmdbufs[i],
@@ -209,6 +218,8 @@ impl PresentManager {
 
         PresentManager {
             device,
+            memory_properties,
+            frame_image_format,
             cmdpool,
             frames,
             present_queue: Mutex::new(VecDeque::new()),
@@ -226,6 +237,16 @@ impl PresentManager {
     ///
     /// Blocks until a free presentation frame is available, then returns it.
     pub fn get_render_frame(&mut self) -> &mut Frame {
+        let index = self.get_render_frame_index();
+        &mut self.frames[index]
+    }
+
+    /// Rust ownership helper for upstream `PresentManager::GetRenderFrame`.
+    ///
+    /// Upstream returns a `Frame*`; callers later pass the same pointer to
+    /// `Present`. Rust needs the frame identity explicitly to avoid holding a
+    /// mutable borrow across the whole present path.
+    pub fn get_render_frame_index(&mut self) -> usize {
         let index = {
             let mut free = self.free_queue.lock().unwrap();
             while free.is_empty() {
@@ -247,26 +268,114 @@ impl PresentManager {
             }
         }
 
+        index
+    }
+
+    pub fn frame(&self, index: usize) -> &Frame {
+        &self.frames[index]
+    }
+
+    pub fn frame_mut(&mut self, index: usize) -> &mut Frame {
         &mut self.frames[index]
+    }
+
+    pub fn release_frame(&self, index: usize) {
+        let mut free = self.free_queue.lock().unwrap();
+        free.push_back(index);
+        self.free_cv.notify_one();
+    }
+
+    pub fn recreate_frame_by_index(
+        &mut self,
+        frame_index: usize,
+        width: u32,
+        height: u32,
+        image_view_format: vk::Format,
+        render_pass: vk::RenderPass,
+    ) {
+        let mut frame = std::mem::take(&mut self.frames[frame_index]);
+        self.recreate_frame(&mut frame, width, height, image_view_format, render_pass);
+        self.frames[frame_index] = frame;
     }
 
     /// Port of `PresentManager::Present`.
     ///
     /// Queues a frame for presentation, or presents directly if no present
     /// thread is active.
-    pub fn present(&self, frame_index: usize) {
+    pub fn present(
+        &mut self,
+        frame_index: usize,
+        swapchain: &mut Swapchain,
+        graphics_queue: vk::Queue,
+    ) {
         if !self.use_present_thread {
-            // Direct present path (no threading)
-            // In the full implementation, this calls CopyToSwapchain.
-            let mut free = self.free_queue.lock().unwrap();
-            free.push_back(frame_index);
-            self.free_cv.notify_one();
+            self.copy_to_swapchain(frame_index, swapchain, graphics_queue);
+            self.release_frame(frame_index);
             return;
         }
 
         let mut queue = self.present_queue.lock().unwrap();
         queue.push_back(frame_index);
         self.frame_cv.notify_one();
+    }
+
+    /// Port-facing subset of `PresentManager::CopyToSwapchain`.
+    fn copy_to_swapchain(
+        &mut self,
+        frame_index: usize,
+        swapchain: &mut Swapchain,
+        graphics_queue: vk::Queue,
+    ) {
+        let frame_width = self.frames[frame_index].width;
+        let frame_height = self.frames[frame_index].height;
+        let needs_recreation = swapchain.needs_recreation()
+            || swapchain.get_width() != frame_width
+            || swapchain.get_height() != frame_height;
+        if needs_recreation && !self.recreate_swapchain(frame_index, swapchain) {
+            return;
+        }
+
+        let mut recreate_attempts = 0;
+        while swapchain.acquire_next_image() {
+            if !self.recreate_swapchain(frame_index, swapchain) {
+                return;
+            }
+            recreate_attempts += 1;
+            if recreate_attempts >= 8 {
+                log::warn!("Vulkan swapchain acquisition remained stale after recreation");
+                return;
+            }
+        }
+
+        let swapchain_image = swapchain.current_image();
+        let swapchain_extent = swapchain.get_extent();
+        let present_semaphore = swapchain.current_present_semaphore();
+        let render_semaphore = swapchain.current_render_semaphore();
+        self.copy_to_swapchain_impl(
+            self.frame(frame_index),
+            swapchain_image,
+            swapchain_extent,
+            present_semaphore,
+            render_semaphore,
+            graphics_queue,
+        );
+        swapchain.present(render_semaphore);
+    }
+
+    /// Port-facing subset of `PresentManager::RecreateSwapchain`.
+    fn recreate_swapchain(&mut self, frame_index: usize, swapchain: &mut Swapchain) -> bool {
+        let frame_width = self.frames[frame_index].width;
+        let frame_height = self.frames[frame_index].height;
+        match swapchain.recreate(frame_width, frame_height) {
+            Ok(()) => {
+                self.set_image_count(swapchain.get_image_count());
+                true
+            }
+            Err(err) => {
+                log::error!("Failed to recreate Vulkan swapchain: {}", err);
+                false
+            }
+        }
     }
 
     /// Port of `PresentManager::RecreateFrame`.
@@ -281,6 +390,8 @@ impl PresentManager {
         image_view_format: vk::Format,
         render_pass: vk::RenderPass,
     ) {
+        self.destroy_frame_resources(frame);
+
         frame.width = width;
         frame.height = height;
 
@@ -288,7 +399,7 @@ impl PresentManager {
         let image_ci = vk::ImageCreateInfo::builder()
             .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
             .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::B8G8R8A8_UNORM) // swapchain format
+            .format(self.frame_image_format)
             .extent(vk::Extent3D {
                 width,
                 height,
@@ -308,6 +419,27 @@ impl PresentManager {
                 .create_image(&image_ci, None)
                 .expect("Failed to create present frame image")
         };
+        let memory_requirements = unsafe { self.device.get_image_memory_requirements(frame.image) };
+        let memory_type_index = find_memory_type(
+            &self.memory_properties,
+            memory_requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .expect("Failed to find present frame memory type");
+        let allocate_info = vk::MemoryAllocateInfo::builder()
+            .allocation_size(memory_requirements.size)
+            .memory_type_index(memory_type_index)
+            .build();
+        frame.image_memory = unsafe {
+            self.device
+                .allocate_memory(&allocate_info, None)
+                .expect("Failed to allocate present frame image memory")
+        };
+        unsafe {
+            self.device
+                .bind_image_memory(frame.image, frame.image_memory, 0)
+                .expect("Failed to bind present frame image memory");
+        }
 
         // Create image view
         let view_ci = vk::ImageViewCreateInfo::builder()
@@ -562,4 +694,80 @@ impl PresentManager {
     pub fn set_image_count(&mut self, swapchain_image_count: usize) {
         self.image_count = swapchain_image_count.min(MAX_IMAGES_IN_FLIGHT);
     }
+
+    fn destroy_frame_resources(&self, frame: &mut Frame) {
+        unsafe {
+            if frame.framebuffer != vk::Framebuffer::null() {
+                self.device.destroy_framebuffer(frame.framebuffer, None);
+                frame.framebuffer = vk::Framebuffer::null();
+            }
+            if frame.image_view != vk::ImageView::null() {
+                self.device.destroy_image_view(frame.image_view, None);
+                frame.image_view = vk::ImageView::null();
+            }
+            if frame.image != vk::Image::null() {
+                self.device.destroy_image(frame.image, None);
+                frame.image = vk::Image::null();
+            }
+            if frame.image_memory != vk::DeviceMemory::null() {
+                self.device.free_memory(frame.image_memory, None);
+                frame.image_memory = vk::DeviceMemory::null();
+            }
+        }
+        frame.width = 0;
+        frame.height = 0;
+    }
+}
+
+impl Drop for PresentManager {
+    fn drop(&mut self) {
+        unsafe {
+            let device = self.device.clone();
+            for frame in &mut self.frames {
+                if frame.framebuffer != vk::Framebuffer::null() {
+                    device.destroy_framebuffer(frame.framebuffer, None);
+                    frame.framebuffer = vk::Framebuffer::null();
+                }
+                if frame.image_view != vk::ImageView::null() {
+                    device.destroy_image_view(frame.image_view, None);
+                    frame.image_view = vk::ImageView::null();
+                }
+                if frame.image != vk::Image::null() {
+                    device.destroy_image(frame.image, None);
+                    frame.image = vk::Image::null();
+                }
+                if frame.image_memory != vk::DeviceMemory::null() {
+                    device.free_memory(frame.image_memory, None);
+                    frame.image_memory = vk::DeviceMemory::null();
+                }
+                if frame.render_ready != vk::Semaphore::null() {
+                    device.destroy_semaphore(frame.render_ready, None);
+                    frame.render_ready = vk::Semaphore::null();
+                }
+                if frame.present_done != vk::Fence::null() {
+                    device.destroy_fence(frame.present_done, None);
+                    frame.present_done = vk::Fence::null();
+                }
+            }
+            if self.cmdpool != vk::CommandPool::null() {
+                device.destroy_command_pool(self.cmdpool, None);
+                self.cmdpool = vk::CommandPool::null();
+            }
+        }
+    }
+}
+
+fn find_memory_type(
+    properties: &vk::PhysicalDeviceMemoryProperties,
+    type_bits: u32,
+    required_flags: vk::MemoryPropertyFlags,
+) -> Option<u32> {
+    for index in 0..properties.memory_type_count {
+        let type_supported = (type_bits & (1 << index)) != 0;
+        let flags = properties.memory_types[index as usize].property_flags;
+        if type_supported && flags.contains(required_flags) {
+            return Some(index);
+        }
+    }
+    None
 }

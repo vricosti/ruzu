@@ -1532,11 +1532,18 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         // opportunity. xmm15 acts as a "fallback fired" marker (set to
         // all-FFs by the fastmem fallback when RUZU_FALLBACK_MARK_XMM15=1).
         #[cfg(target_arch = "x86_64")]
-        let (xmm1_lo_at_entry, xmm1_hi_at_entry,
-             xmm15_lo_at_entry, xmm15_hi_at_entry,
-             xmm14_lo_at_entry, xmm14_hi_at_entry,
-             xmm13_lo_at_entry, xmm13_hi_at_entry,
-             xmm12_lo_at_entry, xmm12_hi_at_entry): (u64,u64,u64,u64,u64,u64,u64,u64,u64,u64);
+        let (
+            xmm1_lo_at_entry,
+            xmm1_hi_at_entry,
+            xmm15_lo_at_entry,
+            xmm15_hi_at_entry,
+            xmm14_lo_at_entry,
+            xmm14_hi_at_entry,
+            xmm13_lo_at_entry,
+            xmm13_hi_at_entry,
+            xmm12_lo_at_entry,
+            xmm12_hi_at_entry,
+        ): (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
         #[cfg(target_arch = "x86_64")]
         unsafe {
             std::arch::asm!(
@@ -1564,11 +1571,18 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
             );
         }
         #[cfg(not(target_arch = "x86_64"))]
-        let (xmm1_lo_at_entry, xmm1_hi_at_entry,
-             xmm15_lo_at_entry, xmm15_hi_at_entry,
-             xmm14_lo_at_entry, xmm14_hi_at_entry,
-             xmm13_lo_at_entry, xmm13_hi_at_entry,
-             xmm12_lo_at_entry, xmm12_hi_at_entry) = (0u64,0u64,0u64,0u64,0u64,0u64,0u64,0u64,0u64,0u64);
+        let (
+            xmm1_lo_at_entry,
+            xmm1_hi_at_entry,
+            xmm15_lo_at_entry,
+            xmm15_hi_at_entry,
+            xmm14_lo_at_entry,
+            xmm14_hi_at_entry,
+            xmm13_lo_at_entry,
+            xmm13_hi_at_entry,
+            xmm12_lo_at_entry,
+            xmm12_hi_at_entry,
+        ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         if !self.check_memory_access(vaddr, 16) {
             return;
         }

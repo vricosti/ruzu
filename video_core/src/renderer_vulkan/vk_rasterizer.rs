@@ -16,6 +16,7 @@ use super::query_cache::QueryCache;
 use super::state_tracker::StateTracker;
 use crate::control::channel_state_cache::{ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches};
 use crate::fence_manager::FenceManager;
+use crate::framebuffer_config::FramebufferConfig;
 use crate::query_cache::types::QueryPropertiesFlags;
 
 // ---------------------------------------------------------------------------
@@ -538,6 +539,7 @@ impl RasterizerVulkan {
     /// Port of `RasterizerVulkan::AccelerateDisplay`.
     pub fn accelerate_display(
         &mut self,
+        _config: &FramebufferConfig,
         _framebuffer_addr: u64,
         _pixel_stride: u32,
     ) -> Option<FramebufferTextureInfo> {

@@ -22,6 +22,9 @@ use sdl2::sys as sdl;
 use std::ffi::CStr;
 
 use super::emu_window_sdl2::{DummyContext, EmuWindowSdl2};
+use ruzu_core::frontend::emu_window::{WindowSystemInfo, WindowSystemType};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 // Screen layout constants.
 // Maps to C++ `Layout::ScreenUndocked::Width` / `Layout::ScreenUndocked::Height`.
@@ -35,6 +38,14 @@ const SCREEN_UNDOCKED_HEIGHT: i32 = 720;
 pub struct EmuWindowSdl2Vk {
     /// Shared base window state.
     base: EmuWindowSdl2,
+
+    /// Native window-system data consumed by the Vulkan renderer.
+    /// Maps to upstream `window_info`.
+    window_info: WindowSystemInfo,
+
+    /// SDL-owned Metal view used to keep the CAMetalLayer alive on macOS.
+    #[cfg(target_os = "macos")]
+    metal_view: sdl::SDL_MetalView,
 }
 
 impl EmuWindowSdl2Vk {
@@ -93,14 +104,49 @@ impl EmuWindowSdl2Vk {
             base.show_cursor(false);
         }
 
-        // window_info population (WindowSystemInfo) is omitted here since
-        // video_core::WindowSystemInfo / renderer_vulkan are not yet fully ported.
-        // Upstream populates window_info.type and window_info.render_surface
-        // based on wm.subsystem (X11 / Wayland / Windows / Cocoa / Android).
-        log::warn!(
-            "EmuWindowSdl2Vk: WindowSystemInfo population not yet ported \
-             (video_core::WindowSystemInfo not available)"
-        );
+        // Maps to upstream switch on `wm.subsystem`.
+        let mut window_info = WindowSystemInfo::default();
+        match wm.subsystem {
+            #[cfg(target_os = "linux")]
+            sdl::SDL_SYSWM_TYPE::SDL_SYSWM_X11 => unsafe {
+                window_info.type_ = WindowSystemType::X11;
+                window_info.display_connection = wm.info.x11.display as usize;
+                window_info.render_surface = wm.info.x11.window as usize;
+            },
+            #[cfg(target_os = "linux")]
+            sdl::SDL_SYSWM_TYPE::SDL_SYSWM_WAYLAND => unsafe {
+                window_info.type_ = WindowSystemType::Wayland;
+                window_info.display_connection = wm.info.wl.display as usize;
+                window_info.render_surface = wm.info.wl.surface as usize;
+            },
+            #[cfg(target_os = "macos")]
+            sdl::SDL_SYSWM_TYPE::SDL_SYSWM_COCOA => {
+                window_info.type_ = WindowSystemType::Cocoa;
+            }
+            other => {
+                log::error!("Window manager subsystem {} not implemented", other as i32);
+                std::process::exit(1);
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        let metal_view = {
+            let view = unsafe { sdl::SDL_Metal_CreateView(render_window) };
+            if view.is_null() {
+                let err = unsafe { CStr::from_ptr(sdl::SDL_GetError()) }.to_string_lossy();
+                log::error!("Failed to create SDL Metal view: {}", err);
+                std::process::exit(1);
+            }
+            let layer = unsafe { sdl::SDL_Metal_GetLayer(view) };
+            if layer.is_null() {
+                let err = unsafe { CStr::from_ptr(sdl::SDL_GetError()) }.to_string_lossy();
+                log::error!("Failed to get SDL Metal layer: {}", err);
+                unsafe { sdl::SDL_Metal_DestroyView(view) };
+                std::process::exit(1);
+            }
+            window_info.render_surface = layer as usize;
+            view
+        };
 
         // Maps to: OnResize(); OnMinimalClientAreaChangeRequest(...); SDL_PumpEvents()
         base.on_resize();
@@ -109,7 +155,12 @@ impl EmuWindowSdl2Vk {
 
         log::info!("ruzu-cmd | Vulkan window initialized");
 
-        EmuWindowSdl2Vk { base }
+        EmuWindowSdl2Vk {
+            base,
+            window_info,
+            #[cfg(target_os = "macos")]
+            metal_view,
+        }
     }
 
     /// Returns a `DummyContext` — Vulkan does not require a shared GL context.
@@ -124,6 +175,16 @@ impl EmuWindowSdl2Vk {
         self.base.is_open()
     }
 
+    /// Returns whether the window is currently visible.
+    pub fn is_shown(&self) -> bool {
+        self.base.is_shown()
+    }
+
+    /// Shared visibility state consumed by the Vulkan renderer.
+    pub fn shown_state(&self) -> Arc<AtomicBool> {
+        self.base.shown_state()
+    }
+
     /// Waits for and dispatches the next SDL event.
     pub fn wait_event(&mut self) {
         self.base.wait_event();
@@ -133,11 +194,43 @@ impl EmuWindowSdl2Vk {
     pub fn raw_window(&self) -> *mut sdl::SDL_Window {
         self.base.render_window
     }
+
+    /// Returns the native window-system information for Vulkan surface creation.
+    pub fn window_info(&self) -> &WindowSystemInfo {
+        &self.window_info
+    }
+
+    /// Returns the Vulkan drawable size in pixels.
+    pub fn drawable_size(&self) -> (u32, u32) {
+        let mut width: i32 = 0;
+        let mut height: i32 = 0;
+        #[cfg(target_os = "macos")]
+        unsafe {
+            sdl::SDL_Metal_GetDrawableSize(self.base.render_window, &mut width, &mut height);
+        }
+        #[cfg(not(target_os = "macos"))]
+        unsafe {
+            sdl::SDL_Vulkan_GetDrawableSize(self.base.render_window, &mut width, &mut height);
+        }
+        if width <= 0 || height <= 0 {
+            (SCREEN_UNDOCKED_WIDTH as u32, SCREEN_UNDOCKED_HEIGHT as u32)
+        } else {
+            (width as u32, height as u32)
+        }
+    }
 }
 
 impl Drop for EmuWindowSdl2Vk {
     /// Default destructor — base `EmuWindowSdl2` handles SDL cleanup.
     ///
     /// Maps to C++ `EmuWindow_SDL2_VK::~EmuWindow_SDL2_VK` (`= default`).
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            if !self.metal_view.is_null() {
+                sdl::SDL_Metal_DestroyView(self.metal_view);
+                self.metal_view = std::ptr::null_mut();
+            }
+        }
+    }
 }

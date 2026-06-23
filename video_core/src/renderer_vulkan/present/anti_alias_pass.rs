@@ -7,6 +7,8 @@
 
 use ash::vk;
 
+use crate::renderer_vulkan::scheduler::Scheduler;
+
 // ---------------------------------------------------------------------------
 // AntiAliasPass trait
 // ---------------------------------------------------------------------------
@@ -19,6 +21,7 @@ pub trait AntiAliasPass {
     /// Port of `AntiAliasPass::Draw`.
     fn draw(
         &mut self,
+        _scheduler: &mut Scheduler,
         _image_index: usize,
         _inout_image: &mut vk::Image,
         _inout_image_view: &mut vk::ImageView,
@@ -35,6 +38,7 @@ pub struct NoAa;
 impl AntiAliasPass for NoAa {
     fn draw(
         &mut self,
+        _scheduler: &mut Scheduler,
         _image_index: usize,
         _inout_image: &mut vk::Image,
         _inout_image_view: &mut vk::ImageView,

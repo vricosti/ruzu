@@ -9,7 +9,7 @@
 
 use ash::vk;
 use std::collections::{BTreeSet, HashMap};
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 
 use super::nsight_aftermath_tracker::NsightAftermathTracker;
 use super::vulkan_wrapper::{LogicalDevice, VulkanError};
@@ -22,6 +22,7 @@ use super::vulkan_wrapper::{LogicalDevice, VulkanError};
 ///
 /// Port of `GuestWarpSize` from `vulkan_device.h`.
 pub const GUEST_WARP_SIZE: u32 = 32;
+const ONE_GIB: u64 = 1024 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // FormatType — port of `Vulkan::FormatType`
@@ -232,6 +233,10 @@ pub struct Device {
 
     /// Core physical device features.
     pub device_features: vk::PhysicalDeviceFeatures,
+    /// Feature bit from `VkPhysicalDeviceShaderFloat16Int8Features`.
+    pub shader_float16_supported: bool,
+    /// Feature bit from `VkPhysicalDeviceShaderFloat16Int8Features`.
+    pub shader_int8_supported: bool,
 
     // Misc capability flags
     pub is_optimal_astc_supported: bool,
@@ -261,6 +266,8 @@ pub struct Device {
     pub supported_extensions: BTreeSet<String>,
     /// Loaded Vulkan extensions.
     pub loaded_extensions: BTreeSet<String>,
+    /// Memory heaps used for device-accessible memory accounting.
+    pub valid_heap_memory: Vec<usize>,
     /// Format properties dictionary.
     pub format_properties: HashMap<vk::Format, vk::FormatProperties>,
 
@@ -288,7 +295,7 @@ impl Device {
         _surface: vk::SurfaceKHR,
     ) -> Result<Self, VulkanError> {
         // Query basic properties
-        let device_properties = unsafe { instance.get_physical_device_properties(physical) };
+        let mut device_properties = unsafe { instance.get_physical_device_properties(physical) };
 
         let device_features = unsafe { instance.get_physical_device_features(physical) };
 
@@ -323,6 +330,22 @@ impl Device {
                 name.to_string_lossy().into_owned()
             })
             .collect();
+        let mut driver_properties = vk::PhysicalDeviceDriverProperties::default();
+        if device_properties.api_version >= vk::API_VERSION_1_2
+            || supported_extensions.contains("VK_KHR_driver_properties")
+        {
+            let mut properties2 = vk::PhysicalDeviceProperties2::builder()
+                .push_next(&mut driver_properties)
+                .build();
+            unsafe {
+                instance.get_physical_device_properties2(physical, &mut properties2);
+            }
+            device_properties = properties2.properties;
+        }
+        let has_memory_budget = supported_extensions.contains("VK_EXT_memory_budget");
+        let is_integrated = device_properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+        let (memory_properties, memory_budget_properties) =
+            physical_memory_properties(&instance, physical, has_memory_budget);
 
         // Build queue create infos
         let queue_priority = [1.0f32];
@@ -339,15 +362,45 @@ impl Device {
             );
         }
 
-        // Upstream builds a full extension list and VkPhysicalDeviceFeatures2 chain here,
-        // enabling all supported extensions and features (16-bit storage, timeline semaphores,
-        // transform feedback, custom border color, etc.). This requires iterating the
-        // supported_extensions set and building the pNext chain of feature structs.
-        // Not yet implemented because the full feature chain construction depends on
-        // the extension-specific feature structs and the `RemoveUnavailableExtensions`
-        // logic from upstream. For now, create a minimal device.
+        let mut shader_float16_int8_features =
+            vk::PhysicalDeviceShaderFloat16Int8Features::default();
+        let mut features2 = vk::PhysicalDeviceFeatures2::builder()
+            .push_next(&mut shader_float16_int8_features)
+            .build();
+        unsafe {
+            instance.get_physical_device_features2(physical, &mut features2);
+        }
+
+        let supports_shader_float16 = shader_float16_int8_features.shader_float16 != 0;
+        let supports_shader_int8 = shader_float16_int8_features.shader_int8 != 0;
+
+        let mut enabled_extensions = Vec::<CString>::new();
+        for name in [
+            "VK_KHR_swapchain",
+            "VK_KHR_portability_subset",
+            "VK_KHR_shader_float16_int8",
+        ] {
+            if supported_extensions.contains(name) {
+                enabled_extensions.push(CString::new(name).unwrap());
+            }
+        }
+        let enabled_extension_ptrs: Vec<*const std::os::raw::c_char> = enabled_extensions
+            .iter()
+            .map(|name| name.as_ptr())
+            .collect();
+
+        // Upstream builds a full extension list and VkPhysicalDeviceFeatures2 chain here.
+        // This keeps the mandatory WSI/portability extensions while the larger feature
+        // chain is ported file-by-file.
+        let mut enabled_shader_float16_int8_features =
+            vk::PhysicalDeviceShaderFloat16Int8Features::builder()
+                .shader_float16(supports_shader_float16)
+                .shader_int8(supports_shader_int8)
+                .build();
         let device_create_info = vk::DeviceCreateInfo::builder()
+            .push_next(&mut enabled_shader_float16_int8_features)
             .queue_create_infos(&queue_create_infos)
+            .enabled_extension_names(&enabled_extension_ptrs)
             .build();
 
         let logical = LogicalDevice::create(&instance, physical, &device_create_info)?;
@@ -369,10 +422,14 @@ impl Device {
             vk::api_version_patch(device_properties.api_version),
         );
 
-        let is_integrated = device_properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
         let is_virtual = device_properties.device_type == vk::PhysicalDeviceType::VIRTUAL_GPU;
         let is_non_gpu = device_properties.device_type == vk::PhysicalDeviceType::CPU
             || device_properties.device_type == vk::PhysicalDeviceType::OTHER;
+        let (device_access_memory, valid_heap_memory) = collect_physical_memory_info(
+            &memory_properties,
+            memory_budget_properties.as_ref(),
+            is_integrated,
+        );
 
         Ok(Self {
             instance,
@@ -384,15 +441,23 @@ impl Device {
             instance_version,
             graphics_family,
             present_family,
-            extensions: DeviceExtensions::default(),
+            extensions: DeviceExtensions {
+                driver_properties: supported_extensions.contains("VK_KHR_driver_properties"),
+                memory_budget: has_memory_budget,
+                shader_float16_int8: supported_extensions.contains("VK_KHR_shader_float16_int8"),
+                swapchain: supported_extensions.contains("VK_KHR_swapchain"),
+                ..DeviceExtensions::default()
+            },
             device_properties,
-            driver_properties: vk::PhysicalDeviceDriverProperties::default(),
+            driver_properties,
             subgroup_properties: vk::PhysicalDeviceSubgroupProperties::default(),
             float_controls_properties: vk::PhysicalDeviceFloatControlsProperties::default(),
             push_descriptor_properties: vk::PhysicalDevicePushDescriptorPropertiesKHR::default(),
             subgroup_size_control_properties:
                 vk::PhysicalDeviceSubgroupSizeControlProperties::default(),
             device_features,
+            shader_float16_supported: supports_shader_float16,
+            shader_int8_supported: supports_shader_int8,
             is_optimal_astc_supported: false,
             is_blit_depth24_stencil8_supported: false,
             is_blit_depth32_stencil8_supported: false,
@@ -412,11 +477,15 @@ impl Device {
             dynamic_state3_blending: false,
             dynamic_state3_enables: false,
             supports_conditional_barriers: false,
-            device_access_memory: 0,
+            device_access_memory,
             sets_per_pool: 64,
             nvidia_arch: NvidiaArchitecture::AmpereOrNewer,
             supported_extensions,
-            loaded_extensions: BTreeSet::new(),
+            loaded_extensions: enabled_extensions
+                .iter()
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect(),
+            valid_heap_memory,
             format_properties: HashMap::new(),
             nsight_aftermath_tracker: NsightAftermathTracker::new(),
         })
@@ -467,6 +536,13 @@ impl Device {
         (supported & wanted_usage) == wanted_usage
     }
 
+    /// Gets the format properties for a format.
+    ///
+    /// Port-facing accessor for upstream `vk::PhysicalDevice::GetFormatProperties`.
+    pub fn format_properties(&self, format: vk::Format) -> vk::FormatProperties {
+        self.get_format_properties(format)
+    }
+
     /// Gets the format properties for a format, caching results.
     fn get_format_properties(&self, format: vk::Format) -> vk::FormatProperties {
         if let Some(&cached) = self.format_properties.get(&format) {
@@ -492,10 +568,20 @@ impl Device {
         self.nsight_aftermath_tracker.save_shader(spirv);
     }
 
-    /// Returns the driver name.
+    /// Returns the name of the VkDriverId reported from Vulkan.
     ///
     /// Port of `Device::GetDriverName`.
     pub fn get_driver_name(&self) -> String {
+        if let Some(name) = driver_name_from_id(self.driver_properties.driver_id) {
+            return name.to_string();
+        }
+        self.get_vendor_name()
+    }
+
+    /// Returns the vendor name reported from Vulkan.
+    ///
+    /// Port of `Device::GetVendorName`.
+    pub fn get_vendor_name(&self) -> String {
         let name = unsafe { CStr::from_ptr(self.driver_properties.driver_name.as_ptr()) };
         name.to_string_lossy().into_owned()
     }
@@ -602,6 +688,13 @@ impl Device {
         self.device_features.shader_float64 != 0
     }
 
+    /// Returns true if the device supports float16 natively.
+    ///
+    /// Port of `Device::IsFloat16Supported`.
+    pub fn is_float16_supported(&self) -> bool {
+        self.shader_float16_supported
+    }
+
     /// Returns true if the device supports int64 natively.
     pub fn is_shader_int64_supported(&self) -> bool {
         self.device_features.shader_int64 != 0
@@ -695,6 +788,22 @@ impl Device {
     /// Returns true if memory budget reporting is supported.
     pub fn can_report_memory_usage(&self) -> bool {
         self.extensions.memory_budget
+    }
+
+    /// Returns currently used memory across the heaps tracked by
+    /// `CollectPhysicalMemoryInfo`.
+    ///
+    /// Port of `Device::GetDeviceMemoryUsage`.
+    pub fn get_device_memory_usage(&self) -> u64 {
+        if !self.extensions.memory_budget {
+            return 0;
+        }
+
+        let (_, Some(budget)) = physical_memory_properties(&self.instance, self.physical, true)
+        else {
+            return 0;
+        };
+        device_memory_usage_from_budget(&budget, &self.valid_heap_memory)
     }
 
     /// Returns the number of descriptor sets per pool.
@@ -885,5 +994,202 @@ impl Device {
 
     pub fn must_emulate_bgr565(&self) -> bool {
         self.must_emulate_bgr565
+    }
+}
+
+fn physical_memory_properties(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    has_memory_budget: bool,
+) -> (
+    vk::PhysicalDeviceMemoryProperties,
+    Option<vk::PhysicalDeviceMemoryBudgetPropertiesEXT>,
+) {
+    if has_memory_budget {
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut properties2 = vk::PhysicalDeviceMemoryProperties2::builder()
+            .push_next(&mut budget)
+            .build();
+        unsafe {
+            instance.get_physical_device_memory_properties2(physical, &mut properties2);
+        }
+        return (properties2.memory_properties, Some(budget));
+    }
+
+    let properties = unsafe { instance.get_physical_device_memory_properties(physical) };
+    (properties, None)
+}
+
+fn collect_physical_memory_info(
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    memory_budget: Option<&vk::PhysicalDeviceMemoryBudgetPropertiesEXT>,
+    is_integrated: bool,
+) -> (u64, Vec<usize>) {
+    let mut device_access_memory = 0_u64;
+    let mut device_initial_usage = 0_u64;
+    let mut local_memory = 0_u64;
+    let mut valid_heap_memory = Vec::new();
+
+    for element in 0..memory_properties.memory_heap_count as usize {
+        let heap = memory_properties.memory_heaps[element];
+        let is_heap_local = heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
+        if !is_integrated && !is_heap_local {
+            continue;
+        }
+
+        valid_heap_memory.push(element);
+        if is_heap_local {
+            local_memory = local_memory.saturating_add(heap.size);
+        }
+
+        if let Some(budget) = memory_budget {
+            device_initial_usage = device_initial_usage.saturating_add(budget.heap_usage[element]);
+            device_access_memory = device_access_memory.saturating_add(budget.heap_budget[element]);
+        } else {
+            device_access_memory = device_access_memory.saturating_add(heap.size);
+        }
+    }
+
+    if !is_integrated {
+        let reserve_memory = std::cmp::min(device_access_memory / 8, ONE_GIB);
+        device_access_memory = device_access_memory.saturating_sub(reserve_memory);
+
+        if *common::settings::values().vram_usage_mode.get_value()
+            != common::settings::VramUsageMode::Aggressive
+        {
+            let normal_memory = 6 * ONE_GIB;
+            let scaler_memory =
+                ONE_GIB * common::settings::values().resolution_info.scale_up_u32(1) as u64;
+            device_access_memory =
+                std::cmp::min(device_access_memory, normal_memory + scaler_memory);
+        }
+
+        return (device_access_memory, valid_heap_memory);
+    }
+
+    let available_memory = device_access_memory.wrapping_sub(device_initial_usage) as i64;
+    let upper = std::cmp::min(available_memory - 8 * ONE_GIB as i64, 4 * ONE_GIB as i64);
+    let lower = std::cmp::min(local_memory as i64, 4 * ONE_GIB as i64);
+    (std::cmp::max(upper, lower) as u64, valid_heap_memory)
+}
+
+fn device_memory_usage_from_budget(
+    memory_budget: &vk::PhysicalDeviceMemoryBudgetPropertiesEXT,
+    valid_heap_memory: &[usize],
+) -> u64 {
+    valid_heap_memory
+        .iter()
+        .map(|&heap| memory_budget.heap_usage[heap])
+        .sum()
+}
+
+fn driver_name_from_id(driver_id: vk::DriverId) -> Option<&'static str> {
+    match driver_id {
+        vk::DriverId::AMD_PROPRIETARY => Some("AMD"),
+        vk::DriverId::AMD_OPEN_SOURCE => Some("AMDVLK"),
+        vk::DriverId::MESA_RADV => Some("RADV"),
+        vk::DriverId::NVIDIA_PROPRIETARY => Some("NVIDIA"),
+        vk::DriverId::INTEL_PROPRIETARY_WINDOWS => Some("Intel"),
+        vk::DriverId::INTEL_OPEN_SOURCE_MESA => Some("ANV"),
+        vk::DriverId::IMAGINATION_PROPRIETARY => Some("PowerVR"),
+        vk::DriverId::QUALCOMM_PROPRIETARY => Some("Qualcomm"),
+        vk::DriverId::ARM_PROPRIETARY => Some("Mali"),
+        vk::DriverId::SAMSUNG_PROPRIETARY => Some("Xclipse"),
+        vk::DriverId::GOOGLE_SWIFTSHADER => Some("SwiftShader"),
+        vk::DriverId::BROADCOM_PROPRIETARY => Some("Broadcom"),
+        vk::DriverId::MESA_LLVMPIPE => Some("Lavapipe"),
+        vk::DriverId::MOLTENVK => Some("MoltenVK"),
+        vk::DriverId::VERISILICON_PROPRIETARY => Some("Vivante"),
+        vk::DriverId::MESA_TURNIP => Some("Turnip"),
+        vk::DriverId::MESA_V3DV => Some("V3DV"),
+        vk::DriverId::MESA_PANVK => Some("PanVK"),
+        vk::DriverId::MESA_VENUS => Some("Venus"),
+        vk::DriverId::MESA_DOZEN => Some("Dozen"),
+        vk::DriverId::MESA_NVK => Some("NVK"),
+        vk::DriverId::IMAGINATION_OPEN_SOURCE_MESA => Some("PVR"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_physical_memory_info_sums_device_local_heaps_for_discrete_gpus() {
+        let mut properties = vk::PhysicalDeviceMemoryProperties::default();
+        properties.memory_heap_count = 3;
+        properties.memory_heaps[0].size = 2 * 1024 * 1024;
+        properties.memory_heaps[0].flags = vk::MemoryHeapFlags::DEVICE_LOCAL;
+        properties.memory_heaps[1].size = 4 * 1024 * 1024;
+        properties.memory_heaps[1].flags = vk::MemoryHeapFlags::empty();
+        properties.memory_heaps[2].size = 8 * 1024 * 1024;
+        properties.memory_heaps[2].flags = vk::MemoryHeapFlags::DEVICE_LOCAL;
+
+        let (memory, heaps) = collect_physical_memory_info(&properties, None, false);
+
+        assert_eq!(memory, 10 * 1024 * 1024 - (10 * 1024 * 1024 / 8));
+        assert_eq!(heaps, vec![0, 2]);
+    }
+
+    #[test]
+    fn collect_physical_memory_info_caps_discrete_gpu_memory_like_upstream() {
+        let mut properties = vk::PhysicalDeviceMemoryProperties::default();
+        properties.memory_heap_count = 1;
+        properties.memory_heaps[0].size = 16 * ONE_GIB;
+        properties.memory_heaps[0].flags = vk::MemoryHeapFlags::DEVICE_LOCAL;
+
+        let (memory, heaps) = collect_physical_memory_info(&properties, None, false);
+
+        assert_eq!(memory, 7 * ONE_GIB);
+        assert_eq!(heaps, vec![0]);
+    }
+
+    #[test]
+    fn collect_physical_memory_info_uses_budget_when_available() {
+        let mut properties = vk::PhysicalDeviceMemoryProperties::default();
+        properties.memory_heap_count = 1;
+        properties.memory_heaps[0].size = 16 * ONE_GIB;
+        properties.memory_heaps[0].flags = vk::MemoryHeapFlags::DEVICE_LOCAL;
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        budget.heap_budget[0] = 8 * ONE_GIB;
+        budget.heap_usage[0] = ONE_GIB;
+
+        let (memory, heaps) = collect_physical_memory_info(&properties, Some(&budget), false);
+
+        assert_eq!(memory, 7 * ONE_GIB);
+        assert_eq!(heaps, vec![0]);
+    }
+
+    #[test]
+    fn device_memory_usage_from_budget_sums_valid_heaps() {
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        budget.heap_usage[0] = ONE_GIB;
+        budget.heap_usage[1] = 2 * ONE_GIB;
+        budget.heap_usage[2] = 4 * ONE_GIB;
+
+        assert_eq!(
+            device_memory_usage_from_budget(&budget, &[0, 2]),
+            5 * ONE_GIB
+        );
+    }
+
+    #[test]
+    fn driver_name_from_id_matches_upstream_names() {
+        assert_eq!(
+            driver_name_from_id(vk::DriverId::AMD_PROPRIETARY),
+            Some("AMD")
+        );
+        assert_eq!(driver_name_from_id(vk::DriverId::MESA_RADV), Some("RADV"));
+        assert_eq!(
+            driver_name_from_id(vk::DriverId::NVIDIA_PROPRIETARY),
+            Some("NVIDIA")
+        );
+        assert_eq!(
+            driver_name_from_id(vk::DriverId::MOLTENVK),
+            Some("MoltenVK")
+        );
+        assert_eq!(driver_name_from_id(vk::DriverId::MESA_NVK), Some("NVK"));
+        assert_eq!(driver_name_from_id(vk::DriverId::from_raw(-1)), None);
     }
 }

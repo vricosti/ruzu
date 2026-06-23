@@ -77,37 +77,24 @@ impl Scheduler {
         queue: vk::Queue,
         command_pool: vk::CommandPool,
     ) -> Result<Self, vk::Result> {
-        // Allocate two command buffers: one for rendering, one for uploads
-        let alloc_info = vk::CommandBufferAllocateInfo::builder()
-            .command_pool(command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(2)
+        let fence_info = vk::FenceCreateInfo::builder()
+            .flags(vk::FenceCreateFlags::SIGNALED)
             .build();
-        let cmd_buffers = unsafe { device.allocate_command_buffers(&alloc_info)? };
-
-        let fence_info = vk::FenceCreateInfo::builder().build();
         let fence = unsafe { device.create_fence(&fence_info, None)? };
 
-        // Begin both command buffers
-        let begin_info = vk::CommandBufferBeginInfo::builder()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
-            .build();
-        unsafe {
-            device.begin_command_buffer(cmd_buffers[0], &begin_info)?;
-            device.begin_command_buffer(cmd_buffers[1], &begin_info)?;
-        }
-
-        Ok(Self {
+        let mut scheduler = Self {
             device,
             queue,
             command_pool,
             current_chunk: CommandChunk::new(),
-            current_cmdbuf: cmd_buffers[0],
-            upload_cmdbuf: cmd_buffers[1],
+            current_cmdbuf: vk::CommandBuffer::null(),
+            upload_cmdbuf: vk::CommandBuffer::null(),
             current_tick: AtomicU64::new(0),
             rp_state: RenderPassState::default(),
             fence,
-        })
+        };
+        scheduler.allocate_new_context()?;
+        Ok(scheduler)
     }
 
     /// Record a command that only needs the render command buffer.
@@ -200,6 +187,19 @@ impl Scheduler {
 
     /// Flush — end render pass, dispatch remaining work, submit to GPU, return tick.
     pub fn flush(&mut self) -> u64 {
+        self.flush_impl(&[])
+    }
+
+    /// Port of upstream `Scheduler::Flush(vk::Semaphore signal_semaphore)`.
+    pub fn flush_with_signal(&mut self, signal_semaphore: vk::Semaphore) -> u64 {
+        if signal_semaphore == vk::Semaphore::null() {
+            self.flush()
+        } else {
+            self.flush_impl(&[signal_semaphore])
+        }
+    }
+
+    fn flush_impl(&mut self, signal_semaphores: &[vk::Semaphore]) -> u64 {
         self.request_outside_renderpass();
         self.dispatch_work();
 
@@ -213,9 +213,13 @@ impl Scheduler {
         let cmd_buffers = [self.upload_cmdbuf, self.current_cmdbuf];
         let submit_info = vk::SubmitInfo::builder()
             .command_buffers(&cmd_buffers)
+            .signal_semaphores(signal_semaphores)
             .build();
 
         unsafe {
+            self.device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .ok();
             self.device.reset_fences(&[self.fence]).ok();
             self.device
                 .queue_submit(self.queue, &[submit_info], self.fence)
@@ -224,6 +228,7 @@ impl Scheduler {
 
         let tick = self.current_tick.fetch_add(1, Ordering::SeqCst) + 1;
         debug!("Scheduler: flushed at tick {}", tick);
+        self.allocate_new_context().ok();
         tick
     }
 
@@ -235,35 +240,29 @@ impl Scheduler {
                 .wait_for_fences(&[self.fence], true, u64::MAX)
                 .ok();
         }
+    }
 
-        // Reset and re-begin command buffers for next frame
-        unsafe {
-            self.device
-                .reset_command_pool(self.command_pool, vk::CommandPoolResetFlags::empty())
-                .ok();
-        }
-
+    fn allocate_new_context(&mut self) -> Result<(), vk::Result> {
         let alloc_info = vk::CommandBufferAllocateInfo::builder()
             .command_pool(self.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(2)
             .build();
-        if let Ok(cmd_buffers) = unsafe { self.device.allocate_command_buffers(&alloc_info) } {
-            self.current_cmdbuf = cmd_buffers[0];
-            self.upload_cmdbuf = cmd_buffers[1];
+        let cmd_buffers = unsafe { self.device.allocate_command_buffers(&alloc_info)? };
+        self.current_cmdbuf = cmd_buffers[0];
+        self.upload_cmdbuf = cmd_buffers[1];
 
-            let begin_info = vk::CommandBufferBeginInfo::builder()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
-                .build();
-            unsafe {
-                self.device
-                    .begin_command_buffer(self.current_cmdbuf, &begin_info)
-                    .ok();
-                self.device
-                    .begin_command_buffer(self.upload_cmdbuf, &begin_info)
-                    .ok();
-            }
+        let begin_info = vk::CommandBufferBeginInfo::builder()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
+            .build();
+        unsafe {
+            self.device
+                .begin_command_buffer(self.current_cmdbuf, &begin_info)?;
+            self.device
+                .begin_command_buffer(self.upload_cmdbuf, &begin_info)?;
         }
+        self.rp_state = RenderPassState::default();
+        Ok(())
     }
 
     /// Get the current command buffer for direct recording.
@@ -280,6 +279,26 @@ impl Scheduler {
     pub fn current_tick(&self) -> u64 {
         self.current_tick.load(Ordering::SeqCst)
     }
+
+    /// Tick that will be signalled by the next `Flush`.
+    pub fn pending_tick(&self) -> u64 {
+        self.current_tick() + 1
+    }
+
+    /// Port-facing subset of upstream `Scheduler::Wait`.
+    pub fn wait(&mut self, tick: u64) {
+        if tick == 0 {
+            return;
+        }
+        if tick >= self.current_tick() {
+            self.flush();
+        }
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .ok();
+        }
+    }
 }
 
 impl Drop for Scheduler {
@@ -289,6 +308,7 @@ impl Drop for Scheduler {
                 .wait_for_fences(&[self.fence], true, u64::MAX)
                 .ok();
             self.device.destroy_fence(self.fence, None);
+            self.device.destroy_command_pool(self.command_pool, None);
         }
     }
 }

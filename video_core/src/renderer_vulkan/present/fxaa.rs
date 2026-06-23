@@ -9,6 +9,10 @@ use ash::vk;
 
 use super::anti_alias_pass::AntiAliasPass;
 use super::util;
+use crate::host_shaders::spirv_shaders::{FXAA_FRAG_SPV, FXAA_VERT_SPV};
+use crate::renderer_vulkan::scheduler::Scheduler;
+use crate::renderer_vulkan::shader_util::build_shader;
+use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
 
 // ---------------------------------------------------------------------------
 // Per-image dynamic resources
@@ -50,7 +54,7 @@ impl Fxaa {
     /// Port of `FXAA::FXAA`.
     pub fn new(
         device: ash::Device,
-        allocator: &vk::DeviceMemory,
+        allocator: &MemoryAllocator,
         extent: vk::Extent2D,
         image_count: usize,
     ) -> Self {
@@ -91,9 +95,10 @@ impl Fxaa {
         // Create sampler
         let sampler = util::create_wrapped_sampler(&device, vk::Filter::LINEAR);
 
-        // Create shaders - placeholder empty SPIR-V (actual shader data would come from host_shaders)
-        let vertex_shader = vk::ShaderModule::null();
-        let fragment_shader = vk::ShaderModule::null();
+        let vertex_shader =
+            build_shader(&device, FXAA_VERT_SPV).expect("Failed to build fxaa.vert");
+        let fragment_shader =
+            build_shader(&device, FXAA_FRAG_SPV).expect("Failed to build fxaa.frag");
 
         // Create descriptor pool: 2 descriptors, 1 descriptor set per image
         let descriptor_pool = util::create_wrapped_descriptor_pool(
@@ -177,14 +182,19 @@ impl Fxaa {
     }
 
     /// Port of `FXAA::UploadImages`.
-    fn upload_images(&mut self, cmdbuf: vk::CommandBuffer) {
+    fn upload_images(&mut self, scheduler: &mut Scheduler) {
         if self.images_ready {
             return;
         }
 
-        for img in &self.dynamic_images {
-            util::clear_color_image(&self.device, cmdbuf, img.image);
-        }
+        let images: Vec<vk::Image> = self.dynamic_images.iter().map(|img| img.image).collect();
+        let device = self.device.clone();
+        scheduler.record(move |cmdbuf| {
+            for image in images {
+                util::clear_color_image(&device, cmdbuf, image);
+            }
+        });
+        scheduler.finish();
 
         self.images_ready = true;
     }
@@ -197,35 +207,116 @@ impl AntiAliasPass for Fxaa {
     /// image/view pointers to the output.
     fn draw(
         &mut self,
+        scheduler: &mut Scheduler,
         image_index: usize,
         inout_image: &mut vk::Image,
         inout_image_view: &mut vk::ImageView,
     ) {
-        let image = &self.dynamic_images[image_index];
-        let _input_image = *inout_image;
-        let _output_image = image.image;
-        let _descriptor_set = image.descriptor_sets[0];
-        let _framebuffer = image.framebuffer;
-        let _renderpass = self.renderpass;
-        let _pipeline = self.pipeline;
-        let _layout = self.pipeline_layout;
-        let _extent = self.extent;
+        let input_image = *inout_image;
+        let output_image = self.dynamic_images[image_index].image;
+        let output_image_view = self.dynamic_images[image_index].image_view;
+        let descriptor_set = self.dynamic_images[image_index].descriptor_sets[0];
+        let framebuffer = self.dynamic_images[image_index].framebuffer;
+        let renderpass = self.renderpass;
+        let pipeline = self.pipeline;
+        let layout = self.pipeline_layout;
+        let extent = self.extent;
 
+        self.upload_images(scheduler);
         self.update_descriptor_sets(*inout_image_view, image_index);
 
-        // NOTE: actual command recording requires a scheduler/command buffer
-        // which will be connected when the scheduler is fully ported.
-        // The draw would:
-        // 1. TransitionImageLayout(cmdbuf, input_image, VK_IMAGE_LAYOUT_GENERAL)
-        // 2. TransitionImageLayout(cmdbuf, output_image, VK_IMAGE_LAYOUT_GENERAL)
-        // 3. BeginRenderPass(cmdbuf, renderpass, framebuffer, extent)
-        // 4. BindPipeline(GRAPHICS, pipeline)
-        // 5. BindDescriptorSets(GRAPHICS, layout, 0, descriptor_set)
-        // 6. Draw(3, 1, 0, 0)
-        // 7. EndRenderPass()
-        // 8. TransitionImageLayout(cmdbuf, output_image, VK_IMAGE_LAYOUT_GENERAL)
+        scheduler.request_outside_renderpass();
+        let device = self.device.clone();
+        scheduler.record(move |cmdbuf| unsafe {
+            util::transition_image_layout(
+                &device,
+                cmdbuf,
+                input_image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+            );
+            util::transition_image_layout(
+                &device,
+                cmdbuf,
+                output_image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+            );
+            util::begin_render_pass(&device, cmdbuf, renderpass, framebuffer, extent);
+            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmdbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            device.cmd_draw(cmdbuf, 3, 1, 0, 0);
+            device.cmd_end_render_pass(cmdbuf);
+            util::transition_image_layout(
+                &device,
+                cmdbuf,
+                output_image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+            );
+        });
 
-        *inout_image = image.image;
-        *inout_image_view = image.image_view;
+        *inout_image = output_image;
+        *inout_image_view = output_image_view;
+    }
+}
+
+impl Drop for Fxaa {
+    fn drop(&mut self) {
+        unsafe {
+            for image in &mut self.dynamic_images {
+                if image.framebuffer != vk::Framebuffer::null() {
+                    self.device.destroy_framebuffer(image.framebuffer, None);
+                    image.framebuffer = vk::Framebuffer::null();
+                }
+                if image.image_view != vk::ImageView::null() {
+                    self.device.destroy_image_view(image.image_view, None);
+                    image.image_view = vk::ImageView::null();
+                }
+            }
+            if self.sampler != vk::Sampler::null() {
+                self.device.destroy_sampler(self.sampler, None);
+                self.sampler = vk::Sampler::null();
+            }
+            if self.renderpass != vk::RenderPass::null() {
+                self.device.destroy_render_pass(self.renderpass, None);
+                self.renderpass = vk::RenderPass::null();
+            }
+            if self.pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.pipeline, None);
+                self.pipeline = vk::Pipeline::null();
+            }
+            if self.pipeline_layout != vk::PipelineLayout::null() {
+                self.device
+                    .destroy_pipeline_layout(self.pipeline_layout, None);
+                self.pipeline_layout = vk::PipelineLayout::null();
+            }
+            if self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
+                self.device
+                    .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+                self.descriptor_set_layout = vk::DescriptorSetLayout::null();
+            }
+            if self.descriptor_pool != vk::DescriptorPool::null() {
+                self.device
+                    .destroy_descriptor_pool(self.descriptor_pool, None);
+                self.descriptor_pool = vk::DescriptorPool::null();
+            }
+            if self.fragment_shader != vk::ShaderModule::null() {
+                self.device
+                    .destroy_shader_module(self.fragment_shader, None);
+                self.fragment_shader = vk::ShaderModule::null();
+            }
+            if self.vertex_shader != vk::ShaderModule::null() {
+                self.device.destroy_shader_module(self.vertex_shader, None);
+                self.vertex_shader = vk::ShaderModule::null();
+            }
+        }
     }
 }

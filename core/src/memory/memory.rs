@@ -1773,8 +1773,7 @@ impl Memory {
                             0,
                         )
                     };
-                    if w != copy_amount as isize
-                        && self.invalidate_separate_heap(ptr as *const u8)
+                    if w != copy_amount as isize && self.invalidate_separate_heap(ptr as *const u8)
                     {
                         w = unsafe {
                             libc::process_vm_writev(
@@ -1792,11 +1791,7 @@ impl Memory {
                 #[cfg(not(target_os = "linux"))]
                 let written = {
                     unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            src[offset..].as_ptr(),
-                            ptr,
-                            copy_amount,
-                        );
+                        std::ptr::copy_nonoverlapping(src[offset..].as_ptr(), ptr, copy_amount);
                     }
                     copy_amount as isize
                 };

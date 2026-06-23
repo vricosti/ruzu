@@ -1010,8 +1010,8 @@ fn send_sync_request_impl(
 
     let trace_svc_ipc = std::env::var_os("RUZU_TRACE_SVC_IPC").is_some();
     let dump_ssr = std::env::var_os("RUZU_DUMP_SSR").is_some();
-    let trace_handler_context =
-        (log::log_enabled!(log::Level::Trace) || trace_svc_ipc || dump_ssr).then(|| {
+    let trace_handler_context = (log::log_enabled!(log::Level::Trace) || trace_svc_ipc || dump_ssr)
+        .then(|| {
             let manager = request_manager.lock().unwrap();
             let handler_name = manager
                 .session_handler()

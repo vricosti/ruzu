@@ -8,6 +8,9 @@
 
 use ash::vk;
 
+use crate::vulkan_common::vulkan_device::Device;
+use crate::vulkan_common::vulkan_wrapper::VulkanError;
+
 // ---------------------------------------------------------------------------
 // VSyncMode (matching upstream Settings::VSyncMode)
 // ---------------------------------------------------------------------------
@@ -132,6 +135,15 @@ fn choose_alpha_flags(capabilities: &vk::SurfaceCapabilitiesKHR) -> vk::Composit
 /// Port of `Swapchain` class.
 pub struct Swapchain {
     surface: vk::SurfaceKHR,
+    surface_loader: ash::extensions::khr::Surface,
+    swapchain_loader: ash::extensions::khr::Swapchain,
+    physical_device: vk::PhysicalDevice,
+    device: ash::Device,
+    graphics_queue: vk::Queue,
+    present_queue: vk::Queue,
+    graphics_family: u32,
+    present_family: u32,
+    mutable_format_enabled: bool,
     swapchain: vk::SwapchainKHR,
 
     image_count: usize,
@@ -160,9 +172,26 @@ pub struct Swapchain {
 
 impl Swapchain {
     /// Port of `Swapchain::Swapchain`.
-    pub fn new(surface: vk::SurfaceKHR, width: u32, height: u32) -> Self {
-        Swapchain {
+    pub fn new(
+        instance: &ash::Instance,
+        surface_loader: ash::extensions::khr::Surface,
+        surface: vk::SurfaceKHR,
+        device: &Device,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, VulkanError> {
+        let swapchain_loader = ash::extensions::khr::Swapchain::new(instance, device.get_logical());
+        let mut swapchain = Swapchain {
             surface,
+            surface_loader,
+            swapchain_loader,
+            physical_device: device.get_physical(),
+            device: device.get_logical().clone(),
+            graphics_queue: device.get_graphics_queue(),
+            present_queue: device.get_present_queue(),
+            graphics_family: device.get_graphics_family(),
+            present_family: device.get_present_family(),
+            mutable_format_enabled: device.is_khr_swapchain_mutable_format_enabled(),
             swapchain: vk::SwapchainKHR::null(),
             image_count: 0,
             images: Vec::new(),
@@ -182,38 +211,124 @@ impl Swapchain {
             has_fifo_relaxed: false,
             is_outdated: false,
             is_suboptimal: false,
-        }
+        };
+        swapchain.create(surface, width, height)?;
+        Ok(swapchain)
     }
 
     /// Port of `Swapchain::Create`.
-    pub fn create(&mut self, surface: vk::SurfaceKHR, width: u32, height: u32) {
+    pub fn create(
+        &mut self,
+        surface: vk::SurfaceKHR,
+        width: u32,
+        height: u32,
+    ) -> Result<(), VulkanError> {
         self.is_outdated = false;
         self.is_suboptimal = false;
         self.width = width;
         self.height = height;
         self.surface = surface;
 
-        // NOTE: actual creation requires physical device + logical device.
-        // The full Create() body depends on Device integration which is
-        // done when the Device type is wired in.
-        // For now: clear and prepare resource_ticks.
+        let capabilities = unsafe {
+            self.surface_loader
+                .get_physical_device_surface_capabilities(self.physical_device, self.surface)
+                .map_err(VulkanError::new)?
+        };
+        if capabilities.max_image_extent.width == 0 || capabilities.max_image_extent.height == 0 {
+            return Ok(());
+        }
+
         self.destroy();
+        self.create_swapchain(&capabilities)?;
+        self.create_semaphores()?;
         self.resource_ticks.clear();
         self.resource_ticks.resize(self.image_count, 0);
+        Ok(())
+    }
+
+    /// Recreates the swapchain using the currently owned surface.
+    ///
+    /// Rust equivalent of callers invoking upstream `Swapchain::Create(*surface, width, height)`
+    /// when the `PresentManager` does not need to replace the surface handle.
+    pub fn recreate(&mut self, width: u32, height: u32) -> Result<(), VulkanError> {
+        self.create(self.surface, width, height)
     }
 
     /// Port of `Swapchain::AcquireNextImage`.
     ///
     /// Returns `true` if the swapchain is suboptimal or outdated.
     pub fn acquire_next_image(&mut self) -> bool {
-        // In the full implementation, this calls vkAcquireNextImageKHR
-        // and handles VK_SUBOPTIMAL_KHR / VK_ERROR_OUT_OF_DATE_KHR.
+        if self.swapchain == vk::SwapchainKHR::null() || self.present_semaphores.is_empty() {
+            self.is_outdated = true;
+            return true;
+        }
+        let semaphore = self.present_semaphores[self.frame_index as usize];
+        match unsafe {
+            self.swapchain_loader.acquire_next_image(
+                self.swapchain,
+                u64::MAX,
+                semaphore,
+                vk::Fence::null(),
+            )
+        } {
+            Ok((index, suboptimal)) => {
+                self.image_index = index;
+                self.is_suboptimal |= suboptimal;
+            }
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.is_outdated = true;
+            }
+            Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
+                panic!("vkAcquireNextImageKHR returned ERROR_SURFACE_LOST_KHR");
+            }
+            Err(result) => {
+                log::error!("vkAcquireNextImageKHR returned {:?}", result);
+            }
+        }
+        if let Some(tick) = self.resource_ticks.get_mut(self.image_index as usize) {
+            *tick = tick.saturating_add(1);
+        }
         self.is_suboptimal || self.is_outdated
     }
 
     /// Port of `Swapchain::Present`.
-    pub fn present(&mut self, _render_semaphore: vk::Semaphore) {
-        // In the full implementation, this calls vkQueuePresentKHR.
+    pub fn present(&mut self, render_semaphore: vk::Semaphore) {
+        if self.swapchain == vk::SwapchainKHR::null() {
+            self.is_outdated = true;
+            return;
+        }
+        let wait_semaphores = [render_semaphore];
+        let swapchains = [self.swapchain];
+        let image_indices = [self.image_index];
+        let present_info = vk::PresentInfoKHR::builder()
+            .wait_semaphores(if render_semaphore == vk::Semaphore::null() {
+                &[]
+            } else {
+                &wait_semaphores
+            })
+            .swapchains(&swapchains)
+            .image_indices(&image_indices)
+            .build();
+        match unsafe {
+            self.swapchain_loader
+                .queue_present(self.present_queue, &present_info)
+        } {
+            Ok(suboptimal) => {
+                self.is_suboptimal |= suboptimal;
+                if suboptimal {
+                    log::debug!("Suboptimal swapchain");
+                }
+            }
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.is_outdated = true;
+            }
+            Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
+                panic!("vkQueuePresentKHR returned ERROR_SURFACE_LOST_KHR");
+            }
+            Err(result) => {
+                log::error!("Failed to present with error {:?}", result);
+            }
+        }
         self.frame_index += 1;
         if self.frame_index as usize >= self.image_count {
             self.frame_index = 0;
@@ -308,15 +423,23 @@ impl Swapchain {
     fn create_swapchain(
         &mut self,
         capabilities: &vk::SurfaceCapabilitiesKHR,
-        available_formats: &[vk::SurfaceFormatKHR],
-        available_present_modes: &[vk::PresentModeKHR],
-    ) {
+    ) -> Result<(), VulkanError> {
+        let available_formats = unsafe {
+            self.surface_loader
+                .get_physical_device_surface_formats(self.physical_device, self.surface)
+                .map_err(VulkanError::new)?
+        };
+        let available_present_modes = unsafe {
+            self.surface_loader
+                .get_physical_device_surface_present_modes(self.physical_device, self.surface)
+                .map_err(VulkanError::new)?
+        };
         self.has_mailbox = available_present_modes.contains(&vk::PresentModeKHR::MAILBOX);
         self.has_imm = available_present_modes.contains(&vk::PresentModeKHR::IMMEDIATE);
         self.has_fifo_relaxed = available_present_modes.contains(&vk::PresentModeKHR::FIFO_RELAXED);
 
-        let _alpha_flags = choose_alpha_flags(capabilities);
-        self.surface_format = choose_swap_surface_format(available_formats);
+        let alpha_flags = choose_alpha_flags(capabilities);
+        self.surface_format = choose_swap_surface_format(&available_formats);
         self.present_mode = choose_swap_present_mode(
             self.has_imm,
             self.has_mailbox,
@@ -338,44 +461,105 @@ impl Swapchain {
             requested_image_count = requested_image_count.max(3);
         }
 
-        self.extent = choose_swap_extent(capabilities, self.width, self.height);
-        self.image_view_format = vk::Format::B8G8R8A8_UNORM;
+        let updated_capabilities = unsafe {
+            self.surface_loader
+                .get_physical_device_surface_capabilities(self.physical_device, self.surface)
+                .map_err(VulkanError::new)?
+        };
+        self.extent = choose_swap_extent(&updated_capabilities, self.width, self.height);
 
-        // NOTE: actual vkCreateSwapchainKHR call requires a VkDevice handle.
-        // The swapchain creation info would be:
-        //   surface, min_image_count, image_format, color_space, image_extent,
-        //   image_array_layers=1, image_usage=COLOR_ATTACHMENT|TRANSFER_DST,
-        //   sharing_mode, pre_transform, composite_alpha, present_mode, clipped=false
-        let _ = requested_image_count;
+        let queue_indices = [self.graphics_family, self.present_family];
+        let mut create_info = vk::SwapchainCreateInfoKHR::builder()
+            .surface(self.surface)
+            .min_image_count(requested_image_count)
+            .image_format(self.surface_format.format)
+            .image_color_space(self.surface_format.color_space)
+            .image_extent(self.extent)
+            .image_array_layers(1)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST)
+            .pre_transform(updated_capabilities.current_transform)
+            .composite_alpha(alpha_flags)
+            .present_mode(self.present_mode)
+            .clipped(false);
+        if self.graphics_family != self.present_family {
+            create_info = create_info
+                .image_sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(&queue_indices);
+        } else {
+            create_info = create_info.image_sharing_mode(vk::SharingMode::EXCLUSIVE);
+        }
+
+        let view_formats = [vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB];
+        let mut format_list = vk::ImageFormatListCreateInfo::builder()
+            .view_formats(&view_formats)
+            .build();
+        let mut create_info = create_info.build();
+        if self.mutable_format_enabled {
+            create_info.flags |= vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT;
+            create_info.p_next = (&mut format_list as *mut vk::ImageFormatListCreateInfo).cast();
+        }
+
+        self.swapchain = unsafe {
+            self.swapchain_loader
+                .create_swapchain(&create_info, None)
+                .map_err(VulkanError::new)?
+        };
+        self.images = unsafe {
+            self.swapchain_loader
+                .get_swapchain_images(self.swapchain)
+                .map_err(VulkanError::new)?
+        };
+        self.image_count = self.images.len();
+        self.image_view_format = vk::Format::B8G8R8A8_UNORM;
+        log::info!(
+            "Vulkan swapchain created: {} images, {}x{}, format {:?}, present mode {:?}",
+            self.image_count,
+            self.extent.width,
+            self.extent.height,
+            self.surface_format.format,
+            self.present_mode
+        );
+        Ok(())
     }
 
     /// Port of `Swapchain::CreateSemaphores`.
-    fn create_semaphores(&mut self, device: &ash::Device) {
+    fn create_semaphores(&mut self) -> Result<(), VulkanError> {
         self.present_semaphores.clear();
         self.render_semaphores.clear();
         let semaphore_ci = vk::SemaphoreCreateInfo::builder().build();
         for _i in 0..self.image_count {
             let present = unsafe {
-                device
+                self.device
                     .create_semaphore(&semaphore_ci, None)
-                    .expect("Failed to create present semaphore")
+                    .map_err(VulkanError::new)?
             };
             let render = unsafe {
-                device
+                self.device
                     .create_semaphore(&semaphore_ci, None)
-                    .expect("Failed to create render semaphore")
+                    .map_err(VulkanError::new)?
             };
             self.present_semaphores.push(present);
             self.render_semaphores.push(render);
         }
+        Ok(())
     }
 
     /// Port of `Swapchain::Destroy`.
     fn destroy(&mut self) {
         self.frame_index = 0;
-        self.present_semaphores.clear();
-        self.render_semaphores.clear();
-        self.swapchain = vk::SwapchainKHR::null();
+        unsafe {
+            for semaphore in self.present_semaphores.drain(..) {
+                self.device.destroy_semaphore(semaphore, None);
+            }
+            for semaphore in self.render_semaphores.drain(..) {
+                self.device.destroy_semaphore(semaphore, None);
+            }
+            if self.swapchain != vk::SwapchainKHR::null() {
+                self.swapchain_loader
+                    .destroy_swapchain(self.swapchain, None);
+                self.swapchain = vk::SwapchainKHR::null();
+            }
+        }
     }
 
     /// Port of `Swapchain::NeedsPresentModeUpdate`.
@@ -388,5 +572,11 @@ impl Swapchain {
             true,
         );
         self.present_mode != requested
+    }
+}
+
+impl Drop for Swapchain {
+    fn drop(&mut self) {
+        self.destroy();
     }
 }

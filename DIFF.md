@@ -12344,3 +12344,1368 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Binary layout verification
 - Diagnostic memory reads only; no guest raw-copied payload or serialized ABI layout changed.
+
+## 2026-06-21 — ruzu_cmd/src/main.rs vs yuzu_cmd/yuzu.cpp
+
+### Intentional differences
+- `ruzu-cmd --renderer` defaults to `vulkan` on macOS and keeps `opengl` elsewhere. Upstream reads `Settings::values.renderer_backend` from config; ruzu-cmd still has a CLI override while SDL config/settings plumbing is incomplete. The macOS default is required because Apple's OpenGL support is capped at 4.1 core profile, below upstream's OpenGL 4.6 compatibility requirement.
+- The Rust Vulkan factory passes the SDL drawable size into `RendererVulkan::new`. Upstream gets this size through the `EmuWindow` reference during renderer construction; ruzu-cmd still owns the frontend/backend split.
+
+### Unintentional differences (to fix)
+- The Rust subsystem factory now constructs `video_core::renderer_vulkan::renderer_vulkan::RendererVulkan` for Vulkan, but construction is still wired from ruzu-cmd instead of upstream's `VideoCore::CreateRenderer(system, emu_window, *gpu, context)` ownership path.
+
+### Missing items
+- Full settings-driven renderer selection matching `Settings::values.renderer_backend.GetValue()`.
+
+### Binary layout verification
+- Not applicable; frontend backend selection only.
+
+### Verification
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- `cargo run -p ruzu_cmd --bin ruzu-cmd -- --help` shows `[default: vulkan]` on macOS.
+- MK8D Vulkan runtime validation: MoltenVK loads, the Apple M2 Pro Vulkan device is created, the swapchain is created, and the remaining observed blocker is `ArmDynarmic32::run_thread: JIT not available`.
+
+## 2026-06-21 — ruzu_cmd/src/emu_window/emu_window_sdl2_vk.rs vs yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp
+
+### Intentional differences
+- On macOS, Rust stores the `CAMetalLayer` returned by `SDL_Metal_GetLayer(SDL_Metal_CreateView(...))` in `WindowSystemInfo::render_surface`, while upstream assigns the SDL Metal view handle directly. The Rust Vulkan surface creator passes this value to `vk::MetalSurfaceCreateInfoEXT::layer`, so storing the layer preserves the Vulkan API contract.
+- Rust exposes `drawable_size()` on `EmuWindowSdl2Vk` and calls `SDL_Metal_GetDrawableSize`/`SDL_Vulkan_GetDrawableSize` for renderer construction. Upstream routes drawable-size queries through the frontend window object; the Rust split keeps this in the matching SDL Vulkan frontend file.
+
+### Unintentional differences (to fix)
+- The Rust frontend owns `WindowSystemInfo` locally and passes a clone into the `ruzu_cmd` subsystem factory. Upstream stores this state in the base `EmuWindow` object and `RendererVulkan` reads it from the window reference.
+
+### Missing items
+- Windows and Android native window-info population in `EmuWindowSdl2Vk`.
+
+### Binary layout verification
+- Not applicable; this stores opaque host pointers only and does not serialize guest-visible data.
+
+### Verification
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime validation creates a 2560x1440 Metal-backed swapchain from the SDL drawable size on the tested Retina display.
+
+## 2026-06-21 — video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp
+
+### Intentional differences
+- `RendererVulkan::new` now owns Vulkan library loading, instance creation, surface creation, device creation, and rasterizer construction, matching upstream constructor ownership direction. The Rust constructor takes `WindowSystemInfo` and `SyncpointManager` directly because ruzu's `CreateRenderer(system, emu_window, *gpu, context)` equivalent is still split across `ruzu_cmd` and `video_core`.
+- The Rust renderer uses a dummy graphics context for `RendererBase::context_ptr`, matching upstream Vulkan's `DummyContext` frontend behavior.
+- `RendererVulkan::new` now owns `Swapchain`, `PresentManager`, and `BlitScreen` construction in the same top-level constructor ownership direction as upstream. The blit/present path is kept inactive in `Composite` until the upstream-equivalent blit passes and scheduler integration are ported, avoiding a false-present path built on placeholder pipelines.
+
+### Unintentional differences (to fix)
+- `Composite` does not yet create/present swapchain frames. Upstream renders applet capture, screenshot, swapchain blit, scheduler flush, present, GPU frame-end notification, and rasterizer tick.
+- `RendererVulkan` does not yet own `MemoryAllocator`, `StateTracker`, `Scheduler`, or `TurboMode` in the upstream top-level shape. The current Rust rasterizer internally owns an older scheduler/state/cache set, which is less faithful than upstream.
+- `Report` only logs a generic initialization message and model name access; upstream reports driver, device, Vulkan API, VRAM, extensions, and telemetry fields.
+- `GetAppletCaptureBuffer`, screenshot, and render-to-buffer remain stubs or partial behavior.
+
+### Missing items
+- `RenderToBuffer`, `RenderScreenshot`, and `RenderAppletCaptureLayer` full implementations.
+- Active `Composite` swapchain acquire/blit/flush/present flow.
+- Telemetry fields from upstream `RendererVulkan::Report`.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Vulkan host-handle ownership only.
+
+### Verification
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime validation reaches `Vulkan renderer initialized`, binds the renderer to `Gpu`, and starts the GPU thread before hitting the separate AArch32 JIT-not-available blocker.
+
+## 2026-06-21 — video_core/src/renderer_vulkan/swapchain.rs vs video_core/renderer_vulkan/vk_swapchain.h and video_core/renderer_vulkan/vk_swapchain.cpp
+
+### Intentional differences
+- Rust stores `ash` surface/swapchain loaders and cloned `ash::Device` handles in `Swapchain`, while upstream stores `const Device&` and `Scheduler&`. This is a Rust ownership adaptation while preserving the method owner and host-handle responsibilities in the matching swapchain file.
+- Rust `Destroy` destroys both present and render semaphores explicitly. Upstream clears present semaphores and resets the `vk::SwapchainKHR`; Rust's explicit destruction reflects raw `ash` handle ownership rather than upstream wrapper RAII.
+- A diagnostic `log::info!` line reports swapchain image count, extent, format, and present mode after creation. This has no upstream behavior effect and exists to verify the macOS/MoltenVK bootstrap during the port.
+
+### Unintentional differences (to fix)
+- `AcquireNextImage` does not yet call upstream-equivalent `scheduler.Wait(resource_ticks[image_index])` or assign `scheduler.CurrentTick()` because top-level Vulkan `Scheduler` ownership is not wired into `RendererVulkan` yet.
+- `Present` does not yet lock upstream `scheduler.submit_mutex` around queue present.
+- Present-mode selection currently uses Rust defaults equivalent to FIFO with speed limit enabled; upstream reads `Settings::values.vsync_mode` and `Settings::values.use_speed_limit`.
+- The mutable-format path depends on the current minimal `Device` extension bookkeeping; upstream enables it through the full device extension negotiation path.
+
+### Missing items
+- `Scheduler` integration for resource tick waits/current tick and submit mutex.
+- Settings-driven present-mode updates.
+- Full parity with upstream Android-only transform/image-view-format branches if the Android frontend is later enabled.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Vulkan host handles, semaphores, images, and swapchain state only.
+
+### Verification
+- Re-read upstream `vk_swapchain.h` and `vk_swapchain.cpp`.
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime validation creates a MoltenVK swapchain: 3 images, 2560x1440, `B8G8R8A8_UNORM`, FIFO.
+
+## 2026-06-21 — video_core/src/renderer_vulkan/present_manager.rs vs video_core/renderer_vulkan/vk_present_manager.h and video_core/renderer_vulkan/vk_present_manager.cpp
+
+### Intentional differences
+- Rust `Frame` stores an explicit `image_memory: vk::DeviceMemory` field. Upstream's `vk::Image` wrapper owns the VMA allocation returned by `MemoryAllocator::CreateImage`; Rust currently uses raw `ash` handles, so the memory handle must be tracked explicitly to preserve valid image ownership.
+- `PresentManager::RecreateFrame` now creates the image with the swapchain image format, queries memory requirements, allocates device-local memory, binds it, and then creates the image view/framebuffer. This follows upstream ordering, replacing the previous invalid raw image-without-memory path while Rust VMA integration is still missing.
+- `PresentManager::Drop` explicitly destroys frame framebuffers, image views, images, memory, semaphores, fences, and the command pool. Upstream relies on wrapper RAII and member destruction order; Rust uses raw `ash` handles here.
+
+### Unintentional differences (to fix)
+- `PresentManager` still does not own upstream references to `Instance`, `EmuWindow`, `Device`, `MemoryAllocator`, `Scheduler`, `Swapchain`, and `surface`; instead it receives copied handles/properties from `RendererVulkan`.
+- `RecreateFrame` uses a direct one-allocation-per-image path instead of upstream `MemoryAllocator::CreateImage`/VMA ownership.
+- `Present` still returns frames directly to `free_queue` when async presentation is disabled instead of calling upstream-equivalent `scheduler.WaitWorker()` and `CopyToSwapchain(frame)`.
+- `PresentThread`, `CopyToSwapchain`, `RecreateSwapchain`, and full scheduler submit-mutex integration are still not wired to the renderer's active `Composite` path.
+
+### Missing items
+- VMA-backed `MemoryAllocator::CreateImage` integration.
+- Full `CopyToSwapchain` surface-lost recovery and swapchain recreation loop.
+- Async present thread parity with `std::jthread` stop-token behavior.
+- `CanBlitToSwapchain` physical-format capability query; Rust still passes a constructor boolean.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Vulkan host frame-resource ownership only.
+
+### Verification
+- Re-read upstream `vk_present_manager.h` and `vk_present_manager.cpp`.
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime validation still loads MoltenVK, creates the Apple M2 Pro Vulkan device, creates the swapchain, and reaches `Vulkan renderer initialized`; the remaining runtime blocker is AArch32 JIT allocation/availability, not this present-manager frame allocation change.
+
+## 2026-06-21 — video_core/build.rs and video_core/src/host_shaders/spirv_shaders.rs vs video_core/host_shaders/CMakeLists.txt
+
+### Intentional differences
+- Rust `build.rs` now invokes `glslangValidator` to compile the Vulkan present shaders used by `present/filters.cpp` from the upstream tree into SPIR-V words under `OUT_DIR`. Upstream's CMake generates matching `*_spv.h` files the same way with `-V --target-env spirv1.3`.
+- The generated Rust module exposes present shader SPIR-V constants as `&[u32]` instead of C++ header arrays.
+
+### Unintentional differences (to fix)
+- Only the shaders currently needed by `present/filters.cpp` are generated. Upstream generates every non-OpenGL host shader listed in `host_shaders/CMakeLists.txt`.
+- Rust currently reads shaders from the upstream checkout through `ZUYU_DIR`/default `~/Dev/emulators/zuyu`; upstream's generated files are produced from its own source tree during CMake.
+
+### Missing items
+- SPIR-V generation for FSR, SMAA, blit-image, compute, and remaining Vulkan host shaders not yet used by the Rust present filter factories.
+- A repository-local Rust-side host-shader generation path that does not depend on the upstream checkout at build time.
+
+### Binary layout verification
+- Generated SPIR-V word arrays are host shader data only; no guest raw-copied payloads changed.
+
+### Verification
+- Re-read upstream `host_shaders/CMakeLists.txt`.
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- `cargo test -p video_core host_shaders::spirv_shaders::tests::generated_present_shaders_are_spirv_modules`
+
+## 2026-06-21 — video_core/src/renderer_vulkan/present/filters.rs vs video_core/renderer_vulkan/present/filters.cpp
+
+### Intentional differences
+- `MakeNearestNeighbor` and `MakeBilinear` build `VULKAN_PRESENT_FRAG_SPV` with the Rust `build_shader` helper. This matches upstream's use of `BuildShader(device, VULKAN_PRESENT_FRAG_SPV)` for the base present filters.
+- `MakeBicubic` and `MakeGaussian` now build `PRESENT_BICUBIC_FRAG_SPV` and `PRESENT_GAUSSIAN_FRAG_SPV`, matching upstream.
+- `MakeScaleForce` now builds a real ScaleForce fragment shader instead of passing a null shader module.
+- Fixed by later entry: `MakeScaleForce` now selects FP16 when float16 is supported and FP32 otherwise.
+
+### Unintentional differences (to fix)
+- Fixed by later entry: `MakeScaleForce` no longer always selects `VULKAN_PRESENT_SCALEFORCE_FP32_FRAG_SPV`.
+
+### Missing items
+- Fixed by later entry: `Device::is_float16_supported()` is now threaded into ScaleForce selection.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Vulkan host shader-module creation only.
+
+### Verification
+- Re-read upstream `present/filters.cpp`.
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- `cargo test -p video_core host_shaders::spirv_shaders::tests::generated_present_shaders_are_spirv_modules`
+
+## 2026-06-21 — video_core/src/renderer_vulkan/present/window_adapt_pass.rs vs video_core/renderer_vulkan/present/window_adapt_pass.cpp
+
+### Intentional differences
+- `WindowAdaptPass::new` now builds `VULKAN_PRESENT_VERT_SPV` with `build_shader`, matching upstream `WindowAdaptPass::CreateVertexShader`.
+- Rust adds an explicit `Drop` implementation for pipelines, render pass, shader modules, sampler, pipeline layout, and descriptor set layout. Upstream uses wrapper RAII destructors; Rust owns raw `ash` handles.
+- `WindowAdaptPass::draw` now records its render-pass clear, pipeline binds, push constants, descriptor binds, and draw calls through `Scheduler::record`, matching upstream's `scheduler.Record([=](vk::CommandBuffer cmdbuf) { ... })` command ownership.
+
+### Unintentional differences (to fix)
+- The Rust constructor still creates all resources inline instead of preserving upstream helper-method ownership boundaries (`CreateDescriptorSetLayout`, `CreatePipelineLayout`, `CreateVertexShader`, `CreateRenderPass`, `CreatePipelines`).
+- `Draw` still receives precomputed push constants, descriptor sets, and blend modes rather than owning the full upstream flow over `RasterizerVulkan`, `Layer`, `FramebufferConfig`, layout, and destination `Frame`.
+
+### Missing items
+- Split constructor logic into upstream-equivalent helper methods.
+- Full draw path parity, including layer `ConfigureDraw` invocation, descriptor set/layer update behavior, and destination-frame ownership.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Vulkan host pipeline/shader ownership only.
+
+### Verification
+- Re-read upstream `present/window_adapt_pass.cpp`.
+- `cargo check -p video_core`
+- MK8D Vulkan runtime validation still reaches `Vulkan renderer initialized`; the remaining runtime blocker is AArch32 JIT `CantAlloc`.
+
+## 2026-06-21 — video_core/src/renderer_vulkan/blit_screen.rs vs video_core/renderer_vulkan/vk_blit_screen.h/.cpp
+
+### Intentional differences
+- Rust passes the current scaling filter into `draw_to_frame` / `create_framebuffer` instead of owning a `const PresentFilters&` member. This keeps the current Rust call shape while preserving the same branch behavior inside `SetWindowAdaptPass`.
+- `WaitIdle` calls `PresentManager::wait_present` and `vkDeviceWaitIdle`; upstream also calls `scheduler.Finish()`, but Rust's Vulkan scheduler integration is not wired into `BlitScreen` yet.
+- `DrawToFrame` now receives the real `FramebufferConfig` slice and `ruzu_core::frontend::framebuffer_layout::FramebufferLayout`, matching the upstream method's conceptual inputs.
+
+### Unintentional differences (to fix)
+- `DrawToFrame` now creates per-framebuffer `Layer` entries using `layout.screen.GetWidth()/GetHeight()` parity, but still does not call `window_adapt->Draw(...)`; upstream does that before advancing `image_index`.
+- `CreateFramebuffer` still cannot call `WaitIdle` because the current Rust method signature lacks `PresentManager`/scheduler ownership.
+- `BlitScreen::new` still receives only `ash::Device`; upstream owns references to device memory, `Device`, memory allocator, present manager, scheduler, and filters.
+
+### Missing items
+- `PresentFilters` ownership parity.
+- Full `WindowAdaptPass::Draw` invocation with rasterizer, scheduler, framebuffers, layout, and frame.
+- Scheduler finish parity in `WaitIdle`.
+
+### Binary layout verification
+- `FramebufferTextureInfo` remains field-for-field compatible with upstream host-side Vulkan handles and dimensions; no guest raw-copied payloads changed.
+
+### Verification
+- Re-read upstream `vk_blit_screen.h` and `vk_blit_screen.cpp`.
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-21 — video_core/src/renderer_vulkan/present/layer.rs vs video_core/renderer_vulkan/present/layer.h/.cpp
+
+### Intentional differences
+- Rust now uses the crate-level `FramebufferConfig`, `AndroidPixelFormat`, `RectF`, and `ruzu_core::frontend::framebuffer_layout::FramebufferLayout` instead of local duplicate structs. This improves ownership parity with upstream's `Tegra::FramebufferConfig` and `Layout::FramebufferLayout` and allows `BlitScreen::DrawToFrame` to pass real renderer inputs.
+- Pixel-format matching is currently done by raw Android pixel-format values (`Rgba8888=1`, `Rgbx8888=2`, `Rgb565=4`, `Bgra8888=5`) because Rust's `FramebufferConfig` stores `AndroidPixelFormat(u32)` rather than the upstream enum type.
+
+### Unintentional differences (to fix)
+- `Layer::ConfigureDraw` still takes preselected source image/view and dimensions instead of calling `rasterizer.AccelerateDisplay(...)`, `RefreshResources`, `SetAntiAliasPass`, scheduler waits, `UpdateRawImage`, and `NormalizeCrop` internally like upstream.
+- `Layer::new` still lacks memory allocator, scheduler, device memory, and `PresentFilters` ownership, so FSR construction and raw image upload parity are incomplete.
+- `ReleaseRawImages` clears Rust vectors but does not yet destroy Vulkan images/views/buffers through RAII or explicit destroy paths equivalent to upstream wrappers.
+
+### Missing items
+- Real staging buffer creation and upload in `CreateStagingBuffer` / `UpdateRawImage`.
+- Rasterizer accelerated-display path.
+- Scheduler tick/resource wait tracking.
+- FSR creation conditioned on the scaling filter and anti-alias pass selection from `PresentFilters`.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. The change removes local presentation-only duplicate structs and uses the crate's existing framebuffer descriptor type.
+
+### Verification
+- Re-read upstream `present/layer.h` and `present/layer.cpp`.
+- `cargo check -p video_core`
+
+## 2026-06-22 — video_core/src/renderer_vulkan/present/smaa.rs, video_core/src/renderer_vulkan/present/layer.rs, video_core/build.rs, and video_core/src/host_shaders/spirv_shaders.rs vs video_core/renderer_vulkan/present/smaa.h/.cpp and video_core/host_shaders/smaa_*_spv.h
+
+### Intentional differences
+- `Smaa::new` now creates real shader modules from generated SPIR-V for the same six upstream SMAA shaders: edge detection, blending weight calculation, and neighborhood blending vertex/fragment pairs.
+- `Smaa::upload_images` uploads the upstream `areaTexBytes` and `searchTexBytes` data into the static Vulkan images, clears all dynamic images once, calls `Scheduler::finish()`, and sets `images_ready`, matching upstream `SMAA::UploadImages` ordering.
+- `Smaa::draw` now records the same three pass sequence as upstream: edge detection, blending weight calculation, neighborhood blending, then swaps `inout_image`/`inout_image_view` to the output image.
+- `Layer::set_anti_alias_pass` now constructs `Smaa` when `AntiAliasing::Smaa` is selected instead of falling back to `NoAa`, matching upstream `Layer::SetAntiAliasPass`.
+- Rust stores persistent mapped upload buffers inside `Smaa` because `AntiAliasPass::draw` does not currently pass `MemoryAllocator&`. Upstream stores `MemoryAllocator&` and allocates upload staging through `UploadImage` during `UploadImages`.
+- Rust destroys raw Vulkan handles explicitly in `Drop`; upstream relies on `vk::` RAII wrappers.
+
+### Unintentional differences (to fix)
+- `Smaa` still owns a raw `ash::Device` rather than upstream's `const Device&`, so helper calls cannot yet use the full upstream device wrapper.
+- Static texture upload uses a local Rust command helper instead of the upstream shared `UploadImage(m_device, m_allocator, scheduler, ...)` helper because Rust `present/util.rs` does not yet expose that helper.
+- Image layout transitions use the current Rust `util::transition_image_layout` shape with explicit source layout, while upstream's present helper only takes the target layout and uses its own fixed barrier policy.
+
+### Missing items
+- Port a shared `UploadImage` helper in `present/util.rs` if more present passes need the same staging path.
+- Thread upstream-equivalent `Device` and `MemoryAllocator` ownership through present pass construction so `Smaa` no longer needs persistent upload buffers as an ownership adaptation.
+
+### Binary layout verification
+- SMAA static texture byte sizes match upstream expectations: area texture is `160 * 560 * 2 = 179200` bytes in `R8G8_UNORM`, search texture is `64 * 16 = 1024` bytes in `R8_UNORM`.
+- No guest raw-copied ABI payloads changed.
+
+### Verification
+- Re-read upstream `present/smaa.h` and `present/smaa.cpp`.
+- Re-read upstream SMAA shader file list under `video_core/host_shaders`.
+- `cargo fmt --all`
+- `timeout 120s cargo check -p video_core`
+- `timeout 120s cargo test -p video_core host_shaders::spirv_shaders::tests::generated_vulkan_shaders_are_spirv_modules`
+- `timeout 120s cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D runtime was not executed in this pass because the documented NSP paths under `/Users/vricosti/Games/...` and `/home/vricosti/Games/...` do not exist in the current filesystem.
+
+## 2026-06-22 — video_core/src/renderer_vulkan/blit_image.rs, video_core/build.rs, and video_core/src/host_shaders/spirv_shaders.rs vs video_core/renderer_vulkan/blit_image.h/.cpp and video_core/host_shaders/*_spv.h
+
+### Intentional differences
+- `BlitImageHelper::new` now builds real shader modules for the same upstream shader set: `FULL_SCREEN_TRIANGLE_VERT_SPV`, `BLIT_COLOR_FLOAT_FRAG_SPV`, `VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV`, `VULKAN_COLOR_CLEAR_{VERT,FRAG}_SPV`, `VULKAN_DEPTHSTENCIL_CLEAR_FRAG_SPV`, and all depth/color conversion fragment shaders.
+- The one-texture and two-texture pipeline layouts now use vertex-stage push constants for `PushConstants`, matching upstream `PUSH_CONSTANT_RANGE<VK_SHADER_STAGE_VERTEX_BIT, sizeof(PushConstants)>`.
+- Linear and nearest samplers now use upstream's blit sampler policy: nearest mipmap, `CLAMP_TO_BORDER`, opaque-white border, and unnormalized coordinates.
+- `BlitImageHelper` now explicitly destroys cached pipelines, conversion pipelines, shader modules, samplers, pipeline layouts, and descriptor set layouts in `Drop`, replacing upstream `vk::` RAII wrappers.
+- Rust build generation now emits and smoke-tests the upstream blit/conversion SPIR-V modules used by `BlitImageHelper`.
+
+### Unintentional differences (to fix)
+- `BlitImageHelper` still stores raw `ash::Device` only. Upstream stores `const Device&`, `Scheduler&`, `StateTracker&`, and descriptor allocators from `DescriptorPool`.
+- Blit, clear, conversion, and pipeline-cache methods still have stubbed command recording/pipeline creation bodies. This slice only removes null shader modules and constructor-level Vulkan object divergence.
+- Descriptor allocation remains missing because Rust does not yet port upstream `DescriptorPool::Allocator(...)` / `DescriptorAllocator` ownership for this helper.
+
+### Missing items
+- Port `BlitColor`, `BlitDepthStencil`, conversion methods, clear methods, and all `FindOrEmplace*Pipeline` bodies with scheduler recording and descriptor updates.
+- Thread upstream-equivalent `Scheduler`, `StateTracker`, and `DescriptorPool` ownership into `BlitImageHelper`.
+
+### Binary layout verification
+- `PushConstants` remains `#[repr(C)]` with two `[f32; 2]` arrays, matching upstream field order and size.
+- No guest raw-copied payloads changed. Generated shader slices are host SPIR-V modules.
+
+### Verification
+- Re-read upstream `renderer_vulkan/blit_image.h` and `renderer_vulkan/blit_image.cpp`.
+- Re-read upstream blit/conversion shader file list under `video_core/host_shaders`.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p video_core host_shaders::spirv_shaders::tests::generated_vulkan_shaders_are_spirv_modules`
+- `timeout 120s cargo check -p video_core`
+- `timeout 120s cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-21 — video_core/src/vulkan_common/vulkan_device.rs vs video_core/vulkan_common/vulkan_device.cpp
+
+### Intentional differences
+- Device creation now enables `VK_KHR_swapchain` and `VK_KHR_portability_subset` when advertised. This is the minimal Rust-side subset needed for WSI/MoltenVK startup while the full upstream extension and feature-chain selection is still being ported.
+
+### Unintentional differences (to fix)
+- The full upstream `Device::Device` feature/property/extension chain is still not ported. Rust still creates a minimal logical device instead of upstream's large feature negotiation path.
+
+### Missing items
+- Surface-support-aware queue family selection.
+- Full `VkPhysicalDeviceFeatures2` / pNext chain construction.
+- Complete extension enablement and capability reporting.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Vulkan host capability bookkeeping only.
+
+### Verification
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-21 — video_core/src/vulkan_common/vulkan_library.rs vs video_core/vulkan_common/vulkan_library.cpp
+
+### Intentional differences
+- Rust now mirrors upstream macOS lookup order for `LIBVULKAN_PATH` and app-bundle `Contents/Frameworks/libvulkan.1.dylib` / `libMoltenVK.dylib`, but returns an `ash::Entry` instead of upstream's `Common::DynamicLibrary` wrapper.
+- Rust adds non-bundled development fallbacks for Homebrew, Xcode DerivedData MoltenVK builds, and Android SDK MoltenVK. This is a macOS CLI development adaptation; upstream assumes packaged bundle paths or an explicit `LIBVULKAN_PATH`.
+- Android-specific frontend-provided driver-library ownership is not represented because ruzu's current Rust frontend path does not pass a `GraphicsContext` into `OpenLibrary`.
+
+### Unintentional differences (to fix)
+- The Rust fallback still uses `ash::Entry::load()` as a final platform-default loader, while upstream non-Apple explicitly tries versioned `libvulkan.so.1` then unversioned `libvulkan.so`.
+
+### Missing items
+- Exact Android `context->GetDriverLibrary()` equivalent.
+- Shared filesystem helper equivalent to upstream `Common::FS::GetBundleDirectory()`.
+
+### Binary layout verification
+- Not applicable; dynamic library selection only.
+
+### Verification
+- Re-read upstream `vulkan_library.h` and `vulkan_library.cpp`.
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- `cargo test -p video_core vulkan_library::tests::test_open_library_does_not_panic -- --nocapture`
+- MK8D Vulkan run loads MoltenVK, exposes `VK_EXT_metal_surface`, creates the Apple M2 Pro Vulkan device, and reaches `Vulkan renderer initialized`. The run was stopped after validation; the remaining observed failure is unrelated AArch32 JIT code-buffer allocation (`CantAlloc`).
+
+## 2026-06-21 — video_core/src/vulkan_common/vulkan_memory_allocator.rs vs video_core/vulkan_common/vulkan_memory_allocator.h/.cpp
+
+### Intentional differences
+- `MemoryUsage`, `AllocationChunkSize`, `MemoryCommit`, `MemoryAllocation`, `Commit`, `TryAllocMemory`, `TryCommit`, `MemoryPropertyFlags`, and `FindType` preserve upstream ownership and control-flow shape in the Rust counterpart.
+- `CreateImage` and `CreateBuffer` now create, allocate, bind, and keep alive Vulkan resources through `MemoryAllocator`, matching upstream call ownership for presentation helpers.
+- Rust currently implements the upstream VMA `CreateImage` / `CreateBuffer` path with one dedicated `vkAllocateMemory` allocation per image or buffer and an internal resource list. This is a temporary backend adaptation because the C++ `vk::Image` / `vk::Buffer` VMA RAII wrappers are not ported.
+- `Drop` explicitly destroys tracked dedicated images/buffers and frees memory before freeing suballocation chunks. Upstream relies on wrapper RAII and VMA allocation ownership.
+
+### Unintentional differences (to fix)
+- Upstream `CreateImage` and `CreateBuffer` use VMA (`vmaCreateImage`, `vmaCreateBuffer`) with budget flags, preferred memory flags, mapped upload/download allocations, and coherent flush/invalidate behavior. Rust does not yet have that VMA-backed wrapper behavior.
+- `CreateBuffer` returns only `vk::Buffer`; upstream returns a wrapper carrying mapped data and coherency state, so Rust cannot yet implement upstream `Mapped()`, `Flush()`, and `Invalidate()` semantics on the buffer object.
+- `FindType` currently also applies `valid_memory_types`; upstream applies that mask through the VMA buffer path for non-stream buffers, while raw `FindType` checks only memory properties and type mask.
+- Dedicated resource destruction is allocator-wide instead of per-resource RAII, so lifetime granularity is less faithful than upstream wrappers.
+
+### Missing items
+- VMA-backed `vk::Image` / `vk::Buffer` wrapper equivalents.
+- Buffer mapped-data/coherency support used by upstream upload/download paths.
+- Per-resource RAII ownership matching `vulkan_wrapper.h`.
+- Exact `valid_memory_types` placement parity between VMA buffer allocation and raw commit allocation.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This is host Vulkan memory ownership only.
+
+### Verification
+- Re-read upstream `vulkan_memory_allocator.h` and `vulkan_memory_allocator.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-22 — video_core/src/renderer_vulkan/renderer_vulkan.rs and video_core/src/renderer_vulkan/blit_screen.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp and video_core/renderer_vulkan/vk_blit_screen.h/.cpp
+
+### Intentional differences
+- `RendererVulkan` now owns `blit_swapchain`, `blit_capture`, and `blit_applet`, matching the upstream constructor's three `BlitScreen` instances.
+- The local incomplete `renderer_vulkan.rs` `Frame` duplicate was removed. `RendererVulkan::applet_frame` now uses `present_manager::Frame`, the same conceptual owner as upstream `vk_present_manager.h`.
+- `BlitScreen::draw_to_frame` now targets an explicit `BlitFrame` view containing the upstream-used `Frame*` fields (`width`, `height`, `framebuffer`) so applet/capture rendering is not tied to a `PresentManager` frame index.
+- `BlitScreen::draw_to_present_frame` preserves the present-manager-specific frame recreation path for swapchain frames, while the generic `draw_to_frame` can draw to applet/capture frames like upstream.
+- `RenderAppletCaptureLayer` now lazily creates the applet image, image view, and framebuffer, then draws through `blit_applet` with the 1280x720 capture layout and `CaptureFormat`.
+- `RendererVulkan::drop` destroys the applet framebuffer and image view explicitly before allocator/device teardown. Upstream relies on RAII wrappers; Rust currently stores raw Vulkan handles in `Frame`.
+
+### Unintentional differences (to fix)
+- `BlitScreen` still does not own `device_memory`, `memory_allocator`, `present_manager`, `scheduler`, or `filters` like upstream; they are passed per call to avoid a broader lifetime refactor.
+- `BlitFrame` is a Rust adaptation for borrowing only the upstream-used `Frame*` fields. It should disappear if/when `BlitScreen` owns the same references as upstream and can accept `&mut Frame` directly without borrow conflicts.
+- `RenderToBuffer`, `RenderScreenshot`, and `GetAppletCaptureBuffer` remain incomplete, so `blit_capture` is structurally present but not yet behaviorally exercised.
+- `RenderAppletCaptureLayer` uses the display scaling filter for now. Upstream uses `PresentFiltersForAppletCapture`, whose independent filter object has not yet been ported.
+- Applet image memory is owned indirectly by the dedicated-allocation list in `MemoryAllocator`; upstream uses wrapped RAII image objects attached to `Frame`.
+
+### Missing items
+- Port `PresentFiltersForDisplay` and `PresentFiltersForAppletCapture` ownership into `BlitScreen`.
+- Port `RenderToBuffer`, `RenderScreenshot`, and `GetAppletCaptureBuffer`, including `DownloadColorImage`, mapped download buffers, invalidation, and capture swizzle.
+- Move `BlitScreen` constructor ownership toward upstream once the Rust lifetime model can represent the same references cleanly.
+- Pass `RasterizerVulkan` through `DrawToFrame` and restore the accelerated display path.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Capture layout constants continue to match `video_core/capture.h` (`1280x720`, `B8G8R8A8`, tiled-size helpers unchanged).
+
+### Verification
+- Re-read upstream `renderer_vulkan.cpp` and `vk_blit_screen.h/.cpp` after implementation.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime with `timeout 30s`: MoltenVK loads, a 2560x1440 swapchain is created, and `Vulkan renderer initialized` is reached. No new Vulkan panic/validation failure appeared. The run still stops at the known native macOS ARM64 CPU blocker: `rdynarmic x64 backend is not executable on host architecture aarch64`, followed by `JIT not available` and repeated `SF_COMPOSE ... NO_LAYERS`.
+
+## 2026-06-21 — video_core/src/renderer_vulkan/present/util.rs vs video_core/renderer_vulkan/present/util.h/.cpp
+
+### Intentional differences
+- `CreateWrappedBuffer` is now present in the Rust counterpart and delegates to `MemoryAllocator::create_buffer` with `TRANSFER_SRC | TRANSFER_DST`, matching upstream ownership and usage flags.
+- `CreateWrappedImage` now delegates to `MemoryAllocator::create_image` instead of creating a raw unbound image through `ash::Device`, matching upstream's allocator-owned presentation image path.
+- Rust still passes `ash::Device` into several helper functions because the full upstream `Device` wrapper is not yet threaded through all present modules.
+
+### Unintentional differences (to fix)
+- `UploadImage` is still missing from Rust `present/util.rs`; upstream creates an upload buffer through `MemoryAllocator`, copies initial contents into mapped memory, records layout transitions and copy through `Scheduler`, then finishes.
+- `CreateWrappedImage` keeps an unused `_device` parameter for current call-site compatibility. Upstream takes only `MemoryAllocator&`.
+- Helper return types are raw `ash` handles rather than upstream RAII wrappers, so destruction and mapped-buffer behavior must be handled outside the helper.
+
+### Missing items
+- `UploadImage`.
+- RAII wrapper return types or equivalent ownership handles.
+- Exact function signatures using the upstream `Device`, `MemoryAllocator`, and `Scheduler` ownership model.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Presentation helper resources are host Vulkan objects.
+
+### Verification
+- Re-read upstream `present/util.h` and `present/util.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-21 — video_core/src/renderer_vulkan/scheduler.rs vs video_core/renderer_vulkan/vk_scheduler.h/.cpp
+
+### Intentional differences
+- Added `flush_with_signal`, preserving upstream call ownership for `scheduler.Flush(*frame->render_ready)` in `RendererVulkan::Composite`.
+- The Rust scheduler still implements a simplified boxed-closure command chunk instead of upstream's placement-new command arena, but the new signal-semaphore path submits the render/upload command buffers with `VkSubmitInfo::pSignalSemaphores`.
+
+### Unintentional differences (to fix)
+- `flush_with_signal` does not yet mirror upstream worker-thread wait/on-submit callback behavior.
+- Command pool ownership is still raw `ash` ownership and the scheduler does not destroy the command pool it was given.
+- The simplified scheduler submits upload and render command buffers together; upstream has a richer render-pass/outside-render-pass operation context model.
+
+### Missing items
+- Full `Flush(vk::Semaphore)` parity, including worker synchronization and registered submit callbacks.
+- Upstream command chunk allocator structure.
+- Proper command-pool RAII ownership.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Vulkan submission path only.
+
+### Verification
+- Re-read upstream `vk_scheduler.h`/`.cpp` usage from `renderer_vulkan.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-21 — video_core/src/renderer_vulkan/present_manager.rs vs video_core/renderer_vulkan/vk_present_manager.h/.cpp
+
+### Intentional differences
+- Added `get_render_frame_index` as a Rust ownership helper for upstream `GetRenderFrame() -> Frame*`; it preserves the selected frame identity without holding a mutable borrow across draw, flush, copy, and present.
+- Added `recreate_frame_by_index`, `frame`, `frame_mut`, and `release_frame` so the top-level renderer can follow upstream's `GetRenderFrame -> DrawToFrame -> Flush -> Present` ordering without unsafe aliasing.
+
+### Unintentional differences (to fix)
+- Rust's direct present path is still split across `RendererVulkan::Composite`, `PresentManager::copy_to_swapchain_impl`, and `Swapchain::present`; upstream keeps the direct non-threaded path inside `PresentManager::Present`.
+- `PresentManager::Present(frame)` parity is incomplete: it currently only releases frames in the non-threaded path and does not own swapchain acquisition/copy/present.
+- `RecreateFrame` still allocates frame images with direct `vkAllocateMemory` instead of upstream `MemoryAllocator::CreateImage`.
+
+### Missing items
+- Full `Present(Frame*)` ownership over `scheduler.WaitWorker`, `CopyToSwapchain`, and free-queue release.
+- Present-thread path parity.
+- Swapchain recreation handling inside `CopyToSwapchain`.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Host presentation frame ownership only.
+
+### Verification
+- Re-read upstream `vk_present_manager.h` and `vk_present_manager.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-21 — video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp
+
+### Intentional differences
+- `RendererVulkan` now owns a presentation `Scheduler`, moving closer to upstream top-level ownership (`memory_allocator`, `state_tracker`, `scheduler`, `swapchain`, `present_manager`, `blit_swapchain`, rasterizer).
+- `Composite` now follows the critical upstream presentation ordering: get a render frame, draw through `BlitScreen::DrawToFrame`, flush the scheduler with `frame.render_ready`, copy to the current swapchain image, present, and release the frame.
+- `current_scaling_filter` maps the crate-level `present::get_scaling_filter` into Vulkan `BlitScreen::ScalingFilter`, preserving upstream filter selection intent.
+
+### Unintentional differences (to fix)
+- `Composite` uses a layout derived from the swapchain extent because Rust `RendererVulkan` still does not own or reference `EmuWindow`; upstream calls `render_window.GetFramebufferLayout()`.
+- Swapchain acquire/copy/present is temporarily orchestrated in `RendererVulkan::Composite`; upstream delegates this to `PresentManager::Present` / `CopyToSwapchain`.
+- `RenderAppletCaptureLayer`, screenshot readback, `gpu.RendererFrameEndNotify`, and `rasterizer.TickFrame` are still incomplete.
+- The presentation scheduler is separate from the rasterizer's internal scheduler; upstream has one renderer scheduler shared by blit and rasterizer paths.
+
+### Missing items
+- `EmuWindow` layout ownership/reference.
+- Shared scheduler/state tracker/memory allocator ownership matching upstream constructor fields.
+- Full applet capture, screenshot, frame-end notify, and rasterizer frame tick.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Renderer ownership and presentation control flow only.
+
+### Verification
+- Re-read upstream `renderer_vulkan.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-22 — video_core/src/renderer_vulkan/present/fxaa.rs and anti_alias_pass.rs vs video_core/renderer_vulkan/present/fxaa.h/.cpp and anti_alias_pass.h
+
+### Intentional differences
+- `AntiAliasPass::draw` now receives `&mut Scheduler`, matching upstream `AntiAliasPass::Draw(Scheduler&, ...)`.
+- `FXAA` now builds real `FXAA_VERT_SPV` and `FXAA_FRAG_SPV` shader modules generated from upstream `video_core/host_shaders/fxaa.vert` and `fxaa.frag`.
+- `FXAA::Draw` now records the upstream command sequence through the Rust scheduler: outside-render-pass request, image layout transitions, render pass begin, pipeline/descriptor binding, `Draw(3, 1, 0, 0)`, render pass end, and output image/view swap.
+- `Layer::SetAntiAliasPass` now scales the FXAA render area through `common::settings::values().resolution_info.scale_up_u32`, matching upstream `Settings::values.resolution_info.ScaleUp(raw_width/raw_height)`.
+- Added explicit Vulkan handle destruction in `Drop` because Rust does not use upstream `vk::` RAII wrappers.
+
+### Unintentional differences (to fix)
+- Rust `FXAA::UploadImages` calls `scheduler.finish()` after recording clears, matching upstream behavior, but still relies on the simplified Rust scheduler/fence model rather than upstream `MasterSemaphore` and command chunk implementation.
+
+### Missing items
+- SMAA remains disabled from `Layer::SetAntiAliasPass`; Rust `smaa.rs` still has placeholder shader modules/static texture upload and is not safe to activate.
+- Full upstream AA resource ownership is still split because Rust `Layer` receives `MemoryAllocator` per call instead of storing `MemoryAllocator&`, `Scheduler&`, and `device_memory&` as constructor-owned references.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This slice only changes host Vulkan shader generation, command recording, and handle lifecycle.
+
+### Verification
+- Re-read upstream `present/anti_alias_pass.h`, `present/fxaa.h`, `present/fxaa.cpp`, `present/layer.h`, and `present/layer.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- `cargo test -p video_core host_shaders::spirv_shaders::tests::generated_present_shaders_are_spirv_modules`
+- MK8D Vulkan runtime with `timeout 30s`: MoltenVK loads, the swapchain is created, and `Vulkan renderer initialized` is reached. The run still stops at the known native macOS ARM64 CPU blocker: `rdynarmic x64 backend is not executable on host architecture aarch64`, followed by `JIT not available` and `SF_COMPOSE ... NO_LAYERS`.
+
+## 2026-06-22 — video_core/build.rs and video_core/src/host_shaders/spirv_shaders.rs vs video_core/host_shaders/fxaa_*_spv.h generation
+
+### Intentional differences
+- Rust build script now generates `FXAA_VERT_SPV` and `FXAA_FRAG_SPV` from upstream GLSL alongside the existing Vulkan present shader modules.
+- The generated Rust module remains in `OUT_DIR` and is included through `host_shaders::spirv_shaders`, replacing upstream generated `*_spv.h` headers with Rust constants.
+
+### Unintentional differences (to fix)
+- Rust generation is centralized in `video_core/build.rs`; upstream shader SPIR-V generation is CMake-owned. This is a build-system adaptation, not renderer ownership parity.
+
+### Missing items
+- SMAA SPIR-V constants and static area/search texture generation are still missing.
+
+### Binary layout verification
+- SPIR-V constants are host shader bytecode, not guest ABI payloads. The generated word arrays are checked for word alignment and SPIR-V magic in module tests.
+
+### Verification
+- Re-read upstream `video_core/host_shaders/fxaa.vert`, `video_core/host_shaders/fxaa.frag`, and upstream `present/fxaa.cpp` includes for `fxaa_vert_spv.h` / `fxaa_frag_spv.h`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- `cargo test -p video_core host_shaders::spirv_shaders::tests::generated_present_shaders_are_spirv_modules`
+
+## 2026-06-22 — video_core/src/renderer_vulkan/renderer_vulkan.rs, video_core/src/vulkan_common/vulkan_memory_allocator.rs, video_core/src/renderer_base.rs, and video_core/src/gpu.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp
+
+### Intentional differences
+- `RendererVulkan::RenderToBuffer` now follows the upstream flow: create a temporary `Frame`, create a wrapped image/image view/framebuffer through `blit_capture`, draw the supplied framebuffers, record `DownloadColorImage`, finish the scheduler, invalidate the download buffer, and return a mapped download buffer.
+- `RendererVulkan::RenderScreenshot` now checks `renderer_settings.screenshot_requested`, renders the current framebuffers into a `B8G8R8A8_UNORM` download buffer, copies the mapped data into `screenshot_bits`, invokes the completion callback with `false`, and clears the request flag, matching upstream ordering.
+- `RendererVulkan::GetAppletCaptureBuffer` now performs the upstream mutable scheduler readback from `applet_frame.image`, invalidates the download buffer, and swizzles linear pixels into the tiled capture buffer with `Tegra::Texture::SwizzleTexture` semantics.
+- `MappedBuffer` now exposes immutable `mapped_slice()` and `invalidate()`, matching the upstream VMA wrapper's `Mapped()`/`Invalidate()` readback API.
+- `RendererBase::get_applet_capture_buffer` now takes `&mut self`. Upstream `GetAppletCaptureBuffer` mutates scheduler state; the Rust `Gpu` sync operation already runs on the GPU thread and now locks the renderer mutably before readback.
+- Temporary frame image views and framebuffers are explicitly destroyed after `RenderToBuffer` finishes. Upstream RAII wrappers handle this automatically; Rust currently stores raw Vulkan handles for this path.
+
+### Unintentional differences (to fix)
+- Temporary `Frame::image` memory is still owned indirectly by `MemoryAllocator`'s dedicated allocation list rather than by an upstream-equivalent RAII image wrapper attached to the temporary frame.
+- `RenderScreenshot` constructs a full-screen `FramebufferLayout` from the simplified renderer-base screenshot layout. Upstream stores the complete frontend `Layout::FramebufferLayout`.
+- `GetAppletCaptureBuffer` can only return real data after `RenderAppletCaptureLayer` has created and populated `applet_frame.image`; native macOS ARM64 MK8D runtime still cannot reach real application layers because the AArch32 CPU backend is unavailable.
+- `RendererBase` signature changed to `&mut self` for correctness, but OpenGL/Null implementations still return their existing stub/zero behavior.
+
+### Missing items
+- Replace raw temporary `Frame` handle management with upstream-equivalent Vulkan RAII wrappers once allocator/resource wrappers are ported.
+- Carry the complete screenshot `FramebufferLayout` through renderer-base settings instead of the simplified width/height struct.
+- Add a focused test or harness for capture swizzle/readback once a non-CPU-blocked Vulkan path can produce a populated applet frame.
+
+### Binary layout verification
+- Capture output size and swizzle constants continue to come from `video_core/src/capture.rs`, matching `video_core/capture.h`: `LinearWidth=1280`, `LinearHeight=720`, `BytesPerPixel=4`, `BlockHeight=4`, `BlockDepth=0`, and `TiledSize`.
+- Screenshot copying is raw host memory copy into caller-provided `screenshot_bits`, matching upstream `std::memcpy`.
+
+### Verification
+- Re-read upstream `renderer_vulkan.cpp` methods `RenderToBuffer`, `RenderScreenshot`, `GetAppletCaptureBuffer`, and `RenderAppletCaptureLayer`.
+- Re-read upstream `present/util.cpp` `DownloadColorImage` and the Rust `present/util.rs` equivalent.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime with `timeout 30s`: MoltenVK loads, the 2560x1440 swapchain is created, and `Vulkan renderer initialized` is reached. No new Vulkan panic or validation failure appeared. Runtime still stops at the known native macOS ARM64 CPU blocker: `rdynarmic x64 backend is not executable on host architecture aarch64`, then `JIT not available` and repeated `SF_COMPOSE ... NO_LAYERS`.
+
+## 2026-06-22 — video_core/src/renderer_vulkan/blit_screen.rs, video_core/src/renderer_vulkan/renderer_vulkan.rs, and video_core/src/renderer_vulkan/present/layer.rs vs video_core/renderer_vulkan/vk_blit_screen.h/.cpp and video_core/renderer_vulkan/present/layer.h/.cpp
+
+### Intentional differences
+- `BlitScreen` now owns a `PresentFilters` reference, matching upstream's constructor field `const PresentFilters& filters`.
+- `RendererVulkan` now constructs `blit_swapchain` and `blit_capture` with `PRESENT_FILTERS_FOR_DISPLAY`, and `blit_applet` with `PRESENT_FILTERS_FOR_APPLET_CAPTURE`, matching upstream constructor ownership.
+- `BlitScreen::DrawToFrame`, `DrawToPresentFrame`, and `CreateFramebuffer` no longer receive a scaling filter argument. They read `filters.get_scaling_filter()` internally before recreating `WindowAdaptPass`, matching upstream `BlitScreen::SetWindowAdaptPass`.
+- `Layer` now receives the same `PresentFilters` reference and reads `filters.get_anti_aliasing()` when setting its anti-alias pass, matching upstream ownership direction.
+- Applet capture now uses the applet-capture filter object, so its scaling filter is the fixed bilinear applet-capture filter rather than the current display scaling setting.
+
+### Unintentional differences (to fix)
+- `Layer::SetAntiAliasPass` still falls back to `NoAa` even when FXAA or SMAA is requested because the Rust FXAA/SMAA passes are not fully wired with scheduler/allocator ownership yet. It records the requested setting to avoid repeatedly recreating resources.
+- `BlitScreen` still receives `MemoryAllocator`, `PresentManager`, `Scheduler`, and `device_memory` per call instead of owning references exactly like upstream. This slice only fixes filter ownership.
+- `WindowAdaptPass::Draw` still receives precomputed vectors from `BlitScreen`; upstream owns the layer configure loop inside `WindowAdaptPass::Draw`.
+
+### Missing items
+- Wire `Fxaa` and `Smaa` anti-alias passes through `Layer::SetAntiAliasPass` with upstream-equivalent constructor ownership.
+- Move remaining `BlitScreen` dependencies into constructor ownership shape: `device_memory`, `memory_allocator`, `present_manager`, and `scheduler`.
+- Restore `RasterizerVulkan&` in `DrawToFrame` and the accelerated display path.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This slice changes presentation filter ownership and Vulkan resource selection only.
+
+### Verification
+- Re-read upstream `vk_blit_screen.h/.cpp` and `present/layer.h/.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime with `timeout 30s`: MoltenVK loads, the 2560x1440 swapchain is created, and `Vulkan renderer initialized` is reached. No new Vulkan panic or validation failure appeared. Runtime still stops at the known native macOS ARM64 CPU blocker: `rdynarmic x64 backend is not executable on host architecture aarch64`, then `JIT not available` and repeated `SF_COMPOSE ... NO_LAYERS`.
+
+## 2026-06-22 — video_core/src/renderer_vulkan/blit_screen.rs vs video_core/renderer_vulkan/vk_blit_screen.h/.cpp
+
+### Intentional differences
+- `BlitScreen::wait_idle` now preserves upstream wait ordering for the `DrawToFrame` resource-update path: present wait, scheduler finish, then logical-device idle.
+- Rust passes `Scheduler` and `PresentManager` into `draw_to_frame`/`wait_idle` instead of storing references in `BlitScreen`; this keeps the current Rust ownership shape while matching the upstream call order.
+- `BlitScreen::create_framebuffer` now also receives `Scheduler` and `PresentManager` and calls the same `wait_idle` before `set_window_adapt_pass` when the filter/format/window-adapt state changes. This matches upstream `BlitScreen::CreateFramebuffer` ordering.
+
+### Unintentional differences (to fix)
+- Upstream `BlitScreen` owns references to `PresentManager` and `Scheduler`, so `CreateFramebuffer` is a no-extra-argument method. Rust still passes those references through the method call because `BlitScreen` constructor ownership is not yet in upstream shape.
+- Rust currently has no external caller for `BlitScreen::create_framebuffer`. Upstream calls it from `RendererVulkan::RenderToBuffer` and `RendererVulkan::RenderAppletCaptureLayer`; Rust still stubs those paths and only owns `blit_swapchain`, not separate `blit_capture` and `blit_applet`.
+- Rust still passes `MemoryAllocator`, scheduler, present manager, device memory, and scaling filter per call instead of storing the same constructor-owned references/settings wrapper as upstream.
+
+### Missing items
+- Move `PresentManager`, `Scheduler`, `MemoryAllocator`, device memory, and filters into `BlitScreen` ownership/reference shape so both `DrawToFrame` and `CreateFramebuffer` can call a no-argument `wait_idle`.
+- Add `blit_capture` and `blit_applet` owners to `RendererVulkan`, then port `RenderToBuffer`, `RenderScreenshot`, and `RenderAppletCaptureLayer` so `BlitScreen::create_framebuffer` is exercised by the same owners as upstream.
+- Decouple `BlitScreen::DrawToFrame` from `PresentManager` frame indices so it can draw to arbitrary `Frame` objects like upstream.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This slice only changes Vulkan synchronization ordering.
+
+### Verification
+- Re-read upstream `vk_blit_screen.h` and `vk_blit_screen.cpp`.
+- Re-read upstream `renderer_vulkan.cpp` capture/applet paths that call `BlitScreen::CreateFramebuffer`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime validation: MoltenVK loads, the 2560x1440 swapchain is created, and `Vulkan renderer initialized` is reached. The remaining blocker is `rdynarmic x64 backend is not executable on host architecture aarch64`, followed by `JIT not available` and repeated `SF_COMPOSE ... NO_LAYERS`, so this synchronization slice does not yet exercise real layer drawing.
+
+## 2026-06-22 — video_core/src/renderer_vulkan/present_manager.rs and renderer_vulkan.rs vs video_core/renderer_vulkan/vk_present_manager.h/.cpp and renderer_vulkan.cpp
+
+### Intentional differences
+- `PresentManager::present(...)` now owns the direct presentation sequence for the non-present-thread path: acquire swapchain image, copy/blit the render frame to the swapchain image, queue present, then return the frame to `free_queue`. This matches upstream `PresentManager::Present(frame)` owning `CopyToSwapchain(frame)` and frame release, while Rust passes `Swapchain` and `graphics_queue` explicitly because `PresentManager` does not yet store borrowed subsystem references.
+- `RendererVulkan::Composite` now stops manually orchestrating `AcquireNextImage`, `CopyToSwapchainImpl`, `swapchain.Present`, and `release_frame`; after `scheduler.flush_with_signal(render_ready)` it delegates to `present_manager.present(...)`, matching upstream's `present_manager.Present(frame)` ownership boundary.
+
+### Unintentional differences (to fix)
+- Upstream direct mode calls `scheduler.WaitWorker()` before `CopyToSwapchain(frame)`. Rust has no worker-thread scheduler yet; `RendererVulkan` currently flushes synchronously with `render_ready`, and the missing worker wait remains part of scheduler parity.
+- `PresentManager::CopyToSwapchain` is still a reduced subset: it does not recreate the surface on `VK_ERROR_SURFACE_LOST_KHR`, and it does not loop/recreate the swapchain on suboptimal/outdated acquisition like upstream `while (swapchain.AcquireNextImage()) { RecreateSwapchain(frame); }`.
+- `PresentManager` still does not own references to `Scheduler`, `Swapchain`, `MemoryAllocator`, `Surface`, and `EmuWindow` in its constructor shape. Rust passes `Swapchain` and queue per call as a lifetime adaptation.
+- Async present-thread mode remains queued-only and is not backed by an actual present thread.
+
+### Missing items
+- Full `PresentThread` parity, including `queue_mutex`, `free_mutex`, `swapchain_mutex` ordering, stop token handling, and `WaitPresent`.
+- Full `RecreateSwapchain(frame)` and surface recreation ownership in `PresentManager`.
+- Scheduler worker-thread/MasterSemaphore parity so direct-mode `WaitWorker` can be ported literally.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This slice only moves Vulkan present orchestration between Rust owners.
+
+### Verification
+- Re-read upstream `vk_present_manager.h`, `vk_present_manager.cpp`, and `renderer_vulkan.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime was stopped by `timeout 45s`; backend `vulkan`, swapchain creation, and renderer initialization were logged without panic/Vulkan initialization failure. The compositor still reported repeated `SF_COMPOSE ... NO_LAYERS`, so the present path was not exercised with real queued layers.
+
+## 2026-06-22 — video_core/src/renderer_vulkan/present_manager.rs and swapchain.rs vs video_core/renderer_vulkan/vk_present_manager.cpp and vk_swapchain.h/.cpp
+
+### Intentional differences
+- `PresentManager::copy_to_swapchain(...)` now checks `swapchain.needs_recreation()` and frame/swapchain size mismatch before acquiring an image, then recreates the current swapchain through `Swapchain::recreate(width, height)`, matching upstream `CopyToSwapchainImpl`'s pre-acquire `RecreateSwapchain(frame)` path.
+- The Rust acquire loop now recreates the swapchain while `Swapchain::acquire_next_image()` reports stale/suboptimal state, matching upstream `while (swapchain.AcquireNextImage()) { RecreateSwapchain(frame); }`.
+- `Swapchain::recreate(width, height)` is a narrow Rust helper over existing `Swapchain::create(self.surface, width, height)`. Upstream callers pass `*surface` from `PresentManager`; Rust keeps the surface handle private inside `Swapchain` until `PresentManager` owns the upstream surface reference shape.
+- Rust caps repeated stale acquisition at 8 recreations and logs a warning. Upstream loops unbounded; the cap avoids a host-side infinite loop while the Rust port still lacks full minimized/surface-lost window handling.
+
+### Unintentional differences (to fix)
+- Surface-lost recovery is still incomplete. Upstream `CopyToSwapchain(frame)` catches `VK_ERROR_SURFACE_LOST_KHR`, recreates the surface from `render_window.GetWindowInfo()`, then recreates the swapchain; Rust still panics/logs inside `Swapchain` on surface-lost paths.
+- `PresentManager::RecreateSwapchain` is still represented as a helper taking `&mut Swapchain` rather than a method over stored `swapchain` and `surface` references.
+- `SetImageCount` updates the capped image count, but Rust does not resize/reallocate present frames after swapchain image-count changes; this matches the current reduced owner but not full upstream robustness.
+
+### Missing items
+- Full surface-lost recreation path using the renderer window info.
+- Literal `PresentManager` ownership of `Swapchain`, `surface`, `Scheduler`, and `EmuWindow` references.
+- Present frame pool resize/rebuild if swapchain image count changes beyond the initially allocated frame count.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Vulkan host swapchain/present orchestration only.
+
+### Verification
+- Re-read upstream `vk_present_manager.cpp`, `vk_swapchain.h`, and `vk_swapchain.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime was stopped by `timeout 45s`; backend `vulkan`, swapchain creation, and renderer initialization were logged. No swapchain-recreation warning/error was observed, and the compositor remained at `SF_COMPOSE ... NO_LAYERS`, so the recreated present path still awaits real queued layers.
+
+## 2026-06-22 — video_core/src/renderer_vulkan/renderer_vulkan.rs and vulkan_common/vulkan_device.rs vs video_core/renderer_vulkan/vk_present_manager.cpp and vulkan_common/vulkan_device.h/.cpp
+
+### Intentional differences
+- Ported upstream `CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageViewFormat())` into `renderer_vulkan.rs` as `can_blit_to_swapchain(&Device, vk::Format)`, using `Device::format_properties(format).optimal_tiling_features.contains(BLIT_DST)`.
+- `RendererVulkan::new` now passes the queried `blit_supported` value into `PresentManager::new` instead of hardcoding `true`, so `PresentManager::CopyToSwapchainImpl` chooses `cmd_blit_image` vs `cmd_copy_image` from actual format support like upstream.
+- Added `Device::format_properties(format)` as a narrow public accessor over the existing file-owned physical format-property query. Upstream exposes this through the physical-device wrapper and stores broader `Device::format_properties`; Rust keeps the query in `vulkan_device.rs`.
+
+### Unintentional differences (to fix)
+- Rust `Device::format_properties` does not populate or mutate the `format_properties` cache yet because the current `Device` methods take `&self` and the cache is a plain `HashMap`, not interior-mutable.
+- Upstream computes `blit_supported` inside `PresentManager` construction using stored `Device&`/`Swapchain&`; Rust computes it in `RendererVulkan::new` because `PresentManager` still does not own upstream-style subsystem references.
+
+### Missing items
+- Full upstream `Device` format-properties map initialization and overridden BCN format handling.
+- Move `CanBlitToSwapchain` ownership into `PresentManager::new` once constructor reference ownership matches upstream.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Host Vulkan format capability selection only.
+
+### Verification
+- Re-read upstream `vk_present_manager.cpp` and `vulkan_device.h/.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime was stopped by `timeout 45s`; backend `vulkan`, swapchain creation, and renderer initialization were logged with no Vulkan initialization regression. The compositor still reported `SF_COMPOSE ... NO_LAYERS`, so the blit/copy branch was not exercised by queued layers.
+
+## 2026-06-21 — video_core/src/renderer_vulkan/scheduler.rs vs video_core/renderer_vulkan/vk_scheduler.h/.cpp
+
+### Intentional differences
+- `flush_impl` now allocates and begins a fresh render/upload command-buffer context after submission, matching upstream `Scheduler::Flush -> AllocateNewContext`. This prevents later frames from recording into command buffers already ended by the previous submit.
+- Added `pending_tick()` and a conservative `wait(tick)` subset so presentation resources can follow upstream tick-guarded reuse. Rust currently waits on the scheduler fence rather than the full upstream timeline semaphore/worker-thread model.
+- The scheduler fence is created signaled so the first submit can safely wait/reset it before queue submission.
+- `Drop` now destroys the command pool owned by the scheduler wrapper.
+
+### Unintentional differences (to fix)
+- Upstream dispatches work to a worker thread and synchronizes through `MasterSemaphore`; Rust remains a synchronous/fence-backed scheduler.
+- `wait(tick)` cannot distinguish arbitrary historical timeline ticks yet; it conservatively flushes when waiting for the pending tick and waits the current submission fence.
+- New command buffers are allocated per flush from the command pool; the full upstream command-pool recycling model is still missing.
+
+### Missing items
+- Full `MasterSemaphore` integration with queue submission.
+- Worker-thread command chunk execution parity.
+- Command-pool recycling/retirement parity.
+
+### Binary layout verification
+- No binary payload layout affected. Vulkan host synchronization only.
+
+### Verification
+- Re-read upstream `vk_scheduler.h` and `vk_scheduler.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- `timeout 45s cargo run -p ruzu_cmd --bin ruzu-cmd -- --renderer vulkan -g "...Mario Kart 8 Deluxe..."` exited with `124`; no panic or Vulkan scheduler error appeared in `/tmp/ruzu_run.log`.
+
+## 2026-06-21 — video_core/src/renderer_vulkan/present/layer.rs vs video_core/renderer_vulkan/present/layer.h/.cpp
+
+### Intentional differences
+- `configure_draw_from_framebuffer` now mirrors the upstream raw-image guard ordering more closely: `RefreshResources`, `SetAntiAliasPass`, `RequestOutsideRenderPassOperationContext`, `Wait(resource_ticks[image_index])`, raw upload, then stores the pending scheduler tick for that image.
+- `RefreshResources` now waits all existing `resource_ticks` before releasing raw images, preserving upstream `ReleaseRawImages` synchronization semantics within the Rust ownership shape.
+- `set_anti_alias_pass` remains a no-op/NoAA subset because Rust Vulkan filter ownership is not fully ported, but the method boundary now exists in the correct file.
+
+### Unintentional differences (to fix)
+- Upstream stores `Scheduler&` on `Layer`; Rust still passes it through `BlitScreen::DrawToFrame`.
+- `SetAntiAliasPass` does not yet create FXAA/SMAA resources based on full `PresentFilters`.
+- The stored tick uses the simplified scheduler's `pending_tick()` rather than upstream `MasterSemaphore::CurrentTick()`.
+
+### Missing items
+- Full `SetAntiAliasPass` parity and FSR/filter integration.
+- Move scheduler/memory allocator/device memory ownership into `Layer` constructor shape via `BlitScreen`, matching upstream references.
+- Full `RasterizerVulkan::AccelerateDisplay` path.
+
+### Binary layout verification
+- PASS: no new guest structure layout changes. Raw framebuffer byte offsets remain `stride * height * bpp * image_index`.
+
+### Verification
+- Re-read upstream `present/layer.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime reached timeout without panic/Vulkan errors; VI still reports `NO_LAYERS`, so this path remains not exercised by real layer submission.
+
+## 2026-06-21 — video_core/src/renderer_vulkan/present/layer.rs vs video_core/renderer_vulkan/present/layer.h/.cpp
+
+### Intentional differences
+- Implemented the upstream-owned raw framebuffer upload path in `Layer`: `CreateStagingBuffer` now creates a mapped upload buffer, and `UpdateRawImage` reads `framebuffer.address + framebuffer.offset` through `MaxwellDeviceMemoryManager`, unswizzles via `Tegra::Texture::UnswizzleTexture` equivalent Rust helpers, flushes the mapped buffer, and records `CopyBufferToImage` with transfer-to-sampling layout barriers.
+- Rust keeps the public entry point as `configure_draw_from_framebuffer` while `RasterizerVulkan::AccelerateDisplay` is still unavailable. The method preserves the upstream raw-image fallback path without exposing a renderer-wide coroutine or scheduler abstraction.
+- Raw image layout state is tracked per swapchain image so repeated uploads transition `GENERAL -> TRANSFER_DST_OPTIMAL -> GENERAL`, while first use transitions `UNDEFINED -> TRANSFER_DST_OPTIMAL -> GENERAL`.
+
+### Unintentional differences (to fix)
+- Upstream calls `scheduler.RequestOutsideRenderPassOperationContext()` and waits/stores `resource_ticks[image_index]` around raw image reuse. Rust records the copy on the presentation scheduler but does not yet enforce the exact tick wait/order.
+- Upstream `Layer::ConfigureDraw` first tries `rasterizer.AccelerateDisplay`; Rust Vulkan still uses only the raw-image fallback because the Vulkan rasterizer acceleration path is not ported.
+- Anti-alias and FSR filter ownership remains simplified and does not yet fully match upstream `PresentFilters`.
+
+### Missing items
+- `RasterizerVulkan::AccelerateDisplay` path and texture-info source image selection.
+- Exact scheduler resource tick wait/update parity.
+- Full `SetAntiAliasPass` and FSR ownership parity.
+
+### Binary layout verification
+- PASS: staging upload uses upstream byte counts: `stride * height * bytes_per_pixel`, per-image raw offset, block height log2 `4`, and Tegra tiled size via `calculate_size(true, bpp, stride, height, 1, 4, 0)`.
+
+### Verification
+- Re-read upstream `present/layer.h` and `present/layer.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- `timeout 45s cargo run -p ruzu_cmd --bin ruzu-cmd -- --renderer vulkan -g "...Mario Kart 8 Deluxe..."` exited with `124`; no panic or Vulkan error appeared in `/tmp/ruzu_run.log`, but the run still reported repeated `SF_COMPOSE ... NO_LAYERS`, so real layer upload was not exercised.
+
+## 2026-06-21 — video_core/src/vulkan_common/vulkan_memory_allocator.rs vs video_core/vulkan_common/vulkan_memory_allocator.h/.cpp
+
+### Intentional differences
+- Added `MappedBuffer` as the Rust ownership wrapper needed by upstream `vk::Buffer::Mapped()`/`Flush()` usage. Until the VMA backend is ported, it uses a dedicated host-visible allocation and RAII unmap/destroy/free in `Drop`.
+- `create_mapped_buffer` reuses upstream `MemoryUsage::Upload` memory selection logic and requires `HOST_VISIBLE`, matching callers that immediately map upload memory.
+
+### Unintentional differences (to fix)
+- Upstream `CreateBuffer` returns a VMA-backed wrapper with allocation metadata; Rust still has a dedicated-allocation backend and a separate mapped-buffer helper.
+- Non-coherent flush exists, but the broader upstream `MemoryCommit::Map` path remains incomplete.
+
+### Missing items
+- VMA allocator parity for buffer/image allocations.
+- `MemoryCommit::Map()` parity for suballocated host-visible memory.
+
+### Binary layout verification
+- No guest binary layout changed. The mapped staging buffer exposes byte slices directly and is used by `Layer::UpdateRawImage` with upstream byte-count calculations.
+
+### Verification
+- Re-read upstream `vulkan_memory_allocator.h`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime reached timeout without mapped-buffer/Vulkan allocation errors in `/tmp/ruzu_run.log`.
+
+## 2026-06-21 — video_core/src/renderer_vulkan/renderer_vulkan.rs and ruzu_cmd/src/main.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp
+
+### Intentional differences
+- `RendererVulkan::new` now receives the shared `MaxwellDeviceMemoryManager` from Host1x and stores it for presentation uploads, matching upstream constructor ownership where `BlitScreen`/`Layer` receive `Tegra::MaxwellDeviceMemoryManager&`.
+- `ruzu_cmd` resolves the concrete Host1x manager through `System::host1x_core().as_any().downcast_ref::<Host1x>()`, matching the existing GPU-side ownership rather than creating a second memory manager.
+
+### Unintentional differences (to fix)
+- Upstream passes device memory through `BlitScreen` construction; Rust still passes it from `RendererVulkan::Composite` into `BlitScreen::DrawToFrame` while lifetime ownership is being aligned.
+- `BlitScreen` still receives `MemoryAllocator` per draw instead of owning constructor references like upstream.
+
+### Missing items
+- Constructor ownership parity for `BlitScreen`, `PresentManager`, `Scheduler`, `MemoryAllocator`, and the rasterizer acceleration path.
+
+### Binary layout verification
+- No guest binary layout changed. This is pointer/ownership wiring only.
+
+### Verification
+- Re-read upstream `renderer_vulkan.cpp` constructor and `present/layer.h`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime reached timeout without Host1x memory-manager resolution failure or renderer initialization failure.
+- MK8D Vulkan runtime validation was stopped after a controlled 45s timeout. The run did not hit a Vulkan initialization crash; it reached service/vsync activity, then reported `ArmDynarmic32::run_thread: JIT not available` and repeated `SF_COMPOSE ... NO_LAYERS`, so the active runtime gap remains layer production/upload rather than this composite ordering change alone.
+
+## 2026-06-21 — video_core/src/renderer_vulkan/blit_screen.rs vs video_core/renderer_vulkan/vk_blit_screen.h/.cpp
+
+### Intentional differences
+- `DrawToFrame` now takes the presentation `Scheduler` and `PresentManager` frame index, allowing it to recreate the target frame and record through `WindowAdaptPass::Draw` in the same upstream-owned module.
+- `DrawToFrame` records the final render pass through `WindowAdaptPass::draw`, so the scheduler now owns the presentation commands instead of `Composite` being a no-op.
+
+### Unintentional differences (to fix)
+- `WindowAdaptPass::Draw` is currently invoked with empty layer arrays. This clears the presentation frame but does not composite guest framebuffer layers yet.
+- `Layer::ConfigureDraw` is still not called from `BlitScreen`/`WindowAdaptPass`, so rasterizer accelerated-display, raw image upload, crop normalization, and blending selection are still missing from the active path.
+- `WaitIdle` still lacks upstream `scheduler.Finish()` because it does not own the scheduler internally yet.
+
+### Missing items
+- Pass real `Layer` outputs into `WindowAdaptPass::Draw`.
+- Move scheduler/present-manager/filter ownership fully into `BlitScreen` constructor shape.
+- Scheduler finish parity in `WaitIdle`.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Vulkan presentation command recording only.
+
+### Verification
+- Re-read upstream `vk_blit_screen.h` and `vk_blit_screen.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime validation was stopped after a controlled 45s timeout. The observed compositor state remained `NO_LAYERS`, consistent with `WindowAdaptPass::Draw` being recorded with empty layer arrays until `Layer::ConfigureDraw`/framebuffer upload is connected.
+
+## 2026-06-21 — video_core/src/renderer_vulkan/present/window_adapt_pass.rs vs video_core/renderer_vulkan/present/window_adapt_pass.cpp
+
+### Intentional differences
+- Added `get_sampler` so `BlitScreen` can pass the pass-owned sampler into `Layer::ConfigureDraw`, matching upstream `layer_it->ConfigureDraw(..., *sampler, ...)`.
+- The Rust `Draw` method already records render-pass begin, clear, pipeline selection, push constants, descriptor binding, and draw calls through `Scheduler::record`, matching upstream command ownership.
+
+### Unintentional differences (to fix)
+- Rust still receives precomputed push constants, descriptor sets, and blend modes instead of owning the full upstream loop over `Layer::ConfigureDraw`.
+- Constructor helper ownership is still flattened relative to upstream's `CreateDescriptorSetLayout`, `CreatePipelineLayout`, `CreateVertexShader`, `CreateRenderPass`, and `CreatePipelines`.
+
+### Missing items
+- Move the full per-layer configure loop into `WindowAdaptPass::draw` once rasterizer and allocator ownership are wired with upstream-equivalent signatures.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Vulkan presentation command setup only.
+
+### Verification
+- Re-read upstream `present/window_adapt_pass.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-21 — video_core/src/renderer_vulkan/present/layer.rs vs video_core/renderer_vulkan/present/layer.h/.cpp
+
+### Intentional differences
+- Added `configure_draw_from_framebuffer`, a Rust-side subset of upstream `Layer::ConfigureDraw` for the non-accelerated raw-image path. It calls `RefreshResources`, initializes the raw image for sampling, computes normalized crop data, fills `PresentPushConstants`, updates the descriptor set, and returns the descriptor set through the same out-parameter shape.
+- Added per-swapchain-image raw-image layout tracking so newly-created raw images are transitioned from `UNDEFINED` to `GENERAL` before being sampled.
+- `RefreshResources` continues to allocate raw images through `MemoryAllocator`, preserving upstream ownership for `CreateRawImages`.
+
+### Unintentional differences (to fix)
+- `configure_draw_from_framebuffer` does not call `RasterizerVulkan::AccelerateDisplay`; Rust's Vulkan rasterizer does not yet provide the upstream display-acceleration return path.
+- `UpdateRawImage` is still not implemented. Raw images are descriptor-valid but do not yet contain guest framebuffer contents.
+- `CreateStagingBuffer` still does not allocate a mapped upload buffer with upstream usage flags, because Rust `MemoryAllocator::create_buffer` currently returns a raw `vk::Buffer` without mapped/flush support.
+- Anti-alias and FSR selection still use simplified Rust state and do not yet query the full upstream `PresentFilters`.
+
+### Missing items
+- `CreateStagingBuffer` and `UpdateRawImage` parity, including unswizzle from guest memory and `CopyBufferToImage`.
+- Rasterizer accelerated-display path.
+- Scheduler tick waits for raw resource reuse.
+- Full `SetAntiAliasPass` filter selection parity.
+
+### Binary layout verification
+- No guest raw-copied payloads changed in this slice. Framebuffer crop and pixel-format values are read from existing `FramebufferConfig`.
+
+### Verification
+- Re-read upstream `present/layer.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime was stopped by `timeout 45s`; no Vulkan descriptor/layout error appeared in captured output, but the game still reported repeated `SF_COMPOSE ... NO_LAYERS`, so this path was not exercised with real application layers.
+
+## 2026-06-21 — video_core/src/renderer_vulkan/blit_screen.rs vs video_core/renderer_vulkan/vk_blit_screen.h/.cpp
+
+### Intentional differences
+- `DrawToFrame` now builds the same per-layer vectors upstream builds inside `WindowAdaptPass::Draw`: `PresentPushConstants`, descriptor sets, and blend modes.
+- `DrawToFrame` now calls each `Layer::configure_draw_from_framebuffer` before `WindowAdaptPass::draw`, so the Vulkan present pass can draw one quad per framebuffer instead of always recording an empty pass.
+
+### Unintentional differences (to fix)
+- The per-layer configure loop currently lives in `BlitScreen` rather than `WindowAdaptPass::Draw`; this is a temporary Rust ownership adaptation while the full upstream draw signature is not available.
+- Fixed by the 2026-06-23 Vulkan present ownership slice: `DrawToFrame` now receives `RasterizerVulkan&` and passes it to layer configuration. The remaining divergence is the stubbed `RasterizerVulkan::accelerate_display` body.
+- The `MemoryAllocator` is passed into `DrawToFrame` from `RendererVulkan`; upstream stores it as a `BlitScreen` member.
+
+### Missing items
+- Move `MemoryAllocator`, scheduler, present manager, filters, and device-memory ownership into `BlitScreen` constructor shape.
+- Port the real `RasterizerVulkan::AccelerateDisplay` texture-cache lookup body so the now-wired path can return accelerated framebuffer image/view metadata.
+- Full upload and acceleration paths.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Host Vulkan descriptor/push-constant orchestration only.
+
+### Verification
+- Re-read upstream `vk_blit_screen.cpp` and `present/window_adapt_pass.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime was stopped by `timeout 45s`; the compositor still had `NO_LAYERS`, so the new non-empty layer draw path awaits a title path that reaches queued buffers.
+
+## 2026-06-22 — externals/rdynarmic/src/jit.rs and externals/rxbyak/src/platform/unix.rs vs core/arm/dynarmic CPU backend usage
+
+### Intentional differences
+- `rdynarmic::A32Jit::new` and `rdynarmic::A64Jit::new` now return an explicit unsupported-host error when the Rust process is not running on `x86_64`. The current vendored backend is named and implemented as `backend::x64`; on native Apple Silicon it cannot execute its generated code. This replaces the misleading macOS `CantAlloc` failure with the real backend availability problem.
+- `rxbyak` executable memory allocation now includes `MAP_JIT` on macOS. This preserves the x64/Rosetta or future macOS JIT allocation path without changing Linux allocation flags.
+
+### Unintentional differences (to fix)
+- Upstream C++ selects CPU backends through platform/build feature availability. Rust still exposes the x64 rdynarmic API on non-x86_64 targets and fails at runtime instead of selecting a real AArch64-host backend at construction time.
+- Native macOS ARM64 still has no AArch32 guest CPU backend in this tree. MK8D is AArch32, so Vulkan can initialize but the application cannot execute far enough to create compositor layers.
+
+### Missing items
+- A faithful AArch32-on-AArch64 CPU backend for macOS, or a supported Rosetta/x86_64 build path that runs the existing x64 backend end-to-end.
+- Better top-level CPU backend selection so `KProcess`/system initialization does not build unusable rdynarmic interfaces on unsupported host architectures.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This slice only changes host JIT backend availability checks and host executable-memory allocation flags.
+
+### Verification
+- Re-read upstream `core/arm/dynarmic/arm_dynarmic_32.cpp` and `core/arm/nce/arm_nce.cpp` to confirm the upstream backend split: Dynarmic for JIT-backed execution and NCE as an AArch64/Linux-specific path.
+- `cargo check -p rdynarmic`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+- MK8D Vulkan runtime with `timeout 45s`: MoltenVK loads, the 2560x1440 swapchain is created, and `Vulkan renderer initialized` is reached. The run then reports `rdynarmic x64 backend is not executable on host architecture aarch64` for all four AArch32 cores, followed by `JIT not available` and repeated `SF_COMPOSE ... NO_LAYERS`.
+
+## 2026-06-21 — video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp
+
+### Intentional differences
+- Added top-level `MemoryAllocator` ownership and construction from physical memory properties and `bufferImageGranularity`, moving `RendererVulkan` closer to upstream constructor ownership.
+- `Composite` now passes `MemoryAllocator` into `BlitScreen::DrawToFrame`, allowing layer raw-image allocation to happen through the upstream-owned allocator path.
+
+### Unintentional differences (to fix)
+- Upstream stores `memory_allocator` after the `Device` wrapper but before scheduler/blit/rasterizer and passes references into owned subsystems. Rust currently keeps `MemoryAllocator` top-level and passes it per call to avoid larger lifetime refactors.
+- The Rust allocator backend is still dedicated-allocation based rather than upstream VMA-backed wrappers.
+
+### Missing items
+- Constructor field-order and reference ownership parity for `MemoryAllocator`, `StateTracker`, `Scheduler`, `PresentManager`, and all `BlitScreen` instances.
+- VMA-backed allocator wrapper parity.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Renderer ownership wiring only.
+
+### Verification
+- Re-read upstream `renderer_vulkan.cpp`.
+- `cargo check -p video_core`
+- `cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-22 — video_core/src/renderer_vulkan/present/fsr.rs vs video_core/renderer_vulkan/present/fsr.h/.cpp
+
+### Intentional differences
+- `Fsr` now creates real Vulkan shader modules from generated `VULKAN_FIDELITYFX_FSR_VERT_SPV`, `VULKAN_FIDELITYFX_FSR_EASU_FP32_FRAG_SPV`, and `VULKAN_FIDELITYFX_FSR_RCAS_FP32_FRAG_SPV` instead of placeholder/null modules.
+- `Draw` now follows upstream ordering: compute EASU/RCAS push constants from the crop rectangle, upload/clear dynamic images once through `Scheduler`, update EASU and RCAS descriptors, request an outside-render-pass context, record the EASU pass, record the RCAS pass, and return the RCAS output image view.
+- Rust uses the existing `fsr_easu_con_offset` and `fsr_rcas_con` helpers for parity with upstream `video_core/fsr.h`.
+- Rust currently uses the fp32 FSR fragment shaders unconditionally. Upstream selects fp16 shaders when `Device::IsFloat16Supported()` is true; Rust `Device` does not yet expose a faithful float16 feature query/selection path.
+- Resource cleanup is implemented with `Drop` for Vulkan objects owned directly by `Fsr`; upstream uses `vk::*` RAII wrappers.
+
+### Unintentional differences (to fix)
+- Rust does not yet generate or select `VULKAN_FIDELITYFX_FSR_EASU_FP16_FRAG_SPV` and `VULKAN_FIDELITYFX_FSR_RCAS_FP16_FRAG_SPV`.
+- Rust stores an `ash::Device` clone and receives allocator/scheduler through Rust ownership boundaries, while upstream stores `const Device&`, `MemoryAllocator&`, image count, and extent directly in the C++ object.
+- The Rust allocation path is still the simplified dedicated-allocation wrapper from `MemoryAllocator`; upstream `CreateWrappedImage` returns RAII image wrappers tied to the Vulkan memory allocator.
+- `TransitionImageLayout` in Rust still uses the simplified util helper signature and does not carry the exact upstream barrier helper implementation.
+
+### Missing items
+- Float16 FSR shader generation and device-feature-based selection.
+- Full VMA-backed `MemoryAllocator` wrapper parity for `vk::Image` lifetime and allocation ownership.
+- Exact upstream constructor/helper split if `Fsr` ownership is later tightened with `Device`, `MemoryAllocator`, and `Scheduler` lifetimes.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Push constants are a `[u32; 16]`, matching upstream `std::array<u32, 4 * 4>` size and order.
+
+### Verification
+- Re-read upstream `present/fsr.h` and `present/fsr.cpp`.
+- `cargo check -p video_core`
+- `cargo test -p video_core host_shaders::spirv_shaders::tests::generated_vulkan_shaders_are_spirv_modules`
+
+## 2026-06-22 — video_core/build.rs and video_core/src/host_shaders/spirv_shaders.rs vs video_core/host_shaders/vulkan_fidelityfx_fsr_*_spv.h generation
+
+### Intentional differences
+- Rust build generation now includes the upstream Vulkan FSR vertex shader and fp32 EASU/RCAS fragment shaders as Rust `&[u32]` constants through `glslangValidator`, matching upstream's generated `*_spv.h` concept.
+- The build script adds both upstream `video_core/host_shaders` and local `src/host_shaders` include paths so the FSR shaders can resolve FidelityFX include files.
+- The SPIR-V smoke test was renamed to `generated_vulkan_shaders_are_spirv_modules` because it now validates present, FXAA, FSR, bicubic, gaussian, and scaleforce modules.
+- Fixed by later entry: Rust now also generates the upstream fp16 FSR EASU/RCAS SPIR-V modules.
+
+### Unintentional differences (to fix)
+- Rust keeps local FidelityFX include copies under `video_core/src/host_shaders`, while upstream pulls these through generated shader include/header infrastructure.
+
+### Missing items
+- Broader host-shader generation parity for Vulkan shaders outside the present/FSR/filter set.
+
+### Binary layout verification
+- Generated SPIR-V word slices are validated by checking the SPIR-V magic word. No guest memory payload layout changed.
+
+### Verification
+- Re-read upstream `video_core/host_shaders/vulkan_fidelityfx_fsr.vert`, `vulkan_fidelityfx_fsr_easu_fp32.frag`, and `vulkan_fidelityfx_fsr_rcas_fp32.frag`.
+- `cargo check -p video_core`
+- `cargo test -p video_core host_shaders::spirv_shaders::tests::generated_vulkan_shaders_are_spirv_modules`
+
+## 2026-06-22 — video_core/src/vulkan_common/vulkan_device.rs vs video_core/vulkan_common/vulkan_device.h/.cpp
+
+### Intentional differences
+- Added a minimal `VkPhysicalDeviceShaderFloat16Int8Features` query and pNext enablement path so Rust can expose `Device::is_float16_supported()`, matching upstream `Device::IsFloat16Supported()` ownership.
+- Rust stores `shader_float16_supported` and `shader_int8_supported` as explicit booleans on `Device`. Upstream stores these in its generated `features.shader_float16_int8` feature-chain struct; Rust does not yet have the full generated feature-chain model.
+- `VK_KHR_shader_float16_int8` is enabled when advertised, alongside the existing minimal WSI/portability extension list.
+
+### Unintentional differences (to fix)
+- The full upstream feature/extension negotiation chain remains unported. This slice only covers the feature needed by FSR/ScaleForce shader selection.
+- Upstream disables float16 for known-broken driver/device combinations. Rust does not yet port those driver-specific float16 safety gates.
+
+### Missing items
+- Full `Device::Device` feature-chain parity, including driver-specific float16 disable rules.
+- `Device::IsInt8Supported()` accessor parity if shader int8 becomes needed by downstream code.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Vulkan feature-chain host structs only.
+
+### Verification
+- Re-read upstream `vulkan_device.h` `IsFloat16Supported()` and the surrounding `vulkan_device.cpp` float16 feature handling.
+- `cargo check -p video_core`
+
+## 2026-06-22 — video_core/src/renderer_vulkan/present/fsr.rs and shader generation vs video_core/renderer_vulkan/present/fsr.cpp
+
+### Intentional differences
+- `Fsr::new` now selects fp16 EASU/RCAS shaders when the caller reports `Device::is_float16_supported()`, otherwise it falls back to fp32. This matches upstream `FSR::CreateShaders()` selection order.
+- Rust now generates and smoke-tests `VULKAN_FIDELITYFX_FSR_EASU_FP16_FRAG_SPV` and `VULKAN_FIDELITYFX_FSR_RCAS_FP16_FRAG_SPV`.
+
+### Unintentional differences (to fix)
+- `Fsr::new` receives `supports_float16: bool` instead of a `const Device&`. Upstream calls `m_device.IsFloat16Supported()` internally. This is temporary until Vulkan present objects own/pass the Rust `Device` wrapper instead of raw `ash::Device`.
+- `Layer` still does not construct the Vulkan `Fsr` pass when `ScalingFilter::Fsr` is selected, so the FSR draw path is compiled but not fully integrated into Vulkan layer setup yet.
+
+### Missing items
+- Thread the `Device` wrapper or exact feature accessor into present filter construction.
+- Construct/recreate `Fsr` from `Layer` when the scaling filter is FSR, matching upstream `Layer::ConfigureDraw`.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. Shader module selection and push-constant layout remain unchanged.
+
+### Verification
+- Re-read upstream `present/fsr.cpp` `CreateShaders()`.
+- `cargo check -p video_core`
+- `cargo test -p video_core host_shaders::spirv_shaders::tests::generated_vulkan_shaders_are_spirv_modules`
+
+## 2026-06-22 — video_core/src/renderer_vulkan/present/filters.rs, video_core/src/renderer_vulkan/blit_screen.rs, and video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/present/filters.cpp and video_core/renderer_vulkan/vk_blit_screen.cpp
+
+### Intentional differences
+- `MakeScaleForce` now selects `VULKAN_PRESENT_SCALEFORCE_FP16_FRAG_SPV` when float16 is supported and `VULKAN_PRESENT_SCALEFORCE_FP32_FRAG_SPV` otherwise, matching upstream `SelectScaleForceShader(device)`.
+- `RendererVulkan` reads `Device::is_float16_supported()` once after device creation and passes it into each `BlitScreen`, so swapchain, capture, and applet blit paths use the same ScaleForce shader selection.
+- `BlitScreen::set_window_adapt_pass` forwards the stored float16 capability only for `ScalingFilter::ScaleForce`; the other filter constructors remain unchanged relative to upstream.
+
+### Unintentional differences (to fix)
+- Rust passes a `supports_float16: bool` through `RendererVulkan` and `BlitScreen`; upstream passes `const Device&` into `MakeScaleForce` and queries `device.IsFloat16Supported()` inside `filters.cpp`.
+- `MakeFilter` remains a Rust helper over the filter enum; upstream exposes individual `Make*` functions in `filters.h`.
+
+### Missing items
+- Thread the Vulkan `Device` wrapper into present factory ownership if later constructor parity work removes the bool adaptation.
+- Port upstream driver-specific float16 disable rules before treating float16 selection as fully equivalent on all drivers.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This slice only changes host shader-module selection for Vulkan presentation.
+
+### Verification
+- Re-read upstream `present/filters.cpp`, `present/filters.h`, and `vk_blit_screen.cpp`.
+- `cargo check -p video_core`
+- `cargo test -p video_core host_shaders::spirv_shaders::tests::generated_vulkan_shaders_are_spirv_modules`
+
+## 2026-06-22 — video_core/src/renderer_vulkan/present/layer.rs and video_core/src/renderer_vulkan/blit_screen.rs vs video_core/renderer_vulkan/present/layer.h/.cpp
+
+### Intentional differences
+- `Layer::new` now constructs a Vulkan `Fsr` pass when `filters.get_scaling_filter() == ScalingFilter::Fsr`, matching upstream `Layer::Layer(...){ if (filters.get_scaling_filter() == Settings::ScalingFilter::Fsr) CreateFSR(output_size); }`.
+- `BlitScreen` now passes the current `MemoryAllocator` and float16 capability into `Layer::new` so `Layer` can create FSR images/pipelines in the upstream-owned layer path.
+- `RefreshResources` resets `anti_alias_setting` with the `NoAa` replacement, so a framebuffer resize cannot leave `anti_alias_setting == Fxaa/Smaa` while the actual pass object has been replaced with `NoAa`.
+
+### Unintentional differences (to fix)
+- Rust still passes `MemoryAllocator` into `Layer::new` instead of storing `MemoryAllocator&` in `Layer` like upstream. This is a temporary ownership adaptation until `BlitScreen` owns allocator/scheduler/device-memory references in its constructor shape.
+- Rust still passes `supports_float16: bool` into FSR construction. Upstream `FSR` stores `const Device&` and selects FP16/FP32 internally through `Device::IsFloat16Supported()`.
+- Fixed by the 2026-06-23 Vulkan present ownership slice: `Layer::ConfigureDraw` now calls `rasterizer.accelerate_display(...)` first and only calls `UpdateRawImage` on a miss. The remaining divergence is that the active Rust `accelerate_display` body currently always misses.
+- `SetAntiAliasPass` still falls back to `NoAa` for `Smaa`; upstream constructs `SMAA`.
+
+### Missing items
+- Store upstream-equivalent `Device`, `MemoryAllocator`, `Scheduler`, and `MaxwellDeviceMemoryManager` references in `Layer`.
+- Port the active Rust `RasterizerVulkan::accelerate_display` body to lock the texture cache, call the framebuffer image-view lookup, notify the query cache, and return real image/view metadata.
+- Construct and execute the Vulkan SMAA pass from `SetAntiAliasPass`.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This slice changes host Vulkan pass construction and AA lifecycle state only.
+
+### Verification
+- Re-read upstream `present/layer.h` and `present/layer.cpp`.
+- `cargo check -p video_core`
+
+## 2026-06-22 — video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/renderer_vulkan.h/.cpp
+
+### Intentional differences
+- Rust now selects the Vulkan physical device through `Settings::values().vulkan_device`, validates negative and out-of-range indices, logs the invalid index, and returns `VK_ERROR_INITIALIZATION_FAILED`, matching upstream `CreateDevice` selection semantics.
+- Rust keeps `select_physical_device` and `validate_physical_device_index` as local helpers because `ash::Instance` enumeration, early memory-property queries, and `Device::new` ownership are currently separated.
+- Added a pure bounds-validation unit test because full Vulkan physical-device enumeration is host/driver dependent and not suitable as a deterministic unit test.
+
+### Unintentional differences (to fix)
+- Rust `create_device` still receives a preselected `vk::PhysicalDevice`; upstream `CreateDevice(const vk::Instance&, const vk::InstanceDispatch&, VkSurfaceKHR)` enumerates physical devices and constructs `Device` in one free function.
+- Rust still lacks the upstream `vk::InstanceDispatch` wrapper ownership shape.
+- `RendererVulkan::new` still lacks upstream `StateTracker`, exact scheduler submit-callback wiring, telemetry report parity, and turbo-mode clock boost parity.
+
+### Missing items
+- Collapse enumeration and `Device` construction into a closer `CreateDevice` helper when Vulkan wrapper ownership matches upstream.
+- Full `RendererVulkan::Report` telemetry/log parity.
+- `renderer_force_max_clock` / `TurboMode` parity.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This slice only changes host Vulkan physical-device selection.
+
+### Verification
+- Re-read upstream `renderer_vulkan.h` `CreateDevice` declaration.
+- Re-read upstream `renderer_vulkan.cpp` `CreateDevice` and constructor initialization list.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p video_core renderer_vulkan::renderer_vulkan::tests::physical_device_index_validation_matches_upstream_bounds`
+- `timeout 120s cargo check -p video_core`
+- `timeout 120s cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-22 — video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp
+
+### Intentional differences
+- `RendererVulkan::composite_impl` now calls `rasterizer.tick_frame()` after presentation and frame-count advancement, matching the upstream `Composite` lifecycle position of `rasterizer.TickFrame()`.
+- Rust documents but does not yet call `gpu.RendererFrameEndNotify()` from `RendererVulkan`; the current Rust `Gpu::renderer_frame_end_notify()` is still a PerfStats stub and `RendererVulkan` does not own or receive `Gpu&` in its constructor shape.
+
+### Unintentional differences (to fix)
+- Upstream calls `render_window.OnFrameDisplayed()` through `SCOPE_EXIT`; Rust `RendererVulkan` has no frontend window reference or callback yet.
+- Upstream calls `RenderAppletCaptureLayer(framebuffers)` before checking `render_window.IsShown()`, then skips screenshot/swapchain presentation when hidden. Rust still has no `render_window.IsShown()` equivalent in `RendererVulkan`, so it always proceeds to screenshot/swapchain presentation after applet capture.
+- Upstream calls `gpu.RendererFrameEndNotify()` before `rasterizer.TickFrame()`. Rust still only performs the rasterizer tick.
+
+### Missing items
+- Thread the upstream-equivalent frontend window reference/callbacks into `RendererVulkan` for `IsShown()` and `OnFrameDisplayed()` parity.
+- Thread an upstream-equivalent `Gpu&` or frame-end callback into `RendererVulkan` once Rust PerfStats integration is meaningful.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This slice only changes host renderer frame-lifecycle ordering.
+
+### Verification
+- Re-read upstream `RendererVulkan::Composite`.
+- `cargo fmt --all`
+- `timeout 120s cargo check -p video_core`
+- `timeout 120s cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-22 — video_core/src/renderer_vulkan/renderer_vulkan.rs, ruzu_cmd/src/emu_window/emu_window_sdl2.rs, ruzu_cmd/src/emu_window/emu_window_sdl2_vk.rs, and ruzu_cmd/src/main.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp and yuzu_cmd/emu_window/emu_window_sdl2.cpp
+
+### Intentional differences
+- `RendererVulkan::composite_impl` now performs the upstream `render_window.IsShown()` branch immediately after `RenderAppletCaptureLayer(framebuffers)`, so hidden/minimized windows still update applet capture but skip screenshot and swapchain presentation.
+- Rust threads this through an `Arc<AtomicBool>` shared from `EmuWindowSdl2` into `RendererVulkan`. Upstream stores `EmuWindow& render_window` directly in `RendererBase`; Rust currently constructs Vulkan through `ruzu_cmd` with only window-system data, so the shared visibility flag preserves behavior without introducing an unsafe frontend pointer.
+- `EmuWindowSdl2` keeps the existing `is_shown` boolean and mirrors it into `shown_state` on `SDL_WINDOWEVENT_MINIMIZED` and `SDL_WINDOWEVENT_EXPOSED`, matching upstream `EmuWindow_SDL2::IsShown()`.
+- Added a pure unit test for the visibility gate because constructing a real Vulkan renderer/window is host-display dependent.
+
+### Unintentional differences (to fix)
+- Upstream calls `render_window.OnFrameDisplayed()` through `SCOPE_EXIT`; Rust `RendererVulkan` still lacks a frontend frame-displayed callback.
+- Upstream calls `gpu.RendererFrameEndNotify()` before `rasterizer.TickFrame()`. Rust still only performs the rasterizer tick because `RendererVulkan` does not own or receive an upstream-equivalent `Gpu&`/frame-end callback.
+
+### Missing items
+- Thread an upstream-equivalent frame-displayed callback into `RendererVulkan`.
+- Thread an upstream-equivalent `Gpu&` or frame-end callback into `RendererVulkan` once Rust PerfStats integration is meaningful.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This slice only changes host frontend visibility state and renderer presentation branching.
+
+### Verification
+- Re-read upstream `RendererVulkan::Composite`.
+- Re-read upstream `EmuWindow_SDL2::IsShown`.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p video_core renderer_vulkan::renderer_vulkan::tests::window_visibility_gate_matches_composite_branch`
+- `timeout 120s cargo check -p video_core`
+- `timeout 120s cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-22 — video_core/src/gpu.rs, video_core/src/renderer_vulkan/renderer_vulkan.rs, and ruzu_cmd/src/main.rs vs video_core/gpu.cpp and video_core/renderer_vulkan/renderer_vulkan.cpp
+
+### Intentional differences
+- `Gpu::renderer_frame_end_notify` now calls `SystemRef::get().get_perf_stats().end_game_frame()` when the `SystemRef` and perf stats are available, matching upstream `GPU::Impl::RendererFrameEndNotify()` calling `system.GetPerfStats().EndGameFrame()`.
+- `RendererVulkan::composite_impl` now calls a frame-end notification immediately after `PresentManager::present(...)` and before `rasterizer.tick_frame()`, matching upstream `RendererVulkan::Composite` ordering.
+- Rust threads the notification as an `Arc<dyn Fn() + Send + Sync>` from `ruzu_cmd` because the current Rust Vulkan construction path is still frontend-owned and does not yet mirror upstream `CreateRenderer(system, emu_window, *gpu, context)` passing `Tegra::GPU&` into `RendererVulkan`.
+- `Gpu::renderer_frame_end_notify` is tolerant of null `SystemRef` and missing perf stats. Upstream assumes the fully initialized system path; Rust keeps this guard for partial-initialization tests and incomplete frontend paths.
+- Added a focused unit test verifying `Gpu::renderer_frame_end_notify` advances game-frame perf stats.
+
+### Unintentional differences (to fix)
+- Upstream `RendererVulkan` stores/receives `Tegra::GPU&` directly; Rust still uses a callback adaptation.
+- Upstream calls `render_window.OnFrameDisplayed()` through `SCOPE_EXIT`; Rust `RendererVulkan` still lacks a frontend frame-displayed callback.
+
+### Missing items
+- Restore direct renderer-factory ownership parity so `RendererVulkan` receives the upstream-equivalent GPU reference instead of a callback.
+- Thread the frontend `OnFrameDisplayed` hook into `RendererVulkan`; SDL's current implementation is effectively no-op, but the upstream lifecycle hook still exists.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This slice only changes host renderer frame-lifecycle notification.
+
+### Verification
+- Re-read upstream `video_core/gpu.cpp` `GPU::Impl::RendererFrameEndNotify`.
+- Re-read upstream `video_core/renderer_vulkan/renderer_vulkan.cpp` `RendererVulkan::Composite`.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p video_core gpu::tests::renderer_frame_end_notify_updates_perf_stats_game_frames`
+- `timeout 120s cargo check -p video_core`
+- `timeout 120s cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-22 — video_core/src/renderer_vulkan/renderer_vulkan.rs and ruzu_cmd/src/main.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp and core/frontend/emu_window.h
+
+### Intentional differences
+- `RendererVulkan::composite_impl` now creates a local RAII guard at function entry that calls the frame-displayed callback on drop, matching upstream `SCOPE_EXIT { render_window.OnFrameDisplayed(); }`.
+- The guard is created before the empty-framebuffer branch, so the callback runs for all `Composite` exits, including early returns, matching upstream scope-exit ordering.
+- Rust threads the hook as an `Arc<dyn Fn() + Send + Sync>` because the current Vulkan renderer construction path still receives frontend state through `ruzu_cmd` rather than storing upstream's `Core::Frontend::EmuWindow& render_window`.
+- `ruzu_cmd` passes an explicit no-op callback for SDL Vulkan. This matches upstream `Core::Frontend::EmuWindow::OnFrameDisplayed()` default behavior because the SDL frontend does not override the hook.
+- Added a focused unit test proving the local guard calls the callback when leaving scope.
+
+### Unintentional differences (to fix)
+- Upstream stores `Core::Frontend::EmuWindow&` in `RendererBase` and calls the virtual `OnFrameDisplayed()` directly; Rust still uses a callback adaptation.
+
+### Missing items
+- Restore renderer-factory ownership parity so `RendererVulkan` can receive or access the upstream-equivalent frontend window object directly.
+- If a future Rust frontend overrides `on_frame_displayed`, wire that implementation into the callback instead of the current SDL no-op.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This slice only changes host renderer/frontend lifecycle notification.
+
+### Verification
+- Re-read upstream `video_core/renderer_vulkan/renderer_vulkan.cpp` `RendererVulkan::Composite`.
+- Re-read upstream `core/frontend/emu_window.h` `EmuWindow::OnFrameDisplayed`.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p video_core renderer_vulkan::renderer_vulkan::tests::frame_displayed_notify_guard_matches_scope_exit`
+- `timeout 120s cargo check -p video_core`
+- `timeout 120s cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-23 — video_core/src/renderer_vulkan/renderer_vulkan.rs and video_core/src/vulkan_common/vulkan_device.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp and video_core/vulkan_common/vulkan_device.cpp/.h
+
+### Intentional differences
+- `RendererVulkan::report` now logs driver, device, Vulkan API version, available VRAM, and available extensions, matching upstream `RendererVulkan::Report` log content.
+- `Device::new` now queries `VkPhysicalDeviceDriverProperties` when Vulkan 1.2 or `VK_KHR_driver_properties` is available, so `Device::get_driver_name` and `Device::get_driver_id` can feed `RendererVulkan::report`.
+- `Device::new` now computes `device_access_memory` through a Rust `collect_physical_memory_info` helper mirroring upstream `Device::CollectPhysicalMemoryInfo()`, including `VK_EXT_memory_budget`, dedicated-GPU reserve, non-aggressive VRAM cap, resolution scaling, and integrated-GPU available-memory handling.
+- `Device` now stores `valid_heap_memory` from the same heap-filtering pass as upstream and `Device::get_device_memory_usage()` sums `heapUsage` for those heaps, matching upstream `Device::GetDeviceMemoryUsage()`.
+- Fixed by later entry: `RendererVulkan::new` now receives the Rust `TelemetrySession` and `RendererVulkan::report()` adds the upstream Vulkan telemetry fields.
+- Rust keeps `CollectPhysicalMemoryInfo()` as a free helper in `vulkan_device.rs` rather than a mutating `Device` method because the constructor has not yet been split into upstream's full constructor/helper sequence.
+- Rust returns `0` from `Device::get_device_memory_usage()` when `VK_EXT_memory_budget` is unsupported; upstream expects callers to check `CanReportMemoryUsage()` before calling this path.
+
+### Unintentional differences (to fix)
+- Fixed by later entry: Rust now adds `GPU_Vendor`, `GPU_Model`, `GPU_Vulkan_Driver`, `GPU_Vulkan_Version`, and `GPU_Vulkan_Extensions` during `RendererVulkan::report()`.
+- Fixed by later entry: `Device::get_vendor_name()` now returns `properties.driver.driverName`, and `RendererVulkan::report()` uses it for upstream `RendererVulkan::Report()` parity.
+
+### Missing items
+- Fixed by later entry: `TelemetrySession` is now threaded into `RendererVulkan::new` for report-time fields.
+- Fixed by later entry: upstream `Device::GetVendorName()` naming is now distinct from `Device::get_driver_name()`.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This slice changes host Vulkan device reporting and memory metadata only.
+
+### Verification
+- Re-read upstream `RendererVulkan::Report`.
+- Re-read upstream `Device` driver/memory accessors and memory collection code.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p video_core renderer_vulkan::renderer_vulkan::tests::driver_name_builder_matches_report_format`
+- `timeout 120s cargo test -p video_core renderer_vulkan::renderer_vulkan::tests::bytes_to_gib_matches_upstream_report_units`
+- `timeout 120s cargo test -p video_core vulkan_common::vulkan_device::tests::collect_physical_memory_info_sums_device_local_heaps_for_discrete_gpus`
+- `timeout 120s cargo test -p video_core vulkan_common::vulkan_device::tests::collect_physical_memory_info_caps_discrete_gpu_memory_like_upstream`
+- `timeout 120s cargo test -p video_core vulkan_common::vulkan_device::tests::collect_physical_memory_info_uses_budget_when_available`
+- `timeout 120s cargo test -p video_core vulkan_common::vulkan_device::tests::device_memory_usage_from_budget_sums_valid_heaps`
+- `timeout 120s cargo check -p video_core`
+- `timeout 120s cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-23 — video_core/src/vulkan_common/vulkan_device.rs and video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/vulkan_common/vulkan_device.h/.cpp and video_core/renderer_vulkan/renderer_vulkan.h/.cpp
+
+### Intentional differences
+- `Device::get_driver_name()` now maps `VkDriverId` to the same short names as upstream `Device::GetDriverName()` and falls back to `driverName` for unknown IDs.
+- Added `Device::get_vendor_name()` as the Rust counterpart of upstream `Device::GetVendorName()`, returning `properties.driver.driverName`.
+- `RendererVulkan::report()` now builds the logged driver string from `Device::get_vendor_name()` plus the driver version, matching upstream `RendererVulkan::Report()`.
+- `RendererVulkan::get_device_vendor()` now returns `Device::get_driver_name()`, matching upstream `RendererVulkan::GetDeviceVendor()`.
+
+### Unintentional differences (to fix)
+- Fixed by later entry: Rust now writes the Vulkan report fields into `Core::TelemetrySession`.
+
+### Missing items
+- Fixed by later entry: the Vulkan report fields are now added to `TelemetrySession`.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This slice only changes host Vulkan driver/vendor reporting strings.
+
+### Verification
+- Re-read upstream `vulkan_common/vulkan_device.h` `Device::GetVendorName()`.
+- Re-read upstream `vulkan_common/vulkan_device.cpp` `Device::GetDriverName()`.
+- Re-read upstream `renderer_vulkan/renderer_vulkan.h` `RendererVulkan::GetDeviceVendor()`.
+- Re-read upstream `renderer_vulkan/renderer_vulkan.cpp` `RendererVulkan::Report()`.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p video_core vulkan_common::vulkan_device::tests::driver_name_from_id_matches_upstream_names`
+- `timeout 120s cargo test -p video_core renderer_vulkan::renderer_vulkan::tests::driver_name_builder_matches_report_format`
+- `timeout 120s cargo check -p video_core`
+- `timeout 120s cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-23 — video_core/src/renderer_vulkan/blit_screen.rs, video_core/src/renderer_vulkan/present/layer.rs, video_core/src/renderer_vulkan/mod.rs, and video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/vk_blit_screen.cpp, video_core/renderer_vulkan/present/layer.cpp, and video_core/renderer_vulkan/vk_rasterizer.h/.cpp
+
+### Intentional differences
+- `BlitScreen::draw_to_present_frame` and `BlitScreen::draw_to_frame` now receive `RasterizerVulkan&` and pass it into layer configuration, matching upstream `BlitScreen::DrawToFrame`.
+- `Layer::configure_draw_from_framebuffer` now calls `rasterizer.accelerate_display(framebuffer, framebuffer.address + framebuffer.offset, framebuffer.stride)` before the raw upload path, derives texture and scaled dimensions from returned texture info, skips `UpdateRawImage` on accelerated hit, and uses the scaled render extent for FSR, matching upstream `Layer::ConfigureDraw` ordering.
+- The active Rust `RasterizerVulkan` now exposes a port-facing `accelerate_display` signature matching upstream. Its body still returns `None` because the Vulkan texture-cache `TryFindFramebufferImageView` path is not ported in this owner yet.
+
+### Unintentional differences (to fix)
+- Upstream `RasterizerVulkan::AccelerateDisplay` locks the texture cache, calls `TryFindFramebufferImageView`, notifies query cache, and returns real Vulkan image/view metadata. Rust still falls back to raw upload because the active rasterizer's method is a stub.
+
+### Missing items
+- Port the active Vulkan texture-cache lookup / accelerated display path into `RasterizerVulkan::accelerate_display`.
+- Consolidate the duplicate Rust Vulkan rasterizer owners (`renderer_vulkan/mod.rs` and `vk_rasterizer.rs`) once the active owner graph can use the upstream-shaped `vk_rasterizer.rs` implementation.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This slice changes host Vulkan presentation ownership and source-image selection only.
+
+### Verification
+- Re-read upstream `vk_blit_screen.cpp` `BlitScreen::DrawToFrame`.
+- Re-read upstream `present/layer.cpp` `Layer::ConfigureDraw`.
+- Re-read upstream `vk_rasterizer.h/.cpp` `RasterizerVulkan::AccelerateDisplay`.
+- `cargo fmt --all`
+- `timeout 120s cargo check -p video_core`
+- `timeout 120s cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-23 — video_core/src/renderer_vulkan/renderer_vulkan.rs and ruzu_cmd/src/main.rs vs video_core/renderer_vulkan/renderer_vulkan.h/.cpp and core/core.cpp
+
+### Intentional differences
+- `RendererVulkan::new` now receives `Option<&mut TelemetrySession>` as the first constructor argument, preserving upstream's constructor direction where `Core::TelemetrySession&` is supplied before the frontend window and GPU objects.
+- `RendererVulkan::report()` now adds `GPU_Vendor`, `GPU_Model`, `GPU_Vulkan_Driver`, `GPU_Vulkan_Version`, and `GPU_Vulkan_Extensions` to `TelemetrySession` with `FieldType::UserSystem`, matching upstream `RendererVulkan::Report()`.
+- `ruzu_cmd` passes `system.telemetry_session_mut()` into Vulkan construction after `System::initialize()` creates the telemetry session, matching upstream system-owned telemetry lifetime at construction time.
+
+### Unintentional differences (to fix)
+- Upstream stores `Core::TelemetrySession& telemetry_session` as a `RendererVulkan` member; Rust currently passes a temporary mutable reference only for constructor-time `Report()` because no later Vulkan method uses the session and storing a long-lived reference would require changing the current renderer/GPU ownership graph.
+
+### Missing items
+- Restore exact renderer-factory ownership parity so `RendererVulkan` can store a stable upstream-equivalent telemetry reference without threading it through `ruzu_cmd` directly.
+
+### Binary layout verification
+- No guest raw-copied payloads changed. This slice only adds host telemetry field reporting.
+
+### Verification
+- Re-read upstream `RendererVulkan::RendererVulkan` constructor member list.
+- Re-read upstream `RendererVulkan::Report()`.
+- Re-read Rust `System::initialize()` / `System::telemetry_session_mut()` ownership.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p video_core renderer_vulkan::renderer_vulkan::tests::report_telemetry_fields_match_upstream_names`
+- `timeout 120s cargo test -p video_core renderer_vulkan::renderer_vulkan::tests::driver_name_builder_matches_report_format`
+- `timeout 120s cargo check -p video_core`
+- `timeout 120s cargo check -p ruzu_cmd --bin ruzu-cmd`
