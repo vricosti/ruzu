@@ -15720,3 +15720,32 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `timeout 120s cargo test -q -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words --lib -- --exact --nocapture` passes.
 - `timeout 120s cargo test -q -p rdynarmic backend::arm64::emit_arm64_vector_floating_point --lib -- --nocapture` passes; this filter currently has no focused unit tests and serves as a compile check.
 - MK8D run with isolated data/cache/config directories advances past prior `FPVectorPairedAddLower32`; `timeout 300s cargo run --bin ruzu-cmd -- -g "/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"` exits with code 134 at the next missing ARM64 JIT opcode, `FPVectorFromSignedFixed32`.
+
+## 2026-06-25 — externals/rdynarmic ARM64 FP vector fixed/compare and A32 vector get-set parity vs externals/dynarmic/src/dynarmic
+
+### Intentional differences
+- `backend/arm64/emit_arm64_vector_floating_point.rs`: ports upstream `FPVectorFromSignedFixed32/64` and `FPVectorFromUnsignedFixed32/64` from `backend/arm64/emit_arm64_vector_floating_point.cpp`, including zero-fbits and immediate-fbits `SCVTF`/`UCVTF` vector forms and the upstream check that the IR rounding mode matches the selected FPCR.
+- `backend/arm64/emit_arm64_vector_floating_point.rs`: ports upstream `FPVectorEqual32/64`, `FPVectorGreater32/64`, and `FPVectorGreaterEqual32/64` through the same `EmitThreeOpArranged` ownership as upstream.
+- `backend/arm64/inst.rs`: keeps explicit Rust AArch64 encoder helpers for vector `SCVTF`, `UCVTF`, `FCMEQ`, `FCMGT`, and `FCMGE`; instruction words were checked against Apple AArch64 assembler output.
+- `ir/opt/a32_get_set_elimination.rs`: restores upstream `A32SetVector(D*)` behavior by inserting `VectorZeroUpper(value)` immediately after the set and caching that inserted value for later `A32GetVector(D*)` elimination, matching `a32_get_set_elimination_pass.cpp`.
+
+### Unintentional differences (to fix)
+- `FPVectorEqual16` remains unimplemented, matching upstream's current `ASSERT_FALSE("Unimplemented")` path for that opcode.
+- The run no longer exposes missing ARM64 JIT opcodes within 300 seconds, but rendering remains blocked by Vulkan instance creation on macOS because `VK_KHR_portability_enumeration` is reported unavailable.
+
+### Missing items
+- Vulkan portability-enumeration instance setup must be fixed for macOS/MoltenVK before the renderer can present instead of running with `NO_LAYERS`.
+- Remaining ARM64 backend opcodes may still be incomplete beyond the currently exercised MK8D path.
+
+### Binary layout verification
+- N/A: host AArch64 code emission and IR optimization only; no guest-visible raw layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector_floating_point.cpp` around `EmitFromFixed`, `FPVectorFromSignedFixed*`, `FPVectorFromUnsignedFixed*`, `FPVectorEqual*`, `FPVectorGreater*`, and `FPVectorGreaterEqual*`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/ir/opt/a32_get_set_elimination_pass.cpp` around `A32SetVector` and `VectorZeroUpper` insertion.
+- Re-read local Rust counterparts in `externals/rdynarmic/src/backend/arm64/emit_arm64_vector_floating_point.rs`, `emit_arm64.rs`, `inst.rs`, and `src/ir/opt/a32_get_set_elimination.rs`.
+- `cargo fmt -p rdynarmic --check` passes.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words --lib -- --exact --nocapture` passes.
+- `timeout 120s cargo test -q -p rdynarmic ir::opt::a32_get_set_elimination::tests::test_double_vector_set_forwards_inserted_zero_upper_value --lib -- --exact --nocapture` passes.
+- `git -C externals/rdynarmic diff --check` passes.
+- MK8D run with isolated data/cache/config directories advances past `FPVectorFromSignedFixed32`, `FPVectorGreater32`, and the `VectorTranspose32` regalloc panic; `timeout 300s cargo run --bin ruzu-cmd -- -g "/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"` exits with timeout code 124 and no filtered `not ported`/panic lines. The log still contains `Required instance extension VK_KHR_portability_enumeration is not available`.
