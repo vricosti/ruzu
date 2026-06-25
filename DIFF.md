@@ -15585,3 +15585,30 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Added/verified `externals/rdynarmic/src/backend/arm64/inst.rs` encoding coverage for the `CSET VS` alias used by this emitter path.
 - `timeout 120s cargo test -q -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words --lib -- --exact --nocapture` passes.
 - `cargo fmt -p rdynarmic --check` passes.
+
+## 2026-06-25 — externals/rdynarmic ARM64 A32 flags/regalloc fixes vs externals/dynarmic/src/dynarmic
+
+### Intentional differences
+- `backend/arm64/emit_arm64.rs`: ported upstream `EmitIR<GetCFlagFromNZCV>` and `EmitIR<NZCVFromPackedFlags>` ownership from `backend/arm64/emit_arm64.cpp`; Rust emits the same carry-bit mask and uses `define_as_existing` for packed flags.
+- `ir/opt/a32_get_set_elimination.rs`: restored upstream insertion-before semantics for pending `A32GetCFlag` when handling `A32SetCpsrNZCV`, matching `a32_get_set_elimination_pass.cpp` instead of rewriting the pending get in place.
+- `ir/block.rs`: added an IR insertion helper and use-count recomputation support because Rust `InstRef` indices must be renumbered explicitly where upstream iterator insertion preserves references.
+- `backend/arm64/a32_address_space.rs`: rebuilds pseudo-op links after identity removal before verification so ARM64 follows the same post-optimization invariant already required by the Rust x64 A32 path.
+- `backend/arm64/emit_arm64_data_processing.rs`: `Or`/`Eor` no longer reject associated flag pseudo-ops; upstream `EmitBitOp` only consumes direct flag lambdas for `And`/`AndNot`, leaving other flag requests to be emitted through their normal pseudo-op path.
+- `backend/arm64/reg_alloc.rs`: `define_as_existing` now replaces uses directly when aliasing an immediate, matching upstream `DefineAsExisting` behavior that makes the destination equivalent to the source instead of creating an `Identity` instruction that has no register location.
+
+### Unintentional differences (to fix)
+- `Block::insert` is a Rust arena adaptation for upstream iterator insertion; it clears pseudo-op next links and relies on `rebuild_pseudo_op_links` where needed.
+- `reg_alloc.rs` keeps a more detailed assertion message than upstream to expose invalid undefined-argument paths during ARM64 backend bring-up.
+
+### Missing items
+- No missing items for this specific A32 flags/regalloc slice.
+- Broader ARM64 backend opcode coverage is still incomplete and tracked by subsequent runtime failures.
+
+### Binary layout verification
+- N/A: IR optimization and host AArch64 code-emission changes only; no guest-visible raw layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.cpp` around `GetCFlagFromNZCV`, `NZCVFromPackedFlags`, and `DefineAsExisting` use.
+- Re-read upstream `externals/dynarmic/src/dynarmic/ir/opt/a32_get_set_elimination_pass.cpp` around `A32SetCpsrNZCV`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp` around `EmitBitOp`, `Or32/64`, and `Eor32/64`.
+- Re-read local Rust counterparts in `externals/rdynarmic/src/backend/arm64/emit_arm64.rs`, `emit_arm64_data_processing.rs`, `reg_alloc.rs`, `a32_address_space.rs`, `src/ir/block.rs`, and `src/ir/opt/a32_get_set_elimination.rs`.
