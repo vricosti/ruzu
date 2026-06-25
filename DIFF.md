@@ -15612,3 +15612,29 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `externals/dynarmic/src/dynarmic/ir/opt/a32_get_set_elimination_pass.cpp` around `A32SetCpsrNZCV`.
 - Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp` around `EmitBitOp`, `Or32/64`, and `Eor32/64`.
 - Re-read local Rust counterparts in `externals/rdynarmic/src/backend/arm64/emit_arm64.rs`, `emit_arm64_data_processing.rs`, `reg_alloc.rs`, `a32_address_space.rs`, `src/ir/block.rs`, and `src/ir/opt/a32_get_set_elimination.rs`.
+
+## 2026-06-25 — externals/rdynarmic ARM64 scalar FP conversions/sqrt and use-count invariant vs externals/dynarmic/src/dynarmic
+
+### Intentional differences
+- `backend/arm64/emit_arm64_floating_point.rs`: ported upstream scalar FP ownership for `FPSingleToDouble`, `FPDoubleToSingle`, `FPSqrt32`, `FPSqrt64`, `FPFixedS32ToSingle`, and `FPFixedS32ToDouble` from `backend/arm64/emit_arm64_floating_point.cpp`; opcode routing remains in `emit_arm64.rs` only.
+- Rust keeps explicit AArch64 encoder helpers in `inst.rs`; instruction words were checked against Apple AArch64 assembler output for `FCVT`, `FCVTXN`, `FSQRT`, and `SCVTF`.
+- `emit_convert` validates that the IR rounding-mode argument matches FPCR before emitting native `FCVT`, preserving the upstream assumption that the host FPCR already represents the requested rounding mode while reporting a Rust `Err` on mismatch.
+- `backend/arm64/a32_address_space.rs` and `backend/arm64/a64_address_space.rs`: recompute IR use counts before verification/emission to preserve the upstream regalloc invariant that no stale uses remain after optimization passes. This is a Rust arena/use-count maintenance adaptation, not a semantic guest-visible change.
+- `backend/arm64/reg_alloc.rs`: retains a more detailed `assert_no_more_uses` panic payload than upstream so stale value/use-count failures identify the owning `InstRef`, opcode, args, and expected use count during ARM64 backend bring-up.
+
+### Unintentional differences (to fix)
+- `FPFixedS32ToSingle`, `FPFixedS32ToDouble`, and the existing U32 fixed-to-FP helper still reject `fbits != 0`; upstream emits fixed-point `SCVTF`/`UCVTF` encodings for nonzero fractional bits.
+- Broader scalar FP coverage remains incomplete; these changes only cover the opcodes reached by the current MK8D ARM64 backend run.
+
+### Missing items
+- Fixed-point `SCVTF`/`UCVTF` encoders and emitter paths for nonzero `fbits`.
+- Remaining upstream scalar FP opcodes not yet routed in the Rust ARM64 backend.
+
+### Binary layout verification
+- N/A: host AArch64 code emission and IR bookkeeping only; no guest-visible struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_floating_point.cpp` around `EmitConvert`, `EmitTwoOp`, `EmitFromFixed`, `FPSingleToDouble`, `FPDoubleToSingle`, `FPSqrt32/64`, and `FPFixedS32ToSingle/Double`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs`, `emit_arm64.rs`, `inst.rs`, `a32_address_space.rs`, `a64_address_space.rs`, and `reg_alloc.rs`.
+- `cargo fmt -p rdynarmic --check` passes.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words --lib -- --exact --nocapture` passes.
