@@ -999,6 +999,29 @@ impl CpuManager {
                     {
                         let mut tc_pc = crate::arm::arm_interface::ThreadContext::default();
                         jit_ref.get_context(&mut tc_pc);
+                        static TRACE_A32_SVC_PC: OnceLock<bool> = OnceLock::new();
+                        if *TRACE_A32_SVC_PC
+                            .get_or_init(|| std::env::var_os("RUZU_TRACE_A32_SVC_PC").is_some())
+                        {
+                            eprintln!(
+                                "[SVC_PC] core={} tid={} is_64bit={} svc=0x{:02X} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X}",
+                                core_index,
+                                current_thread_id,
+                                is_64bit,
+                                svc_num,
+                                tc_pc.pc,
+                                tc_pc.lr,
+                                tc_pc.sp,
+                                svc_args[0] as u32,
+                                svc_args[1] as u32,
+                                svc_args[2] as u32,
+                                svc_args[3] as u32,
+                                svc_args[4] as u32,
+                                svc_args[5] as u32,
+                                svc_args[6] as u32,
+                                svc_args[7] as u32,
+                            );
+                        }
                         crate::hle::kernel::kernel::record_guest_full(
                             core_index, tc_pc.pc, tc_pc.lr, tc_pc.sp, &tc_pc.r,
                         );
