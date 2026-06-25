@@ -15563,3 +15563,25 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `timeout 120s cargo test -q -p rdynarmic tests_a32_fuzz::tests::fuzz_neon_f32_vector --lib -- --exact --nocapture` passes.
 - `timeout 60s cargo fmt -q -p rdynarmic -- --check` passes.
 - `git diff --check` passes for the tracked top-level repository; ARM64 backend files are still in an untracked submodule directory, so submodule `git diff --check` does not report them until they are added.
+
+## 2026-06-25 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs Add/Sub overflow pseudo-op vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+- Rust returns an explicit `Err` for unsupported `GetOverflowFromOp` Add/Sub shapes where upstream uses `ASSERT(!sub)`, `ASSERT(!nzcv_inst)`, and `ASSERT(args[2].IsImmediate() && args[2].GetImmediateU1() == false)`. This preserves the upstream accepted shape while reporting a recoverable emitter error instead of an unchecked assertion abort.
+- Rust emits upstream `CSET Woverflow, VS` through the existing `cinc_w(Woverflow, WZR, Cond::VS)` alias encoding. This is the AArch64 conditional-set alias for the same overflow condition.
+
+### Unintentional differences (to fix)
+- None known for the supported upstream branch: Add32/Add64 with associated `GetOverflowFromOp`, no `GetNZCVFromOp`, and false immediate carry-in emits `ADDS` then conditional-set from `VS`.
+
+### Missing items
+- No additional upstream `GetOverflowFromOp` Add/Sub forms are implemented because upstream asserts this limited form only.
+
+### Binary layout verification
+- N/A: emitter code only; no raw serialized layout.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp` around `EmitAddSub<bitsize, sub>` and `GetOverflowFromOp`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs` around `emit_add_sub`.
+- Added/verified `externals/rdynarmic/src/backend/arm64/inst.rs` encoding coverage for the `CSET VS` alias used by this emitter path.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words --lib -- --exact --nocapture` passes.
+- `cargo fmt -p rdynarmic --check` passes.
