@@ -15668,3 +15668,55 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo fmt -p rdynarmic --check` passes.
 - `timeout 120s cargo test -q -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words --lib -- --exact --nocapture` passes.
 - `timeout 120s cargo test -q -p rdynarmic backend::arm64::emit_arm64_a32_coprocessor --lib -- --nocapture` passes.
+
+## 2026-06-25 — externals/rdynarmic ARM64 FP fixed conversion and FP vector min/max vs externals/dynarmic/src/dynarmic
+
+### Intentional differences
+- `backend/arm64/emit_arm64_floating_point.rs`: ports upstream `FPDoubleToFixedS32` and `FPSingleToFixedS32` ownership from `backend/arm64/emit_arm64_floating_point.cpp` by extending the local 32-bit FP-to-fixed helper with the upstream signed conversion paths for `FCVTNS`, `FCVTPS`, `FCVTMS`, `FCVTZS`, and `FCVTAS`.
+- `backend/arm64/emit_arm64_floating_point.rs`: keeps the existing Rust limitation that 32-bit FP-to-fixed conversion with `fbits != 0` returns an explicit `Err`; upstream supports fixed-point `FCVTZS`/`FCVTZU` encodings for `TowardsZero` with nonzero fractional bits.
+- `backend/arm64/emit_arm64_vector_floating_point.rs`: ports upstream `FPVectorMax32/64`, `FPVectorMaxNumeric32/64`, `FPVectorMin32/64`, and `FPVectorMinNumeric32/64` from `backend/arm64/emit_arm64_vector_floating_point.cpp`, preserving the existing Rust FP vector helper's FPSR load and FPCR controlled/standard switching.
+- `backend/arm64/inst.rs`: keeps explicit Rust AArch64 encoder helpers for signed scalar FP-to-fixed and FP vector min/max instructions; instruction words were checked against Apple AArch64 assembler output.
+
+### Unintentional differences (to fix)
+- Nonzero `fbits` for 32-bit FP-to-fixed remains unsupported in Rust, while upstream handles `TowardsZero` fixed-point encodings and asserts `fbits == 0` only for the other rounding modes.
+- Broader ARM64 FP vector opcode coverage remains incomplete; this slice only covers min/max opcodes now reached by MK8D.
+
+### Missing items
+- Fixed-point `FCVTZS`/`FCVTZU` immediate-fbits encoders and emitter paths for FP-to-fixed nonzero `fbits`.
+- Remaining upstream ARM64 scalar/vector FP opcodes not yet reached by the current MK8D run.
+
+### Binary layout verification
+- N/A: host AArch64 code emission only; no guest-visible raw layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_floating_point.cpp` around `EmitToFixed`, `FPDoubleToFixedS32`, and `FPSingleToFixedS32`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector_floating_point.cpp` around `EmitThreeOpArranged`, `FPVectorMax*`, and `FPVectorMin*`.
+- Re-read local Rust counterparts in `externals/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs`, `emit_arm64_vector_floating_point.rs`, `emit_arm64.rs`, and `inst.rs`.
+- `cargo fmt -p rdynarmic --check` passes.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words --lib -- --exact --nocapture` passes.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::emit_arm64_vector_floating_point --lib -- --nocapture` passes; this filter currently has no focused unit tests and serves as a compile check.
+- MK8D run with isolated data/cache/config directories advances past prior `FPDoubleToFixedS32` and `FPVectorMin32` blockers; `timeout 120s cargo run --bin ruzu-cmd -- -g "/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"` exits with timeout code 124 and no `not ported`/panic lines in the filtered log.
+
+## 2026-06-25 — externals/rdynarmic ARM64 FP vector paired add vs externals/dynarmic/src/dynarmic
+
+### Intentional differences
+- `backend/arm64/emit_arm64_vector_floating_point.rs`: ports upstream `FPVectorPairedAdd32`, `FPVectorPairedAdd64`, `FPVectorPairedAddLower32`, and `FPVectorPairedAddLower64` from `backend/arm64/emit_arm64_vector_floating_point.cpp`, preserving the upstream `ZIP1`/zero-vector staging for lower-32 and scalar double-lane `FADDP` for lower-64.
+- `backend/arm64/inst.rs`: keeps explicit Rust AArch64 encoder helpers for vector `FADDP` and scalar-from-vector `FADDP`; instruction words were checked against Apple AArch64 assembler output.
+
+### Unintentional differences (to fix)
+- Broader ARM64 FP vector opcode coverage remains incomplete; after this slice MK8D advances to `FPVectorFromSignedFixed32`, which is not yet routed.
+
+### Missing items
+- `FPVectorFromSignedFixed32` and likely the related signed/unsigned fixed-to-vector-FP opcodes in `backend/arm64/emit_arm64_vector_floating_point.rs`.
+- Remaining upstream ARM64 vector FP opcodes not yet reached by the current MK8D run.
+
+### Binary layout verification
+- N/A: host AArch64 code emission only; no guest-visible raw layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector_floating_point.cpp` around `EmitThreeOpArranged`, `FPVectorPairedAdd32/64`, and `FPVectorPairedAddLower32/64`.
+- Re-read local Rust counterparts in `externals/rdynarmic/src/backend/arm64/emit_arm64_vector_floating_point.rs`, `emit_arm64.rs`, and `inst.rs`.
+- `cargo fmt -p rdynarmic --check` passes.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words --lib -- --exact --nocapture` passes.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::emit_arm64_vector_floating_point --lib -- --nocapture` passes; this filter currently has no focused unit tests and serves as a compile check.
+- MK8D run with isolated data/cache/config directories advances past prior `FPVectorPairedAddLower32`; `timeout 300s cargo run --bin ruzu-cmd -- -g "/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"` exits with code 134 at the next missing ARM64 JIT opcode, `FPVectorFromSignedFixed32`.
