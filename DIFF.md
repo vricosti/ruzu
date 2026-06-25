@@ -13709,3 +13709,1857 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `timeout 120s cargo test -p video_core renderer_vulkan::renderer_vulkan::tests::driver_name_builder_matches_report_format`
 - `timeout 120s cargo check -p video_core`
 - `timeout 120s cargo check -p ruzu_cmd --bin ruzu-cmd`
+
+## 2026-06-23 — externals/rdynarmic/src/backend/arm64/* vs upstream Dynarmic ARM64 host backend
+
+### Intentional differences
+- Added a new Rust `backend::arm64` module as a prerequisite for Apple Silicon host JIT support. This is not a direct zuyu source-file counterpart; it mirrors the missing host-backend role provided by upstream C++ Dynarmic on AArch64 hosts.
+- `abi.rs` records AAPCS64 register classes and now ports upstream `ABI_PushRegisters` / `ABI_PopRegisters` frame calculation and save/restore ordering for GPR and Q-register register lists.
+- `address_space.rs` ports the upstream ARM64 `AddressSpace` ownership shape for executable memory, optional owner-filled `PreludeInfo`, current block-entry lookup, reverse host-PC lookup, block-info storage, block-reference storage, invalidation semantics, and cache clearing back to `prelude_info.end_of_prelude` once an ISA owner has emitted the prelude. The base `AddressSpace::new` now allocates executable memory without implicitly emitting the prelude, matching upstream where `A32AddressSpace::EmitPrelude()` / `A64AddressSpace::EmitPrelude()` fill `prelude_info`.
+- `address_space.rs` now implements the first upstream linking subset: `LinkTarget::ReturnToDispatcher` and `LinkTarget::ReturnFromRunCode` are patched as direct `B`, `BlockRelocationType::Branch` is patched as `B(target)` when the target block exists or `NOP` when missing, and `BlockRelocationType::MoveToScratch1` is patched as an `ADRP` + `ADD` pseudo-`ADRL` sequence loading either the target block or `prelude_info.return_to_dispatcher`. Both block relocation kinds are repatched through `relink_for_descriptor` when the target block is later recorded or invalidated.
+- `a32_address_space.rs` and `a64_address_space.rs` add Rust counterparts for upstream `A32AddressSpace` / `A64AddressSpace` ownership: they own the ARM64 `AddressSpace` base, hold the user config, explicitly emit the current bootstrap prelude from the ISA owner constructor, translate from `LocationDescriptor` into IR through the ISA frontend, derive an ARM64 emit config, register basic-block PC ranges, and invalidate matching ranges.
+- `a32_address_space.rs` / `a64_address_space.rs::get_or_emit` now carry the Rust equivalent of upstream `AddressSpace::GetOrEmit` for ISA-owned state: cached blocks return immediately; misses generate ISA IR, derive `EmitConfig`, call the backend `Emit` boundary, and register the translated block range after successful emission. This is a Rust ownership adaptation because upstream uses virtual `GenerateIR` / `GetEmitConfig` / `RegisterNewBasicBlock` methods on the base `AddressSpace`.
+- `emit_arm64.rs` adds the Rust counterpart for upstream `backend/arm64/emit_arm64.h::EmitConfig`, currently covering the optimization mask, memory/timing fields already represented by `JitConfig`, fastmem/page-table pointers, top-level fastmem/page-table emission fields, A32 32-bit mirrored address-space policy, upstream A64 system-register defaults, A32 zeroed system-register fields, TPIDR placeholders, and ARM64 JIT-state offsets.
+- `emit_arm64.rs` now owns the upstream `backend/arm64/emit_arm64.h` data declarations `CodePtr`, `LinkTarget`, `Relocation`, `BlockRelocationType`, `BlockRelocation`, and `EmittedBlockInfo`. `address_space.rs` imports those definitions rather than defining them locally, matching upstream where `address_space.h` includes `emit_arm64.h` and uses those emitted-block/linking types.
+- `emit_arm64.rs` now ports upstream `backend/arm64/emit_arm64.cpp::EmitRelocation` and `EmitBlockLinkRelocation`: relocation offsets are recorded relative to `EmittedBlockInfo::entry_point`, normal link relocations emit one `NOP`, block branch relocations emit one `NOP`, and `MoveToScratch1` block relocations emit `BRK(0)` then `NOP` as upstream placeholders for later link patching.
+- `emit_arm64.rs::emit_arm64` now exists as the strict Rust boundary for upstream `backend/arm64/emit_arm64.cpp::EmitArm64`: callers can reach the correct owner boundary after IR generation and config construction, but the function returns an explicit missing-emitter error instead of falling back to an unrelated scheduler/interpreter path.
+- `emit_context.rs` ports the upstream header-only `backend/arm64/emit_context.h` ownership shell: `EmitContext` owns references to the current IR block, register allocator, emit config, emitted-block info, FPSR manager, fastmem manager, and deferred emits. It now references the backend-owned `reg_alloc.rs`, `fpsr_manager.rs`, and `fastmem.rs` modules instead of local placeholders.
+- `emit_context.rs::Fpcr` ports the upstream `common/fp/fpcr.h` value masking and `ASIMDStandardValue()` behavior needed by `EmitContext::FPCR()`. `emit_arm64.rs::EmitConfig` now includes `descriptor_to_fpcr`, with A32 deriving FPCR from `A32LocationDescriptor::fpscr()` and A64 deriving it from `A64LocationDescriptor::fpcr()`.
+- `fpsr_manager.rs` ports upstream `backend/arm64/fpsr_manager.h/.cpp`: `Load` lazily clears host FPSR with `MSR FPSR, XZR`, `Spill` lazily merges host FPSR into the JIT-state FPSR field through `LDR` / `MRS` / `ORR` / `STR`, and `Overwrite` marks the loaded host FPSR state stale without emitting code. `emit_context.rs` now references this real backend-owned manager instead of a local placeholder.
+- `fastmem.rs` ports upstream `backend/arm64/fastmem.h`: `DoNotFastmemMarker`, `FastmemPatchInfo`, and `FastmemManager::SupportsFastmem` / `ShouldFastmem` / `MarkDoNotFastmem` now live in the ARM64 backend owner instead of `emit_context.rs`. Rust represents upstream `ExceptionHandler&` as a small local `ExceptionHandler` trait so the ARM64 backend does not depend on the existing x64 exception-handler module.
+- `reg_alloc.rs` now owns the ARM64 register-allocator data model from upstream `backend/arm64/reg_alloc.h/.cpp`: `HostLoc`, `RWType`, `Argument`, `HostLocInfo`, register/spill arrays, defined-instruction tracking, value-location lookup, `GetArgumentInfo`, `WasValueDefined`, `DefineAsExisting`, `DefineAsRegister`, `UpdateAllUses`, unlocked/no-more-uses assertions, register-selection preference, free-spill lookup, `SpillGpr`, `SpillFpr`, and `SpillFlags`. This is still a bounded tranche of the upstream owner and intentionally does not fake the RAII `RAReg` realization or copy/reload paths.
+- `reg_alloc.rs` now ports upstream `RegAlloc::LoadCopyInto(const IR::Value&, XReg)` and `RegAlloc::LoadCopyInto(const IR::Value&, QReg)` as backend-owned `load_copy_into_gpr` and `load_copy_into_fpr`. The Rust methods emit the same source-location cases as upstream: immediate materialization, GPR move, FPR/GPR `FMOV`, stack spill reload, NZCV read for GPR targets, and unsupported flags-to-FPR assertion. Rust keeps the `code.MOV(imm64)` lowering as a local `MOVZ`/`MOVK` helper because there is not yet a full oaknut-equivalent ARM64 emitter object.
+- `reg_alloc.rs` now ports upstream `GenerateImmediate`, `RealizeReadImpl`, `RealizeWriteImpl`, and `RealizeReadWriteImpl` as Rust methods dispatching on `HostLocKind` instead of C++ templates. The implementation preserves upstream ordering: generate immediates by allocating and spilling first, set scratch/realized state, materialize to GPR/FPR/NZCV, reuse locations already of the required kind, require locked unrealized source locations before cross-kind migration, emit the transfer, then move the `HostLocInfo` into the new register owner.
+- `reg_alloc.rs` now ports upstream `PrepareForCall` and `ReadWriteFlags`: FPSR is spilled before flags/caller-save registers, flags are spilled before call preparation or overwritten NZCV sources, caller-save GPR/FPR registers are spilled according to `ABI_CALLER_SAVE`, ABI argument registers are loaded in upstream NGRN/NSRN order, and flags read-write sources from GPR/spill emit `MSR NZCV` or `LDR Wscratch0` + `MSR NZCV`.
+- `reg_alloc.rs` now ports upstream header-owned `RAReg<T>` lifetime behavior: `read_x`/`read_w`/`read_q`/`read_d`/`read_s`/`read_h`/`read_b`, write variants, read-write variants, `write_flags`, `RAReg::realize`, `RegAlloc::realize_all`, lock increment on non-immediate read construction, lock decrement on drop, and clearing the realized bit for the realized register on drop.
+- `inst.rs` introduces ARM64 instruction encoders for executable-code smoke tests, ABI frame construction, atomic halt updates, direct `B` / `BL` relocation patching, `BRK`, `LDR literal` callback trampoline construction, `ADRP` + `ADD` pseudo-`ADRL` block relocation patching, FPSR manager `MRS` / `MSR`, NZCV `MRS` / `MSR`, W/X/Q unsigned `LDR` / `STR`, W-register `ORR`, `FMOV X<->D`, vector `MOV vD.16b, vN.16b`, and future dispatcher/register-allocation construction.
+- `block_of_code.rs` allocates executable ARM64 code with macOS `MAP_JIT`, toggles `pthread_jit_write_protect_np`, flushes the instruction cache, can emit a minimal direct-call dispatcher stub, can write aligned literal data words for prelude trampolines, can align with NOP padding, and can patch a single emitted instruction in place for ARM64 relocation/relinking.
+- `jit_state.rs` ports upstream Dynarmic `backend/arm64/a32_jitstate.h/.cpp` and `backend/arm64/a64_jitstate.h` layouts separately from the existing x64 JIT state. This is intentional because upstream ARM64 and x64 host backends use different in-memory state layouts.
+- `stack_layout.rs` ports upstream Dynarmic `backend/arm64/stack_layout.h`, including `RSBEntry`, `StackLayout`, `SpillCount`, `RSBCount`, `RSBIndexMask`, and the offsets used by generated ARM64 code.
+- `prelude.rs` adds a bootstrap `run_code` / `step_code` entry with the upstream `PreludeInfo::RunCodeFuncType` argument shape, upstream ABI callee-save preservation through `ABI_CALLEE_SAVE` plus `StackLayout`, `X19` as the entry-point register, `X28` as the JIT-state register, `X27` as the halt-reason register, a halt check before block entry, upstream-style atomic `LDAXR` / `STLXR` step halt setting, atomic halt clear on return, and a distinct `return_to_dispatcher` relocation target. `PreludeInfo` now also carries every upstream memory, exclusive-monitor, SVC, exception, cache-maintenance, barrier, and tick callback field as an optional code pointer so the Rust layout of linkable prelude targets matches upstream `address_space.h`.
+- `prelude.rs::emit_call_trampoline` emits the same normal-call trampoline shape used by upstream A32/A64 `EmitCallTrampoline`: `LDR X0, this_literal`, `LDR Xscratch0, fn_literal`, `BR Xscratch0`, 8-byte alignment, then the `this` and function-pointer literals.
+- `prelude.rs` now also owns the upstream A32 wrapped read/write trampoline shapes: preserve caller-save state, move the guest address/value out of `Xscratch0`/`Xscratch1` into the member-function ABI argument registers, call the host function pointer, restore state, and return to generated code. `AddressSpace` exposes these as backend-only prelude emitters.
+- `a32_address_space.rs::emit_callback_trampolines` now mirrors upstream `A32AddressSpace::EmitPrelude()` callback pointer ordering for A32 8/16/32/64 memory reads, wrapped reads, exclusive reads, memory writes, wrapped writes, exclusive writes, SVC, exception, ISB, add ticks, and get ticks remaining. `A32CallbackContext` is the Rust equivalent of the stable upstream `conf` object for generated callback thunks: it holds raw pointers to the ARM64 A32 JIT state, callbacks, global monitor, processor id, and local exclusive expected values.
+- `address_space.rs::link` now mirrors upstream `AddressSpace::Link`'s complete `LinkTarget` switch structurally: `ReturnToDispatcher` / `ReturnFromRunCode` patch direct `B`, and all memory/exclusive/SVC/exception/cache/barrier/tick targets select the matching `PreludeInfo` field and patch `BL` when that prelude target has been emitted.
+- `backend::common::emit_context::MemoryEmitConfig` now owns the frontend-facing memory emission configuration, while `backend::x64::emit_context` re-exports it for compatibility. This removes one x64-only type from `JitConfig` without changing current x64 behavior.
+- `A32LocationDescriptor::from_location` moved out of the x64 backend file into `ir::location`, matching its real ownership and allowing the ARM64 A32 address-space owner to reconstruct descriptors without depending on x64.
+- `backend::common::a32_callbacks` centralizes the host-neutral A32 callback behavior used by the existing x64 trampolines and future ARM64 callback context. This is an ownership correction away from x64-specific code; generated callback ABI adapters remain backend-owned.
+- `a32_core.rs` ports upstream `backend/arm64/a32_core.h` ownership and `Run` / `Step` shape: both methods now call the A32 address-space owner's `get_or_emit` path and then dispatch through the ARM64 prelude `run_code` / `step_code` function pointers.
+- `a64_core.rs` ports upstream `backend/arm64/a64_core.h` ownership and `Run` / `Step` shape with the same ISA-owner `get_or_emit` and ARM64 prelude dispatch ordering as upstream.
+- `a32_interface.rs` and `a64_interface.rs` port the upstream ARM64 backend interface ownership shape from `backend/arm64/a32_interface.cpp` and `backend/arm64/a64_interface.cpp`: current JIT state, current address space, core, halt reason, deferred cache invalidation state, register accessors, reset, halt/clear-halt, and run/step ordering now live in backend-owned ARM64 modules instead of being invented inside `jit.rs`.
+- Rust stores the user config inside `A32AddressSpace` / `A64AddressSpace` and exposes a backend-local `config()` accessor for constructing `A32Core` / `A64Core`; upstream stores a second `conf` member in `Jit::Impl`. This avoids cloning a Rust `Box<dyn UserCallbacks>` while preserving the same effective owner lifetime.
+- `a32_interface.rs` / `a64_interface.rs` now heap-box their internal state, matching upstream's stable `Jit::Impl` allocation and the existing x64 Rust pattern. This is required because Rust callback extensions store raw pointers to `halt_reason`, PC, and A32 `upper_location_descriptor`; installing those pointers before moving the interface would be incorrect.
+
+### Unintentional differences (to fix)
+- `rdynarmic::jit` still imports and constructs `backend::x64::{A32EmitX64,A64EmitX64,...}` and still rejects non-`x86_64` hosts in `A32Jit::new` and `A64Jit::new`.
+- Fixed by this entry: `JitConfig::memory` now uses `backend::common::emit_context::MemoryEmitConfig`.
+- The new ARM64 `AddressSpace`, `A32Core`, and A32/A64 address-space owners are not yet wired into `A32Jit::new` / `A64Jit::new` construction or real ARM64 machine-code emission. `AddressSpace` now patches emitted direct branches for `ReturnToDispatcher` / `ReturnFromRunCode`, all upstream callback `BL` targets whose prelude pointer is present, and both upstream block relocation kinds.
+- The Rust bootstrap prelude is still smaller than upstream `A32AddressSpace::EmitPrelude()` / `A64AddressSpace::EmitPrelude()`: A32 callback trampolines can now be emitted by the A32 owner, but the runnable prelude still lacks the real `return_to_dispatcher` callback into `GetOrEmit`, FPCR save/set/restore, cycle accounting, page-table/fastmem host registers, and return-stack-buffer initialization.
+- Upstream `return_from_run_code` restores host FPCR and accounts cycles before returning. The Rust bootstrap now atomically clears `halt_reason` and restores the upstream callee-save frame, but still lacks FPCR restoration and cycle accounting.
+- Upstream `return_to_dispatcher` checks halt/cycles, calls back into `AddressSpace::GetOrEmit(context.GetLocationDescriptor())`, and branches to the returned block. Rust currently exposes a distinct `return_to_dispatcher` label but makes it branch to `return_from_run_code`; this is a temporary bootstrap target for link-patching only and must be replaced by the real dispatcher before JIT wiring.
+- Upstream `AddressSpace::GetOrEmit` generates IR and calls `EmitArm64` on cache miss through virtual ISA hooks. Rust now preserves that ordering in `A32AddressSpace::get_or_emit` and `A64AddressSpace::get_or_emit`: cache hit, `GenerateIR`, `GetEmitConfig`, backend `Emit`, then `RegisterNewBasicBlock` after successful emission. The remaining divergence is that `emit_arm64.rs::emit_arm64` returns an explicit `EmitArm64 is not ported` error instead of generating ARM64 machine code.
+- `a32_interface.rs` / `a64_interface.rs` are not yet selected by public `rdynarmic::jit::A32Jit::new` / `A64Jit::new`; those constructors still build the x64 backend and reject non-`x86_64`. The new files are backend-owned prerequisites for replacing that hardcoded path with an enum backend without breaking Linux x64.
+- Upstream `Link` emits `BL` for every memory/exclusive/SVC/exception/tick callback target because upstream `A32AddressSpace::EmitPrelude()` / `A64AddressSpace::EmitPrelude()` always populate those prelude pointers first. Rust now has the full target-to-field switch and A32 can populate the upstream A32 callback subset, but A64 callback trampoline assignment and A32 JIT construction wiring are still missing.
+- Upstream `A32AddressSpace::GenerateIR` / `A64AddressSpace::GenerateIR` run all Dynarmic optimization passes, including passes not yet present in rdynarmic (`PolyfillPass`, `NamingPass`, `A64CallbackConfigPass`, full `A64MergeInterpretBlocksPass`). Rust runs the available equivalent passes in upstream order and documents the missing pass coverage here.
+- Upstream `EmitConfig` still includes fields not represented by the current Rust ARM64 owner: emitter callbacks (`emit_cond`, `emit_terminal`, `emit_condition_failed_terminal`, `emit_check_memory_abort`), A32 coprocessors, hookable cache/hint instruction flags, debug flags, and public A64 TPIDR/system-register inputs. Rust now carries `descriptor_to_fpcr`, upstream memory fields, A32/A64 default system-register values, TPIDR placeholders, and state offsets needed by generated code, but the remaining callback/config fields must be added before `EmitArm64` can be implemented faithfully.
+- Upstream `RegAlloc` is now represented by backend-owned `reg_alloc.rs`, including data/usage tracking, GPR/FPR/flags spill emission, immediate generation, read/write/read-write realization, `PrepareForCall`, `ReadWriteFlags`, `LoadCopyInto` copy/reload emission, and `RAReg` lifetime locking/realization wrappers. `SpillAll` and verbose debugging output remain incomplete before `EmitArm64` can use the allocator as a full upstream replacement.
+- Rust `RegAlloc::realize_*` dispatches on `HostLocKind` at runtime instead of using upstream C++ template instantiations. This preserves ownership and behavior while avoiding premature Rust type-level register wrappers before `RAReg` is ported.
+- Rust `RegAlloc::prepare_for_call` takes `&mut FpsrManager` explicitly instead of storing upstream's constructor reference inside `RegAlloc`. This matches the existing Rust owner split where `EmitContext` owns both objects and avoids introducing a long-lived self-referential relationship before the full emitter is wired.
+- Rust `RAReg` stores a non-null raw pointer to `RegAlloc` rather than a Rust borrow. This is intentional to preserve upstream's ability to hold several RAII register guards simultaneously and realize them as a group; constructors remain owned by `RegAlloc`, and tests cover lock/unlock/drop behavior.
+- Upstream `FastmemManager` references the shared C++ `ExceptionHandler` class directly; Rust currently uses an ARM64-local trait boundary because only x64 has a concrete Rust exception handler. A concrete ARM64 exception handler still needs to replace the default false-support implementation before real ARM64 fastmem emission is enabled.
+
+### Missing items
+- Split the remaining host-neutral callback metadata and JIT construction interfaces from `backend::x64`.
+- Port or implement real ARM64 `EmitArm64` machine-code emission, `return_to_dispatcher` callback into `GetOrEmit`, branch/link terminal handling, and exception/fastmem patch path.
+- Complete upstream `backend/arm64/reg_alloc.h/.cpp` in backend-owned `reg_alloc.rs`: spill-all if upstream later defines it in source, and verbose debugging output.
+- Port a concrete ARM64 exception handler so `FastmemManager::supports_fastmem()` can reflect host support instead of the current default-disabled handler.
+- Wire the stable A32 ARM64 callback context into A32 ARM64 JIT construction, then call `A32AddressSpace::emit_callback_trampolines` with that context before emitting linked blocks.
+- Complete A64-specific callback trampoline setup, then construct A32/A64 ARM64 owners from `A32Jit::new` / `A64Jit::new` on `target_arch = "aarch64"`.
+- Use the `StackLayout` frame for the remaining upstream prelude state operations: FPCR save/restore, cycle counting, spills, and return-stack-buffer initialization.
+- Add ARM64 IR emitters for the A32 and A64 frontends, then select them from `A32Jit::new` / `A64Jit::new` on `target_arch = "aarch64"`.
+- Re-run MK8D after the A32 ARM64 host backend is wired, because MK8D is AArch32 guest code and cannot run through the current x64-only `A32Jit`.
+
+### Binary layout verification
+- `backend::arm64::jit_state` has tests verifying `A32JitState` and `A64JitState` alignment, size, and field offsets against upstream ARM64 Dynarmic headers, including the 16-byte aligned vector-register fields.
+- `backend::arm64::stack_layout` has tests verifying `RSBEntry` and `StackLayout` alignment, size, and offsets against upstream `stack_layout.h`: `RSBEntry` size 16, `StackLayout` size 1184, `spill` at 128, `rsb_ptr` at 1152, `cycles_to_run` at 1160, `save_host_fpcr` at 1168, and `check_bit` at 1172.
+- `backend::arm64::abi` has tests verifying upstream `ABI_CALLEE_SAVE` / `ABI_CALLER_SAVE`, frame size calculation for `ABI_CALLEE_SAVE`, and generated push/pop instruction order for the full callee-save frame.
+- `backend::arm64::address_space` has tests verifying `PreludeInfo::end_of_prelude`, remaining code-cache size, `Get`, `ReverseGetLocation`, `ReverseGetEntryPoint`, invalidation keeping reverse history, `ClearCache` preserving prelude code, post-clear emission offset, upstream `LinkTarget` enum count, `ReturnToDispatcher` / `ReturnFromRunCode` branch relocation patching, callback relocation rejection when the prelude target is missing, callback `BL` patching when a prelude target is present, direct block-branch patching, `NOP` patching for missing branch targets, `MoveToScratch1` fallback/target ADRL patching, and relinking when a target block is recorded later.
+- `backend::arm64::emit_arm64` now owns the emitted-block and relocation type definitions that those `address_space` tests instantiate, preserving the upstream `emit_arm64.h` owner while still exercising the `AddressSpace::Link` behavior.
+- `backend::arm64::address_space` also verifies the upstream `GetOrEmit` cached-block fast path and the current strict missing-`EmitArm64` error boundary.
+- `backend::arm64::block_of_code` has tests verifying aligned 64-bit literal writes and NOP alignment padding for prelude trampoline literal pools.
+- `backend::arm64::prelude` has tests verifying the normal call trampoline's literal-pool instruction shape and, on AArch64 hosts, that the trampoline branches to the target function after loading the configured `this` pointer into X0. The wrapped read/write trampoline shape is covered through A32 prelude population and code-cache preservation tests.
+- `backend::arm64::a32_address_space` and `backend::arm64::a64_address_space` have tests verifying `GenerateIR` consumes the ISA-specific location descriptor and callback, and that `RegisterNewBasicBlock` / `InvalidateCacheRanges` track and remove closed PC ranges matching upstream `BlockRangeInformation`. A32 additionally verifies normal callback prelude population, the full upstream A32 8/16/32/64 callback subset, callback-context memory/exclusive thunk forwarding, and extended-prelude preservation across `ClearCache`.
+- `backend::arm64::a32_core` has tests verifying the current missing-`EmitArm64` error boundary through the A32 owner `get_or_emit` path, single-stepping descriptor construction, and on AArch64 hosts that an already emitted block runs through the ARM64 prelude.
+- `backend::arm64::a64_core` has tests verifying the same cached/missing-emitter execution boundary through the A64 owner `get_or_emit` path, A64 single-stepping descriptor construction, and on AArch64 hosts that an already emitted block runs through the ARM64 prelude.
+- `backend::arm64::a32_interface` and `backend::arm64::a64_interface` have tests verifying upstream-style deferred clear-cache ordering before execution and register accessor ownership through the current ARM64 JIT state.
+- `backend::arm64::a32_interface` and `backend::arm64::a64_interface` also verify that constructor-installed callback state pointers reference the final heap-stable halt/PC state, including A32 `upper_location_descriptor`.
+- `backend::common::a32_callbacks` has tests verifying host-neutral memory forwarding and local exclusive read/write expected-value behavior.
+- `backend::arm64::emit_arm64` has tests verifying unsafe optimization masking, A32 32-bit mirrored fastmem/page-table config derivation, A32 state offsets, A64 memory/system-register defaults, A64 top-level memory emission fields, A64 state offsets, relocation offset recording with `NOP` placeholder emission, block branch relocation `NOP` placeholder emission, and `MoveToScratch1` placeholder emission as `BRK(0)` followed by `NOP`.
+- `backend::arm64::emit_context` has tests verifying upstream FPCR reserved-bit masking, `ASIMDStandardValue()` preserving AHP/FZ16 while forcing FZ/DN, and `EmitContext::fpcr()` using the `descriptor_to_fpcr` callback from `EmitConfig`.
+- `backend::arm64::fpsr_manager` has tests verifying upstream lazy `Load` / `Spill` / `Overwrite` behavior and the emitted `MSR FPSR, XZR`, `LDR Wscratch0`, `MRS Xscratch1, FPSR`, `ORR`, and `STR` instruction sequence.
+- `backend::arm64::fastmem` has tests verifying `SupportsFastmem` forwarding to the exception-handler boundary, `ShouldFastmem` changing after `MarkDoNotFastmem`, marker equality by location and instruction index, and default-disabled fastmem support before a concrete ARM64 exception handler is ported.
+- `backend::arm64::reg_alloc` has tests verifying upstream `HostLocInfo` setup/use-update lifecycle, immediate argument accessors and bounds, `GetArgumentInfo` use tracking for already-defined values, `DefineAsExisting` alias/immediate replacement behavior through the current Rust IR identity model, register allocation preference for empty then allocatable registers, free spill-slot lookup, `SpillGpr` / `SpillFpr` stack-store emission and location movement, `SpillFlags` order: spill selected GPR first, then `MRS NZCV` into that GPR, `LoadCopyInto` emission for GPR/FPR/spill/flags/immediate sources, `GenerateImmediate` GPR/FPR/NZCV emission, `RealizeRead` / `RealizeWrite` / `RealizeReadWrite` ownership movement, `ReadWriteFlags` GPR/spill source emission, `PrepareForCall` spill-before-argument ordering, and `RAReg` lock/realize/drop semantics including grouped realization.
+- `backend::arm64::inst` has tests verifying known ARM64 machine words for `BRK`, FPSR/NZCV system instructions, W/X/Q memory instructions, `FMOV X<->D`, vector `MOV v.16b`, and existing branch/literal/atomic encoders used by the ARM64 backend scaffolding. The new RegAlloc-facing words were cross-checked with `clang -target arm64-apple-macos` and `xcrun llvm-objdump`.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_jitstate.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_jitstate.cpp`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a64_jitstate.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/address_space.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/address_space.cpp`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/address_space.cpp` `AddressSpace::GetOrEmit()` and `AddressSpace::Emit()`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a64_address_space.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp` `A32AddressSpace::EmitPrelude()`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a64_address_space.cpp` `A64AddressSpace::EmitPrelude()`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/devirtualize.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp` `A32AddressSpace::GenerateIR()`, `GetEmitConfig()`, and `RegisterNewBasicBlock()`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a64_address_space.cpp` `A64AddressSpace::GenerateIR()`, `GetEmitConfig()`, and `RegisterNewBasicBlock()`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.cpp` relocation helper code.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.cpp` `EmitArm64()`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_context.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/fpsr_manager.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/fpsr_manager.cpp`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/fastmem.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/reg_alloc.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/reg_alloc.cpp`.
+- Verified ARM64 instruction words for RegAlloc prerequisites with `clang -target arm64-apple-macos` and `xcrun llvm-objdump`: `STR/LDR X`, `STR/LDR Q`, `FMOV X<->D`, `MOV v.16b`, `MRS NZCV`, and `MSR NZCV`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/common/fp/fpcr.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/interface/A32/config.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/interface/A64/config.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/stack_layout.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_core.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a64_core.h`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_interface.cpp`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a64_interface.cpp`.
+- `cargo fmt --manifest-path externals/rdynarmic/Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 89 ARM64 backend tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64` passes 6 ARM64 emit config/relocation tests.
+- `timeout 120s cargo test -p rdynarmic a32_callbacks` passes 4 host-neutral A32 callback tests.
+- `timeout 120s cargo check -p rdynarmic` passes with pre-existing warnings and remaining function-pointer cast warnings in the x64 JIT construction path.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64 emit tranche vs externals/dynarmic/src/dynarmic/backend/arm64
+
+### Intentional differences
+- `emit_arm64.rs::emit_arm64` now ports the upstream `EmitArm64` control-flow skeleton instead of returning the previous missing-emitter error: it creates `EmitContext`, rejects unsupported conditional entry paths explicitly, emits the currently ported IR opcodes in instruction order, updates register uses after each instruction, spills FPSR, emits cycle subtraction for small counts, calls the ISA terminal callback, emits the same post-terminal/deferred `BRK(0)` guards, and records `EmittedBlockInfo::size`.
+- `emit_arm64.rs` currently supports only the upstream core opcodes that have enough backend prerequisites ported: `Void`, `Identity`, `Breakpoint`, `CallHostFunction`, and `A64SetPC`. Unsupported opcodes still return explicit errors rather than falling back to a scheduler/interpreter path.
+- `emit_arm64_a32.rs` and `emit_arm64_a64.rs` now own the upstream terminal emitter split for `ReturnToDispatch`, `LinkBlock`, and `LinkBlockFast`. `LinkBlock` preserves upstream PC/descriptor update and return-dispatch ordering when `BLOCK_LINKING` is disabled or the block is single-step.
+- `LinkBlock` with `BLOCK_LINKING` enabled returns an explicit missing guard-emission error. Upstream emits a halt/tick guard before the block-link relocation; Rust does not yet have the needed conditional branch/label helpers in the ARM64 emitter, so emitting an unconditional block-link here would be behaviorally wrong.
+- A64 core/cache tests no longer execute newly generated `LinkBlock` code through the bootstrap dispatcher, because the Rust `return_to_dispatcher` target still returns/bootstraps instead of performing upstream dispatcher lookup. The tests now verify `get_or_emit` emission/cache behavior and leave full generated-code execution to the existing pre-emitted-block prelude tests.
+- A64 interface deferred-clear-cache test intentionally uses an invalid-code short error path to verify clear-cache ordering without entering the incomplete dispatcher loop. This keeps the test truthful while `A64ExceptionRaised` callback trampoline setup remains missing.
+
+### Unintentional differences (to fix)
+- Upstream `EmitArm64` supports conditional block entry (`EmitCond` and condition-failed terminal path). Rust still rejects conditional entry and condition-failed paths explicitly.
+- Upstream `EmitIR<IR::Opcode::A64SetPC>` lives in `emit_arm64_a64.cpp`; Rust currently routes the first `A64SetPC` implementation through `emit_arm64.rs::emit_ir_instruction` because the Rust emitter dispatch table has not yet been split into per-ISA opcode owner files. This should move to the A64-owned emitter when the opcode dispatch table is split.
+- Upstream `LinkBlock` with block-linking emits `CMP/B` or `LDAR/CBNZ` guard code before `EmitBlockLinkRelocation`. Rust has the no-block-linking/single-step path only.
+- Upstream `return_to_dispatcher` calls back into `GetOrEmit` and branches to the returned block. Rust bootstrap still cannot safely execute generated `LinkBlock` loops through dispatcher; tests avoid that path and document it here.
+- Upstream A64 exception/callback prelude targets are populated before exception-emitting blocks are linked. Rust A64 prelude still lacks the A64 callback trampoline setup, so invalid A64 guest code currently fails at the explicit `A64ExceptionRaised` missing-opcode boundary or later missing callback work instead of invoking the host exception callback.
+
+### Missing items
+- Port ARM64 label/conditional branch helpers needed for `LinkBlock` halt/tick guards, `If`, `CheckBit`, `CheckHalt`, condition-failed terminal emission, and memory-abort checks.
+- Split ARM64 IR opcode emission into upstream-owned A32/A64 files once the dispatch table is large enough; move `A64SetPC` to the A64-owned path.
+- Port A64 callback trampoline setup and `A64ExceptionRaised` / SVC / cache/barrier callback emissions.
+- Replace the bootstrap `return_to_dispatcher` with the upstream dispatcher callback into `AddressSpace::GetOrEmit`.
+- Continue porting the remaining ARM64 IR opcodes before selecting the ARM64 backend from public `A32Jit::new` / `A64Jit::new` on Apple Silicon.
+
+### Binary layout verification
+- No new raw serialized structs were introduced in this tranche.
+- Existing `A32JitState`, `A64JitState`, `StackLayout`, ABI frame, relocation, and instruction-word tests remain the layout/encoding verification gates.
+- Fixed the `SUB Xd, Xn, #imm` instruction-word expectation for `sub_x_imm(26, 26, 7)` to `0xd100_1f5a`; the previous expected word encoded the wrong source-register bits.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.cpp` `EmitArm64()`, `EmitRelocation()`, and `EmitBlockLinkRelocation()`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.h` for emitted-block/linking type and `EmitConfig` ownership.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp` terminal emitters for `ReturnToDispatch`, `LinkBlock`, `LinkBlockFast`, and condition-failed terminal routing.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a64.cpp` terminal emitters and `EmitIR<IR::Opcode::A64SetPC>`.
+- `cargo fmt --manifest-path externals/rdynarmic/Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64` passes 16 ARM64 emit/terminal tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 99 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs and emit_arm64_a64.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp and emit_arm64_a64.cpp
+
+### Intentional differences
+- `inst.rs` now owns the small AArch64 encoders needed by upstream terminal guards: `CMP Xn, #imm`, `B.cond`, and the existing `CBNZ Wt, label`. This keeps raw opcode construction in the backend instruction owner instead of scattering literal words through terminal emitters.
+- `emit_arm64_a32.rs::LinkBlock` now follows upstream guard ordering when `BLOCK_LINKING` is enabled and the block is not single-step: update upper location descriptor, emit either `CMP(Xticks, 0); B(LE, fail)` or `LDAR(Wscratch0, Xhalt); CBNZ(Wscratch0, fail)`, record a branch block-link relocation, then emit the fail label path that writes PC and returns to dispatcher.
+- `emit_arm64_a64.rs::LinkBlock` now follows the same upstream guard and relocation ordering without the A32-only upper descriptor update.
+- Rust patches the guard branch after emitting the relocation placeholder by computing the byte distance to the fail label. Upstream Oaknut resolves the label internally; the behavior is equivalent and stays local to the ARM64 backend emitter.
+
+### Unintentional differences (to fix)
+- Upstream still has many terminal emitters not ported in Rust: `PopRSBHint`, `FastDispatchHint`, `If`, `CheckBit`, `CheckHalt`, `Dead`, `FastDispatchHint`, interpreter fallback, exception paths, and memory-abort checks.
+- Upstream dispatcher linkage eventually jumps through `ReturnToDispatcher` into the real `GetOrEmit` dispatcher. Rust still records the relocation but the bootstrap dispatcher path remains incomplete.
+- Upstream uses Oaknut labels for all conditional flow. Rust currently has only the minimal patched-label pattern needed by `LinkBlock`; broader label abstraction is still needed before porting `If`, `CheckBit`, and `CheckHalt`.
+
+### Missing items
+- Port the remaining A32/A64 terminal emitters and their helper encoders in their upstream-owned files.
+- Replace the bootstrap `return_to_dispatcher` with the upstream dispatcher callback into `AddressSpace::GetOrEmit`.
+- Continue splitting opcode emission into upstream-owned A32/A64 files once those emitters are ported.
+
+### Binary layout verification
+- No new raw serialized structs were introduced.
+- Instruction encoding coverage was extended with known words for `CMP X26, #0`, `B.LE +8`, and the already-used `CBNZ W16, +8`.
+- Terminal tests verify relocation offsets and emitted machine words for both halt-guard and cycle-counting `LinkBlock` paths in A32 and A64.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp` `EmitA32Terminal(LinkBlock)` and `EmitA32Terminal(LinkBlockFast)`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a64.cpp` `EmitA64Terminal(LinkBlock)` and `EmitA64Terminal(LinkBlockFast)`.
+- `cargo fmt --manifest-path externals/rdynarmic/Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64_a` passes 10 A32/A64 terminal tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 103 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs and emit_arm64_a64.rs terminal tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp and emit_arm64_a64.cpp
+
+### Intentional differences
+- `emit_arm64_a32.rs` and `emit_arm64_a64.rs` now port upstream terminal recursion for `FastDispatchHint`, `If`, `CheckBit`, and `CheckHalt`. `FastDispatchHint` emits the upstream current TODO path: a `ReturnToDispatcher` relocation.
+- `If` now mirrors upstream `EmitA32Cond` / `EmitA64Cond`: load saved `cpsr_nzcv` from the JIT state, restore host NZCV with `MSR NZCV`, conditionally branch over the else terminal, then emit the then terminal.
+- `CheckBit` now mirrors upstream: `LDRB Wscratch0, [SP, StackLayout::check_bit]`, `CBZ` to the else terminal, emit then terminal, then emit else terminal.
+- `CheckHalt` now mirrors upstream: `LDAR Wscratch0, [Xhalt]`, `CBNZ` to the dispatch fallback, otherwise emit the else terminal, then emit `ReturnToDispatcher`.
+- `PopRSBHint` now preserves the upstream fallback behavior when `RETURN_STACK_BUFFER` is not enabled or the block is single-step: emit `ReturnToDispatcher`. When the RSB optimization is enabled, Rust still returns an explicit missing-optimized-RSB error instead of emitting an incorrect partial implementation.
+- Rust uses patched branch immediates instead of Oaknut label objects. The emitted control-flow layout and relocation order match upstream for the covered paths.
+
+### Unintentional differences (to fix)
+- Upstream optimized `PopRSBHint` is still missing. A32 requires `StackLayout::rsb_ptr`, `RSBIndexMask`, `LDP`, current-PC compare, and `BR Xscratch1`; A64 additionally rebuilds the descriptor from FPCR/PC masks before comparing.
+- Upstream memory-abort checks (`EmitA32CheckMemoryAbort` / `EmitA64CheckMemoryAbort`) are still missing.
+- Upstream dispatcher linkage still eventually enters real `GetOrEmit`; Rust still records `ReturnToDispatcher` relocations against the bootstrap prelude path.
+
+### Missing items
+- Port optimized `PopRSBHint` in A32/A64 with the remaining stack/register encoders.
+- Port memory-abort check emission and required halt-reason `TST`/conditional branch helpers.
+- Replace the bootstrap dispatcher target with the upstream callback/lookup dispatcher.
+
+### Binary layout verification
+- No new raw serialized structs were introduced.
+- `StackLayout::check_bit_offset()` is used for `CheckBit`, and existing stack-layout tests continue to verify it is offset `1172` as upstream.
+- Instruction encoding coverage now includes `CBZ W16, +8` and `LDRB W16, [SP, #1172]`, used by the terminal emitters.
+- Terminal tests verify emitted instruction order and relocation offsets for `FastDispatchHint`, `If`, `CheckBit`, and `CheckHalt` in both A32 and A64.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp` terminal emitters for `PopRSBHint`, `FastDispatchHint`, `If`, `CheckBit`, and `CheckHalt`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a64.cpp` terminal emitters for `PopRSBHint`, `FastDispatchHint`, `If`, `CheckBit`, and `CheckHalt`.
+- `cargo fmt --manifest-path externals/rdynarmic/Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64_a` passes 18 A32/A64 terminal tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 111 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs PopRSBHint tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+
+### Intentional differences
+- `emit_arm64_a32.rs::PopRSBHint` now ports the upstream optimized return-stack-buffer prediction path when `RETURN_STACK_BUFFER` is enabled and the block is not single-step: load `StackLayout::rsb_ptr`, mask with `RSB_INDEX_MASK`, address the predicted `RSBEntry`, decrement and store `rsb_ptr`, load predicted target/code pointer, load current guest PC from `A32JitState::regs[15]`, compare, branch to fail on mismatch, and `BR Xscratch1` on match.
+- Rust keeps the existing fallback relocation after the fail label by patching the `B.NE` displacement after emitting the predicted branch. Upstream uses an Oaknut label; the emitted control flow and fallback ordering are equivalent.
+- `inst.rs` now owns the extra small AArch64 encoders needed by this upstream path: `AND W, #imm` for `RSB_INDEX_MASK`, `ADD Xd, SP, Xm`, `SUB W, #imm`, `LDP X, X`, `LDUR X`, and `CMP X, X`.
+- `emit_arm64_a64.rs::PopRSBHint` remains deliberately unported for the optimized path. A64 needs the additional upstream descriptor reconstruction from FPCR and PC masks before comparing the predicted RSB target; this should be a separate A64-owned tranche, not an approximation inside the A32 fix.
+
+### Unintentional differences (to fix)
+- Upstream optimized A64 `PopRSBHint` is still missing.
+- Upstream memory-abort checks (`EmitA32CheckMemoryAbort` / `EmitA64CheckMemoryAbort`) are still missing.
+- Upstream dispatcher linkage still eventually enters real `GetOrEmit`; Rust still records `ReturnToDispatcher` relocations against the incomplete bootstrap dispatcher path.
+- `inst.rs::logical_imm32` currently supports only the immediate required by this tranche (`0x70`, `RSB_INDEX_MASK`). A general logical-immediate encoder is still needed before wider ARM64 opcode emission.
+
+### Missing items
+- Port optimized A64 `PopRSBHint` in `emit_arm64_a64.rs` with the upstream FPCR/PC descriptor reconstruction.
+- Port memory-abort check emission and required halt-reason `TST`/conditional branch helpers.
+- Replace the bootstrap dispatcher target with the upstream callback/lookup dispatcher.
+- Continue porting remaining ARM64 IR emitters before wiring the ARM64 backend as the public Apple Silicon default.
+
+### Binary layout verification
+- No new raw serialized structs were introduced.
+- The tranche uses existing `StackLayout`, `RSBEntry`, `RSB_INDEX_MASK`, and `A32JitState` layout definitions.
+- Rust mirrors upstream's `static_assert(offsetof(A32JitState, regs) + 16 * sizeof(u32) == offsetof(A32JitState, upper_location_descriptor))` with a `debug_assert_eq!` before loading `regs[15]` as an unscaled 64-bit value.
+- Existing stack-layout tests verify `RSBEntry` size/alignment, `RSB_COUNT == 8`, and `RSB_INDEX_MASK == 112`.
+- Instruction words for the new encoders were verified against `clang -target arm64-apple-macos` plus `xcrun llvm-objdump`.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp` `EmitA32Terminal(PopRSBHint)`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs` `Terminal::PopRSBHint` and `emit_pop_rsb_hint`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/inst.rs` encoder tests for the new instruction words.
+- `cargo fmt --manifest-path externals/rdynarmic/Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64_a32` passes 10 A32 terminal tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 112 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_a64.rs PopRSBHint tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a64.cpp
+
+### Intentional differences
+- `emit_arm64_a64.rs::PopRSBHint` now ports the upstream optimized return-stack-buffer prediction path when `RETURN_STACK_BUFFER` is enabled and the block is not single-step.
+- The Rust path reconstructs the A64 location descriptor in upstream order: move `A64LocationDescriptor::FPCR_MASK`, load `A64JitState::fpcr`, load `A64JitState::pc`, mask FPCR, mask PC with `A64LocationDescriptor::PC_MASK`, shift FPCR by `A64LocationDescriptor::FPCR_SHIFT`, and OR the descriptor into `X0`.
+- The Rust path then mirrors the upstream RSB sequence: load/mask/decrement/store `StackLayout::rsb_ptr`, load the predicted `RSBEntry`, compare descriptor against `Xscratch0`, branch to fallback on mismatch, and `BR Xscratch1` on match.
+- Rust patches the `B.NE` displacement after emitting `BR Xscratch1`; upstream uses an Oaknut label. The emitted control-flow layout and fallback ordering are equivalent.
+- `A64LocationDescriptor` constants are now public associated constants so the ARM64 emitter can reference the descriptor owner instead of duplicating magic values.
+- `inst.rs` now owns the extra encoders needed by this upstream path: `AND W, W, W`, `AND X, #imm`, `LSL X, #imm`, and `ORR X, X, X`.
+
+### Unintentional differences (to fix)
+- Upstream memory-abort checks (`EmitA32CheckMemoryAbort` / `EmitA64CheckMemoryAbort`) are still missing.
+- Upstream dispatcher linkage still eventually enters real `GetOrEmit`; Rust still records `ReturnToDispatcher` relocations against the incomplete bootstrap dispatcher path.
+- `inst.rs::logical_imm32` and `logical_imm64` still only support immediates required by the currently ported ARM64 terminal paths. A general logical-immediate encoder is still needed before broad ARM64 opcode emission.
+
+### Missing items
+- Port memory-abort check emission and required halt-reason `TST`/conditional branch helpers.
+- Replace the bootstrap dispatcher target with the upstream callback/lookup dispatcher.
+- Continue porting remaining ARM64 IR emitters before wiring the ARM64 backend as the public Apple Silicon default.
+
+### Binary layout verification
+- No new raw serialized structs were introduced.
+- The tranche uses existing `A64JitState`, `StackLayout`, `RSBEntry`, `RSB_INDEX_MASK`, and `A64LocationDescriptor` layout/descriptor definitions.
+- Existing tests verify `A64JitState::pc == 256`, `A64JitState::fpcr == 792`, `RSBEntry` size/alignment, `RSB_COUNT == 8`, and `RSB_INDEX_MASK == 112`.
+- Instruction words for the new encoders were verified against `clang -target arm64-apple-macos` plus `xcrun llvm-objdump`.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a64.cpp` `EmitA64Terminal(PopRSBHint)`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_a64.rs` `Terminal::PopRSBHint` and `emit_pop_rsb_hint`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/inst.rs` encoder tests for the new instruction words.
+- `cargo fmt --manifest-path externals/rdynarmic/Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64_a64` passes 10 A64 terminal tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 113 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_memory.rs callback-only scalar/128-bit tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+
+### Intentional differences
+- Added `backend/arm64/emit_arm64_memory.rs` as the direct Rust owner for upstream `emit_arm64_memory.cpp` memory-emitter logic.
+- Ported the callback-only 8/16/32/64/128 paths for `EmitReadMemory`, `EmitExclusiveReadMemory`, `EmitWriteMemory`, and `EmitExclusiveWriteMemory`.
+- Wired A64 memory opcodes in `emit_arm64.rs` to the new memory-owner file instead of keeping this logic in the central dispatcher.
+- Rust returns an explicit error for fastmem/page-table configurations because upstream would select inline fastmem/page-table emitters there; silently falling back to callback-only would hide a parity bug.
+- Rust uses `RegAlloc::prepare_for_call` argument slots instead of upstream's variadic `PrepareForCall` helper. The first slot is intentionally empty to mirror upstream `PrepareForCall({}, args[1])`: the trampoline owns `X0` for `this`, vaddr is in `X1`, scalar write values are in `X2`, and U128 write values are in `Q0`.
+- Rust `RegAlloc::Argument` stores the opcode argument type because the local `Value::Inst` representation is opaque; this preserves upstream typed IR behavior so `PrepareForCall` can route U128 arguments through the SIMD/FPR ABI path.
+- 128-bit read and exclusive-read paths copy `Q0` to `Q8` and define the result in `Q8`, matching upstream's callback-only `bitsize == 128` special case.
+- Rust patches the exclusive-write `CBZ` branch by offset instead of using an Oaknut label. This preserves the emitted control flow: no reservation returns `1`; reservation clears `exclusive_state`, calls the exclusive-write callback, and returns callback result in X0.
+
+### Unintentional differences (to fix)
+- Upstream inline page-table read/write emitters are not ported.
+- Upstream fastmem read/write paths, fallback labels, and fastmem patch-info records are not ported.
+- Upstream wrapped read/write fallback paths and their `emit_check_memory_abort` call sites are not ported in this tranche.
+- `A64AddressSpace::EmitPrelude()` is not yet ported beyond the bootstrap prelude. A64 scalar callback relocations are now covered by the later A64 scalar callback prelude tranche, but full run/step/dispatcher prelude parity is still missing.
+- Page-table/fastmem 128-bit memory paths and wrapped fallback 128-bit paths are not ported.
+
+### Missing items
+- Continue full run/step/dispatcher prelude parity from upstream `A64AddressSpace::EmitPrelude()`; A64 128-bit/special callback trampoline wiring is covered by the later A64 callback prelude tranche.
+- Port `EmitDetectMisalignedVAddr`, `InlinePageTableEmitVAddrLookup`, `EmitMemoryLdr`, `EmitMemoryStr`, and the page-table deferred fallback paths.
+- Port fastmem fallback/patch-info handling from `emit_arm64_memory.cpp`.
+- Continue remaining ARM64 IR emitters and dispatcher `GetOrEmit` work before selecting the ARM64 backend as the Apple Silicon default.
+
+### Binary layout verification
+- No new raw serialized structs were introduced.
+- Exclusive read/write uses existing `A64JitState::exclusive_state` through the verified `state_exclusive_state_offset` helper.
+- Instruction words added for this tranche cover `STRB Wt, [Xn, #imm]` and `DMB ISH`, both verified by local encoder tests.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_memory.cpp` callback-only memory helpers, link-target mapping helpers, `IsOrdered`, and generic `Emit*Memory` dispatch functions.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/reg_alloc.h/.cpp` `Argument`, `GetArgumentInfo`, and `PrepareForCall`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_memory.rs`, `emit_arm64.rs`, `inst.rs`, and `reg_alloc.rs`.
+- `cargo fmt --manifest-path externals/rdynarmic/Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64_memory` passes 8 callback-only memory tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::reg_alloc` passes 19 ARM64 register allocator tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64` passes 45 ARM64 emit/terminal/memory dispatch tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 135 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs A32 basic register tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+
+### Intentional differences
+- Ported `EmitIR<A32SetCheckBit>`, `EmitIR<A32GetRegister>`, and `EmitIR<A32SetRegister>` in the Rust counterpart for upstream `emit_arm64_a32.cpp`, preserving upstream ownership instead of putting the logic in the central dispatcher.
+- `emit_arm64.rs` now routes `A32SetCheckBit`, `A32GetRegister`, and `A32SetRegister` to the A32-owned emitter functions.
+- `A32SetCheckBit` mirrors upstream immediate handling: `true` materializes `1` in `Wscratch0` and stores it to `StackLayout::check_bit`; `false` stores `WZR`; non-immediate values are read through `RegAlloc::read_w` and realized before `STRB`.
+- `A32GetRegister` and `A32SetRegister` access `A32JitState::regs + sizeof(u32) * reg`, matching upstream `LDR`/`STR` behavior for core A32 registers.
+- Rust validates `Reg::is_valid()` before computing the state offset. Upstream receives a typed `A32::Reg` from `GetA32RegRef()` and relies on that typed invariant; returning `Err` is the local Rust equivalent for invalid IR payloads.
+
+### Unintentional differences (to fix)
+- `A32GetExtendedRegister32`, `A32GetExtendedRegister64`, `A32GetVector`, `A32SetExtendedRegister32`, `A32SetExtendedRegister64`, and `A32SetVector` remain unported.
+- CPSR/FPSCR flag emitters, GE/Q flag packing, `A32BXWritePC`, `A32UpdateUpperLocationDescriptor`, supervisor/exception/cache operation emitters, and many arithmetic/data-processing A32 opcodes remain unported.
+- The central ARM64 dispatcher still has broad missing-opcode coverage for A32 blocks; this tranche only covers check-bit and core-register state access.
+
+### Missing items
+- Continue the next upstream-owned tranche in `emit_arm64_a32.cpp`, preferably extended/vector register loads/stores followed by CPSR/FPSCR state emitters.
+- Add dispatch and instruction-word tests for each newly ported A32 opcode group as it is added.
+
+### Binary layout verification
+- No new raw serialized structs were introduced.
+- `A32GetRegister`/`A32SetRegister` use the existing `A32JitState::regs` offset covered by ARM64 JIT-state layout tests.
+- `A32SetCheckBit` uses the existing `StackLayout::check_bit_offset()` covered by ARM64 stack-layout tests.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp` from terminal emission through `EmitIR<A32SetRegister>`, including adjacent unported extended/vector register emitters.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs` and `emit_arm64.rs` after implementation.
+- `cargo fmt --manifest-path externals/rdynarmic/Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64_a32` passes 18 A32 terminal/register/memory-owner tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64` passes 49 ARM64 emit/terminal/memory dispatch tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 140 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs A32 extended/vector register tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+
+### Intentional differences
+- Ported `EmitIR<A32GetExtendedRegister32>`, `EmitIR<A32GetExtendedRegister64>`, `EmitIR<A32GetVector>`, `EmitIR<A32SetExtendedRegister32>`, `EmitIR<A32SetExtendedRegister64>`, and `EmitIR<A32SetVector>` in the Rust counterpart for upstream `emit_arm64_a32.cpp`.
+- Added ARM64 scalar SIMD `LDR/STR S` and `LDR/STR D` encoders in `inst.rs` because upstream emits size-specific Oaknut `LDR/STR` forms for S/D/Q registers.
+- `A32GetExtendedRegister32`/`A32SetExtendedRegister32` use `ext_regs + sizeof(u32) * S-index`, matching upstream single-register indexing.
+- `A32GetExtendedRegister64`/`A32SetExtendedRegister64` use `ext_regs + sizeof(u64) * D-index`, matching upstream double-register indexing.
+- `A32GetVector`/`A32SetVector` preserve upstream split behavior: D registers use 64-bit `LDR/STR D`; Q registers use 128-bit `LDR/STR Q`.
+- Rust validates `ExtReg` family (`S`, `D`, or `D/Q`) and returns `Err` for invalid opcode/register combinations. Upstream uses `ASSERT(A32::IsSingleExtReg/IsDoubleExtReg/IsQuadExtReg)` before emitting.
+- `emit_arm64.rs` now routes the six extended/vector A32 opcodes to the A32-owned emitter functions while keeping implementation ownership in `emit_arm64_a32.rs`.
+
+### Unintentional differences (to fix)
+- CPSR/FPSCR flag emitters, GE/Q flag packing, `A32BXWritePC`, `A32UpdateUpperLocationDescriptor`, supervisor/exception/cache operation emitters, and many arithmetic/data-processing A32 opcodes remain unported.
+- The local `ExtReg` enum currently has no invalid variant, so invalid-family tests cover wrong-family IR only, not malformed raw enum payloads.
+
+### Missing items
+- Continue the next upstream-owned tranche in `emit_arm64_a32.cpp`: CPSR/FPSCR state emitters and upper-location descriptor updates.
+- Add dispatch-level tests for extended/vector opcodes if future dispatcher refactors make central routing less obvious.
+
+### Binary layout verification
+- No new raw serialized structs were introduced.
+- Extended/vector register accesses use the existing `A32JitState::ext_regs` offset, already covered by ARM64 JIT-state layout tests.
+- Added `inst.rs` encoder tests for `LDR/STR S` and `LDR/STR D`; Q encoders were already covered.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp` from `EmitIR<A32GetExtendedRegister32>` through `EmitIR<A32SetVector>`, including the adjacent CPSR emitters that remain unported.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_jitstate.h` for `A32JitState::ext_regs` placement and alignment.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs`, `emit_arm64.rs`, `inst.rs`, and `jit_state.rs` after implementation.
+- `cargo fmt --manifest-path externals/rdynarmic/Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64_a32` passes 24 A32 terminal/register/memory-owner tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64` passes 55 ARM64 emit/terminal/memory dispatch tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 146 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs A32 simple CPSR tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+
+### Intentional differences
+- Ported `EmitIR<A32SetCpsrNZCV>`, `EmitIR<A32SetCpsrNZCVRaw>`, `EmitIR<A32SetCpsrNZCVQ>`, and `EmitIR<A32GetCFlag>` in the Rust counterpart for upstream `emit_arm64_a32.cpp`.
+- `A32SetCpsrNZCV` and `A32SetCpsrNZCVRaw` both read a 32-bit argument, realize it through the ARM64 register allocator, and store it to `A32JitState::cpsr_nzcv`, matching upstream's identical bodies.
+- `A32SetCpsrNZCVQ` preserves upstream flag splitting: `NZCV = arg & 0xf0000000`, `Q = arg & 0x08000000`, then stores the adjacent `cpsr_nzcv`/`cpsr_q` words with one `STP W`.
+- `A32GetCFlag` preserves upstream behavior by loading `cpsr_nzcv` and masking bit 29 without shifting it down to boolean form.
+- Added the required ARM64 instruction support in `inst.rs`: `STP Wt, Wt2, [Xn, #imm]` and logical-immediate encodings for `0xf0000000`, `0x08000000`, and `0x20000000`.
+- `emit_arm64.rs` now routes `A32SetCpsrNZCV`, `A32SetCpsrNZCVRaw`, `A32SetCpsrNZCVQ`, and `A32GetCFlag` to the A32-owned emitter functions while keeping implementation ownership in `emit_arm64_a32.rs`.
+
+### Unintentional differences (to fix)
+- Full `A32GetCpsr` and `A32SetCpsr` reconstruction/writeback remain unported.
+- Adjacent upstream flag emitters `A32SetCpsrNZ`, `A32SetCpsrNZC`, `A32OrQFlag`, `A32GetGEFlags`, `A32SetGEFlags`, and `A32SetGEFlagsCompressed` remain unported.
+- FPSCR state emitters, `A32BXWritePC`, `A32UpdateUpperLocationDescriptor`, supervisor/exception/cache operations, and many arithmetic/data-processing A32 opcodes remain unported.
+
+### Missing items
+- Continue the next upstream-owned tranche in `emit_arm64_a32.cpp`: `A32SetCpsrNZ`, `A32SetCpsrNZC`, Q/GE flag helpers, then the full CPSR/FPSCR emitters.
+- Add any additional instruction encoders only when required by the next upstream-owned emitters, with assembler-verified word tests.
+
+### Binary layout verification
+- No new raw serialized structs were introduced.
+- `A32SetCpsrNZCV`, `A32SetCpsrNZCVRaw`, and `A32GetCFlag` use the existing `A32JitState::cpsr_nzcv` offset.
+- `A32SetCpsrNZCVQ` relies on the upstream invariant that `cpsr_nzcv + sizeof(u32) == cpsr_q`; the Rust layout test already covers this adjacency, and the emitted `STP W` stores the adjacent words.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp` from the full CPSR reconstruction block through `EmitIR<A32OrQFlag>`, including the four ported simple CPSR emitters and adjacent unported NZ/NZC/Q helpers.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs`, `emit_arm64.rs`, `inst.rs`, and `jit_state.rs` after implementation.
+- Verified local ARM64 encodings for `AND W, #0xf0000000`, `AND W, #0x08000000`, `AND W, #0x20000000`, and `STP W, W, [X, #imm]` with `clang -target arm64-apple-macos` and `xcrun llvm-objdump`.
+- `cargo fmt --manifest-path Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64_a32` passes 28 A32 terminal/register/CPSR/memory-owner tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64` passes 59 ARM64 emit/terminal/memory dispatch tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 150 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs A32 CPSR NZ/Q/GE tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+
+### Intentional differences
+- Ported `EmitIR<A32SetCpsrNZ>`, `EmitIR<A32SetCpsrNZC>`, `EmitIR<A32OrQFlag>`, `EmitIR<A32GetGEFlags>`, `EmitIR<A32SetGEFlags>`, and `EmitIR<A32SetGEFlagsCompressed>` in the Rust counterpart for upstream `emit_arm64_a32.cpp`.
+- `A32SetCpsrNZ` preserves upstream ordering: read/realize NZ, load `cpsr_nzcv`, keep existing C/V with `AND #0x30000000`, OR in NZ, then store `cpsr_nzcv`.
+- `A32SetCpsrNZC` preserves all four upstream immediate/non-immediate branches, including the `EmptyNZCVImmediateMarker`-compatible path where an immediate NZ argument is not materialized.
+- `A32OrQFlag` preserves upstream storage format by loading `cpsr_q`, OR-ing `flag << 27`, and storing `cpsr_q`.
+- `A32GetGEFlags` / `A32SetGEFlags` intentionally use `WriteS` / `ReadS` and scalar S-register `LDR/STR`, matching upstream Oaknut emission even though the IR value type is `U32`.
+- `A32SetGEFlagsCompressed` preserves the upstream multiply expansion sequence: `LSR #16`, materialize `0x00204081`, `MUL`, `AND #0x01010101`, `LSL #8`, `SUB`, then store `cpsr_ge`.
+- Added the required ARM64 instruction support in `inst.rs`: `ORR W, #imm`, `ORR W, W, W, LSL #imm`, `LSR W, #imm`, `LSL W, #imm`, `MUL W`, `SUB W, W, W`, and logical-immediate coverage for the new masks.
+- `emit_arm64.rs` now routes the six newly ported A32 flag opcodes to the A32-owned emitter functions while keeping implementation ownership in `emit_arm64_a32.rs`.
+
+### Unintentional differences (to fix)
+- Full `A32GetCpsr` and `A32SetCpsr` reconstruction/writeback remain unported.
+- `A32BXWritePC` and `A32UpdateUpperLocationDescriptor` remain unported immediately after this upstream block.
+- FPSCR state emitters, supervisor/exception/cache operations, and many arithmetic/data-processing A32 opcodes remain unported.
+
+### Missing items
+- Continue the next upstream-owned tranche in `emit_arm64_a32.cpp`: `A32BXWritePC` / upper-location descriptor writeback, or split out full `A32GetCpsr` / `A32SetCpsr` if the needed bitfield encoders are added first.
+- Add additional instruction encoders only as required by the next upstream-owned emitters, with assembler-verified word tests.
+
+### Binary layout verification
+- No new raw serialized structs were introduced.
+- The tranche uses existing `A32JitState::cpsr_nzcv`, `A32JitState::cpsr_q`, and `A32JitState::cpsr_ge` offsets covered by ARM64 JIT-state layout tests.
+- Added `inst.rs` tests for every new instruction word; `MOV W, #0x00204081` is emitted as the local `MOVZ`/`MOVK` sequence already used by this ARM64 backend.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp` from `EmitIR<A32SetCpsrNZ>` through `EmitIR<A32BXWritePC>`, including all six newly ported flag emitters and the adjacent unported PC writeback block.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs`, `emit_arm64.rs`, `inst.rs`, and `jit_state.rs` after implementation.
+- Verified local ARM64 encodings for `ORR W, #0x20000000`, `AND W, #0x30000000`, `AND W, #0x10000000`, `ORR W, W, W, LSL #27`, `LSR W, #16`, `MOVZ/MOVK W` for `0x00204081`, `MUL W`, `AND W, #0x01010101`, `LSL W, #8`, and `SUB W, W, W` with `clang -target arm64-apple-macos` and `xcrun llvm-objdump`.
+- `cargo fmt --manifest-path Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64_a32` passes 34 A32 terminal/register/CPSR/GE/memory-owner tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64` passes 65 ARM64 emit/terminal/memory dispatch tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 156 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64 MemoryAbort tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp and emit_arm64_a64.cpp
+
+### Intentional differences
+- Added `backend/arm64/label.rs` as the local equivalent of upstream Oaknut labels. This keeps branch-target ownership inside the ARM64 backend and lets helpers preserve the upstream `B(cond, end)` shape without inventing a scheduler or dispatcher abstraction.
+- `emit_arm64_a32.rs::emit_a32_check_memory_abort` now mirrors upstream `EmitA32CheckMemoryAbort`: early return when `check_halt_on_memory_access` is false, `LDAR Xscratch0, [Xhalt]`, `TST Xscratch0, HaltReason::MemoryAbort`, `B.EQ end`, update upper A32 location descriptor, write current PC to `A32JitState::regs[15]`, then emit a `ReturnFromRunCode` relocation.
+- `emit_arm64_a64.rs::emit_a64_check_memory_abort` now mirrors upstream `EmitA64CheckMemoryAbort`: early return when disabled, `LDAR Xscratch0, [Xhalt]`, `TST Xscratch0, HaltReason::MemoryAbort`, `B.EQ end`, write current PC to `A64JitState::pc`, then emit a `ReturnFromRunCode` relocation.
+- `inst.rs` now owns the additional encoders required by this upstream path: `LDAR Xt, [Xn]` and `TST Xn, #imm`.
+- Rust helpers take a `LocationDescriptor` directly instead of `IR::Inst*` because the ARM64 memory opcode emitters are not yet ported. This is a narrow API difference: upstream gets `current_location` from `inst->GetArg(0).GetU64()`, and Rust callers will pass that same descriptor when the memory emitters are added.
+
+### Unintentional differences (to fix)
+- The helpers are not yet called from ARM64 memory emitters because those emitters are still missing. Upstream wires these helpers into memory access emission through `EmitConfig::emit_check_memory_abort`.
+- `EmitConfig::emit_check_memory_abort` is now covered by the following EmitConfig callback tranche; the remaining gap is the absence of `emit_arm64_memory.cpp` call sites in Rust.
+- `label.rs` currently supports only conditional branches. Upstream Oaknut labels support all branch forms; Rust should extend this as additional ARM64 emitters need them.
+- `inst.rs::logical_imm64` still only supports immediates required by currently ported paths (`0x4` and A64 PC mask). A general logical-immediate encoder is still needed before broad ARM64 opcode emission.
+
+### Missing items
+- Port the ARM64 memory emitters and call the upstream-owned `EmitConfig::emit_check_memory_abort` callback from the memory access paths.
+- Port memory read/write callback emission around the already-existing prelude trampolines.
+- Replace the bootstrap dispatcher target with the upstream callback/lookup dispatcher.
+- Continue porting remaining ARM64 IR emitters before wiring the ARM64 backend as the public Apple Silicon default.
+
+### Binary layout verification
+- No new raw serialized structs were introduced.
+- The tranche uses existing `A32JitState`, `A64JitState`, and `HaltReason` definitions.
+- Existing tests verify `A32JitState::regs == 24`, `A32JitState::upper_location_descriptor == 88`, `A64JitState::pc == 256`, and `HaltReason::MEMORY_ABORT == 0x00000004`.
+- Instruction words for `LDAR Xscratch0, [Xhalt]` and `TST Xscratch0, #0x4` were verified against `clang -target arm64-apple-macos` plus `xcrun llvm-objdump`.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp` `EmitA32CheckMemoryAbort`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a64.cpp` `EmitA64CheckMemoryAbort`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.h` for `check_halt_on_memory_access` and `emit_check_memory_abort` ownership.
+- `cargo fmt --manifest-path externals/rdynarmic/Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 119 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64.rs EmitConfig memory-abort callback tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.h, a32_address_space.cpp, a64_address_space.cpp, and emit_arm64_memory.cpp
+
+### Intentional differences
+- `emit_arm64.rs::EmitConfig` now includes `emit_check_memory_abort`, matching upstream callback ownership in `emit_arm64.h`.
+- `EmitConfig::from_a32_config` wires `emit_check_memory_abort` to `emit_a32_check_memory_abort`, matching upstream `A32AddressSpace::GetEmitConfig`.
+- `EmitConfig::from_a64_config` wires `emit_check_memory_abort` to `emit_a64_check_memory_abort`, matching upstream `A64AddressSpace::GetEmitConfig`.
+- Rust `EmitCheckMemoryAbort` takes the already-decoded `LocationDescriptor` instead of upstream's `IR::Inst*`. This preserves the same semantic input because upstream `EmitA32CheckMemoryAbort` and `EmitA64CheckMemoryAbort` read `inst->GetArg(0).GetU64()` as the current location descriptor.
+- The callback wiring is tested with `std::ptr::fn_addr_eq` because comparing function pointers directly is not guaranteed to be meaningful in Rust.
+
+### Unintentional differences (to fix)
+- `emit_arm64_memory.cpp` is not yet ported, so the new callback is not yet invoked from generated memory read/write emitters. Upstream calls `ctx.conf.emit_check_memory_abort(code, ctx, inst, *end)` in the memory access paths.
+- Upstream `EmitConfig::emit_cond` is now covered by the following EmitConfig condition callback tranche.
+- Rust `EmitConfig` still omits upstream A32 coprocessor array ownership and very-verbose-debug flag; those belong to later A32-specific and diagnostics tranches, not this memory-abort callback wiring.
+
+### Missing items
+- Port `emit_arm64_memory.cpp` into the ARM64 backend and call `ctx.conf.emit_check_memory_abort` at the upstream memory-access points.
+- Keep `EmitConfig::emit_cond` parity covered by the following tranche while porting the remaining memory/IR emitter call sites.
+- Continue dispatcher `GetOrEmit` and remaining IR emitter coverage before selecting the ARM64 backend as the Apple Silicon default.
+
+### Binary layout verification
+- No new raw serialized structs were introduced.
+- The tranche changes callback wiring only; state offsets and memory-abort state writes remain verified by the prior MemoryAbort tranche tests.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.h` for `EmitConfig::emit_check_memory_abort`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp` `A32AddressSpace::GetEmitConfig`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a64_address_space.cpp` `A64AddressSpace::GetEmitConfig`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_memory.cpp` memory-abort callback call sites.
+- `cargo fmt --manifest-path externals/rdynarmic/Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 119 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64.rs EmitConfig condition callback tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.h, emit_arm64_a32.cpp, emit_arm64_a64.cpp, a32_address_space.cpp, and a64_address_space.cpp
+
+### Intentional differences
+- `emit_arm64.rs::EmitConfig` now includes `emit_cond`, matching upstream callback ownership in `emit_arm64.h`.
+- `EmitConfig::from_a32_config` wires `emit_cond` to `emit_a32_cond`, matching upstream `A32AddressSpace::GetEmitConfig` wiring to `EmitA32Cond`.
+- `EmitConfig::from_a64_config` wires `emit_cond` to `emit_a64_cond`, matching upstream `A64AddressSpace::GetEmitConfig` wiring to `EmitA64Cond`.
+- A32 and A64 `Terminal::If` emission now calls `ctx.conf.emit_cond` instead of calling the frontend-specific helper directly, preserving the upstream frontend-callback boundary.
+- Rust `EmitCond` returns the patch offset of the emitted conditional branch instead of an Oaknut `Label`. This matches the current local label model: the caller patches the same branch to the current code position after emitting the else terminal.
+- The callback wiring is tested with `std::ptr::fn_addr_eq` because comparing function pointers directly is not guaranteed to be meaningful in Rust.
+
+### Unintentional differences (to fix)
+- Upstream condition helpers return Oaknut labels; Rust still represents the immediate terminal branch as a patch offset. This is acceptable for the current terminal emitter but should be revisited if broader ARM64 emitters need multi-branch label reuse.
+- `emit_arm64_memory.cpp` remains unported, so only terminal condition paths currently exercise the `emit_cond` callback.
+- Rust `EmitConfig` still omits upstream A32 coprocessor array ownership and very-verbose-debug flag; those belong to later A32-specific and diagnostics tranches.
+
+### Missing items
+- Port the remaining ARM64 IR emitters that use frontend-specific condition emission.
+- Port `emit_arm64_memory.cpp` and preserve its use of frontend callbacks where applicable.
+- Continue dispatcher `GetOrEmit` coverage before selecting the ARM64 backend as the Apple Silicon default.
+
+### Binary layout verification
+- No new raw serialized structs were introduced.
+- The tranche changes callback ownership and terminal call routing only.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.h` for `EmitConfig::emit_cond`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp` `A32AddressSpace::GetEmitConfig`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a64_address_space.cpp` `A64AddressSpace::GetEmitConfig`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp` `EmitA32Terminal(If)` and `EmitA32Cond`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a64.cpp` `EmitA64Terminal(If)` and `EmitA64Cond`.
+- `cargo fmt --manifest-path externals/rdynarmic/Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64` passes 34 ARM64 emit-config/terminal tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64_a` passes 24 A32/A64 terminal tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 119 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/prelude.rs, a64_address_space.rs, and a64_interface.rs A64 callback prelude tranche vs externals/dynarmic/src/dynarmic/backend/arm64/a64_address_space.cpp
+
+### Intentional differences
+- Added `A64CallbackFns` and `A64CallbackContext` in `a64_address_space.rs` as the Rust backend-owned equivalent of upstream `A64::UserConfig`/devirtualized callback trampoline state.
+- `A64AddressSpace::emit_callback_trampolines` now fills the upstream A64 callback subset in `PreludeInfo`: 8/16/32/64/128 normal read/write, wrapped read/write, exclusive read/write, SVC, exception, ISB, IC, DC, CNTPCT, add ticks, and ticks remaining.
+- `A64Interface::new` now owns a stable `A64CallbackContext` and installs the A64 callback trampolines during construction, preserving the upstream lifetime requirement that prelude callbacks refer to stable JIT state/config objects.
+- Rust emits trampolines to `extern "C"` thunk functions instead of upstream's C++ member-function devirtualization. The ownership boundary remains in `a64_address_space.rs`; the adaptation is required because Rust trait-object method pointers cannot be embedded like C++ member-function pointers.
+- `prelude.rs` now ports the upstream special 128-bit trampoline shapes: read/exclusive-read callbacks return `(X0, X1)` and the trampoline packs those lanes into `Q0`; write/exclusive-write callbacks unpack `Q0` into `(X2, X3)` before branching/calling.
+- Fixed the shared Rust `BLR` trampoline helper so literal pools are emitted after the executable body and `RET`, matching upstream wrapped-call trampoline ordering. The old helper placed literals before the post-call move/pop/ret sequence.
+- Exclusive scalar and 128-bit thunks preserve upstream result polarity for exclusive writes: success returns `0`, failure returns `1`.
+- `isb_raised` is currently a no-op thunk because local `UserCallbacks` has IC/DC hooks but no distinct ISB hook. This is documented as callback-surface debt rather than silently mapped to an unrelated hook.
+
+### Unintentional differences (to fix)
+- Full upstream `A64AddressSpace::EmitPrelude()` is still not ported: the runnable bootstrap remains simplified and lacks FPCR save/set/restore, page-table/fastmem host register setup, cycle accounting setup, return-stack-buffer initialization, the real `return_to_dispatcher` loop, and the upstream `return_from_run_code` epilogue.
+- Upstream `InstructionSynchronizationBarrierRaised` has no local callback-surface equivalent yet.
+- The callback table is installed from `A64Interface::new` after `A64AddressSpace::new`, while upstream installs the full prelude inside the `A64AddressSpace` constructor. This keeps the Rust callback context stable but remains structurally less literal than upstream.
+- Page-table and fastmem memory emitters are still missing, so the callback table only supports the callback-only path.
+- 128-bit callback trampolines and callback-only 128-bit memory op emission are now present; page-table/fastmem and wrapped fallback 128-bit paths remain unported.
+
+### Missing items
+- Port the full `A64AddressSpace::EmitPrelude()` run/step/dispatcher body instead of the bootstrap prelude.
+- Add a distinct ISB callback to the Rust callback surface or otherwise mirror upstream `InstructionSynchronizationBarrierRaised` explicitly.
+- Port page-table/fastmem and wrapped fallback 128-bit memory paths in `emit_arm64_memory.rs`.
+- Continue page-table/fastmem memory emitter parity and the remaining ARM64 IR emitters before selecting the ARM64 backend as the Apple Silicon default.
+
+### Binary layout verification
+- No new raw serialized structs were introduced.
+- Added `Pair128` as a `repr(C)` Rust backend return struct for A64 callback thunks; it is host ABI glue only and not guest-visible serialized state.
+- `A64CallbackContext` is Rust-only backend state, not an upstream guest-visible or serialized layout.
+- Exclusive scalar and 128-bit thunks write the existing `A64JitState::exclusive_state`; the state offset remains covered by existing ARM64 backend layout tests.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a64_address_space.cpp` callback trampoline helpers and full `A64AddressSpace::EmitPrelude()`.
+- Verified `FMOV Vd.D[1], Xn` and `FMOV Xd, Vn.D[1]` encodings with `clang -target arm64-apple-macos` and `xcrun llvm-objdump`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/prelude.rs`, `a64_address_space.rs`, `a64_interface.rs`, and `inst.rs`.
+- `cargo fmt --manifest-path externals/rdynarmic/Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::prelude` passes 9 prelude tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 133 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_memory.rs and reg_alloc.rs callback-only U128 tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_memory.cpp and reg_alloc.cpp
+
+### Intentional differences
+- `emit_arm64_memory.rs` now accepts `BITSIZE == 128` in the callback-only read/write/exclusive paths, matching upstream callback-only templates.
+- Read and exclusive-read emit `MOV Q8.B16, Q0.B16` after the callback relocation and define the result in FPR `Q8`, matching upstream's 128-bit result handoff.
+- Write and exclusive-write rely on `RegAlloc::prepare_for_call({}, args[1], args[2])` to place U128 values in `Q0`, matching upstream AAPCS64 SIMD/FPR argument routing and the existing 128-bit write trampoline.
+- `reg_alloc.rs::Argument` stores the opcode-declared argument type because Rust `Value::Inst` is locally represented as opaque. This is the narrow Rust adaptation needed to preserve upstream typed `IR::Value::GetType()` behavior for `PrepareForCall`.
+- Tests explicitly cover the FPR spill/reload path for a U128 value already resident in caller-save `Q9`, preserving upstream spill-before-call ordering.
+
+### Unintentional differences (to fix)
+- Inline page-table memory read/write emission remains unported for all sizes, including 128-bit.
+- Fastmem read/write emission, fallback labels, and fastmem patch records remain unported for all sizes, including 128-bit.
+- Wrapped read/write fallback relocations and memory-abort fallback call sites remain unported for all sizes, including 128-bit.
+- Full `A64AddressSpace::EmitPrelude()` dispatcher parity is still missing outside callback trampoline entries.
+
+### Missing items
+- Port `InlinePageTableEmitReadMemory`/`InlinePageTableEmitWriteMemory` for scalar and 128-bit paths.
+- Port `FastmemEmitReadMemory`/`FastmemEmitWriteMemory` and fallback patch records.
+- Port wrapped read/write fallback paths and memory-abort callback integration inside the memory emitter.
+- Continue A32 page-table/fastmem/wrapped fallback memory opcode parity through the same upstream-owned ARM64 memory emitter.
+
+### Binary layout verification
+- No new raw serialized structs were introduced.
+- `Argument::ty` is backend allocator metadata only and is not guest-visible or serialized.
+- 128-bit callback paths reuse existing `Q0`/`Q8` host-register ABI behavior and existing `A64JitState::exclusive_state` offset.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_memory.cpp` `CallbackOnlyEmitReadMemory`, `CallbackOnlyEmitExclusiveReadMemory`, `CallbackOnlyEmitWriteMemory`, and `CallbackOnlyEmitExclusiveWriteMemory`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/reg_alloc.h/.cpp` `Argument`, `GetArgumentInfo`, and `PrepareForCall`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_memory.rs` and `reg_alloc.rs`.
+- `cargo fmt --manifest-path externals/rdynarmic/Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64_memory` passes 8 callback-only memory tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::reg_alloc` passes 19 ARM64 register allocator tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 135 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_a32_memory.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32_memory.cpp
+
+### Intentional differences
+- Added `emit_arm64_a32_memory.rs` as the direct Rust counterpart for upstream `emit_arm64_a32_memory.cpp`, preserving A32 memory opcode ownership instead of routing those opcodes directly from the central dispatcher to the shared memory helper.
+- `emit_a32_clear_exclusive` mirrors upstream `EmitIR<A32ClearExclusive>` by storing `WZR` to `A32JitState::exclusive_state`.
+- A32 read, exclusive-read, write, and exclusive-write wrappers delegate to the shared `emit_arm64_memory.rs` helpers for 8/16/32/64-bit sizes, matching upstream's `EmitReadMemory`, `EmitExclusiveReadMemory`, `EmitWriteMemory`, and `EmitExclusiveWriteMemory` calls.
+- `emit_arm64.rs` now routes A32 memory opcodes through this A32-owned wrapper file; callback-only A32 memory blocks can reach the same relocation/prelude path as A64 memory blocks.
+
+### Unintentional differences (to fix)
+- Upstream page-table and fastmem A32 memory paths are still unavailable because the shared ARM64 memory helpers still reject those configurations explicitly.
+- Upstream wrapped fallback paths and memory-abort fallback call sites remain unported in the shared memory helper.
+- Upstream `A32ClearExclusive` ultimately also has host callback/prelude behavior elsewhere; this tranche covers only the direct generated-code store owned by `emit_arm64_a32_memory.cpp`.
+
+### Missing items
+- Port shared page-table and fastmem memory helpers so the A32 wrappers can use non-callback memory configurations.
+- Port wrapped fallback and memory-abort handling in the shared memory helper.
+- Continue remaining A32 ARM64 opcode emitters beyond memory operations before selecting the ARM64 backend for MK8D on Apple Silicon.
+
+### Binary layout verification
+- No new raw serialized structs were introduced.
+- `A32ClearExclusive` uses the existing `A32JitState::exclusive_state` offset, already covered by ARM64 JIT-state layout tests.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32_memory.cpp`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_memory.cpp` callback-only helper ownership.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_a32_memory.rs`, `emit_arm64.rs`, and `emit_arm64_memory.rs`.
+- `cargo fmt --manifest-path externals/rdynarmic/Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64_a32_memory` passes 2 A32 memory wrapper tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64` passes 45 ARM64 emit/terminal/memory dispatch tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 135 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs A32 BX/system/FPSCR tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+
+### Intentional differences
+- Ported `EmitIR<A32BXWritePC>` and `EmitIR<A32UpdateUpperLocationDescriptor>` in the A32 ARM64-owned emitter file. The immediate path stores PC plus upper descriptor together with `STUR X`, and the register path preserves upstream order: read/realize PC, spill flags, `ANDS`, `MOV #3`, `CSEL NE`, `BIC`, `MOV upper_without_t`, `CINC NE`, `STP`.
+- Ported `EmitIR<A32CallSupervisor>` and `EmitIR<A32ExceptionRaised>` with upstream callback ordering: `PrepareForCall`, optional add-ticks relocation, callback argument materialization in `W1`/`W2`, callback relocation, optional get-ticks-remaining relocation, stack tick restore, and `Xticks` restore.
+- Ported `EmitIR<A32DataSynchronizationBarrier>`, `EmitIR<A32DataMemoryBarrier>`, and `EmitIR<A32InstructionSynchronizationBarrier>`. `DSB SY`/`DMB SY` are emitted directly; ISB remains gated by `ctx.conf.hook_isb` and emits the upstream callback relocation only when enabled.
+- Ported `EmitIR<A32GetFpscr>`, `EmitIR<A32SetFpscr>`, `EmitIR<A32GetFpscrNZCV>`, and `EmitIR<A32SetFpscrNZCV>`, preserving the upstream split across `upper_location_descriptor`, `fpsr`, and `fpsr_nzcv`, including `ctx.fpsr.Spill()` before reads and `ctx.fpsr.Overwrite()` before writes.
+- Added the corresponding central dispatcher routes in `emit_arm64.rs`; ownership remains in `emit_arm64_a32.rs`.
+- Added local AArch64 encoders in `inst.rs` for instructions this tranche needs: `SUB X reg`, `LDP W`, `DSB SY`, and `DMB SY`.
+- Rust materializes some immediates via explicit `MOVZ`/`MOVK` plus register-form `AND` where upstream oaknut uses `MOV` pseudo-instructions and logical-immediate forms. This is an encoding-level adaptation only; the dataflow and state writes remain upstream-owned and ordered.
+
+### Unintentional differences (to fix)
+- Full `A32GetCpsr` and full `A32SetCpsr` remain unported in this ARM64 backend file. Earlier narrow CPSR flag helpers are present, but the complete CPSR pack/unpack sequence still needs its own tranche.
+- Local `EmitConfig::from_a32_config` currently sets `hook_isb: false`; upstream exposes the flag through configuration. The emitter behavior is ported and tested by mutating `EmitConfig`, but config-surface parity remains incomplete.
+- `git diff` cannot show the ARM64 file changes yet because `externals/rdynarmic/src/backend/arm64/` is still an untracked directory in the submodule; verification was done by re-reading the files directly.
+
+### Missing items
+- Port full `A32GetCpsr` and `A32SetCpsr`.
+- Continue remaining A32 ARM64 opcode emitters in adjacent upstream-owned files, especially page-table/fastmem/wrapped memory paths and cache operation/system callback details.
+- Wire A32 `hook_isb` through the public configuration surface if local callers require upstream-equivalent ISB callback behavior.
+
+### Binary layout verification
+- No new guest-visible structs were introduced.
+- BX relies on upstream's asserted adjacency between `A32JitState::regs[15]` and `A32JitState::upper_location_descriptor`; local layout tests already cover `regs == 24` and `upper_location_descriptor == 88`, so `regs + 15 * sizeof(u32) == 84` and the 64-bit store covers both words.
+- FPSCR emission relies on upstream's asserted adjacency between `A32JitState::fpsr` and `A32JitState::fpsr_nzcv`; local layout tests cover `fpsr == 16` and `fpsr_nzcv == 20`.
+- Stack cycle-counting uses the existing `StackLayout::cycles_to_run` offset covered by ARM64 stack layout tests.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp` from `EmitIR<A32BXWritePC>` through `EmitIR<A32SetFpscrNZCV>`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs`, `emit_arm64.rs`, and `inst.rs`.
+- Verified `SUB X1, X1, Xticks`, `LDP W16, W17, [X28,#16]`, `DSB SY`, and `DMB SY` encodings with `clang -target arm64-apple-macos` and `xcrun llvm-objdump`.
+- `cargo fmt --manifest-path externals/rdynarmic/Cargo.toml`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64_a32` passes 45 A32 ARM64 emitter tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64` passes 76 ARM64 dispatcher/emitter tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 167 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs A32 full CPSR tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+
+### Intentional differences
+- Ported `EmitIR<A32GetCpsr>` and `EmitIR<A32SetCpsr>` in the A32 ARM64-owned emitter file, closing the full-CPSR gap documented by the previous A32 tranche.
+- `A32GetCpsr` preserves upstream ordering: write/realize result, `LDP` adjacent `cpsr_nzcv`/`cpsr_q`, load `cpsr_jaifm`, OR in `NZCV` and `Q`, compress byte-lane GE state through the upstream multiply/mask sequence, then pack `E`/`T` bits from `upper_location_descriptor`.
+- `A32SetCpsr` preserves upstream ordering: read/realize source, split and store adjacent `cpsr_nzcv`/`cpsr_q`, expand GE bits through the upstream multiply/mask/subtract sequence, mask and store adjacent `cpsr_jaifm`/`cpsr_ge`, rebuild IT/E/T state, preserve upper descriptor bits with `AND #0xffff0000`, then store `upper_location_descriptor`.
+- `emit_arm64.rs` now routes `A32GetCpsr` and `A32SetCpsr` to the A32-owned ARM64 emitter functions; ownership remains aligned with upstream `emit_arm64_a32.cpp`.
+- Added local AArch64 encoder support in `inst.rs` for `ORR W, W, W, LSR`, `UBFX W`, `BFXIL W`, and the logical immediates required by this CPSR sequence. Rust uses explicit local encoders where upstream oaknut uses instruction methods/pseudo-immediate handling, but the emitted instruction semantics and state access order match upstream.
+
+### Unintentional differences (to fix)
+- Local `EmitConfig::from_a32_config` still sets `hook_isb: false`; this tranche does not change the already documented config-surface parity gap.
+- Shared ARM64 memory helpers still lack upstream page-table, fastmem, wrapped fallback, and memory-abort fallback paths; full ARM64 backend selection for Apple Silicon remains blocked on those adjacent upstream-owned files.
+- `externals/rdynarmic/src/backend/arm64/` is still an untracked directory in the submodule, so normal `git diff` does not show these ARM64 file contents until the directory is added.
+
+### Missing items
+- Continue remaining ARM64 A32/A64 opcode emitters outside the CPSR flag family.
+- Port shared page-table/fastmem/wrapped ARM64 memory paths before using this backend as the default for MK8D on Apple Silicon.
+- Wire A32 `hook_isb` through the public configuration surface if local callers require upstream-equivalent ISB callback behavior.
+
+### Binary layout verification
+- No new guest-visible structs were introduced.
+- `A32GetCpsr` and `A32SetCpsr` rely on upstream adjacency invariants: `cpsr_nzcv + sizeof(u32) == cpsr_q` and `cpsr_jaifm + sizeof(u32) == cpsr_ge`. Rust keeps debug assertions at the emission sites, and existing ARM64 JIT-state layout tests cover the concrete offsets.
+- `upper_location_descriptor` is updated as a 32-bit state word and preserves high descriptor bits exactly like upstream's mask/OR sequence.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp` from `EmitIR<A32GetCpsr>` through `EmitIR<A32SetCpsr>`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs`, `emit_arm64.rs`, and `inst.rs`.
+- Verified `UBFX W16, W0, #16, #4`, `BFXIL W16, W0, #5, #1`, `ORR W0, W0, W16, LSR #12`, and all new logical-immediate encodings with `clang -target arm64-apple-macos` and `xcrun llvm-objdump`.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64_a32` passes 47 A32 ARM64 emitter tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64` passes 78 ARM64 dispatcher/emitter tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 169 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/inst.rs ARM64 memory encoder preparation vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+
+### Intentional differences
+- Added explicit AArch64 instruction encoders required by upstream `emit_arm64_memory.cpp` page-table/fastmem paths: `CBZ X`, `UBFX X`, `LSR X`, `ADD X` register and `UXTW`, `AND X` register, byte/half acquire-load and release-store variants, scalar/vector register-offset loads and stores with `LSL` and `UXTW`, and additional 64-bit logical immediates.
+- Kept the encoder functions in `inst.rs`, the existing ARM64 local instruction-encoding owner. The memory behavior itself remains unported in `emit_arm64_memory.rs`; this tranche only prepares verified primitives for the next upstream-owned memory slice.
+- Test constants were derived from `clang -target arm64-apple-macos` plus `xcrun llvm-objdump`, then stored as direct encoder regression tests.
+
+### Unintentional differences (to fix)
+- `emit_arm64_memory.rs` still rejects page-table and fastmem paths; this encoder tranche does not change runtime memory-path selection.
+- The logical-immediate helper is still a narrow table of immediates currently needed by the ARM64 port rather than a general AArch64 logical-immediate encoder.
+- Register-offset memory helpers are explicit per-size/per-extension functions instead of a compact generic emitter; this is deliberate for auditability now, but can be mechanically folded later only if it preserves upstream ownership clarity.
+
+### Missing items
+- Port `EmitDetectMisalignedVAddr`, `InlinePageTableEmitVAddrLookup`, `EmitMemoryLdr`, `EmitMemoryStr`, `InlinePageTableEmitReadMemory`, and `InlinePageTableEmitWriteMemory` in `emit_arm64_memory.rs`.
+- Port wrapped fallback relocations and `emit_check_memory_abort` integration for the deferred fallback blocks.
+- Port `FastmemEmitVAddrLookup`, `FastmemEmitReadMemory`, `FastmemEmitWriteMemory`, and fastmem patch metadata after page-table parity is established.
+
+### Binary layout verification
+- No new guest-visible structs were introduced.
+- The changes are instruction encoders and tests only; no JIT-state, stack, or serialized layout changed.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_memory.cpp` from the page-table lookup helpers through fastmem read/write selection to identify required instructions.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/inst.rs` after the encoder additions.
+- Verified new encodings with `clang -target arm64-apple-macos` and `xcrun llvm-objdump`, including `UBFX X`, `LSR X`, top-bit `TST`, page-table `LDR X [Xbase,Xidx,LSL #3]`, `CBZ X`, acquire/release scalar ops, and register-offset scalar/vector memory ops.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 169 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_memory.rs page-table tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+
+### Intentional differences
+- Ported the upstream page-table helper slice in the shared ARM64 memory owner: `EmitDetectMisalignedVAddr`, `InlinePageTableEmitVAddrLookup`, `EmitMemoryLdr`, `EmitMemoryStr`, `InlinePageTableEmitReadMemory`, and `InlinePageTableEmitWriteMemory`.
+- `EmitReadMemory` and `EmitWriteMemory` now select the inline page-table path when `page_table_pointer != 0`, preserving upstream callback fallback only when neither fastmem nor page-table is active. Exclusive memory operations remain callback-only like upstream.
+- Added wrapped fallback relocation emission for page-table misses/null entries: reads use `WrappedReadMemory*`, writes use `WrappedWriteMemory*`, ordered accesses preserve the upstream DMB placement, and both paths call `emit_check_memory_abort` before branching to the direct path's bound `end` label.
+- Extended `label.rs` with unconditional `B`, `CBZ X`, and `CBNZ X` patching so Rust can model Oaknut shared labels locally without moving memory-emitter ownership elsewhere.
+- `emit_arm64.rs` now drains deferred emits through `std::mem::take`, avoiding a mutable borrow of the deferred vector while deferred closures mutate the emit context through the stored raw pointer.
+- Rust stores deferred page-table fallback emissions as boxed closures with raw `BlockOfCode`/`EmitContext` pointers. This is a Rust borrow-model adaptation of upstream's reference-capturing lambda; the emission order remains upstream-compatible: direct path, `end` label, terminal/brk, deferred fallback, trailing brk.
+- For non-mirrored page-table range checks, Rust currently emits `LSR Xscratch0, Xaddr, #12; LSR Xscratch1, Xscratch0, #valid_bits; CBNZ Xscratch1, fallback` instead of upstream's `LSR; TST Xscratch0, ~0 << valid_bits; B.NE fallback`. This is behavior-equivalent but not instruction-identical; exact parity would require broader logical-immediate encoding.
+- For `page_table_pointer_mask_bits`, Rust materializes the mask into `Xscratch1` and emits register-form `AND`, while upstream uses logical-immediate `AND`. This preserves behavior but differs at encoding level for auditability with the current narrow immediate encoder.
+
+### Unintentional differences (to fix)
+- `FastmemEmitVAddrLookup`, `FastmemEmitReadMemory`, `FastmemEmitWriteMemory`, and fastmem patch metadata are still unported. The current ARM64 memory emitter rejects fastmem when `fastmem_pointer != 0` and the fastmem manager reports support.
+- `EmitMemoryLdr`/`EmitMemoryStr` no longer return the direct memory operation `CodePtr` that upstream uses for fastmem patch metadata. This is acceptable for the page-table tranche, but must be restored or represented before porting fastmem.
+- `externals/rdynarmic/src/backend/arm64/` is still an untracked directory in the submodule, so normal `git diff` does not show these ARM64 file contents until the directory is added.
+
+### Missing items
+- Port the full ARM64 fastmem read/write path and patch metadata.
+- Add page-table tests for ordered 128-bit accesses, misalignment fallback, non-mirrored address-space rejection, and pointer masking.
+- Continue remaining ARM64 A32/A64 opcode emitters before selecting this backend by default for MK8D on Apple Silicon.
+
+### Binary layout verification
+- No new guest-visible structs were introduced.
+- The tranche only emits AArch64 code and records existing relocation metadata; no JIT-state, stack, or serialized layout changed.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_memory.cpp` from `EmitDetectMisalignedVAddr` through `InlinePageTableEmitWriteMemory`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_memory.rs`, `emit_arm64.rs`, `emit_context.rs`, `label.rs`, and `inst.rs`.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::label` passes 3 ARM64 label tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64_memory` passes 10 ARM64 memory tests, including page-table direct/fallback read and write coverage.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64` passes 80 ARM64 dispatcher/emitter tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 172 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_a32_coprocessor.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp
+
+### Intentional differences
+- Added the ARM64 A32 coprocessor-owned Rust file and routed all A32 coprocessor IR opcodes from `emit_arm64.rs` to this file: internal operation, send/get one word, send/get two words, load words, and store words.
+- Upstream delegates all behavior to configured `A32::Coprocessor` objects and emits callback/pointer actions from `Compile*` methods. The current Rust public config has no generic coprocessor registry yet, so this tranche intentionally implements the existing local A32/x64 CP15 shortcut in the correct ARM64-owned file rather than inventing a different scheduler or exposing coroutine-style behavior.
+- `MCR p15,0,Rt,c13,c0,2` writes the backend-owned `TPIDR_UPRW` word, `MRC p15,0,Rt,c13,c0,2` reads `TPIDR_UPRW`, and `MRC p15,0,Rt,c13,c0,3` reads `TPIDR_URO`. Unsupported one-word reads materialize zero, matching the local x64 shortcut behavior rather than upstream's generic coprocessor exception path.
+- `MRRC p15,0,Rt,Rt2,c14` is emitted through the existing ARM64 `GetCNTPCT` relocation and the A32 callback prelude now installs a `get_cntpct` trampoline for both normal and full callback trampoline builders.
+- `A32AddressSpace` stores CP15 UPRW/URO as stable boxed `u32` values and passes raw pointers through `EmitConfig`. This avoids adding CP15-only fields to `A32JitState`, whose ARM64 upstream layout does not contain those fields.
+- Internal operations, two-word sends, load words, and store words are currently no-ops because the existing Rust A32 backend has no generic coprocessor action model to call. The no-ops are intentionally kept in the upstream-owned coprocessor file so the remaining debt is localized and reviewable.
+
+### Unintentional differences (to fix)
+- Full upstream `A32::Coprocessor` parity is missing: no `ctx.conf.coprocessors[coproc_num]`, no `CompileInternalOperation`, no `CompileSendOneWord`, no `CompileSendTwoWords`, no `CompileGetOneWord`, no `CompileGetTwoWords`, no `CompileLoadWords`, and no `CompileStoreWords` action dispatch.
+- Upstream emits coprocessor exceptions when no coprocessor/action exists; Rust currently ignores unsupported sends/operations and returns zero for unsupported reads, matching local x64 behavior but not upstream ARM64 behavior.
+- Upstream supports callback actions with optional user arguments via `CallCoprocCallback`; Rust only emits direct CP15 pointer loads/stores plus the special `GetCNTPCT` relocation.
+- Upstream `GetTwoWords` pointer actions combine two `u32*` sources into one `u64` with `LDR`, `LDR Wscratch1`, and `BFI`; Rust does not implement this generic pointer-pair action yet.
+- `externals/rdynarmic/src/backend/arm64/` is still an untracked directory in the submodule, so normal `git diff` does not show these ARM64 file contents until the directory is added.
+
+### Missing items
+- Add a Rust `A32::Coprocessor`-equivalent configuration surface if strict upstream coprocessor parity becomes required beyond the CP15 registers used by the current public A32 API.
+- Wire the public Apple Silicon `A32Jit` wrapper to the ARM64 `A32Interface`; this tranche only makes the ARM64 backend capable of emitting CP15/CNTPCT operations once selected.
+- Port generic coprocessor callback, pointer, pointer-pair, load-words, store-words, and exception behavior in `emit_arm64_a32_coprocessor.rs`.
+
+### Binary layout verification
+- `A32JitState` layout is unchanged. This is intentional: upstream ARM64 keeps coprocessor state outside `A32JitState`, and local CP15 UPRW/URO words are backend-owned boxed state passed through `EmitConfig`.
+- No guest-visible structs or serialized payloads changed.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp` in full.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_a32_coprocessor.rs`, `emit_arm64.rs`, and `a32_address_space.rs`.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64_a32_coprocessor -- --nocapture` passes 3 ARM64 A32 coprocessor tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::emit_arm64` passes 83 ARM64 dispatcher/emitter tests.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 175 ARM64 backend tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/jit.rs A32 Apple Silicon wrapper vs externals/dynarmic/src/dynarmic/backend/arm64/a32_interface.cpp
+
+### Intentional differences
+- `externals/rdynarmic/src/jit.rs` is the existing public Rust A32 API owner, while upstream implements the public ARM64 A32 interface in `externals/dynarmic/src/dynarmic/backend/arm64/a32_interface.cpp`. The Rust wrapper now preserves the local public API while selecting `backend::arm64::a32_interface::A32Interface` on `target_arch = "aarch64"`.
+- On Apple Silicon, `A32Jit::new` now constructs the ARM64 A32 backend instead of rejecting the platform as x64-only. Non-aarch64 builds continue to use the existing x64 path.
+- The aarch64 wrapper keeps a dummy x64-shaped `A32JitInner` only to avoid a broad public API refactor in this tranche. Public methods dispatch to the ARM64 backend before touching the dummy x64 state.
+- `backend/arm64/a32_interface.rs` exposes compatibility accessors required by the current Rust public API: `halt_reason_ptr`, `jit_state_ptr`, `compile_block_only`, `cp15_uprw`, `set_cp15_uprw`, `cp15_uro`, and `set_cp15_uro`.
+- `get_cntpct`/`set_cntpct` on the public wrapper remain compatibility storage on aarch64. Generated ARM64 CNTPCT reads use the configured callback trampoline, matching the ARM64 backend design rather than the old x64-local storage field.
+
+### Unintentional differences (to fix)
+- `run`, `step`, and `compile_block_only` still panic on ARM64 backend errors because the existing public Rust A32 API returns `HaltReason` or raw pointers rather than `Result`. Upstream has no equivalent fallible public return path, but the Rust backend currently needs one while unported ARM64 emitters can still fail.
+- The dummy x64 inner on aarch64 is a structural compromise in `jit.rs`. A stricter long-term shape would make the backend selection explicit with an enum or split public wrapper while preserving method ownership.
+- This tranche only wires public A32 execution to the ARM64 backend. Public A64 JIT construction is still x64-only in `jit.rs`.
+- Selecting the ARM64 A32 backend exposes remaining missing ARM64 opcode, fastmem, and coprocessor behavior at runtime; this wrapper does not claim full ARM64 backend completion.
+
+### Missing items
+- Replace the aarch64 dummy x64 inner with an explicit backend-owner representation once the ARM64 A32 path is stable enough to refactor safely.
+- Add a public ARM64 A64 wrapper if/when A64 guest execution is required on Apple Silicon.
+- Complete the generic A32 coprocessor surface and remaining ARM64 A32 opcode emitters uncovered by MK8D runtime execution.
+- Decide whether the public Rust A32 API should grow fallible variants or whether ARM64 backend emission should be made non-fallible like upstream before removing the temporary `.expect(...)` adapters.
+
+### Binary layout verification
+- No guest-visible serialized structures were introduced.
+- Existing x64 `A32JitState` layout is unchanged. Existing ARM64 `A32JitState` layout is unchanged; `jit_state_ptr` points at the backend-owned ARM64 state on aarch64.
+- CP15 UPRW/URO remain backend-owned words in `A32AddressSpace`, matching the previous ARM64 coprocessor tranche and avoiding non-upstream fields in ARM64 `A32JitState`.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_interface.cpp` in full.
+- Re-read Rust `externals/rdynarmic/src/jit.rs` A32 public wrapper sections and `externals/rdynarmic/src/backend/arm64/a32_interface.rs`.
+- `cargo fmt --all`
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+- `timeout 120s cargo test -p rdynarmic a32_public_jit_uses_arm64_interface_on_aarch64 -- --nocapture` passes 1 public wrapper test.
+- `timeout 120s cargo test -p rdynarmic backend::arm64` passes 175 ARM64 backend tests.
+- `timeout 180s cargo check --bin ruzu-cmd` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — core/src/arm/dynarmic/arm_dynarmic_32.rs code-cache size vs core/arm/dynarmic/arm_dynarmic_32.cpp
+
+### Intentional differences
+- Restored upstream `ArmDynarmic32::MakeJit` host-architecture code-cache selection: 128 MiB on ARM64 hosts and 512 MiB elsewhere.
+- Added `code_cache_size` to the local `ArmDynarmic32` construction log so Apple Silicon runs can verify that the ARM64-compatible 128 MiB cache is selected before backend creation.
+
+### Unintentional differences (to fix)
+- Rust still does not model upstream's `null_jit` 8 MiB branch directly because this constructor always receives the process memory context and separately gates page-table fastmem through local environment variables.
+- Existing local page-table fastmem gating remains divergent from upstream: upstream wires page table and fastmem whenever `page_table` is present, while Rust keeps page-table fastmem disabled by default pending backend parity.
+
+### Missing items
+- Revisit the `null_jit` code-cache branch if the Rust port adds an explicit no-page-table A32 construction path.
+- Remove the local page-table fastmem environment gate once ARM64/x64 page-table fastmem behavior matches upstream for MK8D.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This only changes `JitConfig::code_cache_size` before backend construction.
+
+### Verification
+- Re-read upstream `src/core/arm/dynarmic/arm_dynarmic_32.cpp` around `ArmDynarmic32::MakeJit` code-cache selection.
+- Re-read Rust `core/src/arm/dynarmic/arm_dynarmic_32.rs` around `JitConfig` construction.
+- Runtime log before this fix showed all four A32 cores failing with `ARM64 code_cache_size > 128 MiB not currently supported: 536870912`.
+- `cargo fmt --all`
+- `timeout 180s cargo check --bin ruzu-cmd` passes with existing warnings outside this tranche.
+- MK8D runtime after this fix creates the ARM64 A32 JIT with `code_cache_size=134217728` and proceeds to the next missing ARM64 emitter instead of failing backend construction.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs add/sub tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+- Added the ARM64 data-processing-owned Rust file and routed `GetNZCVFromOp`, `Add32`, `Add64`, `Sub32`, and `Sub64` from `emit_arm64.rs` into it.
+- The implemented add/sub path preserves upstream ownership and the observed upstream control-flow shape: associated NZCV pseudo-op handling, register-result allocation, normal add/sub, flag-setting add/sub, and complement forms for immediate carry cases.
+- Immediate operands are currently read through the Rust ARM64 regalloc materialization path instead of upstream's `MaybeAddSubImm` immediate-instruction fast path. This preserves behavior for the covered cases but is not instruction-identical.
+- `GetNZCVFromOp` is emitted as an associated pseudo-op when add/sub owns it, and has a local fallback based on `TST` for already-materialized values because the Rust dispatcher can still encounter the pseudo-op directly while the backend is incomplete.
+
+### Unintentional differences (to fix)
+- Upstream supports dynamic carry input via `ADC`, `ADCS`, `SBC`, and `SBCS`; Rust currently rejects non-immediate carry inputs.
+- Upstream supports associated `GetOverflowFromOp` for limited add cases; Rust currently rejects overflow pseudo-op use in this tranche.
+- Upstream emits add/sub immediate forms where possible; Rust currently materializes immediates into registers before using register-form operations.
+- The full upstream `emit_arm64_data_processing.cpp` contains many more arithmetic, logical, shift, bitfield, multiply, divide, and count emitters that remain unported.
+
+### Missing items
+- Port `ADC`/`ADCS`/`SBC`/`SBCS` instruction encoders and dynamic-carry add/sub emission.
+- Port overflow pseudo-op emission for add and the remaining associated pseudo-ops used by upstream data-processing operations.
+- Continue porting the rest of `emit_arm64_data_processing.cpp` in upstream-owned slices as MK8D exposes missing opcodes.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This tranche only emits AArch64 instructions and updates dispatcher ownership for existing IR opcodes.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp` around `MaybeAddSubImm`, `EmitAddSub`, and `EmitIR<Add32/Add64/Sub32/Sub64>`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.cpp` around `EmitIR<GetNZCVFromOp>`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs`, `emit_arm64.rs`, and `inst.rs`.
+- `cargo fmt --all`
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+- MK8D runtime proceeds past the previous `Sub32` missing-emitter failure and reaches the next missing conditional-block prologue.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64.rs conditional block entry vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.cpp
+
+### Intentional differences
+- Ported the upstream `EmitArm64` conditional-block prologue in the same owner file: emit condition branch, add condition-failed cycles, emit condition-failed terminal, then patch the pass branch to the current code position.
+- Rust uses `Option<Cond>` where upstream represents unconditional blocks as `IR::Cond::AL`. The resulting behavior is the same ownership model: unconditional blocks must not carry a condition-failed location, and conditional blocks must carry one.
+- The upstream `oaknut::Label pass` is represented by recording the emitted branch offset and patching it once the pass target is known, matching the existing local terminal branch-patching style.
+
+### Unintentional differences (to fix)
+- The Rust emitter returns `Err` for malformed conditional metadata, while upstream uses assertions.
+- The branch-patching helper is currently local to `emit_arm64.rs`; A32/A64 terminal files each have similar private helpers. This is traceable but duplicated until a faithful shared upstream concept exists.
+
+### Missing items
+- Add focused conditional-block machine-code tests once the ARM64 block-construction helpers can build a minimal conditional block without depending on broader translation state.
+- Continue porting missing ARM64 emitters exposed after the conditional prologue no longer blocks MK8D.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This only changes emitted host AArch64 code for conditional IR blocks.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.cpp` around `EmitArm64` conditional block entry.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64.rs` around `emit_arm64`.
+- `cargo fmt --all`
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64.rs PushRSB vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.cpp
+
+### Intentional differences
+- Ported upstream `EmitIR<IR::Opcode::PushRSB>` in the same Rust owner file and routed `Opcode::PushRSB` through the ARM64 dispatcher.
+- Preserved upstream `ReturnStackBuffer` gating: when `OptimizationFlag::RETURN_STACK_BUFFER` is disabled, the emitter returns without writing code.
+- Preserved upstream RSB update ordering: load `rsb_ptr`, add `sizeof(RSBEntry)`, mask with `RSB_INDEX_MASK`, store `rsb_ptr`, compute the stack RSB entry address, write the target descriptor, emit a `MoveToScratch1` block relocation for the code pointer, then store `{target, code_ptr}` into the RSB entry.
+- Added ARM64 instruction encoders for `ADD W,#imm` and generic `STP X,X,[XN,#imm]` because this upstream path requires them.
+
+### Unintentional differences (to fix)
+- Rust returns an explicit error if `PushRSB` receives a non-immediate target. Upstream asserts that the argument is immediate.
+- The Rust test uses target descriptor zero so `emit_mov_x_imm` is one instruction and the emitted order is easy to audit; broader nonzero descriptor materialization is covered by the existing `emit_mov_x_imm` path, not a dedicated `PushRSB` variant test.
+
+### Missing items
+- Continue validating `PopRSBHint` behavior under MK8D now that `PushRSB` no longer blocks compilation.
+- If runtime exposes RSB mismatch behavior, compare ARM64 `emit_arm64_a32.rs::emit_pop_rsb_hint` again against upstream `emit_arm64_a32.cpp`.
+
+### Binary layout verification
+- No stack-layout changes were made. Existing `StackLayout`/`RSBEntry` layout tests still verify `RSBEntry` size 16, count 8, mask 112, `rsb` offset 0, and `rsb_ptr` offset 1152.
+- No guest-visible serialized payloads changed.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.cpp` around `EmitIR<IR::Opcode::PushRSB>`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/stack_layout.h` constants via the existing Rust `stack_layout.rs` tests.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64.rs`, `inst.rs`, and `stack_layout.rs`.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo test -p rdynarmic emit_push_rsb_matches_upstream_stack_update_and_relocation_order` passes the focused PushRSB emission test.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/a32_interface.rs callback trampoline installation vs externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp
+
+### Intentional differences
+- Upstream emits the A32 ARM64 callback trampolines inside `A32AddressSpace::EmitPrelude` while `conf.callbacks` and `conf` are already stable C++ references.
+- Rust keeps the actual trampoline emission in `a32_address_space.rs`, matching upstream ownership, but calls it from `A32Interface::new` because the stable Rust callback context must own raw pointers to the current JIT state, callbacks trait object, global monitor, and processor id.
+- `A32InterfaceInner` now stores `callback_context: Option<A32CallbackContext>` just like the existing A64 ARM64 interface stores its callback context; this preserves backend-only semantics and does not expose coroutine/scheduler behavior.
+- Normal callbacks and exclusive callbacks currently use the same `A32CallbackContext` pointer. This is equivalent for the Rust thunk layer because the context contains both callbacks and exclusive-monitor state that upstream gets from `conf.callbacks` and `conf`.
+
+### Unintentional differences (to fix)
+- Upstream has one `EmitPrelude` path that emits both callbacks and run-code/bootstrap code. Rust still splits run-code bootstrap emission inside `AddressSpace::new` and callback trampoline installation after interface construction.
+- The Rust `A32CallbackContext::new` now accepts raw pointers like the existing A64 callback context; this is a lifetime-preserving backend adaptation, not instruction-identical C++ object layout.
+
+### Missing items
+- None for the previously blocking A32 ARM64 callback prelude subset used by MK8D: normal, wrapped, exclusive read/write callbacks, SVC, exception, ISB, ticks, and CNTPCT are installed.
+- Continue comparing deeper prelude ordering if future runtime behavior points to callback ABI or exclusive-monitor divergence.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This only installs host-code trampoline entry addresses in backend-local `PreludeInfo`.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp` around `A32AddressSpace::EmitPrelude`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/a32_address_space.rs` callback trampoline emission and `a32_interface.rs` constructor/context ownership.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p rdynarmic constructor_installs_full_callback_trampolines` passes.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+- MK8D runtime proceeds past the previous `ARM64 prelude trampoline is not emitted yet: ReadMemory32` failure and reaches the next missing data-processing emitter.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs least-significant extractors vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+- Ported upstream-owned `LeastSignificantWord`, `LeastSignificantHalf`, and `LeastSignificantByte` into the ARM64 data-processing Rust owner file and routed them from `emit_arm64.rs`.
+- `LeastSignificantWord` emits `MOV Wresult, Woperand`, matching upstream's lower-32-bit move from an X operand.
+- `LeastSignificantHalf` and `LeastSignificantByte` emit `UBFX W,#0,#16` and `UBFX W,#0,#8`, matching upstream `UXTH`/`UXTB` aliases.
+
+### Unintentional differences (to fix)
+- Rust currently uses explicit `UBFX` encoder names instead of separate `UXTH`/`UXTB` aliases. The machine encoding is equivalent, but the mnemonic trace is less direct than upstream.
+- No dedicated machine-code test exists yet for all three IR extractors because the current ARM64 emitter tests are still sparse for generic IR blocks.
+
+### Missing items
+- Port adjacent upstream data-processing emitters exposed next by MK8D, especially `MostSignificantWord`, `MostSignificantBit`, shifts, bitfield, and extension operations.
+- Add focused IR-emission tests for these extractors once the local ARM64 block test helpers cover minimal data-processing blocks consistently.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This only emits AArch64 data-processing instructions for existing IR opcodes.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp` around `EmitIR<LeastSignificantWord/Half/Byte>`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs`, `emit_arm64.rs`, and `inst.rs`.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs extension tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+- Ported the upstream-owned sign-extension group in the ARM64 data-processing Rust file: `SignExtendByteToWord`, `SignExtendHalfToWord`, `SignExtendByteToLong`, `SignExtendHalfToLong`, and `SignExtendWordToLong`.
+- Ported the upstream-owned zero-extension group as a no-code `define_as_existing` path, matching upstream `DefineAsExisting` for `ZeroExtendByteToWord`, `ZeroExtendHalfToWord`, `ZeroExtendByteToLong`, `ZeroExtendHalfToLong`, and `ZeroExtendWordToLong`.
+- Added ARM64 instruction encoders for `SXTB`, `SXTH`, and `SXTW` aliases required by the sign-extension group.
+
+### Unintentional differences (to fix)
+- None known for this extension tranche.
+- Rust funnels all zero-extension opcodes through one helper while upstream specializes each opcode separately with identical bodies. Ownership remains in the same ARM64 data-processing file.
+
+### Missing items
+- `ZeroExtendLongToQuad` remains unported; upstream handles it separately via `FMOV D, X`.
+- Adjacent byte-reverse emitters remain unported.
+- Add focused IR-emission tests once the ARM64 block-emission test harness covers register-aliasing cases.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This only emits AArch64 sign-extension instructions or aliases existing register allocation values.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp` around `EmitIR<SignExtend*/ZeroExtend*>`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs`, `emit_arm64.rs`, and `inst.rs`.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+- Assembled and disassembled a temporary arm64 object with Apple `clang`/`otool` to confirm the added sign-extension mnemonics decode as `SXTB`, `SXTH`, and `SXTW`.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs shift tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+- Ported the upstream-owned non-carry shift group in the ARM64 data-processing Rust file: `LogicalShiftLeft32/64`, `LogicalShiftRight32/64`, `ArithmeticShiftRight32/64`, and `RotateRight32/64`.
+- Preserved upstream out-of-range immediate behavior for logical shifts by writing zero, and for arithmetic shifts by clamping to the sign-bit shift.
+- Preserved upstream dynamic logical-shift behavior by masking the shift to 8 bits, emitting the variable shift, then selecting zero when the masked shift is outside the element width.
+- Preserved the upstream `shift == 0` carry-associated case by defining both carry-out and result as existing values through regalloc aliases.
+- Added ARM64 instruction encoders for variable shifts, immediate arithmetic/rotate shifts, `CMP W,#imm`, and `CSEL X`.
+
+### Unintentional differences (to fix)
+- Non-zero `GetCarryFromOp` handling for 32-bit shifts is still rejected explicitly instead of being emitted. Upstream implements this with additional flag-sensitive sequences and labels.
+- Rust groups the eight shift opcodes through shared helpers in the same upstream-owned file; upstream uses one specialization per opcode. This keeps ownership but is less line-by-line direct.
+- `RotateRight64` immediate shifts are normalized modulo 64 before encoding because the Rust encoder validates AArch64 immediate range.
+
+### Missing items
+- Full carry-out sequences for non-zero `LogicalShiftLeft32`, `LogicalShiftRight32`, `ArithmeticShiftRight32`, and `RotateRight32`.
+- `RotateRightExtended` and the masked shift family remain unported.
+- Add focused IR-emission tests once the ARM64 block-emission test harness covers flag/carry-associated pseudo operations.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This only emits AArch64 shift/select instructions for existing IR opcodes.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp` around `EmitIR<LogicalShift*/ArithmeticShift*/RotateRight*>`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs`, `emit_arm64.rs`, and `inst.rs`.
+- Assembled a temporary arm64 object with Apple `clang` and checked `llvm-objdump` words for `LSL/LSR/ASR/ROR` variable and immediate forms.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs Pack2x32To1x64 tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+- Ported upstream-owned `Pack2x32To1x64` at the start of the ARM64 data-processing Rust file, matching upstream placement before the extractors.
+- Preserved upstream low/high ordering: read `Wlo`, read `Whi`, write `Xresult`, then emit `MOV Xresult.W, Wlo` followed by `BFI Xresult, Xhi, #32, #32`.
+- Added a local `bfi_x` AArch64 encoder in `inst.rs`; the `bfi x16, x17, #32, #32` encoding was verified against Apple `clang`/`llvm-objdump`.
+
+### Unintentional differences (to fix)
+- None known for `Pack2x32To1x64`.
+
+### Missing items
+- Adjacent upstream `Pack2x64To1x128` remains unported in ARM64 and must be handled in vector/FPR form when hit.
+- Add focused ARM64 block-emission tests for packed 64-bit results once the local ARM64 test harness can assert emitted data-processing sequences.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This only emits AArch64 register packing instructions for an existing IR opcode.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp` around `EmitIR<Pack2x32To1x64>`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs`, `emit_arm64.rs`, and `inst.rs`.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs MostSignificantWord tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+- Ported upstream-owned `MostSignificantWord` in the ARM64 data-processing file and routed it from the ARM64 dispatcher.
+- Preserved upstream result behavior: read one `U64`, write the high 32 bits via `LSR Xresult, Xoperand, #32`.
+- Preserved upstream associated `GetCarryFromOp` behavior: when present, materialize carry from source bit 31 into ARM NZCV bit position `1 << 29`, matching local ARM64 `A32GetCFlag`/`A32SetCpsrNZC` representation.
+
+### Unintentional differences (to fix)
+- None known for `MostSignificantWord`.
+
+### Missing items
+- Adjacent upstream `MostSignificantBit`, `IsZero32`, and `IsZero64` remain separate unported scalar data-processing emitters if hit later.
+- Add focused ARM64 IR-emission tests for associated `GetCarryFromOp` once the local ARM64 block-emission test harness covers pseudo-op associations.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This only emits AArch64 data-processing instructions for an existing IR opcode and its associated carry pseudo-op.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp` around `EmitIR<MostSignificantWord>`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/ir/ir_emitter.cpp` and constant folding for `MostSignificantWord` to confirm result/carry semantics.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs`, `emit_arm64.rs`, and ARM64 A32 carry flag handling.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs CountLeadingZeros tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+- Ported upstream-owned `CountLeadingZeros32` and `CountLeadingZeros64` in the ARM64 data-processing file and routed both opcodes from the ARM64 dispatcher.
+- Preserved upstream `EmitTwoOp` behavior: realize result and operand in the same bit width, then emit native AArch64 `CLZ`.
+- Added local `clz_w` and `clz_x` encoders in `inst.rs`; encodings were verified against Apple `clang`/`llvm-objdump`.
+
+### Unintentional differences (to fix)
+- None known for scalar `CountLeadingZeros32` and `CountLeadingZeros64`.
+
+### Missing items
+- Adjacent byte-reversal scalar opcodes in the same upstream area remain separate unported work if hit later.
+- Vector `VectorCountLeadingZeros*` is owned by upstream `emit_arm64_vector.cpp`, not this scalar data-processing tranche.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This only emits AArch64 `CLZ` instructions for existing IR opcodes.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp` around `EmitIR<CountLeadingZeros32/64>`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs`, `emit_arm64.rs`, and `inst.rs`.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-25 — externals/rdynarmic/src/backend/arm64/emit_arm64_vector.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector.cpp
+
+### Intentional differences
+- Ported the upstream-owned ARM64 vector helper structure into Rust-owned `emit_arm64_vector.rs`: `emit_two_op`, `emit_three_op`, arranged/lower variants, immediate shifts, extract, widening, zero-upper, and transpose dispatch.
+- Routed the direct NEON vector families from `emit_arm64.rs` into `emit_arm64_vector.rs` instead of exposing vector behavior through unrelated backend files.
+- Added small local instruction encoders in `inst.rs` because Rust does not use upstream oaknut directly. Encodings were verified against Apple ARM64 assembler output for `UMOV`, element insert, `DUP`, `UXTL`, `SXTL`, `FMOV D,D`, core three-same vector ops, shifts, reversals, and `EXT`.
+- Rust has renamed/split comparison opcodes relative to upstream (`VectorGreaterSigned*`, `VectorGreaterEqualSigned*`, `VectorLess*`, `VectorGreaterEqualUnsigned*`). These are emitted with the corresponding ARM64 compare instructions or operand swapping while preserving the same vector mask semantics.
+- Rust IR currently lacks upstream `VectorBroadcastElement*` opcodes, so only scalar-source vector broadcasts are routed.
+- Added `logical_imm32(0xff)` to the ARM64 instruction encoder. This is adjacent infrastructure needed by the ARM64 backend and verified against assembler output.
+
+### Unintentional differences (to fix)
+- Saturating/FPSR-sensitive vector opcodes are still not ported in this tranche. Upstream calls `ctx.fpsr.Load()` in those helpers before emitting saturated instructions.
+- Table lookup (`VectorTable`, `VectorTableLookup64`, `VectorTableLookup128`) is still missing. Upstream has nontrivial `TBL/TBX` lowering and temporary vector-register usage.
+- Reduction, pairwise, polynomial, reciprocal-estimate, narrow, multiply-long, and saturated narrow/accumulate vector groups remain unported.
+- `VectorMultiply64`, `VectorEqual128`, `VectorMax*64`, and `VectorMin*64` retain upstream's unimplemented status or remain unrouted rather than inventing different semantics.
+- Immediate shift helpers rely on the same nonzero/valid shift contract as upstream oaknut emission; no extra Rust identity fast-path was added.
+
+### Missing items
+- `VectorBroadcastElementLower8/16/32` and `VectorBroadcastElement8/16/32/64` cannot be routed until the Rust IR enum grows the corresponding opcodes or upstream-equivalent lowering.
+- FPSR-backed saturating helpers: `EmitTwoOpArrangedSaturated`, `EmitThreeOpArrangedSaturated`, `EmitImmShiftSaturated`, saturated accumulate, saturated narrow, and related opcode routes.
+- Table lookup lowering and temporary vector register policy matching upstream `V0`-`V3` use.
+- Focused block-emission tests for the newly routed vector IR opcodes beyond instruction-encoder tests.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- Changes only affect host AArch64 code emission and instruction encoding.
+
+## 2026-06-25 — externals/rdynarmic/src/backend/arm64/prelude.rs, a32_address_space.rs, a32_interface.rs, a32_core.rs vs externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp and a32_core.h
+
+### Intentional differences
+- Supersedes the earlier 2026-06-25 A32 ARM64 entry that documented a temporary host-side redispatch loop. `A32Core::run` now matches upstream `A32Core::Run` shape again: compute the current `LocationDescriptor`, call `A32AddressSpace::get_or_emit` once, then enter `prelude_info.run_code`.
+- Added a generated ARM64 `return_to_dispatcher` callback path in the prelude. The generated code now follows the upstream control-flow core: load/check halt, optionally check remaining cycles, call back into the A32 address-space owner with `(A32AddressSpace*, A32JitState*)`, and branch to the returned block pointer.
+- `A32Interface::new` constructs `A32AddressSpace` without an initial prelude, boxes the interface state, then emits the dispatcher prelude using stable callback/address-space pointers. This preserves Rust pointer validity while moving toward upstream's stable `Jit::Impl`/address-space ownership model.
+- Cycle handling was added to the dispatcher prelude path: `run_code` obtains initial ticks, `step_code` starts with one tick, `return_to_dispatcher` exits when ticks are exhausted, and `return_from_run_code` reports elapsed ticks through the configured callback.
+- Direct `A32AddressSpace::new` still emits the old bootstrap prelude without a dispatcher. This keeps low-level owner tests and direct address-space construction usable while the public A32 ARM64 interface uses the upstream-shaped dispatcher path.
+
+### Unintentional differences (to fix)
+- Upstream `A32AddressSpace::EmitPrelude()` emits callback trampolines before `run_code`, `step_code`, `return_to_dispatcher`, and `return_from_run_code`. Rust currently emits the dispatcher prelude before callback trampolines in the public interface, then fills callback pointers afterward.
+- Because of that ordering, Rust's tick setup calls the callback context thunks directly via materialized function pointers, while upstream branches to `prelude_info.get_ticks_remaining` and `prelude_info.add_ticks` trampolines.
+- Upstream saves host FPCR, derives guest FPCR from A32 FPSCR bits in `upper_location_descriptor`, installs it before entering guest code, and restores host FPCR on exit. Rust still lacks this FPCR save/set/restore sequence.
+- Upstream initializes the return-stack-buffer entries to `return_to_dispatcher` when the optimization is enabled. Rust still lacks this RSB initialization in the ARM64 prelude.
+- Upstream initializes page-table and fastmem host registers from config before entering guest code. Rust still lacks this prelude setup.
+- A64 ARM64 prelude parity is not covered by this tranche; this only advances the public A32 ARM64 path needed by MK8D-class AArch32 games.
+
+### Missing items
+- Reorder ARM64 A32 prelude emission so callback trampolines are emitted first, then `run_code` / `step_code` / dispatcher entries can branch to `prelude_info.*` exactly like upstream.
+- Port FPCR save/set/restore from upstream `A32AddressSpace::EmitPrelude()`.
+- Port RSB initialization, page-table register setup, and fastmem register setup.
+- Add a generated-code regression that directly exercises a `LinkBlock` return to the generated dispatcher and proves it redispatches through `A32AddressSpace::get_or_emit` without host-side looping.
+- Mirror the same upstream dispatcher/cycle/FPCR treatment for the A64 ARM64 backend before claiming ARM64 host backend completion.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This tranche changes host AArch64 prelude/control-flow generation and public A32 ARM64 backend construction order only.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_core.h`; confirmed upstream `Run` and `Step` each perform one `GetOrEmit` before entering `run_code` / `step_code`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp` around `A32AddressSpace::EmitPrelude()`; confirmed callback trampoline order, dispatcher callback shape, cycle checks, FPCR handling, RSB setup, and page-table/fastmem setup.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/prelude.rs`, `address_space.rs`, `a32_address_space.rs`, `a32_interface.rs`, and `a32_core.rs`.
+- `timeout 120s cargo test -q -p rdynarmic tests_a32::tests::test_bcs_after_cmp --lib -- --test-threads=1` passes.
+- `timeout 120s cargo test -q -p rdynarmic tests_a32::tests::test_eors_asr0_carry --lib -- --test-threads=1` passes.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::a32_interface::tests::constructor_installs_full_callback_trampolines --lib -- --test-threads=1` passes.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::prelude::tests::emits_distinct_run_and_step_entries --lib -- --test-threads=1` passes.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector.cpp`, including helper definitions, direct NEON opcode specializations, extract/transpose/zero-upper handling, and the remaining table/saturating regions.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_vector.rs`, `emit_arm64.rs`, and `inst.rs`.
+- `cargo fmt --all --check`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words` passes.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-25 — externals/rdynarmic/src/jit.rs A32 CLREX test fixture vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32_memory.cpp and frontend/A32/translate/impl/synchronization.cpp
+
+### Intentional differences
+- Rust public `A32Jit` keeps an inactive x64 `A32JitInner` placeholder on aarch64 while delegating execution to `backend::arm64::a32_interface::A32Interface`: the CLREX fixture now initializes and checks the active backend state through `jit_state_ptr()` on aarch64, while keeping the direct x64 state access on non-aarch64 hosts.
+
+### Unintentional differences (to fix)
+- None for this fixture. Upstream A32 CLREX translates to `IR::Opcode::A32ClearExclusive`, and the ARM64 backend emits a store of zero to `A32JitState::exclusive_state`; the Rust backend already matches that behavior.
+
+### Missing items
+- None for this fixture.
+
+### Binary layout verification
+- PASS: the aarch64 fixture uses the active `backend::arm64::jit_state::A32JitState` reached through `A32Jit::jit_state_ptr()`, avoiding the inactive x64 state layout.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/frontend/A32/translate/impl/synchronization.cpp`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.cpp`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32_memory.cpp`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_a32_memory.rs`.
+- `timeout 60s cargo test -p rdynarmic jit::tests::test_a32_clrex_advances_pc_and_clears_exclusive_state --lib -- --exact --nocapture` passes.
+- `rustfmt --check externals/rdynarmic/src/jit.rs` passes.
+
+## 2026-06-25 — externals/rdynarmic/src/backend/arm64/a32_address_space.rs test fixture vs externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp
+
+### Intentional differences
+- Updated the A32 ARM64 prelude-size test fixture after the upstream-ordered Rust prelude gained the page-table, fastmem, RSB, and FPCR setup emitted by `A32AddressSpace::EmitPrelude`.
+- The bootstrap prelude fixture is now `352` bytes and the normal-callback trampoline fixture is now `800` bytes, matching the current emitted Rust ARM64 code layout.
+
+### Unintentional differences (to fix)
+- Rust A32 ARM64 still carries a `get_cntpct` callback/trampoline path for local CP15 timer support; upstream `A32AddressSpace::EmitPrelude` does not emit an A32 `get_cntpct` trampoline. This was not changed in this test-fixture pass.
+
+### Missing items
+- None for the fixture update.
+- Separately audit the local A32 CP15 `GetCNTPCT` relocation path against zuyu's expected ARM32 timer handling before deciding whether to keep or remove it.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- The change only updates Rust test constants for host AArch64 prelude code size.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp` around `A32AddressSpace::EmitPrelude`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/address_space.h/.cpp` for `PreludeInfo` fields and relocation targets.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/a32_address_space.rs`, `address_space.rs`, and `prelude.rs`.
+- `timeout 60s cargo test -p rdynarmic backend::arm64::a32_address_space::tests::normal_callback_trampolines_populate_prelude_and_extend_cache_base --lib -- --exact --nocapture` passes.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::a32_address_space::tests --lib -- --test-threads=1` passes 6 tests.
+- `timeout 120s cargo test -p rdynarmic backend::x64 --lib -- --test-threads=1` passes 155 tests.
+
+## 2026-06-25 — externals/rdynarmic/src/backend/arm64/a32_interface.rs test fixture vs externals/dynarmic/src/dynarmic/backend/arm64/a32_core.h and a32_address_space.cpp
+
+### Intentional differences
+- Updated `run_performs_deferred_clear_cache_before_execution` so it sets `HaltReason::EXTERNAL_HALT` before entering `A32Interface::run()`.
+- This keeps the upstream `A32Core::Run` ordering under test: deferred cache invalidation is processed first, `process.GetOrEmit(thread_ctx.GetLocationDescriptor())` still compiles the current block, and the ARM64 prelude then observes an existing halt reason before entering guest code.
+
+### Unintentional differences (to fix)
+- None for this test fixture.
+
+### Missing items
+- None for the A32 interface invalidation-order test.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This only constrains a unit test so it no longer depends on an unbounded guest instruction stream returning.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_core.h`; `Run` compiles the current location and then calls `prelude_info.run_code`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp`; the run prelude checks `halt_reason` before branching to the guest entry point.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/a32_interface.rs`, `a32_core.rs`, and `prelude.rs`.
+- `timeout 60s cargo test -p rdynarmic backend::arm64::a32_interface::tests::run_performs_deferred_clear_cache_before_execution --lib -- --exact --nocapture` passes.
+- `timeout 180s cargo test -p rdynarmic backend::arm64 --lib -- --test-threads=1` passes 182 tests.
+
+## 2026-06-25 — externals/rdynarmic/src/backend/arm64/prelude.rs A32 RSB initialization vs externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp and stack_layout.h
+
+### Intentional differences
+- Added `PreludeOptions::return_stack_buffer` so the A32 owner can gate prelude RSB initialization from `JitConfig::has_optimization(OptimizationFlag::RETURN_STACK_BUFFER)`, matching upstream `conf.HasOptimization(OptimizationFlag::ReturnStackBuffer)`.
+- The Rust prelude emits placeholder `NOP`s and patches them to `LDR Xscratch0, literal` after `return_to_dispatcher` offset is known; upstream oaknut resolves `LDR(Xscratch0, l_return_to_dispatcher)` labels internally. The resulting code shape remains a literal load followed by per-entry `STR` into `StackLayout::rsb[i].code_ptr`.
+- Existing generic/bootstrap prelude calls keep `return_stack_buffer: false`; A32 dispatcher-owned prelude now passes the real optimization flag.
+
+### Unintentional differences (to fix)
+- Upstream A32 prelude also initializes `Xpagetable` and `Xfastmem` from config before RSB setup. Rust ARM64 prelude still does not load page-table/fastmem registers.
+- Upstream emits `return_from_run_code` after `return_to_dispatcher`; the current Rust bootstrap keeps the existing earlier `return_from_run_code` layout and patches branches/literals around it.
+- Tick callback trampolines are still simplified in the Rust prelude compared to upstream's emitted `add_ticks` and `get_ticks_remaining` trampolines.
+
+### Missing items
+- A64 prelude still needs the same optimization-aware RSB initialization audit.
+- Page-table and fastmem prelude register setup for A32 ARM64.
+- Full upstream `EmitPrelude` ownership split once Rust ARM64 `A32AddressSpace` no longer uses the bootstrap helper.
+
+### Binary layout verification
+- PASS: `RSBEntry` remains `repr(C, align(16))` with `target` at offset 0, `code_ptr` at offset 8, and size 16, matching upstream `stack_layout.h`.
+- PASS: `StackLayout::rsb_entry_offset(i) + offset_of!(RSBEntry, code_ptr)` is used for every seeded RSB entry, matching upstream `offsetof(StackLayout, rsb) + offsetof(RSBEntry, code_ptr) + i * sizeof(RSBEntry)`.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp` around run/step prelude setup, `return_to_dispatcher`, `return_from_run_code`, and `l_return_to_dispatcher`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/stack_layout.h` for RSB layout and count.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/prelude.rs`, `address_space.rs`, `a32_address_space.rs`, and `stack_layout.rs`.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::prelude::tests --lib -- --test-threads=1` passes 11 tests.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::stack_layout::tests --lib -- --test-threads=1` passes 2 tests.
+- `timeout 120s cargo check -q -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-25 — externals/rdynarmic/src/backend/arm64/prelude.rs A32 page-table/fastmem registers vs externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp and abi.h
+
+### Intentional differences
+- Extended `PreludeOptions` with `page_table_pointer` and `fastmem_pointer` so A32 can pass `JitConfig` memory base pointers into the ARM64 prelude without moving ownership out of `backend/arm64/prelude.rs`.
+- Emitted `XPAGETABLE` and `XFASTMEM` setup only when the corresponding pointer is non-zero, matching upstream `if (conf.page_table)` and `if (conf.fastmem_pointer)`.
+- Kept the upstream ordering inside run and step entries: `X19`, `Xstate`, `Xhalt`, optional `Xpagetable`, optional `Xfastmem`, optional RSB setup, cycle counting, FPCR setup.
+- Rust materializes the 64-bit constants with the local `movz/movk` helper; upstream oaknut emits `MOV(Xreg, imm)` and chooses the same kind of immediate materialization internally.
+
+### Unintentional differences (to fix)
+- The prelude is still a bootstrap helper shared through Rust `AddressSpace`, while upstream A32 owns the full `EmitPrelude` body directly in `A32AddressSpace::EmitPrelude`.
+- Tick callback trampolines remain simplified versus upstream `prelude_info.add_ticks` and `prelude_info.get_ticks_remaining`.
+- A64 prelude has not yet been audited/updated for matching page-table/fastmem and RSB setup.
+
+### Missing items
+- Full upstream-owned A32 `EmitPrelude` split once the bootstrap helper can be retired.
+- A64 prelude parity pass.
+- Fastmem direct memory emission remains explicitly unported; this tranche only installs the registers required by page-table/fastmem-backed emitters.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- PASS: ARM64 ABI register constants remain `Xfastmem = 25` and `Xpagetable = 24`, matching upstream `abi.h`.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp` around run/step prelude setup.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/abi.h` for `Xfastmem` and `Xpagetable` register ownership.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/prelude.rs`, `address_space.rs`, `a32_address_space.rs`, and `abi.rs`.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::prelude::tests --lib -- --test-threads=1` passes 12 tests.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::emit_arm64_memory::tests --lib -- --test-threads=1` passes 10 tests.
+- `timeout 120s cargo check -q -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-25 — externals/rdynarmic/src/backend/arm64/prelude.rs A64 FPCR/register prelude vs externals/dynarmic/src/dynarmic/backend/arm64/a64_address_space.cpp
+
+### Intentional differences
+- Added `PreludeIsa` so the shared Rust bootstrap prelude has explicit A32/A64 behavior instead of accidentally applying the A32 FPCR path to A64.
+- A64 now passes `PreludeIsa::A64`, `RETURN_STACK_BUFFER`, `page_table_pointer`, and `fastmem_pointer` from `A64AddressSpace::new`, matching upstream `A64AddressSpace::EmitPrelude` config gating.
+- A64 FPCR setup now follows upstream ordering: `MRS FPCR`, store host FPCR to `StackLayout::save_host_fpcr`, load guest FPCR from `A64JitState::fpcr`, then `MSR FPCR`.
+- A32 keeps its upstream-specific ordering and source: load `upper_location_descriptor`, mask FPCR bits, save host FPCR, then install guest FPCR.
+
+### Unintentional differences (to fix)
+- Rust still emits A64 through the shared bootstrap prelude rather than an A64-owned `EmitPrelude` body in `a64_address_space.rs`.
+- A64 `return_to_dispatcher` currently has no owner-specific dispatcher callback wired in this tranche; upstream emits `A64AddressSpace::GetOrEmit(context.GetLocationDescriptor())`.
+- Tick callback trampolines are still simplified compared with upstream generated `add_ticks` and `get_ticks_remaining` trampoline calls.
+
+### Missing items
+- A64-owned return-to-dispatcher callback parity.
+- Full upstream `EmitPrelude` split for A32 and A64 when the bootstrap helper can be retired.
+- Direct fastmem emission remains unported; this tranche only ensures the prelude registers are correctly installed when fastmem/page-table paths are used.
+
+### Binary layout verification
+- PASS: `A64JitState::fpcr` offset remains 792, matching the existing Rust layout test against upstream.
+- PASS: The A64 prelude no longer reads `A32JitState::upper_location_descriptor`.
+- No serialized guest-visible payloads changed.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a64_address_space.cpp` around run/step prelude setup, FPCR save/restore, RSB setup, and `l_return_to_dispatcher`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/prelude.rs`, `a64_address_space.rs`, `a32_address_space.rs`, and `jit_state.rs`.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::prelude::tests --lib -- --test-threads=1` passes 13 tests.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::a64_address_space::tests --lib -- --test-threads=1` passes 4 tests.
+- `timeout 120s cargo check -q -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-25 — externals/rdynarmic/src/jit.rs x64 execution tests vs externals/dynarmic tests and backend/x64 emitters
+
+### Intentional differences
+- Gated the A64 TBL/TBX JIT execution regression tests with `#[cfg(target_arch = "x86_64")]`.
+- These tests instantiate `A64Jit::new`, which is currently the x64 backend in Rust and intentionally returns `Err` on non-x86_64 hosts. On Apple Silicon, executing those tests was testing the host backend availability, not the table lookup lowering itself.
+- Kept pure x64 backend and fallback tests active on ARM64 hosts; only native execution of generated x64 code is skipped.
+
+### Unintentional differences (to fix)
+- Rust still lacks an A64 ARM64 execution backend, so these A64 execution regressions cannot be run natively on Apple Silicon yet.
+
+### Missing items
+- Re-enable equivalent A64 table lookup execution coverage on Apple Silicon once the ARM64 A64 backend is wired through `A64Jit::new` or a separate A64 ARM64 test harness.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This only changes test compilation on non-x86_64 hosts.
+
+### Verification
+- Re-read upstream Dynarmic x64 table lookup emitters in `externals/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp`.
+- Re-read upstream Dynarmic A32 table lookup tests in `externals/dynarmic/tests/A32/test_arm_instructions.cpp`; no exact upstream A64 Rust-test counterpart exists.
+- Re-read Rust `externals/rdynarmic/src/jit.rs` around `A64Jit::new` and the A64 TBL/TBX tests.
+- `rustfmt --check externals/rdynarmic/src/jit.rs` passes.
+- `timeout 120s cargo test -q -p rdynarmic table_lookup --lib -- --test-threads=1` passes: 7 passed.
+- `timeout 120s cargo test -q -p rdynarmic backend::x64 --lib -- --test-threads=1` passes: 155 passed.
+
+## 2026-06-25 — externals/rdynarmic/src/backend/arm64/prelude.rs FPCR tranche vs externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp
+
+### Intentional differences
+- Ported the upstream A32 ARM64 FPCR save/set/restore sequence into the Rust ARM64 prelude owner.
+- `run_code` and `step_code` now load `A32JitState::upper_location_descriptor`, mask `0xffff0000`, save the host FPCR to `StackLayout::save_host_fpcr`, and install the guest FPCR before halt checking and entering guest code.
+- `return_from_run_code` now restores host FPCR from `StackLayout::save_host_fpcr` before clearing `halt_reason` and popping the host frame.
+- Added `mrs_fpcr` and `msr_fpcr` instruction encoders next to the existing FPSR/NZCV system-register encoders.
+
+### Unintentional differences (to fix)
+- The Rust prelude still lacks upstream page-table/fastmem host register setup and RSB initialization before the FPCR setup.
+- Callback trampoline ordering and tick-callback invocation are still not fully upstream-exact; this tranche only fixes FPCR ordering around the current run/step/return path.
+- A64 ARM64 prelude FPCR handling remains separate pending the A64 backend wiring.
+
+### Missing items
+- Full upstream `A32AddressSpace::EmitPrelude()` parity for page-table/fastmem registers, return-stack-buffer initialization, and callback trampoline ordering.
+- A64 ARM64 prelude parity pass.
+
+### Binary layout verification
+- No guest-visible struct layout changed.
+- Existing `StackLayout::save_host_fpcr_offset()` is used and remains verified at offset 1168.
+- Existing `A32JitState::upper_location_descriptor` layout is used through `offset_of!` and remains the upstream-owned field source for A32 FPSCR mode bits.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp` around `A32AddressSpace::EmitPrelude()` run/step/return FPCR sequences.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/stack_layout.h` and `a32_jitstate.h`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/prelude.rs`, `inst.rs`, `stack_layout.rs`, and `jit_state.rs`.
+- Verified `MRS/MSR FPCR` instruction words against Apple AArch64 assembler output.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::prelude::tests --lib -- --test-threads=1` passes: 10 passed.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words --lib -- --test-threads=1` passes.
+- `timeout 120s cargo test -q -p rdynarmic tests_a32::tests::test_bcs_after_cmp --lib -- --test-threads=1` passes.
+- `timeout 120s cargo test -q -p rdynarmic tests_a32::tests::test_eors_asr0_carry --lib -- --test-threads=1` passes.
+- `timeout 120s cargo check -q -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-25 — externals/rdynarmic/src/backend/arm64/a32_core.rs vs externals/dynarmic/src/dynarmic/backend/arm64/a32_core.h and a32_address_space.cpp
+
+### Intentional differences
+- Added a temporary host-side redispatch loop in `A32Core::run` for the ARM64 backend. Upstream `A32Core::Run` calls `process.GetOrEmit(thread_ctx.GetLocationDescriptor())` once and then enters `prelude_info.run_code`; upstream's repeated block dispatch happens inside `A32AddressSpace::EmitPrelude()` at `return_to_dispatcher`, which calls `GetOrEmit(context.GetLocationDescriptor())` and branches to the returned block.
+- The Rust bootstrap prelude currently makes `return_to_dispatcher` return from `run_code` instead of calling back into `A32AddressSpace::get_or_emit`. The host-side loop preserves enough behavior for current A32 block-chain tests while avoiding an unsafe generated-code callback to a movable Rust `A32AddressSpace`.
+- The loop stops when `halt_reason` is nonzero, when the PC remains stable across redispatch, or after a safety iteration limit. This is deliberately narrower than upstream and exists only until the prelude can own the faithful dispatcher callback.
+
+### Unintentional differences (to fix)
+- `A32Core::run` is no longer structurally identical to upstream `A32Core::Run`; upstream has no outer Rust/C++ loop.
+- The faithful fix is to make `A32AddressSpace`/`AddressSpace` have stable pinned or boxed ownership, then port upstream `A32AddressSpace::EmitPrelude()`'s `return_to_dispatcher` callback: halt check, optional cycle check, `GetOrEmit(context.GetLocationDescriptor())`, and `BR X0`.
+- The current Rust prelude still lacks upstream FPCR save/set/restore and cycle-accounting ordering in this dispatch path.
+
+### Missing items
+- Stable generated-code callback from ARM64 prelude into `A32AddressSpace::get_or_emit`.
+- Full upstream `return_to_dispatcher` / `return_from_run_code` implementation in the ARM64 prelude, including halt, cycle, FPCR, and callback ordering.
+- Regression test that exercises generated `return_to_dispatcher` directly once the prelude owns redispatch.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This changes host-side ARM64 execution control flow only.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_core.h`; confirmed upstream `Run` performs one `GetOrEmit` before calling `run_code`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp` around `A32AddressSpace::EmitPrelude()`; confirmed upstream redispatch is implemented in generated code at `return_to_dispatcher`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/a32_core.rs`.
+- `timeout 120s cargo test -q -p rdynarmic tests_a32::tests::test_bcs_after_cmp --lib -- --test-threads=1` passes.
+- `timeout 120s cargo test -q -p rdynarmic tests_a32::tests::test_eors_asr0_carry --lib -- --test-threads=1` passes.
+
+## 2026-06-25 — externals/rdynarmic/src/backend/arm64/emit_arm64_vector.rs, abi.rs, reg_alloc.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector.cpp and abi.h
+
+### Intentional differences
+- Ported upstream `VectorTable`, `VectorTableLookup64`, and `VectorTableLookup128` in the ARM64 vector emitter. The Rust lowering preserves upstream's pseudo-op ownership, `UseCount()==1` guard, table-size handling, zero-default `TBL` vs fallback-default `TBX` choice, and fixed temporary register sequence.
+- Added `GPR_ORDER` and `FPR_ORDER` constants in Rust `abi.rs` matching upstream `abi.h`, and changed `RegAlloc::default()` to use them. This reserves `V0`-`V7` from normal FPR allocation like upstream, so `VectorTableLookup64/128` can safely use fixed temporaries `V0`-`V3`.
+- Added the narrow ARM64 encoders needed by the upstream table lowering (`MOVI v.16b` for `0x08`/`0x18`, `ORR v.8b`, `TBL`, and `TBX`) next to the existing ARM64 instruction encoders.
+- The `MOVI v.16b` encoder is intentionally narrow and only accepts immediates used by upstream table lookup (`0x08`, `0x18`); broaden it only when another upstream emitter needs the generic form.
+- Rust's `is_default_zero(...)` treats both immediate zero and `ZeroVector` as upstream `IsZero()` equivalents, because the Rust IR can represent the zero default through the existing `ZeroVector` opcode.
+- ARM64 unit-test fixtures were updated to derive allocated registers from upstream-order `GPR_ORDER` / `FPR_ORDER` instead of assuming the old local allocation order (`X0`, `V0`, ...). The address-space prelude fixture now derives the prelude size from generated metadata instead of hard-coding the old local size.
+
+### Unintentional differences (to fix)
+- None known for `VectorTable`, `VectorTableLookup64`, or `VectorTableLookup128` after re-reading upstream.
+
+### Missing items
+- Remaining unrouted vector opcodes after this tranche: `VectorEqual128`, `VectorMaxSigned64`, `VectorMaxUnsigned64`, `VectorMinSigned64`, `VectorMinUnsigned64`, `VectorMultiply64`, `VectorShuffleHighHalfwords`, `VectorShuffleLowHalfwords`, `VectorShuffleWords`, `VectorSignExtend64`, `VectorSignedMultiplyLong16`, `VectorSignedMultiplyLong32`, `VectorUnsignedMultiplyLong16`, and `VectorUnsignedMultiplyLong32`.
+- Several of those are also upstream ARM64 `ASSERT_FALSE("Unimplemented")` cases (`VectorEqual128`, signed/unsigned min/max 64-bit lanes, `VectorSignExtend64`, and `VectorMultiply64` debug-only), while the Rust-specific shuffle/multiply-long opcodes need a separate ownership audit before routing.
+- Add block-emission regression tests for `VectorTableLookup64/128` once the local ARM64 block-emission test harness can assert generated words with register allocation state.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- Changes only affect host AArch64 register allocation order and emitted NEON instruction words.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/abi.h` and confirmed Rust `GPR_ORDER` / `FPR_ORDER` now match upstream exactly.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector.cpp` around `VectorTable`, `VectorTableLookup64`, and `VectorTableLookup128`; Rust lowering follows the same register-realization and instruction ordering.
+- Verified new `TBL`/`TBX`/`MOVI`/`ORR` instruction words against Apple AArch64 assembler output.
+- `cargo fmt --all --check`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words` passes.
+- `timeout 120s cargo test -p rdynarmic backend::arm64::abi` passes.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64 --lib -- --test-threads=1` passes.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+- Full `timeout 240s cargo test -q -p rdynarmic --lib -- --test-threads=1` was attempted after the fixture updates. The earlier x64 emission SIGBUS was fixed by the 2026-06-25 `rxbyak` allocation slice below; the remaining failures are functional A32/A64 JIT tests that currently hit incomplete ARM64 emitter paths or unsupported native x64 execution on Apple Silicon.
+
+## 2026-06-25 — externals/rxbyak/src/platform/unix.rs vs externals/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp
+
+### Intentional differences
+- Changed the Unix `rxbyak` code-buffer allocation back to upstream Dynarmic's effective x64 allocation model: initial mappings are `PROT_READ | PROT_WRITE`, and executable permissions are applied later through protection helpers. This preserves `MAP_JIT` on macOS but avoids writing to an initially executable JIT mapping on Apple Silicon.
+- The Rust allocator still does not store allocation size in a prefix page like upstream `CustomXbyakAllocator`; `CodeBuffer` already owns and passes its capacity to `munmap`, so the extra prefix page is not needed in this Rust ownership model.
+
+### Unintentional differences (to fix)
+- None known for the allocation protection mode after re-reading upstream `block_of_code.cpp`.
+
+### Missing items
+- Native x64 code execution remains unsupported in an `aarch64` Rust process; this change only fixes x64 byte emission tests and allocation parity, not x64 backend executability on Apple Silicon.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed. Host executable-memory protection only.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp`; upstream maps writable memory first and uses protection helpers for executable transitions.
+- `timeout 60s cargo test -q -p rdynarmic backend::x64::a32_emit_a32::tests::a32_write_memory32_after_shift_and_add_emits_without_losing_address_value --lib -- --test-threads=1 --nocapture` passes.
+- `timeout 240s cargo test -q -p rdynarmic --lib -- --test-threads=1` no longer exits with `SIGBUS`; it now runs to known functional failures from incomplete native ARM64 emitter coverage and unsupported native x64 execution tests.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs flag pseudo-op source type resolution vs externals/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
+
+### Intentional differences
+- Updated standalone ARM64 `GetNZFromOp`/`GetNZCVFromOp` materialization to resolve the real producer type instead of using the formal `OPQ` argument type.
+- This mirrors upstream `GetArgumentInfo(inst)` behavior where the C++ IR value carries its concrete type even though the opcode declares `OPQ`.
+- `U8` and `U16` sources are masked before `TST` so high bits do not affect N/Z.
+
+### Unintentional differences (to fix)
+- Upstream ARM64 mostly consumes `GetNZFromOp`/`GetNZCVFromOp` as associated pseudo-ops inside producer emitters; Rust still needs a standalone fallback because the dispatcher can visit the pseudo-op separately.
+- Standalone fallback currently emits `TST`/masking instead of registering the pseudo-op against a producer in regalloc. This is acceptable only when the producer did not define the pseudo-op as associated flags.
+
+### Missing items
+- Add proper ARM64 regalloc pseudo-operation registration if later blocks require strict upstream associated-flag ownership.
+- Add focused pseudo-op tests once ARM64 block-emission tests can build flag-associated IR.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This only changes host-side flag materialization for pseudo-op emission.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp` around `EmitGetNZFromOp`/`EmitGetNZCVFromOp` and upstream ARM64 associated flag handling.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs` and `emit_arm64.rs`.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64.rs GetNZFromOp dispatch vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+- Routed standalone `GetNZFromOp` through the existing ARM64 `GetNZCVFromOp` flag materialization helper.
+- This matches the upstream ARM64 associated-flag model: NZ and NZCV both use the backend flag location, while consumers decide which bits matter.
+
+### Unintentional differences (to fix)
+- Upstream does not expose this as a separate data-processing specialization in the same way; most `GetNZFromOp` uses are associated pseudo operations consumed by emitters such as bitwise ops.
+- Rust currently needs an explicit dispatcher route because the IR block can still contain `GetNZFromOp` as a visited pseudo-op.
+
+### Missing items
+- None for standalone NZ materialization with the current ARM64 regalloc flag format.
+- More precise tests should be added when the ARM64 block-emission test harness can assert pseudo-op visitation/association.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This only changes ARM64 dispatcher routing for an existing pseudo-op.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp` around associated `GetNZFromOp` handling in bitwise emitters.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64.rs` and `emit_arm64_data_processing.rs`.
+- `cargo fmt --all`
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs multiply tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+- Ported upstream-owned `Mul32` and `Mul64` in the ARM64 data-processing file and routed both opcodes from the ARM64 dispatcher.
+- Preserved upstream `EmitThreeOp` behavior: realize result, left operand, and right operand in the same bit width, then emit `MUL`.
+- Added the missing ARM64 `MUL Xd, Xn, Xm` encoder next to the existing `MUL Wd, Wn, Wm` encoder.
+
+### Unintentional differences (to fix)
+- None known for simple `Mul32` and `Mul64`.
+- Adjacent multiply-high and division emitters remain unported.
+
+### Missing items
+- `SignedMultiplyHigh64`, `UnsignedMultiplyHigh64`, `UnsignedDiv32`, `UnsignedDiv64`, `SignedDiv32`, and `SignedDiv64`.
+- Add focused IR-emission tests once the local ARM64 generic block helpers are broad enough for this tranche.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This only emits AArch64 multiplication instructions for existing IR opcodes.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp` around `EmitIR<Mul32/Mul64>`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs`, `emit_arm64.rs`, and `inst.rs`.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs bitwise tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+- Ported the upstream-owned bitwise IR group in the ARM64 data-processing Rust file: `And32/64`, `AndNot32/64`, `Eor32/64`, `Or32/64`, and `Not32/64`.
+- Preserved upstream associated flag handling where upstream supports it: `And` and `AndNot` consume `GetNZFromOp` or `GetNZCVFromOp` via `ANDS`/`BICS`.
+- `Eor`, `Or`, and `Not` are emitted without associated flag handling, matching upstream's one-emitter overloads for these opcodes.
+- Added AArch64 instruction encoders for register-form `ANDS`, `EOR`, `BIC X`, and `BICS` required by this upstream tranche.
+
+### Unintentional differences (to fix)
+- Upstream `EmitBitOp` uses `MaybeBitImm` to emit logical immediates directly when representable. Rust currently lets regalloc materialize immediate operands and emits register-form logical operations.
+- Upstream falls back to scratch materialization only when a logical immediate is not encodable; Rust uses the scratch/materialized path for all immediate bitwise operands in this tranche.
+- Rust returns explicit `Err` if both `GetNZFromOp` and `GetNZCVFromOp` are associated. Upstream asserts this invariant.
+
+### Missing items
+- Add logical-immediate fast paths for `And`, `AndNot`, `Eor`, and `Or` after the broader ARM64 data-processing emitter is less skeletal.
+- Add focused IR-emission tests for flag-associated `And`/`AndNot`, not only instruction encoder tests.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This only emits AArch64 data-processing instructions for existing IR opcodes.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp` around `EmitBitOp`, `EmitAndNot`, and `EmitIR<And/AndNot/Eor/Or/Not>`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs`, `emit_arm64.rs`, and `inst.rs`.
+- `cargo fmt --all`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst` passes 3 ARM64 instruction encoder tests.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+## 2026-06-25 — externals/rdynarmic/src/backend/arm64/emit_arm64_vector.rs and emit_arm64_vector_saturation.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector.cpp and emit_arm64_vector_saturation.cpp
+
+### Intentional differences
+- Added Rust ARM64 NEON encoders in `inst.rs` for the upstream vector families needed by this tranche: widening multiply, narrow, pairwise add/min/max, polynomial multiply, FPSR-backed saturating unary/accumulate/narrow/shift/multiply, reciprocal estimate, and saturated add/sub.
+- Kept upstream ownership split: `VectorSignedSaturatedAdd/Sub` and `VectorUnsignedSaturatedAdd/Sub` live in new `emit_arm64_vector_saturation.rs`, matching upstream `emit_arm64_vector_saturation.cpp`, while the rest remains in `emit_arm64_vector.rs`.
+- Rust helpers return `Result` and explicit errors where C++ uses asserts; the instruction ordering remains upstream-equivalent: realize registers, load FPSR for saturating ops, emit the NEON instruction.
+- `VectorMultiply64` remains unimplemented because upstream guards it with `ASSERT_MSG(ctx.conf.very_verbose_debugging_output, "VectorMultiply64 is for debugging only")`; Rust currently has no equivalent config field in this backend path.
+
+### Unintentional differences (to fix)
+- `VectorTable`, `VectorTableLookup64`, and `VectorTableLookup128` are still not ported. Upstream uses fixed temporaries `V0`-`V3`; Rust ARM64 `RegAlloc::default()` currently allows allocation of `V0`-`V3`, so a faithful port needs temporary reservation/spill policy before emitting this lowering.
+- Rust-specific `VectorShuffleHighHalfwords`, `VectorShuffleLowHalfwords`, `VectorShuffleWords`, `VectorSignedMultiplyLong16/32`, and `VectorUnsignedMultiplyLong16/32` have no matching upstream ARM64 emitter found in this comparison pass and remain unrouted.
+
+### Missing items
+- `VectorTable` pseudo-op and table lookup lowering with safe `V0`-`V3` temporary handling.
+- Explicit block-emission regression tests for routed vector opcodes beyond instruction encoder word tests.
+- Upstream-unimplemented opcodes intentionally remain unrouted: `VectorEqual128`, signed/unsigned max/min 64-bit lanes, and `VectorSignExtend64`.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- Changes only affect host AArch64 code emission and instruction encoding.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector.cpp`, including helper templates and all newly routed `EmitIR` specializations.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector_saturation.cpp`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_vector.rs`, `emit_arm64_vector_saturation.rs`, `emit_arm64.rs`, `mod.rs`, and `inst.rs`.
+- Verified new instruction encoders against Apple AArch64 assembler output for `XTN`, `SMULL/UMULL`, `PMUL/PMULL`, `ADDP`, `SADDLP/UADDLP`, `SQ*`, `UQ*`, `URECPE`, and `URSQRTE`.
+- `cargo fmt --all --check`
+- `timeout 120s cargo test -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words` passes.
+- `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
+
+## 2026-06-25 — externals/rdynarmic/src/backend/arm64/emit_arm64_a32.rs A32 SVC halt convention vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp and externals/rdynarmic/src/backend/x64/a32_emit_a32.rs
+
+### Intentional differences
+- Updated Rust ARM64 `emit_a32_call_supervisor` to store `HaltReason::SVC` into `XHALT` before emitting the `CallSVC` relocation.
+- Upstream C++ Dynarmic ARM64 only emits the callback relocation and lets the embedding callback decide what to do after SVC.
+- This Rust port already had a local x64 public-JIT convention in `backend/x64/a32_emit_a32.rs`: `A32CallSupervisor` writes `HaltReason::SVC` before calling the callback. The ARM64 backend now follows that existing Rust convention so public `A32Jit::run()` returns at SVC instead of redispatching through zero-filled guest memory.
+- Updated ARM64 `call_supervisor` emitter fixtures to use the existing immediate-materialization helper, preserving the real `MOVZ`/`MOVK` sequence for `HaltReason::SVC.bits()`.
+
+### Unintentional differences (to fix)
+- The local Rust SVC-halt convention is not upstream C++ behavior. A stricter upstream-faithful model would require tests/callbacks to request halt explicitly rather than having the backend force `SVC`.
+- The current ARM64 A32 prelude still uses a temporary host-side redispatch model documented in earlier entries; once upstream `return_to_dispatcher` is fully ported, SVC halt ownership should be audited again.
+
+### Missing items
+- No missing item for the current Rust public-JIT convention.
+- Future parity work: decide whether to unwind the local x64/ARM64 Rust `SVC` halt convention in favor of upstream callback-owned halt semantics.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This only changes host-side ARM64 generated control flow around SVC.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp::EmitIR<A32CallSupervisor>`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp::EmitA32CallSupervisor`.
+- Re-read local Rust `externals/rdynarmic/src/backend/x64/a32_emit_a32.rs::emit_a32_call_supervisor`.
+- `timeout 60s cargo test -q -p rdynarmic backend::arm64::emit_arm64_a32::tests::call_supervisor --lib -- --test-threads=1` passes.
+- `timeout 60s cargo test -q -p rdynarmic jit::tests::test_a32_cmp_bne_loop_exits_when_equal --lib -- --exact --nocapture` passes.
+- `timeout 60s cargo test -q -p rdynarmic jit::tests::test_a32_cmp_addhs_subhs_division_tail_with_all_optimizations --lib -- --exact --nocapture` passes.
+
+## 2026-06-25 — externals/rdynarmic/src/jit.rs A64 x64-only public tests on Apple Silicon vs rdynarmic backend ownership
+
+### Intentional differences
+- Marked public A64 JIT execution tests that instantiate `A64Jit` as `#[cfg(target_arch = "x86_64")]`.
+- This matches current Rust backend ownership: public `A32Jit::new` selects the ARM64 backend on Apple Silicon, but public `A64Jit::new` still owns only the x64 emitter path and explicitly rejects non-`x86_64` hosts.
+- Kept A64 tests that exercise pure Rust trampoline logic enabled; only tests requiring native x64 code execution are gated.
+
+### Unintentional differences (to fix)
+- Upstream Dynarmic has an ARM64 A64 backend; rdynarmic public `A64Jit::new` is still not wired to `backend::arm64::a64_interface::A64Interface`.
+- These tests should be re-enabled on `aarch64` once the public A64 ARM64 backend is wired and emits the required opcode coverage.
+
+### Missing items
+- Public A64 ARM64 backend selection in `A64Jit::new`.
+- A64 ARM64 executable-code parity for the gated tests.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- Test selection only.
+
+### Verification
+- Re-read local `externals/rdynarmic/src/jit.rs` around public A32/A64 JIT construction.
+- `timeout 240s cargo test -q -p rdynarmic jit::tests --lib -- --test-threads=1` no longer reports `rdynarmic x64 backend is not executable on host architecture aarch64`; remaining failures are A32 ARM64 opcode coverage/behavior issues (`FPCompare*`, `FP*ToFixedU32`, `FPMul64`, and UDIV/MOD remainder).
+
+## 2026-06-25 — externals/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_floating_point.cpp
+
+### Intentional differences
+- Added the Rust ARM64 scalar floating-point emitter file under the same backend ownership as upstream `emit_arm64_floating_point.cpp`.
+- Ported the subset required by current A32/MK8D regressions: `FPCompare32/64`, `FPMul32/64`, `FPSub32/64`, `FPSingleToFixedU32`, `FPDoubleToFixedU32`, `FPFixedU32ToSingle`, and `FPFixedU32ToDouble`.
+- Preserved upstream-style ordering for the ported operations: realize operands/results, emit the host FP instruction, and use explicit FPSR manager access for conversion paths that need FPCR rounding mode state.
+- Rust returns `Result` errors for invalid rounding modes where C++ uses asserts/templates.
+
+### Unintentional differences (to fix)
+- Only the scalar FP subset above is ported. Upstream `emit_arm64_floating_point.cpp` has broader FP opcode coverage.
+- Conversion rounding helpers are explicit Rust matches rather than upstream C++ template dispatch, but the selected host instruction families match the intended rounding behavior for the currently routed IR opcodes.
+
+### Missing items
+- Remaining upstream scalar FP emitters not needed by the current A32 test tranche.
+- Focused block-emission fixtures for every routed FP opcode; current coverage is through JIT regression tests plus instruction encoder word tests.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- Changes only affect host AArch64 code emission and instruction encoding.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_floating_point.cpp`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs`, `emit_arm64.rs`, `mod.rs`, and `inst.rs`.
+- Verified new scalar FP instruction encoders against Apple AArch64 assembler output.
+- `timeout 60s cargo test -q -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words --lib -- --exact` passes.
+- `timeout 60s cargo test -q -p rdynarmic jit::tests::test_vfp_f64_vmrs_apsr_then_bne_uses_equal_flags --lib -- --exact --nocapture` passes.
+- `timeout 60s cargo test -q -p rdynarmic jit::tests::test_vcvt_u32_f64_does_not_truncate_to_u16 --lib -- --exact --nocapture` passes.
+- `timeout 60s cargo test -q -p rdynarmic jit::tests::test_vcvt_u32_f32_small_positive_float --lib -- --exact --nocapture` passes.
+- `timeout 60s cargo test -q -p rdynarmic jit::tests::test_vcvt_vsub_vmul_loop_no_optimizations --lib -- --exact --nocapture` passes.
+- `timeout 60s cargo test -q -p rdynarmic jit::tests::test_vmul_f64_with_literal_operand_stays_finite --lib -- --exact --nocapture` passes.
+
+## 2026-06-25 — externals/rdynarmic/src/jit.rs MockCallbacks shared-memory tests vs rdynarmic backend ownership
+
+### Intentional differences
+- Changed test-only `MockCallbacks` memory from a private `Vec<u8>` to `Arc<Mutex<Vec<u8>>>`.
+- This makes tests inspect the same memory object that the active backend callbacks mutate, instead of reading through `jit.inner.callbacks`.
+- The change is required on Apple Silicon because public `A32Jit` routes execution through `backend::arm64::a32_interface::A32Interface`; `jit.inner.callbacks` is only a dummy holder on that path.
+- Updated RTLD helper tests to use `MockCallbacks::from_shared_memory` and direct shared-memory reads/writes for stack flags, output slots, and division remainder.
+
+### Unintentional differences (to fix)
+- Test code still knows about the public `A32Jit` wrapper/backend split. A stricter long-term test API would expose backend-independent callback inspection helpers instead of sharing the mock memory directly.
+
+### Missing items
+- No runtime backend item is missing for this test fix.
+- Future cleanup: move common test callback/memory helpers out of the large `jit.rs` test module if upstream ownership for tests is later formalized.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- This is test-only host memory plumbing.
+
+### Verification
+- Re-read local `externals/rdynarmic/src/jit.rs` around public A32 backend selection and the RTLD regression helpers.
+- `timeout 120s cargo test -q -p rdynarmic jit::tests::test_a32_rtld_udivmod_dispatch_with_all_optimizations --lib -- --exact --nocapture` passes.
+- `timeout 240s cargo test -q -p rdynarmic jit::tests --lib -- --test-threads=1` passes: 34 passed, 0 failed, 5 ignored.
+- `rustfmt --check externals/rdynarmic/src/jit.rs externals/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs externals/rdynarmic/src/backend/arm64/inst.rs externals/rdynarmic/src/backend/arm64/emit_arm64.rs externals/rdynarmic/src/backend/arm64/mod.rs externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs` passes.
+- `git diff --check` passes.
+
+## 2026-06-25 — externals/rdynarmic/src/backend/arm64 FP/data-processing tranche vs externals/dynarmic/src/dynarmic/backend/arm64
+
+### Intentional differences
+- `emit_arm64_data_processing.rs`: ported `RotateRightExtended` from upstream `emit_arm64_data_processing.cpp`, including associated carry-out handling through `GetCarryFromOp` and separate immediate/register carry-in paths.
+- `emit_arm64_floating_point.rs`: extended the scalar FP tranche from upstream `emit_arm64_floating_point.cpp` with `FPAdd32/64`, `FPDiv32/64`, `FPMulAdd32/64`, `FPMulSub32/64`, and `FPNeg32/64`.
+- `emit_arm64_vector_floating_point.rs`: extended the vector FP tranche from upstream `emit_arm64_vector_floating_point.cpp` with `FPVectorAdd/Sub/Mul/Div32/64`, `FPVectorMulAdd32/64`, `FPVectorRecipStepFused32/64`, and `FPVectorRSqrtStepFused32/64`.
+- Kept the same backend ownership split as upstream: scalar FP logic stays in scalar FP emitter, vector FP logic stays in vector FP emitter, and opcode routing only coordinates in `emit_arm64.rs`.
+- Rust keeps explicit encoder functions in `inst.rs`; encodings were verified against Apple AArch64 assembler output instead of relying on oaknut.
+
+### Unintentional differences (to fix)
+- The ARM64 FP emitters still cover only the currently exercised subset. Upstream has broader scalar/vector FP coverage including estimates, round-int, paired, min/max, abs/neg vector families, and FP16 paths.
+- Some upstream instructions that use oaknut aliases are represented as explicit 32-bit encoders in Rust; this is mechanically equivalent for the verified words but less complete than an assembler abstraction.
+
+### Missing items
+- Remaining upstream scalar FP opcodes not yet routed in the Rust ARM64 backend.
+- Remaining upstream vector FP opcodes beyond the add/sub/mul/div/FMA/recip-step/rsqrt-step subset.
+- Focused per-opcode emission fixtures for every newly routed opcode; current validation relies on encoder word tests plus A32 fuzz regressions.
+
+### Binary layout verification
+- No guest-visible structs or serialized payloads changed.
+- Changes only affect host AArch64 code emission and opcode dispatch.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp`, `emit_arm64_floating_point.cpp`, and `emit_arm64_vector_floating_point.cpp`.
+- Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs`, `emit_arm64_floating_point.rs`, `emit_arm64_vector_floating_point.rs`, `emit_arm64.rs`, and `inst.rs`.
+- Verified new AArch64 encoders with Apple clang/llvm-objdump for `EXTR`, scalar `FADD/FDIV/FMADD/FMSUB/FNEG`, and vector `FADD/FSUB/FMUL/FDIV/FMLA/FRECPS/FRSQRTS`.
+- `timeout 60s cargo test -q -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words --lib -- --exact` passes.
+- `timeout 120s cargo test -q -p rdynarmic tests_a32_fuzz::tests::fuzz_compare_with_upstream --lib -- --exact --nocapture` passes.
+- `timeout 120s cargo test -q -p rdynarmic tests_a32_fuzz::tests::fuzz_vfp_scalar_f32_decoded_ops --lib -- --exact --nocapture` passes.
+- `timeout 120s cargo test -q -p rdynarmic tests_a32_fuzz::tests::fuzz_vfp_scalar_f32_fused_mac --lib -- --exact --nocapture` passes.
+- `timeout 120s cargo test -q -p rdynarmic tests_a32_fuzz::tests::fuzz_vfp_scalar_f64_fused_mac --lib -- --exact --nocapture` passes.
+- `timeout 120s cargo test -q -p rdynarmic tests_a32_fuzz::tests::fuzz_neon_f32_vector --lib -- --exact --nocapture` passes.
+- `timeout 60s cargo fmt -q -p rdynarmic -- --check` passes.
+- `git diff --check` passes for the tracked top-level repository; ARM64 backend files are still in an untracked submodule directory, so submodule `git diff --check` does not report them until they are added.

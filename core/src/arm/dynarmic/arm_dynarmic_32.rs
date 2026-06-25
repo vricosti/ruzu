@@ -738,7 +738,10 @@ fn maybe_dump_instance_at_pc(cb: &DynarmicCallbacks32, pc_ptr: Option<*const u32
 /// first low-address unmapped guest reads. Unlike the generic Memory hook,
 /// this reads Dynarmic's live register array at the memory callback boundary.
 fn trace_unmapped_guest_read_regs(cb: &DynarmicCallbacks32, vaddr: u64, size: u64) {
-    if std::env::var_os("RUZU_TRACE_UNMAPPED_GUEST_REGS").is_none() || vaddr >= 0x1000 {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_UNMAPPED_GUEST_REGS").is_some())
+        || vaddr >= 0x1000
+    {
         return;
     }
     let mapped = if let Some(ref cm) = cb.core_memory {
@@ -797,6 +800,49 @@ fn trace_unmapped_guest_read_regs(cb: &DynarmicCallbacks32, vaddr: u64, size: u6
         r[11],
         r[12],
         r[13],
+    );
+}
+
+/// `RUZU_TRACE_A32_EXCLUSIVE=1` — bounded diagnostic trace for A32 LDREX/STREX
+/// hot loops at the Dynarmic callback boundary.
+fn maybe_trace_a32_exclusive(
+    cb: &DynarmicCallbacks32,
+    op: &str,
+    vaddr: u64,
+    value: u32,
+    expected: Option<u32>,
+    ok: Option<bool>,
+) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+
+    if !*ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_A32_EXCLUSIVE").is_some()) {
+        return;
+    }
+
+    let idx = COUNT.fetch_add(1, Ordering::Relaxed);
+    if idx >= 512 {
+        return;
+    }
+
+    let pc_ptr = cb.jit_pc_ptr;
+    let pc = pc_ptr.map(|p| unsafe { p.read_volatile() }).unwrap_or(0);
+    let lr = pc_ptr
+        .map(|p| unsafe { p.offset(-1).read_volatile() })
+        .unwrap_or(0);
+    let core = cb.parent.load(Ordering::Relaxed);
+    let core_id = if core.is_null() {
+        usize::MAX
+    } else {
+        unsafe { (*core).core_index() }
+    };
+    let expected = expected
+        .map(|v| format!("0x{v:08X}"))
+        .unwrap_or_else(|| "-".to_string());
+    let ok = ok.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+
+    eprintln!(
+        "[A32_EXCL] #{idx} core={core_id} op={op} pc=0x{pc:08X} lr=0x{lr:08X} vaddr=0x{vaddr:08X} value=0x{value:08X} expected={expected} ok={ok}"
     );
 }
 
@@ -1927,7 +1973,9 @@ impl UserCallbacks for DynarmicCallbacks32 {
     }
 
     fn exclusive_read_32(&self, vaddr: u64) -> u32 {
-        self.memory_read_32(vaddr)
+        let value = self.memory_read_32(vaddr);
+        maybe_trace_a32_exclusive(self, "read32", vaddr, value, None, None);
+        value
     }
 
     fn exclusive_read_64(&self, vaddr: u64) -> u64 {
@@ -1956,6 +2004,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
         }
         maybe_trace_w_at_vaddr(self, vaddr, 4, value as u128);
         let ok = self.mem().write_exclusive_32(vaddr, value, expected);
+        maybe_trace_a32_exclusive(self, "write32", vaddr, value, Some(expected), Some(ok));
         // Same PC-range filter as watch_read / watch_write. Reports STLEX
         // attempts (write_exclusive_32) so we can distinguish "lock never
         // tried" from "lock always fails exclusive-check".
@@ -2238,8 +2287,8 @@ impl ArmDynarmic32 {
         core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
         debugger_enabled: bool,
     ) -> Self {
-        // Get page-table and fastmem pointers from core_memory before moving
-        // it into callbacks. Matches upstream `ArmDynarmic32::MakeJit`:
+        // Get page-table and fastmem pointers from the process page table.
+        // Matches upstream `ArmDynarmic32::MakeJit(Common::PageTable*)`:
         // `config.page_table = page_table->pointers.data()` and
         // `config.fastmem_pointer = page_table->fastmem_arena`.
         let use_page_table_fastmem = std::env::var_os("RUZU_A32_PAGE_TABLE_FASTMEM").is_some()
@@ -2248,21 +2297,23 @@ impl ArmDynarmic32 {
             if std::env::var_os("RUZU_NO_FASTMEM").is_some() {
                 (None, None)
             } else {
-                core_memory
-                    .as_ref()
-                    .and_then(|cm| {
-                        let guard = cm.lock().unwrap();
-                        let page_table = guard.current_page_table_raw();
-                        if page_table.is_null() {
-                            return None;
-                        }
-                        let page_table = unsafe { &*page_table };
+                let kernel_process = unsafe {
+                    &*(process as *const _ as *const crate::hle::kernel::k_process::KProcess)
+                };
+                kernel_process
+                    .page_table
+                    .get_base()
+                    .get_impl()
+                    .and_then(|page_table| {
                         let page_table_pointer = page_table.pointers.data() as *const u8;
                         let fastmem_pointer = page_table.fastmem_arena;
-                        if page_table_pointer.is_null() || fastmem_pointer.is_null() {
+                        if page_table_pointer.is_null() {
                             None
                         } else {
-                            Some((Some(page_table_pointer), Some(fastmem_pointer)))
+                            Some((
+                                Some(page_table_pointer),
+                                (!fastmem_pointer.is_null()).then_some(fastmem_pointer),
+                            ))
                         }
                     })
                     .unwrap_or((None, None))
@@ -2310,10 +2361,19 @@ impl ArmDynarmic32 {
             optimization_flags_from_mask(0x3F)
         };
 
+        // Upstream `ArmDynarmic32::MakeJit` uses 128 MiB on ARM64 hosts and
+        // 512 MiB elsewhere. Dynarmic's ARM64 backend cannot branch across a
+        // larger cache with its current direct-branch layout.
+        let code_cache_size = if cfg!(target_arch = "aarch64") {
+            128 * 1024 * 1024
+        } else {
+            512 * 1024 * 1024
+        };
+
         let config = JitConfig {
             callbacks: Box::new(callbacks),
             enable_cycle_counting: !uses_wall_clock,
-            code_cache_size: 512 * 1024 * 1024,
+            code_cache_size,
             optimizations,
             unsafe_optimizations: false,
             global_monitor: if exclusive_monitor.is_null() {
@@ -2357,10 +2417,12 @@ impl ArmDynarmic32 {
         };
 
         log::warn!(
-            "ArmDynarmic32: fastmem_pointer={:?} cycle_counting={} optimizations={:#x}",
+            "ArmDynarmic32: page_table_pointer={:?} fastmem_pointer={:?} cycle_counting={} optimizations={:#x} code_cache_size={}",
+            page_table_pointer.map(|p| p as usize),
             fastmem_pointer.map(|p| p as usize),
             !uses_wall_clock,
-            optimizations.bits()
+            optimizations.bits(),
+            code_cache_size
         );
 
         let jit = match rdynarmic::A32Jit::new(config) {
