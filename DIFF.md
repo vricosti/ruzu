@@ -15638,3 +15638,33 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs`, `emit_arm64.rs`, `inst.rs`, `a32_address_space.rs`, `a64_address_space.rs`, and `reg_alloc.rs`.
 - `cargo fmt -p rdynarmic --check` passes.
 - `timeout 120s cargo test -q -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words --lib -- --exact --nocapture` passes.
+
+## 2026-06-25 — externals/rdynarmic ARM64 A32 coprocessor, conditional select, and numeric min/max vs externals/dynarmic/src/dynarmic
+
+### Intentional differences
+- `backend/arm64/emit_arm64_a32_coprocessor.rs`: consumes argument info for `A32CoprocSendOneWord`, `A32CoprocSendTwoWords`, `A32CoprocLoadWords`, and `A32CoprocStoreWords` before no-op or unsupported-return paths, matching upstream `emit_arm64_a32_coprocessor.cpp` ownership and preserving regalloc use accounting.
+- `backend/arm64/emit_arm64_data_processing.rs`: ports upstream `ConditionalSelect32`, `ConditionalSelect64`, and `ConditionalSelectNZCV` from `emit_arm64_data_processing.cpp`, including spilling flags, loading stored NZCV from state, writing host NZCV, and emitting `CSEL`.
+- `backend/arm64/emit_arm64_floating_point.rs`: ports upstream scalar `FPMaxNumeric32/64` and `FPMinNumeric32/64` from `emit_arm64_floating_point.cpp` through the same three-operand emitter shape.
+- `backend/arm64/inst.rs`: keeps explicit Rust AArch64 encoders for `FMAXNM` and `FMINNM`; instruction words were checked against Apple AArch64 assembler output.
+- `backend/arm64/a32_address_space.rs` and `backend/arm64/a64_address_space.rs`: recompute use counts between optimization passes and DCE where Rust passes can otherwise leave stale use counts; this preserves the upstream invariant that regalloc receives accurate use accounting.
+- `backend/arm64/reg_alloc.rs`: retains a more detailed assertion payload than upstream so ARM64 backend bring-up failures include block location, owner instructions, and remaining users.
+
+### Unintentional differences (to fix)
+- `A32CoprocSendTwoWords`, `A32CoprocLoadWords`, and `A32CoprocStoreWords` remain local no-op stubs after consuming args; upstream contains fuller coprocessor action handling where configured.
+- Broader ARM64 scalar FP coverage remains incomplete; the next observed MK8D blocker after these changes is `FPDoubleToFixedS32`.
+
+### Missing items
+- `FPDoubleToFixedS32` and related signed fixed-point conversion emitters in `backend/arm64/emit_arm64_floating_point.rs`.
+- Remaining upstream ARM64 backend opcodes not yet reached by the current MK8D run.
+
+### Binary layout verification
+- N/A: host AArch64 code emission and IR bookkeeping only; no guest-visible raw layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp` around `A32CoprocSendOneWord`, `A32CoprocSendTwoWords`, `A32CoprocLoadWords`, and `A32CoprocStoreWords`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp` around `ConditionalSelect32`, `ConditionalSelect64`, and `ConditionalSelectNZCV`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_floating_point.cpp` around `FPMaxNumeric32/64` and `FPMinNumeric32/64`.
+- Re-read local Rust counterparts in `externals/rdynarmic/src/backend/arm64/emit_arm64_a32_coprocessor.rs`, `emit_arm64_data_processing.rs`, `emit_arm64_floating_point.rs`, `emit_arm64.rs`, `inst.rs`, `a32_address_space.rs`, `a64_address_space.rs`, and `reg_alloc.rs`.
+- `cargo fmt -p rdynarmic --check` passes.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words --lib -- --exact --nocapture` passes.
+- `timeout 120s cargo test -q -p rdynarmic backend::arm64::emit_arm64_a32_coprocessor --lib -- --nocapture` passes.
