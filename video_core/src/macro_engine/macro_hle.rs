@@ -8,9 +8,18 @@
 //! interpreting/JIT-compiling the macro code, providing significant speedup.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use super::macro_engine::CachedMacro;
 use crate::engines::maxwell_3d::Maxwell3D;
+
+fn trace_macro_hle_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("RUZU_TRACE_MACRO_FLOW").is_some()
+            || std::env::var_os("RUZU_TRACE_MACRO_HASH").is_some()
+    })
+}
 
 // ── Known HLE program hashes ─────────────────────────────────────────────────
 
@@ -411,7 +420,9 @@ impl HleMacro {
     /// Returns `None` if the hash is not recognized.
     pub fn get_hle_program(&self, hash: u64) -> Option<Box<dyn CachedMacro>> {
         let hit = self.builders.contains_key(&hash);
-        log::info!("HleMacro::get_hle_program hash=0x{:016X} hit={}", hash, hit);
+        if trace_macro_hle_enabled() {
+            log::info!("HleMacro::get_hle_program hash=0x{:016X} hit={}", hash, hit);
+        }
         self.builders
             .get(&hash)
             .map(|builder| builder(self.maxwell3d))

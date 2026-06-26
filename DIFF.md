@@ -16296,3 +16296,72 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo check -p core` passes with existing workspace warnings.
 - `git diff --check` passes.
 - MK8D macOS/AArch64 release run `/tmp/ruzu_mk8d_diag_after.log` exits via timeout code 124 without default info `nvmap::IocCreate called`, `nvmap::IocAlloc called`, `nvmap::IocGetId called`, or `nvmap::IocFromId called` lines.
+
+## 2026-06-26 — video_core/src/macro_engine/macro_engine.rs vs video_core/macro/macro.cpp
+
+### Intentional differences
+- `MacroEngine::{add_code,clear_code,execute}` keep local `RUZU_TRACE_MACRO_FLOW` and `RUZU_TRACE_MACRO_HASH` diagnostics for Apple Silicon bring-up, but the default path now matches upstream's no-log behavior. Previous forced logging for macro method `0x14F` was local instrumentation and is removed.
+- Trace environment checks are cached with `OnceLock` to avoid repeated host environment lookups in the GPU macro hot path.
+
+### Unintentional differences (to fix)
+- None for the corrected default macro logging behavior.
+
+### Missing items
+- None identified for this instrumentation-parity slice.
+
+### Binary layout verification
+- N/A: macro upload/cache state is host renderer state, not a guest-visible raw payload.
+
+### Verification
+- Re-read upstream `video_core/macro/macro.cpp` around `MacroEngine::AddCode`, `ClearCode`, and `Execute`.
+- Re-read local `video_core/src/macro_engine/macro_engine.rs` around `add_code`, `clear_code`, and `execute`.
+- `cargo fmt -p video_core --check` passes.
+- `cargo check -p video_core` passes with existing workspace warnings.
+- `git diff --check` passes.
+- MK8D macOS/AArch64 release run `/tmp/ruzu_mk8d_macro_after.log` exits via timeout code 124 without default info `MacroEngine::add_code`, `MacroEngine::clear_code`, or `MacroEngine::execute` lines.
+
+## 2026-06-26 — video_core/src/macro_engine/macro_hle.rs vs video_core/macro/macro_hle.cpp
+
+### Intentional differences
+- `HleMacro::get_hle_program` keeps local `RUZU_TRACE_MACRO_FLOW`/`RUZU_TRACE_MACRO_HASH` diagnostics for hash lookup investigations, but the default path now matches upstream's silent `GetHLEProgram`.
+- Trace environment checks are cached with `OnceLock`.
+
+### Unintentional differences (to fix)
+- None for the corrected default HLE macro lookup logging behavior.
+
+### Missing items
+- None identified for this instrumentation-parity slice.
+
+### Binary layout verification
+- N/A: HLE macro lookup is host renderer state.
+
+### Verification
+- Re-read upstream `video_core/macro/macro_hle.cpp` around `HLEMacro::GetHLEProgram`.
+- Re-read local `video_core/src/macro_engine/macro_hle.rs` around `get_hle_program`.
+- `cargo fmt -p video_core --check` passes.
+- `cargo check -p video_core` passes with existing workspace warnings.
+- `git diff --check` passes.
+- MK8D macOS/AArch64 release run `/tmp/ruzu_mk8d_macro_after.log` exits via timeout code 124 without default info `HleMacro::get_hle_program` lines.
+
+## 2026-06-26 — video_core/src/engines/maxwell_3d.rs vs video_core/engines/maxwell_3d.cpp
+
+### Intentional differences
+- `process_macro_bind` keeps local `RUZU_TRACE_MACRO_FLOW` diagnostics, but the default path now matches upstream `ProcessMacroBind`, which only stores the macro position and advances the pointer.
+- `call_macro_method` keeps existing explicit `RUZU_TRACE_DMA_FLOW` diagnostics, but the previous unconditional `macro_method == 0x14F` info log is removed. Upstream `CallMacroMethod` does not log macro executions by default.
+
+### Unintentional differences (to fix)
+- None for the corrected default macro bind/call logging behavior.
+
+### Missing items
+- None identified for this instrumentation-parity slice.
+
+### Binary layout verification
+- N/A: Maxwell3D macro dispatch is host renderer state.
+
+### Verification
+- Re-read upstream `video_core/engines/maxwell_3d.cpp` around `Maxwell3D::CallMacroMethod` and `ProcessMacroBind`.
+- Re-read local `video_core/src/engines/maxwell_3d.rs` around `call_macro_method` and `process_macro_bind`.
+- `cargo fmt -p video_core --check` passes.
+- `cargo check -p video_core` passes with existing workspace warnings.
+- `git diff --check` passes.
+- MK8D macOS/AArch64 release run `/tmp/ruzu_mk8d_macro_after.log` exits via timeout code 124 without default info `Maxwell3D::call_macro_method` or `Maxwell3D::process_macro_bind` lines.

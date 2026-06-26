@@ -7,10 +7,21 @@
 //! base that manages macro code upload, caching, and execution dispatch.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use super::macro_hle::HleMacro;
 use crate::engines::maxwell_3d::Maxwell3D;
 use common::container_hash::hash_u32_slice;
+
+fn trace_macro_flow_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_MACRO_FLOW").is_some())
+}
+
+fn trace_macro_hash_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_MACRO_HASH").is_some())
+}
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -320,7 +331,7 @@ impl MacroEngine {
     pub fn add_code(&mut self, method: u32, data: u32) {
         let entry = self.uploaded_macro_code.entry(method).or_default();
         entry.push(data);
-        if method >= 0x140 && method <= 0x180 {
+        if trace_macro_flow_enabled() {
             log::info!(
                 "MacroEngine::add_code method=0x{:X} len={} data=0x{:08X}",
                 method,
@@ -336,7 +347,7 @@ impl MacroEngine {
     pub fn clear_code(&mut self, method: u32) {
         self.macro_cache.remove(&method);
         self.uploaded_macro_code.remove(&method);
-        if method >= 0x140 && method <= 0x180 {
+        if trace_macro_flow_enabled() {
             log::info!("MacroEngine::clear_code method=0x{:X}", method);
         }
     }
@@ -399,7 +410,7 @@ impl MacroEngine {
                 .clone()
         };
         let hash = hash_macro_code(&code_for_compile);
-        if method == 0x14F || std::env::var_os("RUZU_TRACE_MACRO_FLOW").is_some() {
+        if trace_macro_flow_enabled() {
             log::info!(
                 "MacroEngine::execute method=0x{:X} code_len={} hash=0x{:016X} mid_method={:?}",
                 method,
@@ -408,7 +419,7 @@ impl MacroEngine {
                 mid_method
             );
         }
-        if std::env::var_os("RUZU_TRACE_MACRO_HASH").is_some() {
+        if trace_macro_hash_enabled() {
             let head: String = code_for_compile
                 .iter()
                 .take(8)
@@ -427,7 +438,7 @@ impl MacroEngine {
 
         let hle_program = self.hle_macros.get_hle_program(hash);
         let has_hle = hle_program.is_some();
-        if method == 0x14F || std::env::var_os("RUZU_TRACE_MACRO_FLOW").is_some() {
+        if trace_macro_flow_enabled() {
             log::info!(
                 "MacroEngine::execute method=0x{:X} has_hle={}",
                 method,

@@ -10,7 +10,7 @@
 //! draw begin/end) are triggered on specific register writes.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
@@ -39,9 +39,13 @@ static MAXWELL3D_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static CBUF_BIND_SCAN_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn should_trace_dma_flow() -> bool {
-    use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some())
+}
+
+fn should_trace_macro_flow() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("RUZU_TRACE_MACRO_FLOW").is_some())
 }
 
 impl Maxwell3DPtr {
@@ -4301,11 +4305,13 @@ impl Maxwell3D {
         let ptr = self.regs[LOAD_MME_START_ADDR_PTR as usize];
         self.macro_positions[ptr as usize] = data;
         self.regs[LOAD_MME_START_ADDR_PTR as usize] = ptr + 1;
-        log::info!(
-            "Maxwell3D::process_macro_bind slot={} start=0x{:X}",
-            ptr,
-            data
-        );
+        if should_trace_macro_flow() {
+            log::info!(
+                "Maxwell3D::process_macro_bind slot={} start=0x{:X}",
+                ptr,
+                data
+            );
+        }
     }
 
     /// Handle firmware call 4. Matches upstream `ProcessFirmwareCall4`.
@@ -4919,16 +4925,6 @@ impl Maxwell3D {
                     self.current_macro_dirty
                 );
             }
-        } else if macro_method == 0x14F {
-            log::info!(
-                "Maxwell3D::call_macro_method trace entry={} macro_start=0x{:X} params={:08X?} addrs={:X?} segments={:X?} dirty={}",
-                entry,
-                macro_method,
-                params,
-                self.macro_addresses,
-                self.macro_segments,
-                self.current_macro_dirty
-            );
         }
         let self_raw = std::ptr::from_mut(self);
         let self_ptr = Maxwell3DPtr(self_raw);
