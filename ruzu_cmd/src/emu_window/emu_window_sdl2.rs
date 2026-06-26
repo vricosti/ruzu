@@ -14,10 +14,13 @@
 use sdl2::sys as sdl;
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use hid_core::frontend::emulated_controller::set_simple_npad_button;
 use hid_core::hid_types::{KeyboardKeyIndex, NpadButton};
+use ruzu_core::frontend::framebuffer_layout::{
+    default_frame_layout, FramebufferLayout, ScreenUndocked,
+};
 
 // SDL_TOUCH_MOUSEID is defined in SDL_touch.h as ((Uint32)-1).
 // It is not exported by sdl2-sys as a Rust constant, so we define it here.
@@ -42,6 +45,9 @@ pub struct EmuWindowSdl2 {
 
     /// Shared visibility flag used by render backends running on the GPU thread.
     pub shown_state: Arc<AtomicBool>,
+
+    /// Shared framebuffer layout used by render backends running on the GPU thread.
+    pub framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
 
     /// Tracks when the title bar was last updated (SDL ticks).
     /// Maps to C++ `last_time`.
@@ -83,6 +89,10 @@ impl EmuWindowSdl2 {
             is_open: true,
             is_shown: true,
             shown_state: Arc::new(AtomicBool::new(true)),
+            framebuffer_layout: Arc::new(RwLock::new(default_frame_layout(
+                ScreenUndocked::WIDTH,
+                ScreenUndocked::HEIGHT,
+            ))),
             last_time: 0,
             render_window: std::ptr::null_mut(),
         }
@@ -104,6 +114,18 @@ impl EmuWindowSdl2 {
 
     pub fn shown_state(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.shown_state)
+    }
+
+    pub fn framebuffer_layout(&self) -> Arc<RwLock<FramebufferLayout>> {
+        Arc::clone(&self.framebuffer_layout)
+    }
+
+    /// Updates the current framebuffer layout.
+    ///
+    /// Maps to upstream `Core::Frontend::EmuWindow::UpdateCurrentFramebufferLayout`.
+    pub(crate) fn update_current_framebuffer_layout(&mut self, width: u32, height: u32) {
+        *self.framebuffer_layout.write().unwrap() =
+            default_frame_layout(width.max(1), height.max(1));
     }
 
     /// Waits for and dispatches the next SDL event.
@@ -392,7 +414,6 @@ impl EmuWindowSdl2 {
     /// Called when the window is resized or restored.
     ///
     /// Maps to C++ `EmuWindow_SDL2::OnResize`.
-    /// Note: UpdateCurrentFramebufferLayout depends on Core::Frontend not yet ported.
     pub(crate) fn on_resize(&mut self) {
         // Maps to: int width, height; SDL_GL_GetDrawableSize(render_window, &width, &height);
         // then UpdateCurrentFramebufferLayout(width, height).
@@ -402,12 +423,10 @@ impl EmuWindowSdl2 {
         let mut width: i32 = 0;
         let mut height: i32 = 0;
         unsafe { sdl::SDL_GL_GetDrawableSize(self.render_window, &mut width, &mut height) };
-        // UpdateCurrentFramebufferLayout not yet ported (Core::Frontend).
-        log::trace!(
-            "on_resize: {}x{} (UpdateCurrentFramebufferLayout not yet ported)",
-            width,
-            height
-        );
+        let width = width.max(1) as u32;
+        let height = height.max(1) as u32;
+        self.update_current_framebuffer_layout(width, height);
+        log::trace!("on_resize: {}x{}", width, height);
     }
 
     /// Shows or hides the mouse cursor.

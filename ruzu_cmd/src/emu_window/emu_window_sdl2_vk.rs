@@ -23,13 +23,32 @@ use std::ffi::CStr;
 
 use super::emu_window_sdl2::{DummyContext, EmuWindowSdl2};
 use ruzu_core::frontend::emu_window::{WindowSystemInfo, WindowSystemType};
+use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 // Screen layout constants.
 // Maps to C++ `Layout::ScreenUndocked::Width` / `Layout::ScreenUndocked::Height`.
 const SCREEN_UNDOCKED_WIDTH: i32 = 1280;
 const SCREEN_UNDOCKED_HEIGHT: i32 = 720;
+
+fn query_vulkan_drawable_size(render_window: *mut sdl::SDL_Window) -> (u32, u32) {
+    let mut width: i32 = 0;
+    let mut height: i32 = 0;
+    #[cfg(target_os = "macos")]
+    unsafe {
+        sdl::SDL_Metal_GetDrawableSize(render_window, &mut width, &mut height);
+    }
+    #[cfg(not(target_os = "macos"))]
+    unsafe {
+        sdl::SDL_Vulkan_GetDrawableSize(render_window, &mut width, &mut height);
+    }
+    if width <= 0 || height <= 0 {
+        (SCREEN_UNDOCKED_WIDTH as u32, SCREEN_UNDOCKED_HEIGHT as u32)
+    } else {
+        (width as u32, height as u32)
+    }
+}
 
 /// Vulkan-backed SDL2 emulator window.
 ///
@@ -150,6 +169,8 @@ impl EmuWindowSdl2Vk {
 
         // Maps to: OnResize(); OnMinimalClientAreaChangeRequest(...); SDL_PumpEvents()
         base.on_resize();
+        let (drawable_width, drawable_height) = query_vulkan_drawable_size(render_window);
+        base.update_current_framebuffer_layout(drawable_width, drawable_height);
         base.on_minimal_client_area_change_request(256, 256);
         unsafe { sdl::SDL_PumpEvents() };
 
@@ -185,9 +206,16 @@ impl EmuWindowSdl2Vk {
         self.base.shown_state()
     }
 
+    /// Shared framebuffer layout consumed by Vulkan presentation.
+    pub fn framebuffer_layout(&self) -> Arc<RwLock<FramebufferLayout>> {
+        self.base.framebuffer_layout()
+    }
+
     /// Waits for and dispatches the next SDL event.
     pub fn wait_event(&mut self) {
         self.base.wait_event();
+        let (width, height) = query_vulkan_drawable_size(self.base.render_window);
+        self.base.update_current_framebuffer_layout(width, height);
     }
 
     /// Returns the raw SDL window pointer.
@@ -202,21 +230,7 @@ impl EmuWindowSdl2Vk {
 
     /// Returns the Vulkan drawable size in pixels.
     pub fn drawable_size(&self) -> (u32, u32) {
-        let mut width: i32 = 0;
-        let mut height: i32 = 0;
-        #[cfg(target_os = "macos")]
-        unsafe {
-            sdl::SDL_Metal_GetDrawableSize(self.base.render_window, &mut width, &mut height);
-        }
-        #[cfg(not(target_os = "macos"))]
-        unsafe {
-            sdl::SDL_Vulkan_GetDrawableSize(self.base.render_window, &mut width, &mut height);
-        }
-        if width <= 0 || height <= 0 {
-            (SCREEN_UNDOCKED_WIDTH as u32, SCREEN_UNDOCKED_HEIGHT as u32)
-        } else {
-            (width as u32, height as u32)
-        }
+        query_vulkan_drawable_size(self.base.render_window)
     }
 }
 

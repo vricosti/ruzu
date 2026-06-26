@@ -258,8 +258,12 @@ impl Swapchain {
     ///
     /// Returns `true` if the swapchain is suboptimal or outdated.
     pub fn acquire_next_image(&mut self) -> bool {
+        let trace_present = std::env::var_os("RUZU_TRACE_PRESENT").is_some();
         if self.swapchain == vk::SwapchainKHR::null() || self.present_semaphores.is_empty() {
             self.is_outdated = true;
+            if trace_present {
+                log::info!("[PRESENT] Swapchain::AcquireNextImage missing swapchain/semaphore");
+            }
             return true;
         }
         let semaphore = self.present_semaphores[self.frame_index as usize];
@@ -274,9 +278,20 @@ impl Swapchain {
             Ok((index, suboptimal)) => {
                 self.image_index = index;
                 self.is_suboptimal |= suboptimal;
+                if trace_present {
+                    log::info!(
+                        "[PRESENT] Swapchain::AcquireNextImage ok image_index={} frame_index={} suboptimal={}",
+                        self.image_index,
+                        self.frame_index,
+                        suboptimal
+                    );
+                }
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.is_outdated = true;
+                if trace_present {
+                    log::info!("[PRESENT] Swapchain::AcquireNextImage out_of_date");
+                }
             }
             Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
                 panic!("vkAcquireNextImageKHR returned ERROR_SURFACE_LOST_KHR");
@@ -293,8 +308,12 @@ impl Swapchain {
 
     /// Port of `Swapchain::Present`.
     pub fn present(&mut self, render_semaphore: vk::Semaphore) {
+        let trace_present = std::env::var_os("RUZU_TRACE_PRESENT").is_some();
         if self.swapchain == vk::SwapchainKHR::null() {
             self.is_outdated = true;
+            if trace_present {
+                log::info!("[PRESENT] Swapchain::Present missing swapchain");
+            }
             return;
         }
         let wait_semaphores = [render_semaphore];
@@ -315,12 +334,23 @@ impl Swapchain {
         } {
             Ok(suboptimal) => {
                 self.is_suboptimal |= suboptimal;
+                if trace_present {
+                    log::info!(
+                        "[PRESENT] Swapchain::Present ok image_index={} frame_index={} suboptimal={}",
+                        self.image_index,
+                        self.frame_index,
+                        suboptimal
+                    );
+                }
                 if suboptimal {
                     log::debug!("Suboptimal swapchain");
                 }
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.is_outdated = true;
+                if trace_present {
+                    log::info!("[PRESENT] Swapchain::Present out_of_date");
+                }
             }
             Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
                 panic!("vkQueuePresentKHR returned ERROR_SURFACE_LOST_KHR");

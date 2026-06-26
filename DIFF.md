@@ -15854,3 +15854,32 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo test -p rdynarmic encodes_known_arm64_words -- --nocapture` passes.
 - `git -C externals/rdynarmic diff --check` passes.
 - MK8D release run with isolated data/cache/config directories and `timeout -k 5s 180s` exits with timeout code 124, without the previous `FPRoundInt32` missing-opcode failure. The log reaches `BQP_QUEUE #256`, `BQC_RELEASE #256`, repeated `SurfaceFlinger` composition on display 0 with one layer, and syncpoint increments beyond 800.
+
+## 2026-06-26 — ruzu_cmd SDL2 Vulkan framebuffer layout and Vulkan present tracing vs yuzu_cmd/emu_window and video_core/renderer_vulkan
+
+### Intentional differences
+- `ruzu_cmd/src/emu_window/emu_window_sdl2.rs`: adds shared framebuffer-layout state and updates it from `on_resize`, restoring the upstream `EmuWindow_SDL2::OnResize -> EmuWindow::UpdateCurrentFramebufferLayout -> DefaultFrameLayout` ownership path.
+- `ruzu_cmd/src/emu_window/emu_window_sdl2_vk.rs`: refreshes the shared layout from SDL Vulkan/Metal drawable size at construction and after event processing. Upstream uses `SDL_GL_GetDrawableSize`; Rust uses the platform-specific Vulkan/Metal drawable query so MoltenVK/SDL Cocoa reports the same pixel dimensions used by the swapchain.
+- `video_core/src/renderer_vulkan/renderer_vulkan.rs`: `RendererVulkan::Composite` now reads the shared frontend layout instead of constructing `DefaultFrameLayout` from the swapchain extent locally, matching upstream `render_window.GetFramebufferLayout()` ownership.
+- `video_core/src/renderer_vulkan/{renderer_vulkan.rs,present_manager.rs,swapchain.rs}`: adds `RUZU_TRACE_PRESENT`-gated diagnostics for `RendererVulkan::Composite`, `PresentManager::Present/CopyToSwapchain`, `Swapchain::AcquireNextImage`, and `Swapchain::Present`. Normal behavior is unchanged when the env var is absent.
+
+### Unintentional differences (to fix)
+- `RendererVulkan` still receives frontend state as shared Rust handles instead of owning a direct `Core::Frontend::EmuWindow&` like upstream. This preserves the correct data ownership source while avoiding a wider frontend lifetime refactor.
+- `PresentManager` still does not own `render_window`, `surface`, and present-thread lifecycle exactly like upstream `vk_present_manager.*`; consequently upstream's `VK_ERROR_SURFACE_LOST_KHR` surface recreation path is not yet fully representable.
+- Vulkan present-thread support remains disabled in the active Rust path (`use_present_thread=false`) while upstream supports queued threaded presentation.
+
+### Missing items
+- Refactor Vulkan frontend ownership so `RendererVulkan`/`PresentManager` can mirror upstream references more directly, including surface recreation on `VK_ERROR_SURFACE_LOST_KHR`.
+- Continue visual/runtime validation beyond successful swapchain presentation; MK8D now reaches repeated `queue_present` success, but full gameplay correctness is not proven.
+
+### Binary layout verification
+- N/A: frontend layout state and host Vulkan presentation diagnostics only; no guest-visible raw struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `core/frontend/emu_window.h`, `core/frontend/emu_window.cpp`, and `yuzu_cmd/emu_window/emu_window_sdl2.cpp` around `GetFramebufferLayout`, `UpdateCurrentFramebufferLayout`, and `EmuWindow_SDL2::OnResize`.
+- Re-read upstream `video_core/renderer_vulkan/renderer_vulkan.cpp` around `RendererVulkan::Composite`, and `vk_present_manager.cpp` / `vk_swapchain.cpp` around present/acquire ordering.
+- Re-read local Rust counterparts in `core/src/frontend/framebuffer_layout.rs`, `ruzu_cmd/src/emu_window/emu_window_sdl2.rs`, `ruzu_cmd/src/emu_window/emu_window_sdl2_vk.rs`, `ruzu_cmd/src/main.rs`, `video_core/src/renderer_vulkan/renderer_vulkan.rs`, `video_core/src/renderer_vulkan/present_manager.rs`, and `video_core/src/renderer_vulkan/swapchain.rs`.
+- `cargo fmt -p ruzu_cmd -p video_core` passes.
+- `cargo check -p ruzu_cmd -p video_core` passes.
+- `git diff --check` passes.
+- MK8D release run with isolated data/cache/config directories, `RUZU_TRACE_PRESENT=1`, and `timeout -k 5s 160s` exits with timeout code 124, without panic or missing-opcode failure. The log records 637 `Swapchain::Present ok` events and 637 `RendererVulkan::Composite exit` events, with `RendererVulkan::Composite draw ... swapchain=2560x1440 layout=2560x1440 image_count=3`.
