@@ -226,6 +226,8 @@ pub struct RendererVulkan {
     applet_frame: Frame,
     /// Whether turbo mode is enabled.
     turbo_mode_enabled: bool,
+    /// One-shot diagnostic dump for the presented framebuffer.
+    present_frame_dumped: bool,
 }
 
 unsafe impl Send for RendererVulkan {}
@@ -378,6 +380,7 @@ impl RendererVulkan {
             dummy_context: VulkanDummyContext,
             applet_frame: Frame::default(),
             turbo_mode_enabled: false,
+            present_frame_dumped: false,
         };
         renderer.report(telemetry_session);
         Ok(renderer)
@@ -423,6 +426,7 @@ impl RendererVulkan {
             return;
         }
         self.render_screenshot(framebuffers);
+        self.dump_present_frame_if_requested(framebuffers);
 
         let frame_index = self.present_manager.get_render_frame_index();
         let swapchain_extent = self.swapchain.get_extent();
@@ -678,6 +682,60 @@ impl RendererVulkan {
             .store(false, Ordering::Relaxed);
     }
 
+    /// Diagnostic-only capture of the presented framebuffer.
+    ///
+    /// This intentionally reuses the same owner and readback path as upstream
+    /// `RendererVulkan::RenderToBuffer`; it is gated by environment variables
+    /// and does not affect normal presentation.
+    fn dump_present_frame_if_requested(&mut self, framebuffers: &[FramebufferConfig]) {
+        if self.present_frame_dumped {
+            return;
+        }
+        let Some(path) = std::env::var_os("RUZU_DUMP_PRESENT_FRAME") else {
+            return;
+        };
+        let target_frame = std::env::var("RUZU_DUMP_PRESENT_FRAME_AT")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(300);
+        if self.base_data.current_frame < target_frame {
+            return;
+        }
+
+        let layout = self.framebuffer_layout.read().unwrap().clone();
+        let buffer_size = layout.width as vk::DeviceSize * layout.height as vk::DeviceSize * 4;
+        let dst_buffer = self.render_to_buffer(
+            framebuffers,
+            &layout,
+            vk::Format::B8G8R8A8_UNORM,
+            buffer_size,
+        );
+        let path = std::path::PathBuf::from(path);
+        match write_bgra_ppm(
+            &path,
+            dst_buffer.mapped_slice(),
+            layout.width,
+            layout.height,
+        ) {
+            Ok(()) => {
+                self.present_frame_dumped = true;
+                log::info!(
+                    "[PRESENT] dumped presented frame to {} at frame {}",
+                    path.display(),
+                    self.base_data.current_frame
+                );
+            }
+            Err(err) => {
+                self.present_frame_dumped = true;
+                log::error!(
+                    "[PRESENT] failed to dump presented frame to {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
+    }
+
     /// Port of `RendererVulkan::RenderAppletCaptureLayer`.
     ///
     /// Renders framebuffers to the applet capture frame at 1280x720
@@ -856,6 +914,34 @@ fn should_present_window(window_shown: &AtomicBool) -> bool {
     window_shown.load(Ordering::Relaxed)
 }
 
+fn write_bgra_ppm(
+    path: &std::path::Path,
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let pixel_count = width as usize * height as usize;
+    let required_len = pixel_count * 4;
+    if bgra.len() < required_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "BGRA buffer is smaller than framebuffer dimensions",
+        ));
+    }
+
+    let mut output =
+        Vec::with_capacity(format!("P6\n{} {}\n255\n", width, height).len() + pixel_count * 3);
+    write!(&mut output, "P6\n{} {}\n255\n", width, height)?;
+    for pixel in bgra[..required_len].chunks_exact(4) {
+        output.push(pixel[2]);
+        output.push(pixel[1]);
+        output.push(pixel[0]);
+    }
+    std::fs::write(path, output)
+}
+
 struct FrameDisplayedNotifyGuard {
     notify: Arc<dyn Fn() + Send + Sync>,
 }
@@ -974,6 +1060,18 @@ mod tests {
         }
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn write_bgra_ppm_converts_to_rgb() {
+        let path =
+            std::env::temp_dir().join(format!("ruzu-test-present-dump-{}.ppm", std::process::id()));
+        let bgra = [0x03, 0x02, 0x01, 0xFF, 0x30, 0x20, 0x10, 0x80];
+        write_bgra_ppm(&path, &bgra, 2, 1).unwrap();
+        let data = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(&data[..11], b"P6\n2 1\n255\n");
+        assert_eq!(&data[11..], &[0x01, 0x02, 0x03, 0x10, 0x20, 0x30]);
     }
 
     #[test]
