@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::mem;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use super::k_hardware_timer_base::KHardwareTimerBase;
@@ -44,6 +44,16 @@ pub struct KHardwareTimer {
 enum TimerTaskTarget {
     ThreadArc(Arc<KThreadLock>),
     RawPtr(usize),
+}
+
+fn should_trace_wait_sync() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some())
+}
+
+fn should_trace_ct_fire() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_CT_FIRE").is_some())
 }
 
 fn with_current_emu_thread_dispatch_disabled<R>(f: impl FnOnce() -> R) -> R {
@@ -168,7 +178,7 @@ impl KHardwareTimer {
     }
 
     pub fn register_absolute_task_by_id(&self, thread_id: u64, thread_ptr: usize, task_time: i64) {
-        if std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some() {
+        if should_trace_wait_sync() {
             log::info!(
                 "KHardwareTimer::register_absolute_task_by_id tid={} task_time={} now_tick={}",
                 thread_id,
@@ -342,7 +352,7 @@ impl KHardwareTimer {
     /// Called by the CoreTiming callback.
     /// Matches upstream: `KHardwareTimer::DoTask()`
     fn do_task(&self) {
-        let trace = std::env::var_os("RUZU_TRACE_CT_FIRE").is_some();
+        let trace = should_trace_ct_fire();
         if trace {
             log::info!("KHardwareTimer::do_task entry");
         }

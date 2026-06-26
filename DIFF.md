@@ -16388,3 +16388,150 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo check -p hid_core` passes with existing workspace warnings.
 - `git diff --check` passes.
 - MK8D macOS/AArch64 release run `/tmp/ruzu_mk8d_npad_after.log` exits via timeout code 124 without filtered panic/fatal lines and reaches the same HID/ACC/FS/time/am progression as before the direct-loop change.
+
+## 2026-06-26 — core/src/core_timing.rs vs core/core_timing.cpp
+
+### Intentional differences
+- Rust keeps local `RUZU_TRACE_CT_FIRE` diagnostics around `ThreadLoop`/event firing for macOS boot investigations. Upstream has no equivalent default logging; the env flag is now cached with `OnceLock` so disabled diagnostics do not repeatedly query the environment in the hot timing loop.
+
+### Unintentional differences (to fix)
+- None for this diagnostic-cache slice.
+
+### Missing items
+- None identified for this slice.
+
+### Binary layout verification
+- N/A: CoreTiming event scheduling state is host-only and no raw guest-visible payload layout changed.
+
+### Verification
+- Re-read upstream `core/core_timing.cpp` around `CoreTiming::ThreadEntry`, `ThreadLoop`, and event scheduling/firing behavior.
+- Re-read local `core/src/core_timing.rs` around `should_trace_ct_fire`, `initialize`, and `advance`.
+- `cargo fmt -p core` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `git diff --check` passes.
+
+## 2026-06-26 — core/src/hle/kernel/k_hardware_timer.rs vs core/hle/kernel/k_hardware_timer.cpp
+
+### Intentional differences
+- Rust keeps local `RUZU_TRACE_WAIT_SYNC` and `RUZU_TRACE_CT_FIRE` diagnostics around timer registration and `DoTask` for scheduler/timer investigations. Upstream does not poll environment variables in these paths; Rust now caches these local flags with `OnceLock`.
+
+### Unintentional differences (to fix)
+- None for this diagnostic-cache slice.
+
+### Missing items
+- None identified for this slice.
+
+### Binary layout verification
+- N/A: hardware timer state is host kernel state, not a raw guest-visible payload.
+
+### Verification
+- Re-read upstream `core/hle/kernel/k_hardware_timer.cpp` around absolute task registration and `KHardwareTimer::DoTask`.
+- Re-read local `core/src/hle/kernel/k_hardware_timer.rs` around `should_trace_wait_sync`, `should_trace_ct_fire`, `register_absolute_task_by_id`, and `do_task`.
+- `cargo fmt -p core` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `git diff --check` passes.
+
+## 2026-06-26 — core/src/hle/kernel/k_thread.rs vs core/hle/kernel/k_thread.cpp
+
+### Intentional differences
+- Rust keeps local trace flags for wait sync, priority inheritance, end-wait, timer firing, and `Exit()` returning through the cooperative execution bridge. Upstream has no equivalent environment polling in these hot methods; the Rust-only flags are now cached with `OnceLock`.
+
+### Unintentional differences (to fix)
+- The broader `KThread` port still has known structural debt documented in earlier entries; this slice only changes local diagnostic gating.
+
+### Missing items
+- None newly identified for this slice.
+
+### Binary layout verification
+- N/A: no `KThread` guest-visible raw layout changed.
+
+### Verification
+- Re-read upstream `core/hle/kernel/k_thread.cpp` around `Exit`, state transition, and timer wait cancellation behavior.
+- Re-read local `core/src/hle/kernel/k_thread.rs` around the trace helpers, `exit`, `commit_state_transition`, and `on_timer`.
+- `cargo fmt -p core` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `git diff --check` passes.
+
+## 2026-06-26 — core/src/hle/kernel/k_scheduler_lock.rs vs core/hle/kernel/k_scheduler_lock.h
+
+### Intentional differences
+- Rust has local scheduler-lock diagnostics (`RUZU_TRACE_SCHED_LOCK`, `RUZU_TRACE_SLEEP`, owner filters, and trace-ring emission) that are absent upstream. The trace-enable and owner-filter environment values are now cached with `OnceLock` so disabled diagnostics do not add repeated environment lookups to lock acquisition/release paths.
+
+### Unintentional differences (to fix)
+- None for this diagnostic-cache slice.
+
+### Missing items
+- None identified for this slice.
+
+### Binary layout verification
+- N/A: scheduler lock state is host kernel synchronization state.
+
+### Verification
+- Re-read upstream `core/hle/kernel/k_scheduler_lock.h` around `KAbstractSchedulerLock`.
+- Re-read local `core/src/hle/kernel/k_scheduler_lock.rs` around scheduler-lock trace helpers and lock ownership logic.
+- `cargo fmt -p core` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `git diff --check` passes.
+
+## 2026-06-26 — core/src/hle/kernel/k_scheduler.rs vs core/hle/kernel/k_scheduler.cpp
+
+### Intentional differences
+- Rust keeps local scheduler state/pick diagnostics for Apple Silicon scheduling investigations. Upstream scheduler code does not query environment variables in the pick path; Rust now caches `RUZU_TRACE_SCHED_STATE` and `RUZU_TRACE_SCHED_PICK` before applying the same local filters.
+
+### Unintentional differences (to fix)
+- None for this diagnostic-cache slice.
+
+### Missing items
+- None identified for this slice.
+
+### Binary layout verification
+- N/A: scheduler diagnostic filters do not alter guest-visible state layout.
+
+### Verification
+- Re-read upstream `core/hle/kernel/k_scheduler.cpp` around scheduler selection and yield paths.
+- Re-read local `core/src/hle/kernel/k_scheduler.rs` around `trace_tid_filter_matches` and scheduler-pick diagnostics.
+- `cargo fmt -p core` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `git diff --check` passes.
+
+## 2026-06-26 — core/src/hle/kernel/global_scheduler_context.rs vs core/hle/kernel/global_scheduler_context.cpp
+
+### Intentional differences
+- Rust keeps local global-scheduler state diagnostics used by trace tooling. Upstream `GlobalSchedulerContext` has no corresponding env polling; the Rust trace filter is now cached with `OnceLock`.
+
+### Unintentional differences (to fix)
+- None for this diagnostic-cache slice.
+
+### Missing items
+- None identified for this slice.
+
+### Binary layout verification
+- N/A: no guest-visible raw layout changed.
+
+### Verification
+- Re-read upstream `core/hle/kernel/global_scheduler_context.cpp` around scheduler context operations.
+- Re-read local `core/src/hle/kernel/global_scheduler_context.rs` around `should_trace_sched_state`, `trace_sched_state`, and trace-ring emission.
+- `cargo fmt -p core` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `git diff --check` passes.
+
+## 2026-06-26 — core/src/hle/kernel/physical_core.rs vs core/hle/kernel/physical_core.cpp
+
+### Intentional differences
+- Rust keeps local `RUZU_TRACE_ZERO_PC_SAVE` and `RUZU_TRACE_IPI` diagnostics for Apple Silicon context/interrupt investigations. Upstream has no corresponding env polling in `PhysicalCore`; Rust now caches those local flags with `OnceLock`.
+
+### Unintentional differences (to fix)
+- None for this diagnostic-cache slice.
+
+### Missing items
+- None identified for this slice.
+
+### Binary layout verification
+- N/A: physical-core runtime diagnostics do not alter guest-visible layout.
+
+### Verification
+- Re-read upstream `core/hle/kernel/physical_core.cpp` around `RunThread`, context enter/exit, and interrupt handling.
+- Re-read local `core/src/hle/kernel/physical_core.rs` around context save diagnostics and `interrupt`.
+- `cargo fmt -p core` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `git diff --check` passes.

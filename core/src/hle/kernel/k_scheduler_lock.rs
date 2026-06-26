@@ -11,25 +11,65 @@
 //! pointers set at initialization to break the circular dependency.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use super::k_spin_lock::KAlignedSpinLock;
 
 fn should_trace_scheduler_lock() -> bool {
-    std::env::var_os("RUZU_TRACE_SCHED_LOCK").is_some()
-        || std::env::var_os("RUZU_TRACE_SLEEP").is_some()
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("RUZU_TRACE_SCHED_LOCK").is_some()
+            || std::env::var_os("RUZU_TRACE_SLEEP").is_some()
+    })
+}
+
+fn should_trace_scheduler_lock_strict() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_SCHED_LOCK").is_some())
 }
 
 fn should_trace_scheduler_lock_owner(owner: u64) -> bool {
-    if std::env::var_os("RUZU_TRACE_SCHED_LOCK").is_none() {
+    if !should_trace_scheduler_lock_strict() {
         return false;
     }
-    match std::env::var("RUZU_TRACE_SCHED_LOCK_OWNER") {
-        Ok(spec) => spec
-            .split(',')
-            .filter_map(|raw| raw.trim().parse::<u64>().ok())
-            .any(|id| id == owner),
-        Err(_) => false,
+    static OWNERS: OnceLock<Option<Vec<u64>>> = OnceLock::new();
+    OWNERS
+        .get_or_init(|| {
+            std::env::var("RUZU_TRACE_SCHED_LOCK_OWNER")
+                .ok()
+                .map(|spec| {
+                    spec.split(',')
+                        .filter_map(|raw| raw.trim().parse::<u64>().ok())
+                        .collect()
+                })
+        })
+        .as_ref()
+        .is_some_and(|owners| owners.iter().copied().any(|id| id == owner))
+}
+
+fn should_trace_scheduler_lock_ring() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_SCHED_LOCK_RING").is_some())
+}
+
+fn trace_scheduler_lock_ring(stage: u64, owner_sched_id: u64, cores: u64, lock_count: i32) {
+    if !should_trace_scheduler_lock_ring() {
+        return;
     }
+    if !common::trace::is_enabled(common::trace::cat::SCHED_STATE) {
+        return;
+    }
+    let guest_tid = super::kernel::get_current_thread_id_fast().unwrap_or(u64::MAX);
+    common::trace::emit_raw(
+        common::trace::cat::SCHED_STATE,
+        &[
+            stage,
+            owner_sched_id,
+            guest_tid,
+            cores,
+            lock_count as u32 as u64,
+        ],
+    );
 }
 
 fn trace_scheduler_lock_context(label: &str, current_id: u64, owner: u64, elapsed_us: u128) {
@@ -61,27 +101,6 @@ fn trace_scheduler_lock_context(label: &str, current_id: u64, owner: u64, elapse
         svc.join(" | "),
     );
 }
-
-fn trace_scheduler_lock_ring(stage: u64, owner_sched_id: u64, cores: u64, lock_count: i32) {
-    if std::env::var_os("RUZU_TRACE_SCHED_LOCK_RING").is_none() {
-        return;
-    }
-    if !common::trace::is_enabled(common::trace::cat::SCHED_STATE) {
-        return;
-    }
-    let guest_tid = super::kernel::get_current_thread_id_fast().unwrap_or(u64::MAX);
-    common::trace::emit_raw(
-        common::trace::cat::SCHED_STATE,
-        &[
-            stage,
-            owner_sched_id,
-            guest_tid,
-            cores,
-            lock_count as u32 as u64,
-        ],
-    );
-}
-
 /// Counter for synthetic host-thread IDs. Reserved range: `>= 2^63` so it
 /// never collides with guest KThread IDs (those are allocated starting at
 /// small positive values by the kernel thread-id allocator).

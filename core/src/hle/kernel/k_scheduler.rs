@@ -5,6 +5,7 @@
 //! KScheduler: per-core scheduler managing thread dispatch and context switching.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -57,10 +58,9 @@ pub(crate) fn trace_tid_filter_matches(thread_id: Option<u64>) -> bool {
     let Some(thread_id) = thread_id else {
         return false;
     };
-    let Some(raw) = std::env::var_os("RUZU_TRACE_SCHED_STATE") else {
+    let Some(raw) = trace_sched_state_filter() else {
         return true;
     };
-    let raw = raw.to_string_lossy();
     let raw = raw.trim();
     if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
         return true;
@@ -79,9 +79,22 @@ pub(crate) fn trace_tid_filter_matches(thread_id: Option<u64>) -> bool {
     })
 }
 
+fn trace_sched_state_filter() -> Option<&'static str> {
+    static FILTER: OnceLock<Option<String>> = OnceLock::new();
+    FILTER
+        .get_or_init(|| {
+            std::env::var_os("RUZU_TRACE_SCHED_STATE").map(|raw| raw.to_string_lossy().into_owned())
+        })
+        .as_deref()
+}
+
+fn should_trace_sched_pick() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_SCHED_PICK").is_some())
+}
+
 fn should_log_sched_pick_for(ids: &[Option<u64>]) -> bool {
-    std::env::var_os("RUZU_TRACE_SCHED_PICK").is_some()
-        && ids.iter().copied().any(trace_tid_filter_matches)
+    should_trace_sched_pick() && ids.iter().copied().any(trace_tid_filter_matches)
 }
 
 fn trace_sched_fiber_event(

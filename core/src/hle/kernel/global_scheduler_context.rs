@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 use crate::hardware_properties;
@@ -26,10 +27,9 @@ fn increment_process_scheduled_count(
 }
 
 fn should_trace_sched_state(thread_id: u64) -> bool {
-    let Some(raw) = std::env::var_os("RUZU_TRACE_SCHED_STATE") else {
+    let Some(raw) = trace_sched_state_filter() else {
         return false;
     };
-    let raw = raw.to_string_lossy();
     let raw = raw.trim();
     if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
         return true;
@@ -48,8 +48,17 @@ fn should_trace_sched_state(thread_id: u64) -> bool {
     })
 }
 
+fn trace_sched_state_filter() -> Option<&'static str> {
+    static FILTER: OnceLock<Option<String>> = OnceLock::new();
+    FILTER
+        .get_or_init(|| {
+            std::env::var_os("RUZU_TRACE_SCHED_STATE").map(|raw| raw.to_string_lossy().into_owned())
+        })
+        .as_deref()
+}
+
 fn trace_sched_state(args: std::fmt::Arguments<'_>) {
-    if std::env::var_os("RUZU_TRACE_SCHED_STATE").is_none() {
+    if trace_sched_state_filter().is_none() {
         return;
     }
     let idx = TRACE_GSC_STATE_COUNT.fetch_add(1, Ordering::Relaxed);
