@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use common::settings;
@@ -29,7 +29,8 @@ use super::vsync_manager::VsyncManager;
 pub const FRAME_NS: i64 = 1_000_000_000 / 60;
 
 fn should_trace_vsync_debug() -> bool {
-    std::env::var_os("RUZU_TRACE_VSYNC").is_some()
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_VSYNC").is_some())
 }
 
 static VSYNC_CALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -40,7 +41,8 @@ static VSYNC_PROCESS_TOTAL_US: AtomicU64 = AtomicU64::new(0);
 static VSYNC_PROCESS_MAX_US: AtomicU64 = AtomicU64::new(0);
 
 fn vsync_profile_enabled() -> bool {
-    std::env::var_os("RUZU_PROFILE_VSYNC").is_some()
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_VSYNC").is_some())
 }
 
 fn update_max(target: &AtomicU64, value: u64) {

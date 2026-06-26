@@ -185,39 +185,19 @@ impl KHardwareTimer {
                 task_time,
                 self.get_tick()
             );
-        }
-        log::trace!(
-            "KHardwareTimer::register_absolute_task_by_id tid={} task_time={} ptr=0x{:x}",
-            thread_id,
-            task_time,
-            thread_ptr
-        );
-        with_current_emu_thread_dispatch_disabled(|| {
             log::trace!(
-                "KHardwareTimer::register_absolute_task_by_id tid={} before state.lock",
-                thread_id
-            );
-            let mut state = self.state.lock().unwrap();
-            log::trace!(
-                "KHardwareTimer::register_absolute_task_by_id tid={} after state.lock wakeup_time={}",
+                "KHardwareTimer::register_absolute_task_by_id tid={} task_time={} ptr=0x{:x}",
                 thread_id,
-                state.m_wakeup_time
+                task_time,
+                thread_ptr
             );
+        }
+        with_current_emu_thread_dispatch_disabled(|| {
+            let mut state = self.state.lock().unwrap();
             state.thread_ptrs.insert(thread_id, thread_ptr);
 
             if state.base.register_absolute_task_impl(thread_id, task_time) {
-                log::trace!(
-                    "KHardwareTimer::register_absolute_task_by_id tid={} inserted task_time={} wakeup_time={}",
-                    thread_id,
-                    task_time,
-                    state.m_wakeup_time
-                );
                 if task_time <= state.m_wakeup_time {
-                    log::trace!(
-                        "KHardwareTimer::register_absolute_task_by_id tid={} enabling interrupt for task_time={}",
-                        thread_id,
-                        task_time
-                    );
                     self.enable_interrupt_locked(&mut state, task_time);
                 }
             }
@@ -256,29 +236,16 @@ impl KHardwareTimer {
 
     /// Matches upstream: `KHardwareTimer::EnableInterrupt()`
     fn enable_interrupt_locked(&self, state: &mut KHardwareTimerState, wakeup_time: i64) {
-        log::trace!(
-            "KHardwareTimer::enable_interrupt_locked wakeup_time={} old_wakeup_time={}",
-            wakeup_time,
-            state.m_wakeup_time
-        );
         self.disable_interrupt_locked(state);
 
         state.m_wakeup_time = wakeup_time;
         if let (Some(ref core_timing), Some(ref event_type)) =
             (&state.core_timing, &state.m_event_type)
         {
-            log::trace!(
-                "KHardwareTimer::enable_interrupt_locked before schedule_event wakeup_time={}",
-                wakeup_time
-            );
             core_timing.schedule_event(
                 Duration::from_nanos(wakeup_time as u64),
                 event_type,
                 true, // absolute time
-            );
-            log::trace!(
-                "KHardwareTimer::enable_interrupt_locked after schedule_event wakeup_time={}",
-                wakeup_time
             );
         }
     }
@@ -295,24 +262,11 @@ impl KHardwareTimer {
         state: &mut KHardwareTimerState,
         wakeup_time: i64,
     ) {
-        log::trace!(
-            "KHardwareTimer::rearm_interrupt_after_callback_locked wakeup_time={} old_wakeup_time={}",
-            wakeup_time,
-            state.m_wakeup_time
-        );
         state.m_wakeup_time = wakeup_time;
         if let (Some(ref core_timing), Some(ref event_type)) =
             (&state.core_timing, &state.m_event_type)
         {
-            log::trace!(
-                "KHardwareTimer::rearm_interrupt_after_callback_locked before schedule_event wakeup_time={}",
-                wakeup_time
-            );
             core_timing.schedule_event(Duration::from_nanos(wakeup_time as u64), event_type, true);
-            log::trace!(
-                "KHardwareTimer::rearm_interrupt_after_callback_locked after schedule_event wakeup_time={}",
-                wakeup_time
-            );
         }
     }
 
@@ -454,14 +408,14 @@ impl KHardwareTimer {
                             "KHardwareTimer::do_task after_thread_lock tid={}",
                             thread.get_thread_id()
                         );
+                        log::trace!(
+                            "KHardwareTimer::do_task delivering tid={} state={:?} active_core={} current_core={}",
+                            thread.get_thread_id(),
+                            thread.get_state(),
+                            thread.get_active_core(),
+                            thread.get_current_core()
+                        );
                     }
-                    log::trace!(
-                        "KHardwareTimer::do_task delivering tid={} state={:?} active_core={} current_core={}",
-                        thread.get_thread_id(),
-                        thread.get_state(),
-                        thread.get_active_core(),
-                        thread.get_current_core()
-                    );
                     thread.set_timer_task_time(0);
                     thread.on_timer();
                 }
@@ -475,25 +429,27 @@ impl KHardwareTimer {
                             "KHardwareTimer::do_task RawPtr tid={} pre_on_timer",
                             thread.get_thread_id()
                         );
+                        log::trace!(
+                            "KHardwareTimer::do_task delivering raw tid={} state={:?} active_core={} current_core={}",
+                            thread.get_thread_id(),
+                            thread.get_state(),
+                            thread.get_active_core(),
+                            thread.get_current_core()
+                        );
                     }
-                    log::trace!(
-                        "KHardwareTimer::do_task delivering raw tid={} state={:?} active_core={} current_core={}",
-                        thread.get_thread_id(),
-                        thread.get_state(),
-                        thread.get_active_core(),
-                        thread.get_current_core()
-                    );
                     thread.set_timer_task_time(0);
                     thread.on_timer();
                 }
             }
         });
         state.thread_ptrs = thread_ptrs;
-        log::trace!(
-            "KHardwareTimer::do_task cur_tick={} next_time={}",
-            cur_tick,
-            next_time
-        );
+        if trace {
+            log::trace!(
+                "KHardwareTimer::do_task cur_tick={} next_time={}",
+                cur_tick,
+                next_time
+            );
+        }
 
         if next_time > 0 && next_time <= state.m_wakeup_time {
             self.rearm_interrupt_after_callback_locked(&mut state, next_time);

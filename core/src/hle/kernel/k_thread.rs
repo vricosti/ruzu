@@ -3469,12 +3469,15 @@ impl KThread {
             return RESULT_INVALID_STATE.get_inner_value();
         }
 
-        log::trace!(
-            "KThread::sleep enter tid={} timeout_tick={} disable_dispatch={}",
-            self.thread_id,
-            timeout,
-            self.get_disable_dispatch_count()
-        );
+        let trace_wait = should_trace_wait_debug();
+        if trace_wait {
+            log::trace!(
+                "KThread::sleep enter tid={} timeout_tick={} disable_dispatch={}",
+                self.thread_id,
+                timeout,
+                self.get_disable_dispatch_count()
+            );
+        }
         self.wait_result = RESULT_SUCCESS.get_inner_value();
         let hardware_timer = super::kernel::get_hardware_timer_arc();
         let mut wait_queue = KThreadQueueWithoutEndWait::new();
@@ -3502,13 +3505,15 @@ impl KThread {
             }
 
             self.set_timer_task_time(timeout);
-            log::trace!(
-                "KThread::sleep tid={} before begin_wait_with_queue",
-                self.thread_id
-            );
+            if trace_wait {
+                log::trace!(
+                    "KThread::sleep tid={} before begin_wait_with_queue",
+                    self.thread_id
+                );
+            }
             self.begin_wait_with_queue(wait_queue.base);
             self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::Sleep);
-            if should_trace_wait_debug() {
+            if trace_wait {
                 log::info!(
                     "KThread::sleep tid={} timeout_tick={} current_tick={:?}",
                     self.thread_id,
@@ -3516,10 +3521,14 @@ impl KThread {
                     super::kernel::get_current_hardware_tick()
                 );
             }
-            log::trace!("KThread::sleep tid={} wait armed", self.thread_id);
+            if trace_wait {
+                log::trace!("KThread::sleep tid={} wait armed", self.thread_id);
+            }
         }
 
-        log::trace!("KThread::sleep exit tid={}", self.thread_id);
+        if trace_wait {
+            log::trace!("KThread::sleep exit tid={}", self.thread_id);
+        }
         RESULT_SUCCESS.get_inner_value()
     }
 
@@ -3875,15 +3884,17 @@ impl KThread {
                 self.wait_result
             );
         }
-        log::trace!(
-            "KThread::on_timer tid={} state={:?} active_core={} current_core={} wait_queue={}",
-            self.thread_id,
-            self.get_state(),
-            self.get_active_core(),
-            self.get_current_core(),
-            self.wait_queue.is_some()
-        );
         let ct_trace = should_trace_ct_fire();
+        if ct_trace {
+            log::trace!(
+                "KThread::on_timer tid={} state={:?} active_core={} current_core={} wait_queue={}",
+                self.thread_id,
+                self.get_state(),
+                self.get_active_core(),
+                self.get_current_core(),
+                self.wait_queue.is_some()
+            );
+        }
         if ct_trace {
             log::info!(
                 "on_timer tid={} state={:?} has_wait_queue={} reason={:?}",
@@ -3908,12 +3919,14 @@ impl KThread {
                     log::info!("on_timer tid={} after_cancel_wait", self.thread_id);
                 }
             }
-            log::trace!(
-                "KThread::on_timer tid={} post-cancel state={:?} wait_result=0x{:x}",
-                self.thread_id,
-                self.get_state(),
-                self.wait_result
-            );
+            if ct_trace {
+                log::trace!(
+                    "KThread::on_timer tid={} post-cancel state={:?} wait_result=0x{:x}",
+                    self.thread_id,
+                    self.get_state(),
+                    self.wait_result
+                );
+            }
         }
     }
 

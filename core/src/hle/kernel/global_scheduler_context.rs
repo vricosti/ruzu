@@ -222,16 +222,18 @@ impl GlobalSchedulerContext {
                     .unwrap_or(-1),
             ));
         }
-        log::trace!(
-            "GSC::on_thread_state_changed tid={} {:?}->{:?} prio={} active_core={} affinity=0x{:x} dummy={}",
-            thread_id,
-            old_state,
-            new_state,
-            priority,
-            active_core,
-            affinity,
-            is_dummy
-        );
+        if should_trace_sched_state(thread_id) {
+            log::trace!(
+                "GSC::on_thread_state_changed tid={} {:?}->{:?} prio={} active_core={} affinity=0x{:x} dummy={}",
+                thread_id,
+                old_state,
+                new_state,
+                priority,
+                active_core,
+                affinity,
+                is_dummy
+            );
+        }
         if old_state == new_state {
             return;
         }

@@ -93,6 +93,10 @@ fn should_trace_sched_pick() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_SCHED_PICK").is_some())
 }
 
+fn should_trace_sched_state() -> bool {
+    trace_sched_state_filter().is_some()
+}
+
 fn should_log_sched_pick_for(ids: &[Option<u64>]) -> bool {
     should_trace_sched_pick() && ids.iter().copied().any(trace_tid_filter_matches)
 }
@@ -1121,19 +1125,23 @@ impl KScheduler {
             return;
         }
 
-        log::trace!(
-            "KScheduler::ensure_switch_fiber core={} host={}",
-            self.core_id,
-            std::thread::current().name().unwrap_or("?"),
-        );
+        if should_trace_sched_state() {
+            log::trace!(
+                "KScheduler::ensure_switch_fiber core={} host={}",
+                self.core_id,
+                std::thread::current().name().unwrap_or("?"),
+            );
+        }
         let sched_ptr = self as *mut KScheduler as usize;
         self.switch_fiber = Some(Fiber::new(Box::new(move || loop {
             let sched = unsafe { &mut *(sched_ptr as *mut KScheduler) };
-            log::trace!(
-                "KScheduler::switch_fiber entry core={} host={}",
-                sched.core_id,
-                std::thread::current().name().unwrap_or("?"),
-            );
+            if should_trace_sched_state() {
+                log::trace!(
+                    "KScheduler::switch_fiber entry core={} host={}",
+                    sched.core_id,
+                    std::thread::current().name().unwrap_or("?"),
+                );
+            }
             sched.schedule_impl_fiber_loop();
         })));
     }
@@ -1244,12 +1252,14 @@ impl KScheduler {
                     ],
                 );
             }
-            log::trace!(
-                "KScheduler::Reload: core={} r15/PC=0x{:X} r13/SP=0x{:X}",
-                self.core_id,
-                k_ctx.r[15],
-                k_ctx.r[13],
-            );
+            if should_trace_sched_state() {
+                log::trace!(
+                    "KScheduler::Reload: core={} r15/PC=0x{:X} r13/SP=0x{:X}",
+                    self.core_id,
+                    k_ctx.r[15],
+                    k_ctx.r[13],
+                );
+            }
         }
     }
 
@@ -1280,7 +1290,9 @@ impl KScheduler {
         if core_mask == 0 {
             return;
         }
-        log::trace!("KScheduler::reschedule_cores mask=0x{:x}", core_mask);
+        if should_trace_sched_state() {
+            log::trace!("KScheduler::reschedule_cores mask=0x{:x}", core_mask);
+        }
 
         if let Some(kernel) = super::kernel::get_kernel_ref() {
             for i in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
@@ -1505,15 +1517,14 @@ impl KScheduler {
             }
         }
 
-        // Hot path: this runs on every scheduling decision. Keep at trace level
-        // so it is gated out at info/warn — emitting it at info throttled guest
-        // throughput (135k+ lines per MK8D run) and perturbed thread timing.
-        log::trace!(
-            "update_highest_prio: cores_needing=0x{:x} idle=0x{:x} tops={:?}",
-            cores_needing_scheduling,
-            idle_cores,
-            top_threads
-        );
+        if should_trace_sched_state() {
+            log::trace!(
+                "update_highest_prio: cores_needing=0x{:x} idle=0x{:x} tops={:?}",
+                cores_needing_scheduling,
+                idle_cores,
+                top_threads
+            );
+        }
         while idle_cores != 0 {
             let core_id = idle_cores.trailing_zeros() as usize;
             if let Some(mut suggested_id) = gsc.m_priority_queue.get_suggested_front(core_id as i32)

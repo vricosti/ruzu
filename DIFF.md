@@ -16535,3 +16535,149 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo fmt -p core` passes.
 - `cargo check -p core` passes with existing workspace warnings.
 - `git diff --check` passes.
+
+## 2026-06-26 — core/src/hle/kernel/k_scheduler_lock.rs vs core/hle/kernel/k_scheduler_lock.h
+
+### Intentional differences
+- Rust keeps local scheduler-lock tracing for Apple Silicon investigations, but upstream `KAbstractSchedulerLock::Lock/Unlock` has no logging in the hot lock path. The remaining `log::trace!` calls are now guarded by the explicit cached local scheduler-lock trace flag so the default path avoids logger class lookup overhead.
+
+### Unintentional differences (to fix)
+- None for this diagnostic-gating slice.
+
+### Missing items
+- None identified for this slice.
+
+### Binary layout verification
+- N/A: scheduler-lock diagnostic gating does not alter guest-visible layout.
+
+### Verification
+- Re-read upstream `core/hle/kernel/k_scheduler_lock.h` around `KAbstractSchedulerLock::Lock` and `Unlock`.
+- Re-read local `core/src/hle/kernel/k_scheduler_lock.rs` around `lock` and `unlock`.
+- `cargo fmt -p core --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `git diff --check` passes.
+
+## 2026-06-26 — core/src/hle/kernel/k_hardware_timer.rs vs core/hle/kernel/k_hardware_timer.cpp
+
+### Intentional differences
+- Rust keeps local wait/timer diagnostics, but upstream `KHardwareTimer::EnableInterrupt`, `DisableInterrupt`, and `DoTask` do not emit trace logs in the hot callback path. Default-path `log::trace!` calls were removed or gated behind the cached local trace flags.
+
+### Unintentional differences (to fix)
+- None for this diagnostic-gating slice.
+
+### Missing items
+- None identified for this slice.
+
+### Binary layout verification
+- N/A: hardware timer diagnostic gating does not alter guest-visible layout.
+
+### Verification
+- Re-read upstream `core/hle/kernel/k_hardware_timer.cpp` around `DoTask`, `EnableInterrupt`, and `DisableInterrupt`.
+- Re-read local `core/src/hle/kernel/k_hardware_timer.rs` around `register_absolute_task_by_id`, `enable_interrupt_locked`, `rearm_interrupt_after_callback_locked`, and `do_task`.
+- `cargo fmt -p core --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `git diff --check` passes.
+
+## 2026-06-26 — core/src/hle/kernel/k_thread.rs vs core/hle/kernel/k_thread.cpp
+
+### Intentional differences
+- Rust keeps local wait/timer tracing for investigations, but upstream `KThread::Sleep`/`OnTimer` do not pay default-path logger overhead. The local `log::trace!` calls in these paths are now gated behind cached explicit diagnostics.
+
+### Unintentional differences (to fix)
+- The broader `KThread` structural debt remains documented in earlier entries; this slice only gates diagnostics.
+
+### Missing items
+- None newly identified for this slice.
+
+### Binary layout verification
+- N/A: no `KThread` guest-visible raw layout changed.
+
+### Verification
+- Re-read upstream `core/hle/kernel/k_thread.cpp` around sleep and timer wait cancellation behavior.
+- Re-read local `core/src/hle/kernel/k_thread.rs` around `sleep` and `on_timer`.
+- `cargo fmt -p core --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `git diff --check` passes.
+
+## 2026-06-26 — core/src/hle/kernel/global_scheduler_context.rs vs core/hle/kernel/global_scheduler_context.cpp
+
+### Intentional differences
+- Rust keeps local scheduler-state diagnostics, but upstream `GlobalSchedulerContext::OnThreadStateChanged` has no default trace logging. The local trace log is now behind the cached scheduler-state filter.
+
+### Unintentional differences (to fix)
+- None for this diagnostic-gating slice.
+
+### Missing items
+- None identified for this slice.
+
+### Binary layout verification
+- N/A: no guest-visible layout changed.
+
+### Verification
+- Re-read upstream `core/hle/kernel/global_scheduler_context.cpp`.
+- Re-read local `core/src/hle/kernel/global_scheduler_context.rs` around `on_thread_state_changed`.
+- `cargo fmt -p core --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `git diff --check` passes.
+
+## 2026-06-26 — core/src/hle/kernel/sleep_timing.rs vs no upstream file
+
+### Intentional differences
+- `sleep_timing.rs` is Rust-local diagnostic support with no upstream file. Its environment flag is now cached so disabled diagnostics do not poll the environment from timer wake paths.
+
+### Unintentional differences (to fix)
+- None for this diagnostic-only file.
+
+### Missing items
+- None identified for this slice.
+
+### Binary layout verification
+- N/A: diagnostic-only host state.
+
+### Verification
+- Re-read local `core/src/hle/kernel/sleep_timing.rs`; upstream has no counterpart.
+- `cargo fmt -p core --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `git diff --check` passes.
+
+## 2026-06-26 — core/src/hle/service/vi/conductor.rs vs core/hle/service/vi/conductor.cpp
+
+### Intentional differences
+- Rust keeps local vsync trace/profile diagnostics absent from upstream `Conductor`; the environment flags are now cached so disabled diagnostics do not poll the environment during vsync signaling.
+
+### Unintentional differences (to fix)
+- None for this diagnostic-gating slice.
+
+### Missing items
+- None identified for this slice.
+
+### Binary layout verification
+- N/A: VI conductor diagnostics are host-only state.
+
+### Verification
+- Re-read upstream `core/hle/service/vi/conductor.cpp`.
+- Re-read local `core/src/hle/service/vi/conductor.rs` around trace/profile helpers and `ThreadEvent::set`.
+- `cargo fmt -p core --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `git diff --check` passes.
+
+## 2026-06-26 — core/src/hle/kernel/k_scheduler.rs vs core/hle/kernel/k_scheduler.cpp
+
+### Intentional differences
+- Rust keeps local scheduler state diagnostics (`RUZU_TRACE_SCHED_STATE`/`RUZU_TRACE_SCHED_PICK`) for Apple Silicon scheduling investigations. Upstream `KScheduler` does not emit default trace logs during switch-fiber setup, reload, reschedule, or highest-priority updates. Those local trace logs are now gated behind the cached scheduler-state flag.
+
+### Unintentional differences (to fix)
+- None for this diagnostic-gating slice.
+
+### Missing items
+- None identified for this slice.
+
+### Binary layout verification
+- N/A: scheduler diagnostic gating does not alter guest-visible layout.
+
+### Verification
+- Re-read upstream `core/hle/kernel/k_scheduler.cpp` around scheduler update/reschedule paths.
+- Re-read local `core/src/hle/kernel/k_scheduler.rs` around `ensure_switch_fiber`, `reload`, `reschedule_cores`, and `update_highest_priority_threads_impl`.
+- `cargo fmt -p core --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `git diff --check` passes.
