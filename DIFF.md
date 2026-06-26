@@ -15928,3 +15928,29 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read local Rust counterpart in `core/src/hle/service/nvnflinger/buffer_queue_producer.rs`.
 - `cargo fmt -p core` passes.
 - `cargo check -p core` passes.
+
+## 2026-06-26 — externals/rdynarmic/src/backend/arm64/emit_arm64_memory.rs and a32_address_space.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_memory.cpp and a32_address_space.cpp
+
+### Intentional differences
+- `externals/rdynarmic/src/backend/arm64/emit_arm64_memory.rs`: ports the direct ARM64 fastmem read/write path for the A32 mirror-32 configuration. This matches upstream's A32 `FastmemEmitVAddrLookup` shape where the base is `Xfastmem`, the guest address is used as a 32-bit extended offset, and `EmitMemoryLdr/Str` performs the final load/store.
+- `externals/rdynarmic/src/backend/arm64/a32_address_space.rs`: adds `RUZU_TRACE_A32_MEM_PC` and `RUZU_TRACE_A32_TICK_PC` diagnostic-only logging around A32 ARM64 callbacks. Upstream has no equivalent host diagnostics; these are environment-gated, bounded, and do not change callback return values or guest state.
+
+### Unintentional differences (to fix)
+- `emit_arm64_memory.rs`: upstream fastmem also records patch information and relies on the host exception handler/recompile path for invalid or unmapped fastmem accesses. The Rust path currently only enables the direct mirror-32 addressing case and does not yet port the fault recovery machinery.
+- `emit_arm64_memory.rs`: `should_fastmem` is intentionally constrained to `fastmem_address_space_bits == 32 && silently_mirror_fastmem` so A64/39-bit fastmem is not incorrectly routed through the partial implementation.
+
+### Missing items
+- Port upstream ARM64 fastmem patch-info recording, exception-handler integration, and recompilation fallback.
+- Extend fastmem emission beyond A32 mirror-32 only after the upstream fault/recompile path exists.
+
+### Binary layout verification
+- N/A: host JIT emission and diagnostics only; no guest-visible raw struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_memory.cpp` around `EmitReadMemory`, `EmitWriteMemory`, `ShouldFastmem`, `FastmemEmitVAddrLookup`, `FastmemEmitReadMemory`, and `FastmemEmitWriteMemory`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp` around A32 fastmem configuration.
+- Re-read local Rust counterparts in `externals/rdynarmic/src/backend/arm64/emit_arm64_memory.rs` and `externals/rdynarmic/src/backend/arm64/a32_address_space.rs`.
+- `cargo fmt -p rdynarmic --check` passes.
+- `cargo check -p rdynarmic` passes with existing warnings.
+- `git -C externals/rdynarmic diff --check` passes.
+- `git diff --check` passes.
