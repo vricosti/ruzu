@@ -15954,3 +15954,48 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo check -p rdynarmic` passes with existing warnings.
 - `git -C externals/rdynarmic diff --check` passes.
 - `git diff --check` passes.
+
+## 2026-06-26 — common/src/host_memory.rs macOS mmap backend vs common/host_memory.cpp
+
+### Intentional differences
+- `common/src/host_memory.rs`: extends the existing Unix mmap-backed `HostMemoryImpl` path to macOS and uses `shm_open`/`shm_unlink` for the backing file descriptor, matching upstream's BSD/macOS-style anonymous shared-memory branch where available.
+- `common/src/host_memory.rs`: uses `PROT_NONE` for the reserved virtual arena mapping before fixed remaps, preserving the upstream intent that the reserved area is an address-space reservation rather than immediately accessible guest memory.
+- `common/src/host_memory.rs`: keeps Linux-only `MADV_HUGEPAGE` and `MADV_REMOVE` behavior behind Linux cfgs. macOS falls back to the existing deterministic memset clearing path when `MADV_REMOVE` is unavailable.
+
+### Unintentional differences (to fix)
+- macOS on Apple Silicon reports a 16 KiB host page size, so the current 4 KiB page-size gate still disables the mmap-backed fastmem arena at runtime. Upstream's generic Unix implementation assumes a 4 KiB host page size for this backend, so Apple Silicon needs a separate parity-preserving strategy before `VirtualBasePointer` can be non-null.
+- The macOS `HostMemoryImpl` path has not yet proven that all `Map`/`Unmap`/`Protect` calls are host-page aligned on Apple Silicon. Guest pages are 4 KiB; standard macOS `mmap`/`mprotect` operations require host-page granularity.
+
+### Missing items
+- Decide and implement the Apple Silicon fastmem strategy: either a page-table backed JIT fast path that avoids 4 KiB mmap aliases, or a host-page coalescing mmap strategy if it can be proven correct for all guest mappings.
+- Add a macOS-specific regression test that asserts the intended fastmem capability instead of only checking that the backing allocation exists.
+
+### Binary layout verification
+- N/A: host virtual-memory management only; no guest-visible raw struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `common/host_memory.h` around `HostMemory`, `BackingBasePointer`, and `VirtualBasePointer`.
+- Re-read upstream `common/host_memory.cpp` around the Unix `HostMemory::Impl`, anonymous shared-memory backing creation, virtual reservation, mapping, unmapping, protection, and backing clear paths.
+- Re-read local counterpart in `common/src/host_memory.rs`.
+
+## 2026-06-26 — core/src/arm/dynarmic/arm_dynarmic_32.rs fastmem wiring vs core/arm/dynarmic/arm_dynarmic_32.cpp and core/memory.cpp
+
+### Intentional differences
+- `core/src/arm/dynarmic/arm_dynarmic_32.rs`: keeps A32 page-table fastmem optional via `RUZU_A32_PAGE_TABLE_FASTMEM`, but obtains the fastmem arena base from the per-process `Memory` bridge when present. This mirrors upstream's effective data source, where `Memory::SetCurrentPageTable` stores `DeviceMemory().buffer.VirtualBasePointer()` into `page_table->fastmem_arena` before `ArmDynarmic32::MakeJit` reads it.
+- `core/src/arm/dynarmic/arm_dynarmic_32.rs`: preserves the existing null-fastmem behavior when `RUZU_NO_FASTMEM` is set or when the host memory backend cannot provide a virtual arena.
+
+### Unintentional differences (to fix)
+- Upstream always constructs `ArmDynarmic32` with `process->GetPageTable().GetBasePageTable().GetImpl()` and passes that page table into `MakeJit`; Rust still has a lifecycle gap where the page-table pointer can be unavailable at A32 JIT construction.
+- Upstream wires `config.page_table` and `config.fastmem_pointer` from the same `Common::PageTable` object. Rust currently reads the page-table pointer from `KProcess` and the fastmem pointer from `Memory` because the Rust process/page-table lifecycle is not yet fully upstream-faithful.
+
+### Missing items
+- Fix the process initialization ordering so the A32 JIT is built only after the process base page table implementation and memory fastmem arena are available, matching upstream `KProcess::LoadFromMetadata` / `InitializeInterfaces` ordering.
+- Revisit the disabled A32 page-table fastmem path once lifecycle ordering is faithful; upstream enables both page-table and fastmem configuration together when the page table exists.
+
+### Binary layout verification
+- N/A: JIT configuration pointer wiring only; no guest-visible raw struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `core/arm/dynarmic/arm_dynarmic_32.h` and `core/arm/dynarmic/arm_dynarmic_32.cpp` around `ArmDynarmic32`, `MakeJit`, page-table config, and fastmem config.
+- Re-read upstream `core/memory.cpp` around `Memory::SetCurrentPageTable`, `MapMemoryRegion`, `UnmapRegion`, and `ProtectRegion` fastmem handling.
+- Re-read local counterpart in `core/src/arm/dynarmic/arm_dynarmic_32.rs`.

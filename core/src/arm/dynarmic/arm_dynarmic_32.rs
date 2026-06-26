@@ -2287,36 +2287,35 @@ impl ArmDynarmic32 {
         core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
         debugger_enabled: bool,
     ) -> Self {
-        // Get page-table and fastmem pointers from the process page table.
-        // Matches upstream `ArmDynarmic32::MakeJit(Common::PageTable*)`:
-        // `config.page_table = page_table->pointers.data()` and
-        // `config.fastmem_pointer = page_table->fastmem_arena`.
+        // Get page-table and fastmem pointers from the process memory state.
+        // Upstream `ArmDynarmic32::MakeJit(Common::PageTable*)` receives the
+        // process page table and then reads `page_table->fastmem_arena`, which
+        // is set from `DeviceMemory().buffer.VirtualBasePointer()` by
+        // `Memory::SetCurrentPageTable`. In Rust the page-table path remains
+        // optional while the fastmem arena base is available directly through
+        // the per-process Memory bridge, matching ArmDynarmic64's wiring.
         let use_page_table_fastmem = std::env::var_os("RUZU_A32_PAGE_TABLE_FASTMEM").is_some()
             && std::env::var_os("RUZU_A32_LEGACY_FASTMEM").is_none();
         let (mut page_table_pointer, fastmem_pointer): (Option<*const u8>, Option<*mut u8>) =
             if std::env::var_os("RUZU_NO_FASTMEM").is_some() {
                 (None, None)
             } else {
-                let kernel_process = unsafe {
-                    &*(process as *const _ as *const crate::hle::kernel::k_process::KProcess)
+                let page_table_pointer = {
+                    let kernel_process = unsafe {
+                        &*(process as *const _ as *const crate::hle::kernel::k_process::KProcess)
+                    };
+                    kernel_process
+                        .page_table
+                        .get_base()
+                        .get_impl()
+                        .map(|page_table| page_table.pointers.data() as *const u8)
+                        .filter(|p| !p.is_null())
                 };
-                kernel_process
-                    .page_table
-                    .get_base()
-                    .get_impl()
-                    .and_then(|page_table| {
-                        let page_table_pointer = page_table.pointers.data() as *const u8;
-                        let fastmem_pointer = page_table.fastmem_arena;
-                        if page_table_pointer.is_null() {
-                            None
-                        } else {
-                            Some((
-                                Some(page_table_pointer),
-                                (!fastmem_pointer.is_null()).then_some(fastmem_pointer),
-                            ))
-                        }
-                    })
-                    .unwrap_or((None, None))
+                let fastmem_pointer = core_memory
+                    .as_ref()
+                    .map(|memory| memory.lock().unwrap().fastmem_pointer())
+                    .filter(|p| !p.is_null());
+                (page_table_pointer, fastmem_pointer)
             };
         // Upstream wires both `page_table` and `fastmem_pointer` for A32.
         // rdynarmic's current A32 page-table fastmem path regresses MK8D's
