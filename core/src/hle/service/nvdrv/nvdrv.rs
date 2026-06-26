@@ -26,6 +26,11 @@ use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
 
+fn should_trace_ioctl_summary() -> bool {
+    std::env::var_os("RUZU_NVDRV_TRACE").is_some()
+        || std::env::var_os("RUZU_TRACE_NVDRV_IOCTL").is_some()
+}
+
 /// EventInterface manages kernel event creation and destruction for nvdrv.
 ///
 /// Port of EventInterface from nvdrv.h/nvdrv.cpp.
@@ -209,7 +214,7 @@ impl Module {
                 hex
             );
         }
-        {
+        if should_trace_ioctl_summary() {
             use std::collections::HashMap;
             use std::sync::{Mutex, OnceLock};
             // Per (fd, cmd, group) counter. First occurrence always logs;
