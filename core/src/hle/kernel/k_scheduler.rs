@@ -1766,16 +1766,263 @@ impl KScheduler {
         process: &Arc<ProcessLock>,
         current_thread_id: u64,
     ) {
-        // Single-core bring-up: match upstream control flow entry point, but keep the same
-        // local-core behavior until cross-core migration exists.
-        self.yield_without_core_migration(process, current_thread_id);
+        if self.exit_thread_if_termination_requested(process, current_thread_id) {
+            self.request_schedule();
+            return;
+        }
+
+        let current_thread = {
+            let process = process.lock().unwrap();
+            process.get_thread_by_thread_id(current_thread_id)
+        };
+        let Some(current_thread) = current_thread else {
+            return;
+        };
+
+        let mut process_guard = process.lock().unwrap();
+        {
+            let current_thread = current_thread.lock().unwrap();
+            if current_thread.get_yield_schedule_count() == process_guard.get_scheduled_count() {
+                return;
+            }
+        }
+
+        let scheduler_lock = super::kernel::scheduler_lock()
+            .expect("global scheduler lock must be initialized before yielding");
+        let _scheduler_guard = super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
+
+        {
+            let current_thread = current_thread.lock().unwrap();
+            if current_thread.get_raw_state() != ThreadState::RUNNABLE {
+                return;
+            }
+            if current_thread.get_yield_schedule_count() == process_guard.get_scheduled_count() {
+                return;
+            }
+        }
+
+        let (core_id, current_priority, is_dummy) = {
+            let current_thread = current_thread.lock().unwrap();
+            (
+                current_thread.get_active_core(),
+                current_thread.get_priority(),
+                current_thread.is_dummy_thread(),
+            )
+        };
+
+        let next_thread_id = if let Some(ref gsc) = process_guard.global_scheduler_context {
+            let mut gsc = gsc.lock().unwrap();
+            gsc.move_to_scheduled_back(current_thread_id, current_priority, core_id, is_dummy)
+        } else {
+            None
+        };
+        process_guard.increment_scheduled_count();
+
+        let mut recheck = false;
+        let mut migrated_suggestion = false;
+
+        if let Some(ref gsc_arc) = process_guard.global_scheduler_context {
+            let mut gsc = gsc_arc.lock().unwrap();
+            let mut suggested_id = gsc.m_priority_queue.get_suggested_front(core_id);
+            while let Some(suggested) = suggested_id {
+                let Some(suggested_thread) = gsc.get_thread_by_thread_id(suggested) else {
+                    break;
+                };
+                let (suggested_core, suggested_priority, suggested_last_tick) = {
+                    let suggested_thread = suggested_thread.lock().unwrap();
+                    (
+                        suggested_thread.get_active_core(),
+                        suggested_thread.get_priority(),
+                        suggested_thread.get_last_scheduled_tick(),
+                    )
+                };
+                let running_on_suggested_core = if suggested_core >= 0 {
+                    gsc.m_priority_queue.get_scheduled_front(suggested_core)
+                } else {
+                    None
+                };
+
+                if running_on_suggested_core != Some(suggested) {
+                    let prefer_next = suggested_priority > current_priority
+                        || (suggested_priority == current_priority
+                            && next_thread_id != Some(current_thread_id)
+                            && next_thread_id
+                                .and_then(|next| gsc.get_thread_by_thread_id(next))
+                                .map(|next| {
+                                    next.lock().unwrap().get_last_scheduled_tick()
+                                        < suggested_last_tick
+                                })
+                                .unwrap_or(false));
+                    if prefer_next {
+                        suggested_id = None;
+                        break;
+                    }
+
+                    let can_migrate = running_on_suggested_core
+                        .and_then(|running| gsc.get_thread_by_thread_id(running))
+                        .map(|running| {
+                            running.lock().unwrap().get_priority()
+                                >= super::global_scheduler_context::HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY
+                        })
+                        .unwrap_or(true);
+                    if can_migrate {
+                        suggested_thread.lock().unwrap().set_active_core(core_id);
+                        gsc.m_priority_queue.change_core(
+                            suggested_core,
+                            suggested,
+                            core_id,
+                            suggested_priority,
+                            false,
+                            true,
+                        );
+                        gsc.m_priority_queue.increment_scheduled_count(suggested);
+                        migrated_suggestion = true;
+                        break;
+                    } else {
+                        recheck = true;
+                    }
+                }
+
+                suggested_id =
+                    gsc.m_priority_queue
+                        .get_suggested_next(core_id, suggested, suggested_priority);
+            }
+        }
+
+        if migrated_suggestion || next_thread_id != Some(current_thread_id) {
+            self.yielded_thread_id = Some(current_thread_id);
+            self.request_schedule();
+        } else if !recheck {
+            current_thread
+                .lock()
+                .unwrap()
+                .set_yield_schedule_count(process_guard.get_scheduled_count());
+        }
     }
 
     /// Yield to any thread.
     pub fn yield_to_any_thread(&mut self, process: &Arc<ProcessLock>, current_thread_id: u64) {
-        // Single-core bring-up: preserve the SVC ownership in KScheduler while deferring
-        // real inter-core migration until the full priority queue exists.
-        self.yield_without_core_migration(process, current_thread_id);
+        if self.exit_thread_if_termination_requested(process, current_thread_id) {
+            self.request_schedule();
+            return;
+        }
+
+        let current_thread = {
+            let process = process.lock().unwrap();
+            process.get_thread_by_thread_id(current_thread_id)
+        };
+        let Some(current_thread) = current_thread else {
+            return;
+        };
+
+        let mut process_guard = process.lock().unwrap();
+        {
+            let current_thread = current_thread.lock().unwrap();
+            if current_thread.get_yield_schedule_count() == process_guard.get_scheduled_count() {
+                return;
+            }
+        }
+
+        let scheduler_lock = super::kernel::scheduler_lock()
+            .expect("global scheduler lock must be initialized before yielding");
+        let _scheduler_guard = super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
+
+        {
+            let current_thread = current_thread.lock().unwrap();
+            if current_thread.get_raw_state() != ThreadState::RUNNABLE {
+                return;
+            }
+            if current_thread.get_yield_schedule_count() == process_guard.get_scheduled_count() {
+                return;
+            }
+        }
+
+        let (core_id, current_priority, is_dummy) = {
+            let current_thread = current_thread.lock().unwrap();
+            (
+                current_thread.get_active_core(),
+                current_thread.get_priority(),
+                current_thread.is_dummy_thread(),
+            )
+        };
+
+        let mut suggested_id = None;
+        if let Some(ref gsc_arc) = process_guard.global_scheduler_context {
+            let mut gsc = gsc_arc.lock().unwrap();
+            current_thread.lock().unwrap().set_active_core(-1);
+            gsc.m_priority_queue.change_core(
+                core_id,
+                current_thread_id,
+                -1,
+                current_priority,
+                is_dummy,
+                false,
+            );
+            gsc.m_priority_queue
+                .increment_scheduled_count(current_thread_id);
+
+            if gsc.m_priority_queue.get_scheduled_front(core_id).is_none() {
+                suggested_id = gsc.m_priority_queue.get_suggested_front(core_id);
+                while let Some(suggested) = suggested_id {
+                    let Some(suggested_thread) = gsc.get_thread_by_thread_id(suggested) else {
+                        break;
+                    };
+                    let (suggested_core, suggested_priority, suggested_is_dummy) = {
+                        let suggested_thread = suggested_thread.lock().unwrap();
+                        (
+                            suggested_thread.get_active_core(),
+                            suggested_thread.get_priority(),
+                            suggested_thread.is_dummy_thread(),
+                        )
+                    };
+                    let top_on_suggested_core = if suggested_core >= 0 {
+                        gsc.m_priority_queue.get_scheduled_front(suggested_core)
+                    } else {
+                        None
+                    };
+                    if top_on_suggested_core != Some(suggested) {
+                        let can_migrate = top_on_suggested_core
+                            .and_then(|top| gsc.get_thread_by_thread_id(top))
+                            .map(|top| {
+                                top.lock().unwrap().get_priority()
+                                    >= super::global_scheduler_context::HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY
+                            })
+                            .unwrap_or(true);
+                        if can_migrate {
+                            suggested_thread.lock().unwrap().set_active_core(core_id);
+                            gsc.m_priority_queue.change_core(
+                                suggested_core,
+                                suggested,
+                                core_id,
+                                suggested_priority,
+                                suggested_is_dummy,
+                                false,
+                            );
+                            gsc.m_priority_queue.increment_scheduled_count(suggested);
+                        }
+                        break;
+                    }
+
+                    suggested_id = gsc.m_priority_queue.get_suggested_next(
+                        core_id,
+                        suggested,
+                        suggested_priority,
+                    );
+                }
+            }
+        } else {
+            process_guard.increment_scheduled_count();
+        }
+
+        if suggested_id != Some(current_thread_id) {
+            self.yielded_thread_id = Some(current_thread_id);
+            self.request_schedule();
+        } else {
+            current_thread
+                .lock()
+                .unwrap()
+                .set_yield_schedule_count(process_guard.get_scheduled_count());
+        }
     }
 
     pub fn set_scheduler_current_thread_id(&mut self, thread_id: u64) {

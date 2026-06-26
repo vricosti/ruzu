@@ -16165,3 +16165,25 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo check -p core` passes with existing warnings outside this slice.
 - `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings, confirming `corosensei` compiles and links on macOS/AArch64.
 - MK8D macOS/AArch64 release run `/tmp/ruzu_corosensei_mk8d_25s.log` exits via timeout code 124 without filtered panic/fatal lines; it uses the legacy yuzu data root, loads yuzu keys, selects Vulkan, and creates the Apple M2 Pro Vulkan device.
+
+## 2026-06-26 — core/src/hle/kernel/k_scheduler.rs vs core/hle/kernel/k_scheduler.cpp
+
+### Intentional differences
+- `KScheduler::yield_with_core_migration` and `KScheduler::yield_to_any_thread` keep ownership in `core/src/hle/kernel/k_scheduler.rs`, matching upstream `KScheduler::{YieldWithCoreMigration,YieldToAnyThread}`.
+- `KScheduler::yield_with_core_migration`: upstream checks `kernel.Scheduler(suggested_core).m_state.highest_priority_thread`; the Rust port currently uses `GlobalSchedulerContext::m_priority_queue.get_scheduled_front(suggested_core)` because per-core scheduler state is not exposed with the same upstream ownership shape yet.
+
+### Unintentional differences (to fix)
+- `KScheduler::yield_with_core_migration`: replace the scheduled-front approximation with the exact per-core `highest_priority_thread` state once the Rust scheduler state exposes the same ownership boundary as upstream.
+
+### Missing items
+- Focused regression tests for `yield_with_core_migration` and `yield_to_any_thread` candidate migration ordering are still needed.
+
+### Binary layout verification
+- N/A: scheduler queues and host thread state are not guest-visible raw memory payloads.
+
+### Verification
+- Re-read upstream `core/hle/kernel/k_scheduler.cpp` around `KScheduler::YieldWithCoreMigration` and `KScheduler::YieldToAnyThread`.
+- Re-read local `core/src/hle/kernel/k_scheduler.rs` around `KScheduler::yield_with_core_migration` and `KScheduler::yield_to_any_thread`.
+- `cargo fmt -p core` was run.
+- `cargo check -p core` passes with existing workspace warnings.
+- MK8D macOS/AArch64 release run `/tmp/ruzu_corosensei_mk8d_120s.log` exits via timeout code 124 without filtered panic/fatal lines; it reaches Mii database loading and audio renderer startup.
