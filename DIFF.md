@@ -16187,3 +16187,26 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo fmt -p core` was run.
 - `cargo check -p core` passes with existing workspace warnings.
 - MK8D macOS/AArch64 release run `/tmp/ruzu_corosensei_mk8d_120s.log` exits via timeout code 124 without filtered panic/fatal lines; it reaches Mii database loading and audio renderer startup.
+
+## 2026-06-26 — core/src/hle/kernel/k_scheduler.rs vs core/hle/kernel/k_scheduler.cpp
+
+### Intentional differences
+- `KScheduler::yield_with_core_migration`: Rust now reads `KScheduler::state.highest_priority_thread_id` from the scheduler for `suggested_core`, matching upstream's `kernel.Scheduler(suggested_core).m_state.highest_priority_thread`. This supersedes the earlier scheduled-front approximation entry.
+- `KScheduler::yield_to_any_thread`: Rust now increments the current process scheduled count directly after moving the current thread to core `-1`, matching upstream `IncrementScheduledCount(std::addressof(cur_thread))`.
+- `highest_priority_thread_id_for_core` is a private Rust helper in `k_scheduler.rs` only. It exists because Rust stores schedulers behind `Arc<Mutex<KScheduler>>`; upstream accesses `kernel.Scheduler(core)` directly in the same file.
+
+### Unintentional differences (to fix)
+- None for the corrected `YieldWithCoreMigration` running-thread source and current-thread scheduled-count update.
+
+### Missing items
+- A full integration-style `yield_with_core_migration` unit test that enters and exits `KScopedSchedulerLock` is still not present; the direct integrated harness deadlocked in the test runner. The committed regression instead verifies the parity-sensitive state source without triggering scheduler-lock callbacks.
+- Additional focused coverage for `YieldToAnyThread` candidate migration ordering is still needed.
+
+### Binary layout verification
+- N/A: scheduler queues and host thread state are not guest-visible raw memory payloads.
+
+### Verification
+- Re-read upstream `core/hle/kernel/k_scheduler.cpp` around `KScheduler::YieldWithCoreMigration` and `KScheduler::YieldToAnyThread`.
+- Re-read local `core/src/hle/kernel/k_scheduler.rs` around `KScheduler::highest_priority_thread_id_for_core`, `yield_with_core_migration`, and `yield_to_any_thread`.
+- `cargo fmt -p core --check` passes.
+- `cargo test -p core yield_with_core_migration_reads_scheduler_highest_priority_state -- --nocapture` passes: 1 test passed.

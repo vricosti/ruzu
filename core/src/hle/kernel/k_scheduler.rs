@@ -555,6 +555,45 @@ mod tests {
     }
 
     #[test]
+    fn yield_with_core_migration_reads_scheduler_highest_priority_state() {
+        let mut kernel = crate::hle::kernel::kernel::KernelCore::new();
+        kernel.initialize();
+
+        let gsc = kernel.global_scheduler_context().unwrap().clone();
+        let suggested = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut thread = suggested.lock().unwrap();
+            thread.thread_id = 200;
+            thread.object_id = 200;
+            thread.priority = 10;
+            thread.core_id = 1;
+            thread.physical_affinity_mask.set_affinity_mask(0b0011);
+            thread.set_state(ThreadState::RUNNABLE);
+            thread.set_yield_schedule_count(0);
+        }
+
+        {
+            let mut gsc_guard = gsc.lock().unwrap();
+            gsc_guard.add_thread(Arc::clone(&suggested));
+            gsc_guard
+                .m_priority_queue
+                .push_back(200, 10, 1, 0b0011, false, None);
+            assert_eq!(gsc_guard.m_priority_queue.get_scheduled_front(1), Some(200));
+            gsc_guard
+                .m_scheduler_update_needed
+                .store(false, Ordering::Relaxed);
+        }
+
+        {
+            let mut scheduler1 = kernel.scheduler(1).unwrap().lock().unwrap();
+            scheduler1.state.highest_priority_thread_id = None;
+        }
+
+        let scheduler0 = kernel.scheduler(0).unwrap().lock().unwrap();
+        assert_eq!(scheduler0.highest_priority_thread_id_for_core(1), None);
+    }
+
+    #[test]
     fn scheduled_front_prefers_runnable_pinned_thread_like_upstream() {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let top = Arc::new(KThreadLock::new(KThread::new()));
@@ -713,6 +752,17 @@ pub struct KScheduler {
 }
 
 impl KScheduler {
+    fn highest_priority_thread_id_for_core(&self, core_id: i32) -> Option<u64> {
+        if core_id == self.core_id {
+            return self.state.highest_priority_thread_id;
+        }
+
+        let core_index = usize::try_from(core_id).ok()?;
+        super::kernel::get_kernel_ref()
+            .and_then(|kernel| kernel.scheduler(core_index).cloned())
+            .and_then(|scheduler| scheduler.lock().unwrap().state.highest_priority_thread_id)
+    }
+
     /// Refresh this core's selected thread directly from the global priority
     /// queue. Rust cannot hold the scheduler mutex across the fiber switch, so
     /// the raw scheduling entry points perform the upstream
@@ -1837,7 +1887,7 @@ impl KScheduler {
                     )
                 };
                 let running_on_suggested_core = if suggested_core >= 0 {
-                    gsc.m_priority_queue.get_scheduled_front(suggested_core)
+                    self.highest_priority_thread_id_for_core(suggested_core)
                 } else {
                     None
                 };
@@ -1958,8 +2008,7 @@ impl KScheduler {
                 is_dummy,
                 false,
             );
-            gsc.m_priority_queue
-                .increment_scheduled_count(current_thread_id);
+            process_guard.increment_scheduled_count();
 
             if gsc.m_priority_queue.get_scheduled_front(core_id).is_none() {
                 suggested_id = gsc.m_priority_queue.get_suggested_front(core_id);
