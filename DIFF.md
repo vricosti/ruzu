@@ -16023,3 +16023,118 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read local `core/src/arm/dynarmic/arm_dynarmic_32.rs` around A32 JIT configuration and page-table gating.
 - MK8D macOS/aarch64 run with `RUZU_A32_PAGE_TABLE_FASTMEM=1` for 75 seconds timed out without panic, produced `page_table_pointer=Some(...)`, avoided the previous `0x02003E2C` A32 memory hot loop, and progressed to `IAudioRendererManager::OpenAudioRenderer`, audio renderer initialization with `voices=96`, and `IAudioRenderer::Start`.
 - MK8D macOS/aarch64 run without `RUZU_A32_PAGE_TABLE_FASTMEM` for 35 seconds timed out without panic and produced `page_table_pointer=Some(...)` on all four A32 JIT cores, proving the Apple Silicon default path is active.
+
+## 2026-06-26 — core/src/arm/dynarmic/arm_dynarmic_32.rs CNTPCT callback vs core/arm/dynarmic/dynarmic_cp15.cpp
+
+### Intentional differences
+- `core/src/arm/dynarmic/arm_dynarmic_32.rs`: keeps the env-gated `RUZU_TRACE_PC_WINDOW` CNTPCT diagnostic hook. Upstream has no equivalent logging in `DynarmicCP15::CompileGetTwoWords`, but this hook is inactive unless explicitly requested and does not change the guest-visible counter value.
+
+### Unintentional differences (to fix)
+- None for the default callback path. Rust now returns `self.parent().core_timing.get_clock_ticks()` without the previous unconditional `[A32_CNTPCT]` log, matching upstream's callback returning `m_system.CoreTiming().GetClockTicks()`.
+
+### Missing items
+- None for `GetCNTPCT`.
+
+### Binary layout verification
+- N/A: callback logging behavior only; no guest-visible raw struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `core/arm/dynarmic/dynarmic_cp15.cpp` around `DynarmicCP15::CompileGetTwoWords` and the CNTPCT callback.
+- Re-read local `core/src/arm/dynarmic/arm_dynarmic_32.rs` around `DynarmicCallbacks32::get_cntpct`.
+- `cargo fmt -p core --check` passes.
+- `git diff --check` passes.
+- `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
+- MK8D macOS/aarch64 direct run for 35 seconds timed out without panic; the previous default `[A32_CNTPCT]` log is absent, and the run still reaches nvdrv GPU initialization plus `SurfaceFlinger` composition on display 0.
+
+## 2026-06-26 — core/src/hle/service/nvnflinger/surface_flinger.rs hot-path compose diagnostics vs core/hle/service/nvnflinger/surface_flinger.cpp
+
+### Intentional differences
+- `core/src/hle/service/nvnflinger/surface_flinger.rs`: keeps local `RUZU_TRACE_PRESENT`, `RUZU_TRACE_SF_COMPOSE`, and `RUZU_TRACE_SF_COMPOSE_DENSE` diagnostics around `compose_display`. Upstream has no equivalent hot-path logging in `SurfaceFlinger::ComposeDisplay`; the Rust diagnostics are environment-gated and inactive by default.
+
+### Unintentional differences (to fix)
+- None for default compose logging. Rust no longer emits `[SF_COMPOSE]` info logs by default when a display is missing, has no layers, or is composing layers.
+
+### Missing items
+- None for this logging/parity slice.
+
+### Binary layout verification
+- N/A: diagnostic gating only; no guest-visible raw struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `core/hle/service/nvnflinger/surface_flinger.cpp` around `SurfaceFlinger::ComposeDisplay`.
+- Re-read local `core/src/hle/service/nvnflinger/surface_flinger.rs` around `SurfaceFlinger::compose_display`.
+- `cargo fmt -p core --check` passes.
+- `git diff --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
+- MK8D macOS/aarch64 direct run for 25 seconds timed out without panic; `[SF_COMPOSE]` was absent from the rebuilt release log by default.
+
+## 2026-06-26 — core/src/hle/service/vi/conductor.rs hot-path vsync diagnostics vs core/hle/service/vi/conductor.cpp
+
+### Intentional differences
+- `core/src/hle/service/vi/conductor.rs`: keeps local `RUZU_TRACE_VSYNC` diagnostics around the CoreTiming callback, `vsync_thread`, and `process_vsync`. Upstream has no equivalent periodic info logging in `Conductor::VsyncThread` or `Conductor::ProcessVsync`; the Rust diagnostics are environment-gated and inactive by default.
+- `core/src/hle/service/vi/conductor.rs`: keeps the `conductor DROPPED` error log active because it reports an invalid Rust lifecycle state, not normal periodic vsync activity.
+
+### Unintentional differences (to fix)
+- None for default vsync logging. Rust no longer emits `[SC_CB]`, `[VSYNC_THREAD]`, or `[VSYNC]` logs by default from the hot path.
+
+### Missing items
+- None for this logging/parity slice.
+
+### Binary layout verification
+- N/A: diagnostic gating only; no guest-visible raw struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `core/hle/service/vi/conductor.cpp` around the constructor CoreTiming callback, `Conductor::VsyncThread`, and `Conductor::ProcessVsync`.
+- Re-read local `core/src/hle/service/vi/conductor.rs` around `Conductor::start`, `Conductor::vsync_thread`, and `Conductor::process_vsync`.
+- `cargo fmt -p core --check` passes.
+- `git diff --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
+- MK8D macOS/aarch64 direct run for 25 seconds timed out without panic; `[SC_CB]`, `[VSYNC_THREAD]`, and `[VSYNC]` were absent from the rebuilt release log by default.
+
+## 2026-06-26 — core/src/hle/service/nvdrv/nvdrv.rs hot-path ioctl diagnostics vs core/hle/service/nvdrv/nvdrv.cpp
+
+### Intentional differences
+- `core/src/hle/service/nvdrv/nvdrv.rs`: keeps local `RUZU_NVDRV_TRACE` and `RUZU_TRACE_NVDRV_IOCTL` diagnostics around the ioctl summary counter. Upstream has no equivalent periodic info logging in `Module::Ioctl1`; the Rust diagnostics are environment-gated and inactive by default.
+
+### Unintentional differences (to fix)
+- None for default `Ioctl1` logging. Rust still validates the fd and dispatches to the device as before, but no longer emits `[NVDRV_IOCTL1]` summaries unless tracing is explicitly requested.
+
+### Missing items
+- None for this logging/parity slice.
+
+### Binary layout verification
+- N/A: diagnostic gating only; no guest-visible raw struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `core/hle/service/nvdrv/nvdrv.cpp` around `Module::Ioctl1`.
+- Re-read local `core/src/hle/service/nvdrv/nvdrv.rs` around `Module::ioctl1`.
+- `cargo fmt -p core --check` passes.
+- `git diff --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
+- MK8D macOS/aarch64 direct run for 25 seconds timed out without panic; `[NVDRV_IOCTL1]` was absent from the rebuilt release log by default.
+
+## 2026-06-26 — core/src/arm/dynarmic/arm_dynarmic_32.rs JIT config diagnostic vs core/arm/dynarmic/arm_dynarmic_32.cpp
+
+### Intentional differences
+- `core/src/arm/dynarmic/arm_dynarmic_32.rs`: keeps the local `RUZU_TRACE_A32_JIT_CONFIG` diagnostic for page-table/fastmem/cycle-counting configuration. Upstream `ArmDynarmic32::MakeJit` does not log this configuration; the Rust diagnostic is environment-gated and inactive by default.
+
+### Unintentional differences (to fix)
+- None for default JIT configuration logging. Rust still builds the same local `JitConfig`, but no longer emits the A32 config warning in normal runs.
+
+### Missing items
+- None for this logging/parity slice.
+
+### Binary layout verification
+- N/A: diagnostic gating only; no guest-visible raw struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `core/arm/dynarmic/arm_dynarmic_32.cpp` around `ArmDynarmic32::MakeJit`.
+- Re-read local `core/src/arm/dynarmic/arm_dynarmic_32.rs` around A32 `JitConfig` construction.
+- `cargo fmt -p core --check` passes.
+- `git diff --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
+- MK8D macOS/aarch64 direct run for 12 seconds timed out without panic; `ArmDynarmic32: page_table_pointer=...` was absent from the rebuilt release log by default.

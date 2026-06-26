@@ -40,6 +40,12 @@ struct SurfaceFlingerInner {
     consumers: HashMap<i32, Arc<BufferQueueConsumer>>,
 }
 
+fn should_trace_compose() -> bool {
+    std::env::var_os("RUZU_TRACE_PRESENT").is_some()
+        || std::env::var_os("RUZU_TRACE_SF_COMPOSE").is_some()
+        || std::env::var_os("RUZU_TRACE_SF_COMPOSE_DENSE").is_some()
+}
+
 impl SurfaceFlinger {
     pub fn new(system: SystemRef, server: Arc<HosBinderDriverServer>) -> Arc<Self> {
         let service_manager = system
@@ -119,6 +125,7 @@ impl SurfaceFlinger {
         static NO_DISPLAY: AtomicU64 = AtomicU64::new(0);
         static NO_LAYERS: AtomicU64 = AtomicU64::new(0);
         let n = COMPOSE_COUNT.fetch_add(1, Ordering::Relaxed);
+        let trace_compose = should_trace_compose();
         let inner = self.inner.lock().unwrap();
         let Some(display) = Self::find_display(&inner.displays, display_id) else {
             let c = NO_DISPLAY.fetch_add(1, Ordering::Relaxed);
@@ -126,7 +133,7 @@ impl SurfaceFlinger {
                 "compose_no_display",
                 [n, display_id, c, inner.displays.len() as u64, 0, 0],
             );
-            if c < 8 || c.is_power_of_two() {
+            if trace_compose && (c < 8 || c.is_power_of_two()) {
                 log::info!("[SF_COMPOSE] #{} NO_DISPLAY display_id={}", n, display_id);
             }
             return false;
@@ -148,7 +155,7 @@ impl SurfaceFlinger {
             );
             // Log first 8, every power-of-2, AND every 60 ticks (~1s at 60Hz
             // vsync) so we can detect post-add NO_LAYERS regressions.
-            if c < 8 || c.is_power_of_two() || c % 60 == 0 {
+            if trace_compose && (c < 8 || c.is_power_of_two() || c % 60 == 0) {
                 log::info!(
                     "[SF_COMPOSE] #{} NO_LAYERS display_id={} display_layers_count={}",
                     n,
@@ -158,7 +165,7 @@ impl SurfaceFlinger {
             }
             return false;
         }
-        if n < 8 || n.is_power_of_two() || n % 60 == 0 {
+        if trace_compose && (n < 8 || n.is_power_of_two() || n % 60 == 0) {
             log::info!(
                 "[SF_COMPOSE] #{} COMPOSING display_id={} layers={}",
                 n,

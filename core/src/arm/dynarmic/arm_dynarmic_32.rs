@@ -2189,14 +2189,6 @@ impl UserCallbacks for DynarmicCallbacks32 {
     /// Returns the current system counter value from CoreTiming.
     fn get_cntpct(&self) -> u64 {
         let v = self.parent().core_timing.get_clock_ticks();
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNT: AtomicU64 = AtomicU64::new(0);
-            let n = COUNT.fetch_add(1, Ordering::Relaxed);
-            if n < 8 || n.is_power_of_two() {
-                log::info!("[A32_CNTPCT] call#{} value=0x{:X} (= {} dec)", n, v, v);
-            }
-        }
         // PC-window hook: log every CNTPCT read while RUZU_TRACE_PC_WINDOW is
         // active. Matched by zuyu's CNTPCT hook to compare clock-branch paths.
         if rdynarmic::jit::PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2414,14 +2406,16 @@ impl ArmDynarmic32 {
             },
         };
 
-        log::warn!(
-            "ArmDynarmic32: page_table_pointer={:?} fastmem_pointer={:?} cycle_counting={} optimizations={:#x} code_cache_size={}",
-            page_table_pointer.map(|p| p as usize),
-            fastmem_pointer.map(|p| p as usize),
-            !uses_wall_clock,
-            optimizations.bits(),
-            code_cache_size
-        );
+        if std::env::var_os("RUZU_TRACE_A32_JIT_CONFIG").is_some() {
+            log::warn!(
+                "ArmDynarmic32: page_table_pointer={:?} fastmem_pointer={:?} cycle_counting={} optimizations={:#x} code_cache_size={}",
+                page_table_pointer.map(|p| p as usize),
+                fastmem_pointer.map(|p| p as usize),
+                !uses_wall_clock,
+                optimizations.bits(),
+                code_cache_size
+            );
+        }
 
         let jit = match rdynarmic::A32Jit::new(config) {
             Ok(jit) => {

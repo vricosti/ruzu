@@ -230,7 +230,7 @@ impl Conductor {
                     static SC_COUNT: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
                     let sc = SC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if sc < 3 {
+                    if should_trace_vsync_debug() && sc < 3 {
                         log::info!("[SC_CB] #{} signal_ptr={:p}", sc, &*signal_for_callback);
                     }
                     if vsync_profile_enabled() {
@@ -311,7 +311,9 @@ impl Conductor {
         system: SystemRef,
     ) {
         static VT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        log::info!("[VSYNC_THREAD] started signal_ptr={:p}", &*signal);
+        if should_trace_vsync_debug() {
+            log::info!("[VSYNC_THREAD] started signal_ptr={:p}", &*signal);
+        }
         while !stop.load(Ordering::Relaxed) {
             signal.wait();
 
@@ -319,12 +321,14 @@ impl Conductor {
             if vsync_profile_enabled() {
                 VSYNC_THREAD_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
             }
-            if vt < 10 || vt % 60 == 0 {
+            if should_trace_vsync_debug() && (vt < 10 || vt % 60 == 0) {
                 log::info!("[VSYNC_THREAD] woke #{}", vt);
             }
 
             if system.get().is_shutting_down() {
-                log::info!("[VSYNC_THREAD] shutting down");
+                if should_trace_vsync_debug() {
+                    log::info!("[VSYNC_THREAD] shutting down");
+                }
                 return;
             }
 
@@ -335,7 +339,9 @@ impl Conductor {
                 return;
             }
         }
-        log::info!("[VSYNC_THREAD] stop requested");
+        if should_trace_vsync_debug() {
+            log::info!("[VSYNC_THREAD] stop requested");
+        }
     }
 
     pub fn link_vsync_event(&mut self, display_id: u64, event: Arc<Event>) {
@@ -372,7 +378,7 @@ impl Conductor {
         };
         static VSYNC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let vc = VSYNC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if vc % 300 == 0 || (should_trace_vsync_debug() && vc % 60 == 0) {
+        if should_trace_vsync_debug() && (vc % 300 == 0 || vc % 60 == 0) {
             let total_events: usize = self.vsync_managers.values().map(|m| m.event_count()).sum();
             log::info!("[VSYNC] tick#{} total_linked_events={}", vc, total_events);
         }
