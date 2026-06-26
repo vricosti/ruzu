@@ -9,6 +9,17 @@ use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::{Handle, PseudoHandle, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use std::sync::OnceLock;
+
+fn trace_query_ret_filter() -> Option<&'static str> {
+    static FILTER: OnceLock<Option<String>> = OnceLock::new();
+    FILTER
+        .get_or_init(|| {
+            std::env::var_os("RUZU_TRACE_QUERY_RET")
+                .map(|value| value.to_string_lossy().into_owned())
+        })
+        .as_deref()
+}
 
 /// Gets system/memory information for the current process.
 ///
@@ -21,7 +32,7 @@ pub fn get_info(
     handle: Handle,
     info_sub_id: u64,
 ) -> ResultCode {
-    log::info!(
+    log::trace!(
         "svc::GetInfo called info_id={:?}, info_sub_id=0x{:X}, handle=0x{:08X}",
         info_id_type,
         info_sub_id,
@@ -33,12 +44,11 @@ pub fn get_info(
     // RUZU_TRACE_QUERY_RET=N (or comma list, or "*"/"all") — log GetInfo return values
     // for the matching tid(s). Same env var as QueryMemory so we get a unified return-value
     // log against the zuyu side.
-    if let Some(target_str) = std::env::var_os("RUZU_TRACE_QUERY_RET") {
+    if let Some(s) = trace_query_ret_filter() {
         let tid = system
             .current_thread()
             .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
             .unwrap_or(0);
-        let s = target_str.to_string_lossy();
         let want = s == "*"
             || s == "all"
             || s.split(',')

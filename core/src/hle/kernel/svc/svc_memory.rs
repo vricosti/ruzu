@@ -187,7 +187,7 @@ pub fn set_memory_attribute(
 
 /// Maps a memory range into a different range.
 pub fn map_memory(system: &System, dst_addr: u64, src_addr: u64, size: u64) -> ResultCode {
-    log::info!(
+    log::trace!(
         "svc::MapMemory called, dst_addr=0x{:X}, src_addr=0x{:X}, size=0x{:X}",
         dst_addr,
         src_addr,

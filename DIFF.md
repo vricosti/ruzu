@@ -16210,3 +16210,89 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read local `core/src/hle/kernel/k_scheduler.rs` around `KScheduler::highest_priority_thread_id_for_core`, `yield_with_core_migration`, and `yield_to_any_thread`.
 - `cargo fmt -p core --check` passes.
 - `cargo test -p core yield_with_core_migration_reads_scheduler_highest_priority_state -- --nocapture` passes: 1 test passed.
+
+## 2026-06-26 — hid_core/src/resources/npad/npad.rs vs hid_core/resources/npad/npad.cpp
+
+### Intentional differences
+- `NPad::on_update`: Rust still has local `RUZU_TRACE_NPAD_UPDATE` and `RUZU_TRACE_NPAD_STATE` diagnostics that do not exist upstream. They are now cached with `OnceLock` so the hot update loop does not perform repeated environment lookups during normal MK8D runtime.
+- `NPad::on_update`: existing Rust controller-data simplification remains unchanged in this slice; this entry only covers diagnostic overhead removal.
+
+### Unintentional differences (to fix)
+- `NPad::on_update`: Rust still lacks the full upstream `controller_data[aruid_index]` ownership and `RequestPadStateUpdate` path. This was pre-existing and remains a required HID parity task.
+
+### Missing items
+- Full upstream `controller_data` storage and active-controller update flow.
+
+### Binary layout verification
+- N/A for this instrumentation-only change; shared-memory payload writes were not changed.
+
+### Verification
+- Re-read upstream `hid_core/resources/npad/npad.cpp` around `NPad::OnUpdate`.
+- Re-read local `hid_core/src/resources/npad/npad.rs` around `NPad::on_update`.
+- `cargo fmt -p hid_core --check` passes.
+- `cargo check -p hid_core` passes with existing workspace warnings.
+- MK8D macOS/AArch64 release run `/tmp/ruzu_mk8d_diag_after.log` exits via timeout code 124 without filtered panic/fatal lines and without default info `NPad` diagnostic spam.
+
+## 2026-06-26 — core/src/hle/kernel/svc/svc_memory.rs vs core/hle/kernel/svc/svc_memory.cpp
+
+### Intentional differences
+- `map_memory`: Rust keeps local `svc_memory_history` recording around the call. The default call log is now `log::trace!`, matching upstream `LOG_TRACE(Kernel_SVC, ...)` instead of emitting at info level during MK8D.
+
+### Unintentional differences (to fix)
+- None for the logging level corrected in this slice.
+
+### Missing items
+- None identified for this logging-level parity slice.
+
+### Binary layout verification
+- N/A: no guest-visible raw payload changed.
+
+### Verification
+- Re-read upstream `core/hle/kernel/svc/svc_memory.cpp` around `MapMemory`.
+- Re-read local `core/src/hle/kernel/svc/svc_memory.rs` around `map_memory`.
+- `cargo fmt -p core --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- MK8D macOS/AArch64 release run `/tmp/ruzu_mk8d_diag_after.log` exits via timeout code 124 without default info `svc::MapMemory called` lines.
+
+## 2026-06-26 — core/src/hle/kernel/svc/svc_info.rs vs core/hle/kernel/svc/svc_info.cpp
+
+### Intentional differences
+- `get_info`: Rust retains local `RUZU_TRACE_QUERY_RET` diagnostics for previous query-return investigations. The environment filter is now cached with `OnceLock`, and the default call log is `log::trace!`, matching upstream `LOG_TRACE(Kernel_SVC, ...)`.
+
+### Unintentional differences (to fix)
+- None for the logging/filter overhead corrected in this slice.
+
+### Missing items
+- None identified for this logging-level parity slice.
+
+### Binary layout verification
+- N/A: no guest-visible raw payload changed.
+
+### Verification
+- Re-read upstream `core/hle/kernel/svc/svc_info.cpp` around `GetInfo`.
+- Re-read local `core/src/hle/kernel/svc/svc_info.rs` around `get_info`.
+- `cargo fmt -p core --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- MK8D macOS/AArch64 release run `/tmp/ruzu_mk8d_diag_after.log` exits via timeout code 124 without default info `svc::GetInfo called` lines.
+
+## 2026-06-26 — core/src/hle/service/nvdrv/devices/nvmap.rs vs core/hle/service/nvdrv/devices/nvmap.cpp
+
+### Intentional differences
+- `ioc_create`, `ioc_alloc`, `ioc_get_id`, and `ioc_from_id`: Rust still has additional local trace/history diagnostics (`record_nvmap_history`, `trace_nvmap_caller`, `trace_nvmap_stack`) for Apple Silicon bring-up. Default entry/result logs are now `log::debug!`, matching upstream `LOG_DEBUG(Service_NVDRV, ...)` instead of emitting at info level during MK8D.
+
+### Unintentional differences (to fix)
+- None for the default nvmap logging level corrected in this slice.
+
+### Missing items
+- The existing Rust diagnostic/history hooks are local bring-up instrumentation and should be retired or fully gated once the macOS/arm64 runtime reaches stable game boot.
+
+### Binary layout verification
+- PASS: no nvmap ioctl parameter structs or guest-visible return fields were changed.
+
+### Verification
+- Re-read upstream `core/hle/service/nvdrv/devices/nvmap.cpp` around `IocCreate`, `IocAlloc`, `IocGetId`, and `IocFromId`.
+- Re-read local `core/src/hle/service/nvdrv/devices/nvmap.rs` around the same methods.
+- `cargo fmt -p core --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `git diff --check` passes.
+- MK8D macOS/AArch64 release run `/tmp/ruzu_mk8d_diag_after.log` exits via timeout code 124 without default info `nvmap::IocCreate called`, `nvmap::IocAlloc called`, `nvmap::IocGetId called`, or `nvmap::IocFromId called` lines.
