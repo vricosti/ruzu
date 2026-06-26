@@ -15800,3 +15800,30 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `video_core/renderer_vulkan/vk_scheduler.h` and `vk_master_semaphore.h/cpp` around `CurrentTick`, `IsFree`, and `Wait`.
 - Re-read local Rust counterparts in `video_core/src/renderer_vulkan/mod.rs`, `video_core/src/renderer_vulkan/fence_manager.rs`, `video_core/src/renderer_vulkan/scheduler.rs`, and `video_core/src/fence_manager.rs`.
 - `cargo check -p video_core` passes after the Vulkan fence-ordering change.
+
+## 2026-06-26 — externals/rdynarmic ARM64 transpose regalloc and FPAbs parity vs externals/dynarmic/src/dynarmic
+
+### Intentional differences
+- `externals/rdynarmic/src/backend/arm64/emit_arm64_vector.rs`: `emit_transpose` reads the immediate `part` argument directly from the IR instruction instead of going through `RegAlloc::get_argument_info`; this matches upstream `inst->GetArg(2).GetU1()` and avoids consuming register-use counts before `EmitThreeOpArranged`.
+- `externals/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs`: ports upstream `FPAbs32` and `FPAbs64` using the same two-operand floating-point helper shape as upstream `EmitTwoOp<32/64>`.
+- `externals/rdynarmic/src/backend/arm64/inst.rs`: keeps explicit Rust encoders for scalar `FABS S` and `FABS D` where upstream uses oaknut `code.FABS`.
+- `externals/rdynarmic/src/backend/arm64/reg_alloc.rs`: the assertion message now includes block location and source use count for diagnostics; runtime behavior is unchanged except for panic text.
+
+### Unintentional differences (to fix)
+- ARM64 JIT opcode coverage remains incomplete relative to upstream Dynarmic; this slice only fixes the currently hit transpose use-accounting bug and missing scalar `FPAbs32/64`.
+- The release MK8D run no longer crashes in this slice, but it was stopped by timeout and has not yet been verified as fully presenting gameplay.
+
+### Missing items
+- Continue porting missing ARM64 JIT opcodes and backend behavior as runtime or parity audit exposes them.
+- Complete ARM64 backend parity audit against upstream Dynarmic beyond the currently exercised MK8D path.
+
+### Binary layout verification
+- N/A: host AArch64 code emission and regalloc diagnostics only; no guest-visible raw struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector.cpp` around `VectorTranspose8/16/32/64`.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_floating_point.cpp` around `FPAbs32` and `FPAbs64`.
+- Re-read local Rust counterparts in `externals/rdynarmic/src/backend/arm64/emit_arm64_vector.rs`, `externals/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs`, `externals/rdynarmic/src/backend/arm64/emit_arm64.rs`, `externals/rdynarmic/src/backend/arm64/inst.rs`, and `externals/rdynarmic/src/backend/arm64/reg_alloc.rs`.
+- `cargo fmt -p rdynarmic --check` passes.
+- `cargo test -p rdynarmic encodes_known_arm64_words -- --nocapture` passes.
+- MK8D release run with isolated data/cache/config directories and `timeout -k 5s 120s` exits with timeout code 124, without the previous `VectorTranspose32` regalloc panic and without the previous missing `FPAbs32` error. The log reaches repeated `SurfaceFlinger` composition and continued guest `svc::MapMemory` calls.
