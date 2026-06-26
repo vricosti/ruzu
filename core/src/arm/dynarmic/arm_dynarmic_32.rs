@@ -2359,6 +2359,7 @@ impl ArmDynarmic32 {
         } else {
             512 * 1024 * 1024
         };
+        let check_halt_on_memory_access = debugger_enabled;
 
         let config = JitConfig {
             callbacks: Box::new(callbacks),
@@ -2398,11 +2399,15 @@ impl ArmDynarmic32 {
                     page_table_pointer_mask_bits: PageInfo::ATTRIBUTE_BITS as u32,
                     detect_misaligned_access_via_page_table: 16 | 32 | 64 | 128,
                     only_detect_misalignment_via_page_table_on_page_boundary: true,
-                    check_halt_on_memory_access: false,
+                    check_halt_on_memory_access,
                     processor_id: core_index as usize,
                 }
             } else {
-                rdynarmic::backend::x64::emit_context::MemoryEmitConfig::default()
+                rdynarmic::backend::x64::emit_context::MemoryEmitConfig {
+                    check_halt_on_memory_access,
+                    processor_id: core_index as usize,
+                    ..rdynarmic::backend::x64::emit_context::MemoryEmitConfig::default()
+                }
             },
         };
 

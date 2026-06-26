@@ -855,6 +855,7 @@ impl KProcess {
                     shared_memory.clone(),
                     core_timing.clone(),
                     Some(memory.clone()),
+                    self.debugger_enabled,
                 ))
             } else {
                 use crate::arm::dynarmic::arm_dynarmic_32::ArmDynarmic32;

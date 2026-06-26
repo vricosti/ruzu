@@ -2106,6 +2106,7 @@ impl ArmDynarmic64 {
         shared_memory: SharedProcessMemory,
         core_timing: Arc<crate::core_timing::CoreTiming>,
         core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
+        debugger_enabled: bool,
     ) -> Self {
         // Fetch fastmem pointer from core_memory BEFORE it gets moved
         // into the callbacks. Mirrors A32's pattern
@@ -2188,13 +2189,19 @@ impl ArmDynarmic64 {
             } else {
                 OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
             };
+        let code_cache_size = if cfg!(target_arch = "aarch64") {
+            128 * 1024 * 1024
+        } else {
+            512 * 1024 * 1024
+        };
+        let check_halt_on_memory_access = debugger_enabled;
 
         // Configure JIT
         // Upstream: enable_cycle_counting = !uses_wall_clock
         let config = JitConfig {
             callbacks: Box::new(callbacks),
             enable_cycle_counting: !uses_wall_clock,
-            code_cache_size: 512 * 1024 * 1024, // 512 MiB on x86_64 (upstream default)
+            code_cache_size,
             optimizations,
             unsafe_optimizations: false,
             global_monitor: if exclusive_monitor.is_null() {
@@ -2227,7 +2234,7 @@ impl ArmDynarmic64 {
                 page_table_pointer_mask_bits: 0,
                 detect_misaligned_access_via_page_table: 0,
                 only_detect_misalignment_via_page_table_on_page_boundary: false,
-                check_halt_on_memory_access: false,
+                check_halt_on_memory_access,
                 processor_id: core_index as usize,
             },
         };

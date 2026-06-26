@@ -16681,3 +16681,73 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo fmt -p core --check` passes.
 - `cargo check -p core` passes with existing workspace warnings.
 - `git diff --check` passes.
+
+## 2026-06-26 — core/src/arm/dynarmic/arm_dynarmic_32.rs vs core/arm/dynarmic/arm_dynarmic_32.cpp
+
+### Intentional differences
+- Rust stores memory-emission options in `rdynarmic::MemoryEmitConfig` instead of Dynarmic's C++ `UserConfig` fields, but the ownership remains in `ArmDynarmic32::new`/`MakeJit`.
+- Rust receives `debugger_enabled` as a process snapshot rather than reading `m_system.DebuggerEnabled()` directly, matching the existing `KProcess` JIT construction boundary.
+
+### Unintentional differences (to fix)
+- None for this configuration-parity slice.
+
+### Missing items
+- CPU debug-mode setting toggles and unsafe/curated CPU accuracy flags remain less complete than upstream's full settings matrix.
+
+### Binary layout verification
+- N/A: JIT configuration wiring only; no guest-visible raw structure layout changed.
+
+### Verification
+- Re-read upstream `core/arm/dynarmic/arm_dynarmic_32.cpp` around timing, ARM64 code-cache size, and `DebuggerEnabled()` memory-abort handling.
+- Re-read local `core/src/arm/dynarmic/arm_dynarmic_32.rs` around `JitConfig` construction.
+- `cargo fmt -p core --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
+- `git diff --check` passes.
+- MK8D runtime validation with `timeout 60s` loaded the v0 NSP from `/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/`; the process reached A32 JIT creation on all four cores and logged `code_cache_size=134217728` with `optimizations=0x3f`. The run ended by timeout (`rc=124`), not by a crash.
+
+## 2026-06-26 — core/src/arm/dynarmic/arm_dynarmic_64.rs vs core/arm/dynarmic/arm_dynarmic_64.cpp
+
+### Intentional differences
+- Rust stores memory-emission options in `rdynarmic::MemoryEmitConfig` instead of Dynarmic's C++ `UserConfig` fields, but the ownership remains in `ArmDynarmic64::new`/`MakeJit`.
+- Rust receives `debugger_enabled` from `KProcess` construction because this port currently passes a dummy `System` object into the dynarmic constructor.
+
+### Unintentional differences (to fix)
+- None for this configuration-parity slice.
+
+### Missing items
+- A64 page-table setup and the full upstream CPU accuracy/settings matrix remain incomplete compared with upstream.
+
+### Binary layout verification
+- N/A: JIT configuration wiring only; no guest-visible raw structure layout changed.
+
+### Verification
+- Re-read upstream `core/arm/dynarmic/arm_dynarmic_64.cpp` around timing, ARM64 code-cache size, and `DebuggerEnabled()` memory-abort handling.
+- Re-read local `core/src/arm/dynarmic/arm_dynarmic_64.rs` around `JitConfig` construction.
+- `cargo fmt -p core --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
+- `git diff --check` passes.
+- MK8D runtime validation with `timeout 60s` loaded the v0 NSP from `/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/`; the process reached A32 JIT creation on all four cores and logged `code_cache_size=134217728` with `optimizations=0x3f`. The run ended by timeout (`rc=124`), not by a crash.
+
+## 2026-06-26 — core/src/hle/kernel/k_process.rs vs core/hle/kernel/k_process.cpp
+
+### Intentional differences
+- Rust creates per-core `ArmDynarmic32`/`ArmDynarmic64` instances from `KProcess::initialize`, so it forwards the process snapshot of `System::DebuggerEnabled()` into the JIT constructors.
+
+### Unintentional differences (to fix)
+- None for this JIT-construction wiring slice.
+
+### Missing items
+- Broader `KProcess` lifecycle parity remains documented in earlier entries; this slice only forwards debugger state for JIT configuration.
+
+### Binary layout verification
+- N/A: constructor wiring only; no guest-visible raw structure layout changed.
+
+### Verification
+- Re-read upstream dynarmic `MakeJit` debugger checks and local `KProcess::initialize` JIT creation.
+- `cargo fmt -p core --check` passes.
+- `cargo check -p core` passes with existing workspace warnings.
+- `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
+- `git diff --check` passes.
+- MK8D runtime validation with `timeout 60s` loaded the v0 NSP from `/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/`; the process reached A32 JIT creation on all four cores and logged `code_cache_size=134217728` with `optimizations=0x3f`. The run ended by timeout (`rc=124`), not by a crash.
