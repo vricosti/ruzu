@@ -15749,3 +15749,29 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `timeout 120s cargo test -q -p rdynarmic ir::opt::a32_get_set_elimination::tests::test_double_vector_set_forwards_inserted_zero_upper_value --lib -- --exact --nocapture` passes.
 - `git -C externals/rdynarmic diff --check` passes.
 - MK8D run with isolated data/cache/config directories advances past `FPVectorFromSignedFixed32`, `FPVectorGreater32`, and the `VectorTranspose32` regalloc panic; `timeout 300s cargo run --bin ruzu-cmd -- -g "/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"` exits with timeout code 124 and no filtered `not ported`/panic lines. The log still contains `Required instance extension VK_KHR_portability_enumeration is not available`.
+
+## 2026-06-26 — externals/rdynarmic A32 get-set elimination CPSR/PC parity vs externals/dynarmic/src/dynarmic
+
+### Intentional differences
+- `externals/rdynarmic/src/ir/opcode.rs`: restores upstream `IR::Inst::ReadsFromCPSR()` classification for `A32UpdateUpperLocationDescriptor`, matching `externals/dynarmic/src/dynarmic/ir/microinstruction.cpp`.
+- `externals/rdynarmic/src/ir/opt/a32_get_set_elimination.rs`: restores upstream `RegisterPass` PC handling by not tracking `A32GetRegister/A32SetRegister(PC)` and continuing to the next instruction, matching `externals/dynarmic/src/dynarmic/ir/opt/a32_get_set_elimination_pass.cpp`.
+- Rust uses `reg_idx < 15` guards instead of C++ `ASSERT(reg != PC)`/`break` syntax because the Rust pass uses index-based iteration rather than upstream iterators; behavior is equivalent for the pass state.
+
+### Unintentional differences (to fix)
+- The existing `A32SetCpsrNZC(..., A32GetCFlag)` rewrite still mutates the instruction in place, while upstream invalidates it and inserts a fresh `SetCpsrNZ` via `IREmitter`. Existing tests cover use counts and ordering, but the structural difference remains to review separately.
+
+### Missing items
+- Remaining MK8D runtime still loops with `NO_LAYERS`; this slice only fixes the early A32 JIT `GET_SET_ELIMINATION` stall before SVCs.
+
+### Binary layout verification
+- N/A: IR opcode classification and optimization only; no guest-visible raw layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/ir/microinstruction.cpp` around `ReadsFromCPSR()`, `WritesToCPSR()`, and core-register read/write classification.
+- Re-read upstream `externals/dynarmic/src/dynarmic/ir/opt/a32_get_set_elimination_pass.cpp` around `FlagsPass` reset behavior and `RegisterPass` handling for `A32GetRegister`/`A32SetRegister`.
+- Re-read local Rust counterparts in `externals/rdynarmic/src/ir/opcode.rs` and `externals/rdynarmic/src/ir/opt/a32_get_set_elimination.rs`.
+- `cargo fmt -p rdynarmic --check` passes.
+- `cargo test -p rdynarmic test_register_pass_ignores_pc_without_stalling -- --nocapture` passes.
+- `cargo test -p rdynarmic test_update_upper_location_descriptor_blocks_cflag_forwarding -- --nocapture` passes.
+- MK8D with `RUZU_A32_OPTIMIZATION_MASK=0x08 RUZU_TRACE_A32_SVC_PC=1 timeout -k 5s 45s cargo run --bin ruzu-cmd -- -g "/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"` reaches `svc=29`; before the PC fix the same mask reached `svc=0`.
+- MK8D with default A32 optimizations and `RUZU_TRACE_A32_SVC_PC=1 timeout -k 5s 45s cargo run --bin ruzu-cmd -- -g "/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"` reaches `svc=663`; before this slice default optimizations reached `svc=0`.
