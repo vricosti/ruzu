@@ -15883,3 +15883,27 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo check -p ruzu_cmd -p video_core` passes.
 - `git diff --check` passes.
 - MK8D release run with isolated data/cache/config directories, `RUZU_TRACE_PRESENT=1`, and `timeout -k 5s 160s` exits with timeout code 124, without panic or missing-opcode failure. The log records 637 `Swapchain::Present ok` events and 637 `RendererVulkan::Composite exit` events, with `RendererVulkan::Composite draw ... swapchain=2560x1440 layout=2560x1440 image_count=3`.
+
+## 2026-06-26 — video_core/src/renderer_vulkan/renderer_vulkan.rs diagnostic present dump vs video_core/renderer_vulkan/renderer_vulkan.cpp
+
+### Intentional differences
+- `video_core/src/renderer_vulkan/renderer_vulkan.rs`: adds `RUZU_DUMP_PRESENT_FRAME` / `RUZU_DUMP_PRESENT_FRAME_AT` diagnostic-only one-shot framebuffer dumping from `RendererVulkan::Composite`. Upstream has no equivalent environment diagnostic, but the Rust diagnostic remains owned by the same renderer file and reuses the same readback path as upstream `RendererVulkan::RenderToBuffer`.
+- `video_core/src/renderer_vulkan/renderer_vulkan.rs`: writes the diagnostic output as binary PPM after converting upstream/Rust `VK_FORMAT_B8G8R8A8_UNORM` readback bytes from BGRA to RGB. This is host-side inspection only and is inactive unless the environment variable is set.
+
+### Unintentional differences (to fix)
+- The diagnostic dump is not an upstream feature and should not become part of normal presentation semantics. It exists only because macOS window capture failed during Apple Silicon Vulkan validation.
+
+### Missing items
+- Complete visual validation with a generated present dump or another reliable capture path, then remove or keep this diagnostic only as an explicitly gated troubleshooting aid.
+
+### Binary layout verification
+- N/A: host-side Vulkan readback file output only; no guest-visible raw struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `video_core/renderer_vulkan/renderer_vulkan.h` around `RendererVulkan` fields and private methods.
+- Re-read upstream `video_core/renderer_vulkan/renderer_vulkan.cpp` around `RendererVulkan::Composite`, `RendererVulkan::RenderToBuffer`, and `RendererVulkan::RenderScreenshot`.
+- Re-read local Rust counterpart in `video_core/src/renderer_vulkan/renderer_vulkan.rs`.
+- `cargo fmt -p video_core` passes.
+- `cargo check -p video_core` passes.
+- `cargo test -p video_core write_bgra_ppm_converts_to_rgb -- --nocapture` passes.
+- `git diff --check` passes.
