@@ -73,6 +73,19 @@ fn next_bqp_seq() -> u64 {
     BQP_RING_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+fn trace_dequeue_return_for_present(seq: u64, status: Status, slot: i32, flags: i32) {
+    if std::env::var_os("RUZU_TRACE_PRESENT").is_none() {
+        return;
+    }
+    log::info!(
+        "[BQP_DEQUEUE_RET] seq={} status={:?} slot={} flags=0x{:X}",
+        seq,
+        status,
+        slot,
+        flags
+    );
+}
+
 fn stop_unimplemented_transact(code: u32, name: &str) -> ! {
     #[cfg(not(test))]
     {
@@ -439,6 +452,7 @@ impl BufferQueueProducer {
                 width,
                 height
             );
+            trace_dequeue_return_for_present(bqp_seq, Status::BadValue, -1, 0);
             return (Status::BadValue.into(), -1, Fence::default());
         }
 
@@ -471,6 +485,7 @@ impl BufferQueueProducer {
                     0,
                     current_bqp_tid(),
                 ]);
+                trace_dequeue_return_for_present(bqp_seq, status, -1, return_flags.raw());
                 return (status.into(), -1, Fence::default());
             }
 
@@ -484,6 +499,7 @@ impl BufferQueueProducer {
                     0,
                     current_bqp_tid(),
                 ]);
+                trace_dequeue_return_for_present(bqp_seq, Status::Busy, -1, return_flags.raw());
                 return (Status::Busy.into(), -1, Fence::default());
             }
 
@@ -537,6 +553,7 @@ impl BufferQueueProducer {
                         0,
                         current_bqp_tid(),
                     ]);
+                    trace_dequeue_return_for_present(bqp_seq, Status::NoInit, -1, 0);
                     return (Status::NoInit.into(), -1, Fence::default());
                 }
                 inner.slots[out_slot as usize].frame_number = u32::MAX as u64;
@@ -582,6 +599,7 @@ impl BufferQueueProducer {
                 0,
             ],
         );
+        trace_dequeue_return_for_present(bqp_seq, Status::NoError, out_slot, return_flags.raw());
         (return_flags, out_slot, out_fence)
     }
 

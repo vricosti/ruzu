@@ -15907,3 +15907,24 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo check -p video_core` passes.
 - `cargo test -p video_core write_bgra_ppm_converts_to_rgb -- --nocapture` passes.
 - `git diff --check` passes.
+
+## 2026-06-26 — core/src/hle/service/nvnflinger/buffer_queue_producer.rs BQP dequeue-return tracing vs core/hle/service/nvnflinger/buffer_queue_producer.cpp
+
+### Intentional differences
+- `core/src/hle/service/nvnflinger/buffer_queue_producer.rs`: adds `RUZU_TRACE_PRESENT`-gated `[BQP_DEQUEUE_RET]` diagnostics on `dequeue_buffer` return paths. Upstream has no equivalent diagnostic, but the trace is inactive unless explicitly enabled and does not alter status, slot, fence, return flags, locking, or buffer state ordering.
+- `core/src/hle/service/nvnflinger/buffer_queue_producer.rs`: logs raw return flags as hexadecimal `i32`, preserving the raw status bit-pattern already returned through the parcel path.
+
+### Unintentional differences (to fix)
+- None for runtime behavior; this is diagnostic-only host logging.
+
+### Missing items
+- Continue investigating why the current MK8D Apple Silicon run dequeues one preallocated buffer but does not reach `QueueBuffer` in the observed 240s run.
+
+### Binary layout verification
+- N/A: host-side logging only; no guest-visible raw struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `core/hle/service/nvnflinger/buffer_queue_producer.cpp` around `BufferQueueProducer::DequeueBuffer`.
+- Re-read local Rust counterpart in `core/src/hle/service/nvnflinger/buffer_queue_producer.rs`.
+- `cargo fmt -p core` passes.
+- `cargo check -p core` passes.
