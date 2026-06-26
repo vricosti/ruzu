@@ -280,6 +280,21 @@ impl Scheduler {
         self.current_tick.load(Ordering::SeqCst)
     }
 
+    /// Returns true when the GPU has completed `tick`.
+    ///
+    /// Port-facing subset of upstream `Scheduler::IsFree`. This simplified
+    /// scheduler reuses a single fence, waiting on it before every new submit;
+    /// older ticks are therefore complete once a newer tick exists.
+    pub fn is_free(&self, tick: u64) -> bool {
+        if tick == 0 || tick < self.current_tick() {
+            return true;
+        }
+        if tick > self.current_tick() {
+            return false;
+        }
+        unsafe { self.device.get_fence_status(self.fence).unwrap_or(false) }
+    }
+
     /// Tick that will be signalled by the next `Flush`.
     pub fn pending_tick(&self) -> u64 {
         self.current_tick() + 1
