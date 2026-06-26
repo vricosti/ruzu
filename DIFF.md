@@ -15999,3 +15999,27 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `core/arm/dynarmic/arm_dynarmic_32.h` and `core/arm/dynarmic/arm_dynarmic_32.cpp` around `ArmDynarmic32`, `MakeJit`, page-table config, and fastmem config.
 - Re-read upstream `core/memory.cpp` around `Memory::SetCurrentPageTable`, `MapMemoryRegion`, `UnmapRegion`, and `ProtectRegion` fastmem handling.
 - Re-read local counterpart in `core/src/arm/dynarmic/arm_dynarmic_32.rs`.
+
+## 2026-06-26 — core/src/arm/dynarmic/arm_dynarmic_32.rs Apple Silicon page-table fastmem default vs core/arm/dynarmic/arm_dynarmic_32.cpp
+
+### Intentional differences
+- `core/src/arm/dynarmic/arm_dynarmic_32.rs`: enables A32 page-table fastmem by default on macOS/aarch64 while preserving `RUZU_A32_LEGACY_FASTMEM` as an escape hatch and `RUZU_A32_PAGE_TABLE_FASTMEM=1` as a force-enable override on other hosts. Upstream wires `config.page_table` whenever the process page table exists; this change moves Apple Silicon closer to that upstream default.
+- `core/src/arm/dynarmic/arm_dynarmic_32.rs`: leaves Linux/x64 defaults unchanged because that path was already the known working host configuration, and the current goal is to correct the Apple Silicon port without regressing Linux.
+
+### Unintentional differences (to fix)
+- Upstream does not have a platform-specific gate for A32 page-table fastmem. The Rust gate remains narrower because rdynarmic still has historical non-macOS page-table fastmem risk that has not been revalidated in this pass.
+- Apple Silicon still has no mmap-backed 4 KiB fastmem arena because macOS uses a 16 KiB host page size. This page-table fast path avoids the arena requirement, but it is not the same as upstream's `fastmem_pointer = page_table->fastmem_arena` when a 4 KiB host arena exists.
+
+### Missing items
+- Revalidate A32 page-table fastmem on Linux/x64 and remove the platform-specific default gate if it matches upstream behavior there.
+- Implement or explicitly rule out a true Apple Silicon fastmem arena strategy that can preserve guest 4 KiB granularity on a 16 KiB host page system.
+- Continue runtime validation past audio renderer startup until MK8D reaches layer queue/present on macOS/aarch64.
+
+### Binary layout verification
+- N/A: JIT configuration policy only; no guest-visible raw struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `core/arm/dynarmic/arm_dynarmic_32.cpp` around `ArmDynarmic32::MakeJit`, including `config.page_table`, `absolute_offset_page_table`, misalignment config, and `config.fastmem_pointer`.
+- Re-read local `core/src/arm/dynarmic/arm_dynarmic_32.rs` around A32 JIT configuration and page-table gating.
+- MK8D macOS/aarch64 run with `RUZU_A32_PAGE_TABLE_FASTMEM=1` for 75 seconds timed out without panic, produced `page_table_pointer=Some(...)`, avoided the previous `0x02003E2C` A32 memory hot loop, and progressed to `IAudioRendererManager::OpenAudioRenderer`, audio renderer initialization with `voices=96`, and `IAudioRenderer::Start`.
+- MK8D macOS/aarch64 run without `RUZU_A32_PAGE_TABLE_FASTMEM` for 35 seconds timed out without panic and produced `page_table_pointer=Some(...)` on all four A32 JIT cores, proving the Apple Silicon default path is active.
