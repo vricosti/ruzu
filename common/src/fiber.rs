@@ -2,20 +2,14 @@
 //! Status: IN_PROGRESS
 //! Derniere synchro: 2026-04-04
 //!
-//! This backend uses the `context` crate, which wraps Boost.Context and maps
-//! much more directly to upstream `make_fcontext` / `jump_fcontext` than the
-//! previous coroutine-based backend.
+//! The macOS/AArch64 backend uses `corosensei` as an implementation detail.
+//! The public model intentionally remains upstream's low-level `Fiber`
+//! transfer API rather than exposing coroutine semantics outside this file.
 
-// Use `ProtectedFixedSizeStack` so that fiber stack overflows fault on a
-// guard page instead of silently corrupting adjacent memory. Upstream zuyu
-// uses `VirtualBuffer<u8>` which is paired with explicit guard handling;
-// ruzu's prior `FixedSizeStack` had no protection — a 512 KB fiber stack
-// overflow could land anywhere in the host VA space, including the
-// fastmem arena's backing pages, causing the kind of silent dlmalloc
-// state corruption observed in the STK multi-core wedge.
-use context::stack::ProtectedFixedSizeStack as FixedSizeStack;
-use context::{Context, Transfer};
+use corosensei::stack::{DefaultStack, Stack};
+use corosensei::{Coroutine, CoroutineResult, Yielder};
 use parking_lot::Mutex;
+use std::cell::Cell;
 use std::sync::{Arc, Weak};
 
 // Upstream zuyu uses 512 KB but with `VirtualBuffer<u8>` which is paired
@@ -25,46 +19,53 @@ use std::sync::{Arc, Weak};
 // the 512 KB stack overflows almost immediately at STK boot. Use 4 MB
 // to give Rust frames headroom; release-mode builds could shrink this.
 const DEFAULT_STACK_SIZE: usize = 4 * 1024 * 1024;
-type RawContext = usize;
 
-fn context_to_raw(context: Context) -> RawContext {
-    unsafe { std::mem::transmute::<Context, RawContext>(context) }
+type FiberCoroutine = Coroutine<ResumeCommand, SwitchRequest, (), DefaultStack>;
+
+#[derive(Clone)]
+enum ResumeCommand {
+    Continue,
 }
 
-fn raw_to_context(raw: RawContext) -> Context {
-    unsafe { std::mem::transmute::<RawContext, Context>(raw) }
+#[derive(Clone)]
+enum SwitchRequest {
+    YieldTo(Arc<Fiber>),
+    Rewind(Arc<Fiber>),
+}
+
+thread_local! {
+    static CURRENT_YIELDER: Cell<*const Yielder<ResumeCommand, SwitchRequest>> =
+        const { Cell::new(std::ptr::null()) };
 }
 
 struct FiberImpl {
-    stack: Option<FixedSizeStack>,
-    rewind_stack: Option<FixedSizeStack>,
+    coroutine: Option<FiberCoroutine>,
     guard: Mutex<()>,
     entry_point: Option<Box<dyn FnOnce() + Send>>,
     rewind_point: Option<Box<dyn FnOnce() + Send>>,
     previous_fiber: Option<Arc<Fiber>>,
+    self_weak: Weak<Fiber>,
     is_thread_fiber: bool,
     released: bool,
     stack_limit: usize,
     rewind_stack_limit: usize,
-    context: Option<RawContext>,
-    rewind_context: Option<RawContext>,
+    in_rewind: bool,
 }
 
 impl FiberImpl {
     fn new_empty() -> Self {
         Self {
-            stack: None,
-            rewind_stack: None,
+            coroutine: None,
             guard: Mutex::new(()),
             entry_point: None,
             rewind_point: None,
             previous_fiber: None,
+            self_weak: Weak::new(),
             is_thread_fiber: false,
             released: false,
             stack_limit: 0,
             rewind_stack_limit: 0,
-            context: None,
-            rewind_context: None,
+            in_rewind: false,
         }
     }
 }
@@ -85,86 +86,48 @@ unsafe impl Send for Fiber {}
 unsafe impl Sync for Fiber {}
 
 impl Fiber {
-    extern "C" fn fiber_start_func(transfer: Transfer) -> ! {
-        // Optional alignment trace. SysV x86-64 ABI requires RSP at function
-        // entry to satisfy `RSP mod 16 == 8` (after a `call` pushes the
-        // return address from a 16-aligned RSP). The context crate's
-        // trampoline ends with `push %rbp; jmp *%rbx` which preserves that
-        // invariant, so fiber-entry alignment is correct here.
-        //
-        // Verified 2026-05-16: the MK8D ~60s SIGSEGV in `hash_one` came from
-        // a downstream misalignment, NOT from this entry point. The fiber
-        // stack itself is correctly aligned. Trace kept as a sanity check
-        // for future fiber-related investigations.
-        #[cfg(target_arch = "x86_64")]
-        if std::env::var_os("RUZU_TRACE_FIBER_ENTRY").is_some() {
-            let rsp: u64;
-            unsafe {
-                core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack));
+    fn make_coroutine(fiber: Weak<Fiber>, rewind: bool) -> (FiberCoroutine, usize) {
+        let stack = DefaultStack::new(DEFAULT_STACK_SIZE).expect("failed to allocate fiber stack");
+        let stack_limit = stack.limit().get();
+        let coroutine = Coroutine::with_stack(stack, move |yielder, _| {
+            CURRENT_YIELDER.with(|slot| slot.set(yielder as *const _));
+            let fiber = fiber.upgrade().expect("Fiber coroutine outlived Fiber");
+            if rewind {
+                fiber.on_rewind();
+            } else {
+                fiber.start();
             }
-            eprintln!(
-                "[FIBER_ENTRY] post-prologue rsp=0x{:016x} rsp_mod_16={:#x} (expected 0x0 if ABI entry RSP mod 16 == 8 and prologue subtracts 0x88)",
-                rsp,
-                rsp & 0xF
-            );
-        }
-        let fiber = unsafe { &*(transfer.data as *const Fiber) };
-        fiber.start(transfer)
+        });
+        (coroutine, stack_limit)
     }
 
-    extern "C" fn rewind_start_func(transfer: Transfer) -> ! {
-        let fiber = unsafe { &*(transfer.data as *const Fiber) };
-        fiber.on_rewind(transfer)
-    }
-
-    fn start(&self, transfer: Transfer) -> ! {
-        // Inside start() the new fiber's guard is locked by the YieldTo
-        // caller, so this fiber's FiberImpl is exclusively accessible. We
-        // can safely create &mut here — but the PREVIOUS fiber's guard
-        // hand-off requires care: it's locked by us (via this fiber's
-        // resume path) and we'll unlock it. While the unlock window is
-        // open, another thread on a different core could begin its own
-        // YieldTo targeting the previous fiber. We must therefore drop
-        // any `&mut FiberImpl` to the previous fiber BEFORE force_unlock.
-        let entry_point = {
+    fn finish_resume(&self) {
+        let previous_fiber = {
             let imp = unsafe { &mut *self.imp.get() };
-            let previous_fiber = imp
-                .previous_fiber
+            imp.previous_fiber.take()
+        };
+        if let Some(previous_fiber) = previous_fiber {
+            unsafe { (*previous_fiber.imp.get()).guard.force_unlock() };
+        }
+    }
+
+    fn start(&self) -> ! {
+        let entry_point = {
+            self.finish_resume();
+            let imp = unsafe { &mut *self.imp.get() };
+            imp.entry_point
                 .take()
-                .expect("Fiber::start missing previous_fiber");
-            let entry = imp.entry_point.take();
-            // Drop `imp` (this fiber's &mut) before touching previous's
-            // FiberImpl so we don't briefly hold &mut to two FiberImpls
-            // and risk aliasing if the second &mut narrowly overlaps with
-            // another core's YieldTo on the previous fiber.
-            let _ = imp;
-            // Access previous fiber's FiberImpl via raw pointer so we
-            // never create a `&mut FiberImpl` that could alias with a
-            // concurrent YieldTo on the previous fiber after we unlock.
-            let prev_imp_ptr = previous_fiber.imp.get();
-            unsafe {
-                std::ptr::addr_of_mut!((*prev_imp_ptr).context)
-                    .write(Some(context_to_raw(transfer.context)));
-                // Release-store visible to whichever thread will pick up
-                // the previous fiber next via lock().
-                (*prev_imp_ptr).guard.force_unlock();
-            }
-            entry.expect("Fiber::start missing entry point")
+                .expect("Fiber::start missing entry point")
         };
 
         entry_point();
         unreachable!("Fiber entry point returned");
     }
 
-    fn on_rewind(&self, _transfer: Transfer) -> ! {
-        // on_rewind runs on this fiber while its guard is held by the
-        // caller of Rewind. Safe to use `&mut` for fields of self.
+    fn on_rewind(&self) -> ! {
         let rewind_point = {
+            self.finish_resume();
             let imp = unsafe { &mut *self.imp.get() };
-            assert!(imp.context.is_some(), "Fiber::on_rewind missing context");
-            imp.context = imp.rewind_context.take();
-            std::mem::swap(&mut imp.stack, &mut imp.rewind_stack);
-            std::mem::swap(&mut imp.stack_limit, &mut imp.rewind_stack_limit);
             imp.rewind_point
                 .take()
                 .expect("Fiber::on_rewind missing rewind point")
@@ -177,39 +140,32 @@ impl Fiber {
     /// Create a new fiber with the given entry point function.
     /// Matches upstream `Fiber::Fiber(std::function<void()>&& entry_point_func)`.
     pub fn new(entry_point_func: Box<dyn FnOnce() + Send>) -> Arc<Self> {
-        let stack =
-            FixedSizeStack::new(DEFAULT_STACK_SIZE).expect("failed to allocate fiber stack");
-        let rewind_stack =
-            FixedSizeStack::new(DEFAULT_STACK_SIZE).expect("failed to allocate rewind stack");
-
-        let mut imp = FiberImpl::new_empty();
-        imp.stack_limit = stack.bottom() as usize;
-        imp.rewind_stack_limit = rewind_stack.bottom() as usize;
-        imp.context = Some(context_to_raw(unsafe {
-            Context::new(
-                &stack,
-                Self::fiber_start_func as extern "C" fn(Transfer) -> !,
-            )
-        }));
-        imp.stack = Some(stack);
-        imp.rewind_stack = Some(rewind_stack);
-        imp.entry_point = Some(entry_point_func);
-
-        Arc::new(Self {
-            imp: std::cell::UnsafeCell::new(imp),
+        Arc::new_cyclic(|weak| {
+            let (coroutine, stack_limit) = Self::make_coroutine(weak.clone(), false);
+            let mut imp = FiberImpl::new_empty();
+            imp.self_weak = weak.clone();
+            imp.stack_limit = stack_limit;
+            imp.rewind_stack_limit = stack_limit;
+            imp.coroutine = Some(coroutine);
+            imp.entry_point = Some(entry_point_func);
+            Self {
+                imp: std::cell::UnsafeCell::new(imp),
+            }
         })
     }
 
     /// Convert the current thread to a fiber (creates a fiber that represents the current thread).
     /// Matches upstream `Fiber::ThreadToFiber()`.
     pub fn thread_to_fiber() -> Arc<Self> {
-        let imp = FiberImpl {
-            is_thread_fiber: true,
-            ..FiberImpl::new_empty()
-        };
-
-        let fiber = Arc::new(Self {
-            imp: std::cell::UnsafeCell::new(imp),
+        let fiber = Arc::new_cyclic(|weak| {
+            let mut imp = FiberImpl {
+                is_thread_fiber: true,
+                ..FiberImpl::new_empty()
+            };
+            imp.self_weak = weak.clone();
+            Self {
+                imp: std::cell::UnsafeCell::new(imp),
+            }
         });
 
         // Lock the guard via &Mutex (raw-pointer-dereferenced field) — does
@@ -241,35 +197,92 @@ impl Fiber {
         std::mem::forget(guard);
         let to_imp = unsafe { &mut *to.imp.get() };
         to_imp.previous_fiber = weak_from.upgrade();
-
-        let context = to_imp.context.expect("Target fiber missing context");
-        // Drop the &mut before the context-switch so no `&mut FiberImpl`
-        // lives across the resume. After resume returns, another thread
-        // might have already unlocked our guard and started its own
-        // yield_to with this fiber as the target; that would create a new
-        // `&mut FiberImpl` and the OLD `to_imp` would be an aliased &mut.
         let _ = to_imp;
-        let transfer = unsafe { raw_to_context(context).resume(Arc::as_ptr(to) as usize) };
 
+        let request = SwitchRequest::YieldTo(Arc::clone(to));
         if let Some(from) = weak_from.upgrade() {
-            // Same pattern: acquire access without creating &mut, then
-            // narrow scope of any &mut we do construct.
-            let from_imp = unsafe { &mut *from.imp.get() };
-            let previous_fiber = from_imp
-                .previous_fiber
-                .take()
-                .expect("previous_fiber is nullptr!");
-            let _ = from_imp;
-            // Use raw pointer for the previous fiber — after the
-            // force_unlock below, another thread can immediately take its
-            // guard. Holding `&mut` past force_unlock would be the
-            // mirror-image of the bug at the entry of yield_to.
-            let prev_imp_ptr = previous_fiber.imp.get();
-            unsafe {
-                std::ptr::addr_of_mut!((*prev_imp_ptr).context)
-                    .write(Some(context_to_raw(transfer.context)));
-                (*prev_imp_ptr).guard.force_unlock();
+            let is_thread_fiber = unsafe { (*from.imp.get()).is_thread_fiber };
+            if !is_thread_fiber {
+                let yielder = CURRENT_YIELDER.with(|slot| slot.get());
+                assert!(
+                    !yielder.is_null(),
+                    "Fiber::yield_to missing current yielder"
+                );
+                let resumed = unsafe { (&*yielder).suspend(request) };
+                // A guest fiber may resume on a different host thread. Do not
+                // carry a reference to the old thread's TLS cell across the
+                // switch; reacquire TLS after returning on the new host thread.
+                CURRENT_YIELDER.with(|slot| slot.set(yielder));
+                from.finish_resume();
+                match resumed {
+                    ResumeCommand::Continue => return,
+                }
             }
+        }
+
+        Self::dispatch_until_thread(weak_from, request);
+    }
+
+    fn dispatch_until_thread(root: Weak<Fiber>, mut request: SwitchRequest) {
+        loop {
+            let target = match request {
+                SwitchRequest::YieldTo(target) => target,
+                SwitchRequest::Rewind(target) => {
+                    Self::replace_with_rewind_coroutine(&target);
+                    target
+                }
+            };
+
+            if unsafe { (*target.imp.get()).is_thread_fiber } {
+                target.finish_resume();
+                return;
+            }
+
+            let result = {
+                let imp = unsafe { &mut *target.imp.get() };
+                let coroutine = imp
+                    .coroutine
+                    .as_mut()
+                    .expect("Target fiber missing coroutine");
+                coroutine.resume(ResumeCommand::Continue)
+            };
+
+            request = match result {
+                CoroutineResult::Yield(next) => next,
+                CoroutineResult::Return(()) => unreachable!("Fiber coroutine returned"),
+            };
+
+            if let (Some(root), SwitchRequest::YieldTo(next)) = (root.upgrade(), &request) {
+                if Arc::ptr_eq(&root, next) {
+                    root.finish_resume();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn replace_with_rewind_coroutine(fiber: &Arc<Fiber>) {
+        let (new_coroutine, stack_limit) = {
+            let weak = unsafe { (*fiber.imp.get()).self_weak.clone() };
+            Self::make_coroutine(weak, true)
+        };
+        let old_coroutine = {
+            let imp = unsafe { &mut *fiber.imp.get() };
+            assert!(imp.rewind_point.is_some(), "No rewind point set");
+            assert!(!imp.in_rewind, "Already has rewind context");
+            imp.in_rewind = true;
+            let old_coroutine = std::mem::replace(&mut imp.coroutine, Some(new_coroutine));
+            imp.rewind_stack_limit = stack_limit;
+            imp.in_rewind = false;
+            old_coroutine
+        };
+        if let Some(mut old_coroutine) = old_coroutine {
+            unsafe { old_coroutine.force_reset() };
+        }
+        let imp = unsafe { &mut *fiber.imp.get() };
+        if imp.coroutine.is_none() {
+            let (coroutine, _) = Self::make_coroutine(imp.self_weak.clone(), true);
+            imp.coroutine = Some(coroutine);
         }
     }
 
@@ -284,24 +297,13 @@ impl Fiber {
     /// which calls OnRewind logic (run rewind_point).
     /// Matches upstream `Fiber::Rewind`.
     pub fn rewind(&self) {
-        let imp = unsafe { &mut *self.imp.get() };
-        assert!(imp.rewind_point.is_some(), "No rewind point set");
-        assert!(imp.rewind_context.is_none(), "Already has rewind context");
-        let rewind_stack = imp
-            .rewind_stack
-            .as_ref()
-            .expect("Fiber missing rewind stack");
-        imp.rewind_context = Some(context_to_raw(unsafe {
-            Context::new(
-                rewind_stack,
-                Self::rewind_start_func as extern "C" fn(Transfer) -> !,
-            )
-        }));
-
-        let _ = unsafe {
-            raw_to_context(imp.rewind_context.expect("rewind context missing"))
-                .resume(self as *const Fiber as usize)
-        };
+        let fiber = unsafe { (*self.imp.get()).self_weak.upgrade() }
+            .expect("Fiber::rewind missing self weak");
+        CURRENT_YIELDER.with(|slot| {
+            let yielder = slot.get();
+            assert!(!yielder.is_null(), "Fiber::rewind missing current yielder");
+            unsafe { (&*yielder).suspend(SwitchRequest::Rewind(fiber)) };
+        });
         unreachable!("Fiber::rewind returned");
     }
 

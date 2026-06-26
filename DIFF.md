@@ -16138,3 +16138,30 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo check -p core` passes with existing workspace warnings.
 - `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
 - MK8D macOS/aarch64 direct run for 12 seconds timed out without panic; `ArmDynarmic32: page_table_pointer=...` was absent from the rebuilt release log by default.
+
+## 2026-06-26 — common/src/fiber.rs vs common/fiber.cpp and common/fiber.h
+
+### Intentional differences
+- `common/src/fiber.rs`: replaces the previous Rust `context` crate backend with `corosensei` while keeping the upstream-owned `Fiber` API in this file. Upstream uses `boost::context::detail::make_fcontext` / `jump_fcontext`; Rust uses `corosensei::Coroutine` only as the same-thread stack-switch backend because that crate supports Darwin AArch64.
+- `common/src/fiber.rs`: translates upstream's symmetric `jump_fcontext` transfers through a private per-thread dispatcher (`SwitchRequest`) because `corosensei` exposes an asymmetric `resume` / `suspend` API. This dispatcher is deliberately not exposed outside `common/src/fiber.rs`; callers still use `Fiber::yield_to`, `thread_to_fiber`, `set_rewind_point`, `rewind`, and `exit`.
+- `common/src/fiber.rs`: keeps a 4 MiB stack instead of upstream's 512 KiB `VirtualBuffer<u8>` stack. This size was already present in the Rust port to account for larger Rust debug frames; `corosensei::DefaultStack` still supplies a guard page.
+- `common/src/fiber.rs`: stores a `Weak<Fiber>` in `FiberImpl` so `Rewind` can request replacement of the current coroutine backend without changing the public `rewind(&self)` signature. Upstream has an owning `unique_ptr<FiberImpl>` and passes `this` through `jump_fcontext`.
+
+### Unintentional differences (to fix)
+- None for the exercised lifecycle behavior. `Start`, `OnRewind`, `YieldTo`, `Rewind`, `Exit`, `previous_fiber`, and guard handoff remain owned by `common/src/fiber.rs` and are covered by the upstream-derived fiber tests.
+
+### Missing items
+- A future stricter backend could expose a lower-level local AArch64 `jump_fcontext` equivalent and remove the private dispatcher adaptation. This is not required for the current macOS/AArch64 correctness step because no coroutine semantics leak outside this file.
+
+### Binary layout verification
+- N/A: `Fiber` is an internal host scheduler object, not a guest-visible raw memory payload.
+
+### Verification
+- Re-read upstream `common/fiber.h` and `common/fiber.cpp` around `FiberImpl`, `SetRewindPoint`, `Start`, `OnRewind`, `FiberStartFunc`, `RewindStartFunc`, constructor, destructor, `Exit`, `Rewind`, `YieldTo`, and `ThreadToFiber`.
+- Re-read local `common/src/fiber.rs` around the `corosensei` backend, `finish_resume`, `start`, `on_rewind`, `yield_to`, dispatcher, rewind replacement, and tests.
+- `cargo fmt -p common --check` passes.
+- `cargo test -p common fiber -- --nocapture` passes: 5 upstream-derived fiber tests passed.
+- `cargo check -p common` passes with existing warnings outside this slice.
+- `cargo check -p core` passes with existing warnings outside this slice.
+- `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings, confirming `corosensei` compiles and links on macOS/AArch64.
+- MK8D macOS/AArch64 release run `/tmp/ruzu_corosensei_mk8d_25s.log` exits via timeout code 124 without filtered panic/fatal lines; it uses the legacy yuzu data root, loads yuzu keys, selects Vulkan, and creates the Apple M2 Pro Vulkan device.
