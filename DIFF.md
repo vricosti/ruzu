@@ -15827,3 +15827,30 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo fmt -p rdynarmic --check` passes.
 - `cargo test -p rdynarmic encodes_known_arm64_words -- --nocapture` passes.
 - MK8D release run with isolated data/cache/config directories and `timeout -k 5s 120s` exits with timeout code 124, without the previous `VectorTranspose32` regalloc panic and without the previous missing `FPAbs32` error. The log reaches repeated `SurfaceFlinger` composition and continued guest `svc::MapMemory` calls.
+
+## 2026-06-26 — externals/rdynarmic ARM64 scalar FPRoundInt parity vs externals/dynarmic/src/dynarmic
+
+### Intentional differences
+- `externals/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs`: ports upstream `FPRoundInt32` and `FPRoundInt64` from `backend/arm64/emit_arm64_floating_point.cpp`, including `exact` handling through `FRINTX` and non-exact rounding through `FRINTN/P/M/Z/A`.
+- `externals/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs`: reads the rounding-mode and exact immediates directly from the IR instruction before `RegAlloc::get_argument_info`, matching upstream `inst->GetArg(1/2)` and avoiding immediate reads affecting regalloc use accounting.
+- `externals/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs`: represents upstream `ASSERT(ctx.FPCR().RMode() == rounding_mode)` for exact rounding as a Rust `Err`, matching existing Rust ARM64 FP convert behavior for failed upstream assertions.
+- `externals/rdynarmic/src/backend/arm64/inst.rs`: keeps explicit Rust encoders for scalar `FRINTN/P/M/Z/A/X` S/D forms where upstream uses oaknut instruction emission; instruction words were checked against the local Apple/LLVM ARM64 assembler output.
+
+### Unintentional differences (to fix)
+- `FPRoundInt16` remains unimplemented, matching upstream ARM64's current `ASSERT_FALSE("Unimplemented")` path.
+- ARM64 JIT opcode coverage remains incomplete relative to upstream Dynarmic outside the currently exercised MK8D path.
+
+### Missing items
+- Continue runtime-driven and audit-driven ARM64 backend parity work until Apple Silicon runs games without JIT fallback failures.
+- Verify the visible presentation path end-to-end; the latest MK8D run reaches buffer queue/release and display 0 composition, but gameplay presentation has not been visually confirmed.
+
+### Binary layout verification
+- N/A: host AArch64 code emission only; no guest-visible raw struct layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_floating_point.cpp` around `FPRoundInt16`, `FPRoundInt32`, and `FPRoundInt64`.
+- Re-read local Rust counterparts in `externals/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs`, `externals/rdynarmic/src/backend/arm64/emit_arm64.rs`, and `externals/rdynarmic/src/backend/arm64/inst.rs`.
+- `cargo fmt -p rdynarmic --check` passes.
+- `cargo test -p rdynarmic encodes_known_arm64_words -- --nocapture` passes.
+- `git -C externals/rdynarmic diff --check` passes.
+- MK8D release run with isolated data/cache/config directories and `timeout -k 5s 180s` exits with timeout code 124, without the previous `FPRoundInt32` missing-opcode failure. The log reaches `BQP_QUEUE #256`, `BQC_RELEASE #256`, repeated `SurfaceFlinger` composition on display 0 with one layer, and syncpoint increments beyond 800.
