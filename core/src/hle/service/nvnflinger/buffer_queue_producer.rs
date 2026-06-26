@@ -826,23 +826,26 @@ impl BufferQueueProducer {
             graphic_buffer.get_width() as i32,
             graphic_buffer.get_height() as i32,
         );
-        match crop.intersect(&buffer_rect) {
-            Some(cropped_rect) if cropped_rect == crop => {}
-            _ => {
-                log::error!(
-                    "BufferQueueProducer::queue_buffer: crop {:?} not contained in slot {} buffer {:?}",
-                    crop,
-                    slot,
-                    buffer_rect
-                );
-                trace_bqp_ring(&[
-                    5,
-                    bqp_seq,
-                    Status::BadValue as i32 as u64,
-                    slot as i64 as u64,
-                ]);
-                return (Status::BadValue, QueueBufferOutput::new());
-            }
+        let cropped_rect = Rectangle::new(
+            crop.left.max(buffer_rect.left),
+            crop.top.max(buffer_rect.top),
+            crop.right.min(buffer_rect.right),
+            crop.bottom.min(buffer_rect.bottom),
+        );
+        if cropped_rect != crop {
+            log::error!(
+                "BufferQueueProducer::queue_buffer: crop {:?} not contained in slot {} buffer {:?}",
+                crop,
+                slot,
+                buffer_rect
+            );
+            trace_bqp_ring(&[
+                5,
+                bqp_seq,
+                Status::BadValue as i32 as u64,
+                slot as i64 as u64,
+            ]);
+            return (Status::BadValue, QueueBufferOutput::new());
         }
 
         inner.slots[s].buffer_state = super::buffer_slot::BufferState::Queued;
@@ -1924,6 +1927,27 @@ mod tests {
         input.crop = Rectangle::new(0, 0, 32, 32);
         let (status, _) = producer.queue_buffer(slot, &input);
         assert_eq!(status, Status::BadValue);
+    }
+
+    #[test]
+    fn queue_buffer_accepts_empty_default_crop() {
+        let core = BufferQueueCore::new();
+        install_test_consumer(&core);
+        let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
+        let buffer = Arc::new(NvGraphicBuffer::new(16, 16, PixelFormat::Rgba8888, 0));
+        assert_eq!(
+            producer.set_preallocated_buffer(0, Some(buffer)),
+            Status::NoError
+        );
+
+        let (status, slot, _fence) =
+            producer.dequeue_buffer(false, 16, 16, PixelFormat::Rgba8888, 0);
+        assert_eq!(status, Status::NoError.into());
+        let (status, _buffer) = producer.request_buffer(slot);
+        assert_eq!(status, Status::NoError);
+
+        let (status, _) = producer.queue_buffer(slot, &QueueBufferInput::default());
+        assert_eq!(status, Status::NoError);
     }
 
     #[test]

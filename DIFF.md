@@ -16138,3 +16138,156 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo check -p core` passes with existing workspace warnings.
 - `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
 - MK8D macOS/aarch64 direct run for 12 seconds timed out without panic; `ArmDynarmic32: page_table_pointer=...` was absent from the rebuilt release log by default.
+
+## 2026-06-26 — externals/rdynarmic/src/backend/arm64/emit_arm64_a64.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a64.cpp
+
+### Intentional differences
+- Rust uses `Result<(), String>`, `emit_relocation`, `emit_mov_*_imm`, and explicit `BlockOfCode` writes instead of C++ templates, oaknut methods, and `EmitRelocation`. The emitted control-flow order matches upstream for `A64CallSupervisor` and `A64ExceptionRaised`.
+
+### Unintentional differences (to fix)
+- None for `A64CallSupervisor` and `A64ExceptionRaised`. Rust now preserves upstream call preparation, cycle-counting `AddTicks`/`GetTicksRemaining` ordering, argument registers, and relocation targets.
+
+### Missing items
+- None for this opcode slice.
+
+### Binary layout verification
+- N/A: backend code emission only; no guest-visible raw struct layout changed.
+
+### Verification
+- Re-read upstream `emit_arm64_a64.cpp` around `EmitIR<IR::Opcode::A64CallSupervisor>` and `EmitIR<IR::Opcode::A64ExceptionRaised>`.
+- Re-read local `externals/rdynarmic/src/backend/arm64/emit_arm64_a64.rs` around `emit_a64_call_supervisor` and `emit_a64_exception_raised`.
+- `cargo fmt -p rdynarmic --check` passes.
+- `cargo check -p rdynarmic` passes with existing warnings.
+- `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
+
+## 2026-06-26 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+- Rust uses explicit `debug_assert!(bit < 64)` and `RegAlloc::realize_all`; upstream uses `ASSERT(args[1].IsImmediate())`, `ASSERT(args[1].GetImmediateU8() < 64)`, and `RegAlloc::Realize`.
+
+### Unintentional differences (to fix)
+- None for `TestBit`. Rust now emits `UBFX Xresult, Xoperand, #bit, #1`, matching upstream.
+
+### Missing items
+- None for this opcode slice.
+
+### Binary layout verification
+- N/A: backend code emission only; no guest-visible raw struct layout changed.
+
+### Verification
+- Re-read upstream `emit_arm64_data_processing.cpp` around `EmitIR<IR::Opcode::TestBit>`.
+- Re-read local `externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs` around `emit_test_bit`.
+- `cargo fmt -p rdynarmic --check` passes.
+- `cargo check -p rdynarmic` passes with existing warnings.
+- `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
+
+## 2026-06-26 — externals/rdynarmic/src/backend/arm64/emit_arm64.rs dispatch vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.cpp
+
+### Intentional differences
+- Rust dispatches through a `match Opcode` table rather than C++ template specialization lookup. The ownership still points at the upstream-equivalent emitter files: A64 exception/SVC logic in `emit_arm64_a64.rs`, and `TestBit` in `emit_arm64_data_processing.rs`.
+
+### Unintentional differences (to fix)
+- None for this dispatch slice. `A64CallSupervisor`, `A64ExceptionRaised`, and `TestBit` now route to their matching ARM64 emitters instead of falling through to the generic "not ported" error.
+
+### Missing items
+- Other ARM64 backend opcodes may still be missing outside this slice; they are not silently handled by these changes.
+
+### Binary layout verification
+- N/A: dispatcher routing only; no guest-visible raw struct layout changed.
+
+### Verification
+- Re-read upstream ARM64 backend emit files for the owner functions.
+- Re-read local `externals/rdynarmic/src/backend/arm64/emit_arm64.rs` dispatch arms.
+- `cargo fmt -p rdynarmic --check` passes.
+- `cargo check -p rdynarmic` passes with existing warnings.
+- hbmenu NRO run reaches the expected `svcBreak` userspace panic and no longer panics on `A64CallSupervisor`, `A64ExceptionRaised`, `TestBit`, or `Interpret should never be emitted`.
+
+## 2026-06-26 — externals/rdynarmic/src/frontend/a64/translate/visitor.rs vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.cpp
+
+### Intentional differences
+- Rust dispatches decoded instruction variants through a generated enum match; upstream routes generated `UnallocatedEncoding` to `TranslatorVisitor::UnallocatedEncoding()`.
+
+### Unintentional differences (to fix)
+- None for `UnallocatedEncoding`. Rust now calls `unallocated_encoding()`, which raises `Exception::UnallocatedEncoding`, matching upstream.
+
+### Missing items
+- None for this dispatch slice.
+
+### Binary layout verification
+- N/A: translator dispatch only; no guest-visible raw struct layout changed.
+
+### Verification
+- Re-read upstream `impl.cpp` around `TranslatorVisitor::UnallocatedEncoding`.
+- Re-read local `externals/rdynarmic/src/frontend/a64/translate/visitor.rs` dispatch table.
+- `cargo test -p rdynarmic frontend::a64::translate::visitor::tests::unallocated_encoding_raises_exception_instead_of_interpret -- --nocapture` passes.
+- `cargo fmt -p rdynarmic --check` passes.
+- `cargo check -p rdynarmic` passes with existing warnings.
+
+## 2026-06-26 — externals/rdynarmic/src/frontend/a64/translate/mod.rs UDF decode guard vs externals/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
+
+### Intentional differences
+- Rust special-cases architectural AArch64 `UDF #imm16` encodings (`instruction & 0xffff_0000 == 0`) as `UnallocatedEncoding` before generic decode fallback. Upstream leaves decoder misses as `Interpret`, but the ARM64 host backend asserts that `Interpret` should never be emitted. The Rust guard is intentionally narrow so missing real opcode ports still surface as interpreter fallback/not-ported issues.
+
+### Unintentional differences (to fix)
+- None for the hbmenu fatal-path `0x00000000` UDF case. Rust now raises `A64ExceptionRaised` instead of generating an ARM64-host `Interpret` terminal that cannot be emitted.
+
+### Missing items
+- A lower-level decoder-table parity audit for all A64 undefined encodings is still outside this slice.
+
+### Binary layout verification
+- N/A: translator control flow only; no guest-visible raw struct layout changed.
+
+### Verification
+- Re-read upstream `a64_translate.cpp` translation loop and `impl.cpp` exception helpers.
+- Re-read local `externals/rdynarmic/src/frontend/a64/translate/mod.rs` translation loop.
+- `cargo test -p rdynarmic frontend::a64::translate::tests::test_translate_udf_raises_exception_instead_of_interpret -- --nocapture` passes.
+- `cargo fmt -p rdynarmic --check` passes.
+- `cargo check -p rdynarmic` passes with existing warnings.
+- hbmenu NRO run reaches the expected `svcBreak` userspace panic and continues until the 30 second timeout without the previous `Interpret should never be emitted` panic.
+
+## 2026-06-26 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+- Rust exposes explicit functions and dispatch arms instead of C++ `EmitIR<Opcode>` template specializations. Ownership remains in the upstream-equivalent ARM64 data-processing emitter.
+- Rust instruction encodings live in `backend/arm64/inst.rs`; upstream calls oaknut methods directly.
+
+### Unintentional differences (to fix)
+- None for this slice. `ByteReverseHalf`, `ByteReverseDual`, `ReplicateBit32`, and `ReplicateBit64` now match upstream instruction sequences:
+- `ByteReverseHalf`: `REV16 Wresult, Woperand`.
+- `ByteReverseDual`: `REV Xresult, Xoperand`.
+- `ReplicateBit32`: `LSL Wresult, Wvalue, 31 - bit`; `ASR Wresult, Wresult, 31`.
+- `ReplicateBit64`: `LSL Xresult, Xvalue, 63 - bit`; `ASR Xresult, Xresult, 63`.
+
+### Missing items
+- Other ARM64 backend opcode gaps may still exist outside this verified slice.
+
+### Binary layout verification
+- N/A: backend code emission only; no guest-visible raw struct layout changed.
+
+### Verification
+- Re-read upstream `emit_arm64_data_processing.cpp` around `ByteReverse*`, `ExtractRegister*`, and `ReplicateBit*`.
+- Re-read local `externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs`, `emit_arm64.rs`, and `inst.rs`.
+- `cargo test encodes_known_arm64_words -- --nocapture` passes.
+- `cargo test test_a64_byte_reverse_word_half_and_dual -- --nocapture` passes.
+- `cargo test test_a64_sbfm_uses_replicate_bit_32_and_64 -- --nocapture` passes.
+
+## 2026-06-26 — core/src/hle/service/nvnflinger/buffer_queue_producer.rs vs core/hle/service/nvnflinger/buffer_queue_producer.cpp
+
+### Intentional differences
+- Rust keeps the existing `Rectangle::intersect -> Option<Rectangle>` API unchanged globally. `QueueBuffer` computes the clamped intersection locally to preserve this upstream call-site's exact behavior.
+
+### Unintentional differences (to fix)
+- None for crop validation. Rust now matches upstream `crop.Intersect(buffer_rect, &cropped_rect); if (cropped_rect != crop) BadValue`, including accepting a default empty crop `{0,0,0,0}`.
+
+### Missing items
+- Existing `nvnflinger` stubs and diagnostics outside this crop-validation slice remain as previously documented/work-in-progress.
+
+### Binary layout verification
+- N/A: no parcel or raw struct layout changed.
+
+### Verification
+- Re-read upstream `buffer_queue_producer.cpp` around `BufferQueueProducer::QueueBuffer` crop validation.
+- Re-read local `core/src/hle/service/nvnflinger/buffer_queue_producer.rs` queue validation and tests.
+- `cargo test -p core queue_buffer_accepts_empty_default_crop -- --nocapture` passes.
+- `cargo build --release --bin ruzu-cmd` passes with existing warnings.
+- `RUST_LOG=info timeout 10s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/switch-homebrew-template/out/Hello_World.nro` reaches continuous `BQP_QUEUE`/`BQC_RELEASE` frame flow until timeout, with no `A64 ARM64 run failed`, `not ported`, `svcBreak`, or guest abort in the final log.
