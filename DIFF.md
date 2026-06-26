@@ -15775,3 +15775,28 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo test -p rdynarmic test_update_upper_location_descriptor_blocks_cflag_forwarding -- --nocapture` passes.
 - MK8D with `RUZU_A32_OPTIMIZATION_MASK=0x08 RUZU_TRACE_A32_SVC_PC=1 timeout -k 5s 45s cargo run --bin ruzu-cmd -- -g "/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"` reaches `svc=29`; before the PC fix the same mask reached `svc=0`.
 - MK8D with default A32 optimizations and `RUZU_TRACE_A32_SVC_PC=1 timeout -k 5s 45s cargo run --bin ruzu-cmd -- -g "/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"` reaches `svc=663`; before this slice default optimizations reached `svc=0`.
+
+## 2026-06-26 — video_core/src/renderer_vulkan/mod.rs and scheduler.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp, vk_fence_manager.cpp, vk_scheduler.h
+
+### Intentional differences
+- `video_core/src/renderer_vulkan/mod.rs`: the active Rust Vulkan rasterizer still lives in `renderer_vulkan/mod.rs` while upstream owns this logic in `renderer_vulkan/vk_rasterizer.cpp`; this keeps the current runtime path intact for this focused fix, but the existing split `renderer_vulkan/vk_rasterizer.rs` remains the structurally better long-term owner.
+- `video_core/src/renderer_vulkan/scheduler.rs`: `Scheduler::is_free` uses the current single-fence scheduler model. Upstream delegates `Scheduler::IsFree` to `MasterSemaphore::IsFree`; Rust treats older ticks as complete because the simplified scheduler waits on its reused fence before every new submit, and checks the current fence status for the current tick.
+
+### Unintentional differences (to fix)
+- `video_core/src/renderer_vulkan/mod.rs`: Vulkan rasterizer ownership is still duplicated between the active `mod.rs` type and the more upstream-shaped `vk_rasterizer.rs`; this should be unwound by moving the active runtime to `vk_rasterizer.rs`.
+- `video_core/src/renderer_vulkan/fence_manager.rs`: `InnerFence` does not own a `Scheduler&` like upstream; the active rasterizer supplies scheduler ticks and waits through callback glue.
+- `video_core/src/renderer_vulkan/scheduler.rs`: the scheduler still lacks upstream's full master-semaphore/timeline model, so fence completion is faithful to the current simplified submit model, not the complete upstream implementation.
+
+### Missing items
+- Full Vulkan scheduler/master semaphore parity (`vk_scheduler.*`, `vk_master_semaphore.*`) remains incomplete.
+- Full Vulkan rasterizer file-ownership parity remains incomplete until the active `RasterizerVulkan` implementation is consolidated into `renderer_vulkan/vk_rasterizer.rs`.
+
+### Binary layout verification
+- N/A: renderer fence ordering and scheduler status only; no guest-visible raw layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `video_core/renderer_vulkan/vk_rasterizer.cpp` around `RasterizerVulkan::SignalFence`, `SyncOperation`, `SignalSyncPoint`, `SignalReference`, and `ReleaseFences`.
+- Re-read upstream `video_core/renderer_vulkan/vk_fence_manager.cpp` around `InnerFence::Queue`, `IsSignaled`, `Wait`, and `FenceManager::{CreateFence,QueueFence,IsFenceSignaled,WaitFence}`.
+- Re-read upstream `video_core/renderer_vulkan/vk_scheduler.h` and `vk_master_semaphore.h/cpp` around `CurrentTick`, `IsFree`, and `Wait`.
+- Re-read local Rust counterparts in `video_core/src/renderer_vulkan/mod.rs`, `video_core/src/renderer_vulkan/fence_manager.rs`, `video_core/src/renderer_vulkan/scheduler.rs`, and `video_core/src/fence_manager.rs`.
+- `cargo check -p video_core` passes after the Vulkan fence-ordering change.

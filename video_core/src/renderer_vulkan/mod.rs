@@ -66,11 +66,13 @@ use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, ComparisonOp, CullFace, DrawCall, FrontFace, PrimitiveTopology,
 };
 use crate::engines::Framebuffer;
+use crate::fence_manager::FenceManager as GenericFenceManager;
 use crate::framebuffer_config::FramebufferConfig;
 use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
 use shader_recompiler::{PipelineCache as ShaderPipelineCache, Profile};
 
+use self::fence_manager::{Fence as VkFence, FenceManager as VkFenceBackend};
 use buffer_cache::BufferCache;
 use descriptor_pool::DescriptorPool;
 use pipeline_cache::PipelineCache as VulkanPipelineCache;
@@ -127,6 +129,8 @@ pub struct RasterizerVulkan {
     buffer_cache: BufferCache,
     texture_cache: TextureCache,
     query_cache: VulkanQueryCache,
+    fence_manager: GenericFenceManager<VkFence>,
+    fence_backend: VkFenceBackend,
 
     // Default render pass for the offscreen framebuffer
     default_render_pass: vk::RenderPass,
@@ -272,6 +276,8 @@ impl RasterizerVulkan {
             buffer_cache,
             texture_cache,
             query_cache,
+            fence_manager: GenericFenceManager::new(true),
+            fence_backend: VkFenceBackend::new(),
             default_render_pass,
             offscreen_image,
             offscreen_memory,
@@ -427,6 +433,42 @@ impl RasterizerVulkan {
         self.state_tracker.invalidate_command_buffer_state();
         self.staging_pool.new_frame();
         self.descriptor_pool.reset_pools();
+    }
+
+    fn should_wait_async_flushes(&self) -> bool {
+        self.query_cache.should_wait_async_flushes()
+    }
+
+    fn should_flush_async(&self) -> bool {
+        self.query_cache.has_uncommitted_flushes()
+    }
+
+    fn pop_async_flushes(&mut self) {
+        self.query_cache.pop_async_flushes();
+    }
+
+    fn commit_async_flushes(&mut self) {
+        self.query_cache.commit_async_flushes();
+    }
+
+    fn queue_fence(&mut self, fence: &mut VkFence) {
+        let is_stubbed = fence.lock().unwrap().is_stubbed();
+        let tick = if is_stubbed {
+            0
+        } else {
+            self.scheduler.flush()
+        };
+        self.fence_backend.queue_fence(fence, tick);
+    }
+
+    fn is_fence_signaled(&self, fence: &VkFence) -> bool {
+        let wait_tick = fence.lock().unwrap().wait_tick();
+        self.scheduler.is_free(wait_tick)
+    }
+
+    fn wait_fence(&mut self, fence: &VkFence) {
+        let wait_tick = fence.lock().unwrap().wait_tick();
+        self.scheduler.wait(wait_tick);
     }
 
     /// Read back the offscreen framebuffer as RGBA8 pixels.
@@ -880,22 +922,82 @@ impl RasterizerInterface for RasterizerVulkan {
     fn disable_graphics_uniform_buffer(&mut self, _stage: usize, _index: u32) {}
 
     fn signal_fence(&mut self, func: Box<dyn FnOnce() + Send>) {
-        self.finish();
-        func();
+        let this = self as *mut Self;
+        let this_for_pop = this as usize;
+        self.fence_manager.signal_fence(
+            func,
+            move |is_stubbed| unsafe { (*this).fence_backend.create_fence(is_stubbed) },
+            move |fence| unsafe { (*this).queue_fence(fence) },
+            move || unsafe { (*this).should_wait_async_flushes() },
+            move |fence| unsafe { (*this).is_fence_signaled(fence) },
+            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
+            move || unsafe { (*this).draw_counter != 0 || (*this).should_flush_async() },
+            move || unsafe { (*this).commit_async_flushes() },
+            move || unsafe { (*this).flush_commands() },
+            move || unsafe { (*this).invalidate_gpu_cache() },
+        );
     }
 
     fn sync_operation(&mut self, func: Box<dyn FnOnce() + Send>) {
-        func();
+        self.fence_manager.sync_operation(func);
     }
 
     fn signal_sync_point(&mut self, id: u32) {
-        self.syncpoints.increment_guest(id);
-        self.syncpoints.increment_host(id);
+        let this = self as *mut Self;
+        let this_for_pop = this as usize;
+        let syncpoints = Arc::clone(&self.syncpoints);
+        self.fence_manager.signal_sync_point(
+            id,
+            {
+                let syncpoints = Arc::clone(&syncpoints);
+                move |value| syncpoints.increment_guest(value)
+            },
+            move |value| syncpoints.increment_host(value),
+            move |is_stubbed| unsafe { (*this).fence_backend.create_fence(is_stubbed) },
+            move |fence| unsafe { (*this).queue_fence(fence) },
+            move || unsafe { (*this).should_wait_async_flushes() },
+            move |fence| unsafe { (*this).is_fence_signaled(fence) },
+            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
+            move || unsafe { (*this).draw_counter != 0 || (*this).should_flush_async() },
+            move || unsafe { (*this).commit_async_flushes() },
+            move || unsafe { (*this).flush_commands() },
+            move || unsafe { (*this).invalidate_gpu_cache() },
+        );
     }
 
-    fn signal_reference(&mut self) {}
+    fn signal_reference(&mut self) {
+        let this = self as *mut Self;
+        let this_for_pop = this as usize;
+        self.fence_manager.signal_reference(
+            move |is_stubbed| unsafe { (*this).fence_backend.create_fence(is_stubbed) },
+            move |fence| unsafe { (*this).queue_fence(fence) },
+            move || unsafe { (*this).should_wait_async_flushes() },
+            move |fence| unsafe { (*this).is_fence_signaled(fence) },
+            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
+            move || unsafe { (*this).draw_counter != 0 || (*this).should_flush_async() },
+            move || unsafe { (*this).commit_async_flushes() },
+            move || unsafe { (*this).flush_commands() },
+            move || unsafe { (*this).invalidate_gpu_cache() },
+        );
+    }
 
-    fn release_fences(&mut self, _force: bool) {}
+    fn release_fences(&mut self, force: bool) {
+        let this = self as *mut Self;
+        let this_for_pop = this as usize;
+        self.fence_manager.wait_pending_fences(
+            force,
+            move |is_stubbed| unsafe { (*this).fence_backend.create_fence(is_stubbed) },
+            move |fence| unsafe { (*this).queue_fence(fence) },
+            move || unsafe { (*this).should_wait_async_flushes() },
+            move |fence| unsafe { (*this).is_fence_signaled(fence) },
+            move |fence| unsafe { (*this).wait_fence(fence) },
+            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
+            move || unsafe { (*this).draw_counter != 0 || (*this).should_flush_async() },
+            move || unsafe { (*this).commit_async_flushes() },
+            move || unsafe { (*this).flush_commands() },
+            move || unsafe { (*this).invalidate_gpu_cache() },
+        );
+    }
 
     fn flush_all(&mut self) {
         self.scheduler.flush();
