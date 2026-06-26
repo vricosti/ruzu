@@ -6,7 +6,11 @@ use crate::alignment::align_up;
 use crate::free_region_manager::FreeRegionManager;
 use crate::virtual_buffer::VirtualBuffer;
 use log::error;
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
 use std::ptr;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const PAGE_ALIGNMENT: usize = 0x1000;
 const HUGE_PAGE_SIZE: usize = 0x200000;
@@ -22,8 +26,8 @@ bitflags::bitflags! {
     }
 }
 
-/// Platform-specific implementation of host memory management (Linux).
-#[cfg(target_os = "linux")]
+/// Platform-specific implementation of host memory management.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct HostMemoryImpl {
     backing_size: usize,
     virtual_size: usize,
@@ -34,7 +38,7 @@ struct HostMemoryImpl {
     free_manager: FreeRegionManager,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl HostMemoryImpl {
     fn new(backing_size: usize, virtual_size: usize) -> Result<Self, String> {
         unsafe {
@@ -47,12 +51,10 @@ impl HostMemoryImpl {
                 ));
             }
 
-            // Create backing memory file descriptor
-            let name = b"HostMemory\0";
-            let fd = libc::syscall(libc::SYS_memfd_create, name.as_ptr(), 0) as i32;
+            let fd = create_backing_fd()?;
             if fd < 0 {
                 return Err(format!(
-                    "memfd_create failed: {}",
+                    "create backing fd failed: {}",
                     std::io::Error::last_os_error()
                 ));
             }
@@ -88,8 +90,8 @@ impl HostMemoryImpl {
             let virtual_map_base = libc::mmap(
                 ptr::null_mut(),
                 virtual_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | map_noreserve(),
                 -1,
                 0,
             );
@@ -104,6 +106,7 @@ impl HostMemoryImpl {
 
             // Enable huge pages (skip when RUZU_NO_HUGEPAGE=1; diagnostic for
             // multi-thread mmap THP interactions).
+            #[cfg(target_os = "linux")]
             if std::env::var_os("RUZU_NO_HUGEPAGE").is_none() {
                 libc::madvise(virtual_map_base, virtual_size, libc::MADV_HUGEPAGE);
             }
@@ -250,6 +253,7 @@ impl HostMemoryImpl {
     }
 
     fn clear_backing_region(&self, physical_offset: usize, length: usize) -> bool {
+        #[cfg(target_os = "linux")]
         unsafe {
             let ret = libc::madvise(
                 self.backing_base.add(physical_offset) as *mut libc::c_void,
@@ -258,7 +262,16 @@ impl HostMemoryImpl {
             );
             assert!(ret == 0, "madvise MADV_REMOVE failed");
         }
-        true
+        #[cfg(target_os = "linux")]
+        {
+            true
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = physical_offset;
+            let _ = length;
+            false
+        }
     }
 
     fn enable_direct_mapped_address(&mut self) {
@@ -286,6 +299,55 @@ impl HostMemoryImpl {
 }
 
 #[cfg(target_os = "linux")]
+fn create_backing_fd() -> Result<i32, String> {
+    unsafe {
+        let name = b"HostMemory\0";
+        let fd = libc::syscall(libc::SYS_memfd_create, name.as_ptr(), 0) as i32;
+        if fd < 0 {
+            Err(format!(
+                "memfd_create failed: {}",
+                std::io::Error::last_os_error()
+            ))
+        } else {
+            Ok(fd)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn create_backing_fd() -> Result<i32, String> {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let name = CString::new(format!("/ruzu-host-memory-{}-{}", std::process::id(), id))
+        .map_err(|e| e.to_string())?;
+    unsafe {
+        let fd = libc::shm_open(
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        );
+        if fd < 0 {
+            return Err(format!(
+                "shm_open failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        libc::shm_unlink(name.as_ptr());
+        Ok(fd)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn map_noreserve() -> i32 {
+    libc::MAP_NORESERVE
+}
+
+#[cfg(target_os = "macos")]
+fn map_noreserve() -> i32 {
+    0
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for HostMemoryImpl {
     fn drop(&mut self) {
         unsafe {
@@ -312,7 +374,7 @@ impl Drop for HostMemoryImpl {
 pub struct HostMemory {
     backing_size: usize,
     virtual_size: usize,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     imp: Option<HostMemoryImpl>,
     backing_base: *mut u8,
     virtual_base: *mut u8,
@@ -329,7 +391,7 @@ impl HostMemory {
         let aligned_virtual =
             align_up(virtual_size as u64, PAGE_ALIGNMENT as u64) as usize + HUGE_PAGE_SIZE;
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             match HostMemoryImpl::new(aligned_backing, aligned_virtual) {
                 Ok(imp) => {
@@ -367,7 +429,7 @@ impl HostMemory {
         Self {
             backing_size,
             virtual_size,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             imp: None,
             backing_base,
             virtual_base: ptr::null_mut(),
@@ -398,7 +460,7 @@ impl HostMemory {
             return;
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(ref imp) = self.imp {
             imp.map(
                 virtual_offset + self.virtual_base_offset,
@@ -418,7 +480,7 @@ impl HostMemory {
             return;
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(ref imp) = self.imp {
             imp.unmap(virtual_offset + self.virtual_base_offset, length);
         }
@@ -437,7 +499,7 @@ impl HostMemory {
         let write = perm.contains(MemoryPermission::WRITE);
         let execute = perm.contains(MemoryPermission::EXECUTE);
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(ref imp) = self.imp {
             imp.protect(
                 virtual_offset + self.virtual_base_offset,
@@ -450,7 +512,7 @@ impl HostMemory {
     }
 
     pub fn clear_backing_region(&self, physical_offset: usize, length: usize, fill_value: u32) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             if fill_value == 0 {
                 if let Some(ref imp) = self.imp {
