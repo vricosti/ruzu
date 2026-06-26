@@ -2294,8 +2294,7 @@ impl ArmDynarmic32 {
         // `Memory::SetCurrentPageTable`. In Rust the page-table path remains
         // optional while the fastmem arena base is available directly through
         // the per-process Memory bridge, matching ArmDynarmic64's wiring.
-        let use_page_table_fastmem = std::env::var_os("RUZU_A32_PAGE_TABLE_FASTMEM").is_some()
-            && std::env::var_os("RUZU_A32_LEGACY_FASTMEM").is_none();
+        let use_page_table_fastmem = should_use_page_table_fastmem();
         let (mut page_table_pointer, fastmem_pointer): (Option<*const u8>, Option<*mut u8>) =
             if std::env::var_os("RUZU_NO_FASTMEM").is_some() {
                 (None, None)
@@ -2317,12 +2316,12 @@ impl ArmDynarmic32 {
                     .filter(|p| !p.is_null());
                 (page_table_pointer, fastmem_pointer)
             };
-        // Upstream wires both `page_table` and `fastmem_pointer` for A32.
-        // rdynarmic's current A32 page-table fastmem path regresses MK8D's
-        // title transition by making the guest stop submitting active audio
-        // voices. Keep the stable pre-page-table fastmem path as the default
-        // until the backend path is fixed; use RUZU_A32_PAGE_TABLE_FASTMEM=1
-        // to re-enable the upstream-shaped path for targeted validation.
+        // Upstream wires `page_table` whenever the process page table exists.
+        // On Apple Silicon the host page size is 16 KiB, so the mmap-backed
+        // 4 KiB fastmem arena is unavailable; the page-table path is the
+        // upstream-shaped fast path that does not depend on 4 KiB host aliases.
+        // Keep RUZU_A32_LEGACY_FASTMEM as an escape hatch while Linux/x64 keeps
+        // its previously validated default.
         if !use_page_table_fastmem {
             page_table_pointer = None;
         }
@@ -2905,6 +2904,12 @@ impl ArmInterface for ArmDynarmic32 {
     }
 }
 
+fn should_use_page_table_fastmem() -> bool {
+    std::env::var_os("RUZU_A32_LEGACY_FASTMEM").is_none()
+        && (std::env::var_os("RUZU_A32_PAGE_TABLE_FASTMEM").is_some()
+            || cfg!(all(target_os = "macos", target_arch = "aarch64")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2926,5 +2931,19 @@ mod tests {
 
         assert_eq!(callbacks.memory_read_code(0x1000), Some(0x12345678));
         assert_eq!(callbacks.memory_read_code(0x805A2D08), None);
+    }
+
+    #[test]
+    fn page_table_fastmem_default_matches_platform_policy() {
+        if std::env::var_os("RUZU_A32_LEGACY_FASTMEM").is_some()
+            || std::env::var_os("RUZU_A32_PAGE_TABLE_FASTMEM").is_some()
+        {
+            return;
+        }
+
+        assert_eq!(
+            should_use_page_table_fastmem(),
+            cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        );
     }
 }
