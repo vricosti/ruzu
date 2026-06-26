@@ -2379,6 +2379,8 @@ impl ArmDynarmic32 {
             processor_id: core_index as usize,
             // Upstream: config.wall_clock_cntpct = m_uses_wall_clock
             wall_clock_cntpct: uses_wall_clock,
+            tpidrro_el0: None,
+            tpidr_el0: None,
             // Upstream `ArmDynarmic32::MakeJit` configures A32 with the
             // process page table and 32-bit fastmem. rdynarmic uses the page
             // table to reject free/debug pages before falling back to memory

@@ -8,12 +8,17 @@
 use std::sync::{Arc, Mutex};
 
 use super::k_memory_block::{
-    KMemoryAttribute, KMemoryInfo, KMemoryPermission, KMemoryState, PAGE_SIZE,
+    convert_to_k_memory_permission, KMemoryAttribute, KMemoryInfo, KMemoryPermission, KMemoryState,
+    SvcMemoryPermission, PAGE_SIZE,
 };
 use super::k_page_table_base::KPageTableBase;
 use super::k_resource_limit::KResourceLimit;
 use super::k_typed_address::{KPhysicalAddress, KProcessAddress};
 use crate::memory::memory::Memory;
+
+fn svc_perm_to_k_memory_permission(perm: u32) -> KMemoryPermission {
+    convert_to_k_memory_permission(SvcMemoryPermission::from_bits_truncate(perm as u8))
+}
 
 /// The process page table.
 /// Matches upstream `KProcessPageTable` (k_process_page_table.h).
@@ -157,7 +162,7 @@ impl KProcessPageTable {
         self.base.set_memory_permission(
             addr.get() as usize,
             size,
-            KMemoryPermission::from_bits_truncate(perm as u8),
+            svc_perm_to_k_memory_permission(perm),
         )
     }
 
@@ -814,5 +819,32 @@ impl KProcessPageTable {
 impl Default for KProcessPageTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_memory_permission_converts_svc_permission_bits() {
+        assert_eq!(
+            svc_perm_to_k_memory_permission(
+                crate::hle::kernel::svc::svc_types::MemoryPermission::Read as u32
+            ),
+            KMemoryPermission::USER_READ
+        );
+        assert_eq!(
+            svc_perm_to_k_memory_permission(
+                crate::hle::kernel::svc::svc_types::MemoryPermission::ReadWrite as u32
+            ),
+            KMemoryPermission::USER_READ_WRITE
+        );
+        assert_eq!(
+            svc_perm_to_k_memory_permission(
+                crate::hle::kernel::svc::svc_types::MemoryPermission::None as u32
+            ),
+            KMemoryPermission::KERNEL_READ | KMemoryPermission::NOT_MAPPED
+        );
     }
 }

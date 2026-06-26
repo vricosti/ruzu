@@ -2079,12 +2079,15 @@ pub struct ArmDynarmic64 {
     /// The rdynarmic A64 JIT instance
     jit: Option<rdynarmic::A64Jit>,
 
-    /// TPIDRRO_EL0 system register value (stored here since callbacks
-    /// are moved into the JIT and we need to track it externally)
-    tpidrro_el0: u64,
+    /// TPIDRRO_EL0 system register storage.
+    /// Upstream stores this in `DynarmicCallbacks64::m_tpidrro_el0` and gives
+    /// Dynarmic a stable pointer to it through `config.tpidrro_el0`.
+    tpidrro_el0: Box<u64>,
 
-    /// TPIDR_EL0 system register value
-    tpidr_el0: u64,
+    /// TPIDR_EL0 system register storage.
+    /// Upstream stores this in `DynarmicCallbacks64::m_tpidr_el0` and gives
+    /// Dynarmic a stable pointer to it through `config.tpidr_el0`.
+    tpidr_el0: Box<u64>,
 
     /// Last exception address reported by dynarmic for the current halt.
     last_exception_address: Arc<AtomicU64>,
@@ -2189,12 +2192,21 @@ impl ArmDynarmic64 {
                 OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
             };
 
+        let tpidrro_el0 = Box::new(0u64);
+        let mut tpidr_el0 = Box::new(0u64);
+        let tpidrro_el0_ptr = (&*tpidrro_el0) as *const u64;
+        let tpidr_el0_ptr = (&mut *tpidr_el0) as *mut u64;
+
         // Configure JIT
         // Upstream: enable_cycle_counting = !uses_wall_clock
         let config = JitConfig {
             callbacks: Box::new(callbacks),
             enable_cycle_counting: !uses_wall_clock,
-            code_cache_size: 512 * 1024 * 1024, // 512 MiB on x86_64 (upstream default)
+            code_cache_size: if cfg!(target_arch = "aarch64") {
+                128 * 1024 * 1024
+            } else {
+                512 * 1024 * 1024
+            },
             optimizations,
             unsafe_optimizations: false,
             global_monitor: if exclusive_monitor.is_null() {
@@ -2207,6 +2219,8 @@ impl ArmDynarmic64 {
             define_unpredictable_behaviour: true,
             processor_id: core_index as usize,
             wall_clock_cntpct: uses_wall_clock,
+            tpidrro_el0: Some(tpidrro_el0_ptr),
+            tpidr_el0: Some(tpidr_el0_ptr),
             // Memory emit options matching upstream zuyu's
             // `ArmDynarmic64::MakeJit` setup
             // (zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp:225-248).
@@ -2259,8 +2273,8 @@ impl ArmDynarmic64 {
             halted_watchpoint: None,
             breakpoint_context,
             jit,
-            tpidrro_el0: 0,
-            tpidr_el0: 0,
+            tpidrro_el0,
+            tpidr_el0,
             last_exception_address,
         }
     }
@@ -2424,15 +2438,12 @@ impl ArmInterface for ArmDynarmic64 {
 
         jit.set_fpcr(ctx.fpcr);
         jit.set_fpsr(ctx.fpsr);
+        *self.tpidr_el0 = ctx.tpidr;
         jit.set_tpidr_el0(ctx.tpidr);
     }
 
     fn set_tpidrro_el0(&mut self, value: u64) {
-        // Upstream: m_cb->m_tpidrro_el0 = value, but the callback's value is
-        // read by the JIT through the JitState's tpidrro_el0 field — so we
-        // must propagate to the JIT. Without this, MRS x, tpidrro_el0 returns
-        // zero (libnx's TLS code reads at offset 0x1E0 from null and panics).
-        self.tpidrro_el0 = value;
+        *self.tpidrro_el0 = value;
         if let Some(jit) = self.jit.as_mut() {
             jit.set_tpidrro_el0(value);
         }
@@ -2442,7 +2453,7 @@ impl ArmInterface for ArmDynarmic64 {
         self.jit
             .as_ref()
             .map(|jit| jit.get_tpidrro_el0())
-            .unwrap_or(self.tpidrro_el0)
+            .unwrap_or(*self.tpidrro_el0)
     }
 
     fn get_svc_arguments(&self, args: &mut [u64; 8]) {
