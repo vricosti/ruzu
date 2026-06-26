@@ -60,6 +60,92 @@ fn trace_npad_update(
     );
 }
 
+fn update_fullkey_entry(
+    npad: &mut NpadInternalState,
+    aruid: u64,
+    entry_index: usize,
+    controller_type: NpadStyleIndex,
+    is_connected: bool,
+    button_state: NpadButtonState,
+    trace_update: bool,
+    trace_index: u64,
+) -> bool {
+    if controller_type == NpadStyleIndex::None || !is_connected {
+        return false;
+    }
+
+    // Mirror upstream `NPad::InitNewlyAddedController` for the
+    // Pro Controller (Fullkey) case (npad.cpp:202-215). These
+    // fields are connect-time state upstream, not per-poll state.
+    if !matches!(
+        controller_type,
+        NpadStyleIndex::Fullkey
+            | NpadStyleIndex::NES
+            | NpadStyleIndex::SNES
+            | NpadStyleIndex::N64
+            | NpadStyleIndex::SegaGenesis
+    ) {
+        return false;
+    }
+    if !npad.style_tag.raw.contains(NpadStyleSet::FULLKEY) {
+        npad.style_tag.raw |= NpadStyleSet::FULLKEY;
+        // device_type.fullkey = bit 0 (upstream `BitField<0,1,s32> fullkey`).
+        npad.device_type.raw |= 1 << 0;
+        // system_properties bits 11 (is_vertical), 13 (use_plus), 14 (use_minus).
+        npad.system_properties.raw |= (1 << 11) | (1 << 13) | (1 << 14);
+        npad.fullkey_color.attribute = ColorAttribute::Ok;
+        npad.applet_footer_type = AppletFooterUiType::SwitchProController;
+        npad.sixaxis_fullkey_properties.set_is_newly_assigned(true);
+    }
+
+    // Build a Pro Controller / Fullkey `NPadGenericState`:
+    //   connection_status.raw bits: is_connected (0) | is_wired (1) = 0x3.
+    // Sampling number monotonically increases (upstream:
+    //   `npad->fullkey_lifo.ReadCurrentEntry().state.sampling_number + 1`).
+    let prev_sampling = npad.fullkey_lifo.read_current_entry().state.sampling_number;
+    let mut pad_state = NPadGenericState::default();
+    pad_state.connection_status.raw = 0x3;
+    pad_state.npad_buttons = button_state;
+    pad_state.sampling_number = prev_sampling + 1;
+    if trace_npad_state_env_enabled() && !pad_state.npad_buttons.raw.is_empty() {
+        log::info!(
+            "[NPAD_STATE] aruid=0x{:X} entry={} buttons=0x{:X} sampling={}",
+            aruid,
+            entry_index,
+            pad_state.npad_buttons.raw.bits(),
+            pad_state.sampling_number
+        );
+    }
+    if trace_update && trace_index % 600 == 0 {
+        trace_npad_update(
+            aruid,
+            entry_index,
+            pad_state.npad_buttons.raw.bits(),
+            pad_state.sampling_number,
+            npad.style_tag.raw.bits(),
+            npad.sixaxis_fullkey_properties.raw as u32,
+        );
+    }
+    npad.fullkey_lifo.write_next_entry(pad_state);
+
+    // Mirror the libnx-state write: upstream also updates
+    // `system_ext_lifo` with the `NpadCommonState` so libnx clients
+    // (which don't activate any specific style) still see a connected
+    // controller via that LIFO.
+    let prev_ext = npad
+        .system_ext_lifo
+        .read_current_entry()
+        .state
+        .sampling_number;
+    let mut libnx_state = NPadGenericState::default();
+    libnx_state.connection_status.raw = 0x3;
+    libnx_state.npad_buttons = pad_state.npad_buttons;
+    libnx_state.sampling_number = prev_ext + 1;
+    npad.system_ext_lifo.write_next_entry(libnx_state);
+
+    !pad_state.npad_buttons.raw.is_empty()
+}
+
 /// Main NPad controller resource
 pub struct NPad {
     hid_core: Option<Arc<parking_lot::Mutex<HIDCore>>>,
@@ -287,121 +373,48 @@ impl NPad {
                 continue;
             };
 
-            let controller_states: Vec<_> = if let Some(hid_core) = self.hid_core.as_ref() {
-                let hid_core = hid_core.lock();
-                (0..AVAILABLE_CONTROLLERS)
-                    .map(|entry_index| {
-                        let controller = hid_core.get_emulated_controller_by_index(entry_index);
-                        (
-                            entry_index,
-                            controller.get_npad_id_type(),
-                            controller.get_npad_style_index(false),
-                            controller.is_connected(),
-                            {
-                                let mut buttons = controller.get_npad_buttons();
-                                buttons.raw |= get_simple_npad_button_state().raw;
-                                buttons
-                            },
-                        )
-                    })
-                    .collect()
-            } else {
-                vec![(
-                    0,
-                    NpadIdType::Player1,
-                    NpadStyleIndex::Fullkey,
-                    true,
-                    get_simple_npad_button_state(),
-                )]
-            };
-
             // Mirror upstream's controller_data[aruid_index][i] loop. ruzu still
             // lacks the per-aruid controller_data storage, but the runtime path
             // now consumes HIDCore's EmulatedController state instead of inventing
             // a local Player1 controller.
-            for (entry_index, npad_id, controller_type, is_connected, button_state) in
-                controller_states
-            {
-                let npad = &mut shared.npad.npad_entry[entry_index].internal_state;
-
-                if controller_type == NpadStyleIndex::None || !is_connected {
-                    continue;
-                }
-
-                // Mirror upstream `NPad::InitNewlyAddedController` for the
-                // Pro Controller (Fullkey) case (npad.cpp:202-215). These
-                // fields are connect-time state upstream, not per-poll state.
-                if !matches!(
-                    controller_type,
-                    NpadStyleIndex::Fullkey
-                        | NpadStyleIndex::NES
-                        | NpadStyleIndex::SNES
-                        | NpadStyleIndex::N64
-                        | NpadStyleIndex::SegaGenesis
-                ) {
-                    continue;
-                }
-                if !npad.style_tag.raw.contains(NpadStyleSet::FULLKEY) {
-                    npad.style_tag.raw |= NpadStyleSet::FULLKEY;
-                    // device_type.fullkey = bit 0 (upstream `BitField<0,1,s32> fullkey`).
-                    npad.device_type.raw |= 1 << 0;
-                    // system_properties bits 11 (is_vertical), 13 (use_plus), 14 (use_minus).
-                    npad.system_properties.raw |= (1 << 11) | (1 << 13) | (1 << 14);
-                    npad.fullkey_color.attribute = ColorAttribute::Ok;
-                    npad.applet_footer_type = AppletFooterUiType::SwitchProController;
-                    npad.sixaxis_fullkey_properties.set_is_newly_assigned(true);
-                }
-
-                // Build a Pro Controller / Fullkey `NPadGenericState`:
-                //   connection_status.raw bits: is_connected (0) | is_wired (1) = 0x3.
-                // Sampling number monotonically increases (upstream:
-                //   `npad->fullkey_lifo.ReadCurrentEntry().state.sampling_number + 1`).
-                let prev_sampling = npad.fullkey_lifo.read_current_entry().state.sampling_number;
-                let mut pad_state = NPadGenericState::default();
-                pad_state.connection_status.raw = 0x3;
-                pad_state.npad_buttons = button_state;
-                pad_state.sampling_number = prev_sampling + 1;
-                if trace_npad_state_env_enabled() && !pad_state.npad_buttons.raw.is_empty() {
-                    log::info!(
-                        "[NPAD_STATE] aruid=0x{:X} entry={} buttons=0x{:X} sampling={}",
+            if let Some(hid_core) = self.hid_core.as_ref() {
+                let mut hid_core = hid_core.lock();
+                for entry_index in 0..AVAILABLE_CONTROLLERS {
+                    let (npad_id, controller_type, is_connected, mut button_state) = {
+                        let controller = hid_core.get_emulated_controller_by_index(entry_index);
+                        (
+                            controller.get_npad_id_type(),
+                            controller.get_npad_style_index(false),
+                            controller.is_connected(),
+                            controller.get_npad_buttons(),
+                        )
+                    };
+                    button_state.raw |= get_simple_npad_button_state().raw;
+                    let had_input = update_fullkey_entry(
+                        &mut shared.npad.npad_entry[entry_index].internal_state,
                         aruid,
                         entry_index,
-                        pad_state.npad_buttons.raw.bits(),
-                        pad_state.sampling_number
+                        controller_type,
+                        is_connected,
+                        button_state,
+                        trace_update,
+                        trace_index,
                     );
-                }
-                if trace_update && trace_index % 600 == 0 {
-                    trace_npad_update(
-                        aruid,
-                        entry_index,
-                        pad_state.npad_buttons.raw.bits(),
-                        pad_state.sampling_number,
-                        npad.style_tag.raw.bits(),
-                        npad.sixaxis_fullkey_properties.raw as u32,
-                    );
-                }
-                npad.fullkey_lifo.write_next_entry(pad_state);
-
-                // Mirror the libnx-state write: upstream also updates
-                // `system_ext_lifo` with the `NpadCommonState` so libnx clients
-                // (which don't activate any specific style) still see a connected
-                // controller via that LIFO.
-                let prev_ext = npad
-                    .system_ext_lifo
-                    .read_current_entry()
-                    .state
-                    .sampling_number;
-                let mut libnx_state = NPadGenericState::default();
-                libnx_state.connection_status.raw = 0x3;
-                libnx_state.npad_buttons = pad_state.npad_buttons;
-                libnx_state.sampling_number = prev_ext + 1;
-                npad.system_ext_lifo.write_next_entry(libnx_state);
-
-                if !pad_state.npad_buttons.raw.is_empty() {
-                    if let Some(hid_core) = self.hid_core.as_ref() {
-                        hid_core.lock().set_last_active_controller(npad_id);
+                    if had_input {
+                        hid_core.set_last_active_controller(npad_id);
                     }
                 }
+            } else {
+                update_fullkey_entry(
+                    &mut shared.npad.npad_entry[0].internal_state,
+                    aruid,
+                    0,
+                    NpadStyleIndex::Fullkey,
+                    true,
+                    get_simple_npad_button_state(),
+                    trace_update,
+                    trace_index,
+                );
             }
         }
     }

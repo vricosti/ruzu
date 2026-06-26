@@ -16365,3 +16365,26 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo check -p video_core` passes with existing workspace warnings.
 - `git diff --check` passes.
 - MK8D macOS/AArch64 release run `/tmp/ruzu_mk8d_macro_after.log` exits via timeout code 124 without default info `Maxwell3D::call_macro_method` or `Maxwell3D::process_macro_bind` lines.
+
+## 2026-06-26 — hid_core/src/resources/npad/npad.rs vs hid_core/resources/npad/npad.cpp
+
+### Intentional differences
+- `NPad::on_update`: Rust still lacks upstream's full `controller_data[aruid_index]` array, but the active update path now mirrors upstream's direct per-controller iteration instead of allocating a temporary `Vec` snapshot on every HID tick.
+- `update_fullkey_entry` is a private Rust helper in the same upstream-owned file. It exists only to keep the direct loop readable while preserving the current simplified Fullkey-only write path.
+
+### Unintentional differences (to fix)
+- `NPad::on_update`: Rust still needs full upstream `controller_data` ownership, `controller.is_active`, `RequestPadStateUpdate`, and style-specific LIFO writes for Handheld/Joycon/SystemExt/Palma beyond the current Fullkey path.
+
+### Missing items
+- Full upstream controller-data storage and style-specific update flow.
+
+### Binary layout verification
+- PASS for this slice: no shared-memory struct layouts changed; the same `NPadGenericState` and `system_ext_lifo` payload writes are executed without the previous temporary allocation.
+
+### Verification
+- Re-read upstream `hid_core/resources/npad/npad.cpp` around `NPad::OnUpdate`.
+- Re-read local `hid_core/src/resources/npad/npad.rs` around `NPad::on_update` and `update_fullkey_entry`.
+- `cargo fmt -p hid_core --check` passes.
+- `cargo check -p hid_core` passes with existing workspace warnings.
+- `git diff --check` passes.
+- MK8D macOS/AArch64 release run `/tmp/ruzu_mk8d_npad_after.log` exits via timeout code 124 without filtered panic/fatal lines and reaches the same HID/ACC/FS/time/am progression as before the direct-loop change.
