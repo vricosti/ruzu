@@ -841,7 +841,12 @@ fn main() {
         EmuWindow::Null(w) => w.raw_window() as usize,
     };
     let vulkan_window_info = match &emu_window {
-        EmuWindow::Vk(w) => Some((w.window_info().clone(), w.drawable_size(), w.shown_state())),
+        EmuWindow::Vk(w) => Some((
+            w.window_info().clone(),
+            w.drawable_size(),
+            w.shown_state(),
+            w.framebuffer_layout(),
+        )),
         _ => None,
     };
     let renderer_backend_str = renderer_backend.to_string();
@@ -972,7 +977,7 @@ fn main() {
                     Box::new(renderer)
                 }
                 "vulkan" => {
-                    let Some((window_info, drawable_size, shown_state)) =
+                    let Some((window_info, drawable_size, shown_state, framebuffer_layout)) =
                         vulkan_window_info.as_ref()
                     else {
                         log::error!("Vulkan renderer selected without Vulkan window info");
@@ -1005,6 +1010,7 @@ fn main() {
                             window_info,
                             *drawable_size,
                             Arc::clone(shown_state),
+                            Arc::clone(framebuffer_layout),
                             frame_displayed_notify,
                             frame_end_notify,
                             syncpoints.clone(),

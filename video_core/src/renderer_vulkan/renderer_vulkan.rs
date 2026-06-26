@@ -7,7 +7,7 @@
 //! blit screens, rasterizer, and optional turbo mode.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use ash::vk;
 
@@ -196,6 +196,8 @@ pub struct RendererVulkan {
     device_memory: Arc<MaxwellDeviceMemoryManager>,
     /// Frontend visibility state used for upstream `render_window.IsShown()`.
     window_shown: Arc<AtomicBool>,
+    /// Frontend framebuffer layout used for upstream `render_window.GetFramebufferLayout()`.
+    framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
     /// Callback for upstream `render_window.OnFrameDisplayed()`.
     frame_displayed_notify: Arc<dyn Fn() + Send + Sync>,
     /// Callback for upstream `gpu.RendererFrameEndNotify()`.
@@ -245,6 +247,7 @@ impl RendererVulkan {
         window_info: &ruzu_core::frontend::emu_window::WindowSystemInfo,
         drawable_size: (u32, u32),
         window_shown: Arc<AtomicBool>,
+        framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
         frame_displayed_notify: Arc<dyn Fn() + Send + Sync>,
         frame_end_notify: Arc<dyn Fn() + Send + Sync>,
         syncpoints: Arc<SyncpointManager>,
@@ -360,6 +363,7 @@ impl RendererVulkan {
             memory_allocator,
             device_memory,
             window_shown,
+            framebuffer_layout,
             frame_displayed_notify,
             frame_end_notify,
             device,
@@ -395,22 +399,45 @@ impl RendererVulkan {
     /// 8. Notify GPU of frame end
     /// 9. Tick rasterizer frame
     pub fn composite_impl(&mut self, framebuffers: &[FramebufferConfig]) {
+        let trace_present = std::env::var_os("RUZU_TRACE_PRESENT").is_some();
+        if trace_present {
+            log::info!(
+                "[PRESENT] RendererVulkan::Composite enter layers={} current_frame={} shown={}",
+                framebuffers.len(),
+                self.base_data.current_frame,
+                self.window_shown.load(Ordering::Relaxed)
+            );
+        }
         let _frame_displayed = FrameDisplayedNotifyGuard::new(&self.frame_displayed_notify);
         if framebuffers.is_empty() {
+            if trace_present {
+                log::info!("[PRESENT] RendererVulkan::Composite skip empty layers");
+            }
             return;
         }
         self.render_applet_capture_layer(framebuffers);
         if !should_present_window(&self.window_shown) {
+            if trace_present {
+                log::info!("[PRESENT] RendererVulkan::Composite skip hidden window");
+            }
             return;
         }
         self.render_screenshot(framebuffers);
 
         let frame_index = self.present_manager.get_render_frame_index();
         let swapchain_extent = self.swapchain.get_extent();
-        let layout = ruzu_core::frontend::framebuffer_layout::default_frame_layout(
-            swapchain_extent.width.max(1),
-            swapchain_extent.height.max(1),
-        );
+        let layout = self.framebuffer_layout.read().unwrap().clone();
+        if trace_present {
+            log::info!(
+                "[PRESENT] RendererVulkan::Composite draw frame_index={} swapchain={}x{} layout={}x{} image_count={}",
+                frame_index,
+                swapchain_extent.width,
+                swapchain_extent.height,
+                layout.width,
+                layout.height,
+                self.swapchain.get_image_count()
+            );
+        }
         self.blit_swapchain.draw_to_present_frame(
             &mut self.rasterizer,
             &mut self.scheduler,
@@ -426,6 +453,12 @@ impl RendererVulkan {
 
         let render_ready = self.present_manager.frame(frame_index).render_ready;
         self.scheduler.flush_with_signal(render_ready);
+        if trace_present {
+            log::info!(
+                "[PRESENT] RendererVulkan::Composite flushed frame_index={}",
+                frame_index
+            );
+        }
         self.present_manager.present(
             frame_index,
             &mut self.swapchain,
@@ -435,6 +468,13 @@ impl RendererVulkan {
 
         (self.frame_end_notify)();
         self.rasterizer.tick_frame();
+        if trace_present {
+            log::info!(
+                "[PRESENT] RendererVulkan::Composite exit frame_index={} current_frame={}",
+                frame_index,
+                self.base_data.current_frame
+            );
+        }
     }
 
     /// Port of `RendererVulkan::GetAppletCaptureBuffer`.

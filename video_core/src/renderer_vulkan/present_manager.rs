@@ -250,6 +250,9 @@ impl PresentManager {
         let index = {
             let mut free = self.free_queue.lock().unwrap();
             while free.is_empty() {
+                if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+                    log::info!("[PRESENT] PresentManager::GetRenderFrame waiting for free frame");
+                }
                 free = self.free_cv.wait(free).unwrap();
             }
             free.pop_front().unwrap()
@@ -266,6 +269,15 @@ impl PresentManager {
                     .reset_fences(&[frame.present_done])
                     .expect("Failed to reset present_done fence");
             }
+        }
+
+        if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+            log::info!(
+                "[PRESENT] PresentManager::GetRenderFrame index={} size={}x{}",
+                index,
+                frame.width,
+                frame.height
+            );
         }
 
         index
@@ -308,9 +320,26 @@ impl PresentManager {
         swapchain: &mut Swapchain,
         graphics_queue: vk::Queue,
     ) {
+        let trace_present = std::env::var_os("RUZU_TRACE_PRESENT").is_some();
+        if trace_present {
+            let frame = &self.frames[frame_index];
+            log::info!(
+                "[PRESENT] PresentManager::Present frame_index={} size={}x{} threaded={}",
+                frame_index,
+                frame.width,
+                frame.height,
+                self.use_present_thread
+            );
+        }
         if !self.use_present_thread {
             self.copy_to_swapchain(frame_index, swapchain, graphics_queue);
             self.release_frame(frame_index);
+            if trace_present {
+                log::info!(
+                    "[PRESENT] PresentManager::Present direct complete frame_index={}",
+                    frame_index
+                );
+            }
             return;
         }
 
@@ -326,17 +355,35 @@ impl PresentManager {
         swapchain: &mut Swapchain,
         graphics_queue: vk::Queue,
     ) {
+        let trace_present = std::env::var_os("RUZU_TRACE_PRESENT").is_some();
         let frame_width = self.frames[frame_index].width;
         let frame_height = self.frames[frame_index].height;
         let needs_recreation = swapchain.needs_recreation()
             || swapchain.get_width() != frame_width
             || swapchain.get_height() != frame_height;
+        if trace_present {
+            log::info!(
+                "[PRESENT] PresentManager::CopyToSwapchain frame_index={} frame={}x{} swapchain={}x{} needs_recreation={}",
+                frame_index,
+                frame_width,
+                frame_height,
+                swapchain.get_width(),
+                swapchain.get_height(),
+                needs_recreation
+            );
+        }
         if needs_recreation && !self.recreate_swapchain(frame_index, swapchain) {
             return;
         }
 
         let mut recreate_attempts = 0;
         while swapchain.acquire_next_image() {
+            if trace_present {
+                log::info!(
+                    "[PRESENT] PresentManager::CopyToSwapchain acquire requested recreation attempt={}",
+                    recreate_attempts + 1
+                );
+            }
             if !self.recreate_swapchain(frame_index, swapchain) {
                 return;
             }
@@ -360,6 +407,14 @@ impl PresentManager {
             graphics_queue,
         );
         swapchain.present(render_semaphore);
+        if trace_present {
+            log::info!(
+                "[PRESENT] PresentManager::CopyToSwapchain presented frame_index={} image_index={} frame_slot={}",
+                frame_index,
+                swapchain.get_image_index(),
+                swapchain.get_frame_index()
+            );
+        }
     }
 
     /// Port-facing subset of `PresentManager::RecreateSwapchain`.
