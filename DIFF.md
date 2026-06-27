@@ -16291,3 +16291,102 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo test -p core queue_buffer_accepts_empty_default_crop -- --nocapture` passes.
 - `cargo build --release --bin ruzu-cmd` passes with existing warnings.
 - `RUST_LOG=info timeout 10s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/switch-homebrew-template/out/Hello_World.nro` reaches continuous `BQP_QUEUE`/`BQC_RELEASE` frame flow until timeout, with no `A64 ARM64 run failed`, `not ported`, `svcBreak`, or guest abort in the final log.
+
+## 2026-06-27 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+- Rust uses `emit_zero_extend_long_to_quad` plus an explicit `emit_arm64.rs` dispatch arm instead of upstream C++ `EmitIR<IR::Opcode::ZeroExtendLongToQuad>`.
+- Rust emits the same operation through local instruction encoding helper `fmov_d_from_x`; upstream emits `code.FMOV(Qresult->toD(), Xvalue)`.
+
+### Unintentional differences (to fix)
+- None for `ZeroExtendLongToQuad`; Rust now moves the 64-bit X source into the lower D lane of the Q result, matching upstream.
+
+### Missing items
+- Other unrelated ARM64 data-processing opcode gaps may remain outside this slice.
+
+### Binary layout verification
+- N/A: backend code emission only; no guest-visible raw struct layout changed.
+
+### Verification
+- Re-read upstream `emit_arm64_data_processing.cpp` around `EmitIR<IR::Opcode::ZeroExtendLongToQuad>`.
+- Re-read local `emit_arm64_data_processing.rs` and `emit_arm64.rs` dispatch.
+- `cargo test test_a64_zero_extend_long_to_quad_from_movi_d -- --nocapture` passes.
+
+## 2026-06-27 — externals/rdynarmic/src/frontend/a64/translate/simd_three_same.rs vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_three_same.cpp
+
+### Intentional differences
+- Rust decodes fields from `DecodedInst`; upstream receives decoded operands as typed parameters.
+
+### Unintentional differences (to fix)
+- None for `MUL_vec`. Rust now rejects `size == 0b11`, computes `esize = 8 << size`, reads `V(datasize, Vn/Vm)`, emits `VectorMultiply`, and writes `V(datasize, Vd)`, matching upstream.
+
+### Missing items
+- Other SIMD three-same operations not involved in this crash remain outside this slice.
+
+### Binary layout verification
+- N/A: translator IR generation only.
+
+### Verification
+- Re-read upstream `simd_three_same.cpp` around `TranslatorVisitor::MUL_vec`.
+- Re-read local `simd_three_same.rs` and `visitor.rs` dispatch.
+- `cargo test test_translate_mul_vec_emits_vector_multiply -- --nocapture` passes.
+
+## 2026-06-27 — externals/rdynarmic/src/frontend/a64/translate/load_store_register_immediate.rs vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/load_store_register_immediate.cpp
+
+### Intentional differences
+- Rust represents upstream `IR::MemOp` with a local `SimdMemOp` enum and uses explicit helper methods for memory reads/writes.
+
+### Unintentional differences (to fix)
+- None for `LoadStoreSIMD`. Rust now computes `scale = concat(opc_1, size)`, rejects `scale > 4`, stores sub-128-bit SIMD values via `VectorGetElement(datasize, GetQ(Vt), 0)`, and loads sub-128-bit values via zero-extension to Q, matching upstream.
+
+### Missing items
+- Broader parity audit for non-SIMD integer immediate load/store paths remains outside this slice.
+
+### Binary layout verification
+- N/A: translator IR generation only.
+
+### Verification
+- Re-read upstream `load_store_register_immediate.cpp` around `LoadStoreSIMD`, `STR_imm_fpsimd_*`, `LDR_imm_fpsimd_*`, `STUR_fpsimd`, and `LDUR_fpsimd`.
+- Re-read local `load_store_register_immediate.rs`.
+- `cargo test test_translate_str_imm_fpsimd_byte_extracts_lane_zero -- --nocapture` passes.
+
+## 2026-06-27 — externals/rdynarmic/src/frontend/a64/translate/visitor.rs vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.cpp
+
+### Intentional differences
+- Rust keeps a single `v_scalar_write` helper and makes it type-aware; upstream has separate `V(bitsize, Vec, U128)` and `V_scalar(bitsize, Vec, UAnyU128)` helpers.
+
+### Unintentional differences (to fix)
+- None for scalar vector writes. Rust now preserves existing `U128` writes through `SetS/SetD/SetQ`, but zero-extends scalar `U8/U16/U32/U64` values to Q for scalar writes, matching upstream `V_scalar`.
+
+### Missing items
+- Naming still differs from upstream helper split; a future cleanup could split Rust helpers into explicit `v_write` and `v_scalar_write` for clearer ownership parity.
+
+### Binary layout verification
+- N/A: translator helper only.
+
+### Verification
+- Re-read upstream `impl.cpp` around `TranslatorVisitor::V`, `V_scalar`, `Vpart`, and `Vpart_scalar`.
+- Re-read local `visitor.rs` vector read/write helpers.
+- `cargo test test_translate_ -- --nocapture` passes.
+
+## 2026-06-27 — externals/rdynarmic/src/backend/arm64/emit_arm64_a64_memory.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a64_memory.cpp
+
+### Intentional differences
+- Rust adds an explicit counterpart file and wrapper functions around the shared `emit_arm64_memory.rs` helpers; upstream uses C++ `EmitIR<Opcode>` template specializations.
+
+### Unintentional differences (to fix)
+- None for `A64ClearExclusive`. Rust now emits `STR WZR, [Xstate + offset_of(A64JitState::exclusive_state)]`, matching upstream.
+- Rust A64 memory dispatch now routes through the A64-owned wrapper file instead of direct generic helper calls, improving file ownership parity.
+
+### Missing items
+- Other `emit_arm64_a64_memory.cpp` specializations are wrapper-routed but not exhaustively retested in this slice.
+
+### Binary layout verification
+- PASS: `A64JitState::exclusive_state` offset is already covered by existing layout tests; the new emitter uses `offset_of!(A64JitState, exclusive_state)`.
+
+### Verification
+- Re-read upstream `emit_arm64_a64_memory.cpp` around `A64ClearExclusive` and memory specialization ownership.
+- Re-read local `emit_arm64_a64_memory.rs`, `emit_arm64.rs`, and `mod.rs`.
+- `cargo test clear_exclusive_stores_wzr_to_a64_exclusive_state -- --nocapture` passes.
+- `cargo build --release --bin ruzu-cmd` passes with existing warnings.
+- `RUST_LOG=info timeout 10s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/nx-hbmenu-release/extracted/hbmenu.nro` reaches `OpenLayer` and continuous `BQP_QUEUE`/`BQC_RELEASE` frame flow until timeout, with no panic, `A64 ARM64 run failed`, or `not ported` in the filtered log.
