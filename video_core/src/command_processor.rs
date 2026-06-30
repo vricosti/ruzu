@@ -136,7 +136,12 @@ impl CommandProcessor {
     /// Process a list of GPFIFO entries by reading pushbuffer data from memory.
     ///
     /// `read_mem` reads bytes from a GPU virtual address into a buffer.
-    pub fn process_entries(&mut self, entries: &[GpEntry], read_mem: &dyn Fn(u64, &mut [u8])) {
+    pub fn process_entries(
+        &mut self,
+        entries: &[GpEntry],
+        read_mem: &dyn Fn(u64, &mut [u8]),
+    ) -> Vec<PendingWrite> {
+        let mut pending = Vec::new();
         for entry in entries {
             let addr = entry.address();
             let len = entry.length() as usize;
@@ -155,12 +160,18 @@ impl CommandProcessor {
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
 
-            self.process_pushbuffer(&words);
+            pending.extend(self.process_pushbuffer(&words, read_mem));
         }
+        pending
     }
 
     /// Process a pushbuffer (sequence of compressed method headers + data words).
-    fn process_pushbuffer(&mut self, data: &[u32]) {
+    fn process_pushbuffer(
+        &mut self,
+        data: &[u32],
+        read_gpu: &dyn Fn(u64, &mut [u8]),
+    ) -> Vec<PendingWrite> {
+        let mut pending = Vec::new();
         let mut pos = 0;
 
         while pos < data.len() {
@@ -179,6 +190,7 @@ impl CommandProcessor {
                             break;
                         }
                         self.dispatch(subchannel, method + i as u32, data[pos]);
+                        pending.extend(self.execute_pending_ops(read_gpu));
                         pos += 1;
                     }
                 }
@@ -189,6 +201,7 @@ impl CommandProcessor {
                             break;
                         }
                         self.dispatch(subchannel, method, data[pos]);
+                        pending.extend(self.execute_pending_ops(read_gpu));
                         pos += 1;
                     }
                 }
@@ -199,6 +212,7 @@ impl CommandProcessor {
                             break;
                         }
                         self.dispatch(subchannel, method, data[pos]);
+                        pending.extend(self.execute_pending_ops(read_gpu));
                         pos += 1;
                         if i == 0 {
                             method += 1;
@@ -208,6 +222,7 @@ impl CommandProcessor {
                 SecOp::ImmdDataMethod => {
                     // Immediate data is embedded in the header.
                     self.dispatch(subchannel, method, header.immd_data());
+                    pending.extend(self.execute_pending_ops(read_gpu));
                 }
                 SecOp::EndPbSegment => {
                     // End of this pushbuffer segment.
@@ -224,6 +239,7 @@ impl CommandProcessor {
                 }
             }
         }
+        pending
     }
 
     /// Collect framebuffer output from all engines after processing.
@@ -344,7 +360,8 @@ mod tests {
         let header = (1u32 << 29) | (2 << 16) | (0 << 13) | 0x10;
         let data = vec![header, 0xAAAA, 0xBBBB];
 
-        proc.process_pushbuffer(&data);
+        let writes = proc.process_pushbuffer(&data, &|_, _| {});
+        assert!(writes.is_empty());
 
         let engine = unsafe { &*engine_ptr };
         assert_eq!(engine.writes.len(), 2);
@@ -362,7 +379,8 @@ mod tests {
         let header = (3u32 << 29) | (3 << 16) | (0 << 13) | 0x20;
         let data = vec![header, 0x11, 0x22, 0x33];
 
-        proc.process_pushbuffer(&data);
+        let writes = proc.process_pushbuffer(&data, &|_, _| {});
+        assert!(writes.is_empty());
 
         let engine = unsafe { &*engine_ptr };
         assert_eq!(engine.writes.len(), 3);
@@ -382,7 +400,8 @@ mod tests {
         let header = (4u32 << 29) | (0x42 << 16) | (0 << 13) | 0x30;
         let data = vec![header];
 
-        proc.process_pushbuffer(&data);
+        let writes = proc.process_pushbuffer(&data, &|_, _| {});
+        assert!(writes.is_empty());
 
         let engine = unsafe { &*engine_ptr };
         assert_eq!(engine.writes.len(), 1);
@@ -399,7 +418,8 @@ mod tests {
         let header = (5u32 << 29) | (3 << 16) | (0 << 13) | 0x50;
         let data = vec![header, 0xAA, 0xBB, 0xCC];
 
-        proc.process_pushbuffer(&data);
+        let writes = proc.process_pushbuffer(&data, &|_, _| {});
+        assert!(writes.is_empty());
 
         let engine = unsafe { &*engine_ptr };
         assert_eq!(engine.writes.len(), 3);
@@ -432,7 +452,8 @@ mod tests {
             buf[..len].copy_from_slice(&mem_data[..len]);
         };
 
-        proc.process_entries(&[entry], &read_mem);
+        let writes = proc.process_entries(&[entry], &read_mem);
+        assert!(writes.is_empty());
 
         let engine = unsafe { &*engine_ptr };
         assert_eq!(engine.writes.len(), 1);

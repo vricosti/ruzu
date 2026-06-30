@@ -673,6 +673,29 @@ mod tests {
     }
 
     #[test]
+    fn unknown_revision_uses_upstream_default_mask() {
+        let mut resource = NPadResource::new();
+        assert!(resource
+            .register_applet_resource_user_id(ARUID)
+            .is_success());
+        assert!(resource
+            .set_supported_npad_style_set(ARUID, NpadStyleSet::ALL)
+            .is_success());
+
+        resource.set_npad_revision(ARUID, NpadRevision::from_raw(5));
+        assert_eq!(
+            resource.get_masked_supported_npad_style_set(ARUID).unwrap(),
+            NpadStyleSet::FULLKEY
+                | NpadStyleSet::HANDHELD
+                | NpadStyleSet::JOY_DUAL
+                | NpadStyleSet::JOY_LEFT
+                | NpadStyleSet::JOY_RIGHT
+                | NpadStyleSet::SYSTEM_EXT
+                | NpadStyleSet::SYSTEM
+        );
+    }
+
+    #[test]
     fn available_styleset_matches_masked_revision_path() {
         let mut resource = NPadResource::new();
         assert!(resource

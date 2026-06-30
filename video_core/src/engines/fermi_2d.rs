@@ -1537,7 +1537,88 @@ impl Fermi2D {
         if self.clip_enable() != 0 {
             log::warn!("Fermi2D: clipped blit enabled");
         }
-        self.pending_blit = true;
+        self.execute_blit();
+    }
+
+    fn execute_blit(&mut self) {
+        self.pending_blit = false;
+        let (src_surface, dst_surface, blit_config) = self.prepare_blit();
+        self.memory_manager.lock().flush_caching();
+
+        let trace_blit = std::env::var_os("RUZU_TRACE_FERMI2D_BLIT").is_some();
+        if trace_blit {
+            log::info!(
+                "[FERMI2D_BLIT] src=0x{:X} {}x{} pitch={} fmt={:?} layout={:?} dst=0x{:X} {}x{} pitch={} fmt={:?} layout={:?} rect dst=({},{})->({},{}) src=({},{})->({},{}) must_accel={}",
+                src_surface.address(),
+                src_surface.width,
+                src_surface.height,
+                src_surface.pitch,
+                src_surface.format,
+                src_surface.linear,
+                dst_surface.address(),
+                dst_surface.width,
+                dst_surface.height,
+                dst_surface.pitch,
+                dst_surface.format,
+                dst_surface.linear,
+                blit_config.dst_x0,
+                blit_config.dst_y0,
+                blit_config.dst_x1,
+                blit_config.dst_y1,
+                blit_config.src_x0,
+                blit_config.src_y0,
+                blit_config.src_x1,
+                blit_config.src_y1,
+                blit_config.must_accelerate,
+            );
+        }
+
+        if let Some(rasterizer_handle) = self.rasterizer {
+            let rasterizer = unsafe { rasterizer_handle.as_mut() };
+            if rasterizer.accelerate_surface_copy(&src_surface, &dst_surface, &blit_config) {
+                if trace_blit {
+                    log::info!("[FERMI2D_BLIT] accelerated=true");
+                }
+                return;
+            }
+        }
+
+        self.sw_blitter
+            .blit(&src_surface, &dst_surface, &blit_config);
+
+        if trace_blit {
+            let bytes_per_pixel = surface::bytes_per_block(
+                surface::pixel_format_from_render_target_format(dst_surface.format as u32),
+            ) as usize;
+            let row_bytes = if dst_surface.pitch != 0 {
+                dst_surface.pitch as usize
+            } else {
+                dst_surface.width as usize * bytes_per_pixel
+            };
+            let sample_size = row_bytes
+                .saturating_mul(dst_surface.height.max(1) as usize)
+                .min(4096);
+            let mut sample = vec![0u8; sample_size];
+            let nonzero = if sample_size != 0 {
+                self.memory_manager
+                    .lock()
+                    .read_block(dst_surface.address(), &mut sample);
+                sample.iter().filter(|&&byte| byte != 0).count()
+            } else {
+                0
+            };
+            let first_words: Vec<u32> = sample
+                .chunks_exact(4)
+                .take(4)
+                .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            log::info!(
+                "[FERMI2D_BLIT] accelerated=false sample_size={} nonzero={} first={:08X?}",
+                sample_size,
+                nonzero,
+                first_words,
+            );
+        }
     }
 }
 
@@ -1610,20 +1691,7 @@ impl Engine for Fermi2D {
         if !self.pending_blit {
             return vec![];
         }
-        self.pending_blit = false;
-
-        let (src_surface, dst_surface, blit_config) = self.prepare_blit();
-        self.memory_manager.lock().flush_caching();
-
-        if let Some(rasterizer_handle) = self.rasterizer {
-            let rasterizer = unsafe { rasterizer_handle.as_mut() };
-            if rasterizer.accelerate_surface_copy(&src_surface, &dst_surface, &blit_config) {
-                return vec![];
-            }
-        }
-
-        self.sw_blitter
-            .blit(&src_surface, &dst_surface, &blit_config);
+        self.execute_blit();
         vec![]
     }
 }
@@ -2267,7 +2335,7 @@ mod tests {
     }
 
     #[test]
-    fn test_blit_trigger_sets_pending() {
+    fn test_blit_trigger_executes_immediately() {
         let mut eng = Fermi2D::default();
         assert!(!eng.pending_blit);
 
@@ -2287,16 +2355,16 @@ mod tests {
 
         // Trigger blit
         eng.write_reg(BLIT_TRIGGER, 1);
-        assert!(eng.pending_blit);
+        assert!(!eng.pending_blit);
     }
 
     #[test]
-    fn test_call_method_blit_trigger_sets_pending() {
+    fn test_call_method_blit_trigger_executes_immediately() {
         let mut eng = Fermi2D::default();
         assert!(!eng.pending_blit);
 
         eng.call_method(BLIT_TRIGGER, 1, true);
-        assert!(eng.pending_blit);
+        assert!(!eng.pending_blit);
     }
 
     #[test]
@@ -2355,8 +2423,7 @@ mod tests {
         eng.write_reg(DST_PITCH, 16);
 
         eng.write_reg(BLIT_TRIGGER, 1);
-        let writes = eng.execute_pending(&|_, _| panic!("software fallback should not run"));
-        assert!(writes.is_empty());
+        assert!(!eng.pending_blit);
     }
 
     #[test]
@@ -2392,10 +2459,6 @@ mod tests {
         eng.write_reg(PIXELS_FROM_MEMORY_SRC_X0_HIGH, 0);
         eng.write_reg(PIXELS_FROM_MEMORY_SRC_Y0_LOW, 0);
 
-        // Trigger blit.
-        eng.write_reg(BLIT_TRIGGER, 0);
-        assert!(eng.pending_blit);
-
         // Source data: 2 rows of 16 bytes each.
         let src_data: Vec<u8> = (0..32).collect();
         let mut backing = vec![0u8; 0x5000];
@@ -2407,10 +2470,9 @@ mod tests {
             mm.map(0x2000, 0x4000, src_data.len() as u64, 0xFF, false);
         }
 
-        let pending = eng.execute_pending(&|_, _| panic!("legacy read_gpu path should be unused"));
+        eng.write_reg(BLIT_TRIGGER, 0);
 
         assert!(!eng.pending_blit);
-        assert!(pending.is_empty());
         assert_eq!(&backing[0x4000..0x4000 + src_data.len()], &src_data);
     }
 
@@ -2448,8 +2510,6 @@ mod tests {
         eng.write_reg(PIXELS_FROM_MEMORY_SRC_X0_HIGH, 0);
         eng.write_reg(PIXELS_FROM_MEMORY_SRC_Y0_LOW, 0);
 
-        eng.write_reg(BLIT_TRIGGER, 0);
-
         // Source: 2 rows * 8 bytes = 16 bytes.
         let src_data: Vec<u8> = vec![
             1, 2, 3, 4, 5, 6, 7, 8, // row 0
@@ -2464,9 +2524,8 @@ mod tests {
             mm.map(0x2000, 0x4000, 32, 0xFF, false);
         }
 
-        let pending = eng.execute_pending(&|_, _| panic!("legacy read_gpu path should be unused"));
-
-        assert!(pending.is_empty());
+        eng.write_reg(BLIT_TRIGGER, 0);
+        assert!(!eng.pending_blit);
 
         // copy_width = min(8, 16) = 8; each row copies 8 bytes into a 16-byte stride.
         let dst = &backing[0x4000..0x4000 + 32];

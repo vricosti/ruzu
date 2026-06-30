@@ -159,7 +159,7 @@ impl PageTable {
         }
 
         // Populate the results
-        entry.phys_addr = phys_addr + next_offset;
+        entry.phys_addr = phys_addr.wrapping_add(next_offset);
 
         Some(entry)
     }

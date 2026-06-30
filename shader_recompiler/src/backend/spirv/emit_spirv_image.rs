@@ -114,6 +114,7 @@ pub fn emit_image_gradient(
 
 // ── IR-instruction dispatching helpers (called from spirv_emit_context) ───
 
+use crate::ir::types::TextureInstInfo;
 use crate::ir::{self, Opcode};
 use rspirv::dr::Operand;
 use rspirv::spirv;
@@ -125,16 +126,11 @@ pub fn emit_image_sample(
     block_idx: u32,
     inst_idx: u32,
 ) {
-    let desc_idx = inst.arg(0).imm_u32();
-    let coord_x = ctx.resolve_value(inst.arg(1));
-    let coord_y = ctx.resolve_value(inst.arg(2));
+    let info = TextureInstInfo::from_u32(inst.flags);
+    let desc_idx = info.descriptor_index as u32;
+    let coord = ctx.resolve_value(inst.arg(1));
 
     if let Some(&tex_var) = ctx.texture_vars.get(&desc_idx) {
-        let coord = ctx
-            .builder
-            .composite_construct(ctx.f32_vec2_type, None, vec![coord_x, coord_y])
-            .unwrap();
-
         let image_type = {
             let img = ctx.builder.type_image(
                 ctx.f32_type,
@@ -154,7 +150,7 @@ pub fn emit_image_sample(
             .unwrap();
 
         let id = if inst.opcode == Opcode::ImageSampleExplicitLod && inst.args.len() > 3 {
-            let lod = ctx.resolve_value(inst.arg(3));
+            let lod = ctx.resolve_value(inst.arg(2));
             ctx.builder
                 .image_sample_explicit_lod(
                     ctx.f32_vec4_type,
@@ -196,16 +192,11 @@ pub fn emit_image_fetch_inst(
     block_idx: u32,
     inst_idx: u32,
 ) {
-    let desc_idx = inst.arg(0).imm_u32();
-    let coord_x = ctx.resolve_value(inst.arg(1));
-    let coord_y = ctx.resolve_value(inst.arg(2));
+    let info = TextureInstInfo::from_u32(inst.flags);
+    let desc_idx = info.descriptor_index as u32;
+    let coord = ctx.resolve_value(inst.arg(1));
 
     if let Some(&tex_var) = ctx.texture_vars.get(&desc_idx) {
-        let coord = ctx
-            .builder
-            .composite_construct(ctx.u32_vec2_type, None, vec![coord_x, coord_y])
-            .unwrap();
-
         let sampled_img_type = {
             let img = ctx.builder.type_image(
                 ctx.f32_type,

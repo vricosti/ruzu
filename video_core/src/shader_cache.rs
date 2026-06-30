@@ -26,7 +26,7 @@ pub type VAddr = u64;
 
 const YUZU_PAGEBITS: u64 = 14;
 const YUZU_PAGESIZE: u64 = 1 << YUZU_PAGEBITS;
-const NUM_PROGRAMS: usize = 6;
+pub const NUM_PROGRAMS: usize = 6;
 const SHADER_INSTRUCTION_SIZE: u32 = 8;
 
 static REFRESH_STAGES_LAST_STAGE: AtomicU64 = AtomicU64::new(0);
@@ -806,11 +806,24 @@ impl ShaderCache {
             stack: Vec::new(),
         }];
         let mut visited = HashSet::new();
+        let trace = std::env::var_os("RUZU_TRACE_SHADER_ANALYZE").is_some();
+        let mut steps = 0usize;
 
         while let Some(mut state) = pending.pop() {
             loop {
                 if !visited.insert(state.clone()) {
                     break;
+                }
+                steps += 1;
+                if trace && steps.is_power_of_two() {
+                    eprintln!(
+                        "[SHADER_ANALYZE] slow_walk_progress steps={} visited={} pending={} pc=0x{:X} stack_depth={}",
+                        steps,
+                        visited.len(),
+                        pending.len(),
+                        state.pc,
+                        state.stack.len(),
+                    );
                 }
 
                 let pc = state.pc;
@@ -977,6 +990,14 @@ impl ShaderCache {
                     }
                 }
             }
+        }
+        if trace {
+            eprintln!(
+                "[SHADER_ANALYZE] slow_walk_done steps={} visited={} read_size=0x{:X}",
+                steps,
+                visited.len(),
+                env.read_size_bytes(),
+            );
         }
     }
 

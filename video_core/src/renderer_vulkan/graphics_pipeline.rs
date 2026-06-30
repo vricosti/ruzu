@@ -9,21 +9,72 @@
 
 use ash::vk;
 use log::{debug, warn};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
-use crate::engines::maxwell_3d::{DrawCall, ShaderStageType};
+use crate::engines::maxwell_3d::{
+    DrawCall, ShaderStageType, VertexAttribSize, VertexAttribType,
+};
 use crate::shader;
-use shader_recompiler::{CompiledShader, PipelineCache, RuntimeInfo, ShaderStage};
+use crate::shader_cache::{GraphicsEnvironments, NUM_PROGRAMS};
+use shader_recompiler::backend::bindings::Bindings;
+use shader_recompiler::host_translate_info::HostTranslateInfo;
+use shader_recompiler::{CompiledShader, PipelineCache, Profile, RuntimeInfo, ShaderStage};
 
+use super::descriptor_pool::DescriptorBankInfo;
 use super::fixed_pipeline_state::FixedPipelineState;
+use super::maxwell_to_vk;
+
+#[derive(Debug, Clone, Copy)]
+pub struct GraphicsDescriptorBinding {
+    pub binding: u32,
+    pub descriptor_type: vk::DescriptorType,
+    pub descriptor_count: u32,
+    pub stage_flags: vk::ShaderStageFlags,
+    pub uniform_stage: Option<u32>,
+    pub uniform_index: Option<u32>,
+    pub texture: Option<GraphicsTextureBinding>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GraphicsTextureBinding {
+    pub graphics_stage: u32,
+    pub cbuf_index: u32,
+    pub cbuf_offset: u32,
+    pub shift_left: u32,
+    pub has_secondary: bool,
+    pub secondary_cbuf_index: u32,
+    pub secondary_cbuf_offset: u32,
+    pub secondary_shift_left: u32,
+    pub size_shift: u32,
+}
+
+type DescriptorBindingRecord = (
+    vk::DescriptorType,
+    u32,
+    vk::ShaderStageFlags,
+    Option<u32>,
+    Option<u32>,
+    Option<GraphicsTextureBinding>,
+);
 
 /// Cache key for graphics pipeline lookup.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GraphicsPipelineKey {
-    /// Shader hashes: [VS, FS] (expand for GS/TCS/TES later).
-    pub shader_hashes: [u64; 2],
+    /// Upstream shader unique hashes, indexed by Maxwell shader program slot.
+    pub unique_hashes: [u64; NUM_PROGRAMS],
     /// Fixed (non-dynamic) pipeline state.
     pub fixed_state: FixedPipelineState,
+}
+
+impl Default for GraphicsPipelineKey {
+    fn default() -> Self {
+        Self {
+            unique_hashes: [0; NUM_PROGRAMS],
+            fixed_state: FixedPipelineState::default(),
+        }
+    }
 }
 
 /// A compiled Vulkan graphics pipeline.
@@ -34,6 +85,8 @@ pub struct GraphicsPipeline {
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
+    pub descriptor_bindings: Vec<GraphicsDescriptorBinding>,
+    pub descriptor_bank_info: DescriptorBankInfo,
     pub vs_module: vk::ShaderModule,
     pub fs_module: vk::ShaderModule,
     is_built: AtomicBool,
@@ -84,13 +137,17 @@ impl GraphicsPipeline {
 pub struct GraphicsPipelineCache {
     device: ash::Device,
     shader_cache: PipelineCache,
+    profile: Profile,
+    host_info: HostTranslateInfo,
 }
 
 impl GraphicsPipelineCache {
-    pub fn new(device: ash::Device, shader_cache: PipelineCache) -> Self {
+    pub fn new(device: ash::Device, shader_cache: PipelineCache, profile: Profile) -> Self {
         Self {
             device,
             shader_cache,
+            profile,
+            host_info: HostTranslateInfo::default(),
         }
     }
 
@@ -113,10 +170,29 @@ impl GraphicsPipelineCache {
             .unwrap_or(0);
 
         let key = GraphicsPipelineKey {
-            shader_hashes: [vs_hash, fs_hash],
+            unique_hashes: [0, vs_hash, 0, 0, 0, fs_hash],
             fixed_state: fixed_state.clone(),
         };
         Some((key, fixed_state))
+    }
+
+    /// Build the current graphics pipeline key from the shared shader-cache
+    /// hashes. This matches upstream's `PipelineCache::RefreshStages` owner
+    /// boundary more closely than the legacy direct GPU read fallback.
+    pub fn make_key_from_unique_hashes(
+        &mut self,
+        draw: &DrawCall,
+        unique_hashes: [u64; NUM_PROGRAMS],
+    ) -> (GraphicsPipelineKey, FixedPipelineState) {
+        let mut fixed_state = FixedPipelineState::default();
+        fixed_state.refresh(draw);
+        (
+            GraphicsPipelineKey {
+                unique_hashes,
+                fixed_state: fixed_state.clone(),
+            },
+            fixed_state,
+        )
     }
 
     /// Build a graphics pipeline for the given draw/key pair.
@@ -129,7 +205,7 @@ impl GraphicsPipelineCache {
         render_pass: vk::RenderPass,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         key: &GraphicsPipelineKey,
-        _fixed_state: &FixedPipelineState,
+        fixed_state: &FixedPipelineState,
     ) -> Option<GraphicsPipeline> {
         let vs_compiled = self.compile_vertex_shader(draw, read_gpu)?;
         let fs_compiled = self.compile_fragment_shader(draw, read_gpu);
@@ -144,18 +220,20 @@ impl GraphicsPipelineCache {
         };
 
         // Create pipeline layout and pipeline
-        let (pipeline_layout, descriptor_set_layout) = self.create_pipeline_layout()?;
+        let descriptor_layout = self.create_pipeline_layout(&vs_compiled, fs_compiled.as_ref())?;
         let pipeline = self.create_graphics_pipeline(
             vs_module,
             fs_module,
-            pipeline_layout,
+            descriptor_layout.pipeline_layout,
             render_pass,
             draw,
+            fixed_state,
+            &vs_compiled,
         )?;
 
         debug!(
             "GraphicsPipelineCache: compiled new pipeline (vs_hash=0x{:016X}, fs_hash=0x{:016X})",
-            key.shader_hashes[0], key.shader_hashes[1]
+            key.unique_hashes[1], key.unique_hashes[5]
         );
 
         Some(GraphicsPipeline {
@@ -163,12 +241,146 @@ impl GraphicsPipelineCache {
             key: key.clone(),
             transition_keys: Vec::new(),
             pipeline,
-            pipeline_layout,
-            descriptor_set_layout,
+            pipeline_layout: descriptor_layout.pipeline_layout,
+            descriptor_set_layout: descriptor_layout.descriptor_set_layout,
+            descriptor_bindings: descriptor_layout.bindings,
+            descriptor_bank_info: descriptor_layout.bank_info,
             vs_module,
             fs_module,
             is_built: AtomicBool::new(true),
         })
+    }
+
+    /// Build a Vulkan graphics pipeline from shared shader environments.
+    pub fn build_pipeline_keyed_from_environments(
+        &mut self,
+        draw: &DrawCall,
+        render_pass: vk::RenderPass,
+        environments: &mut GraphicsEnvironments,
+        key: &GraphicsPipelineKey,
+        fixed_state: &FixedPipelineState,
+    ) -> Option<GraphicsPipeline> {
+        let mut bindings = Bindings::default();
+        let vertex_stage = if environment_has_stage(environments, 1) {
+            1
+        } else if environment_has_stage(environments, 0) {
+            0
+        } else {
+            return None;
+        };
+        let vs_compiled =
+            self.compile_stage_from_environment(environments, vertex_stage, &mut bindings)?;
+        let fs_compiled = if environment_has_stage(environments, 5) {
+            self.compile_stage_from_environment(environments, 5, &mut bindings)
+        } else {
+            None
+        };
+
+        let vs_module = self.create_shader_module(&vs_compiled.spirv_words)?;
+        let fs_module = if let Some(ref fs) = fs_compiled {
+            self.create_shader_module(&fs.spirv_words)?
+        } else {
+            self.create_shader_module(&vs_compiled.spirv_words)?
+        };
+
+        let descriptor_layout = self.create_pipeline_layout(&vs_compiled, fs_compiled.as_ref())?;
+        let pipeline = self.create_graphics_pipeline(
+            vs_module,
+            fs_module,
+            descriptor_layout.pipeline_layout,
+            render_pass,
+            draw,
+            fixed_state,
+            &vs_compiled,
+        )?;
+
+        debug!(
+            "GraphicsPipelineCache: compiled env pipeline (vb_hash=0x{:016X}, fs_hash=0x{:016X})",
+            key.unique_hashes[1], key.unique_hashes[5]
+        );
+
+        Some(GraphicsPipeline {
+            device: self.device.clone(),
+            key: key.clone(),
+            transition_keys: Vec::new(),
+            pipeline,
+            pipeline_layout: descriptor_layout.pipeline_layout,
+            descriptor_set_layout: descriptor_layout.descriptor_set_layout,
+            descriptor_bindings: descriptor_layout.bindings,
+            descriptor_bank_info: descriptor_layout.bank_info,
+            vs_module,
+            fs_module,
+            is_built: AtomicBool::new(true),
+        })
+    }
+
+    fn compile_stage_from_environment(
+        &self,
+        environments: &mut GraphicsEnvironments,
+        stage_index: usize,
+        bindings: &mut Bindings,
+    ) -> Option<CompiledShader> {
+        if stage_index >= NUM_PROGRAMS {
+            return None;
+        }
+        if !environment_has_stage(environments, stage_index) {
+            return None;
+        }
+        let env = &mut environments.envs[stage_index];
+        let trace = std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some();
+        let start = Instant::now();
+        if env.generic_environment().cached_code_slice().is_empty()
+            && (!env.generic_environment().has_runtime_gpu_memory_owner()
+                || env.generic_environment_mut().analyze().is_none())
+        {
+            if trace {
+                eprintln!(
+                    "[VK_SHADER_ENV_COMPILE] stage_index={} analyze_failed elapsed_ms={}",
+                    stage_index,
+                    start.elapsed().as_millis(),
+                );
+            }
+            return None;
+        }
+        if trace {
+            eprintln!(
+                "[VK_SHADER_ENV_COMPILE] stage_index={} analyze_done elapsed_ms={} code_words={} instruction_start=0x{:X}",
+                stage_index,
+                start.elapsed().as_millis(),
+                env.generic_environment().cached_code_slice().len(),
+                env.generic_environment().cached_instruction_start(),
+            );
+        }
+        let code = env
+            .generic_environment()
+            .cached_instruction_slice()
+            .to_vec();
+        if code.is_empty() {
+            return None;
+        }
+        let base_offset = env.generic_environment().cached_instruction_start();
+        let runtime_info = RuntimeInfo::default();
+        let compile_start = Instant::now();
+        let compiled = shader_recompiler::compile_shader_from_env_with_bindings_and_host_info(
+            &code,
+            base_offset,
+            env,
+            &self.profile,
+            &runtime_info,
+            bindings,
+            &self.host_info,
+        );
+        if trace {
+            eprintln!(
+                "[VK_SHADER_ENV_COMPILE] stage_index={} compile_done elapsed_ms={} spirv_words={} cbufs={} textures={}",
+                stage_index,
+                compile_start.elapsed().as_millis(),
+                compiled.spirv_words.len(),
+                compiled.info.constant_buffer_descriptors.len(),
+                compiled.info.texture_descriptors.len(),
+            );
+        }
+        Some(compiled)
     }
 
     fn compile_vertex_shader(
@@ -233,9 +445,70 @@ impl GraphicsPipelineCache {
         }
     }
 
-    fn create_pipeline_layout(&self) -> Option<(vk::PipelineLayout, vk::DescriptorSetLayout)> {
-        // Create descriptor set layout (empty for now — will add UBO/sampler bindings)
-        let layout_info = vk::DescriptorSetLayoutCreateInfo::builder().build();
+    fn create_pipeline_layout(
+        &self,
+        vs: &CompiledShader,
+        fs: Option<&CompiledShader>,
+    ) -> Option<GraphicsDescriptorLayout> {
+        let mut bindings = BTreeMap::new();
+        let mut binding = 0u32;
+        add_shader_descriptor_bindings(
+            &mut bindings,
+            vs,
+            vk::ShaderStageFlags::VERTEX,
+            0,
+            &mut binding,
+        );
+        if let Some(fs) = fs {
+            add_shader_descriptor_bindings(
+                &mut bindings,
+                fs,
+                vk::ShaderStageFlags::FRAGMENT,
+                4,
+                &mut binding,
+            );
+        }
+        let descriptor_bindings: Vec<_> = bindings
+            .into_iter()
+            .map(
+                |(
+                    binding,
+                    (
+                        descriptor_type,
+                        descriptor_count,
+                        stage_flags,
+                        uniform_stage,
+                        uniform_index,
+                        texture,
+                    ),
+                )| {
+                    GraphicsDescriptorBinding {
+                        binding,
+                        descriptor_type,
+                        descriptor_count,
+                        stage_flags,
+                        uniform_stage,
+                        uniform_index,
+                        texture,
+                    }
+                },
+            )
+            .collect();
+        let bank_info = descriptor_bank_info(&descriptor_bindings);
+        let layout_bindings: Vec<_> = descriptor_bindings
+            .iter()
+            .map(|binding| {
+                vk::DescriptorSetLayoutBinding::builder()
+                    .binding(binding.binding)
+                    .descriptor_type(binding.descriptor_type)
+                    .descriptor_count(binding.descriptor_count)
+                    .stage_flags(binding.stage_flags)
+                    .build()
+            })
+            .collect();
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::builder()
+            .bindings(&layout_bindings)
+            .build();
         let desc_layout = unsafe {
             self.device
                 .create_descriptor_set_layout(&layout_info, None)
@@ -252,7 +525,12 @@ impl GraphicsPipelineCache {
                 .ok()?
         };
 
-        Some((pipeline_layout, desc_layout))
+        Some(GraphicsDescriptorLayout {
+            pipeline_layout,
+            descriptor_set_layout: desc_layout,
+            bindings: descriptor_bindings,
+            bank_info,
+        })
     }
 
     fn create_graphics_pipeline(
@@ -262,6 +540,8 @@ impl GraphicsPipelineCache {
         pipeline_layout: vk::PipelineLayout,
         render_pass: vk::RenderPass,
         draw: &DrawCall,
+        fixed_state: &FixedPipelineState,
+        vs: &CompiledShader,
     ) -> Option<vk::Pipeline> {
         let entry_name = std::ffi::CString::new("main").unwrap();
 
@@ -278,16 +558,24 @@ impl GraphicsPipelineCache {
                 .build(),
         ];
 
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
-
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
-            .topology(super::map_topology(draw.topology))
-            .primitive_restart_enable(false)
+        let (vertex_bindings, vertex_attributes) = build_vertex_input_state(draw, vs);
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder()
+            .vertex_binding_descriptions(&vertex_bindings)
+            .vertex_attribute_descriptions(&vertex_attributes)
             .build();
 
+        let input_assembly_topology = super::map_topology(draw.topology);
+        let primitive_restart_enable = fixed_state.dynamic_state.primitive_restart_enable()
+            && supports_primitive_restart(input_assembly_topology);
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
+            .topology(input_assembly_topology)
+            .primitive_restart_enable(primitive_restart_enable)
+            .build();
+
+        let num_viewports = crate::engines::maxwell_3d::NUM_VIEWPORTS as u32;
         let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
-            .viewport_count(1)
-            .scissor_count(1)
+            .viewport_count(num_viewports)
+            .scissor_count(num_viewports)
             .build();
 
         let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
@@ -374,6 +662,229 @@ impl GraphicsPipelineCache {
             }
         }
     }
+}
+
+fn environment_has_stage(environments: &GraphicsEnvironments, stage_index: usize) -> bool {
+    environments
+        .env_ptrs
+        .iter()
+        .flatten()
+        .any(|&index| index == stage_index)
+}
+
+/// Port of `SupportsPrimitiveRestart` in upstream `vk_graphics_pipeline.cpp`.
+fn supports_primitive_restart(topology: vk::PrimitiveTopology) -> bool {
+    !matches!(
+        topology,
+        vk::PrimitiveTopology::POINT_LIST
+            | vk::PrimitiveTopology::LINE_LIST
+            | vk::PrimitiveTopology::TRIANGLE_LIST
+            | vk::PrimitiveTopology::LINE_LIST_WITH_ADJACENCY
+            | vk::PrimitiveTopology::TRIANGLE_LIST_WITH_ADJACENCY
+            | vk::PrimitiveTopology::PATCH_LIST
+    )
+}
+
+fn add_shader_descriptor_bindings(
+    bindings: &mut BTreeMap<u32, DescriptorBindingRecord>,
+    shader: &CompiledShader,
+    stage: vk::ShaderStageFlags,
+    graphics_stage: u32,
+    binding: &mut u32,
+) {
+    for desc in &shader.info.constant_buffer_descriptors {
+        merge_descriptor_binding(
+            bindings,
+            *binding,
+            vk::DescriptorType::UNIFORM_BUFFER,
+            desc.count,
+            stage,
+            Some(graphics_stage),
+            Some(desc.index),
+            None,
+        );
+        *binding += 1;
+    }
+    for desc in &shader.info.texture_descriptors {
+        merge_descriptor_binding(
+            bindings,
+            *binding,
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            desc.count,
+            stage,
+            None,
+            None,
+            Some(GraphicsTextureBinding {
+                graphics_stage,
+                cbuf_index: desc.cbuf_index,
+                cbuf_offset: desc.cbuf_offset,
+                shift_left: desc.shift_left,
+                has_secondary: desc.has_secondary,
+                secondary_cbuf_index: desc.secondary_cbuf_index,
+                secondary_cbuf_offset: desc.secondary_cbuf_offset,
+                secondary_shift_left: desc.secondary_shift_left,
+                size_shift: desc.size_shift,
+            }),
+        );
+        *binding += 1;
+    }
+}
+
+fn merge_descriptor_binding(
+    bindings: &mut BTreeMap<u32, DescriptorBindingRecord>,
+    binding: u32,
+    descriptor_type: vk::DescriptorType,
+    descriptor_count: u32,
+    stage: vk::ShaderStageFlags,
+    uniform_stage: Option<u32>,
+    uniform_index: Option<u32>,
+    texture: Option<GraphicsTextureBinding>,
+) {
+    bindings
+        .entry(binding)
+        .and_modify(
+            |(
+                existing_type,
+                existing_count,
+                existing_stages,
+                existing_uniform_stage,
+                existing_uniform_index,
+                existing_texture,
+            )| {
+                if *existing_type != descriptor_type {
+                    warn!(
+                        "GraphicsPipelineCache: descriptor binding {} type conflict {:?} vs {:?}",
+                        binding, *existing_type, descriptor_type
+                    );
+                }
+                if *existing_count != descriptor_count {
+                    warn!(
+                        "GraphicsPipelineCache: descriptor binding {} count conflict {} vs {}",
+                        binding, *existing_count, descriptor_count
+                    );
+                    *existing_count = (*existing_count).max(descriptor_count);
+                }
+                *existing_stages |= stage;
+                if existing_uniform_stage.is_none() {
+                    *existing_uniform_stage = uniform_stage;
+                }
+                if existing_uniform_index.is_none() {
+                    *existing_uniform_index = uniform_index;
+                }
+                if existing_texture.is_none() {
+                    *existing_texture = texture;
+                }
+            },
+        )
+        .or_insert((
+            descriptor_type,
+            descriptor_count,
+            stage,
+            uniform_stage,
+            uniform_index,
+            texture,
+        ));
+}
+
+struct GraphicsDescriptorLayout {
+    pipeline_layout: vk::PipelineLayout,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    bindings: Vec<GraphicsDescriptorBinding>,
+    bank_info: DescriptorBankInfo,
+}
+
+fn descriptor_bank_info(bindings: &[GraphicsDescriptorBinding]) -> DescriptorBankInfo {
+    let mut info = DescriptorBankInfo::default();
+    for binding in bindings {
+        match binding.descriptor_type {
+            vk::DescriptorType::UNIFORM_BUFFER => info.uniform_buffers += binding.descriptor_count,
+            vk::DescriptorType::STORAGE_BUFFER => info.storage_buffers += binding.descriptor_count,
+            vk::DescriptorType::UNIFORM_TEXEL_BUFFER => {
+                info.texture_buffers += binding.descriptor_count
+            }
+            vk::DescriptorType::STORAGE_TEXEL_BUFFER => {
+                info.image_buffers += binding.descriptor_count
+            }
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER => info.textures += binding.descriptor_count,
+            vk::DescriptorType::STORAGE_IMAGE => info.images += binding.descriptor_count,
+            _ => {}
+        }
+        info.score += binding.descriptor_count as i32;
+    }
+    info
+}
+
+fn build_vertex_input_state(
+    draw: &DrawCall,
+    vs: &CompiledShader,
+) -> (
+    Vec<vk::VertexInputBindingDescription>,
+    Vec<vk::VertexInputAttributeDescription>,
+) {
+    let mut binding_descs = BTreeMap::<u32, vk::VertexInputBindingDescription>::new();
+    for stream in &draw.vertex_streams {
+        if !stream.enabled {
+            continue;
+        }
+        let input_rate = if stream.frequency != 0 {
+            vk::VertexInputRate::INSTANCE
+        } else {
+            vk::VertexInputRate::VERTEX
+        };
+        binding_descs.insert(
+            stream.index,
+            vk::VertexInputBindingDescription {
+                binding: stream.index,
+                stride: stream.stride,
+                input_rate,
+            },
+        );
+    }
+
+    let mut attributes = Vec::new();
+    for (location, attrib) in draw.vertex_attribs.iter().enumerate() {
+        if attrib.constant
+            || attrib.size == VertexAttribSize::Invalid
+            || attrib.attrib_type == VertexAttribType::Invalid
+            || !vs.info.loads.generic_any(location)
+        {
+            continue;
+        }
+        let format = maxwell_to_vk::vertex_format(false, attrib.attrib_type, attrib.size);
+        if format == vk::Format::UNDEFINED {
+            warn!(
+                "GraphicsPipelineCache: unsupported vertex format location={} type={:?} size={:?}",
+                location, attrib.attrib_type, attrib.size
+            );
+            continue;
+        }
+        if std::env::var_os("RUZU_TRACE_VK_VERTEX_INPUT").is_some() {
+            log::info!(
+                "[VK_VERTEX_INPUT] attr location={} binding={} offset={} type={:?} size={:?} format={:?}",
+                location,
+                attrib.buffer_index,
+                attrib.offset,
+                attrib.attrib_type,
+                attrib.size,
+                format
+            );
+        }
+        binding_descs.entry(attrib.buffer_index).or_insert_with(|| {
+            vk::VertexInputBindingDescription {
+                binding: attrib.buffer_index,
+                stride: attrib.size.size_bytes(),
+                input_rate: vk::VertexInputRate::VERTEX,
+            }
+        });
+        attributes.push(vk::VertexInputAttributeDescription {
+            location: location as u32,
+            binding: attrib.buffer_index,
+            format,
+            offset: attrib.offset,
+        });
+    }
+
+    (binding_descs.into_values().collect(), attributes)
 }
 
 fn hash_spirv(words: &[u32]) -> u64 {

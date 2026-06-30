@@ -291,6 +291,18 @@ impl GenericEnvironment {
         self
     }
 
+    /// Whether this environment can perform runtime GPU reads.
+    ///
+    /// Upstream stores a non-null `Tegra::MemoryManager*` in
+    /// `GenericEnvironment`. Rust default environments are possible before a
+    /// stage slot is populated, so callers must not ask them to analyze.
+    pub fn has_runtime_gpu_memory_owner(&self) -> bool {
+        let has_owner = self.gpu_memory.is_some();
+        #[cfg(test)]
+        let has_owner = has_owner || self.gpu_read.is_some();
+        has_owner
+    }
+
     /// Port of the upstream base-owner `StartAddress()` accessor.
     pub fn start_address(&self) -> u32 {
         self.start_address
@@ -339,10 +351,39 @@ impl GenericEnvironment {
     ///
     /// Port of upstream `GenericEnvironment::Analyze` (cpp:152).
     pub fn analyze(&mut self) -> Option<u64> {
-        let size = self.try_find_size()?;
+        let size = match self.try_find_size() {
+            Some(size) => size,
+            None => {
+                if std::env::var_os("RUZU_TRACE_SHADER_ANALYZE").is_some() {
+                    let first_words: Vec<String> = self
+                        .code
+                        .iter()
+                        .take(8)
+                        .map(|word| format!("{word:016X}"))
+                        .collect();
+                    eprintln!(
+                        "[SHADER_ANALYZE] try_find_size_failed program_base=0x{:X} start=0x{:X} cached_words={} first_words=[{}]",
+                        self.program_base,
+                        self.start_address,
+                        self.code.len(),
+                        first_words.join(","),
+                    );
+                }
+                return None;
+            }
+        };
         self.cached_lowest = self.start_address;
         self.cached_highest = self.start_address + size as u32;
         let bytes = self.code_bytes(size as usize);
+        if std::env::var_os("RUZU_TRACE_SHADER_ANALYZE").is_some() {
+            eprintln!(
+                "[SHADER_ANALYZE] try_find_size_ok program_base=0x{:X} start=0x{:X} size=0x{:X} cached_size=0x{:X}",
+                self.program_base,
+                self.start_address,
+                size,
+                self.cached_size_bytes(),
+            );
+        }
         Some(common::cityhash::city_hash64(bytes))
     }
 
@@ -754,6 +795,17 @@ impl GraphicsEnvironment {
             "GraphicsEnvironment::read_cbuf_value: disabled cbuf {} for stage {}",
             cbuf_index, self.stage_index
         );
+        if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
+            eprintln!(
+                "[SHADER_CBUF_READ] stage_index={} cbuf={} offset=0x{:X} addr=0x{:X} size=0x{:X} enabled={}",
+                self.stage_index,
+                cbuf_index,
+                cbuf_offset,
+                binding.address,
+                binding.size,
+                binding.enabled,
+            );
+        }
         let mut value = 0u32;
         if cbuf_offset < binding.size {
             value = self.base.read_u32(binding.address + cbuf_offset as u64);

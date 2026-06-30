@@ -35,6 +35,15 @@ pub fn emit_spirv(
     spirv::emit_spirv::emit_spirv(program, profile, runtime_info)
 }
 
+pub fn emit_spirv_with_bindings(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut bindings::Bindings,
+) -> Vec<u32> {
+    spirv::emit_spirv::emit_spirv_with_bindings(program, profile, runtime_info, bindings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,6 +11,7 @@ use rspirv::dr::{Builder, Operand};
 use rspirv::spirv;
 use std::collections::HashMap;
 
+use crate::backend::bindings::Bindings;
 use crate::ir;
 use crate::ir::types::ShaderStage;
 use crate::profile::Profile;
@@ -86,6 +87,12 @@ pub struct SpirvEmitContext {
     pub input_vars: HashMap<u32, spirv::Word>,
     /// Output variables (vertex outputs / fragment colors).
     pub output_vars: HashMap<u32, spirv::Word>,
+    /// Entry-point interface variables.
+    ///
+    /// Upstream keeps this list on `EmitContext` and appends variables as they
+    /// are defined. Do not reconstruct it later, because resources are part of
+    /// the interface for SPIR-V 1.4+.
+    pub interfaces: Vec<spirv::Word>,
 
     // ── Value mapping ─────────────────────────────────────────────────
     /// Maps IR instruction references (block, inst) to SPIR-V result IDs.
@@ -96,7 +103,10 @@ impl SpirvEmitContext {
     /// Create a new SPIR-V emission context.
     pub fn new(program: &ir::Program, profile: &Profile, runtime_info: &RuntimeInfo) -> Self {
         let mut builder = Builder::new();
-        builder.set_version(1, 5);
+        builder.set_version(
+            (profile.supported_spirv >> 16) as u8,
+            ((profile.supported_spirv >> 8) & 0xff) as u8,
+        );
         builder.capability(spirv::Capability::Shader);
 
         // Upstream gates Float16/Float64/Int* capabilities on
@@ -223,6 +233,7 @@ impl SpirvEmitContext {
             texture_vars: HashMap::new(),
             input_vars: HashMap::new(),
             output_vars: HashMap::new(),
+            interfaces: Vec::new(),
             values: HashMap::new(),
         }
     }
@@ -243,7 +254,7 @@ impl SpirvEmitContext {
     }
 
     /// Define global variables (inputs, outputs, UBOs, textures) from shader info.
-    pub fn define_global_variables(&mut self, program: &ir::Program) {
+    pub fn define_global_variables(&mut self, program: &ir::Program, bindings: &mut Bindings) {
         let info = &program.info;
 
         // Input variables — upstream reads `info.loads` VaryingState.
@@ -265,6 +276,7 @@ impl SpirvEmitContext {
                             vec![Operand::LiteralBit32(i)],
                         );
                         self.input_vars.insert(i, var);
+                        self.interfaces.push(var);
                     }
                 }
             }
@@ -291,6 +303,7 @@ impl SpirvEmitContext {
                         vec![Operand::BuiltIn(spirv::BuiltIn::Position)],
                     );
                     self.output_vars.insert(0xFFFF_0000, var);
+                    self.interfaces.push(var);
                 }
                 for i in 0..32u32 {
                     if info.stores.generic_any(i as usize) {
@@ -311,6 +324,7 @@ impl SpirvEmitContext {
                             vec![Operand::LiteralBit32(i)],
                         );
                         self.output_vars.insert(i, var);
+                        self.interfaces.push(var);
                     }
                 }
             }
@@ -329,12 +343,18 @@ impl SpirvEmitContext {
                     vec![Operand::LiteralBit32(0)],
                 );
                 self.output_vars.insert(0, var);
+                self.interfaces.push(var);
             }
             _ => {}
         }
 
         // Constant buffers (UBOs)
         for desc in &info.constant_buffer_descriptors {
+            let binding = if self.profile.unified_descriptor_binding {
+                &mut bindings.unified
+            } else {
+                &mut bindings.uniform_buffer
+            };
             let array_len = 4096u32; // 0x10000 bytes / 4 = 4096 u32s
             let array_len_const = self.builder.constant_bit32(self.u32_type, array_len);
             let array_type = self.builder.type_array(self.u32_type, array_len_const);
@@ -368,14 +388,25 @@ impl SpirvEmitContext {
             self.builder.decorate(
                 var,
                 spirv::Decoration::Binding,
-                vec![Operand::LiteralBit32(desc.index)],
+                vec![Operand::LiteralBit32(*binding)],
             );
 
-            self.cbuf_vars.insert(desc.index, var);
+            for i in 0..desc.count {
+                self.cbuf_vars.insert(desc.index + i, var);
+            }
+            if self.profile.supported_spirv >= 0x0001_0400 {
+                self.interfaces.push(var);
+            }
+            *binding += 1;
         }
 
         // Textures (combined image samplers)
-        for desc in &info.texture_descriptors {
+        for (descriptor_index, desc) in info.texture_descriptors.iter().enumerate() {
+            let binding = if self.profile.unified_descriptor_binding {
+                &mut bindings.unified
+            } else {
+                &mut bindings.texture
+            };
             let image_type = self.builder.type_image(
                 self.f32_type,
                 spirv::Dim::Dim2D,
@@ -398,15 +429,19 @@ impl SpirvEmitContext {
             self.builder.decorate(
                 var,
                 spirv::Decoration::DescriptorSet,
-                vec![Operand::LiteralBit32(1)],
+                vec![Operand::LiteralBit32(0)],
             );
             self.builder.decorate(
                 var,
                 spirv::Decoration::Binding,
-                vec![Operand::LiteralBit32(desc.cbuf_index)],
+                vec![Operand::LiteralBit32(*binding)],
             );
 
-            self.texture_vars.insert(desc.cbuf_index, var);
+            self.texture_vars.insert(descriptor_index as u32, var);
+            if self.profile.supported_spirv >= 0x0001_0400 {
+                self.interfaces.push(var);
+            }
+            *binding += 1;
         }
 
         // System value input variables
@@ -423,6 +458,7 @@ impl SpirvEmitContext {
                 vec![Operand::BuiltIn(spirv::BuiltIn::WorkgroupId)],
             );
             self.workgroup_id = var;
+            self.interfaces.push(var);
         }
         if info.uses_local_invocation_id {
             let ptr_type =
@@ -437,6 +473,7 @@ impl SpirvEmitContext {
                 vec![Operand::BuiltIn(spirv::BuiltIn::LocalInvocationId)],
             );
             self.local_invocation_id = var;
+            self.interfaces.push(var);
         }
         if info.uses_invocation_id {
             let ptr_type =
@@ -451,6 +488,7 @@ impl SpirvEmitContext {
                 vec![Operand::BuiltIn(spirv::BuiltIn::InvocationId)],
             );
             self.invocation_id = var;
+            self.interfaces.push(var);
         }
         if info.uses_invocation_info
             && (self.stage == ShaderStage::TessellationControl
@@ -468,6 +506,7 @@ impl SpirvEmitContext {
                 vec![Operand::BuiltIn(spirv::BuiltIn::PatchVertices)],
             );
             self.patch_vertices_in = var;
+            self.interfaces.push(var);
         }
         if info.uses_sample_id {
             let ptr_type =
@@ -482,6 +521,7 @@ impl SpirvEmitContext {
                 vec![Operand::BuiltIn(spirv::BuiltIn::SampleId)],
             );
             self.sample_id = var;
+            self.interfaces.push(var);
         }
         if info.uses_is_helper_invocation {
             let ptr_type =
@@ -496,33 +536,12 @@ impl SpirvEmitContext {
                 vec![Operand::BuiltIn(spirv::BuiltIn::HelperInvocation)],
             );
             self.is_helper_invocation = var;
+            self.interfaces.push(var);
         }
     }
 
     /// Define the main() function and emit IR instructions as SPIR-V.
     pub fn define_main_function(&mut self, program: &ir::Program) {
-        // Collect interface variables for the entry point
-        let mut interface: Vec<spirv::Word> = Vec::new();
-        for &var in self.input_vars.values() {
-            interface.push(var);
-        }
-        for &var in self.output_vars.values() {
-            interface.push(var);
-        }
-        // System value input variables
-        for &var in &[
-            self.workgroup_id,
-            self.local_invocation_id,
-            self.invocation_id,
-            self.patch_vertices_in,
-            self.sample_id,
-            self.is_helper_invocation,
-        ] {
-            if var != 0 {
-                interface.push(var);
-            }
-        }
-
         // Create main function
         let main_fn = self
             .builder
@@ -562,7 +581,7 @@ impl SpirvEmitContext {
         };
 
         self.builder
-            .entry_point(exec_model, main_fn, "main", interface);
+            .entry_point(exec_model, main_fn, "main", self.interfaces.clone());
 
         if self.stage == ShaderStage::Fragment {
             self.builder
@@ -1289,7 +1308,12 @@ impl SpirvEmitContext {
 
     /// Emit the complete program (entry point used by emit_spirv.rs).
     pub fn emit_program(&mut self, program: &ir::Program) {
-        self.define_global_variables(program);
+        let mut bindings = Bindings::default();
+        self.emit_program_with_bindings(program, &mut bindings);
+    }
+
+    pub fn emit_program_with_bindings(&mut self, program: &ir::Program, bindings: &mut Bindings) {
+        self.define_global_variables(program, bindings);
         self.define_main_function(program);
     }
 

@@ -1802,7 +1802,7 @@ impl IHidServer {
         let revision_raw = rp.pop_u32();
         let _padding = rp.pop_u32();
         let aruid = rp.pop_u64();
-        let revision: NpadRevision = unsafe { core::mem::transmute(revision_raw) };
+        let revision = NpadRevision::from_raw(revision_raw);
         log::debug!(
             "IHidServer::ActivateNpadWithRevision called, revision={:?}, aruid={}",
             revision,

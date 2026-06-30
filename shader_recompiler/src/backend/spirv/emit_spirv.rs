@@ -8,6 +8,7 @@
 //! push constant layouts.
 
 use super::spirv_emit_context::SpirvEmitContext;
+use crate::backend::bindings::Bindings;
 use crate::ir;
 use crate::runtime_info::RuntimeInfo;
 
@@ -72,7 +73,17 @@ pub fn emit_spirv(
     profile: &super::super::Profile,
     runtime_info: &RuntimeInfo,
 ) -> Vec<u32> {
+    let mut bindings = Bindings::default();
+    emit_spirv_with_bindings(program, profile, runtime_info, &mut bindings)
+}
+
+pub fn emit_spirv_with_bindings(
+    program: &ir::Program,
+    profile: &super::super::Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut Bindings,
+) -> Vec<u32> {
     let mut ctx = SpirvEmitContext::new(program, profile, runtime_info);
-    ctx.emit_program(program);
+    ctx.emit_program_with_bindings(program, bindings);
     ctx.finalize()
 }

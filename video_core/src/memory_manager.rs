@@ -1968,6 +1968,9 @@ impl MemoryManager {
 
     pub fn register_cbuf_write_watch(&self, stage: usize, slot: usize, gpu_addr: u64, size: u32) {
         register_cbuf_write_watch(stage, slot, gpu_addr, size);
+        if std::env::var_os("RUZU_TRACE_CBUF_WRITES").is_none() {
+            return;
+        }
         if let Some(device_addr) = self.gpu_to_cpu_address_range(gpu_addr, size as u64) {
             if let Some(backing) = self.device_memory.smmu_cpu_backing_for_address(device_addr) {
                 log::info!(

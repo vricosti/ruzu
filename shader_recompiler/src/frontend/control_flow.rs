@@ -8,7 +8,11 @@
 //!
 //! Ref: zuyu `frontend/maxwell/control_flow.cpp`
 
+use super::instruction::{Instruction, Predicate};
+use super::location::Location;
 use super::maxwell_opcodes::{self, MaxwellOpcode};
+use crate::environment::Environment;
+use crate::ir::flow_test::FlowTest;
 
 /// How a basic block ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +86,702 @@ enum StackKind {
     Ssy,
     Pbk,
     Pcnt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Token {
+    Ssy,
+    Pbk,
+    Pexit,
+    Pret,
+    Pcnt,
+    Plongjmp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlowStackEntry {
+    pub token: Token,
+    pub target: Location,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FlowStack {
+    entries: Vec<FlowStackEntry>,
+}
+
+impl FlowStack {
+    pub fn push(&mut self, token: Token, target: Location) {
+        self.entries.push(FlowStackEntry { token, target });
+    }
+
+    pub fn pop(&self, token: Token) -> Option<(Location, Self)> {
+        let pc = self.peek(token)?;
+        Some((pc, self.remove(token)))
+    }
+
+    pub fn peek(&self, token: Token) -> Option<Location> {
+        self.entries
+            .iter()
+            .rfind(|entry| entry.token == token)
+            .map(|entry| entry.target)
+    }
+
+    pub fn remove(&self, token: Token) -> Self {
+        let Some(pos) = self.entries.iter().rposition(|entry| entry.token == token) else {
+            return self.clone();
+        };
+        Self {
+            entries: self.entries[..pos].to_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IndirectBranch {
+    pub block: usize,
+    pub address: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlowBlock {
+    pub begin: Location,
+    pub end: Location,
+    pub end_class: EndClass,
+    pub cond: Condition,
+    pub stack: FlowStack,
+    pub branch_true: Option<usize>,
+    pub branch_false: Option<usize>,
+    pub function_call: usize,
+    pub return_block: Option<usize>,
+    pub branch_reg: u32,
+    pub branch_offset: i32,
+    pub indirect_branches: Vec<IndirectBranch>,
+}
+
+impl FlowBlock {
+    fn new(begin: Location) -> Self {
+        Self {
+            begin,
+            end: begin,
+            end_class: EndClass::Branch,
+            cond: Condition::always(),
+            stack: FlowStack::default(),
+            branch_true: None,
+            branch_false: None,
+            function_call: 0,
+            return_block: None,
+            branch_reg: 0,
+            branch_offset: 0,
+            indirect_branches: Vec::new(),
+        }
+    }
+
+    pub fn contains(&self, pc: Location) -> bool {
+        pc >= self.begin && pc < self.end
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FlowLabel {
+    pub address: Location,
+    pub block: usize,
+    pub stack: FlowStack,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlowFunction {
+    pub entrypoint: Location,
+    pub labels: Vec<FlowLabel>,
+    pub blocks: Vec<usize>,
+}
+
+impl FlowFunction {
+    fn new(blocks: &mut Vec<FlowBlock>, start_address: Location) -> Self {
+        let block = blocks.len();
+        blocks.push(FlowBlock::new(start_address));
+        Self {
+            entrypoint: start_address,
+            labels: vec![FlowLabel {
+                address: start_address,
+                block,
+                stack: FlowStack::default(),
+            }],
+            blocks: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalysisState {
+    Branch,
+    Continue,
+}
+
+/// Port of upstream `Shader::Maxwell::Flow::CFG`.
+pub struct FlowCfg {
+    pub functions: Vec<FlowFunction>,
+    pub blocks: Vec<FlowBlock>,
+    program_start: Location,
+    exits_to_dispatcher: bool,
+    dispatch_block: Option<usize>,
+}
+
+impl FlowCfg {
+    pub fn new(
+        env: &mut dyn Environment,
+        start_address: Location,
+        exits_to_dispatcher: bool,
+    ) -> Self {
+        let mut cfg = Self {
+            functions: Vec::new(),
+            blocks: Vec::new(),
+            program_start: start_address,
+            exits_to_dispatcher,
+            dispatch_block: None,
+        };
+        if exits_to_dispatcher {
+            let dispatch = cfg.blocks.len();
+            let mut block = FlowBlock::new(Location::default());
+            block.end_class = EndClass::Exit;
+            cfg.blocks.push(block);
+            cfg.dispatch_block = Some(dispatch);
+        }
+        cfg.functions
+            .push(FlowFunction::new(&mut cfg.blocks, start_address));
+        let mut function_id = 0;
+        while function_id < cfg.functions.len() {
+            while let Some(mut label) = cfg.functions[function_id].labels.pop() {
+                cfg.analyze_label(env, function_id, &mut label);
+            }
+            function_id += 1;
+        }
+        if let Some(dispatch) = cfg.dispatch_block {
+            if let Some(&last) = cfg.functions[0].blocks.last() {
+                let end = cfg.blocks[last].end.next();
+                cfg.blocks[dispatch].begin = end;
+                cfg.blocks[dispatch].end = end;
+                cfg.insert_block_sorted(0, dispatch);
+            }
+        }
+        cfg
+    }
+
+    fn analyze_label(
+        &mut self,
+        env: &mut dyn Environment,
+        function_id: usize,
+        label: &mut FlowLabel,
+    ) {
+        if self.inspect_visited_blocks(function_id, label) {
+            return;
+        }
+        let mut pc = label.address;
+        let next = self.next_block_after(function_id, pc);
+        let block = label.block;
+        self.blocks[block].stack = label.stack.clone();
+        let mut is_branch = false;
+        while next.is_none_or(|next_block| pc < self.blocks[next_block].begin) {
+            is_branch = self.analyze_inst(env, block, function_id, pc) == AnalysisState::Branch;
+            if is_branch {
+                break;
+            }
+            pc.step();
+        }
+        if !is_branch {
+            self.blocks[block].end = pc;
+            self.blocks[block].cond = Condition::always();
+            self.blocks[block].branch_true = next;
+            self.blocks[block].branch_false = None;
+        }
+        self.insert_block_sorted(function_id, block);
+    }
+
+    fn inspect_visited_blocks(&mut self, function_id: usize, label: &FlowLabel) -> bool {
+        let pc = label.address;
+        let containing = self.functions[function_id]
+            .blocks
+            .iter()
+            .copied()
+            .find(|&block| self.blocks[block].contains(pc));
+        let Some(visited) = containing else {
+            return false;
+        };
+        if self.blocks[visited].begin == pc {
+            return true;
+        }
+        self.split_block(function_id, visited, label.block, pc);
+        true
+    }
+
+    fn analyze_inst(
+        &mut self,
+        env: &mut dyn Environment,
+        block: usize,
+        function_id: usize,
+        pc: Location,
+    ) -> AnalysisState {
+        let inst = Instruction::new(env.read_instruction(pc.offset()));
+        let Some(opcode) = maxwell_opcodes::decode_opcode(inst.raw) else {
+            return AnalysisState::Continue;
+        };
+        match opcode {
+            MaxwellOpcode::BRA | MaxwellOpcode::JMP | MaxwellOpcode::RET | MaxwellOpcode::PRET => {
+                if !self.analyze_branch(block, function_id, pc, inst, opcode) {
+                    return AnalysisState::Continue;
+                }
+                match opcode {
+                    MaxwellOpcode::BRA | MaxwellOpcode::JMP => {
+                        self.analyze_bra(block, function_id, pc, inst, is_absolute_jump(opcode));
+                    }
+                    MaxwellOpcode::RET | MaxwellOpcode::PRET => {
+                        self.blocks[block].end_class = EndClass::Return;
+                    }
+                    _ => {}
+                }
+                self.blocks[block].end = pc;
+                AnalysisState::Branch
+            }
+            MaxwellOpcode::BRK
+            | MaxwellOpcode::CONT
+            | MaxwellOpcode::LONGJMP
+            | MaxwellOpcode::SYNC => {
+                if !self.analyze_branch(block, function_id, pc, inst, opcode) {
+                    return AnalysisState::Continue;
+                }
+                if let Some((stack_pc, new_stack)) =
+                    self.blocks[block].stack.pop(opcode_token(opcode))
+                {
+                    self.blocks[block].branch_true =
+                        Some(self.add_label(block, new_stack, stack_pc, function_id));
+                }
+                self.blocks[block].end = pc;
+                AnalysisState::Branch
+            }
+            MaxwellOpcode::KIL => {
+                let pred = inst.pred();
+                let cond = condition_from_flow(inst.branch_flow_test(), pred);
+                self.analyze_cond_inst(block, function_id, pc, EndClass::Kill, cond);
+                AnalysisState::Branch
+            }
+            MaxwellOpcode::PBK
+            | MaxwellOpcode::PCNT
+            | MaxwellOpcode::PEXIT
+            | MaxwellOpcode::PLONGJMP
+            | MaxwellOpcode::SSY => {
+                let target = branch_offset(pc, inst);
+                self.blocks[block].stack.push(opcode_token(opcode), target);
+                AnalysisState::Continue
+            }
+            MaxwellOpcode::BRX | MaxwellOpcode::JMX => {
+                self.analyze_indirect_branch(block, pc, opcode, function_id)
+            }
+            MaxwellOpcode::EXIT => self.analyze_exit(block, function_id, pc, inst),
+            MaxwellOpcode::CAL | MaxwellOpcode::JCAL => {
+                let cal_pc = if is_absolute_jump(opcode) {
+                    Location::new(inst.branch_absolute())
+                } else {
+                    branch_offset(pc, inst)
+                };
+                let call_id = self
+                    .functions
+                    .iter()
+                    .position(|function| function.entrypoint == cal_pc)
+                    .unwrap_or_else(|| {
+                        let id = self.functions.len();
+                        self.functions
+                            .push(FlowFunction::new(&mut self.blocks, cal_pc));
+                        id
+                    });
+                self.blocks[block].end_class = EndClass::Call;
+                self.blocks[block].function_call = call_id;
+                self.blocks[block].return_block = Some(self.add_label(
+                    block,
+                    self.blocks[block].stack.clone(),
+                    pc.next(),
+                    function_id,
+                ));
+                self.blocks[block].end = pc;
+                AnalysisState::Branch
+            }
+            _ => {
+                let pred = inst.pred();
+                if pred == Predicate::from_bool(true) || pred == Predicate::from_bool(false) {
+                    return AnalysisState::Continue;
+                }
+                let cond = condition_from_predicate(pred);
+                self.analyze_cond_inst(block, function_id, pc, EndClass::Branch, cond);
+                AnalysisState::Branch
+            }
+        }
+    }
+
+    fn analyze_cond_inst(
+        &mut self,
+        block: usize,
+        function_id: usize,
+        pc: Location,
+        end_class: EndClass,
+        cond: Condition,
+    ) {
+        if self.blocks[block].begin != pc {
+            self.blocks[block].end = pc;
+            self.blocks[block].cond = Condition::always();
+            self.blocks[block].branch_true =
+                Some(self.add_label(block, self.blocks[block].stack.clone(), pc, function_id));
+            self.blocks[block].branch_false = None;
+            return;
+        }
+
+        let conditional_block = self.blocks.len();
+        let original = self.blocks[block].clone();
+        self.blocks.push(original);
+        self.blocks[block] = FlowBlock::new(pc.virtual_loc());
+        self.blocks[block].end = pc.virtual_loc();
+        self.blocks[block].stack = self.blocks[conditional_block].stack.clone();
+        self.blocks[block].cond = cond;
+        self.blocks[block].branch_true = Some(conditional_block);
+
+        self.blocks[conditional_block].end = pc.next();
+        self.blocks[conditional_block].end_class = end_class;
+        let endif = self.add_label(
+            conditional_block,
+            self.blocks[block].stack.clone(),
+            pc.next(),
+            function_id,
+        );
+        self.blocks[block].branch_false = Some(endif);
+        if matches!(end_class, EndClass::Branch | EndClass::Kill) {
+            self.blocks[conditional_block].cond = Condition::always();
+            self.blocks[conditional_block].branch_true = Some(endif);
+            self.blocks[conditional_block].branch_false = None;
+        }
+        self.insert_block_sorted(function_id, conditional_block);
+    }
+
+    fn analyze_branch(
+        &mut self,
+        block: usize,
+        function_id: usize,
+        pc: Location,
+        inst: Instruction,
+        opcode: MaxwellOpcode,
+    ) -> bool {
+        if inst.branch_is_cbuf() {
+            log::warn!("Branch with constant buffer offset is not implemented");
+        }
+        let pred = inst.pred();
+        if pred == Predicate::from_bool(false) {
+            return false;
+        }
+        let flow_test = if has_flow_test(opcode) {
+            inst.branch_flow_test().unwrap_or(FlowTest::T)
+        } else {
+            FlowTest::T
+        };
+        if pred != Predicate::from_bool(true) || flow_test != FlowTest::T {
+            self.blocks[block].cond = condition_from_flow(Some(flow_test), pred);
+            self.blocks[block].branch_false = Some(self.add_label(
+                block,
+                self.blocks[block].stack.clone(),
+                pc.next(),
+                function_id,
+            ));
+        } else {
+            self.blocks[block].cond = Condition::always();
+        }
+        true
+    }
+
+    fn analyze_bra(
+        &mut self,
+        block: usize,
+        function_id: usize,
+        pc: Location,
+        inst: Instruction,
+        is_absolute: bool,
+    ) {
+        let target = if is_absolute {
+            Location::new(inst.branch_absolute())
+        } else {
+            branch_offset(pc, inst)
+        };
+        self.blocks[block].branch_true =
+            Some(self.add_label(block, self.blocks[block].stack.clone(), target, function_id));
+    }
+
+    fn analyze_indirect_branch(
+        &mut self,
+        block: usize,
+        pc: Location,
+        opcode: MaxwellOpcode,
+        _function_id: usize,
+    ) -> AnalysisState {
+        self.blocks[block].cond = Condition::always();
+        self.blocks[block].end = pc.next();
+        self.blocks[block].end_class = EndClass::IndirectBranch;
+        self.blocks[block].branch_offset = if is_absolute_jump(opcode) {
+            8
+        } else {
+            pc.offset() as i32 + 8
+        };
+        AnalysisState::Branch
+    }
+
+    fn analyze_exit(
+        &mut self,
+        block: usize,
+        function_id: usize,
+        pc: Location,
+        inst: Instruction,
+    ) -> AnalysisState {
+        let flow_test = inst.branch_flow_test().unwrap_or(FlowTest::T);
+        let pred = inst.pred();
+        if pred == Predicate::from_bool(false) || flow_test == FlowTest::F {
+            return AnalysisState::Continue;
+        }
+        if pred != Predicate::from_bool(true) || flow_test != FlowTest::T {
+            if self.exits_to_dispatcher {
+                self.blocks[block].end = pc;
+                self.blocks[block].end_class = EndClass::Branch;
+                self.blocks[block].cond = condition_from_flow(Some(flow_test), pred);
+                self.blocks[block].branch_true = self.dispatch_block;
+                self.blocks[block].branch_false = Some(self.add_label(
+                    block,
+                    self.blocks[block].stack.clone(),
+                    pc.next(),
+                    function_id,
+                ));
+                return AnalysisState::Branch;
+            }
+            self.analyze_cond_inst(
+                block,
+                function_id,
+                pc,
+                EndClass::Exit,
+                condition_from_flow(Some(flow_test), pred),
+            );
+            return AnalysisState::Branch;
+        }
+        if let Some(exit_pc) = self.blocks[block].stack.peek(Token::Pexit) {
+            let stack = self.blocks[block].stack.remove(Token::Pexit);
+            self.blocks[block].cond = Condition::always();
+            self.blocks[block].branch_true =
+                Some(self.add_label(block, stack, exit_pc, function_id));
+            self.blocks[block].branch_false = None;
+            return AnalysisState::Branch;
+        }
+        if self.exits_to_dispatcher {
+            self.blocks[block].cond = Condition::always();
+            self.blocks[block].end = pc;
+            self.blocks[block].end_class = EndClass::Branch;
+            self.blocks[block].branch_true = self.dispatch_block;
+            self.blocks[block].branch_false = None;
+            return AnalysisState::Branch;
+        }
+        self.blocks[block].end = pc.next();
+        self.blocks[block].end_class = EndClass::Exit;
+        AnalysisState::Branch
+    }
+
+    fn add_label(
+        &mut self,
+        block: usize,
+        stack: FlowStack,
+        pc: Location,
+        function_id: usize,
+    ) -> usize {
+        if self.blocks[block].begin == pc {
+            return block;
+        }
+        if let Some(existing) = self.find_block_by_begin(function_id, pc) {
+            if let Some(prev) = self.previous_block(function_id, existing) {
+                if self.blocks[existing].begin.virtual_loc() == self.blocks[prev].begin {
+                    return prev;
+                }
+            }
+            return existing;
+        }
+        if let Some(label) = self.functions[function_id]
+            .labels
+            .iter()
+            .find(|label| label.address == pc)
+        {
+            return label.block;
+        }
+        let new_block = self.blocks.len();
+        let mut flow_block = FlowBlock::new(pc);
+        flow_block.stack = stack.clone();
+        self.blocks.push(flow_block);
+        self.functions[function_id].labels.push(FlowLabel {
+            address: pc,
+            block: new_block,
+            stack,
+        });
+        new_block
+    }
+
+    fn next_block_after(&self, function_id: usize, pc: Location) -> Option<usize> {
+        self.functions[function_id]
+            .blocks
+            .iter()
+            .copied()
+            .filter(|&block| self.blocks[block].begin > pc)
+            .min_by_key(|&block| self.blocks[block].begin)
+    }
+
+    fn find_block_by_begin(&self, function_id: usize, pc: Location) -> Option<usize> {
+        self.functions[function_id]
+            .blocks
+            .iter()
+            .copied()
+            .find(|&block| self.blocks[block].begin == pc)
+    }
+
+    fn previous_block(&self, function_id: usize, block: usize) -> Option<usize> {
+        let blocks = &self.functions[function_id].blocks;
+        let pos = blocks.iter().position(|&candidate| candidate == block)?;
+        pos.checked_sub(1).map(|prev| blocks[prev])
+    }
+
+    fn insert_block_sorted(&mut self, function_id: usize, block: usize) {
+        let blocks = &mut self.functions[function_id].blocks;
+        if blocks.contains(&block) {
+            return;
+        }
+        let pos = blocks
+            .binary_search_by_key(&self.blocks[block].begin, |&id| self.blocks[id].begin)
+            .unwrap_or_else(|pos| pos);
+        blocks.insert(pos, block);
+    }
+
+    fn split_block(
+        &mut self,
+        function_id: usize,
+        old_block: usize,
+        new_block: usize,
+        pc: Location,
+    ) {
+        if pc <= self.blocks[old_block].begin || pc >= self.blocks[old_block].end {
+            return;
+        }
+        let mut split = self.blocks[old_block].clone();
+        split.begin = pc;
+        self.blocks[new_block] = split;
+        self.blocks[old_block].end = pc;
+        self.blocks[old_block].end_class = EndClass::Branch;
+        self.blocks[old_block].cond = Condition::always();
+        self.blocks[old_block].branch_true = Some(new_block);
+        self.blocks[old_block].branch_false = None;
+        self.insert_block_sorted(function_id, new_block);
+    }
+
+    pub fn to_cfg_blocks(&self, base_offset: u32) -> Vec<CfgBlock> {
+        let Some(function) = self.functions.first() else {
+            return Vec::new();
+        };
+        let mut index_by_block = std::collections::HashMap::new();
+        for (index, &block) in function.blocks.iter().enumerate() {
+            index_by_block.insert(block, index);
+        }
+        function
+            .blocks
+            .iter()
+            .map(|&block| {
+                let flow = &self.blocks[block];
+                CfgBlock {
+                    begin: location_to_word_index(flow.begin, base_offset),
+                    end: location_to_word_index(flow.end, base_offset),
+                    end_class: flow.end_class,
+                    branch_true: flow
+                        .branch_true
+                        .and_then(|target| index_by_block.get(&target).copied()),
+                    branch_false: flow
+                        .branch_false
+                        .and_then(|target| index_by_block.get(&target).copied()),
+                    cond: flow.cond,
+                    stack_depth: flow.stack.entries.len() as u32,
+                }
+            })
+            .collect()
+    }
+}
+
+pub fn build_cfg_from_env(
+    env: &mut dyn Environment,
+    base_offset: u32,
+    _code_words: usize,
+) -> Vec<CfgBlock> {
+    let cfg = FlowCfg::new(env, Location::new(base_offset), false);
+    cfg.to_cfg_blocks(base_offset)
+}
+
+fn opcode_token(opcode: MaxwellOpcode) -> Token {
+    match opcode {
+        MaxwellOpcode::PBK | MaxwellOpcode::BRK => Token::Pbk,
+        MaxwellOpcode::PCNT | MaxwellOpcode::CONT => Token::Pcnt,
+        MaxwellOpcode::PEXIT | MaxwellOpcode::EXIT => Token::Pexit,
+        MaxwellOpcode::PLONGJMP | MaxwellOpcode::LONGJMP => Token::Plongjmp,
+        MaxwellOpcode::PRET | MaxwellOpcode::RET | MaxwellOpcode::CAL => Token::Pret,
+        MaxwellOpcode::SSY | MaxwellOpcode::SYNC => Token::Ssy,
+        _ => Token::Ssy,
+    }
+}
+
+fn is_absolute_jump(opcode: MaxwellOpcode) -> bool {
+    matches!(
+        opcode,
+        MaxwellOpcode::JCAL | MaxwellOpcode::JMP | MaxwellOpcode::JMX
+    )
+}
+
+fn has_flow_test(opcode: MaxwellOpcode) -> bool {
+    matches!(
+        opcode,
+        MaxwellOpcode::BRA
+            | MaxwellOpcode::BRX
+            | MaxwellOpcode::EXIT
+            | MaxwellOpcode::JMP
+            | MaxwellOpcode::JMX
+            | MaxwellOpcode::KIL
+            | MaxwellOpcode::BRK
+            | MaxwellOpcode::CONT
+            | MaxwellOpcode::LONGJMP
+            | MaxwellOpcode::PRET
+            | MaxwellOpcode::RET
+            | MaxwellOpcode::SYNC
+    )
+}
+
+fn branch_offset(pc: Location, inst: Instruction) -> Location {
+    Location::new(
+        pc.offset()
+            .wrapping_add(inst.branch_offset() as u32)
+            .wrapping_add(8),
+    )
+}
+
+fn condition_from_predicate(pred: Predicate) -> Condition {
+    Condition {
+        pred: pred.index as u8,
+        negated: pred.negated,
+    }
+}
+
+fn condition_from_flow(flow_test: Option<FlowTest>, pred: Predicate) -> Condition {
+    let mut cond = condition_from_predicate(pred);
+    if matches!(flow_test, Some(FlowTest::F)) {
+        cond.negated = !cond.negated;
+    }
+    cond
+}
+
+fn location_to_word_index(location: Location, base_offset: u32) -> u32 {
+    let offset = if location.is_virtual() {
+        location.offset().wrapping_add(4)
+    } else {
+        location.offset()
+    };
+    offset.saturating_sub(base_offset) / 8
 }
 
 /// Build a control flow graph from Maxwell instruction words.

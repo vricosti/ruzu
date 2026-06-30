@@ -16,6 +16,8 @@ use common::cityhash::city_hash64;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
 use crate::engines::maxwell_3d::DrawCall;
+use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache, NUM_PROGRAMS};
+use shader_recompiler::Profile;
 
 use super::compute_pipeline::ComputePipeline;
 use super::fixed_pipeline_state::FixedPipelineState;
@@ -156,7 +158,7 @@ pub struct PipelineCache {
     channel_caches: ChannelSetupCaches<ChannelInfo>,
     graphics_pipeline_cache: GraphicsPipelineCache,
     graphics_cache: HashMap<GraphicsPipelineKey, GraphicsPipeline>,
-    graphics_key: Option<GraphicsPipelineKey>,
+    graphics_key: GraphicsPipelineKey,
     current_pipeline: Option<GraphicsPipelineKey>,
 
     main_pools: ShaderPools,
@@ -190,15 +192,16 @@ impl PipelineCache {
         use_asynchronous_shaders: bool,
         use_vulkan_pipeline_cache: bool,
         shader_cache: shader_recompiler::PipelineCache,
+        profile: Profile,
     ) -> Self {
         let mut pipeline_cache = PipelineCache {
             device: device.clone(),
             use_asynchronous_shaders,
             use_vulkan_pipeline_cache,
             channel_caches: ChannelSetupCaches::new(),
-            graphics_pipeline_cache: GraphicsPipelineCache::new(device, shader_cache),
+            graphics_pipeline_cache: GraphicsPipelineCache::new(device, shader_cache, profile),
             graphics_cache: HashMap::new(),
-            graphics_key: None,
+            graphics_key: GraphicsPipelineKey::default(),
             current_pipeline: None,
             main_pools: ShaderPools::new(),
             pipeline_cache_filename: PathBuf::new(),
@@ -240,7 +243,7 @@ impl PipelineCache {
         read_gpu: &dyn Fn(u64, &mut [u8]),
     ) -> Option<(&GraphicsPipeline, FixedPipelineState)> {
         let (key, fixed_state) = self.graphics_pipeline_cache.make_key(draw, read_gpu)?;
-        self.graphics_key = Some(key.clone());
+        self.graphics_key = key.clone();
 
         if let Some(current_key) = self.current_pipeline.clone() {
             let next_key = self
@@ -260,6 +263,51 @@ impl PipelineCache {
         }
 
         self.current_graphics_pipeline_slow_path(draw, render_pass, read_gpu, key, fixed_state)
+    }
+
+    /// Shared-cache runtime path matching upstream's pipeline-cache ownership:
+    /// shader discovery and unique hashes come from `VideoCommon::ShaderCache`,
+    /// while this Vulkan owner builds/caches the VkPipeline.
+    pub fn current_graphics_pipeline_with_shared_cache(
+        &mut self,
+        draw: &DrawCall,
+        render_pass: vk::RenderPass,
+        shared_cache: &mut SharedShaderCache,
+    ) -> Option<(&GraphicsPipeline, FixedPipelineState)> {
+        let mut unique_hashes = self.graphics_key.unique_hashes;
+        if !shared_cache.refresh_stages(&mut unique_hashes) {
+            self.current_pipeline = None;
+            return None;
+        }
+        let (key, fixed_state) = self
+            .graphics_pipeline_cache
+            .make_key_from_unique_hashes(draw, unique_hashes);
+        self.graphics_key = key.clone();
+
+        if let Some(current_key) = self.current_pipeline.clone() {
+            let next_key = self
+                .graphics_cache
+                .get(&current_key)
+                .and_then(|pipeline| pipeline.next(&key).cloned());
+            if let Some(next_key) = next_key {
+                self.current_pipeline = Some(next_key.clone());
+                let pipeline = self
+                    .graphics_cache
+                    .get(&next_key)
+                    .expect("graphics cache transition entry vanished before lookup");
+                return self
+                    .built_pipeline(pipeline, draw)
+                    .map(|pipeline| (pipeline, fixed_state));
+            }
+        }
+
+        self.current_graphics_pipeline_slow_path_with_shared_cache(
+            draw,
+            render_pass,
+            shared_cache,
+            key,
+            fixed_state,
+        )
     }
 
     /// Port of `PipelineCache::CurrentComputePipeline`.
@@ -284,6 +332,42 @@ impl PipelineCache {
         if is_new {
             let pipeline =
                 self.create_graphics_pipeline(draw, render_pass, read_gpu, &key, &fixed_state)?;
+            self.graphics_cache.insert(key.clone(), pipeline);
+        }
+
+        if is_new {
+            if let Some(current_key) = self.current_pipeline.clone() {
+                if current_key != key {
+                    if let Some(current_pipeline) = self.graphics_cache.get_mut(&current_key) {
+                        current_pipeline.add_transition(key.clone());
+                    }
+                }
+            }
+        }
+
+        self.current_pipeline = Some(key.clone());
+        let pipeline = self.graphics_cache.get(&key)?;
+        self.built_pipeline(pipeline, draw)
+            .map(|pipeline| (pipeline, fixed_state))
+    }
+
+    fn current_graphics_pipeline_slow_path_with_shared_cache(
+        &mut self,
+        draw: &DrawCall,
+        render_pass: vk::RenderPass,
+        shared_cache: &SharedShaderCache,
+        key: GraphicsPipelineKey,
+        fixed_state: FixedPipelineState,
+    ) -> Option<(&GraphicsPipeline, FixedPipelineState)> {
+        let is_new = !self.graphics_cache.contains_key(&key);
+        if is_new {
+            let pipeline = self.create_graphics_pipeline_with_shared_cache(
+                draw,
+                render_pass,
+                shared_cache,
+                &key,
+                &fixed_state,
+            )?;
             self.graphics_cache.insert(key.clone(), pipeline);
         }
 
@@ -335,6 +419,27 @@ impl PipelineCache {
             key,
             fixed_state,
         )
+    }
+
+    fn create_graphics_pipeline_with_shared_cache(
+        &mut self,
+        draw: &DrawCall,
+        render_pass: vk::RenderPass,
+        shared_cache: &SharedShaderCache,
+        key: &GraphicsPipelineKey,
+        fixed_state: &FixedPipelineState,
+    ) -> Option<GraphicsPipeline> {
+        self.main_pools.release_contents();
+        let mut environments = GraphicsEnvironments::default();
+        shared_cache.get_graphics_environments(&mut environments, &key.unique_hashes);
+        self.graphics_pipeline_cache
+            .build_pipeline_keyed_from_environments(
+                draw,
+                render_pass,
+                &mut environments,
+                key,
+                fixed_state,
+            )
     }
 
     /// Port of `PipelineCache::LoadDiskResources`.
@@ -462,7 +567,11 @@ mod tests {
             index_format: IndexFormat::UnsignedInt,
             vertex_streams: Vec::new(),
             viewports: [ViewportInfo::default(); 16],
+            viewport_transforms: Default::default(),
             scissors: [ScissorInfo::default(); 16],
+            viewport_scale_offset_enabled: false,
+            window_origin_lower_left: false,
+            surface_clip: Default::default(),
             blend: [BlendInfo::default(); 8],
             blend_color: BlendColorInfo {
                 r: 0.0,
@@ -493,6 +602,7 @@ mod tests {
                 depth_bias_clamp: 0.0,
                 ..RasterizerInfo::default()
             },
+            primitive_restart: Default::default(),
             program_base_address: 0,
             cb_bindings: [[ConstBufferBinding::default(); 18]; 5],
             vertex_attribs: Vec::new(),

@@ -24,6 +24,10 @@ fn should_trace_hwc() -> bool {
     std::env::var_os("RUZU_TRACE_HWC").is_some()
 }
 
+fn should_trace_hwc_dense() -> bool {
+    std::env::var_os("RUZU_TRACE_HWC_DENSE").is_some()
+}
+
 fn should_emit_hwc_acquire_status(status: super::status::Status) -> bool {
     if status == super::status::Status::NoError {
         return true;
@@ -164,6 +168,24 @@ impl HardwareComposer {
                     crop_rect: item.crop,
                     acquire_fence: item.fence,
                 });
+                if should_trace_hwc_dense() {
+                    log::info!(
+                        "[HWC_LAYER] consumer={} frame={} buffer={} offset=0x{:X} size={}x{} stride={} fmt={:?} transform=0x{:X} crop=({}, {}, {}, {})",
+                        consumer_id,
+                        self.frame_number,
+                        graphic_buffer.get_buffer_id(),
+                        graphic_buffer.get_offset(),
+                        graphic_buffer.get_width(),
+                        graphic_buffer.get_height(),
+                        graphic_buffer.get_stride(),
+                        graphic_buffer.get_external_format(),
+                        item.transform.bits(),
+                        item.crop.left,
+                        item.crop.top,
+                        item.crop.right,
+                        item.crop.bottom,
+                    );
+                }
             }
 
             let item_swap_interval =
@@ -187,26 +209,62 @@ impl HardwareComposer {
                     0,
                 ],
             );
+            if should_trace_hwc_dense() {
+                log::info!(
+                    "[HWC_DENSE] composite_begin frame_number={} layers={} swap_interval={}",
+                    self.frame_number,
+                    composition_stack.len(),
+                    swap_interval.unwrap_or(1)
+                );
+            }
             nvdisp.composite(&composition_stack);
+            if should_trace_hwc_dense() {
+                log::info!(
+                    "[HWC_DENSE] composite_end frame_number={} layers={}",
+                    self.frame_number,
+                    composition_stack.len()
+                );
+            }
         }
 
         let frame_advance = swap_interval.unwrap_or(1) as u32;
         self.frame_number += frame_advance as u64;
 
         for (layer_id, framebuffer) in &mut self.framebuffers {
+            if should_trace_hwc_dense() {
+                log::info!(
+                    "[HWC_DENSE] release_check consumer={} frame_number={} release_frame_number={} is_acquired={}",
+                    layer_id,
+                    self.frame_number,
+                    framebuffer.release_frame_number,
+                    framebuffer.is_acquired
+                );
+            }
             if framebuffer.release_frame_number > self.frame_number || !framebuffer.is_acquired {
                 continue;
             }
 
             let Some(layer) = display.stack.find_layer(*layer_id) else {
+                if should_trace_hwc_dense() {
+                    log::info!("[HWC_DENSE] release_skip_no_layer consumer={}", layer_id);
+                }
                 continue;
             };
 
-            layer
+            let status = layer
                 .lock()
                 .unwrap()
                 .buffer_item_consumer
                 .release_buffer(&framebuffer.item, &Fence::no_fence());
+            if should_trace_hwc_dense() {
+                log::info!(
+                    "[HWC_DENSE] release_done consumer={} slot={} frame={} status={:?}",
+                    layer_id,
+                    framebuffer.item.slot,
+                    framebuffer.item.frame_number,
+                    status
+                );
+            }
             framebuffer.is_acquired = false;
         }
 

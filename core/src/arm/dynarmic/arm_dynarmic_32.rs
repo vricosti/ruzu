@@ -14,6 +14,7 @@ use crate::arm::arm_interface::{
 use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::memory::memory::Memory;
 use common::page_table::PageInfo;
+use common::settings_enums::CpuAccuracy;
 
 use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
 
@@ -82,6 +83,71 @@ fn optimization_flags_from_mask(mask: u32) -> OptimizationFlag {
     }
 
     flags
+}
+
+fn upstream_optimization_config_from_settings() -> (OptimizationFlag, bool) {
+    let settings = common::settings::values();
+
+    if *settings.cpu_debug_mode.get_value() {
+        let mut flags = optimization_flags_from_mask(0x3F);
+        if !*settings.cpuopt_block_linking.get_value() {
+            flags = flags & !OptimizationFlag::BLOCK_LINKING;
+        }
+        if !*settings.cpuopt_return_stack_buffer.get_value() {
+            flags = flags & !OptimizationFlag::RETURN_STACK_BUFFER;
+        }
+        if !*settings.cpuopt_fast_dispatcher.get_value() {
+            flags = flags & !OptimizationFlag::FAST_DISPATCH;
+        }
+        if !*settings.cpuopt_context_elimination.get_value() {
+            flags = flags & !OptimizationFlag::GET_SET_ELIMINATION;
+        }
+        if !*settings.cpuopt_const_prop.get_value() {
+            flags = flags & !OptimizationFlag::CONST_PROP;
+        }
+        if !*settings.cpuopt_misc_ir.get_value() {
+            flags = flags & !OptimizationFlag::MISC_IR_OPT;
+        }
+        return (flags, false);
+    }
+
+    let mut flags = optimization_flags_from_mask(0x3F);
+    let mut unsafe_optimizations = false;
+
+    match *settings.cpu_accuracy.get_value() {
+        CpuAccuracy::Unsafe => {
+            unsafe_optimizations = true;
+            if *settings.cpuopt_unsafe_unfuse_fma.get_value() {
+                flags |= OptimizationFlag::UNSAFE_UNFUSE_FMA;
+            }
+            if *settings.cpuopt_unsafe_reduce_fp_error.get_value() {
+                flags |= OptimizationFlag::UNSAFE_REDUCED_ERROR_FP;
+            }
+            if *settings.cpuopt_unsafe_ignore_standard_fpcr.get_value() {
+                flags |= OptimizationFlag::UNSAFE_IGNORE_STANDARD_FPCR_VALUE;
+            }
+            if *settings.cpuopt_unsafe_inaccurate_nan.get_value() {
+                flags |= OptimizationFlag::UNSAFE_INACCURATE_NAN;
+            }
+            if *settings.cpuopt_unsafe_ignore_global_monitor.get_value() {
+                flags |= OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR;
+            }
+        }
+        CpuAccuracy::Auto => {
+            unsafe_optimizations = true;
+            flags |= OptimizationFlag::UNSAFE_UNFUSE_FMA;
+            flags |= OptimizationFlag::UNSAFE_IGNORE_STANDARD_FPCR_VALUE;
+            flags |= OptimizationFlag::UNSAFE_INACCURATE_NAN;
+            flags |= OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR;
+        }
+        CpuAccuracy::Paranoid => {
+            flags = OptimizationFlag::NO_OPTIMIZATIONS;
+            unsafe_optimizations = false;
+        }
+        CpuAccuracy::Accurate => {}
+    }
+
+    (flags, unsafe_optimizations)
 }
 
 fn parse_trace_hex_env(name: &str) -> Option<u32> {
@@ -2329,26 +2395,31 @@ impl ArmDynarmic32 {
             debugger_enabled,
         );
 
-        let optimizations = if let Some(mask) = std::env::var("RUZU_A32_OPTIMIZATION_MASK")
-            .ok()
-            .and_then(|value| {
-                let trimmed = value.trim();
-                let digits = trimmed
-                    .strip_prefix("0x")
-                    .or_else(|| trimmed.strip_prefix("0X"))
-                    .unwrap_or(trimmed);
-                u32::from_str_radix(digits, 16)
-                    .ok()
-                    .or_else(|| trimmed.parse::<u32>().ok())
-            }) {
-            optimization_flags_from_mask(mask)
+        let (optimizations, unsafe_optimizations) = if let Some(mask) =
+            std::env::var("RUZU_A32_OPTIMIZATION_MASK")
+                .ok()
+                .and_then(|value| {
+                    let trimmed = value.trim();
+                    let digits = trimmed
+                        .strip_prefix("0x")
+                        .or_else(|| trimmed.strip_prefix("0X"))
+                        .unwrap_or(trimmed);
+                    u32::from_str_radix(digits, 16)
+                        .ok()
+                        .or_else(|| trimmed.parse::<u32>().ok())
+                }) {
+            let flags = optimization_flags_from_mask(mask);
+            (
+                flags,
+                (flags.bits() & !OptimizationFlag::ALL_SAFE_OPTIMIZATIONS.bits()) != 0,
+            )
         } else if std::env::var("RUZU_A32_NO_OPTIMIZATIONS")
             .ok()
             .is_some_and(|value| value != "0")
         {
-            OptimizationFlag::NO_OPTIMIZATIONS
+            (OptimizationFlag::NO_OPTIMIZATIONS, false)
         } else {
-            optimization_flags_from_mask(0x3F)
+            upstream_optimization_config_from_settings()
         };
 
         // Upstream `ArmDynarmic32::MakeJit` uses 128 MiB on ARM64 hosts and
@@ -2365,7 +2436,7 @@ impl ArmDynarmic32 {
             enable_cycle_counting: !uses_wall_clock,
             code_cache_size,
             optimizations,
-            unsafe_optimizations: false,
+            unsafe_optimizations,
             global_monitor: if exclusive_monitor.is_null() {
                 None
             } else {
@@ -2410,11 +2481,12 @@ impl ArmDynarmic32 {
 
         if std::env::var_os("RUZU_TRACE_A32_JIT_CONFIG").is_some() {
             log::warn!(
-                "ArmDynarmic32: page_table_pointer={:?} fastmem_pointer={:?} cycle_counting={} optimizations={:#x} code_cache_size={}",
+                "ArmDynarmic32: page_table_pointer={:?} fastmem_pointer={:?} cycle_counting={} optimizations={:#x} unsafe_optimizations={} code_cache_size={}",
                 page_table_pointer.map(|p| p as usize),
                 fastmem_pointer.map(|p| p as usize),
                 !uses_wall_clock,
                 optimizations.bits(),
+                unsafe_optimizations,
                 code_cache_size
             );
         }
