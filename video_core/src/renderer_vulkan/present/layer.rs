@@ -283,6 +283,7 @@ impl Layer {
             |info| (info.image, info.image_view),
         );
         let crop_rect = normalize_crop(framebuffer, texture_width, texture_height);
+        let trace_present_layer = std::env::var_os("RUZU_TRACE_VK_PRESENT_LAYER").is_some();
 
         self.configure_draw(
             out_push_constants,
@@ -299,6 +300,45 @@ impl Layer {
             layout,
             crop_rect,
         );
+        if trace_present_layer {
+            let v = &out_push_constants.vertices;
+            log::info!(
+                "[VK_PRESENT_LAYER] fb=0x{:X}+0x{:X} fb={}x{} stride={} fmt={} crop=({}, {}, {}, {}) tex={}x{} scaled={}x{} uv=({}, {}, {}, {}) accelerated={} layout={}x{} screen=({}, {}, {}, {}) vertices=({}, {}) ({}, {}) ({}, {}) ({}, {})",
+                framebuffer.address,
+                framebuffer.offset,
+                framebuffer.width,
+                framebuffer.height,
+                framebuffer.stride,
+                framebuffer.pixel_format.0,
+                framebuffer.crop_rect.left,
+                framebuffer.crop_rect.top,
+                framebuffer.crop_rect.right,
+                framebuffer.crop_rect.bottom,
+                texture_width,
+                texture_height,
+                scaled_width,
+                scaled_height,
+                crop_rect.left,
+                crop_rect.top,
+                crop_rect.right,
+                crop_rect.bottom,
+                texture_info.is_some(),
+                layout.width,
+                layout.height,
+                layout.screen.left,
+                layout.screen.top,
+                layout.screen.right,
+                layout.screen.bottom,
+                v[0].position[0],
+                v[0].position[1],
+                v[1].position[0],
+                v[1].position[1],
+                v[2].position[0],
+                v[2].position[1],
+                v[3].position[0],
+                v[3].position[1],
+            );
+        }
     }
 
     fn update_raw_image(
@@ -363,6 +403,33 @@ impl Layer {
                 0,
                 0,
             );
+            if std::env::var_os("RUZU_TRACE_VK_RAW_PRESENT").is_some() {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+                let n = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 32 || n.is_power_of_two() {
+                    let output = &mapped[image_offset as usize..end];
+                    let nonzero = output.iter().filter(|&&byte| byte != 0).count();
+                    let first = output
+                        .chunks_exact(4)
+                        .take(4)
+                        .map(|px| u32::from_le_bytes([px[0], px[1], px[2], px[3]]))
+                        .collect::<Vec<_>>();
+                    log::info!(
+                        "[VK_RAW_PRESENT] #{} fb=0x{:X} {}x{} stride={} fmt={} tiled_size={} linear_size={} nonzero={} first={:08X?}",
+                        n,
+                        framebuffer_addr,
+                        framebuffer.width,
+                        framebuffer.height,
+                        framebuffer.stride,
+                        framebuffer.pixel_format.0,
+                        tiled_size,
+                        linear_size,
+                        nonzero,
+                        first,
+                    );
+                }
+            }
         }
         buffer.flush();
 

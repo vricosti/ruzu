@@ -87,13 +87,25 @@ pub enum NpadCommunicationMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[repr(u32)]
 pub enum NpadRevision {
     #[default]
-    Revision0 = 0,
-    Revision1 = 1,
-    Revision2 = 2,
-    Revision3 = 3,
+    Revision0,
+    Revision1,
+    Revision2,
+    Revision3,
+    Unknown(u32),
+}
+
+impl NpadRevision {
+    pub fn from_raw(raw: u32) -> Self {
+        match raw {
+            0 => Self::Revision0,
+            1 => Self::Revision1,
+            2 => Self::Revision2,
+            3 => Self::Revision3,
+            value => Self::Unknown(value),
+        }
+    }
 }
 
 /// This is nn::hid::detail::ColorAttribute

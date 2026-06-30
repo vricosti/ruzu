@@ -171,11 +171,11 @@ impl MaxwellDMA {
     /// Corresponds to upstream `MaxwellDMA::CallMethod`.
     pub fn call_method(&mut self, method: u32, argument: u32, _is_last_call: bool) {
         let idx = method as usize;
-        if idx < ENGINE_REG_COUNT {
-            self.regs[idx] = argument;
-        }
+        assert!(idx < ENGINE_REG_COUNT, "Invalid MaxwellDMA register");
+        self.regs[idx] = argument;
         if method == LAUNCH_DMA {
-            self.handle_launch();
+            self.log_launch();
+            self.launch_immediate();
         }
     }
 
@@ -736,7 +736,7 @@ impl MaxwellDMA {
         }])
     }
 
-    fn handle_launch(&mut self) {
+    fn log_launch(&self) {
         if std::env::var_os("RUZU_TRACE_ENGINE_LAUNCH").is_some() {
             log::info!(
                 "MaxwellDMA::LAUNCH src=0x{:X} dst=0x{:X} pitch_in={} pitch_out={} {}x{}",
@@ -757,79 +757,30 @@ impl MaxwellDMA {
             self.line_length(),
             self.line_count(),
         );
+    }
+
+    fn handle_deferred_launch(&mut self) {
+        self.log_launch();
         self.pending_launch = true;
     }
-}
 
-impl EngineInterface for MaxwellDMA {
-    fn call_method(&mut self, method: u32, method_argument: u32, is_last_call: bool) {
-        MaxwellDMA::call_method(self, method, method_argument, is_last_call);
-    }
+    fn launch_immediate(&mut self) {
+        let memory_manager = Arc::clone(&self.memory_manager);
+        let read_gpu = move |addr: u64, buf: &mut [u8]| {
+            let _ = memory_manager.lock().read_block(addr, buf);
+        };
+        let writes = self.collect_launch_writes(&read_gpu);
+        if writes.is_empty() {
+            return;
+        }
 
-    fn call_multi_method(
-        &mut self,
-        method: u32,
-        base_start: &[u32],
-        amount: u32,
-        methods_pending: u32,
-    ) {
-        MaxwellDMA::call_multi_method(self, method, base_start, amount, methods_pending);
-    }
-
-    fn consume_sink_impl(&mut self) {
-        let sink = std::mem::take(&mut self.interface_state.method_sink);
-        for (method, value) in sink {
-            let idx = method as usize;
-            if idx < ENGINE_REG_COUNT {
-                self.regs[idx] = value;
-            }
+        let memory_manager = self.memory_manager.lock();
+        for write in writes {
+            let _ = memory_manager.write_block_unsafe(write.gpu_va, &write.data);
         }
     }
 
-    fn execution_mask(&self) -> &[bool] {
-        &self.interface_state.execution_mask
-    }
-
-    fn push_method_sink(&mut self, method: u32, value: u32) {
-        self.interface_state.method_sink.push((method, value));
-    }
-
-    fn set_current_dma_segment(&mut self, segment: u64) {
-        self.interface_state.current_dma_segment = segment;
-    }
-
-    fn current_dirty(&self) -> bool {
-        self.interface_state.current_dirty
-    }
-
-    fn set_current_dirty(&mut self, dirty: bool) {
-        self.interface_state.current_dirty = dirty;
-    }
-}
-
-#[cfg(test)]
-impl Default for MaxwellDMA {
-    fn default() -> Self {
-        Self::new(Arc::new(Mutex::new(MemoryManager::new(0))))
-    }
-}
-
-impl Engine for MaxwellDMA {
-    fn class_id(&self) -> ClassId {
-        ClassId::Dma
-    }
-
-    fn write_reg(&mut self, method: u32, value: u32) {
-        log::trace!("MaxwellDMA: reg[0x{:X}] = 0x{:X}", method, value);
-        self.call_method(method, value, true);
-    }
-
-    fn execute_pending(&mut self, read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
-        if !self.pending_launch {
-            return vec![];
-        }
-        self.pending_launch = false;
-
+    fn collect_launch_writes(&mut self, read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
         if self.launch_data_transfer_type() != LAUNCH_DATA_TRANSFER_NON_PIPELINED {
             self.stop_unimplemented_dma_path("data_transfer_type is not NON_PIPELINED");
         }
@@ -1023,7 +974,6 @@ impl Engine for MaxwellDMA {
             });
         }
 
-        // Build destination buffer line-by-line.
         let dst_size = dst_span as usize;
         let mut dst_buf = vec![0u8; dst_size];
         let mut line_buf = vec![0u8; ll as usize];
@@ -1053,6 +1003,83 @@ impl Engine for MaxwellDMA {
             gpu_va: self.dst_addr(),
             data: dst_buf,
         }]
+    }
+}
+
+impl EngineInterface for MaxwellDMA {
+    fn call_method(&mut self, method: u32, method_argument: u32, is_last_call: bool) {
+        MaxwellDMA::call_method(self, method, method_argument, is_last_call);
+    }
+
+    fn call_multi_method(
+        &mut self,
+        method: u32,
+        base_start: &[u32],
+        amount: u32,
+        methods_pending: u32,
+    ) {
+        MaxwellDMA::call_multi_method(self, method, base_start, amount, methods_pending);
+    }
+
+    fn consume_sink_impl(&mut self) {
+        let sink = std::mem::take(&mut self.interface_state.method_sink);
+        for (method, value) in sink {
+            let idx = method as usize;
+            if idx < ENGINE_REG_COUNT {
+                self.regs[idx] = value;
+            }
+        }
+    }
+
+    fn execution_mask(&self) -> &[bool] {
+        &self.interface_state.execution_mask
+    }
+
+    fn push_method_sink(&mut self, method: u32, value: u32) {
+        self.interface_state.method_sink.push((method, value));
+    }
+
+    fn set_current_dma_segment(&mut self, segment: u64) {
+        self.interface_state.current_dma_segment = segment;
+    }
+
+    fn current_dirty(&self) -> bool {
+        self.interface_state.current_dirty
+    }
+
+    fn set_current_dirty(&mut self, dirty: bool) {
+        self.interface_state.current_dirty = dirty;
+    }
+}
+
+#[cfg(test)]
+impl Default for MaxwellDMA {
+    fn default() -> Self {
+        Self::new(Arc::new(Mutex::new(MemoryManager::new(0))))
+    }
+}
+
+impl Engine for MaxwellDMA {
+    fn class_id(&self) -> ClassId {
+        ClassId::Dma
+    }
+
+    fn write_reg(&mut self, method: u32, value: u32) {
+        log::trace!("MaxwellDMA: reg[0x{:X}] = 0x{:X}", method, value);
+        let idx = method as usize;
+        assert!(idx < ENGINE_REG_COUNT, "Invalid MaxwellDMA register");
+        self.regs[idx] = value;
+        if method == LAUNCH_DMA {
+            self.handle_deferred_launch();
+        }
+    }
+
+    fn execute_pending(&mut self, read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
+        if !self.pending_launch {
+            return vec![];
+        }
+        self.pending_launch = false;
+        self.collect_launch_writes(read_gpu)
     }
 }
 

@@ -445,6 +445,28 @@ impl Swapchain {
         self.extent
     }
 
+    /// Returns the platform-reported current surface extent when it is fixed.
+    ///
+    /// Upstream obtains this through `ChooseSwapExtent` during swapchain
+    /// creation. ruzu also needs the value before drawing on macOS, where SDL
+    /// resize events can lag behind MoltenVK's surface extent during live
+    /// resize/maximize.
+    pub fn current_surface_extent(&self) -> Option<vk::Extent2D> {
+        let capabilities = unsafe {
+            self.surface_loader
+                .get_physical_device_surface_capabilities(self.physical_device, self.surface)
+                .ok()?
+        };
+        if capabilities.current_extent.width == u32::MAX
+            || capabilities.current_extent.height == u32::MAX
+            || capabilities.current_extent.width == 0
+            || capabilities.current_extent.height == 0
+        {
+            return None;
+        }
+        Some(capabilities.current_extent)
+    }
+
     // --- Private ---
 
     /// Port of `Swapchain::CreateSwapchain`.

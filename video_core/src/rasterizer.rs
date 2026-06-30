@@ -2786,7 +2786,11 @@ mod tests {
             index_format: IndexFormat::UnsignedByte,
             vertex_streams: vec![],
             viewports: [ViewportInfo::default(); NUM_VIEWPORTS],
+            viewport_transforms: Default::default(),
             scissors: [ScissorInfo::default(); NUM_VIEWPORTS],
+            viewport_scale_offset_enabled: false,
+            window_origin_lower_left: false,
+            surface_clip: SurfaceClipInfo::default(),
             blend: [BlendInfo::default(); 8],
             blend_color: BlendColorInfo {
                 r: 0.0,
@@ -2817,6 +2821,7 @@ mod tests {
                 depth_bias_clamp: 0.0,
                 ..RasterizerInfo::default()
             },
+            primitive_restart: PrimitiveRestartInfo::default(),
             program_base_address: 0,
             cb_bindings: [[ConstBufferBinding::default(); 18]; 5],
             vertex_attribs: vec![],

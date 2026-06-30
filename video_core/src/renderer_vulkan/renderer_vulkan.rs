@@ -25,7 +25,7 @@ use crate::vulkan_common::vulkan_memory_allocator::{MappedBuffer, MemoryAllocato
 use crate::vulkan_common::vulkan_surface;
 use crate::vulkan_common::vulkan_wrapper::{Instance, VulkanError};
 use common::telemetry::{FieldType, FieldValue};
-use ruzu_core::frontend::framebuffer_layout::{FramebufferLayout, Rectangle};
+use ruzu_core::frontend::framebuffer_layout::{default_frame_layout, FramebufferLayout, Rectangle};
 use ruzu_core::telemetry_session::TelemetrySession;
 
 use super::blit_screen::{BlitFrame, BlitScreen};
@@ -350,7 +350,9 @@ impl RendererVulkan {
             device.get_graphics_family(),
             CAPTURE_IMAGE_WIDTH,
             CAPTURE_IMAGE_HEIGHT,
+            device.supported_spirv_version(),
             syncpoints,
+            Arc::clone(&device_memory),
         )
         .map_err(|err| {
             log::error!("Failed to initialize Vulkan rasterizer: {}", err);
@@ -425,12 +427,12 @@ impl RendererVulkan {
             }
             return;
         }
+        let layout = self.current_framebuffer_layout_for_present(trace_present);
         self.render_screenshot(framebuffers);
-        self.dump_present_frame_if_requested(framebuffers);
+        self.dump_present_frame_if_requested(framebuffers, &layout);
 
         let frame_index = self.present_manager.get_render_frame_index();
         let swapchain_extent = self.swapchain.get_extent();
-        let layout = self.framebuffer_layout.read().unwrap().clone();
         if trace_present {
             log::info!(
                 "[PRESENT] RendererVulkan::Composite draw frame_index={} swapchain={}x{} layout={}x{} image_count={}",
@@ -687,7 +689,11 @@ impl RendererVulkan {
     /// This intentionally reuses the same owner and readback path as upstream
     /// `RendererVulkan::RenderToBuffer`; it is gated by environment variables
     /// and does not affect normal presentation.
-    fn dump_present_frame_if_requested(&mut self, framebuffers: &[FramebufferConfig]) {
+    fn dump_present_frame_if_requested(
+        &mut self,
+        framebuffers: &[FramebufferConfig],
+        layout: &FramebufferLayout,
+    ) {
         if self.present_frame_dumped {
             return;
         }
@@ -702,11 +708,10 @@ impl RendererVulkan {
             return;
         }
 
-        let layout = self.framebuffer_layout.read().unwrap().clone();
         let buffer_size = layout.width as vk::DeviceSize * layout.height as vk::DeviceSize * 4;
         let dst_buffer = self.render_to_buffer(
             framebuffers,
-            &layout,
+            layout,
             vk::Format::B8G8R8A8_UNORM,
             buffer_size,
         );
@@ -790,6 +795,38 @@ impl RendererVulkan {
         self.memory_allocator
             .create_mapped_buffer(&ci, MemoryUsage::Download)
             .expect("Failed to create Vulkan download buffer")
+    }
+
+    /// Keep the present layout synchronized with the fixed WSI surface extent.
+    ///
+    /// Upstream relies on `EmuWindow_SDL2::OnResize` updating
+    /// `render_window.GetFramebufferLayout()` before `RendererVulkan::Composite`.
+    /// On macOS/MoltenVK, SDL resize events can lag behind the surface extent
+    /// visible to Vulkan during live resize/maximize, so synchronize here before
+    /// `BlitScreen::DrawToFrame` recreates the presentation frame.
+    fn current_framebuffer_layout_for_present(&self, trace_present: bool) -> FramebufferLayout {
+        let layout = self.framebuffer_layout.read().unwrap().clone();
+        let Some(extent) = self.swapchain.current_surface_extent() else {
+            return layout;
+        };
+        if extent.width == layout.width && extent.height == layout.height {
+            return layout;
+        }
+
+        let updated = default_frame_layout(extent.width, extent.height);
+        if trace_present {
+            log::info!(
+                "[PRESENT] RendererVulkan::Composite sync layout from surface old={}x{} new={}x{} screen={}x{}",
+                layout.width,
+                layout.height,
+                updated.width,
+                updated.height,
+                updated.screen.get_width(),
+                updated.screen.get_height()
+            );
+        }
+        *self.framebuffer_layout.write().unwrap() = updated.clone();
+        updated
     }
 }
 

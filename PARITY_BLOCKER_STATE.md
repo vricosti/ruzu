@@ -1,5 +1,17 @@
 # 2026-06-13 Texture Cache Sparse Parity Blocker
 
+## Active blocker — Vulkan active texture-cache display path
+
+Status: partially resolved; keep open for full upstream `PrepareDraw` / texture-cache backend parity.
+
+- Suspended implementation: making SpaceCadetPinball-NX display through `ruzu-cmd` on macOS Vulkan/MoltenVK after audio, applet scheduling, and nvnflinger queue/release are working.
+- Implemented prerequisite in this pass: active `video_core/src/renderer_vulkan/mod.rs::RasterizerVulkan::draw(Maxwell3DDrawView, ...)` now receives direct draw calls, binds the channel `MemoryManager`, builds a `DrawCall` snapshot through `draw_manager.rs`, and calls the existing partial Vulkan draw path. SpaceCadet logs 123 active direct draws in 180s.
+- Implemented prerequisite in this pass: active `renderer_vulkan/texture_cache.rs` now owns the common `TextureCacheBase`, creates minimal Vulkan RT0 images/framebuffers keyed by translated CPU address, and answers active `RasterizerVulkan::AccelerateDisplay` through `TextureCacheBase::TryFindFramebufferImageView`. SpaceCadet logs 128 active direct draws and 256 accelerated present hits in 180s.
+- Remaining prerequisite: upstream `RasterizerVulkan::Draw` still uses `PrepareDraw`, `RenderPassCache`, `TextureCache::UpdateRenderTargets`, backend `PrepareImageView`, and format-specific framebuffer/render-pass selection. Rust currently binds only RT0 through a minimal active Vulkan bridge and uses the fixed active render pass format.
+- Evidence: SpaceCadet render targets rotate through GPU addresses `0x82D1000`, `0x8B41000`, and `0x93B1000`; these now translate to presented framebuffer addresses `0x4C5C000`, `0x54CD000`, and `0x5D3E000`, and `AccelerateDisplay` hits image views for all three. The previous raw-RAM fallback explanation for the black screen is no longer current.
+- Required before resuming visual-specific fixes: port the full active Vulkan `PrepareDraw`/texture-cache backend path so render-target images/views are prepared with upstream ordering, formats, barriers, descriptor sync, and render-pass cache. Do not regress to presenting the temporary offscreen image or writing Vulkan render output back into guest RAM.
+- Resume point: compare upstream `vk_rasterizer.cpp::{Draw,PrepareDraw,AccelerateDisplay}` and `vk_texture_cache.h` with the active Rust `renderer_vulkan::{mod.rs,texture_cache.rs}`, then replace the RT0-only bridge with upstream-shaped framebuffer/render-pass/image-view ownership.
+
 ## Active blocker — Texture cache render-target rescale parity
 
 Status: partially resolved; keep open for the remaining owner/dirty-flag parity.

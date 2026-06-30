@@ -60,9 +60,34 @@ impl Location {
         self.offset += 8 + if self.offset % 32 == 24 { 8 } else { 0 };
     }
 
+    /// Return the next instruction location.
+    pub fn next(mut self) -> Self {
+        self.step();
+        self
+    }
+
     /// Go back to the previous instruction.
     pub fn back(&mut self) {
         self.offset -= 8 + if self.offset % 32 == 8 { 8 } else { 0 };
+    }
+
+    /// Return the previous instruction location.
+    pub fn prev(mut self) -> Self {
+        self.back();
+        self
+    }
+
+    /// Port of upstream `Location::operator+(int)`.
+    pub fn add_instructions(mut self, mut count: i32) -> Self {
+        while count > 0 {
+            count -= 1;
+            self.step();
+        }
+        while count < 0 {
+            count += 1;
+            self.back();
+        }
+        self
     }
 
     fn align(&mut self) {

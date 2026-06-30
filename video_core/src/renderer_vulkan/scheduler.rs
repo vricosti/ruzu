@@ -124,7 +124,11 @@ impl Scheduler {
     ) {
         if self.rp_state.inside_renderpass {
             // Already in a render pass — check if compatible
-            if self.rp_state.renderpass == renderpass && self.rp_state.framebuffer == framebuffer {
+            if self.rp_state.renderpass == renderpass
+                && self.rp_state.framebuffer == framebuffer
+                && self.rp_state.render_area.extent.width == render_area.extent.width
+                && self.rp_state.render_area.extent.height == render_area.extent.height
+            {
                 return;
             }
             // Different render pass — end current one first

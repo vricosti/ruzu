@@ -956,8 +956,9 @@ impl Memory {
         let raw = pt.pointers[page_idx].raw_value();
         let pointer = PageInfo::extract_pointer(raw);
         if pointer != 0 {
-            // Fast path: direct host pointer + vaddr
-            return (pointer + vaddr as usize) as *mut u8;
+            // Upstream stores a biased host pointer and reconstructs with
+            // unchecked unsigned addition: `pointer + vaddr`.
+            return pointer.wrapping_add(vaddr as usize) as *mut u8;
         }
 
         // Slow path: check page type

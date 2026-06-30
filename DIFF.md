@@ -16390,3 +16390,713 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo test clear_exclusive_stores_wzr_to_a64_exclusive_state -- --nocapture` passes.
 - `cargo build --release --bin ruzu-cmd` passes with existing warnings.
 - `RUST_LOG=info timeout 10s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/nx-hbmenu-release/extracted/hbmenu.nro` reaches `OpenLayer` and continuous `BQP_QUEUE`/`BQC_RELEASE` frame flow until timeout, with no panic, `A64 ARM64 run failed`, or `not ported` in the filtered log.
+
+## 2026-06-27 — core/src/arm/dynarmic/arm_dynarmic_32.rs vs core/arm/dynarmic/arm_dynarmic_32.cpp
+
+### Intentional differences
+- Rust keeps `RUZU_A32_OPTIMIZATION_MASK` and `RUZU_A32_NO_OPTIMIZATIONS` as explicit diagnostic overrides; upstream uses settings only.
+- Rust retains the existing macOS page-table/fastmem policy outside the optimization helper; upstream applies `cpuopt_page_tables`, `cpuopt_fastmem`, `cpuopt_fastmem_exclusives`, and `cpuopt_reduce_misalign_checks` inside `MakeJit`.
+
+### Unintentional differences (to fix)
+- None for `cpu_accuracy` optimization mode selection. Rust now mirrors upstream `CpuAccuracy::Unsafe`, `Auto`, and `Paranoid` handling for A32 JIT optimization flags and `unsafe_optimizations`.
+- Remaining debug CPU option toggles listed above still need a separate parity pass if `cpu_debug_mode` is made user-facing for ruzu.
+
+### Missing items
+- No new upstream methods or structs were added in this slice.
+
+### Binary layout verification
+- N/A: JIT configuration only.
+
+### Verification
+- Re-read upstream `arm_dynarmic_32.cpp` around `ArmDynarmic32::MakeJit` safe optimizations, unsafe optimizations, curated Auto optimizations, and Paranoid mode.
+- Re-read local `arm_dynarmic_32.rs` optimization configuration and `JitConfig` construction.
+- `cargo check -p core` passes with existing warnings.
+
+## 2026-06-27 — video_core/src/memory_manager.rs vs video_core/memory_manager.cpp
+
+### Intentional differences
+- Rust keeps the temporary cbuf write-watch diagnostics behind `RUZU_TRACE_CBUF_WRITES`. Upstream has no cbuf watch/backing diagnostic path; keeping this opt-in avoids hot-path logging in normal runs while preserving local debugging support.
+
+### Unintentional differences (to fix)
+- None identified for this instrumentation gating pass.
+
+### Missing items
+- Full `video_core/memory_manager.*` parity still requires a separate broader pass; this entry only covers the cbuf diagnostic path.
+
+### Binary layout verification
+- N/A: diagnostic gating only; no guest-visible struct layout.
+
+### Verification
+- Re-read upstream `video_core/memory_manager.*` search results for cbuf diagnostics; upstream has no equivalent `CBUF_GUEST_BACKING`/write-watch path.
+- Re-read local `memory_manager.rs` cbuf watch registration path.
+
+## 2026-06-27 — core/src/hle/service/nvnflinger/buffer_queue_producer.rs vs core/hle/service/nvnflinger/buffer_queue_producer.cpp
+
+### Intentional differences
+- Rust keeps `[BQP_DEQUEUE_BLOCK]` as an opt-in diagnostic behind `RUZU_TRACE_BQP_DEQUEUE_BLOCK`. Upstream does not log every empty-slot wait; it only logs the `too_many_buffers` condition, which Rust now mirrors with an error log.
+
+### Unintentional differences (to fix)
+- None identified for this instrumentation gating pass.
+
+### Missing items
+- Existing broader `BufferQueueProducer` parity gaps remain tracked separately in earlier DIFF.md entries.
+
+### Binary layout verification
+- N/A: logging/control-flow parity around dequeue waiting only; no guest-visible struct layout.
+
+### Verification
+- Re-read upstream `BufferQueueProducer::WaitForFreeSlotThenRelock`.
+- Re-read local `wait_for_free_slot_then_relock`.
+
+## 2026-06-27 — core/src/hle/service/nvdrv/devices/nvmap.rs vs core/hle/service/nvdrv/devices/nvmap.cpp
+
+### Intentional differences
+- Rust retains existing opt-in allocation loop diagnostics behind `RUZU_TRACE_NVMAP_LOOP` and nvmap history tracing. These are local diagnostics, not upstream behavior.
+
+### Unintentional differences (to fix)
+- None for the audited call-level logging: `IocCreate`, `IocAlloc`, `IocGetId`, and `IocFromId` now use debug-level logs like upstream `LOG_DEBUG` instead of unconditional info-level logs.
+
+### Missing items
+- Broader nvmap parity, including all diagnostics and error severity mapping, remains outside this slice.
+
+### Binary layout verification
+- PASS: existing Rust `Ioc*Params` size assertions match upstream static asserts; this change only adjusts logging severity.
+
+### Verification
+- Re-read upstream `nvmap.cpp` around `IocCreate`, `IocAlloc`, `IocGetId`, and `IocFromId`.
+- Re-read local `nvmap.rs` matching methods.
+
+## 2026-06-27 — core/src/memory/memory.rs vs core/memory.cpp
+
+### Intentional differences
+- Rust uses `usize::wrapping_add` in `get_pointer_impl` to preserve upstream C++ unchecked unsigned arithmetic for the biased page-table pointer fast path. This avoids debug-build overflow panics while matching upstream `pointer + vaddr`.
+
+### Unintentional differences (to fix)
+- None identified for this fast-path pointer reconstruction slice.
+
+### Missing items
+- Broader `core/memory.*` parity is not claimed by this entry.
+
+### Binary layout verification
+- N/A: pointer arithmetic behavior only; no guest-visible struct layout changed.
+
+### Verification
+- Re-read upstream `Memory::Impl::MapPages` and `Memory::Impl::GetPointerImpl` in `core/memory.cpp`.
+- Re-read local `map_pages` and `get_pointer_impl` in `core/src/memory/memory.rs`.
+
+## 2026-06-27 — externals/rdynarmic/src/backend/arm64/emit_arm64_vector_floating_point.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector_floating_point.cpp
+
+### Intentional differences
+- Rust emits through local `inst::fneg_v4s`/`inst::fneg_v2d` helpers instead of oaknut's `code.FNEG`, preserving the same ARM64 instruction encodings.
+
+### Unintentional differences (to fix)
+- None for `FPVectorNeg32`/`FPVectorNeg64`: Rust now routes both opcodes through the ARM64 FP vector dispatcher and emits `FNEG` like upstream.
+
+### Missing items
+- `FPVectorNeg16` remains unimplemented, matching upstream ARM64 which asserts unimplemented for this opcode.
+
+### Binary layout verification
+- N/A: code generation only; no guest-visible struct layout changed.
+
+### Verification
+- Re-read upstream `EmitTwoOp`, `EmitTwoOpArranged`, `FPVectorNeg32`, and `FPVectorNeg64` in Dynarmic `emit_arm64_vector_floating_point.cpp`.
+- Re-read local `emit_two_op_arranged`, `emit_fp_vector_neg32`, `emit_fp_vector_neg64`, and ARM64 opcode dispatch.
+- `cargo test -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words -- --nocapture` passes.
+
+## 2026-06-27 — common/src/page_table.rs vs common/page_table.cpp
+
+### Intentional differences
+- Rust uses `u64::wrapping_add` in `continue_traversal` to preserve upstream C++ unchecked unsigned addition for biased `backing_addr[page] + next_offset`.
+
+### Unintentional differences (to fix)
+- None identified for traversal pointer/physical-address reconstruction.
+
+### Missing items
+- No new upstream methods or structs were added in this slice.
+
+### Binary layout verification
+- N/A: traversal arithmetic only; no guest-visible struct layout changed.
+
+### Verification
+- Re-read upstream `PageTable::BeginTraversal` and `PageTable::ContinueTraversal` in `common/page_table.cpp`.
+- Re-read local `begin_traversal` and `continue_traversal` in `common/src/page_table.rs`.
+
+## 2026-06-27 — hid_core/src/resources/npad/npad_types.rs and core/src/hle/service/hid/hid_server.rs vs hid_core/resources/npad/npad_types.h and core/hle/service/hid/hid_server.cpp
+
+### Intentional differences
+- Rust represents `NpadRevision` as an open enum with `Unknown(u32)` instead of a closed `#[repr(u32)]` enum. This preserves upstream behavior for future/unknown raw revision values: C++ accepts the bitpattern and downstream `switch` statements use their `default` case.
+
+### Unintentional differences (to fix)
+- None for `ActivateNpadWithRevision` raw revision handling. Rust no longer panics on raw revision `0x5`.
+
+### Missing items
+- Broader HID transmute cleanup remains separate; this entry only covers `NpadRevision`.
+
+### Binary layout verification
+- N/A: `NpadRevision` is stored internally in Rust state and is not raw-copied to guest-visible memory in this slice.
+
+### Verification
+- Re-read upstream `NpadRevision` declaration, `IHidServer::ActivateNpadWithRevision`, and `NPadResource` revision switch/default handling.
+- Re-read local `NpadRevision`, `activate_npad_with_revision`, and `npad_style_mask_for_revision`.
+
+## 2026-06-28 — audio_core/src/renderer/command/data_source/decode.rs vs audio_core/renderer/command/data_source/decode.cpp
+
+### Intentional differences
+- Rust routes guest sample reads through the crate-local `GUEST_MEMORY_ACCESSOR` bridge rather than passing `Core::Memory::Memory&` through every decode helper. This preserves the upstream ownership boundary at the audio command layer while matching upstream's guest-memory read behavior.
+- Rust keeps a raw host-pointer fallback only for tests that call decode helpers without a guest-memory accessor.
+
+### Unintentional differences (to fix)
+- None for PCM/adpcm data reads in this slice. Rust no longer treats high guest virtual addresses as host pointers, and no longer relies on the old `< 4 GiB` heuristic.
+
+### Missing items
+- Broader decode parity is not claimed by this entry.
+
+### Binary layout verification
+- N/A: memory access path only; no guest-visible struct layout changed.
+
+### Verification
+- Re-read upstream `DecodePcmInt16`, `DecodePcmFloat`, `DecodeAdpcm`, `ReadAdpcmCoefficients`, and context loading in `decode.cpp`.
+- Re-read local `read_audio_bytes`, `decode_pcm_i16`, `decode_pcm_f32`, `decode_adpcm`, `read_adpcm_coefficients`, and `load_adpcm_context`.
+- `cargo check -p audio_core` passes.
+- `cargo test -p audio_core renderer::command::data_source::decode::tests -- --nocapture` does not currently compile due pre-existing audio_core test API drift unrelated to this decode-memory slice.
+
+## 2026-06-28 — externals/rdynarmic/src/backend/arm64/emit_arm64_vector_floating_point.rs and inst.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector_floating_point.cpp
+
+### Intentional differences
+- Rust uses explicit `inst::*` ARM64 encoders instead of oaknut method calls, preserving the same instruction encodings while fitting the local backend structure.
+- Rust returns explicit `Err` values for unsupported `ToOdd` and invalid `fbits` combinations where upstream uses assertions.
+
+### Unintentional differences (to fix)
+- None for `FPVectorToSignedFixed32`, `FPVectorToSignedFixed64`, `FPVectorToUnsignedFixed32`, and `FPVectorToUnsignedFixed64`. Rust now follows upstream `EmitToFixed`: fixed-point `fbits` is emitted only for `TowardsZero`; non-zero `fbits` with other rounding modes is rejected; non-fixed conversions select `FCVT{N/P/M/Z/A}{S/U}` by rounding mode and signedness.
+
+### Missing items
+- `FPVectorToSignedFixed16` and `FPVectorToUnsignedFixed16` remain unimplemented, matching upstream ARM64's explicit unimplemented assertions for 16-bit vector fixed conversion.
+
+### Binary layout verification
+- N/A: code generation only; no guest-visible struct layout changed.
+
+### Verification
+- Re-read upstream `EmitToFixed` and `FPVectorTo*Fixed*` emitters in `emit_arm64_vector_floating_point.cpp`.
+- Re-read local vector fixed conversion helpers, ARM64 FP-vector dispatch, and ARM64 top-level opcode dispatch.
+- Verified added instruction encodings with local `clang -target arm64-apple-macos` plus `otool -X -s __TEXT __text`.
+- `cargo test -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words -- --nocapture` passes.
+- `cargo check -p rdynarmic` passes.
+
+## 2026-06-28 — externals/rdynarmic/src/backend/arm64/emit_arm64_a64.rs, a64_address_space.rs, address_space.rs, prelude.rs, and emit_arm64.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a64.cpp and backend/x64/a64_emit_x64.cpp
+
+### Intentional differences
+- Upstream ARM64 asserts that `IR::Term::Interpret` should never be emitted, while upstream x64 emits a fallback call to `A64::UserCallbacks::InterpreterFallback` and returns from run code. Rust ARM64 now uses the x64 fallback behavior so Apple Silicon can execute translated blocks that intentionally fall back to the interpreter.
+- Rust adds a backend-local `InterpreterFallback` relocation and prelude callback trampoline, matching the existing ARM64 callback-trampoline pattern used for SVC, exceptions, cache operations, ticks, and memory.
+
+### Unintentional differences (to fix)
+- None for the immediate `Interpret` terminal crash: Rust now stores the A64 PC into `A64JitState::pc`, passes `(pc, num_instructions)` to `interpreter_fallback`, and returns through `ReturnFromRunCode`.
+
+### Missing items
+- The upstream ARM64 `A64MergeInterpretBlocksPass` is still only a simplified placeholder in Rust and does not merge adjacent interpret blocks by re-decoding following instructions.
+
+### Binary layout verification
+- N/A: callback trampoline and terminal emission only; no guest-visible struct layout changed.
+
+### Verification
+- Re-read upstream ARM64 terminal `Interpret` assertion and upstream x64 `A64EmitX64::EmitTerminalImpl(IR::Term::Interpret)`.
+- Re-read local `emit_a64_terminal_inner`, `A64CallbackFns`, `A64CallbackContext`, `PreludeInfo`, `LinkTarget`, and `AddressSpace::resolve_link_target`.
+- `cargo check -p rdynarmic` passes.
+- `cargo test -p rdynarmic backend::arm64:: -- --nocapture` compiles but the broad ARM64 fixture run currently exits with SIGSEGV in an existing trampoline test path after initial tests pass.
+- SpaceCadetPinball-NX under `ruzu-cmd` runs for 120 seconds until `timeout` exits with `rc=124`; no panic/crash occurs and audio renderer logs show continuous render queue activity.
+
+## 2026-06-28 — externals/rdynarmic/src/frontend/a64/translate/simd_shift_by_immediate.rs vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_shift_by_immediate.cpp
+
+### Intentional differences
+- Rust implements the upstream `ShiftLeftLong` helper as a local `shift_left_long` method and extracts `Vpart(64, Vn, 1)` with `GetQ + VectorGetElement(64) + ZeroExtendToQuad`, matching the local IR helper style used elsewhere.
+
+### Unintentional differences (to fix)
+- None for `SSHLL`/`USHLL`. Rust now follows upstream validation (`immh == 0` decode error, `immh.Bit<3>()` reserved), element-size/part/shift calculation, sign/zero extension, widened logical shift-left, and `V(128, Vd)` writeback.
+
+### Missing items
+- Other vector shift-by-immediate operations in upstream `simd_shift_by_immediate.cpp` remain outside this slice.
+
+### Binary layout verification
+- N/A: frontend IR translation only; no guest-visible struct layout changed.
+
+### Verification
+- Re-read upstream `ShiftLeftLong`, `TranslatorVisitor::SSHLL`, and `TranslatorVisitor::USHLL`.
+- Re-read local `shift_left_long`, `sshll`, `ushll`, and A64 dispatcher entries.
+- `cargo test -p rdynarmic frontend::a64::translate::simd_shift_by_immediate::tests::sshll_spacecadet_encoding_translates_without_interpret_terminal -- --nocapture` passes.
+- `cargo check -p rdynarmic` passes.
+
+## 2026-06-28 — externals/rdynarmic/src/frontend/a64/translate/simd_three_different.rs vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_three_different.cpp
+
+### Intentional differences
+- Rust adds a new upstream-owned counterpart file but ports only the `LongOperation` subset needed for `SADDL`, `SSUBL`, `UADDL`, and `USUBL`. This preserves file ownership while avoiding unrelated partial ports.
+- Rust implements `Vpart(64, vec, part)` locally using the same `GetD`/`GetQ + VectorGetElement(64)` pattern used by existing Rust A64 frontend code.
+
+### Unintentional differences (to fix)
+- None for the `LongOperation` subset. Rust now preserves upstream validation (`size == 0b11` reserved), element size, source half selection via `Q`, signed/unsigned extension, add/sub behavior, and `V(128, Vd)` writeback.
+
+### Missing items
+- The remaining upstream `simd_three_different.cpp` operations (`PMULL`, absolute-difference long, multiply-long, wide add/sub, saturated doubling multiply long) are not ported by this slice.
+
+### Binary layout verification
+- N/A: frontend IR translation only; no guest-visible struct layout changed.
+
+### Verification
+- Re-read upstream `LongOperation`, `SADDL`, `SSUBL`, `UADDL`, and `USUBL`.
+- Re-read local `simd_three_different.rs`, `mod.rs`, and A64 dispatcher entries.
+- `cargo test -p rdynarmic frontend::a64::translate::simd_three_different::tests::saddl_spacecadet_encoding_translates_without_interpret_terminal -- --nocapture` passes.
+- `cargo check -p rdynarmic` passes.
+- Rebuilt `ruzu-cmd` and ran SpaceCadetPinball-NX for 180 seconds until timeout (`rc=124`): no `Unimplemented instruction`, no `PrefetchAbort`, frames reached `frame_number=129`, and audio renderer opened two cubeb render streams.
+- Ran SpaceCadetPinball-NX with audio tracing for 130 seconds until timeout (`rc=124`): `ADSP::AudioRenderer post-process=13547`, `CubebSink callback=32`, `BQP_QUEUE=18`, `BQC_RELEASE=18`, `Unimplemented instruction=0`, `PrefetchAbort=0`.
+
+## 2026-06-28 — video_core/src/engines/fermi_2d.rs vs video_core/engines/fermi_2d.cpp and video_core/engines/fermi_2d.h
+
+### Intentional differences
+- Rust keeps `Engine::execute_pending` as a compatibility path for older callers, but the Fermi2D blit trigger now executes immediately from `handle_blit`, matching upstream `Fermi2D::CallMethod` calling `Blit()` directly when `pixels_from_memory.src_y0` high is written.
+- Rust has an env-gated `RUZU_TRACE_FERMI2D_BLIT` diagnostic around the immediate blit path. It is inactive by default and does not alter normal behavior.
+
+### Unintentional differences (to fix)
+- None for trigger ordering in this slice. Rust no longer depends on a deferred `pending_blit` path that the active DMA pusher/scheduler never calls.
+
+### Missing items
+- Broader Fermi2D parity is not claimed here. `AccelerateSurfaceCopy` in the active Vulkan rasterizer still returns `false`, so GPU-side Fermi2D image blit acceleration remains missing.
+
+### Binary layout verification
+- PASS for the touched path: no Fermi2D register struct layout was changed; only trigger execution ordering and diagnostics changed.
+
+### Verification
+- Re-read upstream `Fermi2D::CallMethod` and `Fermi2D::Blit` trigger behavior in `fermi_2d.cpp`.
+- Re-read local `handle_blit`, `execute_blit`, and `Engine::execute_pending`.
+- `cargo build --bin ruzu-cmd` passes.
+- `cargo test -p video_core engines::fermi_2d --lib` could not complete because the local test link environment cannot find Homebrew FFmpeg `libavcodec` (`/opt/homebrew/Cellar/ffmpeg/8.1_1/lib` is absent).
+- SpaceCadetPinball-NX run with `RUZU_TRACE_FERMI2D_BLIT=1` produced no `FERMI2D_BLIT` entries, proving this title's current black screen is not caused by a missing Fermi2D blit.
+
+## 2026-06-28 — video_core/src/engines/draw_manager.rs vs video_core/engines/draw_manager.cpp and video_core/engines/maxwell_3d.cpp
+
+### Intentional differences
+- Rust exposes `Maxwell3DDrawView::draw_call_snapshot` so rasterizers that still consume the crate-local `DrawCall` compatibility struct can build that snapshot from the same draw-manager-owned data. This preserves logic ownership in `draw_manager.rs` rather than duplicating Maxwell register harvesting in `renderer_vulkan`.
+- Snapshot-mode fallback fills unavailable live-only fields conservatively for tests. Runtime live mode uses `Maxwell3DAccess`, matching the same source used by the existing private `DrawManager::build_compat_draw_call`.
+
+### Unintentional differences (to fix)
+- The active Vulkan renderer still consumes a `DrawCall` compatibility snapshot instead of upstream's direct `maxwell3d->draw_manager->GetDrawState()` inside `RasterizerVulkan::Draw`. This is a transitional divergence until the Vulkan rasterizer owns the upstream `Maxwell3D*`-equivalent state directly.
+
+### Missing items
+- `DrawIndirect` and `DrawTexture` still need the same upstream-faithful active Vulkan path; this slice only connects direct draws.
+
+### Binary layout verification
+- N/A: draw snapshots are internal Rust structs and are not raw-copied to guest-visible memory.
+
+### Verification
+- Re-read local private `DrawManager::build_compat_draw_call` and upstream draw-state ownership in `draw_manager.cpp`/`maxwell_3d.cpp`.
+- `cargo build --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX now logs active Vulkan direct draws via `RUZU_TRACE_VK_DRAW_STUB=1`, proving the active rasterizer receives draw snapshots.
+
+## 2026-06-28 — video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp and video_core/renderer_vulkan/present/layer.cpp
+
+### Intentional differences
+- Rust active `RasterizerVulkan` now stores the channel-bound `MemoryManager` from `ChannelSetupCaches`, matching upstream rasterizer access to the active channel GPU memory owner.
+- Rust active `RasterizerVulkan::draw(Maxwell3DDrawView, instance_count)` now converts the draw view to a `DrawCall` snapshot and calls the existing partial Vulkan draw path with a GPU-memory reader. This is a necessary bridge while the full upstream `PrepareDraw` path is still incomplete.
+- `RUZU_TRACE_VK_DRAW_STUB` and `RUZU_TRACE_VK_RAW_PRESENT` remain env-gated diagnostics only.
+
+### Unintentional differences (to fix)
+- Major: upstream `RasterizerVulkan::Draw` calls `PrepareDraw`, which synchronizes descriptors, updates render targets through `texture_cache.UpdateRenderTargets`, binds real framebuffer images, records the draw, and later lets `Layer::ConfigureDraw` use `rasterizer.AccelerateDisplay`. The active Rust Vulkan path still renders through a simplified offscreen framebuffer and `accelerate_display` still returns `None`.
+- Major: because `accelerate_display` is unported in the active rasterizer, `Layer` falls back to `UpdateRawImage` and reads guest framebuffer RAM. SpaceCadet renders to RT addresses `0x82D1000/0x8B41000/0x93B1000`, while nvnflinger presents `0x4C5C000/0x54CD000/0x5D3E000`; those presented buffers remain zero.
+
+### Missing items
+- Port active Vulkan `PrepareDraw` ownership and ordering from `vk_rasterizer.cpp`.
+- Port active Vulkan texture-cache render-target binding sufficiently for `TextureCache::TryFindFramebufferImageView`.
+- Implement active `RasterizerVulkan::AccelerateDisplay` so `present/layer.rs` can use the rendered Vulkan image instead of raw guest RAM fallback.
+- Investigate shader fetch warnings (`Unknown Maxwell opcode: 0x0000000000000000`) after render-target/display plumbing is connected; these indicate shader code reads may still be wrong or overrun.
+
+### Binary layout verification
+- N/A: renderer-side ownership and command submission only; no guest-visible struct layout changed.
+
+### Verification
+- Re-read upstream `RasterizerVulkan::Draw`, `AccelerateSurfaceCopy`, `AccelerateDisplay`, and `Layer::ConfigureDraw`.
+- Re-read local active `RasterizerVulkan::draw`, `initialize_channel`, `bind_channel`, `accelerate_display`, and `present/layer.rs::configure_draw_with_rasterizer`.
+- `cargo build --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX with `RUZU_TRACE_VK_DRAW_STUB=1 RUZU_TRACE_VK_RAW_PRESENT=1` for 180 seconds reached `BQP_QUEUE`, logged 123 active Vulkan draws, and still had `raw nonzero presents: 0`. This proves progress into the active draw path, but not a working display yet.
+
+## 2026-06-28 — video_core/src/renderer_vulkan/texture_cache.rs and video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp, vk_texture_cache.h, and present/layer.cpp
+
+### Intentional differences
+- Rust active `renderer_vulkan::TextureCache` now owns `TextureCacheBase` and forwards `CreateChannel`, `BindToChannel`, and `EraseChannel` into it, matching the upstream rasterizer/texture-cache ownership edge needed by `TryFindFramebufferImageView`.
+- Rust active `RasterizerVulkan::draw` registers the current RT0 in `TextureCacheBase`, creates a minimal backend Vulkan image/view/framebuffer for the translated CPU address, and renders to that framebuffer instead of the old fixed offscreen framebuffer when possible. This is a transitional backend wrapper while full upstream `PrepareDraw` is not yet ported.
+- Rust active `RasterizerVulkan::AccelerateDisplay` now locks the texture cache and calls `try_find_framebuffer_image_view`, then returns a Vulkan image/view to `present/layer.rs`, matching the upstream `Layer::ConfigureDraw -> RasterizerVulkan::AccelerateDisplay -> TextureCache::TryFindFramebufferImageView` control flow.
+- `RUZU_TRACE_VK_PRESENT` and `RUZU_TRACE_VK_DRAW_STUB` are env-gated diagnostics only.
+
+### Unintentional differences (to fix)
+- Major: upstream `RasterizerVulkan::Draw` calls `PrepareDraw`, which updates descriptors, synchronizes render targets, obtains framebuffer objects from `TextureCache`, and uses `RenderPassCache` with the actual guest attachment formats. Rust still uses a minimal RT0-only bridge and the existing fixed render pass.
+- Major: upstream `vk_texture_cache` has backend image/view objects for every `ImageId`/`ImageViewId`, complete image preparation, barriers, rescaling, alias handling, and framebuffer cache ownership. Rust active Vulkan only creates a presentable RT0 image keyed by translated CPU address.
+- The active draw path still consumes a Rust `DrawCall` compatibility snapshot instead of upstream's direct `Maxwell3D`/draw-manager state access.
+
+### Missing items
+- Full active Vulkan `PrepareDraw` ordering.
+- Vulkan backend `PrepareImageView`, image barriers/layout transitions, and image/view slot ownership keyed by common `ImageId`/`ImageViewId`.
+- Format-specific render-pass/framebuffer cache selection from upstream `RenderPassCache`.
+- Shader fetch/pipeline correctness investigation remains after framebuffer selection is no longer falling back to raw RAM.
+
+### Binary layout verification
+- N/A: renderer-side state only; no guest-visible raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `RasterizerVulkan::AccelerateDisplay` and `Layer::ConfigureDraw`.
+- Re-read local active `renderer_vulkan::TextureCache`, `RasterizerVulkan::draw`, and `RasterizerVulkan::accelerate_display`.
+- `cargo build --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX run for 180 seconds with `RUST_LOG='video_core::renderer_vulkan=info,core::hle::service::nvnflinger=info' RUZU_TRACE_VK_PRESENT=1 RUZU_TRACE_VK_DRAW_STUB=1` timed out normally (`rc=124`) after logging `128` active Vulkan direct draws and `256` accelerated present hits. No accelerated present misses were captured. This removes the previous raw guest-RAM fallback as the current explanation for the black screen.
+
+## 2026-06-28 — video_core/src/renderer_vulkan/mod.rs and video_core/src/renderer_vulkan/buffer_cache.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp
+
+### Intentional differences
+- Rust active `RasterizerVulkan::accelerate_inline_to_memory` now follows upstream `RasterizerVulkan::AccelerateInlineToMemory` ordering: translate GPU address, write guest GPU memory, notify buffer/texture caches, invalidate shader and query caches.
+- The active Rust Vulkan `BufferCache` is still a reduced cache keyed by GPU VA, while upstream `BufferCache::WriteMemory` receives translated CPU/device address and tracks pages through the common buffer cache. Rust therefore invalidates overlapping cached GPU-VA buffers as the faithful adaptation available in the current owner.
+- Upstream invalidates `pipeline_cache.InvalidateRegion`; active Rust keeps shader invalidation in `shader_cache` because the current Vulkan pipeline cache delegates shader environment ownership to the shared shader cache bridge.
+- `RUZU_TRACE_INLINE_TO_MEMORY` and shader-analyze logs are env-gated diagnostics only.
+
+### Unintentional differences (to fix)
+- The active Vulkan buffer cache still lacks upstream `BufferCache::InlineMemory` semantics for patching GPU-modified cached buffers in place.
+- The active Vulkan texture/cache path remains a partial bridge; `texture_cache.base.write_memory` marks common images CPU-modified, but the full upstream Vulkan image/view runtime invalidation path is not ported.
+- `TryFindSize` still fails for the SpaceCadet shaders, but the fallback CFG walk now sees real shader words and terminates quickly; this points to shader-size/end-marker parity rather than missing inline memory writes.
+
+### Missing items
+- Port active Vulkan `BufferCache::InlineMemory` parity and wire it from `RasterizerVulkan::accelerate_inline_to_memory`.
+- Port active Vulkan `PipelineCache::InvalidateRegion` ownership if/when pipeline cache owns compiled shader entries directly instead of relying on the shared shader cache bridge.
+- Investigate why SpaceCadet does not call `audren:u/OpenAudioRenderer` until about 48 seconds despite audio_core/cubeb being initialized at about 0.60 seconds.
+
+### Binary layout verification
+- N/A: renderer cache invalidation and guest memory writes only; no guest-visible raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `RasterizerVulkan::AccelerateInlineToMemory` in `vk_rasterizer.cpp` and upstream `MemoryManager::WriteBlock/WriteBlockUnsafe`.
+- Re-read local `MemoryManager::write_block/write_block_unsafe`, OpenGL `accelerate_inline_to_memory`, active Vulkan `accelerate_inline_to_memory`, and active Vulkan `BufferCache`.
+- `cargo build --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX with `RUZU_TRACE_SHADER_ANALYZE=1 RUZU_TRACE_SHADER_WORDS=1 RUZU_TRACE_INLINE_TO_MEMORY=1` now logs nonzero shader words at `0x4000BF6B0` and `0x4000BF430`; the fallback shader CFG walk terminates in `38` and `29` steps instead of walking tens of thousands of zero instructions.
+
+## 2026-06-28 — video_core/src/renderer_vulkan/graphics_pipeline.rs, video_core/src/renderer_vulkan/mod.rs, shader_recompiler/src/backend/spirv/spirv_emit_context.rs, and video_core/src/shader_environment.rs vs video_core/renderer_vulkan/vk_graphics_pipeline.cpp, video_core/renderer_vulkan/pipeline_helper.h, and video_core/shader_environment.cpp
+
+### Intentional differences
+- Rust `GraphicsPipeline` now stores descriptor layout metadata and a descriptor-bank summary next to the Vulkan pipeline, matching upstream ownership where `GraphicsPipeline` owns `descriptor_set_layout`, `descriptor_allocator`, and descriptor update template state.
+- Rust descriptor binding allocation now advances one binding per descriptor record with `descriptorCount = desc.count`, matching upstream `DescriptorLayoutBuilder::Add` ordering instead of treating each array element as a separate binding.
+- Rust active `RasterizerVulkan::draw` now allocates, updates, and binds a graphics descriptor set before draw. This matches the upstream `GraphicsPipeline::ConfigureDraw` command ordering at the draw point.
+- Rust `GenericEnvironment::has_runtime_gpu_memory_owner` is a guard for default Rust environment slots. Upstream cannot construct a runtime `GenericEnvironment` without `Tegra::MemoryManager&`; Rust can temporarily hold default array entries, so the guard prevents analyzing an unpopulated slot.
+- Rust `GraphicsPipelineCache::build_pipeline_keyed_from_environments` now selects active environment slots instead of unconditionally compiling VertexB and Fragment. This follows upstream's enabled-stage model more closely.
+
+### Unintentional differences (to fix)
+- Major: upstream `GraphicsPipeline::ConfigureImpl` resolves real uniform buffers, texture handles, image views, samplers, storage buffers, texture buffers, render-area push constants, rescaling push constants, render targets, and feedback loops before `ConfigureDraw`. Rust currently binds fallback uniform/image resources for missing real descriptor data. This avoids MoltenVK descriptor crashes but is not faithful rendering.
+- Major: upstream uses `DescriptorUpdateTemplate` and `guest_descriptor_queue.UpdateData()`; Rust currently builds `vk::WriteDescriptorSet` entries directly in `RasterizerVulkan::bind_graphics_descriptors`.
+- Major: Rust only covers `UNIFORM_BUFFER`, `STORAGE_BUFFER`, `COMBINED_IMAGE_SAMPLER`, and `STORAGE_IMAGE` in the active fallback binding path. Upstream also handles texture buffers, image buffers, and their buffer-cache synchronization.
+- Rust still creates a simplified graphics pipeline and render pass rather than upstream `MakePipeline` plus `RenderPassCache::Get(MakeRenderPassKey(key.state))`.
+
+### Missing items
+- Port upstream `GraphicsPipeline::ConfigureImpl` resource resolution into the Rust Vulkan owner.
+- Port `DescriptorLayoutBuilder::CreateTemplate` usage into the active graphics pipeline path.
+- Replace fallback descriptor resources with real `BufferCache` and `TextureCache` descriptor data.
+- Add push constant updates for upstream rescaling and render-area layouts.
+- Investigate remaining `Unknown Maxwell opcode: 0x0000000000000000` warning after real descriptor/render-target binding is in place.
+
+### Binary layout verification
+- N/A: Vulkan descriptor metadata and shader environment ownership only; no guest-visible raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::GraphicsPipeline`, `GraphicsPipeline::ConfigureImpl`, `GraphicsPipeline::ConfigureDraw`, `DescriptorLayoutBuilder`, and `GenericEnvironment::GenericEnvironment/TryFindSize`.
+- Re-read local `GraphicsPipelineCache::create_pipeline_layout`, `RasterizerVulkan::draw`, `RasterizerVulkan::bind_graphics_descriptors`, SPIR-V descriptor decoration emission, and `GenericEnvironment::read_gpu_bytes`.
+- `cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX with Vulkan/MoltenVK ran for 75 seconds until timeout (`rc=124`) without the previous MoltenVK `bindMetalResources` segfault and without the previous `GenericEnvironment runtime GPU read requires a live MemoryManager owner` panic. The run reached audio startup, `BQP_QUEUE` frames, `BQC_RELEASE` frames, and at least `submit#64`, proving the runtime now advances past the previous descriptor/panic blockers.
+
+## 2026-06-28 — video_core/src/renderer_vulkan/graphics_pipeline.rs and video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_graphics_pipeline.cpp, video_core/renderer_vulkan/vk_rasterizer.cpp, and video_core/buffer_cache/buffer_cache.h
+
+### Intentional differences
+- Rust graphics descriptor metadata now records the upstream graphics stage and constant-buffer slot for each UBO descriptor. This preserves upstream ownership enough for the active reduced Vulkan path to bind the same guest constant buffers that `Maxwell3D::CB_BIND` recorded.
+- Rust active `RasterizerVulkan::bind_graphics_descriptors` now uploads enabled `draw.cb_bindings[stage][slot]` through the existing Vulkan `BufferCache::get_or_upload` and writes those buffers into `UNIFORM_BUFFER` descriptors. This is the active-path equivalent of upstream `RasterizerVulkan::BindGraphicsUniformBuffer -> BufferCache::BindGraphicsUniformBuffer -> BindHostGraphicsUniformBuffer`.
+- Rust caps uploaded UBO descriptor ranges at `0x10000`, matching the SPIR-V UBO array size used by the current emitter.
+
+### Unintentional differences (to fix)
+- Major: upstream tracks `enabled_uniform_buffer_masks`, `uniform_buffer_sizes`, dirty masks, fast uniform paths, and real `BindHostStageBuffers` ordering. Rust currently binds UBOs directly from the draw snapshot during descriptor update.
+- Major: upstream uses translated CPU/device addresses and buffer-cache synchronization; Rust active `BufferCache` is still keyed by GPU VA and uploads into standalone Vulkan buffers.
+- Texture, sampler, storage-buffer, texture-buffer, image-buffer, rescaling push constants, and render-area push constants remain incomplete in the active Vulkan descriptor path. Combined image samplers still use fallback resources.
+
+### Missing items
+- Port active Vulkan `BufferCache::BindGraphicsUniformBuffer`, `DisableGraphicsUniformBuffer`, `SetUniformBuffersState`, and `BindHostStageBuffers` as owned state rather than reading UBOs from the draw snapshot.
+- Port upstream texture/sampler handle resolution from `GraphicsPipeline::ConfigureImpl`.
+- Replace fallback image descriptors with `TextureCache::FillGraphicsImageViews` / `PushImageDescriptors` equivalent data.
+
+### Binary layout verification
+- N/A: Vulkan host descriptor binding only; no guest-visible raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `RasterizerVulkan::BindGraphicsUniformBuffer`, `BufferCache::BindGraphicsUniformBuffer`, `BufferCache::BindHostGraphicsUniformBuffers`, and `GraphicsPipeline::ConfigureImpl`.
+- Re-read local `Maxwell3D::process_cb_bind`, active `RasterizerVulkan::bind_graphics_descriptors`, and active `BufferCache::get_or_upload`.
+- `cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX with Vulkan/MoltenVK ran for 90 seconds until timeout (`rc=124`) with real UBO descriptor uploads enabled. The run reached audio startup, `BQP_QUEUE #64`, `BQC_RELEASE frame_number=65`, and `submit#64` without Vulkan crash or shader-environment panic.
+
+## 2026-06-28 — video_core/src/renderer_vulkan/texture_cache.rs and video_core/src/renderer_vulkan/mod.rs vs video_core/texture_cache/texture_cache.h, video_core/renderer_vulkan/vk_texture_cache.cpp, video_core/renderer_vulkan/vk_graphics_pipeline.cpp, and video_core/renderer_vulkan/vk_rasterizer.cpp
+
+### Intentional differences
+- Rust active Vulkan sampled-image materialization remains a backend bridge in `renderer_vulkan/texture_cache.rs`; upstream owns this through `TextureCache<P>::RefreshContents`, `Image::UploadMemory`, and `ImageView::Handle`.
+- Rust sampled-image upload now uses an explicit unsafe GPU-memory reader, matching upstream `GpuGuestMemory<UnsafeRead>` for normal `UploadImageContents`.
+- Rust upload layout transition now uses `UNDEFINED` only on first upload and `GENERAL` on reupload, matching upstream `Image::UploadMemory` / `CopyBufferToImage` initialized-state ordering.
+- Rust active `RasterizerVulkan::invalidate_region`, `on_cache_invalidation`, and `on_cpu_write` now notify the common texture cache before shader/query invalidation, matching the upstream Vulkan invalidation order for the texture portion.
+- `RUZU_TRACE_VK_TEXTURE_HANDLE`, `RUZU_TRACE_VK_TEXTURE_BIND`, and `RUZU_TRACE_VK_TEXTURE_UPLOAD` are env-gated diagnostics only.
+
+### Unintentional differences (to fix)
+- Major: upstream Vulkan texture cache owns full image/runtime state, including converted images, accelerated upload, rescaling, aliases, MSAA upload handling, copy/reinterpret paths, and sampler materialization. Rust active Vulkan currently materializes only a small sampled 2D/linear subset and uses the fallback sampler.
+- Major: upstream `RasterizerVulkan::InvalidateRegion` and `InnerInvalidation` also update the full buffer cache with translated CPU/device addresses. Rust active Vulkan buffer cache is still a reduced GPU-VA cache, so only the texture/shader/query portions are faithful here.
+- Major: SpaceCadet resolves fragment texture handle `raw=0` from valid cbuf `stage=4 slot=15 addr=0x82A1000 offset=0x20`, producing TIC 0 -> `gpu=0xA299000 cpu=0x88C8000`, but traces show no CPU or GPU-VA write to that image before upload. The upload is therefore bit-faithful to current guest memory but still black.
+- Rust `GraphicsPipeline::ConfigureImpl` parity is still incomplete; descriptor resolution is active-path code in `RasterizerVulkan::bind_graphics_descriptors` rather than upstream's pipeline-owned configure method.
+
+### Missing items
+- Port Vulkan texture-cache image copy / render-target feedback paths so GPU-generated surfaces become visible to sampled-image views.
+- Port active Vulkan buffer cache CPU/device-address tracking before claiming full `RasterizerVulkan::InvalidateRegion` parity.
+- Determine whether TIC 0 at `0xA299000` should be produced by Fermi2D, MaxwellDMA, render target rendering, or resource upload in SpaceCadet; current traces show writes to nearby control/cbuf addresses but not to the sampled image.
+- Replace fallback sampler with `TextureCache::GetSampler` / TSC materialization parity.
+
+### Binary layout verification
+- N/A: Vulkan host image upload and invalidation logic only; no guest-visible raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::RefreshContents`, `TextureCache<P>::UploadImageContents`, `Image::UploadMemory`, `CopyBufferToImage`, `GraphicsPipeline::ConfigureImpl`, and `RasterizerVulkan::{InvalidateRegion,OnCPUWrite,OnCacheInvalidation}`.
+- Re-read local active Vulkan `materialize_sampled_image_view`, `upload_sampled_image_contents`, `bind_graphics_descriptors`, and `RasterizerInterface` implementation.
+- `cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan/MoltenVK runs to timeout (`rc=124`) without crash. Trace shows `[VK_TEXTURE_HANDLE] raw=0 tic=0 tsc=0 cbuf_addr=0x82A1000 cbuf_size=0x10000`, followed by one upload for `gpu=0xA299000 cpu=0x88C8000` with `guest_nonzero=false`.
+
+## 2026-06-28 — video_core/src/engines/maxwell_dma.rs, video_core/src/command_processor.rs, and video_core/src/gpu_context.rs vs video_core/engines/maxwell_dma.cpp, video_core/engines/maxwell_dma.h, and video_core/dma_pusher.cpp
+
+### Intentional differences
+- Rust `MaxwellDMA::call_method` now matches upstream `MaxwellDMA::CallMethod`: it validates the method index, writes `regs[method]`, and executes the launch immediately when `method == launch_dma`.
+- Rust keeps the existing `Engine::write_reg` / `execute_pending` compatibility path by marking a deferred launch there only. This path has no direct upstream equivalent; upstream-shaped `DmaPusher -> EngineInterface::CallMethod` now uses immediate launch semantics.
+- The DMA copy implementation is shared through `collect_launch_writes`, so the same ported copy/remap/swizzle logic is used by immediate and compatibility paths. Immediate launch applies returned writes through `MemoryManager::write_block_unsafe`, matching upstream `MemoryManager::CopyBlock` / `WriteBlockUnsafe` synchronous guest-memory visibility.
+- `command_processor.rs` and `gpu_context.rs` now return/apply pending writes after each compatibility dispatch. This is a reduced compatibility adaptation for the old `GpuContext` command path; the real upstream-shaped scheduler/DmaPusher path should not depend on it.
+- `RUZU_TRACE_GPU_WRITEBACKS` is env-gated diagnostic output only.
+
+### Unintentional differences (to fix)
+- Upstream `MaxwellDMA::Launch` calls `memory_manager.FlushCaching()` directly before software DMA reads. Rust approximates this through rasterizer `flush_region` calls in the copied paths; full upstream cache ownership is still incomplete.
+- Upstream routes accelerated DMA through `rasterizer->AccessAccelerateDMA()` and returns early on success. Rust has matching interface hooks, but the active Vulkan acceleration/cache integration remains partial.
+- The compatibility `GpuContext` command processor still does not mirror upstream `DmaPusher` method sink/current segment state exactly; it is kept only as a legacy backend.
+
+### Missing items
+- Port full upstream Vulkan DMA acceleration and cache synchronization so `BufferToImage`, `ImageToBuffer`, and `BufferCopy` are owned by the renderer cache path instead of mostly falling back to CPU writes.
+- Remove or retire the compatibility `GpuContext` command path once all runtime submission uses upstream-shaped `DmaPusher`.
+- Continue rendering investigation after the fixed DMA upload: SpaceCadet now uploads nonzero texture data, so remaining visual issues are no longer explained by a missing MaxwellDMA write.
+
+### Binary layout verification
+- N/A: engine register constants and raw byte DMA payloads are involved, but no guest-visible raw-copied struct layout changed in this slice.
+
+### Verification
+- Re-read upstream `MaxwellDMA::CallMethod`, `MaxwellDMA::CallMultiMethod`, `MaxwellDMA::Launch`, `CopyPitchToBlockLinear`, `ReleaseSemaphore`, and `DmaPusher::CallMethod`.
+- Re-read local `MaxwellDMA::call_method`, `call_multi_method`, `collect_launch_writes`, `EngineInterface` implementation, `Engine::write_reg`, and the compatibility `CommandProcessor`/`GpuContext` writeback path.
+- `cargo build --release --bin ruzu-cmd` passes.
+- `cargo test -p video_core maxwell_dma --lib` does not currently compile because of pre-existing Vulkan test-build errors in `graphics_pipeline.rs` (`GraphicsPipelineKey` field mismatch and missing descriptor fields), not because of this MaxwellDMA refactor.
+- SpaceCadetPinball-NX Vulkan/MoltenVK run reached the previous texture upload point. Trace now shows `MaxwellDMA::LAUNCH src=0xA3C9000 dst=0xA299000 ...`, followed by `[GPU_VA_WRITEBLOCK] gpu_va=0xA299000 ...` with nonzero payloads, then `[VK_TEXTURE_UPLOAD] gpu=0xA299000 ... guest_nonzero=true linear_nonzero=true`.
+
+## 2026-06-28 — video_core/src/renderer_vulkan/pipeline_cache.rs and video_core/src/renderer_vulkan/graphics_pipeline.rs vs video_core/renderer_vulkan/vk_pipeline_cache.cpp and video_core/shader_cache.cpp
+
+### Intentional differences
+- Rust `PipelineCache` now keeps a persistent `graphics_key`, matching upstream `PipelineCache::graphics_key`. The active shared-cache path passes the previous `graphics_key.unique_hashes` into `ShaderCache::refresh_stages` before refreshing fixed state.
+- Rust adds `Default` for `GraphicsPipelineKey` to represent upstream zero-initialized member state: all shader hashes zero and default fixed pipeline state.
+- Rust still constructs the refreshed key through `GraphicsPipelineCache::make_key_from_unique_hashes` instead of mutating `graphics_key.state.Refresh(...)` in place. This is mechanical Rust ownership separation; the persistent hash input/output behavior now matches upstream.
+
+### Unintentional differences (to fix)
+- Upstream `PipelineCache::CurrentGraphicsPipeline` refreshes fixed state directly from `maxwell3d` and dynamic feature state. Rust refreshes from the reduced `DrawCall` snapshot, so incomplete fixed-state fields can still cause pipeline-key divergence.
+- Upstream `ShaderCache::RefreshStages` is owned by `video_core/shader_cache.cpp` and directly reads `maxwell3d->dirty.flags`. Rust uses the ported shared `ShaderCache` adapter through channel state; this is structurally close but still not a byte-for-byte owner match.
+
+### Missing items
+- Complete `FixedPipelineState::refresh` parity with upstream `GraphicsPipelineCacheKey::FixedPipelineState::Refresh`.
+- Add focused unit coverage for the non-dirty shader path once `PipelineCache` construction can be tested without a live Vulkan device.
+
+### Binary layout verification
+- N/A: host Vulkan pipeline-cache key ownership only; no guest-visible raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `VideoCommon::ShaderCache::RefreshStages`: when shaders are not dirty it returns `last_shaders_valid` without rewriting `unique_hashes`.
+- Re-read upstream `Vulkan::PipelineCache::CurrentGraphicsPipeline`: it passes persistent member `graphics_key.unique_hashes` into `RefreshStages`, then refreshes the same member key state before lookup.
+- Re-read local `ShaderCache::refresh_stages`, `PipelineCache::current_graphics_pipeline_with_shared_cache`, and `GraphicsPipelineKey`.
+- `cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan/MoltenVK ran to timeout (`rc=124`). Trace now shows render-target registration and `AccelerateDisplay hit` for all three rotating present buffers: `0x4C5C000`, `0x54CD000`, and `0x5D3E000`.
+
+## 2026-06-29 — video_core/src/renderer_vulkan/mod.rs, video_core/src/renderer_vulkan/texture_cache.rs, and video_core/src/renderer_vulkan/present/layer.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp, video_core/renderer_vulkan/present/layer.cpp, and video_core/framebuffer_config.cpp
+
+### Intentional differences
+- Rust `RasterizerVulkan::clear` now honors `clear_control.use_scissor` when building the `VkClearRect`, matching upstream `RasterizerVulkan::Clear` choosing `GetScissorState(regs, 0, up_scale, down_shift)` only when the clear control requests it.
+- Rust passes the draw-manager `surface_clip` snapshot into `Maxwell3DRenderTargets` when registering render targets instead of fabricating a local max-size clip. This keeps render-target dimensions sourced from Maxwell state like upstream.
+- Rust adds an env-gated `RUZU_TRACE_VK_PRESENT_LAYER` diagnostic in `present/layer.rs`. Upstream has no equivalent log; it is inactive by default and records only framebuffer/crop/texture dimensions for display debugging.
+- Rust adds a reduced-backend fallback for full RGBA RT0 clears: after the upstream-shaped `cmd_clear_attachments`, it clears the backing RT0 image with `cmd_clear_color_image` through a transfer layout transition. This is a temporary Vulkan backend workaround because the current reduced render-target/renderpass path did not visibly initialize the sampled RT0 image outside the guest-drawn area under MoltenVK. Upstream does not need this fallback because its texture cache/framebuffer scheduler owns full renderpass image state.
+- Rust render-target images now include `TRANSFER_DST` usage so the fallback clear can legally target them.
+
+### Unintentional differences (to fix)
+- Major: active Rust Vulkan clear handling is still owned inside `renderer_vulkan/mod.rs`; upstream owns this in `vk_rasterizer.cpp`. This should move when the Vulkan rasterizer is split into upstream-faithful files.
+- Major: upstream `RasterizerVulkan::Clear` calls `FlushWork`, `gpu_memory->FlushCaching`, query-cache notifications, `texture_cache.UpdateRenderTargets(true)`, and scheduler renderpass request before clearing. Rust still implements only the active reduced subset.
+- Major: upstream converts integer render-target clear colors and uses `blit_image.ClearColor` for partial color masks. Rust currently handles only the normal full-color float path used by SpaceCadet.
+- Major: upstream depth/stencil clear paths, stencil mask fallback, rescaling state, and full attachment selection are still incomplete in the active Rust path.
+
+### Missing items
+- Port full `RasterizerVulkan::Clear` ownership and ordering, including cache flushes, query notifications, renderpass/framebuffer ownership, integer format conversion, partial color-mask blit fallback, non-RT0 color attachments, depth/stencil, and rescaling.
+- Replace the `cmd_clear_color_image` fallback with the upstream-equivalent renderpass/framebuffer texture-cache scheduler once the Vulkan backend is structurally split and complete.
+- Keep `Layer::ConfigureDraw` parity under review: Rust now matches upstream's empty-crop behavior (`NormalizeCrop` falls back to framebuffer dimensions), but the surrounding anti-alias/FSR/resource tick machinery remains a reduced implementation.
+
+### Binary layout verification
+- N/A: Vulkan host image/renderpass behavior only; no guest-visible raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `RasterizerVulkan::Clear` in `vk_rasterizer.cpp`, including scissor selection, render-area clamping, full color clear, and partial-mask fallback.
+- Re-read upstream `Layer::ConfigureDraw` and `Layer::UpdateDescriptorSet` in `present/layer.cpp`, including `AccelerateDisplay`, `NormalizeCrop`, and descriptor layout `VK_IMAGE_LAYOUT_GENERAL`.
+- Re-read upstream `NormalizeCrop` in `framebuffer_config.cpp`; empty crop correctly expands to the full framebuffer dimensions.
+- `cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX with Vulkan/MoltenVK ran until `timeout` (`rc=124`) and dumped `/tmp/ruzu_pinball_present5.png`. Logs show repeated `[VK_CLEAR_IMAGE] color=[0.0, 0.0, 0.0, 1.0] ... size=1920x1080` and `[VK_PRESENT_LAYER] ... fb=1920x1080 ... crop=(0, 0, 0, 0) ... uv=(0, 0, 1, 1) accelerated=true`.
+- Visual verification: `/tmp/ruzu_pinball_present5.png` no longer has the magenta uninitialized background shown in `/Users/vricosti/Movies/Capture d’écran 2026-06-29 à 09.37.34.png`; the out-of-game region is black.
+
+## 2026-06-29 — video_core/src/engines/maxwell_3d.rs, video_core/src/engines/draw_manager.rs, video_core/src/renderer_vulkan/mod.rs, and core/src/hle/service/nvnflinger/hardware_composer.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp and core/hle/service/nvnflinger/hardware_composer.cpp
+
+### Intentional differences
+- Rust `DrawCall` now carries raw `ViewportTransformInfo` alongside the older derived `ViewportInfo`. Upstream `RasterizerVulkan::UpdateViewportsState` reads `regs.viewport_transform[index]` directly; carrying the raw snapshot preserves that ownership contract for the reduced active renderer.
+- Rust active Vulkan viewport setup now uses the already ported `vk_rasterizer::get_viewport_state` helper for `viewport_scale_offset_enabled` draws. This restores upstream signed `scale_y` behavior, allowing Vulkan negative-height viewports such as `y=1080, height=-1080`.
+- Rust keeps `[HWC_LAYER]` as an opt-in `RUZU_TRACE_HWC_DENSE` diagnostic. Upstream has no equivalent log; it is local instrumentation only and inactive by default.
+
+### Unintentional differences (to fix)
+- Rust active `renderer_vulkan/mod.rs` still sets only viewport 0, while upstream builds all Maxwell viewports up to device max viewport count.
+- Rust currently passes `lower_left=false`, `y_negate=false`, `depth_minus_one_to_one=false`, and `clamp_depth=true` into `get_viewport_state` because the active `DrawCall` snapshot does not yet carry window-origin mode, viewport swizzle device feature state, depth mode, or depth-range-unrestricted device support. SpaceCadet's observed path does not require those fields, but full upstream parity does.
+- Rust `DrawCall` still carries both derived `ViewportInfo` and raw `ViewportTransformInfo`; upstream does not store the derived helper in the draw snapshot.
+
+### Missing items
+- Carry window-origin mode, depth mode, viewport swizzle state, and depth-range-unrestricted support into the active Vulkan viewport path.
+- Set all active viewports like upstream `cmdbuf.SetViewport(0, viewports)` instead of only viewport 0.
+- Add focused unit coverage that a negative `scale_y` viewport produces the upstream Vulkan negative-height viewport.
+
+### Binary layout verification
+- N/A: host-side draw snapshot and Vulkan dynamic state only; no guest-visible raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `GetViewportState` and `RasterizerVulkan::UpdateViewportsState` in `vk_rasterizer.cpp`.
+- Re-read local `ViewportTransformInfo`, `DrawCall`, draw-manager snapshot creation, and active `RasterizerVulkan::update_viewports`.
+- `cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX with Vulkan/MoltenVK ran until `timeout` (`rc=124`) and dumped `/tmp/ruzu_pinball_final.png`. Logs show `viewport scale_offset=true x=0 y=1080 w=1920 h=-1080 min_depth=0.5 max_depth=1`, `VK_PRESENT_LAYER ... fb=1920x1080 ... uv=(0, 0, 1, 1) accelerated=true`, `BQP_QUEUE=19`, `BQC_RELEASE=19`, and no `panic`, `ERROR`, `Unimplemented instruction`, or `PrefetchAbort`.
+- Visual verification: `/tmp/ruzu_pinball_final.png` shows the table with the corrected vertical orientation compared with the previous `/tmp/ruzu_pinball_verify.png` capture.
+- Longer SpaceCadetPinball-NX verification ran until `timeout` (`rc=124`) and dumped `/tmp/ruzu_pinball_late50.png` at present frame 50. Logs reached `RendererVulkan::Composite exit ... current_frame=204`, had `BQP_QUEUE=20`, `BQC_RELEASE=20`, `AudioRenderer=5`, opened two cubeb render streams at 48000 Hz, and contained no `panic`, `ERROR`, `Unimplemented instruction`, or `PrefetchAbort`.
+
+## 2026-06-29 — video_core/src/renderer_vulkan/renderer_vulkan.rs and video_core/src/renderer_vulkan/swapchain.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp, video_core/renderer_vulkan/vk_swapchain.cpp, and yuzu_cmd/emu_window/emu_window_sdl2.cpp
+
+### Intentional differences
+- Rust `Swapchain::current_surface_extent` exposes the fixed `VkSurfaceCapabilitiesKHR::currentExtent` before swapchain creation. Upstream reads the same value only inside `ChooseSwapExtent` during swapchain creation.
+- Rust `RendererVulkan::current_framebuffer_layout_for_present` synchronizes the shared `FramebufferLayout` from the fixed Vulkan surface extent immediately before `BlitScreen::DrawToFrame`. Upstream relies on `EmuWindow_SDL2::OnResize` calling `UpdateCurrentFramebufferLayout` before `RendererVulkan::Composite`.
+- This is a macOS/MoltenVK resize adaptation: during live resize/maximize, SDL drawable-size events can lag behind the extent already reported by Vulkan, leaving ruzu with a stale layout while the swapchain is recreated to the new surface size.
+
+### Unintentional differences (to fix)
+- None introduced by this change. The existing Rust Vulkan presentation path still has broader structural differences from upstream that are documented in earlier entries.
+
+### Missing items
+- Verify with a user-driven maximize/live-resize run that the present frame, `FramebufferLayout`, and swapchain extent stay aligned after the window reaches its final size.
+- If the resize race persists, the stricter upstream-faithful fix is to make the SDL Vulkan window deliver the same framebuffer-layout update ordering as upstream before `Composite`, rather than keeping this renderer-side synchronization.
+
+### Binary layout verification
+- N/A: host WSI/layout synchronization only; no guest-visible raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `RendererVulkan::Composite`: it passes `render_window.GetFramebufferLayout()` directly to `BlitScreen::DrawToFrame`.
+- Re-read upstream `Swapchain::CreateSwapchain`: it re-queries surface capabilities just before creation and uses `ChooseSwapExtent` to prefer fixed `currentExtent`.
+- Re-read upstream `EmuWindow::UpdateCurrentFramebufferLayout` and `EmuWindow_SDL2::OnResize`: resize events rebuild `Layout::DefaultFrameLayout(width, height)`.
+- `cargo build --release --bin ruzu-cmd` passes.
+
+## 2026-06-29 — video_core/src/engines/maxwell_3d.rs, video_core/src/engines/draw_manager.rs, video_core/src/renderer_vulkan/mod.rs, video_core/src/renderer_vulkan/graphics_pipeline.rs, and video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp, video_core/renderer_vulkan/vk_graphics_pipeline.cpp, video_core/texture_cache/texture_cache_base.h, and video_core/renderer_vulkan/present/layer.cpp
+
+### Intentional differences
+- Rust active Vulkan draw snapshots now carry `window_origin_lower_left`, and the active renderer emits all 16 Maxwell viewports/scissors for `viewport_scale_offset_enabled` draws. This follows upstream `RasterizerVulkan::UpdateViewportsState` / `UpdateScissorsState`, which build arrays for `Maxwell::NumViewports` and call `SetViewport(0, viewports)` / `SetScissor(0, scissors)`.
+- Rust pipeline creation now declares 16 viewport/scissor slots to match the dynamic state count used by the active renderer. Upstream uses `min(device.GetMaxViewports(), Maxwell::NumViewports)`; the current reduced Rust path assumes the Vulkan device supports the Switch-required 16 slots.
+- Rust `TextureCache` now tracks the reduced render-target image layout across render and present use, transitioning `GENERAL <-> COLOR_ATTACHMENT_OPTIMAL` around the active render-target path. Upstream owns this more generally through texture-cache image preparation and framebuffer scheduling; Rust implements only the minimal backend-local equivalent needed by the partial renderer.
+
+### Unintentional differences (to fix)
+- Rust still hard-codes the viewport swizzle device behavior by treating raw swizzle value `3` as `NegativeY` in the reduced active renderer. Upstream gates this with `!device.IsNvViewportSwizzleSupported()`.
+- Rust still clamps depth in `get_viewport_state` unconditionally in the active renderer path. Upstream only clamps when `!device.IsExtDepthRangeUnrestrictedSupported()`.
+- Rust render-target layout tracking is backend-local and keyed by the reduced `CachedRenderTarget`; upstream tracks image state across the full texture cache, renderpass scheduler, blits, copies, and sampled/storage descriptors.
+
+### Missing items
+- Port the full Vulkan texture-cache image preparation model so present, render-target, sampled-image, copy, and clear transitions share upstream ownership instead of reduced per-path layout fixes.
+- Replace the active reduced renderer in `renderer_vulkan/mod.rs` with upstream-owned `vk_rasterizer.rs` methods so dynamic state, renderpass request, and texture cache ordering are no longer split.
+- Query device viewport count, viewport swizzle support, and depth-range-unrestricted support instead of using reduced assumptions in the active path.
+
+### Binary layout verification
+- N/A: host-side Vulkan state and draw snapshot fields only; no guest-visible raw-copied struct layout changed.
+
+### Verification
+- Re-read upstream `GetViewportState`, `GetScissorState`, `RasterizerVulkan::UpdateViewportsState`, and `RasterizerVulkan::UpdateScissorsState` in `vk_rasterizer.cpp`.
+- Re-read upstream `vk_graphics_pipeline.cpp` viewport state creation using `Maxwell::NumViewports`.
+- Re-read upstream `present/layer.cpp`, which samples accelerated display images using descriptor layout `VK_IMAGE_LAYOUT_GENERAL`, relying on texture-cache preparation to make that valid.
+- `cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX with Vulkan/MoltenVK ran until `timeout` (`rc=124`) after the layout transition fix. Logs show repeated `AccelerateDisplay hit ... size=1920x1080`, `VK_PRESENT_LAYER ... layout=2560x1440 screen=(0, 0, 2560, 1440) vertices=(0, 0) (2560, 0) (0, 1440) (2560, 1440)`, `CopyToSwapchain ... frame=2560x1440 swapchain=2560x1440`, and no panic or `DEVICE_LOST`.
+
+## 2026-06-29 — shader_recompiler/src/frontend/location.rs, shader_recompiler/src/frontend/control_flow.rs, and shader_recompiler/src/pipeline_cache.rs vs shader_recompiler/frontend/maxwell/location.h, shader_recompiler/frontend/maxwell/control_flow.h, shader_recompiler/frontend/maxwell/control_flow.cpp, and shader_recompiler/frontend/maxwell/translate_program.cpp
+
+### Intentional differences
+- Rust `Location` keeps the upstream offset/virtual/step/back arithmetic and adds explicit `next`, `prev`, and `add_instructions` helpers instead of C++ operators.
+- Rust adds `FlowCfg`, `FlowFunction`, `FlowBlock`, `FlowLabel`, `FlowStack`, and `Token` in `control_flow.rs` as the upstream-owned CFG model. Pointer ownership from C++ `ObjectPool<Block>` is represented with stable block indices in a `Vec<FlowBlock>`.
+- `translate_program_from_env_with_host_info` now builds CFG through `Environment::read_instruction(Location::offset())` via `build_cfg_from_env`, matching upstream CFG ownership more closely than slice-local `build_cfg(code)`.
+- The old `CfgBlock` API remains temporarily as a compatibility bridge for the still-simplified Rust `structured_control_flow.rs`.
+
+### Unintentional differences (to fix)
+- Rust `FlowCfg::analyze_indirect_branch` does not yet port upstream `TrackIndirectBranchTable`; indirect branches are marked as `IndirectBranch` without enumerating targets.
+- Rust `Condition` currently stores predicate/negation only. Upstream `IR::Condition` also preserves `FlowTest`; this must be ported before conditional branch behavior is bit-faithful.
+- `FlowCfg::to_cfg_blocks` is a temporary bridge back to the old block-index model. Upstream passes `Flow::CFG` directly into `BuildASL`.
+
+### Missing items
+- Port `frontend/maxwell/structured_control_flow.cpp` so `BuildASL` consumes `FlowCfg` directly instead of the legacy `CfgBlock` bridge.
+- Port `indirect_branch_table_track.cpp` behavior into `analyze_indirect_branch`.
+- Replace legacy `translate_cfg_to_program` block iteration with upstream `TranslatePass` ownership once `structured_control_flow.rs` is ported.
+
+### Binary layout verification
+- N/A: shader frontend control-flow structures are host-only IR metadata; no raw guest-visible binary layout changed.
+
+### Verification
+- Re-read upstream `location.h`, `control_flow.h`, `control_flow.cpp`, and `translate_program.cpp`.
+- `cargo test -p shader_recompiler frontend::control_flow -- --nocapture` passes.
+- `cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX ran under Vulkan/MoltenVK until timeout and reached presentation frames; `/tmp/ruzu_pinball_flowcfg.log` no longer contains `Unknown Maxwell opcode: 0x0000000000000000`. The visible image remains truncated, so the next parity target is `structured_control_flow.cpp` and remaining shader frontend/IR differences.
+
+## 2026-06-29 — shader_recompiler/src/frontend/structured_control_flow.rs vs shader_recompiler/frontend/maxwell/structured_control_flow.h and shader_recompiler/frontend/maxwell/structured_control_flow.cpp
+
+### Intentional differences
+- Rust now uses upstream-shaped `StatementType`, `Statement`, expression nodes, and `GotoPass` ownership instead of the previous one-pass linear `CfgBlock` scanner.
+- C++ stores `Statement` nodes in an intrusive `boost::intrusive::list` allocated by `ObjectPool<Statement>` and keeps stable iterators. Rust uses `Vec<Statement>` plus recursive `StatementPath` lookup for the current last `Goto`, because direct pointer/iterator identity is not available in the existing Rust bridge.
+- Rust now recursively finds gotos inside nested statement trees and ports the upstream outward-movement shape for `If` and `Loop`: an internal goto is converted to a `SetVariable`/`Break` or guarded child body, then a new goto is inserted after the parent.
+- Rust ports the upstream relation helpers in `StatementPath` form (`Level`, direct/indirect relation, sibling-from-nephew, ordered sibling checks, and lift detection) and uses the same `RemoveGoto` ordering: outward movement, optional lift, inward movement, then adjacent/conditional/loop elimination.
+- Rust ports `MoveInward` and `Lift` with `Vec` splice/drain operations matching the upstream tree transformations and adds focused regression tests for both paths.
+- Rust still returns the existing simplified `Vec<SyntaxNode>` because the active pipeline still owns translation through `translate_cfg_to_program` and materializes conditions after block translation. Upstream `BuildASL` directly returns `IR::AbstractSyntaxList` from `TranslatePass`.
+- A legacy bridge case where `CfgBlock` can contain a predicated `EndClass::Exit` is translated as `if (cond) return`; upstream normally reaches this shape through `AnalyzeCondInst` splitting before `BuildTree`.
+
+### Unintentional differences (to fix)
+- Rust `GotoPass` operates on `Vec<Statement>` paths instead of stable intrusive-list iterators. The transformation order now matches upstream, but complex nested CFGs still need validation once `FlowCfg` is passed directly.
+- Rust does not yet port upstream `BuildTree(Flow::CFG&, Flow::Function&, ...)` directly. It still consumes the compatibility `CfgBlock` list emitted by `FlowCfg::to_cfg_blocks`.
+- Rust `Expr::Identity` still wraps the reduced frontend `Condition` instead of upstream `IR::Condition`, so non-`T` `FlowTest` predicates are not preserved.
+- Rust `SetVariable`, `SetIndirectBranchVariable`, `Variable`, and `IndirectBranchCond` are represented but are not fully emitted into IR through `SetGotoVariable`, `SetIndirectBranchVariable`, `GetGotoVariable`, and `GetIndirectBranchVariable` in this pass.
+- Rust `Kill` still does not perform upstream `DemoteCombinationPass` reordering.
+
+### Missing items
+- Replace `structure_cfg(CfgBlock)` with upstream-owned `BuildASL` consuming `FlowCfg` directly.
+- Port `TranslatePass::Visit`, `VisitExpr`, `TryFindForwardBlock`, `MergeBlock`, and `DemoteCombinationPass` against the Rust IR block allocator instead of the current `SyntaxNode` bridge.
+- Preserve upstream `IR::Condition` in frontend control-flow analysis.
+
+### Binary layout verification
+- N/A: structured control flow statements are host-only shader IR metadata; no guest-visible raw-copied binary layout changed.
+
+### Verification
+- Re-read upstream `structured_control_flow.h` and `structured_control_flow.cpp`.
+- `cargo test -p shader_recompiler frontend::structured_control_flow -- --nocapture` passes.
+- `cargo build --release --bin ruzu-cmd` passes.
+
+## 2026-06-30 — video_core/src/renderer_vulkan/scheduler.rs, video_core/src/renderer_vulkan/texture_cache.rs, and video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_scheduler.cpp, video_core/renderer_vulkan/vk_texture_cache.cpp, and video_core/renderer_vulkan/vk_rasterizer.cpp
+
+### Intentional differences
+- Rust `Scheduler::request_renderpass` still takes raw `VkFramebuffer`, `VkRenderPass`, `VkRect2D`, and clear values because the active reduced renderer does not yet own a Rust `Framebuffer` wrapper equivalent to upstream `Vulkan::Framebuffer`.
+- Rust `TextureCache::update_render_targets_and_get_rt0_framebuffer` returns a small backend struct containing the framebuffer, CPU address, and render extent. Upstream returns `TextureCache::GetFramebuffer()` and callers query `Framebuffer::RenderArea()`.
+
+### Unintentional differences (to fix)
+- The active Rust Vulkan path still uses a reduced framebuffer/render-pass model. Upstream framebuffer construction owns render-pass selection, attachment image ranges, image barriers, color/depth attachment count, samples, and rescaling state.
+- Rust `DrawTexture` remains a stub in the active Vulkan rasterizer. I verified Pinball did not hit it during the captured runs, but upstream has a full `RasterizerVulkan::DrawTexture` path through `BlitImageHelper::BlitColor`.
+
+### Missing items
+- Port the full upstream `Vulkan::Framebuffer` wrapper into the active Rust backend so `Scheduler::request_renderpass` can take a framebuffer object and derive render pass, handle, image ranges, and render area from it.
+- Port upstream `BlitImageHelper::BlitColor` before implementing `RasterizerVulkan::DrawTexture`; do not replace it with scheduler/thread or raw-blit shortcuts.
+
+### Binary layout verification
+- N/A: host-side Vulkan scheduler/cache state only; no guest-visible raw-copied layout changed.
+
+### Verification
+- Re-read upstream `Scheduler::RequestRenderpass` in `vk_scheduler.cpp`; Rust now matches the reuse condition by comparing render pass, framebuffer, and render-area width/height.
+- Re-read upstream `Framebuffer::Framebuffer` and `Framebuffer::CreateFramebuffer` in `vk_texture_cache.cpp`; Rust now returns the framebuffer extent from the texture-cache owner and uses that in draw/clear instead of recomputing render area in `renderer_vulkan/mod.rs`.
+- `cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan/MoltenVK reached frame 20 and frame 100 captures without crash. The visible image remains unchanged/truncated, so the next verified target is not present scaling but the render-target contents / reduced active Vulkan draw path.

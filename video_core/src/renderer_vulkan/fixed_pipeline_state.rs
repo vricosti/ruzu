@@ -1083,6 +1083,8 @@ impl FixedPipelineState {
             .set_stencil_enable(draw.depth_stencil.stencil_enable);
         self.dynamic_state
             .set_depth_bias_enable(draw.rasterizer.depth_bias != 0.0);
+        self.dynamic_state
+            .set_primitive_restart_enable(draw.primitive_restart.enabled);
 
         // Populate color formats from render targets
         for (i, rt) in draw.render_targets.iter().enumerate() {

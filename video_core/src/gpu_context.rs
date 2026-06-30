@@ -250,17 +250,16 @@ impl GpuContext {
 
         log::debug!("GpuContext: flush {} GPFIFO entries", entries.len());
 
-        let mm = self.memory_manager.read();
         let mut proc = self.command_processor.lock();
 
-        let gpu_read = |gpu_va: u64, buf: &mut [u8]| {
-            mm.read_block(gpu_va, buf);
+        let pending = {
+            let mm = self.memory_manager.read();
+            let gpu_read = |gpu_va: u64, buf: &mut [u8]| {
+                mm.read_block(gpu_va, buf);
+            };
+
+            proc.process_entries(&entries, &gpu_read)
         };
-
-        proc.process_entries(&entries, &gpu_read);
-
-        // Execute pending memory operations (blit, DMA copy).
-        let pending = proc.execute_pending_ops(&gpu_read);
         let mut write_backs: Vec<GpuWriteBack> = pending
             .into_iter()
             .map(|pw| GpuWriteBack {
@@ -268,6 +267,35 @@ impl GpuContext {
                 data: pw.data,
             })
             .collect();
+
+        if std::env::var_os("RUZU_TRACE_GPU_WRITEBACKS").is_some() {
+            for write_back in &write_backs {
+                let head = write_back
+                    .data
+                    .iter()
+                    .take(4)
+                    .enumerate()
+                    .fold(0u32, |acc, (idx, byte)| acc | ((*byte as u32) << (idx * 8)));
+                log::info!(
+                    "[GPU_WRITEBACK] gpu=0x{:X} size={} head_u32=0x{:X}",
+                    write_back.gpu_va,
+                    write_back.data.len(),
+                    head
+                );
+            }
+        }
+
+        if !write_backs.is_empty() {
+            let mm = self.memory_manager.write();
+            for write_back in &write_backs {
+                mm.write_block_unsafe(write_back.gpu_va, &write_back.data);
+            }
+        }
+
+        let mm = self.memory_manager.read();
+        let gpu_read = |gpu_va: u64, buf: &mut [u8]| {
+            mm.read_block(gpu_va, buf);
+        };
 
         // Collect framebuffer output from engines (CLEAR_SURFACE result).
         let framebuffers = proc.take_framebuffers();

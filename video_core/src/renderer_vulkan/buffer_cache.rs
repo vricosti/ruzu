@@ -261,6 +261,26 @@ impl BufferCache {
         }
     }
 
+    /// Notify the cache that guest memory was written and drop stale GPU buffers.
+    ///
+    /// Upstream receives a translated CPU address here. This reduced Vulkan cache
+    /// is keyed by GPU VA, so invalidate overlapping cached GPU ranges instead.
+    pub fn write_memory(&mut self, gpu_va: u64, size: u64) {
+        let end = gpu_va.saturating_add(size);
+        let stale: Vec<u64> = self
+            .cache
+            .iter()
+            .filter_map(|(&base, cached)| {
+                let cached_end = base.saturating_add(cached.size);
+                (base < end && gpu_va < cached_end).then_some(base)
+            })
+            .collect();
+
+        for base in stale {
+            self.invalidate(base);
+        }
+    }
+
     /// Get the null buffer handle.
     pub fn null_buffer(&self) -> vk::Buffer {
         self.null_buffer

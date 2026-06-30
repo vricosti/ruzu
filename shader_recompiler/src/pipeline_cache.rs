@@ -419,18 +419,16 @@ pub fn translate_program_at_offset(code: &[u64], stage: ShaderStage, base_offset
 /// owner for stage metadata and environment-dependent optimization passes.
 ///
 /// This is an incremental Rust counterpart of upstream
-/// `TranslateProgram(inst_pool, block_pool, env, cfg, host_info)`: CFG
-/// construction still happens from the caller-provided instruction slice, but
-/// shader stage, SPH metadata, local/shared/workgroup sizes, texture
-/// resolution, shader-info header gathering, and interpolation metadata are
-/// read from `env`.
+/// `TranslateProgram(inst_pool, block_pool, env, cfg, host_info)`: the CFG is
+/// built through the upstream-owned environment path so instruction locations
+/// are byte-addressed Maxwell `Location`s instead of slice-local indices.
 pub fn translate_program_from_env_with_host_info(
     code: &[u64],
     base_offset: u32,
     env: &mut dyn Environment,
     host_info: &crate::host_translate_info::HostTranslateInfo,
 ) -> Program {
-    let cfg_blocks = control_flow::build_cfg(code);
+    let cfg_blocks = control_flow::build_cfg_from_env(env, base_offset, code.len());
     let sph = env.sph().clone();
     let mut program = translate_cfg_to_program(
         code,
@@ -594,6 +592,61 @@ pub fn compile_shader_glsl_from_env_with_bindings_and_host_info(
     let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, bindings);
     CompiledGlslShader {
         source,
+        info: program.info,
+        stage,
+    }
+}
+
+/// Compile a Maxwell shader to SPIR-V through the upstream-shaped Environment
+/// translation bridge.
+pub fn compile_shader_from_env_with_host_info(
+    code: &[u64],
+    base_offset: u32,
+    env: &mut dyn Environment,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
+) -> CompiledShader {
+    let stage = env.shader_stage();
+    let dump = ShaderIrDumpConfig::from_env(stage, base_offset, code);
+    let mut program = translate_program_from_env_with_host_info(code, base_offset, env, host_info);
+    if let Some(dump) = dump.as_ref() {
+        dump.write(&program, "00_env_translated");
+    }
+    convert_legacy_to_generic(&mut program, runtime_info);
+    if let Some(dump) = dump.as_ref() {
+        dump.write(&program, "01_env_legacy_to_generic");
+    }
+    let spirv_words = backend::emit_spirv(&program, profile, runtime_info);
+    CompiledShader {
+        spirv_words,
+        info: program.info,
+        stage,
+    }
+}
+
+pub fn compile_shader_from_env_with_bindings_and_host_info(
+    code: &[u64],
+    base_offset: u32,
+    env: &mut dyn Environment,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut backend::bindings::Bindings,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
+) -> CompiledShader {
+    let stage = env.shader_stage();
+    let dump = ShaderIrDumpConfig::from_env(stage, base_offset, code);
+    let mut program = translate_program_from_env_with_host_info(code, base_offset, env, host_info);
+    if let Some(dump) = dump.as_ref() {
+        dump.write(&program, "00_env_translated");
+    }
+    convert_legacy_to_generic(&mut program, runtime_info);
+    if let Some(dump) = dump.as_ref() {
+        dump.write(&program, "01_env_legacy_to_generic");
+    }
+    let spirv_words = backend::emit_spirv_with_bindings(&program, profile, runtime_info, bindings);
+    CompiledShader {
+        spirv_words,
         info: program.info,
         stage,
     }

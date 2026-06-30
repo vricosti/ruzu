@@ -270,14 +270,22 @@ impl BufferQueueProducer {
             }
 
             let too_many_buffers = inner.queue.len() > max_buffer_count as usize;
+            if too_many_buffers {
+                log::error!(
+                    "BufferQueueProducer: queue size is {}, waiting",
+                    inner.queue.len()
+                );
+            }
             try_again = (*found == BufferQueueCore::INVALID_BUFFER_SLOT) || too_many_buffers;
-            if try_again {
+            if try_again && std::env::var_os("RUZU_TRACE_BQP_DEQUEUE_BLOCK").is_some() {
                 log::info!(
                     "[BQP_DEQUEUE_BLOCK] found={} too_many={} max_count={} dequeued={} acquired={} queue_len={} cannot_block={} override={}",
                     *found, too_many_buffers, max_buffer_count, dequeued_count, acquired_count,
                     inner.queue.len(), inner.dequeue_buffer_cannot_block,
                     inner.override_max_buffer_count,
                 );
+            }
+            if try_again {
                 if inner.dequeue_buffer_cannot_block
                     && acquired_count <= inner.max_acquired_buffer_count
                 {

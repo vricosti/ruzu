@@ -835,6 +835,74 @@ impl<'a> Maxwell3DDrawView<'a> {
         self.draw_state
     }
 
+    pub fn draw_call_snapshot(&self, draw_indexed: bool, instance_count: u32) -> DrawCall {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => {
+                build_draw_call_snapshot(self.draw_state, draw_indexed, instance_count, *maxwell3d)
+            }
+            Maxwell3DDrawSource::Snapshot(registers) => {
+                let mut shader_stages =
+                    [crate::engines::maxwell_3d::ShaderStageInfo::default(); NUM_SHADER_PROGRAMS];
+                for (index, stage) in shader_stages.iter_mut().enumerate() {
+                    stage.enabled = registers
+                        .shader_config_enabled
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false);
+                    stage.offset = registers.shader_program_addresses[index] as u32;
+                }
+
+                DrawCall {
+                    topology: self.draw_state.topology,
+                    vertex_first: self.draw_state.vertex_buffer.first,
+                    vertex_count: self.draw_state.vertex_buffer.count,
+                    indexed: draw_indexed,
+                    index_buffer_addr: registers.index_buffer_gpu_addr,
+                    index_buffer_count: self.draw_state.index_buffer.count,
+                    index_buffer_first: self.draw_state.index_buffer.first,
+                    index_format: self.draw_state.index_buffer.format,
+                    vertex_streams: registers
+                        .vertex_streams
+                        .iter()
+                        .copied()
+                        .filter(|stream| stream.enabled)
+                        .collect(),
+                    viewports: Default::default(),
+                    viewport_transforms: registers.viewport_transforms,
+                    scissors: registers.scissors,
+                    viewport_scale_offset_enabled: registers.viewport_scale_offset_enabled,
+                    window_origin_lower_left: registers.window_origin_lower_left,
+                    surface_clip: registers.surface_clip,
+                    blend: registers.blend,
+                    blend_color: registers.blend_color,
+                    depth_stencil: registers.depth_stencil.clone(),
+                    rasterizer: registers.rasterizer.clone(),
+                    primitive_restart: registers.primitive_restart,
+                    program_base_address: 0,
+                    cb_bindings: registers.cb_bindings,
+                    vertex_attribs: registers.vertex_attribs.to_vec(),
+                    shader_stages,
+                    color_masks: registers.color_masks,
+                    rt_control: registers.render_targets.rt_control,
+                    tex_header_pool_addr: registers.descriptor_sync_regs.tex_header_addr,
+                    tex_header_pool_limit: registers.descriptor_sync_regs.tex_header_limit,
+                    tex_sampler_pool_addr: registers.descriptor_sync_regs.tex_sampler_addr,
+                    tex_sampler_pool_limit: registers.descriptor_sync_regs.tex_sampler_limit,
+                    instance_count,
+                    base_instance: self.draw_state.base_instance,
+                    base_vertex: self.draw_state.base_index as i32,
+                    inline_index_data: self.draw_state.inline_index_draw_indexes.clone(),
+                    sampler_binding: if registers.descriptor_sync_regs.sampler_binding_via_header {
+                        crate::engines::maxwell_3d::SamplerBinding::ViaHeaderBinding
+                    } else {
+                        crate::engines::maxwell_3d::SamplerBinding::Independently
+                    },
+                    render_targets: registers.render_targets.render_targets,
+                }
+            }
+        }
+    }
+
     pub fn registers(&self) -> Maxwell3DDrawRegisters {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => {
@@ -1213,6 +1281,96 @@ impl<'a> Maxwell3DDrawView<'a> {
     }
 }
 
+fn build_draw_call_snapshot(
+    draw_state: &DrawState,
+    draw_indexed: bool,
+    instance_count: u32,
+    maxwell3d: &dyn Maxwell3DAccess,
+) -> DrawCall {
+    let mut vertex_streams = Vec::new();
+    for i in 0..32u32 {
+        let info = maxwell3d.vertex_stream_info(i);
+        if info.enabled {
+            vertex_streams.push(info);
+        }
+    }
+
+    let mut vertex_attribs = Vec::new();
+    for i in 0..NUM_VERTEX_ATTRIBS {
+        let info = maxwell3d.vertex_attrib_info(i);
+        if info.buffer_index != 0
+            || info.constant
+            || info.offset != 0
+            || info.size as u32 != 0
+            || info.attrib_type as u32 != 0
+            || info.bgra
+        {
+            vertex_attribs.push(info);
+        }
+    }
+
+    let mut shader_stages =
+        [crate::engines::maxwell_3d::ShaderStageInfo::default(); NUM_SHADER_PROGRAMS];
+    for (i, stage) in shader_stages.iter_mut().enumerate() {
+        *stage = maxwell3d.shader_stage_info(i as u32);
+    }
+
+    let mut color_masks = [crate::engines::maxwell_3d::ColorMaskInfo::default(); 8];
+    for (i, mask) in color_masks.iter_mut().enumerate() {
+        *mask = maxwell3d.color_mask_info(i);
+    }
+
+    let render_targets = std::array::from_fn(|i| maxwell3d.rt_info(i));
+
+    let mut blend = [crate::engines::maxwell_3d::BlendInfo::default(); 8];
+    for (i, item) in blend.iter_mut().enumerate() {
+        *item = maxwell3d.effective_blend_info(i);
+    }
+
+    let cb_bindings = std::array::from_fn(|stage| {
+        std::array::from_fn(|slot| maxwell3d.const_buffer_binding(stage, slot))
+    });
+
+    DrawCall {
+        topology: draw_state.topology,
+        vertex_first: draw_state.vertex_buffer.first,
+        vertex_count: draw_state.vertex_buffer.count,
+        indexed: draw_indexed,
+        index_buffer_addr: maxwell3d.index_buffer_addr(),
+        index_buffer_count: draw_state.index_buffer.count,
+        index_buffer_first: draw_state.index_buffer.first,
+        index_format: draw_state.index_buffer.format,
+        vertex_streams,
+        viewports: std::array::from_fn(|i| maxwell3d.viewport_info(i as u32)),
+        viewport_transforms: std::array::from_fn(|i| maxwell3d.viewport_transform_info(i as u32)),
+        scissors: std::array::from_fn(|i| maxwell3d.scissor_info(i as u32)),
+        viewport_scale_offset_enabled: maxwell3d.viewport_scale_offset_enabled(),
+        window_origin_lower_left: maxwell3d.window_origin_lower_left(),
+        surface_clip: maxwell3d.surface_clip_info(),
+        blend,
+        blend_color: maxwell3d.blend_color_info(),
+        depth_stencil: maxwell3d.depth_stencil_info(),
+        rasterizer: maxwell3d.rasterizer_info(),
+        primitive_restart: maxwell3d.primitive_restart_info(),
+        program_base_address: maxwell3d.program_base_address(),
+        cb_bindings,
+        vertex_attribs,
+        shader_stages,
+        color_masks,
+        rt_control: maxwell3d.rt_control_info(),
+        tex_header_pool_addr: maxwell3d.tex_header_pool_address(),
+        tex_header_pool_limit: maxwell3d.tex_header_pool_limit(),
+        tex_sampler_pool_addr: maxwell3d.tex_sampler_pool_address(),
+        tex_sampler_pool_limit: maxwell3d.tex_sampler_pool_limit(),
+        instance_count,
+        base_instance: draw_state.base_instance,
+        base_vertex: draw_state.base_index as i32,
+        inline_index_data: draw_state.inline_index_draw_indexes.clone(),
+        sampler_binding: maxwell3d.sampler_binding(),
+        render_targets,
+    }
+}
+
 enum Maxwell3DClearSource<'a> {
     Live(&'a mut dyn Maxwell3DAccess),
     Snapshot {
@@ -1561,11 +1719,18 @@ impl DrawManager {
             index_format: draw_state.index_buffer.format,
             vertex_streams,
             viewports: std::array::from_fn(|i| maxwell3d.viewport_info(i as u32)),
+            viewport_transforms: std::array::from_fn(|i| {
+                maxwell3d.viewport_transform_info(i as u32)
+            }),
             scissors: std::array::from_fn(|i| maxwell3d.scissor_info(i as u32)),
+            viewport_scale_offset_enabled: maxwell3d.viewport_scale_offset_enabled(),
+            window_origin_lower_left: maxwell3d.window_origin_lower_left(),
+            surface_clip: maxwell3d.surface_clip_info(),
             blend,
             blend_color: maxwell3d.blend_color_info(),
             depth_stencil: maxwell3d.depth_stencil_info(),
             rasterizer: maxwell3d.rasterizer_info(),
+            primitive_restart: maxwell3d.primitive_restart_info(),
             program_base_address: maxwell3d.program_base_address(),
             cb_bindings,
             vertex_attribs,

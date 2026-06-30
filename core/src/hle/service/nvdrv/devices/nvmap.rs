@@ -337,7 +337,7 @@ impl NvMapDevice {
     }
 
     pub fn ioc_create(&self, params: &mut IocCreateParams) -> NvResult {
-        log::info!("nvmap::IocCreate called, size=0x{:08X}", params.size);
+        log::debug!("nvmap::IocCreate called, size=0x{:08X}", params.size);
 
         if params.size == 0 {
             log::error!("Failed to create Object");
@@ -380,7 +380,7 @@ impl NvMapDevice {
     }
 
     pub fn ioc_alloc(&self, params: &mut IocAllocParams, fd: DeviceFD) -> NvResult {
-        log::info!(
+        log::debug!(
             "nvmap::IocAlloc called, handle=0x{:X} addr=0x{:X}",
             params.handle,
             params.address
@@ -593,7 +593,7 @@ impl NvMapDevice {
     }
 
     pub fn ioc_get_id(&self, params: &mut IocGetIdParams) -> NvResult {
-        log::info!("nvmap::IocGetId called, handle=0x{:X}", params.handle);
+        log::debug!("nvmap::IocGetId called, handle=0x{:X}", params.handle);
 
         if params.handle == 0 {
             log::error!("nvmap::IocGetId handle=0 invalid");
@@ -611,12 +611,12 @@ impl NvMapDevice {
 
         let id = handle.unwrap().id;
         params.id = id;
-        log::info!("nvmap::IocGetId handle=0x{:X} -> id={}", params.handle, id);
+        log::debug!("nvmap::IocGetId handle=0x{:X} -> id={}", params.handle, id);
         NvResult::Success
     }
 
     pub fn ioc_from_id(&self, params: &mut IocFromIdParams) -> NvResult {
-        log::info!("nvmap::IocFromId called, id:{}", params.id);
+        log::debug!("nvmap::IocFromId called, id:{}", params.id);
 
         if params.id == 0 {
             log::error!("nvmap::IocFromId Zero Id is invalid!");
