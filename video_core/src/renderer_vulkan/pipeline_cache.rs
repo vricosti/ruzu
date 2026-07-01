@@ -6,7 +6,7 @@
 //! Manages compilation and caching of both graphics and compute pipelines,
 //! including disk serialization of the Vulkan pipeline cache.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
@@ -158,6 +158,7 @@ pub struct PipelineCache {
     channel_caches: ChannelSetupCaches<ChannelInfo>,
     graphics_pipeline_cache: GraphicsPipelineCache,
     graphics_cache: HashMap<GraphicsPipelineKey, GraphicsPipeline>,
+    failed_graphics_cache: HashSet<GraphicsPipelineKey>,
     graphics_key: GraphicsPipelineKey,
     current_pipeline: Option<GraphicsPipelineKey>,
 
@@ -193,14 +194,29 @@ impl PipelineCache {
         use_vulkan_pipeline_cache: bool,
         shader_cache: shader_recompiler::PipelineCache,
         profile: Profile,
+        extended_dynamic_state_supported: bool,
+        extended_dynamic_state2_supported: bool,
+        topology_list_primitive_restart_supported: bool,
+        patch_list_primitive_restart_supported: bool,
+        max_viewports: u32,
     ) -> Self {
         let mut pipeline_cache = PipelineCache {
             device: device.clone(),
             use_asynchronous_shaders,
             use_vulkan_pipeline_cache,
             channel_caches: ChannelSetupCaches::new(),
-            graphics_pipeline_cache: GraphicsPipelineCache::new(device, shader_cache, profile),
+            graphics_pipeline_cache: GraphicsPipelineCache::new(
+                device,
+                shader_cache,
+                profile,
+                extended_dynamic_state_supported,
+                extended_dynamic_state2_supported,
+                topology_list_primitive_restart_supported,
+                patch_list_primitive_restart_supported,
+                max_viewports,
+            ),
             graphics_cache: HashMap::new(),
+            failed_graphics_cache: HashSet::new(),
             graphics_key: GraphicsPipelineKey::default(),
             current_pipeline: None,
             main_pools: ShaderPools::new(),
@@ -328,10 +344,18 @@ impl PipelineCache {
         key: GraphicsPipelineKey,
         fixed_state: FixedPipelineState,
     ) -> Option<(&GraphicsPipeline, FixedPipelineState)> {
+        if self.failed_graphics_cache.contains(&key) {
+            return None;
+        }
+
         let is_new = !self.graphics_cache.contains_key(&key);
         if is_new {
-            let pipeline =
-                self.create_graphics_pipeline(draw, render_pass, read_gpu, &key, &fixed_state)?;
+            let Some(pipeline) =
+                self.create_graphics_pipeline(draw, render_pass, read_gpu, &key, &fixed_state)
+            else {
+                self.failed_graphics_cache.insert(key);
+                return None;
+            };
             self.graphics_cache.insert(key.clone(), pipeline);
         }
 
@@ -359,15 +383,22 @@ impl PipelineCache {
         key: GraphicsPipelineKey,
         fixed_state: FixedPipelineState,
     ) -> Option<(&GraphicsPipeline, FixedPipelineState)> {
+        if self.failed_graphics_cache.contains(&key) {
+            return None;
+        }
+
         let is_new = !self.graphics_cache.contains_key(&key);
         if is_new {
-            let pipeline = self.create_graphics_pipeline_with_shared_cache(
+            let Some(pipeline) = self.create_graphics_pipeline_with_shared_cache(
                 draw,
                 render_pass,
                 shared_cache,
                 &key,
                 &fixed_state,
-            )?;
+            ) else {
+                self.failed_graphics_cache.insert(key);
+                return None;
+            };
             self.graphics_cache.insert(key.clone(), pipeline);
         }
 
@@ -566,11 +597,13 @@ mod tests {
             index_buffer_first: 0,
             index_format: IndexFormat::UnsignedInt,
             vertex_streams: Vec::new(),
+            vertex_stream_limits: Default::default(),
             viewports: [ViewportInfo::default(); 16],
             viewport_transforms: Default::default(),
             scissors: [ScissorInfo::default(); 16],
             viewport_scale_offset_enabled: false,
             window_origin_lower_left: false,
+            window_origin_flip_y: false,
             surface_clip: Default::default(),
             blend: [BlendInfo::default(); 8],
             blend_color: BlendColorInfo {
@@ -602,7 +635,10 @@ mod tests {
                 depth_bias_clamp: 0.0,
                 ..RasterizerInfo::default()
             },
+            rasterize_enable: true,
             primitive_restart: Default::default(),
+            logic_op: LogicOpInfo::default(),
+            depth_clamp_enabled: true,
             program_base_address: 0,
             cb_bindings: [[ConstBufferBinding::default(); 18]; 5],
             vertex_attribs: Vec::new(),

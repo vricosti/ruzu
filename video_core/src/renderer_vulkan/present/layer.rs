@@ -436,8 +436,6 @@ impl Layer {
         let image = self.raw_images[image_index];
         let staging_buffer = buffer.buffer();
         let was_initialized = self.raw_image_initialized.get(image_index).copied() == Some(true);
-        let buffer_row_length = framebuffer.stride;
-        let buffer_image_height = framebuffer.height;
         let image_width = framebuffer.width;
         let image_height = framebuffer.height;
         let device = self.device.clone();
@@ -474,8 +472,8 @@ impl Layer {
 
             let copy = vk::BufferImageCopy::builder()
                 .buffer_offset(image_offset)
-                .buffer_row_length(buffer_row_length)
-                .buffer_image_height(buffer_image_height)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
                 .image_subresource(vk::ImageSubresourceLayers {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     mip_level: 0,

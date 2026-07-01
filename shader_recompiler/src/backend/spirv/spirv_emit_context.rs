@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use crate::backend::bindings::Bindings;
 use crate::ir;
+use crate::ir::program::ShaderInfo;
 use crate::ir::types::ShaderStage;
 use crate::profile::Profile;
 use crate::runtime_info::RuntimeInfo;
@@ -537,6 +538,116 @@ impl SpirvEmitContext {
             );
             self.is_helper_invocation = var;
             self.interfaces.push(var);
+        }
+
+        self.define_rescaling_input(info);
+        self.define_render_area(info);
+    }
+
+    fn define_rescaling_input(&mut self, info: &ShaderInfo) {
+        if !info.uses_rescaling_uniform {
+            return;
+        }
+        if self.profile.unified_descriptor_binding {
+            self.define_rescaling_input_push_constant();
+        }
+    }
+
+    fn define_rescaling_input_push_constant(&mut self) {
+        use super::emit_spirv::{
+            NUM_IMAGE_SCALING_WORDS, NUM_TEXTURE_SCALING_WORDS,
+            RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, RESCALING_LAYOUT_WORDS_OFFSET,
+        };
+
+        let textures_len = self
+            .builder
+            .constant_bit32(self.u32_type, NUM_TEXTURE_SCALING_WORDS);
+        let textures_type = self.builder.type_array(self.u32_type, textures_len);
+        self.builder.decorate(
+            textures_type,
+            spirv::Decoration::ArrayStride,
+            vec![Operand::LiteralBit32(4)],
+        );
+
+        let images_len = self
+            .builder
+            .constant_bit32(self.u32_type, NUM_IMAGE_SCALING_WORDS);
+        let images_type = self.builder.type_array(self.u32_type, images_len);
+        self.builder.decorate(
+            images_type,
+            spirv::Decoration::ArrayStride,
+            vec![Operand::LiteralBit32(4)],
+        );
+
+        let mut members = vec![textures_type, images_type];
+        if self.stage != ShaderStage::Compute {
+            self.rescaling_downfactor_member_index = members.len() as u32;
+            members.push(self.f32_type);
+        }
+
+        let push_constant_struct = self.builder.type_struct(members);
+        self.builder
+            .decorate(push_constant_struct, spirv::Decoration::Block, vec![]);
+        self.builder.member_decorate(
+            push_constant_struct,
+            0,
+            spirv::Decoration::Offset,
+            vec![Operand::LiteralBit32(RESCALING_LAYOUT_WORDS_OFFSET)],
+        );
+        self.builder.member_decorate(
+            push_constant_struct,
+            1,
+            spirv::Decoration::Offset,
+            vec![Operand::LiteralBit32(16)],
+        );
+        if self.stage != ShaderStage::Compute {
+            self.builder.member_decorate(
+                push_constant_struct,
+                self.rescaling_downfactor_member_index,
+                spirv::Decoration::Offset,
+                vec![Operand::LiteralBit32(RESCALING_LAYOUT_DOWN_FACTOR_OFFSET)],
+            );
+        }
+
+        let pointer_type = self.builder.type_pointer(
+            None,
+            spirv::StorageClass::PushConstant,
+            push_constant_struct,
+        );
+        self.rescaling_push_constants =
+            self.builder
+                .variable(pointer_type, None, spirv::StorageClass::PushConstant, None);
+        if self.profile.supported_spirv >= 0x0001_0400 {
+            self.interfaces.push(self.rescaling_push_constants);
+        }
+    }
+
+    fn define_render_area(&mut self, info: &ShaderInfo) {
+        if !info.uses_render_area || !self.profile.unified_descriptor_binding {
+            return;
+        }
+
+        self.render_are_member_index = 0;
+        let push_constant_struct = self.builder.type_struct(vec![self.f32_vec4_type]);
+        self.builder
+            .decorate(push_constant_struct, spirv::Decoration::Block, vec![]);
+        self.builder.member_decorate(
+            push_constant_struct,
+            self.render_are_member_index,
+            spirv::Decoration::Offset,
+            vec![Operand::LiteralBit32(0)],
+        );
+
+        let pointer_type = self.builder.type_pointer(
+            None,
+            spirv::StorageClass::PushConstant,
+            push_constant_struct,
+        );
+        self.render_area_push_constant =
+            self.builder
+                .variable(pointer_type, None, spirv::StorageClass::PushConstant, None);
+        if self.profile.supported_spirv >= 0x0001_0400 {
+            self.interfaces.push(self.render_area_push_constant);
         }
     }
 

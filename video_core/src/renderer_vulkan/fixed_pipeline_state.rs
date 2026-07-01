@@ -1121,11 +1121,12 @@ impl FixedPipelineState {
         }
 
         // Populate vertex strides
-        for (i, stream) in draw.vertex_streams.iter().enumerate() {
-            if i >= NUM_VERTEX_ARRAYS {
-                break;
+        for stream in &draw.vertex_streams {
+            let index = stream.index as usize;
+            if index >= NUM_VERTEX_ARRAYS {
+                continue;
             }
-            self.vertex_strides[i] = stream.stride as u16;
+            self.vertex_strides[index] = stream.stride as u16;
         }
     }
 }
