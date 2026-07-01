@@ -351,6 +351,11 @@ impl RendererVulkan {
             CAPTURE_IMAGE_WIDTH,
             CAPTURE_IMAGE_HEIGHT,
             device.supported_spirv_version(),
+            device.is_ext_extended_dynamic_state_supported(),
+            device.is_ext_extended_dynamic_state2_supported(),
+            device.is_topology_list_primitive_restart_supported(),
+            device.is_patch_list_primitive_restart_supported(),
+            device.get_max_viewports(),
             syncpoints,
             Arc::clone(&device_memory),
         )

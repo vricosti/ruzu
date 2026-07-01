@@ -17100,3 +17100,130 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `Framebuffer::Framebuffer` and `Framebuffer::CreateFramebuffer` in `vk_texture_cache.cpp`; Rust now returns the framebuffer extent from the texture-cache owner and uses that in draw/clear instead of recomputing render area in `renderer_vulkan/mod.rs`.
 - `cargo build --release --bin ruzu-cmd` passes.
 - SpaceCadetPinball-NX under Vulkan/MoltenVK reached frame 20 and frame 100 captures without crash. The visible image remains unchanged/truncated, so the next verified target is not present scaling but the render-target contents / reduced active Vulkan draw path.
+
+## 2026-06-30 — video_core/src/renderer_vulkan/pipeline_cache.rs vs video_core/renderer_vulkan/vk_pipeline_cache.h and video_core/renderer_vulkan/vk_pipeline_cache.cpp
+
+### Intentional differences
+- Upstream `graphics_cache` stores `std::unique_ptr<GraphicsPipeline>` and `try_emplace` leaves a cache entry containing `nullptr` when `CreateGraphicsPipeline()` fails. Rust keeps `graphics_cache` as `HashMap<GraphicsPipelineKey, GraphicsPipeline>`, so failed graphics pipeline keys are tracked in a sibling `HashSet<GraphicsPipelineKey>` instead of storing `None` in the primary map.
+- Rust still has two slow paths, one direct and one using the shared shader cache. Both now use the same failed-key caching behavior corresponding to upstream `CurrentGraphicsPipelineSlowPath`.
+
+### Unintentional differences (to fix)
+- Rust does not yet model upstream graphics cache values as optional pipeline ownership in one map. The separate `failed_graphics_cache` is behaviorally equivalent for failed creation retries, but less structurally identical than `HashMap<GraphicsPipelineKey, Option<GraphicsPipeline>>`.
+- Rust transition storage records target keys instead of upstream `GraphicsPipeline*` transitions because Rust pipeline storage is keyed and does not expose stable C++-style owning pointers.
+
+### Missing items
+- Port the full upstream asynchronous shader/pipeline build model and cache serialization path before replacing the split failed-key set with a more literal optional pipeline entry.
+
+### Binary layout verification
+- N/A: Vulkan pipeline cache ownership is host-side state only; no guest-visible raw-copied binary layout changed.
+
+### Verification
+- Re-read upstream `PipelineCache::CurrentGraphicsPipelineSlowPath` in `vk_pipeline_cache.cpp` and the `graphics_cache` declaration in `vk_pipeline_cache.h`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+
+## 2026-06-30 — shader_recompiler/src/backend/spirv/spirv_emit_context.rs, video_core/src/renderer_vulkan/pipeline_helper.rs, video_core/src/renderer_vulkan/graphics_pipeline.rs, video_core/src/renderer_vulkan/mod.rs, video_core/src/engines/maxwell_3d.rs, and video_core/src/engines/draw_manager.rs vs shader_recompiler/backend/spirv/emit_spirv.h, shader_recompiler/backend/spirv/spirv_emit_context.cpp, video_core/renderer_vulkan/pipeline_helper.h, video_core/renderer_vulkan/vk_graphics_pipeline.cpp, and video_core/buffer_cache/buffer_cache.h
+
+### Intentional differences
+- Rust defines SPIR-V rescaling/render-area push constants from `SpirvEmitContext::define_global_variables` because this port's SPIR-V emitter uses an explicit setup method instead of upstream's `EmitContext` constructor sequence. The emitted structures, offsets, and interface insertion now match upstream `DefineRescalingInputPushConstant` and `DefineRenderArea` for unified descriptor binding.
+- Rust stores `uses_render_area` and `uses_rescaling_uniform` on the active `GraphicsPipeline` so the reduced active rasterizer can perform the equivalent of upstream `GraphicsPipeline::ConfigureDraw`. Upstream computes this through per-stage `stage_infos` inside the full pipeline owner.
+- Rust pushes the rescaling down-factor every draw when `uses_rescaling_uniform` is true. Upstream gates that push through `scheduler.UpdateRescaling(is_rescaling)`. This is behaviorally safe but still less structurally faithful until the scheduler rescaling state is ported.
+- Rust carries `vertex_stream_limits` through `DrawCall` snapshots so the reduced active Vulkan binder can use upstream `UpdateVertexBuffer` sizing (`limit - address + 1`) without the full upstream `BufferCache<P>` owner.
+
+### Unintentional differences (to fix)
+- The active Rust Vulkan path still lacks upstream `BufferCache<P>::UpdateGraphicsBuffers`, `BindHostGeometryBuffers`, and `BindHostStageBuffers` as the owners of all geometry/resource binding. The current changes make the active reduced path closer but do not replace the reduced path with the upstream-owned buffer-cache flow.
+- Rust currently determines `uses_render_area` from vertex/fragment shader info with an `any` check, while the upstream templated path reads stage info inside `prepare_stage`. This should be revisited when the full stage-info array and templated pipeline configuration are ported.
+- The active Rust scheduler does not yet model upstream `UpdateRescaling`, so rescaling push-constant update elision is not preserved.
+
+### Missing items
+- Port the full upstream Vulkan `BufferCache<P>` geometry/stage binding path into Rust's active Vulkan backend and move the reduced ad-hoc vertex/index binding out of `renderer_vulkan/mod.rs`.
+- Port scheduler rescaling state (`UpdateRescaling`) and texture-cache rescaling decisions before claiming full `GraphicsPipeline::ConfigureDraw` parity.
+- Add SPIR-V validation tests that inspect generated push-constant blocks and member offsets for shaders using `RenderArea` and `ResolutionDownFactor`.
+
+### Binary layout verification
+- PASS: Rust rescaling push-constant constants now match upstream layout intent for graphics: rescaling words offset 0, down-factor offset 24, `sizeof(RescalingLayout)` treated as 32 bytes, and render-area layout size 16 bytes.
+- PASS: `RenderAreaLayout` remains a 4-float payload with member offset 0, matching upstream `offsetof(RenderAreaLayout, render_area)`.
+- N/A: `DrawCall::vertex_stream_limits` is an internal Rust snapshot field, not a guest raw-copied binary layout.
+
+### Verification
+- Re-read upstream `RescalingLayout`, `RenderAreaLayout`, and offset constants in `shader_recompiler/backend/spirv/emit_spirv.h`.
+- Re-read upstream `EmitContext::DefineRescalingInputPushConstant` and `EmitContext::DefineRenderArea` in `shader_recompiler/backend/spirv/spirv_emit_context.cpp`.
+- Re-read upstream `DescriptorLayoutBuilder::CreatePipelineLayout` in `video_core/renderer_vulkan/pipeline_helper.h` and `GraphicsPipeline::ConfigureDraw` in `video_core/renderer_vulkan/vk_graphics_pipeline.cpp`.
+- Re-read upstream `BufferCache<P>::UpdateVertexBuffer`, `BindHostVertexBuffers`, and `UpdateIndexBuffer` in `video_core/buffer_cache/buffer_cache.h`.
+- `cargo fmt --all` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+
+## 2026-06-30 — video_core/src/renderer_vulkan/texture_cache.rs and video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp, video_core/renderer_vulkan/vk_texture_cache.h, video_core/renderer_vulkan/vk_graphics_pipeline.cpp, and video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust now materializes Vulkan samplers from common-cache `TSCEntry` data and binds those sampler handles for combined image samplers in the active reduced Vulkan descriptor path. Upstream owns this through `TextureCache::GetSampler(id).Handle()` and the full descriptor update queue; Rust keeps it in the reduced backend wrapper until that full owner is ported.
+- Rust render-target attachment images now use `surface::pixel_format_from_render_target_format(rt.format)` before creating the Vulkan image. Upstream reaches the same format through `ImageInfo::ImageInfo(RenderTargetConfig)` and `MakeImageCreateInfo`.
+- Rust still returns the reduced backend render-target `VkImageView` from `TryFindFramebufferImageView` rather than a fully materialized backend `ImageView::Handle(Color2D)`. A local attempt to force the upstream-shaped view exposed that the reduced backend image/view ownership is not complete enough yet and produced black frames in SpaceCadetPinball-NX, so this is documented as remaining parity debt rather than kept as a regressing change.
+
+### Unintentional differences (to fix)
+- Rust does not yet port upstream `ImageView` as a backend object with per-texture-type handles, swizzle conversion, `ImageViewUsageCreateInfo`, subresource range conversion, and render-target handle selection. This is the likely remaining reason the display image can be partial even though presentation vertices, viewport, scissor, and swapchain extents are correct.
+- Rust sampler creation is still incomplete: sampler reduction/filter-minmax, full depth compare op decode, and full custom-border-color/device-extension gating are not yet ported.
+- Rust `CreateImage` remains a reduced attachment helper and does not yet port upstream `MakeImageCreateInfo` flags/usages for every image type.
+
+### Missing items
+- Port upstream `Vulkan::ImageView` from `vk_texture_cache.h/cpp` as the backend owner for common `ImageViewBase`, then make `RasterizerVulkan::AccelerateDisplay` return `image_view->Handle(Color2D)` equivalent.
+- Port upstream `MakeImageCreateInfo`, `ImageUsageFlags`, `ImageViewAspectMask`, and `MakeSubresourceRange` instead of the current reduced render-target helper.
+- Add a regression test or trace assertion showing `AccelerateDisplay` returns the selected common `view_id` and a backend view with matching format/range once the backend `ImageView` owner exists.
+
+### Binary layout verification
+- N/A: Vulkan image views, sampler handles, and render-target image formats are host-side state only; no guest-visible raw-copied binary layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::TryFindFramebufferImageView` in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `RasterizerVulkan::AccelerateDisplay` in `video_core/renderer_vulkan/vk_rasterizer.cpp`.
+- Re-read upstream `ImageView::ImageView`, `ImageView::Handle`, `MakeImageCreateInfo`, and `MakeSubresourceRange` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan still reaches continuous present with `PresentManager::CopyToSwapchain frame=2560x1440 swapchain=2560x1440` and no pipeline creation errors. Local capture `/tmp/ruzu_pinball_after_vertex_limits.png` shows the same black right-side game-content area as before, so the remaining issue is not present-layer truncation.
+
+## 2026-06-30 — video_core/src/vulkan_common/vulkan_device.rs, video_core/src/renderer_vulkan/graphics_pipeline.rs, video_core/src/renderer_vulkan/pipeline_cache.rs, video_core/src/renderer_vulkan/mod.rs, and video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/vulkan_common/vulkan_device.h, video_core/vulkan_common/vulkan_device.cpp, and video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust now queries `VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT`, stores `primitive_topology_list_restart_supported` and `primitive_topology_patch_list_restart_supported`, and exposes accessors matching upstream `Device::IsTopologyListPrimitiveRestartSupported` and `Device::IsPatchListPrimitiveRestartSupported`.
+- Rust enables `VK_EXT_primitive_topology_list_restart` and its feature struct only when `vkEnumerateDeviceExtensionProperties` reports the device extension. On the tested MoltenVK device, the runtime capability log reports `extension=false list=false patch=false`, so Rust keeps the feature disabled.
+- Rust passes the two feature booleans through the active reduced rasterizer/pipeline-cache constructor chain because the active renderer owns only an `ash::Device` in the pipeline leaf. Upstream passes the full `Vulkan::Device` reference directly.
+- Rust `GraphicsPipelineCache` now uses upstream's full `primitiveRestartEnable` gate: guest primitive restart must be enabled, and the topology must be either normally restart-capable, list-restart capable, or patch-list-restart capable.
+
+### Unintentional differences (to fix)
+- The active reduced Rust Vulkan pipeline leaf still does not own a full `Vulkan::Device` reference, so feature access is constructor-threaded instead of queried through `device.Is...()` at the call site.
+- Rust `Device::new` still ports only a subset of upstream's complete feature/property chain; this pass adds only the primitive-topology-list-restart feature needed by graphics pipeline parity.
+
+### Missing items
+- Port the full upstream `Device::Features` and `Device::Extensions` macro-driven feature chain from `vulkan_device.h/cpp`, then replace constructor-threaded capability booleans with a shared device-capability owner.
+- Port upstream tessellation topology correction around patch-list topology before the graphics pipeline create path can be considered complete.
+
+### Binary layout verification
+- N/A: Vulkan feature/capability state and graphics pipeline state are host-side only; no guest-visible raw-copied binary layout changed.
+
+### Verification
+- Re-read upstream `Device::IsTopologyListPrimitiveRestartSupported`, `Device::IsPatchListPrimitiveRestartSupported`, and the `FOR_EACH_VK_FEATURE_EXT` primitive-topology-list-restart entry in `vulkan_device.h`.
+- Re-read upstream `primitiveRestartEnable` construction in `vk_graphics_pipeline.cpp`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig cargo test -p video_core renderer_vulkan::graphics_pipeline::tests -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- `RUST_LOG=info timeout -k 5s 8s ./target/release/ruzu-cmd -r vulkan -g /Users/vricosti/Dev/emulators/switch-homebrew-template/out/Hello_World.nro` reaches continuous `BQP_QUEUE`/`BQC_RELEASE` and logs `Vulkan primitive topology restart: extension=false list=false patch=false` on the current MoltenVK device.
+
+## 2026-06-30 — video_core/src/renderer_vulkan/present/layer.rs and video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/present/layer.cpp and video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust keeps opt-in diagnostic logging under `RUZU_TRACE_VK_RT_FRAMEBUFFER` in the Vulkan texture-cache owner. Upstream has no equivalent runtime log, but this does not affect behavior and is scoped to the active reduced backend while the full framebuffer wrapper is still incomplete.
+- Rust `FramebufferImageViewVulkan` still combines the common texture-cache image view with the active reduced backend render-target handle. The returned display size now comes from `FramebufferImageView.view.size`, matching upstream `image_view->size`, while the Vulkan image/view handles still come from the backend render target.
+
+### Unintentional differences (to fix)
+- Rust still uses a reduced Vulkan render-target materialization path instead of upstream `Framebuffer`/`ImageView` wrappers. The render-area clamp now remains as previously documented, but full framebuffer attachment ownership is not yet ported.
+
+### Missing items
+- Port upstream `Vulkan::Framebuffer` and `TextureCacheRuntime` ownership completely, including render-pass keys, image ranges, attachment count, layer count, samples, and rescaling state.
+- Validate SpaceCadetPinball-NX with `RUZU_TRACE_PRESENT=1 RUZU_TRACE_VK_PRESENT_LAYER=1 RUZU_TRACE_VK_RT_FRAMEBUFFER=1` once the app reaches presentation reliably under the current run.
+
+### Binary layout verification
+- N/A: Vulkan present copy parameters and diagnostic logging are host-side state only; no guest-visible raw-copied binary layout changed.
+
+### Verification
+- Re-read upstream `Layer::UpdateRawImage` in `present/layer.cpp`; Rust now matches `.bufferRowLength = 0` and `.bufferImageHeight = 0` for the raw present image upload.
+- Re-read upstream `TextureCache<P>::TryFindFramebufferImageView` in `texture_cache.h` and `RasterizerVulkan::AccelerateDisplay` in `vk_rasterizer.cpp`; Rust now exposes the selected image view's size instead of the reduced backend render target's stored width/height.
+- Re-read upstream `Framebuffer::Framebuffer`/`CreateFramebuffer` in `vk_texture_cache.cpp`; the added Rust trace is diagnostic only and the known reduced framebuffer path remains documented.
+- `cargo fmt --all` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.

@@ -23,7 +23,18 @@ struct PositionInst {
 
 /// Port of upstream `Optimization::PositionPass`.
 pub fn position_pass(env: &mut dyn Environment, program: &mut Program) {
-    if env.shader_stage() != ShaderStage::VertexB || env.read_viewport_transform_state() != 0 {
+    let stage = env.shader_stage();
+    let viewport_transform_state = env.read_viewport_transform_state();
+    if std::env::var_os("RUZU_TRACE_POSITION_PASS").is_some() {
+        eprintln!(
+            "[POSITION_PASS] stage={:?} viewport_transform_state=0x{:X} post_order_blocks={} blocks={}",
+            stage,
+            viewport_transform_state,
+            program.post_order_blocks.len(),
+            program.blocks.len(),
+        );
+    }
+    if stage != ShaderStage::VertexB || viewport_transform_state != 0 {
         return;
     }
 

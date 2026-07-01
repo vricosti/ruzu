@@ -76,7 +76,70 @@ use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
 use crate::texture_cache::texture_cache_base::{DescriptorSyncRegs, ImageViewInOut};
 use crate::texture_cache::types::NULL_IMAGE_VIEW_ID;
 use crate::textures::texture::texture_pair;
+use shader_recompiler::shader_info::Info as ShaderInfo;
 use shader_recompiler::{PipelineCache as ShaderPipelineCache, Profile};
+
+use self::pipeline_helper::{
+    RescalingPushConstant, RENDERAREA_LAYOUT_OFFSET, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET,
+    RESCALING_LAYOUT_WORDS_OFFSET,
+};
+
+fn bytes_of<T: Sized>(value: &T) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts((value as *const T).cast::<u8>(), std::mem::size_of::<T>())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DrawParams {
+    base_instance: u32,
+    num_instances: u32,
+    base_vertex: i32,
+    num_vertices: u32,
+    first_index: u32,
+    is_indexed: bool,
+}
+
+fn make_draw_params(draw: &DrawCall) -> DrawParams {
+    let mut params = DrawParams {
+        base_instance: draw.base_instance,
+        num_instances: draw.instance_count.max(1),
+        base_vertex: if draw.indexed {
+            draw.base_vertex
+        } else {
+            draw.vertex_first as i32
+        },
+        num_vertices: if draw.indexed {
+            draw.index_buffer_count
+        } else {
+            draw.vertex_count
+        },
+        first_index: if draw.indexed {
+            draw.index_buffer_first
+        } else {
+            0
+        },
+        is_indexed: draw.indexed,
+    };
+
+    match draw.topology {
+        PrimitiveTopology::Quads => {
+            params.num_vertices = (params.num_vertices / 4) * 6;
+            params.base_vertex = 0;
+            params.first_index = 0;
+            params.is_indexed = true;
+        }
+        PrimitiveTopology::QuadStrip => {
+            params.num_vertices = params.num_vertices.saturating_sub(2) / 2 * 6;
+            params.base_vertex = 0;
+            params.first_index = 0;
+            params.is_indexed = true;
+        }
+        _ => {}
+    }
+
+    params
+}
 
 use self::fence_manager::{Fence as VkFence, FenceManager as VkFenceBackend};
 
@@ -222,6 +285,9 @@ pub struct RasterizerVulkan {
 
     // Draw counter for periodic flush (zuyu: 7 draws → dispatch, 4096 → flush)
     draw_counter: u32,
+    extended_dynamic_state_supported: bool,
+    extended_dynamic_state2_supported: bool,
+    max_viewports: u32,
 
     // Channel-bound GPU memory manager, matching upstream rasterizer access to
     // the active channel's Tegra::MemoryManager.
@@ -250,6 +316,11 @@ impl RasterizerVulkan {
         width: u32,
         height: u32,
         supported_spirv_version: u32,
+        extended_dynamic_state_supported: bool,
+        extended_dynamic_state2_supported: bool,
+        topology_list_primitive_restart_supported: bool,
+        patch_list_primitive_restart_supported: bool,
+        max_viewports: u32,
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<MaxwellDeviceMemoryManager>,
     ) -> Result<Self, RendererError> {
@@ -308,8 +379,18 @@ impl RasterizerVulkan {
         let shader_cache = ShaderPipelineCache::new(profile.clone());
 
         // Create pipeline cache owner
-        let pipeline_cache =
-            VulkanPipelineCache::new(device.clone(), false, false, shader_cache, profile);
+        let pipeline_cache = VulkanPipelineCache::new(
+            device.clone(),
+            false,
+            false,
+            shader_cache,
+            profile,
+            extended_dynamic_state_supported,
+            extended_dynamic_state2_supported,
+            topology_list_primitive_restart_supported,
+            patch_list_primitive_restart_supported,
+            max_viewports,
+        );
 
         // Create buffer cache
         let buffer_cache = BufferCache::new(device.clone(), instance.clone(), physical_device)
@@ -394,6 +475,9 @@ impl RasterizerVulkan {
             readback_mapped,
             readback_size,
             draw_counter: 0,
+            extended_dynamic_state_supported,
+            extended_dynamic_state2_supported,
+            max_viewports: max_viewports.min(NUM_VIEWPORTS as u32).max(1),
             channel_memory_manager: None,
         })
     }
@@ -435,6 +519,9 @@ impl RasterizerVulkan {
             descriptor_set_layout,
             descriptor_bindings,
             descriptor_bank_info,
+            stage_infos,
+            uses_render_area,
+            uses_rescaling_uniform,
         ) = match pipeline_result {
             Some((gp, _fixed_state)) => (
                 gp.pipeline,
@@ -442,6 +529,9 @@ impl RasterizerVulkan {
                 gp.descriptor_set_layout,
                 gp.descriptor_bindings.clone(),
                 gp.descriptor_bank_info,
+                gp.stage_infos.clone(),
+                gp.uses_render_area,
+                gp.uses_rescaling_uniform,
             ),
             None => {
                 debug!("RasterizerVulkan: skipping draw (pipeline compilation failed)");
@@ -490,27 +580,31 @@ impl RasterizerVulkan {
                 },
             },
         ];
-        self.scheduler.request_renderpass(
-            framebuffer,
-            self.default_render_pass,
-            vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent,
-            },
-            &clear_values,
-        );
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
 
         // 4. Bind pipeline
         unsafe {
             self.device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
         }
+        self.push_graphics_push_constants(
+            cmd,
+            pipeline_layout,
+            draw,
+            uses_render_area,
+            uses_rescaling_uniform,
+        );
+        let draw_params = make_draw_params(draw);
         self.bind_graphics_descriptors(
             cmd,
             pipeline_layout,
             descriptor_set_layout,
             &descriptor_bindings,
             &descriptor_bank_info,
+            &stage_infos,
             draw,
             read_gpu,
             read_gpu_unsafe,
@@ -521,30 +615,73 @@ impl RasterizerVulkan {
 
         // 6. Bind vertex/index buffers
         self.bind_vertex_buffers(cmd, draw, read_gpu);
-        if draw.indexed {
-            self.bind_index_buffer(cmd, draw, read_gpu);
+        if draw_params.is_indexed {
+            self.bind_index_buffer(cmd, draw, draw_params, read_gpu);
+        }
+
+        self.scheduler.request_renderpass(
+            framebuffer,
+            self.default_render_pass,
+            render_area,
+            &clear_values,
+        );
+
+        if std::env::var_os("RUZU_TRACE_VK_DRAW").is_some() {
+            let rt0 = draw.render_targets[0];
+            log::info!(
+                "[VK_DRAW] draw={} topology={:?} guest_indexed={} vk_indexed={} vertices={} instances={} first_index={} base_vertex={} base_instance={} vertex_first={} vertex_count={} index_first={} index_count={} rt0_addr=0x{:X} rt0={}x{} fmt={} prim_restart={} rasterize={} uses_render_area={} uses_rescaling_uniform={} blend0={} color=({:?},{:?},{:?}) alpha=({:?},{:?},{:?}) mask={:?}",
+                self.draw_counter,
+                draw.topology,
+                draw.indexed,
+                draw_params.is_indexed,
+                draw_params.num_vertices,
+                draw_params.num_instances,
+                draw_params.first_index,
+                draw_params.base_vertex,
+                draw_params.base_instance,
+                draw.vertex_first,
+                draw.vertex_count,
+                draw.index_buffer_first,
+                draw.index_buffer_count,
+                rt0.address,
+                rt0.width,
+                rt0.height,
+                rt0.format,
+                draw.primitive_restart.enabled,
+                draw.rasterize_enable,
+                uses_render_area,
+                uses_rescaling_uniform,
+                draw.blend[0].enabled,
+                draw.blend[0].color_src,
+                draw.blend[0].color_dst,
+                draw.blend[0].color_op,
+                draw.blend[0].alpha_src,
+                draw.blend[0].alpha_dst,
+                draw.blend[0].alpha_op,
+                draw.color_masks[0],
+            );
         }
 
         // 7. Issue draw call
-        if draw.indexed {
+        if draw_params.is_indexed {
             unsafe {
                 self.device.cmd_draw_indexed(
                     cmd,
-                    draw.index_buffer_count,
-                    draw.instance_count.max(1),
-                    draw.index_buffer_first,
-                    draw.base_vertex,
-                    draw.base_instance,
+                    draw_params.num_vertices,
+                    draw_params.num_instances,
+                    draw_params.first_index,
+                    draw_params.base_vertex,
+                    draw_params.base_instance,
                 );
             }
         } else {
             unsafe {
                 self.device.cmd_draw(
                     cmd,
-                    draw.vertex_count,
-                    draw.instance_count.max(1),
-                    draw.vertex_first,
-                    draw.base_instance,
+                    draw_params.num_vertices,
+                    draw_params.num_instances,
+                    draw_params.base_vertex as u32,
+                    draw_params.base_instance,
                 );
             }
         }
@@ -552,6 +689,57 @@ impl RasterizerVulkan {
         self.draw_counter += 1;
         // Mark state dirty for next draw (conservative — real tracking per-register later)
         self.state_tracker.invalidate_state();
+    }
+
+    fn push_graphics_push_constants(
+        &self,
+        cmd: vk::CommandBuffer,
+        pipeline_layout: vk::PipelineLayout,
+        draw: &DrawCall,
+        uses_render_area: bool,
+        uses_rescaling_uniform: bool,
+    ) {
+        let rescaling = RescalingPushConstant::new();
+        unsafe {
+            self.device.cmd_push_constants(
+                cmd,
+                pipeline_layout,
+                vk::ShaderStageFlags::ALL_GRAPHICS,
+                RESCALING_LAYOUT_WORDS_OFFSET,
+                bytes_of(rescaling.data()),
+            );
+        }
+
+        if uses_rescaling_uniform {
+            let scale_down_factor = 1.0f32;
+            unsafe {
+                self.device.cmd_push_constants(
+                    cmd,
+                    pipeline_layout,
+                    vk::ShaderStageFlags::ALL_GRAPHICS,
+                    RESCALING_LAYOUT_DOWN_FACTOR_OFFSET,
+                    bytes_of(&scale_down_factor),
+                );
+            }
+        }
+
+        if uses_render_area {
+            let render_area = [
+                draw.surface_clip.width as f32,
+                draw.surface_clip.height as f32,
+                0.0,
+                0.0,
+            ];
+            unsafe {
+                self.device.cmd_push_constants(
+                    cmd,
+                    pipeline_layout,
+                    vk::ShaderStageFlags::ALL_GRAPHICS,
+                    RENDERAREA_LAYOUT_OFFSET,
+                    bytes_of(&render_area),
+                );
+            }
+        }
     }
 
     /// Clear framebuffer.
@@ -750,7 +938,192 @@ impl RasterizerVulkan {
         self.update_depth_bias(cmd, draw);
         self.update_blend_constants(cmd, draw);
         self.update_depth_bounds(cmd, draw);
+        self.update_stencil_faces(cmd, draw);
         self.update_line_width(cmd, draw);
+        if self.extended_dynamic_state_supported {
+            self.update_cull_mode(cmd, draw);
+            self.update_depth_compare_op(cmd, draw);
+            self.update_front_face(cmd, draw);
+            self.update_stencil_op(cmd, draw);
+
+            if self.state_tracker.touch_state_enable() {
+                self.update_depth_bounds_test_enable(cmd, draw);
+                self.update_depth_test_enable(cmd, draw);
+                self.update_depth_write_enable(cmd, draw);
+                self.update_stencil_test_enable(cmd, draw);
+                if self.extended_dynamic_state2_supported {
+                    self.update_primitive_restart_enable(cmd, draw);
+                    self.update_rasterizer_discard_enable(cmd, draw);
+                    self.update_depth_bias_enable(cmd, draw);
+                }
+            }
+        }
+    }
+
+    fn update_primitive_restart_enable(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+        if !self.state_tracker.touch_primitive_restart_enable() {
+            return;
+        }
+        unsafe {
+            self.device
+                .cmd_set_primitive_restart_enable(cmd, draw.primitive_restart.enabled);
+        }
+    }
+
+    fn update_cull_mode(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+        if !self.state_tracker.touch_cull_mode() {
+            return;
+        }
+        let cull_mode = if draw.rasterizer.cull_enable {
+            maxwell_to_vk::cull_face(draw.rasterizer.cull_face)
+        } else {
+            vk::CullModeFlags::NONE
+        };
+        unsafe {
+            self.device.cmd_set_cull_mode(cmd, cull_mode);
+        }
+    }
+
+    fn update_depth_bounds_test_enable(&mut self, cmd: vk::CommandBuffer, _draw: &DrawCall) {
+        if !self.state_tracker.touch_depth_bounds_test_enable() {
+            return;
+        }
+        // ruzu does not expose regs.depth_bounds_enable in DrawCall yet.
+        unsafe {
+            self.device.cmd_set_depth_bounds_test_enable(cmd, false);
+        }
+    }
+
+    fn update_depth_test_enable(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+        if !self.state_tracker.touch_depth_test_enable() {
+            return;
+        }
+        unsafe {
+            self.device
+                .cmd_set_depth_test_enable(cmd, draw.depth_stencil.depth_test_enable);
+        }
+    }
+
+    fn update_depth_write_enable(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+        if !self.state_tracker.touch_depth_write_enable() {
+            return;
+        }
+        unsafe {
+            self.device
+                .cmd_set_depth_write_enable(cmd, draw.depth_stencil.depth_write_enable);
+        }
+    }
+
+    fn update_stencil_test_enable(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+        if !self.state_tracker.touch_stencil_test_enable() {
+            return;
+        }
+        unsafe {
+            self.device
+                .cmd_set_stencil_test_enable(cmd, draw.depth_stencil.stencil_enable);
+        }
+    }
+
+    fn update_rasterizer_discard_enable(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+        if !self.state_tracker.touch_rasterizer_discard_enable() {
+            return;
+        }
+        unsafe {
+            self.device
+                .cmd_set_rasterizer_discard_enable(cmd, !draw.rasterize_enable);
+        }
+    }
+
+    fn update_depth_bias_enable(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+        if !self.state_tracker.touch_depth_bias_enable() {
+            return;
+        }
+        let enabled = match draw.topology {
+            PrimitiveTopology::Points => draw.rasterizer.polygon_offset_point_enable,
+            PrimitiveTopology::Lines
+            | PrimitiveTopology::LineLoop
+            | PrimitiveTopology::LineStrip
+            | PrimitiveTopology::LinesAdjacency
+            | PrimitiveTopology::LineStripAdjacency => draw.rasterizer.polygon_offset_line_enable,
+            PrimitiveTopology::Triangles
+            | PrimitiveTopology::TriangleStrip
+            | PrimitiveTopology::TriangleFan
+            | PrimitiveTopology::Quads
+            | PrimitiveTopology::QuadStrip
+            | PrimitiveTopology::Polygon
+            | PrimitiveTopology::TrianglesAdjacency
+            | PrimitiveTopology::TriangleStripAdjacency
+            | PrimitiveTopology::Patches => draw.rasterizer.polygon_offset_fill_enable,
+        };
+        unsafe {
+            self.device.cmd_set_depth_bias_enable(cmd, enabled);
+        }
+    }
+
+    fn update_depth_compare_op(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+        if !self.state_tracker.touch_depth_compare_op() {
+            return;
+        }
+        unsafe {
+            self.device.cmd_set_depth_compare_op(
+                cmd,
+                maxwell_to_vk::comparison_op(draw.depth_stencil.depth_func),
+            );
+        }
+    }
+
+    fn update_front_face(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+        if !self.state_tracker.touch_front_face() {
+            return;
+        }
+        let mut front_face = maxwell_to_vk::front_face(draw.rasterizer.front_face);
+        if draw.window_origin_flip_y {
+            front_face = if front_face == vk::FrontFace::CLOCKWISE {
+                vk::FrontFace::COUNTER_CLOCKWISE
+            } else {
+                vk::FrontFace::CLOCKWISE
+            };
+        }
+        unsafe {
+            self.device.cmd_set_front_face(cmd, front_face);
+        }
+    }
+
+    fn update_stencil_op(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+        if !self.state_tracker.touch_stencil_op() {
+            return;
+        }
+        let front = &draw.depth_stencil.front;
+        unsafe {
+            if draw.depth_stencil.stencil_two_side {
+                let back = &draw.depth_stencil.back;
+                self.device.cmd_set_stencil_op(
+                    cmd,
+                    vk::StencilFaceFlags::FRONT,
+                    maxwell_to_vk::stencil_op(front.fail_op),
+                    maxwell_to_vk::stencil_op(front.zpass_op),
+                    maxwell_to_vk::stencil_op(front.zfail_op),
+                    maxwell_to_vk::comparison_op(front.func),
+                );
+                self.device.cmd_set_stencil_op(
+                    cmd,
+                    vk::StencilFaceFlags::BACK,
+                    maxwell_to_vk::stencil_op(back.fail_op),
+                    maxwell_to_vk::stencil_op(back.zpass_op),
+                    maxwell_to_vk::stencil_op(back.zfail_op),
+                    maxwell_to_vk::comparison_op(back.func),
+                );
+            } else {
+                self.device.cmd_set_stencil_op(
+                    cmd,
+                    vk::StencilFaceFlags::FRONT_AND_BACK,
+                    maxwell_to_vk::stencil_op(front.fail_op),
+                    maxwell_to_vk::stencil_op(front.zpass_op),
+                    maxwell_to_vk::stencil_op(front.zfail_op),
+                    maxwell_to_vk::comparison_op(front.func),
+                );
+            }
+        }
     }
 
     fn update_viewports(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
@@ -774,7 +1147,8 @@ impl RasterizerVulkan {
                 let viewports = std::array::from_fn::<_, { NUM_VIEWPORTS }, _>(|index| {
                     viewport_state(draw, index)
                 });
-                self.device.cmd_set_viewport(cmd, 0, &viewports);
+                self.device
+                    .cmd_set_viewport(cmd, 0, &viewports[..self.max_viewports as usize]);
             } else {
                 self.device.cmd_set_viewport(cmd, 0, &[viewport]);
             }
@@ -818,7 +1192,8 @@ impl RasterizerVulkan {
                 let scissors = std::array::from_fn::<_, { NUM_VIEWPORTS }, _>(|index| {
                     scissor_state(draw, index)
                 });
-                self.device.cmd_set_scissor(cmd, 0, &scissors);
+                self.device
+                    .cmd_set_scissor(cmd, 0, &scissors[..self.max_viewports as usize]);
             } else {
                 self.device.cmd_set_scissor(cmd, 0, &[scissor]);
             }
@@ -839,15 +1214,13 @@ impl RasterizerVulkan {
         if !self.state_tracker.touch_depth_bias() {
             return;
         }
-        if draw.rasterizer.depth_bias != 0.0 {
-            unsafe {
-                self.device.cmd_set_depth_bias(
-                    cmd,
-                    draw.rasterizer.depth_bias,
-                    draw.rasterizer.depth_bias_clamp,
-                    draw.rasterizer.slope_scale_depth_bias,
-                );
-            }
+        unsafe {
+            self.device.cmd_set_depth_bias(
+                cmd,
+                draw.rasterizer.depth_bias,
+                draw.rasterizer.depth_bias_clamp,
+                draw.rasterizer.slope_scale_depth_bias,
+            );
         }
     }
 
@@ -866,6 +1239,137 @@ impl RasterizerVulkan {
                 ],
             );
         }
+    }
+
+    fn update_stencil_faces(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+        if !self.state_tracker.touch_stencil_properties() {
+            return;
+        }
+        let mut update_references = self.state_tracker.touch_stencil_reference();
+        let mut update_write_mask = self.state_tracker.touch_stencil_write_mask();
+        let mut update_compare_masks = self.state_tracker.touch_stencil_compare();
+
+        if self
+            .state_tracker
+            .touch_stencil_side(draw.depth_stencil.stencil_two_side)
+        {
+            update_references = true;
+            update_write_mask = true;
+            update_compare_masks = true;
+        }
+
+        let front = &draw.depth_stencil.front;
+        let back = &draw.depth_stencil.back;
+
+        if update_references {
+            unsafe {
+                if draw.depth_stencil.stencil_two_side && front.ref_value != back.ref_value {
+                    if self
+                        .state_tracker
+                        .check_stencil_reference_front(front.ref_value)
+                    {
+                        self.device.cmd_set_stencil_reference(
+                            cmd,
+                            vk::StencilFaceFlags::FRONT,
+                            front.ref_value,
+                        );
+                    }
+                    if self
+                        .state_tracker
+                        .check_stencil_reference_back(back.ref_value)
+                    {
+                        self.device.cmd_set_stencil_reference(
+                            cmd,
+                            vk::StencilFaceFlags::BACK,
+                            back.ref_value,
+                        );
+                    }
+                } else if self
+                    .state_tracker
+                    .check_stencil_reference_front(front.ref_value)
+                {
+                    self.device.cmd_set_stencil_reference(
+                        cmd,
+                        vk::StencilFaceFlags::FRONT_AND_BACK,
+                        front.ref_value,
+                    );
+                }
+            }
+        }
+
+        if update_write_mask {
+            unsafe {
+                if draw.depth_stencil.stencil_two_side && front.write_mask != back.write_mask {
+                    if self
+                        .state_tracker
+                        .check_stencil_write_mask_front(front.write_mask)
+                    {
+                        self.device.cmd_set_stencil_write_mask(
+                            cmd,
+                            vk::StencilFaceFlags::FRONT,
+                            front.write_mask,
+                        );
+                    }
+                    if self
+                        .state_tracker
+                        .check_stencil_write_mask_back(back.write_mask)
+                    {
+                        self.device.cmd_set_stencil_write_mask(
+                            cmd,
+                            vk::StencilFaceFlags::BACK,
+                            back.write_mask,
+                        );
+                    }
+                } else if self
+                    .state_tracker
+                    .check_stencil_write_mask_front(front.write_mask)
+                {
+                    self.device.cmd_set_stencil_write_mask(
+                        cmd,
+                        vk::StencilFaceFlags::FRONT_AND_BACK,
+                        front.write_mask,
+                    );
+                }
+            }
+        }
+
+        if update_compare_masks {
+            unsafe {
+                if draw.depth_stencil.stencil_two_side && front.func_mask != back.func_mask {
+                    if self
+                        .state_tracker
+                        .check_stencil_compare_mask_front(front.func_mask)
+                    {
+                        self.device.cmd_set_stencil_compare_mask(
+                            cmd,
+                            vk::StencilFaceFlags::FRONT,
+                            front.func_mask,
+                        );
+                    }
+                    if self
+                        .state_tracker
+                        .check_stencil_compare_mask_back(back.func_mask)
+                    {
+                        self.device.cmd_set_stencil_compare_mask(
+                            cmd,
+                            vk::StencilFaceFlags::BACK,
+                            back.func_mask,
+                        );
+                    }
+                } else if self
+                    .state_tracker
+                    .check_stencil_compare_mask_front(front.func_mask)
+                {
+                    self.device.cmd_set_stencil_compare_mask(
+                        cmd,
+                        vk::StencilFaceFlags::FRONT_AND_BACK,
+                        front.func_mask,
+                    );
+                }
+            }
+        }
+
+        self.state_tracker.clear_stencil_reset();
     }
 
     fn update_depth_bounds(&mut self, cmd: vk::CommandBuffer, _draw: &DrawCall) {
@@ -901,9 +1405,21 @@ impl RasterizerVulkan {
             if !stream.enabled || stream.address == 0 {
                 continue;
             }
-            // Estimate buffer size from stride × vertex_count
-            let size =
-                (stream.stride as u64) * (draw.vertex_count.max(draw.index_buffer_count) as u64);
+            let limit = draw
+                .vertex_stream_limits
+                .get(stream.index as usize)
+                .map(|limit| limit.address)
+                .unwrap_or(0);
+            let fallback_count = draw.vertex_first.saturating_add(draw.vertex_count).max(
+                draw.index_buffer_first
+                    .saturating_add(draw.index_buffer_count),
+            );
+            let fallback_size = (stream.stride as u64).saturating_mul(fallback_count as u64);
+            let size = if limit >= stream.address {
+                limit.saturating_sub(stream.address).saturating_add(1)
+            } else {
+                fallback_size
+            };
             if size == 0 {
                 continue;
             }
@@ -939,8 +1455,40 @@ impl RasterizerVulkan {
         &mut self,
         cmd: vk::CommandBuffer,
         draw: &DrawCall,
+        draw_params: DrawParams,
         read_gpu: &dyn Fn(u64, &mut [u8]),
     ) {
+        let upload_cmd = self.scheduler.upload_command_buffer();
+        if matches!(
+            draw.topology,
+            PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip
+        ) {
+            if draw.indexed {
+                self.buffer_cache.bind_quad_indexed_buffer(
+                    cmd,
+                    draw.topology,
+                    draw.index_format,
+                    draw.base_vertex,
+                    draw.index_buffer_first,
+                    draw.index_buffer_count,
+                    draw.index_buffer_addr,
+                    read_gpu,
+                    &mut self.staging_pool,
+                    upload_cmd,
+                );
+            } else {
+                self.buffer_cache.bind_quad_index_buffer(
+                    cmd,
+                    draw.topology,
+                    draw.vertex_first,
+                    draw.vertex_count,
+                    &mut self.staging_pool,
+                    upload_cmd,
+                );
+            }
+            return;
+        }
+
         if draw.index_buffer_addr == 0 {
             return;
         }
@@ -949,13 +1497,15 @@ impl RasterizerVulkan {
             crate::engines::maxwell_3d::IndexFormat::UnsignedShort => 2,
             crate::engines::maxwell_3d::IndexFormat::UnsignedInt => 4,
         };
-        let size = (index_size * draw.index_buffer_count) as u64;
+        let size = (index_size
+            * draw_params
+                .first_index
+                .saturating_add(draw_params.num_vertices)) as u64;
         let index_type = match draw.index_format {
             crate::engines::maxwell_3d::IndexFormat::UnsignedByte => vk::IndexType::UINT8_EXT,
             crate::engines::maxwell_3d::IndexFormat::UnsignedShort => vk::IndexType::UINT16,
             crate::engines::maxwell_3d::IndexFormat::UnsignedInt => vk::IndexType::UINT32,
         };
-        let upload_cmd = self.scheduler.upload_command_buffer();
         self.buffer_cache.bind_index_buffer(
             cmd,
             draw.index_buffer_addr,
@@ -974,6 +1524,7 @@ impl RasterizerVulkan {
         descriptor_set_layout: vk::DescriptorSetLayout,
         descriptor_bindings: &[GraphicsDescriptorBinding],
         descriptor_bank_info: &DescriptorBankInfo,
+        stage_infos: &[Option<ShaderInfo>; 5],
         draw: &DrawCall,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
@@ -1030,6 +1581,105 @@ impl RasterizerVulkan {
             read_gpu(addr, &mut bytes);
             u32::from_le_bytes(bytes)
         };
+        let read_stage_handle = |stage: usize,
+                                 cbuf_index: u32,
+                                 cbuf_offset: u32,
+                                 size_shift: u32,
+                                 element: u32,
+                                 has_secondary: bool,
+                                 shift_left: u32,
+                                 secondary_cbuf_index: u32,
+                                 secondary_cbuf_offset: u32,
+                                 secondary_shift_left: u32|
+         -> Option<u32> {
+            let index_offset = element.checked_shl(size_shift.min(31))?;
+            let cbuf = draw
+                .cb_bindings
+                .get(stage)
+                .and_then(|stage| stage.get(cbuf_index as usize))?;
+            if !cbuf.enabled || cbuf.address == 0 {
+                return None;
+            }
+            let offset = cbuf_offset.checked_add(index_offset)?;
+            if cbuf.size as u32 <= offset {
+                return None;
+            }
+            let addr = cbuf.address.wrapping_add(offset as u64);
+            if !has_secondary {
+                return Some(read_u32(addr));
+            }
+            let secondary_cbuf = draw
+                .cb_bindings
+                .get(stage)
+                .and_then(|stage| stage.get(secondary_cbuf_index as usize))?;
+            if !secondary_cbuf.enabled || secondary_cbuf.address == 0 {
+                return None;
+            }
+            let secondary_offset = secondary_cbuf_offset.checked_add(index_offset)?;
+            if secondary_cbuf.size as u32 <= secondary_offset {
+                return None;
+            }
+            let secondary_addr = secondary_cbuf.address.wrapping_add(secondary_offset as u64);
+            Some(
+                (read_u32(addr) << shift_left) | (read_u32(secondary_addr) << secondary_shift_left),
+            )
+        };
+        let mut sampled_views = Vec::new();
+        let mut sampled_samplers = Vec::new();
+        for (stage, info) in stage_infos.iter().enumerate() {
+            let Some(info) = info else {
+                continue;
+            };
+            for desc in &info.texture_descriptors {
+                for element in 0..desc.count {
+                    let raw = read_stage_handle(
+                        stage,
+                        desc.cbuf_index,
+                        desc.cbuf_offset,
+                        desc.size_shift,
+                        element,
+                        desc.has_secondary,
+                        desc.shift_left,
+                        desc.secondary_cbuf_index,
+                        desc.secondary_cbuf_offset,
+                        desc.secondary_shift_left,
+                    )
+                    .unwrap_or(0);
+                    let (tic_id, tsc_id) = texture_pair(raw, via_header_index);
+                    if std::env::var_os("RUZU_TRACE_VK_TEXTURE_HANDLE").is_some() {
+                        log::warn!(
+                            "[VK_TEXTURE_HANDLE] stage={} elem={} type={:?} cbuf={} offset=0x{:X} raw=0x{:X} tic={} tsc={} via_header={}",
+                            stage,
+                            element,
+                            desc.texture_type,
+                            desc.cbuf_index,
+                            desc.cbuf_offset.wrapping_add(element << desc.size_shift.min(31)),
+                            raw,
+                            tic_id,
+                            tsc_id,
+                            via_header_index,
+                        );
+                    }
+                    let sampler_id = unsafe {
+                        let _texture_lock = (*texture_cache).base.mutex.lock();
+                        (*texture_cache).base.get_graphics_sampler_id(tsc_id)
+                    };
+                    sampled_views.push(ImageViewInOut {
+                        index: tic_id,
+                        blacklist: false,
+                        id: NULL_IMAGE_VIEW_ID,
+                    });
+                    sampled_samplers.push(sampler_id);
+                }
+            }
+        }
+        unsafe {
+            let _texture_lock = (*texture_cache).base.mutex.lock();
+            (*texture_cache)
+                .base
+                .fill_graphics_image_views(&mut sampled_views, false);
+        }
+        let mut sampled_cursor = 0usize;
 
         for binding in descriptor_bindings {
             match binding.descriptor_type {
@@ -1112,132 +1762,119 @@ impl RasterizerVulkan {
                 vk::DescriptorType::COMBINED_IMAGE_SAMPLER | vk::DescriptorType::STORAGE_IMAGE => {
                     let start = image_infos.len();
                     if binding.descriptor_type == vk::DescriptorType::COMBINED_IMAGE_SAMPLER {
-                        let mut views = Vec::with_capacity(binding.descriptor_count as usize);
-                        let mut sampler_ids = Vec::with_capacity(binding.descriptor_count as usize);
-                        if let Some(texture) = binding.texture {
-                            for element in 0..binding.descriptor_count {
-                                let index_offset = element << texture.size_shift;
-                                let cbuf = draw
-                                    .cb_bindings
-                                    .get(texture.graphics_stage as usize)
-                                    .and_then(|stage| stage.get(texture.cbuf_index as usize));
-                                let raw = cbuf
-                                    .filter(|binding| {
-                                        binding.enabled
-                                            && binding.address != 0
-                                            && binding.size as u32
-                                                >= texture.cbuf_offset.saturating_add(4)
-                                    })
-                                    .map(|binding| {
-                                        let addr = binding
-                                            .address
-                                            .wrapping_add(texture.cbuf_offset as u64)
-                                            .wrapping_add(index_offset as u64);
-                                        if texture.has_secondary {
-                                            let lhs = read_u32(addr) << texture.shift_left;
-                                            let rhs = draw
-                                                .cb_bindings
-                                                .get(texture.graphics_stage as usize)
-                                                .and_then(|stage| {
-                                                    stage.get(texture.secondary_cbuf_index as usize)
-                                                })
-                                                .filter(|binding| {
-                                                    binding.enabled && binding.address != 0
-                                                })
-                                                .map(|binding| {
-                                                    let secondary_addr = binding
-                                                        .address
-                                                        .wrapping_add(
-                                                            texture.secondary_cbuf_offset as u64,
-                                                        )
-                                                        .wrapping_add(index_offset as u64);
-                                                    read_u32(secondary_addr)
-                                                        << texture.secondary_shift_left
-                                                })
-                                                .unwrap_or(0);
-                                            lhs | rhs
-                                        } else {
-                                            read_u32(addr)
-                                        }
-                                    })
-                                    .unwrap_or(0);
-                                let (tic_id, tsc_id) = texture_pair(raw, via_header_index);
-                                if std::env::var_os("RUZU_TRACE_VK_TEXTURE_HANDLE").is_some() {
-                                    let (cbuf_address, cbuf_size) = draw
-                                        .cb_bindings
-                                        .get(texture.graphics_stage as usize)
-                                        .and_then(|stage| stage.get(texture.cbuf_index as usize))
-                                        .map(|binding| (binding.address, binding.size))
-                                        .unwrap_or((0, 0));
-                                    log::warn!(
-                                        "[VK_TEXTURE_HANDLE] binding={} elem={} stage={} cbuf={} cbuf_addr=0x{:X} cbuf_size=0x{:X} offset=0x{:X} raw=0x{:X} tic={} tsc={} via_header={}",
-                                        binding.binding,
-                                        element,
-                                        texture.graphics_stage,
-                                        texture.cbuf_index,
-                                        cbuf_address,
-                                        cbuf_size,
-                                        texture.cbuf_offset.wrapping_add(index_offset),
-                                        raw,
-                                        tic_id,
-                                        tsc_id,
-                                        via_header_index,
-                                    );
-                                }
-                                let sampler_id = unsafe {
-                                    let _texture_lock = (*texture_cache).base.mutex.lock();
-                                    (*texture_cache).base.get_graphics_sampler_id(tsc_id)
-                                };
-                                views.push(ImageViewInOut {
-                                    index: tic_id,
-                                    blacklist: false,
-                                    id: NULL_IMAGE_VIEW_ID,
-                                });
-                                sampler_ids.push(sampler_id);
-                            }
-                            unsafe {
-                                let _texture_lock = (*texture_cache).base.mutex.lock();
-                                (*texture_cache)
-                                    .base
-                                    .fill_graphics_image_views(&mut views, false);
-                            }
-                        }
-
                         for element in 0..binding.descriptor_count as usize {
-                            let view_id = views
-                                .get(element)
+                            let sampled_index = sampled_cursor + element;
+                            let view_id = sampled_views
+                                .get(sampled_index)
                                 .map(|view| view.id)
                                 .unwrap_or(NULL_IMAGE_VIEW_ID);
                             let image_view = self
                                 .texture_cache
                                 .materialize_sampled_image_view(
                                     view_id,
+                                    binding
+                                        .texture
+                                        .map(|texture| texture.texture_type)
+                                        .unwrap_or(
+                                            shader_recompiler::shader_info::TextureType::Color2D,
+                                        ),
                                     read_gpu_unsafe,
                                     &mut self.staging_pool,
-                                    upload_cmd,
+                                    cmd,
                                 )
                                 .unwrap_or(self.offscreen_view);
+                            let sampler_id = sampled_samplers
+                                .get(sampled_index)
+                                .copied()
+                                .unwrap_or_default();
+                            let sampler = self
+                                .texture_cache
+                                .sampler_handle(sampler_id)
+                                .unwrap_or(self.fallback_sampler);
+                            if std::env::var_os("RUZU_TRACE_VK_TEXTURE_STATE").is_some() {
+                                if view_id.is_valid() && view_id != NULL_IMAGE_VIEW_ID {
+                                    let view =
+                                        self.texture_cache.base.slot_image_views.get(view_id);
+                                    let image =
+                                        self.texture_cache.base.slot_images.get(view.image_id);
+                                    log::warn!(
+                                        "[VK_TEXTURE_STATE] binding={} elem={} sampled_index={} view_id={} sampler_id={} image_id={} view_gpu=0x{:X} view_fmt={:?} view_type={:?} view_range={:?} view_swizzle={:?} view_size={:?} view_flags={:?} image_type={:?} image_fmt={:?} image_size={:?} image_gpu=0x{:X} image_cpu=0x{:X} guest_size={} unswizzled_size={} image_flags={:?}",
+                                        binding.binding,
+                                        element,
+                                        sampled_index,
+                                        view_id.index,
+                                        sampler_id.index,
+                                        view.image_id.index,
+                                        view.gpu_addr,
+                                        view.format,
+                                        view.view_type,
+                                        view.range,
+                                        view.swizzle,
+                                        view.size,
+                                        view.flags,
+                                        image.info.image_type,
+                                        image.info.format,
+                                        image.info.size,
+                                        image.gpu_addr,
+                                        image.cpu_addr,
+                                        image.guest_size_bytes,
+                                        image.unswizzled_size_bytes,
+                                        image.flags,
+                                    );
+                                } else {
+                                    log::warn!(
+                                        "[VK_TEXTURE_STATE] binding={} elem={} sampled_index={} view_id={} sampler_id={} null_view",
+                                        binding.binding,
+                                        element,
+                                        sampled_index,
+                                        view_id.index,
+                                        sampler_id.index,
+                                    );
+                                }
+                                if sampler_id.is_valid()
+                                    && sampler_id != crate::texture_cache::types::NULL_SAMPLER_ID
+                                {
+                                    let tsc = self.texture_cache.base.slot_samplers.get(sampler_id);
+                                    log::warn!(
+                                        "[VK_TEXTURE_SAMPLER] binding={} elem={} sampler_id={} raw={:016X?} wrap=({},{},{}) filter=({},{},{}) depth_cmp={} depth_func={} lod=({:.3},{:.3}) bias={:.3}",
+                                        binding.binding,
+                                        element,
+                                        sampler_id.index,
+                                        tsc.raw,
+                                        tsc.wrap_u(),
+                                        tsc.wrap_v(),
+                                        tsc.wrap_p(),
+                                        tsc.mag_filter(),
+                                        tsc.min_filter(),
+                                        tsc.mipmap_filter(),
+                                        tsc.depth_compare_enabled(),
+                                        tsc.depth_compare_func(),
+                                        tsc.min_lod(),
+                                        tsc.max_lod(),
+                                        tsc.lod_bias(),
+                                    );
+                                }
+                            }
                             if std::env::var_os("RUZU_TRACE_VK_TEXTURE_BIND").is_some() {
-                                let sampler_id = sampler_ids
-                                    .get(element)
-                                    .map(|id| id.index)
-                                    .unwrap_or_default();
                                 log::warn!(
-                                    "[VK_TEXTURE_BIND] binding={} elem={} view_id={} sampler_id={} vk_view=0x{:X} fallback={}",
+                                    "[VK_TEXTURE_BIND] binding={} elem={} view_id={} sampler_id={} vk_view=0x{:X} fallback_view={} fallback_sampler={}",
                                     binding.binding,
                                     element,
                                     view_id.index,
-                                    sampler_id,
+                                    sampler_id.index,
                                     image_view.as_raw(),
                                     image_view == self.offscreen_view,
+                                    sampler == self.fallback_sampler,
                                 );
                             }
                             image_infos.push(vk::DescriptorImageInfo {
-                                sampler: self.fallback_sampler,
+                                sampler,
                                 image_view,
                                 image_layout: vk::ImageLayout::GENERAL,
                             });
                         }
+                        sampled_cursor =
+                            sampled_cursor.saturating_add(binding.descriptor_count as usize);
                     } else {
                         for _ in 0..binding.descriptor_count {
                             image_infos.push(vk::DescriptorImageInfo {
@@ -1363,6 +2000,18 @@ impl RasterizerVulkan {
         framebuffer_addr: u64,
         _pixel_stride: u32,
     ) -> Option<blit_screen::FramebufferTextureInfo> {
+        if std::env::var_os("RUZU_DISABLE_VK_ACCELERATE_DISPLAY").is_some() {
+            if std::env::var_os("RUZU_TRACE_VK_PRESENT").is_some() {
+                log::info!(
+                    "[VK_PRESENT] AccelerateDisplay disabled addr=0x{:X} {}x{} stride={}",
+                    framebuffer_addr,
+                    config.width,
+                    config.height,
+                    config.stride,
+                );
+            }
+            return None;
+        }
         if framebuffer_addr == 0 {
             return None;
         }

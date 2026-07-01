@@ -237,6 +237,10 @@ pub struct Device {
     pub shader_float16_supported: bool,
     /// Feature bit from `VkPhysicalDeviceShaderFloat16Int8Features`.
     pub shader_int8_supported: bool,
+    /// Feature bit from `VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT`.
+    pub primitive_topology_list_restart_supported: bool,
+    /// Feature bit from `VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT`.
+    pub primitive_topology_patch_list_restart_supported: bool,
 
     // Misc capability flags
     pub is_optimal_astc_supported: bool,
@@ -362,23 +366,66 @@ impl Device {
             );
         }
 
+        let has_primitive_topology_list_restart =
+            supported_extensions.contains("VK_EXT_primitive_topology_list_restart");
+        let has_extended_dynamic_state =
+            supported_extensions.contains("VK_EXT_extended_dynamic_state");
+        let has_extended_dynamic_state2 =
+            supported_extensions.contains("VK_EXT_extended_dynamic_state2");
         let mut shader_float16_int8_features =
             vk::PhysicalDeviceShaderFloat16Int8Features::default();
-        let mut features2 = vk::PhysicalDeviceFeatures2::builder()
-            .push_next(&mut shader_float16_int8_features)
-            .build();
-        unsafe {
-            instance.get_physical_device_features2(physical, &mut features2);
+        let mut primitive_topology_list_restart_features =
+            vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT::default();
+        let mut extended_dynamic_state_features =
+            vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
+        let mut extended_dynamic_state2_features =
+            vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default();
+        {
+            let mut features2_builder =
+                vk::PhysicalDeviceFeatures2::builder().push_next(&mut shader_float16_int8_features);
+            if has_primitive_topology_list_restart {
+                features2_builder =
+                    features2_builder.push_next(&mut primitive_topology_list_restart_features);
+            }
+            if has_extended_dynamic_state {
+                features2_builder =
+                    features2_builder.push_next(&mut extended_dynamic_state_features);
+            }
+            if has_extended_dynamic_state2 {
+                features2_builder =
+                    features2_builder.push_next(&mut extended_dynamic_state2_features);
+            }
+            let mut features2 = features2_builder.build();
+            unsafe {
+                instance.get_physical_device_features2(physical, &mut features2);
+            }
         }
 
         let supports_shader_float16 = shader_float16_int8_features.shader_float16 != 0;
         let supports_shader_int8 = shader_float16_int8_features.shader_int8 != 0;
+        let supports_primitive_topology_list_restart =
+            primitive_topology_list_restart_features.primitive_topology_list_restart != 0;
+        let supports_primitive_topology_patch_list_restart =
+            primitive_topology_list_restart_features.primitive_topology_patch_list_restart != 0;
+        let supports_extended_dynamic_state = has_extended_dynamic_state
+            && extended_dynamic_state_features.extended_dynamic_state != 0;
+        let supports_extended_dynamic_state2 = has_extended_dynamic_state2
+            && extended_dynamic_state2_features.extended_dynamic_state2 != 0;
+        log::info!(
+            "Vulkan primitive topology restart: extension={} list={} patch={}",
+            has_primitive_topology_list_restart,
+            supports_primitive_topology_list_restart,
+            supports_primitive_topology_patch_list_restart
+        );
 
         let mut enabled_extensions = Vec::<CString>::new();
         for name in [
             "VK_KHR_swapchain",
             "VK_KHR_portability_subset",
             "VK_KHR_shader_float16_int8",
+            "VK_EXT_primitive_topology_list_restart",
+            "VK_EXT_extended_dynamic_state",
+            "VK_EXT_extended_dynamic_state2",
         ] {
             if supported_extensions.contains(name) {
                 enabled_extensions.push(CString::new(name).unwrap());
@@ -397,11 +444,38 @@ impl Device {
                 .shader_float16(supports_shader_float16)
                 .shader_int8(supports_shader_int8)
                 .build();
-        let device_create_info = vk::DeviceCreateInfo::builder()
-            .push_next(&mut enabled_shader_float16_int8_features)
-            .queue_create_infos(&queue_create_infos)
-            .enabled_extension_names(&enabled_extension_ptrs)
-            .build();
+        let mut enabled_primitive_topology_list_restart_features =
+            vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT::builder()
+                .primitive_topology_list_restart(supports_primitive_topology_list_restart)
+                .primitive_topology_patch_list_restart(
+                    supports_primitive_topology_patch_list_restart,
+                )
+                .build();
+        let mut enabled_extended_dynamic_state_features =
+            vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::builder()
+                .extended_dynamic_state(supports_extended_dynamic_state)
+                .build();
+        let mut enabled_extended_dynamic_state2_features =
+            vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::builder()
+                .extended_dynamic_state2(supports_extended_dynamic_state2)
+                .build();
+        let device_create_info = {
+            let mut builder = vk::DeviceCreateInfo::builder()
+                .push_next(&mut enabled_shader_float16_int8_features);
+            if has_primitive_topology_list_restart {
+                builder = builder.push_next(&mut enabled_primitive_topology_list_restart_features);
+            }
+            if has_extended_dynamic_state {
+                builder = builder.push_next(&mut enabled_extended_dynamic_state_features);
+            }
+            if has_extended_dynamic_state2 {
+                builder = builder.push_next(&mut enabled_extended_dynamic_state2_features);
+            }
+            builder
+                .queue_create_infos(&queue_create_infos)
+                .enabled_extension_names(&enabled_extension_ptrs)
+                .build()
+        };
 
         let logical = LogicalDevice::create(&instance, physical, &device_create_info)?;
         let graphics_queue = logical.get_queue(graphics_family);
@@ -445,6 +519,9 @@ impl Device {
                 driver_properties: supported_extensions.contains("VK_KHR_driver_properties"),
                 memory_budget: has_memory_budget,
                 shader_float16_int8: supported_extensions.contains("VK_KHR_shader_float16_int8"),
+                primitive_topology_list_restart: has_primitive_topology_list_restart,
+                extended_dynamic_state: supports_extended_dynamic_state,
+                extended_dynamic_state2: supports_extended_dynamic_state2,
                 swapchain: supported_extensions.contains("VK_KHR_swapchain"),
                 ..DeviceExtensions::default()
             },
@@ -458,6 +535,9 @@ impl Device {
             device_features,
             shader_float16_supported: supports_shader_float16,
             shader_int8_supported: supports_shader_int8,
+            primitive_topology_list_restart_supported: supports_primitive_topology_list_restart,
+            primitive_topology_patch_list_restart_supported:
+                supports_primitive_topology_patch_list_restart,
             is_optimal_astc_supported: false,
             is_blit_depth24_stencil8_supported: false,
             is_blit_depth32_stencil8_supported: false,
@@ -693,6 +773,20 @@ impl Device {
     /// Port of `Device::IsFloat16Supported`.
     pub fn is_float16_supported(&self) -> bool {
         self.shader_float16_supported
+    }
+
+    /// Returns true if the device supports VK_EXT_primitive_topology_list_restart.
+    ///
+    /// Port of `Device::IsTopologyListPrimitiveRestartSupported`.
+    pub fn is_topology_list_primitive_restart_supported(&self) -> bool {
+        self.primitive_topology_list_restart_supported
+    }
+
+    /// Returns true if the device supports patch-list primitive restart.
+    ///
+    /// Port of `Device::IsPatchListPrimitiveRestartSupported`.
+    pub fn is_patch_list_primitive_restart_supported(&self) -> bool {
+        self.primitive_topology_patch_list_restart_supported
     }
 
     /// Returns true if the device supports int64 natively.

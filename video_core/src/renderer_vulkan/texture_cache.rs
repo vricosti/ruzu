@@ -18,16 +18,20 @@ use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
 use crate::engines::maxwell_3d::RenderTargetInfo;
 use crate::framebuffer_config::FramebufferConfig;
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-use crate::surface::PixelFormat;
+use crate::surface::{PixelFormat, SurfaceType};
 use crate::texture_cache::image_base::ImageFlagBits;
 use crate::texture_cache::texture_cache_base::{
     FramebufferImageView, TextureCacheBase as CommonTextureCache,
 };
 use crate::texture_cache::types::{
-    BufferImageCopy, ImageType, ImageViewId, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID,
+    BufferImageCopy, ImageType, ImageViewId, SamplerId, SubresourceRange, NULL_IMAGE_ID,
+    NULL_IMAGE_VIEW_ID,
 };
 use crate::texture_cache::util::unswizzle_image;
+use crate::textures::texture::{TextureFilter, TextureMipmapFilter, TscEntry, WrapMode};
+use shader_recompiler::shader_info::TextureType;
 
+use super::maxwell_to_vk;
 use super::staging_buffer_pool::StagingBufferPool;
 
 /// A cached GPU texture (VkImage + VkImageView + VkSampler).
@@ -57,11 +61,28 @@ pub struct CachedRenderTarget {
     pub image: vk::Image,
     pub memory: vk::DeviceMemory,
     pub view: vk::ImageView,
+    /// Depth attachment sized to match this render target. A shared,
+    /// window-sized depth buffer would clamp the framebuffer (and therefore
+    /// all rendering) to the smallest attachment, truncating draws to targets
+    /// larger than the initial window. See `create_render_target`.
+    pub depth_image: vk::Image,
+    pub depth_memory: vk::DeviceMemory,
+    pub depth_view: vk::ImageView,
     pub framebuffer: vk::Framebuffer,
     pub extent: vk::Extent2D,
     pub width: u32,
     pub height: u32,
     pub layout: vk::ImageLayout,
+}
+
+/// Backend-owned sampler corresponding to an upstream `TSCEntry`.
+pub struct CachedSampler {
+    pub sampler: vk::Sampler,
+}
+
+/// Backend-owned Vulkan view corresponding to an upstream `ImageView`.
+pub struct CachedRenderTargetView {
+    pub view: vk::ImageView,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,6 +136,12 @@ pub struct TextureCache {
 
     /// Minimal active Vulkan render-target images keyed by translated CPU address.
     render_targets: HashMap<u64, CachedRenderTarget>,
+
+    /// Vulkan views materialized from common-cache render-target `ImageViewId`s.
+    render_target_views: HashMap<ImageViewId, CachedRenderTargetView>,
+
+    /// Vulkan samplers materialized from common-cache `SamplerId`s.
+    samplers: HashMap<SamplerId, CachedSampler>,
 }
 
 impl TextureCache {
@@ -133,6 +160,8 @@ impl TextureCache {
             textures: HashMap::new(),
             framebuffers: HashMap::new(),
             render_targets: HashMap::new(),
+            render_target_views: HashMap::new(),
+            samplers: HashMap::new(),
         }
     }
 
@@ -200,6 +229,21 @@ impl TextureCache {
                 .max(1)
                 .min(rt0.height.max(1)),
         };
+        if std::env::var_os("RUZU_TRACE_VK_RT_FRAMEBUFFER").is_some() {
+            log::info!(
+                "[VK_RT_FRAMEBUFFER] rt0_gpu=0x{:X} cpu=0x{:X} rt={}x{} surface_clip={}x{} base_size={}x{} render_area={}x{}",
+                rt0.address,
+                cpu_addr,
+                rt0.width,
+                rt0.height,
+                render_targets.surface_clip.width,
+                render_targets.surface_clip.height,
+                self.base.render_targets.size.width,
+                self.base.render_targets.size.height,
+                render_area.width,
+                render_area.height,
+            );
+        }
 
         if !self.render_targets.contains_key(&cpu_addr) {
             let target = self
@@ -297,30 +341,133 @@ impl TextureCache {
             .base
             .try_find_framebuffer_image_view(config, cpu_addr)?;
         let target = self.render_targets.get(&cpu_addr)?;
+        let target_image = target.image;
+        let fallback_view = target.view;
+        let image_view = self
+            .materialize_render_target_color2d_view(
+                framebuffer_view.view_id,
+                target_image,
+                &framebuffer_view.view,
+            )
+            .unwrap_or(fallback_view);
         Some(FramebufferImageViewVulkan {
+            width: framebuffer_view.view.size.width,
+            height: framebuffer_view.view.size.height,
             common: framebuffer_view,
-            image: target.image,
-            image_view: target.view,
-            width: target.width,
-            height: target.height,
+            image: target_image,
+            image_view,
         })
     }
 
     /// Resolve a common texture-cache `ImageViewId` to a Vulkan image view
     /// when the backend image is already materialized by this partial Vulkan
     /// cache. This currently covers render-target-backed images.
-    pub fn image_view_handle(&self, view_id: ImageViewId) -> Option<vk::ImageView> {
+    pub fn image_view_handle(
+        &mut self,
+        view_id: ImageViewId,
+        texture_type: TextureType,
+    ) -> Option<vk::ImageView> {
         if !view_id.is_valid() || view_id == NULL_IMAGE_VIEW_ID {
             return None;
         }
-        let view = self.base.slot_image_views.get(view_id);
-        if !view.image_id.is_valid() || view.image_id == NULL_IMAGE_ID {
+        let view_base = self.base.slot_image_views.get(view_id).clone();
+        if !view_base.image_id.is_valid() || view_base.image_id == NULL_IMAGE_ID {
             return None;
         }
-        let image = self.base.slot_images.get(view.image_id);
-        self.render_targets
-            .get(&image.cpu_addr)
-            .map(|target| target.view)
+        let image_base = self.base.slot_images.get(view_base.image_id).clone();
+        if let Some(target) = self.render_targets.get(&image_base.cpu_addr) {
+            let target_image = target.image;
+            let target_view = target.view;
+            return match texture_type {
+                TextureType::Color2D | TextureType::Color2DRect => self
+                    .materialize_render_target_color2d_view(view_id, target_image, &view_base)
+                    .or(Some(target_view)),
+                TextureType::ColorArray2D => Some(target_view),
+                _ => Some(target_view),
+            };
+        }
+        None
+    }
+
+    /// Port-facing subset of upstream `ImageView::Handle(TextureType::Color2D)`.
+    fn materialize_render_target_color2d_view(
+        &mut self,
+        view_id: ImageViewId,
+        image: vk::Image,
+        view_base: &crate::texture_cache::image_view_base::ImageViewBase,
+    ) -> Option<vk::ImageView> {
+        if let Some(cached) = self.render_target_views.get(&view_id) {
+            return Some(cached.view);
+        }
+        let format = pixel_format_to_vk(view_base.format);
+        let aspect_mask = image_view_aspect_mask(view_base);
+        let components = image_view_components(view_base);
+        let subresource_range =
+            color2d_subresource_range(aspect_mask, view_base.range, view_base.flags);
+
+        let mut usage_info = vk::ImageViewUsageCreateInfo::builder()
+            .usage(
+                vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::TRANSFER_SRC,
+            )
+            .build();
+        let view_info = vk::ImageViewCreateInfo::builder()
+            .push_next(&mut usage_info)
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .components(components)
+            .subresource_range(subresource_range)
+            .build();
+        let view = unsafe { self.device.create_image_view(&view_info, None) }
+            .inspect_err(|err| {
+                log::warn!(
+                    "TextureCacheVulkan: failed to create framebuffer Color2D view id={} image=0x{:X} format={:?} range={:?}: {:?}",
+                    view_id.index,
+                    image.as_raw(),
+                    format,
+                    subresource_range,
+                    err
+                );
+            })
+            .ok()?;
+        if std::env::var_os("RUZU_TRACE_PRESENT_IMG").is_some() {
+            log::warn!(
+                "[PRESENT_VIEW] view_id={} image=0x{:X} view=0x{:X} fmt={:?} base_mip={} levels={} base_layer={} layers={} swizzle=({:?},{:?},{:?},{:?})",
+                view_id.index,
+                image.as_raw(),
+                view.as_raw(),
+                format,
+                subresource_range.base_mip_level,
+                subresource_range.level_count,
+                subresource_range.base_array_layer,
+                subresource_range.layer_count,
+                components.r,
+                components.g,
+                components.b,
+                components.a,
+            );
+        }
+        self.render_target_views
+            .insert(view_id, CachedRenderTargetView { view });
+        Some(view)
+    }
+
+    /// Port-facing subset of upstream `TextureCache::GetSampler(id).Handle()`.
+    pub fn sampler_handle(&mut self, sampler_id: SamplerId) -> Option<vk::Sampler> {
+        use crate::texture_cache::types::NULL_SAMPLER_ID;
+        if !sampler_id.is_valid() || sampler_id == NULL_SAMPLER_ID {
+            return None;
+        }
+        if let Some(sampler) = self.samplers.get(&sampler_id) {
+            return Some(sampler.sampler);
+        }
+        let tsc = *self.base.slot_samplers.get(sampler_id);
+        let sampler = self.create_sampler_from_tsc(&tsc).ok()?;
+        self.samplers.insert(sampler_id, CachedSampler { sampler });
+        Some(sampler)
     }
 
     /// Materialize a common `ImageViewId` into a Vulkan image/view when the
@@ -330,11 +477,12 @@ impl TextureCache {
     pub fn materialize_sampled_image_view(
         &mut self,
         view_id: ImageViewId,
+        texture_type: TextureType,
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
         staging_pool: &mut StagingBufferPool,
         cmd: vk::CommandBuffer,
     ) -> Option<vk::ImageView> {
-        if let Some(view) = self.image_view_handle(view_id) {
+        if let Some(view) = self.image_view_handle(view_id, texture_type) {
             return Some(view);
         }
         if !view_id.is_valid() || view_id == NULL_IMAGE_VIEW_ID {
@@ -346,6 +494,32 @@ impl TextureCache {
             return None;
         }
         let image_base = self.base.slot_images.get(view_base.image_id).clone();
+        if self.textures.get(&view_id.index).is_some_and(|cached| {
+            cached.format != vk_format_from_pixel_format(view_base.format).unwrap_or(cached.format)
+                || cached.width != view_base.size.width.max(1)
+                || cached.height != view_base.size.height.max(1)
+        }) {
+            if let Some(old) = self.textures.remove(&view_id.index) {
+                if std::env::var_os("RUZU_TRACE_VK_TEXTURE_UPLOAD").is_some() {
+                    log::warn!(
+                        "[VK_TEXTURE_CACHE_RECREATE] view_id={} old={:?} {}x{} new={:?} {}x{}",
+                        view_id.index,
+                        old.format,
+                        old.width,
+                        old.height,
+                        view_base.format,
+                        view_base.size.width.max(1),
+                        view_base.size.height.max(1)
+                    );
+                }
+                unsafe {
+                    self.device.destroy_image_view(old.view, None);
+                    self.device.destroy_image(old.image, None);
+                    self.device.free_memory(old.memory, None);
+                }
+            }
+        }
+
         if let Some(cached) = self.textures.get(&view_id.index) {
             let view = cached.view;
             let image = cached.image;
@@ -381,7 +555,7 @@ impl TextureCache {
         let height = view_base.size.height.max(1);
 
         let (image, memory, view) = self
-            .create_sampled_image(format, width, height)
+            .create_sampled_image(format, width, height, &view_base, texture_type)
             .inspect_err(|err| {
                 log::warn!(
                     "TextureCacheVulkan: failed to create sampled image {:?} {}x{}: {:?}",
@@ -495,9 +669,21 @@ impl TextureCache {
             let linear_crc = linear.iter().take(4096).fold(0u64, |acc, &byte| {
                 acc.wrapping_mul(16777619).wrapping_add(byte as u64)
             });
+            let (alpha_min, alpha_max, alpha_zero, alpha_full) =
+                linear
+                    .chunks_exact(4)
+                    .fold((u8::MAX, 0u8, 0usize, 0usize), |acc, px| {
+                        let alpha = px[3];
+                        (
+                            acc.0.min(alpha),
+                            acc.1.max(alpha),
+                            acc.2 + usize::from(alpha == 0),
+                            acc.3 + usize::from(alpha == u8::MAX),
+                        )
+                    });
             let first_copy = copies.first().copied();
             log::warn!(
-                "[VK_TEXTURE_UPLOAD] view_id={} image_id={} gpu=0x{:X} cpu=0x{:X} initialized={} type={:?} fmt={:?} size={}x{} guest={} unswizzled={} copies={} cpu_modified={} guest_nonzero={} linear_nonzero={} guest_crc=0x{:X} linear_crc=0x{:X} first_copy={:?}",
+                "[VK_TEXTURE_UPLOAD] view_id={} image_id={} gpu=0x{:X} cpu=0x{:X} initialized={} type={:?} fmt={:?} size={}x{} guest={} unswizzled={} copies={} cpu_modified={} guest_nonzero={} linear_nonzero={} guest_crc=0x{:X} linear_crc=0x{:X} alpha_min={} alpha_max={} alpha_zero={} alpha_full={} first_copy={:?}",
                 view_id.index,
                 view_base.image_id.index,
                 image_base.gpu_addr,
@@ -515,6 +701,10 @@ impl TextureCache {
                 linear_nonzero,
                 guest_crc,
                 linear_crc,
+                alpha_min,
+                alpha_max,
+                alpha_zero,
+                alpha_full,
                 first_copy,
             );
         }
@@ -534,15 +724,29 @@ impl TextureCache {
         rt: &RenderTargetInfo,
         render_area: vk::Extent2D,
         render_pass: vk::RenderPass,
-        depth_view: vk::ImageView,
+        _shared_depth_view: vk::ImageView,
     ) -> Result<CachedRenderTarget, vk::Result> {
+        let pixel_format = crate::surface::pixel_format_from_render_target_format(rt.format);
+        let format = pixel_format_to_vk(pixel_format);
         let (image, memory, view) = self.create_attachment(
-            vk::Format::R8G8B8A8_UNORM,
+            format,
             vk::ImageUsageFlags::COLOR_ATTACHMENT
                 | vk::ImageUsageFlags::SAMPLED
                 | vk::ImageUsageFlags::TRANSFER_DST
                 | vk::ImageUsageFlags::TRANSFER_SRC,
             vk::ImageAspectFlags::COLOR,
+            rt.width.max(1),
+            rt.height.max(1),
+        )?;
+        // Create a depth attachment sized to this render target rather than
+        // reusing the shared window-sized depth buffer. Vulkan clamps a
+        // framebuffer to its smallest attachment, so a smaller depth buffer
+        // would truncate rendering to targets larger than the initial window
+        // (e.g. a 1280x720 depth buffer clipping a 1920x1080 target).
+        let (depth_image, depth_memory, depth_view) = self.create_attachment(
+            vk::Format::D32_SFLOAT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            vk::ImageAspectFlags::DEPTH,
             rt.width.max(1),
             rt.height.max(1),
         )?;
@@ -558,12 +762,56 @@ impl TextureCache {
             image,
             memory,
             view,
+            depth_image,
+            depth_memory,
+            depth_view,
             framebuffer,
             extent: render_area,
             width: rt.width.max(1),
             height: rt.height.max(1),
             layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         })
+    }
+
+    fn create_sampler_from_tsc(&self, tsc: &TscEntry) -> Result<vk::Sampler, vk::Result> {
+        let mag_filter = texture_filter_from_raw(tsc.mag_filter());
+        let min_filter = texture_filter_from_raw(tsc.min_filter());
+        let mipmap_filter = texture_mipmap_filter_from_raw(tsc.mipmap_filter());
+        let wrap_u = wrap_mode_from_raw(tsc.wrap_u());
+        let wrap_v = wrap_mode_from_raw(tsc.wrap_v());
+        let wrap_p = wrap_mode_from_raw(tsc.wrap_p());
+        let max_anisotropy = tsc.computed_max_anisotropy().clamp(1.0, 16.0);
+        let mut custom_border_color = vk::SamplerCustomBorderColorCreateInfoEXT::builder()
+            .custom_border_color(vk::ClearColorValue {
+                float32: tsc.computed_border_color(),
+            })
+            .format(vk::Format::UNDEFINED)
+            .build();
+        let sampler_info = vk::SamplerCreateInfo::builder()
+            .push_next(&mut custom_border_color)
+            .mag_filter(maxwell_to_vk::sampler::filter(mag_filter))
+            .min_filter(maxwell_to_vk::sampler::filter(min_filter))
+            .mipmap_mode(maxwell_to_vk::sampler::mipmap_mode(mipmap_filter))
+            .address_mode_u(maxwell_to_vk::sampler::wrap_mode(false, wrap_u, mag_filter))
+            .address_mode_v(maxwell_to_vk::sampler::wrap_mode(false, wrap_v, mag_filter))
+            .address_mode_w(maxwell_to_vk::sampler::wrap_mode(false, wrap_p, mag_filter))
+            .mip_lod_bias(tsc.lod_bias())
+            .anisotropy_enable(max_anisotropy > 1.0)
+            .max_anisotropy(max_anisotropy)
+            .compare_enable(tsc.depth_compare_enabled() != 0)
+            .compare_op(vk::CompareOp::ALWAYS)
+            .min_lod(if mipmap_filter == TextureMipmapFilter::None {
+                0.0
+            } else {
+                tsc.min_lod()
+            })
+            .max_lod(if mipmap_filter == TextureMipmapFilter::None {
+                0.25
+            } else {
+                tsc.max_lod()
+            })
+            .border_color(vk::BorderColor::FLOAT_CUSTOM_EXT);
+        unsafe { self.device.create_sampler(&sampler_info, None) }
     }
 
     /// Get or create a framebuffer for the given render target configuration.
@@ -602,6 +850,7 @@ impl TextureCache {
         height: u32,
     ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), vk::Result> {
         let image_info = vk::ImageCreateInfo::builder()
+            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
             .extent(vk::Extent3D {
@@ -665,14 +914,69 @@ impl TextureCache {
         format: vk::Format,
         width: u32,
         height: u32,
+        view_base: &crate::texture_cache::image_view_base::ImageViewBase,
+        texture_type: TextureType,
     ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), vk::Result> {
-        self.create_attachment(
+        let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
+        let image_info = vk::ImageCreateInfo::builder()
+            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .build();
+
+        let image = unsafe { self.device.create_image(&image_info, None)? };
+        let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
+        let mem_type = find_device_local_memory(
+            &self.instance,
+            self.physical_device,
+            mem_reqs.memory_type_bits,
+        )
+        .unwrap_or(0);
+        let alloc_info = vk::MemoryAllocateInfo::builder()
+            .allocation_size(mem_reqs.size)
+            .memory_type_index(mem_type)
+            .build();
+        let memory = unsafe { self.device.allocate_memory(&alloc_info, None)? };
+        unsafe {
+            self.device.bind_image_memory(image, memory, 0)?;
+        }
+
+        let aspect_mask = image_view_aspect_mask(view_base);
+        let mut usage_info = vk::ImageViewUsageCreateInfo::builder().usage(usage).build();
+        let view_info = vk::ImageViewCreateInfo::builder()
+            .push_next(&mut usage_info)
+            .image(image)
+            .view_type(image_view_type_from_texture_type(texture_type))
+            .format(format)
+            .components(image_view_components(view_base))
+            .subresource_range(sampled_subresource_range(
+                aspect_mask,
+                view_base.range,
+                texture_type,
+            ))
+            .build();
+        let view = unsafe { self.device.create_image_view(&view_info, None)? };
+
+        trace!(
+            "TextureCache: created sampled {:?} {}x{} {:?}",
             format,
-            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
-            vk::ImageAspectFlags::COLOR,
             width,
             height,
-        )
+            texture_type
+        );
+
+        Ok((image, memory, view))
     }
 
     fn upload_sampled_image(
@@ -879,14 +1183,186 @@ impl TextureCache {
     }
 }
 
+fn pixel_format_to_vk(format: PixelFormat) -> vk::Format {
+    match format {
+        PixelFormat::A8B8G8R8Unorm => vk::Format::A8B8G8R8_UNORM_PACK32,
+        PixelFormat::A8B8G8R8Srgb => vk::Format::A8B8G8R8_SRGB_PACK32,
+        PixelFormat::B8G8R8A8Unorm => vk::Format::B8G8R8A8_UNORM,
+        PixelFormat::B8G8R8A8Srgb => vk::Format::B8G8R8A8_SRGB,
+        PixelFormat::R5G6B5Unorm => vk::Format::R5G6B5_UNORM_PACK16,
+        PixelFormat::R8Unorm => vk::Format::R8_UNORM,
+        PixelFormat::R8G8Unorm => vk::Format::R8G8_UNORM,
+        PixelFormat::R16Unorm => vk::Format::R16_UNORM,
+        PixelFormat::R16G16Unorm => vk::Format::R16G16_UNORM,
+        PixelFormat::R16G16B16A16Unorm => vk::Format::R16G16B16A16_UNORM,
+        PixelFormat::R16G16B16A16Float => vk::Format::R16G16B16A16_SFLOAT,
+        PixelFormat::R32Float => vk::Format::R32_SFLOAT,
+        PixelFormat::R32G32Float => vk::Format::R32G32_SFLOAT,
+        PixelFormat::R32G32B32A32Float => vk::Format::R32G32B32A32_SFLOAT,
+        PixelFormat::D16Unorm => vk::Format::D16_UNORM,
+        PixelFormat::D32Float => vk::Format::D32_SFLOAT,
+        PixelFormat::S8Uint => vk::Format::S8_UINT,
+        PixelFormat::D24UnormS8Uint => vk::Format::D24_UNORM_S8_UINT,
+        PixelFormat::D32FloatS8Uint => vk::Format::D32_SFLOAT_S8_UINT,
+        _ => vk::Format::R8G8B8A8_UNORM,
+    }
+}
+
+fn image_aspect_mask(format: PixelFormat) -> vk::ImageAspectFlags {
+    match crate::surface::get_format_type(format) {
+        SurfaceType::ColorTexture => vk::ImageAspectFlags::COLOR,
+        SurfaceType::Depth => vk::ImageAspectFlags::DEPTH,
+        SurfaceType::Stencil => vk::ImageAspectFlags::STENCIL,
+        SurfaceType::DepthStencil => vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+        SurfaceType::Invalid => vk::ImageAspectFlags::empty(),
+    }
+}
+
+fn image_view_aspect_mask(
+    view: &crate::texture_cache::image_view_base::ImageViewBase,
+) -> vk::ImageAspectFlags {
+    if view.is_render_target() {
+        return image_aspect_mask(view.format);
+    }
+    let any_r = view
+        .swizzle
+        .iter()
+        .any(|&source| source == crate::texture_cache::image_view_info::SwizzleSource::R as u8);
+    match view.format {
+        PixelFormat::D24UnormS8Uint | PixelFormat::D32FloatS8Uint => {
+            if any_r {
+                vk::ImageAspectFlags::DEPTH
+            } else {
+                vk::ImageAspectFlags::STENCIL
+            }
+        }
+        PixelFormat::S8UintD24Unorm => {
+            if any_r {
+                vk::ImageAspectFlags::STENCIL
+            } else {
+                vk::ImageAspectFlags::DEPTH
+            }
+        }
+        PixelFormat::D16Unorm | PixelFormat::D32Float | PixelFormat::X8D24Unorm => {
+            vk::ImageAspectFlags::DEPTH
+        }
+        PixelFormat::S8Uint => vk::ImageAspectFlags::STENCIL,
+        _ => vk::ImageAspectFlags::COLOR,
+    }
+}
+
+fn image_view_components(
+    view: &crate::texture_cache::image_view_base::ImageViewBase,
+) -> vk::ComponentMapping {
+    let swizzle = if view.is_render_target() {
+        [
+            crate::texture_cache::image_view_info::SwizzleSource::R as u8,
+            crate::texture_cache::image_view_info::SwizzleSource::G as u8,
+            crate::texture_cache::image_view_info::SwizzleSource::B as u8,
+            crate::texture_cache::image_view_info::SwizzleSource::A as u8,
+        ]
+    } else {
+        view.swizzle
+    };
+    vk::ComponentMapping {
+        r: component_swizzle(swizzle[0]),
+        g: component_swizzle(swizzle[1]),
+        b: component_swizzle(swizzle[2]),
+        a: component_swizzle(swizzle[3]),
+    }
+}
+
+fn component_swizzle(source: u8) -> vk::ComponentSwizzle {
+    match source {
+        0 => vk::ComponentSwizzle::ZERO,
+        2 => vk::ComponentSwizzle::R,
+        3 => vk::ComponentSwizzle::G,
+        4 => vk::ComponentSwizzle::B,
+        5 => vk::ComponentSwizzle::A,
+        6 | 7 => vk::ComponentSwizzle::ONE,
+        _ => vk::ComponentSwizzle::IDENTITY,
+    }
+}
+
+fn color2d_subresource_range(
+    aspect_mask: vk::ImageAspectFlags,
+    range: SubresourceRange,
+    flags: crate::texture_cache::image_view_base::ImageViewFlagBits,
+) -> vk::ImageSubresourceRange {
+    let base_layer =
+        if flags.contains(crate::texture_cache::image_view_base::ImageViewFlagBits::SLICE) {
+            0
+        } else {
+            range.base.layer.max(0) as u32
+        };
+    vk::ImageSubresourceRange {
+        aspect_mask,
+        base_mip_level: range.base.level.max(0) as u32,
+        level_count: range.extent.levels.max(1) as u32,
+        base_array_layer: base_layer,
+        layer_count: 1,
+    }
+}
+
+fn sampled_subresource_range(
+    aspect_mask: vk::ImageAspectFlags,
+    range: SubresourceRange,
+    texture_type: TextureType,
+) -> vk::ImageSubresourceRange {
+    let mut subresource_range = vk::ImageSubresourceRange {
+        aspect_mask,
+        base_mip_level: range.base.level.max(0) as u32,
+        level_count: range.extent.levels.max(1) as u32,
+        base_array_layer: range.base.layer.max(0) as u32,
+        layer_count: range.extent.layers.max(1) as u32,
+    };
+    match texture_type {
+        TextureType::Color1D | TextureType::Color2D | TextureType::Color2DRect => {
+            subresource_range.layer_count = 1;
+        }
+        TextureType::ColorCube => {
+            subresource_range.layer_count = 6;
+        }
+        TextureType::Color3D => {
+            subresource_range.base_array_layer = 0;
+            subresource_range.layer_count = 1;
+        }
+        TextureType::ColorArray1D | TextureType::ColorArray2D | TextureType::ColorArrayCube => {}
+        TextureType::Buffer => {
+            subresource_range.base_array_layer = 0;
+            subresource_range.layer_count = 1;
+        }
+    }
+    subresource_range
+}
+
+fn image_view_type_from_texture_type(texture_type: TextureType) -> vk::ImageViewType {
+    match texture_type {
+        TextureType::Color1D => vk::ImageViewType::TYPE_1D,
+        TextureType::ColorArray1D => vk::ImageViewType::TYPE_1D_ARRAY,
+        TextureType::Color2D | TextureType::Color2DRect => vk::ImageViewType::TYPE_2D,
+        TextureType::ColorArray2D => vk::ImageViewType::TYPE_2D_ARRAY,
+        TextureType::Color3D => vk::ImageViewType::TYPE_3D,
+        TextureType::ColorCube => vk::ImageViewType::CUBE,
+        TextureType::ColorArrayCube => vk::ImageViewType::CUBE_ARRAY,
+        TextureType::Buffer => vk::ImageViewType::TYPE_2D,
+    }
+}
+
 impl Drop for TextureCache {
     fn drop(&mut self) {
         unsafe {
+            for (_, view) in self.render_target_views.drain() {
+                self.device.destroy_image_view(view.view, None);
+            }
             for (_, target) in self.render_targets.drain() {
                 self.device.destroy_framebuffer(target.framebuffer, None);
                 self.device.destroy_image_view(target.view, None);
                 self.device.destroy_image(target.image, None);
                 self.device.free_memory(target.memory, None);
+                self.device.destroy_image_view(target.depth_view, None);
+                self.device.destroy_image(target.depth_image, None);
+                self.device.free_memory(target.depth_memory, None);
             }
             for (_, tex) in self.textures.drain() {
                 self.device.destroy_sampler(tex.sampler, None);
@@ -894,10 +1370,42 @@ impl Drop for TextureCache {
                 self.device.destroy_image(tex.image, None);
                 self.device.free_memory(tex.memory, None);
             }
+            for (_, sampler) in self.samplers.drain() {
+                self.device.destroy_sampler(sampler.sampler, None);
+            }
             for (_, fb) in self.framebuffers.drain() {
                 self.device.destroy_framebuffer(fb.framebuffer, None);
             }
         }
+    }
+}
+
+fn texture_filter_from_raw(raw: u32) -> TextureFilter {
+    match raw {
+        2 => TextureFilter::Linear,
+        _ => TextureFilter::Nearest,
+    }
+}
+
+fn texture_mipmap_filter_from_raw(raw: u32) -> TextureMipmapFilter {
+    match raw {
+        2 => TextureMipmapFilter::Nearest,
+        3 => TextureMipmapFilter::Linear,
+        _ => TextureMipmapFilter::None,
+    }
+}
+
+fn wrap_mode_from_raw(raw: u32) -> WrapMode {
+    match raw {
+        0 => WrapMode::Wrap,
+        1 => WrapMode::Mirror,
+        2 => WrapMode::ClampToEdge,
+        3 => WrapMode::Border,
+        4 => WrapMode::Clamp,
+        5 => WrapMode::MirrorOnceClampToEdge,
+        6 => WrapMode::MirrorOnceBorder,
+        7 => WrapMode::MirrorOnceClampOgl,
+        _ => WrapMode::ClampToEdge,
     }
 }
 

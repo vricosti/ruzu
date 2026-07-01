@@ -11,11 +11,17 @@ use ash::vk;
 
 /// Number of u32 words used for texture and image scaling bit flags.
 /// Port of `NUM_TEXTURE_AND_IMAGE_SCALING_WORDS` from shader recompiler.
-pub const NUM_TEXTURE_AND_IMAGE_SCALING_WORDS: usize = 4;
+pub const NUM_TEXTURE_AND_IMAGE_SCALING_WORDS: usize = 6;
 
 /// Number of u32 words for texture-only scaling.
 /// Port of `NUM_TEXTURE_SCALING_WORDS`.
-pub const NUM_TEXTURE_SCALING_WORDS: usize = 2;
+pub const NUM_TEXTURE_SCALING_WORDS: usize = 4;
+
+pub const RESCALING_LAYOUT_WORDS_OFFSET: u32 = 0;
+pub const RESCALING_LAYOUT_DOWN_FACTOR_OFFSET: u32 = 24;
+pub const RESCALING_LAYOUT_SIZE: u32 = 32;
+pub const RENDERAREA_LAYOUT_OFFSET: u32 = 0;
+pub const RENDERAREA_LAYOUT_SIZE: u32 = 16;
 
 /// Size of a single descriptor update entry (buffer info / image info).
 /// Port of `sizeof(DescriptorUpdateEntry)` used as stride.
@@ -129,8 +135,8 @@ impl DescriptorLayoutBuilder {
         // Push constant range covers rescaling layout + render area layout
         // Rescaling layout: NUM_TEXTURE_AND_IMAGE_SCALING_WORDS * 4 bytes + optional down_factor (4 bytes for compute)
         let size_offset: u32 = if self.is_compute { 4 } else { 0 };
-        let rescaling_size = (NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as u32 * 4) + 4; // words + down_factor
-        let render_area_size = 4 * 4u32; // 4 floats
+        let rescaling_size = RESCALING_LAYOUT_SIZE;
+        let render_area_size = RENDERAREA_LAYOUT_SIZE;
         let range = vk::PushConstantRange {
             stage_flags: if self.is_compute {
                 vk::ShaderStageFlags::COMPUTE
@@ -281,7 +287,7 @@ mod tests {
     #[test]
     fn rescaling_push_constant_default() {
         let rpc = RescalingPushConstant::new();
-        assert_eq!(rpc.words, [0, 0, 0, 0]);
+        assert_eq!(rpc.words, [0; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS]);
     }
 
     #[test]
@@ -305,9 +311,6 @@ mod tests {
     #[test]
     fn descriptor_layout_builder_empty() {
         let builder = DescriptorLayoutBuilder::new();
-        assert!(!builder.can_use_push_descriptor(32, true));
-        // 0 descriptors <= 32, so it should be true if supported
-        // Actually 0 <= 32 is true
         assert!(builder.can_use_push_descriptor(32, true));
     }
 }

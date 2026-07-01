@@ -13,18 +13,21 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::engines::maxwell_3d::{
-    DrawCall, ShaderStageType, VertexAttribSize, VertexAttribType,
-};
+use crate::engines::maxwell_3d::{DrawCall, ShaderStageType, VertexAttribSize, VertexAttribType};
 use crate::shader;
 use crate::shader_cache::{GraphicsEnvironments, NUM_PROGRAMS};
 use shader_recompiler::backend::bindings::Bindings;
 use shader_recompiler::host_translate_info::HostTranslateInfo;
+use shader_recompiler::runtime_info::AttributeType;
+use shader_recompiler::shader_info::{Info as ShaderInfo, TextureType};
 use shader_recompiler::{CompiledShader, PipelineCache, Profile, RuntimeInfo, ShaderStage};
 
 use super::descriptor_pool::DescriptorBankInfo;
 use super::fixed_pipeline_state::FixedPipelineState;
 use super::maxwell_to_vk;
+use super::pipeline_helper::{
+    RENDERAREA_LAYOUT_SIZE, RESCALING_LAYOUT_SIZE, RESCALING_LAYOUT_WORDS_OFFSET,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct GraphicsDescriptorBinding {
@@ -39,6 +42,7 @@ pub struct GraphicsDescriptorBinding {
 
 #[derive(Debug, Clone, Copy)]
 pub struct GraphicsTextureBinding {
+    pub texture_type: TextureType,
     pub graphics_stage: u32,
     pub cbuf_index: u32,
     pub cbuf_offset: u32,
@@ -87,6 +91,9 @@ pub struct GraphicsPipeline {
     pub descriptor_set_layout: vk::DescriptorSetLayout,
     pub descriptor_bindings: Vec<GraphicsDescriptorBinding>,
     pub descriptor_bank_info: DescriptorBankInfo,
+    pub stage_infos: [Option<ShaderInfo>; 5],
+    pub uses_render_area: bool,
+    pub uses_rescaling_uniform: bool,
     pub vs_module: vk::ShaderModule,
     pub fs_module: vk::ShaderModule,
     is_built: AtomicBool,
@@ -139,15 +146,34 @@ pub struct GraphicsPipelineCache {
     shader_cache: PipelineCache,
     profile: Profile,
     host_info: HostTranslateInfo,
+    extended_dynamic_state_supported: bool,
+    extended_dynamic_state2_supported: bool,
+    topology_list_primitive_restart_supported: bool,
+    patch_list_primitive_restart_supported: bool,
+    max_viewports: u32,
 }
 
 impl GraphicsPipelineCache {
-    pub fn new(device: ash::Device, shader_cache: PipelineCache, profile: Profile) -> Self {
+    pub fn new(
+        device: ash::Device,
+        shader_cache: PipelineCache,
+        profile: Profile,
+        extended_dynamic_state_supported: bool,
+        extended_dynamic_state2_supported: bool,
+        topology_list_primitive_restart_supported: bool,
+        patch_list_primitive_restart_supported: bool,
+        max_viewports: u32,
+    ) -> Self {
         Self {
             device,
             shader_cache,
             profile,
             host_info: HostTranslateInfo::default(),
+            extended_dynamic_state_supported,
+            extended_dynamic_state2_supported,
+            topology_list_primitive_restart_supported,
+            patch_list_primitive_restart_supported,
+            max_viewports: max_viewports.min(crate::engines::maxwell_3d::NUM_VIEWPORTS as u32),
         }
     }
 
@@ -159,6 +185,8 @@ impl GraphicsPipelineCache {
     ) -> Option<(GraphicsPipelineKey, FixedPipelineState)> {
         let mut fixed_state = FixedPipelineState::default();
         fixed_state.refresh(draw);
+        fixed_state.set_extended_dynamic_state(self.extended_dynamic_state_supported);
+        fixed_state.set_extended_dynamic_state_2(self.extended_dynamic_state2_supported);
 
         let vs_compiled = self.compile_vertex_shader(draw, read_gpu)?;
         let fs_compiled = self.compile_fragment_shader(draw, read_gpu);
@@ -186,6 +214,8 @@ impl GraphicsPipelineCache {
     ) -> (GraphicsPipelineKey, FixedPipelineState) {
         let mut fixed_state = FixedPipelineState::default();
         fixed_state.refresh(draw);
+        fixed_state.set_extended_dynamic_state(self.extended_dynamic_state_supported);
+        fixed_state.set_extended_dynamic_state_2(self.extended_dynamic_state2_supported);
         (
             GraphicsPipelineKey {
                 unique_hashes,
@@ -245,6 +275,22 @@ impl GraphicsPipelineCache {
             descriptor_set_layout: descriptor_layout.descriptor_set_layout,
             descriptor_bindings: descriptor_layout.bindings,
             descriptor_bank_info: descriptor_layout.bank_info,
+            stage_infos: {
+                let mut infos: [Option<ShaderInfo>; 5] = Default::default();
+                infos[0] = Some(vs_compiled.info.clone());
+                if let Some(fs) = fs_compiled.as_ref() {
+                    infos[4] = Some(fs.info.clone());
+                }
+                infos
+            },
+            uses_render_area: vs_compiled.info.uses_render_area
+                || fs_compiled
+                    .as_ref()
+                    .is_some_and(|shader| shader.info.uses_render_area),
+            uses_rescaling_uniform: vs_compiled.info.uses_rescaling_uniform
+                || fs_compiled
+                    .as_ref()
+                    .is_some_and(|shader| shader.info.uses_rescaling_uniform),
             vs_module,
             fs_module,
             is_built: AtomicBool::new(true),
@@ -268,10 +314,22 @@ impl GraphicsPipelineCache {
         } else {
             return None;
         };
-        let vs_compiled =
-            self.compile_stage_from_environment(environments, vertex_stage, &mut bindings)?;
+        let vertex_runtime_info = make_runtime_info(draw, ShaderStage::VertexB, None);
+        let vs_compiled = self.compile_stage_from_environment(
+            environments,
+            vertex_stage,
+            &mut bindings,
+            &vertex_runtime_info,
+        )?;
         let fs_compiled = if environment_has_stage(environments, 5) {
-            self.compile_stage_from_environment(environments, 5, &mut bindings)
+            let fragment_runtime_info =
+                make_runtime_info(draw, ShaderStage::Fragment, Some(&vs_compiled.info));
+            self.compile_stage_from_environment(
+                environments,
+                5,
+                &mut bindings,
+                &fragment_runtime_info,
+            )
         } else {
             None
         };
@@ -308,6 +366,22 @@ impl GraphicsPipelineCache {
             descriptor_set_layout: descriptor_layout.descriptor_set_layout,
             descriptor_bindings: descriptor_layout.bindings,
             descriptor_bank_info: descriptor_layout.bank_info,
+            stage_infos: {
+                let mut infos: [Option<ShaderInfo>; 5] = Default::default();
+                infos[0] = Some(vs_compiled.info.clone());
+                if let Some(fs) = fs_compiled.as_ref() {
+                    infos[4] = Some(fs.info.clone());
+                }
+                infos
+            },
+            uses_render_area: vs_compiled.info.uses_render_area
+                || fs_compiled
+                    .as_ref()
+                    .is_some_and(|shader| shader.info.uses_render_area),
+            uses_rescaling_uniform: vs_compiled.info.uses_rescaling_uniform
+                || fs_compiled
+                    .as_ref()
+                    .is_some_and(|shader| shader.info.uses_rescaling_uniform),
             vs_module,
             fs_module,
             is_built: AtomicBool::new(true),
@@ -319,6 +393,7 @@ impl GraphicsPipelineCache {
         environments: &mut GraphicsEnvironments,
         stage_index: usize,
         bindings: &mut Bindings,
+        runtime_info: &RuntimeInfo,
     ) -> Option<CompiledShader> {
         if stage_index >= NUM_PROGRAMS {
             return None;
@@ -359,14 +434,13 @@ impl GraphicsPipelineCache {
             return None;
         }
         let base_offset = env.generic_environment().cached_instruction_start();
-        let runtime_info = RuntimeInfo::default();
         let compile_start = Instant::now();
         let compiled = shader_recompiler::compile_shader_from_env_with_bindings_and_host_info(
             &code,
             base_offset,
             env,
             &self.profile,
-            &runtime_info,
+            runtime_info,
             bindings,
             &self.host_info,
         );
@@ -380,6 +454,7 @@ impl GraphicsPipelineCache {
                 compiled.info.texture_descriptors.len(),
             );
         }
+        dump_spirv_if_requested(stage_index, base_offset, &compiled.spirv_words);
         Some(compiled)
     }
 
@@ -399,7 +474,7 @@ impl GraphicsPipelineCache {
             return None;
         }
 
-        let runtime_info = RuntimeInfo::default();
+        let runtime_info = make_runtime_info(draw, ShaderStage::VertexB, None);
         let compiled = self
             .shader_cache
             .get_or_compile(&code, ShaderStage::VertexB, &runtime_info);
@@ -422,7 +497,7 @@ impl GraphicsPipelineCache {
             return None;
         }
 
-        let runtime_info = RuntimeInfo::default();
+        let runtime_info = make_runtime_info(draw, ShaderStage::Fragment, None);
         let compiled =
             self.shader_cache
                 .get_or_compile(&code, ShaderStage::Fragment, &runtime_info);
@@ -515,9 +590,15 @@ impl GraphicsPipelineCache {
                 .ok()?
         };
 
+        let push_constant_range = vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::ALL_GRAPHICS,
+            offset: RESCALING_LAYOUT_WORDS_OFFSET,
+            size: RESCALING_LAYOUT_SIZE + RENDERAREA_LAYOUT_SIZE,
+        };
         let layouts = [desc_layout];
         let pipeline_layout_info = vk::PipelineLayoutCreateInfo::builder()
             .set_layouts(&layouts)
+            .push_constant_ranges(std::slice::from_ref(&push_constant_range))
             .build();
         let pipeline_layout = unsafe {
             self.device
@@ -565,14 +646,19 @@ impl GraphicsPipelineCache {
             .build();
 
         let input_assembly_topology = super::map_topology(draw.topology);
-        let primitive_restart_enable = fixed_state.dynamic_state.primitive_restart_enable()
-            && supports_primitive_restart(input_assembly_topology);
+        let primitive_restart_enable = !fixed_state.extended_dynamic_state_2()
+            && fixed_state.dynamic_state.primitive_restart_enable()
+            && primitive_restart_supported_for_topology(
+                input_assembly_topology,
+                self.topology_list_primitive_restart_supported,
+                self.patch_list_primitive_restart_supported,
+            );
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
             .topology(input_assembly_topology)
             .primitive_restart_enable(primitive_restart_enable)
             .build();
 
-        let num_viewports = crate::engines::maxwell_3d::NUM_VIEWPORTS as u32;
+        let num_viewports = self.max_viewports.max(1);
         let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
             .viewport_count(num_viewports)
             .scissor_count(num_viewports)
@@ -631,7 +717,36 @@ impl GraphicsPipelineCache {
             ])
             .build();
 
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let mut dynamic_states = vec![
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::DEPTH_BIAS,
+            vk::DynamicState::BLEND_CONSTANTS,
+            vk::DynamicState::DEPTH_BOUNDS,
+            vk::DynamicState::STENCIL_COMPARE_MASK,
+            vk::DynamicState::STENCIL_WRITE_MASK,
+            vk::DynamicState::STENCIL_REFERENCE,
+            vk::DynamicState::LINE_WIDTH,
+        ];
+        if fixed_state.extended_dynamic_state() {
+            dynamic_states.extend([
+                vk::DynamicState::CULL_MODE,
+                vk::DynamicState::FRONT_FACE,
+                vk::DynamicState::DEPTH_TEST_ENABLE,
+                vk::DynamicState::DEPTH_WRITE_ENABLE,
+                vk::DynamicState::DEPTH_COMPARE_OP,
+                vk::DynamicState::DEPTH_BOUNDS_TEST_ENABLE,
+                vk::DynamicState::STENCIL_TEST_ENABLE,
+                vk::DynamicState::STENCIL_OP,
+            ]);
+        }
+        if fixed_state.extended_dynamic_state_2() {
+            dynamic_states.extend([
+                vk::DynamicState::DEPTH_BIAS_ENABLE,
+                vk::DynamicState::PRIMITIVE_RESTART_ENABLE,
+                vk::DynamicState::RASTERIZER_DISCARD_ENABLE,
+            ]);
+        }
         let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
             .dynamic_states(&dynamic_states)
             .build();
@@ -685,6 +800,16 @@ fn supports_primitive_restart(topology: vk::PrimitiveTopology) -> bool {
     )
 }
 
+fn primitive_restart_supported_for_topology(
+    topology: vk::PrimitiveTopology,
+    topology_list_primitive_restart_supported: bool,
+    patch_list_primitive_restart_supported: bool,
+) -> bool {
+    (topology != vk::PrimitiveTopology::PATCH_LIST && topology_list_primitive_restart_supported)
+        || supports_primitive_restart(topology)
+        || (topology == vk::PrimitiveTopology::PATCH_LIST && patch_list_primitive_restart_supported)
+}
+
 fn add_shader_descriptor_bindings(
     bindings: &mut BTreeMap<u32, DescriptorBindingRecord>,
     shader: &CompiledShader,
@@ -715,6 +840,7 @@ fn add_shader_descriptor_bindings(
             None,
             None,
             Some(GraphicsTextureBinding {
+                texture_type: desc.texture_type,
                 graphics_stage,
                 cbuf_index: desc.cbuf_index,
                 cbuf_offset: desc.cbuf_offset,
@@ -812,6 +938,76 @@ fn descriptor_bank_info(bindings: &[GraphicsDescriptorBinding]) -> DescriptorBan
         info.score += binding.descriptor_count as i32;
     }
     info
+}
+
+/// Port-facing subset of upstream `MakeRuntimeInfo`.
+fn make_runtime_info(
+    draw: &DrawCall,
+    stage: ShaderStage,
+    previous_program: Option<&ShaderInfo>,
+) -> RuntimeInfo {
+    let mut info = RuntimeInfo::default();
+    if let Some(previous_program) = previous_program {
+        info.previous_stage_stores = previous_program.stores.clone();
+        info.previous_stage_legacy_stores_mapping = previous_program.legacy_stores_mapping.clone();
+    } else {
+        info.previous_stage_stores.mask.fill(u64::MAX);
+    }
+    if stage == ShaderStage::VertexB {
+        for (index, attrib) in draw.vertex_attribs.iter().take(32).enumerate() {
+            info.generic_input_types[index] = cast_attribute_type(attrib);
+        }
+    }
+    info
+}
+
+/// Port of `CastAttributeType` in `vk_pipeline_cache.cpp`.
+fn cast_attribute_type(attrib: &crate::engines::maxwell_3d::VertexAttribInfo) -> AttributeType {
+    if attrib.constant {
+        return AttributeType::Disabled;
+    }
+    match attrib.attrib_type {
+        VertexAttribType::Invalid => AttributeType::Disabled,
+        VertexAttribType::SNorm | VertexAttribType::UNorm | VertexAttribType::Float => {
+            AttributeType::Float
+        }
+        VertexAttribType::SInt => AttributeType::SignedInt,
+        VertexAttribType::UInt => AttributeType::UnsignedInt,
+        VertexAttribType::UScaled => AttributeType::UnsignedScaled,
+        VertexAttribType::SScaled => AttributeType::SignedScaled,
+    }
+}
+
+fn dump_spirv_if_requested(stage_index: usize, base_offset: u32, words: &[u32]) {
+    let Some(dir) = std::env::var_os("RUZU_DUMP_SPIRV_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        warn!(
+            "GraphicsPipelineCache: failed to create SPIR-V dump dir {}: {}",
+            dir.display(),
+            err
+        );
+        return;
+    }
+    let path = dir.join(format!(
+        "stage{}_base_{:06X}_{:016X}.spv",
+        stage_index,
+        base_offset,
+        hash_spirv(words)
+    ));
+    let mut bytes = Vec::with_capacity(words.len() * std::mem::size_of::<u32>());
+    for word in words {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    if let Err(err) = std::fs::write(&path, bytes) {
+        warn!(
+            "GraphicsPipelineCache: failed to write SPIR-V dump {}: {}",
+            path.display(),
+            err
+        );
+    }
 }
 
 fn build_vertex_input_state(
@@ -920,6 +1116,11 @@ mod tests {
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            descriptor_bindings: Vec::new(),
+            descriptor_bank_info: DescriptorBankInfo::default(),
+            stage_infos: Default::default(),
+            uses_render_area: false,
+            uses_rescaling_uniform: false,
             vs_module: vk::ShaderModule::null(),
             fs_module: vk::ShaderModule::null(),
             is_built: AtomicBool::new(true),
@@ -942,11 +1143,11 @@ mod tests {
     #[test]
     fn test_pipeline_key_equality() {
         let key_a = GraphicsPipelineKey {
-            shader_hashes: [123, 456],
+            unique_hashes: [0, 123, 0, 0, 0, 456],
             fixed_state: FixedPipelineState::default(),
         };
         let key_b = GraphicsPipelineKey {
-            shader_hashes: [123, 456],
+            unique_hashes: [0, 123, 0, 0, 0, 456],
             fixed_state: FixedPipelineState::default(),
         };
         assert_eq!(key_a, key_b);
@@ -955,11 +1156,11 @@ mod tests {
     #[test]
     fn test_transition_graph_returns_self_and_added_transition() {
         let key_a = GraphicsPipelineKey {
-            shader_hashes: [123, 456],
+            unique_hashes: [0, 123, 0, 0, 0, 456],
             fixed_state: FixedPipelineState::default(),
         };
         let key_b = GraphicsPipelineKey {
-            shader_hashes: [789, 321],
+            unique_hashes: [0, 789, 0, 0, 0, 321],
             fixed_state: FixedPipelineState::default(),
         };
 
@@ -969,5 +1170,34 @@ mod tests {
         assert_eq!(pipeline.next(&key_a), Some(&key_a));
         assert_eq!(pipeline.next(&key_b), Some(&key_b));
         assert!(pipeline.is_built());
+    }
+
+    #[test]
+    fn primitive_restart_topology_gate_matches_upstream() {
+        assert!(primitive_restart_supported_for_topology(
+            vk::PrimitiveTopology::TRIANGLE_STRIP,
+            false,
+            false,
+        ));
+        assert!(!primitive_restart_supported_for_topology(
+            vk::PrimitiveTopology::TRIANGLE_LIST,
+            false,
+            false,
+        ));
+        assert!(primitive_restart_supported_for_topology(
+            vk::PrimitiveTopology::TRIANGLE_LIST,
+            true,
+            false,
+        ));
+        assert!(!primitive_restart_supported_for_topology(
+            vk::PrimitiveTopology::PATCH_LIST,
+            true,
+            false,
+        ));
+        assert!(primitive_restart_supported_for_topology(
+            vk::PrimitiveTopology::PATCH_LIST,
+            false,
+            true,
+        ));
     }
 }
