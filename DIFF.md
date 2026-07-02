@@ -19622,3 +19622,29 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `Vulkan::Sampler::Sampler(TextureCacheRuntime&, const TSCEntry&)` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
 - Re-read Rust `TextureCacheBase::new`, `TextureCacheBase::find_sampler`, and `TextureCache::sampler_handle`.
 - Runtime diagnosis on `deko3d-dma-min`: ruzu reads graphics `TSC[0]` as all zero, maps it to `NULL_SAMPLER_ID`, and now binds the backend null sampler instead of the renderer fallback sampler. With upstream-faithful `maxLod=0`, the final `textureLod(..., 1.0)` samples mip0 and the frame remains blue; a temporary non-faithful max-LOD override made the red triangles appear, proving the mechanism but not a valid upstream-faithful fix. User comparison with `yuzu.app` also showed an all-blue frame.
+
+## 2026-07-02 — core/src/arm/dynarmic/arm_dynarmic_64.rs and externals/rdynarmic vs core/arm/dynarmic/arm_dynarmic_64.cpp and Dynarmic A64 UserConfig
+
+### Intentional differences
+- `rdynarmic::JitConfig` is a shared Rust configuration struct used by both A64 and A32 wrappers, so the new `cntfrq_el0` field is present on all struct initializers. Upstream Dynarmic exposes this field only on `Dynarmic::A64::UserConfig`; A32 does not consume it.
+- The default value inserted in rdynarmic tests/helpers is `600_000_000`, matching upstream Dynarmic's `A64::UserConfig::cntfrq_el0` default. Emulator-owned `core/src/arm/dynarmic/arm_dynarmic_64.rs` overrides it with the Switch hardware value.
+- `core/src/arm/dynarmic/arm_dynarmic_32.rs` also fills the shared Rust field with `common::wall_clock::CNTFRQ`; this is inert for A32 CP15 timing paths but keeps shared config construction explicit and avoids falling back to Dynarmic's A64 default through any common backend path.
+
+### Unintentional differences (to fix)
+- No remaining difference for A64 `CNTFRQ_EL0` in this slice. Rust previously hardcoded `600_000_000` in the ARM64 backend config and could not mirror upstream yuzu's `config.cntfrq_el0 = Hardware::CNTFREQ`.
+
+### Missing items
+- A32 CP15 timer frequency handling was only checked for non-use of this new shared field. A deeper A32 CP15 audit remains separate.
+- The remaining Pinball frame pacing is still below ideal 60 fps in the sampled run; this fix removes the proven 31.25x clock-frequency error but does not address HLE polling, IPC lock ordering, memory callback locking, or vsync cadence.
+
+### Binary layout verification
+- N/A: JIT configuration fields and emitted constants only; no raw-copied guest ABI payload changed.
+
+### Verification
+- Re-read upstream `ArmDynarmic64::MakeJit` in `core/arm/dynarmic/arm_dynarmic_64.cpp`; it sets `config.cntfrq_el0 = Hardware::CNTFREQ`, where upstream `common/wall_clock.h` defines `CNTFRQ = 19'200'000`.
+- Re-read upstream `ArmDynarmic32::MakeJit` in `core/arm/dynarmic/arm_dynarmic_32.cpp`; it has no A32 `cntfrq_el0` assignment and only sets `wall_clock_cntpct` / `enable_cycle_counting`.
+- Re-read rdynarmic A64 frontend/backend paths for `A64GetCNTFRQ`; ARM64 and x64 emitters now consume `JitConfig::cntfrq_el0` instead of a local hardcoded value.
+- `cd externals/rdynarmic && cargo check --tests` passes.
+- `cd externals/rdynarmic && cargo test a64_emit_config_preserves_memory_and_system_defaults -- --nocapture` passes and verifies a configured `19_200_000` value is forwarded.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- Pinball verification: `/Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` advanced from `[BQP_QUEUE] #0` at 44.397s to `#1024` at 68.517s, about 42 fps over that sampled window instead of the previous ~2 fps symptom.

@@ -2298,6 +2298,7 @@ impl ArmDynarmic64 {
             define_unpredictable_behaviour: true,
             processor_id: core_index as usize,
             wall_clock_cntpct: uses_wall_clock,
+            cntfrq_el0: common::wall_clock::CNTFRQ as u32,
             tpidrro_el0: Some(tpidrro_el0_ptr),
             tpidr_el0: Some(tpidr_el0_ptr),
             // Memory emit options matching upstream zuyu's
