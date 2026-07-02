@@ -1068,6 +1068,8 @@ impl FixedPipelineState {
         self.raw2 = 0;
 
         self.set_topology(draw.topology);
+        self.set_depth_enabled(draw.zeta.enabled);
+        self.set_depth_format(draw.zeta.format);
         self.dynamic_state
             .set_cull_enable(draw.rasterizer.cull_enable);
         self.dynamic_state.set_cull_face(draw.rasterizer.cull_face);
@@ -1134,12 +1136,91 @@ impl FixedPipelineState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::maxwell_3d::{
+        BlendColorInfo, ColorMaskInfo, ConstBufferBinding, DepthMode, DepthStencilInfo,
+        IndexFormat, LogicOpInfo, RasterizerInfo, RenderTargetInfo, RtControlInfo, SamplerBinding,
+        ScissorInfo, ShaderStageInfo, StencilFaceInfo, ViewportInfo, ZetaInfo,
+    };
     use std::collections::hash_map::DefaultHasher;
 
     fn hash_state(state: &FixedPipelineState) -> u64 {
         let mut hasher = DefaultHasher::new();
         state.hash(&mut hasher);
         hasher.finish()
+    }
+
+    fn make_test_draw_call() -> DrawCall {
+        DrawCall {
+            topology: PrimitiveTopology::Triangles,
+            vertex_first: 0,
+            vertex_count: 0,
+            indexed: false,
+            index_buffer_addr: 0,
+            index_buffer_count: 0,
+            index_buffer_first: 0,
+            index_format: IndexFormat::UnsignedInt,
+            vertex_streams: Vec::new(),
+            vertex_stream_limits: Default::default(),
+            viewports: [ViewportInfo::default(); NUM_VIEWPORTS],
+            viewport_transforms: Default::default(),
+            scissors: [ScissorInfo::default(); NUM_VIEWPORTS],
+            viewport_scale_offset_enabled: false,
+            window_origin_lower_left: false,
+            window_origin_flip_y: false,
+            surface_clip: Default::default(),
+            blend: [BlendInfo::default(); NUM_RENDER_TARGETS],
+            blend_color: BlendColorInfo {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            },
+            depth_stencil: DepthStencilInfo {
+                depth_test_enable: false,
+                depth_write_enable: false,
+                depth_func: ComparisonOp::Always,
+                depth_mode: DepthMode::MinusOneToOne,
+                stencil_enable: false,
+                stencil_two_side: false,
+                front: StencilFaceInfo::default(),
+                back: StencilFaceInfo::default(),
+            },
+            rasterizer: RasterizerInfo {
+                cull_enable: false,
+                front_face: FrontFace::CCW,
+                cull_face: CullFace::Back,
+                polygon_mode_front: PolygonMode::Fill,
+                polygon_mode_back: PolygonMode::Fill,
+                line_width_smooth: 1.0,
+                line_width_aliased: 1.0,
+                depth_bias: 0.0,
+                slope_scale_depth_bias: 0.0,
+                depth_bias_clamp: 0.0,
+                ..RasterizerInfo::default()
+            },
+            rasterize_enable: true,
+            primitive_restart: Default::default(),
+            logic_op: LogicOpInfo::default(),
+            depth_clamp_enabled: true,
+            program_base_address: 0,
+            cb_bindings: [[ConstBufferBinding::default(); 18]; 5],
+            vertex_attribs: Vec::new(),
+            shader_stages: [ShaderStageInfo::default(); 6],
+            color_masks: [ColorMaskInfo::default(); NUM_RENDER_TARGETS],
+            rt_control: RtControlInfo::default(),
+            tex_header_pool_addr: 0,
+            tex_header_pool_limit: 0,
+            tex_sampler_pool_addr: 0,
+            tex_sampler_pool_limit: 0,
+            instance_count: 1,
+            base_instance: 0,
+            base_vertex: 0,
+            inline_index_data: Vec::new(),
+            sampler_binding: SamplerBinding::Independently,
+            render_targets: [RenderTargetInfo::default(); NUM_RENDER_TARGETS],
+            zeta: ZetaInfo::default(),
+            dirty_flags: [false; 256],
+        }
     }
 
     #[test]
@@ -1266,6 +1347,25 @@ mod tests {
         assert_eq!(ds.depth_test_func(), ComparisonOp::Less);
         assert_eq!(ds.front_face(), FrontFace::CCW);
         assert!(ds.stencil_enable());
+    }
+
+    #[test]
+    fn test_refresh_preserves_zeta_pipeline_state() {
+        let no_zeta_draw = make_test_draw_call();
+        let mut zeta_draw = no_zeta_draw.clone();
+        zeta_draw.zeta.enabled = true;
+        zeta_draw.zeta.format = 7;
+
+        let mut no_zeta = FixedPipelineState::default();
+        no_zeta.refresh(&no_zeta_draw);
+        let mut with_zeta = FixedPipelineState::default();
+        with_zeta.refresh(&zeta_draw);
+
+        assert!(!no_zeta.depth_enabled());
+        assert_eq!(no_zeta.depth_format(), 0);
+        assert!(with_zeta.depth_enabled());
+        assert_eq!(with_zeta.depth_format(), 7);
+        assert_ne!(hash_state(&no_zeta), hash_state(&with_zeta));
     }
 
     #[test]

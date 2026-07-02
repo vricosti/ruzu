@@ -343,6 +343,7 @@ pub struct TextureCacheBase {
     /// the GL wrapper's `HashMap<SamplerId, Sampler>`. Mirrors the
     /// `slot_images` / `slot_image_views` split.
     pub slot_samplers: SlotVector<crate::textures::texture::TscEntry>,
+    pub slot_buffer_downloads: SlotVector<BufferDownload>,
     // slot_framebuffers: concrete backend objects are still owned by renderer backends.
 
     // Render state
@@ -583,6 +584,7 @@ impl TextureCacheBase {
             slot_image_views: SlotVector::new(),
             slot_image_allocs: SlotVector::new(),
             slot_samplers: SlotVector::new(),
+            slot_buffer_downloads: SlotVector::new(),
             render_targets: RenderTargets::default(),
             framebuffers: HashMap::new(),
             page_table: HashMap::new(),

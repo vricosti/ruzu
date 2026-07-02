@@ -602,6 +602,13 @@ pub trait BufferCacheRuntime {
         0
     }
 
+    /// Resolve a backend buffer handle into the raw API object consumed by
+    /// same-backend subsystems. Vulkan uses this to convert the backend handle
+    /// stored in `BufferBase::gpu_handle` into the real `VkBuffer`.
+    fn resolve_backend_buffer_raw(&self, gpu_handle: u32) -> u64 {
+        gpu_handle as u64
+    }
+
     // -- Vertex buffer binding --
 
     /// Bind vertex buffers collected in `HostBindings`.

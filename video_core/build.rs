@@ -126,6 +126,15 @@ fn compile_vulkan_present_shaders(zuyu_base: &str) {
             "convert_s8d24_to_abgr8.frag",
         ),
         (
+            "CONVERT_MSAA_TO_NON_MSAA_COMP_SPV",
+            "convert_msaa_to_non_msaa.comp",
+        ),
+        (
+            "CONVERT_NON_MSAA_TO_MSAA_COMP_SPV",
+            "convert_non_msaa_to_msaa.comp",
+        ),
+        ("ASTC_DECODER_COMP_SPV", "astc_decoder.comp"),
+        (
             "VULKAN_FIDELITYFX_FSR_VERT_SPV",
             "vulkan_fidelityfx_fsr.vert",
         ),

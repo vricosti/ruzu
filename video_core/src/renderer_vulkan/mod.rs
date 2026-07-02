@@ -55,6 +55,7 @@ pub mod turbo_mode;
 pub mod update_descriptor;
 pub mod vk_rasterizer;
 
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use ash::vk;
@@ -62,11 +63,15 @@ use ash::vk::Handle;
 use log::{debug, info, trace, warn};
 use thiserror::Error;
 
+use crate::buffer_cache::buffer_cache_base::{
+    DeviceMemoryAccess, GpuMemoryAccess, ObtainBufferOperation, ObtainBufferSynchronize,
+};
 use crate::control::channel_state_cache::{ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches};
 use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, ComparisonOp, CullFace, DrawCall, FrontFace, PrimitiveTopology,
     NUM_VIEWPORTS,
 };
+use crate::engines::maxwell_dma::dma;
 use crate::engines::Framebuffer;
 use crate::fence_manager::FenceManager as GenericFenceManager;
 use crate::framebuffer_config::FramebufferConfig;
@@ -74,8 +79,9 @@ use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
 use crate::texture_cache::texture_cache_base::{DescriptorSyncRegs, ImageViewInOut};
-use crate::texture_cache::types::NULL_IMAGE_VIEW_ID;
+use crate::texture_cache::types::{NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID};
 use crate::textures::texture::texture_pair;
+use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
 use shader_recompiler::shader_info::Info as ShaderInfo;
 use shader_recompiler::{PipelineCache as ShaderPipelineCache, Profile};
 
@@ -83,6 +89,35 @@ use self::pipeline_helper::{
     RescalingPushConstant, RENDERAREA_LAYOUT_OFFSET, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET,
     RESCALING_LAYOUT_WORDS_OFFSET,
 };
+
+// Rust counterpart of upstream `std::scoped_lock{buffer_cache.mutex,
+// texture_cache.mutex}`. `parking_lot::ReentrantMutex` does not provide a
+// multi-lock scoped helper, so retry both orders to avoid ABBA deadlocks.
+macro_rules! lock_two_reentrant_mutexes {
+    ($first_mutex:expr, $second_mutex:expr, $first_guard:ident, $second_guard:ident) => {
+        let $first_guard;
+        let $second_guard;
+        loop {
+            let first_candidate = unsafe { (*$first_mutex).lock() };
+            if let Some(second_candidate) = unsafe { (*$second_mutex).try_lock() } {
+                $first_guard = first_candidate;
+                $second_guard = second_candidate;
+                break;
+            }
+            drop(first_candidate);
+            std::thread::yield_now();
+
+            let second_candidate = unsafe { (*$second_mutex).lock() };
+            if let Some(first_candidate) = unsafe { (*$first_mutex).try_lock() } {
+                $first_guard = first_candidate;
+                $second_guard = second_candidate;
+                break;
+            }
+            drop(second_candidate);
+            std::thread::yield_now();
+        }
+    };
+}
 
 fn bytes_of<T: Sized>(value: &T) -> &[u8] {
     unsafe {
@@ -198,7 +233,11 @@ fn scissor_state(draw: &DrawCall, index: usize) -> vk::Rect2D {
         }
     }
 }
-use buffer_cache::BufferCache;
+use blit_image::BlitImageHelper;
+use buffer_cache::{
+    BufferCache as DirectBufferCache, BufferCacheRuntime, VulkanCommonBufferCache,
+    VULKAN_DEVICE_TRACKER,
+};
 use descriptor_pool::{DescriptorBankInfo, DescriptorPool};
 use graphics_pipeline::GraphicsDescriptorBinding;
 use pipeline_cache::PipelineCache as VulkanPipelineCache;
@@ -232,6 +271,59 @@ impl From<vk::Result> for RendererError {
     }
 }
 
+struct GpuMemoryAccessAdapter {
+    mm: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
+}
+
+impl GpuMemoryAccess for GpuMemoryAccessAdapter {
+    fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
+        self.mm.lock().gpu_to_cpu_address(gpu_addr)
+    }
+
+    fn read_u64(&self, gpu_addr: u64) -> Option<u64> {
+        let mut buf = [0u8; 8];
+        self.mm.lock().read_block(gpu_addr, &mut buf);
+        Some(u64::from_le_bytes(buf))
+    }
+
+    fn read_u32(&self, gpu_addr: u64) -> Option<u32> {
+        let mut buf = [0u8; 4];
+        self.mm.lock().read_block(gpu_addr, &mut buf);
+        Some(u32::from_le_bytes(buf))
+    }
+
+    fn is_within_gpu_address_range(&self, gpu_addr: u64) -> bool {
+        self.mm.lock().is_within_gpu_address_range(gpu_addr)
+    }
+
+    fn max_continuous_range(&self, gpu_addr: u64, size: u64) -> u64 {
+        self.mm.lock().max_continuous_range(gpu_addr, size)
+    }
+
+    fn get_memory_layout_size(&self, gpu_addr: u64) -> u64 {
+        self.mm.lock().get_memory_layout_size(gpu_addr)
+    }
+}
+
+struct DeviceMemoryAccessAdapter {
+    device_memory: Arc<MaxwellDeviceMemoryManager>,
+}
+
+impl DeviceMemoryAccess for DeviceMemoryAccessAdapter {
+    fn get_pointer(&self, device_addr: u64) -> Option<*const u8> {
+        let pointer = self.device_memory.get_pointer(device_addr);
+        (!pointer.is_null()).then_some(pointer)
+    }
+
+    fn read_block_unsafe(&self, device_addr: u64, dst: &mut [u8]) {
+        self.device_memory.smmu_read_block_unsafe(device_addr, dst);
+    }
+
+    fn write_block_unsafe(&self, device_addr: u64, src: &[u8]) {
+        self.device_memory.smmu_write_block_unsafe(device_addr, src);
+    }
+}
+
 /// Central Vulkan rendering orchestrator.
 ///
 /// Ref: zuyu RasterizerVulkan — coordinates all rendering sub-components:
@@ -245,19 +337,23 @@ pub struct RasterizerVulkan {
     channel_caches: ChannelSetupCaches<ChannelInfo>,
 
     // Sub-components (matching zuyu's architecture)
-    scheduler: Scheduler,
-    state_tracker: StateTracker,
-    staging_pool: StagingBufferPool,
+    scheduler: Box<Scheduler>,
+    memory_allocator: NonNull<MemoryAllocator>,
+    state_tracker: Box<StateTracker>,
+    staging_pool: Box<StagingBufferPool>,
     descriptor_pool: DescriptorPool,
     desc_queue: UpdateDescriptorQueue,
+    compute_pass_desc_queue: UpdateDescriptorQueue,
+    blit_image: BlitImageHelper,
     fallback_uniform_buffer: vk::Buffer,
     fallback_uniform_memory: vk::DeviceMemory,
     fallback_uniform_mapped: *mut u8,
     fallback_sampler: vk::Sampler,
-    render_pass_cache: RenderPassCache,
+    render_pass_cache: Box<RenderPassCache>,
     shader_cache: crate::shader_cache::ShaderCache,
     pipeline_cache: VulkanPipelineCache,
-    buffer_cache: BufferCache,
+    buffer_cache: DirectBufferCache,
+    common_buffer_cache: VulkanCommonBufferCache,
     texture_cache: TextureCache,
     query_cache: VulkanQueryCache,
     fence_manager: GenericFenceManager<VkFence>,
@@ -320,9 +416,11 @@ impl RasterizerVulkan {
         extended_dynamic_state2_supported: bool,
         topology_list_primitive_restart_supported: bool,
         patch_list_primitive_restart_supported: bool,
+        shader_stencil_export_supported: bool,
         max_viewports: u32,
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<MaxwellDeviceMemoryManager>,
+        memory_allocator: &mut MemoryAllocator,
     ) -> Result<Self, RendererError> {
         info!(
             "RasterizerVulkan: initializing {}x{} renderer",
@@ -340,22 +438,36 @@ impl RasterizerVulkan {
                 .map_err(|e| RendererError::InitFailed(format!("command pool: {:?}", e)))?
         };
 
-        // Create scheduler
-        let scheduler = Scheduler::new(device.clone(), graphics_queue, command_pool)
-            .map_err(|e| RendererError::InitFailed(format!("scheduler: {:?}", e)))?;
-
         // Create state tracker
-        let state_tracker = StateTracker::new();
+        let mut state_tracker = Box::new(StateTracker::new());
+
+        // Create scheduler
+        let mut scheduler = Box::new(
+            Scheduler::new(device.clone(), graphics_queue, command_pool)
+                .map_err(|e| RendererError::InitFailed(format!("scheduler: {:?}", e)))?,
+        );
+        scheduler.set_state_tracker(NonNull::from(state_tracker.as_mut()));
 
         // Create staging buffer pool
-        let staging_pool =
-            StagingBufferPool::new(device.clone(), instance.clone(), physical_device);
+        let mut staging_pool = Box::new(StagingBufferPool::new(
+            device.clone(),
+            instance.clone(),
+            physical_device,
+            scheduler.as_mut(),
+        ));
 
         // Create descriptor pool
-        let descriptor_pool = DescriptorPool::new(device.clone(), 64);
+        let mut descriptor_pool = DescriptorPool::new(device.clone(), 64);
 
         // Create descriptor update queue
         let desc_queue = UpdateDescriptorQueue::new();
+        let mut compute_pass_desc_queue = UpdateDescriptorQueue::new();
+        let mut blit_image = BlitImageHelper::new(
+            device.clone(),
+            &mut scheduler,
+            &mut descriptor_pool,
+            shader_stencil_export_supported,
+        );
 
         let (fallback_uniform_buffer, fallback_uniform_memory, fallback_uniform_mapped) =
             create_host_buffer(
@@ -368,7 +480,7 @@ impl RasterizerVulkan {
         let fallback_sampler = create_fallback_sampler(&device)?;
 
         // Create render pass cache
-        let render_pass_cache = RenderPassCache::new(device.clone());
+        let mut render_pass_cache = Box::new(RenderPassCache::new(device.clone()));
 
         // Create shader recompiler pipeline cache
         let profile = Profile {
@@ -393,8 +505,21 @@ impl RasterizerVulkan {
         );
 
         // Create buffer cache
-        let buffer_cache = BufferCache::new(device.clone(), instance.clone(), physical_device)
-            .map_err(|e| RendererError::InitFailed(format!("buffer cache: {:?}", e)))?;
+        let buffer_cache =
+            DirectBufferCache::new(device.clone(), instance.clone(), physical_device)
+                .map_err(|e| RendererError::InitFailed(format!("buffer cache: {:?}", e)))?;
+        let mut common_buffer_cache = VulkanCommonBufferCache::new(&VULKAN_DEVICE_TRACKER);
+        let buffer_runtime = BufferCacheRuntime::new(
+            device.clone(),
+            instance.clone(),
+            physical_device,
+            scheduler.as_mut(),
+            staging_pool.as_mut(),
+        );
+        common_buffer_cache.set_runtime(Box::new(buffer_runtime));
+        common_buffer_cache.set_device_memory(Box::new(DeviceMemoryAccessAdapter {
+            device_memory: Arc::clone(&device_memory),
+        }));
 
         // Create texture cache
         let shader_cache = crate::shader_cache::ShaderCache::new(Arc::clone(&device_memory));
@@ -404,6 +529,13 @@ impl RasterizerVulkan {
             instance.clone(),
             physical_device,
             device_memory,
+            scheduler.as_mut(),
+            &mut *memory_allocator,
+            staging_pool.as_mut(),
+            &mut blit_image,
+            render_pass_cache.as_mut(),
+            &mut descriptor_pool,
+            &mut compute_pass_desc_queue,
         );
 
         // Create query cache
@@ -444,10 +576,13 @@ impl RasterizerVulkan {
             syncpoints,
             channel_caches: ChannelSetupCaches::new(),
             scheduler,
+            memory_allocator: NonNull::from(&mut *memory_allocator),
             state_tracker,
             staging_pool,
             descriptor_pool,
             desc_queue,
+            compute_pass_desc_queue,
+            blit_image,
             fallback_uniform_buffer,
             fallback_uniform_memory,
             fallback_uniform_mapped,
@@ -456,6 +591,7 @@ impl RasterizerVulkan {
             shader_cache,
             pipeline_cache,
             buffer_cache,
+            common_buffer_cache,
             texture_cache,
             query_cache,
             fence_manager: GenericFenceManager::new(true),
@@ -502,17 +638,44 @@ impl RasterizerVulkan {
         read_gpu: &dyn Fn(u64, &mut [u8]),
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
     ) {
+        let mut dirty_flags = draw.dirty_flags;
+
         // 1. Periodic flush
         self.flush_work();
 
-        // 2. Compile or lookup cached pipeline
+        // 2. Update render targets before compiling the pipeline. Upstream
+        // requests the render pass from the framebuffer selected by
+        // TextureCache::UpdateRenderTargets, so the pipeline must be built
+        // against that same render pass.
+        let target_fb = self
+            .texture_cache
+            .update_render_targets_and_get_rt0_framebuffer(
+                &crate::engines::draw_manager::Maxwell3DRenderTargets {
+                    rt_control: draw.rt_control,
+                    render_targets: draw.render_targets,
+                    zeta: draw.zeta,
+                    anti_alias_samples_mode: 0,
+                    surface_clip: draw.surface_clip,
+                },
+                &mut dirty_flags,
+                read_gpu_unsafe,
+                false,
+                None,
+            );
+        let render_pass = target_fb
+            .as_ref()
+            .map(|target| target.render_pass)
+            .unwrap_or(self.default_render_pass);
+        let target_has_depth = target_fb.as_ref().is_some_and(|target| target.has_depth);
+        let target_num_color = target_fb
+            .as_ref()
+            .map(|target| target.num_color)
+            .unwrap_or(1);
+
+        // 3. Compile or lookup cached pipeline
         let pipeline_result = self
             .pipeline_cache
-            .current_graphics_pipeline_with_shared_cache(
-                draw,
-                self.default_render_pass,
-                &mut self.shader_cache,
-            );
+            .current_graphics_pipeline_with_shared_cache(draw, render_pass, &mut self.shader_cache);
         let (
             pipeline,
             pipeline_layout,
@@ -539,25 +702,17 @@ impl RasterizerVulkan {
             }
         };
 
-        // 3. Ensure we're inside a render pass
-        let target_fb = self
-            .texture_cache
-            .update_render_targets_and_get_rt0_framebuffer(
-                &crate::engines::draw_manager::Maxwell3DRenderTargets {
-                    rt_control: draw.rt_control,
-                    render_targets: draw.render_targets,
-                    zeta: Default::default(),
-                    anti_alias_samples_mode: 0,
-                    surface_clip: draw.surface_clip,
-                },
-                self.default_render_pass,
-                self.depth_view,
-            );
+        // 4. Ensure we're inside a render pass
         let cmd = self.scheduler.command_buffer();
-        let (framebuffer, extent) = if let Some(target) = target_fb {
+        let (framebuffer, extent, rp_images, rp_image_ranges) = if let Some(target) = target_fb {
             self.texture_cache
-                .prepare_render_target_for_render(target.cpu_addr, cmd);
-            (target.framebuffer, target.extent)
+                .prepare_render_targets_for_render(&target.image_ids, cmd);
+            (
+                target.framebuffer,
+                target.extent,
+                target.images,
+                target.image_ranges,
+            )
         } else {
             (
                 self.offscreen_fb,
@@ -565,6 +720,8 @@ impl RasterizerVulkan {
                     width: self.fb_width,
                     height: self.fb_height,
                 },
+                Vec::new(),
+                Vec::new(),
             )
         };
         let clear_values = [
@@ -619,11 +776,26 @@ impl RasterizerVulkan {
             self.bind_index_buffer(cmd, draw, draw_params, read_gpu);
         }
 
+        // Build clear values indexed by attachment: one per colour attachment
+        // (ignored by the LOAD colour attachments, but the array must be long
+        // enough to index the CLEAR depth attachment at index `num_color`),
+        // then the depth clear value when a depth attachment is bound.
+        let render_pass_clears: Vec<vk::ClearValue> = if render_pass == self.default_render_pass {
+            clear_values.to_vec()
+        } else {
+            let mut clears = vec![clear_values[0]; target_num_color.max(1) as usize];
+            if target_has_depth {
+                clears.push(clear_values[1]);
+            }
+            clears
+        };
         self.scheduler.request_renderpass(
             framebuffer,
-            self.default_render_pass,
+            render_pass,
             render_area,
-            &clear_values,
+            &render_pass_clears,
+            &rp_images,
+            &rp_image_ranges,
         );
 
         if std::env::var_os("RUZU_TRACE_VK_DRAW").is_some() {
@@ -779,18 +951,26 @@ impl RasterizerVulkan {
     }
 
     fn should_wait_async_flushes(&self) -> bool {
-        self.query_cache.should_wait_async_flushes()
+        self.texture_cache.should_wait_async_flushes()
+            || self.common_buffer_cache.should_wait_async_flushes()
+            || self.query_cache.should_wait_async_flushes()
     }
 
     fn should_flush_async(&self) -> bool {
-        self.query_cache.has_uncommitted_flushes()
+        self.texture_cache.has_uncommitted_flushes()
+            || self.common_buffer_cache.has_uncommitted_flushes()
+            || self.query_cache.has_uncommitted_flushes()
     }
 
     fn pop_async_flushes(&mut self) {
+        self.texture_cache.pop_async_flushes();
+        self.common_buffer_cache.pop_async_flushes();
         self.query_cache.pop_async_flushes();
     }
 
     fn commit_async_flushes(&mut self) {
+        self.texture_cache.commit_async_flushes();
+        self.common_buffer_cache.commit_async_flushes();
         self.query_cache.commit_async_flushes();
     }
 
@@ -1679,6 +1859,15 @@ impl RasterizerVulkan {
                 .base
                 .fill_graphics_image_views(&mut sampled_views, false);
         }
+        let requires_feedback_barrier = unsafe {
+            let _texture_lock = (*texture_cache).base.mutex.lock();
+            (*texture_cache).base.check_feedback_loop(&sampled_views)
+        };
+        if requires_feedback_barrier {
+            unsafe {
+                (*texture_cache).barrier_feedback_loop();
+            }
+        }
         let mut sampled_cursor = 0usize;
 
         for binding in descriptor_bindings {
@@ -1779,7 +1968,6 @@ impl RasterizerVulkan {
                                             shader_recompiler::shader_info::TextureType::Color2D,
                                         ),
                                     read_gpu_unsafe,
-                                    &mut self.staging_pool,
                                     cmd,
                                 )
                                 .unwrap_or(self.offscreen_view);
@@ -2151,12 +2339,26 @@ impl RasterizerInterface for RasterizerVulkan {
         }
 
         let render_targets = clear_view.render_targets();
+        let mut dirty_flags = clear_view.dirty_flags();
+        let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
+            warn!("RasterizerVulkan::clear skipped: no bound channel memory manager");
+            return;
+        };
+        let read_gpu_unsafe = |gpu_va: u64, output: &mut [u8]| {
+            memory_manager.lock().read_block_unsafe(gpu_va, output)
+        };
+        let clear_scissor = clear_view.use_scissor().then(|| {
+            let scissor = clear_view.scissor(0);
+            (scissor.min_x, scissor.min_y, scissor.max_x, scissor.max_y)
+        });
         let Some(target) = self
             .texture_cache
             .update_render_targets_and_get_rt0_framebuffer(
                 &render_targets,
-                self.default_render_pass,
-                self.depth_view,
+                &mut dirty_flags,
+                &read_gpu_unsafe,
+                true,
+                clear_scissor,
             )
         else {
             return;
@@ -2165,7 +2367,7 @@ impl RasterizerInterface for RasterizerVulkan {
         let render_area = target.extent;
         let cmd = self.scheduler.command_buffer();
         self.texture_cache
-            .prepare_render_target_for_render(target.cpu_addr, cmd);
+            .prepare_render_targets_for_render(&target.image_ids, cmd);
         let clear_values = [
             vk::ClearValue {
                 color: vk::ClearColorValue {
@@ -2179,15 +2381,21 @@ impl RasterizerInterface for RasterizerVulkan {
                 },
             },
         ];
+        let mut render_pass_clears = vec![clear_values[0]; target.num_color.max(1) as usize];
+        if target.has_depth {
+            render_pass_clears.push(clear_values[1]);
+        }
         self.scheduler.request_outside_renderpass();
         self.scheduler.request_renderpass(
             framebuffer,
-            self.default_render_pass,
+            target.render_pass,
             vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: render_area,
             },
-            &clear_values,
+            &render_pass_clears,
+            &target.images,
+            &target.image_ranges,
         );
 
         let clear_rect_2d = if clear_view.use_scissor() {
@@ -2241,10 +2449,10 @@ impl RasterizerInterface for RasterizerVulkan {
             }
         }
         let mut depth_stencil_aspects = vk::ImageAspectFlags::empty();
-        if use_depth {
+        if target.has_depth && use_depth {
             depth_stencil_aspects |= vk::ImageAspectFlags::DEPTH;
         }
-        if use_stencil {
+        if target.has_depth && use_stencil {
             depth_stencil_aspects |= vk::ImageAspectFlags::STENCIL;
         }
         if !depth_stencil_aspects.is_empty() {
@@ -2281,7 +2489,7 @@ impl RasterizerInterface for RasterizerVulkan {
                 let to_transfer = vk::ImageMemoryBarrier::builder()
                     .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .old_layout(vk::ImageLayout::GENERAL)
                     .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -2298,7 +2506,7 @@ impl RasterizerInterface for RasterizerVulkan {
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                     .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                     .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(rt_image.image)
@@ -2506,6 +2714,18 @@ impl RasterizerInterface for RasterizerVulkan {
         if addr == 0 || size == 0 {
             return;
         }
+        unsafe {
+            let _lo_tex = common::lock_order::guard("texture_cache");
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            let _texture_guard = (*texture_mutex).lock();
+            self.texture_cache.download_memory(addr, size as usize);
+        }
+        unsafe {
+            let _lo_buf = common::lock_order::guard("buffer_cache");
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            self.common_buffer_cache.download_memory(addr, size);
+        }
         self.query_cache.flush_region(addr, size as usize);
     }
 
@@ -2594,6 +2814,13 @@ impl RasterizerInterface for RasterizerVulkan {
         self.state_tracker.invalidate_command_buffer_state();
         self.staging_pool.new_frame();
         self.descriptor_pool.reset_pools();
+        self.texture_cache.tick_frame(self.scheduler.current_tick());
+        unsafe {
+            let _lo_buf = common::lock_order::guard("buffer_cache");
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            self.common_buffer_cache.tick_frame();
+        }
     }
 
     fn initialize_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
@@ -2619,6 +2846,13 @@ impl RasterizerInterface for RasterizerVulkan {
             .channel_caches
             .current_channel_state()
             .and_then(ChannelCacheAccessor::gpu_memory_arc);
+        if self.common_buffer_cache.channel_state.is_none() {
+            self.common_buffer_cache.channel_state = Some(Box::default());
+        }
+        if let Some(mm) = self.channel_memory_manager.as_ref() {
+            self.common_buffer_cache
+                .set_gpu_memory(Box::new(GpuMemoryAccessAdapter { mm: Arc::clone(mm) }));
+        }
     }
 
     fn release_channel(&mut self, channel_id: i32) {
@@ -2633,11 +2867,188 @@ impl RasterizerInterface for RasterizerVulkan {
 
     fn accelerate_surface_copy(
         &mut self,
-        _src: &crate::engines::fermi_2d::Surface,
-        _dst: &crate::engines::fermi_2d::Surface,
-        _copy_config: &crate::engines::fermi_2d::Config,
+        src: &crate::engines::fermi_2d::Surface,
+        dst: &crate::engines::fermi_2d::Surface,
+        copy_config: &crate::engines::fermi_2d::Config,
     ) -> bool {
-        false
+        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
+            return false;
+        };
+        let texture_cache: *mut TextureCache = &mut self.texture_cache;
+        unsafe {
+            let _texture_lock = (*texture_cache).base.mutex.lock();
+            (*texture_cache).blit_image(
+                dst,
+                src,
+                copy_config,
+                |gpu_addr| mm.lock().gpu_to_cpu_address(gpu_addr),
+                |gpu_addr, out| {
+                    let guard = mm.lock();
+                    guard.read_block(gpu_addr, out);
+                    true
+                },
+            )
+        }
+    }
+
+    fn accelerate_dma_image_to_buffer(
+        &mut self,
+        copy_info: &dma::ImageCopy,
+        src: &dma::ImageOperand,
+        dst: &dma::BufferOperand,
+    ) -> bool {
+        let trace_dma = std::env::var_os("RUZU_TRACE_DMA_IMAGE").is_some();
+        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
+            if trace_dma {
+                info!(
+                    "[DMA_IMAGE] vk image->buffer missing channel memory src=0x{:X} dst=0x{:X} len={}x{}",
+                    src.address, dst.address, copy_info.length_x, copy_info.length_y
+                );
+            }
+            return false;
+        };
+        unsafe {
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+
+            let image_id = self.texture_cache.base.dma_image_id(src, false);
+            if image_id == NULL_IMAGE_ID {
+                if trace_dma {
+                    info!(
+                        "[DMA_IMAGE] vk image->buffer no image src=0x{:X} dst=0x{:X} len={}x{}",
+                        src.address, dst.address, copy_info.length_x, copy_info.length_y
+                    );
+                }
+                return false;
+            }
+
+            let buffer_size = dst.pitch.saturating_mul(dst.height);
+            let (buffer_id, offset) = self.common_buffer_cache.obtain_buffer(
+                dst.address,
+                buffer_size,
+                ObtainBufferSynchronize::FullSynchronize,
+                ObtainBufferOperation::MarkAsWritten,
+            );
+            let raw_buffer = self
+                .common_buffer_cache
+                .resolve_backend_buffer_raw(buffer_id);
+            let buffer = vk::Buffer::from_raw(raw_buffer);
+            if buffer == vk::Buffer::null() {
+                if trace_dma {
+                    info!(
+                        "[DMA_IMAGE] vk image->buffer null buffer image_id={} buffer_id={} src=0x{:X} dst=0x{:X}",
+                        image_id.index, buffer_id.index, src.address, dst.address
+                    );
+                }
+                return false;
+            }
+
+            let read_gpu_unsafe =
+                |gpu_addr: u64, out: &mut [u8]| mm.lock().read_block_unsafe(gpu_addr, out);
+            let copied = self.texture_cache.dma_buffer_image_copy(
+                copy_info,
+                dst,
+                src,
+                image_id,
+                buffer,
+                offset as vk::DeviceSize,
+                false,
+                &read_gpu_unsafe,
+            );
+            if trace_dma {
+                info!(
+                    "[DMA_IMAGE] vk image->buffer image_id={} buffer_id={} raw_buffer=0x{:X} offset={} size={} copied={}",
+                    image_id.index,
+                    buffer_id.index,
+                    raw_buffer,
+                    offset,
+                    buffer_size,
+                    copied
+                );
+            }
+            copied
+        }
+    }
+
+    fn accelerate_dma_buffer_to_image(
+        &mut self,
+        copy_info: &dma::ImageCopy,
+        src: &dma::BufferOperand,
+        dst: &dma::ImageOperand,
+    ) -> bool {
+        let trace_dma = std::env::var_os("RUZU_TRACE_DMA_IMAGE").is_some();
+        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
+            if trace_dma {
+                info!(
+                    "[DMA_IMAGE] vk buffer->image missing channel memory src=0x{:X} dst=0x{:X} len={}x{}",
+                    src.address, dst.address, copy_info.length_x, copy_info.length_y
+                );
+            }
+            return false;
+        };
+        unsafe {
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+
+            let image_id = self.texture_cache.base.dma_image_id(dst, true);
+            if image_id == NULL_IMAGE_ID {
+                if trace_dma {
+                    info!(
+                        "[DMA_IMAGE] vk buffer->image no image src=0x{:X} dst=0x{:X} len={}x{}",
+                        src.address, dst.address, copy_info.length_x, copy_info.length_y
+                    );
+                }
+                return false;
+            }
+
+            let buffer_size = src.pitch.saturating_mul(src.height);
+            let (buffer_id, offset) = self.common_buffer_cache.obtain_buffer(
+                src.address,
+                buffer_size,
+                ObtainBufferSynchronize::FullSynchronize,
+                ObtainBufferOperation::DoNothing,
+            );
+            let raw_buffer = self
+                .common_buffer_cache
+                .resolve_backend_buffer_raw(buffer_id);
+            let buffer = vk::Buffer::from_raw(raw_buffer);
+            if buffer == vk::Buffer::null() {
+                if trace_dma {
+                    info!(
+                        "[DMA_IMAGE] vk buffer->image null buffer image_id={} buffer_id={} src=0x{:X} dst=0x{:X}",
+                        image_id.index, buffer_id.index, src.address, dst.address
+                    );
+                }
+                return false;
+            }
+
+            let read_gpu_unsafe =
+                |gpu_addr: u64, out: &mut [u8]| mm.lock().read_block_unsafe(gpu_addr, out);
+            let copied = self.texture_cache.dma_buffer_image_copy(
+                copy_info,
+                src,
+                dst,
+                image_id,
+                buffer,
+                offset as vk::DeviceSize,
+                true,
+                &read_gpu_unsafe,
+            );
+            if trace_dma {
+                info!(
+                    "[DMA_IMAGE] vk buffer->image image_id={} buffer_id={} raw_buffer=0x{:X} offset={} size={} copied={}",
+                    image_id.index,
+                    buffer_id.index,
+                    raw_buffer,
+                    offset,
+                    buffer_size,
+                    copied
+                );
+            }
+            copied
+        }
     }
 
     fn accelerate_inline_to_memory(&mut self, address: u64, copy_size: usize, memory: &[u8]) {

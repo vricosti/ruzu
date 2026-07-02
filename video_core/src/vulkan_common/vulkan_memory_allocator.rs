@@ -388,6 +388,51 @@ impl MemoryAllocation {
 }
 
 // ---------------------------------------------------------------------------
+// AllocatedImage — port-facing wrapper for MemoryAllocator::CreateImage
+// ---------------------------------------------------------------------------
+
+/// Device-local image allocation returned by `MemoryAllocator::CreateImage`.
+///
+/// Upstream returns a `vk::Image` wrapper whose allocation is released with the
+/// wrapper. Until the Rust allocator grows the full VMA-backed wrapper, this
+/// type preserves the same ownership boundary with a dedicated allocation.
+pub struct AllocatedImage {
+    device: ash::Device,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+}
+
+unsafe impl Send for AllocatedImage {}
+unsafe impl Sync for AllocatedImage {}
+
+impl AllocatedImage {
+    fn new(device: ash::Device, image: vk::Image, memory: vk::DeviceMemory) -> Self {
+        Self {
+            device,
+            image,
+            memory,
+        }
+    }
+
+    pub fn handle(&self) -> vk::Image {
+        self.image
+    }
+}
+
+impl Drop for AllocatedImage {
+    fn drop(&mut self) {
+        unsafe {
+            if self.image != vk::Image::null() {
+                self.device.destroy_image(self.image, None);
+            }
+            if self.memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.memory, None);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MemoryAllocator — port of `Vulkan::MemoryAllocator`
 // ---------------------------------------------------------------------------
 
@@ -478,6 +523,30 @@ impl MemoryAllocator {
     /// dedicated Vulkan allocation per image and keeps it alive in the
     /// allocator until drop.
     pub fn create_image(&self, ci: &vk::ImageCreateInfo) -> Result<vk::Image, VulkanError> {
+        let (image, memory) = self.create_dedicated_image(ci)?;
+        self.dedicated_resources
+            .lock()
+            .expect("dedicated resource mutex poisoned")
+            .push(DedicatedResource::Image { image, memory });
+        Ok(image)
+    }
+
+    /// Creates a device-local image with allocation ownership returned to the caller.
+    ///
+    /// This is the Rust equivalent of the upstream `vk::Image` wrapper returned
+    /// by `MemoryAllocator::CreateImage`.
+    pub fn create_owned_image(
+        &self,
+        ci: &vk::ImageCreateInfo,
+    ) -> Result<AllocatedImage, VulkanError> {
+        let (image, memory) = self.create_dedicated_image(ci)?;
+        Ok(AllocatedImage::new(self.device.clone(), image, memory))
+    }
+
+    fn create_dedicated_image(
+        &self,
+        ci: &vk::ImageCreateInfo,
+    ) -> Result<(vk::Image, vk::DeviceMemory), VulkanError> {
         let image = unsafe {
             self.device
                 .create_image(ci, None)
@@ -515,11 +584,7 @@ impl MemoryAllocator {
             return Err(VulkanError::new(err));
         }
 
-        self.dedicated_resources
-            .lock()
-            .expect("dedicated resource mutex poisoned")
-            .push(DedicatedResource::Image { image, memory });
-        Ok(image)
+        Ok((image, memory))
     }
 
     /// Creates a VMA-allocated buffer.

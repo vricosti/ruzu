@@ -903,6 +903,8 @@ impl<'a> Maxwell3DDrawView<'a> {
                         crate::engines::maxwell_3d::SamplerBinding::Independently
                     },
                     render_targets: registers.render_targets.render_targets,
+                    zeta: registers.render_targets.zeta,
+                    dirty_flags: registers.dirty_flags,
                 }
             }
         }
@@ -1378,6 +1380,8 @@ fn build_draw_call_snapshot(
         inline_index_data: draw_state.inline_index_draw_indexes.clone(),
         sampler_binding: maxwell3d.sampler_binding(),
         render_targets,
+        zeta: maxwell3d.zeta_info(),
+        dirty_flags: maxwell3d.dirty_flags(),
     }
 }
 
@@ -1762,6 +1766,8 @@ impl DrawManager {
             inline_index_data: draw_state.inline_index_draw_indexes.clone(),
             sampler_binding: maxwell3d.sampler_binding(),
             render_targets,
+            zeta: maxwell3d.zeta_info(),
+            dirty_flags: maxwell3d.dirty_flags(),
         }
     }
 

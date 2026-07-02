@@ -1594,6 +1594,18 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         self.slot_buffers[buffer_id].gpu_handle
     }
 
+    /// Resolve the backend buffer handle stored on `BufferBase` into the raw
+    /// API object for same-backend consumers.
+    pub fn resolve_backend_buffer_raw(&self, buffer_id: BufferId) -> u64 {
+        if !buffer_id.is_valid() {
+            return 0;
+        }
+        let gpu_handle = self.slot_buffers[buffer_id].gpu_handle;
+        self.runtime.as_ref().map_or(gpu_handle as u64, |runtime| {
+            runtime.resolve_backend_buffer_raw(gpu_handle)
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Public API — buffer operations retry loop
     // -----------------------------------------------------------------------

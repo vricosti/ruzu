@@ -451,12 +451,24 @@ impl MaxwellDMA {
             height: self.line_count(),
             address: self.dst_addr(),
         };
-        if self
+        let accelerated = self
             .with_rasterizer_mut(|rasterizer| {
                 rasterizer.accelerate_dma_image_to_buffer(&copy_info, &src_operand, &dst_operand)
             })
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        if std::env::var_os("RUZU_TRACE_DMA_IMAGE").is_some() {
+            log::info!(
+                "[DMA_IMAGE] blocklinear->pitch src=0x{:X} dst=0x{:X} len={}x{} pitch={} bpp={} accelerated={}",
+                src_operand.address,
+                dst_operand.address,
+                copy_info.length_x,
+                copy_info.length_y,
+                dst_operand.pitch,
+                src_operand.bytes_per_pixel,
+                accelerated
+            );
+        }
+        if accelerated {
             return Some(vec![]);
         }
 
@@ -562,12 +574,24 @@ impl MaxwellDMA {
             params: dst_params,
             address: self.dst_addr(),
         };
-        if self
+        let accelerated = self
             .with_rasterizer_mut(|rasterizer| {
                 rasterizer.accelerate_dma_buffer_to_image(&copy_info, &src_operand, &dst_operand)
             })
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        if std::env::var_os("RUZU_TRACE_DMA_IMAGE").is_some() {
+            log::info!(
+                "[DMA_IMAGE] pitch->blocklinear src=0x{:X} dst=0x{:X} len={}x{} pitch={} base_bpp={} accelerated={}",
+                src_operand.address,
+                dst_operand.address,
+                copy_info.length_x,
+                copy_info.length_y,
+                src_operand.pitch,
+                base_bpp,
+                accelerated
+            );
+        }
+        if accelerated {
             return Some(vec![]);
         }
 

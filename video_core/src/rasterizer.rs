@@ -2843,6 +2843,8 @@ mod tests {
             inline_index_data: vec![],
             sampler_binding: SamplerBinding::Independently,
             render_targets: [RenderTargetInfo::default(); 8],
+            zeta: ZetaInfo::default(),
+            dirty_flags: [false; 256],
         }
     }
 
