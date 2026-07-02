@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 /// Maximum slice length for single-core timing.
@@ -21,6 +21,11 @@ const MAX_SLICE_LENGTH: i64 = 10000;
 /// A callback that may be scheduled for a particular core timing event.
 /// Returns an optional reschedule time in nanoseconds.
 pub type TimedCallback = Box<dyn Fn(i64, Duration) -> Option<Duration> + Send + Sync>;
+
+fn trace_ct_fire_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_CT_FIRE").is_some())
+}
 
 /// Contains the characteristics of a particular event.
 pub struct EventType {
@@ -207,7 +212,7 @@ impl CoreTiming {
                         if let Some(next_ns) = next_time {
                             let now_ns = ct.get_global_time_ns().as_nanos() as i64;
                             let wait_time = next_ns - now_ns;
-                            if std::env::var_os("RUZU_TRACE_CT_FIRE").is_some() {
+                            if trace_ct_fire_enabled() {
                                 log::info!(
                                     "CT_LOOP next_ns={} now_ns={} wait_ns={}",
                                     next_ns,
@@ -223,7 +228,7 @@ impl CoreTiming {
                                     .wait_for(std::time::Duration::from_nanos(wait_time as u64));
                             }
                         } else {
-                            if std::env::var_os("RUZU_TRACE_CT_FIRE").is_some() {
+                            if trace_ct_fire_enabled() {
                                 log::info!("CT_LOOP queue_empty, parking");
                             }
                             ct.wait_set.store(true, Ordering::SeqCst);
@@ -475,7 +480,7 @@ impl CoreTiming {
             };
 
             let upgraded = evt.event_type.upgrade();
-            if upgraded.is_none() && std::env::var_os("RUZU_TRACE_CT_FIRE").is_some() {
+            if upgraded.is_none() && trace_ct_fire_enabled() {
                 log::info!(
                     "CT_DROP_WEAK time={} reschedule={}",
                     evt.time,
@@ -488,7 +493,7 @@ impl CoreTiming {
 
                 // Fire the callback without holding basic_lock
                 let ns_late = self.get_global_time_ns().as_nanos() as i64 - evt_time;
-                if std::env::var_os("RUZU_TRACE_CT_FIRE").is_some() {
+                if trace_ct_fire_enabled() {
                     let name = event_type_arc.lock().name.clone();
                     log::info!(
                         "CT_FIRE name={} time={} reschedule={}",
