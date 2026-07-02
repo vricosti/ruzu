@@ -8,7 +8,7 @@
 
 use common::ResultCode;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::frontend::emulated_controller::get_simple_npad_button_state;
 use crate::hid_core::{HIDCore, AVAILABLE_CONTROLLERS};
@@ -23,6 +23,16 @@ use crate::resources::shared_memory_format::NpadInternalState;
 use crate::resources::vibration::vibration_device::NpadVibrationDevice;
 
 static NPAD_UPDATE_TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn trace_npad_update_env_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_NPAD_UPDATE").is_some())
+}
+
+fn trace_npad_state_env_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_NPAD_STATE").is_some())
+}
 
 fn trace_npad_update(
     aruid: u64,
@@ -197,7 +207,7 @@ impl NPad {
     /// ported, this should be replaced by the full upstream loop (see
     /// `zuyu/src/hid_core/resources/npad/npad.cpp:461`).
     pub fn on_update(&mut self) {
-        let trace_update = std::env::var_os("RUZU_TRACE_NPAD_UPDATE").is_some();
+        let trace_update = trace_npad_update_env_enabled();
         let trace_index = if trace_update {
             NPAD_UPDATE_TRACE_COUNTER.fetch_add(1, Ordering::Relaxed)
         } else {
@@ -351,9 +361,7 @@ impl NPad {
                 pad_state.connection_status.raw = 0x3;
                 pad_state.npad_buttons = button_state;
                 pad_state.sampling_number = prev_sampling + 1;
-                if std::env::var_os("RUZU_TRACE_NPAD_STATE").is_some()
-                    && !pad_state.npad_buttons.raw.is_empty()
-                {
+                if trace_npad_state_env_enabled() && !pad_state.npad_buttons.raw.is_empty() {
                     log::info!(
                         "[NPAD_STATE] aruid=0x{:X} entry={} buttons=0x{:X} sampling={}",
                         aruid,

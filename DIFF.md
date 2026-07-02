@@ -19648,3 +19648,153 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cd externals/rdynarmic && cargo test a64_emit_config_preserves_memory_and_system_defaults -- --nocapture` passes and verifies a configured `19_200_000` value is forwarded.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
 - Pinball verification: `/Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` advanced from `[BQP_QUEUE] #0` at 44.397s to `#1024` at 68.517s, about 42 fps over that sampled window instead of the previous ~2 fps symptom.
+
+## 2026-07-02 — core/src/core_timing.rs, hid_core/src/resources/npad/npad.rs, and externals/rdynarmic/src/backend/arm64/a64_address_space.rs vs core/core_timing.cpp, hid_core/resources/npad/npad.cpp, and Dynarmic ARM64 callback paths
+
+### Intentional differences
+- Rust-only diagnostic env vars (`RUZU_TRACE_CT_FIRE`, `RUZU_TRACE_NPAD_UPDATE`, `RUZU_TRACE_NPAD_STATE`, `RUZU_TRACE_A64_EXCLUSIVE`) are now cached with `OnceLock`. Upstream has no equivalent process-environment polling in these hot paths. This preserves disabled-by-default diagnostics while avoiding repeated libc environment lookups during timing, HID, and A64 exclusive callback execution.
+- `NPad::on_update` still differs structurally from upstream because the Rust port lacks the full upstream `controller_data[aruid][index]` ownership model. This slice only changes trace gates and does not alter NPad state semantics.
+
+### Unintentional differences (to fix)
+- No remaining difference for this diagnostic-gate slice. The previous Rust-only behavior repeatedly called `std::env::var_os` in hot paths; upstream has no comparable runtime environment polling.
+
+### Missing items
+- This does not address the measured A64 cold-start bottleneck: Pinball still compiles tens of thousands of A64 blocks before audio/first full frame.
+- `core/src/arm/dynarmic/arm_dynarmic_64.rs` still lacked the upstream page-table-backed memory path at the time of this diagnostic-gate slice. The following entry ports that A64 page-table configuration.
+
+### Binary layout verification
+- N/A: diagnostic gate caching only; no guest ABI or raw-copied structure changed.
+
+### Verification
+- Re-read upstream `core/core_timing.cpp`; timing callbacks do not poll process environment.
+- Re-read upstream `hid_core/resources/npad/npad.cpp`; NPad update has no env-var trace gates.
+- Re-read rdynarmic ARM64 exclusive callback path; only diagnostic branches were changed.
+- `cd externals/rdynarmic && cargo check --tests` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- Pinball after this slice: first BQP dequeue at 4.481s, `OpenAudioRenderer` at 30.732s, first BQP queue at 47.338s, and BQP queue `#512` at 59.731s. This removes hot diagnostic polling but does not materially fix startup/frame pacing; follow-up profiling points at A64 cold JIT compilation.
+
+## 2026-07-02 — core/src/arm/dynarmic/arm_dynarmic_64.rs vs core/arm/dynarmic/arm_dynarmic_64.cpp
+
+### Intentional differences
+- Rust obtains the page-table pointer by downcasting the `ArmInterface` `KProcess` parameter to the kernel `KProcess`, matching the existing `ArmDynarmic32` bridge. Upstream receives a `Common::PageTable*` directly in `ArmDynarmic64::MakeJit`.
+- Fastmem remains `None` on macOS ARM64 when the host page size prevents ruzu's 4 KiB fastmem arena from being used. Upstream still assigns `config.fastmem_pointer = page_table->fastmem_arena`; in this Rust port the fastmem pointer is provided by the process `Memory` bridge and can legitimately be unavailable.
+
+### Unintentional differences (to fix)
+- No remaining difference for A64 page-table configuration in this slice. Rust now passes the process page table to `JitConfig::page_table_pointer` and sets `page_table_present`, `page_table_address_space_bits`, `silently_mirror_page_table`, `absolute_offset_page_table`, `page_table_pointer_mask_bits`, `detect_misaligned_access_via_page_table`, and `only_detect_misalignment_via_page_table_on_page_boundary` to match upstream `ArmDynarmic64::MakeJit`.
+
+### Missing items
+- A64 fastmem on macOS ARM64 is still unavailable with the current 4 KiB fastmem arena assumptions. With `fastmem_pointer = None`, rdynarmic correctly falls through to the upstream page-table path, but Pinball is slower than callback-only in the current Rust ARM64 backend.
+- Debug settings parity is still incomplete for A64 CPU options (`cpuopt_page_tables`, `cpuopt_fastmem`, fastmem exclusives, recompile exclusives, unsafe optimizations). This slice ports the baseline non-debug configuration.
+
+### Binary layout verification
+- N/A: JIT memory configuration only; no raw-copied guest ABI payload changed.
+
+### Verification
+- Re-read upstream `ArmDynarmic64::MakeJit` in `core/arm/dynarmic/arm_dynarmic_64.cpp`; it assigns `page_table`, page-table address-space bits, pointer-mask bits, absolute-offset mode, misalignment detection, fastmem pointer, fastmem address-space bits, fastmem mirroring, fastmem exclusive access, and exclusive-failure recompilation in that order when a page table is present.
+- Re-read upstream Dynarmic ARM64 `EmitReadMemory` / `EmitWriteMemory` in `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_memory.cpp`; it selects fastmem first, then inline page-table, then callback-only. rdynarmic has the same selection based on `fastmem_pointer` and `page_table_pointer`.
+- `cd externals/rdynarmic && cargo check --tests` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- Pinball runtime verification with `RUZU_PROFILE_ARM64_CODE_CACHE=1`: A64 now logs a non-null `page_table_pointer` on all cores and `fastmem_pointer=None`. The run does not panic, but startup is slower than the prior callback-only configuration (`OpenAudioRenderer` around 48.7s vs around 30.7s), confirming the next bottleneck is ARM64 fastmem/page-table performance rather than missing page-table wiring.
+
+## 2026-07-02 — externals/rdynarmic/src/backend/arm64/block_of_code.rs and externals/rdynarmic/src/backend/arm64/address_space.rs vs externals/dynarmic/src/dynarmic/backend/arm64/address_space.h/.cpp
+
+### Intentional differences
+- Rust stores the per-thread JIT write-protection state in `BlockOfCode` and avoids calling `pthread_jit_write_protect_np` when the requested state is already active. Upstream delegates this to `oaknut::CodeBlock::protect/unprotect`; the behavior is equivalent for the rdynarmic code-cache owner.
+- `BlockOfCode::seal` still flushes the emitted range from the start of the cache through the current cursor, while upstream invalidates only `block_info.entry_point..entry_point+size` after each block. This is conservative and functionally safe, but less precise.
+
+### Unintentional differences (to fix)
+- No remaining difference for JIT write-protection batching in this slice. Rust previously disabled JIT write protection on every `write_u32`, `write_u64`, and `patch_u32`, causing repeated `pthread_jit_write_protect_np` calls while emitting a single block. Upstream calls `UnprotectCodeMemory()` once before `EmitArm64`, links/patches while writable, invalidates the emitted range, then calls `ProtectCodeMemory()` once.
+
+### Missing items
+- The I-cache invalidation range is still broader than upstream's per-block range.
+- A64 fastmem remains unavailable on macOS ARM64 in ruzu, so page-table/callback performance is still the dominant Pinball startup bottleneck after this batching fix.
+
+### Binary layout verification
+- N/A: host code-cache write-protection state only; no guest ABI or raw-copied structure changed.
+
+### Verification
+- Re-read upstream `AddressSpace::Emit` in `externals/dynarmic/src/dynarmic/backend/arm64/address_space.cpp`; it calls `UnprotectCodeMemory()`, emits, links, relinks, invalidates the emitted block range, then calls `ProtectCodeMemory()`.
+- Re-read upstream `AddressSpace::ProtectCodeMemory` / `UnprotectCodeMemory` in `externals/dynarmic/src/dynarmic/backend/arm64/address_space.h`; they wrap `mem.protect()` / `mem.unprotect()` on Apple platforms.
+- `cd externals/rdynarmic && cargo check --tests` passes.
+- `cd externals/rdynarmic && cargo test emitted_arm64_code_executes -- --nocapture` passes.
+- `cd externals/rdynarmic && cargo test direct_run_code_stub_calls_block_pointer -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- Pinball runtime verification with A64 page-table enabled and `RUZU_PROFILE_ARM64_CODE_CACHE=1`: non-null `page_table_pointer`, `fastmem_pointer=None`, `OpenAudioRenderer` around 47.4s, first `BQP_QUEUE` around 72.5s, and `BQP_QUEUE #64` around 74.2s. This confirms no crash and fast post-first-frame progress, but startup remains dominated by A64 cold compilation/page-table fallback.
+
+## 2026-07-02 — externals/rdynarmic/src/backend/arm64/emit_arm64_memory.rs and externals/rdynarmic/src/backend/arm64/inst.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+
+### Intentional differences
+- Rust keeps AArch64 instruction encoders in `backend/arm64/inst.rs`, while upstream uses oaknut directly from `emit_arm64_memory.cpp`. This is an existing backend-implementation split; the emitted instruction sequence is the parity contract.
+
+### Unintentional differences (to fix)
+- No remaining difference for the non-mirrored page-table range check in this slice. Rust previously emitted `LSR Xscratch0, Xaddr, #12; LSR Xscratch1, Xscratch0, #valid_bits; CBNZ Xscratch1, fallback`. Upstream emits `LSR Xscratch0, Xaddr, #12; TST Xscratch0, ~0 << valid_bits; B.NE fallback`. Rust now emits the upstream `TST`/`B.NE` sequence.
+
+### Missing items
+- Broader ARM64 memory-emitter parity is not declared complete by this slice. Fastmem patch-info handling, exact fault/recompile paths, and full ordered/exclusive behavior still need independent upstream comparison before the file can be called finished.
+
+### Binary layout verification
+- N/A: host JIT code emission only; no raw-copied guest ABI payload changed.
+
+### Verification
+- Re-read upstream `InlinePageTableEmitVAddrLookup` in `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_memory.cpp`; the non-mirrored page-table path performs `LSR`, `TST`, and `B(NE, fallback)` before loading from `Xpagetable`.
+- Added `inst.rs` support for the `0xffff_ffff_f800_0000` logical immediate used by the 39-bit Switch address-space range check and verified its encoding against clang/objdump output (`tst x16, #0xfffffffff8000000` -> `0xf265921f`).
+- Added `page_table_non_mirror_read_memory32_emits_upstream_range_check` to assert the 39-bit non-mirror page-table sequence.
+- `cd externals/rdynarmic && cargo test -p rdynarmic page_table_ -- --nocapture` passes.
+- `cd externals/rdynarmic && cargo check --tests` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- Pinball runtime verification with `RUST_LOG=info timeout 110s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro`: timeout exit `124` after a healthy run, `OpenAudioRenderer` at 53.1s, `IAudioRenderer::Start` at 53.2s, first `BQP_QUEUE` at 79.0s, and `BQP_QUEUE #1024` at 97.7s.
+
+## 2026-07-02 — externals/rdynarmic/src/backend/arm64/block_of_code.rs and externals/rdynarmic/src/backend/arm64/address_space.rs vs externals/dynarmic/src/dynarmic/backend/arm64/address_space.h/.cpp
+
+### Intentional differences
+- Rust exposes `BlockOfCode::seal_range(offset, len)` as the equivalent of upstream `oaknut::CodeBlock::invalidate(entry_point, size)` plus `ProtectCodeMemory()`. Upstream owns this operation in `AddressSpace::Emit`; rdynarmic keeps the raw cache pointer and platform cache-flush helper in `BlockOfCode`, so `AddressSpace::emit` computes the emitted block offset and delegates the range flush/protect step.
+- `BlockOfCode::seal()` remains as a whole-emitted-cache helper for prelude/tests and calls `seal_range(0, cursor)`. The live `AddressSpace::emit` path now uses the upstream per-block range.
+- `record_emitted_block` rolls back inserted maps/references if `link` or `relink_for_descriptor` returns an error. Upstream uses assertions/non-fallible link setup here; rdynarmic exposes `Result`, so rollback preserves map consistency for test/error paths without changing the successful upstream ordering.
+- `patch_u32` still flushes the patched instruction immediately. Upstream invalidates the current block range at the end of `AddressSpace::Emit`, but `RelinkForDescriptor` can patch older blocks outside that range; removing the per-patch flush caused a Pinball crash (`exit=139`) before first BQP. Keeping the immediate patch flush is conservative and required until rdynarmic tracks and invalidates every relinked range.
+
+### Unintentional differences (to fix)
+- No remaining difference for successful `AddressSpace::Emit` map/link ordering in this slice. Rust now inserts `block_entries`, `reverse_block_entries`, and `block_infos` before `link`, then calls `relink_for_descriptor`, matching upstream's successful path ordering.
+
+### Missing items
+- `patch_u32` does not yet batch relink-range invalidation the way a deeper oaknut-equivalent backend could. A stricter future step would collect every patched range from `Link` and `RelinkForDescriptor` and invalidate those ranges explicitly before re-protecting code memory.
+- Fastmem remains unavailable on macOS ARM64 with the current 4 KiB fastmem arena assumptions; this slice only fixes the excessive I-cache invalidation cost in the page-table/callback path.
+
+### Binary layout verification
+- N/A: host code-cache invalidation/protection only; no guest ABI or raw-copied structure changed.
+
+### Verification
+- Re-read upstream `AddressSpace::Emit` in `externals/dynarmic/src/dynarmic/backend/arm64/address_space.cpp`; it calls `UnprotectCodeMemory()`, emits the block, inserts block maps, links/relinks, invalidates exactly `block_info.entry_point..entry_point+size`, then calls `ProtectCodeMemory()`.
+- Re-read upstream `AddressSpace::ProtectCodeMemory` / `UnprotectCodeMemory` in `externals/dynarmic/src/dynarmic/backend/arm64/address_space.h`; Apple platforms protect/unprotect the same code cache owner.
+- `cd externals/rdynarmic && cargo test -p rdynarmic block_of_code -- --nocapture` passes.
+- `cd externals/rdynarmic && cargo test -p rdynarmic address_space -- --nocapture` passes.
+- `cd externals/rdynarmic && cargo check --tests` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- Pinball runtime verification with `RUST_LOG=info timeout 110s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro`: timeout exit `124` after a healthy run, `OpenAudioRenderer` at 4.60s, `IAudioRenderer::Start` at 4.61s, first `BQP_QUEUE` at 5.96s, `BQP_QUEUE #1024` at 23.03s, and `BQP_QUEUE #4096` at 92.10s. This fixes the prior cold-start regression from whole-cache I-cache invalidation (`OpenAudioRenderer` ~53.1s and first `BQP_QUEUE` ~79.0s in the preceding page-table range-check run).
+- After changing successful map/link ordering, a test run with per-patch flush removed crashed Pinball with `exit=139` before first BQP. Restoring immediate `patch_u32` instruction flush fixed the crash.
+- Pinball runtime verification after the final map/link ordering change and restored patch flush: `RUST_LOG=info timeout 35s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` exits by timeout `124`, `OpenAudioRenderer` at 4.60s, `IAudioRenderer::Start` at 4.61s, first `BQP_QUEUE` at 5.95s, and `BQP_QUEUE #1024` at 23.01s.
+
+## 2026-07-02 — externals/rdynarmic/src/backend/arm64/block_of_code.rs and externals/rdynarmic/src/backend/arm64/address_space.rs vs externals/dynarmic/src/dynarmic/backend/arm64/address_space.h/.cpp
+
+### Intentional differences
+- Rust keeps the raw patch primitive split into `patch_u32` (standalone patch with immediate I-cache invalidation) and `patch_u32_deferred_icache` (used by `AddressSpace` while code memory is already unprotected). Upstream oaknut patches through `CodeGenerator::set_xptr` and relies on the caller to invalidate the relevant block range. The Rust split preserves safe standalone tests while making the live `AddressSpace` path match upstream's deferred invalidation model.
+- `AddressSpace::relink_for_descriptor` returns the full block ranges it relinked so the caller can batch them through `BlockOfCode::seal_ranges`. Upstream performs `mem.invalidate(block_info.entry_point, block_info.size)` directly inside `RelinkForDescriptor`; returning ranges is the Rust adaptation needed because `seal_ranges` also owns the final Apple JIT write-protect transition.
+
+### Unintentional differences (to fix)
+- No remaining difference for ARM64 link/relink I-cache invalidation in this slice. Rust no longer flushes each `patch_u32` in the live `AddressSpace` path. `Emit` invalidates the newly emitted block, and `RelinkForDescriptor` contributes every relinked existing block as a full-block invalidation, matching upstream's block-granularity behavior.
+
+### Missing items
+- `invalidate_basic_blocks` still keeps its historical non-`Result` Rust signature and therefore cannot propagate a relink error. It now follows upstream ordering (`unprotect`, relink to no target, remove current entries, protect) and invalidates relinked block ranges, but the error surface is still Rust-specific.
+- Fastmem remains unavailable on macOS ARM64 with the current 4 KiB fastmem arena assumptions; this slice only corrects code-cache patch invalidation ordering.
+
+### Binary layout verification
+- N/A: host code-cache invalidation/protection only; no guest ABI or raw-copied structure changed.
+
+### Verification
+- Re-read upstream `AddressSpace::Emit` in `externals/dynarmic/src/dynarmic/backend/arm64/address_space.cpp`; it calls `UnprotectCodeMemory()`, emits, inserts maps, calls `Link`, calls `RelinkForDescriptor`, invalidates the newly emitted block range, then protects code memory.
+- Re-read upstream `RelinkForDescriptor`; for every block that references the target descriptor, it calls `LinkBlockLinks` and then invalidates that entire referenced block (`mem.invalidate(block_info.entry_point, block_info.size)`).
+- Re-read upstream `InvalidateBasicBlocks`; it unprotects code memory, relinks invalidated descriptors to no target before removing current entries, then protects code memory.
+- `cd externals/rdynarmic && cargo test -p rdynarmic address_space -- --nocapture` passes.
+- `cd externals/rdynarmic && cargo test -p rdynarmic block_of_code -- --nocapture` passes.
+- `cd externals/rdynarmic && cargo check --tests` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- Pinball runtime verification with `RUST_LOG=info timeout 35s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro`: timeout exit `124`, `OpenAudioRenderer` at 4.91s, `IAudioRenderer::Start` at 4.92s, first `BQP_QUEUE` at 6.27s, and `BQP_QUEUE #1024` at 23.33s. No recurrence of the prior `exit=139` crash.

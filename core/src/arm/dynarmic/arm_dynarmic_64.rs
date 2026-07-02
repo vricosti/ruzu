@@ -13,6 +13,7 @@ use crate::arm::arm_interface::{
 };
 use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::memory::memory::Memory;
+use common::page_table::PageInfo;
 
 use rdynarmic::backend::x64::jit_state::A64JitState;
 use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
@@ -2182,7 +2183,7 @@ impl ArmDynarmic64 {
     pub fn new(
         _system: &dyn std::any::Any,
         uses_wall_clock: bool,
-        _process: &KProcess,
+        process: &KProcess,
         exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
         core_index: usize,
         shared_memory: SharedProcessMemory,
@@ -2199,6 +2200,18 @@ impl ArmDynarmic64 {
         // `RUZU_NO_FASTMEM=1` env-var disables fastmem entirely (forces
         // the slow callback path for all memory accesses) — useful for
         // debugging fastmem-related issues without rebuilding.
+        let page_table_pointer: Option<*const u8> = {
+            let kernel_process = unsafe {
+                &*(process as *const _ as *const crate::hle::kernel::k_process::KProcess)
+            };
+            kernel_process
+                .page_table
+                .get_base()
+                .get_impl()
+                .map(|page_table| page_table.pointers.data() as *const u8)
+                .filter(|p| !p.is_null())
+        };
+
         let fastmem_pointer: Option<*mut u8> = if std::env::var("RUZU_NO_FASTMEM").is_ok() {
             log::warn!("ArmDynarmic64: RUZU_NO_FASTMEM set — fastmem disabled");
             None
@@ -2226,7 +2239,8 @@ impl ArmDynarmic64 {
         );
 
         log::warn!(
-            "ArmDynarmic64: fastmem_pointer={:?} for core {}",
+            "ArmDynarmic64: page_table_pointer={:?} fastmem_pointer={:?} for core {}",
+            page_table_pointer.map(|p| p as usize),
             fastmem_pointer.map(|p| p as usize),
             core_index
         );
@@ -2294,7 +2308,7 @@ impl ArmDynarmic64 {
                 Some(unsafe { (*exclusive_monitor).get_monitor() as *mut _ })
             },
             fastmem_pointer,
-            page_table_pointer: None,
+            page_table_pointer,
             define_unpredictable_behaviour: true,
             processor_id: core_index as usize,
             wall_clock_cntpct: uses_wall_clock,
@@ -2312,15 +2326,15 @@ impl ArmDynarmic64 {
             memory: rdynarmic::backend::x64::emit_context::MemoryEmitConfig {
                 fastmem_address_space_bits: 39,
                 silently_mirror_fastmem: false,
-                fastmem_exclusive_access: false,
+                fastmem_exclusive_access: fastmem_pointer.is_some() && !exclusive_monitor.is_null(),
                 recompile_on_fastmem_failure: true,
-                page_table_present: false,
+                page_table_present: page_table_pointer.is_some(),
                 page_table_address_space_bits: 39,
                 silently_mirror_page_table: false,
                 absolute_offset_page_table: true,
-                page_table_pointer_mask_bits: 0,
-                detect_misaligned_access_via_page_table: 0,
-                only_detect_misalignment_via_page_table_on_page_boundary: false,
+                page_table_pointer_mask_bits: PageInfo::ATTRIBUTE_BITS as u32,
+                detect_misaligned_access_via_page_table: 16 | 32 | 64 | 128,
+                only_detect_misalignment_via_page_table_on_page_boundary: true,
                 check_halt_on_memory_access: false,
                 processor_id: core_index as usize,
             },
