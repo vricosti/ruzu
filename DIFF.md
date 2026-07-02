@@ -19439,6 +19439,29 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `deko3d-depth-min` under Vulkan/MoltenVK timed out normally at 15s and dumped `/tmp/ruzu_deko3d_depth_next.ppm` at frame 300 (`2560x1440`), then continued presenting through frame 513 before timeout. No panic, `DEVICE_LOST`, `Unimplemented`, or `PrefetchAbort` appeared.
 - `deko3d-mrt-min` under Vulkan/MoltenVK timed out normally at 15s and dumped `/tmp/ruzu_deko3d_mrt_next.ppm` at frame 300 (`2560x1440`), then continued presenting through frame 513 before timeout. No panic, `DEVICE_LOST`, `Unimplemented`, or `PrefetchAbort` appeared.
 
+## 2026-07-02 — video_core/src/texture_cache/texture_cache.rs tests vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Updated Rust tests only. The runtime behavior already matches upstream: `TextureCache<P>::JoinImages` ends by calling `RegisterImage(new_image_id)`, so a newly joined common-cache image is registered immediately even when Vulkan backend materialization is deferred through `pending_backend_insertions`.
+- The backend-completion split remains a Rust architectural adaptation: `TextureCacheBase` owns upstream metadata/lifecycle registration, while the Vulkan wrapper later materializes backend `Image`/`ImageView` resources.
+
+### Unintentional differences (to fix)
+- None in this slice. The previous test expectations were stale and contradicted upstream registration ordering.
+
+### Missing items
+- This does not complete the remaining runtime validation gap for accelerated Vulkan DMA image upload/download producer paths.
+- This does not validate `CopyImageMSAA`, `ReinterpretImage`, or `ConvertImage` pending-join branches.
+
+### Binary layout verification
+- N/A: tests only; no raw-copied guest payload or packed structure changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages` in `video_core/texture_cache/texture_cache.h`; it calls `RegisterImage(new_image_id)` immediately before returning.
+- Re-read Rust `TextureCacheBase::join_images` / `find_or_insert_image_from_info_with_options_result`; registration is immediate and backend materialization is queued separately.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core backend -- --nocapture` passes (`20 passed`).
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pending_join -- --nocapture` passes (`4 passed`).
+- SpaceCadetPinball-NX under Vulkan/MoltenVK timed out normally at 45s, queued/released frames through `BQP_QUEUE #32` / `BQC_RELEASE #32`, and showed no panic, `DEVICE_LOST`, `Unimplemented`, `PrefetchAbort`, or `UndefinedInstruction`. The known MoltenVK primitive-restart warning remains present.
+
 ## 2026-07-02 — video_core/src/engines/maxwell_dma.rs, video_core/src/renderer_vulkan/mod.rs, and video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp and video_core/texture_cache/texture_cache.h
 
 ### Intentional differences
@@ -19490,3 +19513,112 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `MaxwellDMA::CopyPitchToBlockLinear` in `video_core/engines/maxwell_dma.cpp`.
 - Re-read Rust `TextureCacheBase::dma_image_id`, `TextureCacheBase::find_dma_image`, and `MaxwellDMA::copy_pitch_to_blocklinear`.
 - SpaceCadetPinball-NX under Vulkan/MoltenVK with `RUZU_TRACE_DMA_IMAGE=1 RUZU_TRACE_TEXTURE_CACHE_ADDRS=0xA299000` timed out normally at 45s. The log shows `vk buffer->image no image ... dst=0xA299000` at `32.554520s`, then `TEX_CACHE miss_join/join_begin/join_end id=2 gpu=0xA299000 ... fmt=A8B8G8R8Unorm 600x416` at `32.565136s`, proving image creation happens after the DMA acceleration attempt. Subsequent frames repeat the same fallback-first pattern while presentation continues through `BQP_QUEUE` / `BQC_RELEASE`.
+
+## 2026-07-02 — video_core/src/buffer_cache/buffer_cache.rs vs video_core/buffer_cache/buffer_cache.h and video_core/buffer_cache/buffer_cache_base.h
+
+### Intentional differences
+- `for_each_buffer_in_range` uses a bounds-checked page-table lookup and stops when the requested range is outside the tracked 34-bit page table. Upstream indexes `page_table[page]` directly because the C++ device address space/page table contract assumes the range is representable; the Rust guard preserves the upstream observable behavior for unregistered ranges (no matching buffers, so no downloads) while preventing an out-of-bounds panic when a fallback DMA range exceeds the currently represented table.
+- `download_memory` collects `BufferId`s before calling `download_buffer_memory_range` to satisfy Rust borrowing rules. The visited buffer set and order still come from `for_each_buffer_in_range`, matching upstream `DownloadMemory`.
+- `create_buffer` only performs direct `gl::CreateBuffers` materialization when `P::IS_OPENGL` is true. Upstream materializes the backend buffer in the backend-specific `Buffer` constructor (`OpenGL::Buffer` for GL, `Vulkan::Buffer`/runtime for Vulkan); the Rust common slot stores a backend-agnostic `gpu_handle`, so non-OpenGL backends must let `BufferCacheRuntime::initialize_backend_buffer` create the API object.
+
+### Unintentional differences (to fix)
+- Other Rust buffer-cache paths still index `page_table` directly and were not audited in this slice. They should be checked separately against the upstream helpers before claiming full buffer-cache parity.
+
+### Missing items
+- This does not make the Vulkan DMA image path accelerate successfully; it only fixes the fallback CPU-download crash exposed when `DmaImageId` cannot resolve an image.
+- A positive accelerated DMA workload is still needed for `TextureCacheVulkan::dma_buffer_image_copy -> Image::upload_memory` and `TextureCacheVulkan::download_image_into_buffer`.
+- The common buffer cache still stores a single `gpu_handle: u32` on `BufferBase` instead of using backend-specific `P::Buffer` slot ownership like upstream. The `P::IS_OPENGL` guard prevents cross-backend GL calls, but the fuller upstream-faithful shape would make buffer slots backend-typed.
+
+### Binary layout verification
+- N/A: control-flow/lifecycle fix only; no raw-copied guest payload or packed structure changed.
+
+### Verification
+- Re-read upstream `BufferCache<P>::DownloadMemory` in `video_core/buffer_cache/buffer_cache.h`; it delegates to `ForEachBufferInRange`.
+- Re-read upstream `BufferCache<P>::ForEachBufferInRange` in `video_core/buffer_cache/buffer_cache_base.h`; it skips invalid page-table entries and visits each overlapping registered buffer.
+- Re-read upstream backend ownership expectations: `BufferCache<P>::CreateBuffer` constructs backend `Buffer` through the template parameter, while Rust's common `BufferBase` delegates non-OpenGL materialization to `BufferCacheRuntime::initialize_backend_buffer`.
+- Re-read Rust `BufferCache::download_memory` and `BufferCache::for_each_buffer_in_range`; `download_memory` now delegates through the shared helper, and the helper preserves upstream iteration while avoiding out-of-bounds page-table access.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core test_download_memory_outside_page_table_is_noop -- --nocapture` passes.
+
+## 2026-07-02 — video_core/src/texture_cache/texture_cache.rs, video_core/src/renderer_vulkan/texture_cache.rs, video_core/src/renderer_vulkan/mod.rs, and video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/texture_cache/texture_cache.h and video_core/renderer_vulkan/vk_rasterizer.cpp
+
+### Intentional differences
+- `TextureCacheBase::write_downloaded_image` keeps the normal upstream path first: when the channel `gpu_memory` lock is available it swizzles downloaded image data through `image.gpu_addr`, matching upstream `SwizzleImage(*gpu_memory, image.gpu_addr, ...)`.
+- If the Rust-only `Arc<parking_lot::Mutex<MemoryManager>>` wrapper is already locked by a safe read that triggered `FlushRegion`, `write_downloaded_image` falls back to the direct guest-memory writer and swizzles through `image.cpu_addr`. Upstream does not need this branch because `Tegra::MemoryManager& gpu_memory` is not protected by this outer Rust mutex during `ReadBlockImpl` flush callbacks. The fallback preserves the intended memory contents and avoids an artificial Rust self-deadlock.
+- Vulkan now forwards `RendererBase::set_guest_memory_writer` through `RendererVulkan -> RasterizerVulkan -> TextureCache`, matching the OpenGL renderer wiring pattern and giving the Vulkan texture cache the direct guest-memory writeback path it already expected.
+
+### Unintentional differences (to fix)
+- The broader Rust `Arc<Mutex<MemoryManager>>` ownership model can still expose similar re-entrancy hazards in other safe-read callbacks. This slice fixes the texture-download writeback path reached by Vulkan DMA fallback; it does not audit every `memory_manager.lock().read_block(...)` caller.
+
+### Missing items
+- This does not make the accelerated Vulkan DMA image path resolve a real `ImageId`; the observed fixture still reports `vk image->buffer no image` before falling back.
+- A future structural cleanup should reduce or remove the outer `MemoryManager` mutex where upstream uses direct channel-owned `Tegra::MemoryManager&`, but that is larger than this targeted deadlock fix.
+
+### Binary layout verification
+- N/A: renderer/cache wiring and writeback control-flow fix only; no raw-copied guest payload or packed structure changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::DownloadMemory` in `video_core/texture_cache/texture_cache.h`; it downloads to staging, finishes the runtime, then calls `SwizzleImage(*gpu_memory, image.gpu_addr, ...)`.
+- Re-read upstream `RasterizerVulkan::FlushRegion` in `video_core/renderer_vulkan/vk_rasterizer.cpp`; it locks the texture cache and calls `texture_cache.DownloadMemory(addr, size)`.
+- Re-read Rust `TextureCacheBase::write_downloaded_image`, `TextureCacheVulkan::set_guest_memory_writer`, `RasterizerVulkan::set_guest_memory_writer`, and `RendererVulkan::set_guest_memory_writer`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core write_downloaded_image -- --nocapture` passes.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/graphics_pipeline.rs vs video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+
+### Intentional differences
+- `primitive_restart_enable_for_pipeline` is a Rust-local helper extracted from upstream's `input_assembly_ci.primitiveRestartEnable` initializer to make the exact selection testable. It remains in the `vk_graphics_pipeline.cpp` counterpart file and does not change ownership.
+- Rust uses `bool` instead of `VK_TRUE`/`VK_FALSE`; the boolean expression matches upstream's topology/device-feature gate.
+
+### Unintentional differences (to fix)
+- No remaining difference for the primitive-restart pipeline-state selection in this slice. Rust previously forced `primitiveRestartEnable = false` whenever `extended_dynamic_state_2` was present; upstream does not. That divergence caused MoltenVK to reject graphics pipeline creation with `VK_ERROR_FEATURE_NOT_PRESENT` on Apple Silicon, leaving deko3d-dma-min presenting only its clear color.
+
+### Missing items
+- Other pipeline-state fields were not audited in this slice. This entry only covers primitive restart input-assembly state and the associated dynamic-state interaction.
+
+### Binary layout verification
+- N/A: Vulkan pipeline-create state selection only; no raw-copied guest payload or packed structure changed.
+
+### Verification
+- Re-read upstream `GraphicsPipeline` interface in `video_core/renderer_vulkan/vk_graphics_pipeline.h`.
+- Re-read upstream `input_assembly_ci.primitiveRestartEnable` and dynamic-state list construction in `video_core/renderer_vulkan/vk_graphics_pipeline.cpp`.
+- Re-read Rust `GraphicsPipeline::create_graphics_pipeline` and `primitive_restart_supported_for_topology` in `video_core/src/renderer_vulkan/graphics_pipeline.rs`.
+- Added `primitive_restart_pipeline_state_matches_upstream_dynamic_state2_behavior` to lock the upstream rule that `extended_dynamic_state_2` must not force the pipeline's primitive-restart field to false.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/fixed_pipeline_state.rs vs video_core/renderer_vulkan/fixed_pipeline_state.cpp
+
+### Intentional differences
+- Rust `FixedPipelineState::refresh` still consumes the existing `DrawCall` snapshot instead of direct `Maxwell3D::Regs&`; this is an existing bridge in the Rust renderer. The newly ported front-face logic stays in the upstream counterpart file and uses `draw.window_origin_flip_y`, the snapshot field corresponding to `regs.window_origin.flip_y`.
+- Added `refresh_flips_front_face_when_window_origin_flip_y_matches_upstream` as a Rust unit test for upstream's packed-front-face flip rule.
+
+### Unintentional differences (to fix)
+- No remaining difference for the `DynamicState::Refresh` front-face flip rule. Rust previously stored `draw.rasterizer.front_face` directly; upstream packs `regs.gl_front_face` and flips the packed bit when `regs.window_origin.flip_y != 0`.
+
+### Missing items
+- Other `FixedPipelineState::Refresh` register fields were not audited in this slice. This entry only covers the front-face/window-origin ordering.
+
+### Binary layout verification
+- N/A: bitfield packing behavior only; no guest raw-copied ABI payload changed.
+
+### Verification
+- Re-read upstream `FixedPipelineState::DynamicState::Refresh` in `video_core/renderer_vulkan/fixed_pipeline_state.cpp`; it performs `packed_front_face = 1 - packed_front_face` when `regs.window_origin.flip_y != 0` before assigning `front_face`.
+- Re-read Rust `FixedPipelineState::refresh`; it now performs the same packed-bit flip using `draw.window_origin_flip_y`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core refresh_flips_front_face_when_window_origin_flip_y_matches_upstream -- --nocapture` passes.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h and video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust `TextureCache::sampler_handle` materializes a backend `VkSampler` lazily from `base.slot_samplers[id]`, because ruzu stores raw `TscEntry` descriptors in the common cache and backend samplers in the Vulkan cache. Upstream stores `P::Sampler` directly in `slot_samplers` and `GetSampler(id)` returns that object by reference.
+
+### Unintentional differences (to fix)
+- No remaining difference for `NULL_SAMPLER_ID` handling in this slice. Rust previously returned `None` for `SamplerId(0)` and fell back to the renderer fallback sampler; upstream `GetSampler(SamplerId{0})` returns `slot_samplers[0]`, the configured null sampler descriptor inserted during `TextureCache<P>` construction.
+
+### Missing items
+- The null sampler descriptor itself still matches upstream's constructor fields (`Linear` min/mag/mipmap and cubemap anisotropy), including `max_lod_clamp == 0`. Do not widen its max LOD as a renderer fix: `deko3d-dma-min` presenting blue was also observed under `yuzu.app`, so the all-blue result is not a ruzu-only sampler bug.
+
+### Binary layout verification
+- N/A: backend sampler materialization control flow only; `TscEntry` layout was not changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::TextureCache`, `TextureCache<P>::FindSampler`, and `TextureCache<P>::GetSampler` in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `Vulkan::Sampler::Sampler(TextureCacheRuntime&, const TSCEntry&)` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read Rust `TextureCacheBase::new`, `TextureCacheBase::find_sampler`, and `TextureCache::sampler_handle`.
+- Runtime diagnosis on `deko3d-dma-min`: ruzu reads graphics `TSC[0]` as all zero, maps it to `NULL_SAMPLER_ID`, and now binds the backend null sampler instead of the renderer fallback sampler. With upstream-faithful `maxLod=0`, the final `textureLod(..., 1.0)` samples mip0 and the frame remains blue; a temporary non-faithful max-LOD override made the red triangles appear, proving the mechanism but not a valid upstream-faithful fix. User comparison with `yuzu.app` also showed an all-blue frame.

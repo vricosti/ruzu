@@ -2646,6 +2646,10 @@ impl TextureCache {
         }
     }
 
+    pub fn set_guest_memory_writer(&mut self, writer: crate::renderer_base::GuestMemoryWriter) {
+        self.base.set_guest_memory_writer(writer);
+    }
+
     /// Port of the Vulkan texture-cache owner `CreateChannel` edge.
     pub fn create_channel(&mut self, channel: &ChannelState) {
         self.channel_caches.create_channel(channel);
@@ -3048,6 +3052,9 @@ impl TextureCache {
             return false;
         };
 
+        let async_buffer_id = self.uncommitted_async_buffers.len();
+        self.uncommitted_async_buffers.push(download_map);
+
         let Some(mut image) = self.images.remove(&image_id) else {
             if trace_dma {
                 log::info!(
@@ -3057,14 +3064,18 @@ impl TextureCache {
             }
             let _ = self.base.slot_buffer_downloads.take(slot);
             let _ = self.base.uncommitted_downloads.pop();
-            self.runtime.free_deferred_staging_buffer(&mut download_map);
+            if let Some(mut download_map) = self.uncommitted_async_buffers.pop() {
+                self.runtime.free_deferred_staging_buffer(&mut download_map);
+            }
             return false;
         };
         image.base = image_base;
+        let download_buffer = self.uncommitted_async_buffers[async_buffer_id].buffer;
+        let download_offset = self.uncommitted_async_buffers[async_buffer_id].offset;
         let downloaded = image.download_memory(
             &mut self.runtime,
-            &[buffer, download_map.buffer],
-            &[buffer_offset, download_map.offset],
+            &[buffer, download_buffer],
+            &[buffer_offset, download_offset],
             copies,
         );
         self.base.slot_images[image_id].flags = image.base.flags;
@@ -3083,7 +3094,9 @@ impl TextureCache {
             }
             let _ = self.base.slot_buffer_downloads.take(slot);
             let _ = self.base.uncommitted_downloads.pop();
-            self.runtime.free_deferred_staging_buffer(&mut download_map);
+            if let Some(mut download_map) = self.uncommitted_async_buffers.pop() {
+                self.runtime.free_deferred_staging_buffer(&mut download_map);
+            }
             return false;
         }
 
@@ -3093,11 +3106,10 @@ impl TextureCache {
                 image_id.index,
                 address,
                 size,
-                self.uncommitted_async_buffers.len(),
-                download_map.buffer.as_raw()
+                async_buffer_id,
+                download_buffer.as_raw()
             );
         }
-        self.uncommitted_async_buffers.push(download_map);
         true
     }
 
@@ -3224,6 +3236,20 @@ impl TextureCache {
             extent.width = extent.width.min(width);
             extent.height = extent.height.min(height);
             let view_handle = self.image_views.get(&view_id)?.render_target();
+            if std::env::var_os("RUZU_TRACE_VK_RT_FRAMEBUFFER").is_some() {
+                log::info!(
+                    "[VK_RT_FRAMEBUFFER_VIEW] color view_id={} image_id={} view_gpu=0x{:X} image_gpu=0x{:X} view_size={}x{} image_size={}x{} range={:?}",
+                    view_id.index,
+                    view.image_id.index,
+                    view.gpu_addr,
+                    image_base.gpu_addr,
+                    view.size.width,
+                    view.size.height,
+                    image_base.info.size.width,
+                    image_base.info.size.height,
+                    view.range,
+                );
+            }
             colors.push((view_id, format));
             color_views.push(view_handle);
         }
@@ -5755,8 +5781,7 @@ impl TextureCache {
     /// Port-facing subset of upstream `TextureCache::GetSampler(id).Handle()`.
     pub fn sampler_handle(&mut self, sampler_id: SamplerId) -> Option<vk::Sampler> {
         self.finish_pending_backend_deletions();
-        use crate::texture_cache::types::NULL_SAMPLER_ID;
-        if !sampler_id.is_valid() || sampler_id == NULL_SAMPLER_ID {
+        if !sampler_id.is_valid() {
             return None;
         }
         if let Some(sampler) = self.samplers.get(&sampler_id) {

@@ -646,13 +646,12 @@ impl GraphicsPipelineCache {
             .build();
 
         let input_assembly_topology = super::map_topology(draw.topology);
-        let primitive_restart_enable = !fixed_state.extended_dynamic_state_2()
-            && fixed_state.dynamic_state.primitive_restart_enable()
-            && primitive_restart_supported_for_topology(
-                input_assembly_topology,
-                self.topology_list_primitive_restart_supported,
-                self.patch_list_primitive_restart_supported,
-            );
+        let primitive_restart_enable = primitive_restart_enable_for_pipeline(
+            fixed_state.dynamic_state.primitive_restart_enable(),
+            input_assembly_topology,
+            self.topology_list_primitive_restart_supported,
+            self.patch_list_primitive_restart_supported,
+        );
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
             .topology(input_assembly_topology)
             .primitive_restart_enable(primitive_restart_enable)
@@ -808,6 +807,24 @@ fn primitive_restart_supported_for_topology(
     (topology != vk::PrimitiveTopology::PATCH_LIST && topology_list_primitive_restart_supported)
         || supports_primitive_restart(topology)
         || (topology == vk::PrimitiveTopology::PATCH_LIST && patch_list_primitive_restart_supported)
+}
+
+/// Port of `input_assembly_ci.primitiveRestartEnable` selection in
+/// `vk_graphics_pipeline.cpp`. Upstream does not force this to false when
+/// `VK_EXT_extended_dynamic_state2` is active; the dynamic state is added
+/// separately to the pipeline dynamic-state list.
+fn primitive_restart_enable_for_pipeline(
+    dynamic_primitive_restart_enable: bool,
+    topology: vk::PrimitiveTopology,
+    topology_list_primitive_restart_supported: bool,
+    patch_list_primitive_restart_supported: bool,
+) -> bool {
+    dynamic_primitive_restart_enable
+        && primitive_restart_supported_for_topology(
+            topology,
+            topology_list_primitive_restart_supported,
+            patch_list_primitive_restart_supported,
+        )
 }
 
 fn add_shader_descriptor_bindings(
@@ -1197,6 +1214,28 @@ mod tests {
         assert!(primitive_restart_supported_for_topology(
             vk::PrimitiveTopology::PATCH_LIST,
             false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn primitive_restart_pipeline_state_matches_upstream_dynamic_state2_behavior() {
+        assert!(primitive_restart_enable_for_pipeline(
+            true,
+            vk::PrimitiveTopology::TRIANGLE_STRIP,
+            false,
+            false,
+        ));
+        assert!(primitive_restart_enable_for_pipeline(
+            true,
+            vk::PrimitiveTopology::TRIANGLE_LIST,
+            true,
+            false,
+        ));
+        assert!(!primitive_restart_enable_for_pipeline(
+            false,
+            vk::PrimitiveTopology::TRIANGLE_STRIP,
+            true,
             true,
         ));
     }

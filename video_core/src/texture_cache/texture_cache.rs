@@ -412,18 +412,19 @@ impl TextureCacheBase {
         staging: &[u8],
     ) -> bool {
         if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
-            let gpu_memory = gpu_memory.lock();
-            super::util::swizzle_image(
-                &|gpu_addr, data| {
-                    let _ = gpu_memory.write_block_unsafe(gpu_addr, data);
-                },
-                image.gpu_addr,
-                &image.info,
-                copies,
-                staging,
-                &mut self.swizzle_data_buffer,
-            );
-            return true;
+            if let Some(gpu_memory) = gpu_memory.try_lock() {
+                super::util::swizzle_image(
+                    &|gpu_addr, data| {
+                        let _ = gpu_memory.write_block_unsafe(gpu_addr, data);
+                    },
+                    image.gpu_addr,
+                    &image.info,
+                    copies,
+                    staging,
+                    &mut self.swizzle_data_buffer,
+                );
+                return true;
+            }
         }
 
         let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
@@ -3114,7 +3115,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_image_views_defers_backend_completion_for_inserted_tic_image() {
+    fn fill_image_views_registers_common_image_and_defers_backend_materialization() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
@@ -3170,7 +3171,7 @@ mod tests {
 
         let image_id = cache.slot_image_views[views[0].id].image_id;
         assert_eq!(cache.pending_backend_insertions, vec![image_id]);
-        assert!(!cache.slot_images[image_id]
+        assert!(cache.slot_images[image_id]
             .flags
             .contains(ImageFlagBits::REGISTERED));
     }
@@ -4479,6 +4480,67 @@ mod tests {
     }
 
     #[test]
+    fn write_downloaded_image_uses_guest_writer_when_channel_memory_is_locked() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex as ParkingMutex;
+        use std::sync::{Arc, Mutex};
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
+            7,
+            22,
+            1 << 22,
+            16,
+            12,
+        )));
+        cache.set_channel_gpu_memory(Arc::clone(&gpu_memory));
+
+        let writes = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
+        let writes_for_callback = Arc::clone(&writes);
+        cache.set_guest_memory_writer(Arc::new(move |addr, data| {
+            writes_for_callback
+                .lock()
+                .unwrap()
+                .push((addr, data.to_vec()));
+        }));
+
+        let _held_channel_lock = gpu_memory.lock();
+        let mut info = ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::Linear,
+            size: crate::texture_cache::types::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            tiling: TilingMode::PitchLinear(4),
+            ..ImageInfo::default()
+        };
+        info.resources.levels = 1;
+        info.resources.layers = 1;
+        let image = ImageBase::new(info, 0x4000, 0x8000);
+        let copy = BufferImageCopy {
+            buffer_offset: 0,
+            buffer_size: 4,
+            buffer_row_length: 1,
+            buffer_image_height: 1,
+            image_subresource: SubresourceLayers::default(),
+            image_offset: Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        };
+
+        assert!(cache.write_downloaded_image(&image, &[copy], &[1, 2, 3, 4]));
+        let writes = writes.lock().unwrap();
+        assert!(!writes.is_empty());
+        assert_eq!(writes[0].0, 0x8000);
+    }
+
+    #[test]
     fn register_image_updates_gpu_page_table_and_unregister_clears_it() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
@@ -4729,7 +4791,6 @@ mod tests {
         };
         info.is_sparse = true;
         let old_id = cache.join_images(&info, 0x8000, 0xA000);
-        cache.register_image(old_id);
 
         let new_id = cache.join_images(&info, 0x8000, 0xD000);
 
@@ -4816,8 +4877,6 @@ mod tests {
         };
         info.is_sparse = true;
         let old_id = cache.join_images(&info, 0x8000, 0xA000);
-        cache.register_image(old_id);
-        cache.register_image_alloc(old_id);
         cache.slot_images[old_id]
             .flags
             .insert(ImageFlagBits::GPU_MODIFIED);
@@ -5042,7 +5101,7 @@ mod tests {
         assert!(result.inserted);
         assert!(result.needs_backend_completion);
         assert!(!result.queued_join_tail);
-        assert!(!cache.slot_images[result.image_id]
+        assert!(cache.slot_images[result.image_id]
             .flags
             .contains(ImageFlagBits::REGISTERED));
     }

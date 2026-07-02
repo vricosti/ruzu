@@ -1073,8 +1073,14 @@ impl FixedPipelineState {
         self.dynamic_state
             .set_cull_enable(draw.rasterizer.cull_enable);
         self.dynamic_state.set_cull_face(draw.rasterizer.cull_face);
+        let mut front_face = pack_front_face(draw.rasterizer.front_face);
+        if draw.window_origin_flip_y {
+            // Upstream flips the packed front-face bit when
+            // `regs.window_origin.flip_y != 0`.
+            front_face = 1 - front_face;
+        }
         self.dynamic_state
-            .set_front_face(draw.rasterizer.front_face);
+            .set_front_face(unpack_front_face(front_face));
         self.dynamic_state
             .set_depth_test_enable(draw.depth_stencil.depth_test_enable);
         self.dynamic_state
@@ -1347,6 +1353,21 @@ mod tests {
         assert_eq!(ds.depth_test_func(), ComparisonOp::Less);
         assert_eq!(ds.front_face(), FrontFace::CCW);
         assert!(ds.stencil_enable());
+    }
+
+    #[test]
+    fn refresh_flips_front_face_when_window_origin_flip_y_matches_upstream() {
+        let mut draw = make_test_draw_call();
+        draw.rasterizer.front_face = FrontFace::CCW;
+        draw.window_origin_flip_y = false;
+
+        let mut state = FixedPipelineState::default();
+        state.refresh(&draw);
+        assert_eq!(state.dynamic_state.front_face(), FrontFace::CCW);
+
+        draw.window_origin_flip_y = true;
+        state.refresh(&draw);
+        assert_eq!(state.dynamic_state.front_face(), FrontFace::CW);
     }
 
     #[test]

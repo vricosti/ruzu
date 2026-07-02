@@ -414,25 +414,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::DownloadMemory`
     pub fn download_memory(&mut self, device_addr: VAddr, size: u64) {
-        // Collect overlapping buffer IDs first to avoid borrow issues.
         let mut buffer_ids = Vec::new();
-        {
-            let page_end = div_ceil(device_addr + size, CACHING_PAGESIZE);
-            let mut page = device_addr >> CACHING_PAGEBITS;
-            while page < page_end {
-                let buffer_id = self.page_table[page as usize];
-                if !buffer_id.is_valid() {
-                    page += 1;
-                    continue;
-                }
-                if !buffer_ids.contains(&buffer_id) {
-                    buffer_ids.push(buffer_id);
-                }
-                let buffer = &self.slot_buffers[buffer_id];
-                let end_addr = buffer.cpu_addr() + buffer.size_bytes() as u64;
-                page = div_ceil(end_addr, CACHING_PAGESIZE);
-            }
-        }
+        self.for_each_buffer_in_range(device_addr, size, |buffer_id, _buffer| {
+            buffer_ids.push(buffer_id);
+        });
         for buffer_id in buffer_ids {
             self.download_buffer_memory_range(buffer_id, device_addr, size);
         }
@@ -1659,7 +1644,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let page_end = div_ceil(device_addr + size, CACHING_PAGESIZE);
         let mut page = device_addr >> CACHING_PAGEBITS;
         while page < page_end {
-            let buffer_id = self.page_table[page as usize];
+            let Some(&buffer_id) = self.page_table.get(page as usize) else {
+                break;
+            };
             if !buffer_id.is_valid() {
                 page += 1;
                 continue;
@@ -3322,23 +3309,24 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         let mut new_buffer = BufferBase::new(overlap.begin, size as u64);
 
-        // Allocate a GPU buffer object for this buffer. Upstream does this
-        // inside `Buffer::Buffer(runtime, ...)` (the backend-specific
-        // constructor). The Rust port allocates on `BufferBase` directly
-        // because the slot vector is not parameterised by backend type.
-        unsafe {
-            gl::CreateBuffers(1, &mut new_buffer.gpu_handle);
-            if new_buffer.gpu_handle != 0 {
-                // Upstream OpenGL `Buffer::Buffer` uses glNamedBufferData with
-                // GL_DYNAMIC_DRAW. This cache uploads through glNamedBufferSubData;
-                // do not allocate persistent storage unless the mapped path is
-                // actually ported.
-                gl::NamedBufferData(
-                    new_buffer.gpu_handle,
-                    size as isize,
-                    std::ptr::null(),
-                    gl::DYNAMIC_DRAW,
-                );
+        if P::IS_OPENGL {
+            // OpenGL creates the backend object directly because its handle is
+            // the GL name stored on BufferBase. Other backends materialize via
+            // BufferCacheRuntime::initialize_backend_buffer below.
+            unsafe {
+                gl::CreateBuffers(1, &mut new_buffer.gpu_handle);
+                if new_buffer.gpu_handle != 0 {
+                    // Upstream OpenGL `Buffer::Buffer` uses glNamedBufferData with
+                    // GL_DYNAMIC_DRAW. This cache uploads through glNamedBufferSubData;
+                    // do not allocate persistent storage unless the mapped path is
+                    // actually ported.
+                    gl::NamedBufferData(
+                        new_buffer.gpu_handle,
+                        size as isize,
+                        std::ptr::null(),
+                        gl::DYNAMIC_DRAW,
+                    );
+                }
             }
         }
         if let Some(ref mut rt) = self.runtime {
@@ -4316,6 +4304,14 @@ mod tests {
     }
 
     #[test]
+    fn test_download_memory_outside_page_table_is_noop() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        let outside_tracked_as = (PAGE_TABLE_SIZE as u64) << CACHING_PAGEBITS;
+        cache.download_memory(outside_tracked_as, 0x1000);
+    }
+
+    #[test]
     fn test_get_flush_area() {
         let tracker = DummyTracker;
         let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
@@ -4429,6 +4425,7 @@ mod tests {
         let id2 = cache.find_buffer(addr, size);
         assert_eq!(id1, id2);
         assert_ne!(id1, NULL_BUFFER_ID);
+        assert_eq!(cache.slot_buffers[id1].gpu_handle, 0);
     }
 
     #[test]
