@@ -73,9 +73,14 @@ impl RenderPassCache {
             if format == vk::Format::UNDEFINED {
                 continue;
             }
+            // Upstream `vk_render_pass_cache.cpp` uses one AttachmentDescription
+            // for every render-target attachment: LOAD/STORE (contents persist;
+            // clears are explicit vkCmdClearAttachments), and GENERAL layout
+            // throughout so attachments can be used, sampled and presented
+            // without per-use layout transitions.
             color_refs.push(vk::AttachmentReference {
                 attachment: attachments.len() as u32,
-                layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                layout: vk::ImageLayout::GENERAL,
             });
             attachments.push(
                 vk::AttachmentDescription::builder()
@@ -83,16 +88,18 @@ impl RenderPassCache {
                     .samples(key.samples)
                     .load_op(vk::AttachmentLoadOp::LOAD)
                     .store_op(vk::AttachmentStoreOp::STORE)
-                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                    .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .stencil_load_op(vk::AttachmentLoadOp::LOAD)
+                    .stencil_store_op(vk::AttachmentStoreOp::STORE)
+                    .initial_layout(vk::ImageLayout::GENERAL)
+                    .final_layout(vk::ImageLayout::GENERAL)
                     .build(),
             );
         }
 
-        // If no color attachments, add a default RGBA8 one
-        if color_refs.is_empty() {
+        // If no attachments are bound, keep the legacy fallback colour
+        // attachment. Depth-only render passes are valid and are used by
+        // upstream helper paths such as `Image::BlitScaleHelper`.
+        if color_refs.is_empty() && key.depth_format == vk::Format::UNDEFINED {
             color_refs.push(vk::AttachmentReference {
                 attachment: 0,
                 layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -117,18 +124,22 @@ impl RenderPassCache {
         if has_depth {
             depth_ref = Some(vk::AttachmentReference {
                 attachment: attachments.len() as u32,
-                layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                layout: vk::ImageLayout::GENERAL,
             });
+            // Same as the colour attachments (upstream vk_render_pass_cache.cpp):
+            // LOAD/STORE with GENERAL layout, so the depth/stencil buffer
+            // persists across passes and can be sampled. Guest depth clears are
+            // honoured via explicit vkCmdClearAttachments in RasterizerVulkan.
             attachments.push(
                 vk::AttachmentDescription::builder()
                     .format(key.depth_format)
                     .samples(key.samples)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
-                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                    .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::LOAD)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .stencil_load_op(vk::AttachmentLoadOp::LOAD)
+                    .stencil_store_op(vk::AttachmentStoreOp::STORE)
+                    .initial_layout(vk::ImageLayout::GENERAL)
+                    .final_layout(vk::ImageLayout::GENERAL)
                     .build(),
             );
         } else {

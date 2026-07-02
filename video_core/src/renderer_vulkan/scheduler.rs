@@ -8,7 +8,10 @@
 
 use ash::vk;
 use log::{debug, trace};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use super::state_tracker::StateTracker;
 
 /// Type-erased Vulkan command closure.
 ///
@@ -40,6 +43,17 @@ struct RenderPassState {
     framebuffer: vk::Framebuffer,
     render_area: vk::Rect2D,
     inside_renderpass: bool,
+    images: Vec<vk::Image>,
+    image_ranges: Vec<vk::ImageSubresourceRange>,
+}
+
+/// Port of upstream `Scheduler::State` fields that are independent from the
+/// command-buffer render pass state.
+#[derive(Default)]
+struct SchedulerState {
+    graphics_pipeline: vk::Pipeline,
+    is_rescaling: bool,
+    rescaling_defined: bool,
 }
 
 /// Command buffer scheduler with submission tracking.
@@ -66,8 +80,17 @@ pub struct Scheduler {
     /// Render pass state.
     rp_state: RenderPassState,
 
+    /// Upstream scheduler-local state invalidated by helper draws.
+    state: SchedulerState,
+
     /// Fence for GPU synchronization.
     fence: vk::Fence,
+
+    /// Upstream `Scheduler` owns a `StateTracker&` and invalidates command
+    /// buffer state after helper draws. Some Rust construction paths still
+    /// build a scheduler before a rasterizer state tracker exists, so this is
+    /// installed by the rasterizer once both owners are allocated.
+    state_tracker: Option<NonNull<StateTracker>>,
 }
 
 impl Scheduler {
@@ -91,10 +114,16 @@ impl Scheduler {
             upload_cmdbuf: vk::CommandBuffer::null(),
             current_tick: AtomicU64::new(0),
             rp_state: RenderPassState::default(),
+            state: SchedulerState::default(),
             fence,
+            state_tracker: None,
         };
         scheduler.allocate_new_context()?;
         Ok(scheduler)
+    }
+
+    pub fn set_state_tracker(&mut self, state_tracker: NonNull<StateTracker>) {
+        self.state_tracker = Some(state_tracker);
     }
 
     /// Record a command that only needs the render command buffer.
@@ -121,6 +150,8 @@ impl Scheduler {
         renderpass: vk::RenderPass,
         render_area: vk::Rect2D,
         clear_values: &[vk::ClearValue],
+        images: &[vk::Image],
+        image_ranges: &[vk::ImageSubresourceRange],
     ) {
         if self.rp_state.inside_renderpass {
             // Already in a render pass — check if compatible
@@ -156,6 +187,8 @@ impl Scheduler {
             framebuffer,
             render_area,
             inside_renderpass: true,
+            images: images.to_vec(),
+            image_ranges: image_ranges.to_vec(),
         };
     }
 
@@ -168,13 +201,67 @@ impl Scheduler {
         trace!("Scheduler: ending render pass");
         unsafe {
             self.device.cmd_end_render_pass(self.current_cmdbuf);
+            let barriers: Vec<_> = self
+                .rp_state
+                .images
+                .iter()
+                .zip(self.rp_state.image_ranges.iter())
+                .filter_map(|(&image, &subresource_range)| {
+                    (image != vk::Image::null()).then(|| {
+                        vk::ImageMemoryBarrier::builder()
+                            .src_access_mask(
+                                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                            )
+                            .dst_access_mask(
+                                vk::AccessFlags::SHADER_READ
+                                    | vk::AccessFlags::SHADER_WRITE
+                                    | vk::AccessFlags::COLOR_ATTACHMENT_READ
+                                    | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                            )
+                            .old_layout(vk::ImageLayout::GENERAL)
+                            .new_layout(vk::ImageLayout::GENERAL)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .image(image)
+                            .subresource_range(subresource_range)
+                            .build()
+                    })
+                })
+                .collect();
+            if !barriers.is_empty() {
+                self.device.cmd_pipeline_barrier(
+                    self.current_cmdbuf,
+                    vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &barriers,
+                );
+            }
         }
-        self.rp_state.inside_renderpass = false;
+        self.rp_state = RenderPassState::default();
     }
 
     /// Whether we are currently inside a render pass.
     pub fn is_inside_renderpass(&self) -> bool {
         self.rp_state.inside_renderpass
+    }
+
+    /// Port of upstream `Scheduler::InvalidateState`.
+    pub fn invalidate_state(&mut self) {
+        self.state.graphics_pipeline = vk::Pipeline::null();
+        self.state.rescaling_defined = false;
+        if let Some(mut state_tracker) = self.state_tracker {
+            unsafe {
+                state_tracker.as_mut().invalidate_command_buffer_state();
+            }
+        }
     }
 
     /// Execute all pending commands in the current chunk directly on the command buffer.

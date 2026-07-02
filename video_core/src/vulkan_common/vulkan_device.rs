@@ -38,6 +38,20 @@ pub enum FormatType {
     Buffer,
 }
 
+/// Snapshot of the Vulkan memory heaps tracked by `Device`.
+///
+/// Port-facing helper for runtime owners that currently store
+/// `Instance + PhysicalDevice` instead of the full `Device` wrapper but still
+/// need upstream `Device::GetDeviceLocalMemory`,
+/// `Device::CanReportMemoryUsage`, and `Device::GetDeviceMemoryUsage`
+/// semantics.
+#[derive(Debug, Clone)]
+pub struct DeviceMemoryInfo {
+    pub device_local_memory: u64,
+    pub can_report_memory_usage: bool,
+    valid_heap_memory: Vec<usize>,
+}
+
 // ---------------------------------------------------------------------------
 // NvidiaArchitecture — port of `Vulkan::NvidiaArchitecture`
 // ---------------------------------------------------------------------------
@@ -1114,6 +1128,38 @@ fn physical_memory_properties(
     (properties, None)
 }
 
+/// Query the memory information used by upstream `Device` memory accessors.
+pub fn query_device_memory_info(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+) -> DeviceMemoryInfo {
+    let available_extensions = unsafe {
+        instance
+            .enumerate_device_extension_properties(physical)
+            .unwrap_or_default()
+    };
+    let supported_extensions: BTreeSet<String> = available_extensions
+        .iter()
+        .map(|ext| {
+            let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
+            name.to_string_lossy().into_owned()
+        })
+        .collect();
+    let has_memory_budget = supported_extensions.contains("VK_EXT_memory_budget");
+    let device_properties = unsafe { instance.get_physical_device_properties(physical) };
+    let is_integrated = device_properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+    let (memory_properties, memory_budget) =
+        physical_memory_properties(instance, physical, has_memory_budget);
+    let (device_local_memory, valid_heap_memory) =
+        collect_physical_memory_info(&memory_properties, memory_budget.as_ref(), is_integrated);
+
+    DeviceMemoryInfo {
+        device_local_memory,
+        can_report_memory_usage: has_memory_budget,
+        valid_heap_memory,
+    }
+}
+
 fn collect_physical_memory_info(
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
     memory_budget: Option<&vk::PhysicalDeviceMemoryBudgetPropertiesEXT>,
@@ -1175,6 +1221,21 @@ fn device_memory_usage_from_budget(
         .iter()
         .map(|&heap| memory_budget.heap_usage[heap])
         .sum()
+}
+
+/// Query current memory usage with the same heap filter as `Device`.
+pub fn query_device_memory_usage(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    memory_info: &DeviceMemoryInfo,
+) -> u64 {
+    if !memory_info.can_report_memory_usage {
+        return 0;
+    }
+    let (_, Some(budget)) = physical_memory_properties(instance, physical, true) else {
+        return 0;
+    };
+    device_memory_usage_from_budget(&budget, &memory_info.valid_heap_memory)
 }
 
 fn driver_name_from_id(driver_id: vk::DriverId) -> Option<&'static str> {

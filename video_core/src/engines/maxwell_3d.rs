@@ -2055,6 +2055,11 @@ pub struct DrawCall {
     pub sampler_binding: SamplerBinding,
     /// Render target configurations for up to 8 color targets.
     pub render_targets: [RenderTargetInfo; 8],
+    /// Depth/stencil target configuration (`regs.zeta` + `regs.zeta_size`).
+    pub zeta: ZetaInfo,
+    /// Dirty flags captured with this draw, matching upstream state-tracker
+    /// decisions for render-target refresh.
+    pub dirty_flags: [bool; 256],
 }
 
 /// Port of `Maxwell3D::DirtyState`.

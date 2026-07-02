@@ -71,6 +71,18 @@ pub struct SpirvEmitContext {
     pub patch_vertices_in: spirv::Word,
     pub sample_id: spirv::Word,
     pub is_helper_invocation: spirv::Word,
+    pub primitive_id: spirv::Word,
+    pub layer: spirv::Word,
+    pub instance_id: spirv::Word,
+    pub instance_index: spirv::Word,
+    pub base_instance: spirv::Word,
+    pub vertex_id: spirv::Word,
+    pub vertex_index: spirv::Word,
+    pub base_vertex: spirv::Word,
+    pub draw_index: spirv::Word,
+    pub front_face: spirv::Word,
+    pub point_coord: spirv::Word,
+    pub tess_coord: spirv::Word,
 
     // ── Rescaling / render area push constants ───────────────────────
     pub rescaling_uniform_constant: spirv::Word,
@@ -198,6 +210,18 @@ impl SpirvEmitContext {
             patch_vertices_in: 0,
             sample_id: 0,
             is_helper_invocation: 0,
+            primitive_id: 0,
+            layer: 0,
+            instance_id: 0,
+            instance_index: 0,
+            base_instance: 0,
+            vertex_id: 0,
+            vertex_index: 0,
+            base_vertex: 0,
+            draw_index: 0,
+            front_face: 0,
+            point_coord: 0,
+            tess_coord: 0,
             rescaling_uniform_constant: 0,
             rescaling_push_constants: 0,
             rescaling_downfactor_member_index: 0,
@@ -540,8 +564,123 @@ impl SpirvEmitContext {
             self.interfaces.push(var);
         }
 
+        use crate::ir::value::Attribute as IrAttribute;
+        if info.loads.get(IrAttribute::PRIMITIVE_ID.0 as usize) {
+            self.primitive_id = self.define_builtin_u32_input(spirv::BuiltIn::PrimitiveId);
+        }
+        if info.loads.get(IrAttribute::LAYER.0 as usize) {
+            self.layer = self.define_builtin_u32_input(spirv::BuiltIn::Layer);
+        }
+        if info.loads.get(IrAttribute::INSTANCE_ID.0 as usize) {
+            if self.profile.support_vertex_instance_id {
+                self.instance_id = self.define_builtin_u32_input(spirv::BuiltIn::InstanceId);
+                if info.loads.get(IrAttribute::BASE_INSTANCE.0 as usize) {
+                    self.base_instance =
+                        self.define_builtin_u32_input(spirv::BuiltIn::BaseInstance);
+                }
+            } else {
+                self.instance_index = self.define_builtin_u32_input(spirv::BuiltIn::InstanceIndex);
+                self.base_instance = self.define_builtin_u32_input(spirv::BuiltIn::BaseInstance);
+            }
+        } else if info.loads.get(IrAttribute::BASE_INSTANCE.0 as usize) {
+            self.base_instance = self.define_builtin_u32_input(spirv::BuiltIn::BaseInstance);
+        }
+        if info.loads.get(IrAttribute::VERTEX_ID.0 as usize) {
+            if self.profile.support_vertex_instance_id {
+                self.vertex_id = self.define_builtin_u32_input(spirv::BuiltIn::VertexId);
+                if info.loads.get(IrAttribute::BASE_VERTEX.0 as usize) {
+                    self.base_vertex = self.define_builtin_u32_input(spirv::BuiltIn::BaseVertex);
+                }
+            } else {
+                self.vertex_index = self.define_builtin_u32_input(spirv::BuiltIn::VertexIndex);
+                self.base_vertex = self.define_builtin_u32_input(spirv::BuiltIn::BaseVertex);
+            }
+        } else if info.loads.get(IrAttribute::BASE_VERTEX.0 as usize) {
+            self.base_vertex = self.define_builtin_u32_input(spirv::BuiltIn::BaseVertex);
+        }
+        if info.loads.get(IrAttribute::DRAW_ID.0 as usize) {
+            self.draw_index = self.define_builtin_u32_input(spirv::BuiltIn::DrawIndex);
+        }
+        if info.loads.get(IrAttribute::FRONT_FACE.0 as usize) {
+            let ptr_type =
+                self.builder
+                    .type_pointer(None, spirv::StorageClass::Input, self.bool_type);
+            let var = self
+                .builder
+                .variable(ptr_type, None, spirv::StorageClass::Input, None);
+            self.builder.decorate(
+                var,
+                spirv::Decoration::BuiltIn,
+                vec![Operand::BuiltIn(spirv::BuiltIn::FrontFacing)],
+            );
+            self.front_face = var;
+            self.interfaces.push(var);
+        }
+        if info.loads.get(IrAttribute::POINT_SPRITE_S.0 as usize)
+            || info.loads.get(IrAttribute::POINT_SPRITE_T.0 as usize)
+        {
+            self.point_coord = self.define_builtin_f32_vec2_input(spirv::BuiltIn::PointCoord);
+        }
+        if info
+            .loads
+            .get(IrAttribute::TESSELLATION_EVALUATION_POINT_U.0 as usize)
+            || info
+                .loads
+                .get(IrAttribute::TESSELLATION_EVALUATION_POINT_V.0 as usize)
+        {
+            self.tess_coord = self.define_builtin_f32_vec3_input(spirv::BuiltIn::TessCoord);
+        }
+
         self.define_rescaling_input(info);
         self.define_render_area(info);
+    }
+
+    fn define_builtin_u32_input(&mut self, built_in: spirv::BuiltIn) -> spirv::Word {
+        let ptr_type = self
+            .builder
+            .type_pointer(None, spirv::StorageClass::Input, self.u32_type);
+        let var = self
+            .builder
+            .variable(ptr_type, None, spirv::StorageClass::Input, None);
+        self.builder.decorate(
+            var,
+            spirv::Decoration::BuiltIn,
+            vec![Operand::BuiltIn(built_in)],
+        );
+        self.interfaces.push(var);
+        var
+    }
+
+    fn define_builtin_f32_vec2_input(&mut self, built_in: spirv::BuiltIn) -> spirv::Word {
+        let ptr_type =
+            self.builder
+                .type_pointer(None, spirv::StorageClass::Input, self.f32_vec2_type);
+        let var = self
+            .builder
+            .variable(ptr_type, None, spirv::StorageClass::Input, None);
+        self.builder.decorate(
+            var,
+            spirv::Decoration::BuiltIn,
+            vec![Operand::BuiltIn(built_in)],
+        );
+        self.interfaces.push(var);
+        var
+    }
+
+    fn define_builtin_f32_vec3_input(&mut self, built_in: spirv::BuiltIn) -> spirv::Word {
+        let ptr_type =
+            self.builder
+                .type_pointer(None, spirv::StorageClass::Input, self.f32_vec3_type);
+        let var = self
+            .builder
+            .variable(ptr_type, None, spirv::StorageClass::Input, None);
+        self.builder.decorate(
+            var,
+            spirv::Decoration::BuiltIn,
+            vec![Operand::BuiltIn(built_in)],
+        );
+        self.interfaces.push(var);
+        var
     }
 
     fn define_rescaling_input(&mut self, info: &ShaderInfo) {
@@ -1434,5 +1573,62 @@ impl SpirvEmitContext {
         let mut words = Vec::new();
         module.assemble_into(&mut words);
         words
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::bindings::Bindings;
+    use crate::ir::types::ShaderStage;
+    use crate::ir::value::Attribute;
+
+    #[test]
+    fn vertex_id_declares_vertex_index_and_base_vertex_without_vertex_id_support() {
+        let mut program = ir::Program::new(ShaderStage::VertexB);
+        program
+            .info
+            .loads
+            .set(Attribute::VERTEX_ID.0 as usize, true);
+
+        let profile = Profile {
+            support_vertex_instance_id: false,
+            ..Profile::default()
+        };
+        let runtime_info = RuntimeInfo::default();
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &runtime_info);
+        let mut bindings = Bindings::default();
+
+        ctx.define_global_variables(&program, &mut bindings);
+
+        assert_eq!(ctx.vertex_id, 0);
+        assert_ne!(ctx.vertex_index, 0);
+        assert_ne!(ctx.base_vertex, 0);
+        assert!(ctx.interfaces.contains(&ctx.vertex_index));
+        assert!(ctx.interfaces.contains(&ctx.base_vertex));
+    }
+
+    #[test]
+    fn vertex_id_declares_vertex_id_when_supported() {
+        let mut program = ir::Program::new(ShaderStage::VertexB);
+        program
+            .info
+            .loads
+            .set(Attribute::VERTEX_ID.0 as usize, true);
+
+        let profile = Profile {
+            support_vertex_instance_id: true,
+            ..Profile::default()
+        };
+        let runtime_info = RuntimeInfo::default();
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &runtime_info);
+        let mut bindings = Bindings::default();
+
+        ctx.define_global_variables(&program, &mut bindings);
+
+        assert_ne!(ctx.vertex_id, 0);
+        assert_eq!(ctx.vertex_index, 0);
+        assert_eq!(ctx.base_vertex, 0);
+        assert!(ctx.interfaces.contains(&ctx.vertex_id));
     }
 }

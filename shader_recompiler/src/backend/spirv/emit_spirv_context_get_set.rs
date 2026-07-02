@@ -160,8 +160,12 @@ pub fn emit_get_attribute_inst(
     inst_idx: u32,
 ) {
     let attr = inst.arg(0).attribute();
+    let wants_u32 = inst.opcode == Opcode::GetAttributeU32;
 
-    if attr.is_position() {
+    if wants_u32 {
+        let id = emit_get_attribute_u32_value(ctx, attr);
+        ctx.set_value(block_idx, inst_idx, id);
+    } else if attr.is_position() {
         let comp = attr.position_element();
         if let Some(&pos_var) = ctx.output_vars.get(&0xFFFF_0000) {
             let idx_const = ctx.builder.constant_bit32(ctx.u32_type, comp);
@@ -199,10 +203,140 @@ pub fn emit_get_attribute_inst(
             ctx.set_value(block_idx, inst_idx, zero);
         }
     } else {
-        log::trace!("SPIR-V: unhandled attribute {:?}", attr);
-        let zero = ctx.const_zero_f32;
-        ctx.set_value(block_idx, inst_idx, zero);
+        let id = emit_get_attribute_f32_value(ctx, attr);
+        ctx.set_value(block_idx, inst_idx, id);
     }
+}
+
+fn emit_get_attribute_f32_value(
+    ctx: &mut SpirvEmitContext,
+    attr: crate::ir::value::Attribute,
+) -> Word {
+    use crate::ir::value::Attribute;
+
+    match attr {
+        Attribute::PRIMITIVE_ID => bitcast_u32_builtin_to_f32(ctx, ctx.primitive_id),
+        Attribute::LAYER => bitcast_u32_builtin_to_f32(ctx, ctx.layer),
+        Attribute::INSTANCE_ID => {
+            if ctx.profile.support_vertex_instance_id {
+                bitcast_u32_builtin_to_f32(ctx, ctx.instance_id)
+            } else {
+                let instance = load_u32_builtin(ctx, ctx.instance_index);
+                let base = load_u32_builtin(ctx, ctx.base_instance);
+                let value = ctx
+                    .builder
+                    .i_sub(ctx.u32_type, None, instance, base)
+                    .unwrap();
+                ctx.builder.bitcast(ctx.f32_type, None, value).unwrap()
+            }
+        }
+        Attribute::VERTEX_ID => {
+            if ctx.profile.support_vertex_instance_id {
+                bitcast_u32_builtin_to_f32(ctx, ctx.vertex_id)
+            } else {
+                bitcast_u32_builtin_to_f32(ctx, ctx.vertex_index)
+            }
+        }
+        Attribute::BASE_INSTANCE => bitcast_u32_builtin_to_f32(ctx, ctx.base_instance),
+        Attribute::BASE_VERTEX => bitcast_u32_builtin_to_f32(ctx, ctx.base_vertex),
+        Attribute::DRAW_ID => bitcast_u32_builtin_to_f32(ctx, ctx.draw_index),
+        Attribute::FRONT_FACE => {
+            let front = ctx
+                .builder
+                .load(ctx.bool_type, None, ctx.front_face, None, vec![])
+                .unwrap();
+            let true_value = ctx.builder.constant_bit32(ctx.u32_type, u32::MAX);
+            let true_value = ctx.builder.bitcast(ctx.f32_type, None, true_value).unwrap();
+            ctx.builder
+                .select(ctx.f32_type, None, front, true_value, ctx.const_zero_f32)
+                .unwrap()
+        }
+        Attribute::POINT_SPRITE_S => load_f32_vec_component(ctx, ctx.point_coord, 0, 2),
+        Attribute::POINT_SPRITE_T => load_f32_vec_component(ctx, ctx.point_coord, 1, 2),
+        Attribute::TESSELLATION_EVALUATION_POINT_U => {
+            load_f32_vec_component(ctx, ctx.tess_coord, 0, 3)
+        }
+        Attribute::TESSELLATION_EVALUATION_POINT_V => {
+            load_f32_vec_component(ctx, ctx.tess_coord, 1, 3)
+        }
+        _ => {
+            log::trace!("SPIR-V: unhandled attribute {:?}", attr);
+            ctx.const_zero_f32
+        }
+    }
+}
+
+fn emit_get_attribute_u32_value(
+    ctx: &mut SpirvEmitContext,
+    attr: crate::ir::value::Attribute,
+) -> Word {
+    use crate::ir::value::Attribute;
+
+    match attr {
+        Attribute::PRIMITIVE_ID => load_u32_builtin(ctx, ctx.primitive_id),
+        Attribute::INSTANCE_ID => {
+            if ctx.profile.support_vertex_instance_id {
+                load_u32_builtin(ctx, ctx.instance_id)
+            } else {
+                let instance = load_u32_builtin(ctx, ctx.instance_index);
+                let base = load_u32_builtin(ctx, ctx.base_instance);
+                ctx.builder
+                    .i_sub(ctx.u32_type, None, instance, base)
+                    .unwrap()
+            }
+        }
+        Attribute::VERTEX_ID => {
+            if ctx.profile.support_vertex_instance_id {
+                load_u32_builtin(ctx, ctx.vertex_id)
+            } else {
+                load_u32_builtin(ctx, ctx.vertex_index)
+            }
+        }
+        Attribute::BASE_INSTANCE => load_u32_builtin(ctx, ctx.base_instance),
+        Attribute::BASE_VERTEX => load_u32_builtin(ctx, ctx.base_vertex),
+        Attribute::DRAW_ID => load_u32_builtin(ctx, ctx.draw_index),
+        _ => {
+            log::trace!("SPIR-V: unhandled u32 attribute {:?}", attr);
+            ctx.const_zero_u32
+        }
+    }
+}
+
+fn load_u32_builtin(ctx: &mut SpirvEmitContext, var: Word) -> Word {
+    if var == 0 {
+        return ctx.const_zero_u32;
+    }
+    ctx.builder
+        .load(ctx.u32_type, None, var, None, vec![])
+        .unwrap()
+}
+
+fn bitcast_u32_builtin_to_f32(ctx: &mut SpirvEmitContext, var: Word) -> Word {
+    let value = load_u32_builtin(ctx, var);
+    ctx.builder.bitcast(ctx.f32_type, None, value).unwrap()
+}
+
+fn load_f32_vec_component(
+    ctx: &mut SpirvEmitContext,
+    var: Word,
+    component: u32,
+    component_count: u32,
+) -> Word {
+    if var == 0 {
+        return ctx.const_zero_f32;
+    }
+    let pointer_type =
+        ctx.builder
+            .type_pointer(None, rspirv::spirv::StorageClass::Input, ctx.f32_type);
+    let index = ctx.builder.constant_bit32(ctx.u32_type, component);
+    let ptr = ctx
+        .builder
+        .access_chain(pointer_type, None, var, vec![index])
+        .unwrap();
+    debug_assert!(component < component_count);
+    ctx.builder
+        .load(ctx.f32_type, None, ptr, None, vec![])
+        .unwrap()
 }
 
 /// Dispatch SetAttribute IR instructions.

@@ -7,11 +7,20 @@
 //! to avoid redundant uploads of unchanged data.
 
 use std::collections::HashMap;
+use std::ptr::NonNull;
 
 use ash::vk;
+use ash::vk::Handle;
 use log::{debug, trace};
 
+use super::scheduler::Scheduler;
 use super::staging_buffer_pool::StagingBufferPool;
+use crate::buffer_cache::buffer_base::BufferBase;
+use crate::buffer_cache::buffer_cache::BufferCache as CommonBufferCache;
+use crate::buffer_cache::buffer_cache_base::{
+    self as base, BufferCopy, BufferId, HostBindings, StagingBufferRef, NULL_BUFFER_ID,
+};
+use crate::buffer_cache::word_manager::DeviceTracker;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
 use crate::engines::maxwell_3d::{IndexFormat, PrimitiveTopology};
@@ -21,6 +30,511 @@ pub struct CachedBuffer {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
     pub size: vk::DeviceSize,
+}
+
+/// Buffer cache parameters matching upstream `Vulkan::BufferCacheParams`.
+pub struct BufferCacheParams;
+
+impl BufferCacheParams {
+    pub const IS_OPENGL: bool = false;
+    pub const HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS: bool = false;
+    pub const HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT: bool = false;
+    pub const NEEDS_BIND_UNIFORM_INDEX: bool = false;
+    pub const NEEDS_BIND_STORAGE_INDEX: bool = false;
+    pub const USE_MEMORY_MAPS: bool = true;
+    pub const SEPARATE_IMAGE_BUFFER_BINDINGS: bool = false;
+    pub const USE_MEMORY_MAPS_FOR_UPLOADS: bool = true;
+}
+
+impl base::BufferCacheParams for BufferCacheParams {
+    const IS_OPENGL: bool = Self::IS_OPENGL;
+    const HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS: bool =
+        Self::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS;
+    const HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT: bool = Self::HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT;
+    const NEEDS_BIND_UNIFORM_INDEX: bool = Self::NEEDS_BIND_UNIFORM_INDEX;
+    const NEEDS_BIND_STORAGE_INDEX: bool = Self::NEEDS_BIND_STORAGE_INDEX;
+    const USE_MEMORY_MAPS: bool = Self::USE_MEMORY_MAPS;
+    const SEPARATE_IMAGE_BUFFER_BINDINGS: bool = Self::SEPARATE_IMAGE_BUFFER_BINDINGS;
+    const USE_MEMORY_MAPS_FOR_UPLOADS: bool = Self::USE_MEMORY_MAPS_FOR_UPLOADS;
+}
+
+pub type VulkanCommonBufferCache = CommonBufferCache<BufferCacheParams, VulkanDeviceTracker>;
+
+pub struct VulkanDeviceTracker;
+
+pub static VULKAN_DEVICE_TRACKER: VulkanDeviceTracker = VulkanDeviceTracker;
+
+impl DeviceTracker for VulkanDeviceTracker {
+    fn update_pages_cached_count(&self, _addr: u64, _size: u64, _delta: i32) {}
+}
+
+/// Vulkan implementation of upstream `BufferCacheRuntime`.
+///
+/// This is the runtime service owner used by the common `BufferCache<P>` port:
+/// scheduler-recorded copies/clears, staging allocation, and backend buffer
+/// materialization. The existing `BufferCache` below is still the legacy direct
+/// rasterizer cache and will be retired once the rasterizer is moved onto the
+/// common cache.
+pub struct BufferCacheRuntime {
+    device: ash::Device,
+    instance: ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    scheduler: NonNull<Scheduler>,
+    staging_pool: NonNull<StagingBufferPool>,
+    buffers: HashMap<u32, CachedBuffer>,
+    staging_refs: HashMap<usize, super::staging_buffer_pool::StagingBuffer>,
+    next_handle: u32,
+}
+
+impl BufferCacheRuntime {
+    pub fn new(
+        device: ash::Device,
+        instance: ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        scheduler: &mut Scheduler,
+        staging_pool: &mut StagingBufferPool,
+    ) -> Self {
+        Self {
+            device,
+            instance,
+            physical_device,
+            scheduler: NonNull::from(scheduler),
+            staging_pool: NonNull::from(staging_pool),
+            buffers: HashMap::new(),
+            staging_refs: HashMap::new(),
+            next_handle: 1,
+        }
+    }
+
+    fn scheduler(&mut self) -> &mut Scheduler {
+        // SAFETY: the runtime is constructed from boxed rasterizer services.
+        // Their addresses remain stable and they outlive the runtime.
+        unsafe { self.scheduler.as_mut() }
+    }
+
+    fn staging_pool(&mut self) -> &mut StagingBufferPool {
+        // SAFETY: see `scheduler`.
+        unsafe { self.staging_pool.as_mut() }
+    }
+
+    fn allocate_handle(&mut self) -> u32 {
+        let handle = self.next_handle;
+        self.next_handle = self.next_handle.wrapping_add(1).max(1);
+        handle
+    }
+
+    fn create_gpu_buffer(
+        &self,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+    ) -> Option<CachedBuffer> {
+        let buffer_info = vk::BufferCreateInfo::builder()
+            .size(size.max(1))
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .build();
+        let buffer = unsafe { self.device.create_buffer(&buffer_info, None).ok()? };
+        let mem_reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        let mem_type = find_device_local_memory(
+            &self.instance,
+            self.physical_device,
+            mem_reqs.memory_type_bits,
+        )
+        .unwrap_or(0);
+        let alloc_info = vk::MemoryAllocateInfo::builder()
+            .allocation_size(mem_reqs.size)
+            .memory_type_index(mem_type)
+            .build();
+        let memory = match unsafe { self.device.allocate_memory(&alloc_info, None) } {
+            Ok(memory) => memory,
+            Err(_) => {
+                unsafe { self.device.destroy_buffer(buffer, None) };
+                return None;
+            }
+        };
+        unsafe {
+            if self.device.bind_buffer_memory(buffer, memory, 0).is_err() {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(memory, None);
+                return None;
+            }
+        }
+        Some(CachedBuffer {
+            buffer,
+            memory,
+            size: size.max(1),
+        })
+    }
+
+    fn resolve_buffer(&self, gpu_handle: u32) -> vk::Buffer {
+        if gpu_handle == 0 {
+            return vk::Buffer::null();
+        }
+        self.buffers
+            .get(&gpu_handle)
+            .map(|buffer| buffer.buffer)
+            .unwrap_or(vk::Buffer::null())
+    }
+
+    fn staging_ref_from_map(
+        &mut self,
+        staging: super::staging_buffer_pool::StagingBuffer,
+    ) -> StagingBufferRef {
+        let handle = self.allocate_handle();
+        self.buffers.insert(
+            handle,
+            CachedBuffer {
+                buffer: staging.buffer,
+                memory: vk::DeviceMemory::null(),
+                size: staging.size,
+            },
+        );
+        self.staging_refs.insert(staging.index as usize, staging);
+        unsafe {
+            StagingBufferRef::from_mapped_backend(
+                NULL_BUFFER_ID,
+                handle,
+                staging.offset,
+                staging.index as usize,
+                staging.mapped,
+                staging.size as usize,
+                std::ptr::null_mut(),
+            )
+        }
+    }
+
+    fn make_buffer_copies(copies: &[BufferCopy]) -> Vec<vk::BufferCopy> {
+        copies
+            .iter()
+            .map(|copy| vk::BufferCopy {
+                src_offset: copy.src_offset,
+                dst_offset: copy.dst_offset,
+                size: copy.size,
+            })
+            .collect()
+    }
+}
+
+impl base::BufferCacheRuntime for BufferCacheRuntime {
+    fn initialize_backend_buffer(&mut self, buffer: &mut BufferBase) {
+        if buffer.gpu_handle != 0 || buffer.size_bytes() == 0 {
+            return;
+        }
+        let Some(gpu_buffer) = self.create_gpu_buffer(
+            buffer.size_bytes() as vk::DeviceSize,
+            vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::UNIFORM_BUFFER
+                | vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::INDEX_BUFFER
+                | vk::BufferUsageFlags::VERTEX_BUFFER,
+        ) else {
+            return;
+        };
+        let handle = self.allocate_handle();
+        self.buffers.insert(handle, gpu_buffer);
+        buffer.gpu_handle = handle;
+    }
+
+    fn tick_frame(&mut self) {}
+
+    fn can_report_memory_usage(&self) -> bool {
+        false
+    }
+
+    fn get_device_local_memory(&self) -> u64 {
+        0
+    }
+
+    fn get_device_memory_usage(&self) -> u64 {
+        self.buffers
+            .values()
+            .filter(|buffer| buffer.memory != vk::DeviceMemory::null())
+            .map(|buffer| buffer.size)
+            .sum()
+    }
+
+    fn get_storage_buffer_alignment(&self) -> u32 {
+        let properties = unsafe {
+            self.instance
+                .get_physical_device_properties(self.physical_device)
+        };
+        properties.limits.min_storage_buffer_offset_alignment.max(1) as u32
+    }
+
+    fn resolve_backend_buffer_raw(&self, gpu_handle: u32) -> u64 {
+        self.resolve_buffer(gpu_handle).as_raw()
+    }
+
+    fn finish(&mut self) {
+        self.scheduler().finish();
+    }
+
+    fn upload_staging_buffer(&mut self, size: u64) -> StagingBufferRef {
+        let staging = self
+            .staging_pool()
+            .request_upload_buffer(size as vk::DeviceSize)
+            .expect("Vulkan upload staging allocation failed");
+        self.staging_ref_from_map(staging)
+    }
+
+    fn download_staging_buffer(&mut self, size: u64, deferred: bool) -> StagingBufferRef {
+        let staging = self
+            .staging_pool()
+            .request_download_buffer(size as vk::DeviceSize, deferred)
+            .expect("Vulkan download staging allocation failed");
+        self.staging_ref_from_map(staging)
+    }
+
+    fn free_deferred_staging_buffer(&mut self, buffer: &mut StagingBufferRef) {
+        if let Some(mut staging) = self.staging_refs.remove(&buffer.index) {
+            self.staging_pool().free_deferred(&mut staging);
+            self.staging_refs.insert(buffer.index, staging);
+        }
+    }
+
+    fn can_reorder_upload(&self, _buffer_id: BufferId, _copies: &[BufferCopy]) -> bool {
+        false
+    }
+
+    fn pre_copy_barrier(&mut self) {
+        let device = self.device.clone();
+        self.scheduler().request_outside_renderpass();
+        self.scheduler().record(move |cmdbuf| {
+            let read_barrier = vk::MemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
+                .build();
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    cmdbuf,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&read_barrier),
+                    &[],
+                    &[],
+                );
+            }
+        });
+    }
+
+    fn post_copy_barrier(&mut self) {
+        let device = self.device.clone();
+        self.scheduler().request_outside_renderpass();
+        self.scheduler().record(move |cmdbuf| {
+            let write_barrier = vk::MemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                .build();
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    cmdbuf,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&write_barrier),
+                    &[],
+                    &[],
+                );
+            }
+        });
+    }
+
+    fn copy_buffer(
+        &mut self,
+        _dst: BufferId,
+        dst_gpu_handle: u32,
+        _src: BufferId,
+        src_gpu_handle: u32,
+        copies: &[BufferCopy],
+        barrier: bool,
+        _can_reorder_upload: bool,
+    ) {
+        if copies.is_empty() {
+            return;
+        }
+        let dst_buffer = self.resolve_buffer(dst_gpu_handle);
+        let src_buffer = self.resolve_buffer(src_gpu_handle);
+        if dst_buffer == vk::Buffer::null() || src_buffer == vk::Buffer::null() {
+            return;
+        }
+        let vk_copies = Self::make_buffer_copies(copies);
+        let device = self.device.clone();
+        self.scheduler().request_outside_renderpass();
+        self.scheduler().record(move |cmdbuf| {
+            let read_barrier = vk::MemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
+                .build();
+            let write_barrier = vk::MemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                .build();
+            unsafe {
+                if barrier {
+                    device.cmd_pipeline_barrier(
+                        cmdbuf,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        std::slice::from_ref(&read_barrier),
+                        &[],
+                        &[],
+                    );
+                }
+                device.cmd_copy_buffer(cmdbuf, src_buffer, dst_buffer, &vk_copies);
+                if barrier {
+                    device.cmd_pipeline_barrier(
+                        cmdbuf,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::DependencyFlags::empty(),
+                        std::slice::from_ref(&write_barrier),
+                        &[],
+                        &[],
+                    );
+                }
+            }
+        });
+    }
+
+    fn clear_buffer(
+        &mut self,
+        _buffer: BufferId,
+        gpu_handle: u32,
+        offset: u32,
+        size: u64,
+        value: u32,
+    ) {
+        if size == 0 {
+            return;
+        }
+        let dest_buffer = self.resolve_buffer(gpu_handle);
+        if dest_buffer == vk::Buffer::null() {
+            return;
+        }
+        let device = self.device.clone();
+        self.scheduler().request_outside_renderpass();
+        self.scheduler().record(move |cmdbuf| {
+            let read_barrier = vk::MemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
+                .build();
+            let write_barrier = vk::MemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                .build();
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    cmdbuf,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&read_barrier),
+                    &[],
+                    &[],
+                );
+                device.cmd_fill_buffer(cmdbuf, dest_buffer, offset as u64, size, value);
+                device.cmd_pipeline_barrier(
+                    cmdbuf,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&write_barrier),
+                    &[],
+                    &[],
+                );
+            }
+        });
+    }
+
+    fn bind_index_buffer(&mut self, _buffer: BufferId, _gpu_handle: u32, _offset: u32, _size: u32) {
+    }
+
+    fn bind_vertex_buffers(
+        &mut self,
+        _bindings: &HostBindings,
+        _buffers: &mut common::slot_vector::SlotVector<BufferBase>,
+    ) {
+    }
+
+    fn bind_uniform_buffer(
+        &mut self,
+        _stage: usize,
+        _binding_index: u32,
+        _buffer: BufferId,
+        _gpu_handle: u32,
+        _offset: u32,
+        _size: u32,
+    ) {
+    }
+
+    fn bind_storage_buffer(
+        &mut self,
+        _stage: usize,
+        _binding_index: u32,
+        _buffer: &mut BufferBase,
+        _offset: u32,
+        _size: u32,
+        _is_written: bool,
+    ) {
+    }
+
+    fn bind_texture_buffer(
+        &mut self,
+        _buffer: BufferId,
+        _gpu_handle: u32,
+        _offset: u32,
+        _size: u32,
+        _format: u32,
+    ) {
+    }
+
+    fn bind_image_buffer(
+        &mut self,
+        _buffer: BufferId,
+        _gpu_handle: u32,
+        _offset: u32,
+        _size: u32,
+        _format: u32,
+    ) {
+    }
+
+    fn bind_transform_feedback_buffers(&mut self, _bindings: &HostBindings) {}
+
+    fn bind_compute_uniform_buffer(
+        &mut self,
+        _binding_index: u32,
+        _buffer: BufferId,
+        _offset: u32,
+        _size: u32,
+    ) {
+    }
+
+    fn bind_compute_storage_buffer(
+        &mut self,
+        _binding_index: u32,
+        _buffer: &mut BufferBase,
+        _offset: u32,
+        _size: u32,
+        _is_written: bool,
+    ) {
+    }
+}
+
+impl Drop for BufferCacheRuntime {
+    fn drop(&mut self) {
+        unsafe {
+            for (_, buffer) in self.buffers.drain() {
+                if buffer.memory == vk::DeviceMemory::null() {
+                    continue;
+                }
+                self.device.destroy_buffer(buffer.buffer, None);
+                self.device.free_memory(buffer.memory, None);
+            }
+        }
+    }
 }
 
 /// Manages GPU buffers for vertex, index, uniform, and storage data.
@@ -622,4 +1136,21 @@ fn find_device_local_memory(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffer_cache_params_match_upstream_vulkan() {
+        assert!(!BufferCacheParams::IS_OPENGL);
+        assert!(!BufferCacheParams::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS);
+        assert!(!BufferCacheParams::HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT);
+        assert!(!BufferCacheParams::NEEDS_BIND_UNIFORM_INDEX);
+        assert!(!BufferCacheParams::NEEDS_BIND_STORAGE_INDEX);
+        assert!(BufferCacheParams::USE_MEMORY_MAPS);
+        assert!(!BufferCacheParams::SEPARATE_IMAGE_BUFFER_BINDINGS);
+        assert!(BufferCacheParams::USE_MEMORY_MAPS_FOR_UPLOADS);
+    }
 }

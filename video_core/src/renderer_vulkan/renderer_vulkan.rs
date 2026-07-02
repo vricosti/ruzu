@@ -190,8 +190,6 @@ pub struct RendererVulkan {
     surface_loader: ash::extensions::khr::Surface,
     /// Surface for presentation.
     surface: vk::SurfaceKHR,
-    /// Vulkan memory allocator owner.
-    memory_allocator: MemoryAllocator,
     /// Shared Tegra device memory manager used by presentation uploads.
     device_memory: Arc<MaxwellDeviceMemoryManager>,
     /// Frontend visibility state used for upstream `render_window.IsShown()`.
@@ -218,6 +216,12 @@ pub struct RendererVulkan {
     blit_applet: BlitScreen,
     /// Vulkan rasterizer owner.
     rasterizer: super::RasterizerVulkan,
+    /// Vulkan memory allocator owner.
+    ///
+    /// Declared after `rasterizer` so Rust drops the rasterizer first. This
+    /// mirrors upstream C++ field destruction, where `RasterizerVulkan`
+    /// references `RendererVulkan::memory_allocator`.
+    memory_allocator: Box<MemoryAllocator>,
     /// RendererBase shared state.
     base_data: RendererBaseData,
     /// Vulkan does not require a shared GL-style context.
@@ -287,12 +291,12 @@ impl RendererVulkan {
         };
 
         let device = create_device(&instance.instance, physical_device, surface)?;
-        let memory_allocator = MemoryAllocator::new(
+        let mut memory_allocator = Box::new(MemoryAllocator::new(
             device.get_logical().clone(),
             memory_properties,
             physical_properties.limits.buffer_image_granularity,
             false,
-        );
+        ));
         let scheduler_command_pool = unsafe {
             let pool_info = vk::CommandPoolCreateInfo::builder()
                 .queue_family_index(device.get_graphics_family())
@@ -355,9 +359,11 @@ impl RendererVulkan {
             device.is_ext_extended_dynamic_state2_supported(),
             device.is_topology_list_primitive_restart_supported(),
             device.is_patch_list_primitive_restart_supported(),
+            device.is_ext_shader_stencil_export_supported(),
             device.get_max_viewports(),
             syncpoints,
             Arc::clone(&device_memory),
+            memory_allocator.as_mut(),
         )
         .map_err(|err| {
             log::error!("Failed to initialize Vulkan rasterizer: {}", err);
@@ -369,7 +375,6 @@ impl RendererVulkan {
             debug_messenger: vk::DebugUtilsMessengerEXT::null(),
             surface_loader,
             surface,
-            memory_allocator,
             device_memory,
             window_shown,
             framebuffer_layout,
@@ -383,6 +388,7 @@ impl RendererVulkan {
             blit_capture,
             blit_applet,
             rasterizer,
+            memory_allocator,
             base_data: RendererBaseData::new(),
             dummy_context: VulkanDummyContext,
             applet_frame: Frame::default(),

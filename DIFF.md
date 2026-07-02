@@ -17152,6 +17152,407 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo fmt --all` passes.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
 
+## 2026-07-01 — video_core/src/renderer_vulkan/texture_cache.rs and video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_texture_cache.h and video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust `TextureCacheRuntime` now stores stable runtime-service references to `Scheduler` and `StagingBufferPool`, matching upstream `TextureCacheRuntime` ownership of `Scheduler& scheduler` and `StagingBufferPool& staging_buffer_pool`.
+- Rust uses `NonNull<Scheduler>` and `NonNull<StagingBufferPool>` because `RasterizerVulkan` owns the services in the same struct as `TextureCache`. `RasterizerVulkan` boxes those services before constructing `TextureCache`, so their addresses remain stable for the lifetime of the runtime.
+- Rust `TextureCacheRuntime::upload_staging_buffer` now requests upload staging from its stored staging pool instead of receiving a staging pool parameter.
+- Rust `TextureCacheRuntime::copy_image` now records through its stored scheduler instead of receiving a scheduler parameter.
+- Rust `materialize_sampled_image_view` no longer exposes scheduler/staging in its public API; it only receives the guest-memory reader and active command buffer. This moves the transfer service ownership closer to upstream and keeps coroutine/descriptor callers from leaking runtime service details.
+
+### Unintentional differences (to fix)
+- Rust `TextureCacheRuntime` still lacks the rest of upstream's service-reference set: `MemoryAllocator`, `BlitImageHelper`, `RenderPassCache`, descriptor pool/queue ownership, ASTC decoder pass, MSAA copy pass, and resolution scaling state.
+- Rust uses boxed services plus raw stable pointers to represent the same lifetime relationship that C++ expresses as references. This is a Rust self-referential-struct adaptation; it must remain limited to services whose storage is explicitly stabilized by `Box`.
+- Rust sampled fallback uploads still record the final copy into the active command buffer via the reduced old path, although staging allocation now comes from runtime. The backend `Image::upload_memory` path already records through scheduler.
+
+### Missing items
+- Thread `MemoryAllocator`, `BlitImageHelper`, `RenderPassCache`, descriptor queues/pools, ASTC/MSAA passes, and resolution info into `TextureCacheRuntime`.
+- Move remaining reduced sampled-texture upload paths to backend `Image`/`ImageView` plus scheduler-recorded upload.
+- Port `TextureCacheRuntime::DownloadStagingBuffer`, `FreeDeferredStagingBuffer`, `GetTemporaryBuffer`, memory usage reporting, `BlitImage`, `CopyImageMSAA`, `ReinterpretImage`, `ConvertImage`, `TransitionImageLayout`, and `BarrierFeedbackLoop`.
+
+### Binary layout verification
+- N/A: this slice changes host-side renderer service ownership. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCacheRuntime` constructor/member declarations in `video_core/renderer_vulkan/vk_texture_cache.h`.
+- Re-read upstream `TextureCacheRuntime::TextureCacheRuntime` and `TextureCacheRuntime::UploadStagingBuffer` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs and video_core/src/texture_cache/texture_cache.rs vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust now mirrors upstream `TextureCache<P>::ScaleUp` memory accounting at the split common/backend scale wrapper edge. `TextureCache::scale_up_image` captures whether the backend image already had a scaled copy before calling backend `Image::scale_up`; after a successful scale it calls `TextureCacheBase::account_scale_up_memory`, then runs `invalidate_scale`.
+- `TextureCacheBase::scaled_image_memory_size` is the Rust counterpart of upstream `GetScaledImageSizeBytes`, including `max(guest_size_bytes, unswizzled_size_bytes)`, resolution scale multiplication, down-shift, and 1024-byte alignment.
+- `account_scale_up_memory` uses `saturating_add` rather than raw integer overflow. This is a Rust safety adaptation; normal emulator memory sizes should not reach overflow, and the upstream-visible accounting condition/order is preserved.
+
+### Unintentional differences (to fix)
+- The memory-accounting tail lives in `TextureCacheBase` and is called by the Vulkan wrapper because Rust still splits common image metadata from backend `Image` ownership. Upstream has one templated `TextureCache<P>::ScaleUp(Image&)` owner.
+- Non-scale-up backend paths still depend on wrapper methods to synchronize `ImageBase` state between backend `Image` and `TextureCacheBase::slot_images`.
+
+### Missing items
+- Continue collapsing the split wrapper/common/backend bridge so `TextureCacheRuntime` and backend `Image` own upload/copy/download/scale operations with less duplicated state synchronization.
+- Add a depth/MRT or resolution-scaling workload that actually exercises first-time scaled image memory accounting beyond this focused unit test. Pinball remains a non-regression check, not full scale coverage.
+
+### Binary layout verification
+- N/A: this slice changes host-side texture-cache memory accounting and Vulkan wrapper control flow only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::GetScaledImageSizeBytes`, `TextureCache<P>::ScaleUp`, and `TextureCache<P>::ScaleDown` in `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust `TextureCacheBase::scaled_image_memory_size`, `TextureCacheBase::account_scale_up_memory`, and Vulkan `TextureCache::scale_up_image`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::account_scale_up_memory_adds_scaled_size_once -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::invalidate_scale_removes_views_framebuffers_and_marks_deleted -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX remains complete after scale memory accounting:
+  `/tmp/ruzu_pinball_scale_memory.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[187..1711] y[0..1079]`, `nonblack=2041193`.
+
+## 2026-07-02 — video_core/src/texture_cache/texture_cache.rs and video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust now ports upstream `TextureCache<P>::InvalidateScale` as `TextureCacheBase::invalidate_scale`. It updates `scale_tick`, marks render targets/zeta/color buffers dirty through `mark_render_targets_dirty`, clears current render-target references to the invalidated image views, removes image-view references, removes common framebuffer keys, sentences common image views, clears `image_view_ids` / `image_view_infos`, invalidates active channel image-view tables, and sets `has_deleted_images`.
+- The Vulkan wrapper calls `invalidate_scale` after successful `scale_up_image` / `scale_down_image`, matching upstream `TextureCache<P>::ScaleUp/ScaleDown` calling `InvalidateScale(image)` only after `image.ScaleUp/ScaleDown()` returns true.
+- `TextureCache::finish_scale_invalidation_backend` retires backend `ImageView` and dependent backend `Framebuffer` owners for the invalidated view IDs without destroying the backend `Image`. This is a Rust split-backend adaptation: upstream `slot_image_views` owns the concrete backend image views directly, while Rust has common `ImageViewBase` slots plus Vulkan `ImageView` owners.
+- `Image::upload_memory` remains non-invalidating for its internal `ScaleDown(true) -> upload -> ScaleUp()` sequence because upstream `Vulkan::Image::UploadMemory` also calls `Image::ScaleDown/ScaleUp` directly rather than routing through `TextureCache<P>::ScaleUp/ScaleDown`.
+
+### Unintentional differences (to fix)
+- Upstream `TextureCache<P>::ScaleUp` updates `total_used_memory` with `GetScaledImageSizeBytes(image)` when the image did not already have a scaled copy. Rust still toggles `has_scaled` but does not yet mirror that memory accounting at the scale wrapper edge.
+- The backend retirement path is split between `TextureCacheBase::invalidate_scale` and `TextureCache::finish_scale_invalidation_backend`; upstream performs both common and backend view retirement through the templated `slot_image_views` owner in one method.
+
+### Missing items
+- Port/audit upstream `TextureCache<P>::ScaleUp` scaled-memory accounting.
+- Add a Vulkan-backed test or lightweight workload that exercises depth/stencil `BlitScaleHelper`; Pinball validates the color/no-depth path only.
+
+### Binary layout verification
+- N/A: this slice changes host-side texture-cache lifecycle and Vulkan resource retirement only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::InvalidateScale`, `TextureCache<P>::ScaleUp`, and `TextureCache<P>::ScaleDown` in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `Vulkan::Image::UploadMemory` in `video_core/renderer_vulkan/vk_texture_cache.cpp` to verify that upload-local scale does not call `TextureCache<P>::InvalidateScale`.
+- Re-read Rust `TextureCacheBase::invalidate_scale`, `TextureCache::finish_scale_invalidation_backend`, `TextureCache::scale_up_image`, and `TextureCache::scale_down_image`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::invalidate_scale_removes_views_framebuffers_and_marks_deleted -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- `git diff --check` passes.
+- SpaceCadetPinball-NX remains complete after scale invalidation:
+  `/tmp/ruzu_pinball_invalidate_scale.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[187..1711] y[0..1079]`, `nonblack=2041193`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp and video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Backend scaling ownership is now closer to upstream `Vulkan::Image::ScaleUp`, `Vulkan::Image::ScaleDown`, and `Vulkan::Image::BlitScaleHelper`: Rust `Image::scale_up`, `Image::scale_down`, `blit_scale_helper_color`, and `blit_scale_helper_depth_stencil` own scaled-image allocation, `current_image` switching, `RESCALED` flag mutation, and helper blit dispatch.
+- `TextureCache::scale_up_image` and `TextureCache::scale_down_image` now act as thin common/backend bridges, matching upstream `TextureCache<P>::ScaleUp/ScaleDown`'s delegation direction instead of duplicating Vulkan scale logic in the wrapper.
+- Rust temporarily removes the backend `Image` from the `images` map before calling `Image::scale_up/scale_down` or `Image::upload_memory`, then synchronizes `ImageBase` flags and `has_scaled` back to `TextureCacheBase::slot_images`. This is a Rust borrow-safety adaptation for the split common/backend cache; upstream stores backend image state directly in `slot_images`.
+
+### Unintentional differences (to fix)
+- Upstream `TextureCache<P>::ScaleUp/ScaleDown` calls `InvalidateScale(image)` after backend image scaling. Rust currently synchronizes the common `RESCALED` state and relies on the existing wrapper invalidation/render-target refresh paths, but the exact `InvalidateScale` side effects are still not centralized at the scale call edge.
+- Upstream `Image` stores runtime/scheduler ownership references directly. Rust `Image::scale_up/scale_down` still receives `TextureCacheRuntime` as a parameter because backend images are held inside a split Rust texture-cache wrapper.
+- Unsupported aspect handling for helper-backed scale remains narrower than upstream's asserted expectations: color and combined depth/stencil helper paths are implemented, but other aspect combinations warn and fail.
+
+### Missing items
+- Move or mirror the remaining `InvalidateScale` side effects exactly at every Rust scale call edge.
+- Audit scale tick/memory accounting against upstream `TextureCache<P>::ScaleUp/ScaleDown` once the remaining split common/backend ownership is reduced.
+- Add a focused Vulkan-backed regression for helper scaling beyond Pinball's color path when a small depth/stencil scaling workload is available.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan texture-cache ownership and command ordering only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `Vulkan::Image::ScaleUp`, `Vulkan::Image::ScaleDown`, and `Vulkan::Image::BlitScaleHelper` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `TextureCache<P>::InvalidateScale` in `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust `Image::scale_up`, `Image::scale_down`, `Image::blit_scale_helper_color`, `Image::blit_scale_helper_depth_stencil`, `TextureCache::scale_up_image`, and `TextureCache::scale_down_image` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- `git diff --check` passes.
+- SpaceCadetPinball-NX remains complete after backend `Image` scaling ownership:
+  `/tmp/ruzu_pinball_image_scale_owner_sync.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[187..1711] y[0..1079]`, `nonblack=2041193`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_convert.ppm` at frame 30. The frame remains complete: `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[187..1711] y[0..1079]`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_runtime_owner.png` at frame 30. The frame is complete: `2560x1440`, bbox `x[251..2281] y[0..1439]`, guest approx `x[188..1710] y[0..1079]`.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/texture_cache.rs and video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp, video_core/renderer_vulkan/vk_texture_cache.h, and video_core/renderer_vulkan/vk_scheduler.cpp
+
+### Intentional differences
+- Rust `Image::upload_memory` no longer writes barriers/copies directly to a caller-provided command buffer. It now calls `Scheduler::request_outside_renderpass()` and records the Vulkan transfer/barriers with `Scheduler::record`, matching upstream `Vulkan::Image::UploadMemory` ownership and ordering.
+- Rust still captures `ash::Device` in the recorded closure because upstream's `vk::CommandBuffer` wrapper has member methods while ash requires dispatch through `ash::Device`. This is a Rust/Vulkan binding adaptation; command ownership remains scheduler-recorded.
+- Rust `TextureCacheRuntime::upload_staging_buffer` now wraps the staging-pool upload request, matching upstream's `TextureCacheRuntime::UploadStagingBuffer` call edge while preserving the current split Rust ownership where the pool is still stored in `RasterizerVulkan`.
+- Rust `TextureCacheRuntime::insert_upload_memory_barrier` is present and intentionally empty, matching upstream Vulkan `TextureCacheRuntime::InsertUploadMemoryBarrier() {}` in `vk_texture_cache.h`.
+- Rust `TextureCacheRuntime::copy_image` is now ported as a scheduler-recorded operation with upstream pre/post barriers, `MakeImageCopy`, and `RangedBarrierRange`. It is intentionally not yet called because the full `FinishPendingJoinCopies` drain is the next slice.
+
+### Unintentional differences (to fix)
+- Rust `TextureCacheRuntime` still does not own the full upstream service reference set. Scheduler and staging are passed per operation to avoid fake/self-referential owners until the renderer architecture is moved further toward upstream.
+- Rust `copy_image` is implemented but not wired into join-copy completion yet. Upstream calls `runtime.CopyImage` from `TextureCache<P>::JoinImages` / pending join-copy processing.
+- Rust `Image::upload_memory` still does not handle upstream rescale wrapping (`ScaleDown(true)` before upload and `ScaleUp()` after upload).
+- Rust upload/download work still lacks the complete upstream runtime service family: memory allocator-backed temporary buffers, download staging, blit helper, MSAA copy, reinterpret/convert paths, and rescale helpers.
+
+### Missing items
+- Wire `TextureCacheRuntime::copy_image` into a Vulkan `finish_pending_join_copies` port.
+- Port `TextureCacheRuntime::DownloadStagingBuffer`, `FreeDeferredStagingBuffer`, `GetTemporaryBuffer`, `CopyImageMSAA`, `BlitImage`, `ReinterpretImage`, `ConvertImage`, `TransitionImageLayout`, and `BarrierFeedbackLoop`.
+- Port `Image::DownloadMemory`, rescale upload wrapping, and `ScaleUp`/`ScaleDown` backend image switching.
+- Replace per-operation service passing with a full upstream-shaped runtime service owner once the Rust renderer can safely avoid self-referential borrows.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan command scheduling and resource transfer helpers. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `Vulkan::Image::UploadMemory` and `TextureCacheRuntime::CopyImage` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `TextureCacheRuntime::UploadStagingBuffer` and `InsertUploadMemoryBarrier` declaration in `video_core/renderer_vulkan/vk_texture_cache.h`.
+- Re-read upstream `Scheduler::RequestOutsideRenderPassOperationContext` in `video_core/renderer_vulkan/vk_scheduler.cpp`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_copyimage_preq.png`; the frame is complete with bbox `x[250..2282] y[0..1439]` and repeated `AccelerateDisplay hit`.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.h and video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust now has dedicated backend `Image`, `ImageView`, and `Framebuffer` owners in the upstream-owned file `video_core/src/renderer_vulkan/texture_cache.rs`, replacing the earlier reduced `CachedRenderTarget` / ad-hoc image-view / `RtFramebuffer` ownership.
+- Rust backend images are owned by common-cache `ImageId`, image views by common-cache `ImageViewId`, and framebuffers by common `RenderTargets`, matching upstream `slot_images`, `slot_image_views`, and `GetFramebufferId(const RenderTargets&)` ownership boundaries.
+- Rust `Image` now carries the upstream-shaped fields needed by the backend owner: original/current/scaled image handles, memory handles, storage image views, aspect mask, initialization flag, layout state, and a cloned `ImageBase` snapshot from the common cache.
+- Rust `ImageView` now carries the upstream-shaped fields needed by the backend owner: per-`TextureType` image views, render-target view, lazy depth/stencil/color/storage view slots, samples, buffer size, and a cloned `ImageViewBase` snapshot.
+- Rust `Framebuffer` now owns the Vulkan framebuffer plus render pass, render area, color/depth/stencil state, samples, RT map/image/range storage, attached image IDs, and RT0 CPU compatibility address.
+- Rust ports the upstream helper set needed by those owners: `ConvertImageType`, `ConvertSampleCount`, `ImageUsageFlags`, `MakeImageCreateInfo`, image/view aspect masks, subresource range conversion, texture/view type conversion, and typed `ImageFormat` to `VkFormat` conversion.
+- Rust active render-target/present paths now resolve backend handles through `Image` and `ImageView` instead of directly storing one reduced render-target view per image.
+- Rust keeps the CPU-address map only as a compatibility index for current present/frontend APIs that still arrive with CPU addresses. It is not the backend ownership key.
+
+### Unintentional differences (to fix)
+- Rust `Image` still does not own the full upstream upload/download/copy/rescale behavior. Upstream records barriers and transfer/blit operations through `TextureCacheRuntime` with `Scheduler`, `StagingBufferPool`, `MemoryAllocator`, `BlitImageHelper`, ASTC/MSAA helpers, and resolution state.
+- Rust still allocates images through a local `ash`/device-memory helper rather than upstream's `MemoryAllocator::CreateImage` / `ImageAlloc` abstraction, mutable view-format list support, and device feature queries for format lists/ASTC/BCn.
+- Rust `Framebuffer` still builds a reduced framebuffer from already-selected Vulkan views. It now has the upstream fields, but `rt_map`, `images`, and `image_ranges` are not fully populated from every `ImageView` the same way upstream `Framebuffer::CreateFramebuffer` does.
+- Rust `ImageView` has lazy depth/stencil/color/storage methods, but normal descriptor paths are not yet all migrated to use those methods. Some sampled texture paths still use the older sampled texture cache.
+- Rust rescale state is represented but `ScaleUp`, `ScaleDown`, `BlitScaleHelper`, and resolution-aware image switching are not ported yet.
+- Rust resource recreation still uses `device_wait_idle()` for stale backend image replacement. Upstream uses scheduler/resource lifetime ownership instead of a global idle wait.
+
+### Missing items
+- Port an upstream-shaped `TextureCacheRuntime` owner with scheduler, memory allocator/facade, staging pool, blit helper, render-pass cache, descriptor pools/queues, ASTC/MSAA helper ownership, and resolution state.
+- Port `Image::UploadMemory`, `Image::DownloadMemory`, `Image::StorageImageView`, `Image::ScaleUp`, `Image::ScaleDown`, `Image::BlitScaleHelper`, and `Image::NeedsScaleHelper` with upstream barrier ordering.
+- Port `TextureCacheRuntime::{BlitImage, CopyImage, CopyImageMSAA, ReinterpretImage, ConvertImage, TransitionImageLayout}` fully.
+- Populate `Framebuffer::rt_map`, `Framebuffer::images`, `Framebuffer::image_ranges`, samples, layer count, and rescale-derived render area exactly from backend `ImageView`s.
+- Migrate remaining descriptor/sample paths from reduced `CachedTexture` materialization to backend `Image`/`ImageView` ownership.
+
+### Binary layout verification
+- N/A: Vulkan backend owners are host-side renderer state. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `Vulkan::Image`, `Vulkan::ImageView`, and `Vulkan::Framebuffer` declarations in `video_core/renderer_vulkan/vk_texture_cache.h`.
+- Re-read upstream `MakeImageCreateInfo`, `ImageUsageFlags`, `ImageAspectMask`, `ImageViewAspectMask`, `MakeSubresourceRange`, `ImageView::ImageView`, lazy view helpers, and `Framebuffer::CreateFramebuffer` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Added `.agents/vulkan_texture_cache_state.md` documenting the interrupted upload/download/copy/rescale slice and its missing `TextureCacheRuntime` prerequisite.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan reaches continuous present and dumped `/tmp/ruzu_pinball_image_owner.png`; visual inspection shows the full playfield/right panel with no truncation after switching the render-target path to backend `Image`/`ImageView`/`Framebuffer` owners.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.h and video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust now has an explicit `TextureCacheRuntime` owner in `texture_cache.rs`, matching upstream's placement of `Vulkan::TextureCacheRuntime` in `vk_texture_cache.h/cpp`. In this slice it owns Vulkan resource creation/destruction for images, image views, framebuffers, sampled images, attachments, samplers, and teardown.
+- Rust keeps common-cache slot metadata in `TextureCache.base` and backend `ImageId`/`ImageViewId`/`RenderTargets` maps in `TextureCache`, not in `TextureCacheRuntime`. This preserves upstream's generic `TextureCache<P>` ownership model where the cache owns slots of `P::Image`, `P::ImageView`, and `P::Framebuffer`, while the runtime supplies Vulkan services.
+- Rust `TextureCacheRuntime` currently stores `ash::Device`, `ash::Instance`, and `vk::PhysicalDevice` directly because the full upstream `Vulkan::Device` wrapper is not yet ported into this renderer path. The created resources still use the upstream-owned `MakeImageCreateInfo`, image/view aspect, usage, and view-construction helpers in the same file.
+- Rust keeps scheduler/staging parameters at existing call sites for upload paths rather than storing fake or duplicated runtime owners. Upstream stores references to `Scheduler`, `MemoryAllocator`, `StagingBufferPool`, `BlitImageHelper`, `RenderPassCache`, descriptor queues, ASTC/MSAA passes, and resolution state in `TextureCacheRuntime`; those service references are the next prerequisite.
+
+### Unintentional differences (to fix)
+- Rust `TextureCacheRuntime` does not yet hold upstream's full service reference set: `Scheduler`, `MemoryAllocator`, `StagingBufferPool`, `BlitImageHelper`, `RenderPassCache`, descriptor pools/queues, ASTC decoder pass, MSAA copy pass, and resolution scaling info.
+- Rust image allocation still uses direct `vkCreateImage` plus direct memory allocation rather than upstream `MemoryAllocator::CreateImage` returning allocator-owned `vk::Image`/`ImageAlloc` ownership. This blocks faithful memory reporting and upstream lifetime behavior.
+- Rust upload/sample paths still record directly into an existing command buffer in places. Upstream records copy/barrier work through `scheduler.Record(...)` and runtime staging helpers, so the upload/download/copy/rescale methods remain intentionally unported until runtime services are threaded.
+- Rust `TextureCacheRuntime::view_formats` and `buffers[indexing_slots]` are present structurally but not populated/used like upstream `ViewFormats(PixelFormat)` and `GetTemporaryBuffer`.
+
+### Missing items
+- Thread upstream-equivalent runtime services from `RasterizerVulkan` into `TextureCacheRuntime` without duplicating ownership.
+- Replace direct image memory allocation with the ported Vulkan `MemoryAllocator`/allocation facade where available.
+- Port `TextureCacheRuntime::Finish`, `UploadStagingBuffer`, `DownloadStagingBuffer`, `FreeDeferredStagingBuffer`, `TickFrame`, memory usage reporting, `BlitImage`, `CopyImage`, `CopyImageMSAA`, `ReinterpretImage`, `ConvertImage`, `TransitionImageLayout`, `GetTemporaryBuffer`, and `BarrierFeedbackLoop`.
+- Port `Image::UploadMemory`, `Image::DownloadMemory`, `Image::StorageImageView`, `Image::ScaleUp`, `Image::ScaleDown`, and rescale framebuffer/view ownership after the runtime service references exist.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan renderer ownership only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCacheRuntime`, `Image`, `ImageView`, and `Framebuffer` declarations in `video_core/renderer_vulkan/vk_texture_cache.h`.
+- Re-read upstream `MakeImageCreateInfo`, `ImageUsageFlags`, `ImageAspectMask`, `ImageViewAspectMask`, `ImageView::MakeView`, and `Framebuffer::CreateFramebuffer` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Verified Rust `TextureCache` no longer owns direct `device`/`instance`/`physical_device` fields; Vulkan resource creation/destruction now goes through `TextureCacheRuntime`.
+- `.agents/vulkan_texture_cache_state.md` updated with the new runtime-owner status and the remaining prerequisite for full upload/download/copy/rescale fidelity.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan dumped `/tmp/ruzu_pinball_runtime.png`; visual inspection shows the complete playfield and right panel with no truncation after moving Vulkan resource creation/destruction behind `TextureCacheRuntime`.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp and video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust now adds an upstream-owned backend upload method on `Image` (`Image::upload_memory`) and routes the sampled-image materialization path through targeted pending-backend-insertion completion. This mirrors upstream ownership (`Vulkan::Image::UploadMemory` plus `TextureCache<P>::RefreshContents`) while staying within the current split Rust architecture.
+- Rust targeted completion only removes the requested `ImageId` from `pending_backend_insertions` when a sampled-image call provides guest-memory reader, staging buffer, and command buffer. A broader "drain all pending insertions with this reader" was tested and rejected because it also completed render targets without upstream's full scheduler/barrier context and produced a black Pinball frame.
+- Rust no-reader backend insertion completion now defers `CPU_MODIFIED` images instead of blindly registering them. This is stricter than the previous reduced path and avoids falsely marking an image complete when guest contents were not uploaded.
+- Rust still records the upload directly against the command buffer passed by the active reduced rasterizer. Upstream records through `scheduler.Record(...)`; this remains a documented runtime-service prerequisite rather than a fake scheduler port.
+
+### Unintentional differences (to fix)
+- Rust `Image::upload_memory` does not yet call `ScaleDown(true)`/`ScaleUp()` around uploads for rescaled images. Upstream does this in `Vulkan::Image::UploadMemory`.
+- Rust `refresh_contents_with_reader` only handles the basic `CPU_MODIFIED -> UnswizzleImage -> UploadMemory` path. Upstream also handles `AcceleratedUpload`, `Converted`, `AsynchronousDecode`, MSAA upload fallback, `TrackImage`, `QueueAsyncDecode`, `ConvertImage`, and `runtime.InsertUploadMemoryBarrier()`.
+- Rust targeted insertion completion does not yet run the full upstream join tail (`FinishPendingJoinCopies`): sibling rescale, new-image rescale, alias relation application, GPU-modified overlap copies, and alias copy propagation are still missing.
+- Rust upload barriers are recorded directly with `cmd_pipeline_barrier`; upstream records them via scheduler-owned operations and can request an outside-render-pass context before transfer work.
+
+### Missing items
+- Port `TextureCacheRuntime::UploadStagingBuffer`, `DownloadStagingBuffer`, `CopyImage`, `CopyImageMSAA`, `BlitImage`, and upload/download barrier helpers using scheduler-recorded closures.
+- Port full `TextureCache<P>::FinishPendingJoinCopies` behavior into the Vulkan backend wrapper after scheduler/staging/blit/runtime services are wired.
+- Port `Image::DownloadMemory`, rescale helpers, converted/accelerated uploads, async decode queueing, and explicit upload-memory barrier insertion.
+
+### Binary layout verification
+- N/A: this slice changes Vulkan host resource ownership and GPU command recording only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::RefreshContents` and `TextureCache<P>::UploadImageContents` in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `Vulkan::Image::UploadMemory` and `TextureCacheRuntime::UploadStagingBuffer` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read the Rust OpenGL backend `finish_pending_backend_insertions_impl` and `finish_pending_join_copies_impl` as the existing split-architecture reference.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_backend_upload2.png`; the frame is visually complete with bbox `x[250..2282] y[0..1439]` and repeated `AccelerateDisplay hit`.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/texture_cache.rs, video_core/src/renderer_vulkan/mod.rs, and video_core/src/texture_cache/texture_cache.rs vs video_core/texture_cache/texture_cache.h and video_core/renderer_vulkan/vk_texture_cache.h/cpp
+
+### Intentional differences
+- Rust Vulkan now sets `TextureCacheBase::backend_completes_join_images(true)` and drains `pending_backend_deletions`, mirroring the upstream lifecycle edge from `TextureCache<P>::DeleteImage` through `RemoveImageViewReferences` and `RemoveFramebuffers`.
+- Rust Vulkan evicts backend `framebuffers_by_render_targets` entries whose `RenderTargets` key contains a removed `ImageViewId`, then detaches backend `ImageView` and `Image` objects. Actual Vulkan destruction is deferred through a scheduler-tick queue instead of immediate `vkDestroy*`, preserving Vulkan in-flight resource safety.
+- Rust Vulkan advances this deferred queue from `RasterizerVulkan::tick_frame` using `Scheduler::current_tick()`. Resources retire at `current_tick + TICKS_TO_DESTROY`; if the scheduler tick does not advance, destruction is conservatively delayed.
+- Rust base `update_render_targets_from_snapshot` now uses the backend-completion-aware insertion path for both color render targets and zeta when `backend_completes_join_images` is enabled. Vulkan then completes pending backend insertions by registering the base image allocation before backend image/view materialization.
+- Rust keeps a temporary present compatibility fallback from CPU address to backend `ImageId`/`ImageViewId` when `TryFindFramebufferImageView` misses the common CPU-range lookup. This preserves the current frontend display path while ownership remains `ImageId`/`ImageViewId`/`RenderTargets`.
+
+### Unintentional differences (to fix)
+- Rust Vulkan backend insertion completion is still incomplete versus upstream `FinishPendingJoinCopies`: it registers the base allocation but does not yet perform refresh contents, scheduler-recorded upload, copy/join tails, rescale handling, or reinterpret/convert paths.
+- Rust uses a local scheduler-tick delayed queue in `TextureCacheRuntime` rather than upstream's full runtime/master-semaphore resource retirement model. It is conservative and Vulkan-safe, but not yet the complete upstream lifetime implementation.
+- The CPU-address present fallback is a documented compatibility bridge. Upstream present consumes the backend image view selected by the common texture cache without needing this extra map.
+
+### Missing items
+- Port full Vulkan `finish_pending_backend_insertions`/join-copy completion equivalent: refresh contents, upload/download, copy/reinterpret/convert, rescale, and registration ordering.
+- Thread full runtime services into `TextureCacheRuntime`: scheduler recording, staging pool, memory allocator, blit helper, render pass cache, descriptor queues, ASTC/MSAA passes, and resolution state.
+- Remove `render_target_cpu_map` once the present path consumes common-cache `FramebufferImageView`/backend `ImageView` reliably after full backend insertion completion.
+
+### Binary layout verification
+- N/A: lifecycle changes affect host-side Vulkan resource ownership and base cache slot lifecycle only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::DeleteImage`, `RemoveImageViewReferences`, and `RemoveFramebuffers` in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `TextureCacheRuntime`, `Image`, `ImageView`, and `Framebuffer` ownership in `video_core/renderer_vulkan/vk_texture_cache.h`.
+- Compared with the OpenGL backend drain pattern in `video_core/src/renderer_opengl/gl_texture_cache.rs::finish_pending_backend_deletions`; Vulkan mirrors the call edge but sentences Vulkan handles instead of immediately deleting them.
+- `.agents/vulkan_texture_cache_state.md` updated with delayed backend deletion, pending insertion completion, and remaining join/upload/copy prerequisites.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan dumped `/tmp/ruzu_pinball_deferred.png`; logs show `AccelerateDisplay hit` and visual inspection shows the complete playfield and right panel with no truncation.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/texture_cache.rs and video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_texture_cache.h, video_core/renderer_vulkan/vk_texture_cache.cpp, video_core/renderer_vulkan/vk_render_pass_cache.cpp, video_core/texture_cache/texture_cache.h, and video_core/texture_cache/render_targets.h
+
+### Intentional differences
+- Rust Vulkan render-target surfaces are now keyed by common-cache `ImageId` instead of translated CPU address. This matches upstream backend ownership where `slot_images[ImageId]` owns the backend `Image`, while retaining a small CPU-address compatibility index only for present/frontend paths that still arrive with a CPU address.
+- Rust assembled Vulkan framebuffers are now keyed by `VideoCommon::RenderTargets`, matching upstream `TextureCache<P>::GetFramebufferId(const RenderTargets& key)` instead of using an RT0-only CPU-address key.
+- Rust materializes all bound color render-target image views plus optional zeta from `base.render_targets.color_buffer_ids` and `base.render_targets.depth_buffer_id`, then requests a compatible render pass from `RenderPassCache`. This follows upstream `GetFramebufferId`/`Framebuffer::Framebuffer` ownership more closely than the earlier RT0 plus synthesized-depth path.
+- Rust tracks the `ImageId` list attached to each backend framebuffer and transitions every attached image from `UNDEFINED` to `GENERAL` before render-pass use. This preserves upstream's initial `VK_IMAGE_LAYOUT_UNDEFINED` image creation plus render-pass `GENERAL` layout model without pretending first-use contents are valid.
+- Rust keeps `render_target_cpu_map` as a temporary compatibility index for `rt0_image_info`, `prepare_framebuffer_for_present`, and display acceleration. It is not the owning identity and should disappear once the present path consumes common `ImageViewId`/`ImageId` directly.
+
+### Unintentional differences (to fix)
+- Rust now has dedicated backend `Image` and `ImageView` owner structs equivalent in placement to upstream `Vulkan::Image` and `Vulkan::ImageView`, but their upload/download/rescale methods and full runtime-service integration remain incomplete.
+- Rust image creation still uses the reduced `create_attachment` path instead of upstream `MakeImageCreateInfo`, `ImageUsageFlags`, mutable view format lists, cube/2D-array-compatible flags, sample conversion, allocator-owned `ImageAlloc`, and rescale image ownership.
+- Rust `ImageView` materialization still only ports a framebuffer-facing subset (`Color2D` and reduced fallback view handling). Upstream owns per-texture-type views, depth/stencil/color/storage view helpers, usage override structs, swizzle conversion, and full subresource range selection in `ImageView::MakeView`.
+- Rust render-target framebuffer creation still omits upstream `Framebuffer` details such as `rt_map`, per-attachment `ImageView` ranges, layer count derivation, samples from image info, rescale metadata, and the full `FramebufferId` slot owner.
+- Rust `RenderPassCache` remains keyed by `vk::Format` and still carries a conservative subpass dependency. Upstream keys by `PixelFormat`, derives Vulkan formats through `MaxwellToVK::SurfaceFormat`, and creates render passes with `dependencyCount = 0`.
+- Rust destroys/recreates stale backend images with `device_wait_idle()` because the full upstream scheduler/resource lifetime model is not ported yet. Upstream relies on cache ownership and scheduled resource management rather than global idle waits.
+
+### Missing items
+- Port upstream `Vulkan::Image` as the backend owner for common `ImageBase`, including `MakeImageCreateInfo`, allocation, initialized state, storage views, scale-up/scale-down images, upload/download/copy paths, and layout transition ownership.
+- Port upstream `Vulkan::ImageView` as the backend owner for common `ImageViewBase`, including `DepthView`, `StencilView`, `ColorView`, `StorageView`, `MakeView`, and `Handle(TextureType)`.
+- Port upstream `Vulkan::Framebuffer` as a real owner with all color attachments, optional depth/stencil attachment, `rt_map`, attachment ranges, samples, layer count, render area, and rescaling state.
+- Replace the remaining CPU-address present compatibility path with a direct common-cache `FramebufferImageView`/`ImageViewId` backend lookup.
+- Add a depth/MRT verification title or homebrew test; SpaceCadetPinball-NX validates no regression for the color-present path but does not prove full MRT/depth behavior.
+
+### Binary layout verification
+- N/A: Vulkan backend image/view/framebuffer handles and cache keys are host-side renderer state. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::GetFramebufferId`, `TextureCache<P>::UpdateRenderTargets`, and render-target preparation flow in `video_core/texture_cache/texture_cache.h`; Rust now uses common `RenderTargets` and common `ImageId` as the backend identity for this reduced Vulkan path.
+- Re-read upstream `RenderTargets` equality/hash owner in `video_core/texture_cache/render_targets.h`; Rust uses the same conceptual key for framebuffer cache lookup.
+- Re-read upstream `Vulkan::Image`, `Vulkan::ImageView`, and `Vulkan::Framebuffer` declarations in `video_core/renderer_vulkan/vk_texture_cache.h`; the remaining missing backend owners are explicitly listed above.
+- Re-read upstream `MakeImageCreateInfo`, `ImageAspectMask`, `ImageViewAspectMask`, `ImageView::ImageView`, `ImageView::MakeView`, and `Framebuffer::CreateFramebuffer` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `RenderPassCache::Get` in `video_core/renderer_vulkan/vk_render_pass_cache.cpp`; Rust now matches `GENERAL` plus LOAD/STORE semantics for active attachments but still differs in key type and dependency handling.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan dumped `/tmp/ruzu_pinball_imageid.png`; the capture shows the full playfield and right panel with no render-target truncation after the ImageId/RenderTargets backend-keying change.
+
+## 2026-07-01 — video_core Vulkan zeta/render-target slice vs video_core/engines/maxwell_3d.h, video_core/renderer_vulkan/fixed_pipeline_state.cpp, video_core/renderer_vulkan/vk_graphics_pipeline.cpp, video_core/renderer_vulkan/vk_texture_cache.cpp, and video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust `DrawCall` now carries a `ZetaInfo` snapshot alongside the color render-target snapshots. This preserves the upstream ownership edge where draw-time render-target state comes from Maxwell3D registers, while staying inside the existing Rust `DrawCall` bridge.
+- Rust `FixedPipelineState::refresh` now sets `depth_enabled` from `draw.zeta.enabled` and `depth_format` from `draw.zeta.format`, matching upstream `FixedPipelineState::Refresh` assignments from `regs.zeta_enable` and `regs.zeta.format`.
+- Rust active Vulkan draw/clear now passes real zeta state into `TextureCache::update_render_targets_and_get_rt0_framebuffer` instead of `Default::default()`, superseding the earlier 2026-07-01 documented gap.
+- Rust reduced `CachedRenderTarget` now creates an optional depth/stencil attachment only when the common texture-cache render-target state has a valid zeta image view, and it requests a matching render pass from `RenderPassCache`.
+- Rust reduced render-target cache now detects stale cached RT0 entries by color size, render area, color format, and depth format. It destroys stale host resources after `device_wait_idle()` because the full upstream lifetime/fence model is not ported yet.
+
+### Unintentional differences (to fix)
+- Rust still materializes only RT0 and optional zeta. Upstream `Framebuffer::CreateFramebuffer` consumes all 8 color image views, optional depth image view, `rt_map`, image ranges, layer count, samples, render area, and rescaling state.
+- Rust creates a fresh reduced zeta attachment with the right format/extent, but does not upload/download or alias the real backend zeta image contents. Upstream attaches the actual backend `ImageView` selected by common `TextureCache<P>::UpdateRenderTargets`.
+- Rust framebuffer caching is still keyed by RT0 CPU address plus ad-hoc stale checks. Upstream framebuffers are keyed by full `VideoCommon::RenderTargets`.
+- Rust `RenderPassCache` is still reduced and keyed by `vk::Format`. Upstream `RenderPassKey` is keyed by `Surface::PixelFormat`, computes attachment descriptions from upstream format helpers, and uses the full attachment set.
+- Rust stale-resource destruction uses `device_wait_idle()` as a reduced-backend safety barrier. Upstream lifetime is handled through the scheduler/resource tracking and framebuffer cache owners rather than a global idle wait on size/format changes.
+
+### Missing items
+- Port the full upstream Vulkan `Framebuffer` backend owner and have it consume the common `RenderTargets` key directly.
+- Port backend `ImageView`/`Image` ownership sufficiently that color and zeta attachments are the actual cached guest images, not reduced replacement attachments.
+- Replace the CPU-address RT0 map with upstream-style full `RenderTargets -> FramebufferId` caching.
+- Extend `RenderPassCache` to upstream `PixelFormat` keys and full color/depth/stencil attachment descriptions.
+
+### Binary layout verification
+- N/A: touched zeta/render-target state is host-side renderer state. No guest raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `FixedPipelineState::Refresh` in `video_core/renderer_vulkan/fixed_pipeline_state.cpp`; Rust now preserves the zeta enable/format fields in the fixed pipeline key.
+- Re-read upstream `MakeRenderPassKey`, `GraphicsPipeline::ConfigureImpl`, and `GraphicsPipeline::ConfigureDraw` in `video_core/renderer_vulkan/vk_graphics_pipeline.cpp`.
+- Re-read upstream `Framebuffer::Framebuffer` and `Framebuffer::CreateFramebuffer` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `TextureCache<P>::UpdateRenderTargets` and `TextureCache<P>::GetFramebufferId` in `video_core/texture_cache/texture_cache.h`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::fixed_pipeline_state::tests::test_refresh_preserves_zeta_pipeline_state` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan dumped `/tmp/ruzu_pinball_zeta.png`; the capture shows the full playfield and right panel with no RT0 truncation.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/texture_cache.rs and video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp, video_core/renderer_vulkan/vk_render_pass_cache.cpp, video_core/renderer_vulkan/vk_graphics_pipeline.cpp, and video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust now creates the active reduced RT0 framebuffer with a `RenderPassCache` render pass derived from the RT0 color format and no depth attachment when no zeta is bound. This matches upstream `Framebuffer::CreateFramebuffer` behavior for a color-only framebuffer more closely than the previous shared/fake depth attachment.
+- Rust updates render targets before graphics-pipeline lookup in the active draw path so the pipeline is created with the selected framebuffer render pass. This follows upstream ordering where `GraphicsPipeline::ConfigureImpl` calls `texture_cache.UpdateRenderTargets(false)` before `ConfigureDraw`, and `ConfigureDraw` requests `texture_cache.GetFramebuffer()`.
+- Rust still supports the legacy offscreen/default framebuffer path with `default_render_pass` and the window-sized depth attachment. That path remains a reduced frontend fallback and is not the upstream framebuffer model.
+
+### Unintentional differences (to fix)
+- Rust still materializes only RT0 in this reduced path. Upstream `Framebuffer::CreateFramebuffer` iterates all 8 color attachments, tracks `rt_map`, image ranges, layer count, samples, and render area from the complete `RenderTargets` key.
+- Rust still passes `zeta: Default::default()` from the active draw bridge, so real guest zeta/depth-stencil images are not yet attached. Upstream attaches the depth buffer only when `depth_buffer` is non-null and derives `RenderPassKey.depth_format` from that image view.
+- Rust `RenderPassCache` is keyed by Vulkan formats and has a reduced attachment description. Upstream keys by `PixelFormat`, uses `VK_IMAGE_LAYOUT_GENERAL`, and sets color/depth/stencil load/store operations uniformly through `AttachmentDescription`.
+- Rust `CachedRenderTarget` is still keyed by translated CPU address and does not yet revalidate stale size/format changes. Upstream framebuffers are cached by full `RenderTargets` key.
+
+### Missing items
+- Port a full backend `Framebuffer` owner matching upstream `Vulkan::Framebuffer`, including all color attachments, optional zeta, render-pass key construction, image ranges, samples, layer count, and rescaling state.
+- Thread real `Maxwell3DRenderTargets.zeta` into the active Vulkan draw/clear bridge instead of `Default::default()`.
+- Replace the CPU-address-only render-target cache with a framebuffer cache keyed by the full common `RenderTargets` state.
+
+### Binary layout verification
+- N/A: Vulkan render pass/framebuffer handles and attachment ownership are host-side state only; no guest-visible raw-copied binary layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::UpdateRenderTargets` and `TextureCache<P>::GetFramebufferId` in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `Framebuffer::Framebuffer` and `Framebuffer::CreateFramebuffer` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `RenderPassCache::Get` in `video_core/renderer_vulkan/vk_render_pass_cache.cpp`.
+- Re-read upstream `GraphicsPipeline::ConfigureImpl` and `GraphicsPipeline::ConfigureDraw` in `video_core/renderer_vulkan/vk_graphics_pipeline.cpp`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan reaches continuous present and local capture `/tmp/ruzu_pinball_upstream_rp.png` shows the full playfield and right panel with RT0 `1920x1080` and no truncation.
+
 ## 2026-06-30 — video_core/src/renderer_vulkan/texture_cache.rs and video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp, video_core/renderer_vulkan/vk_texture_cache.h, video_core/renderer_vulkan/vk_graphics_pipeline.cpp, and video_core/texture_cache/texture_cache.h
 
 ### Intentional differences
@@ -17227,3 +17628,1865 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `Framebuffer::Framebuffer`/`CreateFramebuffer` in `vk_texture_cache.cpp`; the added Rust trace is diagnostic only and the known reduced framebuffer path remains documented.
 - `cargo fmt --all` passes.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h and video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust Vulkan now drains `TextureCacheBase::pending_join_copies` from the sampled-image materialization path when the caller provides guest-memory reader, staging pool, and scheduler. This is the current Rust equivalent of the upstream join tail after `JoinImages` queues backend completion.
+- The non-rescaled, non-MSAA join path preserves upstream ordering: sibling rescale gate, refresh contents for the new image, apply alias/bad-overlap relations, copy alias/GPU-modified overlaps, delete overlap images, then register the completed new image.
+- Rust uses `TextureCacheRuntime::copy_image` for join copies; that method records upstream-style Vulkan barriers/copy through `Scheduler::record`, matching upstream `TextureCacheRuntime::CopyImage`.
+- Rust preflights a whole pending join before deleting overlaps. If the join requires an unsupported Vulkan backend prerequisite (`ScaleUp`/`ScaleDown` or `CopyImageMSAA`), it requeues the whole join intact instead of partially completing it with wrong coordinates or missing MSAA contents.
+- Rust `delete_join_overlap_image` mirrors the OpenGL split-backend lifecycle but sentences Vulkan image views/images/framebuffers rather than immediately destroying handles, preserving Vulkan in-flight resource safety.
+
+### Unintentional differences (to fix)
+- Upstream performs `ScaleUp`/`ScaleDown` around join siblings and the new image. Rust Vulkan only ports the gate and requeues joins that require rescale because backend scaled-image ownership and blit helpers are not implemented yet.
+- Upstream calls `runtime.CopyImageMSAA` when overlap and new image sample counts differ. Rust Vulkan detects that requirement and requeues; `CopyImageMSAA` is still missing.
+- Upstream `TextureCache<P>::JoinImages` executes synchronously inside the common cache template. Rust's split architecture queues `PendingJoinCopies`; the ordering is preserved only at the backend completion edge, not at insertion time.
+- Rust sampled-image materialization is currently the only place that can drain pending joins because it has reader/staging/scheduler. Other call sites still lack the full upstream runtime service owner.
+
+### Missing items
+- Port Vulkan `Image::ScaleUp`, `Image::ScaleDown`, scaled-image allocation/switching, and scale invalidation ownership.
+- Port `TextureCacheRuntime::CopyImageMSAA` and its compute/render helper dependencies.
+- Thread the remaining upstream runtime services into `TextureCacheRuntime`: allocator/facade, blit helper, render-pass cache, descriptor queues, ASTC/MSAA passes, and resolution state.
+- Add a depth/MRT/rescale-capable validation title or homebrew; Pinball does not exercise rescale, MSAA, depth reuse, or MRT joins.
+
+### Binary layout verification
+- N/A: this slice changes host-side texture-cache lifecycle and Vulkan command scheduling. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages`, including rescale, refresh, alias relation, copy, overlap delete, and register ordering in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `TextureCacheRuntime::CopyImage` and `CopyImageMSAA` entry point in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Compared Rust Vulkan drain ordering against the existing split-backend OpenGL `finish_pending_join_copies_impl` and `delete_join_overlap_image`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_join.png` at frame 30. The frame is complete: `2560x1440`, bbox `x[251..2281] y[0..1439]`, guest approx `x[188..1710] y[0..1079]`. No pending-join rescale/MSAA requeue warnings appeared for this test.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/texture_cache.rs and video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_texture_cache.h/cpp
+
+### Intentional differences
+- Rust `TextureCacheRuntime` now stores a stable runtime reference to `RenderPassCache`, matching upstream `TextureCacheRuntime` ownership of `RenderPassCache& render_pass_cache`.
+- Rust `RasterizerVulkan` boxes `RenderPassCache` alongside `Scheduler` and `StagingBufferPool` so the split backend can hold a stable `NonNull<RenderPassCache>` without duplicating the owner.
+- Rust `TextureCache::update_render_targets_and_get_rt0_framebuffer` now obtains render passes through `TextureCacheRuntime::render_pass_cache()` instead of receiving a render-pass cache parameter from the draw path. This matches upstream ownership direction, where framebuffer creation asks the runtime-owned render-pass cache.
+
+### Unintentional differences (to fix)
+- Upstream `TextureCacheRuntime` still owns more services than Rust: `MemoryAllocator`, `BlitImageHelper`, descriptor pool/queue services, ASTC/MSAA passes, resolution scaling state, temporary buffers, and full view-format compatibility lists.
+- Rust `RenderPassCache` itself remains a reduced port using the current Rust `RenderPassKey` and simplified attachment/dependency handling rather than the full upstream `vk_render_pass_cache` behavior.
+- Rust uses boxed service owners plus `NonNull` references as the split-architecture adaptation. Upstream stores direct C++ references because `TextureCacheRuntime` is constructed inside the upstream renderer object graph.
+
+### Missing items
+- Thread the remaining upstream runtime services into `TextureCacheRuntime` without duplicating owners, starting with the memory allocator/facade and `BlitImageHelper`.
+- Port `TextureCacheRuntime::DownloadStagingBuffer`, `FreeDeferredStagingBuffer`, `TickFrame`, memory usage reporting, temporary buffers, `BlitImage`, `ConvertImage`, `CopyImageMSAA`, `ScaleUp`/`ScaleDown`, ASTC decode pass ownership, and MSAA copy pass ownership.
+- Replace remaining reduced render-pass/framebuffer compatibility logic with the upstream-compatible `Image`/`ImageView`/`Framebuffer` path once the missing services are available.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan service ownership only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCacheRuntime` declaration in `video_core/renderer_vulkan/vk_texture_cache.h`, including its constructor parameters and `RenderPassCache& render_pass_cache` member.
+- Re-read upstream `TextureCacheRuntime::TextureCacheRuntime` and `UploadStagingBuffer` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_renderpass_owner.png` at frame 30. The frame remains complete: `2560x1440`, bbox `x[251..2281] y[0..1439]`, guest approx `x[188..1710] y[0..1079]`. No panic or new join/copy failure appeared in the log; only pre-existing MoltenVK primitive-restart warnings were present.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/renderer_vulkan.rs, video_core/src/renderer_vulkan/mod.rs, and video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/renderer_vulkan.h, vk_rasterizer.h/cpp, and vk_texture_cache.h/cpp
+
+### Intentional differences
+- Rust `RendererVulkan` now owns `MemoryAllocator` in a `Box<MemoryAllocator>` and passes a stable mutable reference through `RasterizerVulkan::new` to `TextureCacheRuntime::new`, matching upstream's `RendererVulkan::memory_allocator -> RasterizerVulkan(memory_allocator_) -> TextureCacheRuntime(memory_allocator_)` ownership chain.
+- Rust declares `RendererVulkan::rasterizer` before `RendererVulkan::memory_allocator` so Rust field drop order destroys the rasterizer before the allocator. This preserves upstream C++ lifetime behavior, where `RendererVulkan` declares `MemoryAllocator` before `RasterizerVulkan` and C++ destroys fields in reverse declaration order.
+- Rust `RasterizerVulkan` stores a `NonNull<MemoryAllocator>` service reference to preserve upstream `MemoryAllocator& memory_allocator` ownership on the rasterizer side, while `TextureCacheRuntime` stores its own stable service reference matching upstream `TextureCacheRuntime::memory_allocator`.
+
+### Unintentional differences (to fix)
+- Rust `TextureCacheRuntime` does not yet use `MemoryAllocator` for texture-cache image allocation. Current Rust image paths still create and bind raw `VkDeviceMemory` pairs directly, while upstream `MakeImage` calls `allocator.CreateImage(image_ci)`.
+- Rust `MemoryAllocator::create_image` currently keeps created images in allocator-owned delayed lifetime until allocator drop. Texture cache images are individually destroyed by `TextureCacheRuntime`, so switching to that API before porting an allocator-backed image owner would create incorrect lifetime semantics.
+- Rust `StagingBufferPool` still does not take `MemoryAllocator&` in its constructor, while upstream constructs `staging_pool(device, memory_allocator, scheduler)`.
+
+### Missing items
+- Port an allocator-backed per-image owner matching upstream `vk::Image` ownership so `TextureCacheRuntime::create_image_from_info`, sampled image creation, attachments, and scaled images can call the runtime allocator without leaks or double-destroy.
+- Thread `MemoryAllocator` into `StagingBufferPool` once staging buffer allocation ownership is made upstream-faithful.
+- Continue service threading with `BlitImageHelper`, descriptor pool/compute descriptor queue, ASTC/MSAA passes, resolution scaling state, and temporary buffers.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan service ownership and drop ordering only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `RendererVulkan` field declarations in `video_core/renderer_vulkan/renderer_vulkan.h`, including `MemoryAllocator memory_allocator` before `RasterizerVulkan rasterizer`.
+- Re-read upstream `RasterizerVulkan` members and constructor initializer list in `video_core/renderer_vulkan/vk_rasterizer.h/cpp`, including `MemoryAllocator& memory_allocator` and `texture_cache_runtime{device, scheduler, memory_allocator, ...}`.
+- Re-read upstream `TextureCacheRuntime` constructor and member declarations in `video_core/renderer_vulkan/vk_texture_cache.h/cpp`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_allocator_owner.ppm` at frame 30. The frame remains complete: `2560x1440`, bbox `x[251..2281] y[0..1439]`, guest approx `x[188..1710] y[0..1079]`. No panic or new join/copy failure appeared in the log; only pre-existing MoltenVK primitive-restart warnings were present.
+
+## 2026-07-01 — video_core/src/vulkan_common/vulkan_memory_allocator.rs and video_core/src/renderer_vulkan/texture_cache.rs vs video_core/vulkan_common/vulkan_memory_allocator.h/cpp and video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust adds `AllocatedImage` as the port-facing owner for images returned by `MemoryAllocator::CreateImage`. Upstream returns a `vk::Image` wrapper that owns the VMA allocation; Rust uses a dedicated `VkDeviceMemory` allocation inside `AllocatedImage` until the allocator wrapper is fully VMA-equivalent.
+- Rust keeps the existing `MemoryAllocator::create_image -> vk::Image` path for present/util callers that expect allocator-owned lifetime, and adds `create_owned_image -> AllocatedImage` for texture-cache backend images that need per-image lifetime. This avoids changing unrelated present-layer ownership while moving the Vulkan texture cache toward upstream.
+- Rust backend `ImageId` images now allocate through `TextureCacheRuntime::create_image_from_info`, which calls the runtime-owned `MemoryAllocator` with `make_image_create_info`, matching upstream `MakeImage(runtime->device, runtime->memory_allocator, info, ...)` ownership direction.
+- Rust `TextureCacheRuntime::destroy_image` now destroys only image views for backend `Image`; the image and memory are released by `AllocatedImage::drop`, matching upstream wrapper ownership rather than manually freeing raw pairs from the texture-cache runtime.
+
+### Unintentional differences (to fix)
+- Rust `make_image_create_info` does not yet apply upstream view-format-list handling (`VkImageFormatListCreateInfo`) when multiple compatible view formats exist.
+- Rust backend `Image` stores `scaled_image: Option<AllocatedImage>` but `ScaleUp`/`ScaleDown` are not implemented yet, so scaled-image allocation still lacks upstream behavior.
+- Rust legacy `CachedTexture` sampled-image path and attachment helper path still allocate raw `VkImage`/`VkDeviceMemory` pairs directly. Upstream routes image allocation for texture-cache images through `MemoryAllocator::CreateImage` and image wrappers.
+- Rust allocator still uses one dedicated allocation per owned image, not full VMA suballocation/defragmentation behavior.
+
+### Missing items
+- Fold the legacy sampled-image cache into the backend `Image`/`ImageView` model so sampled images also use allocator-backed backend images rather than `CachedTexture` raw memory pairs.
+- Port scaled-image allocation and switching for `Image::ScaleUp`/`ScaleDown`, using `AllocatedImage` for both original and scaled images.
+- Add view-format-list creation to `create_image_from_info` once `TextureCacheRuntime::view_formats` is fully populated like upstream.
+- Convert attachment helper paths to real backend `Framebuffer`/`ImageView` ownership instead of raw helper images.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan image ownership and allocation lifetime only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `MakeImageCreateInfo` and `MakeImage` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `Image` scaled-image allocation references in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read Rust `MemoryAllocator::CreateImage` port in `video_core/src/vulkan_common/vulkan_memory_allocator.rs`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_owned_image.ppm` at frame 30. The frame remains complete: `2560x1440`, bbox `x[251..2281] y[0..1439]`, guest approx `x[188..1710] y[0..1079]`. No panic or new join/copy failure appeared in the log; only pre-existing MoltenVK primitive-restart warnings were present.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h and video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust sampled texture materialization now uses the backend `Image`/`ImageView` owners instead of the removed `CachedTexture` side cache. The path is: finish pending backend deletion/insertion, finish pending joins, refresh CPU-modified contents through `Image::upload_memory`, `ensure_image`, `ensure_image_view`, then return `image_view_handle`.
+- Rust removed the legacy sampled-image helper that created a separate raw `VkImage`/`VkDeviceMemory` pair and uploaded directly into the current command buffer. This moves sampled textures onto the same scheduler-recorded upload path as backend images, matching upstream's `GetImageView(index) -> slot_image_views[image_view_id]` model.
+- Rust keeps the public `materialize_sampled_image_view(..., cmd)` parameter for now because the active rasterizer call path still passes the command buffer, but the parameter is intentionally unused after switching uploads to scheduler-recorded `Image::upload_memory`.
+
+### Unintentional differences (to fix)
+- Rust still relies on the active reduced descriptor/pipeline path to call `materialize_sampled_image_view`; upstream descriptor binding directly asks `TextureCache::GetImageView` and binds the backend `ImageView` handle.
+- Attachment helper paths still create raw image/memory pairs outside the allocator-backed backend model.
+- Full `PrepareImageView` behavior from the common texture cache template is still split across Rust backend completion/refresh helpers rather than literally ported as one ownership path.
+
+### Missing items
+- Port the remaining attachment helper paths to real backend `Framebuffer`/`ImageView` ownership so raw helper images are removed.
+- Continue porting descriptor queue ownership so sampled image views are consumed through upstream-shaped descriptor update paths instead of the active reduced rasterizer bridge.
+- Port scaled-image ownership and `ScaleUp`/`ScaleDown`, then remove conservative pending-join requeue for rescale.
+
+### Binary layout verification
+- N/A: this slice removes a host-side Vulkan sampled-image side cache and changes image/view ownership only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::GetImageView(ImageViewId)`, `TextureCache<P>::GetImageView(u32)`, `VisitImageView`, `FindImageView`, and `CreateImageView` in `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust backend `Image::upload_memory` and `TextureCacheRuntime::create_image_from_info` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- Confirmed `rg` finds no remaining `CachedTexture`, `self.textures`, `create_sampled_image`, or `upload_sampled_image` symbols in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_sampled_backend.ppm` at frame 30. The frame remains complete: `2560x1440`, bbox `x[251..2281] y[0..1439]`, guest approx `x[188..1710] y[0..1079]`. No panic or new join/copy failure appeared in the log; only pre-existing MoltenVK primitive-restart warnings were present.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp and video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust removed dead texture-cache attachment helpers that created and destroyed raw `VkImage`/`VkDeviceMemory` pairs. These helpers were not called by the active backend after framebuffer ownership moved to backend `Image`/`ImageView`/`Framebuffer`.
+- Rust `TextureCacheRuntime` no longer contains local raw image allocation code. Texture-cache image creation now routes through backend `Image` and `MemoryAllocator::create_owned_image`, matching upstream's `MakeImage(... memory_allocator ...)` ownership direction.
+- Rust offscreen framebuffer attachments in `renderer_vulkan/mod.rs` remain untouched because they are rasterizer/offscreen fallback resources, not upstream `TextureCacheRuntime` image ownership.
+
+### Unintentional differences (to fix)
+- Upstream has no equivalent offscreen fallback framebuffer allocation inside `vk_texture_cache.cpp`; Rust still has reduced rasterizer fallback resources in `renderer_vulkan/mod.rs`.
+- `Framebuffer` ownership is still incomplete compared with upstream `Framebuffer::Framebuffer`, especially rescale state, image ranges, and full render-target mapping.
+
+### Missing items
+- Port allocator-backed scaled-image ownership and `Image::ScaleUp`/`ScaleDown`.
+- Port full `Framebuffer` construction metadata so render-target image ranges, samples, rescale state, and RT mapping match upstream.
+- Continue replacing reduced rasterizer fallback paths with upstream framebuffer/render-target paths as the backend services land.
+
+### Binary layout verification
+- N/A: this slice removes unused host-side Vulkan helper methods only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `MakeImage` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `TextureCache<P>::RenderTargetFromImage` in `video_core/texture_cache/texture_cache.h`.
+- Confirmed `rg` finds no `create_attachment`, `destroy_attachment`, `find_device_local_memory`, direct `create_image(&image_info)`, `allocate_memory(&alloc_info)`, or `bind_image_memory` symbols in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_no_attachment_helpers.ppm` at frame 30. The frame remains complete: `2560x1440`, bbox `x[251..2281] y[0..1439]`, guest approx `x[188..1710] y[0..1079]`. No panic or new join/copy failure appeared in the log; only pre-existing MoltenVK primitive-restart warnings were present.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h and video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust ports the direct `Image::ScaleUp` / `Image::ScaleDown` path as backend-owned helpers on `TextureCache`, because the split Rust architecture keeps common `ImageBase` metadata in `TextureCacheBase` and backend `AllocatedImage` ownership in the Vulkan wrapper. The ownership boundary remains the same conceptually: common cache decides rescale state, Vulkan backend owns the `VkImage`.
+- Rust `TextureCacheRuntime::blit_scale` records the direct `vkCmdBlitImage` scaling operation through `Scheduler::record`, matching upstream `BlitScale` ordering and barriers for the non-helper path.
+- Rust pending join completion now mirrors upstream `JoinImages` rescale ordering for the direct path: compute sibling rescale gate, scale siblings, refresh the new image, scale the new image, apply alias relations, preflight copy support, then copy using `MakeShrinkImageCopies` with `resolution.up_scale/down_shift` when rescaled.
+- Rust `can_copy_join_image` / `copy_join_image` now reject only mismatched rescale state instead of rejecting all rescaled images. This matches upstream's expectation that both source and destination can be rescaled together and copied with adjusted regions.
+
+### Unintentional differences (to fix)
+- Upstream `Image::ScaleUp` / `ScaleDown` can fall back to `BlitScaleHelper` when `NeedsScaleHelper()` is true. Rust currently implements only the direct `vkCmdBlitImage` path because `BlitImageHelper` and its descriptor/compute services are not ported into `TextureCacheRuntime` yet.
+- Upstream `TextureCache<P>::ScaleUp` accounts `total_used_memory += GetScaledImageSizeBytes(image)` on first scaled-image allocation and calls `InvalidateScale(image)`. Rust toggles `has_scaled` and `RESCALED` on both backend/base state but does not yet update total memory accounting or invalidate every cached dependent view/framebuffer exactly like upstream.
+- Upstream join copy can call `runtime.CopyImageMSAA` when sample counts differ. Rust still preflights and requeues unsupported MSAA join copies rather than silently copying the wrong image.
+- Rust currently captures `common::settings::values().resolution_info` at runtime construction for `TextureCacheRuntime::resolution`, while upstream stores the runtime resolution member from settings and uses it consistently. This is equivalent for static resolution but should be revisited if runtime resolution changes are supported.
+
+### Missing items
+- Port `NeedsScaleHelper` / `BlitScaleHelper` and its descriptor/compute helper dependencies.
+- Port `CopyImageMSAA` and use it from join completion when `overlap.info.num_samples != new_image.info.num_samples`.
+- Port full scale invalidation and scaled memory accounting from `TextureCache<P>::ScaleUp` / `ScaleDown`.
+- Add focused regression coverage for rescaled join coordinates once a lightweight rescale/MRT/depth test case is available; Pinball does not exercise this path.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan image ownership, scheduler-recorded scaling, and join-copy ordering. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages` in `video_core/texture_cache/texture_cache.h`, especially sibling `ScaleUp`/`ScaleDown`, `RefreshContents`, new-image scale, and `MakeShrinkImageCopies(... up_scale, down_shift)` ordering.
+- Re-read upstream `TextureCache<P>::ScaleUp` / `ScaleDown` in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `BlitScale`, `Image::ScaleUp`, `Image::ScaleDown`, and `Image::BlitScaleHelper` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_scale_join.ppm` at frame 30. The frame remains complete: `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[186..1710] y[0..1077]`. No panic appeared in the log; only pre-existing MoltenVK primitive-restart warnings were present.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/texture_cache.rs, compute_pass.rs, mod.rs, build.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp, vk_compute_pass.cpp, vk_rasterizer.h, texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust `RasterizerVulkan` now owns `BlitImageHelper`, `DescriptorPool`, and `ComputePassDescriptorQueue` and passes stable references into `TextureCacheRuntime`, matching upstream service ownership while using Rust field ordering and `NonNull` references to preserve lifetimes.
+- Rust `TextureCacheRuntime` now creates an optional `MSAACopyPass` when `shaderStorageImageMultisample` is available, mirroring upstream `device.IsStorageImageMultisampleSupported()` construction.
+- Rust ports the sample-count-mismatch join path by allowing `pending_join_copies` to call `TextureCacheRuntime::copy_image_msaa` instead of requeueing solely because MSAA copy was missing.
+- Rust updates MSAA descriptors with direct `vkUpdateDescriptorSets` from concrete image descriptors. Upstream uses `UpdateDescriptorSet` with a descriptor update template and queued raw update data; Rust's current `DescriptorUpdateEntry` abstraction is not a raw C-compatible template payload yet.
+- Rust records the MSAA compute dispatch through the scheduler with captured Vulkan handles. Upstream captures `this` and commits descriptors inside the recorded lambda; Rust avoids capturing runtime references across the scheduler closure boundary.
+
+### Unintentional differences (to fix)
+- `BlitImageHelper` is now owned and threaded into `TextureCacheRuntime`, but helper-backed `BlitImage`, `ConvertImage`, `NeedsScaleHelper`, and `BlitScaleHelper` paths are still not fully ported.
+- `ASTCDecoderPass` runtime ownership is still missing. Upstream constructs it in `TextureCacheRuntime` when GPU ASTC decode is enabled.
+- Descriptor-template raw payload parity is still incomplete for MSAA copy and the broader compute-pass paths.
+- `MSAACopyPass::copy_image` exists as a direct method but the active texture-cache path currently performs the descriptor update and scheduler record in `TextureCacheRuntime::copy_image_msaa`; this should be reconciled with upstream method ownership once descriptor-template payload parity is ported.
+
+### Missing items
+- Port `BlitImageHelper` / `BlitScaleHelper` runtime operations from `vk_texture_cache.cpp`.
+- Port `ASTCDecoderPass` ownership and GPU ASTC decode path.
+- Port `DownloadMemory`, `BlitImage`, `ConvertImage`, helper-backed scale, and full descriptor-template update-data layout.
+- Add a depth/MRT/MSAA validation title or homebrew; SpaceCadetPinball does not exercise MSAA copy.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan service ownership, generated shader constants, descriptor updates, and scheduler-recorded compute copy. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCacheRuntime::TextureCacheRuntime` and `TextureCacheRuntime::CopyImageMSAA` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `MSAACopyPass::MSAACopyPass` and `MSAACopyPass::CopyImage` in `video_core/renderer_vulkan/vk_compute_pass.cpp`.
+- Re-read upstream `TextureCache<P>::JoinImages` sample-count mismatch branch in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `RasterizerVulkan` service field ordering in `video_core/renderer_vulkan/vk_rasterizer.h`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo test -p video_core host_shaders::spirv_shaders::tests::generated_vulkan_shaders_are_spirv_modules -- --exact` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_msaa_runtime.ppm` at frame 30. The frame remains complete: `2560x1440`, bbox `x[251..2281] y[0..1439]`, guest approx `x[188..1710] y[0..1079]`. No panic appeared in the log; only pre-existing MoltenVK primitive-restart warnings were present.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust now ports the format-feature half of upstream `Image::NeedsScaleHelper`: before using the direct `BlitScale` path, `scale_up_image` / `scale_down_image` query optimal `BLIT_SRC|BLIT_DST` support through `vkGetPhysicalDeviceFormatProperties`.
+- When the format requires helper-backed scaling, Rust returns `false` so pending join completion requeues intact instead of issuing an invalid direct `vkCmdBlitImage`. This is a conservative parity improvement while `BlitScaleHelper` remains unported.
+
+### Unintentional differences (to fix)
+- Upstream also checks `device.CantBlitMSAA()` in `NeedsScaleHelper`. Rust `TextureCacheRuntime` currently has only ash device/instance handles, not the full Vulkan `Device` wrapper field containing that driver quirk, so the MSAA-device side of the predicate is still missing.
+- Upstream calls `Image::BlitScaleHelper` when `NeedsScaleHelper()` is true. Rust currently requeues instead because `BlitImageHelper::blit_color` / `blit_depth_stencil` are still structural stubs and would not record a real draw.
+
+### Missing items
+- Thread the full Vulkan `Device` capability wrapper or the specific `cant_blit_msaa` flag into `TextureCacheRuntime`.
+- Port real `BlitImageHelper::BlitColor` and `BlitImageHelper::BlitDepthStencil` scheduler-recorded draw paths.
+- Port `Image::BlitScaleHelper` ownership: scale/normal temporary `ImageView`, temporary `Framebuffer`, color/depth-stencil helper dispatch, and unsupported-aspect fallback.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan feature gating and join/rescale control flow only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `Image::ScaleUp`, `Image::ScaleDown`, `Image::NeedsScaleHelper`, and `Image::BlitScaleHelper` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `Device::IsFormatSupported` and `Device::CantBlitMSAA` in `video_core/vulkan_common/vulkan_device.h/cpp`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_scalehelper_gate.ppm` at frame 30. The frame remains complete: `2560x1440`, bbox `x[251..2281] y[0..1439]`, guest approx `x[188..1710] y[0..1079]`.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/blit_image.rs and mod.rs vs video_core/renderer_vulkan/blit_image.cpp/h
+
+### Intentional differences
+- Rust `BlitImageHelper` now stores stable `NonNull<Scheduler>` and `NonNull<DescriptorPool>` references. Upstream stores `Scheduler&`, `StateTracker&`, and descriptor allocators created from `DescriptorPool`; the Rust split keeps direct descriptor-pool allocation for now.
+- Rust `BlitImageHelper::blit_color` now performs a real upstream-shaped color helper blit: create/cache a fullscreen-triangle graphics pipeline, allocate/update one combined-image-sampler descriptor set, request the destination render pass, bind pipeline/descriptors, bind viewport/scissor/push constants, and draw three vertices.
+- Rust updates the descriptor set before the scheduler closure is recorded. Upstream commits and updates the descriptor set inside the recorded lambda via `DescriptorAllocator::Commit`; the Rust descriptor pool API currently exposes direct allocation, not an allocator object with identical commit timing.
+- Rust introduces `BlitFramebufferInfo` as a small explicit parameter object containing the `Framebuffer` methods used by upstream (`Handle`, `RenderPass`, `RenderArea`). This avoids making `blit_image.rs` depend on the full texture-cache backend type while preserving the same data boundary.
+
+### Unintentional differences (to fix)
+- `StateTracker` is still not threaded into `BlitImageHelper`, so Rust does not yet call upstream-equivalent `scheduler.InvalidateState()` / state invalidation after helper draws.
+- `BlitImageHelper::blit_depth_stencil`, conversion helpers, and clear helpers remain structural stubs.
+- Rust uses `DescriptorPool::allocate` directly; upstream has dedicated `DescriptorAllocator` members (`one_texture_descriptor_allocator`, `two_textures_descriptor_allocator`) owned by `BlitImageHelper`.
+- The color pipeline follows upstream fixed states, but MoltenVK may still warn about `primitiveRestartEnable = VK_FALSE`; this is kept for upstream parity.
+
+### Missing items
+- Port `DescriptorAllocator` ownership for `BlitImageHelper` or an equivalent Rust owner with upstream commit semantics.
+- Port `BlitDepthStencil`, `Convert*`, `ClearColor`, `ClearDepthStencil`, and the lazy pipeline helpers they require.
+- Thread state-tracker invalidation into `BlitImageHelper`.
+- Wire `TextureCacheRuntime::Image::BlitScaleHelper` to this real color blit path for helper-required color scales.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan helper ownership and command recording only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `BlitImageHelper` constructor, `BlitColor`, `UpdateOneTextureDescriptorSet`, `BindBlitState`, and `FindOrEmplaceColorPipeline` in `video_core/renderer_vulkan/blit_image.cpp/h`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_blithelper_owner.ppm` at frame 30. The frame remains complete: `2560x1440`, bbox `x[251..2281] y[0..1439]`, guest approx `x[188..1710] y[0..1079]`.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust now wires the color half of upstream `Image::BlitScaleHelper`: backend `Image` owns cached scale/normal helper image views and framebuffers, creates them lazily, computes upstream source/destination regions, selects bilinear vs point filtering from `IsPixelFormatInteger`, and calls `BlitImageHelper::blit_color`.
+- Rust stores the helper framebuffer as `BlitFramebufferInfo` rather than a full `Framebuffer` object for this temporary path. It contains the exact data consumed by upstream `BlitImageHelper::BlitColor`: framebuffer handle, render pass, and render area.
+- Rust continues to use the direct `BlitScale` path for formats with optimal `BLIT_SRC|BLIT_DST`, and now uses the helper color path only when `needs_scale_helper` requires it.
+
+### Unintentional differences (to fix)
+- Depth/stencil `Image::BlitScaleHelper` remains gated and requeued because `BlitImageHelper::blit_depth_stencil` is still a structural stub.
+- Rust helper views are currently fixed to one `TYPE_2D` color view at mip 0/layer 0, matching the `ImageViewInfo(ImageViewType::e2D, info.format)` use in upstream `BlitScaleHelper`, but not yet represented as a full backend `ImageView` owner.
+- If color helper blit setup fails after `ScaleUp`/`ScaleDown` has switched current image/rescale flags, Rust returns `false` without fully unwinding every state bit. Upstream would throw on Vulkan allocation failures and only explicitly clears `Rescaled` for unsupported aspect.
+
+### Missing items
+- Port depth/stencil helper scaling once `BlitImageHelper::BlitDepthStencil` records a real draw.
+- Replace the minimal `BlitFramebufferInfo` helper with full temporary `Framebuffer` ownership if later conversion/depth helper paths need the full upstream metadata.
+- Add validation coverage that exercises helper-required scaling; Pinball does not hit this path on the current device/formats.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan helper resources and scheduler-recorded color helper scaling only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `Image::ScaleUp`, `Image::ScaleDown`, and `Image::BlitScaleHelper` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `BlitImageHelper::BlitColor` and constructor descriptor allocator ownership in `video_core/renderer_vulkan/blit_image.cpp/h`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_blitscalehelper_color.ppm` at frame 30. The frame remains complete: `2560x1440`, bbox `x[251..2281] y[0..1439]`, guest approx `x[188..1710] y[0..1079]`.
+
+## 2026-07-01 — video_core/src/renderer_vulkan/blit_image.rs, texture_cache.rs, render_pass_cache.rs, mod.rs, renderer_vulkan.rs vs video_core/renderer_vulkan/blit_image.cpp/h and vk_texture_cache.cpp
+
+### Intentional differences
+- Rust now ports upstream `BlitImageHelper::BlitDepthStencil` as a real scheduler-recorded draw path: it respects the `shader_stencil_export` capability gate, requires point filtering plus `SrcCopy`, creates/caches the depth/stencil graphics pipeline, allocates/updates a two-texture descriptor set, requests the destination render pass, binds state, and draws three vertices.
+- Rust threads `device.is_ext_shader_stencil_export_supported()` from `RendererVulkan` into `RasterizerVulkan` and then into `BlitImageHelper`, matching upstream's `device.IsExtShaderStencilExportSupported()` check.
+- Rust `TextureCache` now wires the depth|stencil half of `Image::BlitScaleHelper`: helper-required depth/stencil scaling creates cached combined-target/depth/stencil views plus a depth-only helper framebuffer, then calls `BlitImageHelper::blit_depth_stencil`.
+- Rust `RenderPassCache` no longer injects a fake color attachment when a depth attachment is present and no color attachments are bound. This is required for upstream-style depth-only helper framebuffers.
+
+### Unintentional differences (to fix)
+- Rust still updates descriptor sets before the scheduler closure; upstream commits and updates descriptor sets inside the recorded lambda via owned `DescriptorAllocator`s.
+- Rust helper depth/stencil views are stored as raw cached image-view handles on backend `Image`, not as full temporary `ImageView` owners.
+- Rust supports the upstream depth|stencil helper aspect only. Depth-only or stencil-only helper scaling still follows the unsupported-aspect path, matching upstream's current TODO-style fallback but not extending it.
+- State tracker invalidation after helper draws is still missing.
+
+### Missing items
+- Port `DescriptorAllocator` ownership or equivalent commit timing for helper blits.
+- Port state-tracker invalidation for helper draw paths.
+- Add a real depth/stencil validation workload; Pinball does not exercise this path.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan helper render passes, image views, descriptor updates, and command recording only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `BlitImageHelper::BlitDepthStencil` and `FindOrEmplaceDepthStencilPipeline` in `video_core/renderer_vulkan/blit_image.cpp/h`.
+- Re-read upstream `Image::BlitScaleHelper` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `Device::IsExtShaderStencilExportSupported` in `video_core/vulkan_common/vulkan_device.h`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_blitds.ppm` at frame 30. The frame remains complete: `2560x1440`, bbox `x[251..2281] y[0..1439]`, guest approx `x[188..1710] y[0..1079]`. This is a non-regression check only; it does not exercise depth/stencil helper scaling.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/scheduler.rs, texture_cache.rs, mod.rs, blit_image.rs vs video_core/renderer_vulkan/vk_scheduler.cpp/h and vk_texture_cache.cpp
+
+### Intentional differences
+- Rust `Scheduler::request_renderpass` now stores the currently bound framebuffer images and subresource ranges, matching upstream `Scheduler::RequestRenderpass(const Framebuffer*)` capturing `NumImages()`, `Images()`, and `ImageRanges()`.
+- Rust `Scheduler::request_outside_renderpass` now ends the active render pass and emits the upstream post-render-pass image memory barriers over those captured images/ranges: color/depth-stencil attachment writes to shader read/write plus color/depth-stencil attachment read/write, `GENERAL -> GENERAL`, early/late fragment tests plus color attachment output to all commands.
+- Rust records the begin/end/barrier commands directly into the active command buffer through the existing Rust scheduler API. Upstream wraps these commands in `Record(...)` command chunks; the current Rust scheduler's command recording model differs, but the command ordering and barrier parameters are now aligned for the render-target path.
+- Rust backend `Framebuffer` owner now fills `images` and `image_ranges` from the ImageId/ImageViewId-backed render targets, allowing draw/clear render passes to pass real image handles to the scheduler.
+
+### Unintentional differences (to fix)
+- `BlitImageHelper` temporary framebuffer paths still call `request_renderpass` with empty image/range slices because `BlitFramebufferInfo` currently carries only framebuffer handle, render pass, and render area. Upstream helper framebuffers are full `Framebuffer` owners and therefore contribute images/ranges to the scheduler barrier.
+- Backend framebuffer image/range construction currently resolves an image's range through the first backend image view found for that ImageId. Upstream stores the exact image/view arrays on the `Framebuffer` object at construction time; Rust should preserve the exact view IDs used to assemble the framebuffer.
+
+### Missing items
+- Extend helper framebuffer ownership so `BlitFramebufferInfo` or its replacement exposes upstream-equivalent `NumImages`, `Images`, and `ImageRanges`.
+- Continue the deko3d depth workload investigation: the renderpass barrier parity patch did not fix the black frame or later MoltenVK device loss. Next suspect areas are primitive-restart dynamic/pipeline handling and backend ImageId/ImageViewId churn.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan command ordering/resource tracking only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `Scheduler::RequestRenderpass` and `Scheduler::EndRenderPass` in `video_core/renderer_vulkan/vk_scheduler.cpp`.
+- Re-read upstream scheduler fields `num_renderpass_images`, `renderpass_images`, and `renderpass_image_ranges` in `video_core/renderer_vulkan/vk_scheduler.h`.
+- Re-read upstream framebuffer image/range ownership shape in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- deko3d depth workload command: `RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_deko3d_depth_barrier.ppm RUZU_DUMP_PRESENT_FRAME_AT=30 /opt/homebrew/bin/timeout 20s /Users/vricosti/Dev/emulators/ruzu/target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/deko3d-depth-min/deko3d-depth-min.nro`.
+- deko3d depth workload result: timed out normally after dumping frame 30, but the dumped frame is still entirely black and the run later reports MoltenVK `VK_ERROR_OUT_OF_DEVICE_MEMORY` / device lost. This confirms the scheduler renderpass barrier parity improvement is necessary but not sufficient.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/blit_image.rs and texture_cache.rs vs video_core/renderer_vulkan/blit_image.cpp/h, vk_texture_cache.cpp, and vk_scheduler.cpp
+
+### Intentional differences
+- Rust `BlitFramebufferInfo` now carries upstream-equivalent framebuffer attachment metadata for helper blits: one `VkImage`, one `VkImageSubresourceRange`, and `num_images`.
+- Rust color `BlitScaleHelper` framebuffers now populate that metadata with the current backend image and a color subresource range.
+- Rust depth/stencil `BlitScaleHelper` framebuffers now populate that metadata with the current backend image and a depth|stencil subresource range.
+- `BlitImageHelper::blit_color` and `blit_depth_stencil` now pass those images/ranges into `Scheduler::request_renderpass`, so helper draw render passes participate in the upstream post-render-pass attachment barrier instead of being invisible to the scheduler.
+
+### Unintentional differences (to fix)
+- `BlitFramebufferInfo` is still a reduced bridge rather than the full upstream `Framebuffer` owner. It now exposes the scheduler-critical `NumImages`/`Images`/`ImageRanges` data, but not all framebuffer metadata.
+- Helper image/range metadata is fixed to mip 0/layer 0 because the current helper views are created as upstream `ImageViewInfo(ImageViewType::e2D, info.format)` equivalents. If later helper paths create broader temporary views, this bridge must carry the exact view range rather than deriving the fixed one.
+- Backend render-target framebuffer image/range construction still resolves an image's range through the first backend image view found for that ImageId. This separate render-target path should preserve exact view IDs used to assemble the framebuffer.
+
+### Missing items
+- Replace the reduced `BlitFramebufferInfo` with full temporary `Framebuffer` ownership if conversion/clear/helper paths need additional upstream framebuffer fields.
+- Port state-tracker invalidation and exact descriptor allocator commit timing for helper blits.
+- Continue validation on a real depth/MRT workload once the basic deko3d draw path is no longer black.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan helper framebuffer metadata and scheduler command ordering only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCacheRuntime::BlitImage` in `video_core/renderer_vulkan/vk_texture_cache.cpp`; upstream passes a `Framebuffer*` to `BlitImageHelper`.
+- Re-read upstream `Scheduler::RequestRenderpass` in `video_core/renderer_vulkan/vk_scheduler.cpp`; upstream captures `framebuffer->NumImages()`, `framebuffer->Images()`, and `framebuffer->ImageRanges()`.
+- `cargo fmt` applied.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after render-target rescale parity: `/tmp/ruzu_pinball_rescale_rt.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, `nonblack=2041193`. MoltenVK still reports the known primitive-restart warnings.
+- deko3d depth-min Vulkan non-regression remains full-frame non-black after render-target rescale parity: `/tmp/ruzu_deko3d_rescale_rt.ppm` is `2560x1440`, bbox `x[0..2559] y[0..1439]`, `nonblack=3686400`. MoltenVK still reports the known `D24_UNORM_S8_UINT` substitution warning and primitive-restart warnings.
+- `git diff --check` passes.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp and video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `Image::upload_memory` now records the upload against `original_image.handle()` rather than `handle()`. This matches upstream `Vulkan::Image::UploadMemory`, which captures `const VkImage vk_image = *original_image` before recording `CopyBufferToImage`.
+- Rust still performs the upstream `ScaleDown(true)` / upload / `ScaleUp()` sequence in `TextureCache::refresh_contents_with_reader` around the `Image::upload_memory` call. Upstream keeps that scale transition inside `Image::UploadMemory`; Rust currently keeps it at the backend texture-cache wrapper so it can reuse the existing `scale_down_image` / `scale_up_image` helpers and keep common `ImageBase` and backend `Image` flags synchronized.
+- `TextureCacheRuntime::InsertUploadMemoryBarrier` remains intentionally empty, matching upstream Vulkan `TextureCacheRuntime::InsertUploadMemoryBarrier() {}`. The upload operation records its own scheduler barriers.
+
+### Unintentional differences (to fix)
+- `Image::upload_memory` still receives `device` and `scheduler` parameters from the wrapper instead of owning runtime references directly like upstream `Vulkan::Image`. This is an ownership divergence from the C++ `Image` constructor/runtime pointer model.
+- The scale-down/up sequence for rescaled uploads is still caller-owned in Rust rather than method-owned in `Image::upload_memory`.
+
+### Missing items
+- Move upload scale transition ownership into `Image::upload_memory` once backend `Image` can safely call the same scale helpers or hold the required runtime service references without duplicating state.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan upload target selection only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `Vulkan::Image::UploadMemory` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `TextureCache<P>::UploadImageContents` and `TextureCacheRuntime::InsertUploadMemoryBarrier` call edge in `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust `Image::upload_memory` and `TextureCache::refresh_contents_with_reader` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after recording uploads against `original_image`: `/tmp/ruzu_pinball_upload_original.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, `nonblack=2041193`. MoltenVK still reports the known primitive-restart warnings.
+- `git diff --check` passes.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/blit_image.rs and texture_cache.rs vs video_core/renderer_vulkan/blit_image.cpp and vk_texture_cache.cpp
+
+### Intentional differences
+- Rust now ports `TextureCacheRuntime::ConvertImage` and routes the post-`ShouldReinterpret` cross-format `TextureCache::copy_join_image` branch through per-copy 2D render-target views, a destination framebuffer, and helper conversion draws, matching upstream `TextureCache<P>::CopyImage` ordering.
+- Rust `BlitImageHelper::Convert*` methods now create/cache real conversion graphics pipelines and record scheduler render-pass draws with descriptor sets, viewport/scissor, push constants, and `Draw(3,1,0,0)` like upstream `BlitImageHelper::Convert` and `ConvertDepthStencil`.
+- Rust uses a small `ConversionImageView` bridge containing the source color/depth/stencil view handles, size, and rescale state. This preserves the helper's required data without moving `ImageView`/aux-view creation ownership out of the Vulkan texture cache.
+- Rust returns `false` when conversion prerequisites fail, allowing pending join work to be requeued/rejected explicitly. Upstream uses `UNIMPLEMENTED_IF`/`UNIMPLEMENTED_MSG` assertions for unsupported conversion cases.
+
+### Unintentional differences (to fix)
+- Upstream calls `scheduler.InvalidateState()` after conversion draws. The current Rust scheduler has no equivalent method; state invalidation remains owned by the active rasterizer state tracker and must be ported explicitly rather than faked in `BlitImageHelper`.
+- `ConversionImageView` is a reduced bridge rather than passing the full upstream `ImageView&`. It carries all fields currently consumed by `Convert`/`ConvertDepthStencil`, but future helper paths may require expanding or replacing it with the real backend view owner.
+- Conversion pipeline state is built locally to match the upstream state shape, but the shared upstream static pipeline-state structs are not yet factored out as reusable Rust constants in the same way as `blit_image.cpp`.
+
+### Missing items
+- Validate `ConvertImage` with a workload that actually exercises depth/color cross-format copies; Pinball does not hit this path.
+- Port the scheduler/state-tracker invalidation edge used by helper draws.
+- Continue remaining runtime fallback work: non-MSAA-to-MSAA and unsupported Fermi2D operations.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan helper pipelines and copy routing only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCacheRuntime::ConvertImage` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `BlitImageHelper::Convert*`, `Convert`, `ConvertDepthStencil`, `ConvertPipeline`, and `ConvertPipelineEx` in `video_core/renderer_vulkan/blit_image.cpp`.
+- Re-read upstream `TextureCache<P>::CopyImage` in `video_core/texture_cache/texture_cache.h` for the post-`ShouldReinterpret` conversion branch.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally after dumping `/tmp/ruzu_pinball_reinterpret.ppm` at frame 30. The run resized the swapchain before the dump (`3024x1834`), but the converted PNG is visually complete with full playfield and score panel; measured bbox `x[295..2696] y[66..1766]`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_blitfbinfo.ppm` at frame 30. The frame remains complete: `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[188..1712] y[0..1079]`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp and video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `Image::upload_memory` now owns the upstream `Vulkan::Image::UploadMemory` ordering: detect `RESCALED`, perform `ScaleDown(true)` before recording the upload to `original_image`, record the scheduler `CopyBufferToImage`, then perform `ScaleUp()` after the upload. The wrapper no longer orchestrates that sequence around the upload call.
+- The Rust wrapper temporarily removes the backend `Image` from `self.images` while calling `Image::upload_memory(&mut runtime, ...)`, then writes the backend `ImageBase` flags/`has_scaled` back to `TextureCacheBase::slot_images`. This is a Rust borrow-management adaptation; the ownership of the upload order and scale helper views/framebuffers now lives on `Image`, matching upstream.
+- `Image::blit_scale_helper_color` and `Image::blit_scale_helper_depth_stencil` were added next to backend `Image`, so upload-time `ScaleUp()` can use the same backend-owned scale views/framebuffers that upstream `Image::BlitScaleHelper` owns.
+
+### Unintentional differences (to fix)
+- `Image::scale_up_for_upload` and `Image::scale_down_for_upload` are upload-local ports of upstream `Image::ScaleUp` / `Image::ScaleDown`. The older wrapper methods `TextureCache::scale_up_image` / `scale_down_image` still exist for join/render-target/alias paths, so the scale implementation is duplicated until all callers are migrated to backend `Image` ownership.
+- `Image::upload_memory` still receives `TextureCacheRuntime` as a mutable parameter instead of storing runtime/scheduler pointers like upstream `Vulkan::Image`. This preserves Rust ownership safety but remains a constructor/state-layout divergence.
+
+### Missing items
+- Migrate the remaining wrapper-owned scale call sites (`JoinImages`, alias synchronization, render-target rescale) to backend `Image::ScaleUp` / `ScaleDown` equivalents so there is one upstream owner for scale behavior.
+- Add a regression workload that exercises upload of an already-rescaled image with a format requiring `BlitScaleHelper`; Pinball does not hit this path.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan backend image ownership and command scheduling only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `Vulkan::Image::UploadMemory`, `Image::ScaleUp`, `Image::ScaleDown`, and `Image::BlitScaleHelper` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `TextureCache<P>::RefreshContents`, `UploadImageContents`, and `TextureCacheRuntime::InsertUploadMemoryBarrier` call edge in `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust `Image::upload_memory`, `Image::scale_up_for_upload`, `Image::scale_down_for_upload`, and `TextureCache::refresh_contents_with_reader` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after moving upload-scale ordering into `Image`: `/tmp/ruzu_pinball_image_upload_owner.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, `nonblack=2041193`. MoltenVK still reports the known primitive-restart warnings.
+- `git diff --check` passes.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp and video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust now ports `TextureCacheRuntime::BlitImage` ownership into the Vulkan runtime: color non-MSAA blits delegate to `BlitImageHelper::blit_color`, depth|stencil blits use `BlitImageHelper::blit_depth_stencil` when direct format blit support is missing, and direct blit/resolve paths record upstream-shaped scheduler barriers plus `vkCmdBlitImage`/`vkCmdResolveImage`.
+- Rust added local equivalents of upstream `MakeSubresourceLayers`, `MakeImageBlit`, and `MakeImageResolve` next to the Vulkan texture-cache runtime helpers.
+- Rust returns `false` with explicit warnings for currently unsupported reinterpretation/non-MSAA-to-MSAA/unsupported operation cases instead of asserting or silently falling back. This keeps the unported paths reviewable while the surrounding backend is still incomplete.
+
+### Unintentional differences (to fix)
+- The runtime method is not yet wired to Fermi2D `AccelerateSurfaceCopy`. Upstream `TextureCache<P>::BlitImage` first calls `PrepareImage(src_id, false, false)` and `PrepareImage(dst_id, true, false)`. Rust base `prepare_image` is still an explicit backend-runtime stub, so wiring Fermi2D now would skip upstream `RefreshContents`, `SynchronizeAliases`, `MarkModification`, and LRU touch ordering.
+- Depth/stencil direct-blit capability is approximated through Vulkan format `BLIT_SRC|BLIT_DST` support. Upstream uses `Device::IsBlitDepth24Stencil8Supported` / `IsBlitDepth32Stencil8Supported`; Rust still needs the full Vulkan device capability wrapper or equivalent flags in `TextureCacheRuntime`.
+- The direct blit post-barrier matches upstream's destination image barrier. Upstream does not restore a separate source-image layout barrier in this method because the source remains `GENERAL -> GENERAL`; Rust follows that command shape.
+
+### Missing items
+- Port backend-owned `PrepareImage` equivalent before enabling `TextureCache::blit_image` from Fermi2D: `RefreshContents`, `SynchronizeAliases`, `MarkModification`, and `lru_cache.Touch` ordering must match upstream.
+- After `PrepareImage`, port the wrapper-level `TextureCache<P>::BlitImage` sequence: `GetBlitImages`, rescale mismatch handling, render-target view creation, framebuffer lookup, region scaling, then runtime `BlitImage`.
+- Add coverage for a real Fermi2D accelerated copy once the wrapper is connected.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan runtime command recording only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCacheRuntime::BlitImage`, `MakeSubresourceLayers`, `MakeImageBlit`, and `MakeImageResolve` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `TextureCache<P>::BlitImage` and `TextureCache<P>::PrepareImage` in `video_core/texture_cache/texture_cache.h` to verify why Fermi2D wiring must wait for backend `PrepareImage`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_runtime_blitimage.ppm` at frame 30. The frame remains complete: `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[188..1712] y[0..1079]`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust now ports the backend-owned Vulkan equivalent of upstream `TextureCache<P>::PrepareImage`: invalidation clears `CPU_MODIFIED|GPU_MODIFIED` and tracks untracked images; non-invalidation runs backend `RefreshContents`, then `SynchronizeAliases`; modification then calls `MarkModification`; the final step touches the LRU entry.
+- Rust keeps the common `TextureCacheBase::prepare_image` panic guard because upstream `PrepareImage` requires backend runtime operations (`RefreshContents`, `CopyImage`, `ScaleUp`, `ScaleDown`) that the common base cannot perform alone.
+- Rust `prepare_image_with_reader` returns `bool` so the backend can requeue/decline work when guest memory reads or backend materialization fail. Upstream is `void` because failures assert/throw through C++ runtime paths.
+- Rust wraps `ScaleUp`/`ScaleDown` behind `ensure_image_rescale_state` because the current Vulkan helpers return `false` for an already-correct rescale state; upstream call sites treat those repeated calls as no-op/idempotent in this ordering.
+
+### Unintentional differences (to fix)
+- `SynchronizeAliases` currently uses Vulkan's existing `copy_join_image` path. It preserves alias ordering and modification tick propagation, but still inherits the backend's incomplete `CopyImage` coverage for reinterpret/convert paths.
+- The wrapper-level `TextureCache<P>::BlitImage` sequence is still not connected to Fermi2D `AccelerateSurfaceCopy`. Upstream calls `PrepareImage(src_id, false, false)` and `PrepareImage(dst_id, true, false)` before creating views/framebuffers and invoking runtime `BlitImage`; Rust now has the prerequisite `PrepareImage`, but still needs the full wrapper sequence.
+
+### Missing items
+- Port the Vulkan wrapper `TextureCache::blit_image(dst, src, copy, gpu_to_cpu, read_gpu)` to mirror upstream `TextureCache<P>::BlitImage`: image lookup/insertion, depth-format deduction, pending join completion, `PrepareImage`, rescale mismatch handling, render-target view creation, framebuffer lookup, region scaling, then `TextureCacheRuntime::blit_image`.
+- Wire `RasterizerVulkan::AccelerateSurfaceCopy` to the Vulkan texture-cache wrapper once that wrapper exists.
+- Add targeted Fermi2D accelerated-copy validation after the wrapper is connected.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan texture-cache lifecycle/order only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::SynchronizeAliases`, `PrepareImage`, `PrepareImageView`, and `CopyImage` in `video_core/texture_cache/texture_cache.h`.
+- Re-read existing Rust OpenGL `prepare_image_with_gpu_reader` / `synchronize_aliases` in `video_core/src/renderer_opengl/gl_texture_cache.rs` as the already-ported backend specialization reference.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs and mod.rs vs video_core/texture_cache/texture_cache.h and video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust now ports the wrapper-level Vulkan `TextureCache<P>::BlitImage` sequence: Fermi2D source/destination GPU addresses are translated to CPU addresses, images are found or inserted with backend completion, pending join copies are finished, `PrepareImage(src,false,false)` and `PrepareImage(dst,true,false)` run in upstream order, rescale/resolve mismatch handling is applied, exact render-target `ImageViewInfo(ImageViewType::e2D, format, range)` views are created, a destination framebuffer is resolved, and `TextureCacheRuntime::blit_image` is invoked.
+- Rust adds `find_or_insert_image_from_info_with_options_and_finish` in the Vulkan backend wrapper. This mirrors the OpenGL backend completion edge and drains pending join tails or completes the inserted backend image when `TextureCacheBase` reports backend work is required.
+- Rust adds `blit_framebuffer_from_image_view`, which builds/reuses a backend `Framebuffer` owner from the exact `ImageViewId` chosen for the destination blit view, then exposes the reduced `BlitFramebufferInfo` required by the current runtime helper.
+- `RasterizerVulkan::accelerate_surface_copy` in the active Vulkan renderer (`renderer_vulkan/mod.rs`) now delegates to the Vulkan texture-cache wrapper with the channel memory manager's GPU->CPU translation and read path, matching the OpenGL call edge.
+
+### Unintentional differences (to fix)
+- `BlitFramebufferInfo` remains a reduced bridge rather than passing the full upstream `Framebuffer*` into `TextureCacheRuntime::BlitImage`. The wrapper now owns/reuses a real backend `Framebuffer`, but the runtime interface still receives only the fields currently consumed by `BlitImageHelper`/scheduler.
+- The wrapper relies on existing Vulkan runtime support. Unsupported runtime branches still return `false` for reinterpretation, unsupported operations, and non-MSAA-to-MSAA blits instead of implementing upstream `ConvertImage`/`ReinterpretImage`/emulated copy paths.
+- Vulkan `GetBlitImages` logic is implemented inline in the backend wrapper, matching the current OpenGL Rust port. Upstream owns it as a separate `TextureCache<P>::GetBlitImages` method; a future structural cleanup should split this helper out once the Rust texture-cache generic/base split can preserve backend completion semantics cleanly.
+
+### Missing items
+- Port `TextureCacheRuntime::ConvertImage`, `ReinterpretImage`, and the remaining Fermi2D operation support used by upstream blit fallback paths.
+- Replace the reduced `BlitFramebufferInfo` runtime argument with a full framebuffer owner/reference if later runtime paths need additional upstream `Framebuffer` methods.
+- Validate with a workload that actually exercises Fermi2D accelerated copies beyond Pinball's non-regression coverage, and continue depth/MRT validation on the deko3d workload.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan texture-cache/rasterizer call flow only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::GetBlitImages`, `TextureCache<P>::BlitImage`, and `RenderTargetFromImage` in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `TextureCacheRuntime::BlitImage` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read the existing Rust OpenGL wrapper `OpenGLTextureCache::blit_image` in `video_core/src/renderer_opengl/gl_texture_cache.rs`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_vulkan_blit_wrapper_final.ppm` at frame 30. The frame remains complete: `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[188..1712] y[0..1079]`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs and blit_image.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp and video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust now ports upstream `TextureCacheRuntime::ShouldReinterpret`, `GetTemporaryBuffer`, and `ReinterpretImage`: reinterpret copies use a device-local temporary buffer created through `MemoryAllocator`, transform input/output `VkBufferImageCopy` ranges with the same bytes-per-pixel adjustment, and record the upstream-shaped copy/barrier sequence through the scheduler.
+- Rust exposes `BlitImageHelper::shader_stencil_export_supported()` so `TextureCacheRuntime::ShouldReinterpret` can preserve upstream's `device.IsExtShaderStencilExportSupported()` decision without adding a second device capability source.
+- Rust `copy_join_image` now follows upstream `TextureCache<P>::CopyImage` ordering for this covered subset: scale copies when the source image is rescaled, compare `GetFormatType`, use `runtime.CopyImage` for same surface type, and use `runtime.ReinterpretImage` for 2D cross-type copies only when `ShouldReinterpret` permits it.
+- Rust returns `false` if the temporary buffer allocation cannot be represented or allocated. Upstream returns/asserts through its Vulkan wrapper; this is a Rust `Option`/`Result` adaptation that keeps the join copy requeue/failure path explicit.
+
+### Unintentional differences (to fix)
+- The remaining cross-format `TextureCache<P>::CopyImage` branch after `ShouldReinterpret` is still not ported. Upstream creates per-layer 2D views/framebuffers and calls `TextureCacheRuntime::ConvertImage`; Rust still rejects those copies until the conversion helper pipelines are fully ported.
+- `GetTemporaryBuffer` uses Rust's checked `next_power_of_two` and bounds-checks `buffers[level]`. Upstream assumes valid nonzero sizes and indexes directly.
+- Same-format copies still rely on the current Vulkan `CanImageBeCopied`/emulated-copy coverage being absent; upstream can route through `runtime.EmulateCopyImage` when direct copy is unsupported.
+
+### Missing items
+- Port `TextureCacheRuntime::ConvertImage` together with the concrete `BlitImageHelper::Convert*` pipelines before enabling the final cross-format copy branch.
+- Port non-MSAA-to-MSAA and remaining Fermi2D operation fallbacks used by upstream `TextureCacheRuntime::BlitImage`.
+- Add validation with a depth/stencil or MRT title that exercises `ReinterpretImage`; SpaceCadetPinball remains a color-only non-regression workload.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan resource/copy command recording only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCacheRuntime::ShouldReinterpret`, `GetTemporaryBuffer`, and `ReinterpretImage` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `TextureCache<P>::CopyImage` in `video_core/texture_cache/texture_cache.h` to verify rescale and branch ordering.
+- `cargo fmt` applied.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+
+## 2026-07-02 — video_core/src/texture_cache/texture_cache.rs, video_core/src/renderer_vulkan/texture_cache.rs, video_core/src/renderer_vulkan/mod.rs, video_core/src/engines/draw_manager.rs, and video_core/src/engines/maxwell_3d.rs vs video_core/texture_cache/texture_cache.h and video_core/renderer_vulkan/vk_rasterizer.cpp
+
+### Intentional differences
+- Rust now preserves upstream render-target dirty ownership for the Vulkan path by carrying the Maxwell3D dirty-flag snapshot through `DrawCall` and passing it into `TextureCacheBase::update_render_targets_from_snapshot_with_dirty_flags`. This matches upstream `TextureCache<P>::UpdateRenderTargets`, which only re-evaluates render targets when the relevant dirty bits are set, instead of forcing render-target dirty state on every draw/clear wrapper call.
+- Rust now preserves upstream image lifecycle visibility after `JoinImages`: when no backend copy/delete tail is queued, `TextureCacheBase::join_images` immediately calls `register_image(new_image_id)`, matching upstream's unconditional `RegisterImage(new_image_id)` at the end of `TextureCache<P>::JoinImages`. `find_or_insert_image_from_info_with_options_result` also registers the `ImageId` in `image_allocs_table` immediately after `JoinImages`, matching upstream `InsertImage`.
+- The Vulkan split backend still defers actual `VkImage` materialization/upload through backend methods such as `ensure_image` and pending backend completion. The common cache registration is no longer deferred behind that backend work, because upstream common lookup visibility is immediate once `JoinImages` returns.
+
+### Unintentional differences (to fix)
+- Joins with queued backend copy/delete tails still delay `RegisterImage(new_image_id)` until the Vulkan tail completes. This is a necessary split-backend adaptation for now, but it remains structurally different from upstream's synchronous `RefreshContents`/copy/delete/RegisterImage sequence inside `JoinImages`.
+- `finish_pending_backend_insertions` is now mostly redundant for non-tail insertions because common registration happens immediately. It should be cleaned up once all backend completion paths are audited against upstream `slot_images.insert(runtime, ...)` construction.
+- Primitive-restart warnings remain on MoltenVK. The main pipeline gating was rechecked against upstream and is not changed in this slice; dynamic-state and utility pipeline behavior still need a separate parity pass if these warnings map to a real rendering issue.
+
+### Missing items
+- Finish replacing split-backend join-tail deferral with a fully upstream-ordered backend completion path: refresh contents, rescale, copy aliases/overlaps, delete superseded images, then register the new image.
+- Continue depth/MRT validation with deko3d and a lighter depth workload; Pinball only validates single-color/no-depth behavior.
+
+### Binary layout verification
+- N/A: this slice changes host-side texture-cache lifecycle and Vulkan render-target update flow only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::InsertImage`, `TextureCache<P>::JoinImages`, and `TextureCache<P>::FindImage` in `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust `TextureCacheBase::find_or_insert_image_from_info_with_options_result`, `TextureCacheBase::join_images`, `TextureCacheBase::register_image`, and `TextureCacheBase::collect_images_in_region`.
+- `cargo fmt` applied.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- deko3d depth-min under Vulkan no longer churns render-target `ImageId`s: `0x500F10000/0x806000` remains `image=1`, `0x5012D0000/0xBC6000` remains `image=2`, and present finds the same candidates. `/tmp/ruzu_deko3d_registerfix.ppm` at frame 3 is non-black across the full frame (`2560x1440`, `nonblack=3686400`, bbox `x[0..2559] y[0..1439]`).
+- SpaceCadetPinball-NX Vulkan non-regression remains complete: `/tmp/ruzu_pinball_registerfix.ppm` at frame 30 is `2560x1440`, bbox `x[250..2282] y[0..1439]`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust now preserves upstream `Vulkan::Image::UploadMemory` rescale ordering for CPU refresh uploads: if the image is marked rescaled, the Vulkan wrapper calls `scale_down_image(image_id, true)`, uploads into the original backend image, inserts the upload-memory barrier, then calls `scale_up_image(image_id, false)`. This matches upstream `Image::UploadMemory`, which performs `ScaleDown(true)`, records `CopyBufferToImage`, then calls `ScaleUp()`.
+- The rescale calls live in `TextureCache::refresh_contents_with_reader(...)` instead of `Image::upload_memory(...)` because the Rust split backend keeps `scale_up_image` / `scale_down_image` on the texture-cache wrapper, while upstream `Image` inherits/owns those helper methods directly.
+
+### Unintentional differences (to fix)
+- `Image::upload_memory(...)` still implements only the staged `CopyBufferToImage` path. Upstream upload-adjacent paths such as accelerated upload, conversion, asynchronous decode, and MSAA fallback remain owned by the higher-level texture-cache refresh path and are not all fully ported yet.
+
+### Missing items
+- Continue auditing `TextureCache<P>::RefreshContents` against the Rust wrapper so every upstream branch reaches the Vulkan backend through the correct scheduler/staging/rescale ordering.
+- Validate the rescaled upload path with a workload that actually keeps an image in `ImageFlagBits::Rescaled` while CPU-modified contents are uploaded; Pinball and the current deko3d depth-min run are non-regression checks only.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan upload/rescale command ordering only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `Vulkan::Image::UploadMemory` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read Rust `TextureCache::refresh_contents_with_reader` and `Image::upload_memory` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- deko3d depth-min Vulkan non-regression remains full-frame non-black: `/tmp/ruzu_deko3d_upload_rescale.ppm` is `2560x1440`, bbox `x[0..2559] y[0..1439]`, `nonblack=3686400`.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete: `/tmp/ruzu_pinball_upload_rescale.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, `nonblack=2041193`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust Vulkan pending join completion no longer preflights the entire tail with `pending_join_copy_tail_supported` and then requeues unsupported copy paths. Upstream `TextureCache<P>::JoinImages` does not defer unsupported `CopyImage`/`TryFindBase` cases; it executes the copy path or stops via `UNIMPLEMENTED_IF`/assertion. Rust now mirrors that contract by panicking with a concrete pending-join message if alias or GPU-modified overlap copying cannot be performed.
+- Rust now checks every `copy_join_image(...)` result before deleting an overlap. Previously the preflight tried to prove support up front, but the actual copy result was ignored. The new ordering preserves upstream's data-lifecycle invariant: copy contents first, then untrack/unregister/delete the old overlap.
+- The pending-tail split itself remains a Rust backend adaptation: upstream performs this sequence synchronously inside `JoinImages`, while Rust delays it until the Vulkan wrapper has a GPU reader and backend services. Within that delayed tail, the order remains upstream-shaped: sibling rescale gate, sibling rescale, `RefreshContents(new)`, new-image rescale, alias relation application, alias/GPU-modified copies, overlap deletion, registration.
+
+### Unintentional differences (to fix)
+- `RefreshContents(new_image)` and tail copying are still delayed relative to upstream `JoinImages` when the Rust split backend queues `PendingJoinCopies`. This is structurally different from upstream's synchronous `slot_images.insert(runtime, ...)` model.
+- Rust uses `panic!` for unsupported tail copy paths. Upstream uses `UNIMPLEMENTED_IF`, `UNIMPLEMENTED`, assertions, or optional `.value()` failure depending on the exact branch. The behavior is intentionally fail-fast, but the panic sites are not yet exact one-to-one macro ports.
+
+### Missing items
+- Collapse or further narrow the pending-tail delay so backend insertion/join completion happens at the exact upstream call edge wherever the Vulkan wrapper has a reader.
+- Add a focused Vulkan-capable regression workload that exercises alias and GPU-modified overlap join copies; Pinball and the current deko3d depth-min workload are non-regression checks but do not prove every pending-tail branch.
+
+### Binary layout verification
+- N/A: this slice changes host-side texture-cache join-tail control flow only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages` and `TextureCache<P>::CopyImage` in `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust `finish_pending_join_copies_with_reader` and `copy_join_image` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- deko3d depth-min Vulkan non-regression remains full-frame non-black: `/tmp/ruzu_deko3d_join_strict.ppm` is `2560x1440`, bbox `x[0..2559] y[0..1439]`, `nonblack=3686400`, with no `unsupported pending` panic.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete: `/tmp/ruzu_pinball_join_strict.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, `nonblack=2041193`, with no `unsupported pending` panic.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs and video_core/src/renderer_vulkan/mod.rs vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust Vulkan render-target update now mirrors the upstream `TextureCache<P>::UpdateRenderTargets` call edge more closely: after `update_render_targets_from_snapshot_with_dirty_flags`, the backend completes pending join copies with the available GPU reader, then prepares every bound color and depth/stencil image with `prepare_image_with_reader(image_id, true, invalidate)` before framebuffer assembly. This corresponds to upstream's `PrepareImageView(color_buffer_id, true, is_clear && IsFullClear(...))` and `PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(...))`.
+- Rust computes the clear scissor input in `renderer_vulkan/mod.rs` and passes a reduced `(min_x, min_y, max_x, max_y)` tuple to the texture cache. Upstream reads `maxwell3d->regs.clear_control.use_scissor` and `regs.scissor_test[0]` directly inside `IsFullClear`; the Rust wrapper has already snapshotted clear state through `ClearView`.
+- The implementation keeps preparation in the Vulkan texture-cache wrapper rather than the common base because Rust's common `TextureCacheBase::prepare_image` is intentionally a panic guard until backend-owned refresh/upload/synchronize/mark-modification behavior is fully available there.
+
+### Unintentional differences (to fix)
+- Queued pending join tails are still completed at this render-target prepare edge when the Vulkan wrapper has a GPU reader. Upstream completes the equivalent refresh/copy/delete/register sequence synchronously inside `JoinImages` before `UpdateRenderTargets` reaches `PrepareImageView`.
+- The Rust full-clear check accepts a reduced scissor snapshot. This matches the currently routed clear path, but it is not yet a literal owner-level port of upstream `IsFullClear`, which reads Maxwell registers directly from the common texture cache owner.
+- `finish_pending_backend_insertions()` remains after render-target preparation as a split-backend cleanup step. Upstream constructs backend images directly through `slot_images.insert(runtime, ...)`, so this extra completion drain should disappear once all insertion paths are fully synchronous with upstream ownership.
+
+### Missing items
+- Narrow or remove the remaining pending join-tail delay so `RefreshContents`, `SynchronizeAliases`, alias copies, overlap deletion, and registration happen at the same upstream call edge wherever possible.
+- Audit render-target rescale viewport/scissor dirty propagation against upstream `RescaleRenderTargets` and `flags[Dirty::RescaleViewports/Scissors]`; this slice only ports the missing `PrepareImageView` edge.
+- Add a Vulkan workload that exercises render-target clears with partial scissor and depth/stencil reuse. Pinball is single-color/no-depth; deko3d depth-min validates a depth path but not every `IsFullClear` branch.
+
+### Binary layout verification
+- N/A: this slice changes host-side texture-cache render-target preparation and Vulkan wrapper call ordering only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::UpdateRenderTargets`, `TextureCache<P>::PrepareImage`, `TextureCache<P>::PrepareImageView`, and `TextureCache<P>::IsFullClear` in `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust `TextureCache::update_render_targets_and_get_rt0_framebuffer`, `TextureCache::prepare_bound_render_target_views`, and `TextureCache::render_target_view_is_full_clear` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `cargo fmt` applied.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- deko3d depth-min Vulkan non-regression remains full-frame non-black after this render-target prepare change: `/tmp/ruzu_deko3d_rt_prepare.ppm` is `2560x1440`, bbox `x[0..2559] y[0..1439]`, `nonblack=3686400`.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after this render-target prepare change: `/tmp/ruzu_pinball_rt_prepare.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, `nonblack=2041193`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust Vulkan pending join completion no longer requeues the tail when sibling `ScaleUp`/`ScaleDown`, `RefreshContents(new_image)`, or new-image `ScaleUp`/`ScaleDown` fails. Upstream `TextureCache<P>::JoinImages` performs these operations synchronously and does not have a retry/defer path at those points; a failed backend operation now panics with the affected `ImageId` instead of silently preserving a partially completed join tail.
+- The panic sites are Rust fail-fast equivalents for upstream assertion/`UNIMPLEMENTED`/hard-failure behavior. They are deliberately stricter than the previous split-backend retry path because continuing after failed rescale/refresh would preserve stale common-cache state that upstream never exposes.
+
+### Unintentional differences (to fix)
+- The pending join tail is still delayed until a Vulkan wrapper call provides both backend services and a GPU reader. Upstream does the entire sequence inside `JoinImages`, before returning the new `ImageId`.
+- `RefreshContents(new_image)` can still return `false` in Rust if the split-backend GPU reader cannot read guest memory. Upstream uses its texture-cache-owned `gpu_memory` directly and does not expose this as a recoverable condition.
+- The fail-fast panic messages are not exact one-to-one ports of upstream macro names; they preserve behavior direction but not macro identity.
+
+### Missing items
+- Move more of the pending join tail to the immediate insertion/join call edge so Rust no longer depends on later draw/clear/blit wrapper calls to complete upstream `JoinImages` work.
+- Add a focused regression that exercises a pending join tail with rescaled siblings and GPU-modified overlaps. Pinball and deko3d depth-min validate no regression, but they do not cover every branch.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan pending join control flow only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages`, including sibling rescale, `RefreshContents(new_image)`, new-image rescale, sorted join copies, alias copies, GPU-modified overlap copies, overlap deletion, and final `RegisterImage`.
+- Re-read Rust `TextureCache::finish_pending_join_copies_with_reader`, `prepare_pending_join_sibling_rescale`, and `prepare_pending_join_new_image_rescale`.
+- `cargo fmt` applied.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete with no pending-join panic: `/tmp/ruzu_pinball_join_no_requeue.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, `nonblack=2041193`.
+- deko3d depth-min Vulkan non-regression remains full-frame non-black with no pending-join panic: `/tmp/ruzu_deko3d_join_no_requeue.ppm` is `2560x1440`, bbox `x[0..2559] y[0..1439]`, `nonblack=3686400`. MoltenVK still reports the known `D24_UNORM_S8_UINT` substitution/copy warning and primitive-restart warnings.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs and video_core/src/texture_cache/texture_cache.rs vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- The Vulkan wrapper now owns the backend-sensitive render-target image insertion path through `update_render_targets_from_snapshot_with_dirty_flags_and_finish`. This mirrors upstream `TextureCache<P>::UpdateRenderTargets` / `FindRenderTargetView`, where the templated texture cache owns both common image metadata and runtime backend operations. Each color RT and zeta image is inserted through `find_or_insert_image_from_info_with_options_and_finish`, so a queued join tail is completed immediately at that RT/zeta call edge before the render-target view is created and bound.
+- `TextureCacheBase::bind_color_render_target` and `bind_depth_render_target` are now `pub(crate)` so the Vulkan wrapper can preserve the common-cache binding and preemptive-download behavior while taking ownership of backend completion. The method bodies are unchanged and still live in the common texture-cache file.
+- The older common-cache `update_render_targets_from_snapshot_with_dirty_flags` remains for non-backend tests and non-Vulkan callers. Vulkan no longer uses that monolithic helper because it cannot call backend services while `TextureCacheBase` is mutably borrowed.
+
+### Unintentional differences (to fix)
+- `update_render_targets_from_snapshot_with_dirty_flags_and_finish` duplicates the common render-target snapshot translation logic. Upstream has one templated owner (`TextureCache<P>`); Rust currently splits common metadata and Vulkan backend, so this duplication is a temporary ownership bridge that should shrink once the backend runtime is integrated more directly.
+- Upstream `FindRenderTargetView` loops while `has_deleted_images` changes. The Vulkan wrapper completes backend insertion/join immediately per RT/zeta insertion, but it does not yet reproduce that exact local do/while around each render-target image lookup.
+- Upstream `UpdateRenderTargets` calls `RescaleRenderTargets()` before RT binding and marks `Dirty::RescaleViewports` / `Dirty::RescaleScissors` when rescale state changes. Rust still relies on the existing `base.is_rescaling_active()` state and does not port that dirty propagation in this slice.
+
+### Missing items
+- Port the exact upstream `FindRenderTargetView` retry loop around render-target image lookup when `has_deleted_images` changes.
+- Port/audit `RescaleRenderTargets` and its dirty-flag side effects for the Vulkan draw path.
+- Continue narrowing the remaining pending join delay for descriptor/sample image paths; this slice covers render targets and zeta only.
+
+### Binary layout verification
+- N/A: this slice changes host-side render-target texture-cache ownership and control flow only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::UpdateRenderTargets`, `FindDepthBuffer`, and `FindRenderTargetView` in `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust `TextureCache::update_render_targets_and_get_rt0_framebuffer` and `TextureCache::update_render_targets_from_snapshot_with_dirty_flags_and_finish` in `video_core/src/renderer_vulkan/texture_cache.rs`, plus `TextureCacheBase::bind_color_render_target` and `bind_depth_render_target` in `video_core/src/texture_cache/texture_cache.rs`.
+- `cargo fmt` applied.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after immediate RT/zeta backend completion: `/tmp/ruzu_pinball_rt_immediate_join.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, `nonblack=2041193`.
+- deko3d depth-min Vulkan non-regression remains full-frame non-black after immediate RT/zeta backend completion: `/tmp/ruzu_deko3d_rt_immediate_join.ppm` is `2560x1440`, bbox `x[0..2559] y[0..1439]`, `nonblack=3686400`. MoltenVK still reports the known `D24_UNORM_S8_UINT` substitution warning and primitive-restart warnings.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust Vulkan now ports upstream `TextureCache<P>::FindRenderTargetView`'s local retry loop for render-target/zeta image lookup. `find_or_insert_render_target_image_with_retry` saves the incoming `has_deleted_images`, clears it before each `find_or_insert_image_from_info_with_options_and_finish`, ORs deletion state back into `delete_state`, repeats while a deletion occurred, then restores the accumulated state before creating the image view.
+- The helper lives in `renderer_vulkan/texture_cache.rs` rather than `TextureCacheBase` because each retry must also complete Vulkan backend insertion/join tails. This preserves upstream `TextureCache<P>` ownership semantics in Rust's split common/backend architecture.
+
+### Unintentional differences (to fix)
+- The retry helper accepts an already translated `cpu_addr`. Upstream `FindOrInsertImage(info, gpu_addr)` owns GPU-to-CPU translation internally. In the current Rust wrapper, translation happens immediately before the retry loop and is reused across retries.
+- `update_render_targets_from_snapshot_with_dirty_flags_and_finish` still duplicates common render-target snapshot translation logic while the Rust port remains split between `TextureCacheBase` and the Vulkan wrapper.
+- `RescaleRenderTargets` dirty-flag side effects are still not audited/ported in this slice.
+
+### Missing items
+- Port/audit upstream `TextureCache<P>::RescaleRenderTargets` and its `Dirty::RescaleViewports` / `Dirty::RescaleScissors` side effects.
+- Continue reducing pending join delay for descriptor/sample image paths; render-target and zeta paths now have immediate backend completion plus upstream retry behavior.
+
+### Binary layout verification
+- N/A: this slice changes host-side render-target lookup retry control flow only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::FindRenderTargetView` in `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust `TextureCache::find_or_insert_render_target_image_with_retry` and its color RT/zeta call sites in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after the RT retry loop: `/tmp/ruzu_pinball_rt_retry.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, `nonblack=2041193`.
+- deko3d depth-min Vulkan non-regression remains full-frame non-black after the RT retry loop: `/tmp/ruzu_deko3d_rt_retry.ppm` is `2560x1440`, bbox `x[0..2559] y[0..1439]`, `nonblack=3686400`. MoltenVK still reports the known `D24_UNORM_S8_UINT` substitution warning and primitive-restart warnings.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs and video_core/src/renderer_vulkan/mod.rs vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust Vulkan now ports upstream `TextureCache<P>::RescaleRenderTargets` inside `renderer_vulkan::TextureCache::update_render_targets_from_snapshot_with_dirty_flags_and_finish`, the backend wrapper that already owns render-target insertion and Vulkan image materialization. This preserves the upstream templated owner (`TextureCache<P>`) within Rust's split common/backend architecture.
+- `RasterizerVulkan::draw` and `RasterizerVulkan::clear` pass a mutable per-call dirty flag snapshot to the Vulkan texture cache. Upstream mutates `maxwell3d->dirty.flags` directly; Rust draw/clear commands carry snapshots, so the mutation is local to the same render-target update call edge.
+- `ScaleUp` / `ScaleDown` are represented by `ensure_render_target_scaled_up` and `ensure_render_target_scaled_down`, which call the backend scale operation only when the current image flag says a transition is needed, then intentionally ignore the boolean return. Upstream `RescaleRenderTargets` also ignores `ScaleUp` / `ScaleDown` return values because `false` includes valid no-op cases such as inactive resolution scaling.
+
+### Unintentional differences (to fix)
+- Dirty flag mutations from `RescaleRenderTargets` do not write back into the live Maxwell dirty-state table because Vulkan currently receives draw/clear snapshots. Today this is behaviorally hidden by conservative Vulkan state invalidation after each draw, but the ownership still differs from upstream.
+- `DepthBiasGlobal` is set on the mutable snapshot. Upstream sets the live dirty flag after every render-target update, so this should be revisited when Vulkan dirty-state tracking is connected directly to the common dirty table.
+- The retry loop rebinds all color targets after `has_deleted_images`, matching the safety of upstream's retry but still using Rust wrapper-local dirty arrays rather than upstream's `flags[Dirty::ColorBuffer0 + index]` table.
+
+### Missing items
+- Connect Vulkan dynamic-state dirty tracking to the same common dirty flag mutation path, or document a structural exception if draw snapshots remain the frontend contract.
+- Add a focused unit/regression test for render-target rescale rating/tick behavior once a non-Vulkan backend test hook can exercise backend scale up/down without a live Vulkan device.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan render-target rescale control flow only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::RescaleRenderTargets` and `TextureCache<P>::UpdateRenderTargets` in `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust `TextureCache::update_render_targets_from_snapshot_with_dirty_flags_and_finish`, `rescale_current_render_targets`, `check_render_target_rescale`, `ensure_render_target_scaled_up`, `ensure_render_target_scaled_down`, and `set_render_target_scale_rating` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- Re-read Rust `RasterizerVulkan::draw` and `RasterizerVulkan::clear` call sites in `video_core/src/renderer_vulkan/mod.rs`.
+- `cargo fmt` applied.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs and video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp and video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust Vulkan now ports the upstream texture download path at the Vulkan texture-cache owner: `TextureCacheRuntime::download_staging_buffer`, `TextureCacheRuntime::finish`, `Image::download_memory`, the staging-buffer overload, and `TextureCache::download_memory` mirror upstream `TextureCacheRuntime::DownloadStagingBuffer`, `Image::DownloadMemory`, and `TextureCache<P>::DownloadMemory`.
+- `Image::download_memory` records its copy through the Vulkan scheduler, requests an outside-render-pass context, uses the upstream-shaped `GENERAL -> TRANSFER_SRC_OPTIMAL` read barrier, records `cmd_copy_image_to_buffer`, then records the memory write/read barrier plus `TRANSFER_SRC_OPTIMAL -> GENERAL` image barrier. Rescaled images are scaled down before the copy and scaled back up with the `ScaleUp(true)` path, matching upstream ordering.
+- `RasterizerVulkan::flush_region` now routes texture-cache downloads before query-cache flushing so GPU-modified texture images can be copied to host-visible staging and swizzled back into guest memory.
+- The current `DownloadStagingBuffer(deferred)` ignores the `deferred` flag because Rust's current `StagingBufferPool` has no `FreeDeferredStagingBuffer` equivalent yet. This is documented here rather than hidden as full runtime parity.
+- Download staging reads from host-coherent mapped memory after `runtime.finish()`. The current Vulkan staging allocator requests host-visible, host-coherent download buffers, so no explicit invalidate call is needed in this backend state.
+
+### Unintentional differences (to fix)
+- Upstream has `TextureCacheRuntime::FreeDeferredStagingBuffer`; Rust Vulkan still lacks the deferred download-staging lifetime path and therefore cannot preserve the `deferred=true` branch exactly.
+- Upstream rasterizer flush also covers buffer-cache downloads. Rust Vulkan `BufferCache` does not yet expose a `download_memory` owner, so this slice only makes texture-cache flush faithful.
+- `TextureCache::download_memory` currently skips an image if staging allocation, backend materialization, or image download fails. Upstream treats this path as runtime-owned and does not expose those failures as a silent partial flush.
+- `GetFlushArea` / exact flush-area minimization remains common-cache incomplete for the Vulkan rasterizer; this slice wires the download operation, not the full region-selection algorithm.
+
+### Missing items
+- Port `FreeDeferredStagingBuffer` and the deferred staging-buffer cleanup path from `vk_texture_cache.cpp`.
+- Port Vulkan buffer-cache `DownloadMemory` and route it from `RasterizerVulkan::flush_region`, matching upstream rasterizer flush coverage.
+- Port/audit `TextureCache<P>::GetFlushArea` so flush regions are minimized like upstream rather than relying on conservative callers.
+- Add a focused Vulkan workload that exercises GPU-modified texture download/readback. Pinball is a non-regression check for the live render path, not proof of texture readback correctness.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan command scheduling and texture-cache download ownership only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCacheRuntime::DownloadStagingBuffer`, `Image::DownloadMemory`, and `TextureCache<P>::DownloadMemory` in `video_core/renderer_vulkan/vk_texture_cache.cpp` and `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust `TextureCacheRuntime::download_staging_buffer`, `Image::download_memory`, `TextureCache::download_memory`, `download_image_to_host_staging`, and `RasterizerVulkan::flush_region`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::account_scale_up_memory_adds_scaled_size_once -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after the download path wiring: `/tmp/ruzu_pinball_download.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[187..1711] y[0..1079]`, `nonblack=2041193`. The run exits through the external `timeout` after the frame dump, and MoltenVK still reports the known primitive-restart warnings.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/staging_buffer_pool.rs and video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_staging_buffer_pool.{h,cpp} and video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust Vulkan `StagingBuffer` now carries the upstream `StagingBufferRef` identity fields needed by deferred staging ownership: usage, log2 size class, unique index, and deferred state.
+- `StagingBufferPool::request_download_buffer(size, deferred)` now mirrors upstream `StagingBufferPool::Request(size, MemoryUsage::Download, deferred)` at the call boundary. `TextureCacheRuntime::download_staging_buffer` forwards the `deferred` argument instead of discarding it.
+- `StagingBufferPool::free_deferred` and `TextureCacheRuntime::free_deferred_staging_buffer` now mirror upstream `StagingBufferPool::FreeDeferred` / `TextureCacheRuntime::FreeDeferredStagingBuffer` as the runtime owner edge.
+- Dedicated staging buffers are now owned by `StagingBufferPool` and returned as copyable references, matching upstream's pool-owned entry plus `StagingBufferRef` model. The previous Rust model returned newly allocated dedicated buffers without any pool-owned identity.
+- Because Rust's current `StagingBufferPool` still has no `Scheduler&` and no `scheduler.IsFree(entry.tick)` equivalent, automatic reuse is intentionally conservative: only entries explicitly released by `free_deferred` become reusable. This avoids unsafe reuse of an in-flight staging buffer while preserving the deferred-release call edge needed by upstream texture/buffer cache paths.
+
+### Unintentional differences (to fix)
+- Upstream stores a scheduler tick per staging entry and reuses any non-deferred entry only after `scheduler.IsFree(entry.tick)`. Rust still lacks scheduler ownership inside `StagingBufferPool`, so non-deferred dedicated buffers are retained but not recycled through the exact upstream tick/free test.
+- Upstream has separate caches by `MemoryUsage` and log2 level plus iterate/delete indices. Rust currently has one owned `Vec<StagingBuffer>` with usage/log2 filtering; this preserves identity and deferred semantics but not the exact cache structure.
+- `TickFrame`/`ReleaseCache` parity is still incomplete. Rust `new_frame` resets the upload stream offset, but it does not yet run upstream's level-based release pass for device-local/upload/download staging caches.
+
+### Missing items
+- Thread `Scheduler` or an equivalent scheduler-free query into `StagingBufferPool` so `TryGetReservedBuffer` can use upstream `scheduler.IsFree(entry.tick)` instead of the conservative `reusable` flag.
+- Port the exact per-usage/per-log2 cache arrays, `iterate_index`, `delete_index`, `current_delete_level`, and `ReleaseCache` / `ReleaseLevel` behavior.
+- Wire deferred staging users in the remaining async texture download paths once those paths are ported for Vulkan.
+- Port Vulkan buffer-cache runtime staging methods against this pool before routing `RasterizerVulkan::flush_region` to buffer-cache downloads.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan staging-buffer ownership only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `StagingBufferRef`, `StagingBufferPool::Request`, `FreeDeferred`, `TryGetReservedBuffer`, and `CreateStagingBuffer` in `video_core/renderer_vulkan/vk_staging_buffer_pool.{h,cpp}`.
+- Re-read upstream `TextureCacheRuntime::DownloadStagingBuffer` and `TextureCacheRuntime::FreeDeferredStagingBuffer` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read Rust `StagingBuffer`, `StagingBufferPool::request_download_buffer`, `free_deferred`, `try_get_reserved_buffer`, and `TextureCacheRuntime::{download_staging_buffer,free_deferred_staging_buffer}`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::staging_buffer_pool::tests::log2_ceil_matches_staging_size_classes -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after the staging deferred-owner change: `/tmp/ruzu_pinball_staging_deferred.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[187..1711] y[0..1079]`, `nonblack=2041193`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/staging_buffer_pool.rs and video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_staging_buffer_pool.{h,cpp}
+
+### Intentional differences
+- Rust Vulkan `StagingBufferPool` now owns a stable pointer to `Scheduler`, matching upstream's constructor ownership of `Scheduler& scheduler`.
+- Dedicated staging entries now store a scheduler tick. `request_download_buffer` / dedicated `request_upload_buffer` assign `u64::MAX` for deferred entries and the current command-buffer tick for normal entries; in Rust this uses `Scheduler::pending_tick()` because Rust `current_tick()` means "last submitted tick", while upstream `CurrentTick()` means "current command buffer tick".
+- `try_get_reserved_buffer` now mirrors upstream `TryGetReservedBuffer`'s critical safety predicate: an entry is reusable only when it is not deferred and `scheduler.IsFree(entry.tick)` returns true.
+- `new_frame` now advances a delete level and releases up to 16 free dedicated staging entries from that level, matching upstream `TickFrame -> ReleaseCache -> ReleaseLevel` deletion cadence.
+
+### Unintentional differences (to fix)
+- Upstream has three separate per-usage cache arrays (`device_local_cache`, `upload_cache`, `download_cache`) indexed by log2 size class, with `iterate_index` and `delete_index` per level. Rust still uses one `Vec<StagingBuffer>` filtered by usage/log2 and scans from the start.
+- Rust has no device-local staging usage in this pool yet; only upload/download paths are represented by callers.
+- Rust `new_frame` still resets the stream-buffer offset at the same call edge. Upstream stream-buffer lifetime is controlled by region sync ticks and `AreRegionsActive`, not a plain per-frame reset.
+
+### Missing items
+- Port exact per-usage/per-log2 cache structure with `iterate_index`, `delete_index`, and `current_delete_level`.
+- Port stream-buffer region tracking (`sync_ticks`, `AreRegionsActive`, `used_iterator`, `free_iterator`) instead of the current simplified stream reset.
+- Continue with Vulkan buffer-cache runtime methods now that staging has scheduler-backed deferred/free semantics.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan staging-buffer lifecycle only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `StagingBufferPool::Request`, `FreeDeferred`, `TickFrame`, `TryGetReservedBuffer`, `ReleaseCache`, and `ReleaseLevel` in `video_core/renderer_vulkan/vk_staging_buffer_pool.cpp`.
+- Re-read upstream `Scheduler::CurrentTick` / `Scheduler::IsFree` declarations in `video_core/renderer_vulkan/vk_scheduler.h` and Rust `Scheduler::{pending_tick,is_free}`.
+- Re-read Rust `StagingBufferPool::{new,free_deferred,new_frame,try_get_reserved_buffer,release_level}` and the `RasterizerVulkan::new` construction site.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::staging_buffer_pool::tests::log2_ceil_matches_staging_size_classes -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after scheduler-backed staging reuse: `/tmp/ruzu_pinball_scheduler_pool.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[187..1711] y[0..1079]`, `nonblack=2041193`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/buffer_cache.rs vs video_core/renderer_vulkan/vk_buffer_cache.{h,cpp}
+
+### Intentional differences
+- Rust now has a Vulkan `BufferCacheRuntime` in the upstream-owned file, separate from the older direct `BufferCache` rasterizer helper. This mirrors upstream's `Vulkan::BufferCacheRuntime` service owner for the common `BufferCache<P>` port while preserving the existing runtime path until the rasterizer is migrated.
+- The runtime owns scheduler and staging-pool service pointers, matching upstream constructor ownership of `Scheduler& scheduler` and `StagingBufferPool& staging_pool`.
+- `UploadStagingBuffer`, `DownloadStagingBuffer`, and `FreeDeferredStagingBuffer` are ported through the scheduler-backed Vulkan `StagingBufferPool`.
+- `PreCopyBarrier`, `PostCopyBarrier`, `CopyBuffer`, and `ClearBuffer` now record scheduler commands with the upstream access masks and pipeline-stage ordering: `MEMORY_WRITE -> TRANSFER_READ|TRANSFER_WRITE` before copy/clear and `TRANSFER_WRITE -> MEMORY_READ|MEMORY_WRITE` after.
+- Rust common `BufferBase` stores a `u32 gpu_handle`, while upstream Vulkan `Buffer` stores a real `VkBuffer`. The Rust runtime therefore keeps an internal `u32 -> VkBuffer` table. This is a split-architecture bridge until `BufferBase`/`BufferCache<P>` is parameterized by a backend buffer type like upstream.
+- Runtime-owned GPU buffers are destroyed by `Drop`; staging buffer refs are not destroyed there because they remain owned by `StagingBufferPool`, matching upstream pool ownership.
+
+### Unintentional differences (to fix)
+- The Vulkan rasterizer still uses the legacy direct `renderer_vulkan::BufferCache` helper. The new `BufferCacheRuntime` is available for the common `BufferCache<P>` path but is not yet wired into `RasterizerVulkan`.
+- Binding methods required by the shared Rust trait (`BindIndexBuffer`, `BindVertexBuffers`, uniform/storage/texture/image/transform-feedback bindings) are present but not yet ported to Vulkan descriptor queues / dynamic state. Upstream implements these in `vk_buffer_cache.cpp`.
+- `CanReorderUpload` currently returns false. Upstream checks `Settings::disable_buffer_reorder` and `Buffer::IsRegionUsed` to use `RecordWithUploadBuffer` when safe.
+- Device memory reporting is not exact: `CanReportMemoryUsage` is false and `GetDeviceLocalMemory` returns 0 instead of forwarding Vulkan device memory info like upstream.
+- The `u32 -> VkBuffer` bridge can leak stale handles until the common buffer lifecycle is fully connected to backend deletion. Upstream destroys backend `Buffer` instances through the slot-vector object lifecycle.
+
+### Missing items
+- Wire `RasterizerVulkan` to a common `BufferCache<P>` plus this Vulkan `BufferCacheRuntime`, then retire the legacy direct `renderer_vulkan::BufferCache` helper.
+- Port Vulkan descriptor/guest descriptor queue binding paths from `BindUniformBuffer`, `BindStorageBuffer`, `BindTextureBuffer`, `BindImageBuffer`, compute bindings, and transform-feedback bindings.
+- Port quad index buffer helpers (`QuadArrayIndexBuffer`, `QuadStripIndexBuffer`, `QuadIndexedPass`) as runtime-owned services instead of the current direct helper path.
+- Port `CanReorderUpload` and `RecordWithUploadBuffer` optimization exactly once buffer usage tracking is connected to Vulkan `Buffer` objects.
+- Route `RasterizerVulkan::flush_region` to common `buffer_cache.DownloadMemory` after the common cache is backed by this runtime.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan buffer runtime services only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `Buffer`, `BufferCacheRuntime` declarations in `video_core/renderer_vulkan/vk_buffer_cache.h`.
+- Re-read upstream `Buffer::Buffer`, `BufferCacheRuntime::{UploadStagingBuffer,DownloadStagingBuffer,FreeDeferredStagingBuffer,Finish,CanReorderUpload,CopyBuffer,PreCopyBarrier,PostCopyBarrier,ClearBuffer}` in `video_core/renderer_vulkan/vk_buffer_cache.cpp`.
+- Re-read Rust `renderer_vulkan::BufferCacheRuntime`, its trait implementation, and the legacy direct `renderer_vulkan::BufferCache` helper.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::staging_buffer_pool::tests::log2_ceil_matches_staging_size_classes -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after adding the Vulkan buffer-cache runtime services: `/tmp/ruzu_pinball_vk_buffer_runtime.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[187..1711] y[0..1079]`, `nonblack=2041193`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/buffer_cache.rs vs video_core/renderer_vulkan/vk_buffer_cache.h
+
+### Intentional differences
+- Rust Vulkan now defines `BufferCacheParams` in the upstream-owned Vulkan buffer-cache file with constants matching upstream `Vulkan::BufferCacheParams`: `IS_OPENGL=false`, `HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS=false`, `HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT=false`, `NEEDS_BIND_UNIFORM_INDEX=false`, `NEEDS_BIND_STORAGE_INDEX=false`, `USE_MEMORY_MAPS=true`, `SEPARATE_IMAGE_BUFFER_BINDINGS=false`, and `USE_MEMORY_MAPS_FOR_UPLOADS=true`.
+- Rust adds `VulkanCommonBufferCache = BufferCache<BufferCacheParams, VulkanDeviceTracker>` as the Vulkan counterpart of upstream `using BufferCache = VideoCommon::BufferCache<BufferCacheParams>`.
+- `VulkanDeviceTracker` is currently a no-op, matching the current OpenGL Rust port's tracker behavior. This preserves the Rust port's existing memory-tracker integration level while allowing the Vulkan common cache type to be instantiated.
+
+### Unintentional differences (to fix)
+- The Vulkan common buffer-cache alias is not yet used by `RasterizerVulkan`; the rasterizer still owns the legacy direct helper.
+- Upstream's `MemoryTracker` template parameter is `MemoryTrackerBase<Tegra::MaxwellDeviceMemoryManager>`. Rust still uses a no-op `DeviceTracker` wrapper because page-cache accounting is not wired through the Vulkan rasterizer yet.
+
+### Missing items
+- Replace the legacy direct `renderer_vulkan::BufferCache` field in `RasterizerVulkan` with `VulkanCommonBufferCache` once binding methods and memory access bridges are ready.
+- Wire Vulkan page-cache tracking to the real Maxwell device memory manager instead of the no-op `VulkanDeviceTracker`.
+
+### Binary layout verification
+- N/A: this slice adds backend policy constants/type aliases only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `Vulkan::BufferCacheParams` and `using BufferCache = VideoCommon::BufferCache<BufferCacheParams>` in `video_core/renderer_vulkan/vk_buffer_cache.h`.
+- Re-read Rust `BufferCacheParams`, `VulkanCommonBufferCache`, and `VulkanDeviceTracker`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::buffer_cache::tests::buffer_cache_params_match_upstream_vulkan -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after adding the Vulkan common buffer-cache policy: `/tmp/ruzu_pinball_vk_buffer_params.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[187..1711] y[0..1079]`, `nonblack=2041193`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp and video_core/renderer_vulkan/vk_buffer_cache.h
+
+### Intentional differences
+- `RasterizerVulkan` now owns a `VulkanCommonBufferCache` alongside the legacy direct Vulkan `BufferCache` helper. This is a staged migration toward upstream, where `RasterizerVulkan` owns `Vulkan::BufferCache = VideoCommon::BufferCache<BufferCacheParams>`.
+- The common cache is constructed with `VULKAN_DEVICE_TRACKER` and receives a Vulkan `BufferCacheRuntime`, matching the upstream ownership relationship between `BufferCache<BufferCacheParams>` and `BufferCacheRuntime`.
+- `flush_region` now calls common `buffer_cache.DownloadMemory(addr, size)` between texture-cache download and query-cache flush, preserving upstream `RasterizerVulkan::FlushRegion` order: texture, buffer, query.
+- `tick_frame` now ticks the common buffer cache, matching upstream lifecycle intent that buffer-cache per-frame maintenance happens from the rasterizer.
+- The legacy direct helper remains the draw-time buffer binding owner for now. This avoids routing draw bindings through a runtime whose descriptor/vertex/uniform/storage methods are not yet ported.
+
+### Unintentional differences (to fix)
+- Rust now temporarily has two Vulkan buffer-cache owners: the legacy direct helper for draw bindings and the common cache for lifecycle/download. Upstream has only the common `Vulkan::BufferCache`.
+- The common cache has no channel/gpu/device memory bridge wired yet in Vulkan, so `DownloadMemory` is currently a safe no-op for real buffers. The call edge/order is now correct, but behavior is not complete until channel binding and memory adapters are installed.
+- `tick_frame` order is close but not fully audited against upstream `RasterizerVulkan::TickFrame`; this slice only adds the common buffer-cache tick edge.
+
+### Missing items
+- Wire Vulkan channel binding to common buffer cache: channel state, GPU memory access, device memory access, and engine state adapters.
+- Port Vulkan runtime descriptor/binding methods, then migrate draw-time buffer updates/binds from the legacy direct helper to the common `VulkanCommonBufferCache`.
+- Retire the legacy direct helper once the common cache owns draw bindings, DMA clear/copy, flush, invalidate, and lifecycle.
+
+### Binary layout verification
+- N/A: this slice changes host-side rasterizer ownership/lifecycle only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `RasterizerVulkan::FlushRegion` in `video_core/renderer_vulkan/vk_rasterizer.cpp`.
+- Re-read upstream `using BufferCache = VideoCommon::BufferCache<BufferCacheParams>` in `video_core/renderer_vulkan/vk_buffer_cache.h`.
+- Re-read Rust `RasterizerVulkan` fields, constructor, `flush_region`, and `tick_frame` in `video_core/src/renderer_vulkan/mod.rs`.
+- `cargo fmt` applied.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::buffer_cache::tests::buffer_cache_params_match_upstream_vulkan -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after wiring common buffer-cache lifecycle edges: `/tmp/ruzu_pinball_common_buffer_wire.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[187..1711] y[0..1079]`, `nonblack=2041193`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp and video_core/renderer_vulkan/vk_buffer_cache.h
+
+### Intentional differences
+- Vulkan now installs common buffer-cache memory adapters in the rasterizer-owned location: `DeviceMemoryAccessAdapter` wraps the constructor-owned `Arc<MaxwellDeviceMemoryManager>`, matching upstream `buffer_cache(device_memory, buffer_cache_runtime)` ownership rather than routing through a frontend callback.
+- `GpuMemoryAccessAdapter` is installed when a channel is bound from the channel-owned `MemoryManager`, matching upstream's per-channel GPU-memory owner used by the common buffer cache.
+- `common_buffer_cache.channel_state` is initialized at bind time, mirroring the existing OpenGL Rust bridge while the full upstream channel-state owner graph is still being ported.
+- The legacy direct Vulkan buffer helper remains in place for draw-time bindings. This is intentional until the Vulkan `BufferCacheRuntime` descriptor/vertex/uniform/storage binding methods are ported.
+
+### Unintentional differences (to fix)
+- Rust still has two Vulkan buffer-cache owners: the legacy direct helper for draw bindings and the common `VulkanCommonBufferCache` for lifecycle/download. Upstream has only `Vulkan::BufferCache = VideoCommon::BufferCache<BufferCacheParams>`.
+- The common cache receives channel and memory access, but draw-time engine-state adapters and binding methods are still not ported. `DownloadMemory` can now resolve memory owners, but the common cache still has no complete Vulkan draw/update integration.
+- `common_buffer_cache.channel_state = Some(Box::default())` is a reduced Rust bridge. Upstream stores full channel state in `TextureCache`/`BufferCache` channel setup caches through `CreateChannel`/`BindToChannel`.
+
+### Missing items
+- Port Vulkan engine-state adapters for Maxwell3D/KeplerCompute into the common buffer cache.
+- Port runtime descriptor/vertex/index/uniform/storage/image/texture/transform-feedback binding methods from `vk_buffer_cache.cpp`, then migrate draw-time buffer binding off the legacy direct helper.
+- Replace the no-op `VulkanDeviceTracker` with the upstream-equivalent memory tracker over `MaxwellDeviceMemoryManager`.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan rasterizer/cache wiring only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `RasterizerVulkan::RasterizerVulkan` member initialization in `video_core/renderer_vulkan/vk_rasterizer.cpp`, especially `buffer_cache_runtime(...), buffer_cache(device_memory, buffer_cache_runtime)`.
+- Re-read upstream `RasterizerVulkan::BindChannel`, `FlushRegion`, and `TickFrame` in `video_core/renderer_vulkan/vk_rasterizer.cpp`.
+- Re-read upstream `BufferCacheRuntime` / `using BufferCache = VideoCommon::BufferCache<BufferCacheParams>` declarations in `video_core/renderer_vulkan/vk_buffer_cache.h`.
+- Re-read Rust `RasterizerVulkan` constructor and `bind_channel` in `video_core/src/renderer_vulkan/mod.rs`.
+- `cargo fmt` applied.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::buffer_cache::tests::buffer_cache_params_match_upstream_vulkan -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after wiring common buffer-cache memory adapters: `/tmp/ruzu_pinball_common_buffer_memory.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[188..1712] y[0..1079]`, `nonblack=2041193`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/{scheduler.rs,blit_image.rs,mod.rs} vs video_core/renderer_vulkan/{vk_scheduler.cpp,h,blit_image.cpp,h}
+
+### Intentional differences
+- Rust `Scheduler::new` remains constructor-compatible for non-rasterizer users, so the upstream `StateTracker&` is installed with `set_state_tracker(...)` once `RasterizerVulkan` has allocated both stable owners. This preserves the upstream ownership relation without forcing unrelated presentation scheduler construction paths to fabricate a state tracker.
+- `RasterizerVulkan::state_tracker` is now boxed before it is handed to `Scheduler`, giving the scheduler a stable pointer equivalent to upstream `StateTracker&`.
+- `BlitImageHelper::{blit_color,blit_depth_stencil,convert,convert_depth_stencil}` now call `scheduler.invalidate_state()` after recording their helper draw, matching upstream `blit_image.cpp` helper ordering.
+
+### Unintentional differences (to fix)
+- Rust `BlitImageHelper` still does not store its own `StateTracker&` member even though upstream `BlitImageHelper` does. The helper reaches state invalidation through `Scheduler`, which is behaviorally correct for the currently ported helper methods because upstream also calls `scheduler.InvalidateState()`.
+- Rust `Scheduler::InvalidateState` currently invalidates the command-buffer state through `StateTracker`, but it does not yet track upstream scheduler-local `state.graphics_pipeline = nullptr` or `state.rescaling_defined = false` because those scheduler pipeline/rescaling caches are not ported.
+- Clear helper methods in Rust are still reduced and do not yet call `scheduler.invalidate_state()` because their draw implementations are not fully ported.
+
+### Missing items
+- Port scheduler-local graphics-pipeline/rescaling state so `Scheduler::InvalidateState` can clear the same state fields as upstream.
+- Port clear-color and clear-depth/stencil helper draw paths, including their upstream `scheduler.InvalidateState()` calls.
+- Add focused scheduler/state-tracker tests once the scheduler-local state object exists.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan scheduler/helper ownership and state invalidation only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `Scheduler::Scheduler` and `Scheduler::InvalidateState` in `video_core/renderer_vulkan/vk_scheduler.cpp` and `vk_scheduler.h`.
+- Re-read upstream `BlitImageHelper::{BlitColor,BlitDepthStencil,Convert,ConvertDepthStencil}` in `video_core/renderer_vulkan/blit_image.cpp`.
+- Re-read Rust `Scheduler`, `BlitImageHelper`, and `RasterizerVulkan::new`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after helper scheduler invalidation: `/tmp/ruzu_pinball_scheduler_invalidate.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[188..1712] y[0..1079]`, `nonblack=2041193`. The command exited with timeout status 124 after the dump, as expected for this manual runtime check.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/{scheduler.rs,blit_image.rs} vs video_core/renderer_vulkan/{vk_scheduler.cpp,h,blit_image.cpp,h}
+
+### Intentional differences
+- Rust `Scheduler::State` currently stores a `vk::Pipeline` handle for the upstream `GraphicsPipeline* graphics_pipeline` field because the full upstream `GraphicsPipeline` owner/update path is not yet ported into the Rust scheduler. This preserves the invalidation slot and lets `invalidate_state` clear the same scheduler-owned cache point.
+- Rust keeps a dedicated `bind_clear_state` helper for clear draws instead of reusing `bind_blit_state`. Upstream has overloaded `BindBlitState` forms; the Rust blit helper pushes vertex-stage `PushConstants`, while clear pipelines use `clear_color_pipeline_layout` with fragment-stage push constants only. A separate helper preserves the upstream behavior without pushing incompatible constants.
+- Rust clear helpers return `bool` so call sites can handle Vulkan pipeline-creation failure without exceptions. Upstream throws/aborts through Vulkan wrapper failure paths; Rust uses `Result`/logged `false` for the same host-side error boundary style used by the surrounding port.
+
+### Unintentional differences (to fix)
+- `SchedulerState::is_rescaling` is present but not yet used because upstream `Scheduler::UpdateRescaling` is not ported in Rust. `invalidate_state` now clears `rescaling_defined` like upstream; the producer side still needs to be ported.
+- `SchedulerState::graphics_pipeline` is cleared by `invalidate_state`, but upstream `Scheduler::UpdateGraphicsPipeline` and pipeline-pointer reuse are not yet ported in Rust. Current helper draws still bind Vulkan pipelines directly in recorded commands.
+- Rust `BlitImageHelper` still does not own its own `StateTracker&` member. Behavior for these paths is now correct because all helper draws call `scheduler.invalidate_state()`, but member ownership still differs from upstream.
+
+### Missing items
+- Port upstream `Scheduler::UpdateGraphicsPipeline` and `Scheduler::UpdateRescaling`.
+- Replace direct helper pipeline binding with upstream scheduler pipeline-cache update once Rust has a real `GraphicsPipeline` owner.
+- Add a depth/stencil-using runtime test that actually exercises `ClearDepthStencil`; Pinball is color-only/no-depth for this path.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan command recording and pipeline creation only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `Scheduler::State` and `Scheduler::InvalidateState` in `video_core/renderer_vulkan/vk_scheduler.h` and `vk_scheduler.cpp`.
+- Re-read upstream `BlitImageHelper::ClearColor`, `BlitImageHelper::ClearDepthStencil`, `FindOrEmplaceClearColorPipeline`, and `FindOrEmplaceClearStencilPipeline` in `video_core/renderer_vulkan/blit_image.cpp`.
+- Re-read Rust `Scheduler::invalidate_state`, `BlitImageHelper::clear_color`, `BlitImageHelper::clear_depth_stencil`, and the clear pipeline creation helpers.
+- `cargo fmt` applied.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after porting clear helper pipelines and scheduler-local invalidation: `/tmp/ruzu_pinball_clearhelpers.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[188..1712] y[0..1079]`, `nonblack=2041193`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp and video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust `TextureCacheRuntime::insert_upload_memory_barrier` remains empty, matching upstream Vulkan `TextureCacheRuntime::InsertUploadMemoryBarrier`. Upload synchronization is owned by `Image::upload_memory`/`CopyBufferToImage`, not by a separate runtime barrier.
+- Rust `Image::upload_memory` records the copy through `Scheduler::record` and returns `bool` for host-side failure propagation. Upstream records through `scheduler.Record` and relies on Vulkan wrapper/error policy; the command ordering and barriers are the parity target.
+
+### Unintentional differences (to fix)
+- Rust still inlines upstream `CopyBufferToImage` inside `Image::upload_memory` rather than having a file-local helper named `copy_buffer_to_image`. Behavior now matches the helper's access masks/ranges, but method-boundary parity can be improved.
+- The full ASTC accelerated/asynchronous upload branches from upstream `UploadImageContents` are still incomplete in Rust `refresh_contents_with_reader`.
+- MSAA upload remains reduced: Rust logs and transitions/initializes instead of fully porting upstream's upload limitations and transition path through the same helper ownership.
+
+### Missing items
+- Add a Rust file-local `copy_buffer_to_image` helper matching upstream `CopyBufferToImage` to improve auditability and reduce future drift.
+- Finish ASTC accelerated upload / async decode ownership in `TextureCacheRuntime`.
+- Validate upload barriers on a texture-upload-heavy title/homebrew beyond Pinball; Pinball covers the non-regression path but not all upload modes.
+
+### Binary layout verification
+- N/A: this slice changes Vulkan image barriers and command recording only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::RefreshContents`, `TextureCache<P>::UploadImageContents`, `TextureCacheRuntime::InsertUploadMemoryBarrier`, `Image::UploadMemory`, and file-local `CopyBufferToImage`.
+- Re-read Rust `TextureCache::refresh_contents_with_reader`, `TextureCacheRuntime::insert_upload_memory_barrier`, and `Image::upload_memory`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after aligning upload barriers: `/tmp/ruzu_pinball_uploadbarrier.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[188..1712] y[0..1079]`, `nonblack=2041193`. The command exited with timeout status 124 after the dump, as expected for this manual runtime check.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust `copy_buffer_to_image` takes `&ash::Device` plus the raw `vk::CommandBuffer` because Rust does not wrap command buffers in upstream's `vk::CommandBuffer` RAII helper. The command ordering, barriers, access masks, image layouts, and subresource range match upstream `CopyBufferToImage`.
+- Rust keeps the helper in snake_case as a file-local function next to the other Vulkan texture-cache helper translations. This preserves method ownership and auditability while following Rust naming conventions.
+
+### Unintentional differences (to fix)
+- `Image::upload_memory` currently calls `copy_buffer_to_image` from inside a `Scheduler::record` closure, matching upstream ordering. No behavioral difference was found in this helper extraction slice.
+
+### Missing items
+- Finish ASTC accelerated/asynchronous upload ownership in `TextureCacheRuntime` / `refresh_contents_with_reader`.
+- Continue auditing `finish_pending_join_copies` against upstream join/alias/rescale ordering with a depth/MRT workload; Pinball is still single-color/no-depth.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan command helper ownership only. No guest-visible raw-copied payload layout changed.
+
+### Verification
+- Re-read upstream file-local `CopyBufferToImage` and upstream `Image::UploadMemory` call site in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read Rust `Image::upload_memory`, `transform_buffer_image_copies`, and file-local `copy_buffer_to_image` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after extracting the helper: `/tmp/ruzu_pinball_copy_buffer_to_image.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[188..1712] y[0..1079]`, `nonblack=2041193`. The command exited with timeout status 124 after the dump, as expected for this manual runtime check.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/{compute_pass.rs,texture_cache.rs} vs video_core/renderer_vulkan/{vk_compute_pass.cpp,vk_texture_cache.cpp} and video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust `TextureCacheRuntime` now owns an optional `AstcDecoderPass`, matching upstream `TextureCacheRuntime::astc_decoder_pass` ownership. Construction logs and disables the accelerated path if pipeline creation fails rather than throwing through the C++ Vulkan wrapper.
+- Rust `ASTCDecoderPass::assemble` uses direct `vkUpdateDescriptorSets` writes after allocating descriptor sets from `DescriptorPool`. Upstream uses `ComputePassDescriptorQueue::UpdateData()` plus a descriptor update template. The descriptor contents, bindings, pipeline bind, push constants, dispatch dimensions, image barriers, and `scheduler.finish()` ordering match upstream `ASTCDecoderPass::Assemble`.
+- Rust `TextureCacheRuntime::accelerate_image_upload` takes the split-backend `Image` and staging allocation explicitly because Rust does not store the upstream `runtime*` pointer inside `Image`. The method remains owned by `TextureCacheRuntime`, and the command work is owned by `AstcDecoderPass`.
+- Rust creates ASTC storage views lazily with explicit `VK_FORMAT_A8B8G8R8_UNORM_PACK32`, matching upstream's uncompressed ASTC accelerated upload view format.
+
+### Unintentional differences (to fix)
+- `ImageFlagBits::ASYNCHRONOUS_DECODE` still returns `false` in `refresh_contents_with_reader`; upstream calls `QueueAsyncDecode(image, image_id)`. This requires porting the async decode queue/lifecycle instead of adding a local fallback.
+- The non-accelerated `ImageFlagBits::CONVERTED` upload branch has been ported in a later slice documented below.
+- `ASTCDecoderPass::assemble` records descriptor update data directly rather than consuming the queued payload from `ComputePassDescriptorQueue::update_data()`. Behavior is equivalent for this pass, but descriptor-template/update-data ownership is not yet fully upstream-shaped.
+
+### Missing items
+- Port `QueueAsyncDecode` / async decode completion lifecycle for `ImageFlagBits::ASYNCHRONOUS_DECODE`.
+- Converted upload path in `UploadImageContents` is now ported in the later `refresh_contents_with_reader` entry below.
+- Finish descriptor-template/update-data parity for Vulkan compute passes if strict descriptor allocator ownership is pursued further.
+- Validate accelerated ASTC on an ASTC-using title/homebrew. Pinball is a non-regression check only and does not prove the ASTC path executes.
+
+### Binary layout verification
+- PASS for `AstcPushConstants`: existing test asserts the struct size is `7 * sizeof(u32)`, matching upstream `AstcPushConstants`.
+- N/A for guest payload layout: this slice changes host Vulkan descriptor/barrier/compute dispatch ownership, not raw guest-copied ABI structs.
+
+### Verification
+- Re-read upstream `TextureCache<P>::RefreshContents` and `TextureCache<P>::UploadImageContents` in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `TextureCacheRuntime::AccelerateImageUpload`, `Image::Image`, and `Image::StorageImageView` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `ASTCDecoderPass::ASTCDecoderPass` and `ASTCDecoderPass::Assemble` in `video_core/renderer_vulkan/vk_compute_pass.cpp`.
+- Re-read Rust `TextureCache::refresh_contents_with_reader`, `TextureCacheRuntime::accelerate_image_upload`, `TextureCacheRuntime::storage_image_view_with_format`, and `AstcDecoderPass::assemble`.
+- `cargo fmt` applied.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after wiring accelerated ASTC upload ownership: `/tmp/ruzu_pinball_astc_upload.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[188..1712] y[0..1079]`, `nonblack=2041193`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h and video_core/texture_cache/util.cpp
+
+### Intentional differences
+- Rust `refresh_contents_with_reader` uses the existing Rust `read_gpu_unsafe` callback and local `Vec<u8>` buffers instead of upstream `GpuGuestMemory` and `ScratchBuffer`. The data flow is the same: guest block-linear bytes are read, converted into a staging-sized mapped buffer, then passed to `Image::upload_memory`.
+- Rust uses the already ported `texture_cache::util::convert_image` helper. That helper is the Rust counterpart of upstream `ConvertImage` and mutates `BufferImageCopy` offsets/sizes before upload.
+
+### Unintentional differences (to fix)
+- `ImageFlagBits::ASYNCHRONOUS_DECODE` still returns `false`; upstream calls `QueueAsyncDecode(image, image_id)`. This remains the upload-path blocker after the accelerated and converted synchronous branches.
+- The Vulkan Rust path still lacks a dedicated async decode staging/result lifecycle, so converted synchronous uploads are now faithful but async converted uploads are not.
+
+### Missing items
+- Port `QueueAsyncDecode`, async decode result ownership, and completion/upload ordering.
+- Validate converted upload with an ASTC/BCn workload that forces `ImageFlagBits::CONVERTED`; Pinball remains a non-regression check and does not prove this branch executes.
+
+### Binary layout verification
+- N/A: this slice changes host-side upload data flow. `BufferImageCopy` is an internal Rust struct passed by value to Vulkan copy construction, not a guest raw-copied ABI payload.
+
+### Verification
+- Re-read upstream `TextureCache<P>::UploadImageContents` in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `ConvertImage` in `video_core/texture_cache/util.cpp`.
+- Re-read Rust `refresh_contents_with_reader` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- Re-read Rust `convert_image` in `video_core/src/texture_cache/util.rs`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after converted upload wiring: `/tmp/ruzu_pinball_converted_upload.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[188..1712] y[0..1079]`, `nonblack=2041193`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h and video_core/texture_cache/texture_cache_base.h
+
+### Intentional differences
+- Rust `TextureCache` owns a `ThreadWorker::new_named(1, "TextureDecoder")` for async texture decode, matching the existing Rust OpenGL backend and upstream's dedicated texture decode worker concept.
+- Rust `queue_async_decode` receives the already-read guest bytes from `refresh_contents_with_reader` because the split Vulkan backend reads via a callback instead of upstream's `gpu_memory->ReadBlock` / `GpuGuestMemory` ownership. The queue body still matches upstream: set `IS_DECODING`, create `AsyncDecodeContext`, unswizzle into temporary data, queue worker `ConvertImage`, store decoded data/copies, then mark complete.
+- Rust `tick_async_decode` uploads completed decoded data through `Image::upload_memory` and then calls Vulkan's no-op `insert_upload_memory_barrier`, matching upstream `TickAsyncDecode` ownership/order while adapting to Rust's fallible upload path.
+
+### Unintentional differences (to fix)
+- If `upload_decoded_async_image` fails, Rust removes the completed async decode from the queue and leaves `IS_DECODING` set, matching the surrounding OpenGL Rust behavior but not an upstream-observable failure mode because upstream upload is not fallible. This should be tightened once Vulkan upload errors have a cache invalidation policy.
+- `refresh_contents_with_reader` now consumes `CPU_MODIFIED` and tracks the image when async queueing succeeds, matching upstream intent. The broader `RefreshContents` track-order is still not line-for-line audited against common-cache `TrackImage` for every upload branch.
+
+### Missing items
+- Add a compressed-texture workload that actually exercises `ASYNCHRONOUS_DECODE`; Pinball does not hit this branch.
+- Continue auditing `finish_pending_join_copies` now that synchronous upload, accelerated upload, converted upload, and async decode queue/tick are present.
+
+### Binary layout verification
+- N/A: this slice uses `AsyncDecodeContext`, `Vec<u8>`, and `BufferImageCopy` internally; no guest raw-copied ABI payload changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::RefreshContents`, `QueueAsyncDecode`, and `TickAsyncDecode` in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `AsyncDecodeContext` in `video_core/texture_cache/texture_cache_base.h`.
+- Re-read Rust `AsyncDecodeContext` in `video_core/src/texture_cache/texture_cache_base.rs`.
+- Re-read Rust `queue_async_decode`, `tick_async_decode`, `upload_decoded_async_image`, and `tick_frame` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `cargo fmt` applied.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core texture_cache::texture_cache::tests::backend_completed_join_registers_common_cache_immediately_like_upstream -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after async decode queue/tick wiring: `/tmp/ruzu_pinball_async_decode.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[188..1712] y[0..1079]`, `nonblack=2041193`.
+
+## 2026-07-02 — shader_recompiler/src/backend/spirv/spirv_emit_context.rs and shader_recompiler/src/backend/spirv/emit_spirv_context_get_set.rs vs shader_recompiler/backend/spirv/spirv_emit_context.cpp and shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+
+### Intentional differences
+- Rust factors repeated builtin input declaration through `define_builtin_u32_input`, `define_builtin_f32_vec2_input`, and `define_builtin_f32_vec3_input`. Upstream uses the generic `DefineInput` helper; the Rust helpers preserve the same storage class, type, builtin decoration, and interface insertion.
+- Rust returns zero for unhandled non-system SPIR-V attributes instead of throwing `NotImplementedException`. This pre-existing fallback remains broader SPIR-V backend parity debt; the newly handled system attributes now follow upstream behavior.
+
+### Unintentional differences (to fix)
+- Position input handling is still incomplete compared with upstream for non-fragment stages and `has_broken_spirv_position_input`; this slice only ports system-value inputs needed by deko3d-style `VertexId` shaders.
+- `GetAttributeU32` still handles only the upstream system-value subset currently ported here. Other upstream throw paths remain Rust zero-fallbacks until each attribute class is ported.
+
+### Missing items
+- Finish strict upstream parity for SPIR-V input/output attributes: input position, layer/viewport stores, point size, clip distances, viewport mask, fragment depth, and generic input defaulting using previous-stage store metadata.
+- Add a shader translation fixture that assembles full SPIR-V and verifies the actual `BuiltIn VertexIndex`/`BuiltIn VertexId` decoration in the emitted module, not only the context fields.
+
+### Binary layout verification
+- N/A: this slice changes host SPIR-V declaration/emission logic only; no guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read upstream `EmitContext` builtin input declaration logic in `shader_recompiler/backend/spirv/spirv_emit_context.cpp`.
+- Re-read upstream `EmitGetAttribute` and `EmitGetAttributeU32` in `shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp`.
+- Re-read Rust `SpirvEmitContext::define_global_variables` and `emit_get_attribute_inst`.
+- `cargo check -p shader_recompiler` passes.
+- `cargo test -p shader_recompiler vertex_id_declares -- --nocapture` passes.
+- `cargo fmt` applied.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- deko3d depth validation now renders geometry instead of clear-only: `/tmp/ruzu_deko3d_builtin.ppm` is `2560x1440`, `unique=30`, top colors include clear `(32,75,122)`, blue `(0,0,255)`, and orange `(255,51,0)`, with `nonclear_vs_expected_clear=1318852`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp and video_core/renderer_vulkan/vk_texture_cache.h
+
+### Intentional differences
+- Rust `Image::upload_memory` records `CopyBufferToImage` on the scheduler upload command buffer via `record_with_upload`, while upstream records on a single scheduler command buffer. This preserves upstream scheduler ownership but adapts to Rust's split `current_cmdbuf`/`upload_cmdbuf` scheduler model.
+- Rust `TextureCacheRuntime::insert_upload_memory_barrier` records an acquire-side `TRANSFER_WRITE -> ALL_COMMANDS` memory barrier on the render command buffer. Upstream's `InsertUploadMemoryBarrier` is empty because upload copies and their post-barrier live in the same command stream; Rust needs this bridge because uploads now execute in the dedicated upload command buffer submitted before render.
+
+### Unintentional differences (to fix)
+- `TextureCacheRuntime::CopyImage` was re-read and already mirrors the upstream pre/post image barriers and copy call, but it still records on the render command buffer. This matches upstream's single command stream, but if the Rust scheduler's upload/render split grows stricter, copy ownership should be re-audited with scheduler-level tests.
+- The Rust scheduler still submits upload and render command buffers in one submit without timeline/master-semaphore parity. The new upload barrier is the immediate synchronization bridge, not a full upstream `MasterSemaphore`/command-chunk port.
+
+### Missing items
+- Add scheduler-level tests or a lightweight Vulkan harness that proves upload command-buffer work is submitted before render command-buffer consumers.
+- Continue the next strict slice: `finish_pending_join_copies` parity over `RefreshContents`, rescale sibling/new image, alias relations, and GPU-modified copies.
+
+### Binary layout verification
+- N/A: this slice changes host Vulkan command scheduling only; no guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read upstream `Image::UploadMemory` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `TextureCacheRuntime::InsertUploadMemoryBarrier` declaration in `video_core/renderer_vulkan/vk_texture_cache.h`.
+- Re-read upstream `CopyBufferToImage` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read Rust `Image::upload_memory`, `TextureCacheRuntime::insert_upload_memory_barrier`, and `copy_buffer_to_image`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after upload command-buffer scheduling: `/tmp/ruzu_pinball_upload_barrier.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[188..1712] y[0..1080]`, `nonblack=2041193`.
+- deko3d depth validation still renders clear + blue + orange after upload command-buffer scheduling: `/tmp/ruzu_deko3d_upload_barrier.ppm` is `2560x1440`, `unique=30`, blue pixels `739904`, orange pixels `553176`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust `RangedBarrierRange` now uses the same sentinel initialization as upstream (`min = u32::MAX`, `max = 0`) instead of the previous Rust-only `initialized` flag. This is a direct ownership/local-helper parity fix for `TextureCacheRuntime::copy_image` and related barrier construction.
+- Rust keeps `RangedBarrierRange` and `make_image_copy` as private module helpers in `renderer_vulkan/texture_cache.rs`, matching upstream's anonymous-namespace helper placement inside `vk_texture_cache.cpp`.
+
+### Unintentional differences (to fix)
+- `TextureCacheRuntime::copy_image` still records on Rust's render command buffer. This matches upstream's single scheduler command stream for image-to-image copies, but the surrounding Rust scheduler still lacks full upstream `MasterSemaphore`/command-chunk parity.
+
+### Missing items
+- Add a Vulkan execution-level regression that exercises real image-to-image copies through a title or homebrew workload. The new tests verify helper parity only; they do not submit Vulkan commands.
+- Continue the next strict slice: `finish_pending_join_copies` parity over joined-image completion, backend deletion, framebuffer eviction, and deferred Vulkan destruction.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan helper construction only. `ImageCopy` remains an internal texture-cache transfer descriptor, not a guest raw-copied ABI payload.
+
+### Verification
+- Re-read upstream `MakeImageCopy` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `RangedBarrierRange` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `TextureCacheRuntime::CopyImage` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read Rust `make_image_copy`, `RangedBarrierRange`, and `TextureCacheRuntime::copy_image` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::texture_cache::tests:: -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after `RangedBarrierRange`/`MakeImageCopy` parity: `/tmp/ruzu_pinball_copyimage.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[188..1712] y[0..1079]`, `nonblack=2041193`.
+
+## 2026-07-02 — video_core/src/texture_cache/texture_cache.rs and video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust keeps `TextureCacheBase::join_images` metadata-owned and lets the Vulkan wrapper complete backend-owned `RefreshContents`, rescale, copy, deletion, and registration through `finish_pending_join_copies_with_reader`. Upstream performs all of this synchronously in `TextureCache<P>::JoinImages` because `P::Image` and runtime ownership live in the same template.
+- With `backend_completes_join_images` enabled, Rust now queues a pending join tail not only for `join_copies_to_do`, but also for pending left/right alias relations and bad-overlap relations. This preserves upstream ordering: `RefreshContents` and rescale happen before alias/bad-overlap relation application and before final `RegisterImage(new_image_id)`.
+- Non-backend/common-cache behavior remains synchronous for relation-only joins, matching the previous Rust common-cache test model where no backend runtime exists to run `RefreshContents` or scale images.
+
+### Unintentional differences (to fix)
+- `finish_pending_join_copies_with_reader` is still a Rust split-backend adaptation instead of a direct single-method port of upstream `JoinImages`; the control-flow ordering now matches the relevant upstream tail, but the code is necessarily split across common metadata and Vulkan backend ownership.
+- `join_ignore_textures` with `GPU_MODIFIED` still panics/records unimplemented like the existing Rust port. Upstream also marks this path `UNIMPLEMENTED()`, so this is not a behavioral regression, but it remains an unsupported guest path.
+
+### Missing items
+- Add an execution-level workload that exercises a real Vulkan pending-join copy or bad-overlap tail. The new unit test proves the common-cache deferral condition; Pinball does not prove this path.
+- Continue auditing `finish_pending_join_copies_with_reader` for exact failure behavior around `ScaleUp`/`ScaleDown` and backend `copy_join_image` conversion paths.
+
+### Binary layout verification
+- N/A: this slice changes host-side texture-cache lifecycle ordering and tests. No guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages` in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `TextureCache<P>::RegisterImage`, `UnregisterImage`, `DeleteImage`, `RemoveImageViewReferences`, and `RemoveFramebuffers` in `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust `TextureCacheBase::join_images` and `apply_join_relations` in `video_core/src/texture_cache/texture_cache.rs`.
+- Re-read Rust `TextureCache::finish_pending_join_copies_with_reader`, `delete_join_overlap_image`, and backend deletion helpers in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core join_images_defers_pending_alias_relations_until_backend_tail -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core backend_completed_join_defers_bad_overlap_relations_until_backend_tail -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete after relation-only pending join tail deferral: `/tmp/ruzu_pinball_join_tail.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[188..1712] y[0..1079]`, `nonblack=2041193`.
+
+## 2026-07-02 — Runtime validation for video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- No code change in this validation slice. Rust still keeps the split common-cache/Vulkan-backend ownership documented above while preserving upstream command scheduling and join-tail ordering where currently ported.
+
+### Unintentional differences (to fix)
+- No new behavioral difference was found by the available Pinball and deko3d-depth-min runs.
+- MRT validation remains unavailable locally because `/Users/vricosti/Dev/emulators/deko3d-depth-test` requires the missing devkitPro package `switch-glm` before `Example08_DeferredShading` can be built.
+
+### Missing items
+- Install `switch-glm`, build a non-interactive `deko3d-depth-test` `Example08_DeferredShading` NRO, and validate multiple color attachments plus depth under ruzu.
+- Add an execution-level workload that exercises real pending join copies; current tests verify helper and lifecycle ordering but do not prove a submitted GPU `CopyImage` join path.
+
+### Binary layout verification
+- N/A: validation-only slice; no guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read Rust `Image::upload_memory`, `TextureCacheRuntime::insert_upload_memory_barrier`, `TextureCacheRuntime::copy_image`, and `TextureCache::finish_pending_join_copies_with_reader` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- Re-read upstream `Image::UploadMemory`, `TextureCacheRuntime::CopyImage`, and `CopyBufferToImage` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::texture_cache::tests:: -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete: `/tmp/ruzu_pinball_current.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[188..1712] y[0..1080]`, `nonblack=2041193`.
+- deko3d-depth-min depth validation still renders clear + blue + orange: `/tmp/ruzu_deko3d_depth_current.ppm` is `2560x1440`, `unique=30`, clear pixels `2367548`, blue pixels `739904`, orange pixels `553176`, and overlap window has `orange=322963`, `blue=65000`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs and video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp and video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust `TextureCacheRuntime::transition_image_layout` builds the `VkImageMemoryBarrier` inside the scheduler closure instead of capturing it, because ash's barrier struct contains a raw `pNext` pointer and therefore is not `Send`. The emitted barrier fields match upstream `TextureCacheRuntime::TransitionImageLayout`.
+- Rust keeps `TextureCacheBase::check_feedback_loop` as a pure detector returning `bool`, then `renderer_vulkan/mod.rs` calls `TextureCache::barrier_feedback_loop` when needed. Upstream calls `runtime.BarrierFeedbackLoop()` directly from templated `TextureCache<P>::CheckFeedbackLoop`; the split preserves the same runtime owner and ordering after `FillGraphicsImageViews`.
+
+### Unintentional differences (to fix)
+- The Rust Vulkan scheduler still lacks full upstream worker/master-semaphore parity; `BarrierFeedbackLoop` currently maps to `request_outside_renderpass`, matching upstream behavior at the texture-cache runtime boundary but not proving full scheduler internals.
+- The MSAA upload fallback is now routed through `TextureCacheRuntime::transition_image_layout`, but MSAA uploads themselves remain unsupported, matching upstream `CanUploadMSAA() == false`.
+
+### Missing items
+- Validate `BarrierFeedbackLoop` with a workload that samples from a currently bound render target. Pinball and deko3d-depth-min do not prove this path.
+- MRT validation remains blocked until devkitPro `switch-glm` is installed and `deko3d-depth-test` `Example08_DeferredShading` can be built.
+
+### Binary layout verification
+- N/A: host-side Vulkan command scheduling only; no guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read upstream `TextureCacheRuntime::TransitionImageLayout` and `TextureCacheRuntime::BarrierFeedbackLoop` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `TextureCache<P>::CheckFeedbackLoop` in `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust `TextureCacheBase::check_feedback_loop`, `TextureCacheRuntime::transition_image_layout`, `TextureCacheRuntime::barrier_feedback_loop`, and the graphics descriptor fill path in `video_core/src/renderer_vulkan/mod.rs`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core check_feedback_loop -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::texture_cache::tests:: -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete: `/tmp/ruzu_pinball_feedback.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[188..1712] y[0..1080]`, `nonblack=2041193`.
+- deko3d-depth-min depth validation still renders clear + blue + orange: `/tmp/ruzu_deko3d_feedback.ppm` is `2560x1440`, `unique=30`, clear pixels `2367548`, blue pixels `739904`, orange pixels `553176`, and overlap window has `orange=322963`, `blue=65000`.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs and video_core/src/vulkan_common/vulkan_device.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp, video_core/vulkan_common/vulkan_device.cpp, and video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust `TextureCacheRuntime` stores `Instance + PhysicalDevice` rather than the full upstream `Vulkan::Device&`, so `vulkan_device.rs` exposes `DeviceMemoryInfo`, `query_device_memory_info`, and `query_device_memory_usage` as a thin port-facing bridge over the same memory-budget helpers used by `Device::GetDeviceLocalMemory`, `Device::CanReportMemoryUsage`, and `Device::GetDeviceMemoryUsage`.
+- Rust `TextureCache::tick_frame` calls `finish_pending_backend_deletions` immediately after GC because the split backend queues Vulkan owner deletion through `pending_backend_deletions`; upstream `TextureCache<P>::DeleteImage` owns `P::Image` directly and therefore does not need this extra bridge call.
+- The Vulkan GC download closure refuses to download when an `ImageId` has no materialized backend `Image`. Upstream cannot hit that state because `slot_images` stores `P::Image`; in the split Rust backend, creating a fresh Vulkan image during GC would produce empty contents and corrupt guest memory, so skipping is the conservative behavior until backend images are owned directly by slots.
+
+### Unintentional differences (to fix)
+- `TextureCacheRuntime::TickFrame` is still effectively empty like upstream `vk_texture_cache.cpp`, but async-download deferred staging buffers are not yet modeled in the Vulkan texture cache; the current port has no `async_buffers_death_ring` equivalent to free after `runtime.TickFrame`.
+- The split `ImageId -> Image` map still allows the base/backend materialization gap described above. A fully faithful port should eliminate the gap by making backend `Image` ownership lockstep with base slot creation/destruction.
+
+### Missing items
+- Validate the memory-pressure GC path with a workload that actually exceeds `minimum_memory` and forces `RunGarbageCollector` to download a `GPU_MODIFIED` image.
+- Continue the structural port toward upstream `TextureCache<P>` slot-owned `P::Image`/`P::ImageView` ownership so GC never sees metadata without a backend object.
+- MRT validation remains blocked until devkitPro `switch-glm` is installed and `deko3d-depth-test` `Example08_DeferredShading` can be built.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan memory reporting, GC ordering, and staging download integration. No guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::TextureCache`, `TextureCache<P>::RunGarbageCollector`, and `TextureCache<P>::TickFrame` in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `TextureCacheRuntime::GetDeviceLocalMemory`, `TextureCacheRuntime::GetDeviceMemoryUsage`, `TextureCacheRuntime::CanReportMemoryUsage`, and `TextureCacheRuntime::TickFrame` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `Device::GetDeviceLocalMemory`, `Device::CanReportMemoryUsage`, `Device::GetDeviceMemoryUsage`, and physical-memory collection helpers in `video_core/vulkan_common/vulkan_device.h/.cpp`.
+- Re-read Rust `TextureCacheRuntime`, `TextureCache::new`, and `TextureCache::tick_frame` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- Re-read Rust `Device` memory helpers in `video_core/src/vulkan_common/vulkan_device.rs`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_memory_gc.ppm` at frame 30. The frame remains complete: `2560x1440`, bbox `x[250..2282] y[0..1439]`, guest approx `x[187..1711] y[0..1079]`, `nonblack=2041193`. No panic, `DEVICE_LOST`, `Unimplemented instruction`, or `PrefetchAbort` appeared; only pre-existing MoltenVK primitive-restart warnings were present.
+
+## 2026-07-02 — Runtime validation for video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- No ruzu code change in this validation slice. A new external homebrew gate was created at `/Users/vricosti/Dev/emulators/deko3d-mrt-min` by extending the existing `deko3d-depth-min` sample to bind two color attachments plus depth/stencil, avoiding the `switch-glm` dependency that still blocks `deko3d-depth-test`.
+
+### Unintentional differences (to fix)
+- The full `deko3d-depth-test` `Example08_DeferredShading` gate remains unavailable until `switch-glm` is installed.
+- The new `deko3d-mrt-min` presents only RT0; RT1 is bound and written by the fragment shader, proving the backend MRT binding path (`colors=2 depth=true`) but not a later shader sample/readback from RT1.
+
+### Missing items
+- Install `switch-glm` and build/run `/Users/vricosti/Dev/emulators/deko3d-depth-test` to validate a richer deferred-shading MRT workflow.
+- Add a readback/composition stage to `deko3d-mrt-min` if a self-contained RT1 visual verification is needed without GLM.
+
+### Binary layout verification
+- N/A: validation-only slice; no guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Built `/Users/vricosti/Dev/emulators/deko3d-mrt-min/deko3d-mrt-min.nro` successfully with devkitPro/deko3d.
+- Ran `deko3d-mrt-min` under Vulkan/MoltenVK with `RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_deko3d_mrt_min.ppm`; the frame is `2560x1440`, `unique=30`, `nonblack=3686400`, clear pixels `2367766`, blue pixels `750337`, orange pixels `557567`.
+- Ran `deko3d-mrt-min` with `RUZU_TRACE_VK_RT_FRAMEBUFFER=1`; logs repeatedly show `[VK_RT_FRAMEBUFFER] colors=2 depth=true extent=1280x720 base_size=1280x720`, proving the Vulkan texture-cache render-target owner assembled an MRT framebuffer with depth.
+- The run reached continuous `BQP_QUEUE`/`BQC_RELEASE` frames and dumped `/tmp/ruzu_deko3d_mrt_trace.ppm` at frame 4. No panic, `DEVICE_LOST`, `Unimplemented instruction`, or `PrefetchAbort` appeared. MoltenVK reported the expected `D24S8` fallback to `D32_SFLOAT_S8_UINT` and pre-existing primitive-restart warnings.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust still uses a split `TextureCacheBase` metadata store plus Vulkan-backend `ImageId -> Image` map, unlike upstream `TextureCache<P>` where `slot_images.insert(runtime, ...)` constructs `P::Image` directly. The new `materialize_backend_image` call narrows that split by creating the Vulkan `Image` at the pending-insertion lifecycle edge before registration.
+- CPU-modified insertions are still deferred until a caller supplies the GPU-memory reader, because Rust does not keep the upstream `GPUVAddr -> CPU` reader inside `TextureCacheRuntime`. This preserves content correctness rather than registering an unuploaded backend image.
+- `finish_pending_backend_insertions_with_reader` processes all pending backend insertions when a reader is available from the render-target path. Upstream does this inside `RefreshContents`/`RegisterImage` at insertion time; Rust still requires an explicit reader bridge, but the ordering is now closer: materialize/upload/track before registration instead of leaving CPU-modified images deferred until sampled.
+- Rust `RefreshContents` tracks CPU-modified images before upload via `TextureCacheBase::track_image`, matching upstream `RefreshContents` calling `TrackImage(image, image_id)` after clearing `CpuModified`.
+
+### Unintentional differences (to fix)
+- Backend image ownership is not yet physically stored inside the base slot as upstream `Image = P::Image`; the explicit backend map remains a structural divergence.
+- Deferred CPU-modified insertions can still remain in `pending_backend_insertions` when only no-reader paths run, such as `tick_frame`. Upstream `RefreshContents` is invoked during registration with direct runtime/GPU-memory access and has no no-reader lifecycle gap.
+- Rust preserves `CPU_MODIFIED` if a guest-memory read fails, while upstream has no fallible reader at this layer and clears `CpuModified` before upload. This is a split-architecture safety difference until the reader is owned at the same layer as upstream.
+
+### Missing items
+- Continue moving the Vulkan backend toward lockstep slot ownership so `InsertImage`/`JoinImages` materialize backend images without a split map gap.
+- Port the remaining insertion/refresh path so `TextureCacheRuntime` or the backend texture-cache owner has direct read access and CPU-modified images are uploaded and registered at the same conceptual edge as upstream `TextureCache<P>::RegisterImage`.
+- Add an execution-level workload that exercises GPU-modified pending join copies through `TextureCacheRuntime::CopyImage`; Pinball and `deko3d-mrt-min` do not prove that path.
+
+### Binary layout verification
+- N/A: host-side texture-cache lifecycle only; no guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::InsertImage`, `JoinImages`, `RegisterImage`, `DeleteImage`, `RemoveImageViewReferences`, and `RemoveFramebuffers` in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `TextureCache<P>::RefreshContents`, `UploadImageContents`, and `PrepareImage` in `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust `TextureCache::ensure_image`, `materialize_backend_image`, `finish_pending_backend_insertions`, `finish_pending_backend_insertion_with_reader`, and `register_completed_backend_image` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- Re-read Rust `TextureCache::finish_pending_backend_insertions_with_reader`, `TextureCache::refresh_contents_with_reader`, and `TextureCacheBase::track_image`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan timed out normally at 95s and dumped `/tmp/ruzu_pinball_backend_materialize.ppm` at frame 30. The frame remains complete: `2560x1440`, bbox `x[250..2282] y[0..1439]`, `nonblack=2041193`.
+- `deko3d-mrt-min` under Vulkan timed out normally at 8s and dumped `/tmp/ruzu_deko3d_mrt_materialize.ppm` at frame 4. The frame is `2560x1440`, bbox `x[0..2559] y[0..1439]`, `nonblack=3686400`.
+- `deko3d-mrt-min` with `RUZU_TRACE_VK_RT_FRAMEBUFFER=1` still logs `[VK_RT_FRAMEBUFFER] colors=2 depth=true extent=1280x720 base_size=1280x720`, proving the MRT/depth framebuffer owner path still works after backend image materialization on pending insertions.
+- After `finish_pending_backend_insertions_with_reader` and `TrackImage` ordering changes, `cargo fmt --check` passes.
+- After the same changes, `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- After the same changes, `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX Vulkan non-regression remains complete: `/tmp/ruzu_pinball_pending_refresh.ppm` is `2560x1440`, bbox `x[250..2282] y[0..1439]`, `nonblack=2041193`. The run timed out normally; no panic, `DEVICE_LOST`, `PrefetchAbort`, or unimplemented instruction appeared.
+- `deko3d-mrt-min` Vulkan MRT/depth gate remains complete: `/tmp/ruzu_deko3d_mrt_pending_refresh.ppm` is `2560x1440`, bbox `x[0..2559] y[0..1439]`, `nonblack=3686400`, and logs still show `[VK_RT_FRAMEBUFFER] colors=2 depth=true extent=1280x720 base_size=1280x720`. Only the known MoltenVK `D24S8` fallback and primitive-restart warnings appeared.
+
+## 2026-07-02 — video_core/src/texture_cache/texture_cache.rs vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Added a Rust-only regression test for the split backend lifecycle: `backend_completed_join_preserves_gpu_modified_alias_copy_until_backend_tail` verifies that a GPU-modified alias copy is held in `pending_join_copies` until the backend tail can run. Upstream executes this tail inline inside `TextureCache<P>::JoinImages`; Rust defers it because backend `Image`/`ImageView` ownership is split out of `TextureCacheBase`.
+- Added a second Rust-only regression test for the same split lifecycle: `backend_completed_join_defers_gpu_modified_shrink_copy_until_backend_tail` constructs the upstream non-alias shrink-copy relation by inserting a GPU-modified mip-sized image first, then joining the full image at the base address. This verifies the base side queues a non-alias `JoinCopy` with `gpu_modified_at_join`, leaves the new image unregistered, and defers final registration/deletion until the Vulkan backend tail can run.
+
+### Unintentional differences (to fix)
+- The new non-alias test proves the base-side precondition for `MakeShrinkImageCopies`, but does not execute Vulkan `TextureCacheRuntime::CopyImage` because it intentionally stays inside `TextureCacheBase`. A backend-level test/workload is still needed to prove the queued non-alias copy is consumed by `finish_pending_join_copies_with_reader`.
+
+### Missing items
+- Add or find a focused Vulkan workload/test that creates a non-alias GPU-modified overlap and verifies `finish_pending_join_copies_with_reader` executes `TextureCacheRuntime::CopyImage` for the generated shrink copies.
+- Continue moving backend ownership toward upstream so the join tail can become a direct structural counterpart of `TextureCache<P>::JoinImages` rather than a base/backend deferred bridge.
+
+### Binary layout verification
+- N/A: test-only host-side texture-cache lifecycle coverage; no guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages` in `video_core/texture_cache/texture_cache.h`, especially `RefreshContents`, rescale, alias relation application, GPU-modified copy handling, overlap deletion, and final `RegisterImage`.
+- Re-read Rust `TextureCacheBase::join_images`, `PendingJoinCopies`, and Vulkan `TextureCache::finish_pending_join_copies_with_reader`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core backend_completed_join_preserves_gpu_modified_alias_copy_until_backend_tail -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core backend_completed_join_defers_gpu_modified_shrink_copy_until_backend_tail -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h and video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust extracts `select_join_copy_operation` in the same Vulkan texture-cache owner file as a mechanical split of the existing `copy_join_image` decision tree. This keeps upstream ownership intact while making the `JoinImages` copy tail auditable: same format type dispatches to `TextureCacheRuntime::CopyImage`, sample-count mismatch dispatches to `CopyImageMSAA`, and incompatible format types must be 2D reinterpret/convert candidates.
+- Added `pending_join_shrink_copy_selects_runtime_copy_image`, a Rust-only regression test that reconstructs the upstream non-alias mip-overlap case, generates `make_shrink_image_copies`, and verifies the backend dispatch decision is `JoinCopyOperation::CopyImage`. This pairs with the base test proving `TextureCacheBase` queues that same non-alias GPU-modified relation.
+- Removed the now-unused private runtime wrappers for join reinterpret/convert detection; their logic lives next to the join-copy dispatch helper because upstream's decision is part of the `TextureCache<P>::JoinImages` copy tail, not an independent runtime service method.
+
+### Unintentional differences (to fix)
+- The new test proves the Vulkan backend dispatch decision immediately before `TextureCacheRuntime::copy_image`, but it still does not execute a real Vulkan `finish_pending_join_copies_with_reader` drain with live `VkImage` objects. A workload or heavier Vulkan fixture is still required to prove the queued command is recorded and submitted end-to-end.
+- Rust still splits the upstream inline `TextureCache<P>::JoinImages` tail across `TextureCacheBase`, `finish_pending_join_copies_with_reader`, and `copy_join_image`. The helper improves auditability but does not remove the split-architecture lifecycle difference.
+
+### Missing items
+- Add/find a runtime workload or Vulkan fixture that creates the non-alias GPU-modified overlap and observes `finish_pending_join_copies_with_reader -> copy_join_image -> TextureCacheRuntime::copy_image` end-to-end.
+- Continue moving backend image ownership toward upstream slot-owned `P::Image` so the join tail can eventually be structurally closer to the upstream inline owner.
+
+### Binary layout verification
+- N/A: host-side Vulkan texture-cache dispatch/test only; no guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages` in `video_core/texture_cache/texture_cache.h`, especially the non-alias `GpuModified` branch that builds `MakeShrinkImageCopies` and calls `runtime.CopyImage` when sample counts match.
+- Re-read upstream `TextureCacheRuntime::CopyImage` in `video_core/renderer_vulkan/vk_texture_cache.cpp`, confirming the Rust runtime implementation remains the scheduler-recorded copy operation with upstream pre/post barriers.
+- Re-read Rust `finish_pending_join_copies_with_reader`, `copy_join_image`, `select_join_copy_operation`, and `TextureCacheRuntime::copy_image` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pending_join_shrink_copy_selects_runtime_copy_image -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core backend_completed_join_defers_gpu_modified_shrink_copy_until_backend_tail -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan/MoltenVK with `RUZU_TRACE_VK_JOIN_COPY=1` timed out normally at 75s, reached `IAudioRenderer::Start`, and presented continuous `BQP_QUEUE`/`BQC_RELEASE` frames through frame 65. No panic, `DEVICE_LOST`, `Unimplemented`, `PrefetchAbort`, or `[VK_JOIN_COPY]` trace appeared. Pinball still does not exercise the live pending join-copy path.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan/MoltenVK timed out normally at 75s, reached `IAudioRenderer::Start`, and presented continuous `BQP_QUEUE`/`BQC_RELEASE` frames through frame 65. No panic, `DEVICE_LOST`, `Unimplemented`, `PrefetchAbort`, or `[VK_JOIN_COPY]` trace appeared. The requested present-frame dump was not produced in this run, so this is a runtime non-crash/presentation regression check rather than an image-content comparison.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Extracted the per-`JoinCopy` pending tail decision into `make_pending_join_copy_actions` in the same Vulkan texture-cache owner file. This is a mechanical split of upstream `TextureCache<P>::JoinImages` lines that decide alias copy, GPU-modified shrink copy, modification tick propagation, and non-alias overlap deletion.
+- Added `pending_join_non_alias_gpu_modified_actions_copy_then_delete`, a Rust-only regression test that constructs the upstream non-alias GPU-modified mip-overlap case and verifies the action order is `Copy` followed by `DeleteOverlap`. This directly covers the ordering that protects `runtime.CopyImage(new_image, overlap, copies)` from deleting the overlap first.
+
+### Unintentional differences (to fix)
+- The action helper proves the base-side pending tail ordering before Vulkan dispatch, but a live test with real `VkImage` objects is still needed to prove `copy_join_image` records `TextureCacheRuntime::copy_image` end-to-end from `finish_pending_join_copies_with_reader`.
+- Alias-copy action coverage was not added in this slice because the attempted synthetic alias scenario did not satisfy upstream's `CanAddImageAlias`/`IsSafeDownload` relation state. A valid alias fixture is still needed rather than fabricating impossible state.
+
+### Missing items
+- Add or find a valid alias join fixture that reaches the alias `CopyImage(new_image_id, aliased.id, aliased.copies)` path.
+- Add/find a runtime Vulkan workload or fixture that emits the live `[VK_JOIN_COPY] copy` trace and records the scheduler `CopyImage` command with real backend images.
+
+### Binary layout verification
+- N/A: host-side Vulkan texture-cache tail helper/test only; no guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages` in `video_core/texture_cache/texture_cache.h`, especially the `for (const auto& copy_object : join_copies_to_do)` tail: alias `IsSafeDownload`/`CopyImage`, non-alias `GpuModified` shrink copy, `modification_tick`, `UnregisterImage`, `DeleteImage`, and final `RegisterImage`.
+- Re-read Rust `finish_pending_join_copies_with_reader`, `make_pending_join_copy_actions`, `copy_join_image`, and `delete_join_overlap_image` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pending_join_non_alias_gpu_modified_actions_copy_then_delete -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pending_join_shrink_copy_selects_runtime_copy_image -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core backend_completed_join_defers_gpu_modified_shrink_copy_until_backend_tail -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+
+## 2026-07-02 — Runtime trace for video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h and video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Added env-gated `RUZU_TRACE_VK_JOIN_COPY` diagnostics around the Rust Vulkan pending join-copy tail and `TextureCacheRuntime::copy_image`. This is diagnostic-only and does not change behavior; upstream has no equivalent log path.
+- The trace points stay in the same owner file as the ported Vulkan texture-cache logic, so they do not introduce a new abstraction or move ownership away from upstream `TextureCache<P>::JoinImages` / `TextureCacheRuntime::CopyImage`.
+
+### Unintentional differences (to fix)
+- No executed workload in this pass triggered `finish_pending_join_copies_with_reader -> copy_join_image -> TextureCacheRuntime::copy_image`. The base-side and dispatch tests still prove the precondition and dispatch decision, but live Vulkan command recording for a pending join copy remains unexercised by the available homebrews.
+- Rust still runs the join tail through a deferred base/backend bridge, unlike upstream where `TextureCache<P>::JoinImages` directly owns the copy/register/delete tail.
+
+### Missing items
+- Add or find a focused workload that creates a GPU-modified overlapping image and then joins it into a larger image, producing `[VK_JOIN_COPY] drain`, `[VK_JOIN_COPY] shrink_copy`, and `[VK_JOIN_COPY] runtime.CopyImage` in one run.
+- Continue moving backend image ownership toward upstream slot-owned `P::Image` so the join tail can be executed at the same conceptual lifecycle point as upstream.
+
+### Binary layout verification
+- N/A: diagnostic logging and runtime validation only; no guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages` and `TextureCache<P>::CopyImage` in `video_core/texture_cache/texture_cache.h`, especially the non-alias `GpuModified` branch that calls `runtime.CopyImage` or `runtime.CopyImageMSAA`.
+- Re-read upstream `TextureCacheRuntime::CopyImage` in `video_core/renderer_vulkan/vk_texture_cache.cpp`; Rust `TextureCacheRuntime::copy_image` still records the same pre-barriers, `vkCmdCopyImage`, and post-barriers through the scheduler.
+- Re-read Rust `finish_pending_join_copies_with_reader`, `copy_join_image`, `select_join_copy_operation`, and `TextureCacheRuntime::copy_image` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- `deko3d-mrt-min` under Vulkan/MoltenVK with `RUZU_TRACE_VK_JOIN_COPY=1` timed out normally at 12s and dumped `/tmp/ruzu_deko3d_mrt_join_trace.ppm` at frame 300 (`2560x1440`). No panic, `DEVICE_LOST`, `Unimplemented`, `PrefetchAbort`, or `[VK_JOIN_COPY]` trace appeared.
+- `deko3d-depth-min` under Vulkan/MoltenVK with `RUZU_TRACE_VK_JOIN_COPY=1` timed out normally at 12s and dumped `/tmp/ruzu_deko3d_depth_join_trace.ppm` at frame 300 (`2560x1440`). No panic, `DEVICE_LOST`, `Unimplemented`, `PrefetchAbort`, or `[VK_JOIN_COPY]` trace appeared.
+- SpaceCadetPinball-NX under Vulkan/MoltenVK with `RUZU_TRACE_VK_JOIN_COPY=1` timed out normally at 95s, reached audio initialization and continuous `BQP_QUEUE`/`BQC_RELEASE` presentation up to frame 129, but did not reach the frame-300 dump threshold. No panic, `DEVICE_LOST`, `Unimplemented`, `PrefetchAbort`, or `[VK_JOIN_COPY]` trace appeared; the known MoltenVK primitive-restart warnings remain.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Extracted Rust `make_copy_image_barriers` from `TextureCacheRuntime::copy_image` as a private same-file helper. This is a mechanical auditability split only: upstream still owns this logic in `TextureCacheRuntime::CopyImage`, and Rust keeps the helper in the matching Vulkan texture-cache file.
+- Added `copy_image_barriers_match_upstream_access_layout_and_ranges`, a Rust-only unit test that verifies the upstream `CopyImage` pre/post barrier access masks, layouts, image handles, and min/max subresource ranges without requiring a live Vulkan command buffer.
+
+### Unintentional differences (to fix)
+- This test proves barrier construction and the scheduler-recorded `copy_image` implementation remains structurally faithful, but it still does not execute a live pending join-copy drain with real `VkImage` objects. The runtime workload gate remains open.
+
+### Missing items
+- Add/find a workload or Vulkan fixture that triggers `finish_pending_join_copies_with_reader -> copy_join_image -> TextureCacheRuntime::copy_image` end-to-end.
+- Continue reducing the split base/backend lifecycle so pending join-copy execution can move closer to upstream `TextureCache<P>::JoinImages`.
+
+### Binary layout verification
+- N/A: host-side Vulkan command-barrier helper/test only; no guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read upstream `TextureCacheRuntime::CopyImage` in `video_core/renderer_vulkan/vk_texture_cache.cpp`, including `RangedBarrierRange`, the two pre-barriers, `CopyImage`, and the two post-barriers.
+- Re-read Rust `TextureCacheRuntime::copy_image`, `RangedBarrierRange`, `make_image_copy`, and `make_copy_image_barriers` in `video_core/src/renderer_vulkan/texture_cache.rs`.
+- `cargo fmt --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core copy_image_barriers_match_upstream_access_layout_and_ranges -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pending_join_shrink_copy_selects_runtime_copy_image -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core backend_completed_join_defers_gpu_modified_shrink_copy_until_backend_tail -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+
+## 2026-07-02 — video_core/src/texture_cache/texture_cache_base.rs, video_core/src/texture_cache/texture_cache.rs, video_core/src/renderer_vulkan/texture_cache.rs, and video_core/src/renderer_vulkan/mod.rs vs video_core/texture_cache/texture_cache_base.h, video_core/texture_cache/texture_cache.h, video_core/renderer_vulkan/vk_texture_cache.cpp, and video_core/renderer_vulkan/vk_rasterizer.cpp
+
+### Intentional differences
+- Rust keeps async download staging-buffer ownership in the Vulkan `TextureCache` wrapper instead of `TextureCacheBase`. Upstream `TextureCache<P>` is templated and can store `P::StagingBuffer` directly in `uncommitted_async_buffers`, `async_buffers`, and `async_buffers_death_ring`; ruzu's split base/backend architecture requires the backend-specific staging buffers to live in `renderer_vulkan/texture_cache.rs`.
+- `TextureCacheVulkan::commit_async_flushes` mirrors upstream `TextureCache<P>::CommitAsyncFlushes` for swizzled image downloads: it moves `uncommitted_downloads`, assigns the current async buffer id, allocates one deferred download staging buffer sized by 64-byte aligned unswizzled image sizes, records `Image::DownloadMemory`, advances the staging offset, commits the async buffer batch, and then commits the pending download batch.
+- `TextureCacheVulkan::pop_async_flushes` mirrors upstream `TextureCache<P>::PopAsyncFlushes` for `IMPLEMENTS_ASYNC_DOWNLOADS`: it pops the oldest committed batch, walks downloads in reverse, rewinds the staging offset by the aligned image size, writes the downloaded image data back through the base swizzle path, and moves consumed staging buffers to an async death ring.
+- Added `TextureCacheBase::slot_buffer_downloads`, matching upstream `Common::SlotVector<BufferDownload> slot_buffer_downloads`, so non-swizzled async downloads have the same slot-owned metadata lifecycle as upstream.
+- Added `TextureCacheBase::write_downloaded_buffer` and wired the non-swizzled branch of `TextureCacheVulkan::pop_async_flushes` to take the `BufferDownload`, write the staging span to GPU memory with `WriteBlockUnsafe` semantics, and erase the slot via `SlotVector::take`. This ports the `gpu_memory->WriteBlockUnsafe(...); slot_buffer_downloads.erase(...)` half of upstream `PopAsyncFlushes`.
+- `TextureCacheVulkan::tick_frame` now frees the async death-ring staging buffers through `TextureCacheRuntime::FreeDeferredStagingBuffer`, matching upstream `TextureCache<P>::TickFrame` after `runtime.TickFrame()` / frame tick advancement.
+- `renderer_vulkan/mod.rs` now includes texture cache and buffer cache in `should_wait_async_flushes`, `should_flush_async`, `commit_async_flushes`, and `pop_async_flushes`, matching upstream rasterizer flush ownership where texture, buffer, and query caches all participate instead of only query cache.
+
+### Unintentional differences (to fix)
+- The consumer half of non-swizzled/DMA async downloads is now wired, but the Vulkan producer half is still missing: upstream `TextureCache<P>::DownloadImageIntoBuffer` inserts `slot_buffer_downloads`, creates a deferred download staging buffer, records `Image::DownloadMemory` to both the real buffer and staging buffer, and is reached from `AccelerateDMA::ImageToBuffer`. Rust Vulkan still lacks that producer path, and its `AccelerateDma::image_to_buffer`/`buffer_to_image` methods remain stubbed in `vk_rasterizer.rs`.
+- Rust handles deferred download staging allocation failure by committing the pending batch without a staging buffer and warning at pop time. Upstream assumes `runtime.DownloadStagingBuffer` succeeds and proceeds directly; a stricter Rust equivalent should either make allocation failure fatal or preserve the pending state without losing the required async-download contract.
+- The Rust implementation still reflects the split base/backend architecture: metadata moves through `TextureCacheBase`, while Vulkan staging buffers and live images live in `renderer_vulkan/texture_cache.rs`. Upstream has one templated owner, so this is structurally close but not literal.
+
+### Missing items
+- Port Vulkan `TextureCache<P>::DownloadImageIntoBuffer`, including `slot_buffer_downloads.insert`, `PendingDownload{is_swizzle=false}`, deferred staging allocation, and `Image::DownloadMemory` with the destination buffer plus staging buffer.
+- Port Vulkan `AccelerateDMA::ImageToBuffer` / `BufferToImage` so the Maxwell DMA engine can actually reach the Vulkan `DownloadImageIntoBuffer` path.
+- Add a Vulkan runtime workload or focused test that actually triggers `GetFlushArea -> PREEMTIVE_DOWNLOAD -> CommitAsyncFlushes -> PopAsyncFlushes` for a texture image.
+- Decide the strict failure behavior for `DownloadStagingBuffer(..., deferred=true)` allocation failure, because upstream does not expose a nullable result.
+
+### Binary layout verification
+- N/A: host-side Vulkan texture-cache async download lifecycle only; no guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::TickFrame`, `HasUncommittedFlushes`, `ShouldWaitAsyncFlushes`, `CommitAsyncFlushes`, and `PopAsyncFlushes` in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `TextureCache<P>::DownloadImageIntoBuffer`, `BufferDownload`, `PendingDownload`, and `slot_buffer_downloads` in `video_core/texture_cache/texture_cache.h` and `video_core/texture_cache/texture_cache_base.h`.
+- Re-read upstream `TextureCacheRuntime::DownloadStagingBuffer`, `TextureCacheRuntime::FreeDeferredStagingBuffer`, and `Image::DownloadMemory` in `video_core/renderer_vulkan/vk_texture_cache.cpp`.
+- Re-read upstream `RasterizerVulkan::TickFrame` and `RasterizerVulkan::FlushRegion` in `video_core/renderer_vulkan/vk_rasterizer.cpp`.
+- Re-read Rust `TextureCacheBase::slot_buffer_downloads`, `TextureCacheBase::write_downloaded_buffer`, `TextureCacheVulkan::commit_async_flushes`, `TextureCacheVulkan::pop_async_flushes`, `TextureCacheVulkan::tick_frame`, and Vulkan rasterizer async flush helpers in `video_core/src/texture_cache/texture_cache_base.rs`, `video_core/src/texture_cache/texture_cache.rs`, `video_core/src/renderer_vulkan/texture_cache.rs`, and `video_core/src/renderer_vulkan/mod.rs`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core empty_committed_download_batch_does_not_require_wait -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes after adding `slot_buffer_downloads` and DMA `PopAsyncFlushes` writeback.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes after adding `slot_buffer_downloads` and DMA `PopAsyncFlushes` writeback.
+- SpaceCadetPinball-NX under Vulkan/MoltenVK timed out normally at 75s after the DMA `PopAsyncFlushes` change, reached `IAudioRenderer::Start`, and presented continuous `BQP_QUEUE`/`BQC_RELEASE` frames through frame 65. No panic, `DEVICE_LOST`, `Unimplemented`, `PrefetchAbort`, DMA range warning, or missing async-buffer warning appeared; no present-frame dump was produced in this run.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core copy_image_barriers_match_upstream_access_layout_and_ranges -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pending_join_shrink_copy_selects_runtime_copy_image -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core backend_completed_join_defers_gpu_modified_shrink_copy_until_backend_tail -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- `deko3d-join-min` under Vulkan/MoltenVK with `RUZU_TRACE_VK_JOIN_COPY=1` timed out normally at 12s, observed `drain pending=1`, `copy dst=2 src=1`, `runtime.CopyImage dst=2 src=1`, `runtime.CopyImage dst=2 src=3`, repeated for `new=7`, and dumped `/tmp/ruzu_deko3d_join_async.ppm` at frame 300 (`2560x1440`). No panic, `DEVICE_LOST`, `Unimplemented`, or `PrefetchAbort` appeared.
+- SpaceCadetPinball-NX under Vulkan/MoltenVK timed out normally at 75s, reached `IAudioRenderer::Start`, and presented continuous `BQP_QUEUE`/`BQC_RELEASE` frames through frame 65. No panic, `DEVICE_LOST`, `Unimplemented`, or `PrefetchAbort` appeared; no present-frame dump was produced in this run.
+
+## 2026-07-02 — video_core/src/renderer_vulkan/mod.rs, video_core/src/renderer_vulkan/texture_cache.rs, video_core/src/renderer_vulkan/buffer_cache.rs, video_core/src/buffer_cache/buffer_cache.rs, and video_core/src/buffer_cache/buffer_cache_base.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp, video_core/texture_cache/texture_cache.h, and video_core/renderer_vulkan/vk_buffer_cache.cpp
+
+### Intentional differences
+- Rust `RasterizerVulkan::accelerate_dma_image_to_buffer` / `accelerate_dma_buffer_to_image` live in `renderer_vulkan/mod.rs` because that is the active Rust `RasterizerInterface` owner; upstream owns the corresponding `AccelerateDMA::{ImageToBuffer,BufferToImage,DmaBufferImageCopy}` methods in `renderer_vulkan/vk_rasterizer.cpp`. The control flow matches upstream: lock buffer+texture caches, resolve `DmaImageId`, compute `pitch * height`, `ObtainBuffer` with `FullSynchronize`, use `MarkAsWritten` only for image-to-buffer, then call the texture-cache DMA helper.
+- Rust adds a local `lock_two_reentrant_mutexes!` helper in `renderer_vulkan/mod.rs`, matching the OpenGL port's helper. This preserves upstream `std::scoped_lock{buffer_cache.mutex, texture_cache.mutex}` deadlock-avoidance semantics with `parking_lot::ReentrantMutex`, which has no native two-mutex scoped lock.
+- Rust adds `BufferCacheRuntime::resolve_backend_buffer_raw` and `BufferCache::resolve_backend_buffer_raw` so the backend-agnostic common buffer cache can convert its stored `u32 gpu_handle` into the real `VkBuffer` consumed by Vulkan texture DMA. Upstream passes a `Buffer&` and calls `buffer->Handle()` directly; the Rust split base/backend architecture requires this explicit same-backend bridge.
+- `TextureCacheVulkan::dma_buffer_image_copy` performs the backend half that upstream template `TextureCache<P>::DmaBufferImageCopy` returns as `{image, copy}` plus the subsequent `PrepareImage`/`UploadMemory`/`DownloadImageIntoBuffer` calls in `AccelerateDMA::DmaBufferImageCopy`. Rust keeps descriptor construction in the common base and backend image/staging ownership in the Vulkan texture cache.
+- `TextureCacheVulkan::download_image_into_buffer` now mirrors upstream `TextureCache<P>::DownloadImageIntoBuffer` for `IMPLEMENTS_ASYNC_DOWNLOADS`: insert `BufferDownload`, push `PendingDownload{is_swizzle=false}`, allocate deferred download staging, call `Image::download_memory` with both the destination `VkBuffer` and staging buffer, then commit the staging buffer into `uncommitted_async_buffers`.
+- Rust handles allocation/backend-image failure by erasing the just-inserted `slot_buffer_downloads` entry, popping the pending download, and returning `false`. Upstream assumes `runtime.DownloadStagingBuffer` succeeds and does not model a nullable allocation result; this Rust failure cleanup preserves cache invariants if allocation fails.
+
+### Unintentional differences (to fix)
+- No known behavioral difference in the newly ported DMA producer path after this slice. The remaining structural difference is the already-known split base/backend handle bridge; it is required until the Rust Vulkan buffer cache is fully unified with upstream `BufferCache<P>` ownership.
+
+### Missing items
+- Add a Vulkan runtime workload or focused fixture that actually triggers Maxwell DMA image-to-buffer/buffer-to-image and validates the produced async buffer download through `CommitAsyncFlushes -> PopAsyncFlushes`. Existing Pinball validation exercises non-regression but not this DMA path.
+- Continue retiring the legacy Vulkan direct buffer cache paths once the common Vulkan `BufferCacheRuntime` owns all rasterizer buffer usage.
+
+### Binary layout verification
+- N/A: host-side Vulkan DMA/cache lifecycle only; no guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read upstream `AccelerateDMA::DmaBufferImageCopy`, `ImageToBuffer`, and `BufferToImage` in `video_core/renderer_vulkan/vk_rasterizer.cpp`.
+- Re-read upstream `TextureCache<P>::DownloadImageIntoBuffer` in `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust `RasterizerVulkan::accelerate_dma_image_to_buffer`, `RasterizerVulkan::accelerate_dma_buffer_to_image`, `TextureCacheVulkan::dma_buffer_image_copy`, `TextureCacheVulkan::download_image_into_buffer`, `BufferCacheRuntime::resolve_backend_buffer_raw`, and `BufferCache::resolve_backend_buffer_raw`.
+- `cargo fmt` completed.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes after the producer path changes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core dma_buffer_image_copy_descriptor_matches_upstream_fields -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core empty_committed_download_batch_does_not_require_wait -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan/MoltenVK timed out normally at 75s after the producer path change, reached `IAudioRenderer::Start`, and presented continuous `BQP_QUEUE`/`BQC_RELEASE` frames through frame 65. No panic, `DEVICE_LOST`, `Unimplemented`, `PrefetchAbort`, DMA range warning, or missing async-buffer warning appeared; no present-frame dump was produced in this run.
+
+## 2026-07-02 — runtime validation for video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h and video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- No code change in this validation entry. This closes part of the previous verification gap by proving the existing Vulkan pending-join backend tail reaches live scheduler-recorded `TextureCacheRuntime::copy_image` on a local workload.
+
+### Unintentional differences (to fix)
+- No new behavioral difference observed in the validated join/depth/MRT runs. MoltenVK still prints the known primitive-restart feature warning; that is outside this texture-cache ownership slice.
+
+### Missing items
+- The live join workload validates same-format non-MSAA `CopyImage`; it does not validate `CopyImageMSAA`, `ReinterpretImage`, or `ConvertImage` pending-join branches.
+- Pinball and the deko3d fixtures still do not validate Vulkan DMA image-to-buffer/buffer-to-image producer paths.
+
+### Binary layout verification
+- N/A: runtime validation only; no guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::JoinImages` and `TextureCacheRuntime::CopyImage` control flow before running the workload.
+- `deko3d-join-min` under Vulkan/MoltenVK with `RUZU_TRACE_VK_JOIN_COPY=1` timed out normally at 15s, observed `drain pending=1`, `copy dst=2 src=1`, `runtime.CopyImage dst=2 src=1`, `runtime.CopyImage dst=2 src=3`, repeated for `new=7`, and dumped `/tmp/ruzu_deko3d_join_next.ppm` at frame 300 (`2560x1440`). No panic, `DEVICE_LOST`, `Unimplemented`, or `PrefetchAbort` appeared.
+- `deko3d-depth-min` under Vulkan/MoltenVK timed out normally at 15s and dumped `/tmp/ruzu_deko3d_depth_next.ppm` at frame 300 (`2560x1440`), then continued presenting through frame 513 before timeout. No panic, `DEVICE_LOST`, `Unimplemented`, or `PrefetchAbort` appeared.
+- `deko3d-mrt-min` under Vulkan/MoltenVK timed out normally at 15s and dumped `/tmp/ruzu_deko3d_mrt_next.ppm` at frame 300 (`2560x1440`), then continued presenting through frame 513 before timeout. No panic, `DEVICE_LOST`, `Unimplemented`, or `PrefetchAbort` appeared.
+
+## 2026-07-02 — video_core/src/engines/maxwell_dma.rs, video_core/src/renderer_vulkan/mod.rs, and video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp and video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Added env-gated `RUZU_TRACE_DMA_IMAGE` diagnostics in the Rust owners corresponding to the upstream DMA path: Maxwell DMA launch helpers, `RasterizerVulkan::accelerate_dma_image_to_buffer` / `accelerate_dma_buffer_to_image`, and `TextureCacheVulkan::dma_buffer_image_copy` / `download_image_into_buffer`. This is diagnostic-only and does not change normal behavior; upstream has no equivalent log path.
+- The trace points stay inside the files that own the ported logic, preserving the upstream ownership split: DMA engine decides the copy shape, Vulkan rasterizer owns `AccelerateDMA`, and Vulkan texture cache owns `DmaBufferImageCopy` / `DownloadImageIntoBuffer`.
+
+### Unintentional differences (to fix)
+- No new behavioral difference was introduced by this diagnostic slice.
+- Runtime validation with SpaceCadetPinball-NX now proves the Maxwell DMA pitch-to-blocklinear path is reached, but Vulkan acceleration returns `false` because `DmaImageId` finds no backend image for the destination address (`dst=0xA299000`). The fallback path continues and presentation still works, but this does not validate successful Vulkan `UploadMemory` or `DownloadImageIntoBuffer` execution.
+
+### Missing items
+- Add or find a workload where `DmaImageId` resolves a real image so `RasterizerVulkan::accelerate_dma_buffer_to_image` reaches `TextureCacheVulkan::dma_buffer_image_copy -> Image::upload_memory`.
+- Add or find a workload where image-to-buffer DMA reaches `TextureCacheVulkan::download_image_into_buffer`, queues a non-swizzled `PendingDownload`, and is consumed by `CommitAsyncFlushes -> PopAsyncFlushes`.
+- If Pinball is expected to accelerate its `0xA299000` destination image, investigate why that address is not registered in the Vulkan texture cache before the DMA upload.
+
+### Binary layout verification
+- N/A: diagnostic logging only; no guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read upstream `AccelerateDMA::DmaBufferImageCopy`, `ImageToBuffer`, and `BufferToImage` in `video_core/renderer_vulkan/vk_rasterizer.cpp`.
+- Re-read upstream `TextureCache<P>::DmaBufferImageCopy` and `TextureCache<P>::DownloadImageIntoBuffer` in `video_core/texture_cache/texture_cache.h`.
+- Re-read Rust `MaxwellDMA::copy_blocklinear_to_pitch`, `MaxwellDMA::copy_pitch_to_blocklinear`, `RasterizerVulkan::accelerate_dma_image_to_buffer`, `RasterizerVulkan::accelerate_dma_buffer_to_image`, `TextureCacheVulkan::dma_buffer_image_copy`, and `TextureCacheVulkan::download_image_into_buffer`.
+- `cargo fmt --check` passes.
+- `git diff --check` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core dma_buffer_image_copy_descriptor_matches_upstream_fields -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core empty_committed_download_batch_does_not_require_wait -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- SpaceCadetPinball-NX under Vulkan/MoltenVK with `RUZU_TRACE_DMA_IMAGE=1` timed out normally at 75s, presented through `BQP_QUEUE` / `BQC_RELEASE` frame 65, and emitted repeated `pitch->blocklinear ... accelerated=false` traces with paired `vk buffer->image no image ... dst=0xA299000` diagnostics. No panic, `DEVICE_LOST`, `VK_ERROR`, `Unimplemented`, or `PrefetchAbort` appeared.
+
+## 2026-07-02 — Pinball DMA address investigation for video_core/src/texture_cache/texture_cache.rs and video_core/src/engines/maxwell_dma.rs vs video_core/texture_cache/texture_cache.h and video_core/engines/maxwell_dma.cpp
+
+### Intentional differences
+- No code change in this investigation entry. It uses existing env-gated Rust diagnostics (`RUZU_TRACE_DMA_IMAGE` and `RUZU_TRACE_TEXTURE_CACHE_ADDRS`) to classify whether Pinball can validate the Vulkan accelerated DMA upload/download producer paths.
+
+### Unintentional differences (to fix)
+- No behavioral difference identified for the observed Pinball path. Upstream `MaxwellDMA::CopyPitchToBlockLinear` calls `accelerate.BufferToImage(...)` first and falls back to CPU swizzle/write when `TextureCache<P>::DmaImageId(...)` cannot find an existing GPU-modified image. Rust follows the same sequence: `accelerate_dma_buffer_to_image` returns `false` before the texture image exists, then the fallback writes guest memory and presentation later creates the image from that memory.
+
+### Missing items
+- Pinball is not a valid positive test for `Image::upload_memory` via DMA: the first `pitch->blocklinear` DMA to `0xA299000` happens before `TextureCacheBase::FindOrInsertImage` creates the `A8B8G8R8Unorm 600x416` image for presentation.
+- A separate workload is still needed where an image is already registered and GPU-modified before Maxwell DMA, so `DmaImageId` returns a real `ImageId` and the Vulkan path reaches `TextureCacheVulkan::dma_buffer_image_copy -> Image::upload_memory`.
+- A separate workload is still needed for image-to-buffer DMA where `TextureCacheVulkan::download_image_into_buffer` queues a non-swizzled `PendingDownload` and the data is consumed by `CommitAsyncFlushes -> PopAsyncFlushes`.
+
+### Binary layout verification
+- N/A: runtime investigation only; no guest raw-copied ABI payload or packed struct layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::DmaImageId` and `TextureCache<P>::FindDMAImage` in `video_core/texture_cache/texture_cache.h`.
+- Re-read upstream `MaxwellDMA::CopyPitchToBlockLinear` in `video_core/engines/maxwell_dma.cpp`.
+- Re-read Rust `TextureCacheBase::dma_image_id`, `TextureCacheBase::find_dma_image`, and `MaxwellDMA::copy_pitch_to_blocklinear`.
+- SpaceCadetPinball-NX under Vulkan/MoltenVK with `RUZU_TRACE_DMA_IMAGE=1 RUZU_TRACE_TEXTURE_CACHE_ADDRS=0xA299000` timed out normally at 45s. The log shows `vk buffer->image no image ... dst=0xA299000` at `32.554520s`, then `TEX_CACHE miss_join/join_begin/join_end id=2 gpu=0xA299000 ... fmt=A8B8G8R8Unorm 600x416` at `32.565136s`, proving image creation happens after the DMA acceleration attempt. Subsequent frames repeat the same fallback-first pattern while presentation continues through `BQP_QUEUE` / `BQC_RELEASE`.

@@ -581,9 +581,9 @@ mod tests {
     use super::*;
     use crate::engines::maxwell_3d::{
         BlendColorInfo, BlendInfo, ColorMaskInfo, ComparisonOp, ConstBufferBinding, CullFace,
-        DepthMode, DepthStencilInfo, DrawCall, FrontFace, IndexFormat, PolygonMode,
+        DepthMode, DepthStencilInfo, DrawCall, FrontFace, IndexFormat, LogicOpInfo, PolygonMode,
         PrimitiveTopology, RasterizerInfo, RenderTargetInfo, RtControlInfo, SamplerBinding,
-        ScissorInfo, ShaderStageInfo, StencilFaceInfo, ViewportInfo,
+        ScissorInfo, ShaderStageInfo, StencilFaceInfo, ViewportInfo, ZetaInfo,
     };
 
     fn make_test_draw_call() -> DrawCall {
@@ -655,6 +655,8 @@ mod tests {
             inline_index_data: Vec::new(),
             sampler_binding: SamplerBinding::Independently,
             render_targets: [RenderTargetInfo::default(); 8],
+            zeta: ZetaInfo::default(),
+            dirty_flags: [false; 256],
         }
     }
 
