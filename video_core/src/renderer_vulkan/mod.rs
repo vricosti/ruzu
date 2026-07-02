@@ -628,6 +628,10 @@ impl RasterizerVulkan {
         self.query_cache.set_gpu_ticks_getter(getter);
     }
 
+    pub fn set_guest_memory_writer(&mut self, writer: crate::renderer_base::GuestMemoryWriter) {
+        self.texture_cache.set_guest_memory_writer(writer);
+    }
+
     /// Main draw entry point — process a single draw call.
     ///
     /// Ref: zuyu RasterizerVulkan::Draw() — compiles/caches pipeline,
@@ -801,7 +805,7 @@ impl RasterizerVulkan {
         if std::env::var_os("RUZU_TRACE_VK_DRAW").is_some() {
             let rt0 = draw.render_targets[0];
             log::info!(
-                "[VK_DRAW] draw={} topology={:?} guest_indexed={} vk_indexed={} vertices={} instances={} first_index={} base_vertex={} base_instance={} vertex_first={} vertex_count={} index_first={} index_count={} rt0_addr=0x{:X} rt0={}x{} fmt={} prim_restart={} rasterize={} uses_render_area={} uses_rescaling_uniform={} blend0={} color=({:?},{:?},{:?}) alpha=({:?},{:?},{:?}) mask={:?}",
+                "[VK_DRAW] draw={} topology={:?} guest_indexed={} vk_indexed={} vertices={} instances={} first_index={} base_vertex={} base_instance={} vertex_first={} vertex_count={} index_first={} index_count={} rt0_addr=0x{:X} rt0={}x{} fmt={} prim_restart={} rasterize={} cull_enable={} cull_face={:?} front_face={:?} window_flip_y={} uses_render_area={} uses_rescaling_uniform={} blend0={} color=({:?},{:?},{:?}) alpha=({:?},{:?},{:?}) mask={:?}",
                 self.draw_counter,
                 draw.topology,
                 draw.indexed,
@@ -821,6 +825,10 @@ impl RasterizerVulkan {
                 rt0.format,
                 draw.primitive_restart.enabled,
                 draw.rasterize_enable,
+                draw.rasterizer.cull_enable,
+                draw.rasterizer.cull_face,
+                draw.rasterizer.front_face,
+                draw.window_origin_flip_y,
                 uses_render_area,
                 uses_rescaling_uniform,
                 draw.blend[0].enabled,
@@ -951,26 +959,46 @@ impl RasterizerVulkan {
     }
 
     fn should_wait_async_flushes(&self) -> bool {
-        self.texture_cache.should_wait_async_flushes()
-            || self.common_buffer_cache.should_wait_async_flushes()
-            || self.query_cache.should_wait_async_flushes()
+        let cache_wait = unsafe {
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+            self.texture_cache.should_wait_async_flushes()
+                || self.common_buffer_cache.should_wait_async_flushes()
+        };
+        cache_wait || self.query_cache.should_wait_async_flushes()
     }
 
     fn should_flush_async(&self) -> bool {
-        self.texture_cache.has_uncommitted_flushes()
-            || self.common_buffer_cache.has_uncommitted_flushes()
-            || self.query_cache.has_uncommitted_flushes()
+        let cache_flush = unsafe {
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+            self.texture_cache.has_uncommitted_flushes()
+                || self.common_buffer_cache.has_uncommitted_flushes()
+        };
+        cache_flush || self.query_cache.has_uncommitted_flushes()
     }
 
     fn pop_async_flushes(&mut self) {
-        self.texture_cache.pop_async_flushes();
-        self.common_buffer_cache.pop_async_flushes();
+        unsafe {
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+            self.texture_cache.pop_async_flushes();
+            self.common_buffer_cache.pop_async_flushes();
+        }
         self.query_cache.pop_async_flushes();
     }
 
     fn commit_async_flushes(&mut self) {
-        self.texture_cache.commit_async_flushes();
-        self.common_buffer_cache.commit_async_flushes();
+        unsafe {
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+            self.texture_cache.commit_async_flushes();
+            self.common_buffer_cache.commit_async_flushes();
+        }
         self.query_cache.commit_async_flushes();
     }
 
@@ -2019,9 +2047,7 @@ impl RasterizerVulkan {
                                         sampler_id.index,
                                     );
                                 }
-                                if sampler_id.is_valid()
-                                    && sampler_id != crate::texture_cache::types::NULL_SAMPLER_ID
-                                {
+                                if sampler_id.is_valid() {
                                     let tsc = self.texture_cache.base.slot_samplers.get(sampler_id);
                                     log::warn!(
                                         "[VK_TEXTURE_SAMPLER] binding={} elem={} sampler_id={} raw={:016X?} wrap=({},{},{}) filter=({},{},{}) depth_cmp={} depth_func={} lod=({:.3},{:.3}) bias={:.3}",
