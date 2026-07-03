@@ -70,6 +70,10 @@ impl EmuWindowSdl2 {
     /// matching upstream behavior.
     pub fn new() -> Self {
         // Maps to: input_subsystem->Initialize(); (stubbed — InputSubsystem not yet ported)
+        // Rust binaries do not use SDL's SDL_main wrapper, so SDL must be
+        // told that the application entry point is ready before SDL_Init().
+        unsafe { sdl::SDL_SetMainReady() };
+
         // Maps to: SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER)
         let ret = unsafe {
             sdl::SDL_Init(
@@ -81,9 +85,6 @@ impl EmuWindowSdl2 {
             log::error!("Failed to initialize SDL2: {}, Exiting...", err);
             std::process::exit(1);
         }
-
-        // Maps to: SDL_SetMainReady()
-        unsafe { sdl::SDL_SetMainReady() };
 
         EmuWindowSdl2 {
             is_open: true,
@@ -216,6 +217,7 @@ impl EmuWindowSdl2 {
                         self.on_resize();
                     }
                     x if x == SDL_WINDOWEVENT_CLOSE as u32 => {
+                        log::info!("SDL window close event received");
                         self.is_open = false;
                     }
                     _ => {}
@@ -260,6 +262,7 @@ impl EmuWindowSdl2 {
                 self.on_finger_up();
             }
             x if x == SDL_QUIT as u32 => {
+                log::info!("SDL quit event received");
                 self.is_open = false;
             }
             _ => {}

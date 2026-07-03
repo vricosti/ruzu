@@ -358,6 +358,7 @@ pub struct RasterizerVulkan {
     query_cache: VulkanQueryCache,
     fence_manager: GenericFenceManager<VkFence>,
     fence_backend: VkFenceBackend,
+    wfi_event: vk::Event,
 
     // Default render pass for the offscreen framebuffer
     default_render_pass: vk::RenderPass,
@@ -541,6 +542,13 @@ impl RasterizerVulkan {
         // Create query cache
         let query_cache = VulkanQueryCache::new();
 
+        let wfi_event_info = vk::EventCreateInfo::default();
+        let wfi_event = unsafe {
+            device
+                .create_event(&wfi_event_info, None)
+                .map_err(|e| RendererError::InitFailed(format!("wfi event: {:?}", e)))?
+        };
+
         // Create default render pass
         let default_render_pass = create_default_render_pass(&device)?;
 
@@ -596,6 +604,7 @@ impl RasterizerVulkan {
             query_cache,
             fence_manager: GenericFenceManager::new(true),
             fence_backend: VkFenceBackend::new(),
+            wfi_event,
             default_render_pass,
             offscreen_image,
             offscreen_memory,
@@ -771,14 +780,18 @@ impl RasterizerVulkan {
             read_gpu_unsafe,
         );
 
-        // 5. Update dynamic states via dirty flags
-        self.update_dynamic_states(cmd, draw);
-
-        // 6. Bind vertex/index buffers
+        // 5. Bind vertex/index buffers
         self.bind_vertex_buffers(cmd, draw, read_gpu);
         if draw_params.is_indexed {
             self.bind_index_buffer(cmd, draw, draw_params, read_gpu);
         }
+
+        // Texture/buffer materialization can enqueue upload copies and
+        // barriers through `Scheduler::record_with_upload`. Upstream records
+        // the draw itself through the scheduler, preserving command order in
+        // the chunk. This reduced backend emits vkCmdDraw directly, so flush
+        // the preparation chunk before entering the render pass for the draw.
+        self.scheduler.dispatch_work();
 
         // Build clear values indexed by attachment: one per colour attachment
         // (ignored by the LOAD colour attachments, but the array must be long
@@ -802,10 +815,37 @@ impl RasterizerVulkan {
             &rp_image_ranges,
         );
 
+        // 6. Update dynamic states via dirty flags. Upstream requests the
+        // render pass in `GraphicsPipeline::ConfigureDraw` before
+        // `RasterizerVulkan::UpdateDynamicStates`.
+        self.update_dynamic_states(cmd, draw);
+
         if std::env::var_os("RUZU_TRACE_VK_DRAW").is_some() {
             let rt0 = draw.render_targets[0];
+            if std::env::var_os("RUZU_TRACE_VK_SHADER_INFO").is_some() {
+                let vs_info = stage_infos
+                    .get(1)
+                    .and_then(|info| info.as_ref())
+                    .or_else(|| stage_infos.get(0).and_then(|info| info.as_ref()));
+                let fs_info = stage_infos.get(4).and_then(|info| info.as_ref());
+                log::info!(
+                    "[VK_SHADER_INFO] draw={} rt0_addr=0x{:X} vs_cbufs={} vs_textures={} vs_ssbos={} fs_cbufs={} fs_textures={} fs_ssbos={} fs_stores={} fs_uses_demote={} fs_uses_render_area={} fs_uses_rescaling={}",
+                    self.draw_counter,
+                    rt0.address,
+                    vs_info.map(|info| info.constant_buffer_descriptors.len()).unwrap_or(0),
+                    vs_info.map(|info| info.texture_descriptors.len()).unwrap_or(0),
+                    vs_info.map(|info| info.storage_buffers_descriptors.len()).unwrap_or(0),
+                    fs_info.map(|info| info.constant_buffer_descriptors.len()).unwrap_or(0),
+                    fs_info.map(|info| info.texture_descriptors.len()).unwrap_or(0),
+                    fs_info.map(|info| info.storage_buffers_descriptors.len()).unwrap_or(0),
+                    fs_info.map(|info| info.stores_frag_color.iter().filter(|&&v| v).count()).unwrap_or(0),
+                    fs_info.map(|info| info.uses_demote_to_helper_invocation).unwrap_or(false),
+                    fs_info.map(|info| info.uses_render_area).unwrap_or(false),
+                    fs_info.map(|info| info.uses_rescaling_uniform).unwrap_or(false),
+                );
+            }
             log::info!(
-                "[VK_DRAW] draw={} topology={:?} guest_indexed={} vk_indexed={} vertices={} instances={} first_index={} base_vertex={} base_instance={} vertex_first={} vertex_count={} index_first={} index_count={} rt0_addr=0x{:X} rt0={}x{} fmt={} prim_restart={} rasterize={} cull_enable={} cull_face={:?} front_face={:?} window_flip_y={} uses_render_area={} uses_rescaling_uniform={} blend0={} color=({:?},{:?},{:?}) alpha=({:?},{:?},{:?}) mask={:?}",
+                "[VK_DRAW] draw={} topology={:?} guest_indexed={} vk_indexed={} vertices={} instances={} first_index={} base_vertex={} base_instance={} vertex_first={} vertex_count={} index_first={} index_count={} rt_count={} rt0_addr=0x{:X} rt0={}x{} fmt={} zeta_enable={} zeta_addr=0x{:X} zeta={}x{} zeta_fmt={} depth_mode={:?} depth_test={} depth_write={} depth_func={:?} stencil={} prim_restart={} rasterize={} cull_enable={} cull_face={:?} front_face={:?} window_flip_y={} uses_render_area={} uses_rescaling_uniform={} logic_op={} blend0={} color=({:?},{:?},{:?}) alpha=({:?},{:?},{:?}) mask={:?}",
                 self.draw_counter,
                 draw.topology,
                 draw.indexed,
@@ -819,10 +859,21 @@ impl RasterizerVulkan {
                 draw.vertex_count,
                 draw.index_buffer_first,
                 draw.index_buffer_count,
+                draw.rt_control.count,
                 rt0.address,
                 rt0.width,
                 rt0.height,
                 rt0.format,
+                draw.zeta.enabled,
+                draw.zeta.address,
+                draw.zeta.width,
+                draw.zeta.height,
+                draw.zeta.format,
+                draw.depth_stencil.depth_mode,
+                draw.depth_stencil.depth_test_enable,
+                draw.depth_stencil.depth_write_enable,
+                draw.depth_stencil.depth_func,
+                draw.depth_stencil.stencil_enable,
                 draw.primitive_restart.enabled,
                 draw.rasterize_enable,
                 draw.rasterizer.cull_enable,
@@ -831,6 +882,7 @@ impl RasterizerVulkan {
                 draw.window_origin_flip_y,
                 uses_render_area,
                 uses_rescaling_uniform,
+                draw.logic_op.enabled,
                 draw.blend[0].enabled,
                 draw.blend[0].color_src,
                 draw.blend[0].color_dst,
@@ -866,6 +918,7 @@ impl RasterizerVulkan {
             }
         }
 
+        self.texture_cache.dump_image_if_requested();
         self.draw_counter += 1;
         // Mark state dirty for next draw (conservative — real tracking per-register later)
         self.state_tracker.invalidate_state();
@@ -1631,12 +1684,19 @@ impl RasterizerVulkan {
             if size == 0 {
                 continue;
             }
-            if std::env::var_os("RUZU_TRACE_VK_VERTEX_INPUT").is_some() && self.draw_counter <= 3 {
+            let trace_vertex_input = std::env::var_os("RUZU_TRACE_VK_VERTEX_INPUT").is_some()
+                && (self.draw_counter <= 3
+                    || draw
+                        .render_targets
+                        .first()
+                        .is_some_and(|rt| rt.width == 1920 && rt.height == 1080));
+            if trace_vertex_input {
                 let mut bytes = vec![0u8; size.min(128) as usize];
                 read_gpu(stream.address, &mut bytes);
                 log::info!(
-                    "[VK_VERTEX_BUFFER] draw={} binding={} addr=0x{:X} stride={} frequency={} size={} first={} count={} bytes={:02X?}",
+                    "[VK_VERTEX_BUFFER] draw={} rt0=0x{:X} binding={} addr=0x{:X} stride={} frequency={} size={} first={} count={} bytes={:02X?}",
                     self.draw_counter,
+                    draw.render_targets[0].address,
                     stream.index,
                     stream.address,
                     stream.stride,
@@ -1652,6 +1712,8 @@ impl RasterizerVulkan {
                 stream.index,
                 stream.address,
                 size,
+                stream.stride as vk::DeviceSize,
+                self.extended_dynamic_state_supported,
                 read_gpu,
                 &mut self.staging_pool,
                 upload_cmd,
@@ -1714,6 +1776,27 @@ impl RasterizerVulkan {
             crate::engines::maxwell_3d::IndexFormat::UnsignedShort => vk::IndexType::UINT16,
             crate::engines::maxwell_3d::IndexFormat::UnsignedInt => vk::IndexType::UINT32,
         };
+        let trace_vertex_input = std::env::var_os("RUZU_TRACE_VK_VERTEX_INPUT").is_some()
+            && (self.draw_counter <= 3
+                || draw
+                    .render_targets
+                    .first()
+                    .is_some_and(|rt| rt.width == 1920 && rt.height == 1080));
+        if trace_vertex_input {
+            let mut bytes = vec![0u8; size.min(128) as usize];
+            read_gpu(draw.index_buffer_addr, &mut bytes);
+            log::info!(
+                "[VK_INDEX_BUFFER] draw={} rt0=0x{:X} addr=0x{:X} format={:?} size={} first_index={} count={} bytes={:02X?}",
+                self.draw_counter,
+                draw.render_targets[0].address,
+                draw.index_buffer_addr,
+                draw.index_format,
+                size,
+                draw_params.first_index,
+                draw_params.num_vertices,
+                bytes,
+            );
+        }
         self.buffer_cache.bind_index_buffer(
             cmd,
             draw.index_buffer_addr,
@@ -1931,7 +2014,7 @@ impl RasterizerVulkan {
                                     .uniform_index
                                     .unwrap_or(u32::MAX)
                                     .saturating_add(element);
-                                let mut bytes = vec![0u8; size.min(0x40) as usize];
+                                let mut bytes = vec![0u8; size.min(0x80) as usize];
                                 read_gpu(gpu_va, &mut bytes);
                                 let mut floats = Vec::with_capacity(bytes.len() / 4);
                                 for chunk in bytes.chunks_exact(4) {
@@ -2455,6 +2538,28 @@ impl RasterizerInterface for RasterizerVulkan {
             base_array_layer: ((clear_state.flags >> 10) & 0xFFFF),
             layer_count,
         };
+        if std::env::var_os("RUZU_TRACE_VK_CLEAR").is_some() {
+            let rt_index = (clear_state.flags >> 6) & 0xF;
+            log::info!(
+                "[VK_CLEAR] flags=0x{:X} rt={} color={} depth={} stencil={} rgba=({:.4},{:.4},{:.4},{:.4}) ds=({:.4},{}) rect=({},{} {}x{}) target_rt0=0x{:X}",
+                clear_state.flags,
+                rt_index,
+                use_color,
+                use_depth,
+                use_stencil,
+                clear_state.color[0],
+                clear_state.color[1],
+                clear_state.color[2],
+                clear_state.color[3],
+                clear_state.depth,
+                clear_state.stencil,
+                clear_rect.rect.offset.x,
+                clear_rect.rect.offset.y,
+                clear_rect.rect.extent.width,
+                clear_rect.rect.extent.height,
+                render_targets.render_targets[0].address,
+            );
+        }
         let mut attachments = Vec::with_capacity(2);
         if use_color {
             if (clear_state.flags >> 6) & 0xF != 0 {
@@ -2820,7 +2925,41 @@ impl RasterizerInterface for RasterizerVulkan {
     }
 
     fn wait_for_idle(&mut self) {
-        self.finish();
+        let flags = vk::PipelineStageFlags::DRAW_INDIRECT
+            | vk::PipelineStageFlags::VERTEX_INPUT
+            | vk::PipelineStageFlags::VERTEX_SHADER
+            | vk::PipelineStageFlags::TESSELLATION_CONTROL_SHADER
+            | vk::PipelineStageFlags::TESSELLATION_EVALUATION_SHADER
+            | vk::PipelineStageFlags::GEOMETRY_SHADER
+            | vk::PipelineStageFlags::FRAGMENT_SHADER
+            | vk::PipelineStageFlags::COMPUTE_SHADER
+            | vk::PipelineStageFlags::TRANSFER;
+
+        self.query_cache.notify_wfi();
+
+        let device = self.device.clone();
+        let event = self.wfi_event;
+        self.scheduler.request_outside_renderpass();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_event(cmdbuf, event, flags);
+            device.cmd_wait_events(
+                cmdbuf,
+                &[event],
+                flags,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                &[],
+                &[],
+                &[],
+            );
+        });
+        let this = self as *mut Self;
+        let this_for_pop = this as usize;
+        self.fence_manager.signal_ordering(
+            move || unsafe { (*this).should_wait_async_flushes() },
+            move |fence| unsafe { (*this).is_fence_signaled(fence) },
+            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
+            move || unsafe { (*this).commit_async_flushes() },
+        );
     }
 
     fn fragment_barrier(&mut self) {
@@ -2841,6 +2980,7 @@ impl RasterizerInterface for RasterizerVulkan {
         self.staging_pool.new_frame();
         self.descriptor_pool.reset_pools();
         self.texture_cache.tick_frame(self.scheduler.current_tick());
+        self.buffer_cache.tick_frame(self.scheduler.current_tick());
         unsafe {
             let _lo_buf = common::lock_order::guard("buffer_cache");
             let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
@@ -3160,6 +3300,7 @@ impl Drop for RasterizerVulkan {
             self.device.destroy_image(self.depth_image, None);
             self.device.free_memory(self.depth_memory, None);
 
+            self.device.destroy_event(self.wfi_event, None);
             self.device
                 .destroy_render_pass(self.default_render_pass, None);
         }

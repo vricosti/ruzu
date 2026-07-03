@@ -10,6 +10,7 @@
 use super::spirv_emit_context::SpirvEmitContext;
 use crate::ir::types::ShaderStage;
 use crate::ir::{self, Opcode};
+use crate::runtime_info::AttributeType;
 use rspirv::spirv::Word;
 
 // ── Low-level per-type emit functions (called from other modules) ─────────
@@ -120,20 +121,44 @@ pub fn emit_get_cbuf(ctx: &mut SpirvEmitContext, inst: &ir::Inst, block_idx: u32
 
     if let Some(&cbuf_var) = ctx.cbuf_vars.get(&cbuf_idx) {
         let four = ctx.builder.constant_bit32(ctx.u32_type, 4);
-        let index = ctx
+        let word_index = ctx
             .builder
             .u_div(ctx.u32_type, None, byte_offset, four)
             .unwrap();
+        let three = ctx.builder.constant_bit32(ctx.u32_type, 3);
+        let component = ctx
+            .builder
+            .bitwise_and(ctx.u32_type, None, word_index, three)
+            .unwrap();
+        let sixteen = ctx.builder.constant_bit32(ctx.u32_type, 16);
+        let index = ctx
+            .builder
+            .u_div(ctx.u32_type, None, byte_offset, sixteen)
+            .unwrap();
         let zero = ctx.const_zero_u32;
-        let uniform_u32_ptr = ctx.uniform_u32_ptr;
+        let uniform_u32_vec4_ptr = ctx.uniform_u32_vec4_ptr;
         let ptr = ctx
             .builder
-            .access_chain(uniform_u32_ptr, None, cbuf_var, vec![zero, index])
+            .access_chain(uniform_u32_vec4_ptr, None, cbuf_var, vec![zero, index])
             .unwrap();
-        let loaded = ctx
+        let vector = ctx
             .builder
-            .load(ctx.u32_type, None, ptr, None, vec![])
+            .load(ctx.u32_vec4_type, None, ptr, None, vec![])
             .unwrap();
+        let loaded = if inst.arg(1).is_immediate() {
+            ctx.builder
+                .composite_extract(
+                    ctx.u32_type,
+                    None,
+                    vector,
+                    vec![(inst.arg(1).imm_u32() / 4) & 3],
+                )
+                .unwrap()
+        } else {
+            ctx.builder
+                .vector_extract_dynamic(ctx.u32_type, None, vector, component)
+                .unwrap()
+        };
 
         let id = if inst.opcode == Opcode::GetCbufF32 {
             ctx.builder.bitcast(ctx.f32_type, None, loaded).unwrap()
@@ -167,12 +192,12 @@ pub fn emit_get_attribute_inst(
         ctx.set_value(block_idx, inst_idx, id);
     } else if attr.is_position() {
         let comp = attr.position_element();
-        if let Some(&pos_var) = ctx.output_vars.get(&0xFFFF_0000) {
+        if ctx.input_position != 0 {
             let idx_const = ctx.builder.constant_bit32(ctx.u32_type, comp);
-            let output_f32_ptr = ctx.output_f32_ptr;
+            let input_f32_ptr = ctx.input_f32_ptr;
             let ptr = ctx
                 .builder
-                .access_chain(output_f32_ptr, None, pos_var, vec![idx_const])
+                .access_chain(input_f32_ptr, None, ctx.input_position, vec![idx_const])
                 .unwrap();
             let id = ctx
                 .builder
@@ -188,23 +213,107 @@ pub fn emit_get_attribute_inst(
         let comp = attr.generic_element();
         if let Some(&input_var) = ctx.input_vars.get(&generic_idx) {
             let idx_const = ctx.builder.constant_bit32(ctx.u32_type, comp);
-            let input_f32_ptr = ctx.input_f32_ptr;
-            let ptr = ctx
-                .builder
-                .access_chain(input_f32_ptr, None, input_var, vec![idx_const])
-                .unwrap();
-            let id = ctx
-                .builder
-                .load(ctx.f32_type, None, ptr, None, vec![])
-                .unwrap();
+            let id = load_generic_input_attribute(ctx, generic_idx, input_var, idx_const);
             ctx.set_value(block_idx, inst_idx, id);
         } else {
-            let zero = ctx.const_zero_f32;
-            ctx.set_value(block_idx, inst_idx, zero);
+            let default_value = if comp == 3 {
+                ctx.const_one_f32
+            } else {
+                ctx.const_zero_f32
+            };
+            ctx.set_value(block_idx, inst_idx, default_value);
         }
     } else {
         let id = emit_get_attribute_f32_value(ctx, attr);
         ctx.set_value(block_idx, inst_idx, id);
+    }
+}
+
+fn load_generic_input_attribute(
+    ctx: &mut SpirvEmitContext,
+    generic_idx: u32,
+    input_var: Word,
+    idx_const: Word,
+) -> Word {
+    match ctx.runtime_info.generic_input_types[generic_idx as usize] {
+        AttributeType::Float => {
+            let ptr = ctx
+                .builder
+                .access_chain(ctx.input_f32_ptr, None, input_var, vec![idx_const])
+                .unwrap();
+            ctx.builder
+                .load(ctx.f32_type, None, ptr, None, vec![])
+                .unwrap()
+        }
+        AttributeType::UnsignedInt => {
+            let ptr = ctx
+                .builder
+                .access_chain(ctx.input_u32_ptr, None, input_var, vec![idx_const])
+                .unwrap();
+            let value = ctx
+                .builder
+                .load(ctx.u32_type, None, ptr, None, vec![])
+                .unwrap();
+            ctx.builder.bitcast(ctx.f32_type, None, value).unwrap()
+        }
+        AttributeType::SignedInt => {
+            let ptr = ctx
+                .builder
+                .access_chain(ctx.input_i32_ptr, None, input_var, vec![idx_const])
+                .unwrap();
+            let value = ctx
+                .builder
+                .load(ctx.i32_type, None, ptr, None, vec![])
+                .unwrap();
+            ctx.builder.bitcast(ctx.f32_type, None, value).unwrap()
+        }
+        AttributeType::SignedScaled => {
+            if ctx.profile.support_scaled_attributes {
+                let ptr = ctx
+                    .builder
+                    .access_chain(ctx.input_f32_ptr, None, input_var, vec![idx_const])
+                    .unwrap();
+                ctx.builder
+                    .load(ctx.f32_type, None, ptr, None, vec![])
+                    .unwrap()
+            } else {
+                let ptr = ctx
+                    .builder
+                    .access_chain(ctx.input_i32_ptr, None, input_var, vec![idx_const])
+                    .unwrap();
+                let value = ctx
+                    .builder
+                    .load(ctx.i32_type, None, ptr, None, vec![])
+                    .unwrap();
+                ctx.builder
+                    .convert_s_to_f(ctx.f32_type, None, value)
+                    .unwrap()
+            }
+        }
+        AttributeType::UnsignedScaled => {
+            if ctx.profile.support_scaled_attributes {
+                let ptr = ctx
+                    .builder
+                    .access_chain(ctx.input_f32_ptr, None, input_var, vec![idx_const])
+                    .unwrap();
+                ctx.builder
+                    .load(ctx.f32_type, None, ptr, None, vec![])
+                    .unwrap()
+            } else {
+                let ptr = ctx
+                    .builder
+                    .access_chain(ctx.input_u32_ptr, None, input_var, vec![idx_const])
+                    .unwrap();
+                let value = ctx
+                    .builder
+                    .load(ctx.u32_type, None, ptr, None, vec![])
+                    .unwrap();
+                ctx.builder
+                    .convert_u_to_f(ctx.f32_type, None, value)
+                    .unwrap()
+            }
+        }
+        AttributeType::Disabled => ctx.const_zero_f32,
     }
 }
 
@@ -390,12 +499,31 @@ pub fn emit_set_frag_color_inst(
 
     if let Some(&output_var) = ctx.output_vars.get(&rt) {
         let idx_const = ctx.builder.constant_bit32(ctx.u32_type, comp);
-        let output_f32_ptr = ctx.output_f32_ptr;
-        let ptr = ctx
-            .builder
-            .access_chain(output_f32_ptr, None, output_var, vec![idx_const])
-            .unwrap();
-        ctx.builder.store(ptr, val, None, vec![]).unwrap();
+        match ctx.runtime_info.frag_color_types[rt as usize] {
+            AttributeType::UnsignedInt => {
+                let ptr = ctx
+                    .builder
+                    .access_chain(ctx.output_u32_ptr, None, output_var, vec![idx_const])
+                    .unwrap();
+                let value = ctx.builder.bitcast(ctx.u32_type, None, val).unwrap();
+                ctx.builder.store(ptr, value, None, vec![]).unwrap();
+            }
+            AttributeType::SignedInt => {
+                let ptr = ctx
+                    .builder
+                    .access_chain(ctx.output_i32_ptr, None, output_var, vec![idx_const])
+                    .unwrap();
+                let value = ctx.builder.bitcast(ctx.i32_type, None, val).unwrap();
+                ctx.builder.store(ptr, value, None, vec![]).unwrap();
+            }
+            _ => {
+                let ptr = ctx
+                    .builder
+                    .access_chain(ctx.output_f32_ptr, None, output_var, vec![idx_const])
+                    .unwrap();
+                ctx.builder.store(ptr, val, None, vec![]).unwrap();
+            }
+        }
     }
 }
 

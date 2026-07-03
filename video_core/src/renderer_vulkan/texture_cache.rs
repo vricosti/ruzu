@@ -1804,6 +1804,49 @@ impl TextureCacheRuntime {
         supported.contains(usage)
     }
 
+    /// Port of `MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, ...)`.
+    ///
+    /// The static table gives the guest's preferred Vulkan format, but the
+    /// actual image/view format must be selected through the device's supported
+    /// alternatives. This matters on MoltenVK where D24S8 is not natively
+    /// supported and must resolve to D32S8 before image/view creation.
+    fn surface_format(&self, format: PixelFormat) -> vk::Format {
+        let format_info = maxwell_to_vk::surface_format(format);
+        let mut usage = vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::TRANSFER_DST
+            | vk::FormatFeatureFlags::TRANSFER_SRC;
+        if format_info.attachable {
+            usage |= match crate::surface::get_format_type(format) {
+                SurfaceType::ColorTexture => vk::FormatFeatureFlags::COLOR_ATTACHMENT,
+                SurfaceType::Depth | SurfaceType::Stencil | SurfaceType::DepthStencil => {
+                    vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
+                }
+                SurfaceType::Invalid => vk::FormatFeatureFlags::empty(),
+            };
+        }
+        if format_info.storage {
+            usage |= vk::FormatFeatureFlags::STORAGE_IMAGE;
+        }
+        self.supported_surface_format(format_info.format, usage, true)
+    }
+
+    fn supported_surface_format(
+        &self,
+        wanted_format: vk::Format,
+        wanted_usage: vk::FormatFeatureFlags,
+        optimal: bool,
+    ) -> vk::Format {
+        if self.is_format_supported(wanted_format, wanted_usage, optimal) {
+            return wanted_format;
+        }
+        for &format in surface_format_alternatives(wanted_format) {
+            if self.is_format_supported(format, wanted_usage, optimal) {
+                return format;
+            }
+        }
+        wanted_format
+    }
+
     fn needs_scale_helper(&self, _info: &ImageInfo, format: vk::Format) -> bool {
         // Upstream also checks `device.CantBlitMSAA()` here. The Rust runtime
         // currently owns only ash device handles, not the full Vulkan Device
@@ -2217,7 +2260,7 @@ impl TextureCacheRuntime {
         view_base: &ImageViewBase,
         image: &Image,
     ) -> Result<ImageView, vk::Result> {
-        let format = pixel_format_to_vk(view_base.format);
+        let format = self.surface_format(view_base.format);
         let aspect_mask = image_view_aspect_mask(view_base);
         let components = image_view_components(view_base);
         let base_range = make_subresource_range(aspect_mask, view_base.range, view_base.flags);
@@ -2598,6 +2641,10 @@ pub struct TextureCache {
     async_buffers_death_ring: Vec<StagingBuffer>,
 
     texture_decode_worker: ThreadWorker,
+    present_source_dumped: bool,
+    present_source_seen: u64,
+    image_dumped: bool,
+    image_dump_seen: u64,
 }
 
 impl TextureCache {
@@ -2643,6 +2690,10 @@ impl TextureCache {
             async_buffers: VecDeque::new(),
             async_buffers_death_ring: Vec::new(),
             texture_decode_worker: ThreadWorker::new_named(1, "TextureDecoder"),
+            present_source_dumped: false,
+            present_source_seen: 0,
+            image_dumped: false,
+            image_dump_seen: 0,
         }
     }
 
@@ -2741,7 +2792,7 @@ impl TextureCache {
                 }
                 let image_id = download_info.object_id;
                 let image_base = self.base.slot_images[image_id].clone();
-                let format = pixel_format_to_vk(image_base.info.format);
+                let format = self.runtime.surface_format(image_base.info.format);
                 let aspect = image_aspect_mask(image_base.info.format);
                 if aspect.is_empty()
                     || self
@@ -2919,7 +2970,7 @@ impl TextureCache {
         let copies = [copy];
         if is_upload {
             let image_base = self.base.slot_images[image_id].clone();
-            let format = pixel_format_to_vk(image_base.info.format);
+            let format = self.runtime.surface_format(image_base.info.format);
             let aspect = image_aspect_mask(image_base.info.format);
             if aspect.is_empty()
                 || self
@@ -3008,7 +3059,7 @@ impl TextureCache {
         }
 
         let image_base = self.base.slot_images[image_id].clone();
-        let format = pixel_format_to_vk(image_base.info.format);
+        let format = self.runtime.surface_format(image_base.info.format);
         let aspect = image_aspect_mask(image_base.info.format);
         if aspect.is_empty()
             || self
@@ -3125,7 +3176,7 @@ impl TextureCache {
         if staging_size == 0 {
             return None;
         }
-        let format = pixel_format_to_vk(image_base.info.format);
+        let format = self.runtime.surface_format(image_base.info.format);
         let aspect = image_aspect_mask(image_base.info.format);
         if aspect.is_empty()
             || self
@@ -3205,14 +3256,14 @@ impl TextureCache {
         let base_size = self.base.render_targets.size;
 
         let mut recreated = false;
-        let mut colors: Vec<(ImageViewId, vk::Format)> = Vec::new();
+        let mut colors: Vec<(usize, ImageViewId, vk::Format)> = Vec::new();
         let mut color_views: Vec<vk::ImageView> = Vec::new();
         let mut extent = vk::Extent2D {
             width: base_size.width.max(1),
             height: base_size.height.max(1),
         };
 
-        for &view_id in color_ids.iter() {
+        for (rt_index, &view_id) in color_ids.iter().enumerate() {
             if !view_id.is_valid() || view_id == NULL_IMAGE_VIEW_ID {
                 continue;
             }
@@ -3221,7 +3272,7 @@ impl TextureCache {
                 continue;
             }
             let image_base = self.base.slot_images[view.image_id].clone();
-            let format = pixel_format_to_vk(view.format);
+            let format = self.runtime.surface_format(view.format);
             let width = image_base.info.size.width.max(1);
             let height = image_base.info.size.height.max(1);
             recreated |= self
@@ -3250,7 +3301,7 @@ impl TextureCache {
                     view.range,
                 );
             }
-            colors.push((view_id, format));
+            colors.push((rt_index, view_id, format));
             color_views.push(view_handle);
         }
 
@@ -3265,7 +3316,7 @@ impl TextureCache {
                 gpu_memory.gpu_to_cpu_address_range(rt0.address, approx)
             })?;
             drop(gpu_memory);
-            let format = pixel_format_to_vk(
+            let format = self.runtime.surface_format(
                 crate::surface::pixel_format_from_render_target_format(rt0.format),
             );
             let width = rt0.width.max(1);
@@ -3287,7 +3338,7 @@ impl TextureCache {
                 .image_views
                 .get(&self.base.render_targets.color_buffer_ids[0])?
                 .render_target();
-            colors.push((self.base.render_targets.color_buffer_ids[0], format));
+            colors.push((0, self.base.render_targets.color_buffer_ids[0], format));
             color_views.push(view_handle);
         }
 
@@ -3297,7 +3348,7 @@ impl TextureCache {
             let view = self.base.slot_image_views[depth_id].clone();
             if view.image_id.is_valid() && view.image_id != NULL_IMAGE_ID {
                 let image_base = self.base.slot_images[view.image_id].clone();
-                let format = pixel_format_to_vk(view.format);
+                let format = self.runtime.surface_format(view.format);
                 let aspect = image_aspect_mask(view.format);
                 let width = image_base.info.size.width.max(1);
                 let height = image_base.info.size.height.max(1);
@@ -3312,7 +3363,7 @@ impl TextureCache {
             }
         }
 
-        let rt0_view_id = colors[0].0;
+        let rt0_view_id = colors[0].1;
         let rt0_image_id = self.base.slot_image_views[rt0_view_id].image_id;
         let rt0_cpu = self.base.slot_images[rt0_image_id].cpu_addr;
 
@@ -3341,16 +3392,20 @@ impl TextureCache {
         if !self.framebuffers_by_render_targets.contains_key(&key) {
             let mut rp_key = RenderPassKey::default();
             let max_colors = rp_key.color_formats.len();
-            for (i, (_, fmt)) in colors.iter().enumerate().take(max_colors) {
-                rp_key.color_formats[i] = *fmt;
+            let mut num_attachments = 0usize;
+            for (rt_index, _, fmt) in colors.iter().take(max_colors) {
+                if *rt_index < max_colors {
+                    rp_key.color_formats[*rt_index] = *fmt;
+                    num_attachments = num_attachments.max(*rt_index + 1);
+                }
             }
-            rp_key.num_color_attachments = colors.len().min(max_colors) as u8;
+            rp_key.num_color_attachments = num_attachments as u8;
             rp_key.depth_format = depth_format;
             rp_key.samples = vk::SampleCountFlags::TYPE_1;
             let render_pass = self.runtime.render_pass_cache().get(&rp_key).ok()?;
             let mut image_ids: Vec<ImageId> = colors
                 .iter()
-                .map(|(view_id, _)| self.base.slot_image_views[*view_id].image_id)
+                .map(|(_, view_id, _)| self.base.slot_image_views[*view_id].image_id)
                 .collect();
             if depth_view.is_some() && depth_id.is_valid() && depth_id != NULL_IMAGE_VIEW_ID {
                 image_ids.push(self.base.slot_image_views[depth_id].image_id);
@@ -3896,7 +3951,7 @@ impl TextureCache {
             return false;
         }
         let image_base = self.base.slot_images[image_id].clone();
-        let format = pixel_format_to_vk(image_base.info.format);
+        let format = self.runtime.surface_format(image_base.info.format);
         let aspect = image_aspect_mask(image_base.info.format);
         !aspect.is_empty()
             && self
@@ -4072,7 +4127,7 @@ impl TextureCache {
             return false;
         }
         let image_base = self.base.slot_images[image_id].clone();
-        let format = pixel_format_to_vk(image_base.info.format);
+        let format = self.runtime.surface_format(image_base.info.format);
         let aspect = image_aspect_mask(image_base.info.format);
         if aspect.is_empty()
             || self
@@ -4333,7 +4388,7 @@ impl TextureCache {
         }
         let image_base = self.base.slot_images[image_id].clone();
         let aspect = image_view_aspect_mask(&view_base);
-        let format = pixel_format_to_vk(view_base.format);
+        let format = self.runtime.surface_format(view_base.format);
         if aspect.is_empty()
             || self
                 .ensure_image(image_id, &image_base, format, aspect)
@@ -4841,7 +4896,7 @@ impl TextureCache {
             return false;
         }
         let image_base = self.base.slot_images[image_id].clone();
-        let format = pixel_format_to_vk(image_base.info.format);
+        let format = self.runtime.surface_format(image_base.info.format);
         let aspect = image_aspect_mask(image_base.info.format);
         if aspect.is_empty() {
             return false;
@@ -4905,6 +4960,25 @@ impl TextureCache {
             );
             return false;
         }
+        let trace_upload = std::env::var_os("RUZU_TRACE_VK_TEXTURE_UPLOAD").is_some();
+        if trace_upload {
+            let guest_nonzero = guest.iter().filter(|&&b| b != 0).count();
+            log::warn!(
+                "[VK_TEXTURE_UPLOAD] start image_id={} gpu=0x{:X} cpu=0x{:X} fmt={:?} type={:?} size={}x{}x{} guest_size={} staging_size={} flags={:?} guest_nonzero={}",
+                image_id.index,
+                image_base.gpu_addr,
+                image_base.cpu_addr,
+                image_base.info.format,
+                image_base.info.image_type,
+                image_base.info.size.width,
+                image_base.info.size.height,
+                image_base.info.size.depth,
+                guest_size,
+                staging_size,
+                image_base.flags,
+                guest_nonzero,
+            );
+        }
         if image_base.flags.contains(ImageFlagBits::ACCELERATED_UPLOAD) {
             if staging_size < guest.len() {
                 log::warn!(
@@ -4926,6 +5000,14 @@ impl TextureCache {
             let uploaded = self
                 .runtime
                 .accelerate_image_upload(&mut image, staging, &swizzles);
+            if trace_upload {
+                log::warn!(
+                    "[VK_TEXTURE_UPLOAD] accelerated image_id={} copies={} uploaded={}",
+                    image_id.index,
+                    swizzles.len(),
+                    uploaded,
+                );
+            }
             self.base.slot_images[image_id].flags = image.base.flags;
             self.base.slot_images[image_id].has_scaled = image.base.has_scaled;
             self.images.insert(image_id, image);
@@ -4957,6 +5039,15 @@ impl TextureCache {
                 &mut upload,
             )
         };
+        if trace_upload {
+            let upload_nonzero = upload.iter().filter(|&&b| b != 0).count();
+            log::warn!(
+                "[VK_TEXTURE_UPLOAD] staged image_id={} copies={} upload_nonzero={}",
+                image_id.index,
+                copies.len(),
+                upload_nonzero,
+            );
+        }
         unsafe {
             std::ptr::copy_nonoverlapping(upload.as_ptr(), staging.mapped, upload.len());
         }
@@ -4966,6 +5057,13 @@ impl TextureCache {
         image.base = self.base.slot_images[image_id].clone();
         let uploaded =
             image.upload_memory(&mut self.runtime, staging.buffer, staging.offset, &copies);
+        if trace_upload {
+            log::warn!(
+                "[VK_TEXTURE_UPLOAD] submitted image_id={} uploaded={}",
+                image_id.index,
+                uploaded,
+            );
+        }
         self.base.slot_images[image_id].flags = image.base.flags;
         self.base.slot_images[image_id].has_scaled = image.base.has_scaled;
         self.images.insert(image_id, image);
@@ -5041,7 +5139,7 @@ impl TextureCache {
 
             if self.base_image_exists(image_id) {
                 let base_image = self.base.slot_images[image_id].clone();
-                let format = pixel_format_to_vk(base_image.info.format);
+                let format = self.runtime.surface_format(base_image.info.format);
                 let aspect = image_aspect_mask(base_image.info.format);
                 let upload_ok = !aspect.is_empty()
                     && self
@@ -5264,7 +5362,7 @@ impl TextureCache {
             .ensure_image(
                 dst_id,
                 &dst_base,
-                pixel_format_to_vk(dst_base.info.format),
+                self.runtime.surface_format(dst_base.info.format),
                 dst_aspect,
             )
             .is_err()
@@ -5272,7 +5370,7 @@ impl TextureCache {
                 .ensure_image(
                     src_id,
                     &src_base,
-                    pixel_format_to_vk(src_base.info.format),
+                    self.runtime.surface_format(src_base.info.format),
                     src_aspect,
                 )
                 .is_err()
@@ -5571,6 +5669,112 @@ impl TextureCache {
                 target.exchange_initialization();
             }
         }
+        self.dump_present_source_if_requested(cpu_addr, image_id);
+    }
+
+    pub fn dump_image_if_requested(&mut self) {
+        if self.image_dumped {
+            return;
+        }
+        let Some(path) = std::env::var_os("RUZU_DUMP_VK_IMAGE_FRAME") else {
+            return;
+        };
+        let Some(image_id) = std::env::var("RUZU_DUMP_VK_IMAGE_ID")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(|index| ImageId { index })
+        else {
+            return;
+        };
+        self.image_dump_seen = self.image_dump_seen.saturating_add(1);
+        let target_seen = std::env::var("RUZU_DUMP_VK_IMAGE_AT")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1);
+        if self.image_dump_seen < target_seen {
+            return;
+        }
+        let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        if let Err(err) = write_rgba_like_ppm(
+            &path,
+            &bytes,
+            image_base.info.size.width.max(1),
+            image_base.info.size.height.max(1),
+        ) {
+            log::warn!(
+                "TextureCacheVulkan: failed to dump image_id={} to {}: {}",
+                image_id.index,
+                path.display(),
+                err
+            );
+            return;
+        }
+        self.image_dumped = true;
+        log::info!(
+            "[VK_IMAGE_DUMP] dumped image_id={} {}x{} format={:?} bytes={} to {}",
+            image_id.index,
+            image_base.info.size.width,
+            image_base.info.size.height,
+            image_base.info.format,
+            bytes.len(),
+            path.display()
+        );
+    }
+
+    fn dump_present_source_if_requested(&mut self, cpu_addr: u64, image_id: ImageId) {
+        if self.present_source_dumped {
+            return;
+        }
+        let Some(path) = std::env::var_os("RUZU_DUMP_VK_PRESENT_SOURCE_FRAME") else {
+            return;
+        };
+        self.present_source_seen = self.present_source_seen.saturating_add(1);
+        let target_present = std::env::var("RUZU_DUMP_VK_PRESENT_SOURCE_AT")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1);
+        if self.present_source_seen < target_present {
+            return;
+        }
+        let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) else {
+            log::warn!(
+                "[VK_PRESENT_SOURCE] dump failed addr=0x{:X} image_id={}",
+                cpu_addr,
+                image_id.index
+            );
+            self.present_source_dumped = true;
+            return;
+        };
+        let width = image_base.info.size.width.max(1);
+        let height = image_base.info.size.height.max(1);
+        let path = std::path::PathBuf::from(path);
+        match write_rgba_like_ppm(&path, &bytes, width, height) {
+            Ok(()) => {
+                log::info!(
+                    "[VK_PRESENT_SOURCE] dumped source addr=0x{:X} image_id={} {}x{} format={:?} bytes={} to {}",
+                    cpu_addr,
+                    image_id.index,
+                    width,
+                    height,
+                    image_base.info.format,
+                    bytes.len(),
+                    path.display()
+                );
+            }
+            Err(err) => {
+                log::warn!(
+                    "[VK_PRESENT_SOURCE] dump write failed addr=0x{:X} image_id={} path={} err={}",
+                    cpu_addr,
+                    image_id.index,
+                    path.display(),
+                    err
+                );
+            }
+        }
+        self.present_source_dumped = true;
     }
 
     pub fn rt0_image_info(
@@ -5682,7 +5886,9 @@ impl TextureCache {
             return Some(self.image_views.get(&view_id)?.depth_view);
         }
         let image_handle = self.image_views.get(&view_id)?.image_handle();
-        let format = pixel_format_to_vk(self.image_views.get(&view_id)?.base.format);
+        let format = self
+            .runtime
+            .surface_format(self.image_views.get(&view_id)?.base.format);
         let view = self
             .runtime
             .make_aux_image_view(
@@ -5703,7 +5909,9 @@ impl TextureCache {
             return Some(self.image_views.get(&view_id)?.stencil_view);
         }
         let image_handle = self.image_views.get(&view_id)?.image_handle();
-        let format = pixel_format_to_vk(self.image_views.get(&view_id)?.base.format);
+        let format = self
+            .runtime
+            .surface_format(self.image_views.get(&view_id)?.base.format);
         let view = self
             .runtime
             .make_aux_image_view(
@@ -5843,7 +6051,7 @@ impl TextureCache {
         {
             return None;
         }
-        let format = pixel_format_to_vk(image_base.info.format);
+        let format = self.runtime.surface_format(image_base.info.format);
         let aspect = image_aspect_mask(image_base.info.format);
         if aspect.is_empty() {
             return None;
@@ -6098,6 +6306,31 @@ fn pixel_format_to_vk(format: PixelFormat) -> vk::Format {
         PixelFormat::S8UintD24Unorm => vk::Format::D24_UNORM_S8_UINT,
         PixelFormat::D32FloatS8Uint => vk::Format::D32_SFLOAT_S8_UINT,
         _ => vk::Format::R8G8B8A8_UNORM,
+    }
+}
+
+fn surface_format_alternatives(format: vk::Format) -> &'static [vk::Format] {
+    match format {
+        vk::Format::S8_UINT => &[
+            vk::Format::D16_UNORM_S8_UINT,
+            vk::Format::D24_UNORM_S8_UINT,
+            vk::Format::D32_SFLOAT_S8_UINT,
+        ],
+        vk::Format::D24_UNORM_S8_UINT => &[
+            vk::Format::D32_SFLOAT_S8_UINT,
+            vk::Format::D16_UNORM_S8_UINT,
+        ],
+        vk::Format::D16_UNORM_S8_UINT => &[
+            vk::Format::D24_UNORM_S8_UINT,
+            vk::Format::D32_SFLOAT_S8_UINT,
+        ],
+        vk::Format::R5G6B5_UNORM_PACK16 => &[vk::Format::R5G6B5_UNORM_PACK16],
+        vk::Format::R16G16B16_SFLOAT => &[vk::Format::R16G16B16A16_SFLOAT],
+        vk::Format::R16G16B16_SSCALED => &[vk::Format::R16G16B16A16_SSCALED],
+        vk::Format::R8G8B8_SSCALED => &[vk::Format::R8G8B8A8_SSCALED],
+        vk::Format::R32G32B32_SFLOAT => &[vk::Format::R32G32B32A32_SFLOAT],
+        vk::Format::A4B4G4R4_UNORM_PACK16_EXT => &[vk::Format::R4G4B4A4_UNORM_PACK16],
+        _ => &[],
     }
 }
 
@@ -6911,6 +7144,32 @@ fn image_aspect_mask(format: PixelFormat) -> vk::ImageAspectFlags {
         SurfaceType::DepthStencil => vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
         SurfaceType::Invalid => vk::ImageAspectFlags::empty(),
     }
+}
+
+fn write_rgba_like_ppm(
+    path: &std::path::Path,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let pixel_count = width as usize * height as usize;
+    let required_len = pixel_count * 4;
+    if rgba.len() < required_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "RGBA-like buffer is smaller than framebuffer dimensions",
+        ));
+    }
+
+    let mut output =
+        Vec::with_capacity(format!("P6\n{} {}\n255\n", width, height).len() + pixel_count * 3);
+    write!(&mut output, "P6\n{} {}\n255\n", width, height)?;
+    for pixel in rgba[..required_len].chunks_exact(4) {
+        output.extend_from_slice(&pixel[..3]);
+    }
+    std::fs::write(path, output)
 }
 
 fn image_view_aspect_mask(

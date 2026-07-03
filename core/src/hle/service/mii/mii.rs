@@ -1125,6 +1125,11 @@ impl IStaticService {
         }
     }
 
+    /// Port of upstream `IStaticService::GetMiiManager()`.
+    pub fn get_mii_manager(&self) -> Arc<Mutex<MiiManager>> {
+        Arc::clone(&self.manager)
+    }
+
     fn push_interface_response(
         ctx: &mut HLERequestContext,
         object: Arc<dyn SessionRequestHandler>,

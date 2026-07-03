@@ -713,7 +713,9 @@ impl Gpu {
 
     /// Notify shutdown.
     pub fn notify_shutdown(&self) {
+        let _lock = self.sync_requests.lock().unwrap();
         self.shutting_down.store(true, Ordering::Relaxed);
+        self.sync_request_cv.notify_all();
     }
 
     /// Push GPU command entries to be processed.
@@ -1205,6 +1207,10 @@ impl GpuCoreInterface for Gpu {
             })
             .collect();
         self.request_composite_with_fences(layers, fences);
+    }
+
+    fn notify_shutdown(&self) {
+        Gpu::notify_shutdown(self);
     }
 
     fn on_cpu_write(&self, addr: u64, size: u64) -> bool {

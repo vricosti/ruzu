@@ -16,6 +16,9 @@ use std::time::Instant;
 use crate::engines::maxwell_3d::{DrawCall, ShaderStageType, VertexAttribSize, VertexAttribType};
 use crate::shader;
 use crate::shader_cache::{GraphicsEnvironments, NUM_PROGRAMS};
+use crate::surface::{
+    is_pixel_format_integer, is_pixel_format_signed_integer, pixel_format_from_render_target_format,
+};
 use shader_recompiler::backend::bindings::Bindings;
 use shader_recompiler::host_translate_info::HostTranslateInfo;
 use shader_recompiler::runtime_info::AttributeType;
@@ -188,8 +191,8 @@ impl GraphicsPipelineCache {
         fixed_state.set_extended_dynamic_state(self.extended_dynamic_state_supported);
         fixed_state.set_extended_dynamic_state_2(self.extended_dynamic_state2_supported);
 
-        let vs_compiled = self.compile_vertex_shader(draw, read_gpu)?;
-        let fs_compiled = self.compile_fragment_shader(draw, read_gpu);
+        let vs_compiled = self.compile_vertex_shader(draw, &fixed_state, read_gpu)?;
+        let fs_compiled = self.compile_fragment_shader(draw, &fixed_state, read_gpu);
 
         let vs_hash = hash_spirv(&vs_compiled.spirv_words);
         let fs_hash = fs_compiled
@@ -237,8 +240,8 @@ impl GraphicsPipelineCache {
         key: &GraphicsPipelineKey,
         fixed_state: &FixedPipelineState,
     ) -> Option<GraphicsPipeline> {
-        let vs_compiled = self.compile_vertex_shader(draw, read_gpu)?;
-        let fs_compiled = self.compile_fragment_shader(draw, read_gpu);
+        let vs_compiled = self.compile_vertex_shader(draw, fixed_state, read_gpu)?;
+        let fs_compiled = self.compile_fragment_shader(draw, fixed_state, read_gpu);
 
         // Create shader modules
         let vs_module = self.create_shader_module(&vs_compiled.spirv_words)?;
@@ -314,7 +317,7 @@ impl GraphicsPipelineCache {
         } else {
             return None;
         };
-        let vertex_runtime_info = make_runtime_info(draw, ShaderStage::VertexB, None);
+        let vertex_runtime_info = make_runtime_info(draw, fixed_state, ShaderStage::VertexB, None);
         let vs_compiled = self.compile_stage_from_environment(
             environments,
             vertex_stage,
@@ -322,8 +325,12 @@ impl GraphicsPipelineCache {
             &vertex_runtime_info,
         )?;
         let fs_compiled = if environment_has_stage(environments, 5) {
-            let fragment_runtime_info =
-                make_runtime_info(draw, ShaderStage::Fragment, Some(&vs_compiled.info));
+            let fragment_runtime_info = make_runtime_info(
+                draw,
+                fixed_state,
+                ShaderStage::Fragment,
+                Some(&vs_compiled.info),
+            );
             self.compile_stage_from_environment(
                 environments,
                 5,
@@ -461,6 +468,7 @@ impl GraphicsPipelineCache {
     fn compile_vertex_shader(
         &mut self,
         draw: &DrawCall,
+        fixed_state: &FixedPipelineState,
         read_gpu: &dyn Fn(u64, &mut [u8]),
     ) -> Option<CompiledShader> {
         let stage_info = &draw.shader_stages[1]; // VertexB = index 1
@@ -474,7 +482,7 @@ impl GraphicsPipelineCache {
             return None;
         }
 
-        let runtime_info = make_runtime_info(draw, ShaderStage::VertexB, None);
+        let runtime_info = make_runtime_info(draw, fixed_state, ShaderStage::VertexB, None);
         let compiled = self
             .shader_cache
             .get_or_compile(&code, ShaderStage::VertexB, &runtime_info);
@@ -484,6 +492,7 @@ impl GraphicsPipelineCache {
     fn compile_fragment_shader(
         &mut self,
         draw: &DrawCall,
+        fixed_state: &FixedPipelineState,
         read_gpu: &dyn Fn(u64, &mut [u8]),
     ) -> Option<CompiledShader> {
         let stage_info = &draw.shader_stages[5]; // Fragment = index 5
@@ -497,7 +506,7 @@ impl GraphicsPipelineCache {
             return None;
         }
 
-        let runtime_info = make_runtime_info(draw, ShaderStage::Fragment, None);
+        let runtime_info = make_runtime_info(draw, fixed_state, ShaderStage::Fragment, None);
         let compiled =
             self.shader_cache
                 .get_or_compile(&code, ShaderStage::Fragment, &runtime_info);
@@ -689,25 +698,41 @@ impl GraphicsPipelineCache {
             .stencil_test_enable(draw.depth_stencil.stencil_enable)
             .build();
 
-        let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
-            .blend_enable(draw.blend[0].enabled)
-            .src_color_blend_factor(super::map_blend_factor(draw.blend[0].color_src))
-            .dst_color_blend_factor(super::map_blend_factor(draw.blend[0].color_dst))
-            .color_blend_op(super::map_blend_equation(draw.blend[0].color_op))
-            .src_alpha_blend_factor(super::map_blend_factor(draw.blend[0].alpha_src))
-            .dst_alpha_blend_factor(super::map_blend_factor(draw.blend[0].alpha_dst))
-            .alpha_blend_op(super::map_blend_equation(draw.blend[0].alpha_op))
-            .color_write_mask(
-                vk::ColorComponentFlags::R
-                    | vk::ColorComponentFlags::G
-                    | vk::ColorComponentFlags::B
-                    | vk::ColorComponentFlags::A,
-            )
-            .build();
+        let num_attachments = draw.rt_control.count.clamp(1, 8) as usize;
+        let blend_attachments = (0..num_attachments)
+            .map(|index| {
+                let blend = draw.blend[index];
+                let mask = draw.color_masks[index];
+                let mut write_mask = vk::ColorComponentFlags::empty();
+                if mask.r {
+                    write_mask |= vk::ColorComponentFlags::R;
+                }
+                if mask.g {
+                    write_mask |= vk::ColorComponentFlags::G;
+                }
+                if mask.b {
+                    write_mask |= vk::ColorComponentFlags::B;
+                }
+                if mask.a {
+                    write_mask |= vk::ColorComponentFlags::A;
+                }
+                vk::PipelineColorBlendAttachmentState::builder()
+                    .blend_enable(blend.enabled)
+                    .src_color_blend_factor(super::map_blend_factor(blend.color_src))
+                    .dst_color_blend_factor(super::map_blend_factor(blend.color_dst))
+                    .color_blend_op(super::map_blend_equation(blend.color_op))
+                    .src_alpha_blend_factor(super::map_blend_factor(blend.alpha_src))
+                    .dst_alpha_blend_factor(super::map_blend_factor(blend.alpha_dst))
+                    .alpha_blend_op(super::map_blend_equation(blend.alpha_op))
+                    .color_write_mask(write_mask)
+                    .build()
+            })
+            .collect::<Vec<_>>();
 
         let color_blend = vk::PipelineColorBlendStateCreateInfo::builder()
-            .logic_op_enable(false)
-            .attachments(std::slice::from_ref(&blend_attachment))
+            .logic_op_enable(draw.logic_op.enabled)
+            .logic_op(vk::LogicOp::from_raw(draw.logic_op.op as i32))
+            .attachments(&blend_attachments)
             .blend_constants([
                 draw.blend_color.r,
                 draw.blend_color.g,
@@ -960,6 +985,7 @@ fn descriptor_bank_info(bindings: &[GraphicsDescriptorBinding]) -> DescriptorBan
 /// Port-facing subset of upstream `MakeRuntimeInfo`.
 fn make_runtime_info(
     draw: &DrawCall,
+    fixed_state: &FixedPipelineState,
     stage: ShaderStage,
     previous_program: Option<&ShaderInfo>,
 ) -> RuntimeInfo {
@@ -971,8 +997,24 @@ fn make_runtime_info(
         info.previous_stage_stores.mask.fill(u64::MAX);
     }
     if stage == ShaderStage::VertexB {
+        info.convert_depth_mode = fixed_state.ndc_minus_one_to_one();
         for (index, attrib) in draw.vertex_attribs.iter().take(32).enumerate() {
             info.generic_input_types[index] = cast_attribute_type(attrib);
+        }
+    } else if stage == ShaderStage::Fragment {
+        for (index, rt) in draw.render_targets.iter().take(8).enumerate() {
+            if rt.format == 0 {
+                info.frag_color_types[index] = AttributeType::Float;
+                continue;
+            }
+            let pixel_format = pixel_format_from_render_target_format(rt.format);
+            info.frag_color_types[index] = if is_pixel_format_signed_integer(pixel_format) {
+                AttributeType::SignedInt
+            } else if is_pixel_format_integer(pixel_format) {
+                AttributeType::UnsignedInt
+            } else {
+                AttributeType::Float
+            };
         }
     }
     info
@@ -1238,5 +1280,66 @@ mod tests {
             true,
             true,
         ));
+    }
+
+    #[test]
+    fn runtime_info_convert_depth_mode_tracks_fixed_pipeline_ndc_mode() {
+        let draw = DrawCall {
+            topology: crate::engines::maxwell_3d::PrimitiveTopology::Triangles,
+            vertex_first: 0,
+            vertex_count: 0,
+            indexed: false,
+            index_buffer_addr: 0,
+            index_buffer_count: 0,
+            index_buffer_first: 0,
+            index_format: crate::engines::maxwell_3d::IndexFormat::UnsignedShort,
+            vertex_streams: Vec::new(),
+            vertex_stream_limits: Default::default(),
+            viewports: [crate::engines::maxwell_3d::ViewportInfo::default();
+                crate::engines::maxwell_3d::NUM_VIEWPORTS],
+            viewport_transforms: Default::default(),
+            scissors: [crate::engines::maxwell_3d::ScissorInfo::default();
+                crate::engines::maxwell_3d::NUM_VIEWPORTS],
+            viewport_scale_offset_enabled: false,
+            window_origin_lower_left: false,
+            window_origin_flip_y: false,
+            surface_clip: Default::default(),
+            blend: [crate::engines::maxwell_3d::BlendInfo::default(); 8],
+            blend_color: Default::default(),
+            depth_stencil: Default::default(),
+            rasterizer: Default::default(),
+            rasterize_enable: true,
+            primitive_restart: Default::default(),
+            logic_op: Default::default(),
+            depth_clamp_enabled: false,
+            program_base_address: 0,
+            cb_bindings: Default::default(),
+            vertex_attribs: Vec::new(),
+            shader_stages: Default::default(),
+            color_masks: Default::default(),
+            rt_control: Default::default(),
+            tex_header_pool_addr: 0,
+            tex_header_pool_limit: 0,
+            tex_sampler_pool_addr: 0,
+            tex_sampler_pool_limit: 0,
+            instance_count: 1,
+            base_instance: 0,
+            base_vertex: 0,
+            inline_index_data: Vec::new(),
+            sampler_binding: crate::engines::maxwell_3d::SamplerBinding::Independently,
+            render_targets: Default::default(),
+            zeta: Default::default(),
+            dirty_flags: [false; 256],
+        };
+        let mut fixed_state = FixedPipelineState::default();
+        fixed_state.set_ndc_minus_one_to_one(true);
+        assert!(
+            make_runtime_info(&draw, &fixed_state, ShaderStage::VertexB, None).convert_depth_mode
+        );
+
+        fixed_state.set_ndc_minus_one_to_one(false);
+        assert!(
+            !make_runtime_info(&draw, &fixed_state, ShaderStage::VertexB, None).convert_depth_mode
+        );
     }
 }

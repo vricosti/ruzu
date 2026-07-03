@@ -16,7 +16,7 @@ use crate::ir;
 use crate::ir::program::ShaderInfo;
 use crate::ir::types::ShaderStage;
 use crate::profile::Profile;
-use crate::runtime_info::RuntimeInfo;
+use crate::runtime_info::{AttributeType, RuntimeInfo};
 
 /// SPIR-V emission context.
 ///
@@ -35,6 +35,7 @@ pub struct SpirvEmitContext {
     pub u32_vec2_type: spirv::Word,
     pub u32_vec3_type: spirv::Word,
     pub u32_vec4_type: spirv::Word,
+    pub i32_vec4_type: spirv::Word,
     pub f32_vec2_type: spirv::Word,
     pub f32_vec3_type: spirv::Word,
     pub f32_vec4_type: spirv::Word,
@@ -47,8 +48,11 @@ pub struct SpirvEmitContext {
     pub output_f32_ptr: spirv::Word,
     pub uniform_u32_ptr: spirv::Word,
     pub input_u32_ptr: spirv::Word,
+    pub input_i32_ptr: spirv::Word,
     pub output_u32_ptr: spirv::Word,
+    pub output_i32_ptr: spirv::Word,
     pub uniform_f32_ptr: spirv::Word,
+    pub uniform_u32_vec4_ptr: spirv::Word,
 
     // ── Cached constants ──────────────────────────────────────────────
     pub const_zero_u32: spirv::Word,
@@ -83,6 +87,7 @@ pub struct SpirvEmitContext {
     pub front_face: spirv::Word,
     pub point_coord: spirv::Word,
     pub tess_coord: spirv::Word,
+    pub input_position: spirv::Word,
 
     // ── Rescaling / render area push constants ───────────────────────
     pub rescaling_uniform_constant: spirv::Word,
@@ -96,6 +101,10 @@ pub struct SpirvEmitContext {
     pub cbuf_vars: HashMap<u32, spirv::Word>,
     /// Texture combined image sampler variables, indexed by descriptor index.
     pub texture_vars: HashMap<u32, spirv::Word>,
+    /// Storage buffer variables, indexed by compact SSBO descriptor index.
+    pub ssbo_vars: HashMap<u32, spirv::Word>,
+    /// Pointer to a u32 element inside an SSBO runtime array.
+    pub storage_u32_ptr: spirv::Word,
     /// Input variables (vertex attributes / fragment varyings).
     pub input_vars: HashMap<u32, spirv::Word>,
     /// Output variables (vertex outputs / fragment colors).
@@ -110,6 +119,8 @@ pub struct SpirvEmitContext {
     // ── Value mapping ─────────────────────────────────────────────────
     /// Maps IR instruction references (block, inst) to SPIR-V result IDs.
     pub values: HashMap<(u32, u32), spirv::Word>,
+    /// Maps IR block indices to SPIR-V label IDs.
+    pub block_labels: Vec<spirv::Word>,
 }
 
 impl SpirvEmitContext {
@@ -153,6 +164,7 @@ impl SpirvEmitContext {
         if profile.support_demote_to_helper_invocation {
             builder.capability(spirv::Capability::DemoteToHelperInvocation);
         }
+        builder.capability(spirv::Capability::DrawParameters);
         builder.capability(spirv::Capability::ImageQuery);
         builder.capability(spirv::Capability::Sampled1D);
         builder.capability(spirv::Capability::SampledCubeArray);
@@ -172,13 +184,24 @@ impl SpirvEmitContext {
         let u32_vec2_type = builder.type_vector(u32_type, 2);
         let u32_vec3_type = builder.type_vector(u32_type, 3);
         let u32_vec4_type = builder.type_vector(u32_type, 4);
+        let i32_vec4_type = builder.type_vector(i32_type, 4);
         let f32_vec2_type = builder.type_vector(f32_type, 2);
         let f32_vec3_type = builder.type_vector(f32_type, 3);
         let f32_vec4_type = builder.type_vector(f32_type, 4);
 
-        // 64-bit types
-        let u64_type = builder.type_int(64, 0);
-        let f64_type = builder.type_float(64);
+        // Upstream only defines 64-bit scalar types when the program uses
+        // them. Declaring OpTypeInt/OpTypeFloat 64 without the corresponding
+        // capability makes otherwise 32-bit shaders invalid SPIR-V.
+        let u64_type = if program.info.uses_int64 && profile.support_int64 {
+            builder.type_int(64, 0)
+        } else {
+            u32_type
+        };
+        let f64_type = if program.info.uses_fp64 {
+            builder.type_float(64)
+        } else {
+            f32_type
+        };
 
         // Function type: void(void)
         let void_fn_type = builder.type_function(void_type, vec![]);
@@ -187,9 +210,15 @@ impl SpirvEmitContext {
         let input_f32_ptr = builder.type_pointer(None, spirv::StorageClass::Input, f32_type);
         let output_f32_ptr = builder.type_pointer(None, spirv::StorageClass::Output, f32_type);
         let input_u32_ptr = builder.type_pointer(None, spirv::StorageClass::Input, u32_type);
+        let input_i32_ptr = builder.type_pointer(None, spirv::StorageClass::Input, i32_type);
         let output_u32_ptr = builder.type_pointer(None, spirv::StorageClass::Output, u32_type);
+        let output_i32_ptr = builder.type_pointer(None, spirv::StorageClass::Output, i32_type);
         let uniform_u32_ptr = builder.type_pointer(None, spirv::StorageClass::Uniform, u32_type);
         let uniform_f32_ptr = builder.type_pointer(None, spirv::StorageClass::Uniform, f32_type);
+        let uniform_u32_vec4_ptr =
+            builder.type_pointer(None, spirv::StorageClass::Uniform, u32_vec4_type);
+        let storage_u32_ptr =
+            builder.type_pointer(None, spirv::StorageClass::StorageBuffer, u32_type);
 
         // Define constants
         let const_zero_u32 = builder.constant_bit32(u32_type, 0);
@@ -222,6 +251,7 @@ impl SpirvEmitContext {
             front_face: 0,
             point_coord: 0,
             tess_coord: 0,
+            input_position: 0,
             rescaling_uniform_constant: 0,
             rescaling_push_constants: 0,
             rescaling_downfactor_member_index: 0,
@@ -235,6 +265,7 @@ impl SpirvEmitContext {
             u32_vec2_type,
             u32_vec3_type,
             u32_vec4_type,
+            i32_vec4_type,
             f32_vec2_type,
             f32_vec3_type,
             f32_vec4_type,
@@ -245,8 +276,11 @@ impl SpirvEmitContext {
             output_f32_ptr,
             uniform_u32_ptr,
             input_u32_ptr,
+            input_i32_ptr,
             output_u32_ptr,
+            output_i32_ptr,
             uniform_f32_ptr,
+            uniform_u32_vec4_ptr,
             const_zero_u32,
             const_one_u32,
             const_zero_f32,
@@ -256,10 +290,13 @@ impl SpirvEmitContext {
             glsl_ext,
             cbuf_vars: HashMap::new(),
             texture_vars: HashMap::new(),
+            ssbo_vars: HashMap::new(),
+            storage_u32_ptr,
             input_vars: HashMap::new(),
             output_vars: HashMap::new(),
             interfaces: Vec::new(),
             values: HashMap::new(),
+            block_labels: Vec::new(),
         }
     }
 
@@ -287,10 +324,34 @@ impl SpirvEmitContext {
             ShaderStage::VertexB | ShaderStage::Fragment => {
                 for i in 0..32u32 {
                     if info.loads.generic_any(i as usize) {
+                        let input_type = self.runtime_info.generic_input_types[i as usize];
+                        if input_type == AttributeType::Disabled {
+                            continue;
+                        }
+                        let vector_type = match input_type {
+                            AttributeType::Float => self.f32_vec4_type,
+                            AttributeType::SignedInt => self.i32_vec4_type,
+                            AttributeType::UnsignedInt => self.u32_vec4_type,
+                            AttributeType::SignedScaled => {
+                                if self.profile.support_scaled_attributes {
+                                    self.f32_vec4_type
+                                } else {
+                                    self.i32_vec4_type
+                                }
+                            }
+                            AttributeType::UnsignedScaled => {
+                                if self.profile.support_scaled_attributes {
+                                    self.f32_vec4_type
+                                } else {
+                                    self.u32_vec4_type
+                                }
+                            }
+                            AttributeType::Disabled => unreachable!(),
+                        };
                         let vec4_ptr = self.builder.type_pointer(
                             None,
                             spirv::StorageClass::Input,
-                            self.f32_vec4_type,
+                            vector_type,
                         );
                         let var =
                             self.builder
@@ -354,21 +415,29 @@ impl SpirvEmitContext {
                 }
             }
             ShaderStage::Fragment => {
-                let vec4_ptr = self.builder.type_pointer(
-                    None,
-                    spirv::StorageClass::Output,
-                    self.f32_vec4_type,
-                );
-                let var = self
-                    .builder
-                    .variable(vec4_ptr, None, spirv::StorageClass::Output, None);
-                self.builder.decorate(
-                    var,
-                    spirv::Decoration::Location,
-                    vec![Operand::LiteralBit32(0)],
-                );
-                self.output_vars.insert(0, var);
-                self.interfaces.push(var);
+                for (index, &stores) in info.stores_frag_color.iter().enumerate() {
+                    if !stores && !self.profile.need_declared_frag_colors {
+                        continue;
+                    }
+                    let output_type = match self.runtime_info.frag_color_types[index] {
+                        AttributeType::UnsignedInt => self.u32_vec4_type,
+                        AttributeType::SignedInt => self.i32_vec4_type,
+                        _ => self.f32_vec4_type,
+                    };
+                    let vec4_ptr =
+                        self.builder
+                            .type_pointer(None, spirv::StorageClass::Output, output_type);
+                    let var =
+                        self.builder
+                            .variable(vec4_ptr, None, spirv::StorageClass::Output, None);
+                    self.builder.decorate(
+                        var,
+                        spirv::Decoration::Location,
+                        vec![Operand::LiteralBit32(index as u32)],
+                    );
+                    self.output_vars.insert(index as u32, var);
+                    self.interfaces.push(var);
+                }
             }
             _ => {}
         }
@@ -380,13 +449,13 @@ impl SpirvEmitContext {
             } else {
                 &mut bindings.uniform_buffer
             };
-            let array_len = 4096u32; // 0x10000 bytes / 4 = 4096 u32s
+            let array_len = 4096u32; // 0x10000 bytes / 16 = 4096 uvec4s
             let array_len_const = self.builder.constant_bit32(self.u32_type, array_len);
-            let array_type = self.builder.type_array(self.u32_type, array_len_const);
+            let array_type = self.builder.type_array(self.u32_vec4_type, array_len_const);
             self.builder.decorate(
                 array_type,
                 spirv::Decoration::ArrayStride,
-                vec![Operand::LiteralBit32(4)],
+                vec![Operand::LiteralBit32(16)],
             );
 
             let struct_type = self.builder.type_struct(vec![array_type]);
@@ -423,6 +492,66 @@ impl SpirvEmitContext {
                 self.interfaces.push(var);
             }
             *binding += 1;
+        }
+
+        // Storage buffers (SSBOs). This mirrors upstream's non-descriptor-
+        // aliasing storage path: one `uint[]` block per compact descriptor,
+        // consumed by LoadStorage32/64/128 in emit_spirv_memory.rs.
+        if !info.storage_buffers_descriptors.is_empty() {
+            self.builder
+                .extension("SPV_KHR_storage_buffer_storage_class");
+            let array_type = self.builder.type_runtime_array(self.u32_type);
+            self.builder.decorate(
+                array_type,
+                spirv::Decoration::ArrayStride,
+                vec![Operand::LiteralBit32(4)],
+            );
+
+            let struct_type = self.builder.type_struct(vec![array_type]);
+            self.builder
+                .decorate(struct_type, spirv::Decoration::Block, vec![]);
+            self.builder.member_decorate(
+                struct_type,
+                0,
+                spirv::Decoration::Offset,
+                vec![Operand::LiteralBit32(0)],
+            );
+            let ptr_type =
+                self.builder
+                    .type_pointer(None, spirv::StorageClass::StorageBuffer, struct_type);
+
+            let binding_counter = if self.profile.unified_descriptor_binding {
+                &mut bindings.unified
+            } else {
+                &mut bindings.storage_buffer
+            };
+            let mut descriptor_index = 0u32;
+            for desc in &info.storage_buffers_descriptors {
+                for _ in 0..desc.count {
+                    let var = self.builder.variable(
+                        ptr_type,
+                        None,
+                        spirv::StorageClass::StorageBuffer,
+                        None,
+                    );
+                    self.builder.decorate(
+                        var,
+                        spirv::Decoration::DescriptorSet,
+                        vec![Operand::LiteralBit32(0)],
+                    );
+                    self.builder.decorate(
+                        var,
+                        spirv::Decoration::Binding,
+                        vec![Operand::LiteralBit32(*binding_counter)],
+                    );
+                    self.ssbo_vars.insert(descriptor_index, var);
+                    if self.profile.supported_spirv >= 0x0001_0400 {
+                        self.interfaces.push(var);
+                    }
+                    descriptor_index += 1;
+                    *binding_counter += 1;
+                }
+            }
         }
 
         // Textures (combined image samplers)
@@ -601,6 +730,14 @@ impl SpirvEmitContext {
         if info.loads.get(IrAttribute::DRAW_ID.0 as usize) {
             self.draw_index = self.define_builtin_u32_input(spirv::BuiltIn::DrawIndex);
         }
+        if info.loads.any_component(IrAttribute::POSITION_X.0 as usize) {
+            let built_in = if self.stage == ShaderStage::Fragment {
+                spirv::BuiltIn::FragCoord
+            } else {
+                spirv::BuiltIn::Position
+            };
+            self.input_position = self.define_builtin_f32_vec4_input(built_in);
+        }
         if info.loads.get(IrAttribute::FRONT_FACE.0 as usize) {
             let ptr_type =
                 self.builder
@@ -671,6 +808,22 @@ impl SpirvEmitContext {
         let ptr_type =
             self.builder
                 .type_pointer(None, spirv::StorageClass::Input, self.f32_vec3_type);
+        let var = self
+            .builder
+            .variable(ptr_type, None, spirv::StorageClass::Input, None);
+        self.builder.decorate(
+            var,
+            spirv::Decoration::BuiltIn,
+            vec![Operand::BuiltIn(built_in)],
+        );
+        self.interfaces.push(var);
+        var
+    }
+
+    fn define_builtin_f32_vec4_input(&mut self, built_in: spirv::BuiltIn) -> spirv::Word {
+        let ptr_type =
+            self.builder
+                .type_pointer(None, spirv::StorageClass::Input, self.f32_vec4_type);
         let var = self
             .builder
             .variable(ptr_type, None, spirv::StorageClass::Input, None);
@@ -790,6 +943,67 @@ impl SpirvEmitContext {
         }
     }
 
+    fn phi_type_id(&self, inst: &ir::Inst) -> spirv::Word {
+        use crate::ir::types::Type;
+        match inst.flags {
+            x if x == Type::U1 as u32 => self.bool_type,
+            x if x == Type::U8 as u32 || x == Type::U16 as u32 || x == Type::U32 as u32 => {
+                self.u32_type
+            }
+            x if x == Type::U64 as u32 => self.u64_type,
+            x if x == Type::F32 as u32 => self.f32_type,
+            x if x == Type::F64 as u32 => self.f64_type,
+            flags => panic!("SPIR-V: unimplemented Phi result type flags {flags:#x}"),
+        }
+    }
+
+    fn begin_ir_block(&mut self, block_idx: u32) {
+        let label = self
+            .block_labels
+            .get(block_idx as usize)
+            .copied()
+            .unwrap_or_else(|| panic!("SPIR-V: missing label for block {block_idx}"));
+        self.builder.begin_block(Some(label)).unwrap();
+    }
+
+    fn emit_block_instructions(&mut self, program: &ir::Program, block_idx: u32) {
+        let block = program
+            .blocks
+            .get(block_idx as usize)
+            .unwrap_or_else(|| panic!("SPIR-V: syntax references missing block {block_idx}"));
+        for (inst_idx, inst) in block.indexed_iter() {
+            if matches!(inst.opcode, ir::Opcode::Phi) {
+                self.emit_instruction(inst, block_idx, inst_idx);
+            }
+        }
+        for (inst_idx, inst) in block.indexed_iter() {
+            if matches!(
+                inst.opcode,
+                ir::Opcode::UndefU1
+                    | ir::Opcode::UndefU8
+                    | ir::Opcode::UndefU16
+                    | ir::Opcode::UndefU32
+                    | ir::Opcode::UndefU64
+            ) {
+                self.emit_instruction(inst, block_idx, inst_idx);
+            }
+        }
+        for (inst_idx, inst) in block.indexed_iter() {
+            if matches!(
+                inst.opcode,
+                ir::Opcode::Phi
+                    | ir::Opcode::UndefU1
+                    | ir::Opcode::UndefU8
+                    | ir::Opcode::UndefU16
+                    | ir::Opcode::UndefU32
+                    | ir::Opcode::UndefU64
+            ) {
+                continue;
+            }
+            self.emit_instruction(inst, block_idx, inst_idx);
+        }
+    }
+
     /// Define the main() function and emit IR instructions as SPIR-V.
     pub fn define_main_function(&mut self, program: &ir::Program) {
         // Create main function
@@ -803,18 +1017,120 @@ impl SpirvEmitContext {
             )
             .unwrap();
 
-        // Create entry block label
-        let _entry_label = self.builder.begin_block(None).unwrap();
+        self.block_labels = (0..program.blocks.len())
+            .map(|_| self.builder.id())
+            .collect();
 
-        // Emit instructions from all blocks
-        for (block_idx, block) in program.blocks.iter().enumerate() {
-            for (inst_idx, inst) in block.indexed_iter() {
-                self.emit_instruction(inst, block_idx as u32, inst_idx);
+        let syntax_list = if program.syntax_list.is_empty() {
+            let mut list = Vec::with_capacity(program.blocks.len() + 1);
+            for block_idx in 0..program.blocks.len() as u32 {
+                list.push(ir::SyntaxNode::Block(block_idx));
+            }
+            list.push(ir::SyntaxNode::Return);
+            list
+        } else {
+            program.syntax_list.clone()
+        };
+
+        if let Some(first_block) = syntax_list.iter().find_map(|node| match *node {
+            ir::SyntaxNode::Block(block_idx) => Some(block_idx),
+            _ => None,
+        }) {
+            self.builder.begin_block(None).unwrap();
+            self.builder
+                .branch(self.block_labels[first_block as usize])
+                .unwrap();
+        }
+
+        let mut current_block: Option<u32> = None;
+        for node in &syntax_list {
+            match *node {
+                ir::SyntaxNode::Block(block_idx) => {
+                    let label = self.block_labels[block_idx as usize];
+                    if current_block.is_some() {
+                        self.builder.branch(label).unwrap();
+                    }
+                    current_block = Some(block_idx);
+                    self.begin_ir_block(block_idx);
+                    self.emit_block_instructions(program, block_idx);
+                }
+                ir::SyntaxNode::If { cond, body, merge } => {
+                    let if_label = self.block_labels[body as usize];
+                    let endif_label = self.block_labels[merge as usize];
+                    let cond = self.resolve_value(&cond);
+                    self.builder
+                        .selection_merge(endif_label, spirv::SelectionControl::NONE)
+                        .unwrap();
+                    self.builder
+                        .branch_conditional(cond, if_label, endif_label, std::iter::empty())
+                        .unwrap();
+                    current_block = None;
+                }
+                ir::SyntaxNode::Loop {
+                    body,
+                    continue_block,
+                    merge,
+                } => {
+                    let body_label = self.block_labels[body as usize];
+                    let continue_label = self.block_labels[continue_block as usize];
+                    let endloop_label = self.block_labels[merge as usize];
+                    self.builder
+                        .loop_merge(
+                            endloop_label,
+                            continue_label,
+                            spirv::LoopControl::NONE,
+                            std::iter::empty(),
+                        )
+                        .unwrap();
+                    self.builder.branch(body_label).unwrap();
+                    current_block = None;
+                }
+                ir::SyntaxNode::Break { cond, merge, skip } => {
+                    let break_label = self.block_labels[merge as usize];
+                    let skip_label = self.block_labels[skip as usize];
+                    let cond = self.resolve_value(&cond);
+                    self.builder
+                        .branch_conditional(cond, break_label, skip_label, std::iter::empty())
+                        .unwrap();
+                    current_block = None;
+                }
+                ir::SyntaxNode::EndIf { merge } => {
+                    if current_block.is_some() {
+                        self.builder
+                            .branch(self.block_labels[merge as usize])
+                            .unwrap();
+                    }
+                    current_block = None;
+                }
+                ir::SyntaxNode::Repeat {
+                    cond,
+                    loop_header,
+                    merge,
+                } => {
+                    let cond = self.resolve_value(&cond);
+                    let loop_header_label = self.block_labels[loop_header as usize];
+                    let merge_label = self.block_labels[merge as usize];
+                    self.builder
+                        .branch_conditional(
+                            cond,
+                            loop_header_label,
+                            merge_label,
+                            std::iter::empty(),
+                        )
+                        .unwrap();
+                    current_block = None;
+                }
+                ir::SyntaxNode::Return => {
+                    self.builder.ret().unwrap();
+                    current_block = None;
+                }
+                ir::SyntaxNode::Unreachable => {
+                    self.builder.unreachable().unwrap();
+                    current_block = None;
+                }
             }
         }
 
-        // Return
-        self.builder.ret().unwrap();
         self.builder.end_function().unwrap();
 
         // Entry point
@@ -892,6 +1208,13 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_floating_point::emit_fp_clamp_32(self, a, zero, one);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::FPClamp32 => {
+                let value = self.resolve_value(inst.arg(0));
+                let min = self.resolve_value(inst.arg(1));
+                let max = self.resolve_value(inst.arg(2));
+                let id = super::emit_spirv_floating_point::emit_fp_clamp_32(self, value, min, max);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::FPMin32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
@@ -961,10 +1284,22 @@ impl SpirvEmitContext {
             }
 
             // ── FP comparison ─────────────────────────────────────────
+            Opcode::FPOrdEqual16 | Opcode::FPOrdEqual64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_ord_equal(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::FPOrdEqual32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
                 let id = super::emit_spirv_floating_point::emit_fp_ord_equal_32(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPOrdNotEqual16 | Opcode::FPOrdNotEqual64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_ord_not_equal(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::FPOrdNotEqual32 => {
@@ -973,16 +1308,34 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_floating_point::emit_fp_ord_not_equal_32(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::FPOrdLessThan16 | Opcode::FPOrdLessThan64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_ord_less_than(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::FPOrdLessThan32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
                 let id = super::emit_spirv_floating_point::emit_fp_ord_less_than_32(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::FPOrdGreaterThan16 | Opcode::FPOrdGreaterThan64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_ord_greater_than(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::FPOrdGreaterThan32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
                 let id = super::emit_spirv_floating_point::emit_fp_ord_greater_than_32(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPOrdLessThanEqual16 | Opcode::FPOrdLessThanEqual64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_ord_less_than_equal(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::FPOrdLessThanEqual32 => {
@@ -992,11 +1345,24 @@ impl SpirvEmitContext {
                     super::emit_spirv_floating_point::emit_fp_ord_less_than_equal_32(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::FPOrdGreaterThanEqual16 | Opcode::FPOrdGreaterThanEqual64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id =
+                    super::emit_spirv_floating_point::emit_fp_ord_greater_than_equal(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::FPOrdGreaterThanEqual32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
                 let id =
                     super::emit_spirv_floating_point::emit_fp_ord_greater_than_equal_32(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPUnordEqual16 | Opcode::FPUnordEqual64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_unord_equal(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::FPUnordEqual32 => {
@@ -1005,16 +1371,34 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_floating_point::emit_fp_unord_equal_32(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::FPUnordNotEqual16 | Opcode::FPUnordNotEqual64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_unord_not_equal(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::FPUnordNotEqual32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
                 let id = super::emit_spirv_floating_point::emit_fp_unord_not_equal_32(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::FPUnordLessThan16 | Opcode::FPUnordLessThan64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_unord_less_than(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::FPUnordLessThan32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
                 let id = super::emit_spirv_floating_point::emit_fp_unord_less_than_32(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPUnordGreaterThan16 | Opcode::FPUnordGreaterThan64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_unord_greater_than(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::FPUnordGreaterThan32 => {
@@ -1024,11 +1408,25 @@ impl SpirvEmitContext {
                     super::emit_spirv_floating_point::emit_fp_unord_greater_than_32(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::FPUnordLessThanEqual16 | Opcode::FPUnordLessThanEqual64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id =
+                    super::emit_spirv_floating_point::emit_fp_unord_less_than_equal(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::FPUnordLessThanEqual32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
                 let id =
                     super::emit_spirv_floating_point::emit_fp_unord_less_than_equal_32(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPUnordGreaterThanEqual16 | Opcode::FPUnordGreaterThanEqual64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id =
+                    super::emit_spirv_floating_point::emit_fp_unord_greater_than_equal(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::FPUnordGreaterThanEqual32 => {
@@ -1037,6 +1435,11 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_floating_point::emit_fp_unord_greater_than_equal_32(
                     self, a, b,
                 );
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPIsNan16 | Opcode::FPIsNan64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_is_nan(self, a);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::FPIsNan32 => {
@@ -1330,6 +1733,13 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_composite::emit_composite_construct_f32x2(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::CompositeConstructF32x3 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let c = self.resolve_value(inst.arg(2));
+                let id = super::emit_spirv_composite::emit_composite_construct_f32x3(self, a, b, c);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::CompositeConstructF32x4 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
@@ -1408,6 +1818,9 @@ impl SpirvEmitContext {
             Opcode::ImageSampleImplicitLod | Opcode::ImageSampleExplicitLod => {
                 super::emit_spirv_image::emit_image_sample(self, inst, block_idx, inst_idx);
             }
+            Opcode::ImageSampleDrefImplicitLod | Opcode::ImageSampleDrefExplicitLod => {
+                super::emit_spirv_image::emit_image_sample_dref(self, inst, block_idx, inst_idx);
+            }
             Opcode::ImageFetch => {
                 super::emit_spirv_image::emit_image_fetch_inst(self, inst, block_idx, inst_idx);
             }
@@ -1419,7 +1832,11 @@ impl SpirvEmitContext {
             }
 
             // ── Memory ────────────────────────────────────────────────
-            Opcode::LoadGlobal32 | Opcode::LoadLocal | Opcode::LoadStorage32 => {
+            Opcode::LoadGlobal32
+            | Opcode::LoadLocal
+            | Opcode::LoadStorage32
+            | Opcode::LoadStorage64
+            | Opcode::LoadStorage128 => {
                 super::emit_spirv_memory::emit_load(self, inst, block_idx, inst_idx);
             }
             Opcode::WriteGlobal32 | Opcode::WriteLocal | Opcode::WriteStorage32 => {
@@ -1436,15 +1853,48 @@ impl SpirvEmitContext {
 
             // ── Register/predicate access — these are handled during
             //    SSA construction and don't emit SPIR-V directly ───────
+            Opcode::Phi => {
+                if inst.phi_args.is_empty() {
+                    let id = self.builder.undef(self.phi_type_id(inst), None);
+                    self.set_value(block_idx, inst_idx, id);
+                    return;
+                }
+                let result_id = self.builder.id();
+                self.set_value(block_idx, inst_idx, result_id);
+                let incoming: Vec<_> = inst
+                    .phi_args
+                    .iter()
+                    .map(|(block, value)| {
+                        let value = self.resolve_value(value);
+                        let label = self
+                            .block_labels
+                            .get(*block as usize)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                panic!("SPIR-V: Phi references missing block {block}")
+                            });
+                        (value, label)
+                    })
+                    .collect();
+                self.builder
+                    .phi(self.phi_type_id(inst), Some(result_id), incoming)
+                    .unwrap();
+            }
+            Opcode::Identity | Opcode::ConditionRef => {
+                let id = self.resolve_value(inst.arg(0));
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::Prologue => {
+                super::emit_spirv_special::emit_prologue(self);
+            }
+            Opcode::Epilogue => {
+                super::emit_spirv_special::emit_epilogue(self);
+            }
             Opcode::GetRegister
             | Opcode::SetRegister
             | Opcode::GetPred
             | Opcode::SetPred
-            | Opcode::Phi
-            | Opcode::Identity
             | Opcode::Void
-            | Opcode::Prologue
-            | Opcode::Epilogue
             | Opcode::GetZeroFromOp
             | Opcode::GetSignFromOp
             | Opcode::GetCarryFromOp
@@ -1457,7 +1907,6 @@ impl SpirvEmitContext {
             | Opcode::SetCFlag
             | Opcode::GetOFlag
             | Opcode::SetOFlag
-            | Opcode::ConditionRef
             | Opcode::Reference
             | Opcode::PhiMove
             | Opcode::GetGotoVariable
@@ -1532,10 +1981,12 @@ impl SpirvEmitContext {
     /// Get or create a SPIR-V constant for an IR value.
     pub fn resolve_value(&mut self, value: &ir::Value) -> spirv::Word {
         match value {
-            ir::Value::Inst(r) => *self
-                .values
-                .get(&(r.block, r.inst))
-                .unwrap_or(&self.const_zero_u32),
+            ir::Value::Inst(r) => *self.values.get(&(r.block, r.inst)).unwrap_or_else(|| {
+                panic!(
+                    "SPIR-V: unresolved IR value reference block={} inst={}",
+                    r.block, r.inst
+                )
+            }),
             ir::Value::ImmU32(v) => self.builder.constant_bit32(self.u32_type, *v),
             ir::Value::ImmF32(v) => self.builder.constant_bit32(self.f32_type, v.to_bits()),
             ir::Value::ImmU1(v) => {
@@ -1547,7 +1998,7 @@ impl SpirvEmitContext {
             }
             ir::Value::ImmU64(v) => self.builder.constant_bit64(self.u64_type, *v),
             ir::Value::ImmF64(v) => self.builder.constant_bit64(self.f64_type, v.to_bits()),
-            _ => self.const_zero_u32,
+            other => panic!("SPIR-V: unsupported immediate/reference value {other:?}"),
         }
     }
 
@@ -1630,5 +2081,46 @@ mod tests {
         assert_eq!(ctx.vertex_index, 0);
         assert_eq!(ctx.base_vertex, 0);
         assert!(ctx.interfaces.contains(&ctx.vertex_id));
+    }
+
+    #[test]
+    fn fragment_position_load_declares_frag_coord_input() {
+        let mut program = ir::Program::new(ShaderStage::Fragment);
+        program
+            .info
+            .loads
+            .set(Attribute::POSITION_W.0 as usize, true);
+
+        let profile = Profile::default();
+        let runtime_info = RuntimeInfo::default();
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &runtime_info);
+        let mut bindings = Bindings::default();
+
+        ctx.define_global_variables(&program, &mut bindings);
+
+        assert_ne!(ctx.input_position, 0);
+        assert!(ctx.interfaces.contains(&ctx.input_position));
+
+        let input_position = ctx.input_position;
+        let module = ctx.builder.module();
+        let has_frag_coord = module.annotations.iter().any(|inst| {
+            inst.class.opcode == spirv::Op::Decorate
+                && matches!(inst.operands.as_slice(), [
+                    Operand::IdRef(id),
+                    Operand::Decoration(spirv::Decoration::BuiltIn),
+                    Operand::BuiltIn(spirv::BuiltIn::FragCoord),
+                ] if *id == input_position)
+        });
+        let has_position = module.annotations.iter().any(|inst| {
+            inst.class.opcode == spirv::Op::Decorate
+                && matches!(inst.operands.as_slice(), [
+                    Operand::IdRef(id),
+                    Operand::Decoration(spirv::Decoration::BuiltIn),
+                    Operand::BuiltIn(spirv::BuiltIn::Position),
+                ] if *id == input_position)
+        });
+
+        assert!(has_frag_coord);
+        assert!(!has_position);
     }
 }

@@ -19798,3 +19798,607 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cd externals/rdynarmic && cargo check --tests` passes.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
 - Pinball runtime verification with `RUST_LOG=info timeout 35s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro`: timeout exit `124`, `OpenAudioRenderer` at 4.91s, `IAudioRenderer::Start` at 4.92s, first `BQP_QUEUE` at 6.27s, and `BQP_QUEUE #1024` at 23.33s. No recurrence of the prior `exit=139` crash.
+
+## 2026-07-03 — shader_recompiler/src/backend/spirv/spirv_emit_context.rs and emit_spirv_image.rs vs shader_recompiler/backend/spirv/emit_spirv.cpp, emit_spirv_image.cpp, emit_spirv_composite.cpp, emit_spirv_floating_point.cpp
+
+### Intentional differences
+- Rust still uses `rspirv::dr::Builder` instead of upstream `Sirit::Module`. The emitted SPIR-V instruction ordering is the parity contract.
+- Because Rust SSA construction currently stores `Phi` and some `Undef*` instructions after their users, the SPIR-V block emitter pre-emits `Phi` and `Undef*` before the rest of each block. Upstream stores PHI at block begin and uses Sirit definitions/deferred PHI patching; this Rust ordering preserves the same SPIR-V dominance requirement without changing IR ownership.
+
+### Unintentional differences (to fix)
+- `frontend/structured_control_flow.rs` does not faithfully port upstream `TranslatePass`. It can produce an `If` node immediately after `EndIf` without the upstream merge `Block`, which makes normal SPIR-V traversal hit a detached `OpSelectionMerge`. The correct fix is a faithful `BuildASL`/`TranslatePass` port that creates merge/header/continue blocks and materializes `VisitExpr` into the current IR block.
+- Storage buffer loads remain structurally incomplete in `emit_spirv_memory.rs`; `LoadStorage128` is still not dispatched/implemented and MK8D reaches this missing opcode after the current shader fixes.
+- `ImageSampleDrefImplicitLod` / explicit dref are now emitted for the main sampled-image path, but bias/lod-clamp/offset/sparse handling is still incomplete compared with upstream `ImageOperands`.
+
+### Missing items
+- Faithful SPIR-V structured-control traversal is only partially ported. `DefineMain` now allocates labels, traverses `syntax_list`, emits branches/merge instructions, and emits `Phi`/`ConditionRef`, but it depends on a faithful ASL producer that is not yet present.
+- Missing or incomplete SPIR-V opcode coverage observed while running MK8D: storage-buffer loads (`LoadStorage128` first), full image operands, and broader storage/global memory ops.
+- `PatchPhiNodes`/`DeferredOpPhi` is not fully mirrored. Current Rust resolves PHI operands at emit time after pre-emitting PHI first in each block; a stricter port should reserve/patch PHI operands like upstream.
+
+### Binary layout verification
+- N/A: shader IR/SPIR-V emission only; no raw-copied guest ABI payload changed.
+
+### Verification
+- Re-read upstream `DefineMain`, `Traverse`, `EmitPhi`, `EmitConditionRef`, and `PatchPhiNodes` in `shader_recompiler/backend/spirv/emit_spirv.cpp`.
+- Re-read upstream `EmitImageSampleDrefImplicitLod` / `EmitImageSampleDrefExplicitLod` in `shader_recompiler/backend/spirv/emit_spirv_image.cpp`.
+- Re-read upstream `EmitFPClamp32` in `shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp` and `EmitCompositeConstructF32x3` in `shader_recompiler/backend/spirv/emit_spirv_composite.cpp`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D normal structured run no longer hits the original invalid `mix` path first, but now exposes the ASL/TranslatePass divergence as `DetachedInstruction(OpSelectionMerge)` on `VertexB base_AF5980 hash_4F9AE8F67223BFDA`.
+- MK8D diagnostic run with `RUZU_SHADER_FORCE_LINEAR_SYNTAX=1` progresses past the earlier `ImageGather`, `ImageQuery`, invalid-select, missing `FPClamp32`, missing `CompositeConstructF32x3`, and missing `ImageSampleDrefImplicitLod` blockers, reaching `submit#1024` before exposing the next missing storage-buffer opcode (`LoadStorage128`).
+
+## 2026-07-03 — video_core/src/renderer_vulkan/render_pass_cache.rs and graphics_pipeline.rs vs video_core/renderer_vulkan/vk_render_pass_cache.cpp and vk_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust still uses classic `VkRenderPass`/`VkFramebuffer` objects while upstream has moved more work toward dynamic-rendering style helpers in adjacent paths. This slice follows upstream `RenderPassCache::Get` and `CreateGraphicsPipeline` behavior within the existing Rust render-pass backend.
+- Diagnostic-only traces remain env-gated (`RUZU_TRACE_VK_VERTEX_INPUT`, `RUZU_TRACE_VK_TEXTURE_UPLOAD`, `RUZU_DUMP_VK_PRESENT_SOURCE_FRAME`) to inspect MK8D black-frame state. They do not change behavior unless explicitly enabled.
+
+### Unintentional differences (to fix)
+- No remaining difference for render-pass color attachment slot ownership in this slice. Rust now preserves upstream RT slot indices in `pColorAttachments`, uses `VK_ATTACHMENT_UNUSED` for holes, and compacts only the framebuffer attachment array.
+- No remaining difference for graphics pipeline color blend attachment count in this slice. Rust now builds one `VkPipelineColorBlendAttachmentState` per active render target slot, using that slot's blend state and color mask instead of hard-coding RT0.
+
+### Missing items
+- The broader Vulkan backend is still not fully upstream-faithful: compute dispatch is stubbed in `renderer_vulkan/mod.rs::dispatch_compute`, and `PipelineCache::current_compute_pipeline` returns `None`.
+- MK8D remains black after this slice. Verified draws reach the 1920x1080 backbuffers with plausible fullscreen vertex/index data and non-fallback descriptors, but the presented source image is still all zero. Current evidence points beyond render-pass slotting/blend state into shader opcode coverage, compute, or upstream-incomplete descriptor/image semantics.
+
+### Binary layout verification
+- N/A: Vulkan pipeline/render-pass state only; no guest ABI or raw-copied structure changed.
+
+### Verification
+- Re-read upstream `RenderPassCache::Get` in `video_core/renderer_vulkan/vk_render_pass_cache.cpp`: it iterates all eight color formats, stores `VK_ATTACHMENT_UNUSED` for invalid slots, increments `num_attachments` to `index + 1` for valid slots, and compacts only actual attachment descriptions.
+- Re-read upstream `CreateGraphicsPipeline` in `video_core/renderer_vulkan/vk_graphics_pipeline.cpp`: it creates `cb_attachments` up to `NumAttachments(key.state)`, derives `colorWriteMask` from each attachment mask, and uses each attachment's blend factors/equations.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D verification command: `RUST_LOG=info timeout 30s target/release/ruzu-cmd -g "/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"` runs without Rust pipeline creation failures, but the dumped present source and final frame are still fully black (`nonzero 0`).
+
+## 2026-07-03 — shader_recompiler/src/backend/spirv/spirv_emit_context.rs and emit_spirv_context_get_set.rs vs shader_recompiler/backend/spirv/spirv_emit_context.cpp and emit_spirv_context_get_set.cpp
+
+### Intentional differences
+- Rust stores built-in position input as `SpirvEmitContext::input_position` instead of upstream's `EmitContext::input_position` `Id` field naming. Ownership and behavior match upstream; only Rust naming/module syntax differs.
+- Rust uses a local `define_builtin_f32_vec4_input` helper next to the existing vec2/vec3 helpers. Upstream uses `DefineInput(*this, F32[4], true, built_in)` inline in `EmitContext` construction.
+
+### Unintentional differences (to fix)
+- No remaining difference for fragment `Position.*` loads in this slice. Rust now declares `Position.*` loads as built-in `FragCoord` for fragment shaders and `Position` for non-fragment stages, matching upstream.
+- No remaining difference for `EmitGetAttribute(PositionX/Y/Z/W)` ownership in this slice. Rust now loads position components from the input built-in instead of incorrectly looking in `output_vars`.
+
+### Missing items
+- `profile.has_broken_spirv_position_input` and the upstream indirect input-position struct path are still not ported. The current macOS/MoltenVK profile does not use that path, but it remains a structural gap for profiles that require it.
+- Geometry passthrough decoration for `input_position` is not ported in this slice.
+
+### Binary layout verification
+- N/A: SPIR-V declaration/emission only; no raw-copied guest ABI payload changed.
+
+### Verification
+- Re-read upstream `EmitContext` position input creation in `shader_recompiler/backend/spirv/spirv_emit_context.cpp`: fragment shaders use `spv::BuiltIn::FragCoord`, other stages use `spv::BuiltIn::Position`, with an indirect struct only for `has_broken_spirv_position_input`.
+- Re-read upstream `EmitGetAttribute` in `shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp`: `PositionX/Y/Z/W` load component `element` from `ctx.input_position`.
+- Added `fragment_position_load_declares_frag_coord_input`, which asserts a fragment shader loading `Position.W` declares the input as `BuiltIn FragCoord` and not `BuiltIn Position`.
+- `cargo test -p shader_recompiler fragment_position_load_declares_frag_coord_input -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D SPIR-V dump for `stage5_base_010F80` now contains `OpDecorate %gl_FragCoord BuiltIn FragCoord` and loads `Position.W` from `%gl_FragCoord`; the previous `1 / 0` sequence is gone. MK8D is still black, so this fixed a real shader bug but not the remaining final-blit failure.
+
+## 2026-07-03 — video_core/src/host1x/{host1x.rs,nvdec.rs,vic.rs,codecs/*} vs video_core/host1x/{host1x.*,nvdec.*,vic.*,codecs/*}
+
+### Intentional differences
+- Rust passes the Host1x GMMU as `Arc<parking_lot::Mutex<MemoryManager>>` instead of C++ references/pointers. This preserves the upstream owner (`Host1x::GMMU()`) while adapting lifetime and synchronization to the current Rust service/device ownership.
+
+### Unintentional differences (to fix)
+- No remaining difference for NVDEC/VIC guest-memory ownership in this slice. Rust now routes decoder and VIC reads/writes through the Host1x GMMU, matching upstream `host1x.GMMU()`. The previous Rust path used the GPU SMMU/`MaxwellDeviceMemoryManager`, which rejected low video addresses and caused `failed to read picture`, `failed to read ConfigStruct`, and `Unmapped Device ReadBlock` during MK8D video playback.
+
+### Missing items
+- Broader Host1x/NVDEC/VIC parity remains incomplete outside this memory-owner slice, including exact hardware-decoder selection and remaining codec/VIC edge cases.
+
+### Binary layout verification
+- PASS for this slice: no raw-copied guest structs were reordered or resized; the change only replaces the memory reader/writer owner.
+
+### Verification
+- Re-read upstream Host1x/NVDEC/VIC construction and decode flow: decoder paths are handed `host1x.GMMU()` rather than the GPU SMMU.
+- `rg` confirms Host1x codecs/VIC no longer call `smmu_read_block`/`smmu_write_block` or depend on `MaxwellDeviceMemoryManager` for video frame/config reads.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D no longer logs `failed to read picture`, `failed to read ConfigStruct`, or `Unmapped Device ReadBlock` after this slice.
+
+## 2026-07-03 — shader_recompiler/src/backend/spirv/{spirv_emit_context.rs,emit_spirv_context_get_set.rs} vs shader_recompiler/backend/spirv/{spirv_emit_context.cpp,emit_spirv_context_get_set.cpp}
+
+### Intentional differences
+- Rust keeps the existing `RuntimeInfo`/SPIR-V builder split and selects typed generic input variables there. Upstream derives the same type from `RuntimeInfo::generic_input_types` in `EmitContext::DefineInputs`.
+
+### Unintentional differences (to fix)
+- No remaining difference for generic vertex input variable typing in this slice. Rust no longer declares every generic input as `vec4<f32>`; it now declares `f32`, `i32`, or `u32` vectors according to `runtime_info.generic_input_types`, including scaled-attribute conversion behavior when scaled attributes are not natively supported.
+- No remaining difference for `EmitGetAttribute` generic input loads in this slice. Rust now loads from the pointer type matching the declared input and applies upstream-style `Bitcast`, `ConvertSToF`, or `ConvertUToF` where required.
+
+### Missing items
+- Any generic input type cases not yet represented in Rust `RuntimeInfo` must be added with the same hash/keying discipline as upstream pipeline runtime info.
+
+### Binary layout verification
+- N/A: SPIR-V declaration/emission only; no guest ABI payload changed.
+
+### Verification
+- Re-read upstream `GetAttributeType`, `GetAttributeInfo`, and `DefineInputs` in `spirv_emit_context.cpp`.
+- Re-read upstream `EmitGetAttribute` in `emit_spirv_context_get_set.cpp`.
+- Re-read upstream `CastAttributeType`/`MakeRuntimeInfo` in `video_core/renderer_vulkan/vk_pipeline_cache.cpp`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D no longer emits MoltenVK `Vertex attribute type mismatch`/pipeline initialization failures after this slice.
+
+## 2026-07-03 — video_core/src/host1x/ffmpeg/ffmpeg_shim.c vs video_core/host1x/ffmpeg/ffmpeg.cpp
+
+### Intentional differences
+- Rust keeps upstream's H264 software special path as the first attempt, but falls back from `avcodec_send_frame`/`avcodec_receive_packet` to packet-based software decode when the host FFmpeg returns `AVERROR(EINVAL)`. Current Homebrew FFmpeg on macOS rejects the upstream software decoder `send_frame` call with `Invalid argument`; without the fallback MK8D video decode never produces usable frames. This is a host-library compatibility adaptation, not a replacement scheduler/decoder architecture.
+
+### Unintentional differences (to fix)
+- No remaining difference for the successful upstream path: when `avcodec_send_frame` does not return `AVERROR(EINVAL)`, Rust preserves upstream send/receive behavior.
+
+### Missing items
+- Hardware decoding remains disabled in the Rust port. Upstream's preferred GPU decoder list does not include VideoToolbox; adding a macOS hardware path would be a separate, explicit divergence.
+
+### Binary layout verification
+- N/A: C FFmpeg shim state only; no guest ABI payload changed.
+
+### Verification
+- Re-read upstream `DecoderContext::SendPacket`/receive logic in `video_core/host1x/ffmpeg/ffmpeg.cpp`.
+- Re-read upstream preferred GPU decoder list and confirmed VideoToolbox is not part of the upstream selection.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D no longer logs `FFmpeg::DecoderContext::send_packet: Invalid argument`; remaining `EAGAIN` receive events are packet-order/availability events, not the previous hard send failure.
+
+## 2026-07-03 — video_core/src/renderer_vulkan/scheduler.rs and mod.rs vs video_core/renderer_vulkan/vk_scheduler.cpp and vk_rasterizer.cpp
+
+### Intentional differences
+- Rust still has a reduced synchronous scheduler instead of upstream's worker-thread `CommandChunk` pipeline. This slice keeps that architecture but ports the same command ordering and upload visibility barriers inside it.
+
+### Unintentional differences (to fix)
+- No remaining difference for the upload-submit memory barrier in this slice. Rust now emits the upstream `TRANSFER_WRITE -> MEMORY_READ|MEMORY_WRITE` barrier on the upload command buffer before ending/submitting it.
+- No remaining difference for dynamic-state ordering in this slice. Rust now requests the render pass before `update_dynamic_states`, matching upstream `GraphicsPipeline::ConfigureDraw` followed by `RasterizerVulkan::UpdateDynamicStates`.
+
+### Missing items
+- The broader scheduler is still not fully upstream-faithful: Rust direct-records several graphics commands instead of recording the entire draw path through `Scheduler::Record`, and does not implement upstream's worker-thread chunk submission model.
+- MK8D remains black after these ordering/barrier fixes; forced clear after draw proves the render target/present path can write, while a forced constant fragment sample still presented black, pointing to remaining draw/rasterization or earlier intermediate-pass issues.
+
+### Binary layout verification
+- N/A: Vulkan command scheduling only; no guest ABI or raw-copied structure changed.
+
+### Verification
+- Re-read upstream `Scheduler::SubmitExecution` in `video_core/renderer_vulkan/vk_scheduler.cpp`: it records a `VkMemoryBarrier` with `srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT`, `dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT`, stage `TRANSFER -> ALL_COMMANDS`, then ends upload/render command buffers and submits.
+- Re-read upstream `RasterizerVulkan::PrepareDraw` and `GraphicsPipeline::ConfigureDraw`: render pass request happens inside pipeline configure before `UpdateDynamicStates` and before the recorded draw.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D present-source dump after this slice is still fully black (`nonzero 0`).
+
+## 2026-07-03 — shader_recompiler/src/backend/spirv/emit_spirv_special.rs and spirv_emit_context.rs vs shader_recompiler/backend/spirv/emit_spirv_special.cpp and emit_spirv.cpp
+
+### Intentional differences
+- Rust implements only the upstream `EmitPrologue` default position store and `EmitEpilogue` depth-conversion path in this slice. The remaining special paths are documented below and left explicit, not silently approximated.
+
+### Unintentional differences (to fix)
+- No remaining difference for dispatching `Opcode::Prologue` and `Opcode::Epilogue` in this slice. Rust no longer ignores those opcodes in the SPIR-V backend.
+- No remaining difference for vertex `ConvertDepthMode` when `runtime_info.convert_depth_mode && !profile.support_native_ndc`: Rust now emits `z = (z + w) * 0.5` and stores it back to `gl_Position.z`, matching upstream.
+
+### Missing items
+- `SetFixedPipelinePointSize`, default generic varying initialization, fragment `AlphaTest`, `EmitEmitVertex`, and `EmitEndPrimitive` remain incomplete compared with upstream `emit_spirv_special.cpp`.
+- MK8D's observed final vertex shader did not set `convert_depth_mode`, so this fixes a real backend parity gap but did not change the current black-frame result.
+
+### Binary layout verification
+- N/A: SPIR-V emission only; no guest ABI or raw-copied structure changed.
+
+### Verification
+- Re-read upstream `EmitPrologue`, `EmitEpilogue`, and `ConvertDepthMode` in `shader_recompiler/backend/spirv/emit_spirv_special.cpp`.
+- Re-read upstream SPIR-V main emission path to confirm prologue/epilogue opcodes are real emitted instructions, not no-ops.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D present-source dump after this slice is still fully black (`nonzero 0`).
+
+## 2026-07-03 — video_core/src/renderer_vulkan/buffer_cache.rs and mod.rs vs video_core/renderer_vulkan/vk_buffer_cache.cpp and vk_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust still has a reduced buffer-cache runtime and binds individual vertex streams directly from `RasterizerVulkan::bind_vertex_buffers` instead of upstream's `BufferCache::UpdateGraphicsBuffers` + `BindHostGeometryBuffers` + `BindHostStageBuffers` ownership split. This slice only ports the Vulkan command used by the existing owner.
+
+### Unintentional differences (to fix)
+- No remaining difference for the Vulkan vertex-buffer bind command when `VK_EXT_extended_dynamic_state` is active in this slice. Rust now uses `vkCmdBindVertexBuffers2` with buffer, offset, size, and stride, matching upstream `BufferCacheRuntime::BindVertexBuffer(s)` behavior. The previous Rust path used `vkCmdBindVertexBuffers`, losing the dynamic `size` and `stride` operands.
+
+### Missing items
+- Full upstream ownership is still missing: Rust does not yet port the complete `VideoCommon::BufferCache<P>` host binding aggregation before calling the Vulkan runtime, and still handles vertex/index binding from `renderer_vulkan/mod.rs`.
+- The index-buffer path still direct-binds from the reduced backend and has not been compared as a full `BufferCacheRuntime::BindIndexBuffer` port in this slice.
+- MK8D remains black after this fix. `image_id=1` is nonzero, but the presented backbuffer source remains all zero, so the remaining fault is after intermediate rendering and before/inside the final backbuffer writes.
+
+### Binary layout verification
+- N/A: Vulkan command binding only; no guest ABI or raw-copied structure changed.
+
+### Verification
+- Re-read upstream `BufferCacheRuntime::BindVertexBuffer` and `BindVertexBuffers` in `video_core/renderer_vulkan/vk_buffer_cache.cpp`: when extended dynamic state is supported, upstream records `BindVertexBuffers2EXT` with offsets, sizes, and strides; otherwise it falls back to `BindVertexBuffers`.
+- Re-read upstream `GraphicsPipeline::ConfigureImpl` in `video_core/renderer_vulkan/vk_graphics_pipeline.cpp`: buffer-cache host geometry binding happens before render-target update and draw configuration.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D verification with `RUZU_DUMP_VK_PRESENT_SOURCE_FRAME=/tmp/ruzu_mk8d_finalturn_present.ppm RUZU_DUMP_VK_PRESENT_SOURCE_AT=3 timeout 10s target/release/ruzu-cmd -g ...` still dumps a fully black present source (`nonzero 0`).
+- MK8D diagnostic dump of `image_id=1` remains nonzero (`nonzero 1071119`), confirming intermediate rendering contains data while final presentation source is black.
+
+## 2026-07-03 — shader_recompiler/src/pipeline_cache.rs and video_core/src/renderer_vulkan/{fixed_pipeline_state.rs,graphics_pipeline.rs} vs shader_recompiler/frontend/maxwell/structured_control_flow.cpp and video_core/renderer_vulkan/{fixed_pipeline_state.cpp,vk_pipeline_cache.cpp}
+
+### Intentional differences
+- Rust materializes `Opcode::Epilogue` after `Program` block allocation in `pipeline_cache.rs` instead of directly inside `structured_control_flow.rs`. Upstream emits `IR::IREmitter{*return_block}.Epilogue()` while creating the return block; Rust's structurer owns syntax/block IDs first and the actual `Program` blocks are allocated later, so this is the closest ownership-preserving equivalent in the current split.
+- Rust hashes `RuntimeInfo` into `ShaderKey` because its shader cache is SPIR-V keyed by code/stage. Upstream builds shader modules per graphics-pipeline key and passes `RuntimeInfo` into emission, so runtime state is already part of the effective compile identity there.
+
+### Unintentional differences (to fix)
+- No remaining difference for vertex return epilogues in this slice. Rust now emits `Opcode::Epilogue` in return blocks, matching upstream `StatementType::Return`.
+- No remaining difference for Vulkan GL-NDC depth conversion in this slice. Rust now derives `fixed_state.ndc_minus_one_to_one` from Maxwell `DepthMode::MinusOneToOne`, forwards it through `RuntimeInfo.convert_depth_mode` for `VertexB`, and keys the shader cache on that runtime state so the SPIR-V variant is not reused incorrectly.
+
+### Missing items
+- `RuntimeInfo` hashing is intentionally limited to fields currently carried by the Rust `RuntimeInfo`; any future runtime field that affects emission must be added to the hash at the same time it is ported.
+- Broader shader/frontend parity gaps remain documented in earlier entries, including incomplete special-op emission paths unrelated to this MK8D final-blit depth conversion.
+
+### Binary layout verification
+- N/A: shader IR/SPIR-V and Vulkan fixed-pipeline state only; no raw-copied guest ABI payload changed.
+
+### Verification
+- Re-read upstream `structured_control_flow.cpp`: `StatementType::Return` creates a return block, emits `Epilogue`, branches to it, appends the block syntax node, then appends `Return`.
+- Re-read upstream `fixed_pipeline_state.cpp`: `ndc_minus_one_to_one` is assigned from `regs.depth_mode == Maxwell::DepthMode::MinusOneToOne`.
+- Re-read upstream `vk_pipeline_cache.cpp`: `MakeRuntimeInfo` computes `gl_ndc` from `key.state.ndc_minus_one_to_one` and assigns `info.convert_depth_mode = gl_ndc` for vertex stages.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p shader_recompiler pipeline_cache::tests::cfg_translation_materializes_return_epilogue` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p shader_recompiler pipeline_cache::tests::pipeline_cache_keys_runtime_info_that_affects_emission` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::graphics_pipeline::tests::runtime_info_convert_depth_mode_tracks_fixed_pipeline_ndc_mode` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D run with SPIR-V/present-source dumps now emits the vertex epilogue conversion (`gl_Position.z = (z + w) * 0.5`) in `stage1_base_010A80`, and `/tmp/ruzu_mk8d_epilogue.ppm` is no longer black (`385161` non-black pixels, bbox `x[211..1707] y[322..755]`). The captured frame shows the Mario Kart 8 Deluxe logo.
+
+## 2026-07-03 — core/src/hle/service/am/service/library_applet_creator.rs vs core/hle/service/am/service/library_applet_creator.{h,cpp}
+
+### Intentional differences
+- Rust parses raw `AppletId` and `LibraryAppletMode` command words into enums before dispatch. Upstream receives typed CMIF parameters. The accepted values match the upstream enum values used by `am_types.h`.
+- Rust creates the frontend applet without `system.GetFrontendAppletHolder().GetApplet(...)` because the ruzu frontend holder currently stores only the current applet id and does not own concrete frontend applet implementations. The ownership flow still matches upstream's frontend path: create `Process`, create `Applet`, set `program_id`, `applet_id`, `AppletType::LibraryApplet`, `library_applet_mode`, create `AppletDataBroker`, link caller/child, track in `WindowSystem`, return `ILibraryAppletAccessor`.
+- Rust signals the caller applet's lazily-created `library_applet_launchable_event` through the current process object when present. Upstream owns this event directly on `Applet` and calls `Signal()`.
+
+### Unintentional differences (to fix)
+- The guest applet path (`CreateGuestApplet` with `CreateProcess(system, program_id, Firmware1400, Firmware1700)`) is not ported in this slice. Rust currently falls through to the frontend path, matching upstream only when frontend applet mode is not LLE or guest process creation fails.
+- Rust does not store a concrete `frontend` object on `Applet`, so later `ILibraryAppletAccessor::Start`, `PushInteractiveInData`, and exit paths cannot call `FrontendExecute*` yet. This is the next AM parity prerequisite if MK8D proceeds into the Mii/profile applet flow.
+- `ShouldCreateGuestApplet` is represented with the same applet-id list but without settings-backed per-applet mode values. It currently treats all listed applets as frontend/HLE applets.
+
+### Missing items
+- `CreateGuestApplet` helper with firmware-version selection and guest process creation.
+- Frontend applet holder `GetApplet(applet, applet_id, mode)` and concrete frontend applet ownership on `Applet`.
+- `ILibraryAppletAccessor` command implementations remain mostly missing and are expected to be the next service calls after `CreateLibraryApplet`.
+
+### Binary layout verification
+- N/A: service object creation and IPC response only; no raw-copied guest ABI payload changed.
+
+### Verification
+- Re-read upstream `library_applet_creator.h` and `library_applet_creator.cpp`: command 0 is owned by `ILibraryAppletCreator`, helper mapping is local to the file, applet creation links caller/child before `WindowSystem::TrackApplet`, then signals `library_applet_launchable_event` before returning the accessor.
+- Added focused tests for `AppletIdToProgramId` mapping and frontend-mode applet selection.
+- `cargo test -p core hle::service::am::service::library_applet_creator::tests -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+
+## 2026-07-03 — core/src/hle/service/am/service/library_applet_accessor.rs and core/src/hle/service/am/applet.rs vs core/hle/service/am/service/library_applet_accessor.{h,cpp} and core/hle/service/am/applet.h
+
+### Intentional differences
+- Rust returns event object ids through `ResponseBuilder::push_copy_object_id`, so `Applet` now exposes `ensure_state_changed_event_object_id` alongside the existing handle-based helper. Upstream stores the readable event directly and returns `GetHandle()`.
+- Rust sets `applet.is_process_running = true` in `ILibraryAppletAccessor::Start` for frontend-created applets. Upstream normally observes process state through `EventObserver`; ruzu's frontend `Process::new()` has no kernel process, so the visible lifecycle state must be updated at the service edge.
+- Rust resolves `SharedPointer<IStorage>` input for `PushInData` and `PushInteractiveInData` through the current domain-handler table and `SessionRequestHandler::as_any()` downcast, then stores the payload bytes in the existing Rust `AppletDataBroker` channels. Upstream's CMIF layer passes a typed `SharedPointer<IStorage>` directly and the broker stores that shared object. This preserves the guest-visible input payload behavior while adapting to the current Rust IPC/broker ownership model.
+- `PresetLibraryAppletGpuTimeSliceZero` and `GetIndirectLayerConsumerHandle` keep upstream's stub behavior: success for the former, `0xdeadbeef` for the latter.
+
+### Unintentional differences (to fix)
+- `FrontendExecute`, `FrontendExecuteInteractive`, and `FrontendRequestExit` are still not functionally equivalent because `Applet` does not yet own a concrete frontend applet object.
+- `PopOutData`, `PopInteractiveOutData`, `GetPopOutDataEvent`, and `GetPopInteractiveOutDataEvent` remain unimplemented. The push side now resolves incoming domain `IStorage`; the pop side still needs to return a new `IStorage` service object and expose the broker pop events.
+- `RequestExit` currently requests lifecycle exit but does not call a frontend applet `RequestExit`.
+
+### Missing items
+- Broker pop commands returning `SharedPointer<IStorage>`.
+- Event handles for `AppletStorageChannel` pop events.
+- Full frontend applet execution callbacks.
+
+### Binary layout verification
+- N/A: service dispatch/event wiring only; no raw-copied guest ABI payload changed.
+
+### Verification
+- Re-read upstream `library_applet_accessor.h` and `library_applet_accessor.cpp`: handlers 0, 1, 10, 20, 25, 30, 60, 100, 103, and 160 are now wired in Rust with matching response shapes where the current IPC model supports them.
+- Re-read upstream `cmif_serialization.h`, `ipc_helpers.h`, and `hle_ipc.cpp`: input `SharedPointer<T>` arguments are domain object ids in raw request data and are resolved through the domain handler table.
+- `cargo test -p core hle::service::am::service::library_applet_creator::tests -- --nocapture` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+
+## 2026-07-03 — video_core/src/renderer_vulkan/{scheduler.rs,present_manager.rs,swapchain.rs,renderer_vulkan.rs} vs video_core/renderer_vulkan/{vk_scheduler.h,vk_present_manager.cpp,vk_swapchain.cpp,renderer_vulkan.cpp}
+
+### Intentional differences
+- Rust stores upstream `Scheduler::submit_mutex` as `Arc<Mutex<()>>` so `Scheduler`, `PresentManager`, and `Swapchain` can share the same host-side queue synchronization without introducing C++ reference ownership.
+- Rust passes the shared mutex explicitly from `RendererVulkan::new` into `Swapchain::new` and `PresentManager::new`. Upstream stores references to `Device`/`Scheduler` objects that make this mutex reachable without constructor parameters.
+
+### Unintentional differences (to fix)
+- No remaining difference for queue host synchronization in this slice. Rust now locks the shared submit mutex around scheduler `queue_submit`, present-manager copy/blit `queue_submit`, and swapchain `queue_present`, matching upstream `std::scoped_lock scheduler.submit_mutex` in `PresentManager::CopyToSwapchainImpl` and `Swapchain::Present`.
+- The MK8D black-window symptom is not proven fixed by this synchronization change. Internal readback diagnostics performed before this DIFF entry showed the frame image and swapchain image contained the MK8D logo before `vkQueuePresentKHR`, so remaining black-window investigation is in the SDL/Cocoa/Metal visible-surface path or macOS capture/foreground behavior rather than guest rendering or swapchain copy contents.
+
+### Missing items
+- Upstream scheduler still has broader `MasterSemaphore`/worker-thread semantics not fully represented by the current simplified Rust scheduler. This entry covers only queue submit/present host synchronization.
+
+### Binary layout verification
+- N/A: Vulkan host synchronization only; no guest ABI or raw-copied binary payload changed.
+
+### Verification
+- Re-read upstream `vk_present_manager.cpp`: `CopyToSwapchainImpl` records the same barriers and copy/blit, then submits under `std::scoped_lock submit_lock{scheduler.submit_mutex}` before presenting.
+- Re-read upstream `vk_swapchain.cpp`: `Swapchain::Present` locks `scheduler.submit_mutex` around queue present.
+- Re-read upstream `renderer_vulkan.cpp`: `Composite` flushes `scheduler.Flush(*frame->render_ready)` before `present_manager.Present(frame)`, so the shared mutex protects scheduler submit and presentation submit/present in the same ownership slice.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+
+## 2026-07-03 — ruzu_cmd/src/emu_window/emu_window_sdl2_vk.rs vs yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp
+
+### Intentional differences
+- On macOS only, Rust activates the Cocoa application (`NSApplicationActivationPolicyRegular`, `finishLaunching`, `unhide`, and `activateIgnoringOtherApps`) and calls `SDL_ShowWindow`, `SDL_RaiseWindow`, and `SDL_PumpEvents` after creating the SDL Metal view and after the upstream resize/min-client-area initialization. This is a command-line frontend adaptation: `yuzu.app`/Qt gets AppKit app-bundle activation, while `ruzu-cmd` can otherwise create a valid CAMetalLayer and present frames without a fully activated foreground AppKit application. The Vulkan surface creation path remains upstream-faithful: `SDL_Metal_CreateView` followed by `SDL_Metal_GetLayer`, with the layer stored in `WindowSystemInfo::render_surface`.
+- `ruzu_cmd/Cargo.toml` declares a direct macOS-only `objc` dependency for this AppKit activation hook. Upstream C++ does not need a dependency entry because the AppKit activation path is provided by the application bundle/Qt frontend.
+- Rust keeps the `SDL_MetalView` alive as a field and destroys it in `Drop`. Upstream does not store the returned view; retaining it avoids relying on SDL/Cocoa lifetime side effects while preserving the same CAMetalLayer pointer passed to Vulkan.
+
+### Unintentional differences (to fix)
+- None in this slice. The visible-window calls are frontend-only and do not affect guest rendering, swapchain creation, or Vulkan synchronization.
+
+### Missing items
+- No remaining macOS SDL Vulkan window visibility item identified in this slice. If a normal GUI session still shows a black foreground window while `RUZU_DUMP_PRESENT_FRAME` shows non-black frames, the next owner to inspect is the platform surface/presentation layer, not guest rendering.
+
+### Binary layout verification
+- N/A: frontend window management only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp`: window creation, WM-info lookup, `SDL_Metal_CreateView`, `SDL_Metal_GetLayer`, `OnResize`, `OnMinimalClientAreaChangeRequest`, and `SDL_PumpEvents` ordering is preserved.
+- MK8D diagnostics before this entry proved `RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_present_late.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800` captures a non-black 2560x1440 Mario Kart 8 Deluxe logo, so the black-window symptom is not caused by guest rendering or final framebuffer composition.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes after the macOS window raise/show adaptation.
+- MK8D verification after this entry: `RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_raise_present.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 timeout 75s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, reaches `BQP_QUEUE #2048` / `BQC_RELEASE #2048`, and dumps a non-black 2560x1440 Mario Kart 8 Deluxe logo.
+- MK8D verification after adding `finishLaunching`/`unhide`: `RUZU_TRACE_PRESENT=1 RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_appkit_finish.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 timeout 75s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, continuously reports `Swapchain::AcquireNextImage ok` / `Swapchain::Present ok`, and dumps a non-black frame (`2560x1440`, `nonblack=2140125`, bbox `x[37..2559] y[0..1439]`).
+- Pinball non-regression after this entry: `RUST_LOG=info timeout 35s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` exits by timeout, opens/starts the audio renderer, and reaches `BQP_QUEUE #1024` / `BQC_RELEASE #1024` without crash.
+
+## 2026-07-03 — ruzu_cmd/src/{main.rs,emu_window/emu_window_sdl2_vk.rs} vs yuzu_cmd/{yuzu.cpp,emu_window/emu_window_sdl2_vk.cpp}
+
+### Intentional differences
+- Rust now lets the existing diagnostic `RUZU_POLL_EVENTS_LOOP` mode drive the Vulkan SDL frontend as well as the OpenGL frontend. Upstream `yuzu_cmd` always uses `WaitEvent`; this is a macOS visibility diagnostic to test whether a non-blocking SDL event loop changes command-line Vulkan/CAMetalLayer presentation without altering the default path.
+- `EmuWindowSdl2Vk::poll_events()` mirrors the existing OpenGL wrapper shape: poll pending SDL events, then refresh the Vulkan drawable-size-backed framebuffer layout. The default Vulkan path still calls `wait_event()` and remains upstream-ordered.
+
+### Unintentional differences (to fix)
+- None in default execution. The polling loop is env-gated and inactive unless `RUZU_POLL_EVENTS_LOOP` is set.
+
+### Missing items
+- Upstream has no separate CLI polling mode. If this diagnostic proves necessary for macOS visibility, it should be converted from an env diagnostic into a documented frontend platform adaptation with the same review standard as the AppKit activation hook.
+
+### Binary layout verification
+- N/A: frontend event-loop behavior only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `yuzu.cpp`: after `system.Run()`, the main thread stays in `while (emu_window->IsOpen()) { emu_window->WaitEvent(); }`.
+- Re-read upstream `emu_window_sdl2_vk.cpp`: Vulkan window initialization still matches the default Rust `wait_event` path; the new polling method is not used unless the diagnostic environment variable is set.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D diagnostic with `RUZU_POLL_EVENTS_LOOP=1 RUZU_TRACE_PRESENT=1 RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_poll_window.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 timeout 85s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` reaches frame 1800 at ~40.4s, dumps a non-black frame (`2560x1440`, `nonblack=2140125`, bbox `x[37..2559] y[0..1439]`), and continues presenting through frame 3959 before a later SIGSEGV. The late crash is not resolved by this frontend diagnostic.
+
+## 2026-07-03 — ruzu_cmd/src/emu_window/emu_window_sdl2_vk.rs vs yuzu/{qt_common.cpp,yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp}
+
+### Intentional differences
+- Rust validates that `SDL_Metal_GetLayer(SDL_Metal_CreateView(...))` returns a `CAMetalLayer`, matching the invariant explicitly enforced by upstream `yuzu/qt_common.cpp` for the Qt frontend before handing a macOS layer to MoltenVK.
+- Rust calls `setWantsLayer:YES`, `setNeedsDisplay:YES`, and `displayIfNeeded` on the SDL-created Metal view after validation. Upstream `yuzu_cmd` does not need this explicit AppKit commit, but `yuzu.app`/Qt has equivalent explicit layer setup because non-Metal or uncommitted Cocoa layers break MoltenVK presentation. This is a macOS command-line frontend adaptation and is inactive on non-macOS platforms.
+- The Vulkan surface handle remains the same owner and type as upstream `yuzu_cmd`: the `CAMetalLayer*` returned by `SDL_Metal_GetLayer`, not the `SDL_MetalView` itself.
+
+### Unintentional differences (to fix)
+- None in Vulkan surface identity. The Rust check exits only if SDL violates the expected upstream MoltenVK requirement by returning a non-`CAMetalLayer`.
+
+### Missing items
+- This does not prove that WindowServer visibly composites the layer in every local macOS session; it only proves the SDL/Metal layer handed to Vulkan satisfies the same `CAMetalLayer` invariant upstream enforces for Qt.
+
+### Binary layout verification
+- N/A: frontend AppKit/SDL layer setup only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp`: the command-line Vulkan frontend passes `SDL_Metal_GetLayer(SDL_Metal_CreateView(render_window))` as the render surface.
+- Re-read upstream `yuzu/qt_common.cpp`: the Qt frontend checks whether the native view's layer is a `CAMetalLayer`, creates one if necessary, sets `wantsLayer`, and uses that layer as `render_surface`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D validation after this entry: `unset VK_ICD_FILENAMES; RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_metal_present.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 RUZU_DUMP_SWAPCHAIN_FRAME=/tmp/ruzu_mk8d_metal_swapchain.ppm RUZU_DUMP_SWAPCHAIN_FRAME_AT=1800 timeout 75s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, logs no non-`CAMetalLayer` error, and both dumps are non-black `2560x1440` frames (`nonblack=2140125`, bbox `x[37..2559] y[0..1439]`).
+- MK8D no-readback progress validation after this entry: `unset VK_ICD_FILENAMES; RUST_LOG=info target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` was sampled/killed after 35s and reached `submit#2048` at ~26.3s without relying on `RUZU_DUMP_PRESENT_FRAME` or `RUZU_DUMP_SWAPCHAIN_FRAME`.
+
+## 2026-07-03 — ruzu_cmd/src/emu_window/emu_window_sdl2_vk.rs vs yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp
+
+### Intentional differences
+- On macOS only, Rust creates the SDL Vulkan command-line window with `SDL_WINDOW_METAL` in addition to upstream's `SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI`. Upstream `yuzu_cmd` relies on `SDL_Metal_CreateView` to convert the window to Metal after creation; current SDL documents `SDL_WINDOW_METAL` as the flag for a window usable with a Metal view, and setting it up front avoids a late graphics-backend transition in the unbundled `ruzu-cmd` AppKit path.
+- The render surface is still obtained through the upstream command-line path: `SDL_Metal_CreateView(render_window)` followed by `SDL_Metal_GetLayer(view)`, and the `CAMetalLayer*` is passed to Vulkan.
+
+### Unintentional differences (to fix)
+- None in non-macOS behavior; the additional flag is `#[cfg(target_os = "macos")]`.
+
+### Missing items
+- Upstream `yuzu_cmd` does not include this flag, so this remains a documented macOS CLI/frontend adaptation rather than a renderer parity change. If a future SDL/MoltenVK combination proves the late conversion path reliable again, this can be revisited.
+
+### Binary layout verification
+- N/A: SDL window flags only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp`: window flags are `SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI`, and the Metal layer is created later with `SDL_Metal_CreateView`.
+- Re-read local SDL 2.0.37 source: `SDL_Metal_CreateView` marks an existing window as `SDL_WINDOW_METAL` and clears `SDL_WINDOW_VULKAN` if needed; creating the window with `SDL_WINDOW_METAL` avoids that late transition.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D no-readback progress validation: `unset VK_ICD_FILENAMES; RUST_LOG=info target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` was sampled/killed after 35s and reached `submit#2048` at ~27.9s with no non-`CAMetalLayer` error.
+- MK8D swapchain validation: `unset VK_ICD_FILENAMES; RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_metalflag_present.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 RUZU_DUMP_SWAPCHAIN_FRAME=/tmp/ruzu_mk8d_metalflag_swapchain.ppm RUZU_DUMP_SWAPCHAIN_FRAME_AT=1800 timeout 75s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, and both dumps are non-black `2560x1440` frames (`nonblack=2140125`, bbox `x[37..2559] y[0..1439]`).
+- Pinball non-regression: `unset VK_ICD_FILENAMES; RUST_LOG=info timeout 30s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` exits by timeout, loads the SDK Vulkan loader through the SDK ICD, opens/starts the audio renderer, and reports no Vulkan initialization failure.
+
+## 2026-07-03 — ruzu_cmd/src/emu_window/emu_window_sdl2_vk.rs vs yuzu/{qt_common.cpp,yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp}
+
+### Intentional differences
+- Rust adds `RUZU_TRACE_MACOS_WINDOW`, an environment-gated macOS diagnostic that logs the `NSWindow` pointer, `windowNumber`, visibility/minimized state, `CAMetalLayer` pointer, drawable size, and contents scale for the SDL Metal view. Upstream has no logging equivalent; this is diagnostic-only and inactive by default.
+- The diagnostic lives in the SDL Vulkan frontend owner because it inspects the exact `SDL_MetalView`/`CAMetalLayer` that upstream `yuzu_cmd` passes to `vulkan_surface.cpp`, and the same `CAMetalLayer` invariant upstream `yuzu/qt_common.cpp` enforces for Qt.
+
+### Unintentional differences (to fix)
+- None in default behavior. With `RUZU_TRACE_MACOS_WINDOW` unset, no extra AppKit queries are performed.
+
+### Missing items
+- The local macOS session still cannot provide a reliable WindowServer screenshot: `screencapture -l <window_number>` returned `could not create image from window`, so visual completion still requires direct user observation or a working capture permission state.
+
+### Binary layout verification
+- N/A: frontend diagnostic only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp`: the Metal layer comes from `SDL_Metal_GetLayer(SDL_Metal_CreateView(render_window))`.
+- Re-read upstream `yuzu/qt_common.cpp`: the Qt frontend ensures the native view's layer is a `CAMetalLayer` before assigning `render_surface`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- Trace validation: `RUZU_TRACE_MACOS_WINDOW=1 RUST_LOG=info timeout 8s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` logs `visible=true`, `miniaturized=false`, `drawable=2560x1440`, and `contents_scale=2`.
+- MK8D capture attempt: `RUZU_TRACE_MACOS_WINDOW=1 RUST_LOG=info target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` logs `visible=true`, `miniaturized=false`, `drawable=2560x1440`, reaches `submit#2048` at ~26s, but `screencapture -l <window_number>` fails with `could not create image from window`.
+## 2026-07-03 — ruzu_cmd/src/emu_window/emu_window_sdl2.rs vs yuzu_cmd/emu_window/emu_window_sdl2.cpp
+
+### Intentional differences
+- `SDL_SetMainReady()` is called before `SDL_Init()` in Rust. Upstream C++ calls it after `SDL_Init()` inside `EmuWindow_SDL2::EmuWindow_SDL2`; the Rust command-line binary does not go through SDL's `SDL_main` wrapper, so this follows SDL's documented non-`SDL_main` bootstrap order while preserving the same frontend ownership and SDL subsystem initialization flags.
+- Rust still stores `shown_state` and `framebuffer_layout` in shared state for renderer-thread access; upstream stores equivalent state through the frontend/window object. This is an ownership adaptation for Rust threading, not a behavioral change in event handling.
+
+### Unintentional differences (to fix)
+- None in this slice.
+
+### Missing items
+- Full upstream `InputCommon::InputSubsystem` ownership is still not ported in this file; Rust currently forwards simple HID events directly.
+
+### Binary layout verification
+- N/A: SDL frontend bootstrap code does not serialize raw payloads.
+
+## 2026-07-03 — video_core/src/renderer_vulkan/{mod.rs,query_cache.rs} vs video_core/renderer_vulkan/vk_rasterizer.cpp
+
+### Intentional differences
+- Rust stores upstream `RasterizerVulkan::wfi_event` as a raw `vk::Event` field in the active `renderer_vulkan/mod.rs` owner and destroys it from `Drop`; upstream stores `vk::Event wfi_event` through the Vulkan wrapper type and relies on RAII destruction.
+- Rust `QueryCache::notify_wfi()` is a small wrapper around `QueryCacheBase::notify_wfi()` because the active Rust Vulkan query cache separates the backend owner from the base cache. Upstream calls `query_cache.NotifyWFI()` directly.
+- The Rust `WaitForIdle` stage mask omits `VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT` because the active `RasterizerVulkan` owner currently stores only `ash::Device`, not the upstream `Device` wrapper exposing `IsExtTransformFeedbackSupported()`. This is non-behavioral on macOS/MoltenVK where transform feedback is not supported; wiring the wrapper into this owner remains the faithful follow-up for non-macOS parity.
+
+### Unintentional differences (to fix)
+- No remaining unintentional difference for Vulkan wait-for-idle ordering in this slice. Rust no longer calls `finish()`/`vkWaitForFences` for guest `WAIT_FOR_IDLE`; it now records `vkCmdSetEvent` + `vkCmdWaitEvents` through the scheduler and calls fence `signal_ordering`, matching upstream `RasterizerVulkan::WaitForIdle`.
+
+### Missing items
+- Full upstream Vulkan device-wrapper ownership in the active rasterizer, needed to include the transform-feedback pipeline stage only when `IsExtTransformFeedbackSupported()` is true.
+- Full Vulkan query runtime barriers are still reduced; `notify_wfi()` now reaches the base query-cache hook, but the backend runtime remains less complete than upstream `vk_query_cache.cpp`.
+
+### Binary layout verification
+- N/A: Vulkan command scheduling only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `vk_rasterizer.cpp`: `RasterizerVulkan::WaitForIdle` builds a non-pixel stage mask, calls `query_cache.NotifyWFI()`, requests an outside-render-pass scheduler context, records `SetEvent`/`WaitEvents`, then calls `fence_manager.SignalOrdering()`.
+- Re-read upstream `vk_rasterizer.h`: `wfi_event` is owned by `RasterizerVulkan`.
+- Re-read upstream `query_cache/query_cache.h`: `QueryCacheBase::NotifyWFI` is the base hook used by Vulkan wait-for-idle.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D validation after this entry: `RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_wfi_fix.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 timeout 90s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` reaches `BQP_QUEUE #2048` at ~44.5s and dumps a non-black 2560x1440 Mario Kart 8 Deluxe logo. This is faster than the previous ~58s to the same queue point.
+- MK8D present-path validation after this entry: `RUZU_TRACE_PRESENT=1 RUST_LOG=info timeout 55s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` reaches continuous `Swapchain::AcquireNextImage ok`, `Swapchain::Present ok`, and `PresentManager::CopyToSwapchain presented` logs through `current_frame=2628`, proving the renderer submits non-error swapchain presents after the WFI change.
+- Pinball non-regression after this entry: `RUST_LOG=info timeout 35s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` opens and starts the audio renderer, reaches `BQP_QUEUE #1024` / `BQC_RELEASE #1024`, and exits only by timeout.
+
+## 2026-07-03 — video_core/src/renderer_vulkan/{swapchain.rs,present_manager.rs,renderer_vulkan.rs} vs video_core/renderer_vulkan/{vk_swapchain.cpp,vk_present_manager.cpp,renderer_vulkan.cpp}
+
+### Intentional differences
+- Upstream stores `Scheduler& scheduler` inside `Swapchain`; Rust passes `&mut Scheduler` through `RendererVulkan::composite` -> `PresentManager::present` -> `copy_to_swapchain` -> `Swapchain::acquire_next_image`. This preserves the exact acquire-time wait/update behavior without introducing a self-referential Rust owner between `RendererVulkan`, `Scheduler`, and `Swapchain`.
+- Rust passes the shared queue-submit mutex explicitly into `Swapchain` and `PresentManager`. Upstream reaches it through the stored `Scheduler&`; the Rust ownership adaptation keeps the same lock around present/copy submits.
+
+### Unintentional differences (to fix)
+- No remaining resource-tick ordering difference in this slice. Rust now calls `scheduler.wait(resource_ticks[image_index])` immediately after `vkAcquireNextImageKHR` and stores `scheduler.current_tick()` into the acquired image slot, matching upstream `Swapchain::AcquireNextImage`.
+
+### Missing items
+- Full upstream ownership parity would store/reach the scheduler from `Swapchain` rather than threading it through present calls. The current implementation is behaviorally faithful for acquire ordering but remains an ownership adaptation.
+- `PresentManager::CopyToSwapchain` still recreates the existing surface via `swapchain.recreate(...)`; upstream recreates the platform surface after `VK_ERROR_SURFACE_LOST_KHR` with `CreateSurface(instance, render_window.GetWindowInfo())`. This is not exercised by the current MK8D/Pinball traces.
+
+### Binary layout verification
+- N/A: Vulkan presentation scheduling only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `vk_swapchain.cpp`: `AcquireNextImage` waits the previous `resource_ticks[image_index]` through the scheduler and immediately replaces it with `scheduler.CurrentTick()`.
+- Re-read upstream `vk_present_manager.cpp`: `CopyToSwapchainImpl` loops on `swapchain.AcquireNextImage()` and recreates the swapchain on stale/suboptimal acquisition; Rust now passes the scheduler into the same acquisition point.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes after this change.
+- MK8D validation after this entry: `RUZU_TRACE_PRESENT=1 RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_swap_tick.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 timeout 70s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, remains actively presenting with `Swapchain::AcquireNextImage ok` / `Swapchain::Present ok`, and reaches `BQP_QUEUE #1024` at ~26.2s / `BQC_RELEASE #1024` at ~26.3s.
+- Pinball non-regression after this entry: `RUST_LOG=info timeout 30s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` opens and starts the audio renderer, reaches `BQP_QUEUE #1024` / `BQC_RELEASE #1024`, and exits only by timeout.
+
+## 2026-07-03 — video_core/src/vulkan_common/vulkan_library.rs vs video_core/vulkan_common/vulkan_library.cpp
+
+### Intentional differences
+- Rust keeps upstream's macOS priority order for explicit/bundled libraries: `LIBVULKAN_PATH`, then the current app bundle's `Contents/Frameworks/libvulkan.1.dylib`, then `Contents/Frameworks/libMoltenVK.dylib`.
+- Because `ruzu-cmd` is normally launched unbundled during development, Rust adds a macOS development fallback for `VULKAN_SDK` and `~/Dev/emulators/VulkanSDK/*/macOS` before Homebrew/Xcode DerivedData paths. When this fallback selects `libvulkan.1.dylib` or `libvulkan.dylib` and `VK_ICD_FILENAMES` is unset, Rust points `VK_ICD_FILENAMES` at the SDK's `share/vulkan/icd.d/MoltenVK_icd.json`. This mirrors what an app bundle/installed SDK environment provides externally; it is not guest-visible behavior.
+- Rust also keeps a local yuzu app-bundle fallback under `~/Dev/emulators/zuyu/build/bin/yuzu.app/Contents/Frameworks` for command-line development. Upstream does not need this because `Common::FS::GetBundleDirectory()` already resolves the running app bundle in the Qt frontend.
+
+### Unintentional differences (to fix)
+- None in the upstream-owned lookup order. The extra paths are non-bundled macOS development fallbacks and do not override `LIBVULKAN_PATH` or the current app bundle.
+
+### Missing items
+- A packaged `ruzu.app` should eventually make the SDK/yuzu/Homebrew/DerivedData fallbacks unnecessary for normal users. Until then, `ruzu-cmd` needs the explicit SDK ICD setup to avoid loading a Vulkan loader that cannot discover MoltenVK.
+
+### Binary layout verification
+- N/A: Vulkan host library loading only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `vulkan_common/vulkan_library.cpp`: macOS checks only `LIBVULKAN_PATH`, bundled `libvulkan.1.dylib`, and bundled `libMoltenVK.dylib` through `Common::DynamicLibrary`.
+- Before this entry, loading `/Users/vricosti/Dev/emulators/VulkanSDK/1.4.350.1/macOS/lib/libvulkan.1.dylib` failed device creation because the loader could not enumerate `VK_EXT_metal_surface`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D short validation: `unset VK_ICD_FILENAMES; RUST_LOG=info timeout 8s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` loads `/Users/vricosti/Dev/emulators/VulkanSDK/1.4.350.1/macOS/lib/libvulkan.1.dylib`, logs `Using Vulkan ICD manifest from /Users/vricosti/Dev/emulators/VulkanSDK/1.4.350.1/macOS/share/vulkan/icd.d/MoltenVK_icd.json`, and no longer reports missing `VK_EXT_metal_surface`.
+- MK8D frame validation: `unset VK_ICD_FILENAMES; RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_sdk_loader.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 timeout 75s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, dumps a non-black `2560x1440` frame (`nonblack=2140125`, bbox `x[37..2559] y[0..1439]`), and reports no Vulkan extension initialization failure.
+- Pinball non-regression: `unset VK_ICD_FILENAMES; RUST_LOG=info timeout 30s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` exits by timeout, loads the SDK Vulkan loader through the SDK ICD, opens/starts the audio renderer, and reports no Vulkan initialization failure.
+
+## 2026-07-03 — video_core/src/renderer_vulkan/present_manager.rs vs video_core/renderer_vulkan/vk_present_manager.cpp
+
+### Intentional differences
+- Rust adds an environment-gated diagnostic readback in `PresentManager::copy_to_swapchain_impl` controlled by `RUZU_DUMP_SWAPCHAIN_FRAME` and `RUZU_DUMP_SWAPCHAIN_FRAME_AT`. Upstream has no equivalent diagnostic, but the code is inactive by default and lives in the same owner as upstream `PresentManager::CopyToSwapchainImpl`, because it inspects the image immediately after that method's blit/copy into the acquired swapchain image.
+- The diagnostic temporarily transitions the acquired swapchain image from `TRANSFER_DST_OPTIMAL` to `TRANSFER_SRC_OPTIMAL`, copies it to a host-visible buffer, transitions it back to `TRANSFER_DST_OPTIMAL`, then lets the normal upstream-equivalent post barrier transition it to `PRESENT_SRC_KHR`. This preserves normal command ordering when the diagnostic is disabled.
+- Rust duplicates a small local BGRA-to-PPM helper in `present_manager.rs` instead of using the private `renderer_vulkan.rs` helper, so the diagnostic remains owned by the corresponding upstream file rather than reaching across owners.
+
+### Unintentional differences (to fix)
+- None in default execution. With `RUZU_DUMP_SWAPCHAIN_FRAME` unset, `CopyToSwapchainImpl` records the same pre-barriers, blit/copy, post-barriers, submit, and semaphore/fence flow as before.
+
+### Missing items
+- This is diagnostic-only and should not be treated as a replacement for a real packaged macOS frontend visibility fix if `vkQueuePresentKHR` reaches a non-black swapchain image but the CAMetalLayer still displays black.
+
+### Binary layout verification
+- N/A: Vulkan host diagnostic only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `vk_present_manager.cpp`: `CopyToSwapchainImpl` transitions the swapchain image to transfer destination, blits/copies the `Frame` image into it, transitions it to `PRESENT_SRC_KHR`, then submits the present command buffer with the same wait/signal semaphores.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D swapchain validation: `unset VK_ICD_FILENAMES; RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_present_1800.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 RUZU_DUMP_SWAPCHAIN_FRAME=/tmp/ruzu_mk8d_swapchain_1800.ppm RUZU_DUMP_SWAPCHAIN_FRAME_AT=1800 timeout 75s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout. Both dumps are `2560x1440`, `nonblack=2140125`, bbox `x[37..2559] y[0..1439]`, proving the image written to the acquired swapchain image is non-black at frame 1800.
+- Pinball non-regression with the diagnostic disabled: `unset VK_ICD_FILENAMES; unset RUZU_DUMP_SWAPCHAIN_FRAME; RUST_LOG=info timeout 30s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` exits by timeout, loads the SDK Vulkan loader through the SDK ICD, opens/starts the audio renderer, and reports no Vulkan initialization failure.
+
+## 2026-07-03 — ruzu_cmd/src/emu_window/emu_window_sdl2_vk.rs vs yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp
+
+### Intentional differences
+- On macOS, Rust now explicitly orders the `NSWindow` containing SDL's `SDL_MetalView` to the front with `makeKeyAndOrderFront:` and `orderFrontRegardless` after `SDL_ShowWindow` / `SDL_RaiseWindow`. Upstream `yuzu_cmd` does not do this in `emu_window_sdl2_vk.cpp`; `yuzu.app` gets normal activation/window ordering from the Qt/app-bundle AppKit lifecycle, while unbundled `ruzu-cmd` does not.
+- Rust also asks `NSRunningApplication::currentApplication` to activate all windows while ignoring other apps. This is a command-line macOS activation adaptation; upstream app-bundle frontends get the same AppKit state through normal launch services rather than explicit CLI code.
+- The extra ordering stays in the Vulkan SDL frontend owner, next to the upstream Metal-view creation (`SDL_Metal_CreateView` / `SDL_Metal_GetLayer`) and does not alter the Vulkan renderer, swapchain, or guest-visible behavior.
+
+### Unintentional differences (to fix)
+- None for default Vulkan command flow. If the user still observes a black macOS window while `vkQueuePresentKHR` succeeds and swapchain readback is non-black, the remaining issue is outside guest rendering and must be investigated at the AppKit/CAMetalLayer/WindowServer display boundary.
+
+### Missing items
+- A packaged `ruzu.app` frontend should eventually replace these command-line AppKit activation/order-front adaptations with the normal macOS app lifecycle that `yuzu.app`/Qt receives.
+
+### Binary layout verification
+- N/A: macOS frontend window ordering only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp`: macOS still creates the Metal surface by storing `SDL_Metal_GetLayer(SDL_Metal_CreateView(render_window))` in `window_info.render_surface`.
+- Re-read upstream `yuzu/qt_common.cpp`: the Qt frontend uses Cocoa window-system type, verifies/replaces the native view layer with a `CAMetalLayer`, and relies on Qt/AppKit native window setup rather than command-line SDL ordering.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- Pinball non-regression: `unset VK_ICD_FILENAMES RUZU_DUMP_PRESENT_FRAME RUZU_DUMP_SWAPCHAIN_FRAME RUZU_TRACE_PRESENT RUZU_TRACE_MACOS_WINDOW; RUST_LOG=info timeout 25s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` exits by timeout, loads the SDK Vulkan loader through the SDK ICD, opens/starts the audio renderer, and reports no Vulkan initialization failure.
+- MK8D validation: `unset VK_ICD_FILENAMES RUZU_DUMP_PRESENT_FRAME RUZU_DUMP_SWAPCHAIN_FRAME RUZU_TRACE_PRESENT RUZU_TRACE_MACOS_WINDOW; RUST_LOG=info timeout 70s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, loads the SDK Vulkan loader through the SDK ICD, creates a `2560x1440` FIFO swapchain, starts the audio renderer at ~2.5s, and reaches `submit#2048` at ~26.3s.
+- AppKit diagnostic validation: `RUZU_TRACE_MACOS_WINDOW=1 timeout 6s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` logs the same pointer for `layer` and `view_layer`, `layer_matches_view=true`, `drawable=2560x1440`, and `contents_scale=2`. In this terminal-launched session the window still reports `key=false main=false`, so activation parity with a bundled app is not proven.
+- MK8D swapchain visual validation after the AppKit changes: `RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_current_present.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 RUZU_DUMP_SWAPCHAIN_FRAME=/tmp/ruzu_mk8d_current_swapchain.ppm RUZU_DUMP_SWAPCHAIN_FRAME_AT=1800 timeout 75s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout; both dumps are `2560x1440`, `nonblack=2140125`, bbox `x[37..2559] y[0..1439]`, and the swapchain PNG shows the full Mario Kart 8 Deluxe logo.
+
+## 2026-07-03 — scripts/run_ruzu_cmd_app_macos.sh vs yuzu app-bundle launch path
+
+### Intentional differences
+- Rust adds a development-only macOS launcher script that creates `target/release/ruzu-cmd.app` and launches it through LaunchServices with `open -n -W --stdout ... --stderr ... --env RUST_LOG=info`. Upstream does not need this script because `yuzu.app` is produced by the CMake/Qt bundle path and is normally launched as an app bundle.
+- The script copies the already-built `target/release/ruzu-cmd` into `Contents/MacOS/ruzu-cmd` and writes a minimal `Info.plist` (`CFBundlePackageType=APPL`, `NSHighResolutionCapable=true`). This is a host frontend launch wrapper only; it does not change guest behavior, renderer state, or Vulkan command flow.
+- `RUZU_APP_LAUNCH_MODE=direct` is retained as a diagnostic fallback to execute the bundle binary directly from `Contents/MacOS`, but the default path is LaunchServices because that is the app-bundle lifecycle that matches `yuzu.app`.
+
+### Unintentional differences (to fix)
+- This is not a production packaging replacement. A real `ruzu.app` bundle should eventually be produced by the build/package system and include the proper app metadata/resources instead of a development script under `scripts/`.
+
+### Missing items
+- Proper packaged macOS frontend/bundle with icon, bundle-local frameworks, stable bundle identifier, and normal launcher integration.
+
+### Binary layout verification
+- N/A: host launcher script only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp`: command-line SDL creates `SDL_Metal_GetLayer(SDL_Metal_CreateView(render_window))`, but upstream's working GUI path is `yuzu.app`, not an unbundled Rust CLI binary.
+- Re-read upstream `yuzu/qt_common.cpp`: the Qt app-bundle path uses Cocoa window-system info and a `CAMetalLayer`, relying on normal app-bundle/LaunchServices activation.
+- Pinball LaunchServices validation: `RUZU_APP_LOG=/tmp/ruzu_pinball_app5.log timeout 12s scripts/run_ruzu_cmd_app_macos.sh /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` creates/launches `target/release/ruzu-cmd.app`, writes logs through `open --stdout/--stderr`, creates a `2560x1440` Vulkan swapchain, and starts the audio renderer.
+- MK8D LaunchServices validation: `RUZU_APP_LOG=/tmp/ruzu_mk8d_app_ls.log timeout 90s scripts/run_ruzu_cmd_app_macos.sh "...Mario Kart 8 Deluxe..."` creates a `2560x1440` FIFO swapchain, starts the audio renderer at ~3.6s, reaches `submit#2048` at ~34.9s and `submit#4096` at ~57.8s.
+- AppKit activation validation: `RUZU_TRACE_MACOS_WINDOW=1 RUZU_APP_LOG=/tmp/ruzu_pinball_app_trace.log timeout 8s scripts/run_ruzu_cmd_app_macos.sh /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` logs `key=true main=true`, `layer_matches_view=true`, and `drawable=2560x1440` under LaunchServices. The same diagnostic under direct CLI launch logged `key=false main=false`, proving the remaining visible-window issue was launch-lifecycle related rather than a Vulkan swapchain-content issue.
+
+## 2026-07-03 — core/src/core.rs, core/src/hle/kernel/kernel.rs, video_core/src/gpu.rs, ruzu_cmd/src/emu_window/emu_window_sdl2.rs vs core/core.cpp, core/hle/kernel/kernel.cpp, video_core/gpu.cpp, yuzu_cmd/emu_window/emu_window_sdl2.cpp
+
+### Intentional differences
+- Rust `GpuCoreInterface` now exposes `notify_shutdown`, and `System::shutdown_main_process` calls it before `core_timing.sync_pause(false)`, matching upstream `System::Impl::ShutdownMainProcess()` calling `gpu_core->NotifyShutdown()` before `core_timing.SyncPause(false)`.
+- Rust `Gpu::notify_shutdown` now takes the sync-request mutex and notifies the sync-request condition variable after setting `shutting_down`, matching upstream `GPU::Impl::NotifyShutdown()` taking `sync_mutex`, setting `shutting_down`, and notifying waiters.
+- Rust `KernelCore::close_services` stores stop/wakeup handles beside each tracked `ServerManager` so shutdown can signal service loops without taking the outer `Arc<Mutex<ServerManager>>`. This is a Rust adaptation for the current split ownership; upstream owns raw `ServerManager` objects and `KernelCore::CloseServices()` simply clears the vector, which runs `ServerManager::~ServerManager()`.
+- If a `ServerManager` mutex is still held during shutdown, Rust logs and skips deeper kernel teardown from `System::shutdown_main_process`, allowing the frontend's existing `std::process::exit(0)` path to terminate remaining host threads. This is intentionally not claimed as full upstream parity; it prevents the user close path from deadlocking or panicking while the current Rust `ServerManager` still holds its mutex inside `WaitSignaled`.
+- Rust logs `SDL_WINDOWEVENT_CLOSE` / `SDL_QUIT` and shutdown phases. Upstream does not log these points, but the event handling remains behaviorally identical: both `SDL_WINDOWEVENT_CLOSE` and `SDL_QUIT` set `is_open=false`.
+
+### Unintentional differences (to fix)
+- `ServerManager::loop_process_impl_shared` still holds `Mutex<ServerManager>` while blocked in `wait_signaled()`. Upstream has no outer Rust mutex around `ServerManager::WaitSignaled()`, so `ServerManager::~ServerManager()` can request stop and signal wakeup without ABBA-deadlocking. The correct future fix is to split `ServerManager` state into upstream-like interior ownership so `WaitSignaled` does not monopolize the manager mutex.
+- Because of that structural mismatch, `KernelCore::close_services` cannot always wait for every manager to stop and join every additional host thread the way upstream `ServerManager::~ServerManager()` does. The current close path is a bounded shutdown escape, not complete service teardown parity.
+
+### Missing items
+- Full upstream-faithful `ServerManager` lifecycle: destructor-equivalent stop, wake, `m_stopped.Wait()`, `m_threads.clear()`, and port cleanup without requiring an external manager mutex.
+- Removal of the frontend force-exit workaround once CPU, service, audio, GPU, and CoreTiming threads all shut down through faithful upstream owners.
+
+### Binary layout verification
+- N/A: shutdown/frontend lifecycle only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `yuzu_cmd/emu_window/emu_window_sdl2.cpp`: `SDL_WINDOWEVENT_CLOSE` and `SDL_QUIT` both set `is_open=false`, and the main loop exits before `system.Pause(); system.ShutdownMainProcess();`.
+- Re-read upstream `core/core.cpp`: `System::Impl::ShutdownMainProcess()` sets shutdown state, clears power/exit flags, calls `gpu_core->NotifyShutdown()`, then `core_timing.SyncPause(false)`, `kernel.SuspendEmulation(true)`, `kernel.CloseServices()`, and `kernel.ShutdownCores()`.
+- Re-read upstream `core/hle/kernel/kernel.cpp`: `KernelCore::CloseServices()` locks `server_lock` and clears `server_managers`; `ServerManager::~ServerManager()` owns the stop/wake/wait/thread-clear sequence.
+- Re-read upstream `video_core/gpu.cpp`: `GPU::Impl::NotifyShutdown()` locks sync state, sets `shutting_down`, and notifies waiters.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- Pinball close-path validation with a temporary internal `SDL_WINDOWEVENT_CLOSE` injector before removal: `RUZU_AUTO_CLOSE_MS=5000 RUZU_APP_LOG=/tmp/ruzu_auto_close5.log scripts/run_ruzu_cmd_app_macos.sh /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` exited with `runner_rc=0`, left no `ruzu-cmd`/`open -W` process, logged `SDL window close event received`, entered `system.shutdown_main_process()`, logged `System: service shutdown incomplete; skipping deeper kernel teardown`, returned to the frontend shutdown path, and did not panic.

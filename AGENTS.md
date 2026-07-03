@@ -346,14 +346,6 @@ This document exists because earlier progress proved that a crate can be "substa
   </bad_example>
 </progress_reporting>
 
-<multi_agent_coordination>
-  <branching>
-    Before making repository modifications in `ruzu` or any submodule, Codex
-    MUST create or switch to the single shared development branch `codex-dev`.
-    Do NOT create per-task Codex branches such as `codex-kernel-event-parity`;
-    all Codex changes belong on `codex-dev`.
-  </branching>
-</multi_agent_coordination>
 
 <final_standard>
   The agent MUST keep asking:

@@ -1084,6 +1084,7 @@ dependencies = [
  "hid_core",
  "input_common",
  "log",
+ "objc",
  "parking_lot",
  "raw-window-handle 0.6.2",
  "rdynarmic",

@@ -113,3 +113,31 @@ impl Default for MiiEditAppletOutput {
         unsafe { std::mem::zeroed() }
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MiiEditCharInfo {
+    pub mii_info: [u8; 0x58],
+}
+const _: () = assert!(std::mem::size_of::<MiiEditCharInfo>() == 0x58);
+
+impl Default for MiiEditCharInfo {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MiiEditAppletOutputForCharInfoEditing {
+    pub result: u32,
+    pub char_info: MiiEditCharInfo,
+    _padding: [u8; 0x24],
+}
+const _: () = assert!(std::mem::size_of::<MiiEditAppletOutputForCharInfoEditing>() == 0x80);
+
+impl Default for MiiEditAppletOutputForCharInfoEditing {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}

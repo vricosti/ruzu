@@ -313,11 +313,13 @@ impl RendererVulkan {
             scheduler_command_pool,
         )
         .map_err(VulkanError::new)?;
+        let submit_mutex = scheduler.submit_mutex();
         let swapchain = Swapchain::new(
             &instance.instance,
             surface_loader.clone(),
             surface,
             &device,
+            submit_mutex.clone(),
             drawable_size.0.max(1),
             drawable_size.1.max(1),
         )?;
@@ -329,6 +331,7 @@ impl RendererVulkan {
             swapchain.get_image_count(),
             can_blit_to_swapchain(&device, swapchain.get_image_view_format()),
             false,
+            submit_mutex,
         );
         let supports_float16 = device.is_float16_supported();
         let blit_swapchain = BlitScreen::new(
@@ -479,6 +482,7 @@ impl RendererVulkan {
         self.present_manager.present(
             frame_index,
             &mut self.swapchain,
+            &mut self.scheduler,
             self.device.get_graphics_queue(),
         );
         self.base_data.current_frame += 1;

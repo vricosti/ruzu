@@ -9,17 +9,19 @@
 //!
 //! Matches zuyu's `vk_pipeline_cache.cpp` concept.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 
 use super::backend;
 use super::environment::Environment;
 use super::frontend::control_flow;
-use super::frontend::structured_control_flow;
+use super::frontend::structured_control_flow::{self, Expr, StructuredAction};
 use super::frontend::translate::TranslatorVisitor;
 use super::frontend::translate_program::{
     collect_interpolation_info, convert_legacy_to_generic, merge_dual_vertex_programs,
 };
 use super::ir::basic_block::Block;
+use super::ir::emitter::Emitter;
 use super::ir::instruction::Inst;
 use super::ir::opcodes::Opcode;
 use super::ir::post_order::post_order;
@@ -36,6 +38,8 @@ use super::runtime_info::RuntimeInfo;
 pub struct ShaderKey {
     /// Hash of the Maxwell binary code.
     pub code_hash: u64,
+    /// Hash of pipeline runtime state that affects translation/emission.
+    pub runtime_hash: u64,
     /// Shader stage.
     pub stage: ShaderStage,
 }
@@ -77,29 +81,20 @@ fn translate_cfg_to_program(
     cfg_blocks: &[control_flow::CfgBlock],
     sph: Option<&ProgramHeader>,
 ) -> Program {
-    let syntax_list = if std::env::var_os("RUZU_SHADER_FORCE_LINEAR_SYNTAX").is_some() {
-        linear_syntax_list(cfg_blocks)
+    let mut structured = if std::env::var_os("RUZU_SHADER_FORCE_LINEAR_SYNTAX").is_some() {
+        structured_control_flow::StructuredSyntax {
+            syntax: linear_syntax_list(cfg_blocks),
+            actions: Vec::new(),
+            block_count: cfg_blocks.len(),
+        }
     } else {
-        structured_control_flow::structure_cfg(cfg_blocks)
+        structured_control_flow::structure_cfg_detailed(cfg_blocks)
     };
+    remove_pre_end_if_merge_blocks(&mut structured);
     let mut program = Program::new(stage);
-    program.syntax_list = syntax_list;
-    program.blocks = (0..cfg_blocks.len()).map(|_| Block::new()).collect();
-
-    for (idx, cfg_block) in cfg_blocks.iter().enumerate() {
-        if let Some(target) = cfg_block.branch_true {
-            if target < cfg_blocks.len() {
-                program.block_mut(idx as u32).add_successor(target as u32);
-                program.block_mut(target as u32).add_predecessor(idx as u32);
-            }
-        }
-        if let Some(target) = cfg_block.branch_false {
-            if target < cfg_blocks.len() {
-                program.block_mut(idx as u32).add_successor(target as u32);
-                program.block_mut(target as u32).add_predecessor(idx as u32);
-            }
-        }
-    }
+    program.syntax_list = structured.syntax;
+    program.blocks = (0..structured.block_count).map(|_| Block::new()).collect();
+    materialize_return_epilogues(&mut program);
 
     for (idx, cfg_block) in cfg_blocks.iter().enumerate() {
         program.block_mut(idx as u32).order = idx as u32;
@@ -128,7 +123,11 @@ fn translate_cfg_to_program(
             tv.translate_instruction(code[i]);
         }
     }
-    materialize_syntax_conditions(&mut program, cfg_blocks);
+    for idx in cfg_blocks.len()..program.blocks.len() {
+        program.block_mut(idx as u32).order = idx as u32;
+    }
+    materialize_structured_actions(&mut program, &structured.actions);
+    rebuild_syntax_successors(&mut program);
 
     if !program.blocks.is_empty() {
         program.post_order_blocks = post_order(&program.blocks, 0);
@@ -136,6 +135,25 @@ fn translate_cfg_to_program(
     }
 
     program
+}
+
+/// Upstream `structured_control_flow.cpp` creates a dedicated return block and
+/// immediately emits `IR::IREmitter{*return_block}.Epilogue()`. Ruzu builds the
+/// syntax list before allocating the Rust `Program` blocks, so materialize the
+/// same IR instruction after the block vector exists.
+fn materialize_return_epilogues(program: &mut Program) {
+    let return_blocks: Vec<u32> = program
+        .syntax_list
+        .windows(2)
+        .filter_map(|nodes| match (&nodes[0], &nodes[1]) {
+            (SyntaxNode::Block(block), SyntaxNode::Return) => Some(*block),
+            _ => None,
+        })
+        .collect();
+
+    for block in return_blocks {
+        Emitter::new(program, block).epilogue();
+    }
 }
 
 fn linear_syntax_list(cfg_blocks: &[control_flow::CfgBlock]) -> Vec<SyntaxNode> {
@@ -147,58 +165,6 @@ fn linear_syntax_list(cfg_blocks: &[control_flow::CfgBlock]) -> Vec<SyntaxNode> 
         syntax.push(SyntaxNode::Return);
     }
     syntax
-}
-
-/// Rust adaptation of upstream `Visit(StatementType::If/Loop/Break)`.
-///
-/// Upstream creates an `IR::IREmitter` in the syntax header block and stores
-/// `ir.ConditionRef(VisitExpr(...))` in the abstract syntax node. Ruzu's
-/// simplified structurer still owns only flat CFG blocks, so it first emits
-/// placeholder `true` conditions and this pass patches the syntax nodes after
-/// the corresponding IR blocks have been translated.
-fn materialize_syntax_conditions(program: &mut Program, cfg_blocks: &[control_flow::CfgBlock]) {
-    let mut current_block = None;
-    let mut replacements = Vec::new();
-    for (index, node) in program.syntax_list.iter().enumerate() {
-        match node {
-            SyntaxNode::Block(block) => current_block = Some(*block),
-            SyntaxNode::If { cond, .. } | SyntaxNode::Repeat { cond, .. } => {
-                let Some(block) = current_block else {
-                    continue;
-                };
-                let Some(cfg_block) = cfg_blocks.get(block as usize) else {
-                    continue;
-                };
-                let invert = matches!(cond, Value::ImmU1(false));
-                if cfg_block.cond.is_always() {
-                    if invert {
-                        replacements.push((
-                            index,
-                            block,
-                            control_flow::Condition {
-                                pred: 7,
-                                negated: true,
-                            },
-                        ));
-                    }
-                    continue;
-                }
-                let mut cond = cfg_block.cond;
-                if invert {
-                    cond.negated = !cond.negated;
-                }
-                replacements.push((index, block, cond));
-            }
-            _ => {}
-        }
-    }
-    for (index, block, cond) in replacements {
-        let value = materialize_condition(program, block, cond);
-        match &mut program.syntax_list[index] {
-            SyntaxNode::If { cond, .. } | SyntaxNode::Repeat { cond, .. } => *cond = value,
-            _ => {}
-        }
-    }
 }
 
 fn materialize_condition(
@@ -226,6 +192,195 @@ fn materialize_condition(
         get_pred
     };
     append_inst(program, block, Inst::new(Opcode::ConditionRef, vec![value]))
+}
+
+fn materialize_structured_actions(program: &mut Program, actions: &[StructuredAction]) {
+    for action in actions {
+        match action {
+            StructuredAction::SetVariable { block, id, expr } => {
+                let value = materialize_expr(program, *block, expr);
+                append_inst(
+                    program,
+                    *block,
+                    Inst::new(Opcode::SetGotoVariable, vec![Value::ImmU32(*id), value]),
+                );
+            }
+            StructuredAction::SetIndirectBranchVariable {
+                block,
+                branch_reg,
+                branch_offset,
+            } => {
+                let reg = append_inst(
+                    program,
+                    *block,
+                    Inst::new(
+                        Opcode::GetRegister,
+                        vec![Value::Reg(super::ir::value::Reg(*branch_reg as u8))],
+                    ),
+                );
+                let address = append_inst(
+                    program,
+                    *block,
+                    Inst::new(
+                        Opcode::IAdd32,
+                        vec![reg, Value::ImmU32(*branch_offset as u32)],
+                    ),
+                );
+                append_inst(
+                    program,
+                    *block,
+                    Inst::new(Opcode::SetIndirectBranchVariable, vec![address]),
+                );
+            }
+            StructuredAction::Condition {
+                syntax_index,
+                block,
+                expr,
+            } => {
+                let value = materialize_expr(program, *block, expr);
+                let cond_ref = append_inst(
+                    program,
+                    *block,
+                    Inst::new(Opcode::ConditionRef, vec![value]),
+                );
+                match &mut program.syntax_list[*syntax_index] {
+                    SyntaxNode::If { cond, .. }
+                    | SyntaxNode::Repeat { cond, .. }
+                    | SyntaxNode::Break { cond, .. } => *cond = cond_ref,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn remove_pre_end_if_merge_blocks(structured: &mut structured_control_flow::StructuredSyntax) {
+    let mut index = 1usize;
+    while index < structured.syntax.len() {
+        let SyntaxNode::EndIf { merge } = structured.syntax[index] else {
+            index += 1;
+            continue;
+        };
+        if matches!(structured.syntax[index - 1], SyntaxNode::Block(block) if block == merge) {
+            let removed_index = index - 1;
+            structured.syntax.remove(removed_index);
+            for action in &mut structured.actions {
+                if let StructuredAction::Condition { syntax_index, .. } = action {
+                    if *syntax_index > removed_index {
+                        *syntax_index -= 1;
+                    }
+                }
+            }
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn materialize_expr(program: &mut Program, block: u32, expr: &Expr) -> Value {
+    match expr {
+        Expr::Identity(cond) => materialize_condition(program, block, *cond),
+        Expr::Not(expr) => {
+            let value = materialize_expr(program, block, expr);
+            append_inst(program, block, Inst::new(Opcode::LogicalNot, vec![value]))
+        }
+        Expr::Or(lhs, rhs) => {
+            let lhs = materialize_expr(program, block, lhs);
+            let rhs = materialize_expr(program, block, rhs);
+            append_inst(program, block, Inst::new(Opcode::LogicalOr, vec![lhs, rhs]))
+        }
+        Expr::Variable(id) => append_inst(
+            program,
+            block,
+            Inst::new(Opcode::GetGotoVariable, vec![Value::ImmU32(*id)]),
+        ),
+        Expr::IndirectBranchCond(location) => {
+            let branch = append_inst(
+                program,
+                block,
+                Inst::new(Opcode::GetIndirectBranchVariable, vec![]),
+            );
+            append_inst(
+                program,
+                block,
+                Inst::new(Opcode::IEqual, vec![branch, Value::ImmU32(*location)]),
+            )
+        }
+    }
+}
+
+fn add_syntax_edge(program: &mut Program, from: u32, to: u32) {
+    if from as usize >= program.blocks.len() || to as usize >= program.blocks.len() {
+        return;
+    }
+    if !program.block(from).imm_successors.contains(&to) {
+        program.block_mut(from).add_successor(to);
+    }
+    if !program.block(to).imm_predecessors.contains(&from) {
+        program.block_mut(to).add_predecessor(from);
+    }
+}
+
+fn rebuild_syntax_successors(program: &mut Program) {
+    for block in &mut program.blocks {
+        block.imm_successors.clear();
+        block.imm_predecessors.clear();
+    }
+
+    let mut current_block = None;
+    let syntax = program.syntax_list.clone();
+    for node in syntax {
+        match node {
+            SyntaxNode::Block(block) => {
+                if let Some(current) = current_block {
+                    if current != block {
+                        add_syntax_edge(program, current, block);
+                    }
+                }
+                current_block = Some(block);
+            }
+            SyntaxNode::If { body, merge, .. }
+            | SyntaxNode::Break {
+                merge, skip: body, ..
+            } => {
+                if let Some(current) = current_block {
+                    add_syntax_edge(program, current, body);
+                    add_syntax_edge(program, current, merge);
+                }
+                current_block = None;
+            }
+            SyntaxNode::Loop {
+                body,
+                continue_block,
+                merge,
+            } => {
+                if let Some(current) = current_block {
+                    add_syntax_edge(program, current, body);
+                }
+                add_syntax_edge(program, continue_block, body);
+                add_syntax_edge(program, continue_block, merge);
+                current_block = None;
+            }
+            SyntaxNode::Repeat {
+                loop_header, merge, ..
+            } => {
+                if let Some(current) = current_block {
+                    add_syntax_edge(program, current, loop_header);
+                    add_syntax_edge(program, current, merge);
+                }
+                current_block = None;
+            }
+            SyntaxNode::EndIf { merge } => {
+                if let Some(current) = current_block {
+                    add_syntax_edge(program, current, merge);
+                }
+                current_block = None;
+            }
+            SyntaxNode::Return | SyntaxNode::Unreachable => {
+                current_block = None;
+            }
+        }
+    }
 }
 
 fn append_inst(program: &mut Program, block: u32, inst: Inst) -> Value {
@@ -311,6 +466,7 @@ impl PipelineCache {
     ) -> &CompiledShader {
         let key = ShaderKey {
             code_hash: hash_code(code),
+            runtime_hash: hash_runtime_info(runtime_info),
             stage,
         };
 
@@ -326,6 +482,7 @@ impl PipelineCache {
     pub fn contains(&self, code: &[u64], stage: ShaderStage) -> bool {
         let key = ShaderKey {
             code_hash: hash_code(code),
+            runtime_hash: hash_runtime_info(&RuntimeInfo::default()),
             stage,
         };
         self.cache.contains_key(&key)
@@ -917,6 +1074,39 @@ fn hash_code(code: &[u64]) -> u64 {
     hash
 }
 
+fn hash_runtime_info(info: &RuntimeInfo) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    info.generic_input_types.hash(&mut hasher);
+    info.previous_stage_stores.mask.hash(&mut hasher);
+    info.previous_stage_legacy_stores_mapping.hash(&mut hasher);
+    info.convert_depth_mode.hash(&mut hasher);
+    info.force_early_z.hash(&mut hasher);
+    info.tess_primitive.hash(&mut hasher);
+    info.tess_spacing.hash(&mut hasher);
+    info.tess_clockwise.hash(&mut hasher);
+    info.input_topology.hash(&mut hasher);
+    match info.fixed_state_point_size {
+        Some(value) => {
+            true.hash(&mut hasher);
+            value.to_bits().hash(&mut hasher);
+        }
+        None => false.hash(&mut hasher),
+    }
+    info.alpha_test_func.hash(&mut hasher);
+    info.alpha_test_reference.to_bits().hash(&mut hasher);
+    info.y_negate.hash(&mut hasher);
+    info.glasm_use_storage_buffers.hash(&mut hasher);
+    info.frag_color_types.hash(&mut hasher);
+    info.xfb_count.hash(&mut hasher);
+    for varying in info.xfb_varyings.iter().take(info.xfb_count as usize) {
+        varying.buffer.hash(&mut hasher);
+        varying.stride.hash(&mut hasher);
+        varying.offset.hash(&mut hasher);
+        varying.components.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn translate_and_optimize_with_host_info(
     code: &[u64],
     stage: ShaderStage,
@@ -1407,6 +1597,31 @@ mod tests {
     }
 
     #[test]
+    fn cfg_translation_materializes_return_epilogue() {
+        let cfg_blocks = vec![CfgBlock {
+            begin: 0,
+            end: 1,
+            end_class: EndClass::Exit,
+            branch_true: None,
+            branch_false: None,
+            cond: Condition::always(),
+            stack_depth: 0,
+        }];
+
+        let program = translate_cfg_to_program(&[0], ShaderStage::VertexB, 0, &cfg_blocks, None);
+        let return_block = program
+            .syntax_list
+            .windows(2)
+            .find_map(|nodes| match (&nodes[0], &nodes[1]) {
+                (SyntaxNode::Block(block), SyntaxNode::Return) => Some(*block),
+                _ => None,
+            })
+            .expect("return syntax must have a preceding block");
+
+        assert_eq!(program.block(return_block).front().opcode, Opcode::Epilogue);
+    }
+
+    #[test]
     fn cfg_translation_materializes_conditional_branch_predicate() {
         use crate::ir::opcodes::Opcode;
 
@@ -1632,5 +1847,21 @@ mod tests {
         // Second lookup should hit cache
         let _compiled2 = cache.get_or_compile(&code, ShaderStage::Fragment, &runtime_info);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn pipeline_cache_keys_runtime_info_that_affects_emission() {
+        let mut cache = PipelineCache::with_default_profile();
+        let code: Vec<u64> = vec![0x0000_0000_0000_0000];
+
+        let default_runtime = RuntimeInfo::default();
+        let mut converted_depth_runtime = RuntimeInfo::default();
+        converted_depth_runtime.convert_depth_mode = true;
+
+        let _ = cache.get_or_compile(&code, ShaderStage::VertexB, &default_runtime);
+        assert_eq!(cache.len(), 1);
+
+        let _ = cache.get_or_compile(&code, ShaderStage::VertexB, &converted_depth_runtime);
+        assert_eq!(cache.len(), 2);
     }
 }

@@ -382,12 +382,15 @@ impl Device {
 
         let has_primitive_topology_list_restart =
             supported_extensions.contains("VK_EXT_primitive_topology_list_restart");
+        let has_portability_subset = supported_extensions.contains("VK_KHR_portability_subset");
         let has_extended_dynamic_state =
             supported_extensions.contains("VK_EXT_extended_dynamic_state");
         let has_extended_dynamic_state2 =
             supported_extensions.contains("VK_EXT_extended_dynamic_state2");
         let mut shader_float16_int8_features =
             vk::PhysicalDeviceShaderFloat16Int8Features::default();
+        let mut portability_subset_features =
+            vk::PhysicalDevicePortabilitySubsetFeaturesKHR::default();
         let mut primitive_topology_list_restart_features =
             vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT::default();
         let mut extended_dynamic_state_features =
@@ -397,6 +400,9 @@ impl Device {
         {
             let mut features2_builder =
                 vk::PhysicalDeviceFeatures2::builder().push_next(&mut shader_float16_int8_features);
+            if has_portability_subset {
+                features2_builder = features2_builder.push_next(&mut portability_subset_features);
+            }
             if has_primitive_topology_list_restart {
                 features2_builder =
                     features2_builder.push_next(&mut primitive_topology_list_restart_features);
@@ -431,6 +437,16 @@ impl Device {
             supports_primitive_topology_list_restart,
             supports_primitive_topology_patch_list_restart
         );
+        if has_portability_subset {
+            log::info!(
+                "Vulkan portability subset features: triangle_fans={} image_view_format_reinterpretation={} image_view_format_swizzle={} separate_stencil_mask_ref={} vertex_attribute_access_beyond_stride={}",
+                portability_subset_features.triangle_fans != 0,
+                portability_subset_features.image_view_format_reinterpretation != 0,
+                portability_subset_features.image_view_format_swizzle != 0,
+                portability_subset_features.separate_stencil_mask_ref != 0,
+                portability_subset_features.vertex_attribute_access_beyond_stride != 0,
+            );
+        }
 
         let mut enabled_extensions = Vec::<CString>::new();
         for name in [
@@ -458,6 +474,7 @@ impl Device {
                 .shader_float16(supports_shader_float16)
                 .shader_int8(supports_shader_int8)
                 .build();
+        let mut enabled_portability_subset_features = portability_subset_features;
         let mut enabled_primitive_topology_list_restart_features =
             vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT::builder()
                 .primitive_topology_list_restart(supports_primitive_topology_list_restart)
@@ -476,6 +493,9 @@ impl Device {
         let device_create_info = {
             let mut builder = vk::DeviceCreateInfo::builder()
                 .push_next(&mut enabled_shader_float16_int8_features);
+            if has_portability_subset {
+                builder = builder.push_next(&mut enabled_portability_subset_features);
+            }
             if has_primitive_topology_list_restart {
                 builder = builder.push_next(&mut enabled_primitive_topology_list_restart_features);
             }
@@ -533,6 +553,9 @@ impl Device {
                 driver_properties: supported_extensions.contains("VK_KHR_driver_properties"),
                 memory_budget: has_memory_budget,
                 shader_float16_int8: supported_extensions.contains("VK_KHR_shader_float16_int8"),
+                // MoltenVK devices are portability-subset devices. Upstream's generic
+                // feature chain enables supported feature structs before device creation;
+                // keep the extension visible here for the same ownership boundary.
                 primitive_topology_list_restart: has_primitive_topology_list_restart,
                 extended_dynamic_state: supports_extended_dynamic_state,
                 extended_dynamic_state2: supports_extended_dynamic_state2,

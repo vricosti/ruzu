@@ -1295,8 +1295,15 @@ fn main() {
             }
         }
         EmuWindow::Vk(w) => {
-            while w.is_open() {
-                w.wait_event();
+            if poll_events_loop {
+                while w.is_open() {
+                    w.poll_events();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            } else {
+                while w.is_open() {
+                    w.wait_event();
+                }
             }
         }
         EmuWindow::Null(w) => {
@@ -1311,8 +1318,12 @@ fn main() {
     // Cleanup after window closes.
     // -----------------------------------------------------------------------
     log::info!("Window closed, shutting down");
+    log::info!("Shutdown phase: system.pause() begin");
     system.pause();
+    log::info!("Shutdown phase: system.pause() end");
+    log::info!("Shutdown phase: system.shutdown_main_process() begin");
     system.shutdown_main_process();
+    log::info!("Shutdown phase: system.shutdown_main_process() end");
 
     // Force-exit the process. Some background threads (CPU core idle loops,
     // audio ADSP, CoreTiming timer) block on condvars that aren't cleanly

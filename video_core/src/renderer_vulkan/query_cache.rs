@@ -292,6 +292,9 @@ impl QueryCache {
     pub fn reset_counter(&mut self, _query_type: u32) {}
     pub fn invalidate_region(&mut self, _addr: u64, _size: usize) {}
     pub fn flush_region(&mut self, _addr: u64, _size: usize) {}
+    pub fn notify_wfi(&mut self) {
+        self.base.notify_wfi();
+    }
     pub fn commit_async_flushes(&mut self) {}
     pub fn has_uncommitted_flushes(&self) -> bool {
         false

@@ -15,9 +15,9 @@ use crate::host1x::codecs::decoder::{self, DecoderImpl};
 use crate::host1x::codecs::h264::H264;
 use crate::host1x::codecs::vp8::Vp8;
 use crate::host1x::codecs::vp9::Vp9;
-use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::host1x::FrameQueue;
 use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec, REG_EXECUTE, REG_SET_CODEC_ID};
+use crate::memory_manager::MemoryManager;
 
 /// NVDEC video decoder device.
 ///
@@ -26,7 +26,7 @@ pub struct Nvdec {
     id: i32,
     syncpoint: u32,
     frame_queue: Arc<FrameQueue>,
-    memory_manager: Arc<MaxwellDeviceMemoryManager>,
+    memory_manager: Arc<parking_lot::Mutex<MemoryManager>>,
     regs: NvdecRegisters,
     decoder: Option<Box<dyn DecoderImpl>>,
     wait_needed: bool,
@@ -37,7 +37,7 @@ impl Nvdec {
         id: i32,
         syncpt: u32,
         frame_queue: Arc<FrameQueue>,
-        memory_manager: Arc<MaxwellDeviceMemoryManager>,
+        memory_manager: Arc<parking_lot::Mutex<MemoryManager>>,
     ) -> Self {
         info!("Created nvdec {}", id);
         frame_queue.open(id);
