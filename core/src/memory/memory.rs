@@ -1297,6 +1297,63 @@ impl Memory {
         })
     }
 
+    /// Two-phase variant of `flush_data_cache` for guest cache-maintenance
+    /// SVCs.
+    ///
+    /// Upstream `PerformCacheOperation` runs without any memory-wide lock, so
+    /// its per-page `HandleRasterizerWrite` calls can contend with the GPU
+    /// thread freely. The Rust `Memory` sits behind a `Mutex`, and holding
+    /// that mutex across rasterizer notifications serializes every other
+    /// guest-memory access in the emulator (and inverts lock order against
+    /// the texture-cache mutex held by the GPU thread during draws).
+    ///
+    /// Phase 1 (this method, called under the memory lock) only walks the
+    /// page table: it merges contiguous `RasterizerCachedMemory` pages into
+    /// ranges and resolves their device addresses. Phase 2
+    /// (`RasterizerWriteBatch::apply`, called after the caller has dropped
+    /// the memory lock) performs the actual rasterizer notifications.
+    pub fn collect_rasterizer_write_ranges(
+        &self,
+        dest_addr: u64,
+        size: usize,
+    ) -> RasterizerWriteBatch {
+        let mut ranges: Vec<(u64, usize)> = Vec::new();
+        let mut remaining = size;
+        let mut vaddr = dest_addr;
+
+        while remaining > 0 {
+            let page_offset = (vaddr & PAGE_MASK) as usize;
+            let block_size = ((PAGE_SIZE as usize) - page_offset).min(remaining);
+
+            if !self.get_pointer_impl(vaddr).is_null()
+                && self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory)
+            {
+                if let Some(device_addr) = self.current_physical_address(vaddr) {
+                    match ranges.last_mut() {
+                        // Merge device-contiguous blocks so phase 2 issues one
+                        // rasterizer notification per range instead of one per
+                        // 4 KiB page.
+                        Some((last_device_addr, last_size))
+                            if *last_device_addr + *last_size as u64 == device_addr =>
+                        {
+                            *last_size += block_size;
+                        }
+                        _ => ranges.push((device_addr, block_size)),
+                    }
+                }
+            }
+
+            vaddr += block_size as u64;
+            remaining -= block_size;
+        }
+
+        RasterizerWriteBatch {
+            system: self.system,
+            dirty_manager: self.gpu_dirty_managers.first().cloned(),
+            ranges,
+        }
+    }
+
     /// Get a host pointer for a guest virtual address.
     /// Matches upstream `Memory::GetPointer`.
     pub fn get_pointer(&self, vaddr: u64) -> *mut u8 {
@@ -2705,6 +2762,39 @@ unsafe fn cmpxchg16b(
         options(nostack),
     );
     success != 0
+}
+
+/// Deferred rasterizer notifications produced by
+/// `Memory::collect_rasterizer_write_ranges` (phase 1, under the memory
+/// lock). `apply` is phase 2 and must be called after the memory lock has
+/// been released, mirroring upstream's lock-free `PerformCacheOperation`.
+pub struct RasterizerWriteBatch {
+    system: SystemRef,
+    dirty_manager: Option<Arc<Mutex<GpuDirtyMemoryManager>>>,
+    /// Merged `(device_addr, size)` ranges of rasterizer-cached pages.
+    ranges: Vec<(u64, usize)>,
+}
+
+impl RasterizerWriteBatch {
+    /// Notify the rasterizer for every collected range. Same per-range logic
+    /// as `Memory::handle_rasterizer_write`, without touching `Memory` state.
+    pub fn apply(self) {
+        for (device_addr, size) in self.ranges {
+            let do_collection = self.system.is_null()
+                || self
+                    .system
+                    .get()
+                    .gpu_core()
+                    .map(|gpu| gpu.on_cpu_write(device_addr, size as u64))
+                    .unwrap_or(false);
+            if !do_collection {
+                continue;
+            }
+            if let Some(manager) = &self.dirty_manager {
+                manager.lock().unwrap().collect(device_addr, size);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

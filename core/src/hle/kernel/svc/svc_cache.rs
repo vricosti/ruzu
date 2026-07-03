@@ -8,7 +8,7 @@ use crate::core::System;
 use crate::hle::kernel::k_typed_address::KProcessAddress;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::{Handle, PseudoHandle};
-use crate::hle::result::ResultCode;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// Flushes the entire data cache.
 /// Upstream: UNIMPLEMENTED() — intentionally unimplemented.
@@ -86,9 +86,16 @@ pub fn flush_process_data_cache(
     };
     drop(process);
 
-    let result = memory
+    // Upstream `PerformCacheOperation` holds no memory-wide lock while it
+    // notifies the rasterizer. Guests (e.g. MK8D streaming during the attract
+    // demo) issue thousands of small flushes per frame; holding the `Memory`
+    // mutex across `on_cpu_write` serializes every guest-memory access in the
+    // emulator behind rasterizer-lock contention. Collect the rasterizer
+    // ranges under the lock, then notify with the lock released.
+    let batch = memory
         .lock()
         .unwrap()
-        .flush_data_cache(address, size as usize);
-    result
+        .collect_rasterizer_write_ranges(address, size as usize);
+    batch.apply();
+    RESULT_SUCCESS
 }
