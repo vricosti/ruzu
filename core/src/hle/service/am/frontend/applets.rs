@@ -6,7 +6,13 @@
 //!
 //! Base FrontendApplet class and FrontendAppletHolder.
 
+use std::sync::Arc;
+
+use crate::core::SystemRef;
 use crate::hle::service::am::am_types::{AppletId, LibraryAppletMode};
+use crate::hle::service::am::applet_data_broker::AppletDataBroker;
+
+use super::applet_mii_edit::MiiEdit;
 
 /// Base trait for all frontend applet implementations.
 ///
@@ -40,5 +46,18 @@ impl FrontendAppletHolder {
 
     pub fn set_current_applet_id(&mut self, applet_id: AppletId) {
         self.current_applet_id = applet_id;
+    }
+
+    pub fn get_applet(
+        &self,
+        system: SystemRef,
+        broker: Arc<AppletDataBroker>,
+        id: AppletId,
+        mode: LibraryAppletMode,
+    ) -> Option<Box<dyn FrontendApplet>> {
+        match id {
+            AppletId::MiiEdit => Some(Box::new(MiiEdit::new(system, broker, mode))),
+            _ => None,
+        }
     }
 }

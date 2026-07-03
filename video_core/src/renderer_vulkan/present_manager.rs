@@ -6,10 +6,12 @@
 //! Manages presentation frames, a present thread, and swapchain copies.
 
 use std::collections::VecDeque;
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use ash::vk;
 
+use super::scheduler::Scheduler;
 use super::swapchain::Swapchain;
 
 // ---------------------------------------------------------------------------
@@ -130,6 +132,7 @@ pub struct PresentManager {
     frame_cv: Condvar,
     free_cv: Condvar,
     swapchain_mutex: Mutex<()>,
+    submit_mutex: Arc<Mutex<()>>,
     blit_supported: bool,
     use_present_thread: bool,
     image_count: usize,
@@ -138,6 +141,9 @@ pub struct PresentManager {
 /// Maximum number of images in flight.
 /// Upstream caps this at 7 (FRAMES_IN_FLIGHT=8, TICKS_TO_DESTROY=8).
 const MAX_IMAGES_IN_FLIGHT: usize = 7;
+
+static SWAPCHAIN_FRAME_DUMPED: AtomicBool = AtomicBool::new(false);
+static SWAPCHAIN_FRAME_DUMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 impl PresentManager {
     /// Port of `PresentManager::PresentManager`.
@@ -149,6 +155,7 @@ impl PresentManager {
         image_count: usize,
         blit_supported: bool,
         use_present_thread: bool,
+        submit_mutex: Arc<Mutex<()>>,
     ) -> Self {
         let effective_count = image_count.min(MAX_IMAGES_IN_FLIGHT);
 
@@ -227,6 +234,7 @@ impl PresentManager {
             frame_cv: Condvar::new(),
             free_cv: Condvar::new(),
             swapchain_mutex: Mutex::new(()),
+            submit_mutex,
             blit_supported,
             use_present_thread,
             image_count: effective_count,
@@ -318,6 +326,7 @@ impl PresentManager {
         &mut self,
         frame_index: usize,
         swapchain: &mut Swapchain,
+        scheduler: &mut Scheduler,
         graphics_queue: vk::Queue,
     ) {
         let trace_present = std::env::var_os("RUZU_TRACE_PRESENT").is_some();
@@ -332,7 +341,7 @@ impl PresentManager {
             );
         }
         if !self.use_present_thread {
-            self.copy_to_swapchain(frame_index, swapchain, graphics_queue);
+            self.copy_to_swapchain(frame_index, swapchain, scheduler, graphics_queue);
             self.release_frame(frame_index);
             if trace_present {
                 log::info!(
@@ -353,6 +362,7 @@ impl PresentManager {
         &mut self,
         frame_index: usize,
         swapchain: &mut Swapchain,
+        scheduler: &mut Scheduler,
         graphics_queue: vk::Queue,
     ) {
         let trace_present = std::env::var_os("RUZU_TRACE_PRESENT").is_some();
@@ -377,7 +387,7 @@ impl PresentManager {
         }
 
         let mut recreate_attempts = 0;
-        while swapchain.acquire_next_image() {
+        while swapchain.acquire_next_image(scheduler) {
             if trace_present {
                 log::info!(
                     "[PRESENT] PresentManager::CopyToSwapchain acquire requested recreation attempt={}",
@@ -568,6 +578,7 @@ impl PresentManager {
         graphics_queue: vk::Queue,
     ) {
         let cmdbuf = frame.cmdbuf;
+        let swapchain_dump = self.create_swapchain_dump_buffer(swapchain_extent);
 
         let begin_info = vk::CommandBufferBeginInfo::builder()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
@@ -707,6 +718,71 @@ impl PresentManager {
                 );
             }
 
+            if let Some(dump) = &swapchain_dump {
+                let swapchain_to_transfer_src = vk::ImageMemoryBarrier {
+                    s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
+                    p_next: std::ptr::null(),
+                    src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                    dst_access_mask: vk::AccessFlags::TRANSFER_READ,
+                    old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    image: swapchain_image,
+                    subresource_range: vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: vk::REMAINING_ARRAY_LAYERS,
+                    },
+                };
+                self.device.cmd_pipeline_barrier(
+                    cmdbuf,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[swapchain_to_transfer_src],
+                );
+                let region = vk::BufferImageCopy {
+                    buffer_offset: 0,
+                    buffer_row_length: 0,
+                    buffer_image_height: 0,
+                    image_subresource: make_image_subresource_layers(),
+                    image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                    image_extent: vk::Extent3D {
+                        width: swapchain_extent.width,
+                        height: swapchain_extent.height,
+                        depth: 1,
+                    },
+                };
+                self.device.cmd_copy_image_to_buffer(
+                    cmdbuf,
+                    swapchain_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    dump.buffer,
+                    &[region],
+                );
+                let swapchain_to_transfer_dst = vk::ImageMemoryBarrier {
+                    old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    src_access_mask: vk::AccessFlags::TRANSFER_READ,
+                    dst_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                    ..swapchain_to_transfer_src
+                };
+                self.device.cmd_pipeline_barrier(
+                    cmdbuf,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[swapchain_to_transfer_dst],
+                );
+            }
+
             self.device.cmd_pipeline_barrier(
                 cmdbuf,
                 vk::PipelineStageFlags::TRANSFER,
@@ -739,9 +815,14 @@ impl PresentManager {
             .build();
 
         unsafe {
+            let _submit_lock = self.submit_mutex.lock().unwrap();
             self.device
                 .queue_submit(graphics_queue, &[submit_info], frame.present_done)
                 .expect("Failed to submit present commands");
+        }
+
+        if let Some(dump) = swapchain_dump {
+            self.finish_swapchain_dump(dump, frame.present_done, swapchain_extent);
         }
     }
 
@@ -772,6 +853,145 @@ impl PresentManager {
         frame.width = 0;
         frame.height = 0;
     }
+
+    fn create_swapchain_dump_buffer(&self, extent: vk::Extent2D) -> Option<SwapchainDumpBuffer> {
+        let Some(path) = std::env::var_os("RUZU_DUMP_SWAPCHAIN_FRAME") else {
+            return None;
+        };
+        let current_frame = SWAPCHAIN_FRAME_DUMP_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        let target_frame = std::env::var("RUZU_DUMP_SWAPCHAIN_FRAME_AT")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(300);
+        if current_frame < target_frame {
+            return None;
+        }
+        if SWAPCHAIN_FRAME_DUMPED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+
+        let size = extent.width as vk::DeviceSize * extent.height as vk::DeviceSize * 4;
+        if size == 0 {
+            log::error!("[PRESENT] failed to dump swapchain frame: zero-sized extent");
+            return None;
+        }
+        let buffer_info = vk::BufferCreateInfo::builder()
+            .size(size)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .build();
+        let buffer = match unsafe { self.device.create_buffer(&buffer_info, None) } {
+            Ok(buffer) => buffer,
+            Err(err) => {
+                log::error!("[PRESENT] failed to create swapchain dump buffer: {:?}", err);
+                return None;
+            }
+        };
+        let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        let Some(memory_type_index) = find_memory_type(
+            &self.memory_properties,
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) else {
+            unsafe {
+                self.device.destroy_buffer(buffer, None);
+            }
+            log::error!("[PRESENT] failed to find host-coherent memory for swapchain dump");
+            return None;
+        };
+        let alloc_info = vk::MemoryAllocateInfo::builder()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type_index)
+            .build();
+        let memory = match unsafe { self.device.allocate_memory(&alloc_info, None) } {
+            Ok(memory) => memory,
+            Err(err) => {
+                unsafe {
+                    self.device.destroy_buffer(buffer, None);
+                }
+                log::error!("[PRESENT] failed to allocate swapchain dump memory: {:?}", err);
+                return None;
+            }
+        };
+        if let Err(err) = unsafe { self.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(memory, None);
+            }
+            log::error!("[PRESENT] failed to bind swapchain dump memory: {:?}", err);
+            return None;
+        }
+
+        Some(SwapchainDumpBuffer {
+            path: std::path::PathBuf::from(path),
+            buffer,
+            memory,
+            size,
+        })
+    }
+
+    fn finish_swapchain_dump(
+        &self,
+        dump: SwapchainDumpBuffer,
+        present_done: vk::Fence,
+        extent: vk::Extent2D,
+    ) {
+        let result = unsafe {
+            self.device
+                .wait_for_fences(&[present_done], true, u64::MAX)
+        };
+        if let Err(err) = result {
+            log::error!("[PRESENT] failed waiting for swapchain dump fence: {:?}", err);
+            self.destroy_swapchain_dump_buffer(dump);
+            return;
+        }
+
+        let mapped = match unsafe {
+            self.device
+                .map_memory(dump.memory, 0, dump.size, vk::MemoryMapFlags::empty())
+        } {
+            Ok(mapped) => mapped.cast::<u8>(),
+            Err(err) => {
+                log::error!("[PRESENT] failed to map swapchain dump memory: {:?}", err);
+                self.destroy_swapchain_dump_buffer(dump);
+                return;
+            }
+        };
+        let slice = unsafe { std::slice::from_raw_parts(mapped, dump.size as usize) };
+        let write_result = write_bgra_ppm(&dump.path, slice, extent.width, extent.height);
+        unsafe {
+            self.device.unmap_memory(dump.memory);
+        }
+        match write_result {
+            Ok(()) => log::info!(
+                "[PRESENT] dumped swapchain frame to {}",
+                dump.path.display()
+            ),
+            Err(err) => log::error!(
+                "[PRESENT] failed to write swapchain dump {}: {}",
+                dump.path.display(),
+                err
+            ),
+        }
+        self.destroy_swapchain_dump_buffer(dump);
+    }
+
+    fn destroy_swapchain_dump_buffer(&self, dump: SwapchainDumpBuffer) {
+        unsafe {
+            self.device.destroy_buffer(dump.buffer, None);
+            self.device.free_memory(dump.memory, None);
+        }
+    }
+}
+
+struct SwapchainDumpBuffer {
+    path: std::path::PathBuf,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    size: vk::DeviceSize,
 }
 
 impl Drop for PresentManager {
@@ -825,4 +1045,32 @@ fn find_memory_type(
         }
     }
     None
+}
+
+fn write_bgra_ppm(
+    path: &std::path::Path,
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let pixel_count = width as usize * height as usize;
+    let required_len = pixel_count * 4;
+    if bgra.len() < required_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "BGRA buffer is smaller than framebuffer dimensions",
+        ));
+    }
+
+    let mut output =
+        Vec::with_capacity(format!("P6\n{} {}\n255\n", width, height).len() + pixel_count * 3);
+    write!(&mut output, "P6\n{} {}\n255\n", width, height)?;
+    for pixel in bgra[..required_len].chunks_exact(4) {
+        output.push(pixel[2]);
+        output.push(pixel[1]);
+        output.push(pixel[0]);
+    }
+    std::fs::write(path, output)
 }

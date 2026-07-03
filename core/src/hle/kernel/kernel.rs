@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use super::super::service::server_manager::ServerManager;
+use super::super::service::os::event::Event;
 use super::k_memory_manager::KMemoryManager;
 use super::k_port::KPort;
 use super::k_process::KProcess;
@@ -70,6 +71,12 @@ static SCHEDULER_LOCK_PTR: std::sync::atomic::AtomicPtr<
 /// succeeds. Dropping the migration outright leaves a runnable thread tagged to
 /// the wrong core and can strand all guest cores in idle.
 static PENDING_ACTIVE_CORE_UPDATES: Mutex<Vec<(u64, i32)>> = Mutex::new(Vec::new());
+
+struct TrackedServerManager {
+    manager: Arc<Mutex<ServerManager>>,
+    stop_requested: Arc<AtomicBool>,
+    wakeup_event: Arc<Event>,
+}
 
 /// Public accessor for KERNEL_PTR — used by GSC to interrupt cores on thread state changes.
 pub fn get_kernel_ref() -> Option<&'static KernelCore> {
@@ -1733,7 +1740,7 @@ pub struct KernelCore {
 
     /// Active service server managers.
     /// Upstream: `Impl::server_managers`.
-    server_managers: Mutex<Vec<Arc<Mutex<ServerManager>>>>,
+    server_managers: Mutex<Vec<TrackedServerManager>>,
 
     /// Guest service processes created by `RunOnGuestCoreProcess`.
     /// Upstream keeps them alive after `KProcess::Register(*this, process)`.
@@ -2220,7 +2227,7 @@ impl KernelCore {
     pub fn shutdown(&mut self) {
         self.is_shutting_down.store(true, Ordering::Relaxed);
 
-        self.close_services();
+        let _ = self.close_services();
 
         self.next_object_id.store(0, Ordering::Relaxed);
         self.next_kernel_process_id
@@ -2271,28 +2278,62 @@ impl KernelCore {
     }
 
     /// Close all active services.
-    /// Upstream iterates server_managers and closes each.
-    pub fn close_services(&self) {
+    /// Upstream `KernelCore::CloseServices()` clears the tracked
+    /// `ServerManager` owners; `ServerManager::~ServerManager` requests stop,
+    /// signals its wakeup event, waits for the loop to stop, and clears extra
+    /// `jthread`s. Rust stores service managers behind `Arc<Mutex<_>>`, and
+    /// the service loop may hold that mutex while blocked in `WaitSignaled`.
+    /// Keep stop/wakeup handles outside the mutex so the destructor ordering
+    /// can be reproduced without ABBA-deadlocking the close path.
+    pub fn close_services(&self) -> bool {
         let server_managers = {
             let mut managers = self.server_managers.lock().unwrap();
             std::mem::take(&mut *managers)
         };
 
-        for manager in server_managers {
+        for tracked in &server_managers {
+            tracked.stop_requested.store(true, Ordering::Release);
+            tracked.wakeup_event.signal();
+        }
+
+        let mut closed_all = true;
+        for tracked in server_managers {
+            let manager = tracked.manager;
             let should_wait = {
-                let guard = manager.lock().unwrap();
-                guard.request_stop();
-                guard.loop_started()
+                match manager.try_lock() {
+                    Ok(guard) => guard.loop_started(),
+                    Err(_) => {
+                        log::warn!(
+                            "KernelCore::close_services: skipping locked ServerManager during shutdown"
+                        );
+                        closed_all = false;
+                        continue;
+                    }
+                }
             };
 
             if should_wait {
-                while !manager.lock().unwrap().is_stopped() {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+                while !manager.try_lock().map(|guard| guard.is_stopped()).unwrap_or(false) {
+                    if std::time::Instant::now() >= deadline {
+                        log::warn!(
+                            "KernelCore::close_services: timed out waiting for ServerManager stop"
+                        );
+                        closed_all = false;
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
 
-            manager.lock().unwrap().join_host_threads();
+            {
+                let join_guard = manager.try_lock();
+                if let Ok(mut guard) = join_guard {
+                    guard.join_host_threads();
+                }
+            }
         }
+        closed_all
     }
 
     /// Run a service manager that already lives in its final shared Rust owner.
@@ -2302,23 +2343,43 @@ impl KernelCore {
             if self.is_shutting_down.load(Ordering::Relaxed) {
                 return;
             }
-            managers.push(Arc::clone(&manager));
+            let (stop_requested, wakeup_event) = {
+                let guard = manager.lock().unwrap();
+                (guard.stop_requested_arc(), guard.wakeup_event_arc())
+            };
+            managers.push(TrackedServerManager {
+                manager: Arc::clone(&manager),
+                stop_requested,
+                wakeup_event,
+            });
         }
 
         crate::hle::service::server_manager::ServerManager::loop_process_shared(&manager);
     }
 
     pub(crate) fn track_server_manager_for_test(&self, server_manager: Arc<Mutex<ServerManager>>) {
-        self.server_managers.lock().unwrap().push(server_manager);
+        let (stop_requested, wakeup_event) = {
+            let guard = server_manager.lock().unwrap();
+            (guard.stop_requested_arc(), guard.wakeup_event_arc())
+        };
+        self.server_managers
+            .lock()
+            .unwrap()
+            .push(TrackedServerManager {
+                manager: server_manager,
+                stop_requested,
+                wakeup_event,
+            });
     }
 
     pub(crate) fn ensure_tracked_server_manager_port_registrations(
         &self,
         process: Arc<ProcessLock>,
     ) {
-        let managers = self.server_managers.lock().unwrap().clone();
-        for manager in managers {
-            manager
+        let managers = self.server_managers.lock().unwrap();
+        for tracked in managers.iter() {
+            tracked
+                .manager
                 .lock()
                 .unwrap()
                 .ensure_kernel_port_registrations_for_process(Arc::clone(&process));

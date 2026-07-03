@@ -24,12 +24,23 @@ use crate::buffer_cache::word_manager::DeviceTracker;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
 use crate::engines::maxwell_3d::{IndexFormat, PrimitiveTopology};
+use crate::texture_cache::texture_cache_base::TICKS_TO_DESTROY;
 
 /// A cached GPU buffer backed by VkBuffer + VkDeviceMemory.
 pub struct CachedBuffer {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
     pub size: vk::DeviceSize,
+}
+
+/// A replaced/invalidated buffer awaiting delayed destruction.
+///
+/// Commands referencing the buffer may already be recorded into the
+/// scheduler's pending command buffer; MoltenVK encodes them at
+/// vkQueueSubmit, so destroying immediately is a use-after-free.
+struct SentencedBuffer {
+    retire_tick: u64,
+    buffer: CachedBuffer,
 }
 
 /// Buffer cache parameters matching upstream `Vulkan::BufferCacheParams`.
@@ -550,6 +561,13 @@ pub struct BufferCache {
     /// Cached buffers by GPU VA.
     cache: HashMap<u64, CachedBuffer>,
 
+    /// Delayed-destruction ring for replaced/invalidated buffers, mirroring
+    /// the texture cache's sentenced resources (upstream
+    /// `DelayedDestructionRing` with `TICKS_TO_DESTROY`).
+    sentenced: Vec<SentencedBuffer>,
+    /// Scheduler tick observed at the last `tick_frame`.
+    current_tick: u64,
+
     /// Null buffer for unbound vertex/index slots.
     null_buffer: vk::Buffer,
     null_memory: vk::DeviceMemory,
@@ -592,9 +610,41 @@ impl BufferCache {
             physical_device,
             channel_caches: ChannelSetupCaches::new(),
             cache: HashMap::new(),
+            sentenced: Vec::new(),
+            current_tick: 0,
             null_buffer,
             null_memory,
         })
+    }
+
+    /// Queue a no-longer-cached buffer for destruction once the GPU can no
+    /// longer reference it. Recorded-but-unsubmitted commands (vertex/index
+    /// binds, staging copies) keep the handle alive until the scheduler has
+    /// advanced past the retire tick.
+    fn sentence(&mut self, buffer: CachedBuffer) {
+        self.sentenced.push(SentencedBuffer {
+            retire_tick: self.current_tick.saturating_add(TICKS_TO_DESTROY as u64),
+            buffer,
+        });
+    }
+
+    /// Advance the delayed-destruction ring. Called once per frame by the
+    /// rasterizer with the scheduler's current tick, like
+    /// `TextureCache::tick_frame`.
+    pub fn tick_frame(&mut self, scheduler_tick: u64) {
+        self.current_tick = scheduler_tick;
+        let mut index = 0;
+        while index < self.sentenced.len() {
+            if self.sentenced[index].retire_tick <= scheduler_tick {
+                let sentenced = self.sentenced.swap_remove(index);
+                unsafe {
+                    self.device.destroy_buffer(sentenced.buffer.buffer, None);
+                    self.device.free_memory(sentenced.buffer.memory, None);
+                }
+            } else {
+                index += 1;
+            }
+        }
     }
 
     /// Port of the Vulkan buffer-cache owner `CreateChannel` edge.
@@ -707,12 +757,10 @@ impl BufferCache {
             gpu_va
         );
 
-        // Remove old entry if exists
+        // Remove old entry if exists. The old buffer may still be referenced
+        // by commands recorded this frame — defer its destruction.
         if let Some(old) = self.cache.remove(&gpu_va) {
-            unsafe {
-                self.device.destroy_buffer(old.buffer, None);
-                self.device.free_memory(old.memory, None);
-            }
+            self.sentence(old);
         }
 
         self.cache.insert(
@@ -795,10 +843,7 @@ impl BufferCache {
         }
 
         if let Some(old) = self.cache.remove(&cache_key) {
-            unsafe {
-                self.device.destroy_buffer(old.buffer, None);
-                self.device.free_memory(old.memory, None);
-            }
+            self.sentence(old);
         }
         self.cache.insert(
             cache_key,
@@ -819,14 +864,27 @@ impl BufferCache {
         binding: u32,
         gpu_va: u64,
         size: vk::DeviceSize,
+        stride: vk::DeviceSize,
+        use_dynamic_stride: bool,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         staging_pool: &mut StagingBufferPool,
         upload_cmd: vk::CommandBuffer,
     ) {
         let (buffer, offset) = self.get_or_upload(gpu_va, size, read_gpu, staging_pool, upload_cmd);
         unsafe {
-            self.device
-                .cmd_bind_vertex_buffers(cmd, binding, &[buffer], &[offset]);
+            if use_dynamic_stride {
+                self.device.cmd_bind_vertex_buffers2(
+                    cmd,
+                    binding,
+                    &[buffer],
+                    &[offset],
+                    Some(&[size]),
+                    Some(&[stride]),
+                );
+            } else {
+                self.device
+                    .cmd_bind_vertex_buffers(cmd, binding, &[buffer], &[offset]);
+            }
         }
     }
 
@@ -908,16 +966,18 @@ impl BufferCache {
     }
 
     /// Invalidate a cached buffer range (mark as stale).
+    ///
+    /// The buffer may still be bound or targeted by copies in the pending
+    /// command buffer (e.g. `write_memory` runs mid-frame from
+    /// `accelerate_inline_to_memory`), so destruction is deferred until the
+    /// scheduler tick retires.
     pub fn invalidate(&mut self, gpu_va: u64) {
         if let Some(old) = self.cache.remove(&gpu_va) {
             debug!(
                 "BufferCache: invalidated buffer at GPU VA 0x{:016X}",
                 gpu_va
             );
-            unsafe {
-                self.device.destroy_buffer(old.buffer, None);
-                self.device.free_memory(old.memory, None);
-            }
+            self.sentence(old);
         }
     }
 
@@ -953,6 +1013,10 @@ impl Drop for BufferCache {
             for (_, cached) in self.cache.drain() {
                 self.device.destroy_buffer(cached.buffer, None);
                 self.device.free_memory(cached.memory, None);
+            }
+            for sentenced in self.sentenced.drain(..) {
+                self.device.destroy_buffer(sentenced.buffer.buffer, None);
+                self.device.free_memory(sentenced.buffer.memory, None);
             }
             self.device.destroy_buffer(self.null_buffer, None);
             self.device.free_memory(self.null_memory, None);

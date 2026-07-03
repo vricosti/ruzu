@@ -7,7 +7,9 @@
 //! and recreation.
 
 use ash::vk;
+use std::sync::{Arc, Mutex};
 
+use crate::renderer_vulkan::scheduler::Scheduler;
 use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_wrapper::VulkanError;
 
@@ -141,6 +143,7 @@ pub struct Swapchain {
     device: ash::Device,
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
+    submit_mutex: Arc<Mutex<()>>,
     graphics_family: u32,
     present_family: u32,
     mutable_format_enabled: bool,
@@ -177,6 +180,7 @@ impl Swapchain {
         surface_loader: ash::extensions::khr::Surface,
         surface: vk::SurfaceKHR,
         device: &Device,
+        submit_mutex: Arc<Mutex<()>>,
         width: u32,
         height: u32,
     ) -> Result<Self, VulkanError> {
@@ -189,6 +193,7 @@ impl Swapchain {
             device: device.get_logical().clone(),
             graphics_queue: device.get_graphics_queue(),
             present_queue: device.get_present_queue(),
+            submit_mutex,
             graphics_family: device.get_graphics_family(),
             present_family: device.get_present_family(),
             mutable_format_enabled: device.is_khr_swapchain_mutable_format_enabled(),
@@ -257,7 +262,7 @@ impl Swapchain {
     /// Port of `Swapchain::AcquireNextImage`.
     ///
     /// Returns `true` if the swapchain is suboptimal or outdated.
-    pub fn acquire_next_image(&mut self) -> bool {
+    pub fn acquire_next_image(&mut self, scheduler: &mut Scheduler) -> bool {
         let trace_present = std::env::var_os("RUZU_TRACE_PRESENT").is_some();
         if self.swapchain == vk::SwapchainKHR::null() || self.present_semaphores.is_empty() {
             self.is_outdated = true;
@@ -301,7 +306,8 @@ impl Swapchain {
             }
         }
         if let Some(tick) = self.resource_ticks.get_mut(self.image_index as usize) {
-            *tick = tick.saturating_add(1);
+            scheduler.wait(*tick);
+            *tick = scheduler.current_tick();
         }
         self.is_suboptimal || self.is_outdated
     }
@@ -328,6 +334,7 @@ impl Swapchain {
             .swapchains(&swapchains)
             .image_indices(&image_indices)
             .build();
+        let _submit_lock = self.submit_mutex.lock().unwrap();
         match unsafe {
             self.swapchain_loader
                 .queue_present(self.present_queue, &present_info)

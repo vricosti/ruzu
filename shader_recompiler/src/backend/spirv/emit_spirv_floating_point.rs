@@ -263,91 +263,156 @@ pub fn emit_fp_round_even_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 
 // ── FP Comparison ────────────────────────────────────────────────────────
 
-/// FPOrdEqual32: `OpFOrdEqual`.
-pub fn emit_fp_ord_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+/// FPOrdEqual{16,32,64}: `OpFOrdEqual`.
+pub fn emit_fp_ord_equal(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     ctx.builder.f_ord_equal(ctx.bool_type, None, a, b).unwrap()
 }
 
-/// FPOrdNotEqual32: `OpFOrdNotEqual`.
-pub fn emit_fp_ord_not_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+/// FPOrdEqual32: `OpFOrdEqual`.
+pub fn emit_fp_ord_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    emit_fp_ord_equal(ctx, a, b)
+}
+
+/// FPOrdNotEqual{16,32,64}: `OpFOrdNotEqual`.
+pub fn emit_fp_ord_not_equal(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     ctx.builder
         .f_ord_not_equal(ctx.bool_type, None, a, b)
         .unwrap()
 }
 
-/// FPOrdLessThan32: `OpFOrdLessThan`.
-pub fn emit_fp_ord_less_than_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+/// FPOrdNotEqual32: `OpFOrdNotEqual`.
+pub fn emit_fp_ord_not_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    emit_fp_ord_not_equal(ctx, a, b)
+}
+
+/// FPOrdLessThan{16,32,64}: `OpFOrdLessThan`.
+pub fn emit_fp_ord_less_than(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     ctx.builder
         .f_ord_less_than(ctx.bool_type, None, a, b)
         .unwrap()
 }
 
-/// FPOrdGreaterThan32: `OpFOrdGreaterThan`.
-pub fn emit_fp_ord_greater_than_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+/// FPOrdLessThan32: `OpFOrdLessThan`.
+pub fn emit_fp_ord_less_than_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    emit_fp_ord_less_than(ctx, a, b)
+}
+
+/// FPOrdGreaterThan{16,32,64}: `OpFOrdGreaterThan`.
+pub fn emit_fp_ord_greater_than(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     ctx.builder
         .f_ord_greater_than(ctx.bool_type, None, a, b)
         .unwrap()
 }
 
-/// FPOrdLessThanEqual32: `OpFOrdLessThanEqual`.
-pub fn emit_fp_ord_less_than_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+/// FPOrdGreaterThan32: `OpFOrdGreaterThan`.
+pub fn emit_fp_ord_greater_than_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    emit_fp_ord_greater_than(ctx, a, b)
+}
+
+/// FPOrdLessThanEqual{16,32,64}: `OpFOrdLessThanEqual`.
+pub fn emit_fp_ord_less_than_equal(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     ctx.builder
         .f_ord_less_than_equal(ctx.bool_type, None, a, b)
         .unwrap()
 }
 
-/// FPOrdGreaterThanEqual32: `OpFOrdGreaterThanEqual`.
-pub fn emit_fp_ord_greater_than_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+/// FPOrdLessThanEqual32: `OpFOrdLessThanEqual`.
+pub fn emit_fp_ord_less_than_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    emit_fp_ord_less_than_equal(ctx, a, b)
+}
+
+/// FPOrdGreaterThanEqual{16,32,64}: `OpFOrdGreaterThanEqual`.
+pub fn emit_fp_ord_greater_than_equal(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     ctx.builder
         .f_ord_greater_than_equal(ctx.bool_type, None, a, b)
         .unwrap()
 }
 
-/// FPUnordEqual32: `OpFUnordEqual`.
-pub fn emit_fp_unord_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+/// FPOrdGreaterThanEqual32: `OpFOrdGreaterThanEqual`.
+pub fn emit_fp_ord_greater_than_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    emit_fp_ord_greater_than_equal(ctx, a, b)
+}
+
+/// FPUnordEqual{16,32,64}: `OpFUnordEqual`.
+pub fn emit_fp_unord_equal(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     ctx.builder
         .f_unord_equal(ctx.bool_type, None, a, b)
         .unwrap()
 }
 
-/// FPUnordNotEqual32: `OpFUnordNotEqual`.
-pub fn emit_fp_unord_not_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+/// FPUnordEqual32: `OpFUnordEqual`.
+pub fn emit_fp_unord_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    emit_fp_unord_equal(ctx, a, b)
+}
+
+/// FPUnordNotEqual{16,32,64}: `OpFUnordNotEqual`.
+pub fn emit_fp_unord_not_equal(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     ctx.builder
         .f_unord_not_equal(ctx.bool_type, None, a, b)
         .unwrap()
 }
 
-/// FPUnordLessThan32: `OpFUnordLessThan`.
-pub fn emit_fp_unord_less_than_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+/// FPUnordNotEqual32: `OpFUnordNotEqual`.
+pub fn emit_fp_unord_not_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    emit_fp_unord_not_equal(ctx, a, b)
+}
+
+/// FPUnordLessThan{16,32,64}: `OpFUnordLessThan`.
+pub fn emit_fp_unord_less_than(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     ctx.builder
         .f_unord_less_than(ctx.bool_type, None, a, b)
         .unwrap()
 }
 
-/// FPUnordGreaterThan32: `OpFUnordGreaterThan`.
-pub fn emit_fp_unord_greater_than_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+/// FPUnordLessThan32: `OpFUnordLessThan`.
+pub fn emit_fp_unord_less_than_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    emit_fp_unord_less_than(ctx, a, b)
+}
+
+/// FPUnordGreaterThan{16,32,64}: `OpFUnordGreaterThan`.
+pub fn emit_fp_unord_greater_than(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     ctx.builder
         .f_unord_greater_than(ctx.bool_type, None, a, b)
         .unwrap()
 }
 
-/// FPUnordLessThanEqual32: `OpFUnordLessThanEqual`.
-pub fn emit_fp_unord_less_than_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+/// FPUnordGreaterThan32: `OpFUnordGreaterThan`.
+pub fn emit_fp_unord_greater_than_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    emit_fp_unord_greater_than(ctx, a, b)
+}
+
+/// FPUnordLessThanEqual{16,32,64}: `OpFUnordLessThanEqual`.
+pub fn emit_fp_unord_less_than_equal(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     ctx.builder
         .f_unord_less_than_equal(ctx.bool_type, None, a, b)
         .unwrap()
 }
 
-/// FPUnordGreaterThanEqual32: `OpFUnordGreaterThanEqual`.
-pub fn emit_fp_unord_greater_than_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+/// FPUnordLessThanEqual32: `OpFUnordLessThanEqual`.
+pub fn emit_fp_unord_less_than_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    emit_fp_unord_less_than_equal(ctx, a, b)
+}
+
+/// FPUnordGreaterThanEqual{16,32,64}: `OpFUnordGreaterThanEqual`.
+pub fn emit_fp_unord_greater_than_equal(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     ctx.builder
         .f_unord_greater_than_equal(ctx.bool_type, None, a, b)
         .unwrap()
 }
 
+/// FPUnordGreaterThanEqual32: `OpFUnordGreaterThanEqual`.
+pub fn emit_fp_unord_greater_than_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    emit_fp_unord_greater_than_equal(ctx, a, b)
+}
+
+/// FPIsNan{16,32,64}: `OpIsNan`.
+pub fn emit_fp_is_nan(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder.is_nan(ctx.bool_type, None, value).unwrap()
+}
+
 /// FPIsNan32: `OpIsNan`.
 pub fn emit_fp_is_nan_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    ctx.builder.is_nan(ctx.bool_type, None, value).unwrap()
+    emit_fp_is_nan(ctx, value)
 }
 
 // ── FP64 arithmetic ──────────────────────────────────────────────────────

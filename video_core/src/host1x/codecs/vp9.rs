@@ -10,9 +10,9 @@ use crate::host1x::codecs::decoder::{DecoderImpl, DecoderState};
 use crate::host1x::codecs::vp9_types::{
     PictureInfo, Segmentation, Vp9EntropyProbs, Vp9FrameContainer, Vp9PictureInfo, Vp9SurfaceIndex,
 };
-use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::host1x::FrameQueue;
 use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
+use crate::memory_manager::MemoryManager;
 use std::sync::Arc;
 
 // --------------------------------------------------------------------------
@@ -262,7 +262,7 @@ pub struct Vp9 {
 impl Vp9 {
     pub fn new(
         id: i32,
-        memory_manager: Arc<MaxwellDeviceMemoryManager>,
+        memory_manager: Arc<parking_lot::Mutex<MemoryManager>>,
         frame_queue: Arc<FrameQueue>,
     ) -> Self {
         let mut state = DecoderState::new(id, memory_manager, frame_queue);

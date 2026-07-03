@@ -16,6 +16,7 @@ use crate::hle::service::os::process::Process;
 use super::am_types::*;
 use super::applet_data_broker::AppletDataBroker;
 use super::display_layer_manager::DisplayLayerManager;
+use super::frontend::applets::FrontendApplet;
 use super::lifecycle_manager::LifecycleManager;
 
 /// Port of the Applet struct from upstream applet.h.
@@ -76,6 +77,7 @@ pub struct Applet {
     // Caller applet — upstream: std::weak_ptr<Applet> caller_applet
     pub caller_applet: Weak<Mutex<Applet>>,
     pub caller_applet_broker: Option<Arc<AppletDataBroker>>,
+    pub frontend: Option<Box<dyn FrontendApplet>>,
     // Child applets — upstream: std::list<std::shared_ptr<Applet>> child_applets
     pub child_applets: Vec<Arc<Mutex<Applet>>>,
     pub is_completed: bool,
@@ -160,6 +162,7 @@ impl Applet {
             preselected_user_launch_parameter: std::collections::VecDeque::new(),
             caller_applet: Weak::new(),
             caller_applet_broker: None,
+            frontend: None,
             child_applets: Vec::new(),
             is_completed: false,
             exit_locked: false,
@@ -275,6 +278,12 @@ impl Applet {
     pub fn signal_library_applet_launchable_event(&mut self, process: &mut KProcess) {
         if let Some(event) = self.library_applet_launchable_event.as_ref() {
             Self::signal_persistent_readable_event(process, event);
+        }
+    }
+
+    pub fn signal_state_changed_event_without_process(&mut self) {
+        if let Some(event) = self.state_changed_event.as_ref() {
+            event.lock().unwrap().signal();
         }
     }
 
@@ -415,6 +424,10 @@ impl Applet {
             &mut self.state_changed_event_handle,
             false,
         )
+    }
+
+    pub fn ensure_state_changed_event_object_id(&mut self, ctx: &HLERequestContext) -> Option<u64> {
+        Self::ensure_persistent_readable_event_object_id(ctx, &mut self.state_changed_event, false)
     }
 
     pub fn signal_state_changed_event(&mut self, process: &mut KProcess) {

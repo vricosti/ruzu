@@ -38,7 +38,7 @@ fn has_children(statement_type: StatementType) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Expr {
+pub(crate) enum Expr {
     Identity(Condition),
     Not(Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
@@ -56,11 +56,34 @@ impl Expr {
     }
 
     fn syntax_placeholder(&self) -> Value {
-        match self {
-            Self::Not(op) if matches!(op.as_ref(), Self::Identity(_)) => Value::ImmU1(false),
-            _ => Value::ImmU1(true),
-        }
+        Value::ImmU1(true)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StructuredAction {
+    SetVariable {
+        block: u32,
+        id: u32,
+        expr: Expr,
+    },
+    SetIndirectBranchVariable {
+        block: u32,
+        branch_reg: u32,
+        branch_offset: i32,
+    },
+    Condition {
+        syntax_index: usize,
+        block: u32,
+        expr: Expr,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StructuredSyntax {
+    pub syntax: Vec<SyntaxNode>,
+    pub actions: Vec<StructuredAction>,
+    pub block_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,16 +146,26 @@ impl Statement {
 
 /// Convert a CFG into a structured abstract syntax list.
 pub fn structure_cfg(cfg_blocks: &[CfgBlock]) -> Vec<SyntaxNode> {
+    structure_cfg_detailed(cfg_blocks).syntax
+}
+
+/// Convert a CFG into structured ASL plus the IR actions that upstream
+/// `TranslatePass::Visit` emits into each header/merge block.
+pub(crate) fn structure_cfg_detailed(cfg_blocks: &[CfgBlock]) -> StructuredSyntax {
     if cfg_blocks.is_empty() {
-        return Vec::new();
+        return StructuredSyntax {
+            syntax: Vec::new(),
+            actions: Vec::new(),
+            block_count: 0,
+        };
     }
 
     let mut pass = GotoPass::new(cfg_blocks);
     pass.run();
 
-    let mut syntax = Vec::new();
-    translate_statement_tree(pass.root_children(), &mut syntax);
-    syntax
+    let mut translator = TranslatePass::new(cfg_blocks.len());
+    translator.visit(pass.root_children(), None, None);
+    translator.finish()
 }
 
 struct GotoPass {
@@ -728,73 +761,213 @@ fn contains_break(statement: &Statement) -> bool {
     }
 }
 
-fn translate_statement_tree(tree: &[Statement], syntax: &mut Vec<SyntaxNode>) {
-    for (index, statement) in tree.iter().enumerate() {
-        match statement {
-            Statement::Label { .. } | Statement::SetVariable { .. } => {}
-            Statement::Code { block } => syntax.push(SyntaxNode::Block(*block as u32)),
-            Statement::If { cond, children } => {
-                let body = first_code_block(children).unwrap_or(0) as u32;
-                let merge = next_code_block(tree, index + 1).unwrap_or(body as usize) as u32;
-                syntax.push(SyntaxNode::If {
-                    cond: cond.syntax_placeholder(),
-                    body,
-                    merge,
-                });
-                translate_statement_tree(children, syntax);
-                syntax.push(SyntaxNode::EndIf { merge });
+struct TranslatePass {
+    syntax: Vec<SyntaxNode>,
+    actions: Vec<StructuredAction>,
+    next_block: u32,
+    current_block: Option<u32>,
+}
+
+impl TranslatePass {
+    fn new(original_block_count: usize) -> Self {
+        Self {
+            syntax: Vec::new(),
+            actions: Vec::new(),
+            next_block: original_block_count as u32,
+            current_block: None,
+        }
+    }
+
+    fn finish(self) -> StructuredSyntax {
+        StructuredSyntax {
+            syntax: self.syntax,
+            actions: self.actions,
+            block_count: self.next_block as usize,
+        }
+    }
+
+    fn create_block(&mut self) -> u32 {
+        let block = self.next_block;
+        self.next_block += 1;
+        block
+    }
+
+    fn ensure_block(&mut self) -> u32 {
+        if let Some(block) = self.current_block {
+            return block;
+        }
+        let block = self.create_block();
+        self.syntax.push(SyntaxNode::Block(block));
+        self.current_block = Some(block);
+        block
+    }
+
+    fn merge_block(&mut self) -> u32 {
+        // Upstream returns a fresh IR block even when it can attach it to an
+        // existing forward statement. Keeping merge blocks explicit preserves
+        // SPIR-V dominance and avoids detached selection/loop merge nodes.
+        self.create_block()
+    }
+
+    fn visit(
+        &mut self,
+        tree: &[Statement],
+        break_block: Option<u32>,
+        fallthrough_block: Option<u32>,
+    ) {
+        for statement in tree {
+            match statement {
+                Statement::Label { .. } => {}
+                Statement::Code { block } => {
+                    self.syntax.push(SyntaxNode::Block(*block as u32));
+                    self.current_block = Some(*block as u32);
+                }
+                Statement::SetVariable { id, op } => {
+                    let block = self.ensure_block();
+                    self.actions.push(StructuredAction::SetVariable {
+                        block,
+                        id: *id,
+                        expr: op.clone(),
+                    });
+                }
+                Statement::SetIndirectBranchVariable {
+                    branch_reg,
+                    branch_offset,
+                } => {
+                    let block = self.ensure_block();
+                    self.actions
+                        .push(StructuredAction::SetIndirectBranchVariable {
+                            block,
+                            branch_reg: *branch_reg,
+                            branch_offset: *branch_offset,
+                        });
+                }
+                Statement::If { cond, children } => {
+                    let header_block = self.ensure_block();
+                    let merge = self.merge_block();
+                    let if_index = self.syntax.len();
+                    self.syntax.push(SyntaxNode::If {
+                        cond: cond.syntax_placeholder(),
+                        body: merge,
+                        merge,
+                    });
+                    self.actions.push(StructuredAction::Condition {
+                        syntax_index: if_index,
+                        block: header_block,
+                        expr: cond.clone(),
+                    });
+
+                    self.current_block = None;
+                    let body_index = self.syntax.len();
+                    self.visit(children, break_block, Some(merge));
+                    let body = first_block_from_syntax(&self.syntax[body_index..]).unwrap_or(merge);
+                    if let SyntaxNode::If { body: slot, .. } = &mut self.syntax[if_index] {
+                        *slot = body;
+                    }
+
+                    self.syntax.push(SyntaxNode::EndIf { merge });
+                    self.syntax.push(SyntaxNode::Block(merge));
+                    self.current_block = Some(merge);
+                }
+                Statement::Loop { cond, children } => {
+                    let loop_header = self.create_block();
+                    self.syntax.push(SyntaxNode::Block(loop_header));
+                    self.current_block = Some(loop_header);
+
+                    let continue_block = self.create_block();
+                    let merge = self.merge_block();
+                    let loop_index = self.syntax.len();
+                    self.syntax.push(SyntaxNode::Loop {
+                        body: merge,
+                        continue_block,
+                        merge,
+                    });
+
+                    self.current_block = None;
+                    let body_index = self.syntax.len();
+                    self.visit(children, Some(merge), Some(continue_block));
+                    let body = first_block_from_syntax(&self.syntax[body_index..]).unwrap_or(merge);
+                    if let SyntaxNode::Loop { body: slot, .. } = &mut self.syntax[loop_index] {
+                        *slot = body;
+                    }
+
+                    self.syntax.push(SyntaxNode::Block(continue_block));
+                    self.current_block = Some(continue_block);
+                    let repeat_index = self.syntax.len();
+                    self.syntax.push(SyntaxNode::Repeat {
+                        cond: cond.syntax_placeholder(),
+                        loop_header,
+                        merge,
+                    });
+                    self.actions.push(StructuredAction::Condition {
+                        syntax_index: repeat_index,
+                        block: continue_block,
+                        expr: cond.clone(),
+                    });
+
+                    self.syntax.push(SyntaxNode::Block(merge));
+                    self.current_block = Some(merge);
+                }
+                Statement::Break { cond } => {
+                    let header_block = self.ensure_block();
+                    let skip = self.merge_block();
+                    let merge = break_block.unwrap_or(skip);
+                    let break_index = self.syntax.len();
+                    self.syntax.push(SyntaxNode::Break {
+                        cond: cond.syntax_placeholder(),
+                        merge,
+                        skip,
+                    });
+                    self.actions.push(StructuredAction::Condition {
+                        syntax_index: break_index,
+                        block: header_block,
+                        expr: cond.clone(),
+                    });
+                    self.syntax.push(SyntaxNode::Block(skip));
+                    self.current_block = Some(skip);
+                }
+                Statement::Return => {
+                    self.ensure_block();
+                    let return_block = self.create_block();
+                    self.syntax.push(SyntaxNode::Block(return_block));
+                    self.current_block = None;
+                    self.syntax.push(SyntaxNode::Return);
+                }
+                Statement::Kill => {
+                    self.ensure_block();
+                    let demote_block = self.merge_block();
+                    self.syntax.push(SyntaxNode::Block(demote_block));
+                    self.current_block = Some(demote_block);
+                }
+                Statement::Unreachable | Statement::Goto { .. } => {
+                    self.ensure_block();
+                    self.current_block = None;
+                    self.syntax.push(SyntaxNode::Unreachable);
+                }
+                Statement::Function { children } => {
+                    self.visit(children, break_block, fallthrough_block)
+                }
             }
-            Statement::Loop { cond, children } => {
-                let body = first_code_block(children).unwrap_or(0) as u32;
-                let merge = next_code_block(tree, index + 1).unwrap_or(body as usize) as u32;
-                syntax.push(SyntaxNode::Loop {
-                    body,
-                    continue_block: body,
-                    merge,
-                });
-                translate_statement_tree(children, syntax);
-                syntax.push(SyntaxNode::Repeat {
-                    cond: cond.syntax_placeholder(),
-                    loop_header: body,
-                    merge,
-                });
+        }
+
+        if let (Some(_current), Some(fallthrough)) = (self.current_block, fallthrough_block) {
+            if !matches!(self.syntax.last(), Some(SyntaxNode::Block(block)) if *block == fallthrough)
+            {
+                self.syntax.push(SyntaxNode::Block(fallthrough));
             }
-            Statement::Break { cond } => syntax.push(SyntaxNode::Break {
-                cond: cond.syntax_placeholder(),
-                merge: 0,
-                skip: 0,
-            }),
-            Statement::Return => syntax.push(SyntaxNode::Return),
-            Statement::Kill => {}
-            Statement::Unreachable | Statement::Goto { .. } => {
-                syntax.push(SyntaxNode::Unreachable);
-            }
-            Statement::Function { children } => translate_statement_tree(children, syntax),
-            Statement::SetIndirectBranchVariable { .. } => {}
+            self.current_block = Some(fallthrough);
+        } else if self.current_block.is_some() && fallthrough_block.is_none() {
+            self.current_block = None;
+            self.syntax.push(SyntaxNode::Unreachable);
         }
     }
 }
 
-fn first_code_block(tree: &[Statement]) -> Option<usize> {
-    tree.iter().find_map(|statement| match statement {
-        Statement::Code { block } => Some(*block),
-        Statement::If { children, .. } | Statement::Loop { children, .. } => {
-            first_code_block(children)
-        }
+fn first_block_from_syntax(nodes: &[SyntaxNode]) -> Option<u32> {
+    nodes.iter().find_map(|node| match node {
+        SyntaxNode::Block(block) => Some(*block),
         _ => None,
     })
-}
-
-fn next_code_block(tree: &[Statement], start: usize) -> Option<usize> {
-    tree.iter()
-        .skip(start)
-        .find_map(|statement| match statement {
-            Statement::Code { block } => Some(*block),
-            Statement::If { children, .. } | Statement::Loop { children, .. } => {
-                first_code_block(children)
-            }
-            _ => None,
-        })
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <errno.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavcodec/codec.h>
@@ -19,6 +20,7 @@ typedef struct RuzuFfmpegDecoder {
     int decode_order;
     int got_frame;
     int last_error;
+    int h264_software_packet_decode;
 } RuzuFfmpegDecoder;
 
 typedef struct RuzuFfmpegHardwareContext {
@@ -241,8 +243,11 @@ int ruzu_ffmpeg_decoder_send_packet(RuzuFfmpegDecoder* decoder, const uint8_t* d
     if (decoder->context->hw_device_ctx == NULL && decoder->context->codec_id == AV_CODEC_ID_H264) {
         decoder->decode_order = 1;
         const int ret = avcodec_send_frame(decoder->context, decoder->temp_frame);
-        decoder->last_error = ret;
-        return ret;
+        if (ret != AVERROR(EINVAL)) {
+            decoder->last_error = ret;
+            return ret;
+        }
+        decoder->h264_software_packet_decode = 1;
     }
 #endif
 
@@ -300,7 +305,8 @@ AVFrame* ruzu_ffmpeg_decoder_receive_frame_with_hw_transfer(RuzuFfmpegDecoder* d
     }
 
 #ifndef ANDROID
-    if (decoder->context->hw_device_ctx == NULL && decoder->context->codec_id == AV_CODEC_ID_H264) {
+    if (decoder->context->hw_device_ctx == NULL && decoder->context->codec_id == AV_CODEC_ID_H264 &&
+        !decoder->h264_software_packet_decode) {
         decoder->decode_order = 1;
         int ret = 0;
 

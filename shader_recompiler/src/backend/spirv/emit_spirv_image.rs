@@ -185,6 +185,71 @@ pub fn emit_image_sample(
     }
 }
 
+/// Dispatch ImageSampleDrefImplicitLod / ImageSampleDrefExplicitLod IR instructions.
+pub fn emit_image_sample_dref(
+    ctx: &mut SpirvEmitContext,
+    inst: &ir::Inst,
+    block_idx: u32,
+    inst_idx: u32,
+) {
+    let info = TextureInstInfo::from_u32(inst.flags);
+    let desc_idx = info.descriptor_index as u32;
+    let coord = ctx.resolve_value(inst.arg(1));
+    let dref = ctx.resolve_value(inst.arg(2));
+
+    if let Some(&tex_var) = ctx.texture_vars.get(&desc_idx) {
+        let image_type = {
+            let img = ctx.builder.type_image(
+                ctx.f32_type,
+                spirv::Dim::Dim2D,
+                0,
+                0,
+                0,
+                1,
+                spirv::ImageFormat::Unknown,
+                None,
+            );
+            ctx.builder.type_sampled_image(img)
+        };
+        let sampled_image = ctx
+            .builder
+            .load(image_type, None, tex_var, None, vec![])
+            .unwrap();
+
+        let id = if inst.opcode == Opcode::ImageSampleDrefExplicitLod && inst.args.len() > 3 {
+            let lod = ctx.resolve_value(inst.arg(3));
+            ctx.builder
+                .image_sample_dref_explicit_lod(
+                    ctx.f32_type,
+                    None,
+                    sampled_image,
+                    coord,
+                    dref,
+                    spirv::ImageOperands::LOD,
+                    vec![Operand::IdRef(lod)],
+                )
+                .unwrap()
+        } else {
+            ctx.builder
+                .image_sample_dref_implicit_lod(
+                    ctx.f32_type,
+                    None,
+                    sampled_image,
+                    coord,
+                    dref,
+                    None,
+                    vec![],
+                )
+                .unwrap()
+        };
+
+        ctx.set_value(block_idx, inst_idx, id);
+    } else {
+        let id = ctx.builder.undef(ctx.f32_type, None);
+        ctx.set_value(block_idx, inst_idx, id);
+    }
+}
+
 /// Dispatch ImageFetch IR instructions.
 pub fn emit_image_fetch_inst(
     ctx: &mut SpirvEmitContext,
@@ -262,7 +327,8 @@ pub fn emit_image_query(
     block_idx: u32,
     inst_idx: u32,
 ) {
-    let desc_idx = inst.arg(0).imm_u32();
+    let info = TextureInstInfo::from_u32(inst.flags);
+    let desc_idx = info.descriptor_index as u32;
 
     if let Some(&tex_var) = ctx.texture_vars.get(&desc_idx) {
         let sampled_img_type = {
@@ -300,10 +366,9 @@ pub fn emit_image_query(
             ctx.const_zero_u32
         };
 
-        let i32_vec2 = ctx.builder.type_vector(ctx.i32_type, 2);
         let id = ctx
             .builder
-            .image_query_size_lod(i32_vec2, None, image, lod)
+            .image_query_size_lod(ctx.u32_vec2_type, None, image, lod)
             .unwrap();
 
         ctx.set_value(block_idx, inst_idx, id);
@@ -324,16 +389,11 @@ pub fn emit_image_gather_inst(
     block_idx: u32,
     inst_idx: u32,
 ) {
-    let desc_idx = inst.arg(0).imm_u32();
-    let coord_x = ctx.resolve_value(inst.arg(1));
-    let coord_y = ctx.resolve_value(inst.arg(2));
+    let info = TextureInstInfo::from_u32(inst.flags);
+    let desc_idx = info.descriptor_index as u32;
+    let coord = ctx.resolve_value(inst.arg(1));
 
     if let Some(&tex_var) = ctx.texture_vars.get(&desc_idx) {
-        let coord = ctx
-            .builder
-            .composite_construct(ctx.f32_vec2_type, None, vec![coord_x, coord_y])
-            .unwrap();
-
         let sampled_img_type = {
             let img = ctx.builder.type_image(
                 ctx.f32_type,
@@ -366,7 +426,9 @@ pub fn emit_image_gather_inst(
                 )
                 .unwrap()
         } else {
-            let component = ctx.resolve_value(inst.arg(3));
+            let component = ctx
+                .builder
+                .constant_bit32(ctx.u32_type, info.gather_component as u32);
             ctx.builder
                 .image_gather(
                     ctx.f32_vec4_type,

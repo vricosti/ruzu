@@ -57,7 +57,7 @@ impl RenderPassCache {
         let rp = self.create_render_pass(key)?;
         self.cache.insert(key.clone(), rp);
         debug!(
-            "RenderPassCache: created new render pass ({} color, depth={:?})",
+            "RenderPassCache: created new render pass ({} color slots, depth={:?})",
             key.num_color_attachments, key.depth_format
         );
         Ok(rp)
@@ -66,11 +66,21 @@ impl RenderPassCache {
     fn create_render_pass(&self, key: &RenderPassKey) -> Result<vk::RenderPass, vk::Result> {
         let mut attachments = Vec::new();
         let mut color_refs = Vec::new();
+        let mut num_attachments = 0usize;
+        let mut num_colors = 0u32;
 
-        // Color attachments
-        for i in 0..key.num_color_attachments as usize {
+        // Color attachments. Upstream keeps the original RT slot indices in
+        // pColorAttachments and uses VK_ATTACHMENT_UNUSED for holes; only the
+        // VkFramebuffer attachment array is compacted to the actually-bound
+        // views. Do not compact these references or Location(N) fragment
+        // outputs target the wrong attachment.
+        for i in 0..key.color_formats.len() {
             let format = key.color_formats[i];
             if format == vk::Format::UNDEFINED {
+                color_refs.push(vk::AttachmentReference {
+                    attachment: vk::ATTACHMENT_UNUSED,
+                    layout: vk::ImageLayout::GENERAL,
+                });
                 continue;
             }
             // Upstream `vk_render_pass_cache.cpp` uses one AttachmentDescription
@@ -79,9 +89,11 @@ impl RenderPassCache {
             // throughout so attachments can be used, sampled and presented
             // without per-use layout transitions.
             color_refs.push(vk::AttachmentReference {
-                attachment: attachments.len() as u32,
+                attachment: num_colors,
                 layout: vk::ImageLayout::GENERAL,
             });
+            num_attachments = i + 1;
+            num_colors += 1;
             attachments.push(
                 vk::AttachmentDescription::builder()
                     .format(format)
@@ -99,11 +111,12 @@ impl RenderPassCache {
         // If no attachments are bound, keep the legacy fallback colour
         // attachment. Depth-only render passes are valid and are used by
         // upstream helper paths such as `Image::BlitScaleHelper`.
-        if color_refs.is_empty() && key.depth_format == vk::Format::UNDEFINED {
+        if num_attachments == 0 && key.depth_format == vk::Format::UNDEFINED {
             color_refs.push(vk::AttachmentReference {
                 attachment: 0,
                 layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             });
+            num_attachments = 1;
             attachments.push(
                 vk::AttachmentDescription::builder()
                     .format(vk::Format::R8G8B8A8_UNORM)
@@ -123,7 +136,7 @@ impl RenderPassCache {
         let has_depth = key.depth_format != vk::Format::UNDEFINED;
         if has_depth {
             depth_ref = Some(vk::AttachmentReference {
-                attachment: attachments.len() as u32,
+                attachment: num_colors,
                 layout: vk::ImageLayout::GENERAL,
             });
             // Same as the colour attachments (upstream vk_render_pass_cache.cpp):
@@ -148,7 +161,7 @@ impl RenderPassCache {
 
         let mut subpass = vk::SubpassDescription::builder()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(&color_refs);
+            .color_attachments(&color_refs[..num_attachments]);
         if let Some(ref dr) = depth_ref {
             subpass = subpass.depth_stencil_attachment(dr);
         }

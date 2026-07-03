@@ -33,4 +33,5 @@ rdynarmic = { workspace = true }
 sdl2 = { version = "0.37", features = ["raw-window-handle", "bundled", "static-link"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
 sdl2 = { version = "0.37", features = ["raw-window-handle", "use-pkgconfig"] }

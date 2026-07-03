@@ -9,7 +9,7 @@
 use std::hash::{Hash, Hasher};
 
 use crate::engines::maxwell_3d::{
-    BlendEquation, BlendFactor, BlendInfo, ComparisonOp, CullFace, DrawCall, FrontFace,
+    BlendEquation, BlendFactor, BlendInfo, ComparisonOp, CullFace, DepthMode, DrawCall, FrontFace,
     PolygonMode, PrimitiveTopology, StencilOp,
 };
 
@@ -1068,6 +1068,7 @@ impl FixedPipelineState {
         self.raw2 = 0;
 
         self.set_topology(draw.topology);
+        self.set_ndc_minus_one_to_one(draw.depth_stencil.depth_mode == DepthMode::MinusOneToOne);
         self.set_depth_enabled(draw.zeta.enabled);
         self.set_depth_format(draw.zeta.format);
         self.dynamic_state

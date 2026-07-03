@@ -50,6 +50,114 @@ fn query_vulkan_drawable_size(render_window: *mut sdl::SDL_Window) -> (u32, u32)
     }
 }
 
+#[cfg(target_os = "macos")]
+fn validate_metal_view_and_layer(view: sdl::SDL_MetalView, layer: *mut std::ffi::c_void) {
+    use objc::runtime::{Class, Object, BOOL, NO};
+    use objc::{msg_send, sel, sel_impl};
+
+    unsafe {
+        let Some(metal_layer_class) = Class::get("CAMetalLayer") else {
+            return;
+        };
+        let layer_object = layer as *mut Object;
+        if layer_object.is_null() {
+            return;
+        }
+        let is_metal_layer: BOOL = msg_send![layer_object, isKindOfClass: metal_layer_class];
+        if is_metal_layer == NO {
+            log::error!("SDL_Metal_GetLayer returned a non-CAMetalLayer object");
+            std::process::exit(1);
+        }
+
+        let view_object = view as *mut Object;
+        trace_macos_window_state(view_object, layer_object);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CgSize {
+    width: f64,
+    height: f64,
+}
+
+#[cfg(target_os = "macos")]
+fn trace_macos_window_state(view: *mut objc::runtime::Object, layer: *mut objc::runtime::Object) {
+    if std::env::var_os("RUZU_TRACE_MACOS_WINDOW").is_none() {
+        return;
+    }
+
+    use objc::runtime::{Object, BOOL};
+    use objc::{msg_send, sel, sel_impl};
+
+    unsafe {
+        let window: *mut Object = if view.is_null() {
+            std::ptr::null_mut()
+        } else {
+            msg_send![view, window]
+        };
+        let window_number: i64 = if window.is_null() {
+            -1
+        } else {
+            msg_send![window, windowNumber]
+        };
+        let is_visible: BOOL = if window.is_null() {
+            false
+        } else {
+            msg_send![window, isVisible]
+        };
+        let is_miniaturized: BOOL = if window.is_null() {
+            false
+        } else {
+            msg_send![window, isMiniaturized]
+        };
+        let is_key_window: BOOL = if window.is_null() {
+            false
+        } else {
+            msg_send![window, isKeyWindow]
+        };
+        let is_main_window: BOOL = if window.is_null() {
+            false
+        } else {
+            msg_send![window, isMainWindow]
+        };
+        let view_layer: *mut Object = if view.is_null() {
+            std::ptr::null_mut()
+        } else {
+            msg_send![view, layer]
+        };
+        let drawable_size: CgSize = if layer.is_null() {
+            CgSize {
+                width: 0.0,
+                height: 0.0,
+            }
+        } else {
+            msg_send![layer, drawableSize]
+        };
+        let contents_scale: f64 = if layer.is_null() {
+            0.0
+        } else {
+            msg_send![layer, contentsScale]
+        };
+        log::info!(
+            "[MACOS_WINDOW] nswindow={:?} window_number={} visible={} miniaturized={} key={} main={} layer={:?} view_layer={:?} layer_matches_view={} drawable={}x{} contents_scale={}",
+            window,
+            window_number,
+            is_visible,
+            is_miniaturized,
+            is_key_window,
+            is_main_window,
+            layer,
+            view_layer,
+            layer == view_layer,
+            drawable_size.width,
+            drawable_size.height,
+            contents_scale
+        );
+    }
+}
+
 /// Vulkan-backed SDL2 emulator window.
 ///
 /// Maps to C++ class `EmuWindow_SDL2_VK` in
@@ -78,8 +186,15 @@ impl EmuWindowSdl2Vk {
         let mut base = EmuWindowSdl2::new();
 
         let window_title = b"ruzu-cmd (Vulkan)\0";
-        let window_flags = sdl::SDL_WindowFlags::SDL_WINDOW_RESIZABLE as u32
+        let mut window_flags = sdl::SDL_WindowFlags::SDL_WINDOW_RESIZABLE as u32
             | sdl::SDL_WindowFlags::SDL_WINDOW_ALLOW_HIGHDPI as u32;
+        #[cfg(target_os = "macos")]
+        {
+            // SDL_Metal_CreateView can convert an existing window to Metal,
+            // but command-line macOS presentation is more reliable when the
+            // native view is created as Metal-capable from the start.
+            window_flags |= sdl::SDL_WindowFlags::SDL_WINDOW_METAL as u32;
+        }
 
         // Maps to: render_window = SDL_CreateWindow(...)
         let render_window = unsafe {
@@ -163,6 +278,7 @@ impl EmuWindowSdl2Vk {
                 unsafe { sdl::SDL_Metal_DestroyView(view) };
                 std::process::exit(1);
             }
+            validate_metal_view_and_layer(view, layer.cast());
             window_info.render_surface = layer as usize;
             view
         };
@@ -214,6 +330,16 @@ impl EmuWindowSdl2Vk {
     /// Waits for and dispatches the next SDL event.
     pub fn wait_event(&mut self) {
         self.base.wait_event();
+        let (width, height) = query_vulkan_drawable_size(self.base.render_window);
+        self.base.update_current_framebuffer_layout(width, height);
+    }
+
+    /// Polls and dispatches pending SDL events without blocking.
+    ///
+    /// This mirrors the existing OpenGL frontend helper and is used only when
+    /// the diagnostic `RUZU_POLL_EVENTS_LOOP` mode is enabled from `main`.
+    pub fn poll_events(&mut self) {
+        self.base.poll_events();
         let (width, height) = query_vulkan_drawable_size(self.base.render_window);
         self.base.update_current_framebuffer_layout(width, height);
     }

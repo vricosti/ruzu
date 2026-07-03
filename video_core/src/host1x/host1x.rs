@@ -201,7 +201,7 @@ pub struct Host1x {
     /// Upstream constructs this as
     /// `gmmu_manager{system, memory_manager, 32, 0, 12}` and binds the
     /// renderer rasterizer from `GPU::Impl::BindRenderer`.
-    gmmu_manager: parking_lot::Mutex<MemoryManager>,
+    gmmu_manager: Arc<parking_lot::Mutex<MemoryManager>>,
     /// Upstream `Common::FlatAllocator<u32, 0, 32>` used by NvMap low-area
     /// pins before mapping through `gmmu_manager`.
     allocator: parking_lot::Mutex<FlatAllocator>,
@@ -225,7 +225,7 @@ impl Host1x {
             frame_queue: Arc::new(FrameQueue::new()),
             devices: Mutex::new(HashMap::new()),
             memory_manager: Arc::clone(&memory_manager),
-            gmmu_manager: parking_lot::Mutex::new(
+            gmmu_manager: Arc::new(parking_lot::Mutex::new(
                 MemoryManager::new_with_geometry_and_device_memory(
                     0,
                     memory_manager,
@@ -234,7 +234,7 @@ impl Host1x {
                     12,
                     12,
                 ),
-            ),
+            )),
             allocator: parking_lot::Mutex::new(FlatAllocator::new(1 << 12, u32::MAX)),
         }
     }
@@ -311,7 +311,7 @@ impl Host1x {
                     fd,
                     syncpt,
                     Arc::clone(&self.frame_queue),
-                    Arc::clone(&self.memory_manager),
+                    Arc::clone(&self.gmmu_manager),
                 )),
             ),
             ChannelType::Vic => (
@@ -320,7 +320,7 @@ impl Host1x {
                     fd,
                     syncpt,
                     Arc::clone(&self.frame_queue),
-                    Arc::clone(&self.memory_manager),
+                    Arc::clone(&self.gmmu_manager),
                 )),
             ),
             ChannelType::NvJpg => (

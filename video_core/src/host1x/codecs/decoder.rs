@@ -11,9 +11,9 @@ use log::error;
 use crate::host1x::ffmpeg::ffmpeg::DecodeApi;
 use std::sync::Arc;
 
-use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::host1x::FrameQueue;
 use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
+use crate::memory_manager::MemoryManager;
 
 /// Trait matching the virtual methods of the upstream `Tegra::Decoder` class.
 pub trait DecoderImpl: Send {
@@ -51,14 +51,14 @@ pub struct DecoderState {
     pub initialized: bool,
     pub vp9_hidden_frame: bool,
     pub id: i32,
-    pub memory_manager: Arc<MaxwellDeviceMemoryManager>,
+    pub memory_manager: Arc<parking_lot::Mutex<MemoryManager>>,
     pub frame_queue: Arc<FrameQueue>,
 }
 
 impl DecoderState {
     pub fn new(
         id: i32,
-        memory_manager: Arc<MaxwellDeviceMemoryManager>,
+        memory_manager: Arc<parking_lot::Mutex<MemoryManager>>,
         frame_queue: Arc<FrameQueue>,
     ) -> Self {
         Self {
@@ -152,13 +152,13 @@ pub fn decode(decoder: &mut dyn DecoderImpl, regs: &NvdecRegisters) {
 #[cfg(test)]
 mod tests {
     use super::DecoderState;
-    use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
     use crate::host1x::host1x::FrameQueue;
+    use crate::memory_manager::MemoryManager;
     use std::sync::Arc;
 
     #[test]
     fn decoder_state_owns_memory_manager_and_frame_queue_handles() {
-        let memory_manager = Arc::new(MaxwellDeviceMemoryManager::default());
+        let memory_manager = Arc::new(parking_lot::Mutex::new(MemoryManager::new(0, 32, 0)));
         let frame_queue = Arc::new(FrameQueue::new());
 
         let state = DecoderState::new(3, Arc::clone(&memory_manager), Arc::clone(&frame_queue));

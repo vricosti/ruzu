@@ -237,7 +237,7 @@ pub struct ServerManager {
     pending_registrations: PendingRegistrationQueue,
 
     /// Stop flag. Upstream: `std::stop_source m_stop_source`.
-    stop_requested: AtomicBool,
+    stop_requested: Arc<AtomicBool>,
 
     /// Whether the server has been stopped.
     stopped: AtomicBool,
@@ -443,7 +443,7 @@ impl ServerManager {
             deferred_sessions: Vec::new(),
             wakeup_holder: Some(wakeup_holder),
             deferral_holder: None,
-            stop_requested: AtomicBool::new(false),
+            stop_requested: Arc::new(AtomicBool::new(false)),
             stopped: AtomicBool::new(false),
             loop_started: AtomicBool::new(false),
             pending_registrations: Arc::new(Mutex::new(Vec::new())),
@@ -489,6 +489,10 @@ impl ServerManager {
     /// `pending_registrations_arc`.
     pub fn wakeup_event_arc(&self) -> Arc<Event> {
         Arc::clone(&self.wakeup_event)
+    }
+
+    pub fn stop_requested_arc(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop_requested)
     }
 
     fn service_owner_weak(&self) -> Weak<Mutex<ServerManager>> {

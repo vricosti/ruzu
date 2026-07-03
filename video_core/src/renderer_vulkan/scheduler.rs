@@ -10,6 +10,7 @@ use ash::vk;
 use log::{debug, trace};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::state_tracker::StateTracker;
 
@@ -86,6 +87,9 @@ pub struct Scheduler {
     /// Fence for GPU synchronization.
     fence: vk::Fence,
 
+    /// Port of upstream `Scheduler::submit_mutex`.
+    submit_mutex: Arc<Mutex<()>>,
+
     /// Upstream `Scheduler` owns a `StateTracker&` and invalidates command
     /// buffer state after helper draws. Some Rust construction paths still
     /// build a scheduler before a rasterizer state tracker exists, so this is
@@ -116,10 +120,15 @@ impl Scheduler {
             rp_state: RenderPassState::default(),
             state: SchedulerState::default(),
             fence,
+            submit_mutex: Arc::new(Mutex::new(())),
             state_tracker: None,
         };
         scheduler.allocate_new_context()?;
         Ok(scheduler)
+    }
+
+    pub fn submit_mutex(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.submit_mutex)
     }
 
     pub fn set_state_tracker(&mut self, state_tracker: NonNull<StateTracker>) {
@@ -296,6 +305,19 @@ impl Scheduler {
 
         // End command buffers
         unsafe {
+            let write_barrier = vk::MemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                .build();
+            self.device.cmd_pipeline_barrier(
+                self.upload_cmdbuf,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[write_barrier],
+                &[],
+                &[],
+            );
             self.device.end_command_buffer(self.upload_cmdbuf).ok();
             self.device.end_command_buffer(self.current_cmdbuf).ok();
         }
@@ -312,6 +334,7 @@ impl Scheduler {
                 .wait_for_fences(&[self.fence], true, u64::MAX)
                 .ok();
             self.device.reset_fences(&[self.fence]).ok();
+            let _submit_lock = self.submit_mutex.lock().unwrap();
             self.device
                 .queue_submit(self.queue, &[submit_info], self.fence)
                 .ok();

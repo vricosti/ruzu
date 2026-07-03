@@ -1712,10 +1712,19 @@ impl System {
         self.exit_locked = false;
         self.exit_requested = false;
 
+        if let Some(ref gpu_core) = self.gpu_core {
+            gpu_core.notify_shutdown();
+        }
+
         self.core_timing.sync_pause(false);
         if let Some(ref kernel) = self.kernel {
             kernel.suspend_emulation(true);
-            kernel.close_services();
+            if !kernel.close_services() {
+                log::warn!(
+                    "System: service shutdown incomplete; skipping deeper kernel teardown"
+                );
+                return;
+            }
             kernel.shutdown_cores();
         }
         self.service_manager = None;

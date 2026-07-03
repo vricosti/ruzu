@@ -70,7 +70,11 @@ fn open_library_macos() -> Result<ash::Entry, VulkanError> {
         library_paths.push(bundle_dir.join("Contents/Frameworks/libMoltenVK.dylib"));
     }
 
-    // Non-bundled ruzu-cmd development fallback on macOS.
+    // Non-bundled ruzu-cmd development fallback on macOS. Prefer a Vulkan
+    // loader from the SDK before loading MoltenVK directly; the loader owns
+    // portability-enumeration/ICD discovery semantics.
+    library_paths.extend(vulkan_sdk_paths());
+    library_paths.extend(local_yuzu_bundle_paths());
     library_paths.extend([
         PathBuf::from("/opt/homebrew/lib/libvulkan.1.dylib"),
         PathBuf::from("/opt/homebrew/lib/libvulkan.dylib"),
@@ -87,6 +91,7 @@ fn open_library_macos() -> Result<ash::Entry, VulkanError> {
         if !library_path.exists() {
             continue;
         }
+        configure_macos_vulkan_icd(&library_path);
         log::debug!("Trying Vulkan library: {}", library_path.display());
         match unsafe { ash::Entry::load_from(library_path.as_os_str()) } {
             Ok(entry) => {
@@ -117,6 +122,84 @@ fn open_library_macos() -> Result<ash::Entry, VulkanError> {
             Err(VulkanError::new(vk::Result::ERROR_INITIALIZATION_FAILED))
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_vulkan_icd(library_path: &std::path::Path) {
+    if std::env::var_os("VK_ICD_FILENAMES")
+        .filter(|path| !path.is_empty())
+        .is_some()
+    {
+        return;
+    }
+
+    let Some(file_name) = library_path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    if !matches!(file_name, "libvulkan.1.dylib" | "libvulkan.dylib") {
+        return;
+    }
+
+    let Some(lib_dir) = library_path.parent() else {
+        return;
+    };
+    let Some(sdk_root) = lib_dir.parent() else {
+        return;
+    };
+    let icd_path = sdk_root.join("share/vulkan/icd.d/MoltenVK_icd.json");
+    if !icd_path.exists() {
+        return;
+    }
+
+    log::info!(
+        "Using Vulkan ICD manifest from {}",
+        icd_path.display()
+    );
+    std::env::set_var("VK_ICD_FILENAMES", icd_path);
+}
+
+#[cfg(target_os = "macos")]
+fn vulkan_sdk_paths() -> Vec<std::path::PathBuf> {
+    let mut sdk_roots = Vec::<std::path::PathBuf>::new();
+    if let Some(path) = std::env::var_os("VULKAN_SDK").filter(|path| !path.is_empty()) {
+        sdk_roots.push(std::path::PathBuf::from(path));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let dev_sdk_root = std::path::PathBuf::from(home).join("Dev/emulators/VulkanSDK");
+        if let Ok(entries) = std::fs::read_dir(dev_sdk_root) {
+            let mut versions = entries
+                .flatten()
+                .map(|entry| entry.path().join("macOS"))
+                .filter(|path| path.is_dir())
+                .collect::<Vec<_>>();
+            versions.sort();
+            versions.reverse();
+            sdk_roots.extend(versions);
+        }
+    }
+
+    let mut paths = Vec::new();
+    for root in sdk_roots {
+        let lib = root.join("lib");
+        paths.extend([
+            lib.join("libvulkan.1.dylib"),
+            lib.join("libvulkan.dylib"),
+            lib.join("libMoltenVK.dylib"),
+        ]);
+    }
+    paths
+}
+
+#[cfg(target_os = "macos")]
+fn local_yuzu_bundle_paths() -> Vec<std::path::PathBuf> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let root = std::path::PathBuf::from(home).join("Dev/emulators/zuyu/build/bin/yuzu.app");
+    vec![
+        root.join("Contents/Frameworks/libvulkan.1.dylib"),
+        root.join("Contents/Frameworks/libMoltenVK.dylib"),
+    ]
 }
 
 #[cfg(target_os = "macos")]

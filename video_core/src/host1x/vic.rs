@@ -16,8 +16,8 @@ use log::info;
 
 use crate::cdma_pusher::ProcessMethodHook;
 use crate::host1x::ffmpeg::ffmpeg::Frame;
-use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::host1x::FrameQueue;
+use crate::memory_manager::MemoryManager;
 
 fn emit_vic_timing(id: i32, step: u64, elapsed_us: u64, aux0: u64, aux1: u64, aux2: u64) {
     let _ = common::trace::emit(
@@ -766,7 +766,7 @@ pub struct Vic {
     syncpoint: u32,
     regs: VicRegisters,
     frame_queue: Arc<FrameQueue>,
-    memory_manager: Arc<MaxwellDeviceMemoryManager>,
+    memory_manager: Arc<parking_lot::Mutex<MemoryManager>>,
     output_surface: Vec<Pixel>,
     slot_surface: Vec<Pixel>,
     luma_scratch: Vec<u8>,
@@ -779,7 +779,7 @@ impl Vic {
         id: i32,
         syncpt: u32,
         frame_queue: Arc<FrameQueue>,
-        memory_manager: Arc<MaxwellDeviceMemoryManager>,
+        memory_manager: Arc<parking_lot::Mutex<MemoryManager>>,
     ) -> Self {
         info!("Created VIC {}", id);
         Self {
@@ -828,7 +828,8 @@ impl Vic {
         };
         if !self
             .memory_manager
-            .smmu_read_block(config_addr, config_bytes)
+            .lock()
+            .read_block(config_addr, config_bytes)
         {
             log::error!(
                 "Vic {} failed to read ConfigStruct at 0x{:X}",
@@ -1383,7 +1384,8 @@ impl Vic {
             Some(BlkKind::Pitch) => {
                 let _ = self
                     .memory_manager
-                    .smmu_write_block(self.output_luma_address(), &self.luma_scratch);
+                    .lock()
+                    .write_block(self.output_luma_address(), &self.luma_scratch);
             }
             Some(BlkKind::Generic16Bx2) => {
                 let block_height = output_surface_config.out_block_height();
@@ -1420,7 +1422,8 @@ impl Vic {
                 }
                 let _ = self
                     .memory_manager
-                    .smmu_write_block(self.output_luma_address(), &self.swizzle_scratch);
+                    .lock()
+                    .write_block(self.output_luma_address(), &self.swizzle_scratch);
             }
             kind => log::warn!("Vic {} unimplemented output block kind {:?}", self.id, kind),
         }
@@ -1442,10 +1445,12 @@ impl Vic {
             Some(BlkKind::Pitch) => {
                 let _ = self
                     .memory_manager
-                    .smmu_write_block(self.output_luma_address(), &self.luma_scratch);
+                    .lock()
+                    .write_block(self.output_luma_address(), &self.luma_scratch);
                 let _ = self
                     .memory_manager
-                    .smmu_write_block(self.output_chroma_address(), &self.chroma_scratch);
+                    .lock()
+                    .write_block(self.output_chroma_address(), &self.chroma_scratch);
             }
             Some(BlkKind::Generic16Bx2) => {
                 let block_height = output_surface_config.out_block_height();
@@ -1482,7 +1487,8 @@ impl Vic {
                 }
                 let _ = self
                     .memory_manager
-                    .smmu_write_block(self.output_luma_address(), &self.swizzle_scratch);
+                    .lock()
+                    .write_block(self.output_luma_address(), &self.swizzle_scratch);
 
                 let chroma_size = crate::textures::decoders::calculate_size(
                     true,
@@ -1517,7 +1523,8 @@ impl Vic {
                 }
                 let _ = self
                     .memory_manager
-                    .smmu_write_block(self.output_chroma_address(), &self.swizzle_scratch);
+                    .lock()
+                    .write_block(self.output_chroma_address(), &self.swizzle_scratch);
             }
             kind => log::warn!("Vic {} unimplemented output block kind {:?}", self.id, kind),
         }
@@ -1630,7 +1637,7 @@ mod tests {
 
     #[test]
     fn process_method_uses_cdma_method_index_like_upstream() {
-        let memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let memory = Arc::new(parking_lot::Mutex::new(MemoryManager::new(0, 32, 0)));
         let queue = Arc::new(FrameQueue::new());
         let mut vic = Vic::new(4, 0, queue, memory);
 

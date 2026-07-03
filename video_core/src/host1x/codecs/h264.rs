@@ -7,9 +7,9 @@
 //! SPS/PPS headers, and the H264 decoder struct.
 
 use crate::host1x::codecs::decoder::{DecoderImpl, DecoderState};
-use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::host1x::FrameQueue;
 use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
+use crate::memory_manager::MemoryManager;
 use std::sync::Arc;
 
 // --------------------------------------------------------------------------
@@ -443,7 +443,7 @@ pub struct H264 {
 impl H264 {
     pub fn new(
         id: i32,
-        memory_manager: Arc<MaxwellDeviceMemoryManager>,
+        memory_manager: Arc<parking_lot::Mutex<MemoryManager>>,
         frame_queue: Arc<FrameQueue>,
     ) -> Self {
         let mut state = DecoderState::new(id, memory_manager, frame_queue);
@@ -462,7 +462,9 @@ impl DecoderImpl for H264 {
     fn compose_frame(&mut self, regs: &NvdecRegisters) -> Vec<u8> {
         let memory_manager = Arc::clone(&self.state.memory_manager);
         let mut context_bytes = vec![0u8; std::mem::size_of::<H264DecoderContext>()];
-        if !memory_manager.smmu_read_block(regs.picture_info_offset().address(), &mut context_bytes)
+        if !memory_manager
+            .lock()
+            .read_block(regs.picture_info_offset().address(), &mut context_bytes)
         {
             log::error!(
                 "H264::compose_frame: failed to read picture info at 0x{:X}",
@@ -484,7 +486,7 @@ impl DecoderImpl for H264 {
         if !self.is_first_frame && frame_number != 0 {
             self.frame_scratch
                 .resize(self.current_context.stream_len as usize, 0);
-            if !memory_manager.smmu_read_block(
+            if !memory_manager.lock().read_block(
                 regs.frame_bitstream_offset().address(),
                 &mut self.frame_scratch,
             ) {
@@ -600,7 +602,7 @@ impl DecoderImpl for H264 {
             0,
         );
         self.frame_scratch[..encoded_header.len()].copy_from_slice(encoded_header);
-        if !memory_manager.smmu_read_block(
+        if !memory_manager.lock().read_block(
             regs.frame_bitstream_offset().address(),
             &mut self.frame_scratch[encoded_header.len()..],
         ) {
