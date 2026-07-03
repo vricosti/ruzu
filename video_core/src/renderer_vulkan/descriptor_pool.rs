@@ -170,6 +170,18 @@ pub struct DescriptorPool {
 struct BanksState {
     bank_infos: Vec<DescriptorBankInfo>,
     banks: Vec<DescriptorBank>,
+    /// Pools retired at a frame boundary, reset and returned to their bank
+    /// only once the GPU has passed `retire_tick`. Mirrors upstream's
+    /// tick-tagged `DescriptorAllocator` ring: with pipelined submissions a
+    /// pool must not be reset while an in-flight command buffer still
+    /// references sets allocated from it.
+    retired: Vec<RetiredPools>,
+}
+
+struct RetiredPools {
+    retire_tick: u64,
+    bank_index: usize,
+    pools: Vec<vk::DescriptorPool>,
 }
 
 impl DescriptorPool {
@@ -181,6 +193,7 @@ impl DescriptorPool {
             banks_lock: RwLock::new(BanksState {
                 bank_infos: Vec::new(),
                 banks: Vec::new(),
+                retired: Vec::new(),
             }),
         }
     }
@@ -246,9 +259,15 @@ impl DescriptorPool {
         }
     }
 
-    /// Reset all pools for the next frame.
+    /// Reset all pools immediately. Only safe when the GPU is idle (e.g.
+    /// after `Scheduler::finish`); pipelined frames must use `end_frame`.
     pub fn reset_pools(&self) {
-        let state = self.banks_lock.write().unwrap();
+        let mut state = self.banks_lock.write().unwrap();
+        let state = &mut *state;
+        // Fold retired pools back into their banks first.
+        while let Some(retired) = state.retired.pop() {
+            state.banks[retired.bank_index].pools.extend(retired.pools);
+        }
         for bank in &state.banks {
             for pool in &bank.pools {
                 unsafe {
@@ -260,6 +279,41 @@ impl DescriptorPool {
         }
     }
 
+    /// Tick-safe frame boundary: retire the pools used up to `current_tick`
+    /// and recycle previously retired pools whose tick the GPU has passed.
+    pub fn end_frame(&self, current_tick: u64, is_free: &dyn Fn(u64) -> bool) {
+        let mut state = self.banks_lock.write().unwrap();
+        let state = &mut *state;
+
+        let mut index = 0;
+        while index < state.retired.len() {
+            if is_free(state.retired[index].retire_tick) {
+                let retired = state.retired.swap_remove(index);
+                for pool in &retired.pools {
+                    unsafe {
+                        self.device
+                            .reset_descriptor_pool(*pool, vk::DescriptorPoolResetFlags::empty())
+                            .ok();
+                    }
+                }
+                state.banks[retired.bank_index].pools.extend(retired.pools);
+            } else {
+                index += 1;
+            }
+        }
+
+        for (bank_index, bank) in state.banks.iter_mut().enumerate() {
+            if bank.pools.is_empty() {
+                continue;
+            }
+            state.retired.push(RetiredPools {
+                retire_tick: current_tick,
+                bank_index,
+                pools: std::mem::take(&mut bank.pools),
+            });
+        }
+    }
+
     /// Find or create a bank matching the requirements, return its last pool.
     ///
     /// Port of `DescriptorPool::Bank`.
@@ -267,25 +321,34 @@ impl DescriptorPool {
         &self,
         reqs: &DescriptorBankInfo,
     ) -> Result<vk::DescriptorPool, vk::Result> {
-        // Try to find an existing bank (read lock)
+        // Try to find an existing bank with a live pool (read lock).
+        // `end_frame` retires every pool of a bank, so a matching bank may be
+        // empty; fall through to the write path to grow it in that case.
         {
             let state = self.banks_lock.read().unwrap();
             for (i, bank_info) in state.bank_infos.iter().enumerate() {
                 if (bank_info.score - reqs.score).abs() < SCORE_THRESHOLD
                     && bank_info.is_superset(reqs)
                 {
-                    return Ok(*state.banks[i].pools.last().unwrap());
+                    if let Some(pool) = state.banks[i].pools.last() {
+                        return Ok(*pool);
+                    }
+                    break;
                 }
             }
         }
 
-        // Not found, create a new bank (write lock)
+        // Not found (or bank emptied by end_frame): create/grow (write lock)
         let mut state = self.banks_lock.write().unwrap();
 
         // Double-check after acquiring write lock
-        for (i, bank_info) in state.bank_infos.iter().enumerate() {
+        for i in 0..state.bank_infos.len() {
+            let bank_info = state.bank_infos[i];
             if (bank_info.score - reqs.score).abs() < SCORE_THRESHOLD && bank_info.is_superset(reqs)
             {
+                if state.banks[i].pools.is_empty() {
+                    allocate_pool(&self.device, &mut state.banks[i], self.sets_per_pool)?;
+                }
                 return Ok(*state.banks[i].pools.last().unwrap());
             }
         }
@@ -328,6 +391,13 @@ impl Drop for DescriptorPool {
         let state = self.banks_lock.write().unwrap();
         for bank in &state.banks {
             for pool in &bank.pools {
+                unsafe {
+                    self.device.destroy_descriptor_pool(*pool, None);
+                }
+            }
+        }
+        for retired in &state.retired {
+            for pool in &retired.pools {
                 unsafe {
                     self.device.destroy_descriptor_pool(*pool, None);
                 }

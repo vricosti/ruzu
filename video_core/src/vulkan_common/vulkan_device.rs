@@ -249,6 +249,9 @@ pub struct Device {
     pub device_features: vk::PhysicalDeviceFeatures,
     /// Feature bit from `VkPhysicalDeviceShaderFloat16Int8Features`.
     pub shader_float16_supported: bool,
+    /// Whether `VkPhysicalDeviceTimelineSemaphoreFeatures::timelineSemaphore`
+    /// is supported and enabled (backs the scheduler's MasterSemaphore).
+    pub timeline_semaphore_supported: bool,
     /// Feature bit from `VkPhysicalDeviceShaderFloat16Int8Features`.
     pub shader_int8_supported: bool,
     /// Feature bit from `VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT`.
@@ -382,6 +385,7 @@ impl Device {
 
         let has_primitive_topology_list_restart =
             supported_extensions.contains("VK_EXT_primitive_topology_list_restart");
+        // Read after the features2 query below.
         let has_portability_subset = supported_extensions.contains("VK_KHR_portability_subset");
         let has_extended_dynamic_state =
             supported_extensions.contains("VK_EXT_extended_dynamic_state");
@@ -391,6 +395,8 @@ impl Device {
             vk::PhysicalDeviceShaderFloat16Int8Features::default();
         let mut portability_subset_features =
             vk::PhysicalDevicePortabilitySubsetFeaturesKHR::default();
+        let mut timeline_semaphore_features =
+            vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
         let mut primitive_topology_list_restart_features =
             vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT::default();
         let mut extended_dynamic_state_features =
@@ -398,8 +404,9 @@ impl Device {
         let mut extended_dynamic_state2_features =
             vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default();
         {
-            let mut features2_builder =
-                vk::PhysicalDeviceFeatures2::builder().push_next(&mut shader_float16_int8_features);
+            let mut features2_builder = vk::PhysicalDeviceFeatures2::builder()
+                .push_next(&mut shader_float16_int8_features)
+                .push_next(&mut timeline_semaphore_features);
             if has_portability_subset {
                 features2_builder = features2_builder.push_next(&mut portability_subset_features);
             }
@@ -423,6 +430,7 @@ impl Device {
 
         let supports_shader_float16 = shader_float16_int8_features.shader_float16 != 0;
         let supports_shader_int8 = shader_float16_int8_features.shader_int8 != 0;
+        let supports_timeline_semaphore = timeline_semaphore_features.timeline_semaphore != 0;
         let supports_primitive_topology_list_restart =
             primitive_topology_list_restart_features.primitive_topology_list_restart != 0;
         let supports_primitive_topology_patch_list_restart =
@@ -469,6 +477,10 @@ impl Device {
         // Upstream builds a full extension list and VkPhysicalDeviceFeatures2 chain here.
         // This keeps the mandatory WSI/portability extensions while the larger feature
         // chain is ported file-by-file.
+        let mut enabled_timeline_semaphore_features =
+            vk::PhysicalDeviceTimelineSemaphoreFeatures::builder()
+                .timeline_semaphore(supports_timeline_semaphore)
+                .build();
         let mut enabled_shader_float16_int8_features =
             vk::PhysicalDeviceShaderFloat16Int8Features::builder()
                 .shader_float16(supports_shader_float16)
@@ -493,6 +505,9 @@ impl Device {
         let device_create_info = {
             let mut builder = vk::DeviceCreateInfo::builder()
                 .push_next(&mut enabled_shader_float16_int8_features);
+            if supports_timeline_semaphore {
+                builder = builder.push_next(&mut enabled_timeline_semaphore_features);
+            }
             if has_portability_subset {
                 builder = builder.push_next(&mut enabled_portability_subset_features);
             }
@@ -571,6 +586,7 @@ impl Device {
                 vk::PhysicalDeviceSubgroupSizeControlProperties::default(),
             device_features,
             shader_float16_supported: supports_shader_float16,
+            timeline_semaphore_supported: supports_timeline_semaphore,
             shader_int8_supported: supports_shader_int8,
             primitive_topology_list_restart_supported: supports_primitive_topology_list_restart,
             primitive_topology_patch_list_restart_supported:
@@ -810,6 +826,11 @@ impl Device {
     /// Port of `Device::IsFloat16Supported`.
     pub fn is_float16_supported(&self) -> bool {
         self.shader_float16_supported
+    }
+
+    /// Returns true if timeline semaphores are supported and enabled.
+    pub fn is_timeline_semaphore_supported(&self) -> bool {
+        self.timeline_semaphore_supported
     }
 
     /// Returns true if the device supports VK_EXT_primitive_topology_list_restart.

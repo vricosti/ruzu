@@ -714,8 +714,11 @@ impl Default for Values {
                 "vram_usage_mode",
                 RendererAdvanced,
             ),
+            // Upstream defaults to false; ruzu defaults to true because on
+            // macOS/MoltenVK a `nextDrawable` stall inside the present copy
+            // must not block the GPU thread (it wedges the whole emulator).
             async_presentation: SwitchableSetting::new(
-                false,
+                true,
                 "async_presentation",
                 RendererAdvanced,
             ),
