@@ -122,6 +122,10 @@ pub trait ArmInterface: Send {
     /// Clear a range of the instruction cache for this CPU.
     fn invalidate_cache_range(&mut self, addr: u64, size: usize);
 
+    /// Diagnostic: dump the JIT's emitted-block map (host entry -> guest
+    /// location) to `path` for host-profiler attribution. Default: no-op.
+    fn dump_jit_block_map(&mut self, _path: &str) {}
+
     /// Get the current architecture.
     /// Returns AArch64 when PSTATE.nRW == 0 and AArch32 when PSTATE.nRW == 1.
     fn get_architecture(&self) -> Architecture;

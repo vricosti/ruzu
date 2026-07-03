@@ -720,12 +720,25 @@ fn dump_thread_state(kernel: &KernelCore) {
         }
     }
     let thread_entries: Vec<(u64, std::sync::Arc<super::k_thread::KThreadLock>)> = match acquired {
-        Some(guard) => {
+        Some(mut guard) => {
             eprintln!(
                 "[DUMP] process threads: {} (process.lock() acquired after {} polls)",
                 guard.thread_list.len(),
                 poll_count,
             );
+            // RUZU_DUMP_JIT_MAP=prefix — write each core's JIT block map
+            // (host entry -> guest descriptor) to `prefix.coreN.map` so host
+            // profiler samples inside JIT code can be attributed to guest
+            // locations offline.
+            if let Ok(prefix) = std::env::var("RUZU_DUMP_JIT_MAP") {
+                for core in 0..4 {
+                    if let Some(arm) = guard.get_arm_interface_mut(core) {
+                        let path = format!("{prefix}.core{core}.map");
+                        arm.dump_jit_block_map(&path);
+                        eprintln!("[DUMP] JIT block map core {core} -> {path}");
+                    }
+                }
+            }
             for (core_id, tid, handle, message_addr, size) in &svc21_messages_to_dump {
                 if let Some(object_id) = guard.handle_table.get_object(*handle) {
                     let Some(client_session) = guard.get_client_session_by_object_id(object_id)
