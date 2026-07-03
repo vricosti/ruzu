@@ -2824,6 +2824,14 @@ impl ArmInterface for ArmDynarmic32 {
         }
     }
 
+    fn dump_jit_block_map(&mut self, path: &str) {
+        if let Some(jit) = self.jit.as_ref() {
+            if let Err(err) = jit.dump_jit_block_map(path) {
+                log::warn!("ArmDynarmic32: failed to dump JIT block map: {err}");
+            }
+        }
+    }
+
     fn get_architecture(&self) -> Architecture {
         Architecture::AArch32
     }
