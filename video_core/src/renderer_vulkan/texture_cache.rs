@@ -961,6 +961,9 @@ pub struct TextureCacheRuntime {
     descriptor_pool: NonNull<DescriptorPool>,
     compute_pass_descriptor_queue: NonNull<ComputePassDescriptorQueue>,
     astc_decoder_pass: Option<AstcDecoderPass>,
+    /// Cached `vkGetPhysicalDeviceFormatProperties` results (upstream caches
+    /// these in `Device`); queried on hot per-draw paths via `surface_format`.
+    format_properties: std::cell::RefCell<std::collections::HashMap<vk::Format, vk::FormatProperties>>,
     msaa_copy_pass: Option<MsaaCopyPass>,
     shader_stencil_export_supported: bool,
     resolution: common::settings::ResolutionScalingInfo,
@@ -1031,6 +1034,7 @@ impl TextureCacheRuntime {
             descriptor_pool: NonNull::from(descriptor_pool),
             compute_pass_descriptor_queue: NonNull::from(compute_pass_descriptor_queue),
             astc_decoder_pass,
+            format_properties: std::cell::RefCell::new(std::collections::HashMap::new()),
             msaa_copy_pass,
             shader_stencil_export_supported,
             resolution: common::settings::values().resolution_info.clone(),
@@ -1792,10 +1796,17 @@ impl TextureCacheRuntime {
         usage: vk::FormatFeatureFlags,
         optimal: bool,
     ) -> bool {
-        let props = unsafe {
-            self.instance
-                .get_physical_device_format_properties(self.physical_device, format)
-        };
+        // `vkGetPhysicalDeviceFormatProperties` is a driver call and this
+        // runs several times per draw through `surface_format`. Upstream
+        // caches format properties in `Device`; do the same here.
+        let props = *self
+            .format_properties
+            .borrow_mut()
+            .entry(format)
+            .or_insert_with(|| unsafe {
+                self.instance
+                    .get_physical_device_format_properties(self.physical_device, format)
+            });
         let supported = if optimal {
             props.optimal_tiling_features
         } else {
@@ -3279,18 +3290,25 @@ impl TextureCache {
             if !view.image_id.is_valid() || view.image_id == NULL_IMAGE_ID {
                 continue;
             }
-            let image_base = self.base.slot_images[view.image_id].clone();
             let format = self.runtime.surface_format(view.format);
-            let width = image_base.info.size.width.max(1);
-            let height = image_base.info.size.height.max(1);
-            recreated |= self
-                .ensure_image(
-                    view.image_id,
-                    &image_base,
-                    format,
-                    vk::ImageAspectFlags::COLOR,
-                )
-                .ok()?;
+            let (width, height) = {
+                let base = &self.base.slot_images[view.image_id];
+                (base.info.size.width.max(1), base.info.size.height.max(1))
+            };
+            // Per-draw fast path: only clone the ImageBase (six Vecs) and run
+            // the full `ensure_image` when the backend image actually needs
+            // (re)creation.
+            if !self.backend_image_matches(view.image_id, format, vk::ImageAspectFlags::COLOR) {
+                let image_base = self.base.slot_images[view.image_id].clone();
+                recreated |= self
+                    .ensure_image(
+                        view.image_id,
+                        &image_base,
+                        format,
+                        vk::ImageAspectFlags::COLOR,
+                    )
+                    .ok()?;
+            }
             self.ensure_image_view(view_id).ok()?;
             extent.width = extent.width.min(width);
             extent.height = extent.height.min(height);
@@ -3301,11 +3319,11 @@ impl TextureCache {
                     view_id.index,
                     view.image_id.index,
                     view.gpu_addr,
-                    image_base.gpu_addr,
+                    self.base.slot_images[view.image_id].gpu_addr,
                     view.size.width,
                     view.size.height,
-                    image_base.info.size.width,
-                    image_base.info.size.height,
+                    width,
+                    height,
                     view.range,
                 );
             }
@@ -3355,14 +3373,18 @@ impl TextureCache {
         if depth_id.is_valid() && depth_id != NULL_IMAGE_VIEW_ID {
             let view = self.base.slot_image_views[depth_id].clone();
             if view.image_id.is_valid() && view.image_id != NULL_IMAGE_ID {
-                let image_base = self.base.slot_images[view.image_id].clone();
                 let format = self.runtime.surface_format(view.format);
                 let aspect = image_aspect_mask(view.format);
-                let width = image_base.info.size.width.max(1);
-                let height = image_base.info.size.height.max(1);
-                recreated |= self
-                    .ensure_image(view.image_id, &image_base, format, aspect)
-                    .ok()?;
+                let (width, height) = {
+                    let base = &self.base.slot_images[view.image_id];
+                    (base.info.size.width.max(1), base.info.size.height.max(1))
+                };
+                if !self.backend_image_matches(view.image_id, format, aspect) {
+                    let image_base = self.base.slot_images[view.image_id].clone();
+                    recreated |= self
+                        .ensure_image(view.image_id, &image_base, format, aspect)
+                        .ok()?;
+                }
                 self.ensure_image_view(depth_id).ok()?;
                 extent.width = extent.width.min(width);
                 extent.height = extent.height.min(height);
@@ -3796,6 +3818,41 @@ impl TextureCache {
             }
         }
         true
+    }
+
+    /// In-place fast check: the image has no pending CPU upload and the
+    /// backend image exists with matching format/geometry (i.e. both
+    /// `RefreshContents` and `ensure_image` would be no-ops). Performs no
+    /// clones and no mutations.
+    fn image_up_to_date(&self, image_id: ImageId) -> bool {
+        let base = &self.base.slot_images[image_id];
+        if base.flags.contains(ImageFlagBits::CPU_MODIFIED) {
+            return false;
+        }
+        let format = self.runtime.surface_format(base.info.format);
+        let aspect = image_aspect_mask(base.info.format);
+        self.backend_image_matches(image_id, format, aspect)
+    }
+
+    /// In-place equivalent of `ensure_image`'s no-op test: the backend image
+    /// exists and matches format/geometry, so `ensure_image` would not
+    /// recreate anything. Performs no clones and no mutations.
+    fn backend_image_matches(
+        &self,
+        image_id: ImageId,
+        format: vk::Format,
+        aspect: vk::ImageAspectFlags,
+    ) -> bool {
+        let Some(existing) = self.images.get(&image_id) else {
+            return false;
+        };
+        let base = &self.base.slot_images[image_id];
+        existing.format == format
+            && existing.aspect == aspect
+            && existing.base.info.size == base.info.size
+            && existing.base.info.resources == base.info.resources
+            && existing.base.info.image_type == base.info.image_type
+            && existing.base.info.num_samples == base.info.num_samples
     }
 
     /// Ensure a backend `Image` exists for the common-cache `ImageId`.
@@ -4902,6 +4959,13 @@ impl TextureCache {
     ) -> bool {
         if !self.base_image_exists(image_id) {
             return false;
+        }
+        // Fast path, port of upstream `RefreshContents`' first check: nothing
+        // was CPU-modified and the backend image matches — this runs for
+        // every bound render target on every draw, so it must not clone
+        // `ImageBase` (six `Vec` fields) or touch anything else.
+        if self.image_up_to_date(image_id) {
+            return true;
         }
         let image_base = self.base.slot_images[image_id].clone();
         let format = self.runtime.surface_format(image_base.info.format);

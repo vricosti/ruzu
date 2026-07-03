@@ -20105,6 +20105,52 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `renderer_vulkan.cpp`: `Composite` flushes `scheduler.Flush(*frame->render_ready)` before `present_manager.Present(frame)`, so the shared mutex protects scheduler submit and presentation submit/present in the same ownership slice.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
 
+## 2026-07-03 — externals/rdynarmic/src/backend/arm64/{address_space.rs,emit_arm64.rs,fast_hash.rs,a32_address_space.rs} vs externals/dynarmic/src/dynarmic/backend/arm64/{address_space.cpp,emit_arm64.cpp,a32_address_space.cpp}
+
+### Intentional differences
+- Rust ARM64 code-cache maps now use a backend-local non-cryptographic `FastHashMap`/`FastHashSet` instead of `std::collections::HashMap` for `block_entries`, `block_infos`, `block_references`, `EmittedBlockInfo::block_relocations`, and `fastmem_patch_info`. Upstream uses `tsl::robin_map`/`tsl::robin_set` in the same owner, so this preserves the upstream performance intent for dispatcher-heavy block-cache lookup without changing block ownership or link/relink behavior.
+- `RUZU_PROFILE_ARM64_CODE_CACHE` adds gated diagnostics for dispatcher hit/compile counts, terminal distribution, link slots, and relinks. These counters are inactive unless the env var is set; normal execution does not increment them. Upstream has no equivalent logging, but it is host-only diagnostic code in the corresponding ARM64 address-space owner.
+
+### Unintentional differences (to fix)
+- The Rust `FastHashMap` still uses `std::collections::HashMap` probing/storage rather than upstream `tsl::robin_map`/`tsl::robin_set`. It improves hash cost and avoids the default SipHash path, but does not replicate robin-hood probing/cache-locality behavior. If dispatcher lookup remains hot, the stricter next step is a robin-hood/flat map replacement for these same owner-local maps.
+
+### Missing items
+- ARM64 `FastDispatchHint` remains unimplemented, matching upstream Dynarmic ARM64 where `EmitA32Terminal(... FastDispatchHint ...)` and `EmitA64Terminal(... FastDispatchHint ...)` return to dispatcher with a TODO.
+- No generated-code RSB hit/miss counter exists yet; current diagnostics only count compiled terminal kinds and dispatcher cache-hit rates.
+
+### Binary layout verification
+- N/A: host-side Rust map/hash selection and env-gated diagnostics only. `A32JitState`, `A64JitState`, stack layout, and emitted guest-visible state layout are unchanged.
+
+### Verification
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/address_space.h/.cpp`: `block_entries`, `block_infos`, and `block_references` are `tsl::robin_map`/`tsl::robin_set`; `InvalidateBasicBlocks` only erases `block_entries` after `RelinkForDescriptor(descriptor, nullptr)`, matching the Rust lifecycle.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.h/.cpp`: `EmittedBlockInfo::block_relocations` and `fastmem_patch_info` are `tsl::robin_map`; Rust now keeps those maps backend-local and fast-hashed.
+- Re-read upstream `externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp`: `FastDispatchHint` is still a dispatcher return with TODO, so this pass intentionally did not invent an ARM64 fast-dispatch implementation.
+- `cargo test -p rdynarmic backend::arm64::fast_hash::tests::composite_keys_mix_all_writes` passes.
+- `cargo check -p rdynarmic` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D non-profiled run after gating diagnostics: `RUST_LOG=info timeout 130s ./target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, has no JIT profile lines, reaches `BQP_QUEUE #4096` at ~100.55s and `SP_TRACE submit#8192` at ~100.50s. The comparable run before gating/fast-hash reached only `BQP_QUEUE #2048` at ~122.15s.
+
+## 2026-07-03 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h, video_core/renderer_vulkan/vk_texture_cache.*, video_core/vulkan_common/vulkan_device.*
+
+### Intentional differences
+- Rust `TextureCacheRuntime` now caches `vkGetPhysicalDeviceFormatProperties` results locally in `format_properties`. Upstream stores this cache in `Vulkan::Device::format_properties` and routes format selection through `Device::GetSupportedFormat`; the current Rust split does not have the full `Device` owner, so the cache is placed in the Vulkan texture-cache runtime that owns `surface_format`.
+- Rust adds `image_up_to_date` / `backend_image_matches` as in-place fast checks before cloning `ImageBase` and calling `ensure_image`. This preserves upstream `TextureCache<P>::RefreshContents`' first ordering rule — return immediately when `CpuModified` is false — and mirrors `ensure_image`'s existing no-recreate predicate without moving ownership out of `texture_cache.rs`.
+
+### Unintentional differences (to fix)
+- Format-property caching is still in `TextureCacheRuntime`, not a full `Vulkan::Device` port. A stricter future port should move it to the Rust device owner once `Device::GetSupportedFormat` is represented with upstream ownership.
+
+### Missing items
+- Full upstream `Vulkan::Device::GetSupportedFormat` ownership and `format_properties` storage in the Vulkan device module.
+
+### Binary layout verification
+- N/A: host-side Vulkan format-query caching and clone avoidance only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `video_core/vulkan_common/vulkan_device.cpp/.h`: `Device` builds and owns `format_properties`, and `GetSupportedFormat` uses that cache for format feature checks.
+- Re-read upstream `video_core/renderer_vulkan/maxwell_to_vk.cpp`: `SurfaceFormat` resolves the requested guest format through `device.GetSupportedFormat`.
+- Re-read upstream `video_core/texture_cache/texture_cache.h`: `RefreshContents` returns before upload when `CpuModified` is false, then tracks/uploads only modified images.
+- Re-read upstream `video_core/texture_cache/texture_cache.h`: `GetFramebufferId` keys framebuffers by the full `RenderTargets` key and creates image views from the slot-image owners.
+
 ## 2026-07-03 — ruzu_cmd/src/emu_window/emu_window_sdl2_vk.rs vs yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp
 
 ### Intentional differences
