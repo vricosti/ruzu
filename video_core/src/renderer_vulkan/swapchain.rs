@@ -262,7 +262,7 @@ impl Swapchain {
     /// Port of `Swapchain::AcquireNextImage`.
     ///
     /// Returns `true` if the swapchain is suboptimal or outdated.
-    pub fn acquire_next_image(&mut self, scheduler: &mut Scheduler) -> bool {
+    pub fn acquire_next_image(&mut self, scheduler: Option<&mut Scheduler>) -> bool {
         let trace_present = std::env::var_os("RUZU_TRACE_PRESENT").is_some();
         if self.swapchain == vk::SwapchainKHR::null() || self.present_semaphores.is_empty() {
             self.is_outdated = true;
@@ -306,8 +306,21 @@ impl Swapchain {
             }
         }
         if let Some(tick) = self.resource_ticks.get_mut(self.image_index as usize) {
-            scheduler.wait(*tick);
-            *tick = scheduler.current_tick();
+            match scheduler {
+                Some(scheduler) => {
+                    scheduler.wait(*tick);
+                    *tick = scheduler.current_tick();
+                }
+                // Present-thread path: the scheduler belongs to the GPU thread
+                // and `Scheduler::wait` may record/submit, so it cannot be
+                // called here. Image reuse is already ordered by the
+                // presentation engine (an image is only re-acquired after its
+                // previous present completed, which waited on the blit's
+                // semaphore), and frame readiness by `render_ready`.
+                None => {
+                    *tick = tick.saturating_add(1);
+                }
+            }
         }
         self.is_suboptimal || self.is_outdated
     }

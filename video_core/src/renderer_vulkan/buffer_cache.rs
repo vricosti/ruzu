@@ -622,20 +622,24 @@ impl BufferCache {
     /// binds, staging copies) keep the handle alive until the scheduler has
     /// advanced past the retire tick.
     fn sentence(&mut self, buffer: CachedBuffer) {
+        // The retire tick is finalized at the next `tick_frame`: this cache
+        // has no scheduler handle, so the pending submission tick is stamped
+        // there. `u64::MAX` marks a not-yet-finalized entry.
         self.sentenced.push(SentencedBuffer {
-            retire_tick: self.current_tick.saturating_add(TICKS_TO_DESTROY as u64),
+            retire_tick: u64::MAX,
             buffer,
         });
     }
 
     /// Advance the delayed-destruction ring. Called once per frame by the
-    /// rasterizer with the scheduler's current tick, like
-    /// `TextureCache::tick_frame`.
-    pub fn tick_frame(&mut self, scheduler_tick: u64) {
-        self.current_tick = scheduler_tick;
+    /// rasterizer with the GPU-completed tick (`Scheduler::known_gpu_tick`),
+    /// like `TextureCache::tick_frame`. Destruction only happens once the GPU
+    /// has passed the submission that could last reference a buffer.
+    pub fn tick_frame(&mut self, gpu_tick: u64) {
         let mut index = 0;
         while index < self.sentenced.len() {
-            if self.sentenced[index].retire_tick <= scheduler_tick {
+            let retire_tick = self.sentenced[index].retire_tick;
+            if retire_tick != u64::MAX && retire_tick <= gpu_tick {
                 let sentenced = self.sentenced.swap_remove(index);
                 unsafe {
                     self.device.destroy_buffer(sentenced.buffer.buffer, None);
@@ -643,6 +647,14 @@ impl BufferCache {
                 }
             } else {
                 index += 1;
+            }
+        }
+        // Finalize buffers sentenced during this frame: their last possible
+        // use is covered by the next submission after this frame boundary.
+        let finalize_tick = self.current_tick.saturating_add(1);
+        for sentenced in &mut self.sentenced {
+            if sentenced.retire_tick == u64::MAX {
+                sentenced.retire_tick = finalize_tick;
             }
         }
     }

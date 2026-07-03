@@ -382,6 +382,11 @@ pub struct RasterizerVulkan {
 
     // Draw counter for periodic flush (zuyu: 7 draws → dispatch, 4096 → flush)
     draw_counter: u32,
+    /// Draws dropped because pipeline compilation failed (diagnostic).
+    draw_skipped_pipeline: u64,
+    /// Draws redirected to the offscreen framebuffer because no guest
+    /// render-target framebuffer could be resolved (diagnostic).
+    draw_offscreen_fallback: u64,
     extended_dynamic_state_supported: bool,
     extended_dynamic_state2_supported: bool,
     max_viewports: u32,
@@ -418,6 +423,7 @@ impl RasterizerVulkan {
         topology_list_primitive_restart_supported: bool,
         patch_list_primitive_restart_supported: bool,
         shader_stencil_export_supported: bool,
+        timeline_semaphore_supported: bool,
         max_viewports: u32,
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<MaxwellDeviceMemoryManager>,
@@ -444,8 +450,13 @@ impl RasterizerVulkan {
 
         // Create scheduler
         let mut scheduler = Box::new(
-            Scheduler::new(device.clone(), graphics_queue, command_pool)
-                .map_err(|e| RendererError::InitFailed(format!("scheduler: {:?}", e)))?,
+            Scheduler::new(
+                device.clone(),
+                graphics_queue,
+                command_pool,
+                timeline_semaphore_supported,
+            )
+            .map_err(|e| RendererError::InitFailed(format!("scheduler: {:?}", e)))?,
         );
         scheduler.set_state_tracker(NonNull::from(state_tracker.as_mut()));
 
@@ -620,6 +631,8 @@ impl RasterizerVulkan {
             readback_mapped,
             readback_size,
             draw_counter: 0,
+            draw_skipped_pipeline: 0,
+            draw_offscreen_fallback: 0,
             extended_dynamic_state_supported,
             extended_dynamic_state2_supported,
             max_viewports: max_viewports.min(NUM_VIEWPORTS as u32).max(1),
@@ -648,11 +661,10 @@ impl RasterizerVulkan {
     pub fn draw(
         &mut self,
         draw: &DrawCall,
+        dirty_flags: &mut [bool; 256],
         read_gpu: &dyn Fn(u64, &mut [u8]),
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
     ) {
-        let mut dirty_flags = draw.dirty_flags;
-
         // 1. Periodic flush
         self.flush_work();
 
@@ -670,7 +682,7 @@ impl RasterizerVulkan {
                     anti_alias_samples_mode: 0,
                     surface_clip: draw.surface_clip,
                 },
-                &mut dirty_flags,
+                dirty_flags,
                 read_gpu_unsafe,
                 false,
                 None,
@@ -710,7 +722,22 @@ impl RasterizerVulkan {
                 gp.uses_rescaling_uniform,
             ),
             None => {
-                debug!("RasterizerVulkan: skipping draw (pipeline compilation failed)");
+                self.draw_skipped_pipeline = self.draw_skipped_pipeline.wrapping_add(1);
+                // A skipped draw leaves the previous frame's pixels in place;
+                // with LOAD attachments this accumulates visibly (e.g. the
+                // MK8D title fog washing to white). Surface the loss.
+                if self.draw_skipped_pipeline <= 16 || self.draw_skipped_pipeline.is_power_of_two()
+                {
+                    log::warn!(
+                        "[DRAW_SKIP] #{} pipeline compilation failed (draw={} rt0=0x{:X} fmt={} topology={:?} indexed={})",
+                        self.draw_skipped_pipeline,
+                        self.draw_counter,
+                        draw.render_targets[0].address,
+                        draw.render_targets[0].format,
+                        draw.topology,
+                        draw.indexed,
+                    );
+                }
                 return;
             }
         };
@@ -727,6 +754,21 @@ impl RasterizerVulkan {
                 target.image_ranges,
             )
         } else {
+            self.draw_offscreen_fallback = self.draw_offscreen_fallback.wrapping_add(1);
+            // The draw executes but lands in the internal offscreen
+            // framebuffer instead of the guest render target — the guest RT
+            // keeps its stale contents, which reads as a lost draw.
+            if self.draw_offscreen_fallback <= 16
+                || self.draw_offscreen_fallback.is_power_of_two()
+            {
+                log::warn!(
+                    "[DRAW_OFFSCREEN] #{} no guest framebuffer resolved (draw={} rt0=0x{:X} fmt={})",
+                    self.draw_offscreen_fallback,
+                    self.draw_counter,
+                    draw.render_targets[0].address,
+                    draw.render_targets[0].format,
+                );
+            }
             (
                 self.offscreen_fb,
                 vk::Extent2D {
@@ -845,8 +887,15 @@ impl RasterizerVulkan {
                 );
             }
             log::info!(
-                "[VK_DRAW] draw={} topology={:?} guest_indexed={} vk_indexed={} vertices={} instances={} first_index={} base_vertex={} base_instance={} vertex_first={} vertex_count={} index_first={} index_count={} rt_count={} rt0_addr=0x{:X} rt0={}x{} fmt={} zeta_enable={} zeta_addr=0x{:X} zeta={}x{} zeta_fmt={} depth_mode={:?} depth_test={} depth_write={} depth_func={:?} stencil={} prim_restart={} rasterize={} cull_enable={} cull_face={:?} front_face={:?} window_flip_y={} uses_render_area={} uses_rescaling_uniform={} logic_op={} blend0={} color=({:?},{:?},{:?}) alpha=({:?},{:?},{:?}) mask={:?}",
+                "[VK_DRAW] draw={} vp=({:.0},{:.0} {:.0}x{:.0}) topology={:?} guest_indexed={} vk_indexed={} vertices={} instances={} first_index={} base_vertex={} base_instance={} vertex_first={} vertex_count={} index_first={} index_count={} rt_count={} rt0_addr=0x{:X} rt0={}x{} fmt={} zeta_enable={} zeta_addr=0x{:X} zeta={}x{} zeta_fmt={} depth_mode={:?} depth_test={} depth_write={} depth_func={:?} stencil={} prim_restart={} rasterize={} cull_enable={} cull_face={:?} front_face={:?} window_flip_y={} uses_render_area={} uses_rescaling_uniform={} logic_op={} blend0={} color=({:?},{:?},{:?}) alpha=({:?},{:?},{:?}) mask={:?}",
                 self.draw_counter,
+                {
+                    let vp = viewport_state(draw, 0);
+                    vp.x
+                },
+                viewport_state(draw, 0).y,
+                viewport_state(draw, 0).width,
+                viewport_state(draw, 0).height,
                 draw.topology,
                 draw.indexed,
                 draw_params.is_indexed,
@@ -993,11 +1042,16 @@ impl RasterizerVulkan {
             self.scheduler.dispatch_work();
         }
         if self.draw_counter >= Self::FLUSH_THRESHOLD {
-            self.scheduler.flush();
+            let tick = self.scheduler.flush();
             self.draw_counter = 0;
             self.state_tracker.invalidate_command_buffer_state();
             self.staging_pool.new_frame();
-            self.descriptor_pool.reset_pools();
+            // The freshly submitted work still references this frame's
+            // descriptor sets; retire the pools against the submission tick
+            // instead of resetting them under the GPU.
+            let scheduler = &self.scheduler;
+            self.descriptor_pool
+                .end_frame(tick, &|t| scheduler.is_free(t));
         }
     }
 
@@ -1177,7 +1231,10 @@ impl RasterizerVulkan {
             true
         };
         for draw in draws {
-            self.draw(draw, read_gpu, &read_gpu_unsafe);
+            // Legacy batch path: no live engine to propagate consumed dirty
+            // flags back to, so consume a per-draw copy.
+            let mut dirty_flags = draw.dirty_flags;
+            self.draw(draw, &mut dirty_flags, read_gpu, &read_gpu_unsafe);
         }
 
         // Read back rendered pixels
@@ -2369,7 +2426,7 @@ impl RasterizerVulkan {
 impl RasterizerInterface for RasterizerVulkan {
     fn draw(
         &mut self,
-        draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
+        mut draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
         instance_count: u32,
     ) {
         // Upstream `RasterizerVulkan::PrepareDraw` flushes cached GPU-memory
@@ -2416,7 +2473,18 @@ impl RasterizerInterface for RasterizerVulkan {
                 .lock()
                 .read_block_unsafe(gpu_va, output)
         };
-        self.draw(&draw_call, &read_gpu, &read_gpu_unsafe);
+        let mut dirty_flags = draw_call.dirty_flags;
+        self.draw(&draw_call, &mut dirty_flags, &read_gpu, &read_gpu_unsafe);
+        // Upstream backends consume `maxwell3d->dirty.flags` in place (e.g.
+        // TextureCache::UpdateRenderTargets clears Dirty::RenderTargets on the
+        // live engine). The snapshot in `draw_call` is a copy, so propagate
+        // the flags the backend consumed back to the engine — otherwise every
+        // draw re-runs the full render-target resolution.
+        for (index, dirty) in dirty_flags.iter().enumerate() {
+            if !dirty && draw_call.dirty_flags[index] {
+                draw_view.clear_dirty_flag(index as u8);
+            }
+        }
     }
 
     fn draw_texture(&mut self) {
@@ -2425,7 +2493,7 @@ impl RasterizerInterface for RasterizerVulkan {
 
     fn clear(
         &mut self,
-        clear_view: crate::engines::draw_manager::Maxwell3DClearView<'_>,
+        mut clear_view: crate::engines::draw_manager::Maxwell3DClearView<'_>,
         layer_count: u32,
     ) {
         // Upstream `RasterizerVulkan::Clear` starts with
@@ -2460,7 +2528,8 @@ impl RasterizerInterface for RasterizerVulkan {
             let scissor = clear_view.scissor(0);
             (scissor.min_x, scissor.min_y, scissor.max_x, scissor.max_y)
         });
-        let Some(target) = self
+        let original_flags = dirty_flags;
+        let target = self
             .texture_cache
             .update_render_targets_and_get_rt0_framebuffer(
                 &render_targets,
@@ -2468,8 +2537,15 @@ impl RasterizerInterface for RasterizerVulkan {
                 &read_gpu_unsafe,
                 true,
                 clear_scissor,
-            )
-        else {
+            );
+        // Same live-flag propagation as the draw path: the snapshot copy must
+        // not swallow the flags consumed by UpdateRenderTargets.
+        for (index, dirty) in dirty_flags.iter().enumerate() {
+            if !dirty && original_flags[index] {
+                clear_view.clear_dirty_flag(index as u8);
+            }
+        }
+        let Some(target) = target else {
             return;
         };
         let framebuffer = target.framebuffer;
@@ -2978,9 +3054,17 @@ impl RasterizerInterface for RasterizerVulkan {
         self.draw_counter = 0;
         self.state_tracker.invalidate_command_buffer_state();
         self.staging_pool.new_frame();
-        self.descriptor_pool.reset_pools();
-        self.texture_cache.tick_frame(self.scheduler.current_tick());
-        self.buffer_cache.tick_frame(self.scheduler.current_tick());
+        {
+            let tick = self.scheduler.current_tick();
+            let scheduler = &self.scheduler;
+            self.descriptor_pool
+                .end_frame(tick, &|t| scheduler.is_free(t));
+        }
+        // Retire delayed-destruction rings against GPU completion, not the
+        // submission counter (pipelined submissions run ahead of the GPU).
+        let known_gpu_tick = self.scheduler.known_gpu_tick();
+        self.texture_cache.tick_frame(known_gpu_tick);
+        self.buffer_cache.tick_frame(known_gpu_tick);
         unsafe {
             let _lo_buf = common::lock_order::guard("buffer_cache");
             let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;

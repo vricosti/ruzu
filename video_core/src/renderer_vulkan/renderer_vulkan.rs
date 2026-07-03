@@ -203,7 +203,9 @@ pub struct RendererVulkan {
     /// Physical/logical Vulkan device owner.
     device: Device,
     /// Presentation swapchain owner.
-    swapchain: Swapchain,
+    /// Shared with the present thread (upstream `Swapchain& swapchain` used
+    /// from `PresentThread` under `swapchain_mutex`).
+    swapchain: std::sync::Arc<std::sync::Mutex<Swapchain>>,
     /// Presentation frame manager.
     present_manager: PresentManager,
     /// Presentation command scheduler.
@@ -311,6 +313,7 @@ impl RendererVulkan {
             device.get_logical().clone(),
             device.get_graphics_queue(),
             scheduler_command_pool,
+            device.is_timeline_semaphore_supported(),
         )
         .map_err(VulkanError::new)?;
         let submit_mutex = scheduler.submit_mutex();
@@ -323,15 +326,26 @@ impl RendererVulkan {
             drawable_size.0.max(1),
             drawable_size.1.max(1),
         )?;
+        let blit_supported = can_blit_to_swapchain(&device, swapchain.get_image_view_format());
+        let frame_image_format = swapchain.get_image_format();
+        let swapchain_image_count = swapchain.get_image_count();
+        let swapchain = std::sync::Arc::new(std::sync::Mutex::new(swapchain));
+        // Upstream gates the present thread on `Settings::values.async_presentation`.
+        // On macOS/MoltenVK a blocked `nextDrawable` inside the present copy
+        // must never stall the GPU thread (it wedges the whole emulator), so
+        // ruzu defaults the setting to on.
+        let use_present_thread = *common::settings::values().async_presentation.get_value();
         let present_manager = PresentManager::new(
             device.get_logical().clone(),
             memory_properties,
-            swapchain.get_image_format(),
+            frame_image_format,
             device.get_graphics_family(),
-            swapchain.get_image_count(),
-            can_blit_to_swapchain(&device, swapchain.get_image_view_format()),
-            false,
+            swapchain_image_count,
+            blit_supported,
+            use_present_thread,
             submit_mutex,
+            std::sync::Arc::clone(&swapchain),
+            device.get_graphics_queue(),
         );
         let supports_float16 = device.is_float16_supported();
         let blit_swapchain = BlitScreen::new(
@@ -363,6 +377,7 @@ impl RendererVulkan {
             device.is_topology_list_primitive_restart_supported(),
             device.is_patch_list_primitive_restart_supported(),
             device.is_ext_shader_stencil_export_supported(),
+            device.is_timeline_semaphore_supported(),
             device.get_max_viewports(),
             syncpoints,
             Arc::clone(&device_memory),
@@ -446,7 +461,7 @@ impl RendererVulkan {
         self.dump_present_frame_if_requested(framebuffers, &layout);
 
         let frame_index = self.present_manager.get_render_frame_index();
-        let swapchain_extent = self.swapchain.get_extent();
+        let swapchain_extent = self.swapchain.lock().unwrap().get_extent();
         if trace_present {
             log::info!(
                 "[PRESENT] RendererVulkan::Composite draw frame_index={} swapchain={}x{} layout={}x{} image_count={}",
@@ -455,9 +470,13 @@ impl RendererVulkan {
                 swapchain_extent.height,
                 layout.width,
                 layout.height,
-                self.swapchain.get_image_count()
+                self.swapchain.lock().unwrap().get_image_count()
             );
         }
+        let (swapchain_image_count, swapchain_image_view_format) = {
+            let swapchain = self.swapchain.lock().unwrap();
+            (swapchain.get_image_count(), swapchain.get_image_view_format())
+        };
         self.blit_swapchain.draw_to_present_frame(
             &mut self.rasterizer,
             &mut self.scheduler,
@@ -467,8 +486,8 @@ impl RendererVulkan {
             frame_index,
             framebuffers,
             &layout,
-            self.swapchain.get_image_count(),
-            self.swapchain.get_image_view_format(),
+            swapchain_image_count,
+            swapchain_image_view_format,
         );
 
         let render_ready = self.present_manager.frame(frame_index).render_ready;
@@ -479,12 +498,8 @@ impl RendererVulkan {
                 frame_index
             );
         }
-        self.present_manager.present(
-            frame_index,
-            &mut self.swapchain,
-            &mut self.scheduler,
-            self.device.get_graphics_queue(),
-        );
+        self.present_manager
+            .present(frame_index, &mut self.scheduler);
         self.base_data.current_frame += 1;
 
         (self.frame_end_notify)();
@@ -821,7 +836,7 @@ impl RendererVulkan {
     /// `BlitScreen::DrawToFrame` recreates the presentation frame.
     fn current_framebuffer_layout_for_present(&self, trace_present: bool) -> FramebufferLayout {
         let layout = self.framebuffer_layout.read().unwrap().clone();
-        let Some(extent) = self.swapchain.current_surface_extent() else {
+        let Some(extent) = self.swapchain.lock().unwrap().current_surface_extent() else {
             return layout;
         };
         if extent.width == layout.width && extent.height == layout.height {

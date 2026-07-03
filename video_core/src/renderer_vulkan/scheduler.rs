@@ -84,8 +84,14 @@ pub struct Scheduler {
     /// Upstream scheduler-local state invalidated by helper draws.
     state: SchedulerState,
 
-    /// Fence for GPU synchronization.
+    /// Fence for GPU synchronization (legacy fallback when timeline
+    /// semaphores are unavailable: one submission in flight, wait-before-submit).
     fence: vk::Fence,
+
+    /// Port of upstream `MasterSemaphore`: a timeline semaphore signalled with
+    /// the tick of each submission, so submissions pipeline without waiting
+    /// for the previous one and completion is queried per tick.
+    timeline_semaphore: Option<vk::Semaphore>,
 
     /// Port of upstream `Scheduler::submit_mutex`.
     submit_mutex: Arc<Mutex<()>>,
@@ -103,11 +109,28 @@ impl Scheduler {
         device: ash::Device,
         queue: vk::Queue,
         command_pool: vk::CommandPool,
+        timeline_semaphore_supported: bool,
     ) -> Result<Self, vk::Result> {
         let fence_info = vk::FenceCreateInfo::builder()
             .flags(vk::FenceCreateFlags::SIGNALED)
             .build();
         let fence = unsafe { device.create_fence(&fence_info, None)? };
+
+        let timeline_semaphore = if timeline_semaphore_supported {
+            let mut type_info = vk::SemaphoreTypeCreateInfo::builder()
+                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                .initial_value(0)
+                .build();
+            let semaphore_info = vk::SemaphoreCreateInfo::builder()
+                .push_next(&mut type_info)
+                .build();
+            Some(unsafe { device.create_semaphore(&semaphore_info, None)? })
+        } else {
+            log::warn!(
+                "Scheduler: timeline semaphores unavailable; falling back to                  single-submission fence synchronization"
+            );
+            None
+        };
 
         let mut scheduler = Self {
             device,
@@ -120,6 +143,7 @@ impl Scheduler {
             rp_state: RenderPassState::default(),
             state: SchedulerState::default(),
             fence,
+            timeline_semaphore,
             submit_mutex: Arc::new(Mutex::new(())),
             state_tracker: None,
         };
@@ -324,23 +348,49 @@ impl Scheduler {
 
         // Submit both command buffers (upload first, then render)
         let cmd_buffers = [self.upload_cmdbuf, self.current_cmdbuf];
-        let submit_info = vk::SubmitInfo::builder()
-            .command_buffers(&cmd_buffers)
-            .signal_semaphores(signal_semaphores)
-            .build();
-
-        unsafe {
-            self.device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
-                .ok();
-            self.device.reset_fences(&[self.fence]).ok();
-            let _submit_lock = self.submit_mutex.lock().unwrap();
-            self.device
-                .queue_submit(self.queue, &[submit_info], self.fence)
-                .ok();
-        }
 
         let tick = self.current_tick.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(timeline) = self.timeline_semaphore {
+            // Upstream `MasterSemaphore::SubmitQueue`: signal the timeline
+            // semaphore with this submission's tick and pipeline submissions
+            // without waiting on the previous one. Each flush records into
+            // freshly allocated command buffers, so nothing here is reused
+            // while the GPU is still executing.
+            let mut all_signals = Vec::with_capacity(1 + signal_semaphores.len());
+            all_signals.push(timeline);
+            all_signals.extend_from_slice(signal_semaphores);
+            let mut signal_values = vec![0u64; all_signals.len()];
+            signal_values[0] = tick;
+            let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::builder()
+                .signal_semaphore_values(&signal_values);
+            let submit_info = vk::SubmitInfo::builder()
+                .command_buffers(&cmd_buffers)
+                .signal_semaphores(&all_signals)
+                .push_next(&mut timeline_info)
+                .build();
+            unsafe {
+                let _submit_lock = self.submit_mutex.lock().unwrap();
+                self.device
+                    .queue_submit(self.queue, &[submit_info], vk::Fence::null())
+                    .ok();
+            }
+        } else {
+            let submit_info = vk::SubmitInfo::builder()
+                .command_buffers(&cmd_buffers)
+                .signal_semaphores(signal_semaphores)
+                .build();
+            unsafe {
+                self.device
+                    .wait_for_fences(&[self.fence], true, u64::MAX)
+                    .ok();
+                self.device.reset_fences(&[self.fence]).ok();
+                let _submit_lock = self.submit_mutex.lock().unwrap();
+                self.device
+                    .queue_submit(self.queue, &[submit_info], self.fence)
+                    .ok();
+            }
+        }
+
         debug!("Scheduler: flushed at tick {}", tick);
         self.allocate_new_context().ok();
         tick
@@ -348,12 +398,8 @@ impl Scheduler {
 
     /// Flush + wait for GPU completion.
     pub fn finish(&mut self) {
-        self.flush();
-        unsafe {
-            self.device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
-                .ok();
-        }
+        let tick = self.flush();
+        self.wait(tick);
     }
 
     fn allocate_new_context(&mut self) -> Result<(), vk::Result> {
@@ -394,13 +440,44 @@ impl Scheduler {
         self.current_tick.load(Ordering::SeqCst)
     }
 
+    /// Last tick the GPU has fully completed.
+    ///
+    /// Port of upstream `MasterSemaphore::KnownGpuTick`. Delayed-destruction
+    /// rings must retire against this value, not against the submission tick:
+    /// with pipelined submissions the CPU-side tick runs ahead of the GPU.
+    pub fn known_gpu_tick(&self) -> u64 {
+        if let Some(timeline) = self.timeline_semaphore {
+            return unsafe {
+                self.device
+                    .get_semaphore_counter_value(timeline)
+                    .unwrap_or(0)
+            };
+        }
+        // Legacy single-submission fallback: at most one submission is in
+        // flight, matching the pre-timeline retirement behaviour.
+        self.current_tick()
+    }
+
     /// Returns true when the GPU has completed `tick`.
     ///
     /// Port-facing subset of upstream `Scheduler::IsFree`. This simplified
     /// scheduler reuses a single fence, waiting on it before every new submit;
     /// older ticks are therefore complete once a newer tick exists.
     pub fn is_free(&self, tick: u64) -> bool {
-        if tick == 0 || tick < self.current_tick() {
+        if tick == 0 {
+            return true;
+        }
+        if let Some(timeline) = self.timeline_semaphore {
+            // Upstream `MasterSemaphore::IsFree`: the GPU passed `tick` once
+            // the timeline counter reaches it.
+            return unsafe {
+                self.device
+                    .get_semaphore_counter_value(timeline)
+                    .map(|value| value >= tick)
+                    .unwrap_or(false)
+            };
+        }
+        if tick < self.current_tick() {
             return true;
         }
         if tick > self.current_tick() {
@@ -419,8 +496,21 @@ impl Scheduler {
         if tick == 0 {
             return;
         }
-        if tick >= self.current_tick() {
+        if tick > self.current_tick() {
+            // The tick has not been submitted yet; flush so it will signal.
             self.flush();
+        }
+        if let Some(timeline) = self.timeline_semaphore {
+            let semaphores = [timeline];
+            let values = [tick];
+            let wait_info = vk::SemaphoreWaitInfo::builder()
+                .semaphores(&semaphores)
+                .values(&values)
+                .build();
+            unsafe {
+                self.device.wait_semaphores(&wait_info, u64::MAX).ok();
+            }
+            return;
         }
         unsafe {
             self.device
@@ -433,9 +523,23 @@ impl Scheduler {
 impl Drop for Scheduler {
     fn drop(&mut self) {
         unsafe {
-            self.device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
-                .ok();
+            if let Some(timeline) = self.timeline_semaphore {
+                let tick = self.current_tick();
+                if tick > 0 {
+                    let semaphores = [timeline];
+                    let values = [tick];
+                    let wait_info = vk::SemaphoreWaitInfo::builder()
+                        .semaphores(&semaphores)
+                        .values(&values)
+                        .build();
+                    self.device.wait_semaphores(&wait_info, u64::MAX).ok();
+                }
+                self.device.destroy_semaphore(timeline, None);
+            } else {
+                self.device
+                    .wait_for_fences(&[self.fence], true, u64::MAX)
+                    .ok();
+            }
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.command_pool, None);
         }

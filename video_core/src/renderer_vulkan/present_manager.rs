@@ -6,7 +6,7 @@
 //! Manages presentation frames, a present thread, and swapchain copies.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use ash::vk;
@@ -85,6 +85,9 @@ fn make_image_copy(
 ///
 /// A single presentation frame with its image, views, and synchronization
 /// primitives.
+/// All fields are `Copy` Vulkan handles/sizes: the present thread receives a
+/// snapshot of the frame instead of sharing a reference with the GPU thread.
+#[derive(Clone, Copy)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
@@ -127,15 +130,54 @@ pub struct PresentManager {
     frame_image_format: vk::Format,
     cmdpool: vk::CommandPool,
     frames: Vec<Frame>,
-    present_queue: Mutex<VecDeque<usize>>,
+    use_present_thread: bool,
+    /// State shared with the present thread. Upstream shares `this` between
+    /// the main thread and `PresentThread`; the Rust split keeps the frame
+    /// pool on the render side and the swapchain copy machinery here.
+    ctx: Arc<PresentThreadContext>,
+    /// Upstream `std::jthread present_thread`.
+    present_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Present-thread-side owner: everything `PresentManager::CopyToSwapchain`
+/// needs, shared between the render thread and the present thread.
+pub(crate) struct PresentThreadContext {
+    device: ash::Device,
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
+    submit_mutex: Arc<Mutex<()>>,
+    blit_supported: bool,
+    /// Upstream `Swapchain& swapchain` + `std::mutex swapchain_mutex`.
+    swapchain: Arc<Mutex<Swapchain>>,
+    graphics_queue: vk::Queue,
+    /// Queued `(frame_index, frame snapshot)` presentation jobs.
+    present_queue: Mutex<VecDeque<(usize, Frame)>>,
     free_queue: Mutex<VecDeque<usize>>,
     frame_cv: Condvar,
     free_cv: Condvar,
-    swapchain_mutex: Mutex<()>,
-    submit_mutex: Arc<Mutex<()>>,
-    blit_supported: bool,
-    use_present_thread: bool,
-    image_count: usize,
+    image_count: AtomicUsize,
+    stop: AtomicBool,
+}
+
+/// Port of `PresentManager::PresentThread`.
+fn present_thread_main(ctx: &PresentThreadContext) {
+    loop {
+        let (frame_index, frame) = {
+            let mut queue = ctx.present_queue.lock().unwrap();
+            loop {
+                if ctx.stop.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Some(job) = queue.pop_front() {
+                    break job;
+                }
+                queue = ctx.frame_cv.wait(queue).unwrap();
+            }
+        };
+        ctx.copy_to_swapchain(frame_index, &frame, None);
+        ctx.release_frame(frame_index);
+        // Wake WaitPresent watchers blocked on the queue-empty check.
+        ctx.frame_cv.notify_all();
+    }
 }
 
 /// Maximum number of images in flight.
@@ -147,6 +189,7 @@ static SWAPCHAIN_FRAME_DUMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 impl PresentManager {
     /// Port of `PresentManager::PresentManager`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: ash::Device,
         memory_properties: vk::PhysicalDeviceMemoryProperties,
@@ -156,6 +199,8 @@ impl PresentManager {
         blit_supported: bool,
         use_present_thread: bool,
         submit_mutex: Arc<Mutex<()>>,
+        swapchain: Arc<Mutex<Swapchain>>,
+        graphics_queue: vk::Queue,
     ) -> Self {
         let effective_count = image_count.min(MAX_IMAGES_IN_FLIGHT);
 
@@ -219,9 +264,32 @@ impl PresentManager {
             free_queue.push_back(i);
         }
 
-        // NOTE: present thread would be started here in the full implementation
-        // using std::thread or similar. Omitted because it requires the full
-        // scheduler integration.
+        let ctx = Arc::new(PresentThreadContext {
+            device: device.clone(),
+            memory_properties,
+            submit_mutex,
+            blit_supported,
+            swapchain,
+            graphics_queue,
+            present_queue: Mutex::new(VecDeque::new()),
+            free_queue: Mutex::new(free_queue),
+            frame_cv: Condvar::new(),
+            free_cv: Condvar::new(),
+            image_count: AtomicUsize::new(effective_count),
+            stop: AtomicBool::new(false),
+        });
+
+        let present_thread = if use_present_thread {
+            let thread_ctx = Arc::clone(&ctx);
+            Some(
+                std::thread::Builder::new()
+                    .name("VulkanPresent".into())
+                    .spawn(move || present_thread_main(&thread_ctx))
+                    .expect("Failed to spawn Vulkan present thread"),
+            )
+        } else {
+            None
+        };
 
         PresentManager {
             device,
@@ -229,15 +297,9 @@ impl PresentManager {
             frame_image_format,
             cmdpool,
             frames,
-            present_queue: Mutex::new(VecDeque::new()),
-            free_queue: Mutex::new(free_queue),
-            frame_cv: Condvar::new(),
-            free_cv: Condvar::new(),
-            swapchain_mutex: Mutex::new(()),
-            submit_mutex,
-            blit_supported,
             use_present_thread,
-            image_count: effective_count,
+            ctx,
+            present_thread,
         }
     }
 
@@ -256,12 +318,12 @@ impl PresentManager {
     /// mutable borrow across the whole present path.
     pub fn get_render_frame_index(&mut self) -> usize {
         let index = {
-            let mut free = self.free_queue.lock().unwrap();
+            let mut free = self.ctx.free_queue.lock().unwrap();
             while free.is_empty() {
                 if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
                     log::info!("[PRESENT] PresentManager::GetRenderFrame waiting for free frame");
                 }
-                free = self.free_cv.wait(free).unwrap();
+                free = self.ctx.free_cv.wait(free).unwrap();
             }
             free.pop_front().unwrap()
         };
@@ -300,9 +362,7 @@ impl PresentManager {
     }
 
     pub fn release_frame(&self, index: usize) {
-        let mut free = self.free_queue.lock().unwrap();
-        free.push_back(index);
-        self.free_cv.notify_one();
+        self.ctx.release_frame(index);
     }
 
     pub fn recreate_frame_by_index(
@@ -322,16 +382,13 @@ impl PresentManager {
     ///
     /// Queues a frame for presentation, or presents directly if no present
     /// thread is active.
-    pub fn present(
-        &mut self,
-        frame_index: usize,
-        swapchain: &mut Swapchain,
-        scheduler: &mut Scheduler,
-        graphics_queue: vk::Queue,
-    ) {
+    pub fn present(&mut self, frame_index: usize, scheduler: &mut Scheduler) {
         let trace_present = std::env::var_os("RUZU_TRACE_PRESENT").is_some();
+        // Frame is `Copy`: hand the present thread a snapshot. The frame slot
+        // is exclusively owned by the presentation side until the thread
+        // pushes the index back onto the free queue.
+        let frame = self.frames[frame_index];
         if trace_present {
-            let frame = &self.frames[frame_index];
             log::info!(
                 "[PRESENT] PresentManager::Present frame_index={} size={}x{} threaded={}",
                 frame_index,
@@ -341,8 +398,9 @@ impl PresentManager {
             );
         }
         if !self.use_present_thread {
-            self.copy_to_swapchain(frame_index, swapchain, scheduler, graphics_queue);
-            self.release_frame(frame_index);
+            self.ctx
+                .copy_to_swapchain(frame_index, &frame, Some(scheduler));
+            self.ctx.release_frame(frame_index);
             if trace_present {
                 log::info!(
                     "[PRESENT] PresentManager::Present direct complete frame_index={}",
@@ -352,96 +410,11 @@ impl PresentManager {
             return;
         }
 
-        let mut queue = self.present_queue.lock().unwrap();
-        queue.push_back(frame_index);
-        self.frame_cv.notify_one();
+        let mut queue = self.ctx.present_queue.lock().unwrap();
+        queue.push_back((frame_index, frame));
+        self.ctx.frame_cv.notify_one();
     }
 
-    /// Port-facing subset of `PresentManager::CopyToSwapchain`.
-    fn copy_to_swapchain(
-        &mut self,
-        frame_index: usize,
-        swapchain: &mut Swapchain,
-        scheduler: &mut Scheduler,
-        graphics_queue: vk::Queue,
-    ) {
-        let trace_present = std::env::var_os("RUZU_TRACE_PRESENT").is_some();
-        let frame_width = self.frames[frame_index].width;
-        let frame_height = self.frames[frame_index].height;
-        let needs_recreation = swapchain.needs_recreation()
-            || swapchain.get_width() != frame_width
-            || swapchain.get_height() != frame_height;
-        if trace_present {
-            log::info!(
-                "[PRESENT] PresentManager::CopyToSwapchain frame_index={} frame={}x{} swapchain={}x{} needs_recreation={}",
-                frame_index,
-                frame_width,
-                frame_height,
-                swapchain.get_width(),
-                swapchain.get_height(),
-                needs_recreation
-            );
-        }
-        if needs_recreation && !self.recreate_swapchain(frame_index, swapchain) {
-            return;
-        }
-
-        let mut recreate_attempts = 0;
-        while swapchain.acquire_next_image(scheduler) {
-            if trace_present {
-                log::info!(
-                    "[PRESENT] PresentManager::CopyToSwapchain acquire requested recreation attempt={}",
-                    recreate_attempts + 1
-                );
-            }
-            if !self.recreate_swapchain(frame_index, swapchain) {
-                return;
-            }
-            recreate_attempts += 1;
-            if recreate_attempts >= 8 {
-                log::warn!("Vulkan swapchain acquisition remained stale after recreation");
-                return;
-            }
-        }
-
-        let swapchain_image = swapchain.current_image();
-        let swapchain_extent = swapchain.get_extent();
-        let present_semaphore = swapchain.current_present_semaphore();
-        let render_semaphore = swapchain.current_render_semaphore();
-        self.copy_to_swapchain_impl(
-            self.frame(frame_index),
-            swapchain_image,
-            swapchain_extent,
-            present_semaphore,
-            render_semaphore,
-            graphics_queue,
-        );
-        swapchain.present(render_semaphore);
-        if trace_present {
-            log::info!(
-                "[PRESENT] PresentManager::CopyToSwapchain presented frame_index={} image_index={} frame_slot={}",
-                frame_index,
-                swapchain.get_image_index(),
-                swapchain.get_frame_index()
-            );
-        }
-    }
-
-    /// Port-facing subset of `PresentManager::RecreateSwapchain`.
-    fn recreate_swapchain(&mut self, frame_index: usize, swapchain: &mut Swapchain) -> bool {
-        let frame_width = self.frames[frame_index].width;
-        let frame_height = self.frames[frame_index].height;
-        match swapchain.recreate(frame_width, frame_height) {
-            Ok(()) => {
-                self.set_image_count(swapchain.get_image_count());
-                true
-            }
-            Err(err) => {
-                log::error!("Failed to recreate Vulkan swapchain: {}", err);
-                false
-            }
-        }
-    }
 
     /// Port of `PresentManager::RecreateFrame`.
     ///
@@ -554,14 +527,134 @@ impl PresentManager {
 
         // Wait for the present queue to be empty
         {
-            let mut queue = self.present_queue.lock().unwrap();
+            let mut queue = self.ctx.present_queue.lock().unwrap();
             while !queue.is_empty() {
-                queue = self.frame_cv.wait(queue).unwrap();
+                queue = self.ctx.frame_cv.wait(queue).unwrap();
             }
         }
 
-        // Acquire swapchain mutex to ensure the last frame has been presented
-        let _lock = self.swapchain_mutex.lock().unwrap();
+        // Acquire the swapchain mutex to ensure the last frame has been
+        // presented (the present thread holds it for the whole copy).
+        let _lock = self.ctx.swapchain.lock().unwrap();
+    }
+
+    fn destroy_frame_resources(&self, frame: &mut Frame) {
+        unsafe {
+            if frame.framebuffer != vk::Framebuffer::null() {
+                self.device.destroy_framebuffer(frame.framebuffer, None);
+                frame.framebuffer = vk::Framebuffer::null();
+            }
+            if frame.image_view != vk::ImageView::null() {
+                self.device.destroy_image_view(frame.image_view, None);
+                frame.image_view = vk::ImageView::null();
+            }
+            if frame.image != vk::Image::null() {
+                self.device.destroy_image(frame.image, None);
+                frame.image = vk::Image::null();
+            }
+            if frame.image_memory != vk::DeviceMemory::null() {
+                self.device.free_memory(frame.image_memory, None);
+                frame.image_memory = vk::DeviceMemory::null();
+            }
+        }
+        frame.width = 0;
+        frame.height = 0;
+    }
+}
+
+impl PresentThreadContext {
+    fn release_frame(&self, index: usize) {
+        let mut free = self.free_queue.lock().unwrap();
+        free.push_back(index);
+        self.free_cv.notify_one();
+    }
+
+    fn set_image_count(&self, swapchain_image_count: usize) {
+        self.image_count.store(
+            swapchain_image_count.min(MAX_IMAGES_IN_FLIGHT),
+            Ordering::Release,
+        );
+    }
+
+    /// Port of `PresentManager::CopyToSwapchain`.
+    ///
+    /// `scheduler` is `Some` only on the direct (non-threaded) path; the
+    /// present thread cannot touch the GPU thread's scheduler and relies on
+    /// the `render_ready` semaphore chain instead.
+    fn copy_to_swapchain(&self, frame_index: usize, frame: &Frame, mut scheduler: Option<&mut Scheduler>) {
+        let trace_present = std::env::var_os("RUZU_TRACE_PRESENT").is_some();
+        let mut swapchain = self.swapchain.lock().unwrap();
+        let needs_recreation = swapchain.needs_recreation()
+            || swapchain.get_width() != frame.width
+            || swapchain.get_height() != frame.height;
+        if trace_present {
+            log::info!(
+                "[PRESENT] PresentManager::CopyToSwapchain frame_index={} frame={}x{} swapchain={}x{} needs_recreation={}",
+                frame_index,
+                frame.width,
+                frame.height,
+                swapchain.get_width(),
+                swapchain.get_height(),
+                needs_recreation
+            );
+        }
+        if needs_recreation && !self.recreate_swapchain(frame, &mut swapchain) {
+            return;
+        }
+
+        let mut recreate_attempts = 0;
+        while swapchain.acquire_next_image(scheduler.as_deref_mut()) {
+            if trace_present {
+                log::info!(
+                    "[PRESENT] PresentManager::CopyToSwapchain acquire requested recreation attempt={}",
+                    recreate_attempts + 1
+                );
+            }
+            if !self.recreate_swapchain(frame, &mut swapchain) {
+                return;
+            }
+            recreate_attempts += 1;
+            if recreate_attempts >= 8 {
+                log::warn!("Vulkan swapchain acquisition remained stale after recreation");
+                return;
+            }
+        }
+
+        let swapchain_image = swapchain.current_image();
+        let swapchain_extent = swapchain.get_extent();
+        let present_semaphore = swapchain.current_present_semaphore();
+        let render_semaphore = swapchain.current_render_semaphore();
+        self.copy_to_swapchain_impl(
+            frame,
+            swapchain_image,
+            swapchain_extent,
+            present_semaphore,
+            render_semaphore,
+            self.graphics_queue,
+        );
+        swapchain.present(render_semaphore);
+        if trace_present {
+            log::info!(
+                "[PRESENT] PresentManager::CopyToSwapchain presented frame_index={} image_index={} frame_slot={}",
+                frame_index,
+                swapchain.get_image_index(),
+                swapchain.get_frame_index()
+            );
+        }
+    }
+
+    /// Port of `PresentManager::RecreateSwapchain`.
+    fn recreate_swapchain(&self, frame: &Frame, swapchain: &mut Swapchain) -> bool {
+        match swapchain.recreate(frame.width, frame.height) {
+            Ok(()) => {
+                self.set_image_count(swapchain.get_image_count());
+                true
+            }
+            Err(err) => {
+                log::error!("Failed to recreate Vulkan swapchain: {}", err);
+                false
+            }
+        }
     }
 
     /// Port of `PresentManager::CopyToSwapchainImpl`.
@@ -826,34 +919,6 @@ impl PresentManager {
         }
     }
 
-    /// Port of `PresentManager::SetImageCount`.
-    pub fn set_image_count(&mut self, swapchain_image_count: usize) {
-        self.image_count = swapchain_image_count.min(MAX_IMAGES_IN_FLIGHT);
-    }
-
-    fn destroy_frame_resources(&self, frame: &mut Frame) {
-        unsafe {
-            if frame.framebuffer != vk::Framebuffer::null() {
-                self.device.destroy_framebuffer(frame.framebuffer, None);
-                frame.framebuffer = vk::Framebuffer::null();
-            }
-            if frame.image_view != vk::ImageView::null() {
-                self.device.destroy_image_view(frame.image_view, None);
-                frame.image_view = vk::ImageView::null();
-            }
-            if frame.image != vk::Image::null() {
-                self.device.destroy_image(frame.image, None);
-                frame.image = vk::Image::null();
-            }
-            if frame.image_memory != vk::DeviceMemory::null() {
-                self.device.free_memory(frame.image_memory, None);
-                frame.image_memory = vk::DeviceMemory::null();
-            }
-        }
-        frame.width = 0;
-        frame.height = 0;
-    }
-
     fn create_swapchain_dump_buffer(&self, extent: vk::Extent2D) -> Option<SwapchainDumpBuffer> {
         let Some(path) = std::env::var_os("RUZU_DUMP_SWAPCHAIN_FRAME") else {
             return None;
@@ -996,6 +1061,13 @@ struct SwapchainDumpBuffer {
 
 impl Drop for PresentManager {
     fn drop(&mut self) {
+        // Upstream `std::jthread` stops and joins the present thread before
+        // frame resources are destroyed.
+        if let Some(thread) = self.present_thread.take() {
+            self.ctx.stop.store(true, Ordering::Release);
+            self.ctx.frame_cv.notify_all();
+            let _ = thread.join();
+        }
         unsafe {
             let device = self.device.clone();
             for frame in &mut self.frames {

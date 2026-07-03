@@ -2556,13 +2556,21 @@ impl TextureCacheRuntime {
     }
 
     fn sentence_resource(&mut self, resource: DeferredVkResource) {
+        // The last submission that can reference the resource is the pending
+        // tick (the flush that will carry the currently recorded chunk).
+        // Retire once the GPU (timeline counter) passes it — the submission
+        // counter itself runs ahead of the GPU with pipelined submits.
+        let retire_tick = self.scheduler().pending_tick();
         self.sentenced_resources.push(SentencedVkResource {
-            retire_tick: self.current_tick.saturating_add(TICKS_TO_DESTROY as u64),
+            retire_tick,
             resource,
         });
     }
 
-    fn tick_frame(&mut self, scheduler_tick: u64) {
+    /// `gpu_tick` is `Scheduler::known_gpu_tick()` — the last tick the GPU
+    /// has fully completed.
+    fn tick_frame(&mut self, gpu_tick: u64) {
+        let scheduler_tick = gpu_tick;
         self.current_tick = scheduler_tick;
         let mut retained = Vec::with_capacity(self.sentenced_resources.len());
         let mut ready = Vec::new();
@@ -5732,6 +5740,40 @@ impl TextureCache {
             return;
         };
         self.present_source_seen = self.present_source_seen.saturating_add(1);
+        // RUZU_DUMP_VK_PRESENT_SOURCE_EVERY=N: periodic timeline dumps to
+        // numbered files instead of a single one-shot dump.
+        if let Some(every) = std::env::var("RUZU_DUMP_VK_PRESENT_SOURCE_EVERY")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&every| every > 0)
+        {
+            if self.present_source_seen % every != 0 {
+                return;
+            }
+            let numbered = {
+                let base = std::path::PathBuf::from(&path);
+                let stem = base
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("present_source")
+                    .to_string();
+                base.with_file_name(format!("{stem}_{:06}.ppm", self.present_source_seen))
+            };
+            if let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) {
+                let width = image_base.info.size.width.max(1);
+                let height = image_base.info.size.height.max(1);
+                if write_rgba_like_ppm(&numbered, &bytes, width, height).is_ok() {
+                    log::info!(
+                        "[VK_PRESENT_SOURCE] periodic dump #{} addr=0x{:X} image_id={} to {}",
+                        self.present_source_seen,
+                        cpu_addr,
+                        image_id.index,
+                        numbered.display()
+                    );
+                }
+            }
+            return;
+        }
         let target_present = std::env::var("RUZU_DUMP_VK_PRESENT_SOURCE_AT")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
