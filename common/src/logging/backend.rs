@@ -131,6 +131,30 @@ struct LoggerImpl {
 static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static SUPPRESS_LOGGING: AtomicBool = AtomicBool::new(true);
 
+/// Lock-free snapshot of the active filter for `log::Log::enabled`.
+///
+/// `log::set_max_level(Trace)` routes every `trace!`/`debug!` macro in the
+/// codebase through `enabled()`; taking the global `LOGGER` mutex there
+/// convoys hot paths (the kernel scheduler lock showed up in profiles).
+/// The per-class minimum levels change only in `initialize` and
+/// `set_global_filter`, so they are published to atomics and read without
+/// locking. `FILTER_GLOBAL_MIN` is the minimum across classes: a single load
+/// rejects the common case before the class lookup.
+const FILTER_LEVEL_INIT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+static FILTER_LEVELS: [std::sync::atomic::AtomicU8; crate::logging::types::Class::COUNT] =
+    [FILTER_LEVEL_INIT; crate::logging::types::Class::COUNT];
+static FILTER_GLOBAL_MIN: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(u8::MAX);
+
+fn publish_filter_snapshot(filter: &Filter) {
+    let mut min = u8::MAX;
+    for (slot, &level) in FILTER_LEVELS.iter().zip(filter.class_levels().iter()) {
+        slot.store(level as u8, Ordering::Relaxed);
+        min = min.min(level as u8);
+    }
+    FILTER_GLOBAL_MIN.store(min, Ordering::Release);
+}
+
 // We use a Mutex for the singleton since we need mutable access.
 static LOGGER: Mutex<Option<LoggerState>> = Mutex::new(None);
 
@@ -194,6 +218,7 @@ pub fn initialize(log_dir: Option<PathBuf>, filter_string: Option<&str>) {
         })
         .expect("Failed to spawn logger thread");
 
+    publish_filter_snapshot(&filter);
     *guard = Some(LoggerState {
         filter,
         sender,
@@ -226,13 +251,14 @@ impl log::Log for FacadeLogger {
             return false;
         }
 
-        let guard = LOGGER.lock().unwrap();
-        guard.as_ref().is_some_and(|state| {
-            state.filter.check_message(
-                class_from_target(metadata.target()),
-                level_from_log(metadata.level()),
-            )
-        })
+        // Lock-free fast path: reject on the global minimum level before the
+        // per-class lookup, and never touch the LOGGER mutex here.
+        let level = level_from_log(metadata.level()) as u8;
+        if level < FILTER_GLOBAL_MIN.load(Ordering::Acquire) {
+            return false;
+        }
+        let class = class_from_target(metadata.target());
+        level >= FILTER_LEVELS[class as usize].load(Ordering::Relaxed)
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -345,6 +371,7 @@ pub fn disable_logging_in_tests() {
 
 /// Sets the global filter.
 pub fn set_global_filter(filter: &Filter) {
+    publish_filter_snapshot(filter);
     let mut guard = LOGGER.lock().unwrap();
     if let Some(ref mut state) = *guard {
         state.filter = filter.clone();
