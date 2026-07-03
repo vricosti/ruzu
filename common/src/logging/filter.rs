@@ -50,6 +50,12 @@ impl Filter {
         (level as u8) >= (self.class_levels[log_class as usize] as u8)
     }
 
+    /// Raw per-class minimum levels, used to publish a lock-free snapshot for
+    /// the hot `log::Log::enabled` check.
+    pub fn class_levels(&self) -> &[Level; Class::COUNT] {
+        &self.class_levels
+    }
+
     /// Returns true if any logging classes are set to debug.
     pub fn is_debug(&self) -> bool {
         self.class_levels
