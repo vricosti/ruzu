@@ -20522,3 +20522,60 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `vk_graphics_pipeline.cpp`: `GraphicsPipeline::Configure` sets uniform-buffer state and calls `buffer_cache.UpdateGraphicsBuffers()` / `BindHostStageBuffers(stage)` before descriptor updates.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
 - MK8D regression: before this fix, the post-transition present dump had `maxsat=118 colored=595` and the isolated `RUZU_SKIP_VK_DRAW_RT=0x524C10000 RUZU_SKIP_VK_DRAW_GE=5` case had `maxsat=4 colored=0`, producing grayscale/white logo silhouettes. After forcing fresh uniform uploads, the normal post-transition dump reports `maxsat=247 colored=214970`, and the isolated draws 1+3 dump reports `maxsat=255 colored=197830`; visual inspection confirms the logo and lens flares remain colored.
+
+## 2026-07-04 — video_core/src/buffer_cache/buffer_cache.rs, video_core/src/buffer_cache/buffer_cache_base.rs, video_core/src/renderer_vulkan/buffer_cache.rs, video_core/src/renderer_vulkan/graphics_pipeline.rs, video_core/src/renderer_vulkan/mod.rs vs video_core/buffer_cache/buffer_cache.h and video_core/renderer_vulkan/vk_buffer_cache.h/cpp
+
+### Intentional differences
+- Rust still keeps the legacy direct Vulkan `renderer_vulkan::BufferCache` alive for vertex/index binding and as a fallback for descriptor population. This is temporary while the active rasterizer is migrated to upstream's `VideoCommon::BufferCache<P>` call sequence; the Vulkan runtime owner now exists in the upstream-owned `renderer_vulkan/buffer_cache.rs`.
+- Rust `BufferCacheRuntime` stores backend buffers behind synthetic `u32` handles in `BufferBase::gpu_handle` because the split Rust `BufferBase` is backend-agnostic. Upstream stores `Vulkan::Buffer` directly as the slot object through the `BufferCache<P>` template.
+- Rust uses `UpdateDescriptorQueue` directly instead of upstream's descriptor-update-template path. The descriptor payload order is still produced with the same `AddBuffer` / `AddTexelBuffer` primitives.
+
+### Unintentional differences (to fix)
+- Vertex and index binding in the active Vulkan rasterizer still use the legacy direct cache instead of upstream `UpdateGraphicsBuffers` + `BindHostGeometryBuffers`.
+- Storage buffers, texture buffers, image buffers, transform feedback, and indirect draw buffers are not yet driven from the Vulkan common buffer-cache path in the active draw configuration.
+- Vulkan `BufferCacheRuntime::BindVertexBuffers`, `BindIndexBuffer`, and transform-feedback binding hooks are still incomplete stubs.
+- Vulkan buffer memory allocation still uses direct `vkAllocateMemory` instead of upstream `MemoryAllocator` ownership.
+- `BindTextureBuffer` creates a `VkBufferView` from static `MaxwellToVK::SurfaceFormat` metadata. Upstream uses the Vulkan `Device`-aware format support path; this must be aligned before relying on texel-buffer descriptors for titles that need fallbacks.
+
+### Missing items
+- Full active `GraphicsPipeline::ConfigureImpl` ordering in Vulkan: `SynchronizeGraphicsDescriptors`, `SetUniformBuffersState`, per-stage storage/texture/image-buffer binding, `UpdateGraphicsBuffers`, `BindHostGeometryBuffers`, `guest_descriptor_queue.Acquire`, `BindHostStageBuffers`, and then image descriptor pushes.
+- Full Vulkan runtime implementation for geometry, quad index buffers, transform feedback, texture/image buffer views, compute descriptors, memory usage reporting, allocator-backed buffer creation, and safe delayed destruction of buffer views.
+- Removal of the legacy GPU-VA-keyed direct Vulkan buffer cache after all active paths use `VideoCommon::BufferCache<P>`.
+
+### Binary layout verification
+- N/A: host-side Vulkan buffer-cache/runtime plumbing only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `buffer_cache.h`: `BindHostGraphicsUniformBuffer` uses the stream-buffer path through `runtime.BindMappedUniformBuffer` for Vulkan small UBOs, and compute UBOs call `runtime.BindUniformBuffer(buffer, offset, size)` when `NEEDS_BIND_UNIFORM_INDEX=false`.
+- Re-read upstream `vk_buffer_cache.h`: Vulkan `BindMappedUniformBuffer`, `BindUniformBuffer`, and `BindStorageBuffer` all enqueue descriptors via `guest_descriptor_queue.AddBuffer`; `BindTextureBuffer` enqueues `guest_descriptor_queue.AddTexelBuffer(buffer.View(...))`.
+- Rust now stores `enabled_uniform_buffer_masks` and `uniform_buffer_sizes` on `renderer_vulkan::GraphicsPipeline`, matching upstream `vk_graphics_pipeline.h`, and passes them into the common buffer cache before host UBO binding.
+- Rust now routes active graphics UBO descriptors through `VulkanCommonBufferCache::set_uniform_buffers_state`, `bind_graphics_uniform_buffer`, `update_graphics_buffers`, `bind_host_stage_buffers`, then consumes `UpdateDescriptorQueue::Buffer` entries for Vulkan descriptor writes. The old direct upload remains as a fallback if the common path does not produce an entry.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passed before the compute-UBO signature cleanup; a focused `cargo check -p video_core` passed after that cleanup.
+- MK8D 75-second Vulkan regression run with `RUZU_DUMP_VK_PRESENT_SOURCE_FRAME=/tmp/ruzu-buffer-cache-port2/present.ppm RUZU_DUMP_VK_PRESENT_SOURCE_EVERY=1000` reached 5000 presented frames without crash. Dumps stayed colored: `present_001000.ppm maxsat=255 colored=209328`, `present_002000.ppm maxsat=248 colored=208890`, `present_003000.ppm maxsat=255 colored=209368`, `present_004000.ppm maxsat=255 colored=209210`, `present_005000.ppm maxsat=224 colored=213777`.
+
+## 2026-07-04 — buffer-cache review follow-up vs video_core/buffer_cache/buffer_cache.h and video_core/renderer_vulkan/vk_buffer_cache.cpp
+
+### Intentional differences
+- Rust keeps the trait-object-safe mapped-uniform API as `with_mapped_uniform_buffer(stage, binding, size, write)` instead of returning `std::span<u8>` directly. The ownership is equivalent to upstream `BindMappedUniformBuffer`: the runtime reserves mapped staging memory, the common cache writes guest memory into that span immediately, and the runtime then binds/enqueues the descriptor.
+- Rust exposes `vulkan_common::vulkan_device::format_alternatives` as a small public wrapper so `renderer_vulkan::buffer_cache` can reproduce upstream `Device::GetSupportedFormat` fallback behavior without storing the full `Device` wrapper in the reduced runtime.
+
+### Unintentional differences (to fix)
+- Vulkan `BufferCacheRuntime` still allocates buffers directly with `vkAllocateMemory`; upstream uses `MemoryAllocator`.
+- Vulkan `BufferCacheRuntime` still does not query `Device::HasNullDescriptor`. It now avoids descriptor `VK_NULL_HANDLE` by always using a runtime null buffer, which is safe without `nullDescriptor` but does not yet preserve the upstream optimization where true null descriptors are used when supported.
+- The runtime null buffer is local to the common Vulkan runtime and separate from the legacy direct Vulkan `BufferCache` null buffer. This is acceptable while both paths coexist, but should collapse once the legacy direct cache is removed.
+
+### Missing items
+- Full `BindTransformFeedbackBuffers`, `BindIndexBuffer`, and `BindVertexBuffers` runtime implementations remain incomplete.
+- Full device-wrapper ownership in `BufferCacheRuntime`, including `HasNullDescriptor`, debug object names, transform-feedback support checks, and allocator-backed null buffer creation.
+- Removal of gated debug hooks such as `dump_cbuf_cpu_side` before a clean non-debug commit, unless they are intentionally retained as diagnostics.
+
+### Binary layout verification
+- N/A: host-side Vulkan/OpenGL buffer-cache runtime behavior only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `buffer_cache.h`: the small uniform stream path receives a mapped span from `runtime.BindMappedUniformBuffer` and reads guest memory directly into that span. Rust now follows this ordering and removes the previous `guest -> Vec -> staging` extra copy on mapped-uniform paths.
+- Re-read upstream `vk_buffer_cache.cpp`: `Buffer::View` creates texel buffer views with `MaxwellToVK::SurfaceFormat(*device, FormatType::Buffer, false, format).format`; Rust now checks `buffer_features` for `STORAGE_TEXEL_BUFFER | UNIFORM_TEXEL_BUFFER` and applies the same format-alternative list before creating `VkBufferView`.
+- Re-read upstream `vk_buffer_cache.cpp`: null Vulkan buffers are substituted when `nullDescriptor` is unavailable. Rust now creates a common-runtime null buffer with uniform/storage/texel/vertex/index/transfer usages and uses it for absent buffer descriptors instead of enqueueing `VK_NULL_HANDLE`.
+- `rustfmt video_core/src/buffer_cache/buffer_cache.rs video_core/src/buffer_cache/buffer_cache_base.rs video_core/src/renderer_vulkan/buffer_cache.rs video_core/src/renderer_opengl/gl_buffer_cache.rs video_core/src/vulkan_common/vulkan_device.rs` completed.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.

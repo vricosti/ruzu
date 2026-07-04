@@ -15,6 +15,7 @@ use log::{debug, trace};
 
 use super::scheduler::Scheduler;
 use super::staging_buffer_pool::StagingBufferPool;
+use super::update_descriptor::UpdateDescriptorQueue;
 use crate::buffer_cache::buffer_base::BufferBase;
 use crate::buffer_cache::buffer_cache::BufferCache as CommonBufferCache;
 use crate::buffer_cache::buffer_cache_base::{
@@ -24,13 +25,23 @@ use crate::buffer_cache::word_manager::DeviceTracker;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
 use crate::engines::maxwell_3d::{IndexFormat, PrimitiveTopology};
+use crate::surface::{PixelFormat, MAX_DEPTH_STENCIL_FORMAT};
 use crate::texture_cache::texture_cache_base::TICKS_TO_DESTROY;
+
+/// Cached Vulkan buffer view for texture/image buffer descriptors.
+pub struct CachedBufferView {
+    pub offset: u32,
+    pub size: u32,
+    pub format: u32,
+    pub view: vk::BufferView,
+}
 
 /// A cached GPU buffer backed by VkBuffer + VkDeviceMemory.
 pub struct CachedBuffer {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
     pub size: vk::DeviceSize,
+    pub views: Vec<CachedBufferView>,
 }
 
 /// A replaced/invalidated buffer awaiting delayed destruction.
@@ -92,9 +103,13 @@ pub struct BufferCacheRuntime {
     physical_device: vk::PhysicalDevice,
     scheduler: NonNull<Scheduler>,
     staging_pool: NonNull<StagingBufferPool>,
+    guest_descriptor_queue: NonNull<UpdateDescriptorQueue>,
     buffers: HashMap<u32, CachedBuffer>,
     staging_refs: HashMap<usize, super::staging_buffer_pool::StagingBuffer>,
     next_handle: u32,
+    null_buffer: vk::Buffer,
+    null_memory: vk::DeviceMemory,
+    null_buffer_size: vk::DeviceSize,
 }
 
 impl BufferCacheRuntime {
@@ -104,16 +119,23 @@ impl BufferCacheRuntime {
         physical_device: vk::PhysicalDevice,
         scheduler: &mut Scheduler,
         staging_pool: &mut StagingBufferPool,
+        guest_descriptor_queue: &mut UpdateDescriptorQueue,
     ) -> Self {
+        let (null_buffer, null_memory, null_buffer_size) =
+            create_runtime_null_buffer(&device, &instance, physical_device);
         Self {
             device,
             instance,
             physical_device,
             scheduler: NonNull::from(scheduler),
             staging_pool: NonNull::from(staging_pool),
+            guest_descriptor_queue: NonNull::from(guest_descriptor_queue),
             buffers: HashMap::new(),
             staging_refs: HashMap::new(),
             next_handle: 1,
+            null_buffer,
+            null_memory,
+            null_buffer_size,
         }
     }
 
@@ -126,6 +148,11 @@ impl BufferCacheRuntime {
     fn staging_pool(&mut self) -> &mut StagingBufferPool {
         // SAFETY: see `scheduler`.
         unsafe { self.staging_pool.as_mut() }
+    }
+
+    fn guest_descriptor_queue(&mut self) -> &mut UpdateDescriptorQueue {
+        // SAFETY: see `scheduler`.
+        unsafe { self.guest_descriptor_queue.as_mut() }
     }
 
     fn allocate_handle(&mut self) -> u32 {
@@ -174,6 +201,7 @@ impl BufferCacheRuntime {
             buffer,
             memory,
             size: size.max(1),
+            views: Vec::new(),
         })
     }
 
@@ -198,6 +226,7 @@ impl BufferCacheRuntime {
                 buffer: staging.buffer,
                 memory: vk::DeviceMemory::null(),
                 size: staging.size,
+                views: Vec::new(),
             },
         );
         self.staging_refs.insert(staging.index as usize, staging);
@@ -223,6 +252,120 @@ impl BufferCacheRuntime {
                 size: copy.size,
             })
             .collect()
+    }
+
+    fn pixel_format_from_raw(format: u32) -> Option<PixelFormat> {
+        if format >= MAX_DEPTH_STENCIL_FORMAT {
+            return None;
+        }
+        // SAFETY: PixelFormat is repr(u32), contiguous up to MaxDepthStencilFormat,
+        // and the guard above excludes sentinel/invalid values.
+        Some(unsafe { std::mem::transmute::<u32, PixelFormat>(format) })
+    }
+
+    fn is_buffer_format_supported(&self, format: vk::Format) -> bool {
+        let required = vk::FormatFeatureFlags::STORAGE_TEXEL_BUFFER
+            | vk::FormatFeatureFlags::UNIFORM_TEXEL_BUFFER;
+        let props = unsafe {
+            self.instance
+                .get_physical_device_format_properties(self.physical_device, format)
+        };
+        (props.buffer_features & required) == required
+    }
+
+    fn supported_buffer_format(&self, wanted_format: vk::Format) -> vk::Format {
+        if self.is_buffer_format_supported(wanted_format) {
+            return wanted_format;
+        }
+        if let Some(alternatives) =
+            crate::vulkan_common::vulkan_device::format_alternatives(wanted_format)
+        {
+            for &format in alternatives {
+                if self.is_buffer_format_supported(format) {
+                    return format;
+                }
+            }
+        }
+        wanted_format
+    }
+
+    fn create_buffer_view(
+        &self,
+        buffer: vk::Buffer,
+        offset: u32,
+        size: u32,
+        format: u32,
+    ) -> vk::BufferView {
+        let Some(pixel_format) = Self::pixel_format_from_raw(format) else {
+            return vk::BufferView::null();
+        };
+        if buffer == vk::Buffer::null() || size == 0 {
+            return vk::BufferView::null();
+        }
+        let format_info = super::maxwell_to_vk::surface_format(pixel_format);
+        let format = self.supported_buffer_format(format_info.format);
+        let info = vk::BufferViewCreateInfo::builder()
+            .buffer(buffer)
+            .format(format)
+            .offset(offset as vk::DeviceSize)
+            .range(size as vk::DeviceSize)
+            .build();
+        unsafe {
+            self.device
+                .create_buffer_view(&info, None)
+                .unwrap_or(vk::BufferView::null())
+        }
+    }
+
+    fn buffer_view(
+        &mut self,
+        gpu_handle: u32,
+        offset: u32,
+        size: u32,
+        format: u32,
+    ) -> vk::BufferView {
+        let Some(buffer) = self.buffers.get(&gpu_handle) else {
+            return vk::BufferView::null();
+        };
+        if let Some(view) = buffer
+            .views
+            .iter()
+            .find(|view| view.offset == offset && view.size == size && view.format == format)
+        {
+            return view.view;
+        }
+        let raw_buffer = buffer.buffer;
+        let view = self.create_buffer_view(raw_buffer, offset, size, format);
+        if view == vk::BufferView::null() {
+            return view;
+        }
+        if let Some(buffer) = self.buffers.get_mut(&gpu_handle) {
+            buffer.views.push(CachedBufferView {
+                offset,
+                size,
+                format,
+                view,
+            });
+        }
+        view
+    }
+
+    fn bind_buffer_descriptor(&mut self, gpu_handle: u32, offset: u32, size: u32) {
+        // Upstream binds a reserved null buffer for unbound uniform/storage
+        // descriptors. `resolve_buffer` keeps returning the null sentinel so
+        // copy/clear paths still skip missing handles; the substitution is done
+        // here, locally to descriptor binding.
+        let resolved = self.resolve_buffer(gpu_handle);
+        let (buffer, offset, size) = if resolved == vk::Buffer::null() {
+            (self.null_buffer, 0, self.null_buffer_size as u32)
+        } else {
+            (resolved, offset, size)
+        };
+        self.guest_descriptor_queue().add_buffer(
+            buffer,
+            offset as vk::DeviceSize,
+            size.max(1) as vk::DeviceSize,
+        );
     }
 }
 
@@ -475,62 +618,108 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         _stage: usize,
         _binding_index: u32,
         _buffer: BufferId,
-        _gpu_handle: u32,
-        _offset: u32,
-        _size: u32,
+        gpu_handle: u32,
+        offset: u32,
+        size: u32,
     ) {
+        self.bind_buffer_descriptor(gpu_handle, offset, size);
     }
 
     fn bind_storage_buffer(
         &mut self,
         _stage: usize,
         _binding_index: u32,
-        _buffer: &mut BufferBase,
-        _offset: u32,
-        _size: u32,
+        buffer: &mut BufferBase,
+        offset: u32,
+        size: u32,
         _is_written: bool,
     ) {
+        self.bind_buffer_descriptor(buffer.gpu_handle, offset, size);
     }
 
     fn bind_texture_buffer(
         &mut self,
         _buffer: BufferId,
-        _gpu_handle: u32,
-        _offset: u32,
-        _size: u32,
-        _format: u32,
+        gpu_handle: u32,
+        offset: u32,
+        size: u32,
+        format: u32,
     ) {
+        let view = self.buffer_view(gpu_handle, offset, size, format);
+        self.guest_descriptor_queue().add_texel_buffer(view);
     }
 
     fn bind_image_buffer(
         &mut self,
         _buffer: BufferId,
-        _gpu_handle: u32,
-        _offset: u32,
-        _size: u32,
-        _format: u32,
+        gpu_handle: u32,
+        offset: u32,
+        size: u32,
+        format: u32,
     ) {
+        let view = self.buffer_view(gpu_handle, offset, size, format);
+        self.guest_descriptor_queue().add_texel_buffer(view);
     }
 
-    fn bind_transform_feedback_buffers(&mut self, _bindings: &HostBindings) {}
+    fn bind_transform_feedback_buffers(&mut self, _bindings: &HostBindings) {
+        // Upstream `BindTransformFeedbackBuffers` returns early unless
+        // VK_EXT_transform_feedback is supported (already logged in the
+        // rasterizer). That extension is not available on the MoltenVK target,
+        // so this is a no-op — matching upstream's behaviour there. Recording
+        // vkCmdBindTransformFeedbackBuffersEXT would additionally require the
+        // per-binding VkBuffer handles, which this signature does not carry
+        // (HostBindings holds BufferIds, resolved by the caller); wire both when
+        // a transform-feedback-capable device is targeted.
+    }
 
     fn bind_compute_uniform_buffer(
         &mut self,
         _binding_index: u32,
-        _buffer: BufferId,
-        _offset: u32,
-        _size: u32,
+        buffer: BufferId,
+        gpu_handle: u32,
+        offset: u32,
+        size: u32,
     ) {
+        let _ = buffer;
+        self.bind_buffer_descriptor(gpu_handle, offset, size);
     }
 
     fn bind_compute_storage_buffer(
         &mut self,
         _binding_index: u32,
-        _buffer: &mut BufferBase,
-        _offset: u32,
-        _size: u32,
+        buffer: &mut BufferBase,
+        offset: u32,
+        size: u32,
         _is_written: bool,
     ) {
+        // Vulkan shares the same descriptor-buffer path as graphics storage
+        // buffers (only NEEDS_BIND_STORAGE_INDEX backends route here at all).
+        self.bind_buffer_descriptor(buffer.gpu_handle, offset, size);
+    }
+
+    fn with_mapped_uniform_buffer(
+        &mut self,
+        _stage: usize,
+        _binding_index: u32,
+        size: u32,
+        write: &mut dyn FnMut(&mut [u8]),
+    ) -> bool {
+        let staging = self
+            .staging_pool()
+            .request_upload_buffer(size as vk::DeviceSize);
+        let Some(staging) = staging else {
+            return false;
+        };
+        unsafe {
+            let span = std::slice::from_raw_parts_mut(staging.mapped, size as usize);
+            write(span);
+        }
+        self.guest_descriptor_queue().add_buffer(
+            staging.buffer,
+            staging.offset,
+            size as vk::DeviceSize,
+        );
+        true
     }
 }
 
@@ -538,14 +727,75 @@ impl Drop for BufferCacheRuntime {
     fn drop(&mut self) {
         unsafe {
             for (_, buffer) in self.buffers.drain() {
+                for view in buffer.views {
+                    self.device.destroy_buffer_view(view.view, None);
+                }
                 if buffer.memory == vk::DeviceMemory::null() {
                     continue;
                 }
                 self.device.destroy_buffer(buffer.buffer, None);
                 self.device.free_memory(buffer.memory, None);
             }
+            if self.null_buffer != vk::Buffer::null() {
+                self.device.destroy_buffer(self.null_buffer, None);
+            }
+            if self.null_memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.null_memory, None);
+            }
         }
     }
+}
+
+fn create_runtime_null_buffer(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> (vk::Buffer, vk::DeviceMemory, vk::DeviceSize) {
+    let size = 256;
+    let info = vk::BufferCreateInfo::builder()
+        .size(size)
+        .usage(
+            vk::BufferUsageFlags::VERTEX_BUFFER
+                | vk::BufferUsageFlags::INDEX_BUFFER
+                | vk::BufferUsageFlags::UNIFORM_BUFFER
+                | vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
+                | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::INDIRECT_BUFFER,
+        )
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .build();
+    let Ok(buffer) = (unsafe { device.create_buffer(&info, None) }) else {
+        return (vk::Buffer::null(), vk::DeviceMemory::null(), size);
+    };
+    let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let Some(memory_type) =
+        find_device_local_memory(instance, physical_device, requirements.memory_type_bits)
+    else {
+        unsafe {
+            device.destroy_buffer(buffer, None);
+        }
+        return (vk::Buffer::null(), vk::DeviceMemory::null(), size);
+    };
+    let alloc = vk::MemoryAllocateInfo::builder()
+        .allocation_size(requirements.size)
+        .memory_type_index(memory_type)
+        .build();
+    let Ok(memory) = (unsafe { device.allocate_memory(&alloc, None) }) else {
+        unsafe {
+            device.destroy_buffer(buffer, None);
+        }
+        return (vk::Buffer::null(), vk::DeviceMemory::null(), size);
+    };
+    if unsafe { device.bind_buffer_memory(buffer, memory, 0) }.is_err() {
+        unsafe {
+            device.destroy_buffer(buffer, None);
+            device.free_memory(memory, None);
+        }
+        return (vk::Buffer::null(), vk::DeviceMemory::null(), size);
+    }
+    (buffer, memory, size)
 }
 
 /// Manages GPU buffers for vertex, index, uniform, and storage data.
@@ -781,6 +1031,7 @@ impl BufferCache {
                 buffer,
                 memory,
                 size,
+                views: Vec::new(),
             },
         );
 
@@ -881,6 +1132,7 @@ impl BufferCache {
                 buffer,
                 memory,
                 size,
+                views: Vec::new(),
             },
         );
 

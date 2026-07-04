@@ -270,7 +270,7 @@ use scheduler::Scheduler;
 use staging_buffer_pool::StagingBufferPool;
 use state_tracker::StateTracker;
 use texture_cache::TextureCache;
-use update_descriptor::UpdateDescriptorQueue;
+use update_descriptor::{DescriptorUpdateEntry, UpdateDescriptorQueue};
 
 #[derive(Debug, Error)]
 pub enum RendererError {
@@ -496,7 +496,7 @@ impl RasterizerVulkan {
         let mut descriptor_pool = DescriptorPool::new(device.clone(), 64);
 
         // Create descriptor update queue
-        let desc_queue = UpdateDescriptorQueue::new();
+        let mut desc_queue = UpdateDescriptorQueue::new();
         let mut compute_pass_desc_queue = UpdateDescriptorQueue::new();
         let mut blit_image = BlitImageHelper::new(
             device.clone(),
@@ -551,6 +551,7 @@ impl RasterizerVulkan {
             physical_device,
             scheduler.as_mut(),
             staging_pool.as_mut(),
+            &mut desc_queue,
         );
         common_buffer_cache.set_runtime(Box::new(buffer_runtime));
         common_buffer_cache.set_device_memory(Box::new(DeviceMemoryAccessAdapter {
@@ -733,6 +734,8 @@ impl RasterizerVulkan {
             descriptor_bindings,
             descriptor_bank_info,
             stage_infos,
+            enabled_uniform_buffer_masks,
+            uniform_buffer_sizes,
             uses_render_area,
             uses_rescaling_uniform,
         ) = match pipeline_result {
@@ -743,6 +746,8 @@ impl RasterizerVulkan {
                 gp.descriptor_bindings.clone(),
                 gp.descriptor_bank_info,
                 gp.stage_infos.clone(),
+                gp.enabled_uniform_buffer_masks,
+                gp.uniform_buffer_sizes,
                 gp.uses_render_area,
                 gp.uses_rescaling_uniform,
             ),
@@ -841,6 +846,8 @@ impl RasterizerVulkan {
             &descriptor_bindings,
             &descriptor_bank_info,
             &stage_infos,
+            &enabled_uniform_buffer_masks,
+            &uniform_buffer_sizes,
             draw,
             read_gpu,
             read_gpu_unsafe,
@@ -1917,6 +1924,9 @@ impl RasterizerVulkan {
         descriptor_bindings: &[GraphicsDescriptorBinding],
         descriptor_bank_info: &DescriptorBankInfo,
         stage_infos: &[Option<ShaderInfo>; 5],
+        enabled_uniform_buffer_masks: &[u32; crate::buffer_cache::buffer_cache_base::NUM_STAGES
+            as usize],
+        uniform_buffer_sizes: &crate::buffer_cache::buffer_cache_base::UniformBufferSizes,
         draw: &DrawCall,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
@@ -2018,6 +2028,9 @@ impl RasterizerVulkan {
         };
         let mut sampled_views = Vec::new();
         let mut sampled_samplers = Vec::new();
+        let has_uniform_buffer_descriptors = descriptor_bindings
+            .iter()
+            .any(|binding| binding.descriptor_type == vk::DescriptorType::UNIFORM_BUFFER);
         for (stage, info) in stage_infos.iter().enumerate() {
             let Some(info) = info else {
                 continue;
@@ -2080,13 +2093,64 @@ impl RasterizerVulkan {
                 (*texture_cache).barrier_feedback_loop();
             }
         }
+        let mut common_uniform_buffer_infos = Vec::new();
+        if has_uniform_buffer_descriptors {
+            self.common_buffer_cache
+                .set_uniform_buffers_state(enabled_uniform_buffer_masks, uniform_buffer_sizes);
+            for stage in 0..enabled_uniform_buffer_masks.len().min(draw.cb_bindings.len()) {
+                let mut bits = enabled_uniform_buffer_masks[stage];
+                let mut index = 0u32;
+                while bits != 0 {
+                    let skip = bits.trailing_zeros();
+                    index += skip;
+                    bits >>= skip;
+
+                    let binding = draw.cb_bindings[stage][index as usize];
+                    if binding.enabled && binding.address != 0 && binding.size != 0 {
+                        self.common_buffer_cache.bind_graphics_uniform_buffer(
+                            stage,
+                            index,
+                            binding.address,
+                            binding.size,
+                        );
+                    } else {
+                        self.common_buffer_cache
+                            .disable_graphics_uniform_buffer(stage, index);
+                    }
+
+                    index += 1;
+                    bits >>= 1;
+                }
+            }
+            self.desc_queue.acquire();
+            self.common_buffer_cache.update_graphics_buffers(false);
+            for stage in 0..enabled_uniform_buffer_masks.len() {
+                self.common_buffer_cache.bind_host_stage_buffers(stage);
+            }
+            common_uniform_buffer_infos.extend(self.desc_queue.update_data().iter().filter_map(
+                |entry| match entry {
+                    DescriptorUpdateEntry::Buffer(info) => Some(*info),
+                    _ => None,
+                },
+            ));
+        }
         let mut sampled_cursor = 0usize;
+        let mut common_uniform_cursor = 0usize;
 
         for binding in descriptor_bindings {
             match binding.descriptor_type {
                 vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::STORAGE_BUFFER => {
                     let start = buffer_infos.len();
                     for element in 0..binding.descriptor_count {
+                        if binding.descriptor_type == vk::DescriptorType::UNIFORM_BUFFER {
+                            if let Some(info) =
+                                common_uniform_buffer_infos.get(common_uniform_cursor).copied()
+                            {
+                                common_uniform_cursor += 1;
+                                buffer_infos.push(info);
+                                continue;
+                            }
+                        }
                         let descriptor_info = binding
                             .uniform_stage
                             .zip(binding.uniform_index)

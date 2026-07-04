@@ -722,6 +722,7 @@ pub trait BufferCacheRuntime {
         &mut self,
         binding_index: u32,
         buffer: BufferId,
+        gpu_handle: u32,
         offset: u32,
         size: u32,
     );
@@ -764,14 +765,15 @@ pub trait BufferCacheRuntime {
     /// Upstream (OpenGL): `Runtime::PushFastUniformBuffer(stage, binding_index, data)`
     fn push_fast_uniform_buffer(&mut self, _stage: usize, _binding_index: u32, _data: &[u8]) {}
 
-    /// Bind a mapped uniform buffer and copy uniform data into it.
+    /// Bind a mapped uniform buffer and let the caller write uniform data into it.
     ///
     /// Upstream (OpenGL): `Runtime::BindMappedUniformBuffer(stage, binding_index, size)`
-    fn bind_mapped_uniform_buffer(
+    fn with_mapped_uniform_buffer(
         &mut self,
         _stage: usize,
         _binding_index: u32,
-        _data: &[u8],
+        _size: u32,
+        _write: &mut dyn FnMut(&mut [u8]),
     ) -> bool {
         false
     }

@@ -129,6 +129,15 @@ mod alternatives {
     }
 }
 
+/// Returns the alternative formats for a given format.
+///
+/// Port-facing wrapper for upstream `namespace Alternatives`; runtime owners
+/// that do not store the full `Device` wrapper still need the same fallback
+/// list when reproducing `Device::GetSupportedFormat`.
+pub fn format_alternatives(format: vk::Format) -> Option<&'static [vk::Format]> {
+    alternatives::get_format_alternatives(format)
+}
+
 // ---------------------------------------------------------------------------
 // Extensions tracking — port of `Device::Extensions` struct
 // ---------------------------------------------------------------------------

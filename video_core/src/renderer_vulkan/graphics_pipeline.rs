@@ -13,6 +13,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use crate::buffer_cache::buffer_cache_base::{
+    UniformBufferSizes, NUM_GRAPHICS_UNIFORM_BUFFERS, NUM_STAGES,
+};
 use crate::engines::maxwell_3d::{DrawCall, ShaderStageType, VertexAttribSize, VertexAttribType};
 use crate::shader;
 use crate::shader_cache::{GraphicsEnvironments, NUM_PROGRAMS};
@@ -95,6 +98,8 @@ pub struct GraphicsPipeline {
     pub descriptor_bindings: Vec<GraphicsDescriptorBinding>,
     pub descriptor_bank_info: DescriptorBankInfo,
     pub stage_infos: [Option<ShaderInfo>; 5],
+    pub enabled_uniform_buffer_masks: [u32; NUM_STAGES as usize],
+    pub uniform_buffer_sizes: UniformBufferSizes,
     pub uses_render_area: bool,
     pub uses_rescaling_uniform: bool,
     pub vs_module: vk::ShaderModule,
@@ -137,6 +142,22 @@ impl GraphicsPipeline {
     pub fn is_built(&self) -> bool {
         self.is_built.load(Ordering::Relaxed)
     }
+
+}
+
+fn buffer_cache_metadata(
+    stage_infos: &[Option<ShaderInfo>; 5],
+) -> ([u32; NUM_STAGES as usize], UniformBufferSizes) {
+    let mut masks = [0u32; NUM_STAGES as usize];
+    let mut sizes = [[0u32; NUM_GRAPHICS_UNIFORM_BUFFERS as usize]; NUM_STAGES as usize];
+    for stage in 0..NUM_STAGES as usize {
+        let Some(info) = stage_infos.get(stage).and_then(Option::as_ref) else {
+            continue;
+        };
+        masks[stage] = info.constant_buffer_mask;
+        sizes[stage].copy_from_slice(&info.constant_buffer_used_sizes);
+    }
+    (masks, sizes)
 }
 
 /// Reduced graphics pipeline compilation leaf.
@@ -269,6 +290,17 @@ impl GraphicsPipelineCache {
             key.unique_hashes[1], key.unique_hashes[5]
         );
 
+        let stage_infos = {
+            let mut infos: [Option<ShaderInfo>; 5] = Default::default();
+            infos[0] = Some(vs_compiled.info.clone());
+            if let Some(fs) = fs_compiled.as_ref() {
+                infos[4] = Some(fs.info.clone());
+            }
+            infos
+        };
+        let (enabled_uniform_buffer_masks, uniform_buffer_sizes) =
+            buffer_cache_metadata(&stage_infos);
+
         Some(GraphicsPipeline {
             device: self.device.clone(),
             key: key.clone(),
@@ -278,14 +310,9 @@ impl GraphicsPipelineCache {
             descriptor_set_layout: descriptor_layout.descriptor_set_layout,
             descriptor_bindings: descriptor_layout.bindings,
             descriptor_bank_info: descriptor_layout.bank_info,
-            stage_infos: {
-                let mut infos: [Option<ShaderInfo>; 5] = Default::default();
-                infos[0] = Some(vs_compiled.info.clone());
-                if let Some(fs) = fs_compiled.as_ref() {
-                    infos[4] = Some(fs.info.clone());
-                }
-                infos
-            },
+            stage_infos,
+            enabled_uniform_buffer_masks,
+            uniform_buffer_sizes,
             uses_render_area: vs_compiled.info.uses_render_area
                 || fs_compiled
                     .as_ref()
@@ -364,6 +391,17 @@ impl GraphicsPipelineCache {
             key.unique_hashes[1], key.unique_hashes[5]
         );
 
+        let stage_infos = {
+            let mut infos: [Option<ShaderInfo>; 5] = Default::default();
+            infos[0] = Some(vs_compiled.info.clone());
+            if let Some(fs) = fs_compiled.as_ref() {
+                infos[4] = Some(fs.info.clone());
+            }
+            infos
+        };
+        let (enabled_uniform_buffer_masks, uniform_buffer_sizes) =
+            buffer_cache_metadata(&stage_infos);
+
         Some(GraphicsPipeline {
             device: self.device.clone(),
             key: key.clone(),
@@ -373,14 +411,9 @@ impl GraphicsPipelineCache {
             descriptor_set_layout: descriptor_layout.descriptor_set_layout,
             descriptor_bindings: descriptor_layout.bindings,
             descriptor_bank_info: descriptor_layout.bank_info,
-            stage_infos: {
-                let mut infos: [Option<ShaderInfo>; 5] = Default::default();
-                infos[0] = Some(vs_compiled.info.clone());
-                if let Some(fs) = fs_compiled.as_ref() {
-                    infos[4] = Some(fs.info.clone());
-                }
-                infos
-            },
+            stage_infos,
+            enabled_uniform_buffer_masks,
+            uniform_buffer_sizes,
             uses_render_area: vs_compiled.info.uses_render_area
                 || fs_compiled
                     .as_ref()
@@ -1178,6 +1211,9 @@ mod tests {
             descriptor_bindings: Vec::new(),
             descriptor_bank_info: DescriptorBankInfo::default(),
             stage_infos: Default::default(),
+            enabled_uniform_buffer_masks: [0; NUM_STAGES as usize],
+            uniform_buffer_sizes: [[0; NUM_GRAPHICS_UNIFORM_BUFFERS as usize];
+                NUM_STAGES as usize],
             uses_render_area: false,
             uses_rescaling_uniform: false,
             vs_module: vk::ShaderModule::null(),

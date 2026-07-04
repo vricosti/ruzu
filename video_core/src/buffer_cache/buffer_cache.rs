@@ -1968,7 +1968,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                             }
                             let mut buf = vec![0u8; size as usize];
                             dm.read_block_unsafe(device_addr, &mut buf);
-                            dump_cbuf_cpu_side(stage, binding_index, device_addr, &buf);
                             // RUZU_TRACE_UBO_REFRESH=1 — also cover the fast
                             // push path (small per-binding uploads).
                             if {
@@ -1995,23 +1994,17 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                         // Upstream: runtime.BindMappedUniformBuffer(stage, binding_index, size)
                         // then copies device memory into the mapped span.
                         if let Some(ref dm) = self.device_memory {
-                            let mut buf = vec![0u8; size as usize];
-                            dm.read_block_unsafe(device_addr, &mut buf);
-                            dump_cbuf_cpu_side(stage, binding_index, device_addr, &buf);
-                            fast_buffer_bound =
-                                rt.bind_mapped_uniform_buffer(stage, binding_index, &buf);
+                            let mut write = |span: &mut [u8]| {
+                                dm.read_block_unsafe(device_addr, span);
+                            };
+                            fast_buffer_bound = rt.with_mapped_uniform_buffer(
+                                stage,
+                                binding_index,
+                                size,
+                                &mut write,
+                            );
                         }
                     }
-                }
-                if !fast_buffer_bound {
-                    // No fast storage was actually bound/populated; use the
-                    // regular cached buffer path below.
-                } else {
-                    if let Some(ref mut cs) = self.channel_state {
-                        cs.fast_bound_uniform_buffers[stage] |= 1u32 << binding_index;
-                        cs.uniform_buffer_binding_sizes[stage][binding_index as usize] = size;
-                    }
-                    return;
                 }
             }
             if fast_buffer_bound {
@@ -2020,6 +2013,21 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                     cs.uniform_buffer_binding_sizes[stage][binding_index as usize] = size;
                 }
                 return;
+            }
+            if P::IS_OPENGL {
+                if let Some(ref mut cs) = self.channel_state {
+                    cs.fast_bound_uniform_buffers[stage] |= 1u32 << binding_index;
+                    cs.uniform_buffer_binding_sizes[stage][binding_index as usize] = size;
+                }
+            }
+            // Upstream stream-buffer path is shared by non-Nvidia OpenGL and Vulkan.
+            if let (Some(ref dm), Some(ref mut rt)) = (&self.device_memory, &mut self.runtime) {
+                let mut write = |span: &mut [u8]| {
+                    dm.read_block_unsafe(device_addr, span);
+                };
+                if rt.with_mapped_uniform_buffer(stage, binding_index, size, &mut write) {
+                    return;
+                }
             }
         }
 
@@ -2331,8 +2339,26 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             self.synchronize_buffer(binding.buffer_id, binding.device_addr, size);
 
             let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
+            let gpu_handle = self.slot_buffers[binding.buffer_id].gpu_handle;
             if let Some(ref mut rt) = self.runtime {
-                rt.bind_compute_uniform_buffer(binding_index, binding.buffer_id, offset, size);
+                if P::NEEDS_BIND_UNIFORM_INDEX {
+                    rt.bind_compute_uniform_buffer(
+                        binding_index,
+                        binding.buffer_id,
+                        gpu_handle,
+                        offset,
+                        size,
+                    );
+                } else {
+                    rt.bind_uniform_buffer(
+                        0,
+                        binding_index,
+                        binding.buffer_id,
+                        gpu_handle,
+                        offset,
+                        size,
+                    );
+                }
             }
             if P::NEEDS_BIND_UNIFORM_INDEX {
                 binding_index += 1;
@@ -2380,13 +2406,26 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             if let Some(ref mut rt) = self.runtime {
                 let buffer = &mut self.slot_buffers[binding.buffer_id];
                 let offset = buffer.offset(binding.device_addr);
-                rt.bind_compute_storage_buffer(
-                    binding_index,
-                    buffer,
-                    offset,
-                    binding.size,
-                    is_written,
-                );
+                // Upstream: NEEDS_BIND_STORAGE_INDEX (OpenGL) uses the indexed
+                // compute path; everything else (Vulkan) shares BindStorageBuffer.
+                if P::NEEDS_BIND_STORAGE_INDEX {
+                    rt.bind_compute_storage_buffer(
+                        binding_index,
+                        buffer,
+                        offset,
+                        binding.size,
+                        is_written,
+                    );
+                } else {
+                    rt.bind_storage_buffer(
+                        0,
+                        binding_index,
+                        buffer,
+                        offset,
+                        binding.size,
+                        is_written,
+                    );
+                }
             }
             if P::NEEDS_BIND_STORAGE_INDEX {
                 binding_index += 1;
@@ -4134,88 +4173,6 @@ pub struct RasterizerDownloadArea {
     pub start_address: VAddr,
     pub end_address: VAddr,
     pub preemtive: bool,
-}
-
-/// Non-syncing CPU-side constant-buffer dump for diagnostics.
-///
-/// Logs the leading f32 lanes of a graphics uniform buffer read directly from
-/// guest device memory (the same `buf` the cache uploads), so it costs no GL
-/// readback / GPU sync — unlike `glGetNamedBufferSubData`, which froze the
-/// emulator when probing per draw.
-///
-/// Gating (all via env, evaluated once):
-/// - `RUZU_DUMP_CBUF=1` — enable.
-/// - `RUZU_DUMP_CBUF_AFTER_MS=<ms>` — only dump after this many wall-ms since
-///   the first cbuf bind (default 0). Use to skip the title and land on the
-///   cinematic, e.g. `90000`.
-/// - `RUZU_DUMP_CBUF_STAGE=<n>` — restrict to one shader stage (e.g. fragment).
-/// - `RUZU_DUMP_CBUF_MAX=<n>` — stop after N dumps once the window opens
-///   (default 400) so the log stays a bounded snapshot.
-fn dump_cbuf_cpu_side(stage: usize, binding_index: u32, device_addr: u64, buf: &[u8]) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-    use std::time::Instant;
-
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var_os("RUZU_DUMP_CBUF").is_some()) {
-        return;
-    }
-
-    static STAGE_FILTER: OnceLock<Option<usize>> = OnceLock::new();
-    let stage_filter = *STAGE_FILTER.get_or_init(|| {
-        std::env::var("RUZU_DUMP_CBUF_STAGE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-    });
-    if let Some(want) = stage_filter {
-        if want != stage {
-            return;
-        }
-    }
-
-    static AFTER_MS: OnceLock<u64> = OnceLock::new();
-    let after_ms = *AFTER_MS.get_or_init(|| {
-        std::env::var("RUZU_DUMP_CBUF_AFTER_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
-    });
-    static START: OnceLock<Instant> = OnceLock::new();
-    let elapsed_ms = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
-    if elapsed_ms < after_ms {
-        return;
-    }
-
-    static MAX: OnceLock<u64> = OnceLock::new();
-    let max = *MAX.get_or_init(|| {
-        std::env::var("RUZU_DUMP_CBUF_MAX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(400)
-    });
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    let n = COUNT.fetch_add(1, Ordering::Relaxed);
-    if n >= max {
-        return;
-    }
-
-    let lanes = (buf.len() / 4).min(8);
-    let mut floats = [0f32; 8];
-    for (i, lane) in floats.iter_mut().enumerate().take(lanes) {
-        *lane = f32::from_le_bytes([buf[i * 4], buf[i * 4 + 1], buf[i * 4 + 2], buf[i * 4 + 3]]);
-    }
-    let all_zero = buf.iter().all(|&b| b == 0);
-    log::warn!(
-        "[CBUF_DUMP] #{} stage={} binding={} addr=0x{:X} size={} all_zero={} f[0..{}]={:?}",
-        n,
-        stage,
-        binding_index,
-        device_addr,
-        buf.len(),
-        all_zero,
-        lanes,
-        &floats[..lanes],
-    );
 }
 
 #[cfg(test)]
