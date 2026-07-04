@@ -1103,6 +1103,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         &mut self,
         _binding: u32,
         _buffer: BufferId,
+        _gpu_handle: u32,
         _offset: u32,
         _size: u32,
     ) {
@@ -1172,18 +1173,20 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         }
     }
 
-    fn bind_mapped_uniform_buffer(
+    fn with_mapped_uniform_buffer(
         &mut self,
         stage: usize,
         binding_index: u32,
-        data: &[u8],
+        size: u32,
+        write: &mut dyn FnMut(&mut [u8]),
     ) -> bool {
         let Some(stream_buffer) = self.stream_buffer.as_mut() else {
             return false;
         };
-        let (mapped_ptr, offset) = stream_buffer.request(data.len());
+        let (mapped_ptr, offset) = stream_buffer.request(size as usize);
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped_ptr, data.len());
+            let span = std::slice::from_raw_parts_mut(mapped_ptr, size as usize);
+            write(span);
             let base_binding = self.graphics_base_uniform_bindings[stage];
             let binding = base_binding + binding_index;
             gl::BindBufferRange(
@@ -1191,7 +1194,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
                 binding,
                 stream_buffer.handle(),
                 offset as isize,
-                data.len() as isize,
+                size as isize,
             );
         }
         true
