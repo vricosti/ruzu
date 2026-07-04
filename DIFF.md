@@ -20448,3 +20448,77 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `video_core/gpu.cpp`: `GPU::Impl::NotifyShutdown()` locks sync state, sets `shutting_down`, and notifies waiters.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
 - Pinball close-path validation with a temporary internal `SDL_WINDOWEVENT_CLOSE` injector before removal: `RUZU_AUTO_CLOSE_MS=5000 RUZU_APP_LOG=/tmp/ruzu_auto_close5.log scripts/run_ruzu_cmd_app_macos.sh /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` exited with `runner_rc=0`, left no `ruzu-cmd`/`open -W` process, logged `SDL window close event received`, entered `system.shutdown_main_process()`, logged `System: service shutdown incomplete; skipping deeper kernel teardown`, returned to the frontend shutdown path, and did not panic.
+
+## 2026-07-04 — video_core/src/renderer_vulkan/texture_cache.rs, video_core/src/renderer_vulkan/mod.rs, video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp/h
+
+### Intentional differences
+- Rust still stores Vulkan texture-cache runtime state in the split `TextureCacheRuntime` / `TextureCache` backend rather than upstream's templated `TextureCache<P>` owning `Vulkan::Sampler` directly in `slot_samplers`. The sampler creation behavior is kept in the Vulkan texture-cache owner and remains traceable to upstream `Vulkan::Sampler::Sampler`.
+- Rust passes `custom_border_color_supported` from the renderer/device setup into `TextureCacheRuntime` because the current constructor receives raw `ash::Device` handles rather than the full upstream `Vulkan::Device` object.
+- Diagnostic-only draw skipping and texture/present dump environment hooks remain in the renderer while MK8D is being investigated. They are gated by `RUZU_*` environment variables and do not change default rendering behavior.
+
+### Unintentional differences (to fix)
+- None for sampler border-color fallback: Rust now matches upstream by using `VK_BORDER_COLOR_FLOAT_CUSTOM_EXT` and `VkSamplerCustomBorderColorCreateInfoEXT` only when custom border colors are supported; otherwise it uses the upstream `ConvertBorderColor` fallback.
+- None for image/view usage derivation: Rust now matches upstream `ImageUsageFlags(format_info, format)` by deriving `VkImageUsageFlags` from the device-resolved `FormatInfo` used for the image/view, rather than recomputing storage/attachable from the static guest `PixelFormat` table.
+- Remaining texture-cache structural debt is not resolved by this slice: sampler-filter min/max pNext handling and full upstream device-extension feature-chain ownership are still incomplete outside this change.
+
+### Missing items
+- Complete upstream `Sampler::Sampler` parity for `VK_EXT_sampler_filter_minmax` reduction-mode pNext chaining and warning behavior.
+- Full upstream `Vulkan::Device` feature/extension enablement chain so texture-cache runtime can query loaded extension support from the same owner as upstream instead of receiving selected booleans.
+
+### Binary layout verification
+- N/A: Vulkan sampler creation and renderer constructor plumbing only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `vk_texture_cache.cpp`: `ConvertBorderColor` maps exact transparent/opaque black/white colors, bright RGB sums above `1.35f`, alpha above `0.5f`, and otherwise transparent black; `Sampler::Sampler` only chains `VkSamplerCustomBorderColorCreateInfoEXT` when `runtime.device.IsExtCustomBorderColorSupported()` is true.
+- Re-read upstream `maxwell_to_vk.cpp` and `vk_texture_cache.cpp`: `SurfaceFormat(device, FormatType::Optimal, ...)` computes a device-supported `FormatInfo`, and both `MakeImageCreateInfo` and `ImageView` creation pass that same `FormatInfo` to `ImageUsageFlags`.
+- Re-read upstream `vk_texture_cache.h`: `Vulkan::Sampler` owns the `vk::Sampler` handles and exposes `Handle()` / `HandleWithDefaultAnisotropy()`.
+- `cargo test -p video_core convert_border_color_matches_upstream_fallback --lib` passes.
+- `cargo test -p video_core image_usage_flags_use_resolved_format_info_storage_bit --lib` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D validation without disabling accelerated Vulkan display: `RUST_LOG=info RUZU_TRACE_VK_PRESENT=1 RUZU_DUMP_VK_PRESENT_SOURCE_FRAME=/tmp/ruzu_mk8d_border_check/source.ppm RUZU_DUMP_VK_PRESENT_SOURCE_AT=150 RUZU_DUMP_VK_PRESENT_EXTRA_GPU=0x524C10000 RUZU_DUMP_VK_PRESENT_EXTRA_FRAME=/tmp/ruzu_mk8d_border_check/hdr.ppm timeout 12s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, logs repeated `AccelerateDisplay hit` for 1920x1080 A8B8G8R8Unorm views, and dumps non-black present/HDR frames.
+- Direct VulkanSDK/MoltenVK format-property query on this machine reports `A2B10G10R10_UNORM_PACK32` and `A2B10G10R10_UINT_PACK32` support `SAMPLED_IMAGE | TRANSFER_DST | TRANSFER_SRC | COLOR_ATTACHMENT | STORAGE_IMAGE`, so the earlier hypothesis that MoltenVK rejects A2B10G10R10 storage usage is not true for the installed SDK/device.
+
+## 2026-07-04 — video_core/src/renderer_vulkan/fixed_pipeline_state.rs vs video_core/renderer_vulkan/fixed_pipeline_state.h/cpp
+
+### Intentional differences
+- Rust still hashes modeled fields through `std::hash::Hash` instead of upstream `Common::CityHash64(reinterpret_cast<const char*>(this), Size())`. This preserves cache-key inclusion/exclusion behavior but not the exact CityHash value.
+- Rust still omits upstream `VideoCommon::TransformFeedbackState xfb_state`; when `xfb_enabled` is set, the Rust key can only include the modeled prefix fields, not the full upstream struct. This is pre-existing transform-feedback parity debt outside this local pipeline-cache fix.
+
+### Unintentional differences (to fix)
+- None for the modeled `FixedPipelineState::Size()` boundaries: Rust now keeps `attachments` in the pipeline key when `dynamic_vertex_input` is enabled but `extended_dynamic_state_3_blend` is not, matching upstream `offsetof(FixedPipelineState, attributes)`.
+- None for vertex stride exclusion: Rust now excludes `vertex_strides` when `extended_dynamic_state` is enabled, matching upstream `offsetof(FixedPipelineState, vertex_strides)`.
+
+### Missing items
+- Full `xfb_state` storage, refresh, equality, and hashing when transform feedback is enabled.
+- Exact byte-prefix `memcmp` equality / CityHash hashing is still not implemented; Rust derives `PartialEq` over the whole modeled struct, while `Hash` follows the upstream prefix selection.
+
+### Binary layout verification
+- N/A for guest ABI: this is a host Vulkan pipeline-cache key. Field order was rechecked against upstream for the modeled prefix: `raw1`, `raw2`, `color_formats`, `alpha_test_ref`, `point_size`, `viewport_swizzles`, `attribute_types_or_enabled_divisors`, `dynamic_state`, `attachments`, `attributes`, `binding_divisors`, `vertex_strides`.
+
+### Verification
+- Re-read upstream `fixed_pipeline_state.h`: `Size()` returns `sizeof(*this)` for `xfb_enabled`, `offsetof(dynamic_state)` for `dynamic_vertex_input && extended_dynamic_state_3_blend`, `offsetof(attributes)` for `dynamic_vertex_input`, `offsetof(vertex_strides)` for `extended_dynamic_state`, and `offsetof(xfb_state)` by default.
+- Re-read upstream `fixed_pipeline_state.cpp`: `Hash()` hashes exactly the `Size()` byte prefix, and `operator==` compares the same byte prefix with `memcmp`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::fixed_pipeline_state --lib` passes: 20 passed, 0 failed.
+
+## 2026-07-04 — video_core/src/renderer_vulkan/buffer_cache.rs, video_core/src/renderer_vulkan/mod.rs vs video_core/buffer_cache/buffer_cache.h and video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust still uses a simplified Vulkan `BufferCache` keyed by GPU VA and bound directly from `RasterizerVulkan::bind_graphics_descriptors`, instead of upstream's generic `VideoCommon::BufferCache<P>` plus Vulkan `BufferCacheRuntime` and descriptor-template path.
+- Rust now forces a fresh upload for graphics `UNIFORM_BUFFER` descriptors. This is a local parity-preserving adaptation of upstream's Vulkan small-uniform path, where `BindHostGraphicsUniformBuffer` streams small uniform buffers through `runtime.BindMappedUniformBuffer` and reads guest memory for each bind.
+
+### Unintentional differences (to fix)
+- The full upstream buffer-cache lifecycle is still missing: `SetUniformBuffersState`, `UpdateUniformBuffers`, `FindBuffer`, `SynchronizeBuffer`, `memory_tracker.IsRegionGpuModified`, cached-buffer dirty tracking, and persistent binding state are not fully ported.
+- Vulkan dynamic uniform updates are still driven from descriptor binding rather than upstream `GraphicsPipeline::Configure` calling `buffer_cache.SetUniformBuffersState`, `UpdateGraphicsBuffers`, and `BindHostStageBuffers`.
+
+### Missing items
+- Complete `VideoCommon::BufferCache<P>` / `Vulkan::BufferCacheRuntime` port for graphics uniform, storage, texture, vertex, index, indirect, transform-feedback, DMA, and query buffers.
+- Upstream-equivalent fast-uniform threshold and mapped uniform ring ownership instead of recreating/sentencing a fresh cached buffer for every uniform bind.
+
+### Binary layout verification
+- N/A: host Vulkan buffer-cache behavior only; no guest ABI or raw-copied payload changed.
+
+### Verification
+- Re-read upstream `buffer_cache.h`: `BindHostGraphicsUniformBuffer` uses the stream-buffer path for small uniform buffers on Vulkan (`runtime.BindMappedUniformBuffer`, then `device_memory.ReadBlockUnsafe`) instead of relying on an address-stable cached buffer.
+- Re-read upstream `vk_graphics_pipeline.cpp`: `GraphicsPipeline::Configure` sets uniform-buffer state and calls `buffer_cache.UpdateGraphicsBuffers()` / `BindHostStageBuffers(stage)` before descriptor updates.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D regression: before this fix, the post-transition present dump had `maxsat=118 colored=595` and the isolated `RUZU_SKIP_VK_DRAW_RT=0x524C10000 RUZU_SKIP_VK_DRAW_GE=5` case had `maxsat=4 colored=0`, producing grayscale/white logo silhouettes. After forcing fresh uniform uploads, the normal post-transition dump reports `maxsat=247 colored=214970`, and the isolated draws 1+3 dump reports `maxsat=255 colored=197830`; visual inspection confirms the logo and lens flares remain colored.

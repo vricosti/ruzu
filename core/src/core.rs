@@ -1720,9 +1720,7 @@ impl System {
         if let Some(ref kernel) = self.kernel {
             kernel.suspend_emulation(true);
             if !kernel.close_services() {
-                log::warn!(
-                    "System: service shutdown incomplete; skipping deeper kernel teardown"
-                );
+                log::warn!("System: service shutdown incomplete; skipping deeper kernel teardown");
                 return;
             }
             kernel.shutdown_cores();

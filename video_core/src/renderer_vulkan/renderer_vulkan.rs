@@ -378,6 +378,7 @@ impl RendererVulkan {
             device.is_patch_list_primitive_restart_supported(),
             device.is_ext_shader_stencil_export_supported(),
             device.is_timeline_semaphore_supported(),
+            device.is_ext_custom_border_color_supported(),
             device.get_max_viewports(),
             syncpoints,
             Arc::clone(&device_memory),
@@ -475,7 +476,10 @@ impl RendererVulkan {
         }
         let (swapchain_image_count, swapchain_image_view_format) = {
             let swapchain = self.swapchain.lock().unwrap();
-            (swapchain.get_image_count(), swapchain.get_image_view_format())
+            (
+                swapchain.get_image_count(),
+                swapchain.get_image_view_format(),
+            )
         };
         self.blit_swapchain.draw_to_present_frame(
             &mut self.rasterizer,

@@ -176,6 +176,29 @@ fn make_draw_params(draw: &DrawCall) -> DrawParams {
     params
 }
 
+fn should_skip_debug_draw(rt0_addr: u64, draw_counter: u32) -> bool {
+    let Some(target_rt) = std::env::var("RUZU_SKIP_VK_DRAW_RT")
+        .ok()
+        .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+    else {
+        return false;
+    };
+    if target_rt != rt0_addr {
+        return false;
+    }
+    if std::env::var("RUZU_SKIP_VK_DRAW_GE")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .is_some_and(|target_draw| draw_counter >= target_draw)
+    {
+        return true;
+    }
+    std::env::var("RUZU_SKIP_VK_DRAW")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .is_some_and(|target_draw| target_draw == draw_counter)
+}
+
 use self::fence_manager::{Fence as VkFence, FenceManager as VkFenceBackend};
 
 fn viewport_state(draw: &DrawCall, index: usize) -> vk::Viewport {
@@ -424,6 +447,7 @@ impl RasterizerVulkan {
         patch_list_primitive_restart_supported: bool,
         shader_stencil_export_supported: bool,
         timeline_semaphore_supported: bool,
+        custom_border_color_supported: bool,
         max_viewports: u32,
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<MaxwellDeviceMemoryManager>,
@@ -548,6 +572,7 @@ impl RasterizerVulkan {
             render_pass_cache.as_mut(),
             &mut descriptor_pool,
             &mut compute_pass_desc_queue,
+            custom_border_color_supported,
         );
 
         // Create query cache
@@ -758,8 +783,7 @@ impl RasterizerVulkan {
             // The draw executes but lands in the internal offscreen
             // framebuffer instead of the guest render target — the guest RT
             // keeps its stale contents, which reads as a lost draw.
-            if self.draw_offscreen_fallback <= 16
-                || self.draw_offscreen_fallback.is_power_of_two()
+            if self.draw_offscreen_fallback <= 16 || self.draw_offscreen_fallback.is_power_of_two()
             {
                 log::warn!(
                     "[DRAW_OFFSCREEN] #{} no guest framebuffer resolved (draw={} rt0=0x{:X} fmt={})",
@@ -870,10 +894,19 @@ impl RasterizerVulkan {
                     .and_then(|info| info.as_ref())
                     .or_else(|| stage_infos.get(0).and_then(|info| info.as_ref()));
                 let fs_info = stage_infos.get(4).and_then(|info| info.as_ref());
+                let vs_stage = draw.shader_stages[1];
+                let fs_stage = draw.shader_stages[5];
                 log::info!(
-                    "[VK_SHADER_INFO] draw={} rt0_addr=0x{:X} vs_cbufs={} vs_textures={} vs_ssbos={} fs_cbufs={} fs_textures={} fs_ssbos={} fs_stores={} fs_uses_demote={} fs_uses_render_area={} fs_uses_rescaling={}",
+                    "[VK_SHADER_INFO] draw={} rt0_addr=0x{:X} base=0x{:X} vs_enabled={} vs_offset=0x{:X} vs_addr=0x{:X} fs_enabled={} fs_offset=0x{:X} fs_addr=0x{:X} vs_cbufs={} vs_textures={} vs_ssbos={} fs_cbufs={} fs_textures={} fs_ssbos={} fs_stores={} fs_uses_demote={} fs_uses_render_area={} fs_uses_rescaling={}",
                     self.draw_counter,
                     rt0.address,
+                    draw.program_base_address,
+                    vs_stage.enabled,
+                    vs_stage.offset,
+                    draw.program_base_address + vs_stage.offset as u64,
+                    fs_stage.enabled,
+                    fs_stage.offset,
+                    draw.program_base_address + fs_stage.offset as u64,
                     vs_info.map(|info| info.constant_buffer_descriptors.len()).unwrap_or(0),
                     vs_info.map(|info| info.texture_descriptors.len()).unwrap_or(0),
                     vs_info.map(|info| info.storage_buffers_descriptors.len()).unwrap_or(0),
@@ -944,6 +977,17 @@ impl RasterizerVulkan {
         }
 
         // 7. Issue draw call
+        if should_skip_debug_draw(draw.render_targets[0].address, self.draw_counter) {
+            log::warn!(
+                "[VK_DRAW_SKIP_DEBUG] draw={} rt0_addr=0x{:X}",
+                self.draw_counter,
+                draw.render_targets[0].address
+            );
+            self.texture_cache.dump_image_if_requested();
+            self.draw_counter += 1;
+            self.state_tracker.invalidate_state();
+            return;
+        }
         if draw_params.is_indexed {
             unsafe {
                 self.device.cmd_draw_indexed(
@@ -2063,8 +2107,14 @@ impl RasterizerVulkan {
                         let (buffer, offset, range) = if let Some((gpu_va, size)) = descriptor_info
                         {
                             let size = size.min(0x10000).max(4);
+                            let trace_cbuf_rt = std::env::var("RUZU_TRACE_VK_CBUF_RT")
+                                .ok()
+                                .and_then(|value| {
+                                    u64::from_str_radix(value.trim_start_matches("0x"), 16).ok()
+                                });
                             if std::env::var_os("RUZU_TRACE_VK_CBUF").is_some()
-                                && self.draw_counter <= 3
+                                && trace_cbuf_rt
+                                    .is_none_or(|target| target == draw.render_targets[0].address)
                             {
                                 let stage = binding.uniform_stage.unwrap_or(u32::MAX);
                                 let index = binding
@@ -2080,8 +2130,9 @@ impl RasterizerVulkan {
                                     ]));
                                 }
                                 log::info!(
-                                    "[VK_CBUF] draw={} binding={} stage={} index={} addr=0x{:X} size={} f32={:?}",
+                                    "[VK_CBUF] draw={} rt0_addr=0x{:X} binding={} stage={} index={} addr=0x{:X} size={} f32={:?}",
                                     self.draw_counter,
+                                    draw.render_targets[0].address,
                                     binding.binding,
                                     stage,
                                     index,
@@ -2090,13 +2141,24 @@ impl RasterizerVulkan {
                                     floats
                                 );
                             }
-                            let (buffer, offset) = self.buffer_cache.get_or_upload(
-                                gpu_va,
-                                size,
-                                read_gpu,
-                                &mut self.staging_pool,
-                                upload_cmd,
-                            );
+                            let (buffer, offset) =
+                                if binding.descriptor_type == vk::DescriptorType::UNIFORM_BUFFER {
+                                    self.buffer_cache.get_or_upload_fresh(
+                                        gpu_va,
+                                        size,
+                                        read_gpu,
+                                        &mut self.staging_pool,
+                                        upload_cmd,
+                                    )
+                                } else {
+                                    self.buffer_cache.get_or_upload(
+                                        gpu_va,
+                                        size,
+                                        read_gpu,
+                                        &mut self.staging_pool,
+                                        upload_cmd,
+                                    )
+                                };
                             (buffer, offset, size)
                         } else {
                             (self.fallback_uniform_buffer, 0, 0x10000)
@@ -2147,14 +2209,26 @@ impl RasterizerVulkan {
                                 .texture_cache
                                 .sampler_handle(sampler_id)
                                 .unwrap_or(self.fallback_sampler);
-                            if std::env::var_os("RUZU_TRACE_VK_TEXTURE_STATE").is_some() {
+                            let trace_texture_state =
+                                std::env::var_os("RUZU_TRACE_VK_TEXTURE_STATE").is_some();
+                            let trace_texture_rt = std::env::var("RUZU_TRACE_VK_TEXTURE_STATE_RT")
+                                .ok()
+                                .and_then(|value| {
+                                    u64::from_str_radix(value.trim_start_matches("0x"), 16).ok()
+                                });
+                            if trace_texture_state
+                                && trace_texture_rt
+                                    .is_none_or(|target| target == draw.render_targets[0].address)
+                            {
                                 if view_id.is_valid() && view_id != NULL_IMAGE_VIEW_ID {
                                     let view =
                                         self.texture_cache.base.slot_image_views.get(view_id);
                                     let image =
                                         self.texture_cache.base.slot_images.get(view.image_id);
                                     log::warn!(
-                                        "[VK_TEXTURE_STATE] binding={} elem={} sampled_index={} view_id={} sampler_id={} image_id={} view_gpu=0x{:X} view_fmt={:?} view_type={:?} view_range={:?} view_swizzle={:?} view_size={:?} view_flags={:?} image_type={:?} image_fmt={:?} image_size={:?} image_gpu=0x{:X} image_cpu=0x{:X} guest_size={} unswizzled_size={} image_flags={:?}",
+                                        "[VK_TEXTURE_STATE] draw={} rt0_addr=0x{:X} binding={} elem={} sampled_index={} view_id={} sampler_id={} image_id={} view_gpu=0x{:X} view_fmt={:?} view_type={:?} view_range={:?} view_swizzle={:?} view_size={:?} view_flags={:?} image_type={:?} image_fmt={:?} image_size={:?} image_gpu=0x{:X} image_cpu=0x{:X} guest_size={} unswizzled_size={} image_flags={:?}",
+                                        self.draw_counter,
+                                        draw.render_targets[0].address,
                                         binding.binding,
                                         element,
                                         sampled_index,
@@ -2179,7 +2253,9 @@ impl RasterizerVulkan {
                                     );
                                 } else {
                                     log::warn!(
-                                        "[VK_TEXTURE_STATE] binding={} elem={} sampled_index={} view_id={} sampler_id={} null_view",
+                                        "[VK_TEXTURE_STATE] draw={} rt0_addr=0x{:X} binding={} elem={} sampled_index={} view_id={} sampler_id={} null_view",
+                                        self.draw_counter,
+                                        draw.render_targets[0].address,
                                         binding.binding,
                                         element,
                                         sampled_index,
@@ -2190,7 +2266,9 @@ impl RasterizerVulkan {
                                 if sampler_id.is_valid() {
                                     let tsc = self.texture_cache.base.slot_samplers.get(sampler_id);
                                     log::warn!(
-                                        "[VK_TEXTURE_SAMPLER] binding={} elem={} sampler_id={} raw={:016X?} wrap=({},{},{}) filter=({},{},{}) depth_cmp={} depth_func={} lod=({:.3},{:.3}) bias={:.3}",
+                                        "[VK_TEXTURE_SAMPLER] draw={} rt0_addr=0x{:X} binding={} elem={} sampler_id={} raw={:016X?} wrap=({},{},{}) filter=({},{},{}) depth_cmp={} depth_func={} lod=({:.3},{:.3}) bias={:.3}",
+                                        self.draw_counter,
+                                        draw.render_targets[0].address,
                                         binding.binding,
                                         element,
                                         sampler_id.index,
@@ -2391,9 +2469,11 @@ impl RasterizerVulkan {
             .prepare_framebuffer_for_present(framebuffer_addr, cmd);
         if std::env::var_os("RUZU_TRACE_VK_PRESENT").is_some() {
             log::info!(
-                "[VK_PRESENT] AccelerateDisplay hit addr=0x{:X} view={} image=0x{:X} image_view=0x{:X} size={}x{} scaled={}",
+                "[VK_PRESENT] AccelerateDisplay hit addr=0x{:X} view={} view_fmt={:?} view_swizzle={:?} image=0x{:X} image_view=0x{:X} size={}x{} scaled={}",
                 framebuffer_addr,
                 framebuffer_view.common.view_id.index,
+                framebuffer_view.common.view.format,
+                framebuffer_view.common.view.swizzle,
                 framebuffer_view.image.as_raw(),
                 framebuffer_view.image_view.as_raw(),
                 framebuffer_view.width,

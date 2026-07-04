@@ -14,8 +14,8 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use super::super::service::server_manager::ServerManager;
 use super::super::service::os::event::Event;
+use super::super::service::server_manager::ServerManager;
 use super::k_memory_manager::KMemoryManager;
 use super::k_port::KPort;
 use super::k_process::KProcess;
@@ -443,6 +443,7 @@ fn dump_thread_state(kernel: &KernelCore) {
     dump_pc_sample_hist();
     crate::hle::kernel::svc_dispatch::dump_svc_ring_profile();
     crate::hle::kernel::svc_dispatch::dump_svc_summary_profile();
+    crate::hle::kernel::svc_dispatch::dump_svc_profile();
     crate::hle::kernel::svc::svc_memory_history::dump("sigusr1_thread_dump");
     crate::hle::service::nvnflinger::buffer_queue_core::dump_bqp_wait_profile();
     crate::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
@@ -2327,7 +2328,11 @@ impl KernelCore {
 
             if should_wait {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-                while !manager.try_lock().map(|guard| guard.is_stopped()).unwrap_or(false) {
+                while !manager
+                    .try_lock()
+                    .map(|guard| guard.is_stopped())
+                    .unwrap_or(false)
+                {
                     if std::time::Instant::now() >= deadline {
                         log::warn!(
                             "KernelCore::close_services: timed out waiting for ServerManager stop"

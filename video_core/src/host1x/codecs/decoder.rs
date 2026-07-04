@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn decoder_state_owns_memory_manager_and_frame_queue_handles() {
-        let memory_manager = Arc::new(parking_lot::Mutex::new(MemoryManager::new(0, 32, 0)));
+        let memory_manager = Arc::new(parking_lot::Mutex::new(MemoryManager::new(0)));
         let frame_queue = Arc::new(FrameQueue::new());
 
         let state = DecoderState::new(3, Arc::clone(&memory_manager), Arc::clone(&frame_queue));

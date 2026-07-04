@@ -51,7 +51,14 @@ impl SyncpointEventValue {
 
 struct InternalEvent {
     readable_event: Option<Arc<Mutex<KReadableEvent>>>,
-    status: AtomicU32,
+    // Shared with the syncpoint-manager wait callback. Upstream's callback
+    // captures `this` and touches `events[slot].status` directly without
+    // taking NvEventsLock; the Rust port keeps the table behind a Mutex, so
+    // the callback must hold its own reference to the per-slot atomic to stay
+    // lock-free (RegisterHostAction fires the callback synchronously on the
+    // caller's thread when the fence is already signalled — taking the events
+    // mutex there self-deadlocks, as the caller holds it).
+    status: Arc<AtomicU32>,
     fails: u32,
     assigned_syncpt: u32,
     assigned_value: u32,
@@ -69,7 +76,7 @@ impl Default for InternalEvent {
     fn default() -> Self {
         Self {
             readable_event: None,
-            status: AtomicU32::new(EventState::Available as u32),
+            status: Arc::new(AtomicU32::new(EventState::Available as u32)),
             fails: 0,
             assigned_syncpt: 0,
             assigned_value: 0,
@@ -741,30 +748,40 @@ impl NvHostCtrl {
                     } else {
                         params.value.raw = slot | (fence_id << 4);
                     }
-                    let system = self.events_interface.system();
-                    let events_ref = Arc::clone(&self.events);
+                    // Upstream's callback captures `this`+`slot` and touches only
+                    // `events[slot].status` (atomic) and its kevent — it never takes
+                    // NvEventsLock. `RegisterHostAction` fires the callback
+                    // synchronously on this thread when the fence is already
+                    // signalled, and we are holding the events mutex here, so the
+                    // callback must not lock the events table (self-deadlock).
+                    let status_ref = Arc::clone(&event.status);
+                    let callback_readable_event = event.readable_event.clone();
                     event.wait_handle = self.syncpoint_manager().register_host_action(
                         fence_id,
                         target_value,
                         Box::new(move || {
-                            let should_signal = {
-                                let mut events = events_ref.lock().unwrap();
-                                let event = &mut events[slot as usize];
-                                event
-                                    .status
-                                    .swap(EventState::Signalling as u32, Ordering::AcqRel)
-                                    == EventState::Waiting as u32
-                            };
-
-                            if should_signal {
-                                let _ = system;
-                                Self::signal_event_from_slot(&events_ref, slot);
+                            if status_ref.swap(EventState::Signalling as u32, Ordering::AcqRel)
+                                == EventState::Waiting as u32
+                            {
+                                if let Some(readable_event) = &callback_readable_event {
+                                    let object_id = {
+                                        let mut readable_event = readable_event.lock().unwrap();
+                                        let object_id = readable_event.object_id;
+                                        readable_event.signal_from_host();
+                                        object_id
+                                    };
+                                    Self::trace_event_record(
+                                        12,
+                                        slot,
+                                        slot,
+                                        fence_id,
+                                        target_value,
+                                        EventState::Signalling as u32,
+                                        object_id,
+                                    );
+                                }
                             }
-
-                            let mut events = events_ref.lock().unwrap();
-                            events[slot as usize]
-                                .status
-                                .store(EventState::Signalled as u32, Ordering::Release);
+                            status_ref.store(EventState::Signalled as u32, Ordering::Release);
                         }),
                     );
 

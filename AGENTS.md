@@ -83,6 +83,12 @@ This document exists because earlier progress proved that a crate can be "substa
     "Probably equivalent" is NOT good enough.
   </principle>
 
+  <principle name="fix_small_upstream_divergences_when_found" priority="6">
+    If an upstream divergence is discovered while investigating another issue, fix it immediately when the correction is small, local, and does not require a large structural refactor.
+    Do NOT dismiss a confirmed divergence merely because it is not proven to be the current bug's root cause.
+    If the correction would be large, structural, or risky for the current slice, document it explicitly and continue with the active investigation.
+  </principle>
+
 </core_philosophy>
 
 <non_negotiable_rules>

@@ -1637,7 +1637,7 @@ mod tests {
 
     #[test]
     fn process_method_uses_cdma_method_index_like_upstream() {
-        let memory = Arc::new(parking_lot::Mutex::new(MemoryManager::new(0, 32, 0)));
+        let memory = Arc::new(parking_lot::Mutex::new(MemoryManager::new(0)));
         let queue = Arc::new(FrameQueue::new());
         let mut vic = Vic::new(4, 0, queue, memory);
 

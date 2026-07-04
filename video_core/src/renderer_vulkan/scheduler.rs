@@ -361,8 +361,8 @@ impl Scheduler {
             all_signals.extend_from_slice(signal_semaphores);
             let mut signal_values = vec![0u64; all_signals.len()];
             signal_values[0] = tick;
-            let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::builder()
-                .signal_semaphore_values(&signal_values);
+            let mut timeline_info =
+                vk::TimelineSemaphoreSubmitInfo::builder().signal_semaphore_values(&signal_values);
             let submit_info = vk::SubmitInfo::builder()
                 .command_buffers(&cmd_buffers)
                 .signal_semaphores(&all_signals)
