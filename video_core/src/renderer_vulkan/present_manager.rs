@@ -415,7 +415,6 @@ impl PresentManager {
         self.ctx.frame_cv.notify_one();
     }
 
-
     /// Port of `PresentManager::RecreateFrame`.
     ///
     /// Recreates the frame's image, image view, and framebuffer to match
@@ -581,7 +580,12 @@ impl PresentThreadContext {
     /// `scheduler` is `Some` only on the direct (non-threaded) path; the
     /// present thread cannot touch the GPU thread's scheduler and relies on
     /// the `render_ready` semaphore chain instead.
-    fn copy_to_swapchain(&self, frame_index: usize, frame: &Frame, mut scheduler: Option<&mut Scheduler>) {
+    fn copy_to_swapchain(
+        &self,
+        frame_index: usize,
+        frame: &Frame,
+        mut scheduler: Option<&mut Scheduler>,
+    ) {
         let trace_present = std::env::var_os("RUZU_TRACE_PRESENT").is_some();
         let mut swapchain = self.swapchain.lock().unwrap();
         let needs_recreation = swapchain.needs_recreation()
@@ -951,7 +955,10 @@ impl PresentThreadContext {
         let buffer = match unsafe { self.device.create_buffer(&buffer_info, None) } {
             Ok(buffer) => buffer,
             Err(err) => {
-                log::error!("[PRESENT] failed to create swapchain dump buffer: {:?}", err);
+                log::error!(
+                    "[PRESENT] failed to create swapchain dump buffer: {:?}",
+                    err
+                );
                 return None;
             }
         };
@@ -977,7 +984,10 @@ impl PresentThreadContext {
                 unsafe {
                     self.device.destroy_buffer(buffer, None);
                 }
-                log::error!("[PRESENT] failed to allocate swapchain dump memory: {:?}", err);
+                log::error!(
+                    "[PRESENT] failed to allocate swapchain dump memory: {:?}",
+                    err
+                );
                 return None;
             }
         };
@@ -1004,12 +1014,12 @@ impl PresentThreadContext {
         present_done: vk::Fence,
         extent: vk::Extent2D,
     ) {
-        let result = unsafe {
-            self.device
-                .wait_for_fences(&[present_done], true, u64::MAX)
-        };
+        let result = unsafe { self.device.wait_for_fences(&[present_done], true, u64::MAX) };
         if let Err(err) = result {
-            log::error!("[PRESENT] failed waiting for swapchain dump fence: {:?}", err);
+            log::error!(
+                "[PRESENT] failed waiting for swapchain dump fence: {:?}",
+                err
+            );
             self.destroy_swapchain_dump_buffer(dump);
             return;
         }

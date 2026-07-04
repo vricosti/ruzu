@@ -151,10 +151,7 @@ fn configure_macos_vulkan_icd(library_path: &std::path::Path) {
         return;
     }
 
-    log::info!(
-        "Using Vulkan ICD manifest from {}",
-        icd_path.display()
-    );
+    log::info!("Using Vulkan ICD manifest from {}", icd_path.display());
     std::env::set_var("VK_ICD_FILENAMES", icd_path);
 }
 

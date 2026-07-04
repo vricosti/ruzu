@@ -787,6 +787,24 @@ impl BufferCache {
         (buffer, 0)
     }
 
+    /// Upload a short-lived uniform buffer even when the same GPU VA was seen
+    /// before. Guest constant buffers are commonly allocated from ring buffers
+    /// and rewritten in place; caching solely by address would bind stale
+    /// constants after the ring wraps.
+    pub fn get_or_upload_fresh(
+        &mut self,
+        gpu_va: u64,
+        size: vk::DeviceSize,
+        read_gpu: &dyn Fn(u64, &mut [u8]),
+        staging_pool: &mut StagingBufferPool,
+        cmd: vk::CommandBuffer,
+    ) -> (vk::Buffer, vk::DeviceSize) {
+        if let Some(old) = self.cache.remove(&gpu_va) {
+            self.sentence(old);
+        }
+        self.get_or_upload(gpu_va, size, read_gpu, staging_pool, cmd)
+    }
+
     fn get_or_upload_bytes(
         &mut self,
         cache_key: u64,

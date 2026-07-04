@@ -143,7 +143,15 @@ Examples of common false confidence:
 
 For this port, "probably equivalent" is not good enough.
 
-### 6. Method names, signatures, and lifecycle must match upstream
+### 6. Fix small upstream divergences when found
+
+If an upstream divergence is discovered while investigating another issue, fix it immediately when the correction is small, local, and does not require a large structural refactor.
+
+Do not dismiss a confirmed divergence merely because it is not proven to be the current bug's root cause.
+
+If the correction would be large, structural, or risky for the current slice, document it explicitly and continue with the active investigation.
+
+### 7. Method names, signatures, and lifecycle must match upstream
 
 When porting a C++ method:
 
@@ -153,7 +161,7 @@ When porting a C++ method:
 - **Lifecycle**: if upstream constructs an object in the constructor and destroys it in the destructor, the port does the same (`new` / `Drop`). If upstream initializes in `Initialize()` and finalizes in `Finalize()`, the port does not merge them into the constructor.
 - **Call order**: if upstream calls A before B, the port calls A before B. Effect ordering bugs (like writing LR before reading Rm in `BLX_reg`) are real bugs.
 
-### 7. Zero assumptions — always verify against upstream
+### 8. Zero assumptions — always verify against upstream
 
 Never assume what an upstream function does based on its name. Always read the upstream implementation before writing the port.
 

@@ -854,12 +854,22 @@ impl Hash for FixedPipelineState {
         self.viewport_swizzles.hash(state);
         self.attribute_types_or_enabled_divisors.hash(state);
 
-        // Only include dynamic/vertex state if not managed by dynamic state extensions
-        if !self.extended_dynamic_state() || !self.dynamic_vertex_input() {
-            self.dynamic_state.hash(state);
-            self.attachments.hash(state);
-            self.attributes.hash(state);
-            self.binding_divisors.hash(state);
+        // Match upstream FixedPipelineState::Size(): the hash covers a byte
+        // prefix ending at a different field depending on enabled dynamic
+        // state. Keep this ordered like the C++ struct declaration.
+        if self.dynamic_vertex_input() && self.extended_dynamic_state_3_blend() {
+            return;
+        }
+
+        self.dynamic_state.hash(state);
+        self.attachments.hash(state);
+        if self.dynamic_vertex_input() {
+            return;
+        }
+
+        self.attributes.hash(state);
+        self.binding_divisors.hash(state);
+        if !self.extended_dynamic_state() {
             self.vertex_strides.hash(state);
         }
     }
@@ -1388,6 +1398,65 @@ mod tests {
         assert!(with_zeta.depth_enabled());
         assert_eq!(with_zeta.depth_format(), 7);
         assert_ne!(hash_state(&no_zeta), hash_state(&with_zeta));
+    }
+
+    #[test]
+    fn hash_includes_blend_when_dynamic_vertex_input_without_dynamic_blend() {
+        let mut a = FixedPipelineState::default();
+        let mut b = FixedPipelineState::default();
+        a.set_dynamic_vertex_input(true);
+        b.set_dynamic_vertex_input(true);
+        b.attachments[0].set_enabled(true);
+        b.attachments[0].set_source_rgb_factor(BlendFactor::SrcAlpha);
+
+        assert_ne!(hash_state(&a), hash_state(&b));
+    }
+
+    #[test]
+    fn hash_excludes_blend_when_dynamic_vertex_input_and_dynamic_blend() {
+        let mut a = FixedPipelineState::default();
+        let mut b = FixedPipelineState::default();
+        a.set_dynamic_vertex_input(true);
+        b.set_dynamic_vertex_input(true);
+        a.set_extended_dynamic_state_3_blend(true);
+        b.set_extended_dynamic_state_3_blend(true);
+        b.attachments[0].set_enabled(true);
+        b.attachments[0].set_source_rgb_factor(BlendFactor::SrcAlpha);
+
+        assert_eq!(hash_state(&a), hash_state(&b));
+    }
+
+    #[test]
+    fn hash_excludes_attributes_when_dynamic_vertex_input() {
+        let mut a = FixedPipelineState::default();
+        let mut b = FixedPipelineState::default();
+        a.set_dynamic_vertex_input(true);
+        b.set_dynamic_vertex_input(true);
+        b.attributes[0].set_enabled(true);
+        b.binding_divisors[0] = 7;
+        b.vertex_strides[0] = 16;
+
+        assert_eq!(hash_state(&a), hash_state(&b));
+    }
+
+    #[test]
+    fn hash_excludes_vertex_strides_when_extended_dynamic_state() {
+        let mut a = FixedPipelineState::default();
+        let mut b = FixedPipelineState::default();
+        a.set_extended_dynamic_state(true);
+        b.set_extended_dynamic_state(true);
+        b.vertex_strides[0] = 16;
+
+        assert_eq!(hash_state(&a), hash_state(&b));
+    }
+
+    #[test]
+    fn hash_includes_vertex_strides_without_extended_dynamic_state() {
+        let a = FixedPipelineState::default();
+        let mut b = FixedPipelineState::default();
+        b.vertex_strides[0] = 16;
+
+        assert_ne!(hash_state(&a), hash_state(&b));
     }
 
     #[test]

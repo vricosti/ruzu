@@ -143,8 +143,7 @@ static SUPPRESS_LOGGING: AtomicBool = AtomicBool::new(true);
 const FILTER_LEVEL_INIT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
 static FILTER_LEVELS: [std::sync::atomic::AtomicU8; crate::logging::types::Class::COUNT] =
     [FILTER_LEVEL_INIT; crate::logging::types::Class::COUNT];
-static FILTER_GLOBAL_MIN: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(u8::MAX);
+static FILTER_GLOBAL_MIN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
 
 fn publish_filter_snapshot(filter: &Filter) {
     let mut min = u8::MAX;
