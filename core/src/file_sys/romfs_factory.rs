@@ -42,7 +42,7 @@ pub enum StorageId {
 /// Upstream holds references to `ContentProvider` and `FileSystemController`.
 pub struct RomFSFactory {
     file: Option<VirtualFile>,
-    packed_update_raw: Option<VirtualFile>,
+    packed_update_raw: Mutex<Option<VirtualFile>>,
     updatable: bool,
     content_provider: Option<Arc<Mutex<ContentProviderUnion>>>,
     filesystem_controller: Option<
@@ -74,7 +74,7 @@ impl RomFSFactory {
 
         Self {
             file,
-            packed_update_raw: None,
+            packed_update_raw: Mutex::new(None),
             updatable,
             content_provider: Some(content_provider),
             filesystem_controller: Some(filesystem_controller),
@@ -95,15 +95,15 @@ impl RomFSFactory {
     ) -> Self {
         Self {
             file,
-            packed_update_raw: None,
+            packed_update_raw: Mutex::new(None),
             updatable,
             content_provider,
             filesystem_controller,
         }
     }
 
-    pub fn set_packed_update(&mut self, update_raw_file: VirtualFile) {
-        self.packed_update_raw = Some(update_raw_file);
+    pub fn set_packed_update(&self, update_raw_file: VirtualFile) {
+        *self.packed_update_raw.lock().unwrap() = Some(update_raw_file);
     }
 
     /// Open the RomFS for the current process.
@@ -131,7 +131,7 @@ impl RomFSFactory {
             nca.as_ref(),
             base,
             ContentRecordType::Program,
-            self.packed_update_raw.clone(),
+            self.packed_update_raw.lock().unwrap().clone(),
             true,
         ))
     }
@@ -279,10 +279,10 @@ mod tests {
 
     #[test]
     fn test_set_packed_update() {
-        let mut factory = RomFSFactory::new_with_file(None, false, None, None);
-        assert!(factory.packed_update_raw.is_none());
+        let factory = RomFSFactory::new_with_file(None, false, None, None);
+        assert!(factory.packed_update_raw.lock().unwrap().is_none());
         factory.set_packed_update(make_test_file());
-        assert!(factory.packed_update_raw.is_some());
+        assert!(factory.packed_update_raw.lock().unwrap().is_some());
     }
 
     #[test]

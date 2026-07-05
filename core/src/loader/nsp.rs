@@ -203,7 +203,8 @@ impl AppLoader for AppLoaderNsp {
         // and handles packed updates:
         //   if (ReadUpdateRaw(update_raw) == Success && update_raw != nullptr)
         //       system.GetFileSystemController().SetPackedUpdate(...)
-        // FileSystemController integration is handled at the System level.
+        // In the Rust port, process_id is assigned after Load() returns, so
+        // RegisterProcess and SetPackedUpdate are both performed in System::load.
 
         self.is_loaded = true;
         result

@@ -1457,8 +1457,13 @@ impl System {
         self.load_parameters = load_parameters;
         self.current_process = Some(process);
 
-        if let Some(ref process) = self.current_process {
-            let program_id = process.get_program_id();
+        if let Some((program_id, is_64bit)) = self
+            .current_process
+            .as_ref()
+            .map(|process| (process.get_program_id(), process.is_64bit()))
+        {
+            self.set_runtime_program_id(program_id);
+            self.set_runtime_64bit(is_64bit);
             let launch = self.content_provider.as_ref().map_or_else(
                 || ApplicationLaunchProperty {
                     title_id: program_id,
@@ -1523,6 +1528,19 @@ impl System {
                 program_id,
                 romfs_factory,
             );
+            if let Some(ref loader) = self.app_loader {
+                let mut update_raw = None;
+                if loader.read_update_raw(&mut update_raw)
+                    == crate::loader::loader::ResultStatus::Success
+                {
+                    if let Some(update_raw) = update_raw {
+                        self.filesystem_controller
+                            .lock()
+                            .unwrap()
+                            .set_packed_update(process.process_id, update_raw);
+                    }
+                }
+            }
         }
 
         // Upstream: applet_manager.CreateAndInsertByFrontendAppletParameters(process, params)

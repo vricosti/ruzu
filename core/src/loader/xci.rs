@@ -140,13 +140,8 @@ impl AppLoader for AppLoaderXci {
 
         // Upstream: if (ReadUpdateRaw(update_raw) == Success && update_raw != nullptr)
         //     system.GetFileSystemController().SetPackedUpdate(process.GetProcessId(), update_raw);
-        // FileSystemController::SetPackedUpdate is not yet wired into the loader path.
-        let mut update_raw = None;
-        if self.read_update_raw(&mut update_raw) == ResultStatus::Success {
-            if update_raw.is_some() {
-                log::info!("XCI contains a packed update; SetPackedUpdate not yet wired");
-            }
-        }
+        // In the Rust port, process_id is assigned after Load() returns, so
+        // SetPackedUpdate is performed in System::load.
 
         self.is_loaded = true;
         result
