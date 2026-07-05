@@ -14,7 +14,8 @@ fn map() -> &'static Mutex<HashMap<u64, (Instant, i64)>> {
 }
 
 fn enabled() -> bool {
-    std::env::var_os("RUZU_TRACE_SLEEP_TIMING").is_some()
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_SLEEP_TIMING").is_some())
 }
 
 /// Record that `tid` entered `SleepThread(ns)`. Overwrites any prior pending

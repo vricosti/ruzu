@@ -1060,6 +1060,45 @@ pub fn compile_dual_vertex_shader_glsl_at_offset_with_bindings_and_host_info(
     }
 }
 
+/// Compile a Maxwell VertexA + VertexB pair to SPIR-V through the
+/// upstream-shaped environment bridge, matching upstream
+/// `TranslateProgram(env, cfg, host_info)` followed by
+/// `MergeDualVertexPrograms`.
+pub fn compile_dual_vertex_shader_from_env_with_bindings_and_host_info(
+    vertex_a_code: &[u64],
+    vertex_a_base_offset: u32,
+    vertex_a_env: &mut dyn Environment,
+    vertex_b_code: &[u64],
+    vertex_b_base_offset: u32,
+    vertex_b_env: &mut dyn Environment,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut backend::bindings::Bindings,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
+) -> CompiledShader {
+    let mut vertex_a = translate_program_from_env_with_host_info(
+        vertex_a_code,
+        vertex_a_base_offset,
+        vertex_a_env,
+        host_info,
+    );
+    let mut vertex_b = translate_program_from_env_with_host_info(
+        vertex_b_code,
+        vertex_b_base_offset,
+        vertex_b_env,
+        host_info,
+    );
+    let mut program = merge_dual_vertex_programs(&mut vertex_a, &mut vertex_b);
+
+    convert_legacy_to_generic(&mut program, runtime_info);
+    let spirv_words = backend::emit_spirv_with_bindings(&program, profile, runtime_info, bindings);
+    CompiledShader {
+        spirv_words,
+        info: program.info,
+        stage: ShaderStage::VertexB,
+    }
+}
+
 /// Hash Maxwell instruction code for cache lookup.
 fn hash_code(code: &[u64]) -> u64 {
     // FNV-1a hash

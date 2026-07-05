@@ -229,6 +229,7 @@ pub(crate) const BLEND_PER_TARGET_STRIDE: u32 = 8;
 
 pub(crate) const POLYGON_MODE_FRONT: u32 = reg_index!(0x0DAC);
 pub(crate) const POLYGON_MODE_BACK: u32 = reg_index!(0x0DB0);
+pub(crate) const PATCH_VERTICES: u32 = reg_index!(0x0DCC);
 pub(crate) const POLYGON_OFFSET_POINT_ENABLE: u32 = reg_index!(0x0DC0);
 pub(crate) const POLYGON_OFFSET_LINE_ENABLE: u32 = reg_index!(0x0DC4);
 pub(crate) const POLYGON_OFFSET_FILL_ENABLE: u32 = reg_index!(0x0DC8);
@@ -247,6 +248,8 @@ pub(crate) const DEPTH_BIAS: u32 = reg_index!(0x15BC);
 pub(crate) const DEPTH_BIAS_CLAMP: u32 = reg_index!(0x187C);
 pub(crate) const CULL_TEST_ENABLE: u32 = reg_index!(0x1918);
 pub(crate) const FRONT_FACE: u32 = reg_index!(0x191C);
+pub(crate) const PROVOKING_VERTEX: u32 = reg_index!(0x1684);
+pub(crate) const DEPTH_BOUNDS_ENABLE: u32 = reg_index!(0x19BC);
 pub(crate) const CULL_FACE: u32 = reg_index!(0x1920);
 pub(crate) const FRAMEBUFFER_SRGB: u32 = reg_index!(0x15B8);
 pub(crate) const VIEWPORT_SCALE_OFFSET_ENABLED: u32 = reg_index!(0x192C);
@@ -2033,6 +2036,22 @@ pub struct DrawCall {
     pub primitive_restart: PrimitiveRestartInfo,
     pub logic_op: LogicOpInfo,
     pub depth_clamp_enabled: bool,
+    pub conservative_raster_enable: bool,
+    pub engine_state: EngineHint,
+    pub provoking_vertex_last: bool,
+    pub depth_bounds_enable: bool,
+    pub mandated_early_z: bool,
+    pub alpha_test_enabled: bool,
+    pub alpha_test_func: ComparisonOp,
+    pub alpha_test_ref: f32,
+    pub point_size: f32,
+    pub tessellation_primitive: u32,
+    pub tessellation_spacing: u32,
+    pub tessellation_clockwise: bool,
+    pub patch_vertices: u32,
+    pub anti_alias_samples_mode: u32,
+    pub anti_alias_alpha_control: AntiAliasAlphaControlInfo,
+    pub line_anti_alias_enable: bool,
     pub program_base_address: u64,
     pub cb_bindings: [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
     pub vertex_attribs: Vec<VertexAttribInfo>,
@@ -2057,6 +2076,9 @@ pub struct DrawCall {
     pub render_targets: [RenderTargetInfo; 8],
     /// Depth/stencil target configuration (`regs.zeta` + `regs.zeta_size`).
     pub zeta: ZetaInfo,
+    /// Transform feedback enable/state captured at draw time.
+    pub transform_feedback_enabled: bool,
+    pub transform_feedback_state: TransformFeedbackState,
     /// Dirty flags captured with this draw, matching upstream state-tracker
     /// decisions for render-target refresh.
     pub dirty_flags: [bool; 256],
@@ -2441,6 +2463,11 @@ impl Maxwell3D {
     /// Upstream reads `regs.mandated_early_z != 0` directly.
     pub fn mandated_early_z(&self) -> bool {
         self.regs[MANDATED_EARLY_Z as usize] != 0
+    }
+
+    /// Upstream reads `regs.patch_vertices`.
+    pub fn patch_vertices(&self) -> u32 {
+        self.regs[PATCH_VERTICES as usize]
     }
 
     /// Upstream reads `regs.alpha_test_enabled != 0` directly.
@@ -3041,6 +3068,22 @@ impl Maxwell3D {
     pub fn depth_clamp_enabled(&self) -> bool {
         let geometry_clip = (self.regs[VIEWPORT_CLIP_CONTROL as usize] >> 11) & 0x7;
         !matches!(geometry_clip, 1 | 3 | 5)
+    }
+
+    /// Upstream `regs.conservative_raster_enable != 0`, consumed by
+    /// `FixedPipelineState::Refresh`.
+    pub fn conservative_raster_enable(&self) -> bool {
+        self.regs[CONSERVATIVE_RASTER_ENABLE as usize] != 0
+    }
+
+    /// Upstream `regs.provoking_vertex == ProvokingVertex::Last`.
+    pub fn provoking_vertex_last(&self) -> bool {
+        self.regs[PROVOKING_VERTEX as usize] == 1
+    }
+
+    /// Upstream `regs.depth_bounds_enable != 0`.
+    pub fn depth_bounds_enable(&self) -> bool {
+        self.regs[DEPTH_BOUNDS_ENABLE as usize] != 0
     }
 
     // ── Shader program accessors ─────────────────────────────────────────
@@ -3725,6 +3768,14 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.depth_clamp_enabled()
     }
 
+    fn conservative_raster_enable(&self) -> bool {
+        self.conservative_raster_enable()
+    }
+
+    fn engine_state(&self) -> EngineHint {
+        self.engine_state()
+    }
+
     fn alpha_test_enabled(&self) -> bool {
         self.alpha_test_enabled()
     }
@@ -3737,8 +3788,28 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.alpha_test_ref()
     }
 
+    fn tessellation_domain_type(&self) -> u32 {
+        self.tessellation_domain_type()
+    }
+
+    fn tessellation_spacing(&self) -> u32 {
+        self.tessellation_spacing()
+    }
+
+    fn tessellation_clockwise(&self) -> bool {
+        self.tessellation_clockwise()
+    }
+
+    fn patch_vertices(&self) -> u32 {
+        self.patch_vertices()
+    }
+
     fn transform_feedback_enabled(&self) -> bool {
         self.transform_feedback_enabled()
+    }
+
+    fn transform_feedback_state(&self) -> TransformFeedbackState {
+        self.transform_feedback_state()
     }
 
     fn shader_config_enabled(&self, stage: ShaderStageType) -> bool {

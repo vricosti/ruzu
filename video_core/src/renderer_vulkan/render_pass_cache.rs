@@ -11,6 +11,11 @@ use std::collections::HashMap;
 use ash::vk;
 use log::debug;
 
+use super::fixed_pipeline_state::FixedPipelineState;
+use super::maxwell_to_vk;
+use crate::surface::{pixel_format_from_depth_format, pixel_format_from_render_target_format};
+use crate::textures::texture::MsaaMode;
+
 /// Key for render pass lookup — color formats + depth format + samples.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RenderPassKey {
@@ -28,6 +33,35 @@ impl Default for RenderPassKey {
             depth_format: vk::Format::UNDEFINED,
             samples: vk::SampleCountFlags::TYPE_1,
         }
+    }
+}
+
+impl RenderPassKey {
+    /// Port of upstream `MakeRenderPassKey(const FixedPipelineState&)` from
+    /// `vk_graphics_pipeline.cpp`.
+    pub fn from_fixed_pipeline_state(state: &FixedPipelineState) -> Self {
+        let mut key = RenderPassKey::default();
+        for (index, &encoded_format) in state.color_formats.iter().enumerate() {
+            if encoded_format == 0 {
+                key.color_formats[index] = vk::Format::UNDEFINED;
+                continue;
+            }
+            let pixel_format = pixel_format_from_render_target_format(encoded_format as u32);
+            // Use the authoritative surface-format table (same one that creates
+            // the RT images), so the render-pass key matches the attachments,
+            // matching upstream `MakeRenderPassKey` → `MaxwellToVK::SurfaceFormat`.
+            key.color_formats[index] = maxwell_to_vk::surface_format(pixel_format).format;
+            if key.color_formats[index] != vk::Format::UNDEFINED {
+                key.num_color_attachments = (index + 1) as u8;
+            }
+        }
+        if state.depth_enabled() {
+            let depth_format = pixel_format_from_depth_format(state.depth_format());
+            key.depth_format = maxwell_to_vk::surface_format(depth_format).format;
+        }
+        let msaa_mode = MsaaMode::from_raw(state.msaa_mode_raw()).unwrap_or(MsaaMode::Msaa1x1);
+        key.samples = maxwell_to_vk::msaa_mode(msaa_mode);
+        key
     }
 }
 
@@ -235,5 +269,16 @@ mod tests {
         a.color_formats[0] = vk::Format::R8G8B8A8_UNORM;
         b.color_formats[0] = vk::Format::B8G8R8A8_UNORM;
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn render_pass_key_uses_central_surface_format_table() {
+        let mut state = FixedPipelineState::default();
+        state.color_formats[0] = 0xD1; // A2B10G10R10_UNORM
+
+        let key = RenderPassKey::from_fixed_pipeline_state(&state);
+
+        assert_eq!(key.num_color_attachments, 1);
+        assert_eq!(key.color_formats[0], vk::Format::A2B10G10R10_UNORM_PACK32);
     }
 }

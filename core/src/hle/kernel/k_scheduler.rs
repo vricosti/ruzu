@@ -5,7 +5,7 @@
 //! KScheduler: per-core scheduler managing thread dispatch and context switching.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,38 @@ static STARTTHREAD_SCHED_PROFILE: std::sync::OnceLock<Mutex<Vec<StartThreadSched
     std::sync::OnceLock::new();
 static STARTTHREAD_SCHED_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+fn trace_sched_state_filter() -> &'static Option<Vec<u64>> {
+    static FILTER: OnceLock<Option<Vec<u64>>> = OnceLock::new();
+    FILTER.get_or_init(|| {
+        let raw = std::env::var_os("RUZU_TRACE_SCHED_STATE")?;
+        let raw = raw.to_string_lossy();
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
+            return Some(Vec::new());
+        }
+        Some(
+            raw.split(',')
+                .filter_map(|value| {
+                    let value = value.trim();
+                    if value.is_empty() {
+                        return None;
+                    }
+                    value
+                        .strip_prefix("0x")
+                        .or_else(|| value.strip_prefix("0X"))
+                        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                        .or_else(|| value.parse::<u64>().ok())
+                })
+                .collect(),
+        )
+    })
+}
+
+fn should_trace_sched_pick() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_SCHED_PICK").is_some())
+}
+
 fn startthread_sched_profile_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_STARTTHREAD_SCHED").is_some())
@@ -57,31 +89,14 @@ pub(crate) fn trace_tid_filter_matches(thread_id: Option<u64>) -> bool {
     let Some(thread_id) = thread_id else {
         return false;
     };
-    let Some(raw) = std::env::var_os("RUZU_TRACE_SCHED_STATE") else {
+    let Some(filter) = trace_sched_state_filter() else {
         return true;
     };
-    let raw = raw.to_string_lossy();
-    let raw = raw.trim();
-    if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
-        return true;
-    }
-    raw.split(',').any(|value| {
-        let value = value.trim();
-        if value.is_empty() {
-            return false;
-        }
-        let parsed = value
-            .strip_prefix("0x")
-            .or_else(|| value.strip_prefix("0X"))
-            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
-            .or_else(|| value.parse::<u64>().ok());
-        parsed.is_some_and(|tid| tid == thread_id)
-    })
+    filter.is_empty() || filter.contains(&thread_id)
 }
 
 fn should_log_sched_pick_for(ids: &[Option<u64>]) -> bool {
-    std::env::var_os("RUZU_TRACE_SCHED_PICK").is_some()
-        && ids.iter().copied().any(trace_tid_filter_matches)
+    should_trace_sched_pick() && ids.iter().copied().any(trace_tid_filter_matches)
 }
 
 fn trace_sched_fiber_event(
@@ -555,6 +570,68 @@ mod tests {
     }
 
     #[test]
+    fn yield_with_core_migration_moves_suggestion_to_front_like_upstream() {
+        let mut gsc = GlobalSchedulerContext::new();
+        let suggested = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut guard = suggested.lock().unwrap();
+            guard.thread_id = 10;
+            guard.object_id = 10;
+            guard.priority = 20;
+            guard.core_id = 2;
+            guard.physical_affinity_mask.set_affinity_mask(0b0110);
+            guard.set_state(ThreadState::RUNNABLE);
+        }
+        gsc.add_thread(Arc::clone(&suggested));
+
+        gsc.m_priority_queue
+            .push_back(10, 20, 2, 0b0110, false, None);
+        suggested.lock().unwrap().set_active_core(1);
+        gsc.m_priority_queue.change_core(2, 10, 1, 20, false, true);
+
+        assert_eq!(suggested.lock().unwrap().get_active_core(), 1);
+        assert_eq!(gsc.m_priority_queue.get_scheduled_front(1), Some(10));
+        assert_eq!(
+            gsc.m_priority_queue
+                .get_thread_props(10)
+                .map(|props| props.active_core),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn yield_to_any_thread_moves_current_to_no_active_core_like_upstream() {
+        let mut gsc = GlobalSchedulerContext::new();
+        let current = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut guard = current.lock().unwrap();
+            guard.thread_id = 11;
+            guard.object_id = 11;
+            guard.priority = 30;
+            guard.core_id = 1;
+            guard.physical_affinity_mask.set_affinity_mask(0b1110);
+            guard.set_state(ThreadState::RUNNABLE);
+        }
+        gsc.add_thread(Arc::clone(&current));
+
+        gsc.m_priority_queue
+            .push_back(11, 30, 1, 0b1110, false, None);
+        current.lock().unwrap().set_active_core(-1);
+        gsc.m_priority_queue
+            .change_core(1, 11, -1, 30, false, false);
+
+        assert_eq!(current.lock().unwrap().get_active_core(), -1);
+        assert_ne!(gsc.m_priority_queue.get_scheduled_front(1), Some(11));
+        assert_eq!(gsc.m_priority_queue.get_suggested_front(1), Some(11));
+        assert_eq!(
+            gsc.m_priority_queue
+                .get_thread_props(11)
+                .map(|props| props.active_core),
+            Some(-1)
+        );
+    }
+
+    #[test]
     fn scheduled_front_prefers_runnable_pinned_thread_like_upstream() {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let top = Arc::new(KThreadLock::new(KThread::new()));
@@ -662,6 +739,12 @@ mod tests {
     #[test]
     fn enable_scheduling_defers_switch_for_nested_non_runnable_current_thread() {
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        scheduler
+            .lock()
+            .unwrap()
+            .state
+            .needs_scheduling
+            .store(true, Ordering::Relaxed);
         let current_thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut thread = current_thread.lock().unwrap();
@@ -1760,22 +1843,295 @@ impl KScheduler {
         }
     }
 
+    fn highest_priority_thread_id_on_core(&self, core_id: i32) -> Option<u64> {
+        if core_id < 0 {
+            return None;
+        }
+        if core_id == self.core_id {
+            return self.state.highest_priority_thread_id;
+        }
+        super::kernel::get_kernel_ref()
+            .and_then(|kernel| kernel.scheduler(core_id as usize))
+            .and_then(|scheduler| {
+                scheduler
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.state.highest_priority_thread_id)
+            })
+    }
+
     /// Yield with core migration.
+    /// Matches upstream `KScheduler::YieldWithCoreMigration(kernel)`.
     pub fn yield_with_core_migration(
         &mut self,
         process: &Arc<ProcessLock>,
         current_thread_id: u64,
     ) {
-        // Single-core bring-up: match upstream control flow entry point, but keep the same
-        // local-core behavior until cross-core migration exists.
-        self.yield_without_core_migration(process, current_thread_id);
+        if self.exit_thread_if_termination_requested(process, current_thread_id) {
+            self.request_schedule();
+            return;
+        }
+
+        let current_thread = {
+            let process = process.lock().unwrap();
+            process.get_thread_by_thread_id(current_thread_id)
+        };
+        let Some(current_thread) = current_thread else {
+            return;
+        };
+
+        let mut process = process.lock().unwrap();
+        {
+            let current_thread = current_thread.lock().unwrap();
+            if current_thread.get_yield_schedule_count() == process.get_scheduled_count() {
+                return;
+            }
+        }
+
+        let scheduler_lock = super::kernel::scheduler_lock()
+            .expect("global scheduler lock must be initialized before yielding");
+        let _scheduler_guard = super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
+
+        let (core_id, cur_priority, cur_is_dummy) = {
+            let current_thread = current_thread.lock().unwrap();
+            if current_thread.get_raw_state() != ThreadState::RUNNABLE {
+                return;
+            }
+            if current_thread.get_yield_schedule_count() == process.get_scheduled_count() {
+                return;
+            }
+            (
+                current_thread.get_active_core(),
+                current_thread.priority,
+                current_thread.thread_type == super::k_thread::ThreadType::Dummy,
+            )
+        };
+
+        let Some(ref gsc_arc) = process.global_scheduler_context else {
+            self.yielded_thread_id = Some(current_thread_id);
+            self.request_schedule();
+            return;
+        };
+
+        let mut gsc = gsc_arc.lock().unwrap();
+        let next_thread_id = gsc.m_priority_queue.move_to_scheduled_back(
+            current_thread_id,
+            cur_priority,
+            core_id,
+            cur_is_dummy,
+        );
+        process.increment_scheduled_count();
+
+        let mut recheck = false;
+        let mut suggested_id = if core_id >= 0 {
+            gsc.m_priority_queue.get_suggested_front(core_id)
+        } else {
+            None
+        };
+
+        while let Some(candidate_id) = suggested_id {
+            let Some(candidate_props) =
+                gsc.m_priority_queue.get_thread_props(candidate_id).cloned()
+            else {
+                break;
+            };
+            let suggested_core = candidate_props.active_core;
+            let running_on_suggested_core = self.highest_priority_thread_id_on_core(suggested_core);
+
+            if running_on_suggested_core != Some(candidate_id) {
+                let next_waited_longer = next_thread_id
+                    .filter(|next_id| *next_id != current_thread_id)
+                    .and_then(|next_id| gsc.get_thread_by_thread_id(next_id))
+                    .zip(gsc.get_thread_by_thread_id(candidate_id))
+                    .map(|(next, suggested)| {
+                        next.lock().unwrap().get_last_scheduled_tick()
+                            < suggested.lock().unwrap().get_last_scheduled_tick()
+                    })
+                    .unwrap_or(false);
+
+                if candidate_props.priority > cur_priority
+                    || (candidate_props.priority == cur_priority && next_waited_longer)
+                {
+                    suggested_id = None;
+                    break;
+                }
+
+                let running_priority = running_on_suggested_core
+                    .and_then(|tid| gsc.m_priority_queue.get_thread_props(tid))
+                    .map(|props| props.priority);
+                if running_priority.is_none_or(|priority| {
+                    priority
+                        >= super::global_scheduler_context::HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY
+                }) {
+                    if let Some(suggested_thread) = gsc.get_thread_by_thread_id(candidate_id) {
+                        suggested_thread.lock().unwrap().set_active_core(core_id);
+                    }
+                    gsc.m_priority_queue.change_core(
+                        suggested_core,
+                        candidate_id,
+                        core_id,
+                        candidate_props.priority,
+                        candidate_props.is_dummy,
+                        true,
+                    );
+                    gsc.m_priority_queue.increment_scheduled_count(candidate_id);
+                    break;
+                } else {
+                    recheck = true;
+                }
+            }
+
+            suggested_id = gsc.m_priority_queue.get_suggested_next(
+                core_id,
+                candidate_id,
+                candidate_props.priority,
+            );
+        }
+
+        if suggested_id.is_some() || next_thread_id != Some(current_thread_id) {
+            gsc.m_scheduler_update_needed
+                .store(true, std::sync::atomic::Ordering::Release);
+        } else if !recheck {
+            current_thread
+                .lock()
+                .unwrap()
+                .set_yield_schedule_count(process.get_scheduled_count());
+        }
     }
 
     /// Yield to any thread.
     pub fn yield_to_any_thread(&mut self, process: &Arc<ProcessLock>, current_thread_id: u64) {
-        // Single-core bring-up: preserve the SVC ownership in KScheduler while deferring
-        // real inter-core migration until the full priority queue exists.
-        self.yield_without_core_migration(process, current_thread_id);
+        if self.exit_thread_if_termination_requested(process, current_thread_id) {
+            self.request_schedule();
+            return;
+        }
+
+        let current_thread = {
+            let process = process.lock().unwrap();
+            process.get_thread_by_thread_id(current_thread_id)
+        };
+        let Some(current_thread) = current_thread else {
+            return;
+        };
+
+        let mut process = process.lock().unwrap();
+        {
+            let current_thread = current_thread.lock().unwrap();
+            if current_thread.get_yield_schedule_count() == process.get_scheduled_count() {
+                return;
+            }
+        }
+
+        let scheduler_lock = super::kernel::scheduler_lock()
+            .expect("global scheduler lock must be initialized before yielding");
+        let _scheduler_guard = super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
+
+        let (core_id, cur_priority, cur_affinity, cur_is_dummy) = {
+            let current_thread = current_thread.lock().unwrap();
+            if current_thread.get_raw_state() != ThreadState::RUNNABLE {
+                return;
+            }
+            if current_thread.get_yield_schedule_count() == process.get_scheduled_count() {
+                return;
+            }
+            (
+                current_thread.get_active_core(),
+                current_thread.priority,
+                current_thread.physical_affinity_mask.get_affinity_mask(),
+                current_thread.thread_type == super::k_thread::ThreadType::Dummy,
+            )
+        };
+
+        let Some(ref gsc_arc) = process.global_scheduler_context else {
+            self.yielded_thread_id = Some(current_thread_id);
+            self.request_schedule();
+            return;
+        };
+
+        let mut gsc = gsc_arc.lock().unwrap();
+        current_thread.lock().unwrap().set_active_core(-1);
+        gsc.m_priority_queue.change_core(
+            core_id,
+            current_thread_id,
+            -1,
+            cur_priority,
+            cur_is_dummy,
+            false,
+        );
+        gsc.m_priority_queue
+            .increment_scheduled_count(current_thread_id);
+        process.increment_scheduled_count();
+
+        let scheduled_front = if core_id >= 0 {
+            gsc.m_priority_queue.get_scheduled_front(core_id)
+        } else {
+            None
+        };
+
+        if scheduled_front.is_none() {
+            let mut suggested_id = if core_id >= 0 && (cur_affinity & (1u64 << core_id)) != 0 {
+                gsc.m_priority_queue.get_suggested_front(core_id)
+            } else {
+                None
+            };
+
+            while let Some(candidate_id) = suggested_id {
+                let Some(candidate_props) =
+                    gsc.m_priority_queue.get_thread_props(candidate_id).cloned()
+                else {
+                    break;
+                };
+                let suggested_core = candidate_props.active_core;
+                let top_on_suggested_core = if suggested_core >= 0 {
+                    gsc.m_priority_queue.get_scheduled_front(suggested_core)
+                } else {
+                    None
+                };
+
+                if top_on_suggested_core != Some(candidate_id) {
+                    let top_priority = top_on_suggested_core
+                        .and_then(|tid| gsc.m_priority_queue.get_thread_props(tid))
+                        .map(|props| props.priority);
+                    if top_priority.is_none_or(|priority| {
+                        priority
+                            >= super::global_scheduler_context::HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY
+                    }) {
+                        if let Some(suggested_thread) = gsc.get_thread_by_thread_id(candidate_id) {
+                            suggested_thread.lock().unwrap().set_active_core(core_id);
+                        }
+                        gsc.m_priority_queue.change_core(
+                            suggested_core,
+                            candidate_id,
+                            core_id,
+                            candidate_props.priority,
+                            candidate_props.is_dummy,
+                            false,
+                        );
+                        gsc.m_priority_queue.increment_scheduled_count(candidate_id);
+                    }
+                    break;
+                }
+
+                suggested_id = gsc.m_priority_queue.get_suggested_next(
+                    core_id,
+                    candidate_id,
+                    candidate_props.priority,
+                );
+            }
+
+            if suggested_id != Some(current_thread_id) {
+                gsc.m_scheduler_update_needed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            } else {
+                current_thread
+                    .lock()
+                    .unwrap()
+                    .set_yield_schedule_count(process.get_scheduled_count());
+            }
+        } else {
+            gsc.m_scheduler_update_needed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     pub fn set_scheduler_current_thread_id(&mut self, thread_id: u64) {

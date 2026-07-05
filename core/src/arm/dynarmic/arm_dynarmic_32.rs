@@ -1818,6 +1818,39 @@ fn watched_pc_range() -> Option<(u64, u64)> {
     })
 }
 
+fn maybe_trace_mem_callback_8(cb: &DynarmicCallbacks32, is_write: bool, vaddr: u64, value: u8) {
+    if std::env::var_os("RUZU_A32_MEM_CALLBACK_STATS").is_none() {
+        return;
+    }
+    let Some((pc_lo, pc_hi)) = watched_pc_range() else {
+        return;
+    };
+    let Some(pc_ptr) = cb.jit_pc_ptr else {
+        return;
+    };
+    let pc = unsafe { pc_ptr.read_volatile() } as u64;
+    if pc < pc_lo || pc >= pc_hi {
+        return;
+    }
+
+    static READS: AtomicU64 = AtomicU64::new(0);
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let counter = if is_write { &WRITES } else { &READS };
+    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 8 || count.is_power_of_two() {
+        let lr = unsafe { pc_ptr.offset(-1).read_volatile() };
+        eprintln!(
+            "[A32_MEM_CB_8] kind={} count={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:08X} value=0x{:02X}",
+            if is_write { "W" } else { "R" },
+            count,
+            pc as u32,
+            lr,
+            vaddr as u32,
+            value
+        );
+    }
+}
+
 fn a32_callback_diagnostics_enabled() -> bool {
     static ENV_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENV_ENABLED.get_or_init(|| {
@@ -1827,6 +1860,7 @@ fn a32_callback_diagnostics_enabled() -> bool {
             || std::env::var_os("RUZU_TRACE_W_AT").is_some()
             || std::env::var_os("RUZU_TRACE_W_AT_REGS").is_some()
             || std::env::var_os("RUZU_WATCH_ADDR").is_some()
+            || std::env::var_os("RUZU_WATCH_WRITE").is_some()
             || std::env::var_os("RUZU_WATCH_BLOCK").is_some()
             || std::env::var_os("RUZU_WATCH_PC").is_some()
     }) || rdynarmic::jit::PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
@@ -1987,7 +2021,9 @@ impl UserCallbacks for DynarmicCallbacks32 {
     fn memory_read_8(&self, vaddr: u64) -> u8 {
         self.check_memory_access(vaddr, 1);
         trace_unmapped_guest_read_regs(self, vaddr, 1);
-        self.mem().read_8(vaddr)
+        let value = self.mem().read_8(vaddr);
+        maybe_trace_mem_callback_8(self, false, vaddr, value);
+        value
     }
 
     fn memory_read_16(&self, vaddr: u64) -> u16 {
@@ -2022,6 +2058,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
     }
 
     fn memory_write_8(&mut self, vaddr: u64, value: u8) {
+        maybe_trace_mem_callback_8(self, true, vaddr, value);
         watch_write(self, vaddr, 1, value as u128);
         if self.check_memory_access(vaddr, 1) {
             trace_unmapped_write(self, vaddr, 1, value as u128);

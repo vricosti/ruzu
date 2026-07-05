@@ -67,6 +67,7 @@ use crate::buffer_cache::buffer_cache_base::{
     DeviceMemoryAccess, GpuMemoryAccess, ObtainBufferOperation, ObtainBufferSynchronize,
 };
 use crate::control::channel_state_cache::{ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches};
+use crate::engines::kepler_compute::DispatchCall;
 use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, ComparisonOp, CullFace, DrawCall, FrontFace, PrimitiveTopology,
     NUM_VIEWPORTS,
@@ -445,6 +446,7 @@ impl RasterizerVulkan {
         extended_dynamic_state2_supported: bool,
         topology_list_primitive_restart_supported: bool,
         patch_list_primitive_restart_supported: bool,
+        must_emulate_scaled_formats: bool,
         shader_stencil_export_supported: bool,
         timeline_semaphore_supported: bool,
         custom_border_color_supported: bool,
@@ -525,16 +527,35 @@ impl RasterizerVulkan {
             ..Profile::default()
         };
         let shader_cache = ShaderPipelineCache::new(profile.clone());
+        let must_emulate_scaled_formats =
+            must_emulate_scaled_formats || !profile.support_scaled_attributes;
 
         // Create pipeline cache owner
+        let use_asynchronous_shaders = *common::settings::values()
+            .use_asynchronous_shaders
+            .get_value();
+        let use_vulkan_pipeline_cache = *common::settings::values()
+            .use_vulkan_driver_pipeline_cache
+            .get_value();
         let pipeline_cache = VulkanPipelineCache::new(
             device.clone(),
-            false,
-            false,
+            use_asynchronous_shaders,
+            use_vulkan_pipeline_cache,
             shader_cache,
             profile,
+            render_pass_cache.as_mut(),
             extended_dynamic_state_supported,
             extended_dynamic_state2_supported,
+            // `extendedDynamicState2LogicOp` is not yet exposed by the Rust
+            // device wrapper. Keep the feature false so pipeline keys and disk
+            // cache filtering match the actually enabled command set.
+            false,
+            // Extended dynamic state 3 and vertex-input dynamic state are not
+            // enabled by this simplified Vulkan init path yet.
+            false,
+            false,
+            false,
+            must_emulate_scaled_formats,
             topology_list_primitive_restart_supported,
             patch_list_primitive_restart_supported,
             max_viewports,
@@ -713,15 +734,15 @@ impl RasterizerVulkan {
                 false,
                 None,
             );
-        let render_pass = target_fb
-            .as_ref()
-            .map(|target| target.render_pass)
-            .unwrap_or(self.default_render_pass);
         let target_has_depth = target_fb.as_ref().is_some_and(|target| target.has_depth);
         let target_num_color = target_fb
             .as_ref()
             .map(|target| target.num_color)
             .unwrap_or(1);
+        let render_pass = target_fb
+            .as_ref()
+            .map(|target| target.render_pass)
+            .unwrap_or(self.default_render_pass);
 
         // 3. Compile or lookup cached pipeline
         let pipeline_result = self
@@ -739,18 +760,37 @@ impl RasterizerVulkan {
             uses_render_area,
             uses_rescaling_uniform,
         ) = match pipeline_result {
-            Some((gp, _fixed_state)) => (
-                gp.pipeline,
-                gp.pipeline_layout,
-                gp.descriptor_set_layout,
-                gp.descriptor_bindings.clone(),
-                gp.descriptor_bank_info,
-                gp.stage_infos.clone(),
-                gp.enabled_uniform_buffer_masks,
-                gp.uniform_buffer_sizes,
-                gp.uses_render_area,
-                gp.uses_rescaling_uniform,
-            ),
+            Some((gp, _fixed_state)) => {
+                let Some(pipeline) = gp.pipeline_handle() else {
+                    self.draw_skipped_pipeline = self.draw_skipped_pipeline.wrapping_add(1);
+                    if self.draw_skipped_pipeline <= 16
+                        || self.draw_skipped_pipeline.is_power_of_two()
+                    {
+                        log::warn!(
+                            "[DRAW_SKIP] #{} pipeline build failed asynchronously (draw={} rt0=0x{:X} fmt={} topology={:?} indexed={})",
+                            self.draw_skipped_pipeline,
+                            self.draw_counter,
+                            draw.render_targets[0].address,
+                            draw.render_targets[0].format,
+                            draw.topology,
+                            draw.indexed,
+                        );
+                    }
+                    return;
+                };
+                (
+                    pipeline,
+                    gp.pipeline_layout,
+                    gp.descriptor_set_layout,
+                    gp.descriptor_bindings.clone(),
+                    gp.descriptor_bank_info,
+                    gp.stage_infos.clone(),
+                    gp.enabled_uniform_buffer_masks,
+                    gp.uniform_buffer_sizes,
+                    gp.uses_render_area,
+                    gp.uses_rescaling_uniform,
+                )
+            }
             None => {
                 self.draw_skipped_pipeline = self.draw_skipped_pipeline.wrapping_add(1);
                 // A skipped draw leaves the previous frame's pixels in place;
@@ -1353,13 +1393,13 @@ impl RasterizerVulkan {
         }
     }
 
-    fn update_depth_bounds_test_enable(&mut self, cmd: vk::CommandBuffer, _draw: &DrawCall) {
+    fn update_depth_bounds_test_enable(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
         if !self.state_tracker.touch_depth_bounds_test_enable() {
             return;
         }
-        // ruzu does not expose regs.depth_bounds_enable in DrawCall yet.
         unsafe {
-            self.device.cmd_set_depth_bounds_test_enable(cmd, false);
+            self.device
+                .cmd_set_depth_bounds_test_enable(cmd, draw.depth_bounds_enable);
         }
     }
 
@@ -1925,7 +1965,7 @@ impl RasterizerVulkan {
         descriptor_bank_info: &DescriptorBankInfo,
         stage_infos: &[Option<ShaderInfo>; 5],
         enabled_uniform_buffer_masks: &[u32; crate::buffer_cache::buffer_cache_base::NUM_STAGES
-            as usize],
+             as usize],
         uniform_buffer_sizes: &crate::buffer_cache::buffer_cache_base::UniformBufferSizes,
         draw: &DrawCall,
         read_gpu: &dyn Fn(u64, &mut [u8]),
@@ -2097,7 +2137,10 @@ impl RasterizerVulkan {
         if has_uniform_buffer_descriptors {
             self.common_buffer_cache
                 .set_uniform_buffers_state(enabled_uniform_buffer_masks, uniform_buffer_sizes);
-            for stage in 0..enabled_uniform_buffer_masks.len().min(draw.cb_bindings.len()) {
+            for stage in 0..enabled_uniform_buffer_masks
+                .len()
+                .min(draw.cb_bindings.len())
+            {
                 let mut bits = enabled_uniform_buffer_masks[stage];
                 let mut index = 0u32;
                 while bits != 0 {
@@ -2143,8 +2186,9 @@ impl RasterizerVulkan {
                     let start = buffer_infos.len();
                     for element in 0..binding.descriptor_count {
                         if binding.descriptor_type == vk::DescriptorType::UNIFORM_BUFFER {
-                            if let Some(info) =
-                                common_uniform_buffer_infos.get(common_uniform_cursor).copied()
+                            if let Some(info) = common_uniform_buffer_infos
+                                .get(common_uniform_cursor)
+                                .copied()
                             {
                                 common_uniform_cursor += 1;
                                 buffer_infos.push(info);
@@ -2207,13 +2251,22 @@ impl RasterizerVulkan {
                             }
                             let (buffer, offset) =
                                 if binding.descriptor_type == vk::DescriptorType::UNIFORM_BUFFER {
-                                    self.buffer_cache.get_or_upload_fresh(
-                                        gpu_va,
-                                        size,
-                                        read_gpu,
-                                        &mut self.staging_pool,
-                                        upload_cmd,
-                                    )
+                                    self.buffer_cache
+                                        .bind_mapped_uniform_buffer(
+                                            gpu_va,
+                                            size,
+                                            read_gpu,
+                                            &mut self.staging_pool,
+                                        )
+                                        .unwrap_or_else(|| {
+                                            self.buffer_cache.get_or_upload_fresh(
+                                                gpu_va,
+                                                size,
+                                                read_gpu,
+                                                &mut self.staging_pool,
+                                                upload_cmd,
+                                            )
+                                        })
                                 } else {
                                     self.buffer_cache.get_or_upload(
                                         gpu_va,
@@ -2568,6 +2621,13 @@ impl RasterizerVulkan {
 }
 
 impl RasterizerInterface for RasterizerVulkan {
+    fn load_disk_resources(&mut self, title_id: u64) {
+        let shader_dir =
+            common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::ShaderDir);
+        self.pipeline_cache
+            .load_disk_resources(title_id, &shader_dir);
+    }
+
     fn draw(
         &mut self,
         mut draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
@@ -2937,6 +2997,82 @@ impl RasterizerInterface for RasterizerVulkan {
 
     fn dispatch_compute(&mut self) {
         debug!("RasterizerVulkan::dispatch_compute");
+    }
+
+    fn dispatch_compute_with_call(&mut self, dispatch: &DispatchCall) {
+        self.flush_work();
+        if let Some(mm) = self.channel_memory_manager.as_ref().cloned() {
+            mm.lock().flush_caching();
+        }
+
+        let Some(current_pipeline) = self
+            .pipeline_cache
+            .current_compute_pipeline_with_shared_cache(&mut self.shader_cache)
+        else {
+            if std::env::var_os("RUZU_TRACE_COMPUTE").is_some() {
+                log::warn!(
+                    "[VK_COMPUTE] skipped: no pipeline grid=({},{},{}) block=({},{},{}) qmd=0x{:X} code=0x{:X}",
+                    dispatch.qmd.grid_dim_x,
+                    dispatch.qmd.grid_dim_y,
+                    dispatch.qmd.grid_dim_z,
+                    dispatch.qmd.block_dim_x,
+                    dispatch.qmd.block_dim_y,
+                    dispatch.qmd.block_dim_z,
+                    dispatch.qmd_address,
+                    dispatch.code_address,
+                );
+            }
+            return;
+        };
+
+        if current_pipeline.requires_descriptor_binding {
+            if std::env::var_os("RUZU_TRACE_COMPUTE").is_some() {
+                log::warn!(
+                    "[VK_COMPUTE] skipped dispatch until ComputePipeline::Configure is ported: grid=({},{},{}) block=({},{},{}) qmd=0x{:X} code=0x{:X} indirect={:?}",
+                    dispatch.qmd.grid_dim_x,
+                    dispatch.qmd.grid_dim_y,
+                    dispatch.qmd.grid_dim_z,
+                    dispatch.qmd.block_dim_x,
+                    dispatch.qmd.block_dim_y,
+                    dispatch.qmd.block_dim_z,
+                    dispatch.qmd_address,
+                    dispatch.code_address,
+                    dispatch.indirect_compute_address,
+                );
+            }
+            return;
+        }
+
+        if let Some(indirect_address) = dispatch.indirect_compute_address {
+            if std::env::var_os("RUZU_TRACE_COMPUTE").is_some() {
+                log::warn!(
+                    "[VK_COMPUTE] indirect dispatch skipped until Vulkan compute indirect buffer binding is ported: addr=0x{:X}",
+                    indirect_address
+                );
+            }
+            return;
+        }
+
+        let device = self.device.clone();
+        let pipeline = current_pipeline.pipeline;
+        let dim = [
+            dispatch.qmd.grid_dim_x,
+            dispatch.qmd.grid_dim_y,
+            dispatch.qmd.grid_dim_z,
+        ];
+        self.scheduler.request_outside_renderpass();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
+            device.cmd_dispatch(cmdbuf, dim[0], dim[1], dim[2]);
+        });
+        if std::env::var_os("RUZU_TRACE_COMPUTE").is_some() {
+            log::info!(
+                "[VK_COMPUTE] dispatch grid=({},{},{}) descriptor_free=true",
+                dim[0],
+                dim[1],
+                dim[2],
+            );
+        }
     }
 
     fn reset_counter(&mut self, query_type: u32) {

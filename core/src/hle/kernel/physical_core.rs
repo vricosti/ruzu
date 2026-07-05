@@ -8,7 +8,7 @@
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Condvar, Mutex,
+    Arc, Condvar, Mutex, OnceLock,
 };
 
 use crate::arm::arm_interface::{
@@ -27,6 +27,11 @@ use super::{
 };
 
 static ZERO_PC_SAVE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn should_trace_ipi() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_IPI").is_some())
+}
 
 pub enum PhysicalCoreExecutionControl {
     Continue,
@@ -555,7 +560,7 @@ impl PhysicalCore {
         // diagnose cross-core wake latency for newly-RUNNABLE threads (the
         // MK8D wedge investigation). Format matches the SVC trace
         // elapsed_secs() prefix for inline correlation.
-        if std::env::var_os("RUZU_TRACE_IPI").is_some() {
+        if should_trace_ipi() {
             let t = crate::hle::kernel::trace_format::elapsed_secs();
             let running_tid = current_thread
                 .map(|p| unsafe { (*p).get_thread_id() })

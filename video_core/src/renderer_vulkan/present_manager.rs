@@ -410,9 +410,12 @@ impl PresentManager {
             return;
         }
 
-        let mut queue = self.ctx.present_queue.lock().unwrap();
-        queue.push_back((frame_index, frame));
-        self.ctx.frame_cv.notify_one();
+        let ctx = Arc::clone(&self.ctx);
+        scheduler.record(move |_| {
+            let mut queue = ctx.present_queue.lock().unwrap();
+            queue.push_back((frame_index, frame));
+            ctx.frame_cv.notify_one();
+        });
     }
 
     /// Port of `PresentManager::RecreateFrame`.

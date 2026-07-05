@@ -20482,14 +20482,14 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Intentional differences
 - Rust still hashes modeled fields through `std::hash::Hash` instead of upstream `Common::CityHash64(reinterpret_cast<const char*>(this), Size())`. This preserves cache-key inclusion/exclusion behavior but not the exact CityHash value.
-- Rust still omits upstream `VideoCommon::TransformFeedbackState xfb_state`; when `xfb_enabled` is set, the Rust key can only include the modeled prefix fields, not the full upstream struct. This is pre-existing transform-feedback parity debt outside this local pipeline-cache fix.
+- Historical note: at the time of this entry Rust omitted upstream `VideoCommon::TransformFeedbackState xfb_state`. This was fixed later on 2026-07-04 by adding the full transform-feedback tail to `FixedPipelineState`.
 
 ### Unintentional differences (to fix)
 - None for the modeled `FixedPipelineState::Size()` boundaries: Rust now keeps `attachments` in the pipeline key when `dynamic_vertex_input` is enabled but `extended_dynamic_state_3_blend` is not, matching upstream `offsetof(FixedPipelineState, attributes)`.
 - None for vertex stride exclusion: Rust now excludes `vertex_strides` when `extended_dynamic_state` is enabled, matching upstream `offsetof(FixedPipelineState, vertex_strides)`.
 
 ### Missing items
-- Full `xfb_state` storage, refresh, equality, and hashing when transform feedback is enabled.
+- RESOLVED later on 2026-07-04: full `xfb_state` storage, refresh input, equality, serialization/deserialization, and hashing when transform feedback is enabled.
 - Exact byte-prefix `memcmp` equality / CityHash hashing is still not implemented; Rust derives `PartialEq` over the whole modeled struct, while `Hash` follows the upstream prefix selection.
 
 ### Binary layout verification
@@ -20579,3 +20579,1123 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `vk_buffer_cache.cpp`: null Vulkan buffers are substituted when `nullDescriptor` is unavailable. Rust now creates a common-runtime null buffer with uniform/storage/texel/vertex/index/transfer usages and uses it for absent buffer descriptors instead of enqueueing `VK_NULL_HANDLE`.
 - `rustfmt video_core/src/buffer_cache/buffer_cache.rs video_core/src/buffer_cache/buffer_cache_base.rs video_core/src/renderer_vulkan/buffer_cache.rs video_core/src/renderer_opengl/gl_buffer_cache.rs video_core/src/vulkan_common/vulkan_device.rs` completed.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+
+## 2026-07-04 — ruzu_cmd/src/main.rs and video_core/src/renderer_vulkan/mod.rs vs yuzu_cmd/yuzu.cpp and video_core/renderer_vulkan/vk_rasterizer.cpp
+
+### Intentional differences
+- Rust `RasterizerInterface::load_disk_resources` currently takes only `title_id`, without upstream's `std::stop_token` and progress callback. The current ruzu trait already had this reduced signature, so the call edge is ported through the existing Rust API.
+- Rust `RendererBase::read_rasterizer` exposes a raw trait-object pointer. The frontend uses a guarded `as_mut()` check before calling `load_disk_resources`; upstream has direct ownership through `system.Renderer().ReadRasterizer()`.
+
+### Unintentional differences (to fix)
+- `PipelineCache::load_disk_resources` now parses serialized shader environments from `vulkan.bin` through `VideoCommon::LoadPipelines`, but still skips rebuild/insertion. Upstream compiles parsed entries on worker threads and inserts successful pipelines into the live caches.
+- Vulkan `GraphicsPipeline` construction is still synchronous in the draw path. Upstream can enqueue final pipeline creation on `ThreadWorker` when `build_in_parallel` is true.
+- The Rust load path has no shader-notify/progress callback yet, so it cannot display yuzu's full "loading shaders" progress behavior.
+
+### Missing items
+- Port `PipelineCache::LoadDiskResources` fully: recreate `FileEnvironment` pipelines, queue work on pipeline workers, wait for requests, insert successful pipelines, then serialize the Vulkan driver pipeline cache.
+- Wire the now-owned Vulkan pipeline workers (`Common::ThreadWorker workers` and `serialization_thread`) into rebuild/serialization jobs and split `GraphicsPipeline` construction so `BuiltPipeline` can return `None` for not-yet-built async pipelines like upstream.
+- Add frontend progress callback plumbing matching `VideoCore::DiskResourceLoadCallback`.
+
+### Binary layout verification
+- N/A: frontend/rasterizer call-chain and host pipeline-cache behavior only.
+
+### Verification
+- Re-read upstream `yuzu_cmd/yuzu.cpp`: after `system.GPU().Start()` and `system.GetCpuManager().OnGpuReady()`, yuzu calls `system.Renderer().ReadRasterizer()->LoadDiskResources(system.GetApplicationProcessProgramID(), ...)` when `use_disk_shader_cache` is enabled.
+- Re-read upstream `vk_rasterizer.cpp`: `RasterizerVulkan::LoadDiskResources` delegates directly to `pipeline_cache.LoadDiskResources(...)`.
+- Rust now calls `load_disk_resources(system.runtime_program_id())` at the matching frontend point, the active Vulkan rasterizer overrides `load_disk_resources`, and the override delegates to `self.pipeline_cache.load_disk_resources(title_id, RuzuPath::ShaderDir)`.
+- Rust now passes `settings.use_asynchronous_shaders` and `settings.use_vulkan_driver_pipeline_cache` into `VulkanPipelineCache::new` instead of hardcoding both false.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+
+## 2026-07-04 — video_core/renderer_vulkan/pipeline_cache.rs and graphics_pipeline.rs vs renderer_vulkan/vk_pipeline_cache.cpp and vk_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust keeps live draw-path pipeline creation bound to the `TextureCache` framebuffer render pass passed by `RasterizerVulkan::draw`. A trial state-derived live render pass caused visibly wrong MK8D colors because the reduced Rust `FixedPipelineState -> RenderPassKey` path does not yet include the full upstream/device-aware framebuffer/render-pass model. The state-derived render-pass path is retained only for disk-preload reconstruction.
+- Rust serializes/deserializes `GraphicsPipelineKey` and `FixedPipelineState` with explicit little-endian field writes instead of raw `reinterpret_cast`/`std::memcmp` over C++ object bytes. This avoids relying on Rust layout before `TransformFeedbackState` is ported while preserving upstream field order for the represented prefix.
+- Disk-loaded graphics pipelines are still not queued for rebuild. Rust now owns upstream-shaped `workers` and `serialization_thread`, but the graphics/compute constructors are not yet split enough to safely run the actual builds through those workers.
+- Rust currently parses disk-loaded graphics keys/environments but does not insert the rebuilt graphics pipelines into `graphics_cache`. This is a temporary correctness guard: upstream inserts only pipelines produced by the full `CreateGraphicsPipeline` constructor, while Rust's disk path still uses a reduced state-only constructor that is not behaviorally equivalent and can produce incorrect live rendering if cached.
+- The reduced Rust disk constructor now mirrors several low-risk `GraphicsPipeline::MakePipeline` state decisions: vertex bindings are emitted for every vertex array in order, instanced bindings get divisor state, no attribute-size fallback binding is synthesized, polygon mode comes from `FixedPipelineState`, disabled depth test forces `VK_COMPARE_OP_ALWAYS`, and the upstream extended dynamic-state list/order is represented for the feature bits currently stored in Rust.
+- `PipelineCache::load_disk_resources` now filters disk graphics keys against all six upstream `DynamicFeatures` bits. The Rust renderer currently passes false for `extended_dynamic_state_2_extra`, `extended_dynamic_state_3_blend`, `extended_dynamic_state_3_enables`, and `dynamic_vertex_input` because the corresponding feature enablement / command emission paths are not active in the simplified Vulkan init path.
+
+### Unintentional differences (to fix)
+- RESOLVED later on 2026-07-04: `FixedPipelineState` now includes upstream `VideoCommon::TransformFeedbackState xfb_state`, and transform-feedback-enabled keys serialize/read the full tail.
+- The disk-preload graphics constructor is still a reduced `FixedPipelineState`-only path. It can parse `vulkan.bin`, but rebuilt graphics pipelines are intentionally skipped instead of inserted until the full upstream `GraphicsPipeline` constructor/configure model is ported.
+- The reduced disk-preload constructor still lacks full upstream `GraphicsPipeline` ownership: tessellation/geometry stage handling, device feature pNext chains for viewport swizzle/depth-clip-control/line-rasterization/conservative-raster/provoking-vertex, descriptor template/configure ownership, statistics, shader notify, and worker-thread final creation are not fully ported there.
+- Compute pipeline preload parses and consumes `ComputePipelineCacheKey`, but does not reconstruct/insert compute pipelines because this Vulkan backend's `current_compute_pipeline` path is still a stub.
+- `LoadDiskResources` still lacks upstream `std::stop_token`, progress callback updates, `PipelineStatistics`, and actual `workers.QueueWork` / `workers.WaitForRequests` rebuild semantics.
+- The renderer still does not enable or emit commands for `extendedDynamicState2LogicOp`, extended dynamic state 3 blend/enables, or dynamic vertex input. Those bits are represented and filtered, but intentionally remain false until the matching command paths are ported.
+
+### Missing items
+- Port upstream `GraphicsPipeline` construction ownership: `RenderPassCache&`, `MakeRenderPassKey`, descriptor layout/template ownership, `ConfigureImpl`, and worker-thread final pipeline creation.
+- Port compute pipeline creation from `FileEnvironment` and insert rebuilt pipelines into `compute_cache`.
+- Wire the now-owned async `workers` and `serialization_thread` into deferred `SerializePipeline`, disk preload rebuild jobs, and `SerializeVulkanPipelineCache` ordering.
+- Complete dynamic-feature filtering for `extended_dynamic_state_2_extra`, `extended_dynamic_state_3_blend`, `extended_dynamic_state_3_enables`, and `dynamic_vertex_input`.
+
+### Binary layout verification
+- Partial: `GraphicsPipelineKey::to_cache_bytes` writes `unique_hashes` followed by `FixedPipelineState` fields in upstream declaration order and uses the same prefix-size decision as `GraphicsPipelineCacheKey::Size()` / `FixedPipelineState::Size()` for represented fields.
+- RESOLVED later on 2026-07-04 for `FixedPipelineState`: `xfb_state` is represented and transform-feedback-enabled keys include the full `FixedPipelineState` tail. Full cache parity still depends on validating the complete `GraphicsPipelineCacheKey` against a full upstream cache.
+
+### Verification
+- Re-read upstream `vk_pipeline_cache.cpp`: `LoadDiskResources` calls `VideoCommon::LoadPipelines`, reads `ComputePipelineCacheKey` / `GraphicsPipelineCacheKey` after environments, filters graphics keys by dynamic feature bits, queues rebuild work, waits for workers, then serializes the Vulkan driver cache.
+- Re-read upstream `vk_graphics_pipeline.cpp`: `GraphicsPipeline` derives its render pass from `MakeRenderPassKey(key.state)` through `RenderPassCache`; `GraphicsPipeline::MakePipeline` also owns vertex bindings/divisors, topology/tessellation adjustment, viewport pNext chains, rasterization pNext chains, multisample/depth/blend state, dynamic state list, and final pipeline creation.
+- Rust now parses `vulkan.bin` through `load_pipelines`, reads graphics keys with explicit field order, skips reduced graphics preload insertion for correctness, and serializes newly compiled live graphics environments through `serialize_pipeline`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D regression: using a state-derived render pass for live draws produced visibly wrong colors; after restoring live draw pipeline creation to use the `TextureCache` framebuffer render pass, frame 360 renders with normal colors again at `/tmp/ruzu-mk8d-color-restore-1783166012/frame_360.png`.
+- Added focused tests:
+- `cargo test -p video_core renderer_vulkan::graphics_pipeline::tests::state_vertex_input_keeps_upstream_binding_order_and_divisors -- --nocapture`
+- `cargo test -p video_core renderer_vulkan::graphics_pipeline::tests::state_dynamic_states_follow_upstream_extension_order -- --nocapture`
+- `cargo test -p video_core renderer_vulkan::pipeline_cache::tests::graphics_key_dynamic_features_filter_checks_all_upstream_flags -- --nocapture`
+- `cargo test -p video_core state_ -- --nocapture` also runs those tests, but currently exposes unrelated pre-existing failures in `renderer_opengl::gl_graphics_pipeline::tests::bind_draw_framebuffer_owns_upstream_state_tracker_bind_slice` and `shader_environment::tests::graphics_environment_reads_live_maxwell_state_after_construction`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes after the state-only constructor updates.
+- MK8D frame 360 after these updates remains correctly colored at `/tmp/ruzu-mk8d-state-preload-1783167301/frame_360.png`; the first-logo delay is still present at ~10.5s, so the objective is not complete.
+- MK8D frame 120 after adding the full six-bit disk-cache dynamic-feature filter remains correctly colored at `/tmp/ruzu-mk8d-feature-filter-long-1783168123/frame_120.png`.
+
+## 2026-07-04 — video_core/src/renderer_vulkan/pipeline_cache.rs vs video_core/renderer_vulkan/vk_pipeline_cache.cpp
+
+### Intentional differences
+- Rust now owns `common::thread_worker::ThreadWorker` fields corresponding to upstream `Common::ThreadWorker workers` and `Common::ThreadWorker serialization_thread`, named `VkPipelineBuilder` and `VkPipelineSerialization`.
+- Rust queues live graphics `serialize_pipeline` work onto `serialization_thread` with owned `GenericEnvironment` snapshots, matching upstream's deferred `SerializePipeline` ownership.
+- Rust waits for `serialization_thread` explicitly in `Drop` before serializing the Vulkan driver cache. Upstream gets this ordering through `ThreadWorker` lifetime and destructor sequencing; the explicit wait keeps the ordering reviewable in Rust.
+- Rust does not yet queue graphics/compute rebuild closures onto `workers`. The current `GraphicsPipeline` and `ComputePipeline` constructors are still synchronous/reduced and not yet split like upstream, so queuing them now would preserve the wrong construction model.
+
+### Unintentional differences (to fix)
+- `LoadDiskResources` still parses disk entries synchronously and records skipped entries instead of queuing `CreateComputePipeline` / `CreateGraphicsPipeline` rebuild work into `workers` and inserting successful results into `compute_cache` / `graphics_cache`.
+- Runtime graphics pipeline creation still builds synchronously and marks `is_built=true`; upstream passes `workers` into `GraphicsPipeline` when `build_in_parallel` is true and lets `BuiltPipeline` decide whether an unbuilt pipeline may be used.
+
+### Missing items
+- Split shader translation, shader module creation, descriptor layout creation, and final `VkPipeline` creation so graphics/compute pipelines can use the upstream worker model.
+- Port `PipelineStatistics` and disk-load progress callback updates around worker completion.
+- Queue compute `SerializePipeline` work on `serialization_thread` once `current_compute_pipeline` / compute pipeline construction is ported.
+
+### Binary layout verification
+- N/A for worker ownership. This change affects host-side scheduling/lifetime, not guest ABI or disk key bytes.
+
+### Verification
+- Re-read upstream `vk_pipeline_cache.cpp`: constructor initializes `workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(), "VkPipelineBuilder")` and `serialization_thread(1, "VkPipelineSerialization")`; `LoadDiskResources` queues rebuild jobs and waits for `workers`; runtime graphics/compute creation queues serialization jobs on `serialization_thread`.
+- Rust `get_total_pipeline_workers()` matches the non-Android upstream policy: `max(available_parallelism, 2) - 1`.
+- `cargo test -p video_core pipeline_cache -- --nocapture` passes, including `total_pipeline_workers_matches_upstream_minimum_policy`.
+- `cargo check -p video_core` passes.
+
+## 2026-07-04 — video_core/src/renderer_vulkan/graphics_pipeline.rs + video_core/src/renderer_vulkan/pipeline_cache.rs vs video_core/renderer_vulkan/vk_graphics_pipeline.cpp + video_core/renderer_vulkan/vk_pipeline_cache.cpp
+
+### Intentional differences
+- Rust passes `PipelineCache::vulkan_pipeline_cache` into the reduced graphics pipeline creation helpers explicitly, whereas upstream stores `vk::PipelineCache& pipeline_cache` in each `GraphicsPipeline` and uses it inside `GraphicsPipeline::MakePipeline`.
+- When the driver pipeline cache setting is disabled, Rust passes `VK_NULL_HANDLE`, matching Vulkan semantics for no pipeline cache. Upstream similarly owns an empty/null wrapper depending on the setting.
+
+### Unintentional differences (to fix)
+- `GraphicsPipeline` still does not own the pipeline-cache reference the way upstream does; it receives the handle only at creation time because Rust's reduced object already creates the `VkPipeline` before returning.
+- Disk-loaded graphics pipelines are still skipped before construction, so this driver-cache handle is currently exercised by live graphics compilation only. It is ready for disk rebuild once the full constructor is ported.
+
+### Missing items
+- Move final `VkPipeline` creation into an upstream-shaped `GraphicsPipeline` constructor/build closure that owns `pipeline_cache`, `RenderPassCache`, descriptor layout/template creation, shader notify, statistics, and optional worker-thread execution.
+- Use the same `vulkan_pipeline_cache` handle for compute pipeline creation once `current_compute_pipeline` / disk compute rebuild is ported.
+
+### Binary layout verification
+- N/A: this change affects host Vulkan pipeline-cache handle propagation, not disk key bytes.
+
+### Verification
+- Re-read upstream `vk_graphics_pipeline.cpp`: `GraphicsPipeline::MakePipeline` calls `CreateGraphicsPipeline(..., *pipeline_cache)`.
+- Re-read upstream `vk_pipeline_cache.cpp`: `CreateGraphicsPipeline` passes `vulkan_pipeline_cache` to the `GraphicsPipeline` constructor, and `LoadDiskResources` loads/saves `vulkan_pipelines.bin` around rebuilt pipeline creation.
+- `cargo check -p video_core` passes.
+- `cargo test -p video_core pipeline_cache -- --nocapture` passes.
+- `cargo test -p video_core renderer_vulkan::graphics_pipeline -- --nocapture` passes.
+- Broad `cargo test -p video_core graphics_pipeline -- --nocapture` still includes unrelated existing OpenGL tests and fails in `renderer_opengl::gl_graphics_pipeline`; the Vulkan module-specific test is the relevant verification for this change.
+## 2026-07-04 — video_core/src/renderer_vulkan/fixed_pipeline_state.rs + video_core/src/engines/draw_manager.rs + video_core/src/engines/maxwell_3d.rs vs video_core/renderer_vulkan/fixed_pipeline_state.h/.cpp + video_core/transform_feedback.h
+
+### Intentional differences
+- `video_core/src/renderer_vulkan/fixed_pipeline_state.rs`: anonymous C++ unions/bitfields are represented as explicit raw integer fields plus accessors. This preserves the serialized bit layout while avoiding Rust bitfield emulation.
+- `video_core/src/engines/draw_manager.rs`: the Rust `DrawCall` snapshot carries transform-feedback state explicitly because the active Vulkan path builds `FixedPipelineState` from snapshots, whereas upstream `FixedPipelineState::Refresh` reads `maxwell3d.regs` directly.
+
+### Unintentional differences (to fix)
+- `video_core/src/renderer_vulkan/fixed_pipeline_state.rs`: `Refresh` still consumes the reduced `DrawCall` abstraction rather than the full upstream `Maxwell3D&` owner and `DynamicFeatures&`. This is structurally different even though the newly added transform-feedback state now has an equivalent snapshot source.
+- `video_core/src/renderer_vulkan/fixed_pipeline_state.rs`: dynamic feature flags are still manually stamped by `GraphicsPipelineCache` rather than flowing through a single upstream-shaped `DynamicFeatures` owner.
+
+### Missing items
+- No missing `TransformFeedbackState xfb_state` tail remains in `FixedPipelineState`.
+- Full upstream `FixedPipelineState::Refresh(Maxwell3D&, DynamicFeatures&)` ownership remains to be completed when the Vulkan rasterizer is split closer to upstream.
+
+### Binary layout verification
+- PASS: Rust constants now match upstream offsets used by `FixedPipelineState::Size`: `dynamic_state=64`, `attributes=104`, `vertex_strides=360`, `xfb_state=424`.
+- PASS: Rust `TransformFeedbackState` tail size is `560` bytes (`4 * Layout{u32,u32,u32}` + `4 * 32 * StreamOutLayout{u32}`), giving full `FixedPipelineState` size `984` bytes when `xfb_enabled`.
+- PASS: `cargo test -p video_core fixed_pipeline_state -- --nocapture` passes, including a transform-feedback serialization/deserialization round-trip.
+
+## 2026-07-04 — core/src/core.rs + video_core/src/shader_environment.rs + video_core/src/renderer_vulkan/pipeline_cache.rs vs core/core.cpp + video_core/shader_environment.cpp + video_core/renderer_vulkan/vk_pipeline_cache.cpp
+
+### Intentional differences
+- `video_core/src/shader_environment.rs`: on a Rust-side pipeline-cache deserialization error, `load_pipelines` now logs the error but does not delete the cache file. Upstream deletes on `std::ios_base::failure` because its C++ reader/writer layout is authoritative. The Rust Vulkan cache-key/environment reader is still under binary-parity work; deleting here can destroy a valid upstream/yuzu cache after a Rust parser bug. This divergence must be revisited once `GraphicsPipelineCacheKey`/`FixedPipelineState` and `FileEnvironment` binary layout are fully verified.
+- `video_core/src/renderer_vulkan/pipeline_cache.rs`: added an `info` log with title id and cache path. This is diagnostic-only and does not change upstream behavior.
+
+### Unintentional differences (to fix)
+- `video_core/src/renderer_vulkan/pipeline_cache.rs`: upstream `PipelineCache::LoadDiskResources` queues compute and graphics pipeline rebuild work and inserts successfully rebuilt pipelines into `compute_cache` / `graphics_cache`. Rust still parses entries but skips rebuild/insertion while the full upstream `GraphicsPipeline`/`ComputePipeline` disk constructors are incomplete.
+- `video_core/src/renderer_vulkan/pipeline_cache.rs`: Rust now owns upstream-shaped `ThreadWorker workers` / `serialization_thread`, but still performs a reduced synchronous parse path and does not yet queue rebuild jobs or progress callbacks.
+
+### Missing items
+- Full binary layout parity for `GraphicsPipelineCacheKey` beyond the now-ported `FixedPipelineState::xfb_state` tail still needs validation against a full upstream/yuzu cache.
+- Full upstream `CreateGraphicsPipeline(... FileEnvironment ...)` and `CreateComputePipeline(... FileEnvironment ...)` disk rebuild paths.
+- Worker-backed preload statistics/progress and `vulkan_pipelines.bin` validation.
+
+### Binary layout verification
+- FAIL: `load_pipelines` can parse the small Rust-regenerated MK8D cache after the runtime program-id fix, but the previous attempt to parse the larger yuzu-generated cache hit `invalid ShaderStage discriminant 1235222924`, indicating remaining cache binary-layout divergence. The destructive delete path is disabled until this is fixed.
+
+## 2026-07-04 — video_core/src/renderer_vulkan/graphics_pipeline.rs + video_core/src/renderer_vulkan/pipeline_cache.rs vs video_core/renderer_vulkan/vk_graphics_pipeline.cpp + video_core/renderer_vulkan/maxwell_to_vk.cpp
+
+### Intentional differences
+- `PipelineCache::LoadDiskResources` now keeps disk graphics pipeline insertion disabled by default behind `RUZU_EXPERIMENTAL_VK_DISK_GRAPHICS_REBUILD`. Upstream inserts rebuilt graphics pipelines, but Rust's disk constructor is still reduced and was able to create invalid or visually divergent pipelines. The default path now parses/counts disk entries and leaves live pipeline creation authoritative until the full upstream constructor/configure path is ported.
+- `GraphicsPipelineCache` now receives and stores `must_emulate_scaled_formats` from the Vulkan device path, while Rust also folds in `!Profile::support_scaled_attributes` because the current Rust profile default is not yet device-derived like upstream's `Profile.support_scaled_attributes = !device.MustEmulateScaledFormats()`.
+
+### Unintentional differences (to fix)
+- Upstream `MaxwellToVK::VertexFormat(device.MustEmulateScaledFormats(), ...)` is device-aware through `Device::MustEmulateScaledFormats()`. Rust now forwards that flag for live and state-derived vertex input, but the profile/device ownership is still split differently from upstream.
+- Upstream `LoadDiskResources` rebuilds graphics pipelines with full `GraphicsPipeline` ownership and inserts them. Rust still skips insertion by default because the reduced rebuild path lacks full render-pass/device pNext/configure/descriptor/worker parity.
+
+### Missing items
+- Replace the reduced disk graphics rebuild path with an upstream-shaped `GraphicsPipeline` constructor that owns `RenderPassCache`, device feature pNext chains, descriptor layout/template configuration, shader notify/statistics, and optional worker-backed final `VkPipeline` creation.
+- Remove `RUZU_EXPERIMENTAL_VK_DISK_GRAPHICS_REBUILD` once rebuilt disk graphics pipelines are byte/state-equivalent enough to be inserted safely by default.
+
+### Binary layout verification
+- N/A for `must_emulate_scaled_formats`; this is host device-feature routing, not guest ABI or disk key bytes.
+- Partial for disk preload: the key reader can parse the current regenerated cache, but insertion remains disabled until the full upstream pipeline constructor is ported.
+
+### Verification
+- Re-read upstream `vk_graphics_pipeline.cpp`: vertex input uses `MaxwellToVK::VertexFormat(device.MustEmulateScaledFormats(), ...)` in `MakePipeline`.
+- Re-read upstream `maxwell_to_vk.cpp`: scaled formats are converted to integer Vulkan formats when `must_emulate_scaled_formats` is true.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pipeline_cache -- --nocapture` passes: 12 tests.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::graphics_pipeline::tests::disk_state_ -- --nocapture` passes: 3 tests.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D 12s run at `/tmp/ruzu_mk8d_color_guard_1783176656` logs `Total Pipeline Count: 312 (built=0, skipped=312)` and dumps color-correct `/tmp/ruzu_mk8d_color_guard_1783176656/present_000720.png`.
+
+## 2026-07-04 — video_core/src/renderer_vulkan/graphics_pipeline.rs + video_core/src/renderer_vulkan/fixed_pipeline_state.rs + video_core/src/engines/draw_manager.rs + video_core/src/engines/maxwell_3d.rs vs video_core/renderer_vulkan/vk_graphics_pipeline.cpp + video_core/renderer_vulkan/fixed_pipeline_state.cpp/.h
+
+### Intentional differences
+- Rust `make_runtime_info_from_state` now receives the full `GraphicsPipelineKey` instead of only `FixedPipelineState`, because upstream `MakeRuntimeInfo` derives stage runtime info from the whole `GraphicsPipelineCacheKey`. This is a parity correction rather than a new abstraction.
+- Rust still snapshots Maxwell state into `DrawCall` before refreshing `FixedPipelineState`, while upstream `FixedPipelineState::Refresh` reads `Maxwell3D&` directly. The additional fields added in this slice keep the snapshot path behaviorally closer without changing the current Rust rasterizer ownership.
+
+### Unintentional differences (to fix)
+- Geometry-stage fixed point-size detection is still incomplete in the disk/runtime-info path. Upstream checks the compiled geometry program output topology (`program.output_topology == PointList`), but the reduced Rust disk constructor does not expose that IR program data at the point where runtime info is assembled.
+- Previous-stage geometry passthrough mask handling remains incomplete. Upstream uses `previous_program->is_geometry_passthrough` to adjust previous-stage stores; Rust currently only forwards the existing stores/mapping fields that are already exposed by `ShaderInfo`.
+- `FixedPipelineState::Refresh` still consumes a Rust `DrawCall` snapshot rather than the upstream owner pair `Maxwell3D&` and `DynamicFeatures&`; this keeps dynamic-feature stamping split from upstream until the Vulkan rasterizer/cache ownership is restructured.
+
+### Missing items
+- Complete upstream `MakeRuntimeInfo` geometry passthrough handling once `ShaderInfo` exposes the needed passthrough mask semantics.
+- Complete geometry output-topology point-size handling once the disk graphics constructor is refactored to match upstream `CreateGraphicsPipeline`/`GraphicsPipeline` ownership.
+- Replace the reduced disk graphics constructor with the full upstream path before enabling disk graphics insertion by default.
+
+### Binary layout verification
+- N/A for the newly added `DrawCall` snapshot fields. They are host-side state transfer only, not serialized guest ABI.
+- Partial for `FixedPipelineState`: prior offset/size tests for `FixedPipelineState` including `xfb_state` still pass; this slice adds state population but does not change the serialized struct size.
+
+### Verification
+- Re-read upstream `vk_graphics_pipeline.cpp`: `MakeRuntimeInfo` derives previous-stage stores, vertex input types, point-size state, transform-feedback varyings, convert-depth mode, tessellation state, fragment alpha-test state, input topology, early-z, and y-negate from the full graphics key.
+- Re-read upstream `fixed_pipeline_state.cpp/.h`: `Refresh` stores polygon mode, tessellation primitive/spacing/clockwise, patch control points, MSAA mode, alpha-test func/ref, early-z, y-negate, smooth-lines, alpha-to-coverage, alpha-to-one, point size, and transform-feedback state.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::graphics_pipeline -- --nocapture` passes: 13 tests.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pipeline_cache -- --nocapture` passes: 12 tests.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D 12s run at `/tmp/ruzu_mk8d_color_recheck_1783177851` logs `Total Pipeline Count: 350 (built=0, skipped=350)` and dumps color-correct `/tmp/ruzu_mk8d_color_recheck_1783177851/present_000720.png`; sampled dumps keep high saturation (`max_sat` around 238-243), so the previous black-and-white symptom is not reproduced on the default path.
+
+## 2026-07-04 — video_core/src/renderer_vulkan/pipeline_cache.rs vs video_core/renderer_vulkan/vk_pipeline_cache.cpp
+
+### Intentional differences
+- Rust `should_allow_unbuilt_graphics_pipeline` is a standalone helper used by `PipelineCache::built_pipeline`, while upstream implements the same predicate inline in `PipelineCache::BuiltPipeline`.
+
+### Unintentional differences (to fix)
+- No remaining known behavioral difference in the `BuiltPipeline` predicate after this slice. Rust now rejects unbuilt async pipelines when a zeta target is bound, matching upstream `maxwell3d->regs.zeta_enable`, rather than checking only depth-test/depth-write state.
+
+### Missing items
+- The broader async build model is still incomplete: `GraphicsPipeline` objects are still built synchronously and `is_built` is always true, so this predicate is prepared for upstream parity but not yet exercised by real asynchronous graphics pipeline construction.
+
+### Binary layout verification
+- N/A: this is host-side pipeline scheduling policy, not serialized guest or disk layout.
+
+### Verification
+- Re-read upstream `vk_pipeline_cache.cpp`: `BuiltPipeline` returns `nullptr` for async shaders whenever `maxwell3d->regs.zeta_enable` is set, before applying the small-draw exception.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core should_allow_unbuilt_graphics_pipeline -- --nocapture` passes: 3 tests, including bound-zeta-without-depth-test coverage.
+
+## 2026-07-04 — video_core/src/renderer_vulkan/graphics_pipeline.rs vs video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+
+### Intentional differences
+- The reduced Rust disk constructor still lives in `graphics_pipeline.rs` as `create_graphics_pipeline_from_state`, while upstream uses the same `GraphicsPipeline::MakePipeline` path for live and disk-rebuilt pipelines after constructing the object from a full `GraphicsPipelineCacheKey`.
+
+### Unintentional differences (to fix)
+- No remaining known difference for tessellation-state attachment in the reduced disk constructor. It now passes `VkPipelineTessellationStateCreateInfo` with `patch_control_points` derived from `FixedPipelineState`, matching the live path and upstream `GraphicsPipeline::MakePipeline`.
+
+### Missing items
+- The reduced disk constructor still does not own the full upstream device pNext/configure/statistics/worker path. This change only fixes the missing tessellation state object.
+
+### Binary layout verification
+- N/A: this affects `VkGraphicsPipelineCreateInfo` construction, not serialized key bytes.
+
+### Verification
+- Re-read upstream `vk_graphics_pipeline.cpp`: `GraphicsPipeline::MakePipeline` supplies tessellation state and patch control points as part of graphics pipeline creation.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::graphics_pipeline -- --nocapture` passes: 13 tests.
+
+## 2026-07-04 — video_core/src/renderer_vulkan/fixed_pipeline_state.rs vs video_core/renderer_vulkan/fixed_pipeline_state.cpp/.h
+
+### Intentional differences
+- Rust continues to populate `FixedPipelineState` from `DrawCall` snapshots rather than upstream's direct `Maxwell3D&` owner. This entry covers fields whose draw snapshot source already exists.
+
+### Unintentional differences (to fix)
+- No remaining known field-population difference in `FixedPipelineState::Refresh` for state currently carried by `DrawCall`. The broader ownership difference remains: Rust refreshes from a snapshot rather than directly from `Maxwell3D&` and `DynamicFeatures&`.
+
+### Missing items
+- Once dynamic features are enabled on macOS, split refresh behavior by `DynamicFeatures` like upstream (`Refresh`, `Refresh2`, `Refresh3`) instead of stamping all dynamic-state fields before feature flags are applied.
+
+### Binary layout verification
+- PASS: this slice does not change `FixedPipelineState` serialized size or field offsets.
+- PASS: `cargo test -p video_core fixed_pipeline_state -- --nocapture` passes: 23 tests, including upstream offset/size and transform-feedback round-trip checks.
+
+### Verification
+- Re-read upstream `fixed_pipeline_state.cpp`: `Refresh`, `DynamicState::Refresh`, `Refresh2`, and `Refresh3` populate provoking vertex, conservative raster, app stage, viewport swizzles, depth-bounds enable, rasterize enable, primitive restart, depth-bias enable via `POLYGON_OFFSET_ENABLE_LUT`, logic-op enable/op, and depth-clamp-disabled.
+- Rust `FixedPipelineState::refresh` now populates those fields from `DrawCall::provoking_vertex_last`, `DrawCall::conservative_raster_enable`, `DrawCall::engine_state`, `DrawCall::viewport_transforms`, `DrawCall::depth_bounds_enable`, `DrawCall::rasterize_enable`, `DrawCall::primitive_restart`, `DrawCall::rasterizer.polygon_offset_*_enable`, `DrawCall::logic_op`, and `DrawCall::depth_clamp_enabled`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core fixed_pipeline_state -- --nocapture` passes: 23 tests.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::graphics_pipeline -- --nocapture` passes: 13 tests.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pipeline_cache -- --nocapture` passes: 13 tests.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D 12s run at `/tmp/ruzu_mk8d_fixed_state_full_1783180004` logs `Total Pipeline Count: 390 (built=0, skipped=390)` and dumps color-correct `/tmp/ruzu_mk8d_fixed_state_full_1783180004/present_000720.png`; sampled dumps keep high saturation (`max_sat` around 238-243).
+
+## 2026-07-04 — video_core/src/renderer_vulkan/compute_pipeline.rs + video_core/src/renderer_vulkan/pipeline_cache.rs vs video_core/renderer_vulkan/vk_compute_pipeline.cpp/.h + video_core/renderer_vulkan/vk_pipeline_cache.cpp
+
+### Intentional differences
+- Rust `ComputePipeline::new` currently builds synchronously and returns `Option<Self>`. Upstream accepts an optional `Common::ThreadWorker*` and may queue final descriptor/pipeline creation asynchronously. The Rust worker split is still a broader objective item.
+- Rust creates the compute descriptor-set layout directly from `ShaderInfo` descriptor vectors. Upstream uses `DescriptorLayoutBuilder::Add(info, VK_SHADER_STAGE_COMPUTE_BIT)`, but the descriptor order and descriptor types now match the same upstream categories.
+- Rust keeps `descriptor_update_template` null because the current Vulkan compute `Configure` path is still reduced and does not yet push descriptor data through `GuestDescriptorQueue` like upstream.
+
+### Unintentional differences (to fix)
+- `PipelineCache::CurrentComputePipeline` is still a stub, so disk-rebuilt compute pipelines can be inserted into `compute_cache` but are not yet used by runtime compute dispatch.
+- Compute pipeline configuration still does not bind upstream buffer/texture/image descriptors through `BufferCache`, `TextureCache`, `GuestDescriptorQueue`, descriptor allocator, or update template.
+- Compute rebuild work is performed synchronously after parsing, not queued onto `workers.QueueWork` with progress callbacks like upstream `LoadDiskResources`.
+
+### Missing items
+- Port upstream `ComputePipeline::Configure` descriptor binding path.
+- Wire active Vulkan compute dispatch to the shared-cache runtime compute path and port the descriptor/configure/dispatch side.
+- Move compute disk rebuild into the upstream worker queue once final pipeline creation can safely happen off-thread.
+
+### Binary layout verification
+- PASS: `ComputePipelineCacheKey` layout/hash tests still pass through `pipeline_cache` tests (`repr(C)`, size 24, align 8).
+- N/A for descriptor layout ownership; this is host Vulkan object construction, not disk key layout.
+
+### Verification
+- Re-read upstream `vk_compute_pipeline.cpp/.h`: `ComputePipeline` owns `Shader::Info`, uniform buffer sizes, shader module, descriptor set layout, pipeline layout, descriptor update template, final `vk::Pipeline`, and async build state.
+- Re-read upstream `vk_pipeline_cache.cpp`: disk compute load reads `ComputePipelineCacheKey`, queues `CreateComputePipeline(... FileEnvironment ...)`, and inserts successful pipelines into `compute_cache`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core compute_pipeline -- --nocapture` passes: 16 tests, including compute descriptor binding order/type coverage.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pipeline_cache -- --nocapture` passes: 13 tests.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D 12s run at `/tmp/ruzu_mk8d_compute_preload_1783180549` remains stable and color-correct (`present_000720.ppm` max saturation 238). The local MK8D cache reports `Total Pipeline Count: 410 (built=0, skipped=410)`, so this run did not exercise an actual compute-cache entry.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D 12s run at `/tmp/ruzu_mk8d_state_recheck_1783179220` logs `Total Pipeline Count: 370 (built=0, skipped=370)` and dumps color-correct `/tmp/ruzu_mk8d_state_recheck_1783179220/present_000720.png`; sampled dumps keep high saturation (`max_sat` around 238-243).
+
+## 2026-07-04 — video_core/src/renderer_vulkan/pipeline_cache.rs vs video_core/renderer_vulkan/vk_pipeline_cache.cpp
+
+### Intentional differences
+- Rust keeps the trait-facing `current_compute_pipeline()` stub for now and adds `current_compute_pipeline_with_shared_cache(&mut SharedShaderCache)` as the active owner-compatible bridge. Upstream reads the current compute state directly through the C++ `ShaderCache` inheritance graph; Rust's split shader-cache owner requires this explicit bridge until the rasterizer dispatch path is fully ported.
+- Runtime compute pipeline creation is still synchronous. Upstream can pass `workers` into `CreateComputePipeline` for async build behavior; Rust has the `workers` owner but compute constructor splitting is not complete yet.
+- Runtime compute serialization captures an owned `GenericEnvironment` snapshot before queueing work. This avoids sending Rust's `ComputeEnvironment` raw Kepler pointer across threads while preserving upstream `SerializePipeline` ownership of serializable generic shader environment data.
+
+### Unintentional differences (to fix)
+- Active Vulkan `dispatch_compute` still does not call `current_compute_pipeline_with_shared_cache`, configure descriptors, bind the returned pipeline, or issue `vkCmdDispatch`.
+- `ComputePipeline::Configure` remains reduced and does not yet match upstream descriptor queue / buffer cache / texture cache binding behavior.
+- `current_compute_pipeline()` remains a stub because the current Rust ownership surface requires the explicit shared-cache parameter.
+
+### Missing items
+- Wire `RasterizerVulkan::dispatch_compute` to the shared-cache compute path, then port upstream descriptor binding and dispatch emission.
+- Split compute shader translation/module/pipeline creation so `workers` can be used like upstream.
+- Add runtime regression coverage once a compute-using title or homebrew exercises this path.
+
+### Binary layout verification
+- PASS: `ComputePipelineCacheKey` serialization uses explicit little-endian field order (`unique_hash`, `shared_memory_size`, `workgroup_size[3]`) matching the upstream raw key layout already covered by layout/hash tests.
+
+### Verification
+- Re-read upstream `vk_pipeline_cache.cpp`: `CurrentComputePipeline` builds `ComputePipelineCacheKey` from current compute shader unique hash, QMD shared memory size, and QMD block dimensions, then inserts a newly created compute pipeline into `compute_cache`.
+- Rust `current_compute_pipeline_with_shared_cache` now builds the same key from `SharedShaderCache::compute_shader()` and `current_kepler_compute().launch_description()`, creates `ComputeEnvironment::from_kepler_compute`, compiles through `compile_shader_from_env_with_bindings_and_host_info`, inserts into `compute_cache`, and queues `SerializePipeline`.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core compute_pipeline -- --nocapture` passes: 16 tests.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pipeline_cache -- --nocapture` passes: 13 tests.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D color investigation run `/tmp/ruzu_mk8d_color_weird_1783181198` dumps color-correct `/tmp/ruzu_mk8d_color_weird_1783181198/final_360.png` at about 10s/frame360; source/final saturation remains high (`maxsat` 241-255), so the internal Vulkan output did not reproduce the reported black-and-white/color-loss issue.
+
+## 2026-07-04 — video_core/src/renderer_vulkan/graphics_pipeline.rs + video_core/src/renderer_vulkan/pipeline_cache.rs + shader_recompiler/src/pipeline_cache.rs vs video_core/renderer_vulkan/vk_pipeline_cache.cpp
+
+### Intentional differences
+- Rust catches shader compiler panics around disk `build_pipeline_keyed_from_file_environments` with a temporary panic-hook suppression and converts them to `None`. Upstream catches `Shader::Exception` in `PipelineCache::CreateGraphicsPipeline(...) try` and returns `nullptr`. The Rust panic-hook suppression is host-language glue so the caught failure does not print a misleading fatal panic banner.
+- Rust still builds disk graphics pipelines synchronously after parsing. Upstream queues each rebuild with `workers.QueueWork(...)` and waits with `workers.WaitForRequests(stop_loading)`.
+- Rust dual-vertex disk rebuild uses the current Rust `merge_dual_vertex_programs(program_va, program_vb)` helper. Upstream passes the VertexB environment as a third argument to `MergeDualVertexPrograms(program_va, program_vb, env)`; the Rust helper does not currently expose that parameter.
+
+### Unintentional differences (to fix)
+- Most cached graphics entries still skip or fail under the reduced constructor and incomplete SPIR-V/backend support. Latest MK8D run rebuilt 89 of 585 parsed entries and skipped 496.
+- MoltenVK still reports repeated `VK_ERROR_INITIALIZATION_FAILED: Render pipeline compile failed`, so some preloaded pipelines are not valid on this backend even when shader translation succeeds.
+- Async worker ownership remains incomplete: successful disk rebuilds are inserted, but translation/module/pipeline creation is not yet split into upstream `BuiltPipeline` worker phases.
+
+### Missing items
+- Port worker-backed disk graphics rebuild and runtime async build behavior from upstream `PipelineCache::LoadDiskResources` / `CreateGraphicsPipeline`.
+- Reduce skipped graphics entries by completing the remaining shader emitter and reduced-constructor gaps.
+- Decide whether caught shader compiler failures should be represented as typed Rust errors instead of panics once the recompiler API is refactored.
+
+### Binary layout verification
+- PASS: no serialized key layout changed in this slice. `GraphicsPipelineKey::to_cache_bytes()` and `FixedPipelineState` layout tests remain the active layout guards.
+
+### Verification
+- Re-read upstream `vk_pipeline_cache.cpp`: `CreateGraphicsPipeline(...)` wraps shader translation/emission/pipeline creation in `try`, catches `Shader::Exception`, dumps environments, logs the exception, and returns `nullptr`; `LoadDiskResources` only inserts when `pipeline` is non-null.
+- Rust `build_pipeline_keyed_from_file_environments` now catches shader compiler panics, logs `Skipping cached graphics pipeline 0x...`, returns `None`, and `PipelineCache::load_disk_resources` counts the entry as skipped instead of aborting.
+- Disk graphics rebuild now accepts dual VertexA+VertexB keys, translates both `FileEnvironment`s, merges them before SPIR-V emission, and only rejects VertexA without VertexB.
+- `cargo fmt --all` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pipeline_cache -- --nocapture` passes: 15 tests.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D 12s run `/tmp/ruzu_mk8d_colors_1783183310` reports `Total Pipeline Count: 585 (built=89, skipped=496)`, logs one clean skipped shader compiler failure for `SPIR-V: unresolved IR value reference block=0 inst=90`, and does not print `thread 'main' panicked`.
+- MK8D frame 360 remains color-correct: `/tmp/ruzu_mk8d_colors_1783183310/final_360.png` visually matches the yuzu reference logo, and source/swapchain/final saturation is consistent (`avg_sat≈0.094-0.096`, `max_sat=1.0`).
+
+## 2026-07-04 — video_core/src/renderer_vulkan/pipeline_cache.rs + video_core/src/renderer_vulkan/graphics_pipeline.rs + video_core/src/renderer_vulkan/compute_pipeline.rs vs video_core/renderer_vulkan/vk_pipeline_cache.cpp
+
+### Intentional differences
+- Rust queues disk rebuild jobs into `ThreadWorker workers` and collects successful `GraphicsPipeline` / `ComputePipeline` objects in a mutex-protected result vector, then inserts them into `graphics_cache` / `compute_cache` after `wait_for_requests`. Upstream captures `this`, locks `state.mutex`, and inserts from inside each worker job. Rust keeps final cache mutation on the owner thread to avoid sharing the whole mutable `PipelineCache` across `'static` worker closures.
+- Rust creates a `GraphicsPipelineCache::clone_for_disk_worker()` with a fresh shader-recompiler cache per worker job. Upstream uses per-job `ShaderPools pools` while sharing the same pipeline-cache owner. The Rust clone preserves device/profile/feature flags and avoids sharing mutable shader-recompiler cache state across workers.
+- `unsafe impl Send` was added for Vulkan `GraphicsPipeline` and `ComputePipeline` because upstream transfers worker-built pipeline objects back to the cache. These structs own opaque Vulkan handles and are not accessed concurrently after transfer.
+
+### Unintentional differences (to fix)
+- Runtime graphics/compute creation is still synchronous. Upstream passes `thread_worker` into `GraphicsPipeline` / `ComputePipeline` constructors so final pipeline creation can remain pending and `BuiltPipeline` can gate use of unbuilt pipelines.
+- Disk worker jobs still build the full Rust reduced pipeline synchronously inside each worker job; the finer upstream split of shader translation, shader module creation, and final `VkPipeline` build is not represented as `BuiltPipeline` state yet.
+- Many graphics cache entries still skip/fail under MoltenVK or reduced-constructor limitations. Latest worker-preload MK8D run rebuilt 89 of 624 parsed entries and skipped 535.
+
+### Missing items
+- Port runtime async `GraphicsPipeline` / `ComputePipeline` constructors and true `is_built=false` lifecycle.
+- Replace the reduced graphics disk constructor with the full upstream `GraphicsPipeline` owner/configure model to reduce skipped entries.
+- Add progress callback / `state.has_loaded` behavior matching upstream `LoadDiskResources`; Rust currently logs only final counts.
+
+### Binary layout verification
+- PASS: this slice does not change serialized pipeline key layout. It changes preload scheduling and ownership transfer only.
+
+### Verification
+- Re-read upstream `vk_pipeline_cache.cpp::LoadDiskResources`: load callbacks queue compute/graphics jobs on `workers`, increment `state.total`, insert non-null pipelines into `compute_cache` / `graphics_cache`, then `workers.WaitForRequests(stop_loading)` and serialize the Vulkan driver pipeline cache.
+- Rust `PipelineCache::load_disk_resources` now parses with `load_pipelines`, queues rebuild jobs on `self.workers`, waits with `self.workers.wait_for_requests()`, inserts successful worker results, and serializes `vulkan_pipelines.bin` afterward.
+- `cargo fmt --all` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pipeline_cache -- --nocapture` passes: 15 tests.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::graphics_pipeline -- --nocapture` passes: 13 tests.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core compute_pipeline -- --nocapture` passes: 17 tests.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D 18s run `/tmp/ruzu_mk8d_worker_preload_1783183919` reports `Total Pipeline Count: 624 (built=89, skipped=535)`, reaches frame 360 at about 13.94s total wall time, and dumps color-correct `/tmp/ruzu_mk8d_worker_preload_1783183919/final_360.png`.
+- MK8D sample `/tmp/ruzu_mk8d_worker_sample_1783184015/sample.txt` samples the actual `ruzu-cmd` child process at about 14s; the sampled hot spots no longer include `shader_recompiler`, `structure_cfg`, or `ssa_rewrite`, but still show `RasterizerVulkan::draw` / `PipelineCache::current_graphics_pipeline_with_shared_cache`.
+
+## 2026-07-04 — video_core/src/renderer_vulkan/render_pass_cache.rs vs video_core/renderer_vulkan/vk_graphics_pipeline.cpp + video_core/renderer_vulkan/maxwell_to_vk.cpp
+
+### Intentional differences
+- Rust `RenderPassKey` stores Vulkan `vk::Format` values directly, while upstream `GraphicsPipelineCacheKey::state` stores guest `PixelFormat` values and `MakeRenderPassKey` converts them through `MaxwellToVK::SurfaceFormat`. This existing Rust key representation is kept, but the conversion now uses the same authoritative `maxwell_to_vk::surface_format` table as the render-target image creation path.
+
+### Unintentional differences (to fix)
+- `RenderPassCache` is still a reduced port and does not yet use the full upstream `vk_render_pass_cache.cpp` attachment/dependency model. This slice only removes the duplicated PixelFormat-to-Vulkan-format table and the silent fallback to `R8G8B8A8_UNORM`.
+
+### Missing items
+- Port the remaining upstream render-pass cache details once the Vulkan texture/runtime image model is fully aligned.
+- Make the conversion device-aware like upstream `MaxwellToVK::SurfaceFormat(device, ...)` if the Rust Vulkan format table gains device-specific fallback selection for render-pass keys.
+
+### Binary layout verification
+- N/A: render-pass keys are host-side Vulkan cache keys, not serialized guest ABI or disk pipeline-key bytes.
+
+### Verification
+- Re-read upstream `vk_graphics_pipeline.cpp::MakeRenderPassKey`: it converts color and depth `PixelFormat` through `MaxwellToVK::SurfaceFormat` before asking `RenderPassCache` for a render pass.
+- Re-read upstream `maxwell_to_vk.cpp::SurfaceFormat`: invalid formats map to `VK_FORMAT_UNDEFINED`, and known formats use the central Maxwell-to-Vulkan format table instead of a local render-pass fallback table.
+- Rust `RenderPassKey::from_fixed_pipeline_state` now uses `maxwell_to_vk::surface_format(pixel_format).format` for color and depth formats, so disk-rebuilt pipeline render passes match the formats used to create render-target attachments.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core render_pass_cache -- --nocapture` passes: 4 tests, including `A2B10G10R10_UNORM` mapping to `VK_FORMAT_A2B10G10R10_UNORM_PACK32` instead of the old RGBA8 fallback.
+
+## 2026-07-04 — video_core/src/renderer_vulkan/graphics_pipeline.rs + video_core/src/renderer_vulkan/pipeline_cache.rs + video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_graphics_pipeline.cpp/.h + video_core/renderer_vulkan/vk_pipeline_cache.cpp
+
+### Intentional differences
+- Rust `GraphicsPipeline` now owns upstream-shaped async build state (`build_condvar`, `build_mutex`, `is_built`) and protects the Vulkan pipeline handle behind shared state so a worker can publish it after insertion into `graphics_cache`.
+- Rust still performs shader translation, shader module creation, and descriptor/pipeline-layout creation synchronously before insertion. This slice moves only final `vkCreateGraphicsPipelines` onto `VkPipelineBuilder` for runtime shared-cache graphics pipelines when `use_asynchronous_shaders` is enabled.
+- Because Rust has not yet ported upstream `GraphicsPipeline::ConfigureDraw` ownership, `RasterizerVulkan::draw` calls `GraphicsPipeline::pipeline_handle()` and waits at the handle boundary before binding. Upstream records the wait into the scheduler inside `ConfigureDraw`.
+
+### Unintentional differences (to fix)
+- Final async pipeline creation is now worker-backed, but the wait happens on the draw path rather than being scheduler-recorded. This keeps correctness but does not yet preserve upstream's exact submission/wait placement.
+- Disk graphics rebuild still uses full synchronous construction inside each disk worker job. It does not yet share the runtime pending-pipeline lifecycle.
+- Compute pipeline async construction remains incomplete; `ComputePipeline` still creates descriptor layout, pipeline layout, and `VkPipeline` synchronously with `is_built=true`.
+
+### Missing items
+- Move descriptor layout/template/configure ownership into `GraphicsPipeline` like upstream, then port `ConfigureDraw` so the async build wait is recorded on the Vulkan scheduler instead of blocking at `pipeline_handle()`.
+- Split shader module creation and final graphics pipeline creation exactly along upstream constructor boundaries.
+- Apply the same worker-backed pending lifecycle to `ComputePipeline`.
+
+### Binary layout verification
+- N/A: this is host-side Vulkan object lifetime/scheduling state, not guest ABI or disk key layout.
+
+### Verification
+- Re-read upstream `vk_graphics_pipeline.h`: `GraphicsPipeline` stores `build_condvar`, `build_mutex`, and `std::atomic_bool is_built{false}`.
+- Re-read upstream `vk_graphics_pipeline.cpp`: the constructor queues final descriptor/pipeline creation on `Common::ThreadWorker` when provided, sets `is_built=true`, and notifies `build_condvar`; `ConfigureDraw` waits for build completion before binding the pipeline.
+- Re-read upstream `vk_pipeline_cache.cpp`: runtime `CreateGraphicsPipeline()` passes `build_in_parallel=true`, causing `CreateGraphicsPipeline(..., true)` to pass `&workers` into `GraphicsPipeline`.
+- Rust `PipelineCache::create_graphics_pipeline_with_shared_cache` now calls `build_pipeline_keyed_from_environments_async(..., &self.workers)` when `use_asynchronous_shaders` is enabled; the worker creates the final `VkPipeline`, stores it in the shared handle, sets `is_built`, and notifies the condition variable.
+- `cargo fmt --all` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::graphics_pipeline -- --nocapture` passes: 13 tests.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pipeline_cache -- --nocapture` passes: 15 tests.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D async verification run `/tmp/ruzu_mk8d_async_verify_1783188689` reports `Total Pipeline Count: 904 (built=90, skipped=814)`, first `BQC_RELEASE #0` at `15.602s`, present dump `#360` at `18.733s`, and present dump `#2400` at `35.994s`.
+- Visual verification of `/tmp/ruzu_mk8d_async_verify_1783188689/present_000360.png` and `/tmp/ruzu_mk8d_async_verify_1783188689/present_002400.png` shows the color-correct first MK8D logo in both frames. The color-loss issue is not reproduced, but the first-logo timing issue is still unresolved.
+- MK8D sample `/tmp/ruzu_mk8d_async_verify_1783188689/sample.txt` no longer shows shader translation as the dominant cost (`shader_recompiler` appears once, `structure_cfg` and `ssa_rewrite` do not appear). The sampled guest producer path is instead dominated by `BufferQueueProducer::dequeue_buffer -> wait_for_free_slot_then_relock`, so the next investigation slice is BufferQueue/HWC/fence pacing or the producer-side reason it cannot advance to `queue_buffer` fast enough.
+
+## 2026-07-05 — video_core/src/renderer_vulkan/buffer_cache.rs + video_core/src/renderer_vulkan/mod.rs vs video_core/buffer_cache/buffer_cache.h + video_core/renderer_vulkan/vk_buffer_cache.h
+
+### Intentional differences
+- Rust still has a reduced legacy `DirectBufferCache` used by `RasterizerVulkan` while the common `VulkanCommonBufferCache` port is being integrated. This slice ports the upstream Vulkan fast uniform-buffer behavior into that current owner instead of completing the larger structural replacement.
+- Upstream selects the mapped uniform-buffer path from `VideoCommon::BufferCache<P>::BindHostGraphicsUniformBuffer` only when `use_fast_buffer` is true (`size <= uniform_buffer_skip_cache_size` and not GPU-modified). The Rust descriptor fallback already receives per-draw uniform descriptors after common-cache binding; it now uses mapped staging for those uniform fallback descriptors to avoid the known non-upstream `get_or_upload_fresh` allocation path.
+
+### Unintentional differences (to fix)
+- Full ownership parity is still missing: vertex/index/storage descriptor paths remain partly on the legacy direct cache instead of upstream's common `BufferCache<P>` + `BufferCacheRuntime` model.
+- Rust `StagingBufferPool` still uses a reduced stream-buffer implementation and smaller stream capacity than upstream `vk_staging_buffer_pool.cpp` (`MAX_STREAM_BUFFER_SIZE = 128_MiB` upstream).
+
+### Missing items
+- Retire legacy `DirectBufferCache` from `RasterizerVulkan` hot paths and route vertex/index/storage/descriptor buffer binding through `VulkanCommonBufferCache` and `BufferCacheRuntime`.
+- Port the remaining upstream staging stream region synchronization details from `vk_staging_buffer_pool.cpp`.
+
+### Binary layout verification
+- N/A: this slice changes host-side Vulkan buffer binding and staging allocation, not guest ABI or serialized disk-cache layout.
+
+### Verification
+- Re-read upstream `buffer_cache.h::BindHostGraphicsUniformBuffer`: for Vulkan/non-OpenGL fast UBOs it calls `runtime.BindMappedUniformBuffer(...)`, then reads guest memory directly into the returned mapped span.
+- Re-read upstream `vk_buffer_cache.h::BindMappedUniformBuffer`: it requests a staging upload buffer, binds that buffer/offset/size into the descriptor queue, and returns the mapped span.
+- Rust `BufferCache::bind_mapped_uniform_buffer` now requests a staging upload buffer, reads guest memory directly into the mapped span, and returns `(VkBuffer, offset)` for descriptor binding.
+- Rust `RendererVulkan::bind_graphics_descriptors` now uses `bind_mapped_uniform_buffer` for `UNIFORM_BUFFER` fallback descriptors before falling back to `get_or_upload_fresh`.
+- `cargo fmt --all` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D run `/tmp/ruzu_mk8d_uniform_1783208495` still shows the first logo at present-source dump `source_001800.ppm` around `47.079s`; the UBO allocation fix reduces one sampled Vulkan allocation source but does not resolve the first-logo delay.
+
+## 2026-07-05 — video_core/src/renderer_vulkan/present_manager.rs vs video_core/renderer_vulkan/vk_present_manager.cpp
+
+### Intentional differences
+- Rust passes a `frame_index` plus a copied `Frame` snapshot to the present thread, while upstream passes a `Frame*`. This preserves the same ownership lifecycle: `GetRenderFrame` removes the slot from the free queue, and the presentation side returns it only after `CopyToSwapchain`.
+- Rust uses `Arc<Mutex<_>>` and `Condvar` around `PresentThreadContext` instead of upstream sharing `this` directly with `std::jthread`.
+
+### Unintentional differences (to fix)
+- The non-threaded path still calls `CopyToSwapchain` directly without an exact upstream `scheduler.WaitWorker()` equivalent. The current Vulkan scheduler has no upstream-style worker thread yet, so this remains a scheduler-architecture gap rather than a present-manager-local fix.
+
+### Missing items
+- Complete upstream scheduler worker-thread parity so direct presentation and recorded present callbacks have the same worker ordering semantics as C++.
+
+### Binary layout verification
+- N/A: present frames and queues are host-side Vulkan lifecycle state, not guest ABI or serialized payloads.
+
+### Verification
+- Re-read upstream `vk_present_manager.cpp::Present`: when `use_present_thread` is enabled, upstream calls `scheduler.Record([this, frame](vk::CommandBuffer) { present_queue.push(frame); frame_cv.notify_one(); })`; it does not push directly from `Present`.
+- Re-read upstream `vk_present_manager.cpp::CopyToSwapchainImpl`: upstream still locks `scheduler.submit_mutex` around the copy/blit `vkQueueSubmit`, so removing the submit mutex would be non-faithful and was not done.
+- Rust `PresentManager::present` now records the present-queue push into `Scheduler::record` for the threaded path, matching upstream ordering. The present thread only sees a frame after the scheduler executes the recorded callback.
+
+## 2026-07-05 — common/src/fs/path_util.rs vs common/fs/path_util.cpp
+
+### Intentional differences
+- ruzu can borrow a legacy yuzu data root for user/system data when the ruzu NAND/SDMC is empty. This compatibility layer has no upstream equivalent because upstream yuzu does not need to bridge from another emulator name.
+- `RuzuPath::ShaderDir` now remains under the ruzu root even when the legacy yuzu root is selected for NAND/SDMC/keys. This is intentional: ruzu's Vulkan disk pipeline cache uses ruzu-specific serialized layouts, while yuzu's cache files may share the same upstream filenames and header version. Reading or deleting yuzu's `shader/<title>/vulkan*.bin` from ruzu would be unsafe.
+
+### Unintentional differences (to fix)
+- None for this slice.
+
+### Missing items
+- None for this slice.
+
+### Binary layout verification
+- N/A: this changes host filesystem path ownership, not guest ABI or serialized payload layout.
+
+### Verification
+- Re-read upstream `common/fs/path_util.cpp`: upstream assigns all `YuzuPath` directories under yuzu-owned roots and has no cross-emulator legacy-root fallback.
+- Re-read ruzu `pipeline_cache.rs`: the Rust disk pipeline cache is serialized by ruzu-specific `GraphicsPipelineKey::to_cache_bytes()` and `FixedPipelineState` layout. It currently uses upstream-style filenames, so keeping shader caches under the ruzu-owned root prevents accidental consumption of incompatible yuzu caches.
+
+## 2026-07-05 — diagnostic trace env caches vs upstream kernel scheduler/thread files
+
+Rust files:
+- `core/src/hle/kernel/k_scheduler.rs`
+- `core/src/hle/kernel/global_scheduler_context.rs`
+- `core/src/hle/kernel/physical_core.rs`
+- `core/src/hle/kernel/k_thread.rs`
+- `core/src/hle/kernel/sleep_timing.rs`
+- `core/src/hle/kernel/svc/svc_thread.rs`
+
+Upstream files:
+- `core/hle/kernel/k_scheduler.cpp`
+- `core/hle/kernel/global_scheduler_context.cpp`
+- `core/hle/kernel/physical_core.cpp`
+- `core/hle/kernel/k_thread.cpp`
+- `core/hle/kernel/svc/svc_thread.cpp`
+
+### Intentional differences
+- ruzu has diagnostic-only environment-variable trace gates (`RUZU_TRACE_*`) that have no upstream equivalent. These helpers are intentionally outside upstream behavior and are used only for local investigation.
+- Env trace flags and filters are now cached with `OnceLock` in hot scheduler/timer/SVC paths. This preserves the same diagnostic semantics for a process lifetime, avoids repeated `std::env` lookups in timing-sensitive paths, and does not affect normal execution when the trace variables are unset.
+
+### Unintentional differences (to fix)
+- None for this slice.
+
+### Missing items
+- None for this slice. This did not port new upstream kernel behavior; it only reduced diagnostic overhead while investigating MK8D first-logo timing.
+
+### Binary layout verification
+- N/A: no guest ABI, serialized payload, or raw-copied structure was changed.
+
+### Verification
+- Re-read the corresponding upstream scheduler/thread files conceptually for ownership: these trace helpers remain ruzu-only instrumentation and do not replace upstream scheduler/thread behavior.
+- `cargo build --release --bin ruzu-cmd` passes after the changes.
+- MK8D timing runs still reproduce the first-logo delay, so these caches are not treated as the root-cause fix; they only make subsequent measurements less intrusive.
+
+## 2026-07-05 — core/src/hle/kernel/k_scheduler.rs vs core/hle/kernel/k_scheduler.cpp + core/hle/kernel/k_priority_queue.h
+
+### Intentional differences
+- Rust still accesses the global scheduler context through `Arc<Mutex<_>>` and the process lock, while upstream uses direct `KernelCore&` and intrusive `KThread*` queues under `KScopedSchedulerLock`. The lock ordering follows the existing Rust host-lock constraints while keeping the priority-queue mutations inside the scheduler-lock scope.
+- `highest_priority_thread_id_on_core` reads the Rust per-core scheduler state through the kernel singleton when checking `YieldWithCoreMigration`'s `running_on_suggested_core`. Upstream reads `kernel.Scheduler(suggested_core).m_state.highest_priority_thread` directly.
+- Unit tests exercise the upstream queue effects directly through the Rust `KPriorityQueue` representation because the public yield helpers require the global scheduler-lock singleton installed by a full kernel.
+
+### Unintentional differences (to fix)
+- `yield_without_core_migration` still uses the older Rust fallback behavior for a missing priority-queue entry (`request_schedule`) rather than a fully audited upstream-only path. This was not changed in this slice.
+- The scheduler still has broader known split-architecture differences around raw fiber handoff and mutex avoidance; this slice only removes the explicit single-core shortcuts in the two migration yield helpers.
+
+### Missing items
+- Further audit `RotateScheduledQueue`, `YieldWithoutCoreMigration`, and scheduler-lock unlock ordering against upstream now that the two migration yield paths are no longer stubs.
+
+### Binary layout verification
+- N/A: scheduler queues and thread migration state are host-side kernel state, not guest ABI or serialized payload layout.
+
+### Verification
+- Re-read upstream `k_scheduler.cpp::YieldWithCoreMigration`: it rotates the current thread to the scheduled back, increments scheduled count, scans `GetSuggestedFront/GetSuggestedNext`, migrates a valid suggestion to the current core with `ChangeCore(..., true)`, then either sets scheduler-update-needed or updates the yield schedule count.
+- Re-read upstream `k_scheduler.cpp::YieldToAnyThread`: it sets the current thread active core to `-1`, calls `ChangeCore`, increments scheduled count, optionally migrates a suggested thread when the old core has no scheduled front, then sets scheduler-update-needed or the yield schedule count.
+- Re-read upstream `k_priority_queue.h::ChangeCore`: `SetActiveCore` happens before `ChangeCore`; the queue removes the old scheduled entry, removes the new-core suggested entry, pushes the new scheduled entry, and adds a suggestion back to the old core.
+- Rust `yield_with_core_migration` now follows the upstream control flow instead of delegating to `yield_without_core_migration`.
+- Rust `yield_to_any_thread` now follows the upstream control flow instead of delegating to `yield_without_core_migration`.
+- Added focused queue tests for moving a suggested thread to the front and moving the current thread to active core `-1`.
+- `cargo test -p core hle::kernel::k_scheduler::tests -- --nocapture` passes: 14 tests.
+- `cargo build --release --bin ruzu-cmd` passes.
+- MK8D follow-up run `/tmp/ruzu_mk8d_affinity_1783251489` shows the hot sampled threads have single-core affinities (`0x1`, `0x2`, `0x4`) and no suggested fronts for idle cores, so this parity fix does not resolve the first-logo delay by itself.
+
+## 2026-07-05 — core/src/hle/kernel/kernel.rs diagnostic dump vs upstream kernel diagnostics
+
+### Intentional differences
+- The SIGUSR1 diagnostic dump is ruzu-only instrumentation. It now prints each thread's affinity mask and the priority-queue `(scheduled,suggested)` fronts per core to make scheduler investigations auditable without changing runtime behavior.
+
+### Unintentional differences (to fix)
+- None for this diagnostic slice.
+
+### Missing items
+- None for this diagnostic slice.
+
+### Binary layout verification
+- N/A: diagnostic output only.
+
+### Verification
+- `cargo build --release --bin ruzu-cmd` passes.
+- MK8D diagnostic run `/tmp/ruzu_mk8d_affinity_1783251489` confirmed the sampled workers are pinned by guest affinity, invalidating the earlier scheduler-migration hypothesis for that window.
+
+## 2026-07-05 — core/src/core_timing.rs vs core/core_timing.cpp + core/core_timing.h
+
+### Intentional differences
+- Rust stores timing state behind `Arc<Mutex<CoreTimingState>>` and keeps callback closures in `Arc<Mutex<EventType>>`, while upstream stores `CoreTiming` state directly and uses `std::shared_ptr<EventType>`. This preserves the same event ownership/lifetime within Rust's existing thread model.
+- Rust pushes a replacement `TimingEvent` into the binary heap after a looping event fires; upstream updates the intrusive event handle in place with `event_queue.update`. The observable ordering is preserved by reusing upstream's `event_fifo_id++` behavior for the replacement event.
+
+### Unintentional differences (to fix)
+- None for the looping-event reschedule rule changed in this slice. Rust now matches upstream: `next_time = evt.time + next_schedule_time`, with the only clamp being `pause_end_time + next_schedule_time` when `evt.time < pause_end_time`.
+
+### Missing items
+- A broader CoreTiming audit is still useful for lock granularity and timer-thread wake behavior, but no missing upstream method was identified for this local fix.
+
+### Binary layout verification
+- N/A: CoreTiming events are host scheduler state, not guest ABI or serialized payloads.
+
+### Verification
+- Re-read upstream `core_timing.cpp::Advance`: after a looping event callback, upstream computes `next_time` from `evt.time`, not the current wall/global time, and only adjusts events that were scheduled before `pause_end_time`.
+- Rust `CoreTiming::advance` now follows that ordering. The previous Rust `max(evt_time, now_ns)` behavior was non-faithful and dropped catch-up ticks for late looping events.
+- Focused tests pass:
+- `cargo test -p core core_timing::tests::advance_looping_event_reschedules_from_event_time -- --nocapture`
+- `cargo test -p core core_timing::tests::timer_thread_wakes_for_earlier_new_event -- --nocapture`
+- Broad filtered `cargo test -p core core_timing -- --nocapture` still hits an unrelated existing nvdrv test panic in `nvdrv.rs:55`, while the CoreTiming tests themselves pass.
+- `cargo build --release --bin ruzu-cmd` passes.
+- MK8D run `/tmp/ruzu_mk8d_coretiming_1783252114` shows the expected pacing improvement (`VSYNC_PROFILE callbacks=2721` in about 45.9s, roughly 59 Hz), but present dumps still show the first logo later, so this parity fix is necessary but not the complete first-logo solution.
+## 2026-07-05 — core/src/hle/kernel/svc/svc_thread.rs vs core/hle/kernel/svc/svc_thread.cpp
+
+### Intentional differences
+- Rust includes env-gated diagnostics in `SleepThread` for MK8D first-logo investigation: `RUZU_TRACE_MK8D_LOGO_STATE=1` scans the current A32 context and stack for plausible MK8D loading objects and logs changes to fields around `+0x4300..+0x4319`, including the `+0x430C/+0x430D` phase mask used by the `0x40000` progress-bit writer.
+- Rust already had other env-gated `SleepThread` probes (`RUZU_TRACE_SLEEP*`, Mii wait/resource probes). These are diagnostic-only and inactive by default; upstream has no equivalent instrumentation.
+
+### Unintentional differences (to fix)
+- None in default `SleepThread` behavior for this diagnostic slice. The upstream-positive-sleep behavior remains: convert nanoseconds to hardware ticks and arm the current thread sleep; diagnostics run only before the sleep when explicitly enabled.
+
+### Missing items
+- N/A for this diagnostic slice.
+
+### Binary layout verification
+- N/A: diagnostic logging only, no guest ABI or serialized layout.
+
+### Verification
+- Re-read upstream `core/hle/kernel/svc/svc_thread.cpp`: `SleepThread` has no state inspection and simply handles positive sleeps or the three yield values. Rust's added MK8D state scan is gated by `RUZU_TRACE_MK8D_LOGO_STATE` and therefore does not alter normal execution.
+
+## 2026-07-05 — externals/rdynarmic/src/backend/arm64/a32_address_space.rs + externals/rdynarmic/src/jit.rs vs upstream dynarmic ARM64 A32 address-space diagnostics
+
+### Intentional differences
+- Added ruzu-only env-gated diagnostics for MK8D first-logo investigation:
+  `RUZU_TRACE_A32_MEM_PC_RANGE=0xLO-0xHI` filters existing A32 memory-callback
+  PC logs, and `RUZU_BLOCK_COUNT_PC=0xLO-0xHI` is now wired into the ARM64 A32
+  `A32AddressSpace::get_or_emit` path used on Apple Silicon.
+- Added ARM64 A32 emitted-block support for `RUZU_BLOCK_PROLOGUE_COUNT_PC`.
+  The instrumentation is emitted only for A32 block entry PCs in the requested
+  range and counts direct-linked block execution that bypasses dispatcher
+  lookup.
+- These diagnostics are inactive unless the environment variables are set.
+  Upstream dynarmic has no equivalent ruzu-specific tracing requirement.
+
+### Unintentional differences (to fix)
+- None for default JIT behavior in this diagnostic slice.
+
+### Missing items
+- Generated-code dumps for individual ARM64 A32 blocks are still not exposed by
+  a convenient env gate. The current diagnostics count hot blocks but do not yet
+  print the lowered host instructions for `0x00B92E04/0x00B92EBC`.
+
+### Binary layout verification
+- N/A: diagnostic counters/log filtering only; no guest ABI, serialized
+  payload, or generated-code ABI was changed.
+
+### Verification
+- `cargo check -p rdynarmic` passes.
+- `cargo build --release --bin ruzu-cmd` passes with the existing pkg-config
+  paths for SDL2/FFmpeg.
+- MK8D run `/tmp/ruzu_mk8d_memrange_1783254424` with
+  `RUZU_TRACE_A32_MEM_PC_RANGE=0x00B92000-0x00B94000` produced no memory-callback
+  hits in that range.
+- MK8D run `/tmp/ruzu_mk8d_blockcount_sig_1783254811` with
+  `RUZU_BLOCK_COUNT_PC=0x00B92000-0x00B94000` produced `core=0: 8073` hits in
+  the ARM64 A32 dispatcher/get-or-emit path by the periodic dump.
+- MK8D run `/tmp/ruzu_mk8d_prologue_sig_1783255047` with both
+  `RUZU_BLOCK_COUNT_PC` and `RUZU_BLOCK_PROLOGUE_COUNT_PC` for
+  `0x00B92000-0x00B94000` produced dispatcher counts
+  `core0=17310/core1=1278/core2=30` versus prologue counts
+  `core0=119183428/core1=92668497/core2=1255039`, proving direct-linked block
+  execution dominates this range.
+
+## 2026-07-05 — externals/rdynarmic/src/backend/arm64/emit_arm64_memory.rs vs upstream externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+
+### Intentional differences
+- Rust still uses the local `inst::*` encoder and `BlockOfCode` writer instead
+  of upstream oaknut calls. This is the existing rdynarmic backend structure;
+  the emitted instruction sequence now matches upstream for this slice.
+
+### Unintentional differences (to fix)
+- None for `InlinePageTableEmitVAddrLookup` page-table pointer masking. ruzu
+  previously materialized the mask into `Xscratch1` and emitted register
+  `AND`; upstream emits logical-immediate `AND(Xscratch0, Xscratch0, mask)`.
+  Rust now emits `inst::and_x_imm(XSCRATCH0, XSCRATCH0, mask)`.
+
+### Missing items
+- No missing item was identified for this local page-table masking slice.
+
+### Binary layout verification
+- N/A: generated host code only; no guest ABI, raw-copied structure, or
+  serialized layout changed.
+
+### Verification
+- Re-read upstream `InlinePageTableEmitVAddrLookup`: after loading the
+  page-table entry, upstream applies `code.AND(Xscratch0, Xscratch0, mask)` and
+  then checks `CBZ`.
+- Rust now follows the same ordering and same scratch-register ownership.
+- Updated the focused memory-emitter test offsets because the generated block
+  is shorter by one instruction.
+- `cargo test -p rdynarmic backend::arm64::emit_arm64_memory::tests -- --nocapture` passed earlier for this slice.
+- `cargo check -p rdynarmic` passes.
+- `cargo build --release --bin ruzu-cmd` passes.
+
+## 2026-07-05 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs + inst.rs vs upstream externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+- Rust expresses upstream oaknut `MaybeAddSubImm` through local helpers
+  `encode_add_sub_imm`, `emit_add_sub_imm`, and
+  `emit_add_sub_imm_flags`, plus explicit `inst::*_imm_shift` encoders. This
+  preserves upstream ownership inside the ARM64 data-processing emitter while
+  adapting to rdynarmic's hand-written instruction encoder.
+
+### Unintentional differences (to fix)
+- None for the Add/Sub immediate RHS paths audited in this slice. ruzu
+  previously materialized immediate RHS values through scratch registers even
+  when AArch64 add/sub-immediate encoding was valid. It now mirrors upstream's
+  `MaybeAddSubImm`: use immediate encoding when valid, otherwise materialize
+  into scratch.
+- The dynamic-carry immediate RHS path now also follows upstream ordering:
+  realize result/lhs, `ReadWriteFlags`, then emit `ADC/SBC` or `ADCS/SBCS`
+  with `WZR/XZR` for immediate zero or scratch for non-zero immediates.
+
+### Missing items
+- A broader audit of `emit_arm64_data_processing.rs` is still pending. This
+  entry covers the `EmitAddSub`/`MaybeAddSubImm` parity slice only.
+
+### Binary layout verification
+- N/A: generated host code and instruction encoders only.
+
+### Verification
+- Re-read upstream `MaybeAddSubImm` and `EmitAddSub`: immediate RHS values are
+  masked to 32 bits for 32-bit ops, emitted as add/sub immediate when valid,
+  otherwise moved to `Rscratch0`; dynamic-carry immediate RHS uses
+  `ADC/SBC`/`ADCS/SBCS` rather than routing the immediate through normal
+  register allocation.
+- Rust now follows that control flow for both flag-writing and non-flag-writing
+  Add/Sub forms.
+- Added shifted add/sub immediate encoders in `inst.rs` and focused opcode
+  tests for shifted/non-shifted encodings and compare aliases.
+- `cargo test -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words -- --nocapture` passes.
+- `cargo check -p rdynarmic` passes.
+- `cargo build --release --bin ruzu-cmd` passes.
+- MK8D run `/tmp/ruzu_mk8d_dynaddsub_1783258481` still shows the first-logo
+  state transition is too slow (`w4314=7 -> 3` at about `47.27s`), so this is a
+  real upstream-fidelity/performance fix but not the complete first-logo
+  solution.
+
+## 2026-07-05 — externals/rdynarmic/src/backend/arm64/a32_address_space.rs vs upstream ARM64 A32 translation/code-cache diagnostics
+
+### Intentional differences
+- Added ruzu-only diagnostic dumps:
+  `RUZU_DUMP_A32_IR_AT_PC=0xADDR[,0xADDR2]` prints pre/post optimization A32
+  IR, and `RUZU_DUMP_ARM64_BLOCK_PC=0xLO-0xHI` writes emitted ARM64 block bytes
+  to `RUZU_DUMP_ARM64_BLOCK_DIR` for external disassembly. Upstream has no
+  equivalent env-driven dump contract; these are inactive by default.
+
+### Unintentional differences (to fix)
+- None for default behavior. The diagnostics are gated and do not alter code
+  generation when unset.
+
+### Missing items
+- None for this diagnostic slice.
+
+### Binary layout verification
+- N/A: diagnostics only.
+
+### Verification
+- Used the IR dump to verify A32 GetSetElimination is active for MK8D hot block
+  `0x00B92E04`: post-opt IR retains only live cross-block register state and
+  direct link terminals.
+- Used the ARM64 block dump to verify generated hot-block size improved from
+  about `188` bytes to `156` bytes after page-table immediate masking and to
+  about `148` bytes after Add/Sub immediate emission.
+- `cargo check -p rdynarmic` passes.
+
+## 2026-07-05 — core/src/arm/dynarmic/arm_dynarmic_32.rs vs upstream core/arm/dynarmic/arm_dynarmic_32.cpp callback hot paths
+
+### Intentional differences
+- ruzu keeps env-gated/non-blocking diagnostics around A32 memory/exclusive
+  callbacks (`RUZU_TRACE_*`, `RUZU_WATCH_*`, and `common::trace` categories).
+  Upstream has no equivalent tracing. These diagnostics remain available when
+  explicitly enabled.
+- Rust still stores the memory bridge as `Arc<Mutex<Memory>>`, while upstream
+  stores `Core::Memory::Memory&` directly. This is an existing Rust ownership
+  divergence and was not refactored in this local fast-path slice.
+
+### Unintentional differences (to fix)
+- None for the default exclusive callback behavior changed in this slice. When
+  callback diagnostics are disabled, A32 exclusive read/write callbacks now
+  avoid ruzu-only watch/trace helpers and go straight to `Memory::read_*` /
+  `Memory::write_exclusive_*`, matching upstream's normal callback intent:
+  `CheckMemoryAccess` plus direct memory operation.
+
+### Missing items
+- A deeper upstream-faithful ownership refactor is still pending if callback
+  lock overhead remains a bottleneck: replace the hot callback
+  `Arc<Mutex<Memory>>` access with a stable direct memory reference/pointer
+  whose lifetime matches upstream `m_memory`.
+
+### Binary layout verification
+- N/A: callback control flow only; no guest ABI or serialized layout changed.
+
+### Verification
+- Re-read upstream `DynarmicCallbacks32`: `MemoryRead*` and
+  `MemoryWriteExclusive*` perform `CheckMemoryAccess` and then direct
+  `m_memory.Read*` / `m_memory.WriteExclusive*`.
+- Re-read upstream ARM64 Dynarmic exclusive emitters:
+  `CallbackOnlyEmitExclusiveReadMemory`,
+  `CallbackOnlyEmitExclusiveWriteMemory`, and `a32_address_space.cpp` still use
+  callback trampolines and `global_monitor`; seeing exclusive trampolines in
+  host samples is therefore not itself a bug.
+- Added `a32_callback_diagnostics_enabled()` and default fast paths for A32
+  exclusive read/write callbacks when diagnostics are disabled.
+- `cargo check -p core` passes.
+- `cargo build --release --bin ruzu-cmd` passes.
+- MK8D impact still needs a follow-up run after this change.
+
+## 2026-07-05 — externals/rdynarmic/src/jit.rs + externals/rdynarmic/src/backend/arm64/emit_arm64.rs + ruzu_cmd/src/main.rs vs upstream ARM64 A32 code-cache diagnostics
+
+### Intentional differences
+- Added ruzu-only diagnostic instrumentation:
+  `RUZU_BLOCK_PROLOGUE_TOP_PC=0xLO-0xHI` creates one atomic counter array per
+  A32 block-entry PC and emits an inline increment at block prologue time.
+  `RUZU_BLOCK_PROLOGUE_TOP_N=N` controls the summary size. Upstream Dynarmic
+  has no equivalent env-driven top-PC profiler.
+- `ruzu_cmd` includes the new top-PC summary in the existing SIGUSR2 and
+  `RUZU_COUNT_DUMP_FILE` count-dumper path. This extends existing ruzu-only
+  instrumentation and is inactive unless the environment variable is set.
+
+### Unintentional differences (to fix)
+- None for default execution. When `RUZU_BLOCK_PROLOGUE_TOP_PC` is unset, no
+  per-PC counter is allocated and no per-PC prologue increment is emitted.
+
+### Missing items
+- None for this diagnostic slice.
+
+### Binary layout verification
+- N/A: diagnostics only; no guest ABI or serialized layout changed.
+
+### Verification
+- Re-read upstream `A32AddressSpace::GenerateIR` / `GetEmitConfig` and ARM64
+  block emission. This instrumentation deliberately sits outside upstream
+  behavior and does not change generated code unless the env var is enabled.
+- `cargo check -p rdynarmic` passes.
+- `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
+- MK8D diagnostic run `/tmp/ruzu_mk8d_toppc_1783259411` with
+  `RUZU_BLOCK_PROLOGUE_TOP_PC=0x00206000-0x01C9C000` identified the Yaz0
+  decompressor as the dominant first-logo hot path:
+  `0x00B92E14` ≈ `114.7M` entries and `0x00B92E04` ≈ `113.7M` entries.
+
+## 2026-07-05 — core/src/file_sys/romfs_factory.rs + core/src/hle/service/filesystem/filesystem.rs + core/src/core.rs + core/src/loader/nsp.rs + core/src/loader/xci.rs vs upstream packed RomFS update registration
+
+### Intentional differences
+- Upstream `AppLoader_NSP::Load` and `AppLoader_XCI::Load` call
+  `ReadUpdateRaw` and then `FileSystemController::SetPackedUpdate` directly
+  because the C++ loader receives the already-created `KProcess` and can read
+  `process.GetProcessId()` there. In ruzu, `process_id` is assigned in
+  `System::load` after the loader returns, so the Rust port performs the
+  `ReadUpdateRaw`/`set_packed_update` step immediately after
+  `FileSystemController::register_process` in `System::load`. The Rust
+  `NSP`/`XCI` loader paths keep only the ownership comment and do not call
+  `read_update_raw` locally, avoiding a redundant update lookup before
+  `System::load` performs the real registration.
+- `RomFSFactory::packed_update_raw` is guarded by a `Mutex<Option<VirtualFile>>`
+  so `FileSystemController::set_packed_update` can mutate the factory through
+  the existing `Arc<RomFSFactory>` registration. This preserves upstream's
+  shared `std::shared_ptr<RomFSFactory>` ownership while fitting Rust's shared
+  ownership model.
+
+### Unintentional differences (to fix)
+- None for this slice. The Rust call site is different, but the observable
+  order is preserved: register process RomFS factory first, then attach the
+  packed update before services open the current process RomFS.
+
+### Missing items
+- None for packed update registration. Remaining RomFS/patch-manager parity
+  issues, if any, should be tracked against their own upstream files.
+
+### Binary layout verification
+- N/A: this slice changes service/controller ownership and RomFS factory state,
+  not serialized guest ABI structures.
+
+### Verification
+- Re-read upstream `core/loader/nsp.cpp`, `core/loader/xci.cpp`,
+  `core/hle/service/filesystem/filesystem.cpp`, and
+  `core/file_sys/romfs_factory.cpp`.
+- Rust now exposes `FileSystemController::set_packed_update`, stores the raw
+  update file in `RomFSFactory`, and passes it to `PatchManager::patch_romfs`
+  from `RomFSFactory::open_current_process`.
+- `cargo check -p core` passes.
+
+## 2026-07-05 — core/src/arm/dynarmic/arm_dynarmic_32.rs vs upstream A32 Dynarmic config
+
+### Intentional differences
+- ruzu builds rdynarmic's `MemoryEmitConfig` in
+  `core/src/arm/dynarmic/arm_dynarmic_32.rs`, while upstream splits the same
+  values between `core/arm/dynarmic/arm_dynarmic_32.cpp` and Dynarmic's
+  `backend/arm64/a32_address_space.cpp`. This preserves the effective
+  ownership split in the current Rust architecture: emulator settings in
+  `ArmDynarmic32::new`, backend address-space lowering in rdynarmic.
+- The `RUZU_A32_LEGACY_FASTMEM` escape hatch remains ruzu-only diagnostic
+  fallback. It is disabled by default and does not affect normal upstream-parity
+  execution.
+
+### Unintentional differences (to fix)
+- Fixed: A32 page-table and fastmem address spaces now set
+  `silently_mirror_page_table = true` and `silently_mirror_fastmem = true`,
+  matching upstream `A32AddressSpace::GetEmitConfig`. ruzu previously set both
+  to `false`, which made the ARM64 memory emitter use stricter address handling
+  than upstream for A32 guest addresses.
+- Fixed: `check_halt_on_memory_access` now follows upstream
+  `ArmDynarmic32::MakeJit`: enabled when the debugger is active, and also in
+  CPU debug mode when memory aborts are not ignored. ruzu previously left the
+  generated-memory-access halt check disabled in the page-table fast path.
+
+### Missing items
+- None for the A32 memory emit configuration values changed in this slice.
+  Remaining JIT throughput work should be tracked against the specific
+  rdynarmic backend emitter or upstream Dynarmic file being compared.
+
+### Binary layout verification
+- N/A: JIT configuration/control-flow only; no guest ABI or serialized layout
+  changed.
+
+### Verification
+- Re-read upstream `core/arm/dynarmic/arm_dynarmic_32.cpp::MakeJit`.
+- Re-read upstream Dynarmic
+  `backend/arm64/a32_address_space.cpp::A32AddressSpace::GetEmitConfig`.
+- `cargo check -p core` passes.
+- `cargo check -p rdynarmic` passes.
+- MK8D timing impact still needs a follow-up run.
+
+## 2026-07-05 — externals/rdynarmic/src/backend/arm64/emit_arm64_memory.rs vs upstream ARM64 memory emitter diagnostics
+
+### Intentional differences
+- Added ruzu-only env-gated diagnostic instrumentation:
+  `RUZU_A32_INLINE_WATCH_ADDR=0xADDR[:SIZE][,...]`. When unset, the generated
+  inline page-table write path is unchanged. When set, only stores whose A32
+  virtual address overlaps the configured range branch to the existing wrapped
+  write fallback, allowing the normal A32 callback watchpoint path to log
+  PC/LR/address/value for otherwise-inline mapped stores.
+- This is deliberately diagnostic-only and mirrors no upstream feature.
+  Upstream Dynarmic does not include env-driven inline-store watch routing.
+
+### Unintentional differences (to fix)
+- None for default execution. The hook is inactive unless
+  `RUZU_A32_INLINE_WATCH_ADDR` is set.
+
+### Missing items
+- None for this diagnostic slice. If the hook is kept long-term, it should
+  remain strictly env-gated or be moved behind a dedicated debug feature.
+
+### Binary layout verification
+- N/A: generated-code diagnostics only; no guest ABI or serialized layout
+  changed.
+
+### Verification
+- Re-read upstream `backend/arm64/emit_arm64_memory.cpp` ownership for inline
+  page-table write emission and fallback callback emission. The Rust change is
+  intentionally outside upstream behavior and routes through the already-ported
+  wrapped write fallback only when explicitly requested.
+- `cargo check -p rdynarmic` passes.
+- `cargo build --release --bin ruzu-cmd` passes.
+- MK8D diagnostic run `/tmp/ruzu_mk8d_inlinewatch_long_1783262034` used the
+  hook to attribute the first-logo state writers without forcing all A32 memory
+  stores through callbacks.
+
+## 2026-07-05 — core/src/loader/deconstructed_rom_directory.rs vs upstream core/loader/deconstructed_rom_directory.cpp
+
+### Intentional differences
+- Rust maps `FileSys::ResultStatus` to loader `ResultStatus` explicitly because
+  the port uses separate enums. Upstream returns the shared enum directly.
+- If `override_update` is set but the loader bridge lacks a filesystem
+  controller or content provider, Rust logs a warning and continues with the
+  unpatched ExeFS. Normal application launch provides both references through
+  `loader::System`; this is a defensive Rust-only fallback for incomplete test
+  harnesses.
+
+### Unintentional differences (to fix)
+- None for the `override_update` ExeFS patching path. Rust now mirrors upstream:
+  load `main.npdm`, call `PatchManager::PatchExeFS` when `override_update` is
+  true, then reread `main.npdm` with `ProgramMetadata::reload`.
+
+### Missing items
+- The later NCE patch context in upstream `deconstructed_rom_directory.cpp`
+  remains structurally unported in this file, consistent with the existing NCE
+  status elsewhere in the crate.
+
+### Binary layout verification
+- N/A: no raw guest ABI or serialized structure changed.
+
+### Verification
+- Re-read upstream `AppLoader_DeconstructedRomDirectory::Load` around the
+  `override_update` branch and metadata reload.
+- `cargo check -p core` passes.
+
+## 2026-07-05 — core/src/hle/kernel/svc/svc_thread.rs vs upstream core/hle/kernel/svc/svc_thread.cpp
+
+### Intentional differences
+- Extended the existing ruzu-only MK8D first-logo diagnostic with
+  `RUZU_TRACE_MK8D_LOGO_TABLE=1`. When combined with
+  `RUZU_TRACE_MK8D_LOGO_STATE=1`, positive `SleepThread` calls can now dump
+  the 12-entry resource table for plausible MK8D logo-state objects in states
+  `7` and `0xA`, including handles, offsets, resource pointers, and
+  `resource+0x8AC` data pointers. The dump is throttled to about once per
+  second and is inactive by default.
+- Upstream `SleepThread` has no title-specific state inspection. This Rust
+  diagnostic deliberately remains env-gated and does not change scheduling,
+  sleeping, or guest memory contents when unset.
+
+### Unintentional differences (to fix)
+- None for default execution. This is diagnostic instrumentation only.
+
+### Missing items
+- None for this diagnostic slice.
+
+### Binary layout verification
+- N/A: no guest ABI or serialized structure is changed.
+
+### Verification
+- Re-read upstream `core/hle/kernel/svc/svc_thread.cpp`: positive sleeps call
+  the scheduler sleep path; yield magic values take their dedicated paths.
+  The Rust diagnostic is outside upstream behavior and is gated by
+  `RUZU_TRACE_MK8D_LOGO_STATE`/`RUZU_TRACE_MK8D_LOGO_TABLE`.
+- `cargo build --release --bin ruzu-cmd` passes.
+- MK8D runs `/tmp/ruzu_mk8d_table3_1783263948` and
+  `/tmp/ruzu_mk8d_widetop_1783264237` used this diagnostic to show that state
+  `7` can clear while a later state `0xA` plateau remains, invalidating the
+  earlier assumption that only state `7` explains the first-logo delay.
+
+## 2026-07-05 — externals/rdynarmic/src/backend/arm64/address_space.rs vs upstream Dynarmic backend/arm64/address_space.cpp
+
+### Intentional differences
+- Added ruzu-only env-gated post-relink block dumping:
+  `RUZU_DUMP_ARM64_RELINK_PC=0xLO-0xHI` and
+  `RUZU_DUMP_ARM64_RELINK_DIR=/path`. This captures the already-emitted source
+  block after `relink_for_descriptor` patches block-relocation slots, covering
+  the case missed by compile-time block dumps where an older block is relinked
+  only after its target is compiled.
+- Upstream Dynarmic has no env-driven byte dump facility. This is diagnostic
+  only and does not affect code generation or linking when unset.
+
+### Unintentional differences (to fix)
+- None for default execution. The relink path still calls
+  `link_block_links(...)` in the same order and only copies bytes to disk after
+  patching when the diagnostic range matches.
+
+### Missing items
+- None for this diagnostic slice. Remaining MK8D first-logo work is now
+  focused on rdynarmic ARM64 A32 generated-code quality, not on adding more
+  relink plumbing.
+
+### Binary layout verification
+- N/A: host code-cache diagnostics only; no guest ABI or serialized layout
+  changed.
+
+### Verification
+- Re-read upstream Dynarmic `backend/arm64/address_space.cpp` relink
+  ownership and Rust `AddressSpace::record_emitted_block` /
+  `AddressSpace::relink_for_descriptor`.
+- `cargo check -p rdynarmic` passes.
+- `cargo build --release --bin ruzu-cmd` passes.
+- MK8D diagnostic run `/tmp/ruzu_mk8d_relink_1783264782` captured
+  `0x00B92E14` post-relink. The dumped bytes show direct branches to
+  `0x00B92E04` and `0x00B92E18`, invalidating the hypothesis that the hottest
+  Yaz0 inner loop returns to the dispatcher every iteration.
+
+## 2026-07-05 — video_core/src/renderer_vulkan/renderer_vulkan.rs vs upstream video_core/renderer_vulkan/renderer_vulkan.cpp
+
+### Intentional differences
+- `current_framebuffer_layout_for_present()` is a ruzu/macOS adaptation around
+  upstream `RendererVulkan::Composite`. Upstream uses the frontend
+  `render_window.GetFramebufferLayout()` and does not query or lock the
+  swapchain to compute the present layout inside `Composite`.
+- ruzu previously synchronized from the swapchain each frame to handle
+  macOS/MoltenVK resize/maximize lag, but the blocking `swapchain.lock()` could
+  stall the VI/HWC thread behind the present thread for ~1s. The adaptation now
+  uses `try_lock()` and falls back to the frontend layout when the swapchain is
+  busy. This preserves the resize safeguard when uncontended while matching
+  upstream's non-blocking composite-layout behavior.
+- Added env-gated `RUZU_PROFILE_VK_COMPOSITE=1` phase counters for
+  `RendererVulkan::Composite`. This is diagnostic only and has no effect when
+  unset.
+
+### Unintentional differences (to fix)
+- None for the fixed default behavior. Remaining divergence is the intentional
+  macOS layout synchronization helper described above.
+
+### Missing items
+- None for this slice.
+
+### Binary layout verification
+- N/A: no guest ABI or serialized structure changed.
+
+### Verification
+- Re-read upstream `video_core/renderer_vulkan/renderer_vulkan.cpp`:
+  `RendererVulkan::Composite` renders capture/screenshot, obtains a present
+  frame, draws to it, flushes, presents, then ticks frame state; it does not
+  block on a swapchain layout query.
+- Re-read upstream `video_core/renderer_vulkan/vk_swapchain.h`: swapchain
+  exposes cached `GetExtent()`; expensive surface capability queries are part
+  of swapchain creation/recreation, not per-frame layout selection.
+- `cargo build --release --bin ruzu-cmd` passes.
+- MK8D run `/tmp/ruzu_mk8d_trylayout_1783277701` with
+  `RUZU_PROFILE_VK_COMPOSITE=1` showed `VSYNC_PROFILE callbacks=2074
+  already_set=2 thread_wakes=2072 process=2072`, average `process_vsync`
+  `259us`, and no recurring ~1s layout stalls. Before this change,
+  `/tmp/ruzu_mk8d_vkcomp2_1783277448` accumulated ~18.8s in layout locking
+  with repeated ~1s composite spikes.

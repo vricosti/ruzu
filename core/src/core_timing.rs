@@ -529,18 +529,14 @@ impl CoreTiming {
                         None => evt.reschedule_time,
                     };
 
-                    // Clamp the reschedule base to max(evt_time, now, pause_end_time)
-                    // so a lagging looping event catches up to now exactly once and
-                    // then advances forward at the real interval. Without this, a
-                    // looping event whose scheduled time is far behind wall time
-                    // gets popped every iteration and each pass adds next_time to
-                    // the stale evt_time, so evt_time advances faster than wall
-                    // time and the event ends up scheduled far into the future
-                    // and effectively stops firing. Matches upstream yuzu's timer
-                    // thread, which uses wall time as the reschedule base.
-                    let now_ns = self.get_global_time_ns().as_nanos() as i64;
-                    let base = evt_time.max(now_ns).max(state.pause_end_time);
-                    let next_time = base + next_schedule_time;
+                    // Upstream reschedules relative to the event's scheduled
+                    // time, then only clamps events that were scheduled into a
+                    // pause window. This preserves catch-up behavior for late
+                    // looping events (Core::Timing::CoreTiming::Advance).
+                    let mut next_time = evt_time + next_schedule_time;
+                    if evt_time < state.pause_end_time {
+                        next_time = state.pause_end_time + next_schedule_time;
+                    }
 
                     let fifo_order = state.event_fifo_id;
                     state.event_queue.push(TimingEvent {
