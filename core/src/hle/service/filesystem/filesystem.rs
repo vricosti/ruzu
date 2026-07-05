@@ -252,6 +252,22 @@ impl FileSystemController {
         RESULT_SUCCESS.get_inner_value()
     }
 
+    /// Port of upstream `FileSystemController::SetPackedUpdate` (filesystem.cpp:331-341).
+    pub fn set_packed_update(&self, process_id: ProcessId, update_raw: VirtualFile) {
+        log::trace!(
+            "FileSystemController::SetPackedUpdate: process_id={:#x}",
+            process_id
+        );
+        let registrations = self.registrations.lock().unwrap();
+        let Some(registration) = registrations.get(&process_id) else {
+            return;
+        };
+        let Some(romfs_factory) = registration.romfs_factory.as_ref() else {
+            return;
+        };
+        romfs_factory.set_packed_update(update_raw);
+    }
+
     /// Port of upstream `FileSystemController::OpenProcess` (filesystem.cpp:313-328).
     ///
     /// Looks up the registration for `process_id` and returns the associated
