@@ -441,15 +441,20 @@ fn dump_thread_state(kernel: &KernelCore) {
     eprintln!("=========================================");
     eprintln!("[DUMP] === ruzu kernel thread dump ===");
     dump_pc_sample_hist();
+    eprintln!("{}", rdynarmic::jit::block_prologue_count_summary_string());
+    eprintln!("{}", rdynarmic::jit::block_prologue_top_summary_string());
     crate::hle::kernel::svc_dispatch::dump_svc_ring_profile();
     crate::hle::kernel::svc_dispatch::dump_svc_summary_profile();
     crate::hle::kernel::svc_dispatch::dump_svc_profile();
     crate::hle::kernel::svc::svc_memory_history::dump("sigusr1_thread_dump");
+    crate::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
+    crate::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_history("sigusr1_thread_dump");
     crate::hle::service::nvnflinger::buffer_queue_core::dump_bqp_wait_profile();
     crate::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
     crate::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
     crate::hle::service::nvnflinger::hos_binder_driver::dump_binder_txn_profile();
     crate::hle::service::nvnflinger::diagnostics::dump("sigusr1_thread_dump");
+    crate::hle::service::vi::conductor::dump_vsync_profile();
     // Who holds each coarse lock right now + the full observed nesting graph
     // (RUZU_LOCK_ORDER=1).
     common::lock_order::dump_owners();
@@ -616,10 +621,15 @@ fn dump_thread_state(kernel: &KernelCore) {
             if let (Some(a), Some(l)) = (it.next(), it.next()) {
                 if let (Some(addr), Some(len)) = (parse_u64_auto(a), parse_u64_auto(l)) {
                     let nwords = ((len as usize) / 4).min(64);
-                    // Prefer the fastmem arena (host base + guest vaddr). If
-                    // it is not registered, fall back to the page-table memory
-                    // handle used by the stack dumper below.
-                    let fb = common::fastmem_registry::base();
+                    // Raw fastmem reads can fault when the guest address is
+                    // unmapped (or when VirtualBuffer is used without 4K
+                    // fastmem). Keep SIGUSR1 dumps safe by default and only
+                    // use the raw host pointer when explicitly requested.
+                    let fb = if std::env::var_os("RUZU_DUMP_MEM_USE_FASTMEM").is_some() {
+                        common::fastmem_registry::base()
+                    } else {
+                        0
+                    };
                     if fb != 0 {
                         let mut w = vec![0u32; nwords];
                         for (i, slot) in w.iter_mut().enumerate() {
@@ -668,14 +678,29 @@ fn dump_thread_state(kernel: &KernelCore) {
     let pq_fronts = kernel.global_scheduler_context().and_then(|gsc| {
         gsc.try_lock().ok().map(|gsc| {
             [
-                gsc.get_scheduled_front(0),
-                gsc.get_scheduled_front(1),
-                gsc.get_scheduled_front(2),
-                gsc.get_scheduled_front(3),
+                (
+                    gsc.get_scheduled_front(0),
+                    gsc.m_priority_queue.get_suggested_front(0),
+                ),
+                (
+                    gsc.get_scheduled_front(1),
+                    gsc.m_priority_queue.get_suggested_front(1),
+                ),
+                (
+                    gsc.get_scheduled_front(2),
+                    gsc.m_priority_queue.get_suggested_front(2),
+                ),
+                (
+                    gsc.get_scheduled_front(3),
+                    gsc.m_priority_queue.get_suggested_front(3),
+                ),
             ]
         })
     });
-    eprintln!("[DUMP] scheduler pq_fronts={:?}", pq_fronts);
+    eprintln!(
+        "[DUMP] scheduler pq_fronts=(scheduled,suggested) {:?}",
+        pq_fronts
+    );
     for core_id in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
         let Some(scheduler) = kernel.scheduler(core_id) else {
             eprintln!("[DUMP] scheduler core={} missing", core_id);
@@ -1192,6 +1217,7 @@ fn dump_thread_state(kernel: &KernelCore) {
             let priority = t.get_priority();
             let current_core = t.get_current_core();
             let active_core = t.get_active_core();
+            let affinity = t.physical_affinity_mask.get_affinity_mask();
             let wait_reason = t.get_wait_reason_for_debugging();
             let addr_key = t.get_address_key();
             let addr_key_val = t.get_address_key_value();
@@ -1203,6 +1229,7 @@ fn dump_thread_state(kernel: &KernelCore) {
             let sp = t.thread_context.sp as u32;
             eprintln!(
                 "[DUMP]   tid={} type={:?} state={:?} prio={} core={} active_core={} wait={:?} \
+                 affinity=0x{:X} \
                  addr_key=0x{:X} addr_key_val=0x{:X} cv_key=0x{:X} \
                  waiting_lock={} lock_owner_tid={:?} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
                 tid,
@@ -1212,6 +1239,7 @@ fn dump_thread_state(kernel: &KernelCore) {
                 current_core,
                 active_core,
                 wait_reason,
+                affinity,
                 addr_key.get(),
                 addr_key_val,
                 cv_key,

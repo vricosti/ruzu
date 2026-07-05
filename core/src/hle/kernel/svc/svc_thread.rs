@@ -4,7 +4,7 @@
 //!
 //! SVC handlers for thread operations.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::super::k_process::ProcessLock;
 use crate::core::System;
@@ -174,13 +174,300 @@ pub fn dump_thread_lifecycle_profile() {
 }
 
 fn should_trace_sleep_debug() -> bool {
-    std::env::var_os("RUZU_TRACE_SLEEP").is_some()
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_SLEEP").is_some())
 }
 
-fn should_trace_sleep_backtrace_once(tid: u64) -> bool {
-    static DID_TRACE_TID73: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-    tid == 73 && !DID_TRACE_TID73.swap(true, std::sync::atomic::Ordering::Relaxed)
+fn trace_sleep_tid_filter() -> Option<u64> {
+    static FILTER: OnceLock<Option<u64>> = OnceLock::new();
+    *FILTER.get_or_init(|| {
+        std::env::var("RUZU_TRACE_SLEEP_BT_TID")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+    })
+}
+
+fn trace_sleep_ns_filter() -> Option<i64> {
+    static FILTER: OnceLock<Option<i64>> = OnceLock::new();
+    *FILTER.get_or_init(|| {
+        std::env::var("RUZU_TRACE_SLEEP_BT_NS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+    })
+}
+
+fn trace_sleep_filter_matches(tid: u64, ns: i64) -> bool {
+    trace_sleep_tid_filter().is_none_or(|target| target == tid)
+        && trace_sleep_ns_filter().is_none_or(|target| target == ns)
+}
+
+fn should_trace_sleep_backtrace_once(tid: u64, ns: i64) -> bool {
+    static DID_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    trace_sleep_tid_filter() == Some(tid)
+        && trace_sleep_ns_filter().is_none_or(|target| target == ns)
+        && !DID_TRACE.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn should_trace_mii_wait_periodic(tid: u64, ns: i64) -> bool {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static EVERY: OnceLock<Option<u64>> = OnceLock::new();
+    let Some(every) = *EVERY.get_or_init(|| {
+        std::env::var("RUZU_TRACE_MII_WAIT_EVERY")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+    }) else {
+        return false;
+    };
+    if !trace_sleep_filter_matches(tid, ns) {
+        return false;
+    }
+    let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    count == 1 || count % every == 0
+}
+
+fn should_trace_mii_wait_changes(tid: u64, ns: i64) -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_MII_WAIT_CHANGES").is_some()) {
+        return false;
+    }
+    trace_sleep_filter_matches(tid, ns)
+}
+
+fn should_trace_mii_resource_changes(tid: u64, ns: i64) -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_MII_RESOURCE_CHANGES").is_some()) {
+        return false;
+    }
+    trace_sleep_filter_matches(tid, ns)
+}
+
+fn should_trace_sleep_callsite_changes(tid: u64) -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_SLEEP_CALLSITE_CHANGES").is_some()) {
+        return false;
+    }
+    trace_sleep_tid_filter().is_none_or(|target| target == tid)
+}
+
+fn should_trace_mk8d_logo_state(tid: u64, ns: i64) -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_MK8D_LOGO_STATE").is_some()) {
+        return false;
+    }
+    trace_sleep_filter_matches(tid, ns)
+}
+
+fn should_trace_mk8d_logo_table() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_MK8D_LOGO_TABLE").is_some())
+}
+
+fn mk8d_logo_caller_targets() -> &'static [u32] {
+    static TARGETS: OnceLock<Vec<u32>> = OnceLock::new();
+    TARGETS.get_or_init(|| {
+        std::env::var("RUZU_TRACE_MK8D_LOGO_CALLER")
+            .ok()
+            .into_iter()
+            .flat_map(|value| {
+                value
+                    .split(',')
+                    .filter_map(|part| {
+                        let part = part.trim();
+                        if part.is_empty() {
+                            return None;
+                        }
+                        u32::from_str_radix(part.trim_start_matches("0x"), 16).ok()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    })
+}
+
+fn should_trace_mk8d_logo_caller() -> bool {
+    !mk8d_logo_caller_targets().is_empty()
+}
+
+fn mk8d_logo_table_due() -> bool {
+    static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_ms = (crate::hle::kernel::trace_format::elapsed_secs() * 1000.0) as u64;
+    let last = LAST_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < 1000 {
+        return false;
+    }
+    LAST_MS
+        .compare_exchange(
+            last,
+            now_ms,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct SleepCallsiteTrace {
+    ns: i64,
+    pc: u32,
+    lr: u32,
+    sp: u32,
+    fp: u32,
+    r: [u32; 9],
+}
+
+fn sleep_callsite_changed(tid: u64, current: SleepCallsiteTrace) -> bool {
+    static LAST: std::sync::OnceLock<Mutex<std::collections::BTreeMap<u64, SleepCallsiteTrace>>> =
+        std::sync::OnceLock::new();
+
+    let mut last = LAST
+        .get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .unwrap();
+    let changed = last.get(&tid).copied() != Some(current);
+    if changed {
+        last.insert(tid, current);
+    }
+    changed
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Mk8dLogoStateTrace {
+    word0: u32,
+    word_4300: u32,
+    byte_4304: u8,
+    word_4308: u32,
+    byte_430a: u8,
+    word_430c: u32,
+    byte_430d: u8,
+    word_4314: u32,
+    byte_4319: u8,
+    byte_4259: u8,
+}
+
+fn mk8d_logo_state_changed(base: u32, current: Mk8dLogoStateTrace) -> bool {
+    static LAST: std::sync::OnceLock<Mutex<std::collections::BTreeMap<u32, Mk8dLogoStateTrace>>> =
+        std::sync::OnceLock::new();
+
+    let mut last = LAST
+        .get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .unwrap();
+    let changed = last.get(&base).copied() != Some(current);
+    if changed {
+        last.insert(base, current);
+    }
+    changed
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Mk8dLogoCallerTrace {
+    word_0590: u32,
+    word_0594: u32,
+    word_0598: u32,
+    byte_059c: u8,
+    word_05a0: u32,
+    word_05a4: u32,
+}
+
+fn mk8d_logo_caller_changed(caller: u32, current: Mk8dLogoCallerTrace) -> bool {
+    static LAST: std::sync::OnceLock<Mutex<std::collections::BTreeMap<u32, Mk8dLogoCallerTrace>>> =
+        std::sync::OnceLock::new();
+
+    let mut last = LAST
+        .get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .unwrap();
+    let changed = last.get(&caller).copied() != Some(current);
+    if changed {
+        last.insert(caller, current);
+    }
+    changed
+}
+
+fn mk8d_logo_caller_due(caller: u32) -> bool {
+    static LAST_MS: std::sync::OnceLock<Mutex<std::collections::BTreeMap<u32, u64>>> =
+        std::sync::OnceLock::new();
+
+    let now_ms = (crate::hle::kernel::trace_format::elapsed_secs() * 1000.0) as u64;
+    let mut last = LAST_MS
+        .get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .unwrap();
+    let entry = last.entry(caller).or_default();
+    if now_ms.saturating_sub(*entry) < 1000 {
+        return false;
+    }
+    *entry = now_ms;
+    true
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct MiiWaitEntryTrace {
+    entry: u32,
+    flag_1d9: u8,
+    word_1d8: u32,
+    pending: [u32; 3],
+}
+
+fn mii_wait_entry_changed(index: usize, current: MiiWaitEntryTrace) -> bool {
+    static LAST: std::sync::OnceLock<Mutex<[Option<MiiWaitEntryTrace>; 13]>> =
+        std::sync::OnceLock::new();
+
+    let mut last = LAST.get_or_init(|| Mutex::new([None; 13])).lock().unwrap();
+    let changed = last[index] != Some(current);
+    if changed {
+        last[index] = Some(current);
+    }
+    changed
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct MiiResourceTrace {
+    resource: u32,
+    resource_state: u32,
+    resource_data: u32,
+    resource_data_word0: u32,
+    flag_bc: u8,
+    flag_bd: u8,
+}
+
+fn mii_resource_changed(category: u64, resource_index: u64, current: MiiResourceTrace) -> bool {
+    static LAST: std::sync::OnceLock<
+        Mutex<std::collections::BTreeMap<(u64, u64), MiiResourceTrace>>,
+    > = std::sync::OnceLock::new();
+
+    let mut last = LAST
+        .get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .unwrap();
+    let key = (category, resource_index);
+    let changed = last.get(&key).copied() != Some(current);
+    if changed {
+        last.insert(key, current);
+    }
+    changed
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct MiiQueueTrace {
+    manager: u32,
+    queue: u32,
+    capacity: u32,
+    read_index: u32,
+    count: u32,
+    head: [u32; 3],
+}
+
+fn mii_queue_changed(current: MiiQueueTrace) -> bool {
+    static LAST: std::sync::OnceLock<Mutex<Option<MiiQueueTrace>>> = std::sync::OnceLock::new();
+
+    let mut last = LAST.get_or_init(|| Mutex::new(None)).lock().unwrap();
+    let changed = *last != Some(current);
+    if changed {
+        *last = Some(current);
+    }
+    changed
 }
 
 fn zero_sleep_coerce_ns(tid: u64) -> Option<i64> {
@@ -828,41 +1115,786 @@ pub fn sleep_thread(system: &System, ns: i64) {
             return;
         };
         crate::hle::kernel::sleep_timing::record_sleep_start(current_thread_id, ns);
-        if should_trace_sleep_debug() {
+        let trace_sleep_backtrace = should_trace_sleep_backtrace_once(current_thread_id, ns);
+        let trace_mii_wait_periodic = should_trace_mii_wait_periodic(current_thread_id, ns);
+        let trace_mii_wait_changes = should_trace_mii_wait_changes(current_thread_id, ns);
+        let trace_mii_resource_changes = should_trace_mii_resource_changes(current_thread_id, ns);
+        let trace_sleep_callsite_changes = should_trace_sleep_callsite_changes(current_thread_id);
+        let trace_mk8d_logo_state = should_trace_mk8d_logo_state(current_thread_id, ns);
+        let trace_mk8d_logo_caller = should_trace_mk8d_logo_caller();
+        if should_trace_sleep_debug()
+            || trace_sleep_backtrace
+            || trace_sleep_callsite_changes
+            || trace_mk8d_logo_state
+            || trace_mk8d_logo_caller
+            || trace_mii_wait_periodic
+            || trace_mii_wait_changes
+            || trace_mii_resource_changes
+        {
             if let Some(current_thread) = system.current_thread() {
                 let core_index = current_thread.lock().unwrap().get_current_core().max(0) as usize;
                 let process = system.current_process_arc().lock().unwrap();
                 if let Some(cpu) = process.get_arm_interface(core_index) {
                     let mut ctx = crate::arm::arm_interface::ThreadContext::default();
                     cpu.get_context(&mut ctx);
-                    log::info!(
-                        "svc::SleepThread(sleep) ctx: tid={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X}",
-                        current_thread_id,
-                        ctx.pc,
-                        ctx.lr,
-                        ctx.sp,
-                        ctx.r[0] as u32,
-                        ctx.r[1] as u32,
-                        ctx.r[2] as u32,
-                        ctx.r[3] as u32,
-                        ctx.r[4] as u32,
-                        ctx.r[5] as u32,
-                        ctx.r[6] as u32,
-                        ctx.r[7] as u32,
-                    );
-                    if should_trace_sleep_backtrace_once(current_thread_id) {
-                        let bt = crate::arm::debug::get_backtrace_from_context(&process, &ctx);
-                        for (index, entry) in bt.iter().take(12).enumerate() {
-                            log::info!(
-                                "svc::SleepThread(sleep) bt[{}]: tid={} module={} addr=0x{:X} orig=0x{:X} off=0x{:X} symbol={}",
-                                index,
+                    if should_trace_sleep_debug() {
+                        log::info!(
+                            "svc::SleepThread(sleep) ctx: tid={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X}",
+                            current_thread_id,
+                            ctx.pc,
+                            ctx.lr,
+                            ctx.sp,
+                            ctx.r[0] as u32,
+                            ctx.r[1] as u32,
+                            ctx.r[2] as u32,
+                            ctx.r[3] as u32,
+                            ctx.r[4] as u32,
+                            ctx.r[5] as u32,
+                            ctx.r[6] as u32,
+                            ctx.r[7] as u32,
+                        );
+                    }
+                    if trace_mk8d_logo_state {
+                        if let Some(memory) = process.get_memory() {
+                            let memory = memory.lock().unwrap();
+                            let stack_words = std::array::from_fn::<_, 16, _>(|index| {
+                                let addr = ctx.sp + index as u64 * 4;
+                                if addr >= 0x1000 && memory.is_valid_virtual_address(addr) {
+                                    memory.read_32(addr)
+                                } else {
+                                    0
+                                }
+                            });
+                            let mut candidates = std::collections::BTreeSet::new();
+                            for value in ctx
+                                .r
+                                .iter()
+                                .take(13)
+                                .copied()
+                                .chain(stack_words.into_iter().map(u64::from))
+                            {
+                                if value >= 0x1000 {
+                                    candidates.insert(value as u32);
+                                }
+                                if value >= 0x5314 {
+                                    candidates.insert((value - 0x4314) as u32);
+                                }
+                            }
+                            for candidate in candidates {
+                                let base = candidate as u64;
+                                if !memory.is_valid_virtual_address_range(base, 0x431A) {
+                                    continue;
+                                }
+                                let current = Mk8dLogoStateTrace {
+                                    word0: memory.read_32(base),
+                                    word_4300: memory.read_32(base + 0x4300),
+                                    byte_4304: memory.read_8(base + 0x4304),
+                                    word_4308: memory.read_32(base + 0x4308),
+                                    byte_430a: memory.read_8(base + 0x430A),
+                                    word_430c: memory.read_32(base + 0x430C),
+                                    byte_430d: memory.read_8(base + 0x430D),
+                                    word_4314: memory.read_32(base + 0x4314),
+                                    byte_4319: memory.read_8(base + 0x4319),
+                                    byte_4259: memory.read_8(base + 0x4259),
+                                };
+                                let plausible_logo_object = (0x00E0_0000..=0x00F5_FFFF)
+                                    .contains(&current.word0)
+                                    && current.byte_4259 <= 1
+                                    && current.byte_4319 <= 1
+                                    && current.word_4314 <= 0x40;
+                                let changed = plausible_logo_object
+                                    && mk8d_logo_state_changed(candidate, current);
+                                if changed {
+                                    log::warn!(
+                                        "svc::SleepThread(sleep) mk8d_logo_state: tid={} ns={} base=0x{:08X} word0=0x{:08X} w4300=0x{:08X} b4304=0x{:02X} w4308=0x{:08X} b430A=0x{:02X} w430C=0x{:08X} b430D=0x{:02X} w4314=0x{:08X} b4319=0x{:02X} b4259=0x{:02X}",
+                                        current_thread_id,
+                                        ns,
+                                        candidate,
+                                        current.word0,
+                                        current.word_4300,
+                                        current.byte_4304,
+                                        current.word_4308,
+                                        current.byte_430a,
+                                        current.word_430c,
+                                        current.byte_430d,
+                                        current.word_4314,
+                                        current.byte_4319,
+                                        current.byte_4259,
+                                    );
+                                }
+                                if plausible_logo_object
+                                    && should_trace_mk8d_logo_table()
+                                    && matches!(current.word_4314, 7 | 0xA)
+                                    && current.word_4308 & 0x0010_0000 == 0
+                                    && (changed || mk8d_logo_table_due())
+                                {
+                                    let mut entries = String::new();
+                                    for index in 0..12u64 {
+                                        let handle = memory.read_32(base + 0x180 + index * 4);
+                                        let offset = memory.read_32(base + 0xCC + index * 0x10);
+                                        let res_addr = base
+                                            .wrapping_add((offset as u64) * 4)
+                                            .wrapping_add(index * 0x10)
+                                            .wrapping_add(0xC4);
+                                        let resource =
+                                            if memory.is_valid_virtual_address_range(res_addr, 4) {
+                                                memory.read_32(res_addr)
+                                            } else {
+                                                0
+                                            };
+                                        let data = if resource >= 0x1000
+                                            && memory.is_valid_virtual_address_range(
+                                                resource as u64 + 0x8AC,
+                                                4,
+                                            ) {
+                                            memory.read_32(resource as u64 + 0x8AC)
+                                        } else {
+                                            0
+                                        };
+                                        use std::fmt::Write;
+                                        let _ = write!(
+                                            entries,
+                                            " [{}]h=0x{:08X}/off=0x{:08X}/res=0x{:08X}/data=0x{:08X}",
+                                            index, handle, offset, resource, data
+                                        );
+                                    }
+                                    log::warn!(
+                                        "svc::SleepThread(sleep) mk8d_logo_table: tid={} base=0x{:08X}{}",
+                                        current_thread_id,
+                                        candidate,
+                                        entries,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if trace_mk8d_logo_caller {
+                        if let Some(memory) = process.get_memory() {
+                            let memory = memory.lock().unwrap();
+                            for &caller in mk8d_logo_caller_targets() {
+                                let addr = caller as u64;
+                                if !memory.is_valid_virtual_address_range(addr + 0x590, 0x18) {
+                                    continue;
+                                }
+                                let current = Mk8dLogoCallerTrace {
+                                    word_0590: memory.read_32(addr + 0x590),
+                                    word_0594: memory.read_32(addr + 0x594),
+                                    word_0598: memory.read_32(addr + 0x598),
+                                    byte_059c: memory.read_8(addr + 0x59C),
+                                    word_05a0: memory.read_32(addr + 0x5A0),
+                                    word_05a4: memory.read_32(addr + 0x5A4),
+                                };
+                                if mk8d_logo_caller_changed(caller, current)
+                                    || mk8d_logo_caller_due(caller)
+                                {
+                                    log::warn!(
+                                        "svc::SleepThread(sleep) mk8d_logo_caller: tid={} ns={} caller=0x{:08X} pc=0x{:08X} lr=0x{:08X} w0590=0x{:08X} w0594=0x{:08X} w0598=0x{:08X} b059C=0x{:02X} w05A0=0x{:08X} w05A4=0x{:08X}",
+                                        current_thread_id,
+                                        ns,
+                                        caller,
+                                        ctx.pc,
+                                        ctx.lr,
+                                        current.word_0590,
+                                        current.word_0594,
+                                        current.word_0598,
+                                        current.byte_059c,
+                                        current.word_05a0,
+                                        current.word_05a4,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if trace_sleep_callsite_changes {
+                        let current = SleepCallsiteTrace {
+                            ns,
+                            pc: ctx.pc as u32,
+                            lr: ctx.lr as u32,
+                            sp: ctx.sp as u32,
+                            fp: ctx.fp as u32,
+                            r: [
+                                ctx.r[4] as u32,
+                                ctx.r[5] as u32,
+                                ctx.r[6] as u32,
+                                ctx.r[7] as u32,
+                                ctx.r[8] as u32,
+                                ctx.r[9] as u32,
+                                ctx.r[10] as u32,
+                                ctx.r[11] as u32,
+                                ctx.r[12] as u32,
+                            ],
+                        };
+                        if sleep_callsite_changed(current_thread_id, current) {
+                            log::warn!(
+                                "svc::SleepThread(sleep) callsite_change: tid={} ns={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} fp=0x{:08X} r4-r12=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]",
                                 current_thread_id,
-                                entry.module,
-                                entry.address,
-                                entry.original_address,
-                                entry.offset,
-                                entry.name,
+                                ns,
+                                ctx.pc,
+                                ctx.lr,
+                                ctx.sp,
+                                ctx.fp,
+                                current.r[0],
+                                current.r[1],
+                                current.r[2],
+                                current.r[3],
+                                current.r[4],
+                                current.r[5],
+                                current.r[6],
+                                current.r[7],
+                                current.r[8],
                             );
+                            if std::env::var_os("RUZU_TRACE_SLEEP_CALLSITE_STACK").is_some() {
+                                if let Some(memory) = process.get_memory() {
+                                    let memory = memory.lock().unwrap();
+                                    let words = std::array::from_fn::<_, 16, _>(|index| {
+                                        let addr = ctx.sp + index as u64 * 4;
+                                        if addr >= 0x1000 {
+                                            memory.read_32(addr)
+                                        } else {
+                                            0
+                                        }
+                                    });
+                                    log::warn!(
+                                        "svc::SleepThread(sleep) callsite_stack: tid={} sp=0x{:08X} words=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]",
+                                        current_thread_id,
+                                        ctx.sp,
+                                        words[0],
+                                        words[1],
+                                        words[2],
+                                        words[3],
+                                        words[4],
+                                        words[5],
+                                        words[6],
+                                        words[7],
+                                        words[8],
+                                        words[9],
+                                        words[10],
+                                        words[11],
+                                        words[12],
+                                        words[13],
+                                        words[14],
+                                            words[15],
+                                        );
+                                    if std::env::var_os("RUZU_TRACE_SLEEP_CALLSITE_OBJECTS")
+                                        .is_some()
+                                    {
+                                        let mut candidates = std::collections::BTreeSet::new();
+                                        for value in current.r {
+                                            if value >= 0x1000 {
+                                                candidates.insert(value);
+                                            }
+                                        }
+                                        for value in [
+                                            words[2], words[4], words[6], words[7], words[8],
+                                            words[10], words[12],
+                                        ] {
+                                            if value >= 0x1000 {
+                                                candidates.insert(value);
+                                            }
+                                        }
+                                        for candidate in candidates {
+                                            let base = candidate as u64;
+                                            if !memory.is_valid_virtual_address_range(base, 0x431A)
+                                            {
+                                                continue;
+                                            }
+                                            let word0 = memory.read_32(base);
+                                            let word_4300 = memory.read_32(base + 0x4300);
+                                            let byte_4304 = memory.read_8(base + 0x4304);
+                                            let word_4308 = memory.read_32(base + 0x4308);
+                                            let byte_430a = memory.read_8(base + 0x430A);
+                                            let ptr_4314 = memory.read_32(base + 0x4314);
+                                            let byte_4319 = memory.read_8(base + 0x4319);
+                                            let byte_4259 = memory.read_8(base + 0x4259);
+                                            log::warn!(
+                                                "svc::SleepThread(sleep) callsite_object: tid={} base=0x{:08X} word0=0x{:08X} w4300=0x{:08X} b4304=0x{:02X} w4308=0x{:08X} b430A=0x{:02X} ptr4314=0x{:08X} b4319=0x{:02X} b4259=0x{:02X}",
+                                                current_thread_id,
+                                                candidate,
+                                                word0,
+                                                word_4300,
+                                                byte_4304,
+                                                word_4308,
+                                                byte_430a,
+                                                ptr_4314,
+                                                byte_4319,
+                                                byte_4259,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if std::env::var_os("RUZU_TRACE_SLEEP_CALLSITE_BT").is_some() {
+                                let bt =
+                                    crate::arm::debug::get_backtrace_from_context(&process, &ctx);
+                                for (index, entry) in bt.iter().take(12).enumerate() {
+                                    log::warn!(
+                                        "svc::SleepThread(sleep) callsite_bt[{}]: tid={} module={} addr=0x{:X} orig=0x{:X} off=0x{:X} symbol={}",
+                                        index,
+                                        current_thread_id,
+                                        entry.module,
+                                        entry.address,
+                                        entry.original_address,
+                                        entry.offset,
+                                        entry.name,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if trace_sleep_backtrace
+                        || trace_mii_wait_periodic
+                        || trace_mii_wait_changes
+                        || trace_mii_resource_changes
+                    {
+                        if std::env::var_os("RUZU_A32_TRACE_AFTER_SLEEP_BT").is_some() {
+                            crate::arm::dynarmic::arm_dynarmic_32::arm_trace_after_watch();
+                        }
+                        if trace_sleep_backtrace {
+                            log::info!(
+                                "svc::SleepThread(sleep) trace_ctx: tid={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} fp=0x{:08X} ns={} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X} r12=0x{:08X}",
+                                current_thread_id,
+                                ctx.pc,
+                                ctx.lr,
+                                ctx.sp,
+                                ctx.fp,
+                                ns,
+                                ctx.r[0] as u32,
+                                ctx.r[1] as u32,
+                                ctx.r[2] as u32,
+                                ctx.r[3] as u32,
+                                ctx.r[4] as u32,
+                                ctx.r[5] as u32,
+                                ctx.r[6] as u32,
+                                ctx.r[7] as u32,
+                                ctx.r[8] as u32,
+                                ctx.r[9] as u32,
+                                ctx.r[10] as u32,
+                                ctx.r[11] as u32,
+                                ctx.r[12] as u32,
+                            );
+                        }
+                        if let Some(memory) = process.get_memory() {
+                            let memory = memory.lock().unwrap();
+                            let owner = ctx.r[5] as u64;
+                            let state = ctx.r[4] as u64;
+                            if owner >= 0x1000 {
+                                let table = memory.read_32(owner + 0x34) as u64;
+                                if trace_sleep_backtrace || trace_mii_wait_periodic {
+                                    log::info!(
+                                        "svc::SleepThread(sleep) mii_wait: tid={} owner=0x{:08X} table=0x{:08X} state=0x{:08X}",
+                                        current_thread_id,
+                                        owner as u32,
+                                        table as u32,
+                                        state as u32,
+                                    );
+                                }
+                                if table >= 0x1000 {
+                                    for index in 0..13u64 {
+                                        let entry = memory.read_32(table + index * 4) as u64;
+                                        let flag = if entry >= 0x1000 {
+                                            memory.read_8(entry + 0x1D9)
+                                        } else {
+                                            0
+                                        };
+                                        let word_1d8 = if entry >= 0x1000 {
+                                            memory.read_32(entry + 0x1D8)
+                                        } else {
+                                            0
+                                        };
+                                        let pending_0 = if state >= 0x1000 {
+                                            memory.read_32(state + index * 0x20)
+                                        } else {
+                                            0
+                                        };
+                                        let pending_1 = if state >= 0x1000 {
+                                            memory.read_32(state + 0x1A0 + index * 0x20)
+                                        } else {
+                                            0
+                                        };
+                                        let pending_2 = if state >= 0x1000 {
+                                            memory.read_32(state + 0x340 + index * 0x20)
+                                        } else {
+                                            0
+                                        };
+                                        let changed = trace_mii_wait_changes
+                                            && mii_wait_entry_changed(
+                                                index as usize,
+                                                MiiWaitEntryTrace {
+                                                    entry: entry as u32,
+                                                    flag_1d9: flag,
+                                                    word_1d8,
+                                                    pending: [pending_0, pending_1, pending_2],
+                                                },
+                                            );
+                                        if trace_sleep_backtrace || trace_mii_wait_periodic {
+                                            log::warn!(
+                                                "svc::SleepThread(sleep) mii_wait_entry: tid={} index={} entry=0x{:08X} flag_1d9=0x{:02X} word_1d8=0x{:08X} pending=[0x{:08X},0x{:08X},0x{:08X}]",
+                                                current_thread_id,
+                                                index,
+                                                entry as u32,
+                                                flag,
+                                                word_1d8,
+                                                pending_0,
+                                                pending_1,
+                                                pending_2,
+                                            );
+                                        } else if changed {
+                                            log::warn!(
+                                                "svc::SleepThread(sleep) mii_wait_change: tid={} owner=0x{:08X} table=0x{:08X} state=0x{:08X} index={} entry=0x{:08X} flag_1d9=0x{:02X} word_1d8=0x{:08X} pending=[0x{:08X},0x{:08X},0x{:08X}]",
+                                                current_thread_id,
+                                                owner as u32,
+                                                table as u32,
+                                                state as u32,
+                                                index,
+                                                entry as u32,
+                                                flag,
+                                                word_1d8,
+                                                pending_0,
+                                                pending_1,
+                                                pending_2,
+                                            );
+                                        }
+                                        if std::env::var_os("RUZU_TRACE_MII_WAIT_STATE_WORDS")
+                                            .is_some()
+                                            && (trace_sleep_backtrace
+                                                || trace_mii_wait_periodic
+                                                || changed)
+                                        {
+                                            for (variant, base) in [
+                                                (0u64, state + index * 0x20),
+                                                (1u64, state + 0x1A0 + index * 0x20),
+                                                (2u64, state + 0x340 + index * 0x20),
+                                            ] {
+                                                let pending = match variant {
+                                                    0 => pending_0,
+                                                    1 => pending_1,
+                                                    _ => pending_2,
+                                                };
+                                                if pending == 0 || base < 0x1000 {
+                                                    continue;
+                                                }
+                                                log::info!(
+                                                    "svc::SleepThread(sleep) mii_wait_state: tid={} index={} variant={} base=0x{:08X} words=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]",
+                                                    current_thread_id,
+                                                    index,
+                                                    variant,
+                                                    base as u32,
+                                                    memory.read_32(base),
+                                                    memory.read_32(base + 4),
+                                                    memory.read_32(base + 8),
+                                                    memory.read_32(base + 12),
+                                                    memory.read_32(base + 16),
+                                                    memory.read_32(base + 20),
+                                                    memory.read_32(base + 24),
+                                                    memory.read_32(base + 28),
+                                                );
+                                                if std::env::var_os(
+                                                    "RUZU_TRACE_MII_WAIT_RESOURCE_SLOT",
+                                                )
+                                                .is_some()
+                                                {
+                                                    let category = match variant {
+                                                        0 => 7u64,
+                                                        1 => 8u64,
+                                                        _ => 10u64,
+                                                    };
+                                                    let variant_kind = memory.read_32(base + 4);
+                                                    let resource_index = index
+                                                        + if variant_kind == 1 { 0 } else { 13 };
+                                                    // MK8D v0: `0x9680E0` obtains the resource
+                                                    // manager via `0x94380C`, then returns
+                                                    // `[system+0xE0+3*4]`. This is debug-only and
+                                                    // mirrors the guest code path being traced.
+                                                    let global_slot = 0x00ED3818u64;
+                                                    let global_holder_ptr =
+                                                        memory.read_32(global_slot) as u64;
+                                                    let global_holder =
+                                                        if global_holder_ptr >= 0x1000 {
+                                                            memory.read_32(global_holder_ptr) as u64
+                                                        } else {
+                                                            0
+                                                        };
+                                                    let system_ptr = if global_holder >= 0x1000 {
+                                                        memory.read_32(global_holder + 0x14) as u64
+                                                    } else {
+                                                        0
+                                                    };
+                                                    let manager = if system_ptr >= 0x1000 {
+                                                        memory.read_32(system_ptr + 0xE0 + 3 * 4)
+                                                            as u64
+                                                    } else {
+                                                        0
+                                                    };
+                                                    let resource_table = if manager >= 0x1000 {
+                                                        memory.read_32(manager + 0x10C) as u64
+                                                    } else {
+                                                        0
+                                                    };
+                                                    let category_base = if resource_table >= 0x1000
+                                                    {
+                                                        resource_table + 0x34 + category * 56
+                                                    } else {
+                                                        0
+                                                    };
+                                                    let slot_count = if category_base >= 0x1000 {
+                                                        memory.read_32(category_base + 4)
+                                                    } else {
+                                                        0
+                                                    };
+                                                    let slot_array = if category_base >= 0x1000 {
+                                                        memory.read_32(category_base + 8) as u64
+                                                    } else {
+                                                        0
+                                                    };
+                                                    let slot = if slot_array >= 0x1000 {
+                                                        slot_array + resource_index * 72
+                                                    } else {
+                                                        0
+                                                    };
+                                                    let resource = if slot >= 0x1000 {
+                                                        memory.read_32(slot + 4) as u64
+                                                    } else {
+                                                        0
+                                                    };
+                                                    let resource_data = if resource >= 0x1000 {
+                                                        memory.read_32(resource + 4) as u64
+                                                    } else {
+                                                        0
+                                                    };
+                                                    log::info!(
+                                                        "svc::SleepThread(sleep) mii_wait_resource: tid={} index={} variant={} category={} resource_index={} manager=0x{:08X} table=0x{:08X} slot_count={} slot_array=0x{:08X} slot=0x{:08X} resource=0x{:08X} res_data=0x{:08X} res_data0=0x{:08X} res_words=[{:08X},{:08X},{:08X},{:08X},{:08X}] res_flags=[bc={:02X},bd={:02X}]",
+                                                        current_thread_id,
+                                                        index,
+                                                        variant,
+                                                        category,
+                                                        resource_index,
+                                                        manager as u32,
+                                                        resource_table as u32,
+                                                        slot_count,
+                                                        slot_array as u32,
+                                                        slot as u32,
+                                                        resource as u32,
+                                                        resource_data as u32,
+                                                        if resource_data >= 0x1000 { memory.read_32(resource_data) } else { 0 },
+                                                        if resource >= 0x1000 { memory.read_32(resource) } else { 0 },
+                                                        if resource >= 0x1000 { memory.read_32(resource + 4) } else { 0 },
+                                                        if resource >= 0x1000 { memory.read_32(resource + 0xC0) } else { 0 },
+                                                        if resource >= 0x1000 { memory.read_32(resource + 0xC4) } else { 0 },
+                                                        if resource >= 0x1000 { memory.read_32(resource + 0xC8) } else { 0 },
+                                                        if resource >= 0x1000 { memory.read_8(resource + 0xBC) } else { 0 },
+                                                        if resource >= 0x1000 { memory.read_8(resource + 0xBD) } else { 0 },
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        if trace_mii_resource_changes {
+                                            for (variant, base, pending) in [
+                                                (0u64, state + index * 0x20, pending_0),
+                                                (1u64, state + 0x1A0 + index * 0x20, pending_1),
+                                                (2u64, state + 0x340 + index * 0x20, pending_2),
+                                            ] {
+                                                if pending == 0 || base < 0x1000 {
+                                                    continue;
+                                                }
+                                                let category = match variant {
+                                                    0 => 7u64,
+                                                    1 => 8u64,
+                                                    _ => 10u64,
+                                                };
+                                                let variant_kind = memory.read_32(base + 4);
+                                                let resource_index =
+                                                    index + if variant_kind == 1 { 0 } else { 13 };
+                                                // MK8D v0 debug path: mirrors guest `0x9680E0`
+                                                // resource-manager lookup used by the code under
+                                                // investigation. This stays env-gated and must not
+                                                // become generic emulator behavior.
+                                                let global_slot = 0x00ED3818u64;
+                                                let global_holder_ptr =
+                                                    memory.read_32(global_slot) as u64;
+                                                let global_holder = if global_holder_ptr >= 0x1000 {
+                                                    memory.read_32(global_holder_ptr) as u64
+                                                } else {
+                                                    0
+                                                };
+                                                let system_ptr = if global_holder >= 0x1000 {
+                                                    memory.read_32(global_holder + 0x14) as u64
+                                                } else {
+                                                    0
+                                                };
+                                                let manager = if system_ptr >= 0x1000 {
+                                                    memory.read_32(system_ptr + 0xE0 + 3 * 4) as u64
+                                                } else {
+                                                    0
+                                                };
+                                                let resource_table = if manager >= 0x1000 {
+                                                    memory.read_32(manager + 0x10C) as u64
+                                                } else {
+                                                    0
+                                                };
+                                                if manager >= 0x1000 {
+                                                    let queue = memory.read_32(manager + 0x3B0);
+                                                    let capacity = memory.read_32(manager + 0x3B4);
+                                                    let read_index =
+                                                        memory.read_32(manager + 0x3B8);
+                                                    let count = memory.read_32(manager + 0x3BC);
+                                                    let mut head = [0u32; 3];
+                                                    if queue >= 0x1000
+                                                        && capacity > 0
+                                                        && capacity < 0x1000
+                                                    {
+                                                        for (slot, value) in
+                                                            head.iter_mut().enumerate()
+                                                        {
+                                                            let index = (read_index + slot as u32)
+                                                                % capacity;
+                                                            *value = memory.read_32(
+                                                                queue as u64 + index as u64 * 4,
+                                                            );
+                                                        }
+                                                    }
+                                                    let current = MiiQueueTrace {
+                                                        manager: manager as u32,
+                                                        queue,
+                                                        capacity,
+                                                        read_index,
+                                                        count,
+                                                        head,
+                                                    };
+                                                    if mii_queue_changed(current) {
+                                                        log::warn!(
+                                                            "svc::SleepThread(sleep) mii_queue_change: tid={} manager=0x{:08X} queue=0x{:08X} cap={} read={} count={} head=[0x{:08X},0x{:08X},0x{:08X}]",
+                                                            current_thread_id,
+                                                            manager as u32,
+                                                            queue,
+                                                            capacity,
+                                                            read_index,
+                                                            count,
+                                                            head[0],
+                                                            head[1],
+                                                            head[2],
+                                                        );
+                                                    }
+                                                }
+                                                let category_base = if resource_table >= 0x1000 {
+                                                    resource_table + 0x34 + category * 56
+                                                } else {
+                                                    0
+                                                };
+                                                let slot_array = if category_base >= 0x1000 {
+                                                    memory.read_32(category_base + 8) as u64
+                                                } else {
+                                                    0
+                                                };
+                                                let slot = if slot_array >= 0x1000 {
+                                                    slot_array + resource_index * 72
+                                                } else {
+                                                    0
+                                                };
+                                                let resource = if slot >= 0x1000 {
+                                                    memory.read_32(slot + 4) as u64
+                                                } else {
+                                                    0
+                                                };
+                                                let resource_state = if resource >= 0x1000 {
+                                                    memory.read_32(resource)
+                                                } else {
+                                                    0
+                                                };
+                                                let resource_data = if resource >= 0x1000 {
+                                                    memory.read_32(resource + 4) as u64
+                                                } else {
+                                                    0
+                                                };
+                                                let resource_data_word0 = if resource_data >= 0x1000
+                                                {
+                                                    memory.read_32(resource_data)
+                                                } else {
+                                                    0
+                                                };
+                                                let flag_bc = if resource >= 0x1000 {
+                                                    memory.read_8(resource + 0xBC)
+                                                } else {
+                                                    0
+                                                };
+                                                let flag_bd = if resource >= 0x1000 {
+                                                    memory.read_8(resource + 0xBD)
+                                                } else {
+                                                    0
+                                                };
+                                                let current = MiiResourceTrace {
+                                                    resource: resource as u32,
+                                                    resource_state,
+                                                    resource_data: resource_data as u32,
+                                                    resource_data_word0,
+                                                    flag_bc,
+                                                    flag_bd,
+                                                };
+                                                if mii_resource_changed(
+                                                    category,
+                                                    resource_index,
+                                                    current,
+                                                ) {
+                                                    log::warn!(
+                                                        "svc::SleepThread(sleep) mii_resource_change: tid={} index={} variant={} category={} resource_index={} pending=0x{:08X} base=0x{:08X} manager=0x{:08X} table=0x{:08X} slot=0x{:08X} resource=0x{:08X} res_state=0x{:08X} res_data=0x{:08X} res_data0=0x{:08X} flags=[bc={:02X},bd={:02X}]",
+                                                        current_thread_id,
+                                                        index,
+                                                        variant,
+                                                        category,
+                                                        resource_index,
+                                                        pending,
+                                                        base as u32,
+                                                        manager as u32,
+                                                        resource_table as u32,
+                                                        slot as u32,
+                                                        resource as u32,
+                                                        resource_state,
+                                                        resource_data as u32,
+                                                        resource_data_word0,
+                                                        flag_bc,
+                                                        flag_bd,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if trace_sleep_backtrace {
+                                let mut words = [0u32; 64];
+                                for (index, word) in words.iter_mut().enumerate() {
+                                    *word = memory.read_32(ctx.sp + (index as u64 * 4));
+                                }
+                                for (row, chunk) in words.chunks(8).enumerate() {
+                                    log::info!(
+                                        "svc::SleepThread(sleep) stack: tid={} sp+0x{:03X}: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                                        current_thread_id,
+                                        row * 0x20,
+                                        chunk[0],
+                                        chunk[1],
+                                        chunk[2],
+                                        chunk[3],
+                                        chunk[4],
+                                        chunk[5],
+                                        chunk[6],
+                                        chunk[7],
+                                    );
+                                }
+                            }
+                        }
+                        if trace_sleep_backtrace {
+                            let bt = crate::arm::debug::get_backtrace_from_context(&process, &ctx);
+                            for (index, entry) in bt.iter().take(12).enumerate() {
+                                log::info!(
+                                    "svc::SleepThread(sleep) bt[{}]: tid={} module={} addr=0x{:X} orig=0x{:X} off=0x{:X} symbol={}",
+                                    index,
+                                    current_thread_id,
+                                    entry.module,
+                                    entry.address,
+                                    entry.original_address,
+                                    entry.offset,
+                                    entry.name,
+                                );
+                            }
                         }
                     }
                 }

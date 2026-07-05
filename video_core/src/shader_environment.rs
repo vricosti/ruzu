@@ -176,6 +176,7 @@ fn dump_impl(
 /// The Rust port stores the closest upstream-shaped `MemoryManager` owner.
 /// Tests may still inject a [`GpuMemoryReader`] for reduced fixtures that do
 /// not construct the full channel/MemoryManager owner graph.
+#[derive(Clone)]
 pub struct GenericEnvironment {
     program_base: GPUVAddr,
     start_address: u32,
@@ -1468,6 +1469,15 @@ impl FileEnvironment {
         self.stage
     }
 
+    pub fn start_address(&self) -> u32 {
+        self.start_address
+    }
+
+    pub fn cached_instruction_slice(&self) -> &[u64] {
+        let first_word = (self.initial_offset / INST_SIZE as u32) as usize;
+        self.code.get(first_word..).unwrap_or(&[])
+    }
+
     pub fn has_hle_macro_state(&self) -> bool {
         !self.cbuf_replacements.is_empty()
     }
@@ -1702,12 +1712,12 @@ fn serialize_generic_environment(
 ///
 /// Port of `VideoCommon::LoadPipelines`.
 /// Reads the binary cache file and calls `load_compute` or `load_graphics` for each entry.
-pub fn load_pipelines<FStop>(
+pub fn load_pipelines<'a, FStop>(
     stop_loading: FStop,
     filename: &Path,
     expected_cache_version: u32,
-    mut load_compute: Box<dyn FnMut(&mut std::fs::File, FileEnvironment)>,
-    mut load_graphics: Box<dyn FnMut(&mut std::fs::File, Vec<FileEnvironment>)>,
+    mut load_compute: Box<dyn FnMut(&mut std::fs::File, FileEnvironment) + 'a>,
+    mut load_graphics: Box<dyn FnMut(&mut std::fs::File, Vec<FileEnvironment>) + 'a>,
 ) where
     FStop: Fn() -> bool,
 {
@@ -1788,14 +1798,12 @@ pub fn load_pipelines<FStop>(
 
     if let Err(e) = load_result {
         log::error!("load_pipelines: {}", e);
-        drop(file);
-        if let Err(remove_error) = std::fs::remove_file(filename) {
-            log::error!(
-                "load_pipelines: failed to delete pipeline cache file {:?}: {}",
-                filename,
-                remove_error
-            );
-        }
+        // Upstream deletes the cache on an iostream failure because the C++
+        // reader and writer are the same implementation. The Rust Vulkan
+        // cache reader is still being brought to binary parity with upstream;
+        // deleting a cache here can destroy a valid upstream/yuzu cache after
+        // a Rust-side deserialization bug. Keep the file until the serialized
+        // key/environment layout is fully verified.
     }
 }
 

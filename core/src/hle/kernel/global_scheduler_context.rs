@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::hardware_properties;
 
@@ -16,6 +16,33 @@ use super::k_scheduler_lock::KAbstractSchedulerLock;
 use super::k_thread::{KThread, KThreadLock, ThreadState, ThreadType};
 
 static TRACE_GSC_STATE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn trace_sched_state_filter() -> &'static Option<Vec<u64>> {
+    static FILTER: OnceLock<Option<Vec<u64>>> = OnceLock::new();
+    FILTER.get_or_init(|| {
+        let raw = std::env::var_os("RUZU_TRACE_SCHED_STATE")?;
+        let raw = raw.to_string_lossy();
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
+            return Some(Vec::new());
+        }
+        Some(
+            raw.split(',')
+                .filter_map(|value| {
+                    let value = value.trim();
+                    if value.is_empty() {
+                        return None;
+                    }
+                    value
+                        .strip_prefix("0x")
+                        .or_else(|| value.strip_prefix("0X"))
+                        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                        .or_else(|| value.parse::<u64>().ok())
+                })
+                .collect(),
+        )
+    })
+}
 
 fn increment_process_scheduled_count(
     counter: Option<&std::sync::Arc<std::sync::atomic::AtomicI64>>,
@@ -26,30 +53,14 @@ fn increment_process_scheduled_count(
 }
 
 fn should_trace_sched_state(thread_id: u64) -> bool {
-    let Some(raw) = std::env::var_os("RUZU_TRACE_SCHED_STATE") else {
+    let Some(filter) = trace_sched_state_filter() else {
         return false;
     };
-    let raw = raw.to_string_lossy();
-    let raw = raw.trim();
-    if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
-        return true;
-    }
-    raw.split(',').any(|value| {
-        let value = value.trim();
-        if value.is_empty() {
-            return false;
-        }
-        let parsed = value
-            .strip_prefix("0x")
-            .or_else(|| value.strip_prefix("0X"))
-            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
-            .or_else(|| value.parse::<u64>().ok());
-        parsed.is_some_and(|tid| tid == thread_id)
-    })
+    filter.is_empty() || filter.contains(&thread_id)
 }
 
 fn trace_sched_state(args: std::fmt::Arguments<'_>) {
-    if std::env::var_os("RUZU_TRACE_SCHED_STATE").is_none() {
+    if trace_sched_state_filter().is_none() {
         return;
     }
     let idx = TRACE_GSC_STATE_COUNT.fetch_add(1, Ordering::Relaxed);

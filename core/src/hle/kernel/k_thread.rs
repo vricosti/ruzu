@@ -8,7 +8,7 @@
 
 use bitflags::bitflags;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use super::k_process::KProcess;
 use super::k_scheduler::KScheduler;
@@ -51,15 +51,23 @@ use common::tree::RBEntry;
 pub type KThreadLock = super::sync_cell::KThreadCell;
 
 fn should_trace_wait_debug() -> bool {
-    std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some()
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some())
 }
 
 fn should_trace_priority_inheritance() -> bool {
-    std::env::var_os("RUZU_TRACE_PI").is_some()
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_PI").is_some())
 }
 
 fn should_trace_end_wait() -> bool {
-    std::env::var_os("RUZU_TRACE_END_WAIT").is_some()
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_END_WAIT").is_some())
+}
+
+fn should_trace_ct_fire() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_CT_FIRE").is_some())
 }
 
 /// Mirrors upstream anonymous `ThreadQueueImplForKThreadSetProperty` in
@@ -2992,7 +3000,7 @@ impl KThread {
             let affinity = self.physical_affinity_mask.get_affinity_mask();
             let is_dummy = self.thread_type == ThreadType::Dummy;
 
-            if std::env::var_os("RUZU_TRACE_CT_FIRE").is_some() {
+            if should_trace_ct_fire() {
                 log::info!(
                     "commit_state_transition tid={} {:?}->{:?} before_gsc_lock",
                     thread_id,
@@ -3015,7 +3023,7 @@ impl KThread {
                 is_dummy,
                 self.process_schedule_count.clone(),
             );
-            if std::env::var_os("RUZU_TRACE_CT_FIRE").is_some() {
+            if should_trace_ct_fire() {
                 log::info!(
                     "commit_state_transition tid={} {:?}->{:?} after_gsc",
                     thread_id,
@@ -3870,7 +3878,7 @@ impl KThread {
             self.get_current_core(),
             self.wait_queue.is_some()
         );
-        let ct_trace = std::env::var_os("RUZU_TRACE_CT_FIRE").is_some();
+        let ct_trace = should_trace_ct_fire();
         if ct_trace {
             log::info!(
                 "on_timer tid={} state={:?} has_wait_queue={} reason={:?}",

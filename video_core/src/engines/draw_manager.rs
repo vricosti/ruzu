@@ -509,6 +509,34 @@ pub trait Maxwell3DAccess {
         true
     }
 
+    /// Read `regs.conservative_raster_enable`, matching upstream
+    /// `FixedPipelineState::Refresh`.
+    fn conservative_raster_enable(&self) -> bool {
+        false
+    }
+
+    /// Read upstream owner `Maxwell3D::engine_state`.
+    fn engine_state(&self) -> crate::engines::maxwell_3d::EngineHint {
+        crate::engines::maxwell_3d::EngineHint::None
+    }
+
+    /// Read `regs.provoking_vertex == Last`, matching upstream
+    /// `FixedPipelineState::Refresh`.
+    fn provoking_vertex_last(&self) -> bool {
+        false
+    }
+
+    /// Read `regs.depth_bounds_enable`, matching upstream
+    /// `FixedPipelineState::DynamicState::Refresh`.
+    fn depth_bounds_enable(&self) -> bool {
+        false
+    }
+
+    /// Read `regs.mandated_early_z`, matching upstream `FixedPipelineState::Refresh`.
+    fn mandated_early_z(&self) -> bool {
+        false
+    }
+
     /// Read `regs.alpha_test_enabled`, matching upstream `SyncAlphaTest`.
     fn alpha_test_enabled(&self) -> bool {
         false
@@ -524,10 +552,36 @@ pub trait Maxwell3DAccess {
         0.0
     }
 
+    /// Read `regs.tessellation.params.domain_type`.
+    fn tessellation_domain_type(&self) -> u32 {
+        0
+    }
+
+    /// Read `regs.tessellation.params.spacing`.
+    fn tessellation_spacing(&self) -> u32 {
+        0
+    }
+
+    /// Read whether tessellation output primitives are clockwise triangles.
+    fn tessellation_clockwise(&self) -> bool {
+        false
+    }
+
+    /// Read `regs.patch_vertices`.
+    fn patch_vertices(&self) -> u32 {
+        1
+    }
+
     /// Read `regs.transform_feedback_enabled != 0`, matching upstream
     /// `RasterizerOpenGL::BeginTransformFeedback`.
     fn transform_feedback_enabled(&self) -> bool {
         false
+    }
+
+    /// Read transform feedback layout/varying state, matching upstream
+    /// `RefreshXfbState`.
+    fn transform_feedback_state(&self) -> crate::transform_feedback::TransformFeedbackState {
+        Default::default()
     }
 
     /// Read `regs.IsShaderConfigEnabled(stage)`, matching upstream
@@ -650,10 +704,20 @@ pub struct Maxwell3DDrawRegisters {
     pub point_state: crate::engines::maxwell_3d::PointStateInfo,
     pub line_state: crate::engines::maxwell_3d::LineStateInfo,
     pub depth_clamp_enabled: bool,
+    pub conservative_raster_enable: bool,
+    pub engine_state: crate::engines::maxwell_3d::EngineHint,
+    pub provoking_vertex_last: bool,
+    pub depth_bounds_enable: bool,
+    pub mandated_early_z: bool,
     pub alpha_test_enabled: bool,
     pub alpha_test_func: crate::engines::maxwell_3d::ComparisonOp,
     pub alpha_test_ref: f32,
+    pub tessellation_primitive: u32,
+    pub tessellation_spacing: u32,
+    pub tessellation_clockwise: bool,
+    pub patch_vertices: u32,
     pub transform_feedback_enabled: bool,
+    pub transform_feedback_state: crate::transform_feedback::TransformFeedbackState,
     pub shader_config_enabled: [bool; NUM_SHADER_PROGRAMS],
     pub descriptor_sync_regs: crate::texture_cache::texture_cache_base::DescriptorSyncRegs,
     pub window_origin_lower_left: bool,
@@ -697,10 +761,20 @@ impl Default for Maxwell3DDrawRegisters {
             point_state: Default::default(),
             line_state: Default::default(),
             depth_clamp_enabled: true,
+            conservative_raster_enable: false,
+            engine_state: crate::engines::maxwell_3d::EngineHint::None,
+            provoking_vertex_last: false,
+            depth_bounds_enable: false,
+            mandated_early_z: false,
             alpha_test_enabled: false,
             alpha_test_func: crate::engines::maxwell_3d::ComparisonOp::Always,
             alpha_test_ref: 0.0,
+            tessellation_primitive: 0,
+            tessellation_spacing: 0,
+            tessellation_clockwise: false,
+            patch_vertices: 1,
             transform_feedback_enabled: false,
+            transform_feedback_state: Default::default(),
             shader_config_enabled: [false, true, false, false, false, false],
             descriptor_sync_regs: Default::default(),
             window_origin_lower_left: false,
@@ -755,10 +829,20 @@ impl Maxwell3DDrawRegisters {
             point_state: maxwell3d.point_state_info(),
             line_state: maxwell3d.line_state_info(),
             depth_clamp_enabled: maxwell3d.depth_clamp_enabled(),
+            conservative_raster_enable: maxwell3d.conservative_raster_enable(),
+            engine_state: maxwell3d.engine_state(),
+            provoking_vertex_last: maxwell3d.provoking_vertex_last(),
+            depth_bounds_enable: maxwell3d.depth_bounds_enable(),
+            mandated_early_z: maxwell3d.mandated_early_z(),
             alpha_test_enabled: maxwell3d.alpha_test_enabled(),
             alpha_test_func: maxwell3d.alpha_test_func(),
             alpha_test_ref: maxwell3d.alpha_test_ref(),
+            tessellation_primitive: maxwell3d.tessellation_domain_type(),
+            tessellation_spacing: maxwell3d.tessellation_spacing(),
+            tessellation_clockwise: maxwell3d.tessellation_clockwise(),
+            patch_vertices: maxwell3d.patch_vertices(),
             transform_feedback_enabled: maxwell3d.transform_feedback_enabled(),
+            transform_feedback_state: maxwell3d.transform_feedback_state(),
             shader_config_enabled: std::array::from_fn(|index| {
                 maxwell3d.shader_config_enabled(ShaderStageType::from_raw(index as u32))
             }),
@@ -883,6 +967,22 @@ impl<'a> Maxwell3DDrawView<'a> {
                     primitive_restart: registers.primitive_restart,
                     logic_op: registers.logic_op,
                     depth_clamp_enabled: registers.depth_clamp_enabled,
+                    conservative_raster_enable: registers.conservative_raster_enable,
+                    engine_state: registers.engine_state,
+                    provoking_vertex_last: registers.provoking_vertex_last,
+                    depth_bounds_enable: registers.depth_bounds_enable,
+                    mandated_early_z: registers.mandated_early_z,
+                    alpha_test_enabled: registers.alpha_test_enabled,
+                    alpha_test_func: registers.alpha_test_func,
+                    alpha_test_ref: registers.alpha_test_ref,
+                    point_size: registers.point_state.point_size,
+                    tessellation_primitive: registers.tessellation_primitive,
+                    tessellation_spacing: registers.tessellation_spacing,
+                    tessellation_clockwise: registers.tessellation_clockwise,
+                    patch_vertices: registers.patch_vertices,
+                    anti_alias_samples_mode: registers.render_targets.anti_alias_samples_mode,
+                    anti_alias_alpha_control: registers.anti_alias_alpha_control,
+                    line_anti_alias_enable: registers.line_state.line_anti_alias_enable,
                     program_base_address: 0,
                     cb_bindings: registers.cb_bindings,
                     vertex_attribs: registers.vertex_attribs.to_vec(),
@@ -904,6 +1004,8 @@ impl<'a> Maxwell3DDrawView<'a> {
                     },
                     render_targets: registers.render_targets.render_targets,
                     zeta: registers.render_targets.zeta,
+                    transform_feedback_enabled: registers.transform_feedback_enabled,
+                    transform_feedback_state: registers.transform_feedback_state,
                     dirty_flags: registers.dirty_flags,
                 }
             }
@@ -1117,6 +1219,41 @@ impl<'a> Maxwell3DDrawView<'a> {
         }
     }
 
+    pub fn conservative_raster_enable(&self) -> bool {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.conservative_raster_enable(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.conservative_raster_enable,
+        }
+    }
+
+    pub fn engine_state(&self) -> crate::engines::maxwell_3d::EngineHint {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.engine_state(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.engine_state,
+        }
+    }
+
+    pub fn provoking_vertex_last(&self) -> bool {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.provoking_vertex_last(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.provoking_vertex_last,
+        }
+    }
+
+    pub fn depth_bounds_enable(&self) -> bool {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.depth_bounds_enable(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.depth_bounds_enable,
+        }
+    }
+
+    pub fn mandated_early_z(&self) -> bool {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.mandated_early_z(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.mandated_early_z,
+        }
+    }
+
     pub fn alpha_test_enabled(&self) -> bool {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.alpha_test_enabled(),
@@ -1138,10 +1275,45 @@ impl<'a> Maxwell3DDrawView<'a> {
         }
     }
 
+    pub fn tessellation_domain_type(&self) -> u32 {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.tessellation_domain_type(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.tessellation_primitive,
+        }
+    }
+
+    pub fn tessellation_spacing(&self) -> u32 {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.tessellation_spacing(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.tessellation_spacing,
+        }
+    }
+
+    pub fn tessellation_clockwise(&self) -> bool {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.tessellation_clockwise(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.tessellation_clockwise,
+        }
+    }
+
+    pub fn patch_vertices(&self) -> u32 {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.patch_vertices(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.patch_vertices,
+        }
+    }
+
     pub fn transform_feedback_enabled(&self) -> bool {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.transform_feedback_enabled(),
             Maxwell3DDrawSource::Snapshot(registers) => registers.transform_feedback_enabled,
+        }
+    }
+
+    pub fn transform_feedback_state(&self) -> crate::transform_feedback::TransformFeedbackState {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.transform_feedback_state(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.transform_feedback_state,
         }
     }
 
@@ -1364,6 +1536,22 @@ fn build_draw_call_snapshot(
         primitive_restart: maxwell3d.primitive_restart_info(),
         logic_op: maxwell3d.logic_op_info(),
         depth_clamp_enabled: maxwell3d.depth_clamp_enabled(),
+        conservative_raster_enable: maxwell3d.conservative_raster_enable(),
+        engine_state: maxwell3d.engine_state(),
+        provoking_vertex_last: maxwell3d.provoking_vertex_last(),
+        depth_bounds_enable: maxwell3d.depth_bounds_enable(),
+        mandated_early_z: maxwell3d.mandated_early_z(),
+        alpha_test_enabled: maxwell3d.alpha_test_enabled(),
+        alpha_test_func: maxwell3d.alpha_test_func(),
+        alpha_test_ref: maxwell3d.alpha_test_ref(),
+        point_size: maxwell3d.point_state_info().point_size,
+        tessellation_primitive: maxwell3d.tessellation_domain_type(),
+        tessellation_spacing: maxwell3d.tessellation_spacing(),
+        tessellation_clockwise: maxwell3d.tessellation_clockwise(),
+        patch_vertices: maxwell3d.patch_vertices(),
+        anti_alias_samples_mode: maxwell3d.anti_alias_samples_mode(),
+        anti_alias_alpha_control: maxwell3d.anti_alias_alpha_control_info(),
+        line_anti_alias_enable: maxwell3d.line_state_info().line_anti_alias_enable,
         program_base_address: maxwell3d.program_base_address(),
         cb_bindings,
         vertex_attribs,
@@ -1381,6 +1569,8 @@ fn build_draw_call_snapshot(
         sampler_binding: maxwell3d.sampler_binding(),
         render_targets,
         zeta: maxwell3d.zeta_info(),
+        transform_feedback_enabled: maxwell3d.transform_feedback_enabled(),
+        transform_feedback_state: maxwell3d.transform_feedback_state(),
         dirty_flags: maxwell3d.dirty_flags(),
     }
 }
@@ -1750,6 +1940,22 @@ impl DrawManager {
             primitive_restart: maxwell3d.primitive_restart_info(),
             logic_op: maxwell3d.logic_op_info(),
             depth_clamp_enabled: maxwell3d.depth_clamp_enabled(),
+            conservative_raster_enable: maxwell3d.conservative_raster_enable(),
+            engine_state: maxwell3d.engine_state(),
+            provoking_vertex_last: maxwell3d.provoking_vertex_last(),
+            depth_bounds_enable: maxwell3d.depth_bounds_enable(),
+            mandated_early_z: maxwell3d.mandated_early_z(),
+            alpha_test_enabled: maxwell3d.alpha_test_enabled(),
+            alpha_test_func: maxwell3d.alpha_test_func(),
+            alpha_test_ref: maxwell3d.alpha_test_ref(),
+            point_size: maxwell3d.point_state_info().point_size,
+            tessellation_primitive: maxwell3d.tessellation_domain_type(),
+            tessellation_spacing: maxwell3d.tessellation_spacing(),
+            tessellation_clockwise: maxwell3d.tessellation_clockwise(),
+            patch_vertices: maxwell3d.patch_vertices(),
+            anti_alias_samples_mode: maxwell3d.anti_alias_samples_mode(),
+            anti_alias_alpha_control: maxwell3d.anti_alias_alpha_control_info(),
+            line_anti_alias_enable: maxwell3d.line_state_info().line_anti_alias_enable,
             program_base_address: maxwell3d.program_base_address(),
             cb_bindings,
             vertex_attribs,
@@ -1767,6 +1973,8 @@ impl DrawManager {
             sampler_binding: maxwell3d.sampler_binding(),
             render_targets,
             zeta: maxwell3d.zeta_info(),
+            transform_feedback_enabled: maxwell3d.transform_feedback_enabled(),
+            transform_feedback_state: maxwell3d.transform_feedback_state(),
             dirty_flags: maxwell3d.dirty_flags(),
         }
     }

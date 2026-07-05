@@ -6,7 +6,7 @@
 //! Top-level Vulkan renderer that owns the device, swapchain, present manager,
 //! blit screens, rasterizer, and optional turbo mode.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use ash::vk;
@@ -33,6 +33,38 @@ use super::present::util::{create_wrapped_image, create_wrapped_image_view, down
 use super::present_manager::{Frame, PresentManager};
 use super::scheduler::Scheduler;
 use super::swapchain::Swapchain;
+
+static VK_COMPOSITE_COUNT: AtomicU64 = AtomicU64::new(0);
+static VK_COMPOSITE_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+static VK_COMPOSITE_MAX_US: AtomicU64 = AtomicU64::new(0);
+static VK_COMPOSITE_CAPTURE_US: AtomicU64 = AtomicU64::new(0);
+static VK_COMPOSITE_SCREENSHOT_US: AtomicU64 = AtomicU64::new(0);
+static VK_COMPOSITE_LAYOUT_US: AtomicU64 = AtomicU64::new(0);
+static VK_COMPOSITE_GET_FRAME_US: AtomicU64 = AtomicU64::new(0);
+static VK_COMPOSITE_SWAPCHAIN_EXTENT_US: AtomicU64 = AtomicU64::new(0);
+static VK_COMPOSITE_SWAPCHAIN_INFO_US: AtomicU64 = AtomicU64::new(0);
+static VK_COMPOSITE_DRAW_US: AtomicU64 = AtomicU64::new(0);
+static VK_COMPOSITE_FLUSH_US: AtomicU64 = AtomicU64::new(0);
+static VK_COMPOSITE_PRESENT_US: AtomicU64 = AtomicU64::new(0);
+static VK_COMPOSITE_TICK_US: AtomicU64 = AtomicU64::new(0);
+
+fn vk_composite_profile_enabled() -> bool {
+    std::env::var_os("RUZU_PROFILE_VK_COMPOSITE").is_some()
+}
+
+fn elapsed_us(start: std::time::Instant) -> u64 {
+    start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn update_max(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants (from renderer_vulkan.cpp anonymous namespace)
@@ -376,6 +408,7 @@ impl RendererVulkan {
             device.is_ext_extended_dynamic_state2_supported(),
             device.is_topology_list_primitive_restart_supported(),
             device.is_patch_list_primitive_restart_supported(),
+            device.must_emulate_scaled_formats(),
             device.is_ext_shader_stencil_export_supported(),
             device.is_timeline_semaphore_supported(),
             device.is_ext_custom_border_color_supported(),
@@ -434,6 +467,8 @@ impl RendererVulkan {
     /// 8. Notify GPU of frame end
     /// 9. Tick rasterizer frame
     pub fn composite_impl(&mut self, framebuffers: &[FramebufferConfig]) {
+        let profile = vk_composite_profile_enabled();
+        let composite_start = profile.then(std::time::Instant::now);
         let trace_present = std::env::var_os("RUZU_TRACE_PRESENT").is_some();
         if trace_present {
             log::info!(
@@ -450,20 +485,40 @@ impl RendererVulkan {
             }
             return;
         }
+        let phase_start = profile.then(std::time::Instant::now);
         self.render_applet_capture_layer(framebuffers);
+        if let Some(start) = phase_start {
+            VK_COMPOSITE_CAPTURE_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+        }
         if !should_present_window(&self.window_shown) {
             if trace_present {
                 log::info!("[PRESENT] RendererVulkan::Composite skip hidden window");
             }
             return;
         }
+        let phase_start = profile.then(std::time::Instant::now);
         let layout = self.current_framebuffer_layout_for_present(trace_present);
+        if let Some(start) = phase_start {
+            VK_COMPOSITE_LAYOUT_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+        }
+        let phase_start = profile.then(std::time::Instant::now);
         self.render_screenshot(framebuffers);
         self.dump_present_frame_if_requested(framebuffers, &layout);
+        if let Some(start) = phase_start {
+            VK_COMPOSITE_SCREENSHOT_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+        }
 
+        let phase_start = profile.then(std::time::Instant::now);
         let frame_index = self.present_manager.get_render_frame_index();
-        let swapchain_extent = self.swapchain.lock().unwrap().get_extent();
+        if let Some(start) = phase_start {
+            VK_COMPOSITE_GET_FRAME_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+        }
         if trace_present {
+            let phase_start = profile.then(std::time::Instant::now);
+            let swapchain_extent = self.swapchain.lock().unwrap().get_extent();
+            if let Some(start) = phase_start {
+                VK_COMPOSITE_SWAPCHAIN_EXTENT_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+            }
             log::info!(
                 "[PRESENT] RendererVulkan::Composite draw frame_index={} swapchain={}x{} layout={}x{} image_count={}",
                 frame_index,
@@ -474,6 +529,7 @@ impl RendererVulkan {
                 self.swapchain.lock().unwrap().get_image_count()
             );
         }
+        let phase_start = profile.then(std::time::Instant::now);
         let (swapchain_image_count, swapchain_image_view_format) = {
             let swapchain = self.swapchain.lock().unwrap();
             (
@@ -481,6 +537,10 @@ impl RendererVulkan {
                 swapchain.get_image_view_format(),
             )
         };
+        if let Some(start) = phase_start {
+            VK_COMPOSITE_SWAPCHAIN_INFO_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+        }
+        let phase_start = profile.then(std::time::Instant::now);
         self.blit_swapchain.draw_to_present_frame(
             &mut self.rasterizer,
             &mut self.scheduler,
@@ -493,21 +553,64 @@ impl RendererVulkan {
             swapchain_image_count,
             swapchain_image_view_format,
         );
+        if let Some(start) = phase_start {
+            VK_COMPOSITE_DRAW_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+        }
 
         let render_ready = self.present_manager.frame(frame_index).render_ready;
+        let phase_start = profile.then(std::time::Instant::now);
         self.scheduler.flush_with_signal(render_ready);
+        if let Some(start) = phase_start {
+            VK_COMPOSITE_FLUSH_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+        }
         if trace_present {
             log::info!(
                 "[PRESENT] RendererVulkan::Composite flushed frame_index={}",
                 frame_index
             );
         }
+        let phase_start = profile.then(std::time::Instant::now);
         self.present_manager
             .present(frame_index, &mut self.scheduler);
+        if let Some(start) = phase_start {
+            VK_COMPOSITE_PRESENT_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+        }
         self.base_data.current_frame += 1;
 
+        let phase_start = profile.then(std::time::Instant::now);
         (self.frame_end_notify)();
         self.rasterizer.tick_frame();
+        if let Some(start) = phase_start {
+            VK_COMPOSITE_TICK_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+        }
+        if let Some(start) = composite_start {
+            let total_us = elapsed_us(start);
+            let count = VK_COMPOSITE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            VK_COMPOSITE_TOTAL_US.fetch_add(total_us, Ordering::Relaxed);
+            update_max(&VK_COMPOSITE_MAX_US, total_us);
+            if count <= 8 || count % 60 == 0 || total_us >= 100_000 {
+                let total = VK_COMPOSITE_TOTAL_US.load(Ordering::Relaxed);
+                let avg = total / count.max(1);
+                eprintln!(
+                    "[VK_COMPOSITE_PROFILE] count={} total_us={} avg_us={} max_us={} last_us={} capture_us={} layout_us={} screenshot_us={} get_frame_us={} swapchain_extent_us={} swapchain_info_us={} draw_us={} flush_us={} present_us={} tick_us={}",
+                    count,
+                    total,
+                    avg,
+                    VK_COMPOSITE_MAX_US.load(Ordering::Relaxed),
+                    total_us,
+                    VK_COMPOSITE_CAPTURE_US.load(Ordering::Relaxed),
+                    VK_COMPOSITE_LAYOUT_US.load(Ordering::Relaxed),
+                    VK_COMPOSITE_SCREENSHOT_US.load(Ordering::Relaxed),
+                    VK_COMPOSITE_GET_FRAME_US.load(Ordering::Relaxed),
+                    VK_COMPOSITE_SWAPCHAIN_EXTENT_US.load(Ordering::Relaxed),
+                    VK_COMPOSITE_SWAPCHAIN_INFO_US.load(Ordering::Relaxed),
+                    VK_COMPOSITE_DRAW_US.load(Ordering::Relaxed),
+                    VK_COMPOSITE_FLUSH_US.load(Ordering::Relaxed),
+                    VK_COMPOSITE_PRESENT_US.load(Ordering::Relaxed),
+                    VK_COMPOSITE_TICK_US.load(Ordering::Relaxed),
+                );
+            }
+        }
         if trace_present {
             log::info!(
                 "[PRESENT] RendererVulkan::Composite exit frame_index={} current_frame={}",
@@ -831,18 +934,23 @@ impl RendererVulkan {
             .expect("Failed to create Vulkan download buffer")
     }
 
-    /// Keep the present layout synchronized with the fixed WSI surface extent.
+    /// Keep the present layout synchronized with the cached WSI surface extent.
     ///
     /// Upstream relies on `EmuWindow_SDL2::OnResize` updating
     /// `render_window.GetFramebufferLayout()` before `RendererVulkan::Composite`.
-    /// On macOS/MoltenVK, SDL resize events can lag behind the surface extent
-    /// visible to Vulkan during live resize/maximize, so synchronize here before
-    /// `BlitScreen::DrawToFrame` recreates the presentation frame.
+    /// On macOS/MoltenVK, the present thread can hold the swapchain mutex while
+    /// the WSI layer waits for a drawable. Upstream does not block
+    /// `RendererVulkan::Composite` on a swapchain query for layout; if the
+    /// mutex is busy, use the frontend-provided layout for this frame.
     fn current_framebuffer_layout_for_present(&self, trace_present: bool) -> FramebufferLayout {
         let layout = self.framebuffer_layout.read().unwrap().clone();
-        let Some(extent) = self.swapchain.lock().unwrap().current_surface_extent() else {
+        let Ok(swapchain) = self.swapchain.try_lock() else {
             return layout;
         };
+        let extent = swapchain.get_extent();
+        if extent.width == 0 || extent.height == 0 {
+            return layout;
+        }
         if extent.width == layout.width && extent.height == layout.height {
             return layout;
         }

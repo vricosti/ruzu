@@ -1099,7 +1099,19 @@ fn send_sync_request_impl(
         context.get_command() as u64,
         0,
     );
+    let service_profile = ipc_service_profile_enabled().then(std::time::Instant::now);
+    let service_profile_key = service_profile.as_ref().map(|_| {
+        let manager = request_manager.lock().unwrap();
+        let service_name = manager
+            .session_handler()
+            .map(|handler| handler.service_name().to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        (service_name, context.get_command())
+    });
     let result = complete_sync_request(&request_manager, &mut context);
+    if let (Some(start), Some((service_name, command))) = (service_profile, service_profile_key) {
+        record_ipc_service_profile(&service_name, command, start.elapsed());
+    }
     trace_svc_ipc_progress(
         7,
         session_handle,
@@ -1407,6 +1419,29 @@ fn record_ipc_profile(session_handle: u32, elapsed: std::time::Duration) {
     }
 }
 
+/// Per-service IPC dispatch profile. `RUZU_PROFILE_IPC_SERVICE=1` measures
+/// HLE handler time after command decode, keyed by service name + command.
+static IPC_SERVICE_PROFILE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(String, u32), IpcProfileEntry>>,
+> = std::sync::OnceLock::new();
+
+fn ipc_service_profile_enabled() -> bool {
+    std::env::var_os("RUZU_PROFILE_IPC_SERVICE").is_some()
+}
+
+fn record_ipc_service_profile(service: &str, command: u32, elapsed: std::time::Duration) {
+    let map =
+        IPC_SERVICE_PROFILE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let ns = elapsed.as_nanos() as u64;
+    let mut guard = map.lock().unwrap();
+    let entry = guard.entry((service.to_string(), command)).or_default();
+    entry.count += 1;
+    entry.total_ns = entry.total_ns.saturating_add(ns);
+    if ns > entry.max_ns {
+        entry.max_ns = ns;
+    }
+}
+
 /// Per-phase aggregator for `RUZU_PROFILE_IPC_PHASES`. Keyed by phase label.
 static IPC_PHASE_PROFILE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<&'static str, IpcProfileEntry>>,
@@ -1468,6 +1503,35 @@ pub fn dump_ipc_profile() {
         eprintln!(
             "[IPC_PROFILE]   handle=0x{:X}  count={}  total={:.2}ms  avg={:.1}us  max={:.1}us",
             h,
+            e.count,
+            e.total_ns as f64 / 1e6,
+            e.total_ns as f64 / e.count as f64 / 1e3,
+            e.max_ns as f64 / 1e3,
+        );
+    }
+}
+
+pub fn dump_ipc_service_profile() {
+    let Some(map) = IPC_SERVICE_PROFILE.get() else {
+        return;
+    };
+    let mut snap: Vec<((String, u32), IpcProfileEntry)> = {
+        let guard = map.lock().unwrap();
+        guard
+            .iter()
+            .map(|((service, command), entry)| ((service.clone(), *command), entry.clone()))
+            .collect()
+    };
+    if snap.is_empty() {
+        return;
+    }
+    snap.sort_by_key(|(_, e)| std::cmp::Reverse(e.total_ns));
+    eprintln!("[IPC_SERVICE_PROFILE] top service commands by handler time:");
+    for ((service, command), e) in snap.iter().take(30) {
+        eprintln!(
+            "[IPC_SERVICE_PROFILE]   service={} cmd={} count={} total={:.2}ms avg={:.1}us max={:.1}us",
+            service,
+            command,
             e.count,
             e.total_ns as f64 / 1e6,
             e.total_ns as f64 / e.count as f64 / 1e3,

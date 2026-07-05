@@ -1056,6 +1056,29 @@ impl BufferCache {
         self.get_or_upload(gpu_va, size, read_gpu, staging_pool, cmd)
     }
 
+    /// Bind a short-lived uniform buffer directly from the mapped staging
+    /// stream, matching upstream `BufferCacheRuntime::BindMappedUniformBuffer`.
+    ///
+    /// Uniform buffers rewritten by the guest every draw should not allocate a
+    /// device-local VkBuffer and VkDeviceMemory on the hot path.
+    pub fn bind_mapped_uniform_buffer(
+        &mut self,
+        gpu_va: u64,
+        size: vk::DeviceSize,
+        read_gpu: &dyn Fn(u64, &mut [u8]),
+        staging_pool: &mut StagingBufferPool,
+    ) -> Option<(vk::Buffer, vk::DeviceSize)> {
+        if size == 0 || gpu_va == 0 {
+            return Some((self.null_buffer, 0));
+        }
+        let staging = staging_pool.request_upload_buffer(size)?;
+        unsafe {
+            let span = std::slice::from_raw_parts_mut(staging.mapped, size as usize);
+            read_gpu(gpu_va, span);
+        }
+        Some((staging.buffer, staging.offset))
+    }
+
     fn get_or_upload_bytes(
         &mut self,
         cache_key: u64,

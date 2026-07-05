@@ -455,6 +455,7 @@ fn main() {
         std::env::var_os("RUZU_PROFILE_STARTTHREAD_SCHED").is_some();
     let want_nvdrv_ioctl_profile = std::env::var_os("RUZU_PROFILE_NVDRV_IOCTL").is_some();
     let want_nvdrv_ioctl_history = std::env::var_os("RUZU_DUMP_NVDRV_IOCTL_HISTORY").is_some();
+    let want_ipc_service_profile = std::env::var_os("RUZU_PROFILE_IPC_SERVICE").is_some();
     let want_ipc_phase_profile = std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some();
     let want_bqp_slot_profile = std::env::var_os("RUZU_PROFILE_BQP_SLOTS").is_some();
     let want_binder_txn_profile = std::env::var_os("RUZU_PROFILE_BINDER_TXN").is_some();
@@ -489,6 +490,7 @@ fn main() {
         || want_startthread_sched_profile
         || want_nvdrv_ioctl_profile
         || want_nvdrv_ioctl_history
+        || want_ipc_service_profile
         || want_ipc_phase_profile
         || want_bqp_slot_profile
         || want_binder_txn_profile
@@ -521,6 +523,7 @@ fn main() {
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_history("sigusr2");
             ruzu_core::hle::service::nvdrv::devices::nvhost_gpu::dump_submit_gpfifo_profile();
             video_core::gpu_thread::dump_gpu_thread_profile();
+            ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_service_profile();
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_phase_profile();
             ruzu_core::hle::service::hle_ipc::dump_hle_handler_profile();
             ruzu_core::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
@@ -558,6 +561,7 @@ fn main() {
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_history("atexit");
             ruzu_core::hle::service::nvdrv::devices::nvhost_gpu::dump_submit_gpfifo_profile();
             video_core::gpu_thread::dump_gpu_thread_profile();
+            ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_service_profile();
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_phase_profile();
             ruzu_core::hle::service::hle_ipc::dump_hle_handler_profile();
             ruzu_core::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
@@ -620,12 +624,14 @@ fn main() {
     if std::env::var_os("RUZU_BLOCK_COUNT_PC").is_some()
         || std::env::var_os("RUZU_COUNT_W64_BY_CORE_AT_VADDR").is_some()
         || std::env::var_os("RUZU_BLOCK_PROLOGUE_COUNT_PC").is_some()
+        || std::env::var_os("RUZU_BLOCK_PROLOGUE_TOP_PC").is_some()
         || std::env::var_os("RUZU_FIRST_PCS_PER_CORE").is_some()
     {
         // SIGUSR2 path — useful when the JIT thread isn't flooding stderr.
         extern "C" fn dump_counts(_: libc::c_int) {
             rdynarmic::jit::dump_block_count_summary();
             eprintln!("{}", rdynarmic::jit::block_prologue_count_summary_string());
+            eprintln!("{}", rdynarmic::jit::block_prologue_top_summary_string());
             eprintln!("{}", rdynarmic::jit::first_pcs_per_core_summary_string());
             ruzu_core::arm::dynarmic::arm_dynarmic_64::dump_w64_by_core_counters();
         }
@@ -663,6 +669,8 @@ fn main() {
                             "{}",
                             rdynarmic::jit::block_prologue_count_summary_string()
                         );
+                        let _ =
+                            writeln!(w, "{}", rdynarmic::jit::block_prologue_top_summary_string());
                         let _ =
                             writeln!(w, "{}", rdynarmic::jit::first_pcs_per_core_summary_string());
                         let _ = writeln!(
@@ -1237,6 +1245,22 @@ fn main() {
     // Step 7 (upstream): system.GetCpuManager().OnGpuReady()
     // -----------------------------------------------------------------------
     system.get_cpu_manager().on_gpu_ready();
+
+    if *common::settings::values().use_disk_shader_cache.get_value() {
+        if let Some(gpu_any) = system.gpu_core() {
+            if let Some(gpu) = gpu_any.as_any().downcast_ref::<video_core::gpu::Gpu>() {
+                let mut renderer_guard = gpu.renderer();
+                if let Some(renderer) = renderer_guard.as_mut() {
+                    let rasterizer = renderer.read_rasterizer();
+                    unsafe {
+                        if let Some(rasterizer) = rasterizer.as_mut() {
+                            rasterizer.load_disk_resources(system.runtime_program_id());
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Upstream: system.RegisterExitCallback([&] { exit(0); })

@@ -197,7 +197,11 @@ impl PathManager {
         self.generate_ruzu_path(RuzuPath::PlayTimeDir, &data_root.join(PLAY_TIME_DIR));
         self.generate_ruzu_path(RuzuPath::ScreenshotsDir, &data_root.join(SCREENSHOTS_DIR));
         self.generate_ruzu_path(RuzuPath::SDMCDir, &data_root.join(SDMC_DIR));
-        self.generate_ruzu_path(RuzuPath::ShaderDir, &data_root.join(SHADER_DIR));
+        // Shader caches are emulator-private binary data. ruzu may borrow the
+        // legacy yuzu root for user/system data, but its disk shader cache
+        // layout is not yuzu-compatible and must not read or delete yuzu's
+        // `shader/<title>/vulkan*.bin` files.
+        self.generate_ruzu_path(RuzuPath::ShaderDir, &ruzu_path.join(SHADER_DIR));
         self.generate_ruzu_path(RuzuPath::TASDir, &data_root.join(TAS_DIR));
         self.generate_ruzu_path(RuzuPath::IconsDir, &data_root.join(ICONS_DIR));
     }
@@ -602,6 +606,9 @@ fn normalize_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
     use std::fs;
 
     #[test]
@@ -798,6 +805,72 @@ mod tests {
         .unwrap();
 
         assert_eq!(legacy_yuzu_root_reason(&primary, &legacy), None);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_shader_dir_stays_under_ruzu_root_when_legacy_yuzu_root_is_selected() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_data = std::env::var_os("XDG_DATA_HOME");
+        let old_cache = std::env::var_os("XDG_CACHE_HOME");
+        let old_config = std::env::var_os("XDG_CONFIG_HOME");
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("ruzu-path-util-{unique}"));
+        let data = base.join("data");
+        let cache = base.join("cache");
+        let config = base.join("config");
+        let primary = data.join("ruzu");
+        let legacy = data.join("yuzu");
+
+        fs::create_dir_all(primary.join("nand")).unwrap();
+        fs::create_dir_all(legacy.join("nand/system/Contents/registered")).unwrap();
+        fs::write(
+            legacy
+                .join("nand/system/Contents/registered")
+                .join("dummy.nca"),
+            b"x",
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data);
+            std::env::set_var("XDG_CACHE_HOME", &cache);
+            std::env::set_var("XDG_CONFIG_HOME", &config);
+        }
+
+        let mut manager = PathManager {
+            ruzu_paths: HashMap::new(),
+        };
+        manager.reinitialize(None);
+
+        assert_eq!(
+            manager.get_ruzu_path_impl(RuzuPath::NANDDir),
+            legacy.join("nand").as_path()
+        );
+        assert_eq!(
+            manager.get_ruzu_path_impl(RuzuPath::ShaderDir),
+            primary.join("shader").as_path()
+        );
+
+        unsafe {
+            match old_data {
+                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+            match old_cache {
+                Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+                None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+            match old_config {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
 
         let _ = fs::remove_dir_all(base);
     }

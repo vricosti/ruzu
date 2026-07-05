@@ -50,6 +50,7 @@ pub mod varying_state;
 // Re-export public API
 pub use ir::types::ShaderStage;
 pub use pipeline_cache::{
+    compile_dual_vertex_shader_from_env_with_bindings_and_host_info,
     compile_dual_vertex_shader_glsl_at_offset,
     compile_dual_vertex_shader_glsl_at_offset_with_bindings,
     compile_dual_vertex_shader_glsl_at_offset_with_bindings_and_host_info, compile_shader,

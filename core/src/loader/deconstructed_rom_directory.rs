@@ -9,6 +9,7 @@
 //! contains the other standard ExeFS NSOs (rtld, sdk, etc.).
 
 use crate::file_sys::control_metadata::NACP;
+use crate::file_sys::patch_manager::PatchManager;
 use crate::file_sys::program_metadata::ProgramMetadata;
 use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 use crate::hle::result::RESULT_SUCCESS;
@@ -216,7 +217,7 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
             }
         }
 
-        let dir = match &self.dir {
+        let mut dir = match &self.dir {
             Some(d) => d.clone(),
             None => return (ResultStatus::ErrorNullFile, None),
         };
@@ -249,9 +250,47 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
             return (loader_status, None);
         }
 
-        // Upstream: PatchManager::PatchExeFS when override_update is set,
-        // then reload metadata from potentially-patched npdm.
-        // PatchManager is a separate subsystem; ExeFS patching is skipped.
+        if self.override_update {
+            if let (Some(fs_controller), Some(content_provider)) =
+                (&system.filesystem_controller, &system.content_provider)
+            {
+                let fs_guard = fs_controller.lock().unwrap();
+                let content_guard = content_provider.lock().unwrap();
+                let patch_manager =
+                    PatchManager::new(metadata.get_title_id(), &fs_guard, &*content_guard);
+                dir = patch_manager.patch_exefs(dir);
+                self.dir = Some(dir.clone());
+            } else {
+                log::warn!(
+                    "Unable to patch ExeFS for {:016X}: missing filesystem/content provider",
+                    metadata.get_title_id()
+                );
+            }
+        }
+
+        // Upstream rereads main.npdm after PatchExeFS because an update or
+        // LayeredExeFS mod may replace it.
+        let npdm_file = match dir.get_file("main.npdm") {
+            Some(f) => f,
+            None => return (ResultStatus::ErrorMissingNPDM, None),
+        };
+        let result = metadata.reload(npdm_file);
+        if result != PfsResultStatus::Success {
+            let loader_status = match result {
+                PfsResultStatus::ErrorBadNPDMHeader => ResultStatus::ErrorBadNPDMHeader,
+                PfsResultStatus::ErrorBadACIDHeader => ResultStatus::ErrorBadACIDHeader,
+                PfsResultStatus::ErrorBadACIHeader => ResultStatus::ErrorBadACIHeader,
+                PfsResultStatus::ErrorBadFileAccessControl => {
+                    ResultStatus::ErrorBadFileAccessControl
+                }
+                PfsResultStatus::ErrorBadFileAccessHeader => ResultStatus::ErrorBadFileAccessHeader,
+                PfsResultStatus::ErrorBadKernelCapabilityDescriptors => {
+                    ResultStatus::ErrorBadKernelCapabilityDescriptors
+                }
+                _ => ResultStatus::ErrorBadNPDMHeader,
+            };
+            return (loader_status, None);
+        }
 
         metadata.print();
         self.title_id = metadata.get_title_id();

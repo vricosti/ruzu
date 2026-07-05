@@ -11,25 +11,35 @@
 //! pointers set at initialization to break the circular dependency.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use super::k_spin_lock::KAlignedSpinLock;
 
 fn should_trace_scheduler_lock() -> bool {
-    std::env::var_os("RUZU_TRACE_SCHED_LOCK").is_some()
-        || std::env::var_os("RUZU_TRACE_SLEEP").is_some()
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("RUZU_TRACE_SCHED_LOCK").is_some()
+            || std::env::var_os("RUZU_TRACE_SLEEP").is_some()
+    })
 }
 
 fn should_trace_scheduler_lock_owner(owner: u64) -> bool {
-    if std::env::var_os("RUZU_TRACE_SCHED_LOCK").is_none() {
+    static OWNERS: OnceLock<Option<Vec<u64>>> = OnceLock::new();
+    let owners = OWNERS.get_or_init(|| {
+        if std::env::var_os("RUZU_TRACE_SCHED_LOCK").is_none() {
+            return None;
+        }
+        let spec = std::env::var("RUZU_TRACE_SCHED_LOCK_OWNER").ok()?;
+        Some(
+            spec.split(',')
+                .filter_map(|raw| raw.trim().parse::<u64>().ok())
+                .collect(),
+        )
+    });
+    let Some(owners) = owners.as_ref() else {
         return false;
-    }
-    match std::env::var("RUZU_TRACE_SCHED_LOCK_OWNER") {
-        Ok(spec) => spec
-            .split(',')
-            .filter_map(|raw| raw.trim().parse::<u64>().ok())
-            .any(|id| id == owner),
-        Err(_) => false,
-    }
+    };
+    owners.iter().any(|id| *id == owner)
 }
 
 fn trace_scheduler_lock_context(label: &str, current_id: u64, owner: u64, elapsed_us: u128) {
@@ -63,7 +73,8 @@ fn trace_scheduler_lock_context(label: &str, current_id: u64, owner: u64, elapse
 }
 
 fn trace_scheduler_lock_ring(stage: u64, owner_sched_id: u64, cores: u64, lock_count: i32) {
-    if std::env::var_os("RUZU_TRACE_SCHED_LOCK_RING").is_none() {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_SCHED_LOCK_RING").is_some()) {
         return;
     }
     if !common::trace::is_enabled(common::trace::cat::SCHED_STATE) {
