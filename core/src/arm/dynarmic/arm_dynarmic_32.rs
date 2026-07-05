@@ -20,6 +20,12 @@ use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
 
 static A32_TRACE_AFTER_WATCH_ARMED: AtomicBool = AtomicBool::new(false);
 
+/// Debug hook used to start the bounded A32 single-step tracer from a precise
+/// HLE observation point (for example immediately after a guest sleep).
+pub fn arm_trace_after_watch() {
+    A32_TRACE_AFTER_WATCH_ARMED.store(true, Ordering::Relaxed);
+}
+
 /// Translate rdynarmic's HaltReason to core's HaltReason.
 ///
 /// Same mapping as in arm_dynarmic_64.rs.
@@ -265,17 +271,36 @@ fn maybe_trace_w_at_vaddr(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value
         unsafe { (*core).core_index() as i32 }
     };
     let t = crate::hle::kernel::trace_format::elapsed_secs();
-    eprintln!(
-        "[{:>10.6}] [W{}_AT] core={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:08X} value=0x{:0width$X}",
-        t,
-        size * 8,
-        core_id,
-        pc,
-        lr,
-        vaddr as u32,
-        value,
-        width = (size as usize) * 2
-    );
+    let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+    if common::trace::is_enabled(common::trace::cat::WATCH_WRITE) {
+        common::trace::emit_raw(
+            common::trace::cat::WATCH_WRITE,
+            &[
+                core_id as u32 as u64,
+                tid,
+                pc as u64,
+                lr as u64,
+                vaddr,
+                size,
+                value as u64,
+                (value >> 64) as u64,
+            ],
+        );
+    }
+    if std::env::var_os("RUZU_TRACE_W_AT_REGS").is_some() {
+        eprintln!(
+            "[{:>10.6}] [W{}_AT] core={} tid={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:08X} value=0x{:0width$X}",
+            t,
+            size * 8,
+            core_id,
+            tid,
+            pc,
+            lr,
+            vaddr as u32,
+            value,
+            width = (size as usize) * 2
+        );
+    }
     if std::env::var_os("RUZU_TRACE_W_AT_REGS").is_some() {
         if let Some(p) = pc_ptr {
             let mut regs = [0u32; 16];
@@ -1793,6 +1818,24 @@ fn watched_pc_range() -> Option<(u64, u64)> {
     })
 }
 
+fn a32_callback_diagnostics_enabled() -> bool {
+    static ENV_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV_ENABLED.get_or_init(|| {
+        std::env::var_os("RUZU_TRACE_A32_EXCLUSIVE").is_some()
+            || std::env::var_os("RUZU_TRACE_UNMAPPED_GUEST").is_some()
+            || std::env::var_os("RUZU_TRACE_UNMAPPED_GUEST_ALL").is_some()
+            || std::env::var_os("RUZU_TRACE_W_AT").is_some()
+            || std::env::var_os("RUZU_TRACE_W_AT_REGS").is_some()
+            || std::env::var_os("RUZU_WATCH_ADDR").is_some()
+            || std::env::var_os("RUZU_WATCH_BLOCK").is_some()
+            || std::env::var_os("RUZU_WATCH_PC").is_some()
+    }) || rdynarmic::jit::PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+        || common::trace::is_enabled(common::trace::cat::WATCH_READ)
+        || common::trace::is_enabled(common::trace::cat::WATCH_WRITE)
+        || common::trace::is_enabled(common::trace::cat::UNMAPPED_WRITE)
+        || common::trace::is_enabled(common::trace::cat::STLEX)
+}
+
 /// Corresponds to upstream `DynarmicCallbacks32`.
 ///
 /// Upstream fields: `m_parent`, `m_memory`, `m_process`, `m_debugger_enabled`,
@@ -2025,6 +2068,9 @@ impl UserCallbacks for DynarmicCallbacks32 {
     }
 
     fn exclusive_read_8(&self, vaddr: u64) -> u8 {
+        if !a32_callback_diagnostics_enabled() {
+            return self.mem().read_8(vaddr);
+        }
         // memory_read_8 doesn't currently watch — add inline.
         self.check_memory_access(vaddr, 1);
         trace_unmapped_guest_read_regs(self, vaddr, 1);
@@ -2034,37 +2080,59 @@ impl UserCallbacks for DynarmicCallbacks32 {
     }
 
     fn exclusive_read_16(&self, vaddr: u64) -> u16 {
+        if !a32_callback_diagnostics_enabled() {
+            return self.mem().read_16(vaddr);
+        }
         // memory_read_16 already watches; just delegate.
         self.memory_read_16(vaddr)
     }
 
     fn exclusive_read_32(&self, vaddr: u64) -> u32 {
+        if !a32_callback_diagnostics_enabled() {
+            return self.mem().read_32(vaddr);
+        }
         let value = self.memory_read_32(vaddr);
         maybe_trace_a32_exclusive(self, "read32", vaddr, value, None, None);
         value
     }
 
     fn exclusive_read_64(&self, vaddr: u64) -> u64 {
+        if !a32_callback_diagnostics_enabled() {
+            return self.mem().read_64(vaddr);
+        }
         self.memory_read_64(vaddr)
     }
 
     fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
+        if !a32_callback_diagnostics_enabled() {
+            let m = self.mem();
+            return (m.read_64(vaddr), m.read_64(vaddr + 8));
+        }
         let (lo, hi) = self.memory_read_128(vaddr);
         watch_read(self, vaddr, 16, ((hi as u128) << 64) | (lo as u128));
         (lo, hi)
     }
 
     fn exclusive_write_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
+        if !a32_callback_diagnostics_enabled() {
+            return self.mem().write_exclusive_8(vaddr, value, expected);
+        }
         maybe_trace_w_at_vaddr(self, vaddr, 1, value as u128);
         self.check_memory_access(vaddr, 1) && self.mem().write_exclusive_8(vaddr, value, expected)
     }
 
     fn exclusive_write_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
+        if !a32_callback_diagnostics_enabled() {
+            return self.mem().write_exclusive_16(vaddr, value, expected);
+        }
         maybe_trace_w_at_vaddr(self, vaddr, 2, value as u128);
         self.check_memory_access(vaddr, 2) && self.mem().write_exclusive_16(vaddr, value, expected)
     }
 
     fn exclusive_write_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
+        if !a32_callback_diagnostics_enabled() {
+            return self.mem().write_exclusive_32(vaddr, value, expected);
+        }
         if !self.check_memory_access(vaddr, 4) {
             return false;
         }
@@ -2097,6 +2165,9 @@ impl UserCallbacks for DynarmicCallbacks32 {
     }
 
     fn exclusive_write_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
+        if !a32_callback_diagnostics_enabled() {
+            return self.mem().write_exclusive_64(vaddr, value, expected);
+        }
         maybe_trace_w_at_vaddr(self, vaddr, 8, value as u128);
         self.check_memory_access(vaddr, 8) && self.mem().write_exclusive_64(vaddr, value, expected)
     }
@@ -2109,6 +2180,15 @@ impl UserCallbacks for DynarmicCallbacks32 {
         expected_lo: u64,
         expected_hi: u64,
     ) -> bool {
+        if !a32_callback_diagnostics_enabled() {
+            return self.mem().write_exclusive_128(
+                vaddr,
+                value_lo,
+                value_hi,
+                expected_lo,
+                expected_hi,
+            );
+        }
         maybe_trace_w_at_vaddr(
             self,
             vaddr,
@@ -2255,6 +2335,28 @@ impl UserCallbacks for DynarmicCallbacks32 {
     /// Returns the current system counter value from CoreTiming.
     fn get_cntpct(&self) -> u64 {
         let v = self.parent().core_timing.get_clock_ticks();
+        static TRACE_CNTPCT_LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        static TRACE_CNTPCT_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let limit = *TRACE_CNTPCT_LIMIT.get_or_init(|| {
+            std::env::var("RUZU_TRACE_CNTPCT_LIMIT")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+        });
+        if limit != 0 {
+            let index = TRACE_CNTPCT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if index < limit {
+                let pc = self
+                    .jit_pc_ptr
+                    .map(|p| unsafe { p.read_volatile() })
+                    .unwrap_or(0);
+                eprintln!(
+                    "[TRACE_CNTPCT_LIMITED] index={} pc=0x{:08X} value=0x{:016X}",
+                    index, pc, v
+                );
+            }
+        }
         // PC-window hook: log every CNTPCT read while RUZU_TRACE_PC_WINDOW is
         // active. Matched by zuyu's CNTPCT hook to compare clock-branch paths.
         if rdynarmic::jit::PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2430,6 +2532,10 @@ impl ArmDynarmic32 {
         } else {
             512 * 1024 * 1024
         };
+        let settings = common::settings::values();
+        let check_halt_on_memory_access = debugger_enabled
+            || (*settings.cpu_debug_mode.get_value()
+                && !*settings.cpuopt_ignore_memory_aborts.get_value());
 
         let config = JitConfig {
             callbacks: Box::new(callbacks),
@@ -2458,21 +2564,29 @@ impl ArmDynarmic32 {
             // table to reject free/debug pages before falling back to memory
             // callbacks, avoiding silent writes through the sparse fastmem
             // arena.
+            //
+            // `silently_mirror_{fastmem,page_table}` are hardcoded to true for
+            // A32 in upstream `A32AddressSpace::GetEmitConfig`: the 32-bit
+            // guest address is masked into the fastmem/page-table address space
+            // (`*_address_space_bits = 32`) so out-of-range addresses wrap
+            // instead of faulting. This is independent of the free/debug page
+            // rejection above (that stays driven by `page_table_pointer_mask_bits`
+            // + `recompile_on_fastmem_failure`).
             memory: if use_page_table_fastmem {
                 rdynarmic::backend::x64::emit_context::MemoryEmitConfig {
                     fastmem_address_space_bits: 32,
-                    silently_mirror_fastmem: false,
+                    silently_mirror_fastmem: true,
                     fastmem_exclusive_access: fastmem_pointer.is_some()
                         && !exclusive_monitor.is_null(),
                     recompile_on_fastmem_failure: true,
                     page_table_present: page_table_pointer.is_some(),
                     page_table_address_space_bits: 32,
-                    silently_mirror_page_table: false,
+                    silently_mirror_page_table: true,
                     absolute_offset_page_table: true,
                     page_table_pointer_mask_bits: PageInfo::ATTRIBUTE_BITS as u32,
                     detect_misaligned_access_via_page_table: 16 | 32 | 64 | 128,
                     only_detect_misalignment_via_page_table_on_page_boundary: true,
-                    check_halt_on_memory_access: false,
+                    check_halt_on_memory_access,
                     processor_id: core_index as usize,
                 }
             } else {
