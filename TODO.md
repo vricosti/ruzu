@@ -838,6 +838,99 @@ the core in the buffer-queue wait".
 `wait_for_free_slot_then_relock` waits), remeasuring the core-1 frozen fraction
 and the logo transition time.
 
+### 2026-07-06 — FIXED: option 1 implemented (guest fiber park in dequeue wait)
+
+`BufferQueueCore::wait_for_dequeue_condition` now parks the calling **guest**
+thread in the kernel instead of blocking the host core thread:
+
+- New `dequeue_parked_threads: Mutex<Vec<Weak<KThreadLock>>>` on
+  `BufferQueueCore`. Guest-core callers register there, drop the queue mutex,
+  `begin_wait_with_queue` under `KScopedSchedulerLockAndSleep` (10ms
+  safety-net timer), and fiber-reschedule — the same proven park sequence as
+  the host-thread IPC path in `svc_ipc.rs`. Host threads (env-gated
+  host-thread IPC routing, unit tests) keep the upstream host-condvar wait.
+- `signal_dequeue_condition` additionally drains the parked list and
+  `end_wait`s each thread under the scheduler lock (same lock order as
+  `KReadableEvent::signal`). When the signaler is itself a guest core fiber
+  (it holds `core.mutex`), the current-core inline switch is deferred via a
+  dispatch-disable bracket — otherwise the woken waiter would immediately
+  re-lock `core.mutex` on the same host thread and deadlock it; cross-core
+  IPIs still fire inside `enable_scheduling`.
+- Lost-wakeup-free: the waker sets `dequeue_possible` before draining, the
+  parker registers before re-checking the flag under the scheduler lock.
+- Kill switch: `RUZU_BQ_DEQUEUE_HOST_WAIT=1` restores the old host wait.
+
+**Measured (release, cold-ish run, disk pipeline cache present):** first logo
+→ color splash within ~7s of presented frames (was ~80s); loading spinner
+reached at ~+45s of presentation. No panics, no
+`KTHREAD_QUEUE_WITHOUT_END_WAIT`, no `OWNER_FAIL`, no stuck-session logs in a
+120s run. `cargo test -p core` shows no new failures (the 4
+`buffer_queue_producer` unit-test failures and the parallel-suite SIGSEGV in
+the `k_condition_variable` region reproduce identically at HEAD).
+
+**Still open (option 3 audit):** other inline HLE handlers that block the
+caller with a host condvar/lock on a guest core thread — audio
+`wait_free_space_with_stop`, syncpoint waits, MultiWait `local_timed_wait`,
+and the inline same-session busy retry loop in `svc_ipc.rs`
+(`receive_queued_inline_request_hle` → 5µs host sleep) which spins the host
+core without yielding the fiber if a second guest thread ever hits a session
+whose current request is parked.
+
+### 2026-07-06 — FIXED: disk pipeline-cache preload was serialized (79s black screen)
+
+After the dequeue fix, the remaining startup pain was ~60-80s of black
+window before the first logo. Measured with `RUST_LOG=info`: the
+`load_disk_resources` preload ran from t=0.7 to t=80 (1946-2048 cached
+pipelines, only 213 built, ~1730 rejected), and `system.run()` only starts
+after it (upstream yuzu_cmd ordering), so the guest cannot even boot during
+that window.
+
+**Root cause:** `catch_shader_exception` in
+`video_core/src/renderer_vulkan/graphics_pipeline.rs` swapped the
+process-wide panic hook under a global `SHADER_EXCEPTION_HOOK_LOCK` held for
+the entire pipeline build (shader translate + vkCreateGraphicsPipelines). A
+host `sample` during preload showed the 9 `VkPipelineBuilder` workers ~96%
+blocked on that mutex — the "parallel" preload built one pipeline at a time.
+
+**Fix:** install once (`std::sync::Once`) a panic-hook wrapper that delegates
+to the previous hook unless the current thread is inside
+`catch_shader_exception` (thread-local flag). No lock held during builds.
+Upstream parity note: upstream uses per-thread C++ `catch
+(const Shader::Exception&)` with no global state; the panic-hook filter is
+the Rust equivalent without the serialization.
+
+**Measured:** preload 79.3s → **11.0s** (same results: built=213, same skip
+reasons). First visible frame ≈ t+20-24s after launch (was t+60-77s); logo →
+color splash ≈ t+28-33s.
+
+**Still open (preload follow-ups):**
+- ~85% of cached pipelines are rejected (silent dynamic-feature/key
+  mismatches at load + 47 `FFMA CC` and ~27 `SPIR-V unresolved IR value`
+  translate panics + ~399 MoltenVK `Render pipeline compile failed (Error
+  code 2)`). The cache keeps regrowing entries that will never build;
+  consider purging unbuildable entries or fixing the translate/MSL failures.
+- No loading indication during the remaining ~11s (yuzu GUI shows a
+  "Preparing shaders" screen; yuzu_cmd is also black here, so this is
+  upstream-faithful for the cmd frontend).
+
+### 2026-07-06 — FIXED: GPU-thread panic at ~t80s (dangling descriptor-queue pointers)
+
+`RasterizerVulkan::new` handed `&mut` to stack locals (`descriptor_pool`,
+`desc_queue`, `compute_pass_desc_queue`, `blit_image`) to sub-components that
+store them as `NonNull` (BufferCacheRuntime, TextureCache, BlitImageHelper),
+then moved those locals into `Self` — leaving the pointers dangling on the
+old stack frame. Observed as `add_buffer` growing a stale cursor that
+`acquire()` (which clamps the *real* moved instance) never reset →
+`index out of bounds: the len is 1048576 but the index is 1048576` in
+`update_descriptor.rs` after ~80s of MK8D. Fixed by boxing the four fields
+(same pattern as `scheduler`/`staging_pool`/`render_pass_cache`); upstream
+C++ constructs members in place so this is a Rust-only hazard, semantics
+unchanged. Also restored upstream parity: `RasterizerVulkan::TickFrame`
+rotates `guest_descriptor_queue`/`compute_pass_descriptor_queue`
+(vk_rasterizer.cpp:765-766) — ruzu's `tick_frame` never ticked them, so the
+per-frame payload ring never advanced. Validated: 150s MK8D run, 0 panics
+(previously crashed at ~82s).
+
 ## Success Criteria
 
 - First logo transitions after roughly 3-4 seconds of visible time, like yuzu.
