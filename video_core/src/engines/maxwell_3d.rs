@@ -1070,6 +1070,35 @@ impl VertexAttribSize {
         }
     }
 
+    /// Inverse of `from_raw`: the Maxwell hardware encoding of this size.
+    ///
+    /// Used when packing `FixedPipelineState` attribute bits, which must hold
+    /// the raw hardware values like upstream (`attribute.size.Assign(
+    /// input.size.Value())` in fixed_pipeline_state.cpp) — not Rust enum
+    /// ordinals.
+    pub fn to_raw(self) -> u32 {
+        match self {
+            Self::R32G32B32A32 => 0x01,
+            Self::R32G32B32 => 0x02,
+            Self::R16G16B16A16 => 0x03,
+            Self::R32G32 => 0x04,
+            Self::R16G16B16 => 0x05,
+            Self::R8G8B8A8 => 0x0A,
+            Self::R16G16 => 0x0F,
+            Self::R32 => 0x12,
+            Self::R8G8B8 => 0x13,
+            Self::R8G8 => 0x18,
+            Self::R16 => 0x1B,
+            Self::R8 => 0x1D,
+            Self::A2B10G10R10 => 0x30,
+            Self::B10G11R11 => 0x31,
+            Self::G8R8 => 0x32,
+            Self::X8B8G8R8 => 0x33,
+            Self::A8 => 0x34,
+            Self::Invalid => 0x00,
+        }
+    }
+
     /// Size in bytes of one vertex attribute element.
     pub fn size_bytes(&self) -> u32 {
         match self {
@@ -1134,6 +1163,23 @@ impl VertexAttribType {
             6 => Self::SScaled,
             7 => Self::Float,
             _ => Self::Invalid,
+        }
+    }
+
+    /// Inverse of `from_raw`: the Maxwell hardware encoding of this type.
+    ///
+    /// See `VertexAttribSize::to_raw` — `FixedPipelineState` attribute bits
+    /// must hold raw hardware values, not Rust enum ordinals.
+    pub fn to_raw(self) -> u32 {
+        match self {
+            Self::SNorm => 1,
+            Self::UNorm => 2,
+            Self::SInt => 3,
+            Self::UInt => 4,
+            Self::UScaled => 5,
+            Self::SScaled => 6,
+            Self::Float => 7,
+            Self::Invalid => 0,
         }
     }
 }
@@ -6437,6 +6483,28 @@ mod tests {
         );
         assert_eq!(VertexAttribSize::from_raw(0x34), VertexAttribSize::A8);
         assert_eq!(VertexAttribSize::from_raw(0xFF), VertexAttribSize::Invalid);
+    }
+
+    #[test]
+    fn test_vertex_attrib_size_and_type_raw_roundtrip() {
+        // `to_raw` must be the exact inverse of `from_raw`: FixedPipelineState
+        // packs these raw hardware values and reads them back via `from_raw`
+        // (disk pipeline rebuild). Enum ordinals stored by mistake shifted
+        // every type by one and mapped most sizes to Invalid.
+        for raw in 0u32..=0x3F {
+            let size = VertexAttribSize::from_raw(raw);
+            if size != VertexAttribSize::Invalid {
+                assert_eq!(size.to_raw(), raw, "size raw 0x{raw:X}");
+            }
+        }
+        assert_eq!(VertexAttribSize::Invalid.to_raw(), 0);
+        for raw in 0u32..=7 {
+            let attrib_type = VertexAttribType::from_raw(raw);
+            if attrib_type != VertexAttribType::Invalid {
+                assert_eq!(attrib_type.to_raw(), raw, "type raw {raw}");
+            }
+        }
+        assert_eq!(VertexAttribType::Invalid.to_raw(), 0);
     }
 
     #[test]
