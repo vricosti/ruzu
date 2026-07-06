@@ -1318,8 +1318,18 @@ impl FixedPipelineState {
             va.set_enabled(!attrib.constant);
             va.set_buffer(attrib.buffer_index as u32);
             va.set_offset(attrib.offset as u32);
-            va.set_type(attrib.attrib_type as u32);
-            va.set_size(attrib.size as u32);
+            // Upstream packs the raw hardware register values
+            // (`attribute.type.Assign(input.type.Value())`), which is what
+            // `VertexAttribType::from_raw` / `VertexAttribSize::from_raw`
+            // expect when the state is read back (disk pipeline rebuild,
+            // `cast_attribute_type_from_state`). Storing the Rust enum
+            // ordinals here shifted every type by one (Float read back as
+            // SScaled) and mapped most sizes to Invalid — cached pipelines
+            // were then rebuilt with wrong or silently dropped vertex
+            // attributes (MoltenVK: "Vertex attribute m_NN is missing from
+            // the vertex descriptor").
+            va.set_type(attrib.attrib_type.to_raw());
+            va.set_size(attrib.size.to_raw());
             self.attributes[i] = va;
         }
 
@@ -1590,6 +1600,35 @@ mod tests {
         b.set_topology(PrimitiveTopology::Lines);
         assert_ne!(a, b);
         assert_ne!(hash_state(&a), hash_state(&b));
+    }
+
+    #[test]
+    fn refresh_packs_raw_maxwell_attribute_type_and_size() {
+        use crate::engines::maxwell_3d::{VertexAttribSize, VertexAttribType};
+
+        let mut draw = make_test_draw_call();
+        draw.vertex_attribs.push(Default::default());
+        draw.vertex_attribs[0].constant = false;
+        draw.vertex_attribs[0].attrib_type = VertexAttribType::Float;
+        draw.vertex_attribs[0].size = VertexAttribSize::R32G32B32A32;
+
+        let mut state = FixedPipelineState::default();
+        state.refresh(&draw);
+
+        // The packed bits must hold the raw Maxwell encodings (upstream
+        // `attribute.type.Assign(input.type.Value())`), so `from_raw` on
+        // read-back returns the original enum. Rust enum ordinals here read
+        // Float back as SScaled and R32G32B32A32 back as Invalid.
+        assert_eq!(state.attributes[0].attrib_type(), 7);
+        assert_eq!(state.attributes[0].attrib_size(), 0x01);
+        assert_eq!(
+            VertexAttribType::from_raw(state.attributes[0].attrib_type()),
+            VertexAttribType::Float
+        );
+        assert_eq!(
+            VertexAttribSize::from_raw(state.attributes[0].attrib_size()),
+            VertexAttribSize::R32G32B32A32
+        );
     }
 
     #[test]

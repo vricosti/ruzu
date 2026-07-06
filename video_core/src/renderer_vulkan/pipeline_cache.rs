@@ -126,7 +126,10 @@ impl ShaderPools {
 // ---------------------------------------------------------------------------
 
 /// Vulkan pipeline cache version for disk serialization.
-const CACHE_VERSION: u32 = 11;
+// Version 12: FixedPipelineState vertex-attribute type/size bits switched
+// from Rust enum ordinals to raw Maxwell hardware encodings (matching
+// upstream); older caches carry corrupted attribute state.
+const CACHE_VERSION: u32 = 12;
 const VULKAN_CACHE_MAGIC_NUMBER: [u8; 8] = *b"yuzuvkch";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
