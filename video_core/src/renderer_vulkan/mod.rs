@@ -2180,12 +2180,28 @@ impl RasterizerVulkan {
             for stage in 0..enabled_uniform_buffer_masks.len() {
                 self.common_buffer_cache.bind_host_stage_buffers(stage);
             }
-            common_uniform_buffer_infos.extend(self.desc_queue.update_data().iter().filter_map(
-                |entry| match entry {
-                    DescriptorUpdateEntry::Buffer(info) => Some(*info),
-                    _ => None,
-                },
-            ));
+            // `RUZU_BC_UNIFORM_STREAM=1` — feed uniform descriptors from the
+            // common buffer cache's descriptor-queue stream instead of the
+            // direct guest-memory fallback below.
+            //
+            // Off by default: this consumption was accidentally dead until the
+            // rasterizer sub-object pointers were fixed (the runtime's
+            // descriptor-queue NonNull dangled, so `update_data()` was always
+            // empty). Enabling it regressed MK8D to grayscale/corrupted frames:
+            // the stream interleaves storage-buffer entries with uniform
+            // entries (upstream consumes both through one descriptor update
+            // template in push order, the loop below consumes uniforms only)
+            // and the common buffer cache's upload/synchronization path is not
+            // complete enough yet for cbuf contents. Re-enable once the
+            // consumption is upstream-shaped end-to-end.
+            if std::env::var_os("RUZU_BC_UNIFORM_STREAM").is_some() {
+                common_uniform_buffer_infos.extend(
+                    self.desc_queue.update_data().iter().filter_map(|entry| match entry {
+                        DescriptorUpdateEntry::Buffer(info) => Some(*info),
+                        _ => None,
+                    }),
+                );
+            }
         }
         let mut sampled_cursor = 0usize;
         let mut common_uniform_cursor = 0usize;

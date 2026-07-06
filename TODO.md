@@ -904,11 +904,12 @@ reasons). First visible frame ≈ t+20-24s after launch (was t+60-77s); logo →
 color splash ≈ t+28-33s.
 
 **Still open (preload follow-ups):**
-- ~85% of cached pipelines are rejected (silent dynamic-feature/key
-  mismatches at load + 47 `FFMA CC` and ~27 `SPIR-V unresolved IR value`
-  translate panics + ~399 MoltenVK `Render pipeline compile failed (Error
-  code 2)`). The cache keeps regrowing entries that will never build;
-  consider purging unbuildable entries or fixing the translate/MSL failures.
+- ~~85% of cached pipelines are rejected~~ RESOLVED 2026-07-06 (see next
+  entry): the FixedPipelineState attribute bits were corrupted (enum
+  ordinals instead of raw Maxwell encodings). Remaining rejects are real
+  shader-recompiler gaps: 73 `FFMA CC` (FFMA with condition-code write not
+  implemented) + 3 `SPIR-V unresolved IR value reference` — fixing FFMA.CC
+  in the recompiler would recover those pipelines at runtime too.
 - No loading indication during the remaining ~11s (yuzu GUI shows a
   "Preparing shaders" screen; yuzu_cmd is also black here, so this is
   upstream-faithful for the cmd frontend).
@@ -930,6 +931,50 @@ rotates `guest_descriptor_queue`/`compute_pass_descriptor_queue`
 (vk_rasterizer.cpp:765-766) — ruzu's `tick_frame` never ticked them, so the
 per-frame payload ring never advanced. Validated: 150s MK8D run, 0 panics
 (previously crashed at ~82s).
+
+### 2026-07-06 — FIXED: FixedPipelineState attribute bits held enum ordinals, not raw Maxwell values
+
+`FixedPipelineState::refresh` packed `attrib.attrib_type as u32` /
+`attrib.size as u32` (Rust enum ordinals) while every reader decodes the
+bits with `from_raw` (Maxwell hardware encodings): Float (ordinal 6) read
+back as SScaled, R32G32B32A32 (ordinal 0) read back as Invalid, etc. Disk
+cache rebuilds therefore compiled shaders with wrong input types and
+silently dropped vertex attributes the SPIR-V declared — the ~400 MoltenVK
+"Vertex attribute m_NN is missing from the vertex descriptor" / "Render
+pipeline compile failed" errors per run, and ~85% of cache entries
+unbuildable. Fixed with exact `to_raw()` inverses used in `refresh`
+(upstream packs `input.type.Value()` raw), CACHE_VERSION bumped 11→12.
+Measured: preload rejects 1835/2048 → 151/594 (built 213 → 443), 0 MoltenVK
+errors, 0 DRAW_SKIP at runtime (was: pipelines failing at runtime too).
+
+### 2026-07-06 — REGRESSION fixed by gating: common-buffer-cache uniform stream fed wrong data
+
+After the NonNull/Box fix, `desc_queue.update_data()` (previously always
+empty through the dangling pointer) started feeding
+`common_uniform_buffer_infos` for real — and MK8D regressed to
+grayscale/corrupted frames (with or without disk cache; bisected by cache
+removal). Two known defects in that path: the stream interleaves
+storage-buffer entries with uniform entries (upstream consumes both via one
+descriptor update template in push order; ruzu's loop consumes uniforms
+only, so entries shift across stages), and the common buffer cache's
+upload/synchronization is not complete enough for cbuf contents. The
+consumption is now gated behind `RUZU_BC_UNIFORM_STREAM=1` (default off →
+the direct guest-memory fallback path, which renders correctly). Re-enable
+once the consumption is upstream-shaped end-to-end (descriptor update
+template equivalent).
+
+### 2026-07-06 — OPEN: "Press L + R to start" overlay missing on the title splash
+
+The color splash (Mario kart art) renders, but the blinking "Press L + R to
+start" text never appears. Data points: `DRAW_SKIP=0` (no failed pipelines
+at runtime after the attribute-encoding fix), ~26 `[DRAW_OFFSCREEN] no
+guest framebuffer resolved (rt0=0x520510000/0x5A2961000/0x58B8E0000 fmt=0)`
+per 80s run — draws targeting a render target whose RT0 format is 0
+(unresolved) get diverted to the internal offscreen framebuffer and their
+output is lost; these are the prime suspect for the text layer (drawn to an
+intermediate target composited later). Next: dump/inspect the RT state for
+those draws (why fmt=0 — depth-only pass? mis-captured RT?) and check
+whether upstream resolves a framebuffer for the same state.
 
 ## Success Criteria
 
