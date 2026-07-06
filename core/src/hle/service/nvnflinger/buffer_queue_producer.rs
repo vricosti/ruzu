@@ -186,7 +186,7 @@ impl BufferQueueProducer {
     }
 
     fn wait_for_free_slot_then_relock<'a>(
-        &self,
+        &'a self,
         async_flag: bool,
         found: &mut i32,
         return_flags: &mut StatusCode,
