@@ -365,10 +365,18 @@ pub struct RasterizerVulkan {
     memory_allocator: NonNull<MemoryAllocator>,
     state_tracker: Box<StateTracker>,
     staging_pool: Box<StagingBufferPool>,
-    descriptor_pool: DescriptorPool,
-    desc_queue: UpdateDescriptorQueue,
-    compute_pass_desc_queue: UpdateDescriptorQueue,
-    blit_image: BlitImageHelper,
+    // Boxed like `scheduler`/`staging_pool`/`render_pass_cache`: sub-components
+    // capture `NonNull` pointers to these during construction (BlitImageHelper
+    // and TextureCache point at the descriptor pool and the descriptor queues,
+    // TextureCache at the blit helper). A by-value field would move when the
+    // constructor returns `Self`, leaving those pointers dangling on the old
+    // stack frame — observed as an UpdateDescriptorQueue whose `acquire()`
+    // clamped the real instance while `add_buffer` grew a stale cursor until
+    // the payload overflowed (~80s into MK8D).
+    descriptor_pool: Box<DescriptorPool>,
+    desc_queue: Box<UpdateDescriptorQueue>,
+    compute_pass_desc_queue: Box<UpdateDescriptorQueue>,
+    blit_image: Box<BlitImageHelper>,
     fallback_uniform_buffer: vk::Buffer,
     fallback_uniform_memory: vk::DeviceMemory,
     fallback_uniform_mapped: *mut u8,
@@ -494,18 +502,20 @@ impl RasterizerVulkan {
             scheduler.as_mut(),
         ));
 
-        // Create descriptor pool
-        let mut descriptor_pool = DescriptorPool::new(device.clone(), 64);
+        // Create descriptor pool. Boxed (with the descriptor queues and the
+        // blit helper below) so the `NonNull` pointers captured by
+        // sub-components stay valid when the constructed `Self` is moved.
+        let mut descriptor_pool = Box::new(DescriptorPool::new(device.clone(), 64));
 
         // Create descriptor update queue
-        let mut desc_queue = UpdateDescriptorQueue::new();
-        let mut compute_pass_desc_queue = UpdateDescriptorQueue::new();
-        let mut blit_image = BlitImageHelper::new(
+        let mut desc_queue = Box::new(UpdateDescriptorQueue::new());
+        let mut compute_pass_desc_queue = Box::new(UpdateDescriptorQueue::new());
+        let mut blit_image = Box::new(BlitImageHelper::new(
             device.clone(),
             &mut scheduler,
-            &mut descriptor_pool,
+            descriptor_pool.as_mut(),
             shader_stencil_export_supported,
-        );
+        ));
 
         let (fallback_uniform_buffer, fallback_uniform_memory, fallback_uniform_mapped) =
             create_host_buffer(
@@ -572,7 +582,7 @@ impl RasterizerVulkan {
             physical_device,
             scheduler.as_mut(),
             staging_pool.as_mut(),
-            &mut desc_queue,
+            desc_queue.as_mut(),
         );
         common_buffer_cache.set_runtime(Box::new(buffer_runtime));
         common_buffer_cache.set_device_memory(Box::new(DeviceMemoryAccessAdapter {
@@ -590,10 +600,10 @@ impl RasterizerVulkan {
             scheduler.as_mut(),
             &mut *memory_allocator,
             staging_pool.as_mut(),
-            &mut blit_image,
+            blit_image.as_mut(),
             render_pass_cache.as_mut(),
-            &mut descriptor_pool,
-            &mut compute_pass_desc_queue,
+            descriptor_pool.as_mut(),
+            compute_pass_desc_queue.as_mut(),
             custom_border_color_supported,
         );
 
@@ -3332,6 +3342,12 @@ impl RasterizerInterface for RasterizerVulkan {
 
     fn tick_frame(&mut self) {
         self.draw_counter = 0;
+        // Upstream `RasterizerVulkan::TickFrame` rotates both descriptor
+        // queues to the next per-frame payload slice before anything else
+        // (vk_rasterizer.cpp:765-766). Without this the ring never advances
+        // and in-flight frames overwrite each other's descriptor payload.
+        self.desc_queue.tick_frame();
+        self.compute_pass_desc_queue.tick_frame();
         self.state_tracker.invalidate_command_buffer_state();
         self.staging_pool.new_frame();
         {
