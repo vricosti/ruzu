@@ -46,7 +46,15 @@ use super::pipeline_helper::{
 
 const NUM_VK_GRAPHICS_STAGES: usize = 5;
 
-static SHADER_EXCEPTION_HOOK_LOCK: Mutex<()> = Mutex::new(());
+/// One-time installation of the shader-compile panic-hook filter used by
+/// `catch_shader_exception`. See that function for the rationale.
+static SHADER_EXCEPTION_HOOK_INSTALL: std::sync::Once = std::sync::Once::new();
+
+thread_local! {
+    /// True while the current thread is inside `catch_shader_exception`.
+    /// The process-wide panic hook stays silent for such threads.
+    static IN_SHADER_EXCEPTION_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct GraphicsDescriptorBinding {
@@ -1943,15 +1951,33 @@ fn graphics_pipeline_key_cache_hash(key: &GraphicsPipelineKey) -> u64 {
     city_hash64(&key.to_cache_bytes())
 }
 
+/// Run a shader compilation, converting shader-recompiler panics into an
+/// `Err` like upstream's `catch (const Shader::Exception&)` in
+/// `vk_pipeline_cache.cpp`.
+///
+/// Upstream catches per-thread C++ exceptions with no global state. The Rust
+/// port surfaces those failures as panics; to suppress the default
+/// panic-hook backtrace spam we install — once — a wrapper around the
+/// previous hook that stays silent only for threads currently inside this
+/// function. An earlier version swapped the process-wide hook under a global
+/// mutex held for the entire compilation, which serialized the disk-cache
+/// preload to one pipeline at a time (measured on MK8D: 9 VkPipelineBuilder
+/// workers ~96% blocked on that mutex, 79s preload).
 fn catch_shader_exception<F, T>(f: F) -> std::thread::Result<T>
 where
     F: FnOnce() -> T,
 {
-    let _guard = SHADER_EXCEPTION_HOOK_LOCK.lock().unwrap();
-    let hook = take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    SHADER_EXCEPTION_HOOK_INSTALL.call_once(|| {
+        let previous = take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !IN_SHADER_EXCEPTION_SCOPE.with(std::cell::Cell::get) {
+                previous(info);
+            }
+        }));
+    });
+    IN_SHADER_EXCEPTION_SCOPE.with(|flag| flag.set(true));
     let result = catch_unwind(AssertUnwindSafe(f));
-    std::panic::set_hook(hook);
+    IN_SHADER_EXCEPTION_SCOPE.with(|flag| flag.set(false));
     result
 }
 
