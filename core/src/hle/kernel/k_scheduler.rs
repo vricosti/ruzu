@@ -867,6 +867,10 @@ impl KScheduler {
     }
 
     fn try_lock_thread_context(thread: &Arc<KThreadLock>) -> bool {
+        Self::try_lock_thread_context_at(thread, "switch_fiber")
+    }
+
+    fn try_lock_thread_context_at(thread: &Arc<KThreadLock>, site: &'static str) -> bool {
         let thread_guard = thread.lock().unwrap();
         let Some(context_guard) = thread_guard.context_guard.try_lock() else {
             return false;
@@ -875,22 +879,28 @@ impl KScheduler {
         // Match upstream KThread::m_context_guard semantics: keep the lock
         // held across the fiber switch until Unload() explicitly releases it.
         std::mem::forget(context_guard);
+        thread_guard.record_context_guard_event(true, site);
         true
     }
 
     fn unlock_thread_context(thread: &Arc<KThreadLock>) {
+        Self::unlock_thread_context_at(thread, "unload")
+    }
+
+    fn unlock_thread_context_at(thread: &Arc<KThreadLock>, site: &'static str) {
         let thread_guard = thread.lock().unwrap();
         unsafe {
             thread_guard.context_guard.force_unlock();
         }
+        thread_guard.record_context_guard_event(false, site);
     }
 
     pub(crate) fn lock_thread_context_for_runtime(thread: &Arc<KThreadLock>) -> bool {
-        Self::try_lock_thread_context(thread)
+        Self::try_lock_thread_context_at(thread, "runtime_init")
     }
 
     pub(crate) fn unlock_thread_context_for_runtime(thread: &Arc<KThreadLock>) {
-        Self::unlock_thread_context(thread);
+        Self::unlock_thread_context_at(thread, "runtime_unlock");
     }
 
     fn exit_thread_if_termination_requested(
@@ -2650,7 +2660,7 @@ impl KScheduler {
 
             // Check if we need scheduling again. If so, unlock and retry.
             if self.state.needs_scheduling.load(Ordering::SeqCst) {
-                Self::unlock_thread_context(hpt);
+                Self::unlock_thread_context_at(hpt, "switch_retry");
                 need_retry = true;
                 continue;
             }
@@ -2717,14 +2727,27 @@ impl KScheduler {
         switch_cur_thread: Option<&Arc<KThreadLock>>,
         next_thread_id: u64,
     ) {
-        // Upstream `ScheduleImpl()` captures `m_switch_cur_thread` before
-        // yielding to the scheduler fiber, and `SwitchThread()` accounts CPU
-        // time/prev-thread against that same current thread. Rust fibers share
-        // OS-thread TLS, so recomputing the current thread here can observe a
-        // stale TLS value from another resumed fiber. Prefer the captured
-        // switch current when the scheduler fiber has one.
-        let cur_thread = switch_cur_thread
-            .cloned()
+        // Upstream `SwitchThread()` reads `GetCurrentThreadPointer(kernel)` —
+        // the per-core current-thread pointer that `SwitchThread` itself
+        // updates at the end of every call. The scheduler-owned
+        // `self.current_thread` is that pointer's Rust analogue. It MUST take
+        // precedence over the captured `switch_cur_thread`: in the switch
+        // fiber's retry loop (needs_scheduling fired mid-switch), the capture
+        // is one switch out of date, and comparing `next` against it can hit
+        // the same-thread fast return for a thread that is NOT current. That
+        // skips the bookkeeping update, leaves `current_thread` pointing at
+        // the previous (idle) thread while the reloaded thread runs, and
+        // eventually leaks the reloaded thread's `context_guard` — wedging
+        // the switch fiber's upstream-faithful try_lock spin forever (the
+        // RUZU_SERVER_THREAD_IPC_ALL SendSyncRequest wedge).
+        //
+        // TLS (`current_thread_for_scheduler_core`) stays last: fibers share
+        // OS-thread TLS, so it can name another resumed fiber's thread.
+        let cur_thread = self
+            .current_thread
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .or_else(|| switch_cur_thread.cloned())
             .or_else(|| self.current_thread_for_scheduler_core());
         let cur_thread_id = cur_thread
             .as_ref()

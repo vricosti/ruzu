@@ -487,6 +487,16 @@ pub struct WaitingLockRef {
 // KThread — the main thread structure
 // ---------------------------------------------------------------------------
 
+/// Diagnostic record for `KThread::context_guard` lock/unlock attribution.
+/// Not part of upstream; read by the SIGUSR1 thread dump.
+#[derive(Default)]
+pub struct ContextGuardTrace {
+    /// (call site, host thread name) of the last successful lock.
+    pub last_lock: Option<(&'static str, String)>,
+    /// (call site, host thread name) of the last unlock.
+    pub last_unlock: Option<(&'static str, String)>,
+}
+
 /// The kernel thread object.
 /// Matches upstream `KThread` class (k_thread.h).
 ///
@@ -586,6 +596,11 @@ pub struct KThread {
     /// Context guard for fiber switching.
     /// Upstream: `KSpinLock m_context_guard`
     pub context_guard: parking_lot::Mutex<()>,
+    /// Diagnostic: last lock/unlock sites of `context_guard`
+    /// (`site@host_thread`), shown by the SIGUSR1 dump to attribute leaked
+    /// guards (a thread whose guard stays locked wedges the switch fiber's
+    /// upstream-faithful `while (!context_guard.try_lock())` spin).
+    pub context_guard_trace: parking_lot::Mutex<ContextGuardTrace>,
     pub thread_type: ThreadType,
     pub step_state: StepState,
     pub dummy_thread_runnable: AtomicBool,
@@ -625,6 +640,27 @@ impl KThread {
         ctx.r[13] = ctx.sp;
         ctx.r[14] = ctx.lr;
         ctx.r[15] = ctx.pc;
+    }
+
+    /// Diagnostic: record who locked/unlocked `context_guard` last
+    /// (site + host thread), for the SIGUSR1 dump. Gated behind
+    /// `RUZU_TRACE_CTX_GUARD` — the String allocation per context switch is
+    /// not free on the scheduler hot path.
+    pub fn record_context_guard_event(&self, locked: bool, site: &'static str) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_CTX_GUARD").is_some()) {
+            return;
+        }
+        let host = std::thread::current()
+            .name()
+            .unwrap_or("?")
+            .to_string();
+        let mut trace = self.context_guard_trace.lock();
+        if locked {
+            trace.last_lock = Some((site, host));
+        } else {
+            trace.last_unlock = Some((site, host));
+        }
     }
 
     pub fn capture_guest_context(&mut self, ctx: &ArmThreadContext) {
@@ -705,6 +741,7 @@ impl KThread {
             stack_parameters: StackParameters::default(),
             host_context: None,
             context_guard: parking_lot::Mutex::new(()),
+            context_guard_trace: parking_lot::Mutex::new(ContextGuardTrace::default()),
             thread_type: ThreadType::User,
             step_state: StepState::default(),
             dummy_thread_runnable: AtomicBool::new(true),

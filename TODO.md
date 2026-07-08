@@ -963,18 +963,157 @@ the direct guest-memory fallback path, which renders correctly). Re-enable
 once the consumption is upstream-shaped end-to-end (descriptor update
 template equivalent).
 
-### 2026-07-06 — OPEN: "Press L + R to start" overlay missing on the title splash
+### 2026-07-06 — DIAGNOSED: "Press L + R" is not a rendering bug — the title screen is reached at ~285s
 
-The color splash (Mario kart art) renders, but the blinking "Press L + R to
-start" text never appears. Data points: `DRAW_SKIP=0` (no failed pipelines
-at runtime after the attribute-encoding fix), ~26 `[DRAW_OFFSCREEN] no
-guest framebuffer resolved (rt0=0x520510000/0x5A2961000/0x58B8E0000 fmt=0)`
-per 80s run — draws targeting a render target whose RT0 format is 0
-(unresolved) get diverted to the internal offscreen framebuffer and their
-output is lost; these are the prime suspect for the text layer (drawn to an
-intermediate target composited later). Next: dump/inspect the RT state for
-those draws (why fmt=0 — depth-only pass? mis-captured RT?) and check
-whether upstream resolves a framebuffer for the same state.
+Fine-grained present dumps (every 24 presents) show the splash art region is
+byte-identical across the entire visible phase: what renders at ~15-100s is
+the **static loading splash**, not the title screen. A 300s run maps the
+sequence: static splash (#480-#4320) → black + loading spinner for ~170s of
+presents (#4560-#8640) → white flash (#8880-#9120, title-screen intro) →
+splash again (#9360+, the actual title screen) at **~285s wallclock**. The
+user quits before that. On yuzu the same point is reached in ~15-20s.
+
+Host `sample` during the spinner phase (t=140-150): CPUCore_1 = **97.6% in
+`A32Jit::run`, all inside JIT-generated code** (fragmented unsymbolized
+buckets; no runtime-helper hotspots), cores 0/2/3 ~99% idle (game pins its
+loading workers to core 1), GPU/present threads idle. No blocking waits
+remain — the fiber-park fix holds. The bottleneck is now purely **rdynarmic
+A32 codegen throughput** on the loading/decompression workers (the Yaz0
+loop `0x00B92E04` documented above: 2 inline page-table lookups per copied
+byte, no fastmem on this 16K-page host). Previously classified secondary;
+now the primary remaining cause (~15x slower than yuzu's C++ dynarmic on
+the same fastmem-less host).
+
+Also observed: `[DRAW_OFFSCREEN]` reaches #131072 during the spinner phase
+(133k+ draws diverted to the internal offscreen framebuffer, rt0 fmt=0) —
+worth auditing separately, but the spinner phase is CPU-bound, not
+GPU-bound.
+
+**Next steps (rdynarmic perf campaign):**
+- Profile the emitted code for the Yaz0 inner loop (RUZU_DUMP_JIT_MAP +
+  host-profile attribution landed in rdynarmic) and compare instruction
+  count per iteration vs upstream dynarmic arm64 output.
+- Candidate wins: cache the last translated page (single-entry TLB) in the
+  inline memory path; tighten the page-table lookup sequence; check
+  register allocation quality in the hot block; block linking on the copy
+  loop back-edge (benchmark already added in rdynarmic ba49e4e).
+
+### 2026-07-07 — rdynarmic perf campaign: per-block codegen is at upstream parity; bottleneck is elsewhere
+
+Investigated the spinner-phase JIT throughput theory in depth. Every suspect
+checked came back **upstream-faithful**:
+
+- **FPCR/FPSR churn is upstream-identical.** The hot spinner block
+  (`0x0028A718`, 24.2% of core-1 samples) emits 40× `msr fpcr` + 11×
+  `msr fpsr` + 11× `mrs fpsr` for 24 FP ops because MK8D runs with FPSCR
+  mode bits = 0 (verified at compile time via `RUZU_LOG_A32_FPSCR_MODES`
+  over 150s — every block descriptor mode is 0 — and at runtime via
+  context-restore logging: only NZCV/QC variations, never DN/FZ/RMode).
+  With mode 0, `MaybeStandardFPSCRValue` must swap to the ASIMD standard
+  value (0x03000000) around every vector-FP op — upstream does exactly the
+  same. **Proof**: dumped upstream dynarmic's live emitted code for the
+  same guest block out of a running yuzu process (lldb `memory find` on
+  the terminal's `movz w16,#0xA7E8; movk w16,#0x28` constant): upstream
+  emits **exactly 40× `msr fpcr`, 11× `msr fpsr`, 11× `mrs`**, same FP
+  ops, ~671 instructions vs our 753 (windowing/deferred-stub noise).
+  Also verified faithful: inline page-table lookup (instruction-for-
+  instruction), FPSR spill sites in the memory emitters (upstream spills
+  in the same four places), VMSR translation, `emit_a32_set_fpscr`,
+  terminal shapes and link slots, `descriptor_to_fpcr`, prelude FPCR
+  load/restore.
+- **The hot block is the game's audio DSP** (nn::atk-style software
+  reverb/filter: per-sample loop, 4 channels, vmla/vmls feedback chains,
+  float→s32 conversion). `RUZU_BLOCK_PROLOGUE_COUNT_PC` measured
+  **46,896 iterations/sec** during the spinner — exactly realtime 48kHz.
+  No over-mixing; audio pacing is correct. yuzu pays the same per-sample
+  msr-fpcr cost.
+- **yuzu reference re-established on this machine**: yuzu-cmd (zuyu
+  build) reaches the animated MK8D title screen in **≤24s from a cold
+  shader cache** on this Mac (Vulkan via manual MoltenVK ICD manifest +
+  brew vulkan-loader; see scratchpad yuzucap/). ruzu: ~285s. The ~12x gap
+  is real on identical hardware.
+- **Scheduling divergence found (new prime suspect)**: during yuzu's
+  loading phase, sample shows CPUCore_0/1/2 all busy (~38/39/25%) — the
+  game parallelizes loading across three cores. Under ruzu, cores 0/2/3
+  are ~99% idle and ONLY core 1 works. Also notable: yuzu's total busy
+  CPU during loading ≈ 1.0 core-equivalent, i.e. similar instantaneous
+  CPU usage to ruzu — yet it finishes 10x sooner, so ruzu's core-1 grind
+  may be partly non-productive (starved loaders / repeated work) rather
+  than slow codegen.
+
+**Campaign redirect**: stop optimizing per-block codegen (it's at parity).
+Investigate instead (a) why the game's loader threads never run on cores
+0/2 under ruzu (thread affinity / core assignment / ideal-core handling in
+the ported kernel scheduler), and (b) whether the spinner-phase core-1
+work is productive loading or a starvation/retry pattern (SVC-summary +
+thread-dump snapshots during the spinner).
+
+### 2026-07-07 — FIXED: ruzu clobbered yuzu's disk shader cache (yuzu.app crashed with bad_alloc)
+
+User report: yuzu.app used to work, stopped working. Root cause: before
+commit 40dc9ff (Jul 5 23:38) ruzu, when it selects the legacy yuzu data
+root, wrote its own pipeline-cache files into
+`~/.local/share/yuzu/shader/0100152000022000/` (files dated Jul 5 09:21).
+yuzu then died deserializing the foreign `vulkan.bin`
+(`VideoCommon::FileEnvironment::Deserialize` → `std::bad_alloc`, verified
+via lldb backtrace). Fix applied: moved the directory aside to
+`0100152000022000.corrupt`; yuzu rebuilt its cache and boots to the title
+screen again. 40dc9ff already prevents recurrence (ruzu shader cache stays
+under the ruzu root); the `.corrupt` dir can be deleted once yuzu is
+confirmed healthy.
+
+### 2026-07-08 — FIXED: host-thread-IPC wedge = switch-fiber same-thread-skip race (context_guard leak)
+
+With `RUZU_SERVER_THREAD_IPC_ALL=1`, MK8D wedged 100% of runs at t≈30s:
+SIGUSR1 dump showed the Main thread RUNNABLE in svc 0x21 (SendSyncRequest to
+friend:a / prepo:a) at the front of core 0's priority queue while core 0 sat
+"idle" with `needs_scheduling=false`, and lldb showed CPUCore_0's switch
+fiber spinning at 100% in `schedule_impl_fiber_loop`'s upstream-faithful
+`while (!context_guard.try_lock())` loop. New `ctx_guard` attribution in the
+SIGUSR1 dump (RUZU_TRACE_CTX_GUARD) showed the wedged thread's guard locked
+by the switch fiber itself and never unlocked.
+
+**Root cause** (`k_scheduler.rs::switch_thread_impl`): the function compared
+`next` against the **captured** `switch_cur_thread` instead of the
+scheduler's own `current_thread`. In the switch fiber's retry loop (a
+host-thread `end_wait` fires `needs_scheduling` mid-switch — common with
+host-thread IPC because replies race the client's park), iteration 1
+switches 75→idle (current=idle), iteration 2 picks the re-woken 75 and hits
+`switch_thread_impl(cur=captured 75, next=75)` → same-thread fast return →
+bookkeeping never updated (current stays idle) while the code still reloads
+75 and yields to it. The scheduler now believes idle is current while 75
+runs; 75's context_guard (locked at the reload) is never unloaded/unlocked,
+and the next attempt to schedule 75 spins forever.
+
+Upstream cannot hit this: `KScheduler::SwitchThread` reads
+`GetCurrentThreadPointer(kernel)` — the per-core pointer SwitchThread itself
+updates every call — so retry iterations always compare against the true
+current. Fix: `switch_thread_impl` now prefers `self.current_thread`
+(scheduler-owned, updated by every switch) over the captured
+`switch_cur_thread`, with TLS resolution last.
+
+Validation: 2× `RUZU_SERVER_THREAD_IPC_ALL=1` runs now progress through the
+full boot timeline (logs to t≈98/100s and t≈117/120s, DRAW_OFFSCREEN spinner
+phase reached, 0 leaked guards in dumps) vs 3/3 wedges at t≈30s before;
+baseline (inline IPC) run unaffected (t≈97/100s); `cargo test -p core --lib
+k_scheduler` 17/17. The same race exists in inline mode (any cross-core
+`end_wait` can fire mid-switch) — this is a strong candidate for the OPEN
+t≈11-12s intermittent cold-boot wedge below. Also added: per-thread
+`context_guard` lock/unlock attribution (`RUZU_TRACE_CTX_GUARD`, shown in
+the SIGUSR1 dump) and `[SCHED_PICK]` remains available via
+`RUZU_TRACE_SCHED_PICK` + `RUZU_TRACE_SCHED_STATE=<tids>`.
+
+Host-thread IPC (`RUZU_SERVER_THREAD_IPC_ALL=1`) is now viable for the
+per-service promotion plan (DIFF.md): next step is validating service groups
+(binder/vi first) and comparing boot timing vs inline.
+
+### 2026-07-06 — OPEN: intermittent early wedge at t≈11-12s (~2/8 cold runs)
+
+Some runs stop presenting right at the preload→boot transition (0-3 present
+dumps, log goes silent at t≈11-12, no panic). Matches the pre-existing
+"cold MK8D boots are less stable" note. Not reproduced under a 6-attempt
+loop with 35s windows; needs a SIGUSR1 thread dump captured on a wedged
+instance to classify.
 
 ## Success Criteria
 
@@ -982,3 +1121,44 @@ whether upstream resolves a framebuffer for the same state.
 - Audio transition matches the visual transition, including the "Mario Kart
   eight" voice line.
 - No long-lived first-logo period remains after pipeline preload completes.
+
+---------
+⏺ Pendant que le run de validation tourne (150s, au-delà du point de crash à ~82s), voici la réponse à ta
+  question, changement par changement :
+
+  Fidèle à upstream ou adaptation ?
+
+  1. Park de fibre dans wait_for_dequeue_condition (nvnflinger) — adaptation, documentée
+  - Upstream : DequeueBuffer tourne sur un thread hôte de service (ServerManager). Bloquer une condvar là est
+  inoffensif : le thread guest appelant est déjà parqué dans le noyau le temps de l'IPC
+  (KClientSession::SendSyncRequest → BeginWait).
+  - Ruzu : les handlers HLE tournent (pour l'instant) inline sur la fibre du core guest appelant. Le même
+  condvar.wait upstream y gèle le core émulé entier — c'est un artefact de l'architecture inline de ruzu, pas
+  du code upstream.
+  - Pourquoi nécessaire : l'adaptation reproduit l'effet upstream (l'appelant guest dort dans le noyau
+  pendant que le service attend un buffer) avec les primitives noyau elles-mêmes portées d'upstream
+  (begin_wait_with_queue, KScopedSchedulerLockAndSleep, end_wait). La voie 100 % upstream serait de router le
+  binder vers le routing IPC host-thread — il existe (env-gated) mais a été instable historiquement (TODO.md
+  option 2). Les threads hôtes gardent d'ailleurs le chemin condvar upstream inchangé.
+
+  2. Panic-hook du preload — un retour vers upstream
+  - Upstream : catch (const Shader::Exception&) C++, par thread, aucun état global.
+  - L'ancien code ruzu (verrou global + swap du hook) était déjà une adaptation — c'est elle qui sérialisait
+  les 9 workers. Mon fix supprime la sérialisation ; le hook filtrant par thread-local est simplement
+  l'équivalent Rust du catch per-thread (en Rust, le panic hook est global au process, contrairement aux
+  exceptions C++ — d'où le besoin d'un filtre pour ne pas spammer les backtraces des échecs shader attendus).
+
+  3. Box sur descriptor_pool/desc_queue/compute_pass_desc_queue/blit_image — contrainte Rust, sémantique
+  upstream inchangée
+  - Upstream C++ : les membres sont construits in-place dans RasterizerVulkan, this ne bouge jamais → les
+  pointeurs pris à la construction restent valides.
+  - Rust : retourner Self déplace la struct ; les NonNull pris avant le move pendaient (c'est le crash de ton
+  run : add_buffer incrémentait un curseur fantôme jamais clampé → overflow à 1M après ~80s). Le Box épingle
+  l'objet sur le tas — pattern déjà utilisé dans ce même constructeur pour
+  scheduler/staging_pool/render_pass_cache.
+
+  4. desc_queue.tick_frame() dans tick_frame — correction de parité pure
+  Upstream l'appelle en tête de RasterizerVulkan::TickFrame (vk_rasterizer.cpp:765-766) ; ruzu l'avait oublié
+  (le ring de descripteurs ne tournait jamais). Ajouté à l'identique.
+
+  Je te confirme le résultat du run de validation dès qu'il se termine.
