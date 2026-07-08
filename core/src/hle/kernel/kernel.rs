@@ -446,6 +446,10 @@ fn dump_thread_state(kernel: &KernelCore) {
     crate::hle::kernel::svc_dispatch::dump_svc_ring_profile();
     crate::hle::kernel::svc_dispatch::dump_svc_summary_profile();
     crate::hle::kernel::svc_dispatch::dump_svc_profile();
+    eprintln!(
+        "{}",
+        crate::hle::kernel::k_condition_variable::cv_stats::summary_string()
+    );
     crate::hle::kernel::svc::svc_memory_history::dump("sigusr1_thread_dump");
     crate::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
     crate::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_history("sigusr1_thread_dump");

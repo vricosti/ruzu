@@ -1107,6 +1107,64 @@ Host-thread IPC (`RUZU_SERVER_THREAD_IPC_ALL=1`) is now viable for the
 per-service promotion plan (DIFF.md): next step is validating service groups
 (binder/vi first) and comparing boot timing vs inline.
 
+### 2026-07-08 — AUDIT: KConditionVariable is exonerated; loading bottleneck root-caused to GPU-thread shader recompilation
+
+**KConditionVariable/KAddressArbiter audit (line-by-line vs upstream)**:
+`signal`/`signal_impl`/`wait`/`wait_for_address`/`signal_to_address` are
+faithful — has-waiter-flag protocol (set on wait, clear on empty tree),
+mutex-waiter requalification in SignalImpl (no thundering herd,
+requeue_on_owner ≈ 100% as expected for signal-under-lock),
+UpdateLockAtomic via the process exclusive monitor, cv tree ordered by
+(cv_key, priority, tid), seq-cst fences in place. New always-on protocol
+counters (`[CV_STATS]` in the SIGUSR1 dump) confirm healthy runtime
+behavior: waits_timeout0=0 (no spurious timeouts), unlocks_empty ≈ 2%
+(benign races), and the 69% empty-signal rate is **game behavior** — the
+cv word reads 0 at signal time (`empty_hint0` ≈ 100% of empty signals),
+i.e. MK8D's nn::os signals without consulting the has-waiters hint;
+upstream receives the same syscalls. The condvar churn is a symptom of
+pipeline pacing, not a kernel bug.
+
+**The actual loading bottleneck, measured end-to-end** (fresh spinner
+sample at t=80, 6s):
+1. `[NVHOST_CTRL_WAIT]` tracing shows only **6 host stalls in 95s — but
+   one lasted ~44s** (t=42.7→87.0: waited for syncpt 1 to reach 7762
+   while it was at ~509; the GPU advanced ~165 increments/s). The game
+   runs thousands of fences ahead of the GPU, its event waits time out
+   3× (fails>2), and ruzu falls back to `wait_host_stalled` — which,
+   because HLE runs inline, also freezes CPU core 0 (the Main thread)
+   for the whole catch-up, starving the loader pipeline (hence the
+   condvar churn and idle cores).
+2. The GPU thread itself is saturated: 82% in
+   `DmaPusher::process_commands`, and **~87% of draw time is inside
+   `PipelineCache::current_graphics_pipeline_with_shared_cache →
+   build_pipeline_keyed_from_environments → compile_stage_from_environment
+   → shader_recompiler::compile_shader_from_env`** — dominated by
+   `structured_control_flow::structure_cfg_detailed` /
+   `find_last_goto_in_tree` (deep recursion + Vec grow churn) and
+   `ssa_rewrite_pass`. At t=80+, long past boot, **shaders are being
+   (re)compiled on the per-draw path** — the pipeline cache is not
+   hitting during the spinner phase (relates to the 131k DRAW_OFFSCREEN
+   note above). Secondary Vulkan costs on the same path:
+   `vkCreateGraphicsPipelines` (MoltenVK MTLRenderPipelineState) and
+   per-request `vkAllocateMemory` in `StagingBufferPool`.
+
+**Next steps (redirected campaign)**:
+- Instrument pipeline-cache hit/miss (and miss cause: new key vs
+  invalidation vs unstable key fields) during the spinner; compare
+  consecutive-draw keys for stability. Suspect: a non-stable field in
+  the graphics-pipeline key or shader-hash invalidation churn.
+- Fix the per-draw recompile (expected to collapse the 44s syncpoint
+  stalls and most of the 285s load time).
+- Optimize `structure_cfg_detailed`'s quadratic goto search + preallocate
+  in `find_last_goto_in_tree`/`find_label_in_tree` (upstream uses
+  intrusive lists; our Vec-based port regrows constantly).
+- `StagingBufferPool::request_buffer` should reuse allocations (upstream
+  caches staging buffers; per-request `vkAllocateMemory` shows in the
+  profile).
+- Longer term: `wait_host_stalled` should not block a guest core inline
+  (host-thread IPC promotion for nvdrv, or upstream's event-based path
+  should keep fails at 0 once the GPU keeps up).
+
 ### 2026-07-06 — OPEN: intermittent early wedge at t≈11-12s (~2/8 cold runs)
 
 Some runs stop presenting right at the preload→boot transition (0-3 present
