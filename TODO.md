@@ -1236,6 +1236,26 @@ Remaining from the GPU-thread budget entry above: move pipeline builds
 off the GPU thread, structure_cfg quadratic goto search, composite_layers
 37%, StagingBufferPool vkAllocateMemory reuse.
 
+### 2026-07-08 — FIXED: GPU thread stalled 37% on the swapchain mutex inside Composite
+
+The 20s mid-stall GPU-thread profile showed 37% of samples in
+`composite_impl` — all of it blocked in `pthread_mutex_wait`, not
+compositing. `composite_impl` locked `Mutex<Swapchain>` just to read
+`get_image_count()`/`get_image_view_format()`, while the present thread
+holds that same mutex across all of `copy_to_swapchain` — including
+`acquire_next_image`, where MoltenVK blocks on the next drawable for up
+to a vsync period per presented frame. Upstream `RendererVulkan::
+Composite` reads those getters without any lock (renderer_vulkan.cpp:163).
+
+Fix: `PresentThreadContext` caches both values in atomics (the
+`image_count` atomic already existed), updated at swapchain
+(re)creation; `composite_impl` reads them via new lock-free
+`PresentManager::swapchain_image_count()/swapchain_image_view_format()`.
+
+Validation: GPU-thread sample after the fix: mutexwait 4296→0 samples,
+composite 37%→2%, cvwait ~1.5% (the thread now does useful work);
+MK8D splash at t=30s identical to baseline.
+
 ### 2026-07-06 — OPEN: intermittent early wedge at t≈11-12s (~2/8 cold runs)
 
 Some runs stop presenting right at the preload→boot transition (0-3 present
