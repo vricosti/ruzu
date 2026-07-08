@@ -1249,6 +1249,18 @@ fn dump_thread_state(kernel: &KernelCore) {
                 lr,
                 sp,
             );
+            // Context-guard attribution: a leaked (still-locked) guard on a
+            // RUNNABLE thread wedges the switch fiber's try_lock spin.
+            {
+                let ctx_locked = t.context_guard.is_locked();
+                let trace = t.context_guard_trace.lock();
+                if ctx_locked || trace.last_lock.is_some() {
+                    eprintln!(
+                        "[DUMP]        tid={} ctx_guard locked={} last_lock={:?} last_unlock={:?}",
+                        tid, ctx_locked, trace.last_lock, trace.last_unlock,
+                    );
+                }
+            }
             // AArch32 GPRs r0-r12 (the join loop's subtask-array base is r7).
             let r = &t.thread_context.r;
             eprintln!(
