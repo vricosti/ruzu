@@ -530,13 +530,15 @@ impl RendererVulkan {
             );
         }
         let phase_start = profile.then(std::time::Instant::now);
-        let (swapchain_image_count, swapchain_image_view_format) = {
-            let swapchain = self.swapchain.lock().unwrap();
-            (
-                swapchain.get_image_count(),
-                swapchain.get_image_view_format(),
-            )
-        };
+        // Upstream reads these swapchain getters without a lock
+        // (renderer_vulkan.cpp:163). Locking `swapchain_mutex` here stalled
+        // the GPU thread behind the present thread, which holds that mutex
+        // across `acquire_next_image` (MoltenVK blocks on the next drawable
+        // — up to a vsync period per presented frame; measured at 37% of
+        // the GPU thread during MK8D loading). The PresentManager caches
+        // both values in atomics updated at swapchain (re)creation.
+        let swapchain_image_count = self.present_manager.swapchain_image_count();
+        let swapchain_image_view_format = self.present_manager.swapchain_image_view_format();
         if let Some(start) = phase_start {
             VK_COMPOSITE_SWAPCHAIN_INFO_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
         }

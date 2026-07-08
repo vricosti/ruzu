@@ -155,6 +155,14 @@ pub(crate) struct PresentThreadContext {
     frame_cv: Condvar,
     free_cv: Condvar,
     image_count: AtomicUsize,
+    /// Cached `Swapchain::get_image_view_format()` as a raw `vk::Format`
+    /// value. Upstream `RendererVulkan::Composite` reads the swapchain
+    /// getters without a lock (renderer_vulkan.cpp:163); Rust caches them
+    /// in atomics so the GPU thread's composite never contends on
+    /// `swapchain_mutex`, which the present thread holds across
+    /// `acquire_next_image` (MoltenVK blocks on the next drawable there —
+    /// up to a vsync period per frame).
+    image_view_format: std::sync::atomic::AtomicI32,
     stop: AtomicBool,
 }
 
@@ -264,6 +272,7 @@ impl PresentManager {
             free_queue.push_back(i);
         }
 
+        let initial_image_view_format = swapchain.lock().unwrap().get_image_view_format();
         let ctx = Arc::new(PresentThreadContext {
             device: device.clone(),
             memory_properties,
@@ -276,6 +285,9 @@ impl PresentManager {
             frame_cv: Condvar::new(),
             free_cv: Condvar::new(),
             image_count: AtomicUsize::new(effective_count),
+            image_view_format: std::sync::atomic::AtomicI32::new(
+                initial_image_view_format.as_raw(),
+            ),
             stop: AtomicBool::new(false),
         });
 
@@ -522,6 +534,20 @@ impl PresentManager {
     /// Port of `PresentManager::WaitPresent`.
     ///
     /// Blocks until all queued frames have been presented.
+    /// Lock-free swapchain image count for the GPU thread's composite.
+    /// Upstream `Composite` reads `swapchain.GetImageCount()` without a
+    /// lock (renderer_vulkan.cpp:163); taking `swapchain_mutex` here would
+    /// stall composition behind the present thread's `acquire_next_image`.
+    pub fn swapchain_image_count(&self) -> usize {
+        self.ctx.image_count.load(Ordering::Acquire)
+    }
+
+    /// Lock-free swapchain image-view format (same rationale as
+    /// `swapchain_image_count`).
+    pub fn swapchain_image_view_format(&self) -> vk::Format {
+        vk::Format::from_raw(self.ctx.image_view_format.load(Ordering::Acquire))
+    }
+
     pub fn wait_present(&self) {
         if !self.use_present_thread {
             return;
@@ -576,6 +602,11 @@ impl PresentThreadContext {
             swapchain_image_count.min(MAX_IMAGES_IN_FLIGHT),
             Ordering::Release,
         );
+    }
+
+    fn set_image_view_format(&self, format: vk::Format) {
+        self.image_view_format
+            .store(format.as_raw(), Ordering::Release);
     }
 
     /// Port of `PresentManager::CopyToSwapchain`.
@@ -655,6 +686,7 @@ impl PresentThreadContext {
         match swapchain.recreate(frame.width, frame.height) {
             Ok(()) => {
                 self.set_image_count(swapchain.get_image_count());
+                self.set_image_view_format(swapchain.get_image_view_format());
                 true
             }
             Err(err) => {
