@@ -38,7 +38,7 @@ use shader_recompiler::shader_info::{Info as ShaderInfo, TextureType};
 use shader_recompiler::{CompiledShader, PipelineCache, Profile, RuntimeInfo, ShaderStage};
 
 use super::descriptor_pool::DescriptorBankInfo;
-use super::fixed_pipeline_state::FixedPipelineState;
+use super::fixed_pipeline_state::{DynamicFeatures, FixedPipelineState};
 use super::maxwell_to_vk;
 use super::pipeline_helper::{
     RENDERAREA_LAYOUT_SIZE, RESCALING_LAYOUT_SIZE, RESCALING_LAYOUT_WORDS_OFFSET,
@@ -311,16 +311,7 @@ impl GraphicsPipelineCache {
         read_gpu: &dyn Fn(u64, &mut [u8]),
     ) -> Option<(GraphicsPipelineKey, FixedPipelineState)> {
         let mut fixed_state = FixedPipelineState::default();
-        fixed_state.refresh(draw);
-        fixed_state.set_extended_dynamic_state(self.extended_dynamic_state_supported);
-        fixed_state.set_extended_dynamic_state_2(self.extended_dynamic_state2_supported);
-        fixed_state
-            .set_extended_dynamic_state_2_extra(self.extended_dynamic_state2_extra_supported);
-        fixed_state
-            .set_extended_dynamic_state_3_blend(self.extended_dynamic_state3_blend_supported);
-        fixed_state
-            .set_extended_dynamic_state_3_enables(self.extended_dynamic_state3_enables_supported);
-        fixed_state.set_dynamic_vertex_input(self.dynamic_vertex_input_supported);
+        fixed_state.refresh(draw, &self.dynamic_features());
 
         let vs_compiled = self.compile_vertex_shader(draw, &fixed_state, read_gpu)?;
         let fs_compiled = self.compile_fragment_shader(draw, &fixed_state, read_gpu);
@@ -392,16 +383,7 @@ impl GraphicsPipelineCache {
         unique_hashes: [u64; NUM_PROGRAMS],
     ) -> (GraphicsPipelineKey, FixedPipelineState) {
         let mut fixed_state = FixedPipelineState::default();
-        fixed_state.refresh(draw);
-        fixed_state.set_extended_dynamic_state(self.extended_dynamic_state_supported);
-        fixed_state.set_extended_dynamic_state_2(self.extended_dynamic_state2_supported);
-        fixed_state
-            .set_extended_dynamic_state_2_extra(self.extended_dynamic_state2_extra_supported);
-        fixed_state
-            .set_extended_dynamic_state_3_blend(self.extended_dynamic_state3_blend_supported);
-        fixed_state
-            .set_extended_dynamic_state_3_enables(self.extended_dynamic_state3_enables_supported);
-        fixed_state.set_dynamic_vertex_input(self.dynamic_vertex_input_supported);
+        fixed_state.refresh(draw, &self.dynamic_features());
         (
             GraphicsPipelineKey {
                 unique_hashes,
@@ -409,6 +391,19 @@ impl GraphicsPipelineCache {
             },
             fixed_state,
         )
+    }
+
+    /// Dynamic-state features of the device, in upstream's `DynamicFeatures`
+    /// shape (consumed by `FixedPipelineState::refresh`).
+    fn dynamic_features(&self) -> DynamicFeatures {
+        DynamicFeatures {
+            has_extended_dynamic_state: self.extended_dynamic_state_supported,
+            has_extended_dynamic_state_2: self.extended_dynamic_state2_supported,
+            has_extended_dynamic_state_2_extra: self.extended_dynamic_state2_extra_supported,
+            has_extended_dynamic_state_3_blend: self.extended_dynamic_state3_blend_supported,
+            has_extended_dynamic_state_3_enables: self.extended_dynamic_state3_enables_supported,
+            has_dynamic_vertex_input: self.dynamic_vertex_input_supported,
+        }
     }
 
     /// Build a graphics pipeline for the given draw/key pair.
@@ -1295,7 +1290,8 @@ impl GraphicsPipelineCache {
             .subpass(0)
             .build();
 
-        match unsafe {
+        let vk_create_start = Instant::now();
+        let result = match unsafe {
             self.device
                 .create_graphics_pipelines(pipeline_cache, &[pipeline_info], None)
         } {
@@ -1304,7 +1300,9 @@ impl GraphicsPipelineCache {
                 warn!("GraphicsPipelineCache: pipeline creation failed: {:?}", e);
                 None
             }
-        }
+        };
+        record_vk_pipeline_create("runtime", vk_create_start.elapsed());
+        result
     }
 
     fn create_graphics_pipeline_from_state(
@@ -1477,7 +1475,8 @@ impl GraphicsPipelineCache {
             .subpass(0)
             .build();
 
-        match unsafe {
+        let vk_create_start = Instant::now();
+        let result = match unsafe {
             self.device
                 .create_graphics_pipelines(pipeline_cache, &[pipeline_info], None)
         } {
@@ -1489,7 +1488,38 @@ impl GraphicsPipelineCache {
                 );
                 None
             }
-        }
+        };
+        record_vk_pipeline_create("from_state", vk_create_start.elapsed());
+        result
+    }
+}
+
+/// Diagnostic: cumulative time spent inside `vkCreateGraphicsPipelines`
+/// (MoltenVK compiles MTLRenderPipelineState synchronously in this call).
+/// Prints running totals every 32 creations; slow ones (>100ms) print
+/// immediately.
+fn record_vk_pipeline_create(site: &'static str, elapsed: std::time::Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_US: AtomicU64 = AtomicU64::new(0);
+    static COUNT_RUNTIME: AtomicU64 = AtomicU64::new(0);
+    static COUNT_FROM_STATE: AtomicU64 = AtomicU64::new(0);
+    let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let total_us = TOTAL_US.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed)
+        + elapsed.as_micros() as u64;
+    match site {
+        "runtime" => COUNT_RUNTIME.fetch_add(1, Ordering::Relaxed),
+        _ => COUNT_FROM_STATE.fetch_add(1, Ordering::Relaxed),
+    };
+    if elapsed.as_millis() > 100 || count % 32 == 0 {
+        eprintln!(
+            "[VK_PIPELINE_CREATE] site={site} last_ms={} count={} (runtime={} from_state={}) total_ms={}",
+            elapsed.as_millis(),
+            count,
+            COUNT_RUNTIME.load(Ordering::Relaxed),
+            COUNT_FROM_STATE.load(Ordering::Relaxed),
+            total_us / 1000,
+        );
     }
 }
 
