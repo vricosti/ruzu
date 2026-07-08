@@ -31,6 +31,241 @@ use shader_recompiler::{Profile, RuntimeInfo};
 use super::compute_pipeline::ComputePipeline;
 use super::fixed_pipeline_state::FixedPipelineState;
 use super::graphics_pipeline::{GraphicsPipeline, GraphicsPipelineCache, GraphicsPipelineKey};
+
+/// Diagnostic hit/miss statistics for the graphics pipeline cache
+/// (MK8D loading investigation: per-draw shader recompiles during the
+/// spinner phase). Prints a `[PIPELINE_STATS]` line every 256 misses.
+/// Cheap (GPU-thread only); always on.
+pub(crate) mod pipeline_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    use super::{FixedPipelineState, GraphicsPipelineKey};
+
+    pub static FAST_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static SLOW_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static MISSES: AtomicU64 = AtomicU64::new(0);
+    static MISS_FIRST: AtomicU64 = AtomicU64::new(0);
+    static MISS_HASH_ONLY: AtomicU64 = AtomicU64::new(0);
+    static MISS_FIXED_ONLY: AtomicU64 = AtomicU64::new(0);
+    static MISS_BOTH: AtomicU64 = AtomicU64::new(0);
+
+    // Per-field change counters for FIXED_ONLY misses (vs the current
+    // pipeline's key — i.e. the previous draw).
+    static F_RAW1: AtomicU64 = AtomicU64::new(0);
+    static F_RAW2: AtomicU64 = AtomicU64::new(0);
+    static F_COLOR_FORMATS: AtomicU64 = AtomicU64::new(0);
+    static F_ALPHA_POINT: AtomicU64 = AtomicU64::new(0);
+    static F_SWIZZLES: AtomicU64 = AtomicU64::new(0);
+    static F_ATTR_TYPES: AtomicU64 = AtomicU64::new(0);
+    static F_DYNAMIC_STATE: AtomicU64 = AtomicU64::new(0);
+    static F_ATTACHMENTS: AtomicU64 = AtomicU64::new(0);
+    static F_ATTRIBUTES: AtomicU64 = AtomicU64::new(0);
+    static F_DIVISORS_STRIDES: AtomicU64 = AtomicU64::new(0);
+    static F_XFB: AtomicU64 = AtomicU64::new(0);
+
+    fn diff_fixed(a: &FixedPipelineState, b: &FixedPipelineState) {
+        if a.raw1 != b.raw1 {
+            F_RAW1.fetch_add(1, Ordering::Relaxed);
+        }
+        if a.raw2 != b.raw2 {
+            F_RAW2.fetch_add(1, Ordering::Relaxed);
+        }
+        if a.color_formats != b.color_formats {
+            F_COLOR_FORMATS.fetch_add(1, Ordering::Relaxed);
+        }
+        if a.alpha_test_ref != b.alpha_test_ref || a.point_size != b.point_size {
+            F_ALPHA_POINT.fetch_add(1, Ordering::Relaxed);
+        }
+        if a.viewport_swizzles != b.viewport_swizzles {
+            F_SWIZZLES.fetch_add(1, Ordering::Relaxed);
+        }
+        if a.attribute_types_or_enabled_divisors != b.attribute_types_or_enabled_divisors {
+            F_ATTR_TYPES.fetch_add(1, Ordering::Relaxed);
+        }
+        if a.dynamic_state != b.dynamic_state {
+            F_DYNAMIC_STATE.fetch_add(1, Ordering::Relaxed);
+        }
+        if a.attachments != b.attachments {
+            F_ATTACHMENTS.fetch_add(1, Ordering::Relaxed);
+        }
+        if a.attributes != b.attributes {
+            F_ATTRIBUTES.fetch_add(1, Ordering::Relaxed);
+        }
+        if a.binding_divisors != b.binding_divisors || a.vertex_strides != b.vertex_strides {
+            F_DIVISORS_STRIDES.fetch_add(1, Ordering::Relaxed);
+        }
+        if a.xfb_state != b.xfb_state {
+            F_XFB.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Remember the last missed key so consecutive-miss diffs also work
+    /// when the transition cache keeps `current_pipeline` stale.
+    static LAST_MISS: Mutex<Option<GraphicsPipelineKey>> = Mutex::new(None);
+
+    /// On a runtime miss, look for cached (typically disk-preloaded) keys
+    /// with identical shader hashes and print which FixedPipelineState
+    /// fields diverge — pinpoints cross-run key instability. Capped output.
+    pub fn log_same_hash_neighbors<'a>(
+        key: &GraphicsPipelineKey,
+        cached_keys: impl Iterator<Item = &'a GraphicsPipelineKey>,
+    ) {
+        static PRINTED: AtomicU64 = AtomicU64::new(0);
+        if PRINTED.load(Ordering::Relaxed) >= 40 {
+            return;
+        }
+        let mut neighbors = 0u32;
+        for cached in cached_keys {
+            if cached.unique_hashes != key.unique_hashes {
+                continue;
+            }
+            neighbors += 1;
+            if neighbors > 3 {
+                continue;
+            }
+            let a = &key.fixed_state;
+            let b = &cached.fixed_state;
+            let mut diffs = Vec::new();
+            if a.raw1 != b.raw1 {
+                diffs.push(format!("raw1 {:08X}!={:08X}", a.raw1, b.raw1));
+            }
+            if a.raw2 != b.raw2 {
+                diffs.push(format!("raw2 {:08X}!={:08X}", a.raw2, b.raw2));
+            }
+            if a.color_formats != b.color_formats {
+                diffs.push(format!(
+                    "color_formats {:?}!={:?}",
+                    a.color_formats, b.color_formats
+                ));
+            }
+            if a.alpha_test_ref != b.alpha_test_ref {
+                diffs.push("alpha_test_ref".into());
+            }
+            if a.point_size != b.point_size {
+                diffs.push("point_size".into());
+            }
+            if a.viewport_swizzles != b.viewport_swizzles {
+                diffs.push("viewport_swizzles".into());
+            }
+            if a.attribute_types_or_enabled_divisors != b.attribute_types_or_enabled_divisors {
+                diffs.push(format!(
+                    "attr_types {:016X}!={:016X}",
+                    a.attribute_types_or_enabled_divisors, b.attribute_types_or_enabled_divisors
+                ));
+            }
+            if a.dynamic_state != b.dynamic_state {
+                diffs.push("dynamic_state".into());
+            }
+            if a.attachments != b.attachments {
+                diffs.push("attachments".into());
+            }
+            if a.attributes != b.attributes {
+                let n = a
+                    .attributes
+                    .iter()
+                    .zip(b.attributes.iter())
+                    .filter(|(x, y)| x != y)
+                    .count();
+                diffs.push(format!("attributes({n} slots)"));
+            }
+            if a.binding_divisors != b.binding_divisors {
+                diffs.push("binding_divisors".into());
+            }
+            if a.vertex_strides != b.vertex_strides {
+                diffs.push("vertex_strides".into());
+            }
+            if a.xfb_state != b.xfb_state {
+                diffs.push("xfb_state".into());
+            }
+            eprintln!(
+                "[PIPELINE_KEY_DIFF] miss vs cached (same hashes {:016X}/{:016X}): {}",
+                key.unique_hashes[1],
+                key.unique_hashes[5],
+                if diffs.is_empty() {
+                    "identical?!".to_string()
+                } else {
+                    diffs.join(", ")
+                },
+            );
+            PRINTED.fetch_add(1, Ordering::Relaxed);
+        }
+        if neighbors == 0 && PRINTED.fetch_add(1, Ordering::Relaxed) < 40 {
+            eprintln!(
+                "[PIPELINE_KEY_DIFF] miss with NO cached key sharing hashes {:016X}/{:016X} (genuinely new shaders)",
+                key.unique_hashes[1], key.unique_hashes[5],
+            );
+        }
+    }
+
+    pub fn record_fast_hit() {
+        FAST_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_slow_path(
+        is_new: bool,
+        key: &GraphicsPipelineKey,
+        current: Option<&GraphicsPipelineKey>,
+    ) {
+        if !is_new {
+            SLOW_HITS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let misses = MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+
+        let mut last_miss = LAST_MISS.lock().unwrap();
+        let reference = current.or(last_miss.as_ref());
+        match reference {
+            None => {
+                MISS_FIRST.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(prev) => {
+                let hashes_differ = prev.unique_hashes != key.unique_hashes;
+                let fixed_differ = prev.fixed_state != key.fixed_state;
+                match (hashes_differ, fixed_differ) {
+                    (true, false) => {
+                        MISS_HASH_ONLY.fetch_add(1, Ordering::Relaxed);
+                    }
+                    (false, true) => {
+                        MISS_FIXED_ONLY.fetch_add(1, Ordering::Relaxed);
+                        diff_fixed(&prev.fixed_state, &key.fixed_state);
+                    }
+                    _ => {
+                        MISS_BOTH.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        *last_miss = Some(key.clone());
+        drop(last_miss);
+
+        if misses % 256 == 0 {
+            eprintln!(
+                "[PIPELINE_STATS] fast_hits={} slow_hits={} misses={} (first={} hash_only={} fixed_only={} both={}) \
+                 fixed_diffs: raw1={} raw2={} color_fmt={} alpha_point={} swizzle={} attr_types={} dynstate={} \
+                 attach={} attribs={} divisors_strides={} xfb={}",
+                FAST_HITS.load(Ordering::Relaxed),
+                SLOW_HITS.load(Ordering::Relaxed),
+                misses,
+                MISS_FIRST.load(Ordering::Relaxed),
+                MISS_HASH_ONLY.load(Ordering::Relaxed),
+                MISS_FIXED_ONLY.load(Ordering::Relaxed),
+                MISS_BOTH.load(Ordering::Relaxed),
+                F_RAW1.load(Ordering::Relaxed),
+                F_RAW2.load(Ordering::Relaxed),
+                F_COLOR_FORMATS.load(Ordering::Relaxed),
+                F_ALPHA_POINT.load(Ordering::Relaxed),
+                F_SWIZZLES.load(Ordering::Relaxed),
+                F_ATTR_TYPES.load(Ordering::Relaxed),
+                F_DYNAMIC_STATE.load(Ordering::Relaxed),
+                F_ATTACHMENTS.load(Ordering::Relaxed),
+                F_ATTRIBUTES.load(Ordering::Relaxed),
+                F_DIVISORS_STRIDES.load(Ordering::Relaxed),
+                F_XFB.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
 use super::render_pass_cache::RenderPassCache;
 
 // ---------------------------------------------------------------------------
@@ -129,7 +364,11 @@ impl ShaderPools {
 // Version 12: FixedPipelineState vertex-attribute type/size bits switched
 // from Rust enum ordinals to raw Maxwell hardware encodings (matching
 // upstream); older caches carry corrupted attribute state.
-const CACHE_VERSION: u32 = 12;
+// Version 13: FixedPipelineState::refresh now leaves fields covered by a
+// supported dynamic-state extension at zero (upstream semantics). Older
+// caches carry per-draw dynamic state baked into keys — thousands of
+// duplicate pipelines per logical key that can never match again.
+const CACHE_VERSION: u32 = 13;
 const VULKAN_CACHE_MAGIC_NUMBER: [u8; 8] = *b"yuzuvkch";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,6 +714,7 @@ impl PipelineCache {
                 .get(&current_key)
                 .and_then(|pipeline| pipeline.next(&key).cloned());
             if let Some(next_key) = next_key {
+                pipeline_stats::record_fast_hit();
                 self.current_pipeline = Some(next_key.clone());
                 let pipeline = self
                     .graphics_cache
@@ -665,7 +905,9 @@ impl PipelineCache {
         }
 
         let is_new = !self.graphics_cache.contains_key(&key);
+        pipeline_stats::record_slow_path(is_new, &key, self.current_pipeline.as_ref());
         if is_new {
+            pipeline_stats::log_same_hash_neighbors(&key, self.graphics_cache.keys());
             let Some(pipeline) = self.create_graphics_pipeline_with_shared_cache(
                 draw,
                 render_pass,

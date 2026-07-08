@@ -1217,9 +1217,24 @@ impl FixedPipelineState {
     /// A full port of `FixedPipelineState::Refresh(Maxwell3D&, DynamicFeatures&)`
     /// requires direct register access; this intermediate form captures the
     /// essential state from the DrawCall abstraction.
-    pub fn refresh(&mut self, draw: &DrawCall) {
+    /// Port of `FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D&,
+    /// DynamicFeatures&)`. Fields covered by a supported dynamic-state
+    /// extension are LEFT AT ZERO, exactly like upstream: they are provided
+    /// dynamically at draw time (`update_dynamic_states`,
+    /// `cmd_bind_vertex_buffers2`), so including their per-draw values in
+    /// the pipeline key explodes one logical pipeline into hundreds of
+    /// variants (the MK8D disk-cache growth + perpetual runtime compiles).
+    pub fn refresh(&mut self, draw: &DrawCall, features: &DynamicFeatures) {
         self.raw1 = 0;
         self.raw2 = 0;
+
+        // Upstream assigns the feature flags first (fixed_pipeline_state.cpp:56-61).
+        self.set_extended_dynamic_state(features.has_extended_dynamic_state);
+        self.set_extended_dynamic_state_2(features.has_extended_dynamic_state_2);
+        self.set_extended_dynamic_state_2_extra(features.has_extended_dynamic_state_2_extra);
+        self.set_extended_dynamic_state_3_blend(features.has_extended_dynamic_state_3_blend);
+        self.set_extended_dynamic_state_3_enables(features.has_extended_dynamic_state_3_enables);
+        self.set_dynamic_vertex_input(features.has_dynamic_vertex_input);
 
         self.set_topology(draw.topology);
         self.set_ndc_minus_one_to_one(draw.depth_stencil.depth_mode == DepthMode::MinusOneToOne);
@@ -1252,61 +1267,87 @@ impl FixedPipelineState {
             }
             self.viewport_swizzles[index] = viewport.swizzle as u16;
         }
-        self.dynamic_state
-            .set_cull_enable(draw.rasterizer.cull_enable);
-        self.dynamic_state.set_cull_face(draw.rasterizer.cull_face);
-        let mut front_face = pack_front_face(draw.rasterizer.front_face);
-        if draw.window_origin_flip_y {
-            // Upstream flips the packed front-face bit when
-            // `regs.window_origin.flip_y != 0`.
-            front_face = 1 - front_face;
+        // Upstream zeroes dynamic_state then refreshes each group only when
+        // the covering extension is NOT supported
+        // (fixed_pipeline_state.cpp:142-165):
+        //   - !extended_dynamic_state         → DynamicState::Refresh + vertex_strides
+        //   - !extended_dynamic_state_2_extra → DynamicState::Refresh2 (logic_op always;
+        //                                       rasterize/primitive_restart/depth_bias
+        //                                       only when !extended_dynamic_state_2)
+        //   - !extended_dynamic_state_3_blend → attachments
+        //   - !extended_dynamic_state_3_enables → DynamicState::Refresh3
+        self.dynamic_state = DynamicState::default();
+        if !features.has_extended_dynamic_state {
+            // Port of DynamicState::Refresh(regs).
+            self.dynamic_state
+                .set_cull_enable(draw.rasterizer.cull_enable);
+            self.dynamic_state.set_cull_face(draw.rasterizer.cull_face);
+            let mut front_face = pack_front_face(draw.rasterizer.front_face);
+            if draw.window_origin_flip_y {
+                // Upstream flips the packed front-face bit when
+                // `regs.window_origin.flip_y != 0`.
+                front_face = 1 - front_face;
+            }
+            self.dynamic_state
+                .set_front_face(unpack_front_face(front_face));
+            self.dynamic_state
+                .set_depth_test_enable(draw.depth_stencil.depth_test_enable);
+            self.dynamic_state
+                .set_depth_write_enable(draw.depth_stencil.depth_write_enable);
+            self.dynamic_state
+                .set_depth_bounds_enable(draw.depth_bounds_enable);
+            self.dynamic_state
+                .set_depth_test_func(draw.depth_stencil.depth_func);
+            self.dynamic_state
+                .set_stencil_enable(draw.depth_stencil.stencil_enable);
         }
-        self.dynamic_state
-            .set_front_face(unpack_front_face(front_face));
-        self.dynamic_state
-            .set_depth_test_enable(draw.depth_stencil.depth_test_enable);
-        self.dynamic_state
-            .set_depth_write_enable(draw.depth_stencil.depth_write_enable);
-        self.dynamic_state
-            .set_depth_bounds_enable(draw.depth_bounds_enable);
-        self.dynamic_state
-            .set_depth_test_func(draw.depth_stencil.depth_func);
-        self.dynamic_state
-            .set_stencil_enable(draw.depth_stencil.stencil_enable);
-        let depth_bias_enable = match POLYGON_OFFSET_ENABLE_LUT[draw.topology as usize] {
-            0 => draw.rasterizer.polygon_offset_point_enable,
-            1 => draw.rasterizer.polygon_offset_line_enable,
-            _ => draw.rasterizer.polygon_offset_fill_enable,
-        };
-        self.dynamic_state.set_depth_bias_enable(depth_bias_enable);
-        self.dynamic_state
-            .set_rasterize_enable(draw.rasterize_enable);
-        self.dynamic_state.set_logic_op(draw.logic_op.op);
-        self.dynamic_state
-            .set_logic_op_enable(draw.logic_op.enabled);
-        self.dynamic_state
-            .set_depth_clamp_disabled(!draw.depth_clamp_enabled);
-        self.dynamic_state
-            .set_primitive_restart_enable(draw.primitive_restart.enabled);
+        if !features.has_extended_dynamic_state_2_extra {
+            // Port of DynamicState::Refresh2(regs, topology, eds2).
+            self.dynamic_state.set_logic_op(draw.logic_op.op);
+            if !features.has_extended_dynamic_state_2 {
+                let depth_bias_enable = match POLYGON_OFFSET_ENABLE_LUT[draw.topology as usize] {
+                    0 => draw.rasterizer.polygon_offset_point_enable,
+                    1 => draw.rasterizer.polygon_offset_line_enable,
+                    _ => draw.rasterizer.polygon_offset_fill_enable,
+                };
+                self.dynamic_state.set_depth_bias_enable(depth_bias_enable);
+                self.dynamic_state
+                    .set_rasterize_enable(draw.rasterize_enable);
+                self.dynamic_state
+                    .set_primitive_restart_enable(draw.primitive_restart.enabled);
+            }
+        }
+        if !features.has_extended_dynamic_state_3_enables {
+            // Port of DynamicState::Refresh3(regs).
+            self.dynamic_state
+                .set_logic_op_enable(draw.logic_op.enabled);
+            self.dynamic_state
+                .set_depth_clamp_disabled(!draw.depth_clamp_enabled);
+        }
 
         // Populate color formats from render targets
         for (i, rt) in draw.render_targets.iter().enumerate() {
             self.color_formats[i] = rt.format as u8;
         }
 
-        // Populate blend attachments
-        for (i, blend) in draw.blend.iter().enumerate() {
-            let mut att = BlendingAttachment::default();
-            if blend.enabled {
-                att.set_enabled(true);
-                att.set_equation_rgb(blend.color_op);
-                att.set_equation_alpha(blend.alpha_op);
-                att.set_source_rgb_factor(blend.color_src);
-                att.set_dest_rgb_factor(blend.color_dst);
-                att.set_source_alpha_factor(blend.alpha_src);
-                att.set_dest_alpha_factor(blend.alpha_dst);
+        // Populate blend attachments.
+        // Upstream refreshes them only when !extended_dynamic_state_3_blend.
+        if !features.has_extended_dynamic_state_3_blend {
+            for (i, blend) in draw.blend.iter().enumerate() {
+                let mut att = BlendingAttachment::default();
+                if blend.enabled {
+                    att.set_enabled(true);
+                    att.set_equation_rgb(blend.color_op);
+                    att.set_equation_alpha(blend.alpha_op);
+                    att.set_source_rgb_factor(blend.color_src);
+                    att.set_dest_rgb_factor(blend.color_dst);
+                    att.set_source_alpha_factor(blend.alpha_src);
+                    att.set_dest_alpha_factor(blend.alpha_dst);
+                }
+                self.attachments[i] = att;
             }
-            self.attachments[i] = att;
+        } else {
+            self.attachments = [BlendingAttachment::default(); NUM_RENDER_TARGETS];
         }
 
         // Populate vertex attributes
@@ -1333,7 +1374,17 @@ impl FixedPipelineState {
             self.attributes[i] = va;
         }
 
-        // Populate vertex strides
+        // Populate vertex strides.
+        //
+        // INTENTIONAL DIVERGENCE: upstream fills these only when
+        // !extended_dynamic_state (strides then come from
+        // vkCmdBindVertexBuffers2). Excluding them here — together with
+        // declaring VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE — renders
+        // black on MoltenVK (verified by A/B window captures 2026-07-08),
+        // so ruzu keeps strides in the key on all devices until the
+        // dynamic-stride path is debugged. Cost: a few extra pipeline
+        // variants per shader when games vary strides.
+        self.vertex_strides = [0; NUM_VERTEX_ARRAYS];
         for stream in &draw.vertex_streams {
             let index = stream.index as usize;
             if index >= NUM_VERTEX_ARRAYS {
@@ -1613,7 +1664,7 @@ mod tests {
         draw.vertex_attribs[0].size = VertexAttribSize::R32G32B32A32;
 
         let mut state = FixedPipelineState::default();
-        state.refresh(&draw);
+        state.refresh(&draw, &DynamicFeatures::default());
 
         // The packed bits must hold the raw Maxwell encodings (upstream
         // `attribute.type.Assign(input.type.Value())`), so `from_raw` on
@@ -1629,6 +1680,60 @@ mod tests {
             VertexAttribSize::from_raw(state.attributes[0].attrib_size()),
             VertexAttribSize::R32G32B32A32
         );
+    }
+
+    #[test]
+    fn refresh_leaves_extension_covered_fields_zero_like_upstream() {
+        // Upstream fixed_pipeline_state.cpp:142-165: fields covered by a
+        // supported dynamic-state extension are never refreshed into the
+        // key. Two draws differing only in dynamic state must produce the
+        // SAME FixedPipelineState under the extension (one pipeline, not
+        // hundreds of variants).
+        let mut draw = make_test_draw_call();
+        draw.rasterizer.cull_enable = true;
+        draw.depth_stencil.depth_test_enable = true;
+        draw.depth_stencil.depth_write_enable = true;
+        draw.vertex_streams.push(Default::default());
+        draw.vertex_streams[0].stride = 32;
+
+        let features = DynamicFeatures {
+            has_extended_dynamic_state: true,
+            ..Default::default()
+        };
+        let mut state = FixedPipelineState::default();
+        state.refresh(&draw, &features);
+
+        // EDS1-covered dynamic_state fields stay zero…
+        assert!(!state.dynamic_state.cull_enable());
+        assert!(!state.dynamic_state.depth_test_enable());
+        assert!(!state.dynamic_state.depth_write_enable());
+        // …the extension flag is recorded in the key…
+        assert!(state.extended_dynamic_state());
+        // …and vertex_strides intentionally STAY in the key (documented
+        // MoltenVK divergence in refresh()).
+        assert_eq!(state.vertex_strides[0], 32);
+
+        // Non-covered groups are still captured (eds2/eds3 unsupported here).
+        let mut logic_draw = make_test_draw_call();
+        logic_draw.logic_op = LogicOpInfo {
+            enabled: true,
+            op: 0x1503,
+        };
+        let mut logic_state = FixedPipelineState::default();
+        logic_state.refresh(&logic_draw, &features);
+        assert!(logic_state.dynamic_state.logic_op_enable());
+
+        // Two draws differing only in EDS1-covered dynamic state →
+        // identical keys.
+        let mut other_draw = make_test_draw_call();
+        other_draw.rasterizer.cull_enable = false;
+        other_draw.depth_stencil.depth_test_enable = false;
+        other_draw.vertex_streams.push(Default::default());
+        other_draw.vertex_streams[0].stride = 32;
+        let mut other_state = FixedPipelineState::default();
+        other_state.refresh(&other_draw, &features);
+        assert_eq!(state, other_state);
+        assert_eq!(hash_state(&state), hash_state(&other_state));
     }
 
     #[test]
@@ -1652,7 +1757,7 @@ mod tests {
         draw.rasterizer.polygon_offset_fill_enable = true;
 
         let mut state = FixedPipelineState::default();
-        state.refresh(&draw);
+        state.refresh(&draw, &DynamicFeatures::default());
 
         assert!(!state.dynamic_state.rasterize_enable());
         assert!(!state.dynamic_state.depth_bias_enable());
@@ -1669,7 +1774,7 @@ mod tests {
         assert_eq!(state.viewport_swizzles[0], 0x3210);
 
         draw.rasterizer.polygon_offset_line_enable = true;
-        state.refresh(&draw);
+        state.refresh(&draw, &DynamicFeatures::default());
         assert!(state.dynamic_state.depth_bias_enable());
     }
 
@@ -1788,11 +1893,11 @@ mod tests {
         draw.window_origin_flip_y = false;
 
         let mut state = FixedPipelineState::default();
-        state.refresh(&draw);
+        state.refresh(&draw, &DynamicFeatures::default());
         assert_eq!(state.dynamic_state.front_face(), FrontFace::CCW);
 
         draw.window_origin_flip_y = true;
-        state.refresh(&draw);
+        state.refresh(&draw, &DynamicFeatures::default());
         assert_eq!(state.dynamic_state.front_face(), FrontFace::CW);
     }
 
@@ -1804,9 +1909,9 @@ mod tests {
         zeta_draw.zeta.format = 7;
 
         let mut no_zeta = FixedPipelineState::default();
-        no_zeta.refresh(&no_zeta_draw);
+        no_zeta.refresh(&no_zeta_draw, &DynamicFeatures::default());
         let mut with_zeta = FixedPipelineState::default();
-        with_zeta.refresh(&zeta_draw);
+        with_zeta.refresh(&zeta_draw, &DynamicFeatures::default());
 
         assert!(!no_zeta.depth_enabled());
         assert_eq!(no_zeta.depth_format(), 0);

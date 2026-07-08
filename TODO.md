@@ -1165,6 +1165,77 @@ sample at t=80, 6s):
   (host-thread IPC promotion for nvdrv, or upstream's event-based path
   should keep fails at 0 once the GPU keeps up).
 
+### 2026-07-08 — MEASURED: GPU-thread budget during the spinner; pipeline keys are unstable across runs
+
+Instrumented the graphics pipeline cache (`[PIPELINE_STATS]`, always-on)
+and `vkCreateGraphicsPipelines` (`[VK_PIPELINE_CREATE]`), plus per-shader
+translate timing (existing `RUZU_TRACE_SHADER_WORDS`). Findings on a
+~110s MK8D run + a 20s GPU-thread sample mid-stall (t=45-65):
+
+- **Intra-run cache health is fine**: fast_hits=161k, slow_hits=33k,
+  misses=256 (99.87% hit rate). The earlier "recompile per draw" reading
+  was a sampling-window artifact.
+- **But keys are unstable across runs**: the disk pipeline cache has
+  grown 443 → **9,325 entries** (each debug run appends ~250 "new"
+  pipelines) while every fresh run STILL takes ~250 runtime misses after
+  preloading all 9,325. The runtime-computed keys do not match the
+  preloaded ones — ~250 keys/run differ in unique_hashes and/or
+  fixed_state (miss classification: hash_only=46 fixed_only=38 both=171;
+  fixed-state diffs concentrate in attributes/divisors_strides/attach).
+- **Each miss is expensive and runs on the GPU thread**: shader translate
+  p90=13ms but max=1.77s (`structure_cfg_detailed` /
+  `find_last_goto_in_tree` quadratic recursion), plus synchronous MoltenVK
+  `vkCreateGraphicsPipelines`. Mid-stall the GPU thread is 91% busy:
+  ~28% compiling shaders, ~37% in `Gpu::composite_layers` →
+  `RendererVulkan::composite_impl`, rest DMA dispatch. That undercuts the
+  syncpoint rate to ~165/s → the game runs thousands of fences ahead →
+  the 44s `wait_host_stalled` core-0 freezes documented above.
+
+**Next steps**:
+1. Root-cause the cross-run key instability (dump a few runtime-miss keys
+   and diff against the disk entries with matching unique_hashes; suspect
+   a fixed_state field affected by boot-order/nondeterminism, and/or
+   shader unique_hash sensitivity to code-size probing). This single fix
+   should make the preload actually eliminate runtime compiles AND stop
+   the disk cache from growing unbounded.
+2. Move runtime pipeline builds off the GPU thread (upstream uses
+   VkPipelineBuilder workers + optional async shaders).
+3. Optimize `structure_cfg_detailed` quadratic goto search.
+4. Profile `composite_layers` (37% of the GPU thread during loading is
+   suspicious for a phase that presents a mostly-static image).
+
+### 2026-07-08 — FIXED: pipeline-key instability (dynamic state baked into keys) + cache convergence
+
+Root cause of the disk-cache growth and perpetual runtime compiles:
+`FixedPipelineState::refresh` filled `dynamic_state` unconditionally,
+while upstream (fixed_pipeline_state.cpp:142-165) only refreshes each
+group when the covering extension is missing. With EDS declared in the
+pipeline's dynamic states, every per-draw variation of cull/depth/
+stencil/logic-op state minted a distinct pipeline key for the same
+logical pipeline. Fix: `refresh(draw, features)` now takes upstream's
+`DynamicFeatures` parameter, assigns the extension flags first, and
+gates the DynamicState::Refresh/Refresh2/Refresh3 + attachments groups
+exactly like upstream. CACHE_VERSION 12→13 purges the bloated caches.
+
+**INTENTIONAL DIVERGENCE (documented in refresh())**: `vertex_strides`
+stays in the key on all devices. Upstream excludes it under
+extended_dynamic_state (strides then come from vkCmdBindVertexBuffers2 +
+VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE), but that combination
+renders black on MoltenVK here (A/B window captures). Revisit once the
+dynamic-stride path is debugged; cost is a few extra variants per shader.
+
+Validation: A/B window captures at t=30s show the MK8D splash identical
+to baseline (bisection proved the black screen came from the strides
+half, now excluded). `[PIPELINE_STATS]` miss causes: dynstate=0 (was the
+dominant cause). Cache converges instead of exploding: cold=352 runtime
+creates → warm1=551 (boot progresses further) → warm2=**99**, disk cache
+829 entries / 6.4MB (was 9,325 entries growing ~250/run without ever
+converging). fixed_pipeline_state tests 25/25 incl. new regression test.
+
+Remaining from the GPU-thread budget entry above: move pipeline builds
+off the GPU thread, structure_cfg quadratic goto search, composite_layers
+37%, StagingBufferPool vkAllocateMemory reuse.
+
 ### 2026-07-06 — OPEN: intermittent early wedge at t≈11-12s (~2/8 cold runs)
 
 Some runs stop presenting right at the preload→boot transition (0-3 present
