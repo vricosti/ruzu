@@ -34,6 +34,63 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 static TRACE_KCV_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Diagnostic protocol-health counters for the userspace mutex/condvar
+/// protocol, dumped on SIGUSR1. Relaxed atomic increments — always on.
+/// "Empty" operations are wasted syscalls: userspace observed a
+/// waiters/has-waiters flag that the kernel view does not corroborate.
+pub mod cv_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static SIGNALS: AtomicU64 = AtomicU64::new(0);
+    /// SignalProcessWideKey calls that found no waiter in the tree.
+    pub static SIGNALS_EMPTY: AtomicU64 = AtomicU64::new(0);
+    /// Empty signals where the guest-visible cv word was 0 (guest ignored
+    /// the has-waiters hint — game/SDK behavior, upstream pays it too).
+    pub static SIGNALS_EMPTY_HINT0: AtomicU64 = AtomicU64::new(0);
+    /// Empty signals where the cv word was non-zero (our clear is not
+    /// visible to the guest — a ruzu bug).
+    pub static SIGNALS_EMPTY_HINT_SET: AtomicU64 = AtomicU64::new(0);
+    /// Total waiters woken/requeued across all signals.
+    pub static SIGNALED_WAITERS: AtomicU64 = AtomicU64::new(0);
+    /// signal_impl outcomes: mutex free → thread woken directly.
+    pub static SIGNAL_WAKE_DIRECT: AtomicU64 = AtomicU64::new(0);
+    /// signal_impl outcomes: mutex held → thread requeued on owner.
+    pub static SIGNAL_REQUEUE_ON_OWNER: AtomicU64 = AtomicU64::new(0);
+    pub static UNLOCKS: AtomicU64 = AtomicU64::new(0);
+    /// ArbitrateUnlock calls with no kernel waiter on the key.
+    pub static UNLOCKS_EMPTY: AtomicU64 = AtomicU64::new(0);
+    pub static WAITS: AtomicU64 = AtomicU64::new(0);
+    /// Waits that returned immediately with timeout==0 (TimedOut).
+    pub static WAITS_TIMEOUT0: AtomicU64 = AtomicU64::new(0);
+    pub static WFA: AtomicU64 = AtomicU64::new(0);
+    /// ArbitrateLock calls resolved without waiting (tag mismatch).
+    pub static WFA_IMMEDIATE: AtomicU64 = AtomicU64::new(0);
+
+    pub fn inc(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn summary_string() -> String {
+        format!(
+            "[CV_STATS] signals={} signals_empty={} empty_hint0={} empty_hint_set={} signaled_waiters={} wake_direct={} requeue_on_owner={} \
+             unlocks={} unlocks_empty={} waits={} waits_timeout0={} wfa={} wfa_immediate={}",
+            SIGNALS.load(Ordering::Relaxed),
+            SIGNALS_EMPTY.load(Ordering::Relaxed),
+            SIGNALS_EMPTY_HINT0.load(Ordering::Relaxed),
+            SIGNALS_EMPTY_HINT_SET.load(Ordering::Relaxed),
+            SIGNALED_WAITERS.load(Ordering::Relaxed),
+            SIGNAL_WAKE_DIRECT.load(Ordering::Relaxed),
+            SIGNAL_REQUEUE_ON_OWNER.load(Ordering::Relaxed),
+            UNLOCKS.load(Ordering::Relaxed),
+            UNLOCKS_EMPTY.load(Ordering::Relaxed),
+            WAITS.load(Ordering::Relaxed),
+            WAITS_TIMEOUT0.load(Ordering::Relaxed),
+            WFA.load(Ordering::Relaxed),
+            WFA_IMMEDIATE.load(Ordering::Relaxed),
+        )
+    }
+}
+
 fn trace_kcv(args: std::fmt::Arguments<'_>) {
     if std::env::var_os("RUZU_TRACE_KCV").is_none() {
         return;
@@ -449,6 +506,10 @@ impl KConditionVariable {
                 false, // user address key (RemoveUserWaiterByKey)
                 &mut has_waiters,
             );
+            cv_stats::inc(&cv_stats::UNLOCKS);
+            if next_owner_result.is_none() {
+                cv_stats::inc(&cv_stats::UNLOCKS_EMPTY);
+            }
 
             // If there are remaining waiters, transfer the lock info to the next owner.
             next_owner_thread = if let Some((next_owner_id, _priority, transfer_lock_info)) =
@@ -658,9 +719,11 @@ impl KConditionVariable {
                 return Err(RESULT_INVALID_CURRENT_MEMORY);
             };
 
+            cv_stats::inc(&cv_stats::WFA);
             // If the tag isn't the handle (with wait mask), we're done.
             // Matches upstream: R_SUCCEED_IF(test_tag != (handle | HandleWaitMask))
             if test_tag != (handle | HANDLE_WAIT_MASK) {
+                cv_stats::inc(&cv_stats::WFA_IMMEDIATE);
                 if trace_lock {
                     trace_lock_pi(
                         2,
@@ -955,6 +1018,22 @@ impl KConditionVariable {
 
             num_waiters += 1;
         }
+
+        cv_stats::inc(&cv_stats::SIGNALS);
+        if num_waiters == 0 {
+            cv_stats::inc(&cv_stats::SIGNALS_EMPTY);
+            // Diagnose why the guest syscalled with no kernel waiters: read
+            // the guest-visible cv word. 0 → the guest ignored the
+            // has-waiters hint (SDK behavior); non-zero → our clear is not
+            // landing (ruzu bug).
+            match read_from_user(process_guard, cv_key) {
+                Some(0) => cv_stats::inc(&cv_stats::SIGNALS_EMPTY_HINT0),
+                Some(_) => cv_stats::inc(&cv_stats::SIGNALS_EMPTY_HINT_SET),
+                None => {}
+            }
+        }
+        cv_stats::SIGNALED_WAITERS
+            .fetch_add(num_waiters as u64, std::sync::atomic::Ordering::Relaxed);
 
         // If we have no waiters left for this key, clear the has waiter flag.
         // Matches upstream: if (it == m_tree.end() || it->GetConditionVariableKey() != cv_key)
@@ -1257,7 +1336,9 @@ impl KConditionVariable {
 
         // If timeout is zero, time out.
         // Matches upstream: R_UNLESS(timeout != 0, ResultTimedOut);
+        cv_stats::inc(&cv_stats::WAITS);
         if timeout == 0 {
+            cv_stats::inc(&cv_stats::WAITS_TIMEOUT0);
             sleep_guard.cancel_sleep();
             return crate::hle::kernel::svc::svc_results::RESULT_TIMED_OUT;
         }
@@ -1398,6 +1479,7 @@ impl KConditionVariable {
                 );
             }
             if prev_tag == INVALID_HANDLE {
+                cv_stats::inc(&cv_stats::SIGNAL_WAKE_DIRECT);
                 // If nobody held the lock previously, we're all good.
                 // Matches upstream: thread->EndWait(ResultSuccess);
                 if trace_lock {
@@ -1478,6 +1560,7 @@ impl KConditionVariable {
                         );
                     }
 
+                    cv_stats::inc(&cv_stats::SIGNAL_REQUEUE_ON_OWNER);
                     // Matches upstream `owner_thread->AddWaiter(thread)`
                     // (k_condition_variable.cpp:230): KThread::add_waiter
                     // now sets the waiter's lock-owner back-pointer too.
