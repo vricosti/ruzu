@@ -1256,6 +1256,26 @@ Validation: GPU-thread sample after the fix: mutexwait 4296→0 samples,
 composite 37%→2%, cvwait ~1.5% (the thread now does useful work);
 MK8D splash at t=30s identical to baseline.
 
+### 2026-07-08 — FIXED: structurizer path-clone churn (~10x cheaper shader translation)
+
+`find_last_goto_in_tree`/`find_label_in_tree` cloned the `Vec<usize>`
+statement path once per visited node; with the goto pass re-scanning the
+whole tree after every removed goto, big MK8D shaders spent most of their
+translation time growing/freeing path vectors (GPU-thread profiles:
+`RawVec::grow_one` under `structure_cfg_detailed`; worst shader 1.77s).
+Both scans now use a backtracking path buffer (push/pop around recursion,
+clone only when a match is recorded) — semantics unchanged.
+
+Cold-boot measurement (RUZU_TRACE_SHADER_WORDS): 928 compiles in
+2,350ms total, p90 2ms, max 347ms — vs 196 compiles in 4,207ms, max
+1,767ms before (≈10x per-compile). Splash at t=30s intact. The remaining
+347ms worst case is the goto pass's O(gotos × tree) rescan itself;
+migrating to upstream's intrusive-list structure would shave it further
+if it still matters after the pipeline-build-workers work. NOTE: 3
+structured_control_flow unit tests (conditional_exit/unconditional_exit/
+conditional_forward_branch) fail identically before and after this
+change — pre-existing breakage, not introduced here.
+
 ### 2026-07-06 — OPEN: intermittent early wedge at t≈11-12s (~2/8 cold runs)
 
 Some runs stop presenting right at the preload→boot transition (0-3 present
