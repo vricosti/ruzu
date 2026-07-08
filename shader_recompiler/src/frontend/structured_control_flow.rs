@@ -390,7 +390,7 @@ impl GotoPass {
     }
 
     fn find_last_goto_path(&self) -> Option<StatementPath> {
-        find_last_goto_in_tree(&self.root, Vec::new())
+        find_last_goto_in_tree(&self.root, &mut Vec::new())
     }
 
     fn level(path: &StatementPath) -> usize {
@@ -663,7 +663,7 @@ impl GotoPass {
     }
 
     fn find_label_path(&self, label_id: u32) -> Option<StatementPath> {
-        find_label_in_tree(&self.root, Vec::new(), label_id)
+        find_label_in_tree(&self.root, &mut Vec::new(), label_id)
     }
 
     fn statement_at(&self, path: &StatementPath) -> Option<&Statement> {
@@ -701,11 +701,14 @@ fn tree_mut_at<'a>(tree: &'a mut Vec<Statement>, path: &[usize]) -> &'a mut Vec<
     }
 }
 
-fn find_last_goto_in_tree(tree: &[Statement], parent: Vec<usize>) -> Option<StatementPath> {
+/// Tree scan with a backtracking path buffer: the path Vec is cloned only
+/// when a match is recorded, not per visited node. The per-node clones the
+/// naive version did dominated shader translation for large CFGs (Vec grow
+/// churn under `structure_cfg_detailed` in GPU-thread profiles; worst
+/// observed shader: 1.77s to translate).
+fn find_last_goto_in_tree(tree: &[Statement], parent: &mut Vec<usize>) -> Option<StatementPath> {
     let mut result = None;
     for (index, statement) in tree.iter().enumerate() {
-        let mut child_parent = parent.clone();
-        child_parent.push(index);
         match statement {
             Statement::Goto { .. } => {
                 result = Some(StatementPath {
@@ -716,9 +719,11 @@ fn find_last_goto_in_tree(tree: &[Statement], parent: Vec<usize>) -> Option<Stat
             Statement::If { children, .. }
             | Statement::Loop { children, .. }
             | Statement::Function { children } => {
-                if let Some(path) = find_last_goto_in_tree(children, child_parent) {
+                parent.push(index);
+                if let Some(path) = find_last_goto_in_tree(children, parent) {
                     result = Some(path);
                 }
+                parent.pop();
             }
             _ => {}
         }
@@ -728,22 +733,25 @@ fn find_last_goto_in_tree(tree: &[Statement], parent: Vec<usize>) -> Option<Stat
 
 fn find_label_in_tree(
     tree: &[Statement],
-    parent: Vec<usize>,
+    parent: &mut Vec<usize>,
     label_id: u32,
 ) -> Option<StatementPath> {
     for (index, statement) in tree.iter().enumerate() {
         if matches!(statement, Statement::Label { id } if *id == label_id) {
-            return Some(StatementPath { parent, index });
+            return Some(StatementPath {
+                parent: parent.clone(),
+                index,
+            });
         }
-        let mut child_parent = parent.clone();
-        child_parent.push(index);
         match statement {
             Statement::If { children, .. }
             | Statement::Loop { children, .. }
             | Statement::Function { children } => {
-                if let Some(path) = find_label_in_tree(children, child_parent, label_id) {
+                parent.push(index);
+                if let Some(path) = find_label_in_tree(children, parent, label_id) {
                     return Some(path);
                 }
+                parent.pop();
             }
             _ => {}
         }
