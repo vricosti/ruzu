@@ -3356,17 +3356,30 @@ impl TextureCache {
         }
         self.finish_pending_backend_insertions_with_reader(read_gpu_unsafe);
 
-        let rt0 = render_targets.render_targets[0];
-        if rt0.address == 0 || rt0.width == 0 || rt0.height == 0 || rt0.format == 0 {
-            return None;
-        }
-
         // Materialise every bound colour attachment (MRT) and the depth/stencil
         // attachment from the common cache, then assemble a framebuffer keyed by
         // the whole set — mirroring upstream GetFramebuffer rather than keying on
         // a single RT0 address with a synthesised depth buffer.
         let color_ids = self.base.render_targets.color_buffer_ids;
         let depth_id = self.base.render_targets.depth_buffer_id;
+
+        // Upstream treats a render target with format 0 as DISABLED (the
+        // per-target binding above already bound ImageViewId::default() for
+        // it) and still renders depth-only — shadow maps and depth pre-pass
+        // draws have no colour target at all. Only bail out when NOTHING is
+        // bound. The old `rt0.format == 0 → None` early-out silently dropped
+        // every depth-only draw into the offscreen fallback (MK8D issues
+        // 260k+ such draws during loading).
+        let rt0 = render_targets.render_targets[0];
+        let rt0_disabled =
+            rt0.address == 0 || rt0.width == 0 || rt0.height == 0 || rt0.format == 0;
+        let any_color_bound = color_ids
+            .iter()
+            .any(|id| id.is_valid() && *id != NULL_IMAGE_VIEW_ID);
+        let depth_bound = depth_id.is_valid() && depth_id != NULL_IMAGE_VIEW_ID;
+        if rt0_disabled && !any_color_bound && !depth_bound {
+            return None;
+        }
         let base_size = self.base.render_targets.size;
 
         let mut recreated = false;
@@ -3426,7 +3439,7 @@ impl TextureCache {
             color_views.push(view_handle);
         }
 
-        if colors.is_empty() {
+        if colors.is_empty() && !rt0_disabled {
             // The common cache did not register a colour view; fall back to
             // resolving RT0 directly by GPU address (parity with prior behaviour).
             let gpu_memory = self.base.channel_gpu_memory.as_ref()?.lock();
@@ -3488,9 +3501,18 @@ impl TextureCache {
             }
         }
 
-        let rt0_view_id = colors[0].1;
-        let rt0_image_id = self.base.slot_image_views[rt0_view_id].image_id;
-        let rt0_cpu = self.base.slot_images[rt0_image_id].cpu_addr;
+        // Depth-only framebuffers have no colour attachment at all.
+        if colors.is_empty() && depth_view.is_none() {
+            return None;
+        }
+        let rt0_cpu = if let Some(&(_, rt0_view_id, _)) = colors.first() {
+            let rt0_image_id = self.base.slot_image_views[rt0_view_id].image_id;
+            self.base.slot_images[rt0_image_id].cpu_addr
+        } else {
+            // Depth-only: key writes/invalidation on the depth image instead.
+            let depth_image_id = self.base.slot_image_views[depth_id].image_id;
+            self.base.slot_images[depth_image_id].cpu_addr
+        };
 
         if std::env::var_os("RUZU_TRACE_VK_RT_FRAMEBUFFER").is_some() {
             log::info!(
