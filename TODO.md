@@ -1276,6 +1276,83 @@ structured_control_flow unit tests (conditional_exit/unconditional_exit/
 conditional_forward_branch) fail identically before and after this
 change — pre-existing breakage, not introduced here.
 
+### 2026-07-08 — Pipeline disk cache / async pipeline preload status
+
+Objective file
+`/Users/vricosti/.codex/attachments/34ce0e81-0796-4f62-a368-d641ee3f3e7c/pasted-text-1.txt`
+requires the Vulkan disk pipeline cache path to match upstream:
+`PipelineCache::LoadDiskResources`, async build ownership, disk-rebuildable
+`GraphicsPipelineKey`, and MK8D verification.
+
+Current status:
+- `LoadDiskResources` parses
+  `/Users/vricosti/.local/share/ruzu/shader/0100152000022000/vulkan.bin`
+  through `VideoCommon::LoadPipelines`, queues rebuild work, inserts rebuilt
+  compute/graphics pipelines into the Vulkan caches, and serializes
+  `vulkan_pipelines.bin`.
+- Runtime graphics already uses upstream-style `ThreadWorker` final pipeline
+  creation for async shaders, and disk graphics rebuild uses `FixedPipelineState`
+  instead of a live `DrawCall` for render pass, vertex input, raster/blend/depth
+  state.
+- 2026-07-08 change: compute pipeline construction now also has the upstream
+  nullable-worker model (`ComputePipeline::new_with_worker`), and
+  `PipelineCache::CreateComputePipeline` passes `&workers` when
+  `use_asynchronous_shaders` is enabled. Disk preload remains build-job
+  queued with synchronous inner construction, matching upstream
+  `LoadDiskResources(... build_in_parallel=false)`.
+
+Verification:
+- `cargo check -p video_core` passes.
+- `cargo test -p video_core pipeline_cache --lib` passes (15/15).
+- `cargo build --release --bin ruzu-cmd` passes.
+- MK8D short run
+  `/tmp/ruzu_mk8d_pipeline_async_1783545423`: loaded `vulkan.bin` at t=0.67s,
+  reported `Total Pipeline Count: 2932 (built=1055, skipped=1877)` at t=4.61s,
+  and sample at t≈10s contained no `shader_recompiler` frames.
+
+Remaining validation gap:
+- This proves disk preload is active and removes shader-recompiler domination
+  from the captured t≈10s sample, but it does not yet prove the visual/audio
+  transition reaches parity with yuzu. A longer interactive MK8D run is still
+  needed to confirm the first logo advances around frame ~360 / ~3-4s with
+  the expected audio transition.
+
+### 2026-07-08 — FIXED: depth-only draws were dropped (rt0 fmt=0 → offscreen fallback)
+
+`update_render_targets_and_get_rt0_framebuffer` bailed out whenever
+RT0 had format 0, throwing every depth-only draw (shadow maps, depth
+pre-pass — no colour target bound at all) into the internal offscreen
+fallback. MK8D issues 260k+ such draws during loading; upstream treats
+format 0 as "colour target disabled" (the per-target binding already
+did) and renders with the zeta attachment only. Fixed the early-out to
+bail only when nothing is bound, skipped the RT0-by-address fallback for
+disabled RT0, and made the framebuffer key/rt0_cpu fall back to the
+depth image for colour-less framebuffers (render_pass_cache and
+create_framebuffer_owner already supported 0 colour attachments).
+Validation: [DRAW_OFFSCREEN] 262k+ → **0**, splash at t=30s intact, no
+new MoltenVK errors.
+
+### 2026-07-08 — OPEN: game freezes mid-spinner at t≈140-200s (leaked context guards, no spin)
+
+End-to-end timing runs revealed the spinner IMAGE FREEZES (byte-identical
+window captures) at t≈142s / t≈203s in consecutive runs — the boot never
+reaches the title screen not because loading is slow but because the game
+wedges. SIGUSR1 + host sample on a frozen instance (t=250):
+- 8+ threads (incl. the Main thread, tid 74, and freshly spawned loaders
+  113-119) have `ctx_guard locked=true` with `last_lock=switch_fiber` and
+  no matching unload — permanently unschedulable.
+- Unlike the RUZU_SERVER_THREAD_IPC_ALL wedge (fixed in d106a16), NO
+  switch fiber is spinning: all cores sleep in PhysicalCore::idle while
+  core 2 shows `needs_scheduling=true, highest=83, current=idle` — a
+  lost reschedule on top of the leaked guards.
+- This matches the old "Sig-A wedge" note (frame production collapses
+  t≈210-240s, cores wedge one by one). d106a16 fixed one leak path
+  (stale switch_cur comparison); at least one more remains, plus a lost
+  IPI/needs_scheduling wake. Next: trace ctx_guard lock/unload pairing
+  per thread (RUZU_TRACE_CTX_GUARD already records sites) around the
+  freeze moment, and audit schedule_impl_fiber_loop exits that bypass
+  both yield and unlock (e.g. resolve/host-context failure paths).
+
 ### 2026-07-06 — OPEN: intermittent early wedge at t≈11-12s (~2/8 cold runs)
 
 Some runs stop presenting right at the preload→boot transition (0-3 present
