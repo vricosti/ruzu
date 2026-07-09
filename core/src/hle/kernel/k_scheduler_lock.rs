@@ -192,7 +192,24 @@ fn default_enable_scheduling(cores_needing_scheduling: u64) {
             }
         }
         _ => {
-            // No current thread (host thread) — just a no-op.
+            // No current guest thread — a host thread (CoreTiming timer,
+            // ServerManager, GPU thread…) is releasing the scheduler lock.
+            // Upstream `KScheduler::EnableScheduling` still reschedules in
+            // this case (k_scheduler.cpp):
+            //     if (!scheduler || kernel.IsPhantomModeForSingleCore()) {
+            //         KScheduler::RescheduleCores(kernel, cores_needing_scheduling);
+            //         KScheduler::RescheduleCurrentHLEThread(kernel);
+            //         return;
+            //     }
+            // Dropping the mask here silently lost every wake initiated from
+            // a host thread: KHardwareTimer::do_task would move a timed-out
+            // condvar/sleep waiter to RUNNABLE and set needs_scheduling on
+            // its core, but the sleeping core never received the IPI — it
+            // only resumed when some unrelated event happened to interrupt
+            // it. During MK8D's loading spinner (cores mostly asleep) this
+            // degraded every timeout-paced wake to ~seconds of latency and
+            // read as a mid-loading freeze.
+            super::k_scheduler::KScheduler::reschedule_cores(cores_needing_scheduling);
         }
     }
 }

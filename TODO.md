@@ -1332,7 +1332,44 @@ create_framebuffer_owner already supported 0 colour attachments).
 Validation: [DRAW_OFFSCREEN] 262k+ → **0**, splash at t=30s intact, no
 new MoltenVK errors.
 
-### 2026-07-08 — OPEN: game freezes mid-spinner at t≈140-200s (leaked context guards, no spin)
+### 2026-07-09 — FIXED: host-thread wakes never sent IPIs (the mid-spinner "freeze" below)
+
+Root cause of the 2026-07-08 mid-spinner freeze:
+`default_enable_scheduling` (k_scheduler_lock.rs) had a `_ => no-op`
+branch for "no current thread": when a HOST thread (CoreTiming's
+KHardwareTimer::do_task, ServerManager, GPU thread) released the
+scheduler lock, the `cores_needing_scheduling` mask was silently
+dropped — no IPI was ever sent. Upstream `KScheduler::EnableScheduling`
+calls `RescheduleCores(kernel, cores_needing_scheduling)` in exactly
+that case. Every timeout-paced wake (condvar/sleep timeouts delivered by
+the timer thread) marked the waiter RUNNABLE and set needs_scheduling on
+its core, but a sleeping core never woke — the frozen-instance dump
+showed core 2 asleep with needs=true, is_interrupted=false,
+highest=RUNNABLE-thread. During the loading spinner (cores mostly idle)
+every such wake waited for an unrelated event, degrading the game to
+~1% speed (window captures byte-frozen). The "leaked ctx_guard" threads
+in that dump were TERMINATED loaders (ThreadState 3 = TERMINATED;
+upstream intentionally skips their unlock) — red herring.
+
+Fix: the no-current-thread branch now calls
+`KScheduler::reschedule_cores(cores_needing_scheduling)` (upstream
+semantics). Validated: spinner window captures keep changing through
+t=305s (previously byte-identical from t≈142-203s), k_scheduler tests
+17/17, [CV_STATS] unchanged-healthy. Likely also implicated in the
+older intermittent wedges (t≈11-12s cold boots, "Sig-A" t≈210-240s).
+
+**Post-fix profile (t=150, all of today's fixes in)**: GPU thread
+saturated 99% doing real work — 78% DMA dispatch/draws (the depth-only
+draws now actually execute), 10% in MoltenVK
+MVKCmdBeginRenderPass::encode (render-pass fragmentation: one
+MTLRenderCommandEncoder per pass), 7% composite; shader compiles ≈ 0.
+CPU cores 70-99% idle waiting on the GPU (Main hits wait_host_stalled
+~14%). The loading bottleneck is now genuinely GPU-thread draw
+throughput (~2,500 draws/s vs yuzu's ~30k/s). Next targets: render-pass
+batching (draws alternating framebuffers must not reopen a render pass
+each time), then per-draw encode costs (descriptors/uploads).
+
+### 2026-07-08 — superseded: game freezes mid-spinner at t≈140-200s (see 2026-07-09 fix above)
 
 End-to-end timing runs revealed the spinner IMAGE FREEZES (byte-identical
 window captures) at t≈142s / t≈203s in consecutive runs — the boot never
