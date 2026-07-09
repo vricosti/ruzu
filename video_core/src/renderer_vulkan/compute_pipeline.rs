@@ -7,9 +7,10 @@
 //! Supports asynchronous pipeline building via a background thread worker.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use ash::vk;
+use common::thread_worker::ThreadWorker;
 use shader_recompiler::shader_info::Info as ShaderInfo;
 
 use super::pipeline_helper::{RESCALING_LAYOUT_SIZE, RESCALING_LAYOUT_WORDS_OFFSET};
@@ -54,15 +55,15 @@ pub struct ComputePipeline {
     descriptor_update_template: vk::DescriptorUpdateTemplate,
 
     /// The compiled compute pipeline handle.
-    pipeline: vk::Pipeline,
+    pipeline: Arc<Mutex<vk::Pipeline>>,
 
     /// Uniform buffer sizes per binding (from shader info).
     uniform_buffer_sizes: [u32; ShaderInfo::MAX_CBUFS],
 
     /// Synchronization for async build.
-    build_condvar: Condvar,
-    build_mutex: Mutex<()>,
-    is_built: AtomicBool,
+    build_condvar: Arc<Condvar>,
+    build_mutex: Arc<Mutex<()>>,
+    is_built: Arc<AtomicBool>,
 }
 
 // Vulkan pipeline objects are opaque device handles. Upstream queues compute
@@ -88,6 +89,18 @@ impl ComputePipeline {
         spv_module: vk::ShaderModule,
         pipeline_cache: vk::PipelineCache,
     ) -> Option<Self> {
+        Self::new_with_worker(device, info, spv_module, pipeline_cache, None)
+    }
+
+    /// Port of `ComputePipeline::ComputePipeline` with an optional upstream
+    /// `Common::ThreadWorker`.
+    pub fn new_with_worker(
+        device: ash::Device,
+        info: ShaderInfo,
+        spv_module: vk::ShaderModule,
+        pipeline_cache: vk::PipelineCache,
+        worker: Option<&ThreadWorker>,
+    ) -> Option<Self> {
         let Some(descriptor_set_layout) = create_compute_descriptor_set_layout(&device, &info)
         else {
             unsafe {
@@ -104,31 +117,63 @@ impl ComputePipeline {
             return None;
         };
         let descriptor_update_template = vk::DescriptorUpdateTemplate::null();
-        // Build the compute pipeline synchronously
-        let main_name = std::ffi::CString::new("main").unwrap();
-        let stage_ci = vk::PipelineShaderStageCreateInfo::builder()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(spv_module)
-            .name(&main_name)
-            .build();
+        let mut uniform_buffer_sizes = [0u32; ShaderInfo::MAX_CBUFS];
+        uniform_buffer_sizes.copy_from_slice(&info.constant_buffer_used_sizes);
 
-        let ci = vk::ComputePipelineCreateInfo::builder()
-            .stage(stage_ci)
-            .layout(pipeline_layout)
-            .build();
+        let pipeline = Arc::new(Mutex::new(vk::Pipeline::null()));
+        let build_condvar = Arc::new(Condvar::new());
+        let build_mutex = Arc::new(Mutex::new(()));
+        let is_built = Arc::new(AtomicBool::new(false));
 
-        let pipeline = match unsafe { device.create_compute_pipelines(pipeline_cache, &[ci], None) }
-        {
-            Ok(pipelines) => pipelines[0],
-            Err(_) => unsafe {
+        let build = {
+            let device = device.clone();
+            let pipeline = pipeline.clone();
+            let build_condvar = build_condvar.clone();
+            let build_mutex = build_mutex.clone();
+            let is_built = is_built.clone();
+            move || {
+                let main_name = std::ffi::CString::new("main").unwrap();
+                let stage_ci = vk::PipelineShaderStageCreateInfo::builder()
+                    .stage(vk::ShaderStageFlags::COMPUTE)
+                    .module(spv_module)
+                    .name(&main_name)
+                    .build();
+
+                let ci = vk::ComputePipelineCreateInfo::builder()
+                    .stage(stage_ci)
+                    .layout(pipeline_layout)
+                    .build();
+
+                if let Ok(pipelines) =
+                    unsafe { device.create_compute_pipelines(pipeline_cache, &[ci], None) }
+                {
+                    *pipeline.lock().unwrap() = pipelines[0];
+                } else {
+                    log::warn!("ComputePipeline: failed to create compute pipeline");
+                }
+
+                {
+                    let _lock = build_mutex.lock().unwrap();
+                    is_built.store(true, Ordering::Release);
+                }
+                build_condvar.notify_one();
+            }
+        };
+        let build_in_parallel = worker.is_some();
+        if let Some(worker) = worker {
+            worker.queue_stateless_work(build);
+        } else {
+            build();
+        }
+
+        if !build_in_parallel && *pipeline.lock().unwrap() == vk::Pipeline::null() {
+            unsafe {
                 device.destroy_pipeline_layout(pipeline_layout, None);
                 device.destroy_descriptor_set_layout(descriptor_set_layout, None);
                 device.destroy_shader_module(spv_module, None);
-                return None;
-            },
-        };
-        let mut uniform_buffer_sizes = [0u32; ShaderInfo::MAX_CBUFS];
-        uniform_buffer_sizes.copy_from_slice(&info.constant_buffer_used_sizes);
+            }
+            return None;
+        }
 
         Some(ComputePipeline {
             device,
@@ -139,9 +184,9 @@ impl ComputePipeline {
             descriptor_update_template,
             pipeline,
             uniform_buffer_sizes,
-            build_condvar: Condvar::new(),
-            build_mutex: Mutex::new(()),
-            is_built: AtomicBool::new(true),
+            build_condvar,
+            build_mutex,
+            is_built,
         })
     }
 
@@ -162,20 +207,13 @@ impl ComputePipeline {
         cmdbuf: vk::CommandBuffer,
         descriptor_set: vk::DescriptorSet,
     ) {
-        // Wait for build if async
-        if !self.is_built.load(Ordering::Acquire) {
-            let lock = self.build_mutex.lock().unwrap();
-            let _guard = self
-                .build_condvar
-                .wait_while(lock, |_| !self.is_built.load(Ordering::Relaxed));
-        }
-
-        if self.pipeline == vk::Pipeline::null() {
+        let pipeline = self.pipeline();
+        if pipeline == vk::Pipeline::null() {
             return;
         }
 
         unsafe {
-            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
             if descriptor_set != vk::DescriptorSet::null() {
                 device.cmd_bind_descriptor_sets(
                     cmdbuf,
@@ -196,7 +234,8 @@ impl ComputePipeline {
 
     /// Returns the pipeline handle.
     pub fn pipeline(&self) -> vk::Pipeline {
-        self.pipeline
+        self.wait_for_build();
+        *self.pipeline.lock().unwrap()
     }
 
     /// Returns the pipeline layout handle.
@@ -225,6 +264,17 @@ impl ComputePipeline {
     pub fn requires_descriptor_binding(&self) -> bool {
         info_requires_descriptor_binding(&self.info)
     }
+
+    fn wait_for_build(&self) {
+        if self.is_built.load(Ordering::Acquire) {
+            return;
+        }
+        let lock = self.build_mutex.lock().unwrap();
+        let _guard = self
+            .build_condvar
+            .wait_while(lock, |_| !self.is_built.load(Ordering::Relaxed))
+            .unwrap();
+    }
 }
 
 pub fn info_requires_descriptor_binding(info: &ShaderInfo) -> bool {
@@ -238,9 +288,11 @@ pub fn info_requires_descriptor_binding(info: &ShaderInfo) -> bool {
 
 impl Drop for ComputePipeline {
     fn drop(&mut self) {
+        self.wait_for_build();
         unsafe {
-            if self.pipeline != vk::Pipeline::null() {
-                self.device.destroy_pipeline(self.pipeline, None);
+            let pipeline = *self.pipeline.lock().unwrap();
+            if pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(pipeline, None);
             }
             if self.pipeline_layout != vk::PipelineLayout::null() {
                 self.device

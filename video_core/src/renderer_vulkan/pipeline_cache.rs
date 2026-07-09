@@ -824,11 +824,12 @@ impl PipelineCache {
             .code(&compiled.spirv_words)
             .build();
         let spv_module = unsafe { self.device.create_shader_module(&create_info, None).ok()? };
-        ComputePipeline::new(
+        ComputePipeline::new_with_worker(
             self.device.clone(),
             compiled.info,
             spv_module,
             self.vulkan_pipeline_cache,
+            self.use_asynchronous_shaders.then_some(&self.workers),
         )
         .or_else(|| {
             log::warn!(

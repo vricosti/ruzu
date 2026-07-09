@@ -21699,3 +21699,44 @@ Upstream files:
   `259us`, and no recurring ~1s layout stalls. Before this change,
   `/tmp/ruzu_mk8d_vkcomp2_1783277448` accumulated ~18.8s in layout locking
   with repeated ~1s composite spikes.
+
+## 2026-07-08 — video_core/src/renderer_vulkan/compute_pipeline.rs vs upstream video_core/renderer_vulkan/vk_compute_pipeline.cpp
+
+### Intentional differences
+- Rust stores the async `VkPipeline` handle in `Arc<Mutex<vk::Pipeline>>`
+  with `Arc<Condvar>`/`Arc<AtomicBool>` so the queued `ThreadWorker` closure
+  can publish the result safely. Upstream stores the handle directly because
+  the queued lambda captures `this` for an owning C++ object.
+- `ComputePipeline::new_with_worker(..., Option<&ThreadWorker>)` replaces
+  upstream's nullable `Common::ThreadWorker* thread_worker` constructor
+  argument. `None` preserves the synchronous path; `Some(worker)` queues the
+  descriptor-layout/pipeline-layout/final `vkCreateComputePipelines` work.
+- Runtime `PipelineCache::CreateComputePipeline` passes
+  `self.use_asynchronous_shaders.then_some(&self.workers)`, matching upstream
+  `build_in_parallel ? &workers : nullptr`.
+
+### Unintentional differences (to fix)
+- Upstream also notifies `shader_notify` and optionally collects
+  `PipelineStatistics` inside the queued compute build closure. ruzu does not
+  yet have those Vulkan compute constructor dependencies wired through this
+  reduced backend path.
+
+### Missing items
+- Full compute `Configure(...)` ownership is still reduced versus upstream:
+  descriptor queue acquisition, descriptor allocator/template ownership, and
+  texture/buffer descriptor synchronization are not fully ported here.
+
+### Binary layout verification
+- N/A: no guest ABI or serialized disk-cache layout changed. The existing
+  `ComputePipelineCacheKey` layout tests still cover the disk key.
+
+### Verification
+- Re-read upstream `vk_compute_pipeline.cpp`: constructor builds descriptor
+  layout, pipeline layout, update template, descriptor allocator, then creates
+  the compute pipeline inside a closure queued to `thread_worker` when present;
+  `Configure` waits before binding.
+- Re-read upstream `vk_pipeline_cache.cpp`: `CreateComputePipeline(...,
+  build_in_parallel)` passes `build_in_parallel ? &workers : nullptr` to the
+  compute pipeline constructor.
+- `cargo check -p video_core` passes.
+- `cargo test -p video_core pipeline_cache --lib` passes: 15 passed, 0 failed.
