@@ -1369,6 +1369,34 @@ throughput (~2,500 draws/s vs yuzu's ~30k/s). Next targets: render-pass
 batching (draws alternating framebuffers must not reopen a render pass
 each time), then per-draw encode costs (descriptors/uploads).
 
+### 2026-07-09 — DIAGNOSED: GPU-thread draw throughput gap = inline Vulkan execution (upstream uses a scheduler worker thread)
+
+With the GPU thread now saturated on real work, aggregated its 8s
+profile: **~40% goes to MoltenVK encode/submit on the GPU thread itself**
+(MVKQueue::submit 1816/4435 samples, vkQueueSubmit 908, flush_impl 921,
+MVKCommandEncoder::encode 892 incl. beginMetalRenderPass 808). Render
+pass churn measured with new `[RP_STATS]` counters: ~1,300 begins/s —
+76% genuine framebuffer switches (the game alternates depth-only and
+colour targets), 24% forced reentries; upstream emits the exact same
+EndRenderPass barriers (vk_scheduler.cpp:291-326), so that part is
+parity.
+
+The structural difference: upstream `Scheduler::Flush` only queues the
+recorded chunk for its **worker thread** (vk_scheduler.cpp:46
+`worker_thread = std::jthread(WorkerThread)`), which replays commands,
+encodes and submits off the hot path — yuzu's "VulkanWorker" thread was
+visibly busy in its boot sample. ruzu's scheduler executes every chunk
+INLINE on the GPU thread (`dispatch_work` runs the closures, flush_impl
+calls vkQueueSubmit synchronously), so all MoltenVK encode/submit cost
+lands on the DMA-pusher critical path. `queue_fence` (one flush per
+guest syncpoint fence) makes this fire constantly during loading.
+
+**Next**: port the upstream scheduler worker thread (chunks already are
+boxed closures in ruzu — the recording side is ready; needs the
+WorkerThread loop, AcquireNewChunk reserve, per-chunk submit handoff and
+master-semaphore tick handshake). Expected to reclaim ~40% of the GPU
+thread and materially raise the ~2,500 draws/s ceiling.
+
 ### 2026-07-08 — superseded: game freezes mid-spinner at t≈140-200s (see 2026-07-09 fix above)
 
 End-to-end timing runs revealed the spinner IMAGE FREEZES (byte-identical
