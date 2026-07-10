@@ -47,10 +47,20 @@ pub struct StagingBufferPool {
     physical_device: vk::PhysicalDevice,
     scheduler: NonNull<Scheduler>,
 
-    /// Stream buffer for small allocations (1 MB, reused per frame).
+    /// Stream buffer for small per-draw allocations (uniforms, index data).
+    ///
+    /// Port of upstream's 128MiB stream buffer split into `NUM_SYNCS`
+    /// regions, each stamped with the tick of the submission that may read
+    /// it (vk_staging_buffer_pool.cpp GetStreamBuffer). A region is only
+    /// reused once `Scheduler::known_gpu_tick` passes its stamp — the old
+    /// per-frame `stream_offset = 0` reset recycled mappings while earlier
+    /// (possibly not even submitted) work still read them.
     stream_buffer: Option<StagingBuffer>,
-    stream_offset: vk::DeviceSize,
     stream_capacity: vk::DeviceSize,
+    stream_iterator: vk::DeviceSize,
+    stream_used_iterator: vk::DeviceSize,
+    stream_free_iterator: vk::DeviceSize,
+    stream_sync_ticks: [u64; Self::NUM_SYNCS],
 
     /// Dedicated staging buffers owned by the pool, matching upstream cached
     /// staging entries. Returned `StagingBuffer`s are references to these
@@ -61,8 +71,12 @@ pub struct StagingBufferPool {
 }
 
 impl StagingBufferPool {
-    /// Default stream buffer size (1 MB).
-    const STREAM_BUFFER_SIZE: vk::DeviceSize = 1024 * 1024;
+    /// Stream buffer size, port of upstream `MAX_STREAM_BUFFER_SIZE` (128MiB).
+    const STREAM_BUFFER_SIZE: vk::DeviceSize = 128 * 1024 * 1024;
+    /// Port of upstream `StagingBufferPool::NUM_SYNCS`.
+    const NUM_SYNCS: usize = 16;
+    /// Port of upstream `MAX_ALIGNMENT`.
+    const MAX_ALIGNMENT: vk::DeviceSize = 256;
 
     pub fn new(
         device: ash::Device,
@@ -76,8 +90,11 @@ impl StagingBufferPool {
             physical_device,
             scheduler: NonNull::from(scheduler),
             stream_buffer: None,
-            stream_offset: 0,
             stream_capacity: Self::STREAM_BUFFER_SIZE,
+            stream_iterator: 0,
+            stream_used_iterator: 0,
+            stream_free_iterator: 0,
+            stream_sync_ticks: [0; Self::NUM_SYNCS],
             buffers: Vec::new(),
             unique_ids: 1,
             current_delete_level: 0,
@@ -120,11 +137,12 @@ impl StagingBufferPool {
         buffer.deferred = false;
     }
 
-    /// Reset stream buffer offset for a new frame.
+    /// Per-frame housekeeping (upstream `TickFrame`): rotate the deletion
+    /// level. The stream buffer is NOT reset here — its regions retire
+    /// individually against the GPU timeline (see `try_stream_allocate`).
     pub fn new_frame(&mut self) {
         self.current_delete_level = (self.current_delete_level + 1) % vk::DeviceSize::BITS;
         self.release_level(self.current_delete_level);
-        self.stream_offset = 0;
     }
 
     fn scheduler(&self) -> &Scheduler {
@@ -140,8 +158,12 @@ impl StagingBufferPool {
         usage: StagingBufferUsage,
         deferred: bool,
     ) -> Option<StagingBuffer> {
-        // Upstream only uses the stream buffer for non-deferred uploads.
-        if !deferred && usage == StagingBufferUsage::Upload && size <= self.stream_capacity / 4 {
+        // Upstream only uses the stream buffer for non-deferred uploads that
+        // fit in one region (Request: `size <= region_size`).
+        if !deferred
+            && usage == StagingBufferUsage::Upload
+            && size <= self.stream_capacity / Self::NUM_SYNCS as vk::DeviceSize
+        {
             if let Some(buf) = self.try_stream_allocate(size) {
                 return Some(buf);
             }
@@ -153,37 +175,82 @@ impl StagingBufferPool {
         self.create_staging_buffer(size, usage, deferred)
     }
 
+    /// Port of upstream `StagingBufferPool::GetStreamBuffer`
+    /// (vk_staging_buffer_pool.cpp:105-139). Returns `None` (upstream falls
+    /// back to `GetStagingBuffer`) instead of waiting when the required
+    /// regions are still referenced by in-flight GPU work.
     fn try_stream_allocate(&mut self, size: vk::DeviceSize) -> Option<StagingBuffer> {
         // Initialize stream buffer if needed
         if self.stream_buffer.is_none() {
             let buf = self.allocate_buffer(self.stream_capacity)?;
             self.stream_buffer = Some(buf);
-            self.stream_offset = 0;
+            self.stream_iterator = 0;
+            self.stream_used_iterator = 0;
+            self.stream_free_iterator = 0;
+            self.stream_sync_ticks = [0; Self::NUM_SYNCS];
         }
 
-        let stream = self.stream_buffer.as_ref()?;
+        let region_size = self.stream_capacity / Self::NUM_SYNCS as vk::DeviceSize;
+        let region = |offset: vk::DeviceSize| (offset / region_size) as usize;
 
-        // Align offset to 256 bytes
-        let aligned_offset = (self.stream_offset + 255) & !255;
-        if aligned_offset + size > self.stream_capacity {
+        if self.are_stream_regions_active(
+            region(self.stream_free_iterator) + 1,
+            (region(self.stream_iterator + size) + 1).min(Self::NUM_SYNCS),
+        ) {
+            // Avoid waiting for the previous usages to be free.
             return None;
         }
 
-        let result = StagingBuffer {
+        let current_tick = self.scheduler().pending_tick();
+        for tick in &mut self.stream_sync_ticks
+            [region(self.stream_used_iterator)..region(self.stream_iterator)]
+        {
+            *tick = current_tick;
+        }
+        self.stream_used_iterator = self.stream_iterator;
+        self.stream_free_iterator = self.stream_free_iterator.max(self.stream_iterator + size);
+
+        if self.stream_iterator + size >= self.stream_capacity {
+            for tick in
+                &mut self.stream_sync_ticks[region(self.stream_used_iterator)..Self::NUM_SYNCS]
+            {
+                *tick = current_tick;
+            }
+            self.stream_used_iterator = 0;
+            self.stream_iterator = 0;
+            self.stream_free_iterator = size;
+
+            if self.are_stream_regions_active(0, region(size) + 1) {
+                // Avoid waiting for the previous usages to be free.
+                return None;
+            }
+        }
+
+        let offset = self.stream_iterator;
+        self.stream_iterator =
+            (self.stream_iterator + size + Self::MAX_ALIGNMENT - 1) & !(Self::MAX_ALIGNMENT - 1);
+
+        let stream = self.stream_buffer.as_ref()?;
+        Some(StagingBuffer {
             buffer: stream.buffer,
             memory: stream.memory,
-            mapped: unsafe { stream.mapped.add(aligned_offset as usize) },
-            offset: aligned_offset,
+            mapped: unsafe { stream.mapped.add(offset as usize) },
+            offset,
             size,
             usage: StagingBufferUsage::Upload,
             index: 0,
             log2_level: 0,
-            tick: self.scheduler().pending_tick(),
+            tick: current_tick,
             deferred: false,
-        };
+        })
+    }
 
-        self.stream_offset = aligned_offset + size;
-        Some(result)
+    /// Port of upstream `StagingBufferPool::AreRegionsActive`.
+    fn are_stream_regions_active(&self, region_begin: usize, region_end: usize) -> bool {
+        let gpu_tick = self.scheduler().known_gpu_tick();
+        self.stream_sync_ticks[region_begin..region_end]
+            .iter()
+            .any(|&sync_tick| gpu_tick < sync_tick)
     }
 
     fn try_get_reserved_buffer(
