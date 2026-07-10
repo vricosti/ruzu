@@ -8,9 +8,10 @@
 
 use ash::vk;
 use log::{debug, trace};
+use std::collections::VecDeque;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use super::state_tracker::StateTracker;
 
@@ -104,6 +105,136 @@ pub struct Scheduler {
     /// build a scheduler before a rasterizer state tracker exists, so this is
     /// installed by the rasterizer once both owners are allocated.
     state_tracker: Option<NonNull<StateTracker>>,
+
+    /// Submission worker ("VulkanWorker"), port of the submit half of
+    /// upstream `Scheduler::WorkerThread`. On MoltenVK all Metal encoding
+    /// happens inside vkQueueSubmit (measured ~40% of the GPU thread during
+    /// MK8D loading), so handing the submit to a worker moves that cost off
+    /// the DMA-pusher critical path. Command recording (incl.
+    /// end_command_buffer) stays on the GPU thread: Vulkan requires external
+    /// sync on the command POOL for recording, and ending is cheap.
+    /// `None` on the legacy no-timeline fence path (single submission in
+    /// flight cannot pipeline).
+    submit_worker: Option<Arc<SubmitWorker>>,
+    submit_worker_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// One queued submission for the worker: both command buffers are fully
+/// recorded and ended; the worker only calls vkQueueSubmit.
+struct SubmitJob {
+    render_cmdbuf: vk::CommandBuffer,
+    upload_cmdbuf: vk::CommandBuffer,
+    signal_semaphores: Vec<vk::Semaphore>,
+    tick: u64,
+}
+
+struct SubmitWorker {
+    state: Mutex<SubmitWorkerState>,
+    job_cv: Condvar,
+    /// Signalled whenever the queue drains to empty (for `wait_worker`).
+    drained_cv: Condvar,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+struct SubmitWorkerState {
+    jobs: VecDeque<SubmitJob>,
+    /// Jobs removed from `jobs` whose `vkQueueSubmit` has not returned yet.
+    in_flight: usize,
+}
+
+impl SubmitWorkerState {
+    fn is_drained(&self) -> bool {
+        self.jobs.is_empty() && self.in_flight == 0
+    }
+}
+
+fn submit_worker_sync_mode() -> bool {
+    static SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SYNC.get_or_init(|| {
+        std::env::var("RUZU_VK_SUBMIT_WORKER").is_ok_and(|v| v.eq_ignore_ascii_case("sync"))
+    })
+}
+
+impl SubmitWorker {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(SubmitWorkerState {
+                jobs: VecDeque::new(),
+                in_flight: 0,
+            }),
+            job_cv: Condvar::new(),
+            drained_cv: Condvar::new(),
+            stop: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn push(&self, job: SubmitJob) {
+        self.state.lock().unwrap().jobs.push_back(job);
+        self.job_cv.notify_one();
+    }
+
+    /// Block until every queued submission has been handed to the driver.
+    fn wait_drained(&self) {
+        let mut state = self.state.lock().unwrap();
+        while !state.is_drained() {
+            state = self.drained_cv.wait(state).unwrap();
+        }
+    }
+
+    fn run(
+        &self,
+        device: ash::Device,
+        queue: vk::Queue,
+        timeline: vk::Semaphore,
+        submit_mutex: Arc<Mutex<()>>,
+    ) {
+        loop {
+            let job = {
+                let mut state = self.state.lock().unwrap();
+                loop {
+                    if let Some(job) = state.jobs.pop_front() {
+                        state.in_flight += 1;
+                        break job;
+                    }
+                    if self.stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    state = self.job_cv.wait(state).unwrap();
+                }
+            };
+
+            let cmd_buffers = [job.upload_cmdbuf, job.render_cmdbuf];
+            let mut all_signals = Vec::with_capacity(1 + job.signal_semaphores.len());
+            all_signals.push(timeline);
+            all_signals.extend_from_slice(&job.signal_semaphores);
+            let mut signal_values = vec![0u64; all_signals.len()];
+            signal_values[0] = job.tick;
+            let mut timeline_info =
+                vk::TimelineSemaphoreSubmitInfo::builder().signal_semaphore_values(&signal_values);
+            let submit_info = vk::SubmitInfo::builder()
+                .command_buffers(&cmd_buffers)
+                .signal_semaphores(&all_signals)
+                .push_next(&mut timeline_info)
+                .build();
+            let submit_result = unsafe {
+                let _submit_lock = submit_mutex.lock().unwrap();
+                device.queue_submit(queue, &[submit_info], vk::Fence::null())
+            };
+            if let Err(error) = submit_result {
+                log::error!(
+                    "Vulkan submit worker failed to submit tick {}: {:?}",
+                    job.tick,
+                    error
+                );
+            }
+
+            let mut state = self.state.lock().unwrap();
+            state.in_flight -= 1;
+            if state.is_drained() {
+                self.drained_cv.notify_all();
+            }
+        }
+    }
 }
 
 impl Scheduler {
@@ -135,6 +266,32 @@ impl Scheduler {
             None
         };
 
+        let submit_mutex = Arc::new(Mutex::new(()));
+        // Port of upstream's Scheduler worker thread ("VulkanWorker"):
+        // vkQueueSubmit runs off the GPU thread, which on MoltenVK reclaims
+        // ~40% of it (all Metal encoding happens inside submit; measured
+        // vkQueueSubmit 1182→0 samples on the GPU thread). Default ON like
+        // upstream; RUZU_VK_SUBMIT_WORKER=0 forces synchronous submits and
+        // =sync drains after every push (debug modes).
+        let worker_enabled =
+            !std::env::var("RUZU_VK_SUBMIT_WORKER").is_ok_and(|v| v == "0" || v == "off");
+        let (submit_worker, submit_worker_thread) =
+            if let (true, Some(timeline)) = (worker_enabled, timeline_semaphore) {
+                let worker = Arc::new(SubmitWorker::new());
+                let thread_worker = Arc::clone(&worker);
+                let thread_device = device.clone();
+                let thread_mutex = Arc::clone(&submit_mutex);
+                let handle = std::thread::Builder::new()
+                    .name("VulkanWorker".into())
+                    .spawn(move || {
+                        thread_worker.run(thread_device, queue, timeline, thread_mutex);
+                    })
+                    .expect("Failed to spawn Vulkan submit worker");
+                (Some(worker), Some(handle))
+            } else {
+                (None, None)
+            };
+
         let mut scheduler = Self {
             device,
             queue,
@@ -148,8 +305,10 @@ impl Scheduler {
             state: SchedulerState::default(),
             fence,
             timeline_semaphore,
-            submit_mutex: Arc::new(Mutex::new(())),
+            submit_mutex,
             state_tracker: None,
+            submit_worker,
+            submit_worker_thread,
         };
         scheduler.allocate_new_context()?;
         Ok(scheduler)
@@ -381,7 +540,34 @@ impl Scheduler {
         let cmd_buffers = [self.upload_cmdbuf, self.current_cmdbuf];
 
         let tick = self.current_tick.fetch_add(1, Ordering::SeqCst) + 1;
-        if let Some(timeline) = self.timeline_semaphore {
+        if let Some(worker) = self.submit_worker.as_ref() {
+            // Hand the fully recorded pair to the submit worker: on MoltenVK
+            // vkQueueSubmit performs all Metal encoding, so this moves ~40%
+            // of the GPU thread's loading-phase cost off the critical path
+            // (upstream runs its whole chunk replay + submit on
+            // Scheduler::WorkerThread). Timeline waiters are unaffected
+            // (wait-before-signal is legal for timeline semaphores and jobs
+            // are FIFO).
+            worker.push(SubmitJob {
+                render_cmdbuf: self.current_cmdbuf,
+                upload_cmdbuf: self.upload_cmdbuf,
+                signal_semaphores: signal_semaphores.to_vec(),
+                tick,
+            });
+            if !signal_semaphores.is_empty() || submit_worker_sync_mode() {
+                // BINARY semaphores (e.g. the present manager's render_ready)
+                // do NOT allow wait-before-signal: the consumer may submit a
+                // batch waiting on them as soon as we return, so the signal
+                // must already be queued. Drain the worker on this path only —
+                // it fires per presented frame, while the high-volume
+                // syncpoint-fence flushes stay fully asynchronous.
+                // RUZU_VK_SUBMIT_WORKER=sync drains after every push: a
+                // debugging mode that keeps the submit on the worker THREAD
+                // but removes the deferral WINDOW, to bisect the corruption
+                // race between "window" and "thread" causes.
+                worker.wait_drained();
+            }
+        } else if let Some(timeline) = self.timeline_semaphore {
             // Upstream `MasterSemaphore::SubmitQueue`: signal the timeline
             // semaphore with this submission's tick and pipeline submissions
             // without waiting on the previous one. Each flush records into
@@ -553,6 +739,16 @@ impl Scheduler {
 
 impl Drop for Scheduler {
     fn drop(&mut self) {
+        // Drain and stop the submit worker before waiting on / destroying
+        // the timeline semaphore: pending jobs still reference it.
+        if let Some(worker) = self.submit_worker.take() {
+            worker.wait_drained();
+            worker.stop.store(true, Ordering::Release);
+            worker.job_cv.notify_all();
+            if let Some(handle) = self.submit_worker_thread.take() {
+                let _ = handle.join();
+            }
+        }
         unsafe {
             if let Some(timeline) = self.timeline_semaphore {
                 let tick = self.current_tick();
@@ -593,5 +789,17 @@ mod tests {
         assert!(!state.inside_renderpass);
         assert_eq!(state.renderpass, vk::RenderPass::null());
         assert_eq!(state.framebuffer, vk::Framebuffer::null());
+    }
+
+    #[test]
+    fn submit_worker_is_not_drained_while_submit_is_in_flight() {
+        let mut state = SubmitWorkerState {
+            jobs: VecDeque::new(),
+            in_flight: 1,
+        };
+        assert!(!state.is_drained());
+
+        state.in_flight = 0;
+        assert!(state.is_drained());
     }
 }
