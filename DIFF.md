@@ -21740,3 +21740,446 @@ Upstream files:
   compute pipeline constructor.
 - `cargo check -p video_core` passes.
 - `cargo test -p video_core pipeline_cache --lib` passes: 15 passed, 0 failed.
+
+## 2026-07-09 — video_core/src/renderer_vulkan/pipeline_cache.rs vs upstream video_core/renderer_vulkan/vk_pipeline_cache.cpp
+
+### Intentional differences
+- ruzu uses cache version 14 while the compared upstream revision uses version
+  11. ruzu's serialized `GraphicsPipelineKey`/`FixedPipelineState` layout and
+  sched-control anchoring have changed independently, so accepting older ruzu
+  cache files is unsafe even though the upstream version is unchanged.
+
+### Unintentional differences (to fix)
+- None for cache invalidation behavior: both implementations reject and delete
+  a cache whose version does not match the backend's current version.
+
+### Missing items
+- None for this versioning slice.
+
+### Binary layout verification
+- PASS: only the cache header version changes; the serialized payload layout is
+  unchanged. Version 13 files are rejected before payload decoding.
+
+### Verification
+- Re-read upstream `vk_pipeline_cache.cpp`: `CACHE_VERSION` is passed to both
+  `LoadPipelines` and Vulkan driver-cache load/save, so a semantic/layout change
+  is invalidated by advancing this single version.
+- MK8D A/B: the old version-13 cache loaded 9,992 entries, skipped 6,792 and
+  rendered a black title background; a freshly generated cache loaded 431
+  entries, skipped only 3 and rendered the complete title background.
+
+## 2026-07-09 — video_core/src/renderer_vulkan/fixed_pipeline_state.rs vs upstream video_core/renderer_vulkan/fixed_pipeline_state.h and vk_pipeline_cache.cpp
+
+### Intentional differences
+- Rust compares the ordered fields covered by `serialized_size()` rather than
+  invoking `memcmp` on the struct. This avoids depending on Rust padding while
+  preserving upstream's exact byte-prefix ownership and exclusion rules.
+
+### Unintentional differences (to fix)
+- None in this slice. The previous derived `PartialEq` compared fields beyond
+  upstream `FixedPipelineState::Size()`, so disk-loaded keys whose omitted
+  fields were zero never matched equivalent live keys.
+
+### Missing items
+- None for variable-size key equality and hashing.
+
+### Binary layout verification
+- PASS: serialization offsets remain 64/104/360/424/984 bytes. Equality and
+  hashing now cover the same prefix; transform feedback forces the full 984
+  bytes before dynamic-state early exits, matching upstream's first `Size()`
+  condition.
+
+### Verification
+- Re-read upstream `FixedPipelineState::Size()` and
+  `GraphicsPipelineCacheKey::operator==`/`Hash` in `vk_pipeline_cache.cpp`.
+- `cargo test -p video_core --lib fixed_pipeline_state::tests::`: 27 passed.
+- Two consecutive MK8D boots loaded the same 97 entries (`built=96`,
+  `skipped=1`); `vulkan.bin` remained exactly 339416 bytes and emitted no
+  `PIPELINE_KEY_DIFF`, fixing the approximately 100-entry growth per boot.
+
+## 2026-07-09 — shader_recompiler/src/backend/spirv/spirv_emit_context.rs vs upstream shader_recompiler/backend/spirv/emit_spirv.cpp and Sirit DeferredOpPhi
+
+### Intentional differences
+- rspirv stores deferred Phi records by result ID and patches the mutable
+  module operands. Upstream Sirit stores code-buffer offsets and patches raw
+  words. Both emit placeholder value IDs first and patch them after all IR
+  definitions exist.
+
+### Unintentional differences (to fix)
+- None in this slice. The previous Rust emitter resolved Phi operands while
+  emitting their block, unlike upstream `DeferredOpPhi`/`PatchPhiNodes`, and
+  panicked on legal forward or back-edge definitions.
+
+### Missing items
+- None for deferred Phi value patching.
+
+### Binary layout verification
+- N/A: SPIR-V instructions are assembled by rspirv. Patched operands preserve
+  the upstream `(value, predecessor label)` ordering.
+
+### Verification
+- Re-read upstream `EmitPhi`, `PatchPhiNodes`, Sirit `DeferredOpPhi`, and
+  `PatchDeferredPhi`.
+- `cargo test -p shader_recompiler --lib phi_values_are_patched_after_forward_definitions`
+  passes and verifies that a zero placeholder becomes the later definition ID.
+
+## 2026-07-10 — shader_recompiler/src/frontend/structured_control_flow.rs vs upstream shader_recompiler/frontend/maxwell/structured_control_flow.cpp
+
+### Intentional differences
+- Rust stores block indices in `SyntaxNode`; upstream stores stable `IR::Block*`
+  pointers. The recursive ownership and emission order now match.
+
+### Unintentional differences (to fix)
+- None in this slice. Rust previously stored `current_block` on
+  `TranslatePass`, sharing it across recursive `visit` calls. Upstream declares
+  it locally inside every `Visit`, and the child only branches to the supplied
+  fallthrough. The old Rust child emitted the fallthrough block itself and the
+  parent emitted it again, producing duplicate SPIR-V `OpLabel` definitions.
+
+### Missing items
+- Existing structured-control-flow test failures for conditional exit/forward
+  branch syntax remain pre-existing and outside this loop-fallthrough slice.
+
+### Binary layout verification
+- N/A.
+
+### Verification
+- Re-read upstream `TranslatePass::Visit`, especially the `If`, `Loop`, and
+  final fallthrough handling.
+- `loop_emits_continue_block_once_like_upstream_visit` passes.
+- MK8D preload SPIR-V duplicate-label failures dropped from 31 modules to 0.
+
+## 2026-07-10 — shader_recompiler/src/pipeline_cache.rs loop CFG reconstruction vs upstream BuildASL loop branches
+
+### Intentional differences
+- Rust reconstructs predecessor/successor vectors from `SyntaxNode` after
+  materialization; upstream attaches branches directly to `IR::Block` during
+  `TranslatePass::Visit`.
+
+### Unintentional differences (to fix)
+- None in this slice. Rust previously added `continue_block -> body` and
+  `continue_block -> merge` while processing `SyntaxNode::Loop`. Upstream adds
+  `loop_header -> body`, then `continue_block -> loop_header/merge`; the Rust
+  `Repeat` node already represents the latter two branches. The extra body edge
+  created Phi operands for a block that was not a SPIR-V predecessor.
+
+### Missing items
+- None for loop header/body/continue/merge edge ownership.
+
+### Binary layout verification
+- N/A.
+
+### Verification
+- Re-read upstream loop handling in `structured_control_flow.cpp`.
+- `loop_cfg_routes_continue_through_header_not_body` passes.
+- The remaining MK8D `spirv-val` failure (`OpPhi` incoming count 2 vs one
+  predecessor) is eliminated; all 92 dumped preload modules validate.
+
+## 2026-07-10 — video_core/src/renderer_vulkan/graphics_pipeline.rs vs upstream video_core/renderer_vulkan/vk_pipeline_cache.cpp
+
+### Intentional differences
+- `RUZU_DUMP_SPIRV_DIR` also covers disk-loaded and direct graphics stages.
+  This is env-gated diagnostics only; upstream shader dumping uses its settings
+  infrastructure.
+
+### Unintentional differences (to fix)
+- None in this slice. Disk-loaded graphics stages previously translated the
+  SPH-stripped instruction slice at `env.start_address()`. Upstream constructs
+  every graphics CFG at `env.StartAddress() + sizeof(Shader::ProgramHeader)`.
+  Rust now applies the same 0x50-byte offset for single and dual-vertex paths;
+  compute remains headerless.
+
+### Missing items
+- None for graphics FileEnvironment CFG start-address selection.
+
+### Binary layout verification
+- PASS: `ProgramHeader` remains 0x50 bytes; no cache payload fields changed.
+
+### Verification
+- Re-read both graphics pipeline creation loops in upstream
+  `vk_pipeline_cache.cpp` (normal build and exception-dump path).
+- Full MK8D cache loads `97 built, 0 skipped` and runs without Metal device
+  loss. Disk `stage4_base_010F80` and live `stage5_base_010F80` emit identical
+  SPIR-V hash `4BD624006F4172DE`.
+
+## 2026-07-10 — video_core/src/renderer_vulkan/fixed_pipeline_state.rs vs upstream video_core/renderer_vulkan/fixed_pipeline_state.cpp
+
+### Intentional differences
+- Rust refreshes from the immutable `DrawCall` snapshot rather than directly
+  from mutable Maxwell registers and dirty flags. `DrawCall::color_masks`
+  already contains the resolved per-target masks used by the live draw path.
+
+### Unintentional differences (to fix)
+- None in this slice. Rust previously initialized a blending attachment and
+  copied blend equations/factors only when blending was enabled, but never
+  copied the independent RGBA write mask. Upstream
+  `BlendingAttachment::Refresh` copies `regs.color_mask` before returning when
+  blending is disabled. Rust now preserves the mask in the same order.
+
+### Missing items
+- The broader `FixedPipelineState::refresh` DrawCall bridge and its documented
+  dynamic vertex-stride adaptation remain separate parity work; neither is
+  changed by this correction.
+
+### Binary layout verification
+- PASS: no field or offset changed. The existing 32-bit
+  `BlendingAttachment::raw` mask bits 0..3 are now populated and survive the
+  existing variable-size disk serialization.
+- Cache version increased from 14 to 15 because version-14 payloads contain
+  zero masks and cannot be repaired while loading.
+
+### Verification
+- Re-read upstream `FixedPipelineState::Refresh` and
+  `FixedPipelineState::BlendingAttachment::Refresh` in
+  `fixed_pipeline_state.cpp`; mask assignment precedes the disabled-blend
+  early return in both implementations.
+- `cargo test -p video_core --lib fixed_pipeline_state::tests:: --release`
+  passes, including a disabled-blend color-mask disk round-trip regression.
+- MK8D v15 cold/warm framebuffer sources at present frame 600 are byte-for-byte
+  identical (`ImageMagick compare AE=0`); warm preload builds all 100 entries
+  and the captured swapchain is colored.
+
+## 2026-07-10 — video_core/src/renderer_vulkan/buffer_cache.rs vs upstream video_core/renderer_vulkan/vk_buffer_cache.h
+
+### Intentional differences
+- Rust implements upstream `MemoryTrackerBase<Tegra::MaxwellDeviceMemoryManager>`
+  through the `DeviceTracker` trait. The concrete tracker and ownership are the
+  same; only the generic interface differs.
+
+### Unintentional differences (to fix)
+- None in this slice. Vulkan previously instantiated the common buffer cache
+  with a no-op tracker, so buffer registration never updated guest cached-page
+  counts. It now forwards `update_pages_cached_count` to the real
+  `MaxwellDeviceMemoryManager`.
+
+### Missing items
+- None for Vulkan buffer page registration/invalidation tracking.
+
+### Binary layout verification
+- N/A.
+
+### Verification
+- Re-read upstream `Vulkan::BufferCacheParams` and its
+  `MemoryTrackerBase<Tegra::MaxwellDeviceMemoryManager>` alias.
+- `cargo check -p video_core` passes.
+- MK8D prompt pages transition to `RasterizerCachedMemory`; subsequent guest
+  writes reach `BufferCache::OnCPUWrite`.
+
+## 2026-07-10 — core/src/memory/memory.rs vs upstream core/memory.cpp HandleRasterizerWrite
+
+### Intentional differences
+- Rust's SMMU bridge gathers aliases into an owned vector before invoking the
+  callback instead of using upstream's per-core `ScratchBuffer<u32>`. This
+  avoids holding the reverse-map mutex while entering the rasterizer and
+  preserves the same alias order-independent behavior.
+- Per-core write state and GPU dirty managers are individually mutex-protected;
+  upstream only needs an extra `sys_core_guard` for non-core callers because
+  its system-core scratch/state are otherwise unsynchronized.
+- If no SMMU reverse mapping exists, Rust retains the existing physical-address
+  fallback. Registered GPU mappings take the upstream host-pointer path.
+
+### Unintentional differences (to fix)
+- None in this slice. Rust previously called `current_physical_address` once
+  and only used the first dirty manager. It now applies the operation to every
+  SMMU alias, uses the current host-core slot, preserves the per-page
+  `last_address` fast path, and collects into that core's dirty manager in the
+  same order as upstream.
+
+### Missing items
+- None for `HandleRasterizerWrite` alias fan-out and dirty collection.
+
+### Binary layout verification
+- N/A.
+
+### Verification
+- Re-read upstream `Memory::Impl::HandleRasterizerWrite` and
+  `DeviceMemoryManager::ApplyOpOnPointer`.
+- The three focused `smmu_apply_op_on_host_pointer` tests pass, including
+  multiple aliases with an intra-page offset.
+- MK8D trace: each prompt write resolved one SMMU alias and every animated
+  SSBO synchronization uploaded the dirty page (960/960 in 30 seconds).
+
+## 2026-07-10 — externals/rdynarmic/src/backend/arm64/emit_arm64_memory.rs vs upstream dynarmic backend/arm64/emit_arm64_memory.cpp
+
+### Intentional differences
+- None in `ShouldFastmem`; Rust now applies the same exception-handler
+  capability predicate as upstream.
+
+### Unintentional differences (to fix)
+- None in this slice. Rust previously enabled direct fastmem from the pointer
+  and address-space flags alone. Upstream also requires
+  `ctx.fastmem.SupportsFastmem()`, because protected-page faults need an
+  exception handler to redirect the access to callbacks.
+
+### Missing items
+- A concrete macOS ARM64 fastmem exception handler remains unported. Until it
+  exists, `NullExceptionHandler` correctly disables fastmem and the page-table
+  path preserves cache notifications.
+
+### Binary layout verification
+- N/A.
+
+### Verification
+- Re-read upstream `ShouldFastmem`.
+- `cargo test -p rdynarmic --release backend::arm64::fastmem` passes: 3 passed.
+## 2026-07-10 - video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.h/.cpp
+
+### Intentional differences
+- Rust still transports the selected framebuffer through `RenderTargetFramebuffer` because the rasterizer and split texture-cache backend cannot retain an upstream-style `Framebuffer*` across the borrow boundary. The transport now copies the upstream-owned attachment metadata without changing it.
+- Unbound Rust `rt_map` entries use `u8::MAX` rather than upstream's zero-initialized `size_t`. `has_aspect_color_bit` rejects these entries explicitly; for an unbound subpass slot this has the same no-clear result as `VK_ATTACHMENT_UNUSED`.
+
+### Unintentional differences (to fix)
+- None in the framebuffer attachment mapping corrected by this slice.
+
+### Missing items
+- The broader split `TextureCacheBase` metadata / Vulkan backend ownership remains documented in earlier entries and is outside this framebuffer-clear slice.
+
+### Binary layout verification
+- N/A: these are host-only Vulkan owners and transport values.
+
+### Verification
+- Re-read upstream `Framebuffer::CreateFramebuffer` and `Framebuffer::HasAspectColorBit` in `vk_texture_cache.h/.cpp`.
+- Rust now preserves each original RT slot in `rt_map`, records `images` and `image_ranges` from the exact bound `ImageView` rather than an arbitrary view sharing the `ImageId`, uses view dimensions, propagates attachment samples, and creates the framebuffer with the maximum bound view layer count.
+- `renderer_vulkan::texture_cache::tests::render_target_framebuffer_preserves_sparse_rt_slot_map` passes.
+
+## 2026-07-10 - video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp
+
+### Intentional differences
+- Rust obtains an owned `RenderTargetFramebuffer` transport from the texture cache before recording the clear; upstream keeps a `Framebuffer*`. Attachment slot, aspect, image and range semantics are unchanged.
+
+### Unintentional differences (to fix)
+- None in `RasterizerVulkan::Clear` after this slice.
+
+### Missing items
+- None for color-attachment selection and clear-value conversion.
+
+### Binary layout verification
+- N/A: Vulkan command descriptions are host-only values.
+
+### Verification
+- Re-read upstream `RasterizerVulkan::Clear` in `vk_rasterizer.cpp`.
+- Rust now clears `regs.clear_surface.RT` instead of silently skipping every non-RT0 color clear, checks the selected attachment's color aspect, uses upstream float/unsigned/signed clear-value conversion, routes partial channel masks through `BlitImageHelper::ClearColor`, and uses the actual stencil aspect flag.
+- Removed the extra RT0 `vkCmdClearColorImage` transfer clear and outside-render-pass transition, neither of which exists upstream.
+- `renderer_vulkan::tests::color_clear_value_matches_upstream_format_conversion` passes.
+
+## 2026-07-10 - video_core/src/renderer_vulkan/blit_image.rs vs video_core/renderer_vulkan/blit_image.h/.cpp
+
+### Intentional differences
+- `BlitFramebufferInfo` is a copyable Rust transport instead of an upstream `Framebuffer*`.
+
+### Unintentional differences (to fix)
+- None in the framebuffer image/range capacity corrected by this slice.
+
+### Missing items
+- None for carrying the complete framebuffer attachment set into `BlitImageHelper::ClearColor`.
+
+### Binary layout verification
+- N/A: `BlitFramebufferInfo` is not serialized or shared with guest code.
+
+### Verification
+- Re-read upstream `BlitImageHelper::ClearColor` and `Framebuffer::Images/ImageRanges`.
+- Rust transport capacity now matches upstream's `NUM_RT + 1` images/ranges instead of truncating every helper operation to one attachment.
+## 2026-07-10 — core/src/hle/kernel/k_light_lock.rs vs core/hle/kernel/k_light_lock.h/.cpp
+
+### Intentional differences
+- `KLightLock` obtains the active kernel/scheduler through ruzu's installed `KernelCore` accessors instead of storing a C++ `KernelCore&`; lock ownership and scheduling still use the same kernel-wide objects.
+- `ThreadQueueImplForKLightLock` is represented by a `KThreadQueue` value with the light-lock cancellation callback because Rust does not store a borrowed stack-local polymorphic queue pointer in `KThread`.
+- Before a `KernelCore` exists, isolated native tests use a host-tag/condition-variable fallback. Emulated CPU cores always have a real `KThread` and use the scheduler/fiber path; the fallback cannot park a guest core.
+- Rust waiter lists identify threads by ID, so ownership transfer resolves the corresponding `Arc<KThreadLock>` before installing the exact stable `KThread` pointer in the tag.
+
+### Unintentional differences (to fix)
+- None found in the emulated-thread lock/unlock ordering.
+
+### Missing items
+- None for `KLightLock`.
+
+### Binary layout verification
+- N/A: `KLightLock` is an internal host object. The atomic tag retains upstream's pointer-plus-waiter-bit representation.
+## 2026-07-10 — video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp
+
+### Intentional differences
+- Added disabled-by-default `RUZU_TRACE_VK_DRAW_RT` filtering to the existing Rust-only draw diagnostics. Upstream has no equivalent environment trace; this changes no rendering state and only limits diagnostic log emission to one guest RT0 address.
+
+### Unintentional differences (to fix)
+- None introduced by this diagnostic slice.
+
+### Missing items
+- None for this diagnostic filter.
+
+### Binary layout verification
+- N/A: no serialized or guest-visible layout changed.
+
+## 2026-07-10 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- The Rust-only image dump now decodes `VK_FORMAT_B10G11R11_UFLOAT_PACK32` and applies a Reinhard display curve. Upstream has no PPM diagnostic path; the conversion affects only env-gated host dumps and does not alter the Vulkan image or guest memory.
+
+### Unintentional differences (to fix)
+- None introduced by this diagnostic slice.
+
+### Missing items
+- The active MK8D white-attract investigation still needs the bloom draw inputs and alias-copy regions compared against upstream.
+
+### Binary layout verification
+- N/A: no serialized or guest-visible layout changed.
+## 2026-07-10 — video_core/src/renderer_vulkan/mod.rs and buffer_cache.rs vs video_core/buffer_cache/buffer_cache.h and video_core/renderer_vulkan/vk_buffer_cache.cpp
+
+### Intentional differences
+- The active Rust Vulkan geometry path still uses a reduced GPU-VA keyed direct cache while the upstream-shaped common cache owns descriptors. Until geometry is migrated to `UpdateGraphicsBuffers` / `BindHostGeometryBuffers`, Rust forwards CPU writes, cache invalidations and unmaps to both owners.
+
+### Unintentional differences (fixed)
+- Fixed: `invalidate_region`, `on_cache_invalidation`, `on_cpu_write`, and `unmap_memory` previously notified only `VulkanCommonBufferCache`. Vertex/index bindings still came from `DirectBufferCache`, whose address cache therefore returned stale `VkBuffer` contents after the guest rewrote a range. All four lifecycle edges now evict overlapping direct-cache entries before later draws.
+
+### Missing items
+- Complete the upstream-owned geometry path: expose real draw dirty flags through `VulkanDrawStateEngineAdapter`, extend the runtime index-binding contract with topology/index format/base vertex/count, implement Vulkan `BindIndexBuffer` and `BindVertexBuffers`, call `UpdateGraphicsBuffers(is_indexed)` plus `BindHostGeometryBuffers`, then remove direct geometry binding/cache ownership.
+
+### Binary layout verification
+- N/A: this changes host cache invalidation only.
+
+### Verification
+- Re-read upstream `BufferCache<P>::UpdateGraphicsBuffers`, `BindHostGeometryBuffers`, `BindHostIndexBuffer`, `BindHostVertexBuffers`, and `SynchronizeBuffer` in `video_core/buffer_cache/buffer_cache.h`.
+- Re-read upstream Vulkan `BufferCacheRuntime::BindIndexBuffer` and `BindVertexBuffers` in `video_core/renderer_vulkan/vk_buffer_cache.cpp`.
+- Added half-open overlap regression coverage for the reduced direct cache.
+## 2026-07-10 - `video_core/src/renderer_vulkan/scheduler.rs` vs `video_core/renderer_vulkan/vk_scheduler.cpp/.h`
+
+### Intentional differences
+- Rust's reduced submit worker receives already-ended command buffers rather than executing upstream `CommandChunk` objects. `SubmitWorkerState::in_flight` is the Rust equivalent of upstream `execution_mutex`: it distinguishes an empty work queue from completion of the work already removed from that queue.
+
+### Unintentional differences (fixed)
+- Fixed: `wait_drained()` previously returned as soon as `jobs` became empty, even when the worker had popped the final job but had not completed `vkQueueSubmit`. It now waits for both `jobs.is_empty()` and `in_flight == 0`, matching upstream `WaitWorker()` which first drains `work_queue` and then acquires `execution_mutex`.
+- Fixed: submit-worker `vkQueueSubmit` failures are no longer discarded through `.ok()`; the failing tick and `VkResult` are logged. Upstream additionally routes `VK_ERROR_DEVICE_LOST` through `Device::ReportLoss`, whose device-loss owner is not yet present in this reduced scheduler.
+
+### Missing items
+- Full upstream worker ownership remains unported: command-chunk replay and command-buffer allocation still happen on the rasterizer thread rather than `Scheduler::WorkerThread`.
+- Device-loss propagation remains missing; the current correction makes the failure observable without inventing a replacement owner.
+
+### Binary layout verification
+- N/A: scheduler state is not guest-visible or raw-serialized.
+
+### Verification
+- Re-read upstream `Scheduler::WaitWorker`, `Scheduler::WorkerThread`, and `Scheduler::SubmitExecution`.
+- `cargo test -p video_core --lib renderer_vulkan::scheduler::tests::submit_worker_is_not_drained_while_submit_is_in_flight -- --exact --nocapture`
+- `cargo check -p video_core`
+
+## 2026-07-10 - local Vulkan review parity cleanups
+
+### Intentional differences
+- `RUZU_TRACE_SHADER_WORDS` and `RUZU_TRACE_VK_TEXTURE_HANDLE` remain opt-in Rust diagnostics. The latter no longer embeds one MK8D shader address/instance-count filter.
+
+### Unintentional differences (fixed)
+- Fixed: `BlitFramebufferInfo` now sizes image and subresource arrays as `NUM_RT + 1` instead of a literal, preserving the upstream color-plus-depth attachment invariant.
+- Fixed: the graphics descriptor bridge now debug-asserts that every buffer-cache descriptor emitted in upstream stage order was consumed by the pipeline layout.
+- Fixed: `Memory::handle_rasterizer_write` tests and updates one core's `last_address` under one mutex acquisition, removing the Rust-only TOCTOU window while preserving upstream `HandleRasterizerWrite` ordering (`OnCPUWrite`, update last address, collect dirty range).
+- Fixed: removed dead `lowest` computation from the shader-head diagnostic.
+
+### Missing items
+- `KLightLock` still resolves priority-inheritance waiter IDs through the global scheduler thread table while holding the scheduler lock. Upstream retains direct intrusive `KThread*` references. Replacing IDs with retained thread references is a structural prerequisite; an arbitrary missing-thread fallback would not be faithful.
+
+### Binary layout verification
+- N/A: no guest-visible or raw-serialized layouts changed.
+
+### Verification
+- Re-read upstream `Memory::HandleRasterizerWrite` and Vulkan scheduler worker code.
+- `cargo check -p core`
+- `cargo check -p video_core`
+- `git diff --check`

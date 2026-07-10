@@ -368,7 +368,13 @@ impl ShaderPools {
 // supported dynamic-state extension at zero (upstream semantics). Older
 // caches carry per-draw dynamic state baked into keys — thousands of
 // duplicate pipelines per logical key that can never match again.
-const CACHE_VERSION: u32 = 13;
+// Version 14: Maxwell sched-control decoding is anchored at the shader code
+// start. Version 13 caches may contain environments captured with the old
+// absolute sched grid and therefore rebuild invalid or mismatched pipelines.
+// Version 15: FixedPipelineState::refresh preserves color write masks even
+// when blending is disabled. Older caches reconstruct pipelines with a zero
+// colorWriteMask and can render an entirely black frame.
+const CACHE_VERSION: u32 = 15;
 const VULKAN_CACHE_MAGIC_NUMBER: [u8; 8] = *b"yuzuvkch";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

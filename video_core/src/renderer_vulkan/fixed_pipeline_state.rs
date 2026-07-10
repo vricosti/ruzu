@@ -765,7 +765,7 @@ impl DynamicState {
 ///
 /// The upstream struct uses anonymous unions with bitfields for compact hashing.
 /// We replicate the same bit layout using explicit raw u32 fields.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct FixedPipelineState {
     /// Packed flags word 1: dynamic state features, topology, polygon mode, etc.
     ///
@@ -842,6 +842,56 @@ impl Default for FixedPipelineState {
     }
 }
 
+impl PartialEq for FixedPipelineState {
+    /// Port of `FixedPipelineState`'s byte-prefix equality through
+    /// `GraphicsPipelineCacheKey::operator==`.
+    ///
+    /// Upstream compares only `FixedPipelineState::Size()` bytes. Fields
+    /// excluded by active dynamic-state features are deliberately not part of
+    /// the key and are also omitted from the disk cache.
+    fn eq(&self, rhs: &Self) -> bool {
+        if self.raw1 != rhs.raw1
+            || self.raw2 != rhs.raw2
+            || self.color_formats != rhs.color_formats
+            || self.alpha_test_ref != rhs.alpha_test_ref
+            || self.point_size != rhs.point_size
+            || self.viewport_swizzles != rhs.viewport_swizzles
+            || self.attribute_types_or_enabled_divisors != rhs.attribute_types_or_enabled_divisors
+        {
+            return false;
+        }
+
+        // Transform feedback makes upstream Size() cover the complete state,
+        // regardless of which dynamic-state extensions are enabled.
+        if self.xfb_enabled() {
+            return self.dynamic_state == rhs.dynamic_state
+                && self.attachments == rhs.attachments
+                && self.attributes == rhs.attributes
+                && self.binding_divisors == rhs.binding_divisors
+                && self.vertex_strides == rhs.vertex_strides
+                && self.xfb_state == rhs.xfb_state;
+        }
+        if self.dynamic_vertex_input() && self.extended_dynamic_state_3_blend() {
+            return true;
+        }
+        if self.dynamic_state != rhs.dynamic_state || self.attachments != rhs.attachments {
+            return false;
+        }
+        if self.dynamic_vertex_input() {
+            return true;
+        }
+        if self.attributes != rhs.attributes || self.binding_divisors != rhs.binding_divisors {
+            return false;
+        }
+        if self.extended_dynamic_state() {
+            return true;
+        }
+        self.vertex_strides == rhs.vertex_strides
+    }
+}
+
+impl Eq for FixedPipelineState {}
+
 impl Hash for FixedPipelineState {
     /// Port of `FixedPipelineState::Hash`.
     ///
@@ -855,6 +905,16 @@ impl Hash for FixedPipelineState {
         self.point_size.hash(state);
         self.viewport_swizzles.hash(state);
         self.attribute_types_or_enabled_divisors.hash(state);
+
+        if self.xfb_enabled() {
+            self.dynamic_state.hash(state);
+            self.attachments.hash(state);
+            self.attributes.hash(state);
+            self.binding_divisors.hash(state);
+            self.vertex_strides.hash(state);
+            self.xfb_state.hash(state);
+            return;
+        }
 
         // Match upstream FixedPipelineState::Size(): the hash covers a byte
         // prefix ending at a different field depending on enabled dynamic
@@ -873,9 +933,6 @@ impl Hash for FixedPipelineState {
         self.binding_divisors.hash(state);
         if !self.extended_dynamic_state() {
             self.vertex_strides.hash(state);
-        }
-        if self.xfb_enabled() {
-            self.xfb_state.hash(state);
         }
     }
 }
@@ -1335,6 +1392,11 @@ impl FixedPipelineState {
         if !features.has_extended_dynamic_state_3_blend {
             for (i, blend) in draw.blend.iter().enumerate() {
                 let mut att = BlendingAttachment::default();
+                let mask = draw.color_masks[i];
+                // Upstream writes the color mask before returning early when
+                // blending is disabled. The mask is independent pipeline
+                // state and must survive disk-cache reconstruction.
+                att.set_mask(mask.r, mask.g, mask.b, mask.a);
                 if blend.enabled {
                     att.set_enabled(true);
                     att.set_equation_rgb(blend.color_op);
@@ -1543,6 +1605,47 @@ mod tests {
         assert_eq!(decoded.xfb_state.varyings[2][3].raw(), 0xAABB_CCDD);
     }
 
+    #[test]
+    fn equality_ignores_state_excluded_by_upstream_size() {
+        let mut live = FixedPipelineState::default();
+        live.set_dynamic_vertex_input(true);
+        live.set_extended_dynamic_state_3_blend(true);
+        live.dynamic_state.raw1 = 0x1122_3344;
+        live.dynamic_state.raw2 = 0x5566_7788;
+        live.attachments[0].raw = 0xAABB_CCDD;
+        live.attributes[0].raw = 0x1234_5678;
+        live.binding_divisors[0] = 9;
+        live.vertex_strides[0] = 32;
+
+        let mut loaded = live.clone();
+        loaded.dynamic_state = DynamicState::default();
+        loaded.attachments = [BlendingAttachment::default(); NUM_RENDER_TARGETS];
+        loaded.attributes = [VertexAttribute::default(); NUM_VERTEX_ATTRIBUTES];
+        loaded.binding_divisors = [0; NUM_VERTEX_ARRAYS];
+        loaded.vertex_strides = [0; NUM_VERTEX_ARRAYS];
+
+        assert_eq!(
+            live.serialized_size(),
+            FixedPipelineState::DYNAMIC_STATE_OFFSET
+        );
+        assert_eq!(live, loaded);
+        assert_eq!(hash_state(&live), hash_state(&loaded));
+    }
+
+    #[test]
+    fn transform_feedback_forces_full_state_equality_and_hashing() {
+        let mut a = FixedPipelineState::default();
+        a.set_dynamic_vertex_input(true);
+        a.set_extended_dynamic_state_3_blend(true);
+        a.set_xfb_enabled(true);
+        let mut b = a.clone();
+        b.attachments[0].raw = 1;
+
+        assert_eq!(a.serialized_size(), FixedPipelineState::FULL_SIZE);
+        assert_ne!(a, b);
+        assert_ne!(hash_state(&a), hash_state(&b));
+    }
+
     fn make_test_draw_call() -> DrawCall {
         DrawCall {
             topology: PrimitiveTopology::Triangles,
@@ -1680,6 +1783,38 @@ mod tests {
             VertexAttribSize::from_raw(state.attributes[0].attrib_size()),
             VertexAttribSize::R32G32B32A32
         );
+    }
+
+    #[test]
+    fn refresh_preserves_color_mask_when_blending_is_disabled() {
+        let mut draw = make_test_draw_call();
+        draw.blend[0].enabled = false;
+        draw.color_masks[0] = ColorMaskInfo {
+            r: true,
+            g: false,
+            b: true,
+            a: false,
+        };
+
+        let mut state = FixedPipelineState::default();
+        state.refresh(&draw, &DynamicFeatures::default());
+
+        assert!(!state.attachments[0].is_enabled());
+        assert_eq!(state.attachments[0].mask(), [true, false, true, false]);
+
+        let mut bytes = Vec::new();
+        state.write_prefix_bytes(&mut bytes);
+        let path = std::env::temp_dir().join(format!(
+            "ruzu-fixed-pipeline-state-color-mask-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let decoded = FixedPipelineState::read_from_file(&mut file).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert!(!decoded.attachments[0].is_enabled());
+        assert_eq!(decoded.attachments[0].mask(), [true, false, true, false]);
     }
 
     #[test]

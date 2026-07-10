@@ -763,9 +763,42 @@ pub struct RenderTargetFramebuffer {
     pub extent: vk::Extent2D,
     pub num_color: u32,
     pub has_depth: bool,
+    pub has_stencil: bool,
     pub images: Vec<vk::Image>,
     pub image_ranges: Vec<vk::ImageSubresourceRange>,
     pub image_ids: Vec<ImageId>,
+    rt_map: [u8; NUM_RT],
+}
+
+impl RenderTargetFramebuffer {
+    /// Port of `Vulkan::Framebuffer::HasAspectColorBit`.
+    pub fn has_aspect_color_bit(&self, index: usize) -> bool {
+        let Some(&mapped) = self.rt_map.get(index) else {
+            return false;
+        };
+        if mapped == u8::MAX {
+            return false;
+        }
+        self.image_ranges
+            .get(mapped as usize)
+            .is_some_and(|range| range.aspect_mask.contains(vk::ImageAspectFlags::COLOR))
+    }
+
+    pub fn blit_framebuffer_info(&self) -> BlitFramebufferInfo {
+        let mut images = [vk::Image::null(); NUM_RT + 1];
+        let mut image_ranges = [vk::ImageSubresourceRange::default(); NUM_RT + 1];
+        let num_images = self.images.len().min(NUM_RT + 1);
+        images[..num_images].copy_from_slice(&self.images[..num_images]);
+        image_ranges[..num_images].copy_from_slice(&self.image_ranges[..num_images]);
+        BlitFramebufferInfo {
+            framebuffer: self.framebuffer,
+            render_pass: self.render_pass,
+            render_area: self.extent,
+            images,
+            image_ranges,
+            num_images,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2515,18 +2548,22 @@ impl TextureCacheRuntime {
         rp_key.samples = vk::SampleCountFlags::TYPE_1;
         let render_pass = self.render_pass_cache().get(&rp_key)?;
         let framebuffer = self.create_framebuffer(render_pass, &[view], extent)?;
+        let mut images = [vk::Image::null(); NUM_RT + 1];
+        images[0] = image;
+        let mut image_ranges = [vk::ImageSubresourceRange::default(); NUM_RT + 1];
+        image_ranges[0] = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
         Ok(BlitFramebufferInfo {
             framebuffer,
             render_pass,
             render_area: extent,
-            images: [image],
-            image_ranges: [vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
+            images,
+            image_ranges,
             num_images: 1,
         })
     }
@@ -2545,18 +2582,22 @@ impl TextureCacheRuntime {
         };
         let render_pass = self.render_pass_cache().get(&rp_key)?;
         let framebuffer = self.create_framebuffer(render_pass, &[view], extent)?;
+        let mut images = [vk::Image::null(); NUM_RT + 1];
+        images[0] = image;
+        let mut image_ranges = [vk::ImageSubresourceRange::default(); NUM_RT + 1];
+        image_ranges[0] = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
         Ok(BlitFramebufferInfo {
             framebuffer,
             render_pass,
             render_area: extent,
-            images: [image],
-            image_ranges: [vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
+            images,
+            image_ranges,
             num_images: 1,
         })
     }
@@ -3371,8 +3412,7 @@ impl TextureCache {
         // every depth-only draw into the offscreen fallback (MK8D issues
         // 260k+ such draws during loading).
         let rt0 = render_targets.render_targets[0];
-        let rt0_disabled =
-            rt0.address == 0 || rt0.width == 0 || rt0.height == 0 || rt0.format == 0;
+        let rt0_disabled = rt0.address == 0 || rt0.width == 0 || rt0.height == 0 || rt0.format == 0;
         let any_color_bound = color_ids
             .iter()
             .any(|id| id.is_valid() && *id != NULL_IMAGE_VIEW_ID);
@@ -3399,10 +3439,8 @@ impl TextureCache {
                 continue;
             }
             let format = self.runtime.surface_format(view.format);
-            let (width, height) = {
-                let base = &self.base.slot_images[view.image_id];
-                (base.info.size.width.max(1), base.info.size.height.max(1))
-            };
+            let width = view.size.width.max(1);
+            let height = view.size.height.max(1);
             // Per-draw fast path: only clone the ImageBase (six Vecs) and run
             // the full `ensure_image` when the backend image actually needs
             // (re)creation.
@@ -3483,10 +3521,8 @@ impl TextureCache {
             if view.image_id.is_valid() && view.image_id != NULL_IMAGE_ID {
                 let format = self.runtime.surface_format(view.format);
                 let aspect = image_aspect_mask(view.format);
-                let (width, height) = {
-                    let base = &self.base.slot_images[view.image_id];
-                    (base.info.size.width.max(1), base.info.size.height.max(1))
-                };
+                let width = view.size.width.max(1);
+                let height = view.size.height.max(1);
                 if !self.backend_image_matches(view.image_id, format, aspect) {
                     let image_base = self.base.slot_images[view.image_id].clone();
                     recreated |= self
@@ -3548,26 +3584,25 @@ impl TextureCache {
             }
             rp_key.num_color_attachments = num_attachments as u8;
             rp_key.depth_format = depth_format;
-            rp_key.samples = vk::SampleCountFlags::TYPE_1;
+            let samples = colors
+                .first()
+                .and_then(|(_, view_id, _)| self.image_views.get(view_id))
+                .map(ImageView::samples)
+                .or_else(|| {
+                    depth_view.and_then(|_| self.image_views.get(&depth_id).map(ImageView::samples))
+                })
+                .unwrap_or(vk::SampleCountFlags::TYPE_1);
+            rp_key.samples = samples;
             let render_pass = self.runtime.render_pass_cache().get(&rp_key).ok()?;
-            let mut image_ids: Vec<ImageId> = colors
-                .iter()
-                .map(|(_, view_id, _)| self.base.slot_image_views[*view_id].image_id)
-                .collect();
-            if depth_view.is_some() && depth_id.is_valid() && depth_id != NULL_IMAGE_VIEW_ID {
-                image_ids.push(self.base.slot_image_views[depth_id].image_id);
-            }
             let framebuffer = self
                 .create_framebuffer_owner(
                     render_pass,
                     &color_views,
+                    &colors,
                     depth_view,
                     extent,
-                    colors.len() as u32,
-                    depth_view.is_some(),
                     depth_id,
                     rt0_cpu,
-                    image_ids,
                 )
                 .ok()?;
             self.framebuffers_by_render_targets
@@ -3581,9 +3616,11 @@ impl TextureCache {
             extent: fb.render_area,
             num_color: fb.num_color_buffers,
             has_depth: fb.has_depth,
+            has_stencil: fb.has_stencil,
             images: fb.images[..fb.num_images].to_vec(),
             image_ranges: fb.image_ranges[..fb.num_images].to_vec(),
             image_ids: fb.image_ids.clone(),
+            rt_map: fb.rt_map,
         })
     }
 
@@ -4672,7 +4709,13 @@ impl TextureCache {
                 has_stencil: aspect.contains(vk::ImageAspectFlags::STENCIL),
                 is_rescaled,
                 samples: vk::SampleCountFlags::TYPE_1,
-                rt_map: [u8::MAX; NUM_RT],
+                rt_map: if is_color {
+                    let mut map = [u8::MAX; NUM_RT];
+                    map[0] = 0;
+                    map
+                } else {
+                    [u8::MAX; NUM_RT]
+                },
                 images,
                 image_ranges,
                 num_images: 1,
@@ -4687,9 +4730,9 @@ impl TextureCache {
             framebuffer: fb.framebuffer,
             render_pass: fb.render_pass,
             render_area: fb.render_area,
-            images: [fb.images[0]],
-            image_ranges: [fb.image_ranges[0]],
-            num_images: fb.num_images.min(1),
+            images: fb.images,
+            image_ranges: fb.image_ranges,
+            num_images: fb.num_images,
         })
     }
 
@@ -5104,13 +5147,16 @@ impl TextureCache {
         if aspect.is_empty() {
             return false;
         }
-        if self
-            .ensure_image(image_id, &image_base, format, aspect)
-            .is_err()
-        {
-            return false;
-        }
-        if !image_base.flags.contains(ImageFlagBits::CPU_MODIFIED) {
+        let recreated = match self.ensure_image(image_id, &image_base, format, aspect) {
+            Ok(recreated) => recreated,
+            Err(_) => return false,
+        };
+        // A recreated backend image starts with UNDEFINED contents even when
+        // the guest data was already synced into the OLD image — skipping the
+        // upload here left the fresh image blank (uninitialized-memory
+        // artifacts on render targets whose format toggles during boot).
+        // Force the guest re-upload whenever ensure_image rebuilt the image.
+        if !recreated && !image_base.flags.contains(ImageFlagBits::CPU_MODIFIED) {
             return true;
         }
         if !self.base.slot_images[image_id]
@@ -5888,11 +5934,21 @@ impl TextureCache {
             .ok()
             .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
         {
+            let target_width = std::env::var("RUZU_DUMP_VK_IMAGE_WIDTH")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok());
+            let target_height = std::env::var("RUZU_DUMP_VK_IMAGE_HEIGHT")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok());
             let found = self
                 .base
                 .slot_images
                 .iter()
-                .find(|(_, img)| img.gpu_addr == target)
+                .find(|(_, img)| {
+                    img.gpu_addr == target
+                        && target_width.is_none_or(|width| img.info.size.width == width)
+                        && target_height.is_none_or(|height| img.info.size.height == height)
+                })
                 .map(|(id, _)| id);
             match found {
                 Some(id) => id,
@@ -6457,21 +6513,36 @@ impl TextureCache {
         &self,
         render_pass: vk::RenderPass,
         color_views: &[vk::ImageView],
+        colors: &[(usize, ImageViewId, vk::Format)],
         depth_view: Option<vk::ImageView>,
         extent: vk::Extent2D,
-        num_color: u32,
-        has_depth: bool,
         depth_id: ImageViewId,
         rt0_cpu_addr: u64,
-        image_ids: Vec<ImageId>,
     ) -> Result<Framebuffer, vk::Result> {
         let mut attachments: Vec<vk::ImageView> = color_views.to_vec();
         if let Some(depth_view) = depth_view {
             attachments.push(depth_view);
         }
-        let framebuffer = self
-            .runtime
-            .create_framebuffer(render_pass, &attachments, extent)?;
+        let mut layers = 1u32;
+        for &(_, view_id, _) in colors {
+            layers = layers.max(self.image_views[&view_id].base.range.extent.layers.max(1) as u32);
+        }
+        if depth_view.is_some() {
+            layers = layers.max(self.image_views[&depth_id].base.range.extent.layers.max(1) as u32);
+        }
+        let framebuffer_info = vk::FramebufferCreateInfo::builder()
+            .render_pass(render_pass)
+            .attachments(&attachments)
+            .width(extent.width)
+            .height(extent.height)
+            .layers(layers)
+            .build();
+        let framebuffer = unsafe {
+            self.runtime
+                .device()
+                .create_framebuffer(&framebuffer_info, None)?
+        };
+        let has_depth = depth_view.is_some();
         let has_stencil = has_depth
             && depth_id.is_valid()
             && depth_id != NULL_IMAGE_VIEW_ID
@@ -6479,34 +6550,44 @@ impl TextureCache {
                 .contains(vk::ImageAspectFlags::STENCIL);
         let mut images = [vk::Image::null(); NUM_RT + 1];
         let mut image_ranges = [vk::ImageSubresourceRange::default(); NUM_RT + 1];
-        for (index, image_id) in image_ids.iter().copied().enumerate().take(NUM_RT + 1) {
-            let Some(image) = self.images.get(&image_id) else {
-                continue;
-            };
-            let Some((_, view)) = self
-                .image_views
-                .iter()
-                .find(|(_, view)| view.base.image_id == image_id)
-            else {
-                continue;
-            };
-            images[index] = image.handle();
-            image_ranges[index] = make_subresource_range(
+        let mut rt_map = [u8::MAX; NUM_RT];
+        let mut image_ids = Vec::with_capacity(colors.len() + usize::from(has_depth));
+        for (attachment_index, &(rt_index, view_id, _)) in colors.iter().enumerate() {
+            let view = &self.image_views[&view_id];
+            rt_map[rt_index] = attachment_index as u8;
+            images[attachment_index] = view.image_handle();
+            image_ranges[attachment_index] = make_subresource_range(
                 image_view_aspect_mask(&view.base),
                 view.base.range,
                 view.base.flags,
             );
+            image_ids.push(view.base.image_id);
+        }
+        if has_depth {
+            let attachment_index = colors.len();
+            let view = &self.image_views[&depth_id];
+            images[attachment_index] = view.image_handle();
+            image_ranges[attachment_index] = make_subresource_range(
+                image_view_aspect_mask(&view.base),
+                view.base.range,
+                view.base.flags,
+            );
+            image_ids.push(view.base.image_id);
         }
         Ok(Framebuffer {
             framebuffer,
             render_pass,
             render_area: extent,
-            num_color_buffers: num_color,
+            num_color_buffers: colors.len() as u32,
             has_depth,
             has_stencil,
             is_rescaled: self.base.render_targets.is_rescaled,
-            samples: vk::SampleCountFlags::TYPE_1,
-            rt_map: [u8::MAX; NUM_RT],
+            samples: colors
+                .first()
+                .map(|(_, view_id, _)| self.image_views[view_id].samples())
+                .or_else(|| depth_view.map(|_| self.image_views[&depth_id].samples()))
+                .unwrap_or(vk::SampleCountFlags::TYPE_1),
+            rt_map,
             images,
             image_ranges,
             num_images: image_ids.len(),
@@ -6835,6 +6916,39 @@ mod tests {
     use ash::vk::Handle;
 
     #[test]
+    fn render_target_framebuffer_preserves_sparse_rt_slot_map() {
+        let color_range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 2,
+            level_count: 1,
+            base_array_layer: 3,
+            layer_count: 1,
+        };
+        let framebuffer = RenderTargetFramebuffer {
+            framebuffer: vk::Framebuffer::null(),
+            render_pass: vk::RenderPass::null(),
+            cpu_addr: 0,
+            extent: vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            num_color: 2,
+            has_depth: false,
+            has_stencil: false,
+            images: vec![vk::Image::from_raw(1), vk::Image::from_raw(2)],
+            image_ranges: vec![color_range, color_range],
+            image_ids: vec![ImageId { index: 1 }, ImageId { index: 2 }],
+            rt_map: [u8::MAX, 0, u8::MAX, u8::MAX, 1, u8::MAX, u8::MAX, u8::MAX],
+        };
+
+        assert!(!framebuffer.has_aspect_color_bit(0));
+        assert!(framebuffer.has_aspect_color_bit(1));
+        assert!(!framebuffer.has_aspect_color_bit(2));
+        assert!(framebuffer.has_aspect_color_bit(4));
+        assert!(!framebuffer.has_aspect_color_bit(NUM_RT));
+    }
+
+    #[test]
     fn convert_border_color_matches_upstream_fallback() {
         assert_eq!(
             convert_border_color([0.0, 0.0, 0.0, 0.0]),
@@ -6876,6 +6990,18 @@ mod tests {
             !image_usage_flags(format_info, PixelFormat::A2B10G10R10Unorm)
                 .contains(vk::ImageUsageFlags::STORAGE)
         );
+    }
+
+    #[test]
+    fn decode_b10g11r11_handles_channel_widths_and_hdr_values() {
+        let one_r = 15u32 << 6;
+        let half_g = (14u32 << 6) << 11;
+        let two_b = (16u32 << 5) << 22;
+        let decoded = decode_b10g11r11_to_rgba8(&(one_r | half_g | two_b).to_le_bytes());
+
+        // Reinhard mapping: 1 -> 0.5, 0.5 -> 1/3, 2 -> 2/3.
+        assert_eq!(decoded, [128, 85, 170, 255]);
+        assert_eq!(decode_b10g11r11_to_rgba8(&0u32.to_le_bytes()), [0, 0, 0, 255]);
     }
 
     #[test]
@@ -7563,11 +7689,62 @@ fn decode_a2b10g10r10_to_rgba8(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+fn decode_unsigned_float(bits: u32, mantissa_bits: u32) -> f32 {
+    let mantissa_mask = (1 << mantissa_bits) - 1;
+    let mantissa = bits & mantissa_mask;
+    let exponent = bits >> mantissa_bits;
+    match exponent {
+        0 => (mantissa as f32) * 2.0f32.powi(1 - 15 - mantissa_bits as i32),
+        0x1f => {
+            if mantissa == 0 {
+                f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        _ => {
+            (1.0 + mantissa as f32 / (1 << mantissa_bits) as f32)
+                * 2.0f32.powi(exponent as i32 - 15)
+        }
+    }
+}
+
+/// Decode Vulkan `B10G11R11_UFLOAT_PACK32` and apply a Reinhard curve so
+/// values above 1.0 remain distinguishable in the 8-bit diagnostic dump.
+fn decode_b10g11r11_to_rgba8(bytes: &[u8]) -> Vec<u8> {
+    fn to_u8(value: f32) -> u8 {
+        if value.is_nan() {
+            return 0;
+        }
+        let mapped = if value.is_infinite() {
+            1.0
+        } else {
+            value.max(0.0) / (1.0 + value.max(0.0))
+        };
+        (mapped * 255.0).round() as u8
+    }
+
+    let mut out = Vec::with_capacity(bytes.len());
+    for chunk in bytes.chunks_exact(4) {
+        let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let r = decode_unsigned_float(value & 0x7ff, 6);
+        let g = decode_unsigned_float((value >> 11) & 0x7ff, 6);
+        let b = decode_unsigned_float((value >> 22) & 0x3ff, 5);
+        out.extend_from_slice(&[to_u8(r), to_u8(g), to_u8(b), 255]);
+    }
+    out
+}
+
 fn decode_debug_dump_to_rgba8(bytes: &[u8], info: &ImageInfo) -> Vec<u8> {
     match info.format {
+        PixelFormat::R8Unorm => bytes
+            .iter()
+            .flat_map(|&value| [value, value, value, 255])
+            .collect(),
         PixelFormat::A2B10G10R10Unorm | PixelFormat::A2B10G10R10Uint => {
             decode_a2b10g10r10_to_rgba8(bytes)
         }
+        PixelFormat::B10G11R11Float => decode_b10g11r11_to_rgba8(bytes),
         format if crate::surface::is_pixel_format_bcn(format) => {
             let mut copies = full_download_copies(info);
             let mut decoded_len = 0usize;

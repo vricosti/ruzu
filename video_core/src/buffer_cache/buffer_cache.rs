@@ -652,7 +652,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 log::info!("[BUFFER_BIND_PROFILE] bind_host_index_buffer end");
             }
         }
-        // Non-indexed quad topology path requires maxwell3d draw state — stubbed.
         if trace {
             log::info!("[BUFFER_BIND_PROFILE] bind_host_vertex_buffers begin");
         }
@@ -1741,15 +1740,31 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
 
         let offset = self.slot_buffers[buffer_id].offset(device_addr);
-        let first_index_offset = self
+        let (topology, index_format, first, count, format_size) = self
             .engine_state
             .as_ref()
-            .map(|es| {
-                let index_buffer = es.get_index_buffer();
-                index_buffer.first * index_buffer.format_size_in_bytes
+            .map(|state| {
+                let index = state.get_index_buffer();
+                (
+                    state.get_primitive_topology(),
+                    state.get_index_format(),
+                    index.first,
+                    index.count,
+                    index.format_size_in_bytes,
+                )
             })
-            .unwrap_or(0);
-        let offset = offset + first_index_offset;
+            .unwrap_or((
+                crate::engines::maxwell_3d::PrimitiveTopology::Triangles,
+                crate::engines::maxwell_3d::IndexFormat::UnsignedInt,
+                0,
+                0,
+                4,
+            ));
+        let offset = if P::HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT {
+            offset + first * format_size
+        } else {
+            offset
+        };
         let gpu_handle = self.slot_buffers[buffer_id].gpu_handle;
         if std::env::var_os("RUZU_PROFILE_BUFFER_BIND").is_some() {
             log::info!(
@@ -1762,7 +1777,16 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             if std::env::var_os("RUZU_PROFILE_BUFFER_BIND").is_some() {
                 log::info!("[BUFFER_BIND_PROFILE] index rt.bind_index_buffer begin");
             }
-            rt.bind_index_buffer(buffer_id, gpu_handle, offset, size);
+            rt.bind_index_buffer(
+                topology,
+                index_format,
+                first,
+                count,
+                buffer_id,
+                gpu_handle,
+                offset,
+                size,
+            );
             if std::env::var_os("RUZU_PROFILE_BUFFER_BIND").is_some() {
                 log::info!("[BUFFER_BIND_PROFILE] index rt.bind_index_buffer end");
             }
@@ -1784,10 +1808,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             })
             .collect();
 
+        let mut min_index = NUM_VERTEX_BUFFERS;
+        let mut max_index = 0;
+        let mut any_valid = false;
         for (index, binding) in bindings.iter().enumerate() {
-            if !binding.buffer_id.is_valid() || binding.buffer_id == NULL_BUFFER_ID {
-                continue;
-            }
             if std::env::var_os("RUZU_PROFILE_BUFFER_BIND").is_some() {
                 log::info!(
                     "[BUFFER_BIND_PROFILE] vertex binding index={} buffer_id={:?} device=0x{:X} size=0x{:X}",
@@ -1797,19 +1821,38 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                     binding.size
                 );
             }
-            self.touch_buffer(binding.buffer_id);
-            self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
+            if binding.buffer_id.is_valid() {
+                self.touch_buffer(binding.buffer_id);
+                self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
+            }
+            if !self
+                .engine_state
+                .as_ref()
+                .is_some_and(|state| state.is_dirty(DirtyFlag::VertexBuffer(index as u32)))
+            {
+                continue;
+            }
+            if let Some(state) = self.engine_state.as_mut() {
+                state.clear_dirty(DirtyFlag::VertexBuffer(index as u32));
+            }
+            min_index = min_index.min(index as u32);
+            max_index = max_index.max(index as u32);
+            any_valid = true;
         }
 
+        if !any_valid {
+            return;
+        }
+        max_index += 1;
         let mut host_bindings = HostBindings {
-            min_index: 0,
-            max_index: NUM_VERTEX_BUFFERS,
+            min_index,
+            max_index,
             ..HostBindings::default()
         };
-        // The current OpenGL draw adapter reports every vertex-buffer dirty on
-        // every draw, so the upstream-equivalent host binding range is the full
-        // vertex-buffer table. Include NULL bindings to clear stale GL slots.
-        for index in 0..NUM_VERTEX_BUFFERS as usize {
+        for index in min_index as usize..max_index as usize {
+            if let Some(state) = self.engine_state.as_mut() {
+                state.clear_dirty(DirtyFlag::VertexBuffer(index as u32));
+            }
             let binding = &bindings[index];
             if !binding.buffer_id.is_valid() || binding.buffer_id == NULL_BUFFER_ID {
                 host_bindings.buffer_ids.push(NULL_BUFFER_ID);
@@ -2188,6 +2231,19 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             if let Some(ref mut rt) = self.runtime {
                 let buffer = &mut self.slot_buffers[binding.buffer_id];
                 let offset = buffer.offset(binding.device_addr);
+                if std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some() {
+                    log::info!(
+                        "[SSBO_HOST_BIND] stage={} index={} buffer_id={} gpu_handle={} device_addr=0x{:X} offset=0x{:X} size=0x{:X} written={}",
+                        stage,
+                        binding_index,
+                        binding.buffer_id.index,
+                        buffer.gpu_handle,
+                        binding.device_addr,
+                        offset,
+                        binding.size,
+                        is_written,
+                    );
+                }
                 rt.bind_storage_buffer(
                     stage,
                     binding_index,
@@ -2734,8 +2790,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         if !es.is_dirty(DirtyFlag::VertexBuffer(index)) {
             return;
         }
-        es.clear_dirty(DirtyFlag::VertexBuffer(index));
-
         let array = es.get_vertex_stream(index);
         let limit = es.get_vertex_stream_limit(index);
         drop(es);
@@ -2777,8 +2831,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         if !es.is_dirty(DirtyFlag::VertexBuffer(index)) {
             return;
         }
-        es.clear_dirty(DirtyFlag::VertexBuffer(index));
-
         let array = es.get_vertex_stream(index);
         let limit = es.get_vertex_stream_limit(index);
         drop(es);
@@ -3796,40 +3848,40 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         // Clear any bindings that reference this buffer.
         if cs.index_buffer.buffer_id == buffer_id {
-            cs.index_buffer.buffer_id = SlotId::invalid();
+            cs.index_buffer.buffer_id = NULL_BUFFER_ID;
         }
         for binding in cs.vertex_buffers.iter_mut() {
             if binding.buffer_id == buffer_id {
-                binding.buffer_id = SlotId::invalid();
+                binding.buffer_id = NULL_BUFFER_ID;
             }
         }
         for stage_buffers in cs.uniform_buffers.iter_mut() {
             for binding in stage_buffers.iter_mut() {
                 if binding.buffer_id == buffer_id {
-                    binding.buffer_id = SlotId::invalid();
+                    binding.buffer_id = NULL_BUFFER_ID;
                 }
             }
         }
         for stage_buffers in cs.storage_buffers.iter_mut() {
             for binding in stage_buffers.iter_mut() {
                 if binding.buffer_id == buffer_id {
-                    binding.buffer_id = SlotId::invalid();
+                    binding.buffer_id = NULL_BUFFER_ID;
                 }
             }
         }
         for binding in cs.transform_feedback_buffers.iter_mut() {
             if binding.buffer_id == buffer_id {
-                binding.buffer_id = SlotId::invalid();
+                binding.buffer_id = NULL_BUFFER_ID;
             }
         }
         for binding in cs.compute_uniform_buffers.iter_mut() {
             if binding.buffer_id == buffer_id {
-                binding.buffer_id = SlotId::invalid();
+                binding.buffer_id = NULL_BUFFER_ID;
             }
         }
         for binding in cs.compute_storage_buffers.iter_mut() {
             if binding.buffer_id == buffer_id {
-                binding.buffer_id = SlotId::invalid();
+                binding.buffer_id = NULL_BUFFER_ID;
             }
         }
 
@@ -3947,12 +3999,16 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *F.get_or_init(|| std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some())
         } {
+            let mut preview = [0u8; 64];
+            let preview_read = read_block(gpu_addr, &mut preview);
             log::info!(
-                "[SSBO_BINDING_SRC] cbuf={} ssbo_addr=0x{:X} gpu_addr=0x{:X} written={}",
+                "[SSBO_BINDING_SRC] cbuf={} ssbo_addr=0x{:X} gpu_addr=0x{:X} written={} preview_read={} preview={:02X?}",
                 cbuf_index,
                 ssbo_addr,
                 gpu_addr,
-                is_written
+                is_written,
+                preview_read,
+                preview,
             );
         }
 
@@ -4258,6 +4314,27 @@ mod tests {
         // An unregistered region should return false (no GPU data to flush).
         let result = cache.on_cpu_write(0x20000, 0x100);
         assert!(!result);
+    }
+
+    #[test]
+    fn delete_buffer_replaces_channel_references_with_null_buffer() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        cache.channel_state = Some(Box::default());
+        let buffer_id = cache.create_buffer(0x10000, 0x1000);
+        let channel = cache.channel_state.as_mut().unwrap();
+        channel.index_buffer.buffer_id = buffer_id;
+        channel.vertex_buffers[0].buffer_id = buffer_id;
+        channel.uniform_buffers[0][0].buffer_id = buffer_id;
+        channel.storage_buffers[0][0].buffer_id = buffer_id;
+
+        cache.delete_buffer(buffer_id, true);
+
+        let channel = cache.channel_state.as_ref().unwrap();
+        assert_eq!(channel.index_buffer.buffer_id, NULL_BUFFER_ID);
+        assert_eq!(channel.vertex_buffers[0].buffer_id, NULL_BUFFER_ID);
+        assert_eq!(channel.uniform_buffers[0][0].buffer_id, NULL_BUFFER_ID);
+        assert_eq!(channel.storage_buffers[0][0].buffer_id, NULL_BUFFER_ID);
     }
 
     #[test]

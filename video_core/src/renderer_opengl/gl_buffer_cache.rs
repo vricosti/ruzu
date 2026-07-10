@@ -789,7 +789,17 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
 
     /// Port of upstream `BufferCacheRuntime::BindIndexBuffer`
     /// (`gl_buffer_cache.cpp:215`).
-    fn bind_index_buffer(&mut self, _buffer: BufferId, gpu_handle: u32, offset: u32, _size: u32) {
+    fn bind_index_buffer(
+        &mut self,
+        _topology: crate::engines::maxwell_3d::PrimitiveTopology,
+        _index_format: crate::engines::maxwell_3d::IndexFormat,
+        _base_vertex: u32,
+        _num_indices: u32,
+        _buffer: BufferId,
+        gpu_handle: u32,
+        offset: u32,
+        _size: u32,
+    ) {
         self.index_buffer_offset = offset;
         if gpu_handle != 0 {
             unsafe {

@@ -22,6 +22,7 @@ use crate::host_shaders::spirv_shaders::{
 use crate::renderer_vulkan::descriptor_pool::{DescriptorBankInfo, DescriptorPool};
 use crate::renderer_vulkan::scheduler::Scheduler;
 use crate::renderer_vulkan::shader_util::build_shader;
+use crate::texture_cache::types::NUM_RT;
 
 // ---------------------------------------------------------------------------
 // Push constants (file-local, matching upstream anonymous namespace)
@@ -63,8 +64,8 @@ pub struct BlitFramebufferInfo {
     pub framebuffer: vk::Framebuffer,
     pub render_pass: vk::RenderPass,
     pub render_area: vk::Extent2D,
-    pub images: [vk::Image; 1],
-    pub image_ranges: [vk::ImageSubresourceRange; 1],
+    pub images: [vk::Image; NUM_RT + 1],
+    pub image_ranges: [vk::ImageSubresourceRange; NUM_RT + 1],
     pub num_images: usize,
 }
 

@@ -12,6 +12,7 @@ use common::slot_vector::SlotVector;
 use common::types::VAddr;
 
 use super::buffer_base::BufferBase;
+use crate::engines::maxwell_3d::{IndexFormat, PrimitiveTopology};
 
 // ---------------------------------------------------------------------------
 // Re-export BufferId
@@ -27,7 +28,9 @@ pub type BufferId = SlotId;
 /// Number of vertex buffer binding slots.
 ///
 /// Upstream: 32 on non-Apple, 16 on Apple.
-/// We default to 32 (no Apple target in this port).
+#[cfg(target_vendor = "apple")]
+pub const NUM_VERTEX_BUFFERS: u32 = 16;
+#[cfg(not(target_vendor = "apple"))]
 pub const NUM_VERTEX_BUFFERS: u32 = 32;
 
 /// Number of transform feedback buffer slots.
@@ -593,7 +596,17 @@ pub trait BufferCacheRuntime {
     /// buffer handle) extracted from the slot vector by the caller. Upstream
     /// receives the whole `Buffer&` object; the Rust port passes the handle
     /// separately because `BufferBase` is backend-agnostic.
-    fn bind_index_buffer(&mut self, buffer: BufferId, gpu_handle: u32, offset: u32, size: u32);
+    fn bind_index_buffer(
+        &mut self,
+        topology: PrimitiveTopology,
+        index_format: IndexFormat,
+        base_vertex: u32,
+        num_indices: u32,
+        buffer: BufferId,
+        gpu_handle: u32,
+        offset: u32,
+        size: u32,
+    );
 
     /// Return the backend index offset consumed by the rasterizer draw call.
     ///
@@ -978,6 +991,16 @@ pub trait EngineState {
 
     /// Return the inline index draw data, if any.
     fn get_inline_index_draw_indexes(&self) -> &[u8];
+
+    /// Current primitive topology from `DrawManager::GetDrawState()`.
+    fn get_primitive_topology(&self) -> PrimitiveTopology {
+        PrimitiveTopology::Triangles
+    }
+
+    /// Current index format from `DrawManager::GetDrawState()`.
+    fn get_index_format(&self) -> IndexFormat {
+        IndexFormat::UnsignedInt
+    }
 
     // -- Dirty flags --
 
