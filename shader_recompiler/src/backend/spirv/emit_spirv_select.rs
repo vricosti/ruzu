@@ -48,6 +48,18 @@ pub fn emit_select_u64(
         .unwrap()
 }
 
+/// Emit `OpSelect` for F16 result.
+pub fn emit_select_f16(
+    ctx: &mut SpirvEmitContext,
+    cond: Word,
+    true_val: Word,
+    false_val: Word,
+) -> Word {
+    ctx.builder
+        .select(ctx.f16_type, None, cond, true_val, false_val)
+        .unwrap()
+}
+
 /// Emit `OpSelect` for F32 result.
 ///
 /// Matches upstream `EmitSelectF32(EmitContext&, Id, Id, Id)`.

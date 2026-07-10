@@ -137,6 +137,32 @@ pub fn emit_convert_u32_u64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 
 // ── Signed integer-to-float conversions ──────────────────────────────────
 
+pub fn emit_convert_f16_s8(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    let value = extract_s8(ctx, value);
+    ctx.builder
+        .convert_s_to_f(ctx.f16_type, None, value)
+        .unwrap()
+}
+
+pub fn emit_convert_f16_s16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    let value = extract_s16(ctx, value);
+    ctx.builder
+        .convert_s_to_f(ctx.f16_type, None, value)
+        .unwrap()
+}
+
+pub fn emit_convert_f16_s32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .convert_s_to_f(ctx.f16_type, None, value)
+        .unwrap()
+}
+
+pub fn emit_convert_f16_s64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .convert_s_to_f(ctx.f16_type, None, value)
+        .unwrap()
+}
+
 /// ConvertF32S8: `OpConvertSToF` S8 -> F32 (via sign-extend + convert).
 pub fn emit_convert_f32_s8(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     let s_val = extract_s8(ctx, value);
@@ -174,7 +200,53 @@ pub fn emit_convert_f64_s32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
         .unwrap()
 }
 
+pub fn emit_convert_f64_s8(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    let value = extract_s8(ctx, value);
+    ctx.builder
+        .convert_s_to_f(ctx.f64_type, None, value)
+        .unwrap()
+}
+
+pub fn emit_convert_f64_s16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    let value = extract_s16(ctx, value);
+    ctx.builder
+        .convert_s_to_f(ctx.f64_type, None, value)
+        .unwrap()
+}
+
+pub fn emit_convert_f64_s64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .convert_s_to_f(ctx.f64_type, None, value)
+        .unwrap()
+}
+
 // ── Unsigned integer-to-float conversions ────────────────────────────────
+
+pub fn emit_convert_f16_u8(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    let value = extract_u8(ctx, value);
+    ctx.builder
+        .convert_u_to_f(ctx.f16_type, None, value)
+        .unwrap()
+}
+
+pub fn emit_convert_f16_u16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    let value = extract_u16(ctx, value);
+    ctx.builder
+        .convert_u_to_f(ctx.f16_type, None, value)
+        .unwrap()
+}
+
+pub fn emit_convert_f16_u32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .convert_u_to_f(ctx.f16_type, None, value)
+        .unwrap()
+}
+
+pub fn emit_convert_f16_u64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .convert_u_to_f(ctx.f16_type, None, value)
+        .unwrap()
+}
 
 /// ConvertF32U8: `OpConvertUToF` U8 -> F32 (via extract + convert).
 pub fn emit_convert_f32_u8(ctx: &mut SpirvEmitContext, value: Word) -> Word {
@@ -203,6 +275,32 @@ pub fn emit_convert_f32_u32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 pub fn emit_convert_f32_u64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     ctx.builder
         .convert_u_to_f(ctx.f32_type, None, value)
+        .unwrap()
+}
+
+pub fn emit_convert_f64_u8(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    let value = extract_u8(ctx, value);
+    ctx.builder
+        .convert_u_to_f(ctx.f64_type, None, value)
+        .unwrap()
+}
+
+pub fn emit_convert_f64_u16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    let value = extract_u16(ctx, value);
+    ctx.builder
+        .convert_u_to_f(ctx.f64_type, None, value)
+        .unwrap()
+}
+
+pub fn emit_convert_f64_u32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .convert_u_to_f(ctx.f64_type, None, value)
+        .unwrap()
+}
+
+pub fn emit_convert_f64_u64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .convert_u_to_f(ctx.f64_type, None, value)
         .unwrap()
 }
 

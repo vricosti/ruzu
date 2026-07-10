@@ -17,6 +17,49 @@ use crate::ir::program::ShaderInfo;
 use crate::ir::types::ShaderStage;
 use crate::profile::Profile;
 use crate::runtime_info::{AttributeType, RuntimeInfo};
+use crate::shader_info::{TextureDescriptor, TextureType};
+
+struct DeferredPhi {
+    result_id: spirv::Word,
+    values: Vec<ir::Value>,
+}
+
+/// Port of upstream `TextureDefinition` in `spirv_emit_context.h`.
+#[derive(Clone, Copy)]
+pub(crate) struct TextureDefinition {
+    pub id: spirv::Word,
+    pub sampled_type: spirv::Word,
+    pub pointer_type: spirv::Word,
+    pub image_type: spirv::Word,
+    pub count: u32,
+    pub is_multisample: bool,
+}
+
+/// Port of upstream `ImageType(EmitContext&, const TextureDescriptor&)`.
+fn texture_image_type(ctx: &mut SpirvEmitContext, desc: &TextureDescriptor) -> spirv::Word {
+    let depth = u32::from(desc.is_depth);
+    let multisampled = u32::from(desc.is_multisample);
+    let (dim, arrayed, ms) = match desc.texture_type {
+        TextureType::Color1D => (spirv::Dim::Dim1D, 0, 0),
+        TextureType::ColorArray1D => (spirv::Dim::Dim1D, 1, 0),
+        TextureType::Color2D | TextureType::Color2DRect => (spirv::Dim::Dim2D, 0, multisampled),
+        TextureType::ColorArray2D => (spirv::Dim::Dim2D, 1, multisampled),
+        TextureType::Color3D => (spirv::Dim::Dim3D, 0, 0),
+        TextureType::ColorCube => (spirv::Dim::DimCube, 0, 0),
+        TextureType::ColorArrayCube => (spirv::Dim::DimCube, 1, 0),
+        TextureType::Buffer => panic!("SPIR-V: buffer texture in sampled texture descriptors"),
+    };
+    ctx.builder.type_image(
+        ctx.f32_type,
+        dim,
+        depth,
+        arrayed,
+        ms,
+        1,
+        spirv::ImageFormat::Unknown,
+        None,
+    )
+}
 
 /// SPIR-V emission context.
 ///
@@ -31,7 +74,9 @@ pub struct SpirvEmitContext {
     pub bool_type: spirv::Word,
     pub u32_type: spirv::Word,
     pub i32_type: spirv::Word,
+    pub f16_type: spirv::Word,
     pub f32_type: spirv::Word,
+    pub f16_vec2_type: spirv::Word,
     pub u32_vec2_type: spirv::Word,
     pub u32_vec3_type: spirv::Word,
     pub u32_vec4_type: spirv::Word,
@@ -100,7 +145,7 @@ pub struct SpirvEmitContext {
     /// Constant buffer UBO variables, indexed by CB index.
     pub cbuf_vars: HashMap<u32, spirv::Word>,
     /// Texture combined image sampler variables, indexed by descriptor index.
-    pub texture_vars: HashMap<u32, spirv::Word>,
+    pub(crate) textures: Vec<TextureDefinition>,
     /// Storage buffer variables, indexed by compact SSBO descriptor index.
     pub ssbo_vars: HashMap<u32, spirv::Word>,
     /// Pointer to a u32 element inside an SSBO runtime array.
@@ -121,6 +166,9 @@ pub struct SpirvEmitContext {
     pub values: HashMap<(u32, u32), spirv::Word>,
     /// Maps IR block indices to SPIR-V label IDs.
     pub block_labels: Vec<spirv::Word>,
+    /// Phi values are patched after all blocks have been emitted, matching
+    /// upstream Sirit's `DeferredOpPhi` / `PatchDeferredPhi` lifecycle.
+    deferred_phis: Vec<DeferredPhi>,
 }
 
 impl SpirvEmitContext {
@@ -179,6 +227,11 @@ impl SpirvEmitContext {
         let u32_type = builder.type_int(32, 0);
         let i32_type = builder.type_int(32, 1);
         let f32_type = builder.type_float(32);
+        let f16_type = if program.info.uses_fp16 {
+            builder.type_float(16)
+        } else {
+            f32_type
+        };
 
         // Define vector types
         let u32_vec2_type = builder.type_vector(u32_type, 2);
@@ -188,6 +241,11 @@ impl SpirvEmitContext {
         let f32_vec2_type = builder.type_vector(f32_type, 2);
         let f32_vec3_type = builder.type_vector(f32_type, 3);
         let f32_vec4_type = builder.type_vector(f32_type, 4);
+        let f16_vec2_type = if program.info.uses_fp16 {
+            builder.type_vector(f16_type, 2)
+        } else {
+            f32_vec2_type
+        };
 
         // Upstream only defines 64-bit scalar types when the program uses
         // them. Declaring OpTypeInt/OpTypeFloat 64 without the corresponding
@@ -261,7 +319,9 @@ impl SpirvEmitContext {
             bool_type,
             u32_type,
             i32_type,
+            f16_type,
             f32_type,
+            f16_vec2_type,
             u32_vec2_type,
             u32_vec3_type,
             u32_vec4_type,
@@ -289,7 +349,7 @@ impl SpirvEmitContext {
             const_false,
             glsl_ext,
             cbuf_vars: HashMap::new(),
-            texture_vars: HashMap::new(),
+            textures: Vec::new(),
             ssbo_vars: HashMap::new(),
             storage_u32_ptr,
             input_vars: HashMap::new(),
@@ -297,6 +357,7 @@ impl SpirvEmitContext {
             interfaces: Vec::new(),
             values: HashMap::new(),
             block_labels: Vec::new(),
+            deferred_phis: Vec::new(),
         }
     }
 
@@ -555,31 +616,37 @@ impl SpirvEmitContext {
         }
 
         // Textures (combined image samplers)
-        for (descriptor_index, desc) in info.texture_descriptors.iter().enumerate() {
+        self.textures.reserve(info.texture_descriptors.len());
+        for desc in &info.texture_descriptors {
             let binding = if self.profile.unified_descriptor_binding {
                 &mut bindings.unified
             } else {
                 &mut bindings.texture
             };
-            let image_type = self.builder.type_image(
-                self.f32_type,
-                spirv::Dim::Dim2D,
-                0,
-                0,
-                0,
-                1,
-                spirv::ImageFormat::Unknown,
-                None,
-            );
+            let image_type = texture_image_type(self, desc);
             let sampled_image = self.builder.type_sampled_image(image_type);
-            let ptr_type = self.builder.type_pointer(
+            let pointer_type = self.builder.type_pointer(
                 None,
                 spirv::StorageClass::UniformConstant,
                 sampled_image,
             );
-            let var =
-                self.builder
-                    .variable(ptr_type, None, spirv::StorageClass::UniformConstant, None);
+            let descriptor_type = if desc.count > 1 {
+                let count = self.builder.constant_bit32(self.u32_type, desc.count);
+                self.builder.type_array(sampled_image, count)
+            } else {
+                sampled_image
+            };
+            let descriptor_pointer_type = self.builder.type_pointer(
+                None,
+                spirv::StorageClass::UniformConstant,
+                descriptor_type,
+            );
+            let var = self.builder.variable(
+                descriptor_pointer_type,
+                None,
+                spirv::StorageClass::UniformConstant,
+                None,
+            );
             self.builder.decorate(
                 var,
                 spirv::Decoration::DescriptorSet,
@@ -591,7 +658,14 @@ impl SpirvEmitContext {
                 vec![Operand::LiteralBit32(*binding)],
             );
 
-            self.texture_vars.insert(descriptor_index as u32, var);
+            self.textures.push(TextureDefinition {
+                id: var,
+                sampled_type: sampled_image,
+                pointer_type,
+                image_type,
+                count: desc.count,
+                is_multisample: desc.is_multisample,
+            });
             if self.profile.supported_spirv >= 0x0001_0400 {
                 self.interfaces.push(var);
             }
@@ -1472,9 +1546,19 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_integer::emit_ineg_32(self, a);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::INeg64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_integer::emit_ineg_64(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::IAbs32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let id = super::emit_spirv_integer::emit_iabs_32(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::IAbs64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_integer::emit_iabs_64(self, a);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::ShiftLeftLogical32 => {
@@ -1679,11 +1763,32 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_select::emit_select_u32(self, cond, t, f);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::SelectU64 => {
+                let cond = self.resolve_value(inst.arg(0));
+                let t = self.resolve_value(inst.arg(1));
+                let f = self.resolve_value(inst.arg(2));
+                let id = super::emit_spirv_select::emit_select_u64(self, cond, t, f);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::SelectF16 => {
+                let cond = self.resolve_value(inst.arg(0));
+                let t = self.resolve_value(inst.arg(1));
+                let f = self.resolve_value(inst.arg(2));
+                let id = super::emit_spirv_select::emit_select_f16(self, cond, t, f);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::SelectF32 => {
                 let cond = self.resolve_value(inst.arg(0));
                 let t = self.resolve_value(inst.arg(1));
                 let f = self.resolve_value(inst.arg(2));
                 let id = super::emit_spirv_select::emit_select_f32(self, cond, t, f);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::SelectF64 => {
+                let cond = self.resolve_value(inst.arg(0));
+                let t = self.resolve_value(inst.arg(1));
+                let f = self.resolve_value(inst.arg(2));
+                let id = super::emit_spirv_select::emit_select_f64(self, cond, t, f);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::SelectU1 => {
@@ -1715,6 +1820,116 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_convert::emit_convert_f32_u32(self, a);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::ConvertF16S8 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f16_s8(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF16S16 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f16_s16(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF16S32 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f16_s32(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF16S64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f16_s64(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF16U8 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f16_u8(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF16U16 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f16_u16(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF16U32 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f16_u32(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF16U64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f16_u64(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF32S8 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f32_s8(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF32S16 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f32_s16(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF32S64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f32_s64(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF32U8 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f32_u8(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF32U16 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f32_u16(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF32U64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f32_u64(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF64S8 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f64_s8(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF64S16 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f64_s16(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF64S32 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f64_s32(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF64S64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f64_s64(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF64U8 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f64_u8(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF64U16 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f64_u16(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF64U32 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f64_u32(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF64U64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f64_u64(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::BitCastU32F32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let id = super::emit_spirv_bitwise_conversion::emit_bit_cast_u32_f32(self, a);
@@ -1725,8 +1940,39 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_bitwise_conversion::emit_bit_cast_f32_u32(self, a);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::PackUint2x32 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_bitwise_conversion::emit_pack_uint2x32(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::UnpackUint2x32 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_bitwise_conversion::emit_unpack_uint2x32(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::PackDouble2x32 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_bitwise_conversion::emit_pack_double2x32(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::UnpackDouble2x32 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_bitwise_conversion::emit_unpack_double2x32(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::PackFloat2x16 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_bitwise_conversion::emit_pack_float2x16(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
 
             // ── Composite ─────────────────────────────────────────────
+            Opcode::CompositeConstructF16x2 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_composite::emit_composite_construct_f16x2(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::CompositeConstructF32x2 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
@@ -1864,8 +2110,7 @@ impl SpirvEmitContext {
                 let incoming: Vec<_> = inst
                     .phi_args
                     .iter()
-                    .map(|(block, value)| {
-                        let value = self.resolve_value(value);
+                    .map(|(block, _)| {
                         let label = self
                             .block_labels
                             .get(*block as usize)
@@ -1873,12 +2118,16 @@ impl SpirvEmitContext {
                             .unwrap_or_else(|| {
                                 panic!("SPIR-V: Phi references missing block {block}")
                             });
-                        (value, label)
+                        (0, label)
                     })
                     .collect();
                 self.builder
                     .phi(self.phi_type_id(inst), Some(result_id), incoming)
                     .unwrap();
+                self.deferred_phis.push(DeferredPhi {
+                    result_id,
+                    values: inst.phi_args.iter().map(|(_, value)| *value).collect(),
+                });
             }
             Opcode::Identity | Opcode::ConditionRef => {
                 let id = self.resolve_value(inst.arg(0));
@@ -2007,6 +2256,42 @@ impl SpirvEmitContext {
         self.values.insert((block_idx, inst_idx), id);
     }
 
+    /// Port of upstream `PatchPhiNodes` + Sirit's `PatchDeferredPhi`.
+    fn patch_deferred_phis(&mut self) {
+        for deferred in std::mem::take(&mut self.deferred_phis) {
+            let values: Vec<_> = deferred
+                .values
+                .iter()
+                .map(|value| self.resolve_value(value))
+                .collect();
+            let phi = self
+                .builder
+                .module_mut()
+                .functions
+                .iter_mut()
+                .flat_map(|function| function.blocks.iter_mut())
+                .flat_map(|block| block.instructions.iter_mut())
+                .find(|inst| {
+                    inst.class.opcode == spirv::Op::Phi
+                        && inst.result_id == Some(deferred.result_id)
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "SPIR-V: deferred Phi result {} was not emitted",
+                        deferred.result_id
+                    )
+                });
+            assert_eq!(
+                phi.operands.len(),
+                values.len() * 2,
+                "SPIR-V: deferred Phi operand count changed before patching"
+            );
+            for (index, value) in values.into_iter().enumerate() {
+                phi.operands[index * 2] = Operand::IdRef(value);
+            }
+        }
+    }
+
     /// Emit the complete program (entry point used by emit_spirv.rs).
     pub fn emit_program(&mut self, program: &ir::Program) {
         let mut bindings = Bindings::default();
@@ -2016,6 +2301,7 @@ impl SpirvEmitContext {
     pub fn emit_program_with_bindings(&mut self, program: &ir::Program, bindings: &mut Bindings) {
         self.define_global_variables(program, bindings);
         self.define_main_function(program);
+        self.patch_deferred_phis();
     }
 
     /// Finalize and return SPIR-V words.
@@ -2031,8 +2317,11 @@ impl SpirvEmitContext {
 mod tests {
     use super::*;
     use crate::backend::bindings::Bindings;
+    use crate::ir::instruction::Inst;
+    use crate::ir::opcodes::Opcode;
     use crate::ir::types::ShaderStage;
-    use crate::ir::value::Attribute;
+    use crate::ir::types::Type;
+    use crate::ir::value::{Attribute, InstRef, Value};
 
     #[test]
     fn vertex_id_declares_vertex_index_and_base_vertex_without_vertex_id_support() {
@@ -2122,5 +2411,93 @@ mod tests {
 
         assert!(has_frag_coord);
         assert!(!has_position);
+    }
+
+    #[test]
+    fn sampled_array_texture_preserves_upstream_image_type_flags() {
+        let mut program = ir::Program::new(ShaderStage::Fragment);
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::ColorArray2D,
+            is_depth: true,
+            is_multisample: true,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+
+        let profile = Profile::default();
+        let runtime_info = RuntimeInfo::default();
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &runtime_info);
+        let mut bindings = Bindings::default();
+        ctx.define_global_variables(&program, &mut bindings);
+
+        let image_type = ctx
+            .builder
+            .module_ref()
+            .types_global_values
+            .iter()
+            .find(|inst| inst.class.opcode == spirv::Op::TypeImage)
+            .expect("sampled texture must declare OpTypeImage");
+        assert!(matches!(
+            image_type.operands.as_slice(),
+            [
+                Operand::IdRef(_),
+                Operand::Dim(spirv::Dim::Dim2D),
+                Operand::LiteralBit32(1),
+                Operand::LiteralBit32(1),
+                Operand::LiteralBit32(1),
+                Operand::LiteralBit32(1),
+                Operand::ImageFormat(spirv::ImageFormat::Unknown),
+            ]
+        ));
+    }
+
+    #[test]
+    fn phi_values_are_patched_after_forward_definitions() {
+        let mut program = ir::Program::new(ShaderStage::VertexB);
+        let phi_block = program.add_block();
+        let value_block = program.add_block();
+
+        let value_inst = program.block_mut(value_block).append_inst(Inst::new(
+            Opcode::IAdd32,
+            vec![Value::ImmU32(3), Value::ImmU32(4)],
+        ));
+        let mut phi = Inst::phi();
+        phi.flags = Type::U32 as u32;
+        phi.add_phi_operand(
+            value_block,
+            Value::Inst(InstRef {
+                block: value_block,
+                inst: value_inst,
+            }),
+        );
+        let phi_inst = program.block_mut(phi_block).append_inst(phi);
+
+        let profile = Profile::default();
+        let runtime_info = RuntimeInfo::default();
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &runtime_info);
+        ctx.emit_program(&program);
+
+        let phi_id = ctx.values[&(phi_block, phi_inst)];
+        let value_id = ctx.values[&(value_block, value_inst)];
+        let emitted_phi = ctx
+            .builder
+            .module_ref()
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+            .find(|inst| inst.result_id == Some(phi_id))
+            .expect("Phi result was not emitted");
+
+        assert_eq!(emitted_phi.class.opcode, spirv::Op::Phi);
+        assert_eq!(emitted_phi.operands[0], Operand::IdRef(value_id));
+        assert_ne!(emitted_phi.operands[0], Operand::IdRef(0));
     }
 }

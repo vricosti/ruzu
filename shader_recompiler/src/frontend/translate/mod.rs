@@ -315,6 +315,25 @@ impl<'a> TranslatorVisitor<'a> {
         self.ir.get_cbuf_u32(binding, offset)
     }
 
+    /// Get an aligned packed U64 from a constant buffer.
+    ///
+    /// Corresponds to upstream `TranslatorVisitor::GetPackedCbuf`.
+    pub fn get_packed_cbuf(&mut self, insn: u64) -> Value {
+        if bit(insn, 20) {
+            panic!("Unaligned packed constant buffer read");
+        }
+        let cb_index = field(insn, 34, 5);
+        let cb_offset = field(insn, 20, 14) << 2;
+        self.ir.program.info.register_cbuf(cb_index);
+        let binding = Value::ImmU32(cb_index);
+        let lo = self
+            .ir
+            .get_cbuf_u32(binding.clone(), Value::ImmU32(cb_offset));
+        let hi = self.ir.get_cbuf_u32(binding, Value::ImmU32(cb_offset + 4));
+        let pair = self.ir.composite_construct_u32x2(lo, hi);
+        self.ir.pack_uint_2x32(pair)
+    }
+
     /// Get an F32 from a constant buffer.
     pub fn get_float_cbuf(&mut self, insn: u64) -> Value {
         let cb_index = field(insn, 34, 5);
@@ -341,8 +360,23 @@ impl<'a> TranslatorVisitor<'a> {
 
     /// Get a sign-extended 20-bit immediate as U32 (GetImm20 upstream).
     pub fn get_imm20(&self, insn: u64) -> Value {
-        let imm = sfield(insn, 20, 20);
-        Value::ImmU32(imm as u32)
+        let value = field(insn, 20, 19);
+        let value = if bit(insn, 56) {
+            value.wrapping_add((-(1i32 << 19)) as u32)
+        } else {
+            value
+        };
+        Value::ImmU32(value)
+    }
+
+    /// Get the I2F packed 64-bit immediate.
+    ///
+    /// Corresponds to upstream `TranslatorVisitor::GetPackedImm20`.
+    pub fn get_packed_imm20(&self, insn: u64) -> Value {
+        let Value::ImmU32(value) = self.get_imm20(insn) else {
+            unreachable!("GetImm20 always returns an immediate")
+        };
+        Value::ImmU64((value as u64) << 32)
     }
 
     /// Get a 20-bit immediate as F32 (sign bit at bit 56, mantissa at [20:38]).

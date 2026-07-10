@@ -7,6 +7,14 @@
 use super::spirv_emit_context::SpirvEmitContext;
 use rspirv::spirv::Word;
 
+// ── F16 composite operations ─────────────────────────────────────────────
+
+pub fn emit_composite_construct_f16x2(ctx: &mut SpirvEmitContext, e1: Word, e2: Word) -> Word {
+    ctx.builder
+        .composite_construct(ctx.f16_vec2_type, None, vec![e1, e2])
+        .unwrap()
+}
+
 // ── U32 composite operations ─────────────────────────────────────────────
 
 /// Emit `OpCompositeConstruct` for U32x2.

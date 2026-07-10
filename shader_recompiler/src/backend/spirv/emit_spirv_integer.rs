@@ -41,6 +41,20 @@ pub fn emit_iabs_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
         .unwrap()
 }
 
+/// IAbs64: `GLSL.std.450 SAbs`.
+pub fn emit_iabs_64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    let glsl_set = ctx.glsl_ext;
+    ctx.builder
+        .ext_inst(
+            ctx.u64_type,
+            None,
+            glsl_set,
+            5, /* SAbs */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
+        .unwrap()
+}
+
 /// ShiftLeftLogical32: `OpShiftLeftLogical`.
 pub fn emit_shift_left_logical_32(ctx: &mut SpirvEmitContext, base: Word, shift: Word) -> Word {
     ctx.builder
