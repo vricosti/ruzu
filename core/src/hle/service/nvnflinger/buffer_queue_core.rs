@@ -15,7 +15,9 @@ use std::time::Instant;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_scheduler_lock::KScopedSchedulerLock;
 use crate::hle::kernel::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep;
-use crate::hle::kernel::k_thread::{KThread, KThreadLock, ThreadState, ThreadWaitReasonForDebugging};
+use crate::hle::kernel::k_thread::{
+    KThread, KThreadLock, ThreadState, ThreadWaitReasonForDebugging,
+};
 use crate::hle::kernel::k_thread_queue::KThreadQueue;
 use crate::hle::kernel::kernel as kernel_globals;
 use crate::hle::result::RESULT_SUCCESS;
