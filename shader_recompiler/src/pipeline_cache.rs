@@ -104,9 +104,12 @@ fn translate_cfg_to_program(
                 break;
             }
             // Skip Maxwell sched-control words. Each 32-byte SASS bundle is one
-            // 8-byte sched word followed by three 8-byte instructions, so every
-            // absolute word whose byte offset is 32-byte aligned is control metadata.
-            if is_sched_control_word(base_offset, i) {
+            // 8-byte sched word followed by three 8-byte instructions. The
+            // bundle grid is anchored at the START OF THE CODE (`code[0]` is
+            // always a sched word), NOT at absolute offset 0 — MK8D ships
+            // shaders whose code starts at `abs % 32 == 16` (verified by
+            // memory dump 2026-07-09; see Location::phase).
+            if is_sched_control_word(i) {
                 continue;
             }
             if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some()
@@ -351,14 +354,12 @@ fn rebuild_syntax_successors(program: &mut Program) {
             }
             SyntaxNode::Loop {
                 body,
-                continue_block,
-                merge,
+                continue_block: _,
+                merge: _,
             } => {
                 if let Some(current) = current_block {
                     add_syntax_edge(program, current, body);
                 }
-                add_syntax_edge(program, continue_block, body);
-                add_syntax_edge(program, continue_block, merge);
                 current_block = None;
             }
             SyntaxNode::Repeat {
@@ -430,8 +431,8 @@ fn clear_unreachable_blocks(program: &mut Program) {
     }
 }
 
-fn is_sched_control_word(base_offset: u32, word_index: usize) -> bool {
-    ((base_offset as usize / 8) + word_index) % 4 == 0
+fn is_sched_control_word(word_index: usize) -> bool {
+    word_index % 4 == 0
 }
 
 fn maxwell_opcode_is_unknown(word: u64) -> bool {
@@ -1451,7 +1452,7 @@ fn decoded_shader_words(stage: ShaderStage, base_offset: u32, code: &[u64]) -> S
     let mut out = String::new();
     for (index, &word) in code.iter().enumerate() {
         let abs = base_offset + (index as u32 * 8);
-        let sched = is_sched_control_word(base_offset, index);
+        let sched = is_sched_control_word(index);
         let predicate = super::frontend::instruction::Instruction::new(word).pred();
         let opcode = super::frontend::maxwell_opcodes::decode_opcode(word)
             .map(|op| format!("{op:?}"))
@@ -1508,7 +1509,7 @@ fn trace_shader_words(stage: ShaderStage, base_offset: u32, code: &[u64]) {
             stage,
             base_offset + (i as u32 * 8),
             i,
-            is_sched_control_word(base_offset, i),
+            is_sched_control_word(i),
             word
         );
     }
@@ -1589,6 +1590,37 @@ mod tests {
         assert!(compiled
             .source
             .contains("layout(location=2)out ivec4 frag_color2;"));
+    }
+
+    #[test]
+    fn loop_cfg_routes_continue_through_header_not_body() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        for _ in 0..4 {
+            program.add_block();
+        }
+        program.syntax_list = vec![
+            SyntaxNode::Block(0),
+            SyntaxNode::Loop {
+                body: 1,
+                continue_block: 2,
+                merge: 3,
+            },
+            SyntaxNode::Block(1),
+            SyntaxNode::Block(2),
+            SyntaxNode::Repeat {
+                cond: Value::ImmU1(true),
+                loop_header: 0,
+                merge: 3,
+            },
+            SyntaxNode::Block(3),
+        ];
+
+        rebuild_syntax_successors(&mut program);
+
+        assert_eq!(program.block(1).imm_predecessors, vec![0]);
+        assert!(!program.block(1).imm_predecessors.contains(&2));
+        assert!(program.block(0).imm_predecessors.contains(&2));
+        assert!(program.block(3).imm_predecessors.contains(&2));
     }
 
     #[test]
@@ -1762,12 +1794,17 @@ mod tests {
     }
 
     #[test]
-    fn sched_control_skip_uses_absolute_shader_offset() {
-        assert!(is_sched_control_word(0, 0));
-        assert!(!is_sched_control_word(0, 1));
-        assert!(is_sched_control_word(8, 3));
-        assert!(!is_sched_control_word(8, 0));
-        assert!(is_sched_control_word(0x50, 2));
+    fn sched_control_skip_is_anchored_at_code_start() {
+        // The sched grid is anchored at the start of the code slice
+        // (`code[0]` is always a sched word), regardless of the code's
+        // absolute offset — MK8D ships shaders whose code starts at
+        // `abs % 32 == 16` (verified by memory dump, 2026-07-09).
+        assert!(is_sched_control_word(0));
+        assert!(!is_sched_control_word(1));
+        assert!(!is_sched_control_word(2));
+        assert!(!is_sched_control_word(3));
+        assert!(is_sched_control_word(4));
+        assert!(is_sched_control_word(8));
     }
 
     struct DummyEnvironment {

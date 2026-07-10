@@ -378,7 +378,7 @@ impl FlowCfg {
             MaxwellOpcode::EXIT => self.analyze_exit(block, function_id, pc, inst),
             MaxwellOpcode::CAL | MaxwellOpcode::JCAL => {
                 let cal_pc = if is_absolute_jump(opcode) {
-                    Location::new(inst.branch_absolute())
+                    pc.with_offset(inst.branch_absolute())
                 } else {
                     branch_offset(pc, inst)
                 };
@@ -501,7 +501,7 @@ impl FlowCfg {
         is_absolute: bool,
     ) {
         let target = if is_absolute {
-            Location::new(inst.branch_absolute())
+            pc.with_offset(inst.branch_absolute())
         } else {
             branch_offset(pc, inst)
         };
@@ -711,7 +711,7 @@ pub fn build_cfg_from_env(
     base_offset: u32,
     _code_words: usize,
 ) -> Vec<CfgBlock> {
-    let cfg = FlowCfg::new(env, Location::new(base_offset), false);
+    let cfg = FlowCfg::new(env, Location::new_code_start(base_offset), false);
     cfg.to_cfg_blocks(base_offset)
 }
 
@@ -753,7 +753,7 @@ fn has_flow_test(opcode: MaxwellOpcode) -> bool {
 }
 
 fn branch_offset(pc: Location, inst: Instruction) -> Location {
-    Location::new(
+    pc.with_offset(
         pc.offset()
             .wrapping_add(inst.branch_offset() as u32)
             .wrapping_add(8),

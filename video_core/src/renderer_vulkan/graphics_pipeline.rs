@@ -750,9 +750,25 @@ impl GraphicsPipelineCache {
                     .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                     .unwrap_or("unknown shader compiler panic");
                 log::error!(
-                    "Skipping cached graphics pipeline 0x{:016X}: {}",
+                    "Skipping cached graphics pipeline 0x{:016X}: {} (stage unique_hashes: {}; environments: {})",
                     graphics_pipeline_key_cache_hash(key),
-                    reason
+                    reason,
+                    key.unique_hashes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, hash)| **hash != 0)
+                        .map(|(stage, hash)| format!("{stage}=0x{hash:016X}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    environments
+                        .iter()
+                        .map(|env| format!(
+                            "{:?}@0x{:X}",
+                            env.shader_stage(),
+                            env.start_address()
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 );
                 None
             }
@@ -779,6 +795,10 @@ impl GraphicsPipelineCache {
         if let (Some(vertex_a_index), Some(vertex_b_index)) = (vertex_a_env, vertex_b_env) {
             let runtime_info = make_runtime_info_from_state(key, ShaderStage::VertexB, None);
             let (vertex_a, vertex_b) = two_mut(environments, vertex_a_index, vertex_b_index)?;
+            let header_size =
+                std::mem::size_of::<shader_recompiler::program_header::ProgramHeader>() as u32;
+            let vertex_a_cfg_offset = vertex_a.start_address().wrapping_add(header_size);
+            let vertex_b_cfg_offset = vertex_b.start_address().wrapping_add(header_size);
             let vertex_a_code = vertex_a.cached_instruction_slice().to_vec();
             let vertex_b_code = vertex_b.cached_instruction_slice().to_vec();
             if vertex_a_code.is_empty() || vertex_b_code.is_empty() {
@@ -787,16 +807,17 @@ impl GraphicsPipelineCache {
             let compiled =
                 shader_recompiler::compile_dual_vertex_shader_from_env_with_bindings_and_host_info(
                     &vertex_a_code,
-                    vertex_a.start_address(),
+                    vertex_a_cfg_offset,
                     vertex_a,
                     &vertex_b_code,
-                    vertex_b.start_address(),
+                    vertex_b_cfg_offset,
                     vertex_b,
                     &self.profile,
                     &runtime_info,
                     &mut bindings,
                     &self.host_info,
                 );
+            dump_spirv_if_requested(0, vertex_b_cfg_offset, &compiled.spirv_words);
             previous_stage_info = Some(compiled.info.clone());
             compiled_stages[0] = Some(compiled);
         }
@@ -818,15 +839,19 @@ impl GraphicsPipelineCache {
             if code.is_empty() {
                 continue;
             }
+            let cfg_offset = env.start_address().wrapping_add(std::mem::size_of::<
+                shader_recompiler::program_header::ProgramHeader,
+            >() as u32);
             let compiled = shader_recompiler::compile_shader_from_env_with_bindings_and_host_info(
                 &code,
-                env.start_address(),
+                cfg_offset,
                 env,
                 &self.profile,
                 &runtime_info,
                 &mut bindings,
                 &self.host_info,
             );
+            dump_spirv_if_requested(stage_index, cfg_offset, &compiled.spirv_words);
             if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
                 log::info!(
                     "[VK_SHADER_DISK_COMPILE] env_index={} stage={:?} spirv_words={}",
@@ -929,6 +954,17 @@ impl GraphicsPipelineCache {
                 env.generic_environment().cached_code_slice().len(),
                 env.generic_environment().cached_instruction_start(),
             );
+            let full = env.generic_environment().cached_code_slice();
+            let inst_start = env.generic_environment().cached_instruction_start();
+            for (w, word) in full.iter().take(16).enumerate() {
+                eprintln!(
+                    "[SHADER_HEAD] stage_index={} word={} abs=0x{:X} value=0x{:016X}",
+                    stage_index,
+                    w,
+                    inst_start.wrapping_sub(0x50) + (w as u32 * 8),
+                    word
+                );
+            }
         }
         let code = env
             .generic_environment()
@@ -983,6 +1019,7 @@ impl GraphicsPipelineCache {
         let compiled = self
             .shader_cache
             .get_or_compile(&code, ShaderStage::VertexB, &runtime_info);
+        dump_spirv_if_requested(0, stage_info.offset, &compiled.spirv_words);
         Some(compiled.clone())
     }
 
@@ -1007,6 +1044,7 @@ impl GraphicsPipelineCache {
         let compiled =
             self.shader_cache
                 .get_or_compile(&code, ShaderStage::Fragment, &runtime_info);
+        dump_spirv_if_requested(4, stage_info.offset, &compiled.spirv_words);
         Some(compiled.clone())
     }
 
@@ -1661,6 +1699,19 @@ fn add_shader_descriptor_bindings(
             stage,
             Some(graphics_stage),
             Some(desc.index),
+            None,
+        );
+        *binding += 1;
+    }
+    for desc in &shader.info.storage_buffers_descriptors {
+        merge_descriptor_binding(
+            bindings,
+            *binding,
+            vk::DescriptorType::STORAGE_BUFFER,
+            desc.count,
+            stage,
+            None,
+            None,
             None,
         );
         *binding += 1;
