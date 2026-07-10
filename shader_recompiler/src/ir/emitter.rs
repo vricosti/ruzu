@@ -833,6 +833,10 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::IAbs32, vec![a]))
     }
 
+    pub fn iabs_64(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::IAbs64, vec![a]))
+    }
+
     pub fn shift_left_logical_32(&mut self, base: Value, shift: Value) -> Value {
         self.emit(Inst::new(Opcode::ShiftLeftLogical32, vec![base, shift]))
     }
@@ -986,8 +990,20 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::SelectU32, vec![cond, a, b]))
     }
 
+    pub fn select_u64(&mut self, cond: Value, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::SelectU64, vec![cond, a, b]))
+    }
+
+    pub fn select_f16(&mut self, cond: Value, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::SelectF16, vec![cond, a, b]))
+    }
+
     pub fn select_f32(&mut self, cond: Value, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::SelectF32, vec![cond, a, b]))
+    }
+
+    pub fn select_f64(&mut self, cond: Value, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::SelectF64, vec![cond, a, b]))
     }
 
     pub fn select_u1(&mut self, cond: Value, a: Value, b: Value) -> Value {
@@ -1028,6 +1044,48 @@ impl<'a> Emitter<'a> {
 
     pub fn convert_f32_from_u32(&mut self, a: Value) -> Value {
         self.emit(Inst::new(Opcode::ConvertF32U32, vec![a]))
+    }
+
+    /// Port of upstream `IREmitter::ConvertIToF`.
+    pub fn convert_i_to_f(
+        &mut self,
+        dest_bits: u32,
+        src_bits: u32,
+        is_signed: bool,
+        value: Value,
+        control: FpControl,
+    ) -> Value {
+        let opcode = match (dest_bits, src_bits, is_signed) {
+            (16, 8, true) => Opcode::ConvertF16S8,
+            (16, 16, true) => Opcode::ConvertF16S16,
+            (16, 32, true) => Opcode::ConvertF16S32,
+            (16, 64, true) => Opcode::ConvertF16S64,
+            (16, 8, false) => Opcode::ConvertF16U8,
+            (16, 16, false) => Opcode::ConvertF16U16,
+            (16, 32, false) => Opcode::ConvertF16U32,
+            (16, 64, false) => Opcode::ConvertF16U64,
+            (32, 8, true) => Opcode::ConvertF32S8,
+            (32, 16, true) => Opcode::ConvertF32S16,
+            (32, 32, true) => Opcode::ConvertF32S32,
+            (32, 64, true) => Opcode::ConvertF32S64,
+            (32, 8, false) => Opcode::ConvertF32U8,
+            (32, 16, false) => Opcode::ConvertF32U16,
+            (32, 32, false) => Opcode::ConvertF32U32,
+            (32, 64, false) => Opcode::ConvertF32U64,
+            (64, 8, true) => Opcode::ConvertF64S8,
+            (64, 16, true) => Opcode::ConvertF64S16,
+            (64, 32, true) => Opcode::ConvertF64S32,
+            (64, 64, true) => Opcode::ConvertF64S64,
+            (64, 8, false) => Opcode::ConvertF64U8,
+            (64, 16, false) => Opcode::ConvertF64U16,
+            (64, 32, false) => Opcode::ConvertF64U32,
+            (64, 64, false) => Opcode::ConvertF64U64,
+            _ => panic!(
+                "Invalid integer-to-float bit size combination dst={} src={}",
+                dest_bits, src_bits
+            ),
+        };
+        self.emit(Inst::with_flags(opcode, vec![value], control.to_u32()))
     }
 
     pub fn convert_s32_from_f32(&mut self, a: Value) -> Value {

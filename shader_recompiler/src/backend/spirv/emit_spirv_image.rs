@@ -115,9 +115,57 @@ pub fn emit_image_gradient(
 // ── IR-instruction dispatching helpers (called from spirv_emit_context) ───
 
 use crate::ir::types::TextureInstInfo;
+use crate::ir::value::Value;
 use crate::ir::{self, Opcode};
 use rspirv::dr::Operand;
 use rspirv::spirv;
+
+/// Port of upstream `Texture`: load a combined image sampler, including
+/// descriptor-array indexing when `count > 1`.
+fn texture(ctx: &mut SpirvEmitContext, descriptor_index: u32, index: Value) -> Option<Word> {
+    let def = *ctx.textures.get(descriptor_index as usize)?;
+    let pointer = if def.count > 1 {
+        let index = ctx.resolve_value(&index);
+        ctx.builder
+            .access_chain(def.pointer_type, None, def.id, vec![index])
+            .unwrap()
+    } else {
+        def.id
+    };
+    Some(
+        ctx.builder
+            .load(def.sampled_type, None, pointer, None, vec![])
+            .unwrap(),
+    )
+}
+
+/// Port of upstream `TextureImage`: extract the image from a combined sampler.
+fn texture_image(ctx: &mut SpirvEmitContext, descriptor_index: u32, index: Value) -> Option<Word> {
+    let def = *ctx.textures.get(descriptor_index as usize)?;
+    let sampled_image = if def.count > 1 {
+        let index = ctx.resolve_value(&index);
+        let pointer = ctx
+            .builder
+            .access_chain(def.pointer_type, None, def.id, vec![index])
+            .unwrap();
+        ctx.builder
+            .load(def.sampled_type, None, pointer, None, vec![])
+            .unwrap()
+    // Upstream's default-constructed `IR::Value{}` is the implicit index zero
+    // used for non-array descriptors; Rust represents it as `Value::Void`.
+    } else if matches!(index, Value::Void) || (index.is_immediate() && index.imm_u32() == 0) {
+        ctx.builder
+            .load(def.sampled_type, None, def.id, None, vec![])
+            .unwrap()
+    } else {
+        panic!("SPIR-V: indirect texture image indexing is not implemented");
+    };
+    Some(
+        ctx.builder
+            .image(def.image_type, None, sampled_image)
+            .unwrap(),
+    )
+}
 
 /// Dispatch ImageSampleImplicitLod / ImageSampleExplicitLod IR instructions.
 pub fn emit_image_sample(
@@ -130,25 +178,7 @@ pub fn emit_image_sample(
     let desc_idx = info.descriptor_index as u32;
     let coord = ctx.resolve_value(inst.arg(1));
 
-    if let Some(&tex_var) = ctx.texture_vars.get(&desc_idx) {
-        let image_type = {
-            let img = ctx.builder.type_image(
-                ctx.f32_type,
-                spirv::Dim::Dim2D,
-                0,
-                0,
-                0,
-                1,
-                spirv::ImageFormat::Unknown,
-                None,
-            );
-            ctx.builder.type_sampled_image(img)
-        };
-        let sampled_image = ctx
-            .builder
-            .load(image_type, None, tex_var, None, vec![])
-            .unwrap();
-
+    if let Some(sampled_image) = texture(ctx, desc_idx, *inst.arg(0)) {
         let id = if inst.opcode == Opcode::ImageSampleExplicitLod && inst.args.len() > 3 {
             let lod = ctx.resolve_value(inst.arg(2));
             ctx.builder
@@ -197,25 +227,7 @@ pub fn emit_image_sample_dref(
     let coord = ctx.resolve_value(inst.arg(1));
     let dref = ctx.resolve_value(inst.arg(2));
 
-    if let Some(&tex_var) = ctx.texture_vars.get(&desc_idx) {
-        let image_type = {
-            let img = ctx.builder.type_image(
-                ctx.f32_type,
-                spirv::Dim::Dim2D,
-                0,
-                0,
-                0,
-                1,
-                spirv::ImageFormat::Unknown,
-                None,
-            );
-            ctx.builder.type_sampled_image(img)
-        };
-        let sampled_image = ctx
-            .builder
-            .load(image_type, None, tex_var, None, vec![])
-            .unwrap();
-
+    if let Some(sampled_image) = texture(ctx, desc_idx, *inst.arg(0)) {
         let id = if inst.opcode == Opcode::ImageSampleDrefExplicitLod && inst.args.len() > 3 {
             let lod = ctx.resolve_value(inst.arg(3));
             ctx.builder
@@ -261,36 +273,7 @@ pub fn emit_image_fetch_inst(
     let desc_idx = info.descriptor_index as u32;
     let coord = ctx.resolve_value(inst.arg(1));
 
-    if let Some(&tex_var) = ctx.texture_vars.get(&desc_idx) {
-        let sampled_img_type = {
-            let img = ctx.builder.type_image(
-                ctx.f32_type,
-                spirv::Dim::Dim2D,
-                0,
-                0,
-                0,
-                1,
-                spirv::ImageFormat::Unknown,
-                None,
-            );
-            ctx.builder.type_sampled_image(img)
-        };
-        let img_type = ctx.builder.type_image(
-            ctx.f32_type,
-            spirv::Dim::Dim2D,
-            0,
-            0,
-            0,
-            1,
-            spirv::ImageFormat::Unknown,
-            None,
-        );
-        let sampled_image = ctx
-            .builder
-            .load(sampled_img_type, None, tex_var, None, vec![])
-            .unwrap();
-        let image = ctx.builder.image(img_type, None, sampled_image).unwrap();
-
+    if let Some(image) = texture_image(ctx, desc_idx, *inst.arg(0)) {
         let lod = if inst.args.len() > 3 {
             ctx.resolve_value(inst.arg(3))
         } else {
@@ -330,36 +313,7 @@ pub fn emit_image_query(
     let info = TextureInstInfo::from_u32(inst.flags);
     let desc_idx = info.descriptor_index as u32;
 
-    if let Some(&tex_var) = ctx.texture_vars.get(&desc_idx) {
-        let sampled_img_type = {
-            let img = ctx.builder.type_image(
-                ctx.f32_type,
-                spirv::Dim::Dim2D,
-                0,
-                0,
-                0,
-                1,
-                spirv::ImageFormat::Unknown,
-                None,
-            );
-            ctx.builder.type_sampled_image(img)
-        };
-        let img_type = ctx.builder.type_image(
-            ctx.f32_type,
-            spirv::Dim::Dim2D,
-            0,
-            0,
-            0,
-            1,
-            spirv::ImageFormat::Unknown,
-            None,
-        );
-        let sampled_image = ctx
-            .builder
-            .load(sampled_img_type, None, tex_var, None, vec![])
-            .unwrap();
-        let image = ctx.builder.image(img_type, None, sampled_image).unwrap();
-
+    if let Some(image) = texture_image(ctx, desc_idx, *inst.arg(0)) {
         let lod = if inst.args.len() > 1 {
             ctx.resolve_value(inst.arg(1))
         } else {
@@ -393,25 +347,7 @@ pub fn emit_image_gather_inst(
     let desc_idx = info.descriptor_index as u32;
     let coord = ctx.resolve_value(inst.arg(1));
 
-    if let Some(&tex_var) = ctx.texture_vars.get(&desc_idx) {
-        let sampled_img_type = {
-            let img = ctx.builder.type_image(
-                ctx.f32_type,
-                spirv::Dim::Dim2D,
-                0,
-                0,
-                0,
-                1,
-                spirv::ImageFormat::Unknown,
-                None,
-            );
-            ctx.builder.type_sampled_image(img)
-        };
-        let sampled_image = ctx
-            .builder
-            .load(sampled_img_type, None, tex_var, None, vec![])
-            .unwrap();
-
+    if let Some(sampled_image) = texture(ctx, desc_idx, *inst.arg(0)) {
         let id = if inst.opcode == Opcode::ImageGatherDref && inst.args.len() > 4 {
             let dref = ctx.resolve_value(inst.arg(4));
             ctx.builder

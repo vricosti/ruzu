@@ -773,7 +773,6 @@ struct TranslatePass {
     syntax: Vec<SyntaxNode>,
     actions: Vec<StructuredAction>,
     next_block: u32,
-    current_block: Option<u32>,
 }
 
 impl TranslatePass {
@@ -782,7 +781,6 @@ impl TranslatePass {
             syntax: Vec::new(),
             actions: Vec::new(),
             next_block: original_block_count as u32,
-            current_block: None,
         }
     }
 
@@ -800,13 +798,13 @@ impl TranslatePass {
         block
     }
 
-    fn ensure_block(&mut self) -> u32 {
-        if let Some(block) = self.current_block {
+    fn ensure_block(&mut self, current_block: &mut Option<u32>) -> u32 {
+        if let Some(block) = *current_block {
             return block;
         }
         let block = self.create_block();
         self.syntax.push(SyntaxNode::Block(block));
-        self.current_block = Some(block);
+        *current_block = Some(block);
         block
     }
 
@@ -823,15 +821,19 @@ impl TranslatePass {
         break_block: Option<u32>,
         fallthrough_block: Option<u32>,
     ) {
+        // Upstream `TranslatePass::Visit` owns a local current block for each
+        // recursive tree. Sharing it across recursion emits the child's
+        // fallthrough block once in the child and again in the parent.
+        let mut current_block = None;
         for statement in tree {
             match statement {
                 Statement::Label { .. } => {}
                 Statement::Code { block } => {
                     self.syntax.push(SyntaxNode::Block(*block as u32));
-                    self.current_block = Some(*block as u32);
+                    current_block = Some(*block as u32);
                 }
                 Statement::SetVariable { id, op } => {
-                    let block = self.ensure_block();
+                    let block = self.ensure_block(&mut current_block);
                     self.actions.push(StructuredAction::SetVariable {
                         block,
                         id: *id,
@@ -842,7 +844,7 @@ impl TranslatePass {
                     branch_reg,
                     branch_offset,
                 } => {
-                    let block = self.ensure_block();
+                    let block = self.ensure_block(&mut current_block);
                     self.actions
                         .push(StructuredAction::SetIndirectBranchVariable {
                             block,
@@ -851,7 +853,7 @@ impl TranslatePass {
                         });
                 }
                 Statement::If { cond, children } => {
-                    let header_block = self.ensure_block();
+                    let header_block = self.ensure_block(&mut current_block);
                     let merge = self.merge_block();
                     let if_index = self.syntax.len();
                     self.syntax.push(SyntaxNode::If {
@@ -865,7 +867,6 @@ impl TranslatePass {
                         expr: cond.clone(),
                     });
 
-                    self.current_block = None;
                     let body_index = self.syntax.len();
                     self.visit(children, break_block, Some(merge));
                     let body = first_block_from_syntax(&self.syntax[body_index..]).unwrap_or(merge);
@@ -875,12 +876,11 @@ impl TranslatePass {
 
                     self.syntax.push(SyntaxNode::EndIf { merge });
                     self.syntax.push(SyntaxNode::Block(merge));
-                    self.current_block = Some(merge);
+                    current_block = Some(merge);
                 }
                 Statement::Loop { cond, children } => {
                     let loop_header = self.create_block();
                     self.syntax.push(SyntaxNode::Block(loop_header));
-                    self.current_block = Some(loop_header);
 
                     let continue_block = self.create_block();
                     let merge = self.merge_block();
@@ -891,7 +891,6 @@ impl TranslatePass {
                         merge,
                     });
 
-                    self.current_block = None;
                     let body_index = self.syntax.len();
                     self.visit(children, Some(merge), Some(continue_block));
                     let body = first_block_from_syntax(&self.syntax[body_index..]).unwrap_or(merge);
@@ -900,7 +899,6 @@ impl TranslatePass {
                     }
 
                     self.syntax.push(SyntaxNode::Block(continue_block));
-                    self.current_block = Some(continue_block);
                     let repeat_index = self.syntax.len();
                     self.syntax.push(SyntaxNode::Repeat {
                         cond: cond.syntax_placeholder(),
@@ -914,10 +912,10 @@ impl TranslatePass {
                     });
 
                     self.syntax.push(SyntaxNode::Block(merge));
-                    self.current_block = Some(merge);
+                    current_block = Some(merge);
                 }
                 Statement::Break { cond } => {
-                    let header_block = self.ensure_block();
+                    let header_block = self.ensure_block(&mut current_block);
                     let skip = self.merge_block();
                     let merge = break_block.unwrap_or(skip);
                     let break_index = self.syntax.len();
@@ -932,24 +930,24 @@ impl TranslatePass {
                         expr: cond.clone(),
                     });
                     self.syntax.push(SyntaxNode::Block(skip));
-                    self.current_block = Some(skip);
+                    current_block = Some(skip);
                 }
                 Statement::Return => {
-                    self.ensure_block();
+                    self.ensure_block(&mut current_block);
                     let return_block = self.create_block();
                     self.syntax.push(SyntaxNode::Block(return_block));
-                    self.current_block = None;
+                    current_block = None;
                     self.syntax.push(SyntaxNode::Return);
                 }
                 Statement::Kill => {
-                    self.ensure_block();
+                    self.ensure_block(&mut current_block);
                     let demote_block = self.merge_block();
                     self.syntax.push(SyntaxNode::Block(demote_block));
-                    self.current_block = Some(demote_block);
+                    current_block = Some(demote_block);
                 }
                 Statement::Unreachable | Statement::Goto { .. } => {
-                    self.ensure_block();
-                    self.current_block = None;
+                    self.ensure_block(&mut current_block);
+                    current_block = None;
                     self.syntax.push(SyntaxNode::Unreachable);
                 }
                 Statement::Function { children } => {
@@ -958,14 +956,11 @@ impl TranslatePass {
             }
         }
 
-        if let (Some(_current), Some(fallthrough)) = (self.current_block, fallthrough_block) {
-            if !matches!(self.syntax.last(), Some(SyntaxNode::Block(block)) if *block == fallthrough)
-            {
-                self.syntax.push(SyntaxNode::Block(fallthrough));
-            }
-            self.current_block = Some(fallthrough);
-        } else if self.current_block.is_some() && fallthrough_block.is_none() {
-            self.current_block = None;
+        // Upstream adds a CFG branch to `fallthrough_block` here; the parent
+        // emits that block exactly once after Visit returns. The Rust CFG is
+        // rebuilt from this syntax immediately afterwards, so emitting the
+        // block in the child would duplicate its SPIR-V OpLabel.
+        if current_block.is_some() && fallthrough_block.is_none() {
             self.syntax.push(SyntaxNode::Unreachable);
         }
     }
@@ -1062,6 +1057,37 @@ mod tests {
                 SyntaxNode::Return,
             ]
         ));
+    }
+
+    #[test]
+    fn loop_emits_continue_block_once_like_upstream_visit() {
+        let mut pass = TranslatePass::new(1);
+        pass.visit(
+            &[Statement::Loop {
+                cond: Expr::true_value(),
+                children: vec![Statement::Code { block: 0 }],
+            }],
+            None,
+            None,
+        );
+        let structured = pass.finish();
+        let continue_block = structured
+            .syntax
+            .iter()
+            .find_map(|node| match node {
+                SyntaxNode::Loop { continue_block, .. } => Some(*continue_block),
+                _ => None,
+            })
+            .expect("loop node was not emitted");
+
+        assert_eq!(
+            structured
+                .syntax
+                .iter()
+                .filter(|node| matches!(node, SyntaxNode::Block(block) if *block == continue_block))
+                .count(),
+            1
+        );
     }
 
     #[test]
