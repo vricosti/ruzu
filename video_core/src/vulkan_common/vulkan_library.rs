@@ -73,8 +73,12 @@ fn open_library_macos() -> Result<ash::Entry, VulkanError> {
     // Non-bundled ruzu-cmd development fallback on macOS. Prefer a Vulkan
     // loader from the SDK before loading MoltenVK directly; the loader owns
     // portability-enumeration/ICD discovery semantics.
-    library_paths.extend(vulkan_sdk_paths());
+    // Prefer the MoltenVK built with the local upstream application over the
+    // development SDK fallback. The application bundle follows upstream's
+    // first-party macOS deployment model and may contain a newer MoltenVK than
+    // the installed Vulkan SDK (currently 1.4.2 versus 1.4.1 locally).
     library_paths.extend(local_yuzu_bundle_paths());
+    library_paths.extend(vulkan_sdk_paths());
     library_paths.extend([
         PathBuf::from("/opt/homebrew/lib/libvulkan.1.dylib"),
         PathBuf::from("/opt/homebrew/lib/libvulkan.dylib"),

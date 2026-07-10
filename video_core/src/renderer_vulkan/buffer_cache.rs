@@ -25,6 +25,7 @@ use crate::buffer_cache::word_manager::DeviceTracker;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
 use crate::engines::maxwell_3d::{IndexFormat, PrimitiveTopology};
+use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::surface::{PixelFormat, MAX_DEPTH_STENCIL_FORMAT};
 use crate::texture_cache::texture_cache_base::TICKS_TO_DESTROY;
 
@@ -80,14 +81,12 @@ impl base::BufferCacheParams for BufferCacheParams {
     const USE_MEMORY_MAPS_FOR_UPLOADS: bool = Self::USE_MEMORY_MAPS_FOR_UPLOADS;
 }
 
-pub type VulkanCommonBufferCache = CommonBufferCache<BufferCacheParams, VulkanDeviceTracker>;
+pub type VulkanCommonBufferCache = CommonBufferCache<BufferCacheParams, MaxwellDeviceMemoryManager>;
 
-pub struct VulkanDeviceTracker;
-
-pub static VULKAN_DEVICE_TRACKER: VulkanDeviceTracker = VulkanDeviceTracker;
-
-impl DeviceTracker for VulkanDeviceTracker {
-    fn update_pages_cached_count(&self, _addr: u64, _size: u64, _delta: i32) {}
+impl DeviceTracker for MaxwellDeviceMemoryManager {
+    fn update_pages_cached_count(&self, addr: u64, size: u64, delta: i32) {
+        MaxwellDeviceMemoryManager::update_pages_cached_count(self, addr, size as usize, delta);
+    }
 }
 
 /// Vulkan implementation of upstream `BufferCacheRuntime`.
@@ -110,6 +109,7 @@ pub struct BufferCacheRuntime {
     null_buffer: vk::Buffer,
     null_memory: vk::DeviceMemory,
     null_buffer_size: vk::DeviceSize,
+    extended_dynamic_state_supported: bool,
 }
 
 impl BufferCacheRuntime {
@@ -120,6 +120,7 @@ impl BufferCacheRuntime {
         scheduler: &mut Scheduler,
         staging_pool: &mut StagingBufferPool,
         guest_descriptor_queue: &mut UpdateDescriptorQueue,
+        extended_dynamic_state_supported: bool,
     ) -> Self {
         let (null_buffer, null_memory, null_buffer_size) =
             create_runtime_null_buffer(&device, &instance, physical_device);
@@ -136,6 +137,7 @@ impl BufferCacheRuntime {
             null_buffer,
             null_memory,
             null_buffer_size,
+            extended_dynamic_state_supported,
         }
     }
 
@@ -603,14 +605,86 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         });
     }
 
-    fn bind_index_buffer(&mut self, _buffer: BufferId, _gpu_handle: u32, _offset: u32, _size: u32) {
+    fn bind_index_buffer(
+        &mut self,
+        topology: PrimitiveTopology,
+        index_format: IndexFormat,
+        _base_vertex: u32,
+        _num_indices: u32,
+        _buffer: BufferId,
+        gpu_handle: u32,
+        offset: u32,
+        _size: u32,
+    ) {
+        debug_assert!(!matches!(
+            topology,
+            PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip
+        ));
+        let mut buffer = self.resolve_buffer(gpu_handle);
+        if buffer == vk::Buffer::null() {
+            buffer = self.null_buffer;
+        }
+        let index_type = match index_format {
+            IndexFormat::UnsignedByte => vk::IndexType::UINT8_EXT,
+            IndexFormat::UnsignedShort => vk::IndexType::UINT16,
+            IndexFormat::UnsignedInt => vk::IndexType::UINT32,
+        };
+        let device = self.device.clone();
+        self.scheduler().record(move |cmdbuf| unsafe {
+            device.cmd_bind_index_buffer(cmdbuf, buffer, offset as u64, index_type);
+        });
     }
 
     fn bind_vertex_buffers(
         &mut self,
-        _bindings: &HostBindings,
-        _buffers: &mut common::slot_vector::SlotVector<BufferBase>,
+        bindings: &HostBindings,
+        buffers: &mut common::slot_vector::SlotVector<BufferBase>,
     ) {
+        let binding_count = bindings.max_index.saturating_sub(bindings.min_index) as usize;
+        if binding_count == 0 {
+            return;
+        }
+        let mut vk_buffers = Vec::with_capacity(binding_count);
+        let mut offsets = Vec::with_capacity(binding_count);
+        let mut sizes = Vec::with_capacity(binding_count);
+        let mut strides = Vec::with_capacity(binding_count);
+        for index in 0..binding_count {
+            let buffer_id = bindings.buffer_ids[index];
+            let mut buffer = if buffer_id.is_valid() {
+                self.resolve_buffer(buffers[buffer_id].gpu_handle)
+            } else {
+                vk::Buffer::null()
+            };
+            let is_null = buffer == vk::Buffer::null();
+            if is_null {
+                buffer = self.null_buffer;
+            }
+            vk_buffers.push(buffer);
+            offsets.push(if is_null { 0 } else { bindings.offsets[index] });
+            sizes.push(if is_null {
+                vk::WHOLE_SIZE
+            } else {
+                bindings.sizes[index]
+            });
+            strides.push(bindings.strides[index]);
+        }
+        let first_binding = bindings.min_index;
+        let dynamic_stride = self.extended_dynamic_state_supported;
+        let device = self.device.clone();
+        self.scheduler().record(move |cmdbuf| unsafe {
+            if dynamic_stride {
+                device.cmd_bind_vertex_buffers2(
+                    cmdbuf,
+                    first_binding,
+                    &vk_buffers,
+                    &offsets,
+                    Some(&sizes),
+                    Some(&strides),
+                );
+            } else {
+                device.cmd_bind_vertex_buffers(cmdbuf, first_binding, &vk_buffers, &offsets);
+            }
+        });
     }
 
     fn bind_uniform_buffer(
@@ -627,13 +701,25 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
 
     fn bind_storage_buffer(
         &mut self,
-        _stage: usize,
-        _binding_index: u32,
+        stage: usize,
+        binding_index: u32,
         buffer: &mut BufferBase,
         offset: u32,
         size: u32,
-        _is_written: bool,
+        is_written: bool,
     ) {
+        if std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some() {
+            log::info!(
+                "[VK_SSBO_DESCRIPTOR] stage={} index={} gpu_handle={} vk_buffer=0x{:X} offset=0x{:X} size=0x{:X} written={}",
+                stage,
+                binding_index,
+                buffer.gpu_handle,
+                self.resolve_buffer(buffer.gpu_handle).as_raw(),
+                offset,
+                size,
+                is_written,
+            );
+        }
         self.bind_buffer_descriptor(buffer.gpu_handle, offset, size);
     }
 
@@ -1297,7 +1383,7 @@ impl BufferCache {
             .iter()
             .filter_map(|(&base, cached)| {
                 let cached_end = base.saturating_add(cached.size);
-                (base < end && gpu_va < cached_end).then_some(base)
+                ranges_overlap(base, cached_end, gpu_va, end).then_some(base)
             })
             .collect();
 
@@ -1310,6 +1396,10 @@ impl BufferCache {
     pub fn null_buffer(&self) -> vk::Buffer {
         self.null_buffer
     }
+}
+
+fn ranges_overlap(lhs_begin: u64, lhs_end: u64, rhs_begin: u64, rhs_end: u64) -> bool {
+    lhs_begin < rhs_end && rhs_begin < lhs_end
 }
 
 impl Drop for BufferCache {
@@ -1521,5 +1611,13 @@ mod tests {
         assert!(BufferCacheParams::USE_MEMORY_MAPS);
         assert!(!BufferCacheParams::SEPARATE_IMAGE_BUFFER_BINDINGS);
         assert!(BufferCacheParams::USE_MEMORY_MAPS_FOR_UPLOADS);
+    }
+
+    #[test]
+    fn direct_cache_write_overlap_uses_half_open_ranges() {
+        assert!(ranges_overlap(0x1000, 0x2000, 0x1800, 0x2800));
+        assert!(ranges_overlap(0x1000, 0x2000, 0x0800, 0x1800));
+        assert!(!ranges_overlap(0x1000, 0x2000, 0x2000, 0x3000));
+        assert!(!ranges_overlap(0x1000, 0x2000, 0x0000, 0x1000));
     }
 }

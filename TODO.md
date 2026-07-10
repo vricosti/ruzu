@@ -1,5 +1,62 @@
 # MK8D First-Logo Delay Investigation
 
+## 2026-07-10 - OPEN: attract scene saturates to white
+
+After the KLightLock waiter-path port removed the host-condvar stall, the
+longer attract-mode validation reached the 3D scene. The scene starts black,
+briefly exposes fixed geometry with incorrect colors, then saturates almost
+entirely to white.
+
+Current localization:
+
+- At present 6000, both the presented source and the independently downloaded
+  HDR target `0x524C10000` contain the same overexposed geometry. The final
+  nvnflinger/swapchain composition is therefore **invalidated as the source of
+  the white output**; the corruption already exists in the guest HDR chain.
+- At present 5200, the presented source is already nearly uniform pale pink
+  (`mean=0.9504`, range `0.8667..1.0`).
+- MK8D issues explicit black color clears for every observed bloom level,
+  including the 960x540, 240x136, 120x68, 60x34 and 30x17 views rooted at
+  `0x521410000`. **The hypothesis that the bloom target is never cleared is
+  invalidated.**
+- The texture cache copies between the full alias image and the separately
+  materialized reduced views in both directions. This is consistent with the
+  upstream alias model in principle, but the exact copy regions and
+  modification-tick order still need comparison; it remains an active
+  hypothesis rather than a proven bug.
+- The first bloom dump looked uniformly red because the diagnostic path treated
+  packed `B10G11R11_UFLOAT` bytes as RGBA8. That visual conclusion is
+  **invalidated**. The dump path now decodes the 11/11/10 unsigned-float fields
+  and applies a diagnostic Reinhard curve so the next run can inspect the real
+  HDR contents.
+- The corrected bloom dump is black while the final frame is white. **Bloom
+  amplification/alias feedback is invalidated as the active cause.** The first
+  bloom pass reads the 1920x1080 main HDR target at `0x520510000`; the bad
+  frame is already produced before the bloom pyramid.
+- A controlled present-4200 dump proves the same main HDR target and final
+  output are color-correct on the title screen. The format, depth, clear and
+  tone-map paths are therefore not globally broken.
+- During the attract transition, captures show giant/stale geometry with the
+  old title artwork still visible behind it, not merely excessive exposure.
+  The active Vulkan draw path binds vertex/index data through the reduced
+  GPU-VA keyed `DirectBufferCache`, but CPU/cache invalidation callbacks only
+  notified `VulkanCommonBufferCache`. `DirectBufferCache::get_or_upload`
+  consequently reused the first upload forever at an address rewritten by the
+  guest. The callbacks now invalidate overlapping direct-cache entries too;
+  attract-mode validation is pending.
+- `RUZU_TRACE_COMPUTE=1` produced no dispatch or skipped-dispatch event through
+  the white phase. **The missing compute-descriptor path is retained as a
+  structural gap but invalidated as this symptom's active cause.**
+- No `[DRAW_SKIP]` occurred in the traced interval. Progressive pipeline
+  compilation remains observable, but skipped asynchronous draws are not yet
+  supported as the cause of the white output.
+
+Next gate: rebuild and repeat the long attract run with direct-cache
+invalidation active. If geometry is corrected, continue the full upstream
+geometry migration (`UpdateGraphicsBuffers(is_indexed)` +
+`BindHostGeometryBuffers`) and retire the reduced direct cache rather than
+leaving two buffer owners.
+
 ## Symptom
 
 In upstream yuzu, Mario Kart 8 Deluxe shows the first logo for roughly 3-4
@@ -70,6 +127,53 @@ Maxwell/GPU/service logs and measurably perturbs the logo-delay window.
 - Packed-RomFS-update wiring into `RomFSFactory`.
 - A32 dynarmic parity: `silently_mirror_{fastmem,page_table}=true` and
   `check_halt_on_memory_access = debugger || (cpu_debug_mode && !ignore_aborts)`.
+
+## 2026-07-10 — FIXED: disk pipeline key/cache rebuild divergence and invalid SPIR-V CFG
+
+This was not the sole cause of the original first-logo delay (cold-cache runs
+still reproduce that timing issue), but it made warm-cache visual and timing
+runs unreliable and caused the later black-title/device-hang regressions.
+
+Four upstream-parity defects were found and fixed as one dependency chain:
+
+- `FixedPipelineState` derived full-struct equality while upstream compares
+  only `GraphicsPipelineCacheKey::Size()` bytes. Fields intentionally omitted
+  by dynamic state were zero after disk load, so equivalent live keys missed
+  and approximately 100 duplicate entries were appended per boot. Equality
+  and hashing now cover the same variable prefix as upstream; XFB correctly
+  forces the complete state.
+- SPIR-V Phi operands were resolved while their block was emitted. Upstream
+  uses Sirit `DeferredOpPhi` and patches operands after all definitions exist.
+  Rust now follows that lifecycle, removing the last
+  `unresolved IR value reference` preload failure.
+- Rust `TranslatePass::Visit` shared `current_block` across recursion and the
+  child emitted its fallthrough block; the parent emitted it again. This made
+  duplicate `OpLabel` definitions. `current_block` is now local to each Visit,
+  like upstream.
+- `rebuild_syntax_successors` invented `continue_block -> loop body`; upstream
+  routes continue to `loop_header` or `merge`. The false edge generated Phi
+  operands for non-predecessors and is removed.
+- Most importantly, graphics disk-load passed `env.start_address()` to CFG
+  translation after stripping the 0x50-byte Maxwell SPH. Upstream explicitly
+  uses `env.StartAddress() + sizeof(ProgramHeader)`. Rust now uses the same
+  instruction start for normal and dual-vertex graphics stages; compute keeps
+  its headerless start.
+
+Validation:
+
+- Full portable cache: `97 built, 0 skipped`; no `PIPELINE_KEY_DIFF`, no cache
+  growth (`vulkan.bin` remains 339416 bytes), and no Metal device loss.
+- All 92 dumped preload modules pass `spirv-val --target-env vulkan1.3`.
+- The critical fragment is bit-identical across paths after the offset fix:
+  disk `stage4_base_010F80` and live `stage5_base_010F80` both hash to SPIR-V
+  `4BD624006F4172DE`.
+- Before the fixes, the same preload produced duplicate labels, a Phi with two
+  incoming blocks for one real predecessor, then an immediate MoltenVK GPU
+  hang on the first frames.
+
+Next visual gate: rerun through the title and attract transition with the
+stable full cache, then reassess the missing `Press L+R` prompt and black
+cinematic independently of cache reconstruction.
 
 ## Invalidated Hypotheses (with results)
 
@@ -1369,6 +1473,98 @@ throughput (~2,500 draws/s vs yuzu's ~30k/s). Next targets: render-pass
 batching (draws alternating framebuffers must not reopen a render pass
 each time), then per-draw encode costs (descriptors/uploads).
 
+### 2026-07-09 — FIXED: Maxwell sched-word grid was anchored at absolute offset 0; MK8D shaders anchor it at the code start
+
+With the game now reaching the title screen, the user reported the
+"Press L+R to start" texture missing and the attract demo rendering
+black. The run log showed 645k+ "Unknown Maxwell opcode" warnings and
+1,193 pipelines rejected with "FFMA CC" — 100% of the unknown words sat
+at `abs % 32 == 16` and had sched-word bit patterns.
+
+Memory dump of live shaders (RUZU_TRACE_SHADER_WORDS + new
+[SHADER_HEAD] dump) proved the layout: SPH is 0x50 bytes, the first
+word at `code = sph + 0x50` is ALWAYS a sched word, then every 4th
+word (`code + 0x20k`). The sched grid is anchored at the START OF THE
+CODE, not at absolute offset 0. MK8D ships two shader populations:
+`code % 32 == 0` (absolute grid happens to match — these rendered
+fine, e.g. the splash) and `code % 32 == 16` (absolute grid skips one
+REAL instruction per bundle and decodes the sched words as
+instructions — garbage translations, phantom "FFMA CC" rejects, the
+black demo scene).
+
+DOCUMENTED DIVERGENCE from upstream: upstream `Location` (location.h)
+hardcodes the absolute `offset % 32` grid and works because the games
+it sees keep shader code 32-byte aligned within the program region;
+MK8D's `0x...E0` start addresses (+0x50 SPH = `0x...30` code starts)
+break that assumption. Rust `Location` now carries a `phase`
+(`code_start % 32`); `Location::new_code_start` anchors the CFG at the
+code start, branch targets inherit the phase via `with_offset`, and
+`is_sched_control_word` in translate is simply `word_index % 4 == 0`
+(the slice starts at the code start). Phase 0 = exactly upstream
+behaviour.
+
+Validated (fresh shader cache): "Unknown Maxwell opcode" 678,221 → 0,
+"FFMA CC" pipeline rejects 1,252 → 0. Splash still pixel-clean.
+
+### 2026-07-09 — FIXED: submit-worker splash corruption = stream-buffer per-frame reset (pre-existing race); worker now default ON
+
+The magenta splash region below was NOT a bug in the submit worker: it
+was a pre-existing data race in `StagingBufferPool` that the worker's
+deferral window made deterministic. `new_frame()` reset
+`stream_offset = 0` every frame, so `bind_mapped_uniform_buffer`'s
+mapped uniform writes recycled stream regions the GPU (or a
+not-yet-submitted job) was still reading. Upstream never does this:
+`GetStreamBuffer` (vk_staging_buffer_pool.cpp:105) splits a 128MiB
+stream buffer into NUM_SYNCS=16 regions stamped with the submission
+tick, reuses a region only once `KnownGpuTick()` passes its stamp, and
+falls back to a dedicated staging buffer instead of waiting.
+
+Ported that verbatim: `stream_iterator`/`stream_used_iterator`/
+`stream_free_iterator` + `stream_sync_ticks[16]`,
+`are_stream_regions_active` against `Scheduler::known_gpu_tick`,
+stream capacity 1MiB→128MiB (upstream MAX_STREAM_BUFFER_SIZE), request
+threshold = one region size like upstream `Request`. Also fixed a
+latent texture_cache hole found on the way: `refresh_contents_with_
+reader` skipped the guest upload when `CPU_MODIFIED` was clear even if
+`ensure_image` had just RECREATED the backend image (blank contents) —
+now a recreation forces the re-upload.
+
+Validated: worker ON splash pixel-clean at t=30/45 (window captures,
+6,920,713-byte clean signature), worker OFF unchanged, targeted
+video_core tests pass. The submit worker is now **default ON** like
+upstream (`RUZU_VK_SUBMIT_WORKER=0` forces synchronous submits, `=sync`
+drains per push for bisecting).
+
+### 2026-07-09 — superseded (fixed above): Vulkan submit worker ported, gated behind RUZU_VK_SUBMIT_WORKER=1 (rendering race to fix)
+
+Ported the submit half of upstream's Scheduler::WorkerThread: flush()
+hands the fully recorded command-buffer pair to a FIFO "VulkanWorker"
+thread which performs vkQueueSubmit (where MoltenVK does ALL Metal
+encoding). Recording + end_command_buffer stay on the GPU thread
+(Vulkan requires external sync on the command pool for recording; the
+timeline tick is still taken on the GPU thread so waiters see it
+immediately — timeline semaphores allow wait-before-signal). Flushes
+that signal BINARY semaphores (the present manager's render_ready)
+drain the worker before returning, since binary semaphores forbid
+wait-before-signal submission ordering.
+
+Measured with the worker ON: GPU-thread vkQueueSubmit samples 1182→0,
+MVKQueue::submit 2364→0 on the GPU thread (absorbed by VulkanWorker at
+~26% load), GPU thread 87% useful work and sometimes waiting for
+input, game nvhost stalls 14%→6%.
+
+**BUT**: a deterministic magenta-corrupted texture region appears on
+the MK8D splash (same spot, every run, persists at t=45). A/B with the
+worker stashed (async-compute commit still in) renders clean → the race
+is in the deferred submit. Suspect: some resource (image/buffer/
+framebuffer) is destroyed or reused between flush() and the worker's
+encode; that was safe before because the synchronous vkQueueSubmit had
+already encoded. Staging pool and descriptor rings retire on the GPU
+timeline tick (checked — safe); look for immediate vkDestroy*/reuse
+paths gated on CPU/submitted tick (texture_cache
+finish_pending_backend_deletions, evict_rt_framebuffers,
+framebuffer/image-view recreation). Default OFF until fixed.
+
 ### 2026-07-09 — DIAGNOSED: GPU-thread draw throughput gap = inline Vulkan execution (upstream uses a scheduler worker thread)
 
 With the GPU thread now saturated on real work, aggregated its 8s
@@ -1426,6 +1622,175 @@ dumps, log goes silent at t≈11-12, no panic). Matches the pre-existing
 loop with 35s windows; needs a SIGUSR1 thread dump captured on a wedged
 instance to classify.
 
+### 2026-07-10 — FIXED: warm portable pipeline cache rendered the MK8D title entirely black
+
+The black window was reproducible only after a cold run had generated the
+portable Vulkan pipeline cache. Controlled A/B at present frame 600:
+
+- cold cache (`Total Pipeline Count: 0`): complete color title,
+  `mean=0.475541`, 943105 colors;
+- warm cache (`97 built, 0 skipped`): guest present source was all zero,
+  `mean=0`, one color;
+- cold and warm emitted the same 92 SPIR-V modules byte-for-byte after stage
+  normalization, so shader translation and serialized environments were not
+  the cause.
+
+Root cause: `FixedPipelineState::refresh` built each `BlendingAttachment`
+without copying `draw.color_masks`. If blending was disabled, the attachment
+remained zero. The live pipeline path used `draw.color_masks` directly and
+rendered correctly, while the disk path rebuilt its Vulkan pipeline from the
+serialized fixed state and therefore set `VkPipelineColorBlendAttachmentState
+::colorWriteMask = 0`. Every affected draw executed but wrote no color.
+
+Upstream `FixedPipelineState::BlendingAttachment::Refresh` always copies the
+four color-mask bits before its early return for disabled blending. Rust now
+does the same. Cache version 14 was bumped to 15 because existing payloads
+contain irreparably zeroed masks.
+
+Validation with a newly generated v15 cache:
+
+- cold source: `mean=0.475541`, 943105 colors;
+- warm preload: `100 built, 0 skipped`;
+- warm source: `mean=0.475541`, 943105 colors;
+- cold/warm source files are byte-identical (`compare AE=0`);
+- captured warm swapchain is colored (`mean=0.475889`, 1558960 colors).
+
+Invalidated hypotheses retained for traceability:
+
+- **INVALIDATED for this black-frame regression:** stale/incompatible SPIR-V
+  from disk. All 92 cold/warm modules matched exactly.
+- **INVALIDATED for this black-frame regression:** Vulkan driver cache. The
+  cold run used an empty 48-byte driver cache and the warm failure was fully
+  reproducible from the portable cache alone.
+- **INVALIDATED for this black-frame regression:** submit-worker/present-thread
+  ordering. Disabling `VulkanWorker` did not restore the guest present source;
+  the source itself was black on the bad warm cache.
+
+This fixes the newly introduced all-black warm-cache regression. It does not
+resolve the separate OPEN issue where MK8D remains on the first logo much
+longer than yuzu; continue that timing/scheduler investigation independently.
+
+### 2026-07-10 - FIXED: MK8D title prompt used stale animated instance data
+
+The yuzu captures in `~/Movies/Capture d'ecran 2026-07-10 a 10.42.*.png`
+confirm that `Press L+R to start` keeps a fixed position and size. Only its
+packed RGBA colors and lens-flare layers animate.
+
+The MK8D vertex shader at code address `0xB00080` uses `I2F.U8` selectors to
+unpack those RGBA bytes. Ruzu's `integer_floating_point_conversion.rs` ignores
+the integer size and selector fields and converts the shifted 32-bit word
+directly. Upstream first emits `BitFieldExtract(offset=selector*8, count=8)`,
+which explains why ruzu saturates/fades edge glyphs and makes fixed geometry
+look as if it moves or shrinks.
+
+The IR/SPIR-V integer-to-float conversion matrix and 64-bit
+select/packing dispatch were completed, then upstream `I2F` was ported
+literally. This fixed the packed-byte interpretation but did not fully fix the
+animation. The remaining movement/flicker was stale SSBO data:
+
+- guest checksums for the two alternating instance buffers changed while
+  `SynchronizeBuffer` reported one initial upload followed by cache hits;
+- Vulkan's common buffer cache used a no-op `DeviceTracker`, so registering a
+  buffer never changed the corresponding guest page to
+  `RasterizerCachedMemory`;
+- the ARM64 rdynarmic backend selected fastmem even though its default null
+  exception handler reported `SupportsFastmem() == false`, bypassing the
+  callback required for protected/cached pages;
+- `Memory::handle_rasterizer_write` translated the CPU virtual address as one
+  physical address instead of using upstream `ApplyOpOnPointer` to fan out the
+  host pointer to its SMMU device-address aliases.
+
+The Vulkan cache now uses `MaxwellDeviceMemoryManager` as its tracker, the
+ARM64 backend requires `supports_fastmem()` like upstream, and the memory write
+path uses the SMMU host-pointer fan-out with upstream's per-core
+`last_address`/dirty-manager ordering. A 30-second validation observed 960
+prompt SSBO synchronizations and 960 uploads; no checksum change was missed.
+The text remains at a fixed position and transitions from dark/black to blue.
+
+The faint moving blue glow behind the prompt is present in the yuzu reference
+captures too and is the intended lens-flare layer. Side-by-side crops show no
+second displaced text after the cache fix.
+
+Long-run attract-mode validation (180 seconds, warm v15 pipeline cache): the
+title prompt fix does **not** fix the attract cinematic. After the title phase,
+the window becomes entirely black; the previously visible blue loading spinner
+is also absent. This is not a guest/GPU freeze:
+
+- buffer-queue traffic continues past frame 2048;
+- render-pass begins continue from 122880 to 241664 during the black phase;
+- 122 additional runtime graphics pipelines are created (1117 -> 1239);
+- no panic, Vulkan device loss, unresolved IR value, unknown Maxwell opcode,
+  or Rust-side graphics-pipeline creation failure is logged.
+
+MoltenVK repeatedly reports `VK_ERROR_FEATURE_NOT_PRESENT: Metal does not
+support disabling primitive restart`, including during runtime pipeline
+creation. This is a confirmed backend/driver compatibility signal but is **not
+yet proven causal**: `vkCreateGraphicsPipelines` still returns success and the
+Rust pipeline-failure path is not entered. The next attract-mode investigation
+must dump the guest present source and the principal render targets during the
+black phase, then determine whether the scene is already black before
+nvnflinger composition or is lost in the final copy/present path.
+
+Follow-up investigation resolved that split:
+
+- The black interval is the game's shader/loading phase. A present-source dump
+  at 4608 contains the expected MK8D logo and cyan spinner, even when the
+  foreground window made them difficult to see.
+- The later attract scene was already wrong in the guest HDR render target
+  `0x524C10000`, before nvnflinger and swapchain composition. At present 5000,
+  the HDR/source/composited means were `0.816/0.869/0.854`, and all three
+  showed the same fixed geometry becoming progressively white.
+- **Active root divergence found:** the Vulkan framebuffer owner selected an
+  arbitrary `ImageView` from a `HashMap` when constructing image barriers for
+  a shared `ImageId`. This was wrong for MK8D's layered/mipmapped HDR and bloom
+  targets, so barriers could synchronize a different mip/layer while stale
+  values were repeatedly fed through additive passes. The owner now stores the
+  exact bound view range and preserves upstream `rt_map`, view size, samples
+  and layer count.
+- A separate clear divergence was corrected: Rust silently skipped every
+  color clear where `clear_surface.RT != 0`, while upstream clears the selected
+  attachment. A 70-second `RUZU_TRACE_VK_CLEAR` run observed 46236 MK8D clears,
+  all targeting RT0, so this is **confirmed parity work but invalidated as the
+  active attract-mode root cause**.
+- The extra RT0 transfer clear (`vkCmdClearColorImage`) was removed. Upstream
+  uses the render-pass `vkCmdClearAttachments` path and does not force an
+  outside-render-pass operation after every full RT0 clear.
+
+Initial post-fix validation at present 5000 reached the loading phase sooner
+(74s instead of 145s) and no longer accumulated white: HDR/source/composited
+means were `0.250/0.535/0.577`. A later present-10000 validation is in progress
+to verify the actual moving attract scene rather than the earlier loading
+frame.
+
+That longer validation is currently interrupted by a kernel prerequisite, not
+by shader compilation. A macOS sample taken while presentation stopped showed:
+
+- the GPU queue and all `VkPipelineBuilder` workers idle;
+- CPU cores 2 and 3 idle, and core 1 waiting in the IPC path;
+- CPU core 0 blocked in
+  `NvMapDevice::ioc_alloc -> KPageTableBase::lock_for_map_device_address_space
+  -> KLightLock::lock_slow_path -> pthread_cond_wait`.
+
+Upstream `KLightLock::LockSlowPath` never waits on a host condition variable:
+under `KScopedSchedulerLock` it adds the current `KThread` to the owner's
+priority-inheritance waiter list and calls `BeginWait`, allowing another guest
+fiber to run on the same core. Ruzu's `KLightLock` instead uses a host
+`Condvar`, which freezes the whole physical-core host thread and prevents the
+guest fiber that owns the lock from running. This is a confirmed architectural
+divergence and the active prerequisite for continuing attract-mode validation.
+The interrupted validation must resume after `KLightLock` uses the upstream
+KThread waiter/ownership-transfer path.
+
+Invalidated/refined hypotheses retained for traceability:
+
+- **INVALIDATED:** VSync cadence caused the prompt movement. It did not alter
+  the instance data consumed by the draw.
+- **INVALIDATED:** the prompt needed draw 17 or draw 34 to be skipped. Skipping
+  either only hid part of the upstream effect and was diagnostic, not a fix.
+- **RETRACTED:** stale SSBO synchronization was previously marked invalidated
+  after an incomplete experiment. End-to-end source-checksum/upload tracing
+  later proved it was the main remaining defect.
+
 ## Success Criteria
 
 - First logo transitions after roughly 3-4 seconds of visible time, like yuzu.
@@ -1473,3 +1838,8 @@ instance to classify.
   (le ring de descripteurs ne tournait jamais). Ajouté à l'identique.
 
   Je te confirme le résultat du run de validation dès qu'il se termine.
+## 2026-07-10 - OPEN prerequisite: retain KLightLock waiter thread ownership like upstream
+
+The priority-inheritance port currently stores waiter IDs in `LockWithPriorityInheritanceInfo` and resolves them through `GlobalSchedulerContext` from `KLightLock::unlock_slow_path`. Upstream stores intrusive `KThread*` directly. This creates two Rust-only risks: taking the GSC mutex while the scheduler lock is held, and panicking if a waiter disappears from the GSC table before ownership transfer.
+
+Do not replace the `expect` with a guessed unlock/skip fallback. The faithful correction is structural: make the lock-waiter tree retain stable thread ownership/references, transfer those references from `remove_waiter_by_key`, and remove `find_thread` from the light-lock slow path. Audit cancellation and thread-exit ordering in the same slice.
