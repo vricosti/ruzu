@@ -109,8 +109,15 @@ pub struct Memory {
     /// Upstream owner: `rasterizer_read_areas[Core::Hardware::NUM_CPU_CORES]`.
     rasterizer_read_areas:
         [Mutex<RasterizerDownloadArea>; hardware_properties::NUM_CPU_CORES as usize],
+    /// Upstream owner: `rasterizer_write_areas[Core::Hardware::NUM_CPU_CORES]`.
+    rasterizer_write_areas: [Mutex<GpuDirtyState>; hardware_properties::NUM_CPU_CORES as usize],
     /// Upstream owner: `std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers`.
     gpu_dirty_managers: Vec<Arc<Mutex<GpuDirtyMemoryManager>>>,
+}
+
+#[derive(Default)]
+struct GpuDirtyState {
+    last_address: u64,
 }
 
 /// Parse a `RUZU_WATCH_BLOCK=ADDR:LEN[,ADDR:LEN...]` spec into byte ranges.
@@ -417,6 +424,7 @@ impl Memory {
             heap_tracker: None,
             current_page_table: std::ptr::null_mut(),
             rasterizer_read_areas: new_rasterizer_read_areas(),
+            rasterizer_write_areas: std::array::from_fn(|_| Mutex::new(GpuDirtyState::default())),
             gpu_dirty_managers: Vec::new(),
         }
     }
@@ -1115,24 +1123,45 @@ impl Memory {
     }
 
     fn handle_rasterizer_write(&self, vaddr: u64, size: usize) {
+        if self.system.is_null() {
+            return;
+        }
+
+        let host_ptr = self.get_pointer_impl(vaddr);
+        let Some(gpu) = self.system.get().gpu_core() else {
+            return;
+        };
+        let core = self.current_host_thread_cache_index();
+
+        let mut write = |device_addr: u64| {
+            let subaddress = device_addr >> PAGE_BITS;
+            let mut write_area = self.rasterizer_write_areas[core].lock().unwrap();
+            let mut do_collection = write_area.last_address == subaddress;
+
+            if !do_collection {
+                do_collection = gpu.on_cpu_write(device_addr, size as u64);
+                if !do_collection {
+                    return;
+                }
+                write_area.last_address = subaddress;
+            }
+            drop(write_area);
+
+            if let Some(manager) = self.gpu_dirty_managers.get(core) {
+                manager.lock().unwrap().collect(device_addr, size);
+            }
+        };
+
+        if let Some(host1x) = self.system.get().host1x_core() {
+            if host1x.smmu_apply_op_on_host_pointer(host_ptr as usize, &mut write) != 0 {
+                return;
+            }
+        }
+
         let Some(device_addr) = self.current_physical_address(vaddr) else {
             return;
         };
-
-        let do_collection = self.system.is_null()
-            || self
-                .system
-                .get()
-                .gpu_core()
-                .map(|gpu| gpu.on_cpu_write(device_addr, size as u64))
-                .unwrap_or(false);
-        if !do_collection {
-            return;
-        }
-
-        if let Some(manager) = self.gpu_dirty_managers.first() {
-            manager.lock().unwrap().collect(device_addr, size);
-        }
+        write(device_addr);
     }
 
     fn current_host_thread_cache_index(&self) -> usize {

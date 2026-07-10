@@ -651,10 +651,7 @@ impl KThread {
         if !*ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_CTX_GUARD").is_some()) {
             return;
         }
-        let host = std::thread::current()
-            .name()
-            .unwrap_or("?")
-            .to_string();
+        let host = std::thread::current().name().unwrap_or("?").to_string();
         let mut trace = self.context_guard_trace.lock();
         if locked {
             trace.last_lock = Some((site, host));

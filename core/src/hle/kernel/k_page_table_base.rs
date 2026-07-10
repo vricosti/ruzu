@@ -411,9 +411,9 @@ impl KPageTableBase {
             m_mapped_unsafe_physical_memory: 0,
             m_mapped_insecure_memory: 0,
             m_mapped_ipc_server_memory: 0,
-            m_general_lock: Arc::new(KLightLock::new(0)),
-            m_map_physical_memory_lock: Arc::new(KLightLock::new(0)),
-            m_device_map_lock: Arc::new(KLightLock::new(0)),
+            m_general_lock: Arc::new(KLightLock::new()),
+            m_map_physical_memory_lock: Arc::new(KLightLock::new()),
+            m_device_map_lock: Arc::new(KLightLock::new()),
             m_memory_block_manager: KMemoryBlockManager::new(),
             m_allocate_option: 0,
             m_address_space_width: 0,
@@ -7975,8 +7975,8 @@ mod tests {
 
     #[test]
     fn scoped_light_lock_pair_unlocks_both_locks_on_drop() {
-        let first = Arc::new(KLightLock::new(0));
-        let second = Arc::new(KLightLock::new(0));
+        let first = Arc::new(KLightLock::new());
+        let second = Arc::new(KLightLock::new());
 
         {
             let _pair = KScopedLightLockPair::new(second.clone(), first.clone());
@@ -7990,8 +7990,8 @@ mod tests {
 
     #[test]
     fn scoped_light_lock_pair_try_unlock_half_matches_upstream_helper() {
-        let first = Arc::new(KLightLock::new(0));
-        let second = Arc::new(KLightLock::new(0));
+        let first = Arc::new(KLightLock::new());
+        let second = Arc::new(KLightLock::new());
 
         {
             let mut pair = KScopedLightLockPair::new(first.clone(), second.clone());
@@ -8006,7 +8006,7 @@ mod tests {
 
     #[test]
     fn scoped_light_lock_pair_same_lock_locks_once() {
-        let lock = Arc::new(KLightLock::new(0));
+        let lock = Arc::new(KLightLock::new());
 
         {
             let _pair = KScopedLightLockPair::new(lock.clone(), lock.clone());
