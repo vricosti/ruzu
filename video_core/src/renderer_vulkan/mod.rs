@@ -1075,6 +1075,25 @@ impl RasterizerVulkan {
             uses_rescaling_uniform,
         );
         let draw_params = make_draw_params(draw);
+        // Serialize every common-buffer-cache access on this draw
+        // (uniform/storage descriptor binding AND the geometry binding below)
+        // against concurrent CPU-write invalidation. A guest write on another
+        // core reaches `BufferCache::on_cpu_write` -> `delete_buffer` ->
+        // `slot_buffers.take()`, which frees the very slots this path reads via
+        // `slot_buffers[buffer_id]` (unguarded in release, where SlotVector's
+        // validate_index is a debug_assert). Without this lock the GPU thread
+        // can index a slot the CPU thread just freed -> SlotVector panic /
+        // use-after-free. The mutexes are reentrant, so the texture lock taken
+        // inside `bind_graphics_descriptors` is fine. Matches the locking the
+        // async-flush paths already use for these two caches.
+        let bc_draw_texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        let bc_draw_buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+        lock_two_reentrant_mutexes!(
+            bc_draw_buffer_mutex,
+            bc_draw_texture_mutex,
+            _bc_draw_buffer_guard,
+            _bc_draw_texture_guard
+        );
         self.common_buffer_cache
             .set_engine_state(Box::new(VulkanDrawStateEngineAdapter {
                 draw: draw.clone(),
@@ -1118,6 +1137,15 @@ impl RasterizerVulkan {
                 self.bind_index_buffer(cmd, draw, draw_params, read_gpu);
             }
         }
+        // The guards (`bc_draw_buffer_guard`/`bc_draw_texture_guard`) are held
+        // through the rest of this function, i.e. across texture
+        // materialization and the draw emission below, matching upstream
+        // `RasterizerVulkan::PrepareDraw` which keeps
+        // `scoped_lock{buffer_cache.mutex, texture_cache.mutex}` around
+        // Configure AND draw_func (vk_rasterizer.cpp:223-233). Releasing after
+        // binding would still let a concurrent CPU-write free a slot the draw
+        // depends on before it is recorded. RAII drops them on every exit,
+        // including the early-return trace-stub path.
 
         // Texture/buffer materialization can enqueue upload copies and
         // barriers through `Scheduler::record_with_upload`. Upstream records
