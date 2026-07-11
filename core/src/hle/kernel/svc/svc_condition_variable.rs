@@ -55,6 +55,28 @@ fn trace_wait_process_wide_key(
     );
 }
 
+fn trace_signal_process_wide_key(stage: u64, tid: u64, core: u64, cv_key: u64, count: i32) {
+    common::trace::emit_raw(
+        common::trace::cat::LOCK_PI,
+        &[
+            stage,
+            tid,
+            cv_key,
+            count as u32 as u64,
+            core,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+}
+
 /// Wait process wide key atomic.
 pub fn wait_process_wide_key_atomic(
     system: &System,
@@ -205,24 +227,33 @@ pub fn signal_process_wide_key(system: &System, cv_key: u64, count: i32) {
         cv_key,
         count
     );
+    let entry_tid = system.current_thread_id().unwrap_or(0);
+    let entry_core = system
+        .kernel()
+        .map(|kernel| kernel.current_physical_core_index() as u64)
+        .unwrap_or(0);
     log::trace!(
         "SignalProcessWideKey tid={} core={} cv_key=0x{:X} count={}",
-        system.current_thread_id().unwrap_or(0),
-        system
-            .kernel()
-            .map(|kernel| kernel.current_physical_core_index())
-            .unwrap_or(0),
+        entry_tid,
+        entry_core,
         cv_key,
         count
     );
 
     // Upstream: Common::AlignDown(cv_key, sizeof(u32))
     let aligned_cv_key = cv_key & !3u64;
+    let trace_signal = should_trace_wait_process_wide_key(aligned_cv_key, aligned_cv_key);
+    if trace_signal {
+        trace_signal_process_wide_key(24, entry_tid, entry_core, aligned_cv_key, count);
+    }
     system
         .current_process_arc()
         .lock()
         .unwrap()
         .signal_condition_variable(aligned_cv_key, count);
+    if trace_signal {
+        trace_signal_process_wide_key(25, entry_tid, entry_core, aligned_cv_key, count);
+    }
     log::trace!(
         "svc::SignalProcessWideKey return cv_key=0x{:X}, count={}",
         aligned_cv_key,

@@ -896,7 +896,6 @@ pub struct BufferCache {
 
     /// Cached buffers by GPU VA.
     cache: HashMap<u64, CachedBuffer>,
-
     /// Delayed-destruction ring for replaced/invalidated buffers, mirroring
     /// the texture cache's sentenced resources (upstream
     /// `DelayedDestructionRing` with `TICKS_TO_DESTROY`).

@@ -42,20 +42,68 @@ Current localization:
   GPU-VA keyed `DirectBufferCache`, but CPU/cache invalidation callbacks only
   notified `VulkanCommonBufferCache`. `DirectBufferCache::get_or_upload`
   consequently reused the first upload forever at an address rewritten by the
-  guest. The callbacks now invalidate overlapping direct-cache entries too;
-  attract-mode validation is pending.
+  guest. The callbacks now invalidate overlapping direct-cache entries too,
+  but a long validation still reproduced the corruption. **Direct-cache CPU
+  invalidation alone is invalidated as a sufficient fix.** The incomplete
+  common-cache GPU-write ownership remains a structural gap, so this does not
+  invalidate every possible buffer-coherence issue.
 - `RUZU_TRACE_COMPUTE=1` produced no dispatch or skipped-dispatch event through
   the white phase. **The missing compute-descriptor path is retained as a
   structural gap but invalidated as this symptom's active cause.**
 - No `[DRAW_SKIP]` occurred in the traced interval. Progressive pipeline
   compilation remains observable, but skipped asynchronous draws are not yet
   supported as the cause of the white output.
+- A frame-by-frame run localized the first bad transition: present 4250 was a
+  correct title screen, 4500/4750 were the expected black loading screen, and
+  5000 contained giant malformed geometry. The principal HDR target was
+  already malformed at 5000, confirming the final present path was not the
+  source.
+- **Confirmed upstream divergence fixed:** upstream
+  `Regs::IsShaderConfigEnabled` always enables pipeline slot 1 (`VertexB`),
+  regardless of its raw enable bit. Rust's `is_shader_stage_enabled(1)` had
+  this rule, but `shader_stage_info(1)` copied the raw bit and draw snapshots
+  therefore reported `VertexB.enabled=false` throughout the attract 3D draws.
+  `shader_stage_info` now uses the upstream accessor and its regression test
+  covers the full returned snapshot.
+- Post-fix validation no longer corrupts the frame at the old failure point:
+  at present 5000 the independently downloaded `0x520510000` HDR target is a
+  complete, correctly colored title image, while the presented source is the
+  expected black loading screen with the MK8D logo and cyan spinner. This
+  invalidates the previous malformed/white result at that point.
+- A 300-second run eventually reached present 6000 at 179.44 seconds. The
+  present source was still the black loading layer, while `0x520510000`
+  contained malformed 3D geometry: repeated cones/coins in trails, giant
+  polygons and mostly flat grey/white surfaces. **VertexB enable parity delayed
+  the first bad frame but did not fully fix the attract scene.**
+- **Confirmed vertex-input divergences fixed:** `DrawCall` compacted enabled
+  vertex streams and non-default attributes into `Vec`s, destroying the
+  upstream 32-slot binding/location identity. It also omitted the separate
+  `vertex_stream_instances[32]` register array. Consequently
+  `FixedPipelineState::refresh` never populated `binding_divisors`, and runtime
+  pipelines inferred instancing from `frequency != 0` with an implicit divisor
+  of 1. Draw snapshots now retain both complete 32-slot arrays; fixed state
+  records the upstream instance-enable bit plus frequency; runtime and disk
+  pipelines share the same upstream-shaped binding/divisor/attribute builder.
+- Correctly enabling VertexB exposes the real cost of the attract workload.
+  The first 3D frame now executes the real vertex pipelines instead of the
+  stale cached/incomplete configuration and did not complete within the first
+  120-150 second validation runs. The disk cache was warmed across runs; the
+  second synchronous run created only four new runtime pipelines, so the
+  remaining delay is not explained solely by shader compilation.
+- MoltenVK still logs `VK_ERROR_FEATURE_NOT_PRESENT: Metal does not support
+  disabling primitive restart`, but ruzu's topology gate is already the
+  literal upstream `vk_graphics_pipeline.cpp` expression and Vulkan pipeline
+  creation returns success. This remains a driver/backend compatibility signal,
+  not a proven cause, and no non-upstream workaround was added.
 
-Next gate: rebuild and repeat the long attract run with direct-cache
-invalidation active. If geometry is corrected, continue the full upstream
-geometry migration (`UpdateGraphicsBuffers(is_indexed)` +
-`BindHostGeometryBuffers`) and retire the reduced direct cache rather than
-leaving two buffer owners.
+Next gate: rebuild after the fixed-slot vertex-input/divisor correction and
+repeat the attract run, inspecting present 6000 and `0x520510000`. Separately,
+profile why the real VertexB workload takes far longer than upstream: a sample
+showed MoltenVK spending most submit-worker time materializing Metal texture
+views/residency at render-pass begin, with roughly 90% framebuffer switches.
+The eventual upstream geometry
+migration (`UpdateGraphicsBuffers(is_indexed)` + `BindHostGeometryBuffers`)
+and retirement of the reduced direct cache remain required structural work.
 
 ## Symptom
 
@@ -1670,7 +1718,7 @@ This fixes the newly introduced all-black warm-cache regression. It does not
 resolve the separate OPEN issue where MK8D remains on the first logo much
 longer than yuzu; continue that timing/scheduler investigation independently.
 
-### 2026-07-10 - FIXED: MK8D title prompt used stale animated instance data
+### 2026-07-10 - PARTIALLY FIXED: MK8D title prompt used stale animated instance data
 
 The yuzu captures in `~/Movies/Capture d'ecran 2026-07-10 a 10.42.*.png`
 confirm that `Press L+R to start` keeps a fixed position and size. Only its
@@ -1707,9 +1755,50 @@ path uses the SMMU host-pointer fan-out with upstream's per-core
 prompt SSBO synchronizations and 960 uploads; no checksum change was missed.
 The text remains at a fixed position and transitions from dark/black to blue.
 
-The faint moving blue glow behind the prompt is present in the yuzu reference
-captures too and is the intended lens-flare layer. Side-by-side crops show no
-second displaced text after the cache fix.
+The stale-instance fix removed the large position/size instability, but later
+comparison against the yuzu captures from 2026-07-11 refined this conclusion:
+yuzu keeps the prompt fixed and shows localized lens flares above the final
+`s` in `Press` and the `R` in `L/R`; ruzu still produces a diffuse,
+text-shaped animated layer behind the prompt. Present-source dumps prove that
+the difference already exists in the guest-rendered image, before the final
+macOS presentation blit. The remaining issue is therefore OPEN and must be
+isolated in the prompt's additive draws (texture/view, instance data, blend
+state, and draw ordering), not in swapchain presentation.
+
+#### 2026-07-11 - prompt flare investigation: FMNMX and KIL parity fixes
+
+- The yuzu references are the two latest captures in `~/Movies` from
+  `2026-07-11 00.00.27` and `00.00.40`. The normal title frame keeps the text
+  fixed and uses localized flare sprites; ruzu's difference is already present
+  in guest present-source dumps, so final macOS presentation is invalidated as
+  the cause.
+- The prompt glyph draws use VS/FS `0x400B00030/0x400B00F30` and distinct
+  17/34-instance SSBO ranges. SSBO aliasing, undersized vertex data, dynamic
+  vertex input, and a nonzero fragment alpha threshold were tested and
+  invalidated. The common 0x70-byte vertex binding is four 28-byte quad
+  vertices, not per-instance prompt storage; dynamic vertex input is disabled
+  in the current device profile, so static pipeline state is active.
+- The additive particle family uses VS `0x675130`/FS `0x6B3E30` and a valid
+  256x32 BC5 texture with guest swizzle `[R,R,R,G]`. The fragment threshold at
+  cbuf9+0x5e8 is zero, and all required UBO ranges are present.
+- **Confirmed upstream divergence fixed:** Rust `FMNMX` decoded bit 44 as
+  `abs_b`, but upstream defines it as `ftz` and places `abs_b` at bit 49. The
+  live MK8D word `0x5C6013800057FF03` therefore incorrectly evaluated
+  `min(0, abs(x))`, cancelling the negative particle parameter. The port now
+  decodes predicate 39..41, negated predicate 42, FTZ 44, source modifiers
+  45/46/48/49 and CC 47, emits both min/max plus predicate select, and carries
+  upstream `FpControl` flags.
+- **Confirmed upstream divergence fixed:** `TranslatePass::Kill` previously
+  emitted an empty merge block. It now materializes
+  `DemoteToHelperInvocation`, and `CollectShaderInfoPass` records the usage.
+  `rspirv 0.12` incorrectly models the demote opcode as a terminator, so the
+  backend inserts the SPIR-V instruction directly to preserve upstream's
+  non-terminating control flow.
+- Post-fix guest-source captures show a fixed prompt cycling dark-to-blue and
+  no pipeline `MismatchedTerminator` failures. The remaining visual difference
+  against yuzu needs user-side motion comparison before this item can be
+  marked fully fixed; do not restore the invalidated SSBO, swapchain, or
+  dynamic-vertex-input hypotheses.
 
 Long-run attract-mode validation (180 seconds, warm v15 pipeline cache): the
 title prompt fix does **not** fix the attract cinematic. After the title phase,
@@ -1793,6 +1882,198 @@ Invalidated/refined hypotheses retained for traceability:
 
 ## Success Criteria
 
+### 2026-07-10 - first-logo follow-up: current waits are guest-side; uniform scheduler-latency hypothesis invalidated
+
+All profiling runs in this follow-up used `RUZU_AUDIO_SINK=null`.
+
+- The async scheduler trace now exposes its existing monotonic timestamp. A
+  25-second all-thread capture measured `pq_push -> switch` for the hot MK8D
+  workers at 15-20 us median (`tid 75/82/83`), 50-70 us p95. The earlier
+  estimate of roughly 0.15 ms for every handoff is therefore **INVALIDATED**.
+  There are still long-tail wakes, but they are not the uniform per-handoff
+  cost previously proposed as the complete explanation.
+- BufferQueue guest parking is active: 9,991 profiled waits all returned,
+  averaging about 4 ms. The old host-condvar core freeze is **FIXED** and must
+  not be reused as the current root cause.
+- A filtered SVC trace verified the SDK NSO base as `0x01C9C000` by matching
+  live bytes. The hot PCs `0x01D50434..0x01D50438` are the SDK's literal
+  `svc #0x1C` / return stub (`WaitProcessWideKeyAtomic`). The dominant guest
+  activity remains condvar/mutex handoff, not an unknown JIT exception.
+- `FlushProcessDataCache` is **INVALIDATED** as a host-cost bottleneck:
+  24,153 calls took 4.9 ms total (about 0.2 us each). The profile instead
+  measured actual guest waits: `WaitProcessWideKeyAtomic` about 4.2 ms average,
+  `SleepThread` about 10.4 ms, and `SendSyncRequest` about 1.1 ms.
+- A clean 42-47 second macOS sample shows CPU cores 0/1/2 mostly idle
+  (roughly 79/77/88 percent). At the SIGUSR1 snapshot, `tid 84` was waiting on
+  the logo object's condition variable, `tid 101` was runnable in
+  `SignalProcessWideKey`, and `tid 105` was waiting. GPU submit/present and
+  pipeline-builder threads were not the active bottleneck.
+- The old `RUZU_TRACE_MK8D_LOGO_STATE` register-candidate scan found only a
+  false-positive object in the current build. It is **INVALIDATED as a reliable
+  current probe**; future state traces must use exact guest PCs/validated object
+  pointers rather than scanning SleepThread registers.
+- `GlobalSchedulerContext::recover_scheduled_front_from_runnable` remains an
+  upstream divergence and appears in host samples, but removing it is not yet
+  safe: `DIFF.md` retains documented early ANIMUS `PQ_STALE` cases. No
+  `PQ_RECOVER`/`PQ_STALE` occurred in the clean MK8D run, so this is an
+  architectural follow-up, not a proven first-logo fix.
+- `codex-dev` deliberately still uses the `context` crate's direct
+  `make_fcontext/jump_fcontext` backend. The corosensei migration exists only
+  on `codex-corosensei-fiber` (`1cf61ad`) and was never merged. Do not confuse
+  this branch state with a failed runtime selection. Integrating corosensei is
+  a separate backend experiment and must preserve the later Fiber guard/
+  lifecycle fixes.
+
+Current target: trace the exact producer that signals the logo-object condvar
+and compare the number/order of resource completions before the second logo.
+Do not return to already-invalidated timer, uniform handoff, FlushProcessDataCache,
+or host BufferQueue-condvar hypotheses.
+
+#### First-logo stall narrowed to periodic Vulkan render submissions
+
+All runs below used `RUZU_AUDIO_SINK=null`.
+
+- `tid 78`'s long Binder `DequeueBuffer` calls are downstream backpressure.
+  The HWC consumer acquires and queues buffers correctly, but
+  `Conductor::process_vsync` periodically spends about one second in
+  `RendererVulkan::Composite`; during that interval the three-slot guest
+  BufferQueue fills and the producer parks.
+- Phase traces localize the long interval after `Swapchain::AcquireNextImage`
+  and before `Swapchain::Present` returns. A macOS sample initially showed
+  MoltenVK in `getCAMetalDrawable()` while encoding the presentation blit.
+  With upstream's synchronous presentation path enabled, the same interval is
+  still spent in the blit `vkQueueSubmit`, waiting for the preceding
+  `render_ready` semaphore. The presentation call is therefore exposing a
+  slow prior render submission; it is not the original source of the work.
+- The non-upstream macOS default `async_presentation=true` was removed.
+  `async_presentation` now defaults to false off Android exactly like upstream.
+  This removes the extra present-thread backpressure but does **not** eliminate
+  the periodic slow render submission.
+- Verified on 2026-07-11 that the working `yuzu.app` path really uses this
+  synchronous setting: both `~/.config/yuzu/qt-config.ini` and
+  `~/.local/share/yuzu/log/yuzu_log.txt` report `async_presentation=false`.
+  **INVALIDATED:** macOS inherently requires a present thread because
+  `nextDrawable` would otherwise wedge emulation. Yuzu performs the same
+  blocking `vkAcquireNextImageKHR` on its synchronous GPU path successfully.
+- A real ordering omission was found in ruzu's synchronous path: upstream
+  `PresentManager::Present` calls `scheduler.WaitWorker()` before
+  `CopyToSwapchain`, while ruzu called the copy directly. ruzu now ports that
+  edge as `Scheduler::wait_worker`; command replay is synchronous in the Rust
+  scheduler and the separate submit worker is explicitly drained.
+- Known structural gap outside the active macOS path: upstream also performs
+  `scheduler.Wait(resource_ticks[image_index])` when acquisition runs on its
+  optional present thread. ruzu's present-thread path has no mutable scheduler
+  access and currently advances that tick heuristically. Do not paper this over;
+  it needs shared scheduler/master-semaphore ownership when the asynchronous
+  path is brought to full parity.
+- `Swapchain::CreateSwapchain` and `NeedsPresentModeUpdate` no longer hardcode
+  `FIFO + use_speed_limit=true`; they now read the live `vsync_mode` and
+  `use_speed_limit` settings like upstream `ChooseSwapPresentMode`.
+- **INVALIDATED:** the VulkanSDK was loading MoltenVK 1.4.1 while yuzu used
+  1.4.2. All compared ruzu runs already loaded yuzu's MoltenVK 1.4.2 directly.
+  An explicit 1.4.2 ICD produced one unusually fast run but the result did not
+  reproduce with the same binary and warm cache.
+- **INVALIDATED:** MoltenVK's default limit of 64 active Metal command buffers
+  caused the stalls around frame 67. Raising
+  `MVK_CONFIG_MAX_ACTIVE_METAL_COMMAND_BUFFERS_PER_QUEUE` to 256 did not move
+  the stall points.
+- **INVALIDATED:** `MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=1` fixes the
+  wait. It made the repeated one-second presentation stalls more frequent.
+- **REFINED:** holding `scheduler.submit_mutex` across MoltenVK presentation
+  can move/amplify the wait, but upstream holds the same mutex and disabling
+  the submit worker merely moves the one-second interval into
+  `Scheduler::flush_with_signal`. It is not sufficient as a root cause.
+
+Current target: associate each slow `render_ready` tick with the number and
+kind of Vulkan commands/draws in that scheduler submission, then compare that
+batch and its resource barriers with upstream. Do not change nvnflinger or
+remove the upstream `Layer::ConfigureDraw -> scheduler.Wait(resource_tick)`;
+that wait is correctly revealing the delayed GPU tick.
+
+Latest validation nuance: the stall is intermittent. With the corrected
+upstream presentation default, one 12-second run reached scheduler tick 327
+with no presentation submit over 100 ms, while the next 20-second run recorded
+nine 0.986-1.002 second presentation submits and still reached/presented frame
+200. The frame-200 dump is the full MK8D title artwork, proving that the first
+logo now transitions during the test window, but timing parity with yuzu's
+3-4 seconds is not yet established. Do not mark the issue fixed until repeated
+cold and warm runs have bounded transition times.
+
+#### Exact logo queue producer localized
+
+- A filtered, non-blocking `LOCK_PI` run proved that `tid 84` waits on
+  `address=0x5564C6D0`, `cv_key=0x5564C6D8`. Of 50 observed wake signals,
+  48 came from `tid 75` and 2 from `tid 79`; all used `count=-1`.
+- A `tid 75` SVC trace with the verified SDK base `0x01C9C000` resolved the
+  signal site to `nn::os::TrySendMessageQueue` (`0x01D2B280`, signal return
+  `0x01D2B2D4`). Thus this is a guest message queue, not a lost kernel wake.
+- Unwinding the known ARM prologues from the live `FP` localized the main NSO
+  chain to wrapper `0x00758348`, helper `0x00758E10`, and the MK8D operation at
+  `0x009CC864`. That operation sets state `6`, calls a virtual method at
+  `vtable+0x0C`, and returns from it at `0x009CC8E0`; the method synchronously
+  sends the queue completion.
+- The completion payload sequence advances to 31. On a 60-second run the
+  relevant sends alternated roughly 2.45 seconds and 0.50 seconds apart
+  (36 sends over 53.2 seconds, 1.52 seconds mean). The delay is therefore
+  upstream of `SignalProcessWideKey`; the SVC itself is not stretching it.
+- Between completions, `tid 75` heavily polls ioctl `0xC010001D`, which is
+  `nvhost_ctrl::IocCtrlEventWait` for GPU syncpoint fences. Existing history
+  shows syncpoint 1 thresholds advancing in small increments. The Rust event
+  wait control flow was re-read against upstream and is structurally aligned;
+  the next target is whether syncpoint `min` advances too slowly because GPU
+  command execution/fence completion is delayed.
+
+Refined hypothesis: the first-logo duration is a serialized batch of 32 guest
+resource/GPU completions whose fence progress is much slower than yuzu. Measure
+`threshold/min/result` around each queue completion before changing scheduler,
+condition-variable, or timer behavior.
+
+### 2026-07-10 - OPEN: common Vulkan geometry/UBO path fixes corruption; title transition still slow
+
+The attract-mode corruption was localized to the legacy direct Vulkan buffer
+cache, not nvnflinger or final presentation. At present frame 5000 the bad
+pixels already existed in HDR target `0x520510000`.
+
+Controlled A/B results:
+
+- legacy geometry cache: the HDR mixed stale title geometry with repeated and
+  oversized primitives;
+- CPU-content-hash invalidation: stale title primitives disappeared, proving
+  that the `gpu_va -> VkBuffer` cache reused rewritten ring-buffer contents,
+  but GPU-produced geometry remained invalid;
+- common `UpdateGraphicsBuffers` + `BindHostGeometryBuffers`: scene geometry
+  became stable and recognizable because CPU/GPU writes share the upstream
+  buffer owner;
+- common mapped-uniform descriptor stream: projection and textures improved
+  substantially (trees and foliage became recognizable). This proves that the
+  legacy per-descriptor UBO bridge also diverged from upstream ordering.
+
+The common geometry path and common UBO descriptor stream are now the default
+for supported primitive topologies. The legacy direct cache remains only for
+Quads/QuadStrip until the upstream index-conversion passes are wired through
+`BufferCacheRuntime`.
+
+The remaining title image underneath the first attract geometry is not yet
+classified as a missed clear versus an incomplete game transition. A longer
+post-v17 run is required after the pipeline cache stabilizes.
+
+Pipeline-time finding: ruzu kept `vertex_strides` in `FixedPipelineState` even
+when EDS1 was active. Logs showed the cache growing to 1470 pipelines with
+misses dominated by `vertex_strides`, while upstream excludes strides and
+supplies them with `vkCmdBindVertexBuffers2`. The divergence is removed and
+the portable cache version is now 17.
+
+Invalidated/refined hypotheses retained:
+
+- **INVALIDATED for the remaining attract corruption:** unsupported U8 index
+  type. The affected HDR draws use U16 indices and MoltenVK advertises
+  `VK_EXT_index_type_uint8`/`VK_KHR_index_type_uint8`.
+- **REFINED:** stale CPU-side vertex/index data was real but only one layer of
+  the problem. CPU hash invalidation fixed reuse of rewritten CPU buffers but
+  could not synchronize GPU-produced buffers; the common cache is required.
+- **REFINED:** vertex-input fixed-slot/divisor parity was necessary and removes
+  stale pipeline state, but did not by itself fix attract rendering.
+
 - First logo transitions after roughly 3-4 seconds of visible time, like yuzu.
 - Audio transition matches the visual transition, including the "Mario Kart
   eight" voice line.
@@ -1843,3 +2124,133 @@ Invalidated/refined hypotheses retained for traceability:
 The priority-inheritance port currently stores waiter IDs in `LockWithPriorityInheritanceInfo` and resolves them through `GlobalSchedulerContext` from `KLightLock::unlock_slow_path`. Upstream stores intrusive `KThread*` directly. This creates two Rust-only risks: taking the GSC mutex while the scheduler lock is held, and panicking if a waiter disappears from the GSC table before ownership transfer.
 
 Do not replace the `expect` with a guessed unlock/skip fallback. The faithful correction is structural: make the lock-waiter tree retain stable thread ownership/references, transfer those references from `remove_waiter_by_key`, and remove `find_thread` from the light-lock slow path. Audit cancellation and thread-exit ordering in the same slice.
+
+## 2026-07-11 - MK8D prompt flare and pastel attract investigation
+
+Current symptoms reported before the latest shader fix:
+
+- yuzu shows a localized lens flare over the final `s` in `Press` and the `R` in `L+R`; ruzu showed a faint moving copy/ghost of the prompt text behind it;
+- attract mode rendered black initially, then progressed to incorrectly pastel/whitened textures.
+
+Confirmed prompt draw chain:
+
+- prompt text uses VS/FS `0xB00030/0xB00F30`, 17/34 instances;
+- the following additive flare draw uses VS/FS `0x675130/0x6B3E30`, triangle strip, four vertices, 19 instances, blend `SrcAlpha/One`;
+- text and flare resolve distinct texture descriptors. The flare texture is BC5 256x32 with four flare blobs and contains no text. **INVALIDATED:** stale TIC/TSC, wrong sampled image, or the prompt texture being rebound as the flare texture;
+- the flare fragment shader's conditional kill/demote is now present and its texture/threshold path is coherent. **INVALIDATED for the remaining geometry error:** missing fragment KIL alone.
+
+Root shader divergence found and fixed:
+
+- the flare vertex shader executes three `CSETP NEU` instructions, each fed by an earlier `I2I.CC` writing `RZ` solely for its flags;
+- ruzu decoded `CSETP` but never dispatched it, and `condition_code_set.rs` was a panic stub;
+- ruzu's simplified `I2I` ignored `CC`, selector, destination conversion, saturation, and validation. The `RZ` writes therefore became complete no-ops and the flare placement predicates stayed stale;
+- ported upstream flag IR access, all flow tests, `CSET/CSETP`, full `I2I`, and the incidental missing LEA dispatch/validation. The apparent LEA words in this captured shader are scheduler words and were not the active cause;
+- enabling the flags exposed a second backend divergence: SPIR-V skipped associated `GetZeroFromOp`/`GetSignFromOp` definitions. Ported upstream `SetZeroFlag`/`SetSignFlag` behavior for bitwise and bitfield parent operations. Disk-cache loading changed from dozens of unresolved-reference pipeline rejects plus a live GPU panic to zero.
+
+Verification completed:
+
+- focused live-word regression `I2I.CC -> CSETP -> SSA/DCE` passes;
+- release build passes;
+- 45-second MK8D run with `RUZU_AUDIO_SINK=null` presents over 1,000 frames with zero unresolved IR references and zero shader panic.
+
+Still to verify visually on the corrected build:
+
+- whether the flare is now localized like the yuzu captures rather than text-shaped/moving;
+- whether the same corrected integer condition flags improve the pastel attract scene;
+- if attract remains wrong, capture the active attract pipeline stages and enumerate decoded-but-undispatched opcodes. Geometry/tessellation generic input arrays and vertex-indexed attribute reads remain a known structural SPIR-V gap and must be tested against the actual attract pipelines before attribution.
+
+Follow-up attract evidence:
+
+- periodic guest framebuffer dumps show frame 4000 still correct title art and frame 5000 almost entirely white; the corruption is already present before nvnflinger/presentation;
+- the dominant attract shaders render scene target `0x5211A0000` and HDR/composition target `0x520510000`. Nine dumped dominant shaders cover 58 executed opcodes with no remaining dispatcher fallthrough;
+- **INVALIDATED:** missing per-frame clear/feedback accumulation. The scene target receives full RGBA black clears and the HDR target receives its expected color/depth clears every cycle;
+- **INVALIDATED for the active run:** missing `COLOR_WRITE_MASK_EXT`. EDS3 blend dynamic state is explicitly disabled by the simplified device init, so color masks are baked into these pipelines; the observed R-only passes are guest post-processing state;
+- a major active semantic divergence was found instead: 49 captured attract `XMAD` instructions used a simplified translator that ignored signed halves and variant-specific `.PSL/.MRG` fields. XMAD is now ported literally from upstream. This build still requires visual attract validation.
+
+Post-XMAD validation:
+
+- frame 5000 changed from almost entirely white/pastel to a coherent black loading frame with the small MK8D logo and three dim colored lights. XMAD was therefore a real cause of attract corruption, not merely parity cleanup;
+- the title transition is still wrong (gray checker instead of yuzu's blue streak animation), and the localized prompt lens flare is still absent. These are independent from the XMAD attract fix;
+- **INVALIDATED for the flare:** advanced IADD modifiers. Every captured flare `IADD/IADD32I` has `X=0`, `CC=0`, `SAT=0`, and no `.PO`; the bit 48/49 negate forms used by the shader are already translated;
+- periodic title dumps after the RRO/flag fixes show stable prompt text without the former moving text ghost, but no sampled frame caught the expected localized flare. The next title-specific step is to trace the draw(s) unique to the first-logo -> title transition and compare their texture/image state with yuzu/upstream, rather than continue changing attract shaders.
+
+### 2026-07-11 - Transition blue-streak localization
+
+The yuzu reference `~/Movies/Capture d’écran 2026-07-11 à 11.30.08.png`
+shows two distinct effects over the title artwork: a full-screen blue grade with
+horizontal light streaks, and smaller point-like flare particles. Ruzu's HDR
+target at the corresponding transition phase retains the diagonal mask and
+point particles but lacks the broad horizontal streak layer.
+
+- The particle path is `VS 0x6A4030 / FS 0x6B3E30` (10 instanced quads,
+  `SrcAlpha/One`) and shares `FS 0x6B3E30` with the prompt flare path. Its
+  16x16 radial texture, vertex streams, and instance data are valid.
+- **INVALIDATED:** an excessive fragment alpha threshold. The exact fragment
+  cbuf value at offset `0x5E8` is `0.0`; only zero-alpha texels are demoted.
+- **INVALIDATED:** a zero fade constant. `VS 0x6A4030` writes `Generic3.X`
+  from cbuf 10 offset `0x30`, whose live value is `1.0`; its alpha curve cbuf
+  is also valid (`0 -> 1 -> 1 -> 0`).
+- A first-occurrence execute/skip comparison was byte-identical because that
+  occurrence is the legitimate zero endpoint of the animation. A later
+  occurrence (`RUZU_DUMP_VK_IMAGE_AT=20`) proves the pipeline does render
+  point flares. Therefore this path is relevant to the missing prompt flare,
+  but it is not the producer of the broad blue transition streaks.
+- **INVALIDATED:** the old `AF1930`/`AF5730` fragment `Undef` diagnosis. Fresh
+  current SPIR-V lowers both shaders to normal perspective-correct sampling;
+  the stale dumps with constant `false/0` predate the structured-CFG fixes.
+- The full-screen `AF1930` color-grade cbuf is live and changes during the
+  transition. The blue/white state is scale RGBA
+  `[0.015686, 0.156863, 0, 1]` plus bias `[0.984314, 0.843137, 1, 0]`, so the
+  guest data and UBO binding do request the blue grade.
+- Texture-cache state for the full-screen chain resolves stable non-null
+  `ImageId`/`ImageView` pairs. `AF7B30` receives the color image plus the BC4
+  diagonal mask. The early `AF1930` BC5 input is a valid uniform 8x8 LUT, not
+  the missing streak image. **INVALIDATED:** direct BC5 decode/swizzle loss of
+  a pre-rendered streak texture.
+
+Next: isolate the postprocess/bloom draw that generates the horizontal bands
+from the scene (rather than the particle and diagonal-mask draws), capture its
+input/output attachment around the blue-grade interval, and compare its blend
+and shader translation literally with upstream.
+
+Follow-up correction from 25-frame presentation captures:
+
+- `VS 0x6A4030` receives per-instance size `(2,2,2)` and produces the small
+  point particles visible in ruzu. **INVALIDATED:** treating this draw as the
+  direct producer of the broad horizontal bands.
+- The preceding `VS 0x6A2730 / FS 0x6A3E30` draw receives size
+  `(100,50,100)` and is the large-effect candidate. Its current vertex SPIR-V
+  contains two boolean `OpUndef` values that affect coordinate signs.
+- A line-by-line comparison found that Rust recursively removed phi users in
+  `TryRemoveTrivialPhi`, while upstream explicitly leaves that recursion as a
+  TODO. The extra optimization was removed and its loop fixture changed to
+  assert the retained upstream phi. Focused SSA tests pass.
+- **INVALIDATED as the source of these two Undefs:** recursive phi cleanup.
+  Regenerating `0x6A2780` after the parity fix produces the same shader hash
+  and the same two `OpUndef` values. The parity correction is retained, but
+  it does not fix the transition.
+- A 25-frame contact sheet (`/tmp/ruzu-transition-25/contact.png`) confirms
+  the exact visible mismatch: ruzu fades the first logo over a gray checker,
+  then reveals the title artwork through the diagonal mask. The yuzu
+  reference has the same diagonal mask but overlays a blue full-screen grade
+  and broad horizontal streaks. This is not merely a different sampled time.
+
+Review fixes applied after this investigation:
+
+- `VK_EXT_vertex_attribute_divisor` was exposed by MoltenVK but never enabled;
+  pipeline creation nevertheless chained divisor state. The extension and
+  `vertexAttributeInstanceRateDivisor` feature are now queried/enabled and the
+  capability gates both live and disk-rebuilt graphics pipelines.
+- Demote support is now device-derived. SPIR-V declares the demote capability
+  only for shaders that use it and declares
+  `SPV_EXT_demote_to_helper_invocation` when targeting SPIR-V below 1.6.
+- SPIR-V `IAdd32` now defines upstream carry/zero/sign/overflow pseudo flags.
+  `SClamp32/UClamp32` were added across IR, SPIR-V, GLSL, and GLASM with the
+  upstream broken-driver fallbacks and flag writes.
+- Focused tests and the release build pass. MoltenVK reports divisor v3 and
+  demote v1 at runtime, with no new pipeline/SPIR-V rejection.
+- **INVALIDATED as the sole transition fix:** enabling the divisor and fixing
+  these shader flags does not by itself restore the blue streak transition;
+  a 10-second 25-frame capture still shows the checker/diagonal reveal. These
+  are retained correctness/parity fixes, but the transition investigation
+  remains open.

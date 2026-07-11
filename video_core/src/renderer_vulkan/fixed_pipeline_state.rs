@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, BlendInfo, ComparisonOp, CullFace, DepthMode, DrawCall, FrontFace,
-    PolygonMode, PrimitiveTopology, StencilOp,
+    PolygonMode, PrimitiveTopology, StencilOp, VertexAttribType,
 };
 use crate::transform_feedback::{StreamOutLayout, TransformFeedbackLayout, TransformFeedbackState};
 
@@ -1293,6 +1293,33 @@ impl FixedPipelineState {
         self.set_extended_dynamic_state_3_enables(features.has_extended_dynamic_state_3_enables);
         self.set_dynamic_vertex_input(features.has_dynamic_vertex_input);
 
+        self.attribute_types_or_enabled_divisors = 0;
+        self.binding_divisors = [0; NUM_VERTEX_ARRAYS];
+        if features.has_dynamic_vertex_input {
+            for (index, attrib) in draw.vertex_attribs.iter().enumerate() {
+                let ty: u32 = match attrib.attrib_type {
+                    VertexAttribType::SInt => 2,
+                    VertexAttribType::UInt => 3,
+                    VertexAttribType::Invalid => 0,
+                    VertexAttribType::SNorm
+                    | VertexAttribType::UNorm
+                    | VertexAttribType::UScaled
+                    | VertexAttribType::SScaled
+                    | VertexAttribType::Float => 1,
+                };
+                let mask: u32 = if attrib.constant { 0 } else { 0b11 };
+                self.attribute_types_or_enabled_divisors |= u64::from(ty & mask) << (index * 2);
+            }
+        } else {
+            for (index, stream) in draw.vertex_streams.iter().enumerate() {
+                if draw.vertex_stream_instances[index] == 0 {
+                    continue;
+                }
+                self.binding_divisors[index] = stream.frequency;
+                self.attribute_types_or_enabled_divisors |= 1u64 << index;
+            }
+        }
+
         self.set_topology(draw.topology);
         self.set_ndc_minus_one_to_one(draw.depth_stencil.depth_mode == DepthMode::MinusOneToOne);
         self.set_polygon_mode(draw.rasterizer.polygon_mode_front);
@@ -1436,23 +1463,14 @@ impl FixedPipelineState {
             self.attributes[i] = va;
         }
 
-        // Populate vertex strides.
-        //
-        // INTENTIONAL DIVERGENCE: upstream fills these only when
-        // !extended_dynamic_state (strides then come from
-        // vkCmdBindVertexBuffers2). Excluding them here — together with
-        // declaring VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE — renders
-        // black on MoltenVK (verified by A/B window captures 2026-07-08),
-        // so ruzu keeps strides in the key on all devices until the
-        // dynamic-stride path is debugged. Cost: a few extra pipeline
-        // variants per shader when games vary strides.
+        // Upstream stores strides only when EDS1 is unavailable. With EDS1,
+        // `VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE` and
+        // `vkCmdBindVertexBuffers2` own the current values.
         self.vertex_strides = [0; NUM_VERTEX_ARRAYS];
-        for stream in &draw.vertex_streams {
-            let index = stream.index as usize;
-            if index >= NUM_VERTEX_ARRAYS {
-                continue;
+        if !features.has_extended_dynamic_state {
+            for (index, stream) in draw.vertex_streams.iter().enumerate() {
+                self.vertex_strides[index] = stream.stride as u16;
             }
-            self.vertex_strides[index] = stream.stride as u16;
         }
 
         self.set_xfb_enabled(draw.transform_feedback_enabled);
@@ -1532,8 +1550,8 @@ mod tests {
     use crate::engines::maxwell_3d::{
         AntiAliasAlphaControlInfo, BlendColorInfo, ColorMaskInfo, ConstBufferBinding, DepthMode,
         DepthStencilInfo, IndexFormat, LogicOpInfo, RasterizerInfo, RenderTargetInfo,
-        RtControlInfo, SamplerBinding, ScissorInfo, ShaderStageInfo, StencilFaceInfo, ViewportInfo,
-        ZetaInfo,
+        RtControlInfo, SamplerBinding, ScissorInfo, ShaderStageInfo, StencilFaceInfo,
+        VertexAttribInfo, VertexAttribSize, VertexStreamInfo, ViewportInfo, ZetaInfo,
     };
     use std::collections::hash_map::DefaultHasher;
 
@@ -1656,7 +1674,8 @@ mod tests {
             index_buffer_count: 0,
             index_buffer_first: 0,
             index_format: IndexFormat::UnsignedInt,
-            vertex_streams: Vec::new(),
+            vertex_streams: Default::default(),
+            vertex_stream_instances: Default::default(),
             vertex_stream_limits: Default::default(),
             viewports: [ViewportInfo::default(); NUM_VIEWPORTS],
             viewport_transforms: Default::default(),
@@ -1717,7 +1736,7 @@ mod tests {
             line_anti_alias_enable: false,
             program_base_address: 0,
             cb_bindings: [[ConstBufferBinding::default(); 18]; 5],
-            vertex_attribs: Vec::new(),
+            vertex_attribs: Default::default(),
             shader_stages: [ShaderStageInfo::default(); 6],
             color_masks: [ColorMaskInfo::default(); NUM_RENDER_TARGETS],
             rt_control: RtControlInfo::default(),
@@ -1747,6 +1766,47 @@ mod tests {
     }
 
     #[test]
+    fn refresh_preserves_sparse_attribute_location_and_instance_divisor() {
+        let mut draw = make_test_draw_call();
+        draw.vertex_streams[5] = VertexStreamInfo {
+            // Array position owns the Maxwell binding. Keep the redundant
+            // snapshot field at its default to catch accidental renumbering.
+            index: 0,
+            address: 0x1000,
+            stride: 32,
+            frequency: 5,
+            enabled: true,
+        };
+        draw.vertex_stream_instances[5] = 1;
+        draw.vertex_attribs[7] = VertexAttribInfo {
+            buffer_index: 5,
+            constant: false,
+            offset: 12,
+            size: VertexAttribSize::R32G32,
+            attrib_type: VertexAttribType::Float,
+            bgra: false,
+        };
+
+        let mut state = FixedPipelineState::default();
+        state.refresh(&draw, &DynamicFeatures::default());
+
+        assert_eq!(state.binding_divisors[5], 5);
+        assert_ne!(state.attribute_types_or_enabled_divisors & (1 << 5), 0);
+        assert_eq!(state.vertex_strides[5], 32);
+        assert_eq!(
+            state.attributes[0].attrib_type(),
+            VertexAttribType::Invalid.to_raw()
+        );
+        assert!(state.attributes[7].is_enabled());
+        assert_eq!(
+            state.attributes[7].attrib_type(),
+            VertexAttribType::Float.to_raw()
+        );
+        assert_eq!(state.attributes[7].buffer(), 5);
+        assert_eq!(state.attributes[7].offset(), 12);
+    }
+
+    #[test]
     fn test_different_topology_gives_different_hash() {
         let mut a = FixedPipelineState::default();
         let mut b = FixedPipelineState::default();
@@ -1761,7 +1821,6 @@ mod tests {
         use crate::engines::maxwell_3d::{VertexAttribSize, VertexAttribType};
 
         let mut draw = make_test_draw_call();
-        draw.vertex_attribs.push(Default::default());
         draw.vertex_attribs[0].constant = false;
         draw.vertex_attribs[0].attrib_type = VertexAttribType::Float;
         draw.vertex_attribs[0].size = VertexAttribSize::R32G32B32A32;
@@ -1828,7 +1887,6 @@ mod tests {
         draw.rasterizer.cull_enable = true;
         draw.depth_stencil.depth_test_enable = true;
         draw.depth_stencil.depth_write_enable = true;
-        draw.vertex_streams.push(Default::default());
         draw.vertex_streams[0].stride = 32;
 
         let features = DynamicFeatures {
@@ -1844,9 +1902,9 @@ mod tests {
         assert!(!state.dynamic_state.depth_write_enable());
         // …the extension flag is recorded in the key…
         assert!(state.extended_dynamic_state());
-        // …and vertex_strides intentionally STAY in the key (documented
-        // MoltenVK divergence in refresh()).
-        assert_eq!(state.vertex_strides[0], 32);
+        // …and vertex strides stay out of the key because they are supplied
+        // dynamically by vkCmdBindVertexBuffers2.
+        assert_eq!(state.vertex_strides[0], 0);
 
         // Non-covered groups are still captured (eds2/eds3 unsupported here).
         let mut logic_draw = make_test_draw_call();
@@ -1863,8 +1921,7 @@ mod tests {
         let mut other_draw = make_test_draw_call();
         other_draw.rasterizer.cull_enable = false;
         other_draw.depth_stencil.depth_test_enable = false;
-        other_draw.vertex_streams.push(Default::default());
-        other_draw.vertex_streams[0].stride = 32;
+        other_draw.vertex_streams[0].stride = 64;
         let mut other_state = FixedPipelineState::default();
         other_state.refresh(&other_draw, &features);
         assert_eq!(state, other_state);

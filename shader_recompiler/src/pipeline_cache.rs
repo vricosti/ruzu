@@ -235,6 +235,9 @@ fn materialize_structured_actions(program: &mut Program, actions: &[StructuredAc
                     Inst::new(Opcode::SetIndirectBranchVariable, vec![address]),
                 );
             }
+            StructuredAction::DemoteToHelperInvocation { block } => {
+                Emitter::new(program, *block).demote_to_helper_invocation();
+            }
             StructuredAction::Condition {
                 syntax_index,
                 block,
@@ -1690,6 +1693,29 @@ mod tests {
             .expect("return syntax must have a preceding block");
 
         assert_eq!(program.block(return_block).front().opcode, Opcode::Epilogue);
+    }
+
+    #[test]
+    fn cfg_translation_materializes_kill_as_demote() {
+        let cfg_blocks = vec![CfgBlock {
+            begin: 0,
+            end: 1,
+            end_class: EndClass::Kill,
+            branch_true: None,
+            branch_false: None,
+            cond: Condition::always(),
+            stack_depth: 0,
+        }];
+
+        let program = translate_cfg_to_program(&[0], ShaderStage::Fragment, 0, &cfg_blocks, None);
+
+        assert!(program.blocks.iter().any(|block| {
+            block
+                .instructions
+                .iter()
+                .flatten()
+                .any(|inst| inst.opcode == Opcode::DemoteToHelperInvocation)
+        }));
     }
 
     #[test]

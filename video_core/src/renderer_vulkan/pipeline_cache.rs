@@ -374,7 +374,13 @@ impl ShaderPools {
 // Version 15: FixedPipelineState::refresh preserves color write masks even
 // when blending is disabled. Older caches reconstruct pipelines with a zero
 // colorWriteMask and can render an entirely black frame.
-const CACHE_VERSION: u32 = 15;
+// Version 16: draw snapshots preserve all 32 vertex binding/attribute slots
+// and FixedPipelineState records instance divisors. Version 15 entries can
+// contain renumbered sparse attributes and zero divisors.
+// Version 17: vertex strides are omitted from fixed pipeline state whenever
+// extended dynamic state owns them, matching upstream. Version 16 entries
+// can contain per-draw strides and therefore produce duplicate pipelines.
+const CACHE_VERSION: u32 = 17;
 const VULKAN_CACHE_MAGIC_NUMBER: [u8; 8] = *b"yuzuvkch";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -597,6 +603,8 @@ impl PipelineCache {
         topology_list_primitive_restart_supported: bool,
         patch_list_primitive_restart_supported: bool,
         max_viewports: u32,
+        max_vertex_input_bindings: u32,
+        vertex_attribute_divisor_supported: bool,
     ) -> Self {
         let mut pipeline_cache = PipelineCache {
             device: device.clone(),
@@ -620,6 +628,8 @@ impl PipelineCache {
                 topology_list_primitive_restart_supported,
                 patch_list_primitive_restart_supported,
                 max_viewports,
+                max_vertex_input_bindings,
+                vertex_attribute_divisor_supported,
             ),
             graphics_cache: HashMap::new(),
             failed_graphics_cache: HashSet::new(),
@@ -1360,7 +1370,8 @@ mod tests {
             index_buffer_count: 0,
             index_buffer_first: 0,
             index_format: IndexFormat::UnsignedInt,
-            vertex_streams: Vec::new(),
+            vertex_streams: Default::default(),
+            vertex_stream_instances: Default::default(),
             vertex_stream_limits: Default::default(),
             viewports: [ViewportInfo::default(); 16],
             viewport_transforms: Default::default(),
@@ -1421,7 +1432,7 @@ mod tests {
             line_anti_alias_enable: false,
             program_base_address: 0,
             cb_bindings: [[ConstBufferBinding::default(); 18]; 5],
-            vertex_attribs: Vec::new(),
+            vertex_attribs: Default::default(),
             shader_stages: [ShaderStageInfo::default(); 6],
             color_masks: [ColorMaskInfo::default(); 8],
             rt_control: RtControlInfo::default(),
@@ -1472,6 +1483,11 @@ mod tests {
 
         let result = parse_vulkan_pipeline_cache_blob(&blob, CACHE_VERSION);
         assert_eq!(result, Err(VulkanPipelineCacheHeaderError::VersionMismatch));
+    }
+
+    #[test]
+    fn cache_version_tracks_dynamic_vertex_stride_semantics() {
+        assert_eq!(CACHE_VERSION, 17);
     }
 
     #[test]

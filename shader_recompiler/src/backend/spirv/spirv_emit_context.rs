@@ -209,7 +209,12 @@ impl SpirvEmitContext {
             builder.capability(spirv::Capability::GroupNonUniformShuffle);
             builder.capability(spirv::Capability::GroupNonUniformVote);
         }
-        if profile.support_demote_to_helper_invocation {
+        if program.info.uses_demote_to_helper_invocation
+            && profile.support_demote_to_helper_invocation
+        {
+            if profile.supported_spirv < 0x0001_0600 {
+                builder.extension("SPV_EXT_demote_to_helper_invocation");
+            }
             builder.capability(spirv::Capability::DemoteToHelperInvocation);
         }
         builder.capability(spirv::Capability::DrawParameters);
@@ -1526,7 +1531,7 @@ impl SpirvEmitContext {
             Opcode::IAdd32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
-                let id = super::emit_spirv_integer::emit_iadd_32(self, a, b);
+                let id = super::emit_spirv_integer::emit_iadd_32(self, inst, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::ISub32 => {
@@ -1582,19 +1587,19 @@ impl SpirvEmitContext {
             Opcode::BitwiseAnd32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
-                let id = super::emit_spirv_integer::emit_bitwise_and_32(self, a, b);
+                let id = super::emit_spirv_integer::emit_bitwise_and_32(self, inst, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::BitwiseOr32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
-                let id = super::emit_spirv_integer::emit_bitwise_or_32(self, a, b);
+                let id = super::emit_spirv_integer::emit_bitwise_or_32(self, inst, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::BitwiseXor32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
-                let id = super::emit_spirv_integer::emit_bitwise_xor_32(self, a, b);
+                let id = super::emit_spirv_integer::emit_bitwise_xor_32(self, inst, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::BitwiseNot32 => {
@@ -1616,16 +1621,18 @@ impl SpirvEmitContext {
                 let base = self.resolve_value(inst.arg(0));
                 let offset = self.resolve_value(inst.arg(1));
                 let count = self.resolve_value(inst.arg(2));
-                let id =
-                    super::emit_spirv_integer::emit_bit_field_s_extract(self, base, offset, count);
+                let id = super::emit_spirv_integer::emit_bit_field_s_extract(
+                    self, inst, base, offset, count,
+                );
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::BitFieldUExtract => {
                 let base = self.resolve_value(inst.arg(0));
                 let offset = self.resolve_value(inst.arg(1));
                 let count = self.resolve_value(inst.arg(2));
-                let id =
-                    super::emit_spirv_integer::emit_bit_field_u_extract(self, base, offset, count);
+                let id = super::emit_spirv_integer::emit_bit_field_u_extract(
+                    self, inst, base, offset, count,
+                );
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::BitCount32 => {
@@ -1665,6 +1672,20 @@ impl SpirvEmitContext {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
                 let id = super::emit_spirv_integer::emit_u_max_32(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::SClamp32 => {
+                let value = self.resolve_value(inst.arg(0));
+                let min = self.resolve_value(inst.arg(1));
+                let max = self.resolve_value(inst.arg(2));
+                let id = super::emit_spirv_integer::emit_s_clamp_32(self, inst, value, min, max);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::UClamp32 => {
+                let value = self.resolve_value(inst.arg(0));
+                let min = self.resolve_value(inst.arg(1));
+                let max = self.resolve_value(inst.arg(2));
+                let id = super::emit_spirv_integer::emit_u_clamp_32(self, inst, value, min, max);
                 self.set_value(block_idx, inst_idx, id);
             }
 
@@ -2091,7 +2112,7 @@ impl SpirvEmitContext {
 
             // ── Control ───────────────────────────────────────────────
             Opcode::DemoteToHelperInvocation => {
-                super::emit_spirv_special::emit_demote_to_helper_invocation(self);
+                super::emit_spirv_control_flow::emit_demote_to_helper_invocation(self);
             }
             Opcode::Barrier => {
                 super::emit_spirv_barriers::emit_barrier(self);
@@ -2322,6 +2343,47 @@ mod tests {
     use crate::ir::types::ShaderStage;
     use crate::ir::types::Type;
     use crate::ir::value::{Attribute, InstRef, Value};
+
+    #[test]
+    fn demote_capability_and_extension_are_usage_gated() {
+        let mut unused = ir::Program::new(ShaderStage::Fragment);
+        let profile = Profile {
+            supported_spirv: 0x0001_0500,
+            support_demote_to_helper_invocation: true,
+            ..Profile::default()
+        };
+        let runtime_info = RuntimeInfo::default();
+        let unused_ctx = SpirvEmitContext::new(&unused, &profile, &runtime_info);
+        assert!(!unused_ctx
+            .builder
+            .module_ref()
+            .capabilities
+            .iter()
+            .any(|inst| {
+                matches!(
+                    inst.operands.as_slice(),
+                    [Operand::Capability(
+                        spirv::Capability::DemoteToHelperInvocation
+                    )]
+                )
+            }));
+
+        unused.info.uses_demote_to_helper_invocation = true;
+        let used_ctx = SpirvEmitContext::new(&unused, &profile, &runtime_info);
+        let module = used_ctx.builder.module_ref();
+        assert!(module.capabilities.iter().any(|inst| {
+            matches!(
+                inst.operands.as_slice(),
+                [Operand::Capability(
+                    spirv::Capability::DemoteToHelperInvocation
+                )]
+            )
+        }));
+        assert!(module.extensions.iter().any(|inst| {
+            matches!(inst.operands.as_slice(), [Operand::LiteralString(name)]
+                if name == "SPV_EXT_demote_to_helper_invocation")
+        }));
+    }
 
     #[test]
     fn vertex_id_declares_vertex_index_and_base_vertex_without_vertex_id_support() {

@@ -5,6 +5,8 @@
 //! `backend/spirv/emit_spirv_control_flow.cpp`.
 
 use super::spirv_emit_context::SpirvEmitContext;
+use rspirv::dr::{InsertPoint, Instruction};
+use rspirv::spirv::Op;
 
 /// Emit a demote-to-helper-invocation.
 ///
@@ -13,7 +15,14 @@ use super::spirv_emit_context::SpirvEmitContext;
 /// Otherwise, fall back to a conditional `OpKill` pattern.
 pub fn emit_demote_to_helper_invocation(ctx: &mut SpirvEmitContext) {
     if ctx.profile.support_demote_to_helper_invocation {
-        ctx.builder.demote_to_helper_invocation().unwrap();
+        // rspirv 0.12 incorrectly exposes OpDemoteToHelperInvocation as a
+        // terminator. SPIR-V and upstream both continue in the same block.
+        ctx.builder
+            .insert_into_block(
+                InsertPoint::End,
+                Instruction::new(Op::DemoteToHelperInvocation, None, None, vec![]),
+            )
+            .unwrap();
     } else {
         // Fallback: conditional kill
         // Create labels for the kill path and the merge path

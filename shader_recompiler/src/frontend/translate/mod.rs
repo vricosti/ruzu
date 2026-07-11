@@ -471,6 +471,14 @@ impl<'a> TranslatorVisitor<'a> {
                 self::floating_point_multi_function::mufu(self, insn);
             }
 
+            // floating_point_range_reduction.cpp
+            MaxwellOpcode::RRO_reg | MaxwellOpcode::RRO_cbuf => {
+                self::floating_point_range_reduction::rro(self, insn, opcode);
+            }
+            MaxwellOpcode::RRO_imm => {
+                panic!("RRO (imm)");
+            }
+
             // integer_add.cpp
             MaxwellOpcode::IADD_reg | MaxwellOpcode::IADD_cbuf | MaxwellOpcode::IADD_imm => {
                 self::integer_add::iadd(self, insn, opcode);
@@ -631,6 +639,31 @@ impl<'a> TranslatorVisitor<'a> {
                 self::predicate_set_register::pset(self, insn);
             }
 
+            // condition_code_set.cpp
+            MaxwellOpcode::CSET => {
+                self::condition_code_set::cset(self, insn);
+            }
+            MaxwellOpcode::CSETP => {
+                self::condition_code_set::csetp(self, insn);
+            }
+
+            // load_effective_address.cpp
+            MaxwellOpcode::LEA_hi_reg => {
+                self::load_effective_address::lea_hi_reg(self, insn);
+            }
+            MaxwellOpcode::LEA_hi_cbuf => {
+                self::load_effective_address::lea_hi_cbuf(self, insn);
+            }
+            MaxwellOpcode::LEA_lo_reg => {
+                self::load_effective_address::lea_lo_reg(self, insn);
+            }
+            MaxwellOpcode::LEA_lo_cbuf => {
+                self::load_effective_address::lea_lo_cbuf(self, insn);
+            }
+            MaxwellOpcode::LEA_lo_imm => {
+                self::load_effective_address::lea_lo_imm(self, insn);
+            }
+
             // load_store_memory.cpp
             MaxwellOpcode::LDG => {
                 self::load_store_memory::ldg(self, insn);
@@ -765,5 +798,81 @@ mod tests {
             .collect();
         assert!(!opcodes.contains(&Opcode::DemoteToHelperInvocation));
         assert!(!tv.ir.program.info.uses_demote_to_helper_invocation);
+    }
+
+    #[test]
+    fn mk8d_i2i_cc_feeds_csetp_through_ssa() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        {
+            let mut tv = TranslatorVisitor::new(&mut program, 0);
+            // Live MK8D flare shader words at 0x675F18 and 0x676088.
+            tv.translate_instruction(0x5CE0_8000_0027_0AFF);
+            tv.translate_instruction(0x50A0_0380_0007_0D1F);
+        }
+
+        let before_ssa: Vec<_> = program.blocks[0].iter().map(|inst| inst.opcode).collect();
+        assert!(before_ssa.contains(&Opcode::SetZFlag));
+        assert!(before_ssa.contains(&Opcode::SetSFlag));
+        assert!(before_ssa.contains(&Opcode::GetZFlag));
+        assert!(before_ssa.contains(&Opcode::GetSFlag));
+        assert!(before_ssa.contains(&Opcode::SetPred));
+
+        crate::ir_opt::ssa_rewrite_pass::ssa_rewrite_pass(&mut program);
+        crate::ir_opt::dead_code_elimination::dead_code_elimination_pass(&mut program);
+        let after_ssa: Vec<_> = program.blocks[0].iter().map(|inst| inst.opcode).collect();
+        for flag_op in [
+            Opcode::SetZFlag,
+            Opcode::SetSFlag,
+            Opcode::SetCFlag,
+            Opcode::SetOFlag,
+            Opcode::GetZFlag,
+            Opcode::GetSFlag,
+            Opcode::GetCFlag,
+            Opcode::GetOFlag,
+        ] {
+            assert!(!after_ssa.contains(&flag_op));
+        }
+    }
+
+    #[test]
+    fn mk8d_flare_rro_reg_is_dispatched() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+
+        tv.translate_instruction(0x5C90_0000_0037_0003);
+
+        let opcodes: Vec<_> = tv.ir.program.blocks[0]
+            .iter()
+            .map(|inst| inst.opcode)
+            .collect();
+        assert!(opcodes.contains(&Opcode::GetRegister));
+        assert!(opcodes.contains(&Opcode::SetRegister));
+    }
+
+    #[test]
+    fn mk8d_attract_xmad_cbcc_ports_half_and_psl_semantics() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+
+        tv.translate_instruction(0x5B30_0798_00C7_0D1D);
+
+        let opcodes: Vec<_> = tv.ir.program.blocks[0]
+            .iter()
+            .map(|inst| inst.opcode)
+            .collect();
+        assert!(
+            opcodes
+                .iter()
+                .filter(|&&op| op == Opcode::BitFieldUExtract)
+                .count()
+                >= 2
+        );
+        assert!(opcodes.contains(&Opcode::ShiftLeftLogical32));
+        assert!(opcodes.contains(&Opcode::IMul32));
+        assert!(opcodes.iter().filter(|&&op| op == Opcode::IAdd32).count() >= 2);
+        assert!(opcodes.contains(&Opcode::SetRegister));
     }
 }

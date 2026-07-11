@@ -22183,3 +22183,419 @@ Upstream files:
 - `cargo check -p core`
 - `cargo check -p video_core`
 - `git diff --check`
+## 2026-07-10 — `video_core/src/engines/maxwell_3d.rs` vs `video_core/engines/maxwell_3d.h`
+
+### Intentional differences
+- Rust exposes the pipeline register fields through `ShaderStageInfo`; upstream reads `Regs::Pipeline` directly. The returned enable state now uses the same `IsShaderConfigEnabled` rule.
+
+### Unintentional differences (to fix)
+- None. Fixed `shader_stage_info(1)` previously copying the raw VertexB enable bit even though upstream `Regs::IsShaderConfigEnabled` always enables VertexB. Draw snapshots now preserve the upstream rule.
+
+### Missing items
+- None for this accessor.
+
+### Binary layout verification
+- PASS: no register or serialized layout changed; this only corrects interpretation of the existing pipeline enable bit.
+
+## 2026-07-10 — `video_core/src/engines/draw_manager.rs` and `video_core/src/engines/maxwell_3d.rs` vs `video_core/engines/draw_manager.h` and `video_core/engines/maxwell_3d.h`
+
+### Intentional differences
+- Rust snapshots live Maxwell state into `DrawCall` because rendering crosses Rust owner boundaries; upstream rasterizers read the live fixed-size register arrays directly. The snapshot now preserves the same 32 vertex-stream slots, 32 vertex-attribute slots, and separate 32 instance-enable registers.
+
+### Unintentional differences (to fix)
+- None. Fixed the previous compact `Vec` representation, which renumbered sparse vertex attribute locations and omitted disabled stream slots, and added the previously missing `vertex_stream_instances` snapshot.
+
+### Missing items
+- None for vertex stream/attribute/instance snapshot identity.
+
+### Binary layout verification
+- N/A: `DrawCall` is an internal Rust snapshot and is not copied to guest memory or serialized.
+
+## 2026-07-10 — `video_core/src/renderer_vulkan/fixed_pipeline_state.rs` vs `video_core/renderer_vulkan/fixed_pipeline_state.h` and `video_core/renderer_vulkan/fixed_pipeline_state.cpp`
+
+### Intentional differences
+- Rust refreshes from the complete `DrawCall` register snapshot rather than a live `Maxwell3D&`; field ownership and the upstream 32-slot ordering are preserved.
+
+### Unintentional differences (to fix)
+- None. Fixed `Refresh` previously leaving `enabled_divisors`, `binding_divisors`, and dynamic attribute types at zero. Static vertex input now uses `vertex_stream_instances[index]` to select instance rate and `vertex_streams[index].frequency` as the divisor, matching upstream.
+
+### Missing items
+- None for the vertex-input fields covered by this slice.
+
+### Binary layout verification
+- PASS: `FixedPipelineState` offsets and serialized size are unchanged; existing fields now contain the upstream values.
+
+## 2026-07-10 — `video_core/src/renderer_vulkan/graphics_pipeline.rs` vs `video_core/renderer_vulkan/vk_graphics_pipeline.h` and `video_core/renderer_vulkan/vk_graphics_pipeline.cpp`
+
+### Intentional differences
+- Rust uses ash builders for `VkPipelineVertexInputStateCreateInfo` and `VkPipelineVertexInputDivisorStateCreateInfoEXT`; the attachment lifetime is kept through pipeline creation.
+
+### Unintentional differences (to fix)
+- None. Runtime and disk pipeline creation now share the upstream-shaped fixed-state builder, preserving all 32 binding indices, sparse attribute locations, instance input rates, and non-unit divisors.
+
+### Missing items
+- `VK_EXT_vertex_input_dynamic_state` remains disabled in the simplified Vulkan constructor. If enabled later, upstream `RasterizerVulkan::UpdateVertexInput` must be ported before advertising it to pipeline keys.
+
+### Binary layout verification
+- N/A: Vulkan pipeline create structures only; no guest or disk payload layout changed.
+
+### Verification
+- Re-read upstream `DrawManager::State`, Maxwell `Regs::vertex_streams`, `Regs::vertex_stream_instances`, and `Regs::vertex_attrib_format` ownership.
+- Re-read upstream `FixedPipelineState::Refresh` vertex-input branch and `GraphicsPipeline::MakePipeline` binding/divisor/attribute construction.
+- `cargo check -p video_core --lib` passes with the project FFmpeg `PKG_CONFIG_PATH`.
+- Focused tests for VertexB enable, vertex-input construction, sparse location 7, and divisor 5 pass.
+- Full `cargo test -p video_core --lib` was attempted but cannot currently complete: pre-existing `update_render_targets_size_uses_wrapping_scale_multiply_like_upstream` fails and four shader-cache tests remain running beyond 60 seconds. The run was stopped after all tests in this slice had passed.
+
+## 2026-07-10 — `video_core/src/renderer_vulkan/pipeline_cache.rs` vs `video_core/renderer_vulkan/vk_pipeline_cache.h` and `video_core/renderer_vulkan/vk_pipeline_cache.cpp`
+
+### Intentional differences
+- ruzu's disk format is Rust-specific and uses its own cache version. Version 16 invalidates version-15 entries whose serialized fixed-state bytes contain the old compact-location/divisor-zero semantics.
+
+### Unintentional differences (to fix)
+- None for cache invalidation after this vertex-input semantic correction.
+
+### Missing items
+- Binary compatibility with upstream yuzu caches is not provided; caches remain isolated under the ruzu data root.
+
+### Binary layout verification
+- PASS: the blob header layout is unchanged and the version field is incremented from 15 to 16.
+
+## 2026-07-10 — `video_core/src/renderer_vulkan/graphics_pipeline.rs` vs `video_core/renderer_vulkan/vk_graphics_pipeline.cpp`
+
+### Intentional differences
+- Rust passes the physical-device vertex-binding limit through the constructor instead of retaining the upstream `Device&`; ownership remains with the Vulkan pipeline builder.
+
+### Unintentional differences (to fix)
+- None in this slice. Static vertex bindings are now limited to `min(NumVertexArrays, maxVertexInputBindings)` like upstream `GraphicsPipeline::MakePipeline`.
+
+### Missing items
+- Dynamic vertex-input state remains disabled until the complete upstream `UpdateVertexInput` command path is ported.
+
+### Binary layout verification
+- N/A: this changes Vulkan create-info counts, not serialized field layout.
+
+## 2026-07-10 — `video_core/src/renderer_vulkan/mod.rs` and `buffer_cache.rs` vs `video_core/renderer_vulkan/vk_graphics_pipeline.cpp` and `vk_buffer_cache.cpp`
+
+### Intentional differences
+- The Rust draw snapshot adapter consumes copied dirty flags and propagates the geometry flags back after binding; upstream mutates `maxwell3d->dirty.flags` directly.
+- Quads and QuadStrip still use the legacy direct cache because the runtime conversion passes are not yet wired to the common cache.
+
+### Unintentional differences (to fix)
+- The remaining legacy Quads/QuadStrip ownership must be removed after `BindQuadIndexBuffer` parity is complete.
+
+### Missing items
+- Common-cache indirect geometry binding and transform-feedback binding remain incomplete.
+
+### Binary layout verification
+- N/A: no raw guest or disk payload changed.
+
+### Verification
+- A/B at MK8D present frame 5000 proved that direct `gpu_va -> VkBuffer` reuse retained stale title geometry, while common `UpdateGraphicsBuffers`/`BindHostGeometryBuffers` produced stable scene geometry.
+- Enabling the common mapped-uniform stream made attract geometry and textures recognizable; that upstream path is now the default.
+
+## 2026-07-10 — `video_core/src/renderer_vulkan/fixed_pipeline_state.rs` vs `video_core/renderer_vulkan/fixed_pipeline_state.cpp`
+
+### Intentional differences
+- None for EDS1 vertex-stride ownership.
+
+### Unintentional differences (to fix)
+- None in this slice. With EDS1 enabled, `vertex_strides` now remain zero in the fixed key and are supplied dynamically by `vkCmdBindVertexBuffers2`, matching upstream.
+
+### Missing items
+- None for this state group.
+
+### Binary layout verification
+- PASS: `FixedPipelineState` byte layout is unchanged; only the semantic value of EDS1-covered stride fields changes. The portable cache version is bumped from 16 to 17.
+
+### Verification
+- `refresh_leaves_extension_covered_fields_zero_like_upstream` passes and now checks differing dynamic strides produce identical fixed state.
+- `cache_version_tracks_dynamic_vertex_stride_semantics` passes.
+## 2026-07-10 - common/src/trace.rs vs diagnostic-only (no upstream counterpart)
+
+### Intentional differences
+- Scheduler records already carried `timestamp_ns`; their text formatter now
+  includes `t_us` for every scheduler stage. This only changes the explicitly
+  enabled async diagnostic output and adds no work to the producer path.
+
+### Unintentional differences (to fix)
+- None introduced by this diagnostic formatting change.
+
+### Missing items
+- None; this is local diagnostic infrastructure rather than a ported upstream
+  subsystem.
+
+### Binary layout verification
+- PASS: `LogRecord` remains 128 bytes and its field layout is unchanged.
+
+### Verification
+- `cargo test -p common trace --lib`
+
+## 2026-07-10 - `video_core/src/renderer_vulkan/fixed_pipeline_state.rs` and `mod.rs` vs `video_core/renderer_vulkan/fixed_pipeline_state.cpp` and `vk_rasterizer.cpp`
+
+### Intentional differences
+- Rust carries a redundant `VertexStreamInfo::index` in draw snapshots; upstream reads the fixed Maxwell register arrays directly. Consumers now treat the array position as authoritative and do not use that redundant field.
+
+### Unintentional differences (to fix)
+- None in this slice. Divisor, stride, trace, and fallback binding loops now preserve the positional `regs.vertex_streams[index]` ownership used upstream.
+
+### Missing items
+- The common buffer-cache path still owns normal geometry while the direct binding helper remains only for the documented quad/quad-strip fallback.
+
+### Binary layout verification
+- PASS: no serialized field was added or reordered. Cache version 17 already covers the EDS1 stride semantic change; its version comment now records that reason explicitly.
+
+### Verification
+- Re-read upstream `FixedPipelineState::Refresh`: divisor state indexes `regs.vertex_stream_instances` and `regs.vertex_streams` with the same loop index; stride state transforms the fixed stream array positionally.
+- `cargo test -p video_core --lib refresh_preserves_sparse_attribute_location_and_instance_divisor -- --nocapture` passes with slot 5's redundant `index` deliberately left at zero.
+
+## 2026-07-10 - `core/src/hle/kernel/svc/svc_condition_variable.rs` vs `core/hle/kernel/svc/svc_condition_variable.cpp`
+
+### Intentional differences
+- When the existing asynchronous `LOCK_PI` diagnostic category is explicitly enabled, Rust emits filtered entry/return records around `SignalConditionVariable`. This is observation-only instrumentation with no upstream runtime counterpart.
+
+### Unintentional differences (to fix)
+- None introduced. Address alignment, process ownership, count forwarding, and call ordering remain identical to upstream `SignalProcessWideKey`.
+
+### Missing items
+- None for the signal SVC behavior in this slice.
+
+### Binary layout verification
+- N/A: no guest-visible structure or serialized payload changed.
+
+### Verification
+- Re-read upstream `svc_condition_variable.cpp`; the trace brackets the existing aligned `SignalConditionVariable` call without changing it.
+- `cargo test -p common trace --lib` passes (4 tests).
+- `cargo check -p core --lib` passes with pre-existing warnings.
+## 2026-07-10 - common/src/settings.rs and video_core/src/renderer_vulkan/swapchain.rs vs common/settings.h and video_core/renderer_vulkan/vk_swapchain.cpp
+
+### Intentional differences
+- `requested_swap_present_mode` maps the Rust settings enum to the Vulkan-local enum before applying the upstream selection logic; this is a type-boundary adaptation only.
+
+### Unintentional differences (to fix)
+- None in this slice. The previous non-Android `async_presentation=true` default and hardcoded `FIFO`/enabled-speed-limit swapchain selection were corrected.
+
+### Missing items
+- None introduced by this slice.
+
+### Binary layout verification
+- PASS: no serialized or shared binary layout is involved.
+
+### Verification
+- Re-read upstream `common/settings.h`, `vk_swapchain.h`, and `vk_swapchain.cpp`. Non-Android asynchronous presentation now defaults to false, and both swapchain creation and present-mode refresh use the live settings as upstream does.
+- `cargo test -p video_core --lib choose_swap_present_mode -- --nocapture` passes.
+- MK8D runs used `RUZU_AUDIO_SINK=null`; the corrected default is active (`PresentManager::Present ... threaded=false`). The remaining periodic one-second Vulkan submit is documented in `TODO.md` and is not attributed to this fixed settings divergence.
+## 2026-07-10 - Vulkan submit diagnostics vs vk_scheduler.cpp and vk_present_manager.cpp
+
+### Intentional differences
+- `RUZU_PROFILE_VK_SUBMIT` adds disabled-by-default counters for recorded commands and guest draws, plus timing of scheduler and presentation queue submits. This is diagnostic-only and preserves upstream submission and synchronization order.
+
+### Unintentional differences (to fix)
+- None introduced by the diagnostic. The remaining intermittent one-second `PresentManager` submit is under investigation and tracked in `TODO.md`.
+
+### Missing items
+- The diagnostic does not yet classify copies, barriers, or dispatches separately; it is intentionally limited to locating the slow batch before deeper instrumentation.
+
+### Binary layout verification
+- PASS: no serialized or shared binary layout is involved.
+
+### Verification
+- Re-read upstream `vk_scheduler.h/.cpp`, `vk_present_manager.h/.cpp`, and `vk_swapchain.h/.cpp`; no control-flow or lifecycle ordering was changed.
+- `cargo check -p video_core --lib` and the release `ruzu-cmd` build pass.
+- MK8D profiling runs used `RUZU_AUDIO_SINK=null`.
+
+## 2026-07-11 - `shader_recompiler/src/frontend/translate/floating_point_min_max.rs` and `ir/emitter.rs` vs `shader_recompiler/frontend/maxwell/translate/impl/floating_point_min_max.cpp` and `frontend/ir/ir_emitter.cpp`
+
+### Intentional differences
+- Rust exposes `fp_min_32_with_control` and `fp_max_32_with_control` alongside the older convenience methods; this preserves existing call sites while carrying the same `FpControl` flags as upstream `IREmitter::FPMin/FPMax`.
+
+### Unintentional differences (to fix)
+- None in this slice. The previous `FMNMX` decoder confused `ftz` bit 44 with `abs_b`, omitted predicate 39..41 and CC validation, and treated bit 42 as a static min/max selector. All fields and the predicate-select ordering now match upstream.
+
+### Missing items
+- None for `FMNMX_reg`, `FMNMX_cbuf`, or `FMNMX_imm` decoding in this file.
+
+### Binary layout verification
+- PASS: `FpControl` remains packed into the existing IR instruction `flags` field; no serialized structure changed.
+
+### Verification
+- Re-read upstream `floating_point_min_max.cpp` and `ir_emitter.cpp` after implementation.
+- `cargo test -p shader_recompiler fmnmx -- --nocapture` passes, including the live MK8D word `0x5C6013800057FF03`.
+
+## 2026-07-11 - structured kill/demote path vs `shader_recompiler/frontend/maxwell/structured_control_flow.cpp`, `ir_opt/collect_shader_info_pass.cpp`, and `backend/spirv/emit_spirv_control_flow.cpp`
+
+### Intentional differences
+- `StructuredAction::DemoteToHelperInvocation` defers IR insertion until Rust has allocated the final `Program` blocks. This is the same existing mechanical bridge used for goto variables and conditions; method ownership and emitted ordering match upstream.
+- `rspirv 0.12` exposes `OpDemoteToHelperInvocation` as a block terminator contrary to SPIR-V. Rust inserts the raw instruction at the current block end so execution continues to upstream's merge block.
+
+### Unintentional differences (to fix)
+- None in this slice. `TranslatePass::Kill` now emits demote before the merge, collection sets `uses_demote_to_helper_invocation`, and SPIR-V dispatch is owned only by `emit_spirv_control_flow.rs` like upstream.
+
+### Missing items
+- Upstream's separate `DemoteCombinationPass` behavior remains governed by the broader structured-control-flow port and is outside this localized unconditional/conditional kill materialization fix.
+
+### Binary layout verification
+- N/A: no guest-visible or serialized structure changed.
+
+### Verification
+- Re-read all three upstream implementations after the Rust changes.
+- `cargo test -p shader_recompiler cfg_translation_materializes_kill_as_demote -- --nocapture` and `cargo test -p shader_recompiler collect_info_records_demote_usage_like_upstream -- --nocapture` pass.
+- Release MK8D smoke run with `RUZU_AUDIO_SINK=null` produced no `MismatchedTerminator` or shader panic.
+
+## 2026-07-11 - Maxwell condition flags, CSET/CSETP, I2I, and LEA vs upstream shader recompiler
+
+### Intentional differences
+- Rust represents upstream `NotImplementedException` with `panic!`; pipeline compilation already catches translator panics and rejects the affected pipeline.
+- `SaturateInteger` composes signed/unsigned min and max because the Rust IR emitter has no dedicated `SClamp`/`UClamp` convenience methods; emitted semantics and ownership match upstream.
+
+### Unintentional differences (to fix)
+- None in this slice. `CSET`/`CSETP` and all five LEA variants were decoded but not dispatched; `condition_code_set.rs` was a stale panic stub despite flag IR support.
+- The prior `I2I` translation ignored selector, destination conversion, saturation, validation, and `CC`. This was guest-visible in MK8D: three `I2I.CC` instructions write `RZ` solely to feed `NEU` into the flare vertex shader's following `CSETP` instructions.
+- `LEA.HI` previously used a shift-left/high-word approximation and omitted upstream validation. It now uses the literal logical-right-shift/low-word sequence and validates `X`, predicate, and `CC` fields.
+
+### Missing items
+- `IREmitter::Condition` is not added by this slice; the existing structured-control-flow path materializes conditions separately. `GetFlowTestResult`, which `CSET/CSETP` require, is complete.
+
+### Binary layout verification
+- N/A: no guest-visible or serialized structure changed.
+
+### Verification
+- Re-read upstream `frontend/ir/ir_emitter.h/.cpp`, `translate/impl/condition_code_set.cpp`, `integer_to_integer_conversion.cpp`, and `load_effective_address.cpp` after implementation.
+- `cargo test -p shader_recompiler mk8d_i2i_cc_feeds_csetp_through_ssa -- --nocapture` passes with live MK8D words `0x5CE0800000270AFF` and `0x50A0038000070D1F`; SSA plus DCE removes all flag access opcodes before backend emission.
+- The apparent `LEA_hi_cbuf` words in the captured flare shader are scheduler-control words (`index % 4 == 0`), so LEA parity is a corrected incidental divergence, not the diagnosed flare root cause.
+
+## 2026-07-11 - `backend/spirv/emit_spirv_integer.rs` pseudo flags vs upstream `backend/spirv/emit_spirv_integer.cpp`
+
+### Intentional differences
+- Rust records the generated SPIR-V ID in the backend `values` map for the associated pseudo `InstRef`; upstream stores the ID in `Inst::Definition` and invalidates the pseudo instruction. These are equivalent representations in the split Rust backend.
+
+### Unintentional differences (to fix)
+- None in this slice. The Rust backend previously skipped `GetZeroFromOp`/`GetSignFromOp` without assigning their definitions when emitting the parent integer operation. Enabling faithful `I2I.CC` therefore exposed unresolved references in every dependent `CSETP` pipeline.
+
+### Missing items
+- Carry and overflow pseudo-definition for `IAdd32` remains part of the broader incomplete `IADD.CC` translator/backend path; this slice ports the zero/sign helpers used by the now-faithful I2I and the same upstream calls for bitwise and bitfield operations.
+
+### Binary layout verification
+- N/A: backend-only SPIR-V ID bookkeeping; no serialized or guest-visible structure changed.
+
+### Verification
+- Re-read upstream `emit_spirv_integer.cpp`: `SetZeroFlag` and `SetSignFlag` are now called for `BitwiseAnd32`, `BitwiseOr32`, `BitwiseXor32`, `BitFieldSExtract`, and `BitFieldUExtract` as upstream does.
+- Release MK8D disk-cache smoke test changed from dozens of `SPIR-V: unresolved IR value reference` pipeline rejections and a live GPU-thread panic to zero unresolved references and zero panics.
+- A subsequent 45-second MK8D run with `RUZU_AUDIO_SINK=null` presented more than 1,000 frames without shader compilation failure.
+
+## 2026-07-11 - `floating_point_range_reduction.rs` vs upstream `floating_point_range_reduction.cpp`
+
+### Intentional differences
+- None.
+
+### Unintentional differences (to fix)
+- None in this slice. `RRO_reg/cbuf` had an implementation but no dispatcher entry, so every executed RRO silently fell through. The local shared implementation also accepted `RRO_imm`, while upstream rejects it.
+
+### Missing items
+- None relative to upstream: register and constant-buffer forms are translated; immediate form deliberately raises the upstream not-implemented failure.
+
+### Binary layout verification
+- N/A: no binary structure changed.
+
+### Verification
+- Re-read upstream `floating_point_range_reduction.cpp` after implementation.
+- `cargo test -p shader_recompiler mk8d_flare_rro_reg_is_dispatched -- --nocapture` passes with live flare word `0x5C90000000370003`.
+- The captured flare VertexB shader executes five `RRO_reg` instructions and now has zero decoded non-scheduler opcodes missing from the translator dispatcher.
+
+## 2026-07-11 - `integer_short_multiply_add.rs` XMAD vs upstream `integer_short_multiply_add.cpp`
+
+### Intentional differences
+- Rust uses boolean values instead of upstream `Half`/`SelectMode` enums inside the file-local helper; field values and branch ownership are unchanged.
+
+### Unintentional differences (to fix)
+- None for XMAD in this slice. The previous approximation decoded all four instruction layouts through one generic source path, ignored signed half extraction and `.PSL/.MRG/.X/.CC`, and silently treated invalid/CSFU modes as default accumulation.
+
+### Missing items
+- The IMAD functions in the same Rust file remain a separate parity slice and were not changed here.
+
+### Binary layout verification
+- N/A: translator-only change.
+
+### Verification
+- Re-read upstream `integer_short_multiply_add.cpp` after implementation; register, register-constant, constant-register, and immediate layouts now use their upstream bit fields and source ownership.
+- `cargo test -p shader_recompiler mk8d_attract_xmad_cbcc_ports_half_and_psl_semantics -- --nocapture` passes with live attract word `0x5B30079800C70D1D`.
+
+## 2026-07-11 - Vulkan clear ordering vs upstream `vk_rasterizer.cpp`
+
+### Intentional differences
+- None in the ordering corrected here.
+
+### Unintentional differences (to fix)
+- None in this slice. Rust previously called `gpu_memory->FlushCaching()` before `FlushWork()`; upstream submits pending work first, then flushes the GPU-memory cache.
+
+### Missing items
+- Query-cache clear notifications remain part of the broader Vulkan query-cache parity work.
+
+### Binary layout verification
+- N/A.
+
+### Verification
+- Re-read upstream `RasterizerVulkan::Clear`; Rust now preserves its initial lifecycle ordering.
+## 2026-07-11 — shader_recompiler/src/ir_opt/ssa_rewrite_pass.rs vs shader_recompiler/ir_opt/ssa_rewrite_pass.cpp
+
+### Intentional differences
+- Rust keeps an explicit use-def index and rewrites `Identity` instructions because it does not use upstream's intrusive instruction lists.
+
+### Unintentional differences (to fix)
+- None after this pass. Rust previously recursively re-tested phi users after trivial-phi removal, while upstream explicitly leaves that recursion unimplemented. The extra optimization was removed so loop-header phi retention and rewrite ordering match upstream.
+
+### Missing items
+- None identified in the reviewed `TryRemoveTrivialPhi` slice.
+
+### Binary layout verification
+- N/A: this pass transforms IR and has no serialized binary layout.
+## 2026-07-11 — video_core Vulkan divisor/demote capability plumbing vs upstream Vulkan device and pipeline cache
+
+### Intentional differences
+- Rust passes capability booleans through `RendererVulkan -> RasterizerVulkan -> PipelineCache -> GraphicsPipelineCache`; upstream retains a `Device&` in the pipeline cache. The ownership result is equivalent and avoids introducing a second device wrapper.
+
+### Unintentional differences (to fix)
+- None after this pass. `VK_EXT_vertex_attribute_divisor` and its feature are now queried/enabled, recorded in `DeviceExtensions`, and gate both graphics-pipeline `VkPipelineVertexInputDivisorStateCreateInfoEXT` chains.
+- None after this pass. Shader demote support now comes from the enabled Vulkan feature instead of `Profile::default()`.
+
+### Missing items
+- The broader upstream device feature/extension chain remains only partially ported outside these two capabilities.
+
+### Binary layout verification
+- PASS: Vulkan structures are ash `repr(C)` definitions and remain alive through `vkCreateDevice` / `vkCreateGraphicsPipelines`.
+
+## 2026-07-11 — shader_recompiler SPIR-V integer/demote emission vs upstream emit_spirv.cpp and emit_spirv_integer.cpp
+
+### Intentional differences
+- Rust emits GLSL.std.450 instructions through rspirv numeric operation identifiers; behavior and operand ordering match upstream Sirit helpers.
+
+### Unintentional differences (to fix)
+- None after this pass. Demote extension/capability declaration is gated by shader usage and profile support, with `SPV_EXT_demote_to_helper_invocation` emitted below SPIR-V 1.6.
+- None after this pass. `IAdd32` now defines carry, zero, sign, and overflow associated pseudo-operations exactly as upstream.
+- None after this pass. `SClamp32` and `UClamp32` now exist in IR, the emitter, and all three backends; SPIR-V includes upstream broken-clamp/signed-operation fallbacks and flag writes.
+
+### Missing items
+- No missing items in the reviewed demote, `IAdd32`, `SClamp32`, and `UClamp32` slice.
+
+### Binary layout verification
+- N/A: emitted SPIR-V is instruction-based. Focused tests verify the required capability, extension, `OpIAddCarry`, flag operations, and clamp extended instructions.
+
+## 2026-07-11 — Vulkan synchronous presentation vs vk_present_manager.cpp and vk_scheduler.cpp
+
+### Intentional differences
+- Rust replays command chunks synchronously and only delegates queue submission to `SubmitWorker`; `Scheduler::wait_worker` therefore drains those two Rust stages rather than upstream's chunk worker and execution mutex.
+
+### Unintentional differences (to fix)
+- None after this pass. `PresentManager::present` now calls `scheduler.wait_worker()` before the non-threaded swapchain copy, preserving upstream ordering.
+- The temporary macOS-specific `async_presentation=true` default was removed. Both `yuzu.app` configuration/logs and upstream source confirm that the working macOS path uses `false`.
+
+### Missing items
+- The scheduler's worker architecture remains structurally reduced relative to upstream; this entry only verifies the synchronous-presentation ordering edge.
+- In the optional asynchronous-present path, upstream's `Swapchain::AcquireNextImage` still calls `scheduler.Wait(resource_ticks[image_index])`. ruzu cannot mutably access `Scheduler` from its present thread and currently advances the per-image tick heuristically. Correcting that requires shared scheduler/master-semaphore ownership rather than a local workaround.
+
+### Binary layout verification
+- N/A: no guest-visible or serialized structure changed.
+
+### Verification
+- Re-read upstream `PresentManager::Present`, `Scheduler::WaitWorker`, and `Swapchain::AcquireNextImage` line by line.
+- `yuzu.app`'s active configuration and log both report `async_presentation=false` on this Mac.
+- Release MK8D run logged `threaded=false`, completed synchronous acquire/present cycles, and passed 28,000 render-pass begins during the observation window without a presentation stall.

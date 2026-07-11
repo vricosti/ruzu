@@ -363,9 +363,6 @@ impl RendererVulkan {
         let swapchain_image_count = swapchain.get_image_count();
         let swapchain = std::sync::Arc::new(std::sync::Mutex::new(swapchain));
         // Upstream gates the present thread on `Settings::values.async_presentation`.
-        // On macOS/MoltenVK a blocked `nextDrawable` inside the present copy
-        // must never stall the GPU thread (it wedges the whole emulator), so
-        // ruzu defaults the setting to on.
         let use_present_thread = *common::settings::values().async_presentation.get_value();
         let present_manager = PresentManager::new(
             device.get_logical().clone(),
@@ -404,6 +401,7 @@ impl RendererVulkan {
             CAPTURE_IMAGE_WIDTH,
             CAPTURE_IMAGE_HEIGHT,
             device.supported_spirv_version(),
+            device.is_ext_shader_demote_to_helper_invocation_supported(),
             device.is_ext_extended_dynamic_state_supported(),
             device.is_ext_extended_dynamic_state2_supported(),
             device.is_topology_list_primitive_restart_supported(),
@@ -413,6 +411,8 @@ impl RendererVulkan {
             device.is_timeline_semaphore_supported(),
             device.is_ext_custom_border_color_supported(),
             device.get_max_viewports(),
+            device.get_max_vertex_input_bindings(),
+            device.is_ext_vertex_attribute_divisor_supported(),
             syncpoints,
             Arc::clone(&device_memory),
             memory_allocator.as_mut(),

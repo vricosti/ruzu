@@ -3,10 +3,13 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_range_reduction.cpp
 
-use super::{bit, field, TranslatorVisitor};
+use super::{bit, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::MaxwellOpcode;
 
 pub fn rro(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
+    if opcode == MaxwellOpcode::RRO_imm {
+        panic!("RRO (imm)");
+    }
     let dst = tv.dst_reg(insn);
     let src = tv.decode_src_b_f32(insn, opcode);
 

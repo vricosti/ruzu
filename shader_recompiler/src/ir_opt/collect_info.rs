@@ -163,6 +163,9 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                 Opcode::RenderArea => {
                     program.info.uses_render_area = true;
                 }
+                Opcode::DemoteToHelperInvocation => {
+                    program.info.uses_demote_to_helper_invocation = true;
+                }
 
                 // Texture access
                 Opcode::BindlessImageSampleImplicitLod
@@ -416,7 +419,7 @@ fn set_systemc_attributes(state: &mut crate::varying_state::VaryingState, mask: 
 
 #[cfg(test)]
 mod tests {
-    use super::collect_shader_info_pass_with_sph;
+    use super::{collect_shader_info_pass, collect_shader_info_pass_with_sph};
     use crate::ir::basic_block::Block;
     use crate::ir::instruction::Inst;
     use crate::ir::opcodes::Opcode;
@@ -425,6 +428,19 @@ mod tests {
     use crate::ir::value::{Attribute, Value};
     use crate::program_header::ProgramHeader;
     use crate::shader_info::TextureType;
+
+    #[test]
+    fn collect_info_records_demote_usage_like_upstream() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        program
+            .block_mut(0)
+            .append_inst(Inst::new(Opcode::DemoteToHelperInvocation, vec![]));
+
+        collect_shader_info_pass(&mut program);
+
+        assert!(program.info.uses_demote_to_helper_invocation);
+    }
 
     #[test]
     fn collect_info_header_sets_fragment_indexed_generic_loads() {

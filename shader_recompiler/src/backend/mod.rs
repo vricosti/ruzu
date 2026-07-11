@@ -53,6 +53,20 @@ mod tests {
     use crate::ir::value::Value;
     use crate::runtime_info::RuntimeInfo;
 
+    fn contains_opcode(words: &[u32], opcode: rspirv::spirv::Op) -> bool {
+        let mut offset = 5;
+        while offset < words.len() {
+            let header = words[offset];
+            if header & 0xffff == opcode as u32 {
+                return true;
+            }
+            let word_count = (header >> 16) as usize;
+            assert!(word_count != 0, "invalid SPIR-V instruction word count");
+            offset += word_count;
+        }
+        false
+    }
+
     #[test]
     fn test_emit_empty_vertex_shader() {
         let mut program = ir::Program::new(ShaderStage::VertexB);
@@ -114,6 +128,46 @@ mod tests {
 
         assert!(words.len() >= 5);
         assert_eq!(words[0], 0x07230203);
+    }
+
+    #[test]
+    fn iadd_with_carry_uses_upstream_iadd_carry_path() {
+        let mut program = ir::Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            let add = emitter.iadd_32(Value::ImmU32(u32::MAX), Value::ImmU32(1));
+            let _ = emitter.get_zero_from_op(add);
+            let _ = emitter.get_sign_from_op(add);
+            let _ = emitter.get_carry_from_op(add);
+            let _ = emitter.get_overflow_from_op(add);
+        }
+        let words = emit_spirv(&program, &Profile::default(), &RuntimeInfo::default());
+        assert!(contains_opcode(&words, rspirv::spirv::Op::IAddCarry));
+        assert!(contains_opcode(&words, rspirv::spirv::Op::IEqual));
+        assert!(contains_opcode(&words, rspirv::spirv::Op::SLessThan));
+        assert!(contains_opcode(&words, rspirv::spirv::Op::Select));
+    }
+
+    #[test]
+    fn integer_clamps_emit_glsl_std450_operations() {
+        let mut program = ir::Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            let signed = emitter.s_clamp_32(
+                Value::ImmU32(7),
+                Value::ImmU32((-2i32) as u32),
+                Value::ImmU32(5),
+            );
+            let unsigned = emitter.u_clamp_32(Value::ImmU32(7), Value::ImmU32(2), Value::ImmU32(5));
+            let _ = emitter.get_zero_from_op(signed);
+            let _ = emitter.get_sign_from_op(unsigned);
+        }
+        let words = emit_spirv(&program, &Profile::default(), &RuntimeInfo::default());
+        assert!(contains_opcode(&words, rspirv::spirv::Op::ExtInst));
+        assert!(contains_opcode(&words, rspirv::spirv::Op::IEqual));
+        assert!(contains_opcode(&words, rspirv::spirv::Op::SLessThan));
     }
 
     #[test]
