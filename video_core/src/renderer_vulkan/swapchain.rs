@@ -90,6 +90,28 @@ fn choose_swap_present_mode(
     }
 }
 
+/// Port of upstream `ChooseSwapPresentMode`'s settings lookup.
+fn requested_swap_present_mode(
+    has_imm: bool,
+    has_mailbox: bool,
+    has_fifo_relaxed: bool,
+) -> vk::PresentModeKHR {
+    let settings = common::settings::values();
+    let vsync_mode = match *settings.vsync_mode.get_value() {
+        common::settings_enums::VSyncMode::Immediate => VSyncMode::Immediate,
+        common::settings_enums::VSyncMode::Mailbox => VSyncMode::Mailbox,
+        common::settings_enums::VSyncMode::Fifo => VSyncMode::Fifo,
+        common::settings_enums::VSyncMode::FifoRelaxed => VSyncMode::FifoRelaxed,
+    };
+    choose_swap_present_mode(
+        has_imm,
+        has_mailbox,
+        has_fifo_relaxed,
+        vsync_mode,
+        *settings.use_speed_limit.get_value(),
+    )
+}
+
 /// Port of `ChooseSwapExtent`.
 fn choose_swap_extent(
     capabilities: &vk::SurfaceCapabilitiesKHR,
@@ -512,13 +534,8 @@ impl Swapchain {
 
         let alpha_flags = choose_alpha_flags(capabilities);
         self.surface_format = choose_swap_surface_format(&available_formats);
-        self.present_mode = choose_swap_present_mode(
-            self.has_imm,
-            self.has_mailbox,
-            self.has_fifo_relaxed,
-            VSyncMode::Fifo, // default
-            true,            // use_speed_limit default
-        );
+        self.present_mode =
+            requested_swap_present_mode(self.has_imm, self.has_mailbox, self.has_fifo_relaxed);
 
         // Request triple buffering if possible
         let mut requested_image_count = capabilities.min_image_count + 1;
@@ -636,13 +653,8 @@ impl Swapchain {
 
     /// Port of `Swapchain::NeedsPresentModeUpdate`.
     fn needs_present_mode_update(&self) -> bool {
-        let requested = choose_swap_present_mode(
-            self.has_imm,
-            self.has_mailbox,
-            self.has_fifo_relaxed,
-            VSyncMode::Fifo,
-            true,
-        );
+        let requested =
+            requested_swap_present_mode(self.has_imm, self.has_mailbox, self.has_fifo_relaxed);
         self.present_mode != requested
     }
 }

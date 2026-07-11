@@ -14,9 +14,9 @@ use crate::engines::maxwell_3d::{
     IB_OFF_FIRST, INDEX_BUFFER16_FIRST, INDEX_BUFFER16_SUBSEQUENT, INDEX_BUFFER32_FIRST,
     INDEX_BUFFER32_SUBSEQUENT, INDEX_BUFFER8_FIRST, INDEX_BUFFER8_SUBSEQUENT,
     INLINE_INDEX_2X16_EVEN, INLINE_INDEX_4X8_INDEX0, MAX_CB_SLOTS, NUM_SHADER_PROGRAMS,
-    NUM_SHADER_STAGES, NUM_VERTEX_ATTRIBS, RT_FORMAT_A8B8G8R8_SRGB, RT_FORMAT_A8B8G8R8_UNORM,
-    RT_FORMAT_B5G6R5_UNORM, RT_FORMAT_R8_UNORM, TOPOLOGY_OVERRIDE, VB_COUNT, VB_FIRST,
-    VERTEX_ARRAY_INSTANCE_FIRST, VERTEX_ARRAY_INSTANCE_SUBSEQUENT,
+    NUM_SHADER_STAGES, RT_FORMAT_A8B8G8R8_SRGB, RT_FORMAT_A8B8G8R8_UNORM, RT_FORMAT_B5G6R5_UNORM,
+    RT_FORMAT_R8_UNORM, TOPOLOGY_OVERRIDE, VB_COUNT, VB_FIRST, VERTEX_ARRAY_INSTANCE_FIRST,
+    VERTEX_ARRAY_INSTANCE_SUBSEQUENT,
 };
 use crate::engines::Framebuffer;
 use crate::rasterizer_interface::RasterizerInterface;
@@ -945,12 +945,8 @@ impl<'a> Maxwell3DDrawView<'a> {
                     index_buffer_count: self.draw_state.index_buffer.count,
                     index_buffer_first: self.draw_state.index_buffer.first,
                     index_format: self.draw_state.index_buffer.format,
-                    vertex_streams: registers
-                        .vertex_streams
-                        .iter()
-                        .copied()
-                        .filter(|stream| stream.enabled)
-                        .collect(),
+                    vertex_streams: registers.vertex_streams,
+                    vertex_stream_instances: registers.vertex_stream_instances,
                     vertex_stream_limits: registers.vertex_stream_limits,
                     viewports: Default::default(),
                     viewport_transforms: registers.viewport_transforms,
@@ -985,7 +981,7 @@ impl<'a> Maxwell3DDrawView<'a> {
                     line_anti_alias_enable: registers.line_state.line_anti_alias_enable,
                     program_base_address: 0,
                     cb_bindings: registers.cb_bindings,
-                    vertex_attribs: registers.vertex_attribs.to_vec(),
+                    vertex_attribs: registers.vertex_attribs,
                     shader_stages,
                     color_masks: registers.color_masks,
                     rt_control: registers.render_targets.rt_control,
@@ -1466,27 +1462,9 @@ fn build_draw_call_snapshot(
     instance_count: u32,
     maxwell3d: &dyn Maxwell3DAccess,
 ) -> DrawCall {
-    let mut vertex_streams = Vec::new();
-    for i in 0..32u32 {
-        let info = maxwell3d.vertex_stream_info(i);
-        if info.enabled {
-            vertex_streams.push(info);
-        }
-    }
+    let vertex_streams = std::array::from_fn(|i| maxwell3d.vertex_stream_info(i as u32));
 
-    let mut vertex_attribs = Vec::new();
-    for i in 0..NUM_VERTEX_ATTRIBS {
-        let info = maxwell3d.vertex_attrib_info(i);
-        if info.buffer_index != 0
-            || info.constant
-            || info.offset != 0
-            || info.size as u32 != 0
-            || info.attrib_type as u32 != 0
-            || info.bgra
-        {
-            vertex_attribs.push(info);
-        }
-    }
+    let vertex_attribs = std::array::from_fn(|i| maxwell3d.vertex_attrib_info(i as u32));
 
     let mut shader_stages =
         [crate::engines::maxwell_3d::ShaderStageInfo::default(); NUM_SHADER_PROGRAMS];
@@ -1520,6 +1498,9 @@ fn build_draw_call_snapshot(
         index_buffer_first: draw_state.index_buffer.first,
         index_format: draw_state.index_buffer.format,
         vertex_streams,
+        vertex_stream_instances: std::array::from_fn(|i| {
+            maxwell3d.vertex_stream_instance(i as u32)
+        }),
         vertex_stream_limits: std::array::from_fn(|i| maxwell3d.vertex_stream_limit(i as u32)),
         viewports: std::array::from_fn(|i| maxwell3d.viewport_info(i as u32)),
         viewport_transforms: std::array::from_fn(|i| maxwell3d.viewport_transform_info(i as u32)),
@@ -1868,27 +1849,9 @@ impl DrawManager {
         instance_count: u32,
         maxwell3d: &dyn Maxwell3DAccess,
     ) -> DrawCall {
-        let mut vertex_streams = Vec::new();
-        for i in 0..32u32 {
-            let info = maxwell3d.vertex_stream_info(i);
-            if info.enabled {
-                vertex_streams.push(info);
-            }
-        }
+        let vertex_streams = std::array::from_fn(|i| maxwell3d.vertex_stream_info(i as u32));
 
-        let mut vertex_attribs = Vec::new();
-        for i in 0..NUM_VERTEX_ATTRIBS {
-            let info = maxwell3d.vertex_attrib_info(i);
-            if info.buffer_index != 0
-                || info.constant
-                || info.offset != 0
-                || info.size as u32 != 0
-                || info.attrib_type as u32 != 0
-                || info.bgra
-            {
-                vertex_attribs.push(info);
-            }
-        }
+        let vertex_attribs = std::array::from_fn(|i| maxwell3d.vertex_attrib_info(i as u32));
 
         let mut shader_stages =
             [crate::engines::maxwell_3d::ShaderStageInfo::default(); NUM_SHADER_PROGRAMS];
@@ -1922,6 +1885,9 @@ impl DrawManager {
             index_buffer_first: draw_state.index_buffer.first,
             index_format: draw_state.index_buffer.format,
             vertex_streams,
+            vertex_stream_instances: std::array::from_fn(|i| {
+                maxwell3d.vertex_stream_instance(i as u32)
+            }),
             vertex_stream_limits: std::array::from_fn(|i| maxwell3d.vertex_stream_limit(i as u32)),
             viewports: std::array::from_fn(|i| maxwell3d.viewport_info(i as u32)),
             viewport_transforms: std::array::from_fn(|i| {

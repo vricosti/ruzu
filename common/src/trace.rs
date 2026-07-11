@@ -1208,7 +1208,8 @@ fn format_into(out: &mut String, rec: &LogRecord) {
             );
         }
         cat::TID_SVC => {
-            // args = [t_ns, tid, core, svc_name_id, pc, lr, a0, a1, a2, a3]
+            // args = [t_ns, tid, core, svc_name_id, pc, lr, a0, a1, a2, a3,
+            //         fp, sp, word_at_fp_plus_4, word_at_fp_plus_20]
             let name = svc_name(rec.args[3] as u16);
             let _ = write!(
                 out,
@@ -1218,7 +1219,11 @@ fn format_into(out: &mut String, rec: &LogRecord) {
             let pc = rec.args[4];
             let lr = rec.args[5];
             if pc != 0 || lr != 0 {
-                let _ = write!(out, " pc=0x{:016X} lr=0x{:016X}", pc, lr);
+                let _ = write!(
+                    out,
+                    " pc=0x{:016X} lr=0x{:016X} fp=0x{:016X} sp=0x{:016X} fp4=0x{:08X} fp20=0x{:08X}",
+                    pc, rec.args[5], rec.args[10], rec.args[11], rec.args[12], rec.args[13]
+                );
             }
             let _ = writeln!(
                 out,
@@ -1330,6 +1335,8 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 21 => "svc_wait_return",
                 22 => "svc_lock_handles",
                 23 => "wait_tag_ctx",
+                24 => "svc_signal_enter",
+                25 => "svc_signal_return",
                 _ => "unknown",
             };
             if rec.args[0] == 23 {
@@ -1886,6 +1893,7 @@ fn format_into(out: &mut String, rec: &LogRecord) {
             }
         }
         cat::SCHED_STATE => {
+            let timestamp_us = rec.timestamp_ns / 1_000;
             let top = |idx: usize| -> String {
                 let value = rec.args[idx];
                 if value == u64::MAX {
@@ -1904,7 +1912,8 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                     };
                     let _ = writeln!(
                         out,
-                        "[SCHED_STATE] stage={} tid={} old=0x{:X} new=0x{:X} prio={} core={} top=[{},{},{},{}]",
+                        "[SCHED_STATE] t_us={} stage={} tid={} old=0x{:X} new=0x{:X} prio={} core={} top=[{},{},{},{}]",
+                        timestamp_us,
                         stage,
                         rec.args[1],
                         rec.args[2],
@@ -1920,7 +1929,8 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 4 => {
                     let _ = writeln!(
                         out,
-                        "[SCHED_STATE] stage=schedule_select cur={} highest={} target={} core={} needs={} interrupt={} switch_from={} top=[{},{},{},{}]",
+                        "[SCHED_STATE] t_us={} stage=schedule_select cur={} highest={} target={} core={} needs={} interrupt={} switch_from={} top=[{},{},{},{}]",
+                        timestamp_us,
                         top(1),
                         top(2),
                         top(3),
@@ -1937,7 +1947,8 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 5 => {
                     let _ = writeln!(
                         out,
-                        "[SCHED_STATE] stage=switch cur={} next={} core={} has_gsc={} prev={}",
+                        "[SCHED_STATE] t_us={} stage=switch cur={} next={} core={} has_gsc={} prev={}",
+                        timestamp_us,
                         top(1),
                         top(2),
                         rec.args[4] as i32,
@@ -1953,7 +1964,8 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                     };
                     let _ = writeln!(
                         out,
-                        "[SCHED_STATE] stage={} owner_sched_id={} guest_tid={} cores=0x{:X} lock_count={}",
+                        "[SCHED_STATE] t_us={} stage={} owner_sched_id={} guest_tid={} cores=0x{:X} lock_count={}",
+                        timestamp_us,
                         stage,
                         rec.args[1],
                         top(2),
@@ -1973,7 +1985,8 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                     };
                     let _ = writeln!(
                         out,
-                        "[SCHED_STATE] stage={} cur={} target={} core={} target_active={} target_current={} target_prio={} has_ctx={} needs={}",
+                        "[SCHED_STATE] t_us={} stage={} cur={} target={} core={} target_active={} target_current={} target_prio={} has_ctx={} needs={}",
+                        timestamp_us,
                         stage,
                         top(1),
                         top(2),
@@ -1987,8 +2000,8 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                     if rec.args.len() > 9 {
                         let _ = writeln!(
                             out,
-                            "[SCHED_STATE] stage={}_ctx target_host=0x{:016X}",
-                            stage, rec.args[9]
+                            "[SCHED_STATE] t_us={} stage={}_ctx target_host=0x{:016X}",
+                            timestamp_us, stage, rec.args[9]
                         );
                     }
                 }
@@ -2003,7 +2016,8 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                     };
                     let _ = writeln!(
                         out,
-                        "[SCHED_STATE] stage=core_dispatch phase={} core={} tid={} thread_current={} thread_active={} raw_state=0x{:X}",
+                        "[SCHED_STATE] t_us={} stage=core_dispatch phase={} core={} tid={} thread_current={} thread_active={} raw_state=0x{:X}",
+                        timestamp_us,
                         phase,
                         rec.args[2],
                         rec.args[3],
@@ -2015,7 +2029,8 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 15 => {
                     let _ = writeln!(
                         out,
-                        "[SCHED_STATE] stage=apply_wait_result tid={} result=0x{:X} pc=0x{:016X} sp=0x{:016X} old_r0=0x{:016X} old_r1=0x{:016X} raw_state=0x{:X} has_wait_queue={} wait_reason={} x19=0x{:016X}",
+                        "[SCHED_STATE] t_us={} stage=apply_wait_result tid={} result=0x{:X} pc=0x{:016X} sp=0x{:016X} old_r0=0x{:016X} old_r1=0x{:016X} raw_state=0x{:X} has_wait_queue={} wait_reason={} x19=0x{:016X}",
+                        timestamp_us,
                         rec.args[1],
                         rec.args[2],
                         rec.args[3],

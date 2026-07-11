@@ -363,6 +363,8 @@ pub enum Opcode {
     UMin32,
     SMax32,
     UMax32,
+    SClamp32,
+    UClamp32,
 
     // ── Integer comparison ────────────────────────────────────────────
     IEqual,
@@ -2263,6 +2265,16 @@ impl Opcode {
                 name: "UMax32",
                 return_type: U32,
                 arg_types: &[U32, U32],
+            },
+            Opcode::SClamp32 => OpcodeMeta {
+                name: "SClamp32",
+                return_type: U32,
+                arg_types: &[U32, U32, U32],
+            },
+            Opcode::UClamp32 => OpcodeMeta {
+                name: "UClamp32",
+                return_type: U32,
+                arg_types: &[U32, U32, U32],
             },
 
             // Integer comparison

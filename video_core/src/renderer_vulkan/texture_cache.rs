@@ -5921,8 +5921,22 @@ impl TextureCache {
         self.dump_present_source_if_requested(cpu_addr, image_id);
     }
 
-    pub fn dump_image_if_requested(&mut self) {
+    pub fn dump_image_if_requested(&mut self, draw_counter: u32, fragment_offset: u32) {
         if self.image_dumped {
+            return;
+        }
+        if std::env::var("RUZU_DUMP_VK_IMAGE_DRAW")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .is_some_and(|target| target != draw_counter)
+        {
+            return;
+        }
+        if std::env::var("RUZU_DUMP_VK_IMAGE_FS")
+            .ok()
+            .and_then(|value| u32::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+            .is_some_and(|target| target != fragment_offset)
+        {
             return;
         }
         let Some(path) = std::env::var_os("RUZU_DUMP_VK_IMAGE_FRAME") else {
@@ -7001,7 +7015,10 @@ mod tests {
 
         // Reinhard mapping: 1 -> 0.5, 0.5 -> 1/3, 2 -> 2/3.
         assert_eq!(decoded, [128, 85, 170, 255]);
-        assert_eq!(decode_b10g11r11_to_rgba8(&0u32.to_le_bytes()), [0, 0, 0, 255]);
+        assert_eq!(
+            decode_b10g11r11_to_rgba8(&0u32.to_le_bytes()),
+            [0, 0, 0, 255]
+        );
     }
 
     #[test]

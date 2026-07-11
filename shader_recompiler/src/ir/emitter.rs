@@ -11,6 +11,7 @@ use super::opcodes::Opcode;
 use super::program::Program;
 use super::types::FpControl;
 use super::value::{Attribute, InstRef, Patch, Pred, Reg, Value};
+use super::FlowTest;
 
 /// IR builder that emits instructions into a specific block.
 pub struct Emitter<'a> {
@@ -145,6 +146,181 @@ impl<'a> Emitter<'a> {
 
     pub fn set_pred(&mut self, pred: Pred, value: Value) {
         self.emit_void(Inst::new(Opcode::SetPred, vec![Value::Pred(pred), value]));
+    }
+
+    pub fn get_z_flag(&mut self) -> Value {
+        self.emit(Inst::new(Opcode::GetZFlag, vec![]))
+    }
+
+    pub fn get_s_flag(&mut self) -> Value {
+        self.emit(Inst::new(Opcode::GetSFlag, vec![]))
+    }
+
+    pub fn get_c_flag(&mut self) -> Value {
+        self.emit(Inst::new(Opcode::GetCFlag, vec![]))
+    }
+
+    pub fn get_o_flag(&mut self) -> Value {
+        self.emit(Inst::new(Opcode::GetOFlag, vec![]))
+    }
+
+    pub fn set_z_flag(&mut self, value: Value) {
+        self.emit_void(Inst::new(Opcode::SetZFlag, vec![value]));
+    }
+
+    pub fn set_s_flag(&mut self, value: Value) {
+        self.emit_void(Inst::new(Opcode::SetSFlag, vec![value]));
+    }
+
+    pub fn set_c_flag(&mut self, value: Value) {
+        self.emit_void(Inst::new(Opcode::SetCFlag, vec![value]));
+    }
+
+    pub fn set_o_flag(&mut self, value: Value) {
+        self.emit_void(Inst::new(Opcode::SetOFlag, vec![value]));
+    }
+
+    /// Upstream `IREmitter::GetFlowTestResult`.
+    pub fn get_flow_test_result(&mut self, test: FlowTest) -> Value {
+        match test {
+            FlowTest::F => self.imm_u1(false),
+            FlowTest::LT => {
+                let s = self.get_s_flag();
+                let z = self.get_z_flag();
+                let not_z = self.logical_not(z);
+                let s_and_not_z = self.logical_and(s, not_z);
+                let o = self.get_o_flag();
+                self.logical_xor(s_and_not_z, o)
+            }
+            FlowTest::EQ => {
+                let s = self.get_s_flag();
+                let not_s = self.logical_not(s);
+                let z = self.get_z_flag();
+                self.logical_and(not_s, z)
+            }
+            FlowTest::LE => {
+                let s = self.get_s_flag();
+                let z = self.get_z_flag();
+                let o = self.get_o_flag();
+                let z_or_o = self.logical_or(z, o);
+                self.logical_xor(s, z_or_o)
+            }
+            FlowTest::GT => {
+                let s = self.get_s_flag();
+                let not_s = self.logical_not(s);
+                let o = self.get_o_flag();
+                let not_s_xor_o = self.logical_xor(not_s, o);
+                let z = self.get_z_flag();
+                let not_z = self.logical_not(z);
+                self.logical_and(not_s_xor_o, not_z)
+            }
+            FlowTest::NE => {
+                let z = self.get_z_flag();
+                self.logical_not(z)
+            }
+            FlowTest::GE => {
+                let s = self.get_s_flag();
+                let o = self.get_o_flag();
+                let xor = self.logical_xor(s, o);
+                self.logical_not(xor)
+            }
+            FlowTest::NUM => {
+                let s = self.get_s_flag();
+                let not_s = self.logical_not(s);
+                let z = self.get_z_flag();
+                let not_z = self.logical_not(z);
+                self.logical_or(not_s, not_z)
+            }
+            FlowTest::NaN => {
+                let s = self.get_s_flag();
+                let z = self.get_z_flag();
+                self.logical_and(s, z)
+            }
+            FlowTest::LTU => {
+                let s = self.get_s_flag();
+                let o = self.get_o_flag();
+                self.logical_xor(s, o)
+            }
+            FlowTest::EQU => self.get_z_flag(),
+            FlowTest::LEU => {
+                let s = self.get_s_flag();
+                let o = self.get_o_flag();
+                let xor = self.logical_xor(s, o);
+                let z = self.get_z_flag();
+                self.logical_or(xor, z)
+            }
+            FlowTest::GTU => {
+                let s = self.get_s_flag();
+                let not_s = self.logical_not(s);
+                let z = self.get_z_flag();
+                let o = self.get_o_flag();
+                let z_or_o = self.logical_or(z, o);
+                self.logical_xor(not_s, z_or_o)
+            }
+            FlowTest::NEU => {
+                let s = self.get_s_flag();
+                let z = self.get_z_flag();
+                let not_z = self.logical_not(z);
+                self.logical_or(s, not_z)
+            }
+            FlowTest::GEU => {
+                let s = self.get_s_flag();
+                let not_s = self.logical_not(s);
+                let z = self.get_z_flag();
+                let not_s_or_z = self.logical_or(not_s, z);
+                let o = self.get_o_flag();
+                self.logical_xor(not_s_or_z, o)
+            }
+            FlowTest::T => self.imm_u1(true),
+            FlowTest::OFF => {
+                let o = self.get_o_flag();
+                self.logical_not(o)
+            }
+            FlowTest::LO => {
+                let c = self.get_c_flag();
+                self.logical_not(c)
+            }
+            FlowTest::SFF => {
+                let s = self.get_s_flag();
+                self.logical_not(s)
+            }
+            FlowTest::LS => {
+                let z = self.get_z_flag();
+                let c = self.get_c_flag();
+                let not_c = self.logical_not(c);
+                self.logical_or(z, not_c)
+            }
+            FlowTest::HI => {
+                let c = self.get_c_flag();
+                let z = self.get_z_flag();
+                let not_z = self.logical_not(z);
+                self.logical_and(c, not_z)
+            }
+            FlowTest::SFT => self.get_s_flag(),
+            FlowTest::HS => self.get_c_flag(),
+            FlowTest::OFT => self.get_o_flag(),
+            FlowTest::RLE => {
+                let s = self.get_s_flag();
+                let z = self.get_z_flag();
+                self.logical_or(s, z)
+            }
+            FlowTest::RGT => {
+                let s = self.get_s_flag();
+                let not_s = self.logical_not(s);
+                let z = self.get_z_flag();
+                let not_z = self.logical_not(z);
+                self.logical_and(not_s, not_z)
+            }
+            FlowTest::FCSM_TR => {
+                log::warn!("(STUBBED) FCSM_TR flow test");
+                self.imm_u1(false)
+            }
+            FlowTest::CSM_TA
+            | FlowTest::CSM_TR
+            | FlowTest::CSM_MX
+            | FlowTest::FCSM_TA
+            | FlowTest::FCSM_MX => panic!("Unimplemented flow test {test}"),
+        }
     }
 
     pub fn get_goto_variable(&mut self, index: u32) -> Value {
@@ -373,8 +549,24 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::FPMin32, vec![a, b]))
     }
 
+    pub fn fp_min_32_with_control(&mut self, a: Value, b: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPMin32,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_max_32(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPMax32, vec![a, b]))
+    }
+
+    pub fn fp_max_32_with_control(&mut self, a: Value, b: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPMax32,
+            vec![a, b],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_saturate_32(&mut self, a: Value) -> Value {
@@ -894,6 +1086,14 @@ impl<'a> Emitter<'a> {
 
     pub fn bit_reverse_32(&mut self, a: Value) -> Value {
         self.emit(Inst::new(Opcode::BitReverse32, vec![a]))
+    }
+
+    pub fn s_clamp_32(&mut self, value: Value, min: Value, max: Value) -> Value {
+        self.emit(Inst::new(Opcode::SClamp32, vec![value, min, max]))
+    }
+
+    pub fn u_clamp_32(&mut self, value: Value, min: Value, max: Value) -> Value {
+        self.emit(Inst::new(Opcode::UClamp32, vec![value, min, max]))
     }
 
     pub fn bit_count_32(&mut self, a: Value) -> Value {

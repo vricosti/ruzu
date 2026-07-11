@@ -195,6 +195,10 @@ const MAX_IMAGES_IN_FLIGHT: usize = 7;
 static SWAPCHAIN_FRAME_DUMPED: AtomicBool = AtomicBool::new(false);
 static SWAPCHAIN_FRAME_DUMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+fn submit_profile_enabled() -> bool {
+    std::env::var_os("RUZU_PROFILE_VK_SUBMIT").is_some()
+}
+
 impl PresentManager {
     /// Port of `PresentManager::PresentManager`.
     #[allow(clippy::too_many_arguments)]
@@ -410,6 +414,9 @@ impl PresentManager {
             );
         }
         if !self.use_present_thread {
+            // Upstream `PresentManager::Present` drains Scheduler's worker
+            // before entering the synchronous swapchain path.
+            scheduler.wait_worker();
             self.ctx
                 .copy_to_swapchain(frame_index, &frame, Some(scheduler));
             self.ctx.release_frame(frame_index);
@@ -946,11 +953,21 @@ impl PresentThreadContext {
             .signal_semaphores(&signal_semaphores)
             .build();
 
+        let submit_start = submit_profile_enabled().then(std::time::Instant::now);
         unsafe {
             let _submit_lock = self.submit_mutex.lock().unwrap();
             self.device
                 .queue_submit(graphics_queue, &[submit_info], frame.present_done)
                 .expect("Failed to submit present commands");
+        }
+        if let Some(start) = submit_start {
+            let elapsed_us = start.elapsed().as_micros() as u64;
+            if elapsed_us >= 100_000 {
+                eprintln!(
+                    "[VK_PRESENT_SUBMIT_PROFILE] elapsed_us={} frame={}x{}",
+                    elapsed_us, frame.width, frame.height,
+                );
+            }
         }
 
         if let Some(dump) = swapchain_dump {

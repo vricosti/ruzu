@@ -1888,28 +1888,43 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                     .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
                 let name_id = common::trace::intern_svc_name(&name);
                 let t_ns = super::race_anchor::elapsed_ns();
-                let (pc, lr) = if common::trace::tid_svc_pc_enabled() {
-                    if let Some(kernel) = system.kernel() {
-                        let core_index = kernel.current_physical_core_index() as usize;
-                        if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
-                            let process = process_arc.lock().unwrap();
-                            if let Some(jit) = process.get_arm_interface(core_index) {
-                                use crate::arm::arm_interface::ThreadContext;
-                                let mut ctx = ThreadContext::default();
-                                jit.get_context(&mut ctx);
-                                (ctx.pc, ctx.lr)
+                let (pc, lr, fp, sp, word_at_fp_plus_4, word_at_fp_plus_20) =
+                    if common::trace::tid_svc_pc_enabled() {
+                        if let Some(kernel) = system.kernel() {
+                            let core_index = kernel.current_physical_core_index() as usize;
+                            if let Some(process_arc) = system.current_process_arc.as_ref().cloned()
+                            {
+                                let process = process_arc.lock().unwrap();
+                                if let Some(jit) = process.get_arm_interface(core_index) {
+                                    use crate::arm::arm_interface::ThreadContext;
+                                    let mut ctx = ThreadContext::default();
+                                    jit.get_context(&mut ctx);
+                                    let fp4 = process.read_memory_vec(ctx.fp.saturating_add(4), 4);
+                                    let fp4 = fp4
+                                        .get(..4)
+                                        .and_then(|bytes| bytes.try_into().ok())
+                                        .map(u32::from_le_bytes)
+                                        .unwrap_or(0);
+                                    let fp20 =
+                                        process.read_memory_vec(ctx.fp.saturating_add(20), 4);
+                                    let fp20 = fp20
+                                        .get(..4)
+                                        .and_then(|bytes| bytes.try_into().ok())
+                                        .map(u32::from_le_bytes)
+                                        .unwrap_or(0);
+                                    (ctx.pc, ctx.lr, ctx.fp, ctx.sp, fp4 as u64, fp20 as u64)
+                                } else {
+                                    (0, 0, 0, 0, 0, 0)
+                                }
                             } else {
-                                (0, 0)
+                                (0, 0, 0, 0, 0, 0)
                             }
                         } else {
-                            (0, 0)
+                            (0, 0, 0, 0, 0, 0)
                         }
                     } else {
-                        (0, 0)
-                    }
-                } else {
-                    (0, 0)
-                };
+                        (0, 0, 0, 0, 0, 0)
+                    };
                 common::trace::emit_raw(
                     common::trace::cat::TID_SVC,
                     &[
@@ -1923,6 +1938,10 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                         dispatch_args[1],
                         dispatch_args[2],
                         dispatch_args[3],
+                        fp,
+                        sp,
+                        word_at_fp_plus_4,
+                        word_at_fp_plus_20,
                     ],
                 );
             }

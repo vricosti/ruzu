@@ -70,6 +70,14 @@ fn emit_inst(ctx: &mut EmitContext, inst: &ir::instruction::Inst) {
         Opcode::UMin32 => ctx.add_line("MIN.U RC.x,RC.x,RC.y;"),
         Opcode::SMax32 => ctx.add_line("MAX.S RC.x,RC.x,RC.y;"),
         Opcode::UMax32 => ctx.add_line("MAX.U RC.x,RC.x,RC.y;"),
+        Opcode::SClamp32 => {
+            ctx.add_line("MIN.S RC.x,RC.x,RC.z;");
+            ctx.add_line("MAX.S RC.x,RC.x,RC.y;");
+        }
+        Opcode::UClamp32 => {
+            ctx.add_line("MIN.U RC.x,RC.x,RC.z;");
+            ctx.add_line("MAX.U RC.x,RC.x,RC.y;");
+        }
 
         // Comparisons - float
         Opcode::FPOrdLessThan32 => ctx.add_line("SLT.F RC.x,RC.x,RC.y;"),

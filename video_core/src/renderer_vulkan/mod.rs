@@ -387,6 +387,20 @@ struct VulkanDrawStateEngineAdapter {
     draw: DrawCall,
 }
 
+fn geometry_dirty_flag_index(flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) -> u8 {
+    match flag {
+        crate::buffer_cache::buffer_cache_base::DirtyFlag::IndexBuffer => {
+            crate::dirty_flags::flags::INDEX_BUFFER
+        }
+        crate::buffer_cache::buffer_cache_base::DirtyFlag::VertexBuffers => {
+            crate::dirty_flags::flags::VERTEX_BUFFERS
+        }
+        crate::buffer_cache::buffer_cache_base::DirtyFlag::VertexBuffer(index) => {
+            crate::dirty_flags::flags::VERTEX_BUFFER0.saturating_add(index as u8)
+        }
+    }
+}
+
 impl crate::buffer_cache::buffer_cache_base::EngineState for VulkanDrawStateEngineAdapter {
     fn get_index_buffer(&self) -> crate::buffer_cache::buffer_cache_base::IndexBufferRef {
         let format_size_in_bytes = match self.draw.index_format {
@@ -418,11 +432,15 @@ impl crate::buffer_cache::buffer_cache_base::EngineState for VulkanDrawStateEngi
         self.draw.index_format
     }
 
-    fn is_dirty(&self, _flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) -> bool {
-        false
+    fn is_dirty(&self, flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) -> bool {
+        let index = geometry_dirty_flag_index(flag);
+        self.draw.dirty_flags[index as usize]
     }
 
-    fn clear_dirty(&mut self, _flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) {}
+    fn clear_dirty(&mut self, flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) {
+        let index = geometry_dirty_flag_index(flag);
+        self.draw.dirty_flags[index as usize] = false;
+    }
 
     fn get_vertex_stream(
         &self,
@@ -606,6 +624,7 @@ impl RasterizerVulkan {
         width: u32,
         height: u32,
         supported_spirv_version: u32,
+        shader_demote_to_helper_invocation_supported: bool,
         extended_dynamic_state_supported: bool,
         extended_dynamic_state2_supported: bool,
         topology_list_primitive_restart_supported: bool,
@@ -615,6 +634,8 @@ impl RasterizerVulkan {
         timeline_semaphore_supported: bool,
         custom_border_color_supported: bool,
         max_viewports: u32,
+        max_vertex_input_bindings: u32,
+        vertex_attribute_divisor_supported: bool,
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<MaxwellDeviceMemoryManager>,
         memory_allocator: &mut MemoryAllocator,
@@ -690,6 +711,7 @@ impl RasterizerVulkan {
         let profile = Profile {
             supported_spirv: supported_spirv_version,
             unified_descriptor_binding: true,
+            support_demote_to_helper_invocation: shader_demote_to_helper_invocation_supported,
             ..Profile::default()
         };
         let shader_cache = ShaderPipelineCache::new(profile.clone());
@@ -725,6 +747,8 @@ impl RasterizerVulkan {
             topology_list_primitive_restart_supported,
             patch_list_primitive_restart_supported,
             max_viewports,
+            max_vertex_input_bindings,
+            vertex_attribute_divisor_supported,
         );
 
         // Create buffer cache
@@ -1051,6 +1075,10 @@ impl RasterizerVulkan {
             uses_rescaling_uniform,
         );
         let draw_params = make_draw_params(draw);
+        self.common_buffer_cache
+            .set_engine_state(Box::new(VulkanDrawStateEngineAdapter {
+                draw: draw.clone(),
+            }));
         self.bind_graphics_descriptors(
             cmd,
             pipeline_layout,
@@ -1065,10 +1093,30 @@ impl RasterizerVulkan {
             read_gpu_unsafe,
         );
 
-        // 5. Bind vertex/index buffers
-        self.bind_vertex_buffers(cmd, draw, read_gpu);
-        if draw_params.is_indexed {
-            self.bind_index_buffer(cmd, draw, draw_params, read_gpu);
+        // 5. Bind vertex/index buffers. The common path is the upstream
+        // owner and tracks CPU/GPU writes; keep legacy quad assembly until
+        // BufferCacheRuntime ports the upstream conversion passes.
+        let use_common_geometry = !matches!(
+            draw.topology,
+            PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip
+        );
+        if use_common_geometry {
+            self.common_buffer_cache
+                .update_graphics_buffers(draw_params.is_indexed);
+            self.common_buffer_cache
+                .bind_host_geometry_buffers(draw_params.is_indexed);
+            dirty_flags[crate::dirty_flags::flags::INDEX_BUFFER as usize] = false;
+            dirty_flags[crate::dirty_flags::flags::VERTEX_BUFFERS as usize] = false;
+            for index in crate::dirty_flags::flags::VERTEX_BUFFER0
+                ..=crate::dirty_flags::flags::VERTEX_BUFFER31
+            {
+                dirty_flags[index as usize] = false;
+            }
+        } else {
+            self.bind_vertex_buffers(cmd, draw, read_gpu);
+            if draw_params.is_indexed {
+                self.bind_index_buffer(cmd, draw, draw_params, read_gpu);
+            }
         }
 
         // Texture/buffer materialization can enqueue upload copies and
@@ -1107,6 +1155,48 @@ impl RasterizerVulkan {
 
         if should_trace_vk_draw(self.draw_sequence, draw.render_targets[0].address) {
             let rt0 = draw.render_targets[0];
+            let traced_vertex_streams = draw
+                .vertex_streams
+                .iter()
+                .enumerate()
+                .filter(|(_, stream)| stream.enabled)
+                .map(|(index, stream)| {
+                    format!(
+                        "{}@0x{:X}/s{}/d{}",
+                        index,
+                        stream.address,
+                        stream.stride,
+                        if draw.vertex_stream_instances[index] != 0 {
+                            stream.frequency
+                        } else {
+                            0
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let traced_vertex_attribs = draw
+                .vertex_attribs
+                .iter()
+                .enumerate()
+                .filter(|(_, attrib)| {
+                    !attrib.constant
+                        && attrib.size != crate::engines::maxwell_3d::VertexAttribSize::Invalid
+                        && attrib.attrib_type
+                            != crate::engines::maxwell_3d::VertexAttribType::Invalid
+                })
+                .map(|(location, attrib)| {
+                    format!(
+                        "{}->{}+{}/{:?}/{:?}",
+                        location,
+                        attrib.buffer_index,
+                        attrib.offset,
+                        attrib.attrib_type,
+                        attrib.size
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             if std::env::var_os("RUZU_TRACE_VK_SHADER_INFO").is_some() {
                 let vs_info = stage_infos
                     .get(1)
@@ -1140,7 +1230,7 @@ impl RasterizerVulkan {
                 );
             }
             log::info!(
-                "[VK_DRAW] seq={} draw={} vp=({:.0},{:.0} {:.0}x{:.0}) topology={:?} guest_indexed={} vk_indexed={} vertices={} instances={} first_index={} base_vertex={} base_instance={} vertex_first={} vertex_count={} index_first={} index_count={} rt_count={} rt0_addr=0x{:X} rt0={}x{} fmt={} zeta_enable={} zeta_addr=0x{:X} zeta={}x{} zeta_fmt={} depth_mode={:?} depth_test={} depth_write={} depth_func={:?} stencil={} prim_restart={} rasterize={} cull_enable={} cull_face={:?} front_face={:?} window_flip_y={} uses_render_area={} uses_rescaling_uniform={} logic_op={} blend0={} color=({:?},{:?},{:?}) alpha=({:?},{:?},{:?}) mask={:?}",
+                "[VK_DRAW] seq={} draw={} vp=({:.0},{:.0} {:.0}x{:.0}) topology={:?} guest_indexed={} vk_indexed={} vertices={} instances={} first_index={} base_vertex={} base_instance={} vertex_first={} vertex_count={} index_first={} index_count={} index_format={:?} index_addr=0x{:X} streams=[{}] attribs=[{}] rt_count={} rt0_addr=0x{:X} rt0={}x{} fmt={} zeta_enable={} zeta_addr=0x{:X} zeta={}x{} zeta_fmt={} depth_mode={:?} depth_test={} depth_write={} depth_func={:?} stencil={} prim_restart={} rasterize={} cull_enable={} cull_face={:?} front_face={:?} window_flip_y={} uses_render_area={} uses_rescaling_uniform={} logic_op={} blend0={} color=({:?},{:?},{:?}) alpha=({:?},{:?},{:?}) mask={:?}",
                 self.draw_sequence,
                 self.draw_counter,
                 {
@@ -1162,6 +1252,10 @@ impl RasterizerVulkan {
                 draw.vertex_count,
                 draw.index_buffer_first,
                 draw.index_buffer_count,
+                draw.index_format,
+                draw.index_buffer_addr,
+                traced_vertex_streams,
+                traced_vertex_attribs,
                 draw.rt_control.count,
                 rt0.address,
                 rt0.width,
@@ -1204,11 +1298,13 @@ impl RasterizerVulkan {
                 self.draw_counter,
                 draw.render_targets[0].address
             );
-            self.texture_cache.dump_image_if_requested();
+            self.texture_cache
+                .dump_image_if_requested(self.draw_counter, draw.shader_stages[5].offset);
             self.draw_counter += 1;
             self.state_tracker.invalidate_state();
             return;
         }
+        self.scheduler.note_guest_draw();
         if draw_params.is_indexed {
             unsafe {
                 self.device.cmd_draw_indexed(
@@ -1232,7 +1328,8 @@ impl RasterizerVulkan {
             }
         }
 
-        self.texture_cache.dump_image_if_requested();
+        self.texture_cache
+            .dump_image_if_requested(self.draw_counter, draw.shader_stages[5].offset);
         self.draw_counter += 1;
         // Mark state dirty for next draw (conservative — real tracking per-register later)
         self.state_tracker.invalidate_state();
@@ -1984,13 +2081,13 @@ impl RasterizerVulkan {
         read_gpu: &dyn Fn(u64, &mut [u8]),
     ) {
         let upload_cmd = self.scheduler.upload_command_buffer();
-        for stream in &draw.vertex_streams {
+        for (index, stream) in draw.vertex_streams.iter().enumerate() {
             if !stream.enabled || stream.address == 0 {
                 continue;
             }
             let limit = draw
                 .vertex_stream_limits
-                .get(stream.index as usize)
+                .get(index)
                 .map(|limit| limit.address)
                 .unwrap_or(0);
             let fallback_count = draw.vertex_first.saturating_add(draw.vertex_count).max(
@@ -2019,7 +2116,7 @@ impl RasterizerVulkan {
                     "[VK_VERTEX_BUFFER] draw={} rt0=0x{:X} binding={} addr=0x{:X} stride={} frequency={} size={} first={} count={} bytes={:02X?}",
                     self.draw_counter,
                     draw.render_targets[0].address,
-                    stream.index,
+                    index,
                     stream.address,
                     stream.stride,
                     stream.frequency,
@@ -2031,7 +2128,7 @@ impl RasterizerVulkan {
             }
             self.buffer_cache.bind_vertex_buffer(
                 cmd,
-                stream.index,
+                index as u32,
                 stream.address,
                 size,
                 stream.stride as vk::DeviceSize,
@@ -2150,11 +2247,6 @@ impl RasterizerVulkan {
         {
             return;
         }
-
-        self.common_buffer_cache
-            .set_engine_state(Box::new(VulkanDrawStateEngineAdapter {
-                draw: draw.clone(),
-            }));
 
         let texture_cache: *mut TextureCache = &mut self.texture_cache;
         unsafe {
@@ -2319,7 +2411,6 @@ impl RasterizerVulkan {
         }
         let mut common_uniform_buffer_infos = Vec::new();
         let mut common_storage_buffer_infos = Vec::new();
-        let use_common_uniform_stream = std::env::var_os("RUZU_BC_UNIFORM_STREAM").is_some();
         if has_uniform_buffer_descriptors || has_storage_buffer_descriptors {
             self.common_buffer_cache
                 .set_uniform_buffers_state(enabled_uniform_buffer_masks, uniform_buffer_sizes);
@@ -2394,9 +2485,7 @@ impl RasterizerVulkan {
                 for desc in &info.constant_buffer_descriptors {
                     for _ in 0..desc.count {
                         if let Some(buffer) = queued_buffers.next() {
-                            if use_common_uniform_stream {
-                                common_uniform_buffer_infos.push(buffer);
-                            }
+                            common_uniform_buffer_infos.push(buffer);
                         }
                     }
                 }
@@ -2950,12 +3039,12 @@ impl RasterizerInterface for RasterizerVulkan {
         mut clear_view: crate::engines::draw_manager::Maxwell3DClearView<'_>,
         layer_count: u32,
     ) {
-        // Upstream `RasterizerVulkan::Clear` starts with
-        // `gpu_memory->FlushCaching()`.
+        // Preserve upstream ordering: submit pending work before flushing the
+        // channel GPU-memory cache.
+        self.flush_work();
         if let Some(mm) = self.channel_memory_manager.as_ref().cloned() {
             mm.lock().flush_caching();
         }
-        self.flush_work();
 
         let clear_state = clear_view.clear_state();
         let use_depth = clear_state.flags & (1 << 0) != 0;
@@ -4377,6 +4466,24 @@ mod tests {
         assert_eq!(
             map_front_face(FrontFace::CCW),
             vk::FrontFace::COUNTER_CLOCKWISE
+        );
+    }
+
+    #[test]
+    fn draw_state_adapter_maps_upstream_geometry_dirty_flags() {
+        use crate::buffer_cache::buffer_cache_base::DirtyFlag;
+
+        assert_eq!(
+            geometry_dirty_flag_index(DirtyFlag::IndexBuffer),
+            crate::dirty_flags::flags::INDEX_BUFFER
+        );
+        assert_eq!(
+            geometry_dirty_flag_index(DirtyFlag::VertexBuffers),
+            crate::dirty_flags::flags::VERTEX_BUFFERS
+        );
+        assert_eq!(
+            geometry_dirty_flag_index(DirtyFlag::VertexBuffer(7)),
+            crate::dirty_flags::flags::VERTEX_BUFFER0 + 7
         );
     }
 

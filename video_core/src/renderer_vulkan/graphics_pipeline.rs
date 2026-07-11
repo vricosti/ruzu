@@ -268,6 +268,8 @@ pub struct GraphicsPipelineCache {
     topology_list_primitive_restart_supported: bool,
     patch_list_primitive_restart_supported: bool,
     max_viewports: u32,
+    max_vertex_input_bindings: u32,
+    vertex_attribute_divisor_supported: bool,
 }
 
 impl GraphicsPipelineCache {
@@ -285,6 +287,8 @@ impl GraphicsPipelineCache {
         topology_list_primitive_restart_supported: bool,
         patch_list_primitive_restart_supported: bool,
         max_viewports: u32,
+        max_vertex_input_bindings: u32,
+        vertex_attribute_divisor_supported: bool,
     ) -> Self {
         Self {
             device,
@@ -301,6 +305,9 @@ impl GraphicsPipelineCache {
             topology_list_primitive_restart_supported,
             patch_list_primitive_restart_supported,
             max_viewports: max_viewports.min(crate::engines::maxwell_3d::NUM_VIEWPORTS as u32),
+            max_vertex_input_bindings: max_vertex_input_bindings
+                .min(crate::engines::maxwell_3d::NUM_VERTEX_ARRAYS),
+            vertex_attribute_divisor_supported,
         }
     }
 
@@ -371,6 +378,8 @@ impl GraphicsPipelineCache {
                 .topology_list_primitive_restart_supported,
             patch_list_primitive_restart_supported: self.patch_list_primitive_restart_supported,
             max_viewports: self.max_viewports,
+            max_vertex_input_bindings: self.max_vertex_input_bindings,
+            vertex_attribute_divisor_supported: self.vertex_attribute_divisor_supported,
         }
     }
 
@@ -1181,12 +1190,22 @@ impl GraphicsPipelineCache {
 
         let shader_stages = shader_stage_create_infos(shader_modules, &entry_name);
 
-        let (vertex_bindings, vertex_attributes) =
-            build_vertex_input_state(draw, vs, self.must_emulate_scaled_formats);
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder()
+        let (vertex_bindings, vertex_divisors, vertex_attributes) =
+            build_vertex_input_state_from_state(
+                fixed_state,
+                vs,
+                self.must_emulate_scaled_formats,
+                self.max_vertex_input_bindings,
+            );
+        let mut vertex_divisor_state = vk::PipelineVertexInputDivisorStateCreateInfoEXT::builder()
+            .vertex_binding_divisors(&vertex_divisors);
+        let mut vertex_input_builder = vk::PipelineVertexInputStateCreateInfo::builder()
             .vertex_binding_descriptions(&vertex_bindings)
-            .vertex_attribute_descriptions(&vertex_attributes)
-            .build();
+            .vertex_attribute_descriptions(&vertex_attributes);
+        if self.vertex_attribute_divisor_supported && !vertex_divisors.is_empty() {
+            vertex_input_builder = vertex_input_builder.push_next(&mut vertex_divisor_state);
+        }
+        let vertex_input = vertex_input_builder.build();
 
         let input_assembly_topology = super::map_topology(draw.topology);
         let primitive_restart_enable = primitive_restart_enable_for_pipeline(
@@ -1357,13 +1376,18 @@ impl GraphicsPipelineCache {
         let shader_stages = shader_stage_create_infos(shader_modules, &entry_name);
 
         let (vertex_bindings, vertex_divisors, vertex_attributes) =
-            build_vertex_input_state_from_state(fixed_state, vs, self.must_emulate_scaled_formats);
+            build_vertex_input_state_from_state(
+                fixed_state,
+                vs,
+                self.must_emulate_scaled_formats,
+                self.max_vertex_input_bindings,
+            );
         let mut vertex_divisor_state = vk::PipelineVertexInputDivisorStateCreateInfoEXT::builder()
             .vertex_binding_divisors(&vertex_divisors);
         let mut vertex_input_builder = vk::PipelineVertexInputStateCreateInfo::builder()
             .vertex_binding_descriptions(&vertex_bindings)
             .vertex_attribute_descriptions(&vertex_attributes);
-        if !vertex_divisors.is_empty() {
+        if self.vertex_attribute_divisor_supported && !vertex_divisors.is_empty() {
             vertex_input_builder = vertex_input_builder.push_next(&mut vertex_divisor_state);
         }
         let vertex_input = vertex_input_builder.build();
@@ -2148,88 +2172,11 @@ fn dump_spirv_if_requested(stage_index: usize, base_offset: u32, words: &[u32]) 
     }
 }
 
-fn build_vertex_input_state(
-    draw: &DrawCall,
-    vs: &CompiledShader,
-    must_emulate_scaled_formats: bool,
-) -> (
-    Vec<vk::VertexInputBindingDescription>,
-    Vec<vk::VertexInputAttributeDescription>,
-) {
-    let mut binding_descs = BTreeMap::<u32, vk::VertexInputBindingDescription>::new();
-    for stream in &draw.vertex_streams {
-        if !stream.enabled {
-            continue;
-        }
-        let input_rate = if stream.frequency != 0 {
-            vk::VertexInputRate::INSTANCE
-        } else {
-            vk::VertexInputRate::VERTEX
-        };
-        binding_descs.insert(
-            stream.index,
-            vk::VertexInputBindingDescription {
-                binding: stream.index,
-                stride: stream.stride,
-                input_rate,
-            },
-        );
-    }
-
-    let mut attributes = Vec::new();
-    for (location, attrib) in draw.vertex_attribs.iter().enumerate() {
-        if attrib.constant
-            || attrib.size == VertexAttribSize::Invalid
-            || attrib.attrib_type == VertexAttribType::Invalid
-            || !vs.info.loads.generic_any(location)
-        {
-            continue;
-        }
-        let format = maxwell_to_vk::vertex_format(
-            must_emulate_scaled_formats,
-            attrib.attrib_type,
-            attrib.size,
-        );
-        if format == vk::Format::UNDEFINED {
-            warn!(
-                "GraphicsPipelineCache: unsupported vertex format location={} type={:?} size={:?}",
-                location, attrib.attrib_type, attrib.size
-            );
-            continue;
-        }
-        if std::env::var_os("RUZU_TRACE_VK_VERTEX_INPUT").is_some() {
-            log::info!(
-                "[VK_VERTEX_INPUT] attr location={} binding={} offset={} type={:?} size={:?} format={:?}",
-                location,
-                attrib.buffer_index,
-                attrib.offset,
-                attrib.attrib_type,
-                attrib.size,
-                format
-            );
-        }
-        binding_descs.entry(attrib.buffer_index).or_insert_with(|| {
-            vk::VertexInputBindingDescription {
-                binding: attrib.buffer_index,
-                stride: attrib.size.size_bytes(),
-                input_rate: vk::VertexInputRate::VERTEX,
-            }
-        });
-        attributes.push(vk::VertexInputAttributeDescription {
-            location: location as u32,
-            binding: attrib.buffer_index,
-            format,
-            offset: attrib.offset,
-        });
-    }
-
-    (binding_descs.into_values().collect(), attributes)
-}
-
 fn build_vertex_input_state_from_state(
     fixed_state: &FixedPipelineState,
     vs: &CompiledShader,
     must_emulate_scaled_formats: bool,
+    max_vertex_input_bindings: u32,
 ) -> (
     Vec<vk::VertexInputBindingDescription>,
     Vec<vk::VertexInputBindingDivisorDescriptionEXT>,
@@ -2239,9 +2186,18 @@ fn build_vertex_input_state_from_state(
         return (Vec::new(), Vec::new(), Vec::new());
     }
 
-    let mut bindings = Vec::with_capacity(fixed_state.vertex_strides.len());
+    let num_vertex_bindings = fixed_state
+        .vertex_strides
+        .len()
+        .min(max_vertex_input_bindings as usize);
+    let mut bindings = Vec::with_capacity(num_vertex_bindings);
     let mut divisors = Vec::new();
-    for (index, &stride) in fixed_state.vertex_strides.iter().enumerate() {
+    for (index, &stride) in fixed_state
+        .vertex_strides
+        .iter()
+        .take(num_vertex_bindings)
+        .enumerate()
+    {
         let divisor = fixed_state.binding_divisors[index];
         let input_rate = if divisor != 0 {
             vk::VertexInputRate::INSTANCE
@@ -2580,7 +2536,8 @@ mod tests {
             index_buffer_count: 0,
             index_buffer_first: 0,
             index_format: crate::engines::maxwell_3d::IndexFormat::UnsignedShort,
-            vertex_streams: Vec::new(),
+            vertex_streams: Default::default(),
+            vertex_stream_instances: Default::default(),
             vertex_stream_limits: Default::default(),
             viewports: [crate::engines::maxwell_3d::ViewportInfo::default();
                 crate::engines::maxwell_3d::NUM_VIEWPORTS],
@@ -2618,7 +2575,7 @@ mod tests {
             line_anti_alias_enable: false,
             program_base_address: 0,
             cb_bindings: Default::default(),
-            vertex_attribs: Vec::new(),
+            vertex_attribs: Default::default(),
             shader_stages: Default::default(),
             color_masks: Default::default(),
             rt_control: Default::default(),
@@ -2706,7 +2663,7 @@ mod tests {
         };
 
         let (bindings, divisors, attributes) =
-            build_vertex_input_state_from_state(&fixed_state, &shader, false);
+            build_vertex_input_state_from_state(&fixed_state, &shader, false, 32);
 
         assert_eq!(bindings.len(), 32);
         assert_eq!(bindings[0].binding, 0);
@@ -2722,6 +2679,11 @@ mod tests {
         assert_eq!(attributes[0].location, 0);
         assert_eq!(attributes[0].binding, 1);
         assert_eq!(attributes[0].offset, 4);
+
+        let (limited_bindings, _, _) =
+            build_vertex_input_state_from_state(&fixed_state, &shader, false, 16);
+        assert_eq!(limited_bindings.len(), 16);
+        assert_eq!(limited_bindings[15].binding, 15);
     }
 
     #[test]

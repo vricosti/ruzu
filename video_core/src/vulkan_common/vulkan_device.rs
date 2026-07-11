@@ -400,6 +400,11 @@ impl Device {
             supported_extensions.contains("VK_EXT_extended_dynamic_state");
         let has_extended_dynamic_state2 =
             supported_extensions.contains("VK_EXT_extended_dynamic_state2");
+        let has_vertex_attribute_divisor =
+            supported_extensions.contains("VK_EXT_vertex_attribute_divisor");
+        let has_shader_demote_to_helper_invocation = supported_extensions
+            .contains("VK_EXT_shader_demote_to_helper_invocation")
+            || device_properties.api_version >= vk::API_VERSION_1_3;
         let mut shader_float16_int8_features =
             vk::PhysicalDeviceShaderFloat16Int8Features::default();
         let mut portability_subset_features =
@@ -412,6 +417,10 @@ impl Device {
             vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
         let mut extended_dynamic_state2_features =
             vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default();
+        let mut vertex_attribute_divisor_features =
+            vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT::default();
+        let mut shader_demote_features =
+            vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures::default();
         {
             let mut features2_builder = vk::PhysicalDeviceFeatures2::builder()
                 .push_next(&mut shader_float16_int8_features)
@@ -431,6 +440,13 @@ impl Device {
                 features2_builder =
                     features2_builder.push_next(&mut extended_dynamic_state2_features);
             }
+            if has_vertex_attribute_divisor {
+                features2_builder =
+                    features2_builder.push_next(&mut vertex_attribute_divisor_features);
+            }
+            if has_shader_demote_to_helper_invocation {
+                features2_builder = features2_builder.push_next(&mut shader_demote_features);
+            }
             let mut features2 = features2_builder.build();
             unsafe {
                 instance.get_physical_device_features2(physical, &mut features2);
@@ -448,6 +464,10 @@ impl Device {
             && extended_dynamic_state_features.extended_dynamic_state != 0;
         let supports_extended_dynamic_state2 = has_extended_dynamic_state2
             && extended_dynamic_state2_features.extended_dynamic_state2 != 0;
+        let supports_vertex_attribute_divisor = has_vertex_attribute_divisor
+            && vertex_attribute_divisor_features.vertex_attribute_instance_rate_divisor != 0;
+        let supports_shader_demote_to_helper_invocation = has_shader_demote_to_helper_invocation
+            && shader_demote_features.shader_demote_to_helper_invocation != 0;
         log::info!(
             "Vulkan primitive topology restart: extension={} list={} patch={}",
             has_primitive_topology_list_restart,
@@ -473,6 +493,8 @@ impl Device {
             "VK_EXT_primitive_topology_list_restart",
             "VK_EXT_extended_dynamic_state",
             "VK_EXT_extended_dynamic_state2",
+            "VK_EXT_vertex_attribute_divisor",
+            "VK_EXT_shader_demote_to_helper_invocation",
         ] {
             if supported_extensions.contains(name) {
                 enabled_extensions.push(CString::new(name).unwrap());
@@ -511,6 +533,14 @@ impl Device {
             vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::builder()
                 .extended_dynamic_state2(supports_extended_dynamic_state2)
                 .build();
+        let mut enabled_vertex_attribute_divisor_features =
+            vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT::builder()
+                .vertex_attribute_instance_rate_divisor(supports_vertex_attribute_divisor)
+                .build();
+        let mut enabled_shader_demote_features =
+            vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures::builder()
+                .shader_demote_to_helper_invocation(supports_shader_demote_to_helper_invocation)
+                .build();
         let device_create_info = {
             let mut builder = vk::DeviceCreateInfo::builder()
                 .push_next(&mut enabled_shader_float16_int8_features);
@@ -528,6 +558,12 @@ impl Device {
             }
             if has_extended_dynamic_state2 {
                 builder = builder.push_next(&mut enabled_extended_dynamic_state2_features);
+            }
+            if supports_vertex_attribute_divisor {
+                builder = builder.push_next(&mut enabled_vertex_attribute_divisor_features);
+            }
+            if supports_shader_demote_to_helper_invocation {
+                builder = builder.push_next(&mut enabled_shader_demote_features);
             }
             builder
                 .queue_create_infos(&queue_create_infos)
@@ -583,6 +619,8 @@ impl Device {
                 primitive_topology_list_restart: has_primitive_topology_list_restart,
                 extended_dynamic_state: supports_extended_dynamic_state,
                 extended_dynamic_state2: supports_extended_dynamic_state2,
+                vertex_attribute_divisor: supports_vertex_attribute_divisor,
+                shader_demote_to_helper_invocation: supports_shader_demote_to_helper_invocation,
                 swapchain: supported_extensions.contains("VK_KHR_swapchain"),
                 ..DeviceExtensions::default()
             },
@@ -1091,6 +1129,14 @@ impl Device {
 
     pub fn is_ext_line_rasterization_supported(&self) -> bool {
         self.extensions.line_rasterization
+    }
+
+    pub fn is_ext_vertex_attribute_divisor_supported(&self) -> bool {
+        self.extensions.vertex_attribute_divisor
+    }
+
+    pub fn is_ext_shader_demote_to_helper_invocation_supported(&self) -> bool {
+        self.extensions.shader_demote_to_helper_invocation
     }
 
     pub fn is_khr_shader_float_controls_supported(&self) -> bool {

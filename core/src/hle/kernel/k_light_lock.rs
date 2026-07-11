@@ -190,10 +190,7 @@ impl KLightLock {
                         waiter_thread
                             .lock()
                             .unwrap()
-                            .set_waiting_lock_owner_thread_id(
-                                Some(next_owner_id),
-                                next_owner_ptr,
-                            );
+                            .set_waiting_lock_owner_thread_id(Some(next_owner_id), next_owner_ptr);
                     }
                 }
             }

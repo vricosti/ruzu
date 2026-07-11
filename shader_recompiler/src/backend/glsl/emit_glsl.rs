@@ -379,6 +379,22 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
             GlslVarType::U32,
             "max",
         ),
+        Opcode::SClamp32 => emit_ternary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            |value, min, max| format!("uint(clamp(int({}),int({}),int({})))", value, min, max),
+        ),
+        Opcode::UClamp32 => emit_ternary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            |value, min, max| format!("clamp({},{},{})", value, min, max),
+        ),
         Opcode::BitFieldInsert => emit_quaternary_expr(
             ctx,
             program,

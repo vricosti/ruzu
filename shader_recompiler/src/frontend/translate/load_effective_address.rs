@@ -16,7 +16,17 @@ fn lea_hi_impl(
     offset_hi: Value,
     scale: u32,
     neg: bool,
+    x: bool,
 ) {
+    if x {
+        panic!("LEA.HI X");
+    }
+    if field(insn, 48, 3) != 7 {
+        panic!("LEA.HI Pred");
+    }
+    if bit(insn, 47) {
+        panic!("LEA.HI CC");
+    }
     let dst = field(insn, 0, 8);
     let offset_lo_reg = field(insn, 8, 8);
 
@@ -26,14 +36,12 @@ fn lea_hi_impl(
     let packed = tv.ir.pack_uint_2x32(packed_vec);
     let packed64 = if neg { tv.ir.ineg_64(packed) } else { packed };
 
-    // Shift right by (32 - scale) to get the high 32 bits contribution.
-    let hi_scale = (32u32).wrapping_sub(scale);
-    // We don't have ShiftRightLogical64 yet; use shift_left_logical_64 with negated shift
-    // approximation: shift left by scale and take the high word.
-    let shifted = tv.ir.shift_left_logical_64(packed64, Value::ImmU32(scale));
+    let hi_scale = 32 - scale;
+    let shifted = tv
+        .ir
+        .shift_right_logical_64(packed64, Value::ImmU32(hi_scale));
     let unpacked = tv.ir.unpack_uint_2x32(shifted);
-    let hi_word = tv.ir.composite_extract_u32x2_idx(unpacked, 1);
-    let _ = hi_scale; // Already handled above
+    let hi_word = tv.ir.composite_extract_u32x2_idx(unpacked, 0);
 
     let result = tv.ir.iadd_32(base, hi_word);
     tv.set_x(dst, result);
@@ -43,18 +51,20 @@ fn lea_hi_impl(
 pub fn lea_hi_reg(tv: &mut TranslatorVisitor, insn: u64) {
     let scale = field(insn, 28, 5);
     let neg = bit(insn, 37);
+    let x = bit(insn, 38);
     let base = tv.get_reg20(insn);
     let offset_hi = tv.get_reg39(insn);
-    lea_hi_impl(tv, insn, base, offset_hi, scale, neg);
+    lea_hi_impl(tv, insn, base, offset_hi, scale, neg, x);
 }
 
 /// LEA.HI_cbuf — base from cbuf, offset_hi from reg39.
 pub fn lea_hi_cbuf(tv: &mut TranslatorVisitor, insn: u64) {
     let scale = field(insn, 51, 5);
     let neg = bit(insn, 56);
+    let x = bit(insn, 57);
     let base = tv.get_cbuf(insn);
     let offset_hi = tv.get_reg39(insn);
-    lea_hi_impl(tv, insn, base, offset_hi, scale, neg);
+    lea_hi_impl(tv, insn, base, offset_hi, scale, neg, x);
 }
 
 /// LEA.LO inner implementation.
@@ -65,6 +75,16 @@ fn lea_lo_impl(tv: &mut TranslatorVisitor, insn: u64, base: Value) {
     let offset_lo_reg = field(insn, 8, 8);
     let scale = field(insn, 39, 5);
     let neg = bit(insn, 45);
+
+    if bit(insn, 46) {
+        panic!("LEA.LO X");
+    }
+    if field(insn, 48, 3) != 7 {
+        panic!("LEA.LO Pred");
+    }
+    if bit(insn, 47) {
+        panic!("LEA.LO CC");
+    }
 
     let offset_lo = tv.x(offset_lo_reg);
     let offset = if neg {

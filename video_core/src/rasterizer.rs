@@ -2784,7 +2784,8 @@ mod tests {
             index_buffer_count: 0,
             index_buffer_first: 0,
             index_format: IndexFormat::UnsignedByte,
-            vertex_streams: vec![],
+            vertex_streams: Default::default(),
+            vertex_stream_instances: Default::default(),
             vertex_stream_limits: Default::default(),
             viewports: [ViewportInfo::default(); NUM_VIEWPORTS],
             viewport_transforms: Default::default(),
@@ -2845,7 +2846,7 @@ mod tests {
             line_anti_alias_enable: false,
             program_base_address: 0,
             cb_bindings: [[ConstBufferBinding::default(); 18]; 5],
-            vertex_attribs: vec![],
+            vertex_attribs: Default::default(),
             shader_stages: [ShaderStageInfo::default(); 6],
             color_masks: [ColorMaskInfo::default(); 8],
             rt_control: RtControlInfo::default(),
@@ -3122,21 +3123,21 @@ mod tests {
 
         let mut draw = default_draw_call();
         draw.vertex_count = 3;
-        draw.vertex_streams = vec![VertexStreamInfo {
+        draw.vertex_streams[0] = VertexStreamInfo {
             index: 0,
             address: 0x5000,
             stride: 8,
             frequency: 0,
             enabled: true,
-        }];
-        draw.vertex_attribs = vec![VertexAttribInfo {
+        };
+        draw.vertex_attribs[0] = VertexAttribInfo {
             buffer_index: 0,
             constant: false,
             offset: 0,
             size: VertexAttribSize::R32G32,
             attrib_type: VertexAttribType::Float,
             bgra: false,
-        }];
+        };
         draw.viewports[0] = ViewportInfo {
             x: 0.0,
             y: 0.0,
@@ -3753,21 +3754,21 @@ mod tests {
 
         let mut draw = default_draw_call();
         draw.vertex_count = 3;
-        draw.vertex_streams = vec![VertexStreamInfo {
+        draw.vertex_streams[0] = VertexStreamInfo {
             index: 0,
             address: 0x5000,
             stride: 8,
             frequency: 0,
             enabled: true,
-        }];
-        draw.vertex_attribs = vec![VertexAttribInfo {
+        };
+        draw.vertex_attribs[0] = VertexAttribInfo {
             buffer_index: 0,
             constant: false,
             offset: 0,
             size: VertexAttribSize::R32G32,
             attrib_type: VertexAttribType::Float,
             bgra: false,
-        }];
+        };
         draw.viewports[0] = ViewportInfo {
             x: 0.0,
             y: 0.0,

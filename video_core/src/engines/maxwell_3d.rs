@@ -279,6 +279,7 @@ const STREAM_OUT_LAYOUT_BASE: u32 = reg_index!(0x2800);
 ///            bits[26:21]=size, bits[29:27]=type, bit[31]=bgra.
 pub(crate) const VERTEX_ATTRIB_BASE: u32 = reg_index!(0x1160);
 pub(crate) const NUM_VERTEX_ATTRIBS: u32 = 32;
+pub(crate) const NUM_VERTEX_ARRAYS: u32 = 32;
 
 // ── Shader pipeline registers ─────────────────────────────────────────────
 
@@ -2065,7 +2066,9 @@ pub struct DrawCall {
     pub index_buffer_count: u32,
     pub index_buffer_first: u32,
     pub index_format: IndexFormat,
-    pub vertex_streams: Vec<VertexStreamInfo>,
+    pub vertex_streams: [VertexStreamInfo; 32],
+    /// Per-binding instance-rate enable bits (`regs.vertex_stream_instances`).
+    pub vertex_stream_instances: [u32; 32],
     pub vertex_stream_limits: [crate::engines::draw_manager::VertexStreamLimit; 32],
     pub viewports: [ViewportInfo; NUM_VIEWPORTS],
     pub viewport_transforms: [ViewportTransformInfo; NUM_VIEWPORTS],
@@ -2100,7 +2103,7 @@ pub struct DrawCall {
     pub line_anti_alias_enable: bool,
     pub program_base_address: u64,
     pub cb_bindings: [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
-    pub vertex_attribs: Vec<VertexAttribInfo>,
+    pub vertex_attribs: [VertexAttribInfo; NUM_VERTEX_ATTRIBS as usize],
     pub shader_stages: [ShaderStageInfo; NUM_SHADER_PROGRAMS],
     pub color_masks: [ColorMaskInfo; 8],
     pub rt_control: RtControlInfo,
@@ -3255,7 +3258,7 @@ impl Maxwell3D {
     pub fn shader_stage_info(&self, index: u32) -> ShaderStageInfo {
         let base = (PIPELINE_BASE + index * PIPELINE_STRIDE) as usize;
         let word0 = self.regs[base];
-        let enabled = (word0 & 1) != 0;
+        let enabled = self.is_shader_stage_enabled(index);
         let program_type = ShaderStageType::from_raw((word0 >> 4) & 0xF);
         ShaderStageInfo {
             enabled,
@@ -6644,6 +6647,7 @@ mod tests {
         let engine = Maxwell3D::new();
         // VertexB (index 1) always returns enabled even with zero registers.
         assert!(engine.is_shader_stage_enabled(1));
+        assert!(engine.shader_stage_info(1).enabled);
         // Other stages default to disabled.
         assert!(!engine.is_shader_stage_enabled(0));
         assert!(!engine.is_shader_stage_enabled(2));

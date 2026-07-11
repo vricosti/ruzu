@@ -230,9 +230,8 @@ impl Pass {
     /// Upstream `TryRemoveTrivialPhi`. If every operand resolves to a single
     /// non-self value, replace the phi with that value via the use-def
     /// chain. If no operand exists (unreachable / start block), synthesize
-    /// an `Undef` and use that as the replacement. Phi users of the
-    /// just-removed phi are recursively re-tested — this completes the
-    /// "// TODO: recursively remove phi users" note upstream leaves open.
+    /// an `Undef` and use that as the replacement. Upstream deliberately does
+    /// not recursively re-test phi users here; preserve that ordering.
     fn try_remove_trivial_phi(
         &mut self,
         program: &mut Program,
@@ -268,42 +267,11 @@ impl Pass {
                 inst: undef_idx,
             });
         }
-        // Snapshot the set of phi users BEFORE replace_uses_with mutates the
-        // user map. Recursive triviality re-test happens on them after the
-        // rewrite is complete.
-        let phi_user_refs: Vec<InstRef> = self
-            .users
-            .get(&phi_ref)
-            .map(|set| {
-                set.iter()
-                    .copied()
-                    .filter(|u| {
-                        // Filter to phi users only — non-phi users get their
-                        // operands rewritten in-place by replace_uses_with
-                        // but don't need re-testing.
-                        program.block(u.block).inst(u.inst).opcode == Opcode::Phi
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
         // Drop the phi's variable mapping; it's about to become Identity.
         self.phi_variable.remove(&phi_ref);
 
         // Eagerly rewrite every user of `phi_ref` to point at `same`.
         self.replace_uses_with(program, phi_ref, same);
-
-        // Recursively re-test phi users whose operands just changed. Skip
-        // users that were themselves converted to Identity (e.g. as a side
-        // effect of being trivial earlier).
-        for phi_user in phi_user_refs {
-            if program.block(phi_user.block).inst(phi_user.inst).opcode != Opcode::Phi {
-                continue;
-            }
-            if let Some(&var) = self.phi_variable.get(&phi_user) {
-                self.try_remove_trivial_phi(program, phi_user, undef_opcode(var));
-            }
-        }
 
         same
     }
@@ -622,12 +590,11 @@ mod tests {
         assert!(ops.contains(&v_b));
     }
 
-    /// Loop-header (cycle) case: phi operands include the back-edge value
-    /// equal to the phi itself, which trivial-phi removal should fold away.
-    /// With recursive trivial-phi cleanup driven by the use-def chain, the
-    /// bitcast's arg[0] should be the entry-value `k` directly.
+    /// Loop-header (cycle) case. Upstream does not recursively revisit phi
+    /// users after removing a trivial operand phi, so the loop-header phi is
+    /// intentionally retained.
     #[test]
-    fn loop_with_invariant_value_collapses_to_definition() {
+    fn loop_with_invariant_value_retains_upstream_phi() {
         // CFG: 0 → 1 → 2 → 1 (back-edge), 2 → 3.
         // Block 0 sets R3=K. Block 1 reads R3 (must become K via phi → trivial).
         let mut program = Program::new(ShaderStage::VertexB);
@@ -661,15 +628,13 @@ mod tests {
 
         ssa_rewrite_pass(&mut program);
 
-        // With recursive trivial-phi removal driven by the use-def chain,
-        // the bitcast's operand should resolve directly to K (the phi
-        // becomes trivial after its back-edge operand collapses via the
-        // inner phi's removal).
         let bitcast = program.block(1).inst(use_idx).clone();
-        assert_eq!(
-            bitcast.args[0], k,
-            "loop-invariant value should propagate directly via use-def chain"
-        );
+        let Value::Inst(phi_ref) = bitcast.args[0] else {
+            panic!("upstream ordering retains the loop-header phi");
+        };
+        let phi = program.block(phi_ref.block).inst(phi_ref.inst);
+        assert_eq!(phi.opcode, Opcode::Phi);
+        assert!(phi.phi_args.iter().any(|(_, value)| *value == k));
     }
 
     /// The use-def index must be drained correctly: after rewriting, the

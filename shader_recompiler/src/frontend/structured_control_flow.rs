@@ -72,6 +72,9 @@ pub(crate) enum StructuredAction {
         branch_reg: u32,
         branch_offset: i32,
     },
+    DemoteToHelperInvocation {
+        block: u32,
+    },
     Condition {
         syntax_index: usize,
         block: u32,
@@ -940,7 +943,9 @@ impl TranslatePass {
                     self.syntax.push(SyntaxNode::Return);
                 }
                 Statement::Kill => {
-                    self.ensure_block(&mut current_block);
+                    let block = self.ensure_block(&mut current_block);
+                    self.actions
+                        .push(StructuredAction::DemoteToHelperInvocation { block });
                     let demote_block = self.merge_block();
                     self.syntax.push(SyntaxNode::Block(demote_block));
                     current_block = Some(demote_block);
