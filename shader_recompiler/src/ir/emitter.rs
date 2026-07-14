@@ -873,8 +873,30 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::FPMul64, vec![a, b]))
     }
 
+    pub fn fp_mul_64_with_control(&mut self, a: Value, b: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPMul64,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_fma_64(&mut self, a: Value, b: Value, c: Value) -> Value {
         self.emit(Inst::new(Opcode::FPFma64, vec![a, b, c]))
+    }
+
+    pub fn fp_fma_64_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        c: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPFma64,
+            vec![a, b, c],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_min_64(&mut self, a: Value, b: Value) -> Value {

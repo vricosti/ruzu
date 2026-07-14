@@ -380,7 +380,7 @@ impl ShaderPools {
 // Version 17: vertex strides are omitted from fixed pipeline state whenever
 // extended dynamic state owns them, matching upstream. Version 16 entries
 // can contain per-draw strides and therefore produce duplicate pipelines.
-const CACHE_VERSION: u32 = 17;
+const CACHE_VERSION: u32 = 18;
 const VULKAN_CACHE_MAGIC_NUMBER: [u8; 8] = *b"yuzuvkch";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -605,6 +605,7 @@ impl PipelineCache {
         max_viewports: u32,
         max_vertex_input_bindings: u32,
         vertex_attribute_divisor_supported: bool,
+        provoking_vertex_supported: bool,
     ) -> Self {
         let mut pipeline_cache = PipelineCache {
             device: device.clone(),
@@ -630,6 +631,7 @@ impl PipelineCache {
                 max_viewports,
                 max_vertex_input_bindings,
                 vertex_attribute_divisor_supported,
+                provoking_vertex_supported,
             ),
             graphics_cache: HashMap::new(),
             failed_graphics_cache: HashSet::new(),
@@ -1486,8 +1488,8 @@ mod tests {
     }
 
     #[test]
-    fn cache_version_tracks_dynamic_vertex_stride_semantics() {
-        assert_eq!(CACHE_VERSION, 17);
+    fn cache_version_tracks_environment_constant_buffer_folding() {
+        assert_eq!(CACHE_VERSION, 18);
     }
 
     #[test]

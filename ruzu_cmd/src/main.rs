@@ -1227,6 +1227,26 @@ fn main() {
         );
     }
 
+    // Upstream loads and fully builds the disk pipeline cache before starting
+    // GPU/CPU execution. Starting the guest first lets pipeline workers contend
+    // with presentation and can hide entire early animations behind the cache
+    // build (MK8D's first-logo transition).
+    if *common::settings::values().use_disk_shader_cache.get_value() {
+        if let Some(gpu_any) = system.gpu_core() {
+            if let Some(gpu) = gpu_any.as_any().downcast_ref::<video_core::gpu::Gpu>() {
+                let mut renderer_guard = gpu.renderer();
+                if let Some(renderer) = renderer_guard.as_mut() {
+                    let rasterizer = renderer.read_rasterizer();
+                    unsafe {
+                        if let Some(rasterizer) = rasterizer.as_mut() {
+                            rasterizer.load_disk_resources(system.runtime_program_id());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Step 6 (upstream): system.GPU().Start()
     // Core is loaded, start the GPU (makes the GPU contexts current to this thread).
@@ -1245,22 +1265,6 @@ fn main() {
     // Step 7 (upstream): system.GetCpuManager().OnGpuReady()
     // -----------------------------------------------------------------------
     system.get_cpu_manager().on_gpu_ready();
-
-    if *common::settings::values().use_disk_shader_cache.get_value() {
-        if let Some(gpu_any) = system.gpu_core() {
-            if let Some(gpu) = gpu_any.as_any().downcast_ref::<video_core::gpu::Gpu>() {
-                let mut renderer_guard = gpu.renderer();
-                if let Some(renderer) = renderer_guard.as_mut() {
-                    let rasterizer = renderer.read_rasterizer();
-                    unsafe {
-                        if let Some(rasterizer) = rasterizer.as_mut() {
-                            rasterizer.load_disk_resources(system.runtime_program_id());
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     // -----------------------------------------------------------------------
     // Upstream: system.RegisterExitCallback([&] { exit(0); })

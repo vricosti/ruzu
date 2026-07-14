@@ -272,6 +272,12 @@ pub trait Maxwell3DAccess {
     /// Clear one dirty flag after the backend consumes it.
     fn clear_dirty_flag(&mut self, index: u8);
 
+    /// Return the stable channel-owned dirty flag storage for backends that
+    /// mirror upstream's persistent `Maxwell3D*` ownership.
+    fn dirty_flags_ptr(&mut self) -> Option<std::ptr::NonNull<[bool; 256]>> {
+        None
+    }
+
     /// Run a closure with the bound rasterizer, if present.
     ///
     /// Upstream stores `RasterizerInterface*` on `Maxwell3D` and all draw
@@ -1408,6 +1414,13 @@ impl<'a> Maxwell3DDrawView<'a> {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.dirty_flags(),
             Maxwell3DDrawSource::Snapshot(registers) => registers.dirty_flags,
+        }
+    }
+
+    pub fn dirty_flags_ptr(&mut self) -> Option<std::ptr::NonNull<[bool; 256]>> {
+        match &mut self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.dirty_flags_ptr(),
+            Maxwell3DDrawSource::Snapshot(_) => None,
         }
     }
 

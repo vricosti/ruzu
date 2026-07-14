@@ -268,6 +268,15 @@ pub struct ServerManager {
 }
 
 impl ServerManager {
+    /// Read the parent id without retaining the Rust endpoint mutex.
+    ///
+    /// Upstream passes a direct `KServerSession*` and has no equivalent host
+    /// mutex. Keeping the guard alive while resolving the parent `KSession`
+    /// would invert the close path's parent -> server order.
+    fn server_session_parent_id(server_session: &Arc<Mutex<KServerSession>>) -> Option<u64> {
+        server_session.lock().unwrap().get_parent_id()
+    }
+
     fn host_thread_session_consumption_enabled_from_flags(all: bool) -> bool {
         all
     }
@@ -646,7 +655,12 @@ impl ServerManager {
         // register the session in the current host fiber's KProcess so the
         // kernel-backed wait succeeds.
         if !self.system.is_null() {
-            if let Some(parent_id) = server_session.lock().unwrap().get_parent_id() {
+            // Do not put the lock expression directly in the `if let`
+            // scrutinee: Rust extends that temporary guard through the whole
+            // body, producing server -> parent while CloseHandle uses parent
+            // -> server.
+            let parent_id = Self::server_session_parent_id(&server_session);
+            if let Some(parent_id) = parent_id {
                 if let Some(current_thread) = self.system.get().current_thread() {
                     let process = current_thread
                         .lock()
@@ -2060,6 +2074,18 @@ mod tests {
 
         assert_eq!(manager.sessions.len(), 1);
         assert!(!manager.sessions[0].holder.is_linked());
+    }
+
+    #[test]
+    fn reading_server_session_parent_id_releases_endpoint_lock() {
+        let server_session = Arc::new(Mutex::new(KServerSession::new()));
+        server_session.lock().unwrap().initialize(0x1000);
+
+        assert_eq!(
+            ServerManager::server_session_parent_id(&server_session),
+            Some(0x1000)
+        );
+        assert!(server_session.try_lock().is_ok());
     }
 
     #[test]

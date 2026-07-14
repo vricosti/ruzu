@@ -67,6 +67,21 @@ mod tests {
         false
     }
 
+    fn count_opcode(words: &[u32], opcode: rspirv::spirv::Op) -> usize {
+        let mut count = 0;
+        let mut offset = 5;
+        while offset < words.len() {
+            let header = words[offset];
+            if header & 0xffff == opcode as u32 {
+                count += 1;
+            }
+            let word_count = (header >> 16) as usize;
+            assert!(word_count != 0, "invalid SPIR-V instruction word count");
+            offset += word_count;
+        }
+        count
+    }
+
     #[test]
     fn test_emit_empty_vertex_shader() {
         let mut program = ir::Program::new(ShaderStage::VertexB);
@@ -78,6 +93,7 @@ mod tests {
         // SPIR-V magic number is 0x07230203
         assert!(words.len() >= 5, "SPIR-V should have at least a header");
         assert_eq!(words[0], 0x07230203, "SPIR-V magic number mismatch");
+        assert_eq!(count_opcode(&words, rspirv::spirv::Op::Label), 1);
     }
 
     #[test]
@@ -90,6 +106,36 @@ mod tests {
 
         assert!(words.len() >= 5);
         assert_eq!(words[0], 0x07230203);
+    }
+
+    #[test]
+    fn vertex_prologue_initializes_position_and_generic_outputs() {
+        let mut program = ir::Program::new(ShaderStage::VertexB);
+        program
+            .info
+            .stores
+            .set(crate::ir::value::Attribute::generic(1, 0).0 as usize, true);
+        program.blocks.push(Block::new());
+        Emitter::new(&mut program, 0).prologue();
+
+        let words = emit_spirv(&program, &Profile::default(), &RuntimeInfo::default());
+
+        assert_eq!(count_opcode(&words, rspirv::spirv::Op::Store), 2);
+    }
+
+    #[test]
+    fn vertex_prologue_initializes_fixed_point_size() {
+        let mut program = ir::Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        Emitter::new(&mut program, 0).prologue();
+        let runtime_info = RuntimeInfo {
+            fixed_state_point_size: Some(3.0),
+            ..RuntimeInfo::default()
+        };
+
+        let words = emit_spirv(&program, &Profile::default(), &runtime_info);
+
+        assert_eq!(count_opcode(&words, rspirv::spirv::Op::Store), 2);
     }
 
     #[test]

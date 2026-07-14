@@ -668,8 +668,71 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             });
             strides.push(bindings.strides[index]);
         }
+        if std::env::var_os("RUZU_READBACK_COMMON_VERTEX").is_some()
+            && offsets.first() == Some(&0xB000)
+            && sizes.first() == Some(&0x20)
+            && strides.first() == Some(&8)
+            && !{
+                static LAST_BUFFER: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                LAST_BUFFER.swap(vk_buffers[0].as_raw(), std::sync::atomic::Ordering::Relaxed)
+                    == vk_buffers[0].as_raw()
+            }
+        {
+            if let Some(staging) = self.staging_pool().request_download_buffer(0x20, false) {
+                let src_buffer = vk_buffers[0];
+                let dst_buffer = staging.buffer;
+                let src_offset = offsets[0];
+                let dst_offset = staging.offset;
+                let device = self.device.clone();
+                self.scheduler().request_outside_renderpass();
+                self.scheduler().record(move |cmdbuf| unsafe {
+                    device.cmd_copy_buffer(
+                        cmdbuf,
+                        src_buffer,
+                        dst_buffer,
+                        &[vk::BufferCopy {
+                            src_offset,
+                            dst_offset,
+                            size: 0x20,
+                        }],
+                    );
+                });
+                self.scheduler().finish();
+                let bytes = unsafe { std::slice::from_raw_parts(staging.mapped, 0x20) };
+                log::warn!(
+                    "[COMMON_VERTEX_READBACK] buffer=0x{:X} offset=0x{:X} bytes={:02X?}",
+                    src_buffer.as_raw(),
+                    src_offset,
+                    bytes
+                );
+            }
+        }
         let first_binding = bindings.min_index;
         let dynamic_stride = self.extended_dynamic_state_supported;
+        if std::env::var_os("RUZU_COMMON_VERTEX_BIND_IMMEDIATE").is_some() {
+            let cmdbuf = self.scheduler().command_buffer();
+            unsafe {
+                if dynamic_stride {
+                    self.device.cmd_bind_vertex_buffers2(
+                        cmdbuf,
+                        first_binding,
+                        &vk_buffers,
+                        &offsets,
+                        Some(&sizes),
+                        Some(&strides),
+                    );
+                } else {
+                    self.device.cmd_bind_vertex_buffers(
+                        cmdbuf,
+                        first_binding,
+                        &vk_buffers,
+                        &offsets,
+                    );
+                }
+            }
+            return;
+        }
         let device = self.device.clone();
         self.scheduler().record(move |cmdbuf| unsafe {
             if dynamic_stride {

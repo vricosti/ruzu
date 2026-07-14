@@ -495,6 +495,9 @@ impl StateTracker {
 
     /// Port of `StateTracker::SetupTables`.
     pub fn setup_tables(tables: &mut DirtyTables) {
+        for table in tables.iter_mut() {
+            table.fill(crate::dirty_flags::flags::NULL_ENTRY);
+        }
         setup_dirty_flags(tables);
         setup_dirty_color_masks(tables);
         setup_dirty_viewports(tables);

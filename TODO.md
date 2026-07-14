@@ -2254,3 +2254,514 @@ Review fixes applied after this investigation:
   a 10-second 25-frame capture still shows the checker/diagonal reveal. These
   are retained correctness/parity fixes, but the transition investigation
   remains open.
+
+Follow-up localization with bounded 15-second runs:
+
+- A presentation timeline every 60 presents localizes the mismatch to roughly
+  host time 4.5-5.5 seconds: ruzu keeps the gray checker while the diagonal
+  reveal starts, whereas the yuzu reference overlays broad blue streaks. The
+  later title artwork is colored correctly, so this is not a global
+  desaturation or presentation-copy failure.
+- **INVALIDATED:** stale or incorrect Vulkan blend constants. All traced
+  `ConstantColor` draws use three stable warm bloom constants and
+  `cmd_set_blend_constants` is issued from the live guest `blend_color`.
+  `BlendFactor` decoding also matches upstream for both D3D and GL encodings.
+- The full-screen chain writes `0x524C10000` in the repeating order
+  `AF7B30 -> AF1930 -> AF7B30 -> AF5730`. At a comparable live point,
+  `AF1930` and the final multiplicative `AF5730` output retain the same blue
+  content (about 5.9% blue-dominant pixels). The presented image also retains
+  blue (about 6.5%). **INVALIDATED:** `AF5730` or the present copy removing the
+  blue grade.
+- The historical `VS 0x6A2730 / FS 0x6A3E30` pipeline rejection
+  (`unresolved IR value reference`) no longer occurs in current runs. A
+  temporary fragment-offset skip removed 100 executions of `FS 0x6A3E30`
+  while producing a presentation timeline visually identical to the control.
+  **INCONCLUSIVE, not invalidated:** a draw that is already broken or emits no
+  visible pixels also produces no difference when skipped. Its two start-block
+  `OpUndef` predicates still require CFG-origin analysis before this large
+  effect candidate can be excluded. The debug skip was removed after the
+  comparison.
+- The transition-era `AF1930` draws 9-19 were captured individually at their
+  tenth occurrence. They are the first-logo flare/rainbow series and render
+  correctly; they are not the missing broad blue streak layer. Draw 11 uses a
+  valid BC4 64x64 gradient (`0x558BF4000`), an additive blend, and a live
+  animated alpha. **INVALIDATED:** those `AF1930` masks, their BC4 decode, or
+  their cbuf color multipliers as the source of the missing transition layer.
+
+Follow-up on the two operandless predicate phis in the `6A2730` vertex shader:
+
+- **FIXED upstream divergence:** `translate_cfg_to_program` computed post-order
+  from hardcoded block 0. Upstream computes
+  `PostOrder(program.syntax_list.front())`. The shader's ASL root is synthetic
+  block 60, so ruzu omitted it from post-order, cleared its `60 -> 0` edge as
+  unreachable, and left two detached Phi nodes. Post-order now starts at the
+  first syntax block, exactly like upstream.
+- Fresh-cache IR verification for live shader hash `E2795AB19A7C6DF4` changed
+  block 60 from `preds=[] succs=[]`, absent from post-order, to
+  `preds=[] succs=[0]`, final entry in post-order. The detached Phi nodes are
+  gone. Their replacements are two `UndefU1` values, which is expected and
+  upstream-faithful: upstream `TryRemoveTrivialPhi` emits `UndefU1` for a
+  predicate read in the start block without a predecessor/definition.
+- A fresh-cache 15-second MK8D run produced no unresolved IR reference or
+  shader compiler panic. The periodic presentation captures are stable, but
+  the transition still uses the gray checker and a logo zoom instead of
+  yuzu's broad blue streaks. Therefore this CFG correction is retained as a
+  real parity fix but is **INSUFFICIENT** to solve the visual mismatch.
+
+Next: identify the draw(s) that produce yuzu's blue transition layer rather
+than treating `6A2730` as proven responsible. Compare the transition draw list,
+pipeline state, geometry, and sampled images against a yuzu GPU trace if one
+can be captured. Do not revisit the invalidated blend, `AF1930`/`AF5730`,
+BC4/BC5 texture, or presentation-copy hypotheses without new contradictory
+evidence.
+
+Update/ExeFS parity check:
+
+- **INVALIDATED:** ruzu running the base ExeFS with an installed or packed
+  MK8D update RomFS. Provider probes before/after the loader and services found
+  no `0100152000022800` Program entry, and the NSP contains no packed update.
+  The apparent `RomFS: Update (v64.0.4)` lines in both ruzu and yuzu belong to
+  system title `0100000000000802`, not MK8D. The yuzu log also applies no MK8D
+  ExeFS or RomFS update when launched with this same NSP. Both emulators run
+  the base MK8D program/content, so version mixing does not explain the blue
+  transition mismatch.
+
+Blue-streak transition presentation root cause:
+
+- A fresh-cache dump of `FS 0xAF2C30` after the synthetic-ASL-root fix contains
+  no `OpUndef`; both texture coordinates and both image samples are normal.
+  **INVALIDATED:** stale `AF2C30` SPIR-V dumps with undefined perspective
+  coordinates.
+- `AF2C30` references fragment CBUF index 3. Live values are coherent with its
+  mask/composition role (white RGB with sampled alpha, then passthrough), and
+  its two BC4 views are valid. **INVALIDATED:** a null, stale, or incorrectly
+  routed `AF2C30` constant buffer.
+- Direct render-target dumps prove the effect is rendered correctly inside
+  ruzu. The first `AF2C30` output on `0x524C10000` is the expected broad blue
+  streak field; the immediately following `AF1930` output is a complete blue
+  Mario Kart transition matching the yuzu reference. The shader/texture/render
+  path is therefore not the active fault.
+- A periodic present-source timeline shows no blue transition frame at all:
+  presentation advances to source #140 at host `t=7.49 s`, then stalls until
+  source #160 at `t=9.505 s`, by which time the title frame has replaced the
+  transition. The correct `AF2C30`/`AF1930` output is produced during that
+  two-second presentation hole.
+- **FIXED upstream divergence:** ruzu started `gpu.start()` and
+  `CpuManager::on_gpu_ready()` before `load_disk_resources()`. MK8D therefore
+  ran its first logo while roughly 4,000 cached Vulkan pipelines were still
+  being built (`site=from_state`, about 5.3 seconds cumulative creation time).
+  Upstream
+  `EmuThread::run` calls `LoadDiskResources`, waits for
+  `workers.WaitForRequests`, and only then calls `gpu.Start()` and
+  `OnGpuReady()`. `ruzu_cmd` now uses that exact ordering.
+- **INVALIDATED as the sole root cause:** after moving disk-resource loading
+  before GPU/CPU startup, all cached pipeline builds complete before the first
+  guest presentation, but the same roughly two-second present-source gap
+  remains (now `t=10.30 s` to `t=12.30 s`). The ordering correction is retained
+  for parity and removes startup contention, but the missing transition is
+  caused by a lower buffer-production/queue/present synchronization stall.
+
+Next: correlate the `BQP_DEQUEUE`/`BQP_QUEUE`/`BQC_RELEASE`, nvhost syncpoint,
+and scheduler submit timelines across the two-second present-source gap. The
+correct blue frame exists in `0x524C10000`; determine why it is not queued to
+one of the three nvnflinger buffers before the title frame replaces it. Only
+after this transition is fixed resume the independent attract-mode
+investigation.
+
+Current-build correction:
+
+- **INVALIDATED:** a persistent two-second BufferQueue/presentation hole as
+  the active cause. With disk resources loaded before GPU/CPU startup, a
+  non-blocking GPU-thread ring trace measured the worst presentation
+  `GpuTick` behind queued submits at about 60 ms; the current present-source
+  timeline is continuous through the transition. The older one-second
+  `HardwareComposer::composite` spans are not reproduced by the current
+  build. Keep the historical observation above, but do not use it as the
+  current root cause without new evidence.
+- The current timeline still visibly performs the wrong checker/logo morph
+  and never shows yuzu's broad horizontal blue streaks. The fault therefore
+  remains inside the per-frame render/composition sequence, after the
+  verified blue `AF2C30`/`AF1930` intermediate output and before the final
+  framebuffer draw.
+- A targeted debug skip of the `B20030/B21430` draw at the known transition
+  draw index did not restore the streak layer. **INVALIDATED as the sole
+  cause:** `B21430` reintroducing the logo-shaped mask. It contributes to the
+  visible morph, but suppressing it alone is insufficient. The skip was
+  environment-only; no debug behavior was retained in source.
+
+Next: capture the HDR target after every draw from the known-good
+`AF2C30`/`AF1930` output through the final `10A30/10F30` copy, identify the
+first draw that removes the horizontal streak field, and compare that draw's
+pipeline state, inputs, constants, and translated shader literally with
+upstream. Do not resume attract-mode work until this transition path matches.
+
+Large-effect draw confirmation:
+
+- `VS 0x6A2730 / FS 0x6A3E30` is the only large-effect draw between the two
+  `6B3E30` particle draws in the final HDR overlay sequence. A direct HDR dump
+  after its first occurrence contains only the first logo; a dump after its
+  tenth occurrence contains the checker/logo morph, still without horizontal
+  blue bands. The pipeline executes, but no captured output shows the expected
+  large streak effect.
+- A before/after pixel comparison made from separate emulator runs is
+  **INCONCLUSIVE** because the guest animation ticks differ. Do not use that
+  difference count to claim whether `6A3E30` writes pixels.
+
+Next measurement: extend the existing debug dump temporarily to capture the
+same HDR image immediately before and immediately after one `6A3E30` draw in
+the same command stream. If byte-identical, trace its vertex outputs/demote
+condition against upstream; if different, isolate the written region and
+determine which later draw removes it. Remove the temporary capture hook after
+the measurement.
+
+### 2026-07-12 - yuzu Maxwell/IR/SPIR-V reference capture
+
+- The same-command-stream measurement is complete. The image immediately
+  before and after the tenth `VS 0x6A2730 / FS 0x6A3E30` draw is byte-for-byte
+  identical. Forcing additive blend, removing fragment demote, and forcing an
+  opaque red fragment output also leaves it identical. **INVALIDATED:** blend,
+  fragment alpha, demote, or sampled fragment color as the reason this draw
+  contributes no pixels. Its active failure is before fragment output
+  (vertex/primitive/rasterization).
+- A reusable LLDB capture now filters yuzu pipeline creation by the six
+  `GraphicsPipelineCacheKey::unique_hashes`, calls upstream
+  `Shader::IR::DumpProgram` through an injected helper, and captures the
+  returned SPIR-V vectors. This avoids source changes in the read-only upstream
+  tree.
+- The yuzu shader cache was deleted before capture. A clean run produced the
+  exact pipeline pair
+  `2f5f644f52abd5f9_VB_5eb907d48667d421.ash` and
+  `2f5f644f52abd5f9_FS_0ca64ee54274092f.ash` under
+  `~/.local/share/yuzu/dump/shaders/`.
+- Captured upstream artifacts are in `/tmp/yuzu-target-capture/`. For this
+  exact pair, yuzu's vertex shader is 352 bytes of dumped Maxwell code, two IR
+  blocks, and 679 SPIR-V words. The earlier ruzu artifact associated with
+  `0x6A2730` contains 120 IR blocks and about 64 KiB of SPIR-V. This is a major
+  environment/code-extent mismatch, not a small backend instruction
+  difference.
+- This `6A2730/6A3E30` pair is reached after the initial transition in the
+  current build (a 120-second targeted run did not reach it while blocked on
+  the first logo). It remains a real later rendering bug, but **INVALIDATED as
+  the sole explanation for the initial blue-streak transition**.
+
+Next: use the same LLDB capture on the early `AF5930/AF7B30`,
+`AF0B30/AF1930`, and `AF4F30/AF5730` pipelines. Capture their ruzu unique
+hashes and environment sizes in the same run, then compare Maxwell extent, IR,
+SPIR-V, and fixed pipeline state pair-by-pair. Do not infer correspondence from
+GPU offsets alone.
+
+### 2026-07-12 - early transition shader parity and BuildASL block ownership
+
+- A fresh ruzu shader-environment trace established the exact early pairs:
+  `EA070A91046FB155/165CB4917F9E92B1`,
+  `8C73CF69DC5D4788/D409BB53314E085D`, and
+  `E21DEF9AF8EA1CFD/81546EB8F0ECA705`. All six hashes and Maxwell extents
+  match clean yuzu `.ash` captures in `/tmp/yuzu-af59-capture`,
+  `/tmp/yuzu-af0b-capture`, and `/tmp/yuzu-af4f-capture`.
+- **INVALIDATED:** associating yuzu hashes
+  `5EB907D48667D421/0CA64EE54274092F` with ruzu offsets
+  `0x6A2730/0x6A3E30`. A fresh run maps those hashes to different live
+  offsets, while current `0x6A2730/0x6A3E30` carries another hash pair. GPU
+  shader offsets are reused/relocated and are not a stable cross-run identity.
+  The earlier extent comparison was therefore between different programs.
+- **FIXED upstream divergence:** normal Rust translation omitted the IR
+  `Prologue` that upstream `TranslatePass` inserts at the beginning of the
+  first ASL block. The backend also omitted generic-output defaults and fixed
+  pipeline point size. Entry `Prologue`, return-block `Epilogue`, default
+  `(0,0,0,1)` vertex outputs, and point size now follow upstream. This was a
+  real undefined-varying bug but was **INSUFFICIENT** by itself: the captured
+  transition still lacked yuzu's blue streak grade.
+- Pairwise yuzu/ruzu IR showed the larger structural divergence: ruzu forced
+  every Flow CFG block into a distinct IR block, then added merge blocks.
+  Upstream `TranslatePass::Visit(Code)` translates consecutive Flow blocks
+  into the current IR block until a structured boundary. The three transition
+  vertex programs were `255/308/172` Rust blocks versus `150/158/108` yuzu.
+- **FIXED upstream divergence:** `StructuredAction::TranslateCode` now records
+  Flow-code translation in visit order and targets dynamically allocated IR
+  blocks. Set-variable, condition, and Maxwell translation actions are
+  materialized in that same order. The resulting three block counts are
+  exactly `150/158/108`, matching yuzu; conditional branch and selection-merge
+  counts also match exactly.
+- **FIXED upstream divergence:** the Rust SPIR-V backend inserted an anonymous
+  function-entry label and unconditional branch before the first ASL block.
+  Upstream reserves block label IDs and traverses directly into the first ASL
+  block. The artificial entry block was removed.
+- Validation: focused structured-control-flow, pipeline-cache, and SPIR-V
+  backend tests pass; release builds pass; a warm-cache MK8D run reaches and
+  renders the title screen without shader compiler panic or skipped draw.
+  Dense warm-cache captures subsequently sampled the transition at present
+  sources 420-480: ruzu still shows the logo/checker mask and no broad blue
+  streak grade. The block-ownership correction is therefore **INSUFFICIENT**
+  to solve the visual mismatch, despite matching upstream structure exactly.
+
+Next: capture the transition at a denser cadence on the warm cache (or observe
+the live window) and compare it to the yuzu 2026-07-11 reference. If it still
+differs, compare the exact branch-condition expressions and fixed pipeline
+state for these hash-matched pairs; do not return to offset-only matching.
+
+### 2026-07-12 - blue-streak root cause: FADD control and SPIR-V NoContraction
+
+Direct source instrumentation in the separate `zuyu-instrumented` worktree
+replaced the less reliable LLDB-only comparison. The canonical
+`/Users/vricosti/Dev/emulators/zuyu/src` tree remained read-only, and its
+`yuzu.app` binary was rebuilt from canonical sources after the capture.
+
+The instrumentation dumped the `0x524C10000` HDR attachment after each early
+transition pass in both emulators. The first byte divergence occurs immediately
+after `VS AF5930 / FS AF7B30`; the following `AF0B30/AF1930` pass becomes exact
+again. Replacing only yuzu's `AF7B30` fragment SPIR-V in ruzu makes the first
+intermediate exact; replacing only the vertex shader does not. This proves the
+fault is in ruzu's fragment compilation, not Vulkan state or input resources.
+
+Root cause and fix:
+
+- upstream `FADD/FADD32I` constructs `IR::FpControl` with
+  `no_contraction=true`, decoded rounding, and decoded FTZ state;
+- ruzu previously emitted a plain `FPAdd32`, losing all those controls;
+- upstream SPIR-V decorates add/multiply/FMA results with `NoContraction` when
+  requested; ruzu did not propagate the flag;
+- the frontend now ports the exact FADD controls and CC rejection, and the
+  SPIR-V floating-point owner now applies `NoContraction` to FP32 add,
+  multiply, and FMA.
+
+Post-fix validation: without any yuzu SPIR-V substitution, the complete
+1920x1080 `A2B10G10R10` intermediate is byte-identical to yuzu over all
+8,294,400 bytes, SHA-256
+`7cc395c79066732352e4aa4d6639ae7bccd243c135f5ea97ba94f72fb2d195ae`.
+
+Invalidated hypotheses retained for traceability:
+
+- **INVALIDATED:** descriptor/TIC/TSC mismatch for `AF7B30`; captured values
+  match yuzu.
+- **INVALIDATED:** constant-buffer contents or binding mismatch; all CBUFs
+  match yuzu.
+- **INVALIDATED:** vertex/index geometry or vertex shader as the first
+  divergence; replacing the yuzu vertex SPIR-V alone does not change output.
+- **INVALIDATED:** fixed pipeline state, blend state, or attachment format;
+  serialized state and pass inputs match.
+- **INVALIDATED:** BC4/BC5 image-view format/swizzle/content mismatch; both
+  creation parameters and Vulkan readback bytes match.
+- **INVALIDATED:** the following `AF0B30/AF1930` pass as the source of this
+  first mismatch; its intermediate is exact.
+
+Remaining work is independent of this proven transition-pass fix: visually
+sample the exact blue-streak presentation interval after cleanup, then resume
+the later attract-mode investigation. Do not revisit the invalidated input,
+geometry, or Vulkan-state hypotheses without contradictory evidence.
+
+### 2026-07-12 - post-FADD visual validation and full-frame scope correction
+
+A new post-fix release capture sampled every fifth presented source. Ruzu still
+zooms the first logo/checker image and jumps directly to the title; no frame
+contains yuzu's broad blue horizontal streaks. The FADD/NoContraction fix is
+therefore active and necessary, but it is not sufficient for full-frame parity.
+
+Important scope correction: SHA-256
+`7cc395c79066732352e4aa4d6639ae7bccd243c135f5ea97ba94f72fb2d195ae`
+proves one targeted `AF7B30 -> AF1930` intermediate is byte-identical. It does
+not prove the final frame is identical. The same frame subsequently executes
+many `AF5730`, `AF6430`, `AF2C30`, and `AF1930` draws with different resources
+and state before presentation.
+
+Direct yuzu source instrumentation (in the separate instrumented worktree)
+and ruzu's `RUZU_TRACE_VK_DRAW` show the target-RT shader order around the first
+`AF2C30` is draw-for-draw identical. In both emulators the sequence is:
+
+- `AF2C30`, `AF1930`;
+- eight `AF5730` draws;
+- nine `AF6430` draws;
+- nine `AF2C30` draws;
+- nine `AF6430` draws;
+- nine `AF1930` draws;
+- then the following frame starts with `231630`, `AF7B30`, `B21430`, etc.
+
+This invalidates two additional hypotheses:
+
+- **INVALIDATED:** the shader compiler fix was not present in the executed
+  release binary. The binary timestamp post-dates the fix, disk entries store
+  Maxwell environments rather than old SPIR-V, and the post-fix intermediate
+  hash is exact.
+- **INVALIDATED:** ruzu omits or reorders the broad transition draw sequence.
+  Shader offsets and order match yuzu; the remaining divergence is in the
+  per-draw fixed state, descriptor resources, CBUF contents, image visibility,
+  or render-target load/blend behavior of a later execution.
+
+Next: compare the later executions by stable shader hashes (not offsets),
+starting immediately after the known-exact `AF1930`. Capture fixed pipeline
+state plus TIC/TSC/CBUF identities and contents for each paired draw, then dump
+the first output whose inputs or bytes diverge. Do not infer whole-frame parity
+from the known-exact intermediate.
+
+### 2026-07-13 - ISET parity correction and transition-capture scope
+
+- **FIXED upstream divergence:** ISET decoded its `bf` mode from bit 52 instead
+  of upstream bit 44 and did not implement `neg_pred`, extended `X` comparison,
+  or `CC` flag updates. ISETP used the same incomplete local comparison path.
+  The translators now use upstream-owned `IntegerCompare`,
+  `ExtendedIntegerCompare`, and `PredicateCombine` equivalents from
+  `common_funcs.rs`.
+- Two live words from fragment shader base `0x231680`,
+  `0x5B5A038000870D05` and `0x5B5A038000870508`, now emit the upstream
+  `0xFFFFFFFF` integer true mask instead of `0x3F800000`. Focused tests pass.
+- **INSUFFICIENT for the blue trails:** a post-fix framebuffer capture is
+  unchanged. In this shader the selected value is subsequently reduced to a
+  nonzero predicate, so both old and corrected masks take the same branch.
+- The final presentation draw samples the `A2B10G10R10Unorm` image at GPU
+  address `0x524C10000` directly into the presented `0x501D00000` image. This
+  narrows the missing effect to the production of `0x524C10000` or to the
+  final shader's per-frame constants, not nvnflinger or a later image copy.
+- **INVALIDATED as a complete timeline oracle:** the 256 yuzu per-draw dumps
+  in `/tmp/yuzu-transition-seq` cover only four render frames of 68 draws each.
+  They begin at the first `AF1B30/AF2C30` draw and stop before later phases of
+  the animation. Their contact sheet therefore cannot prove that the visible
+  yuzu trail interval was captured.
+- Exhaustively dumping after every ruzu draw perturbs command execution and
+  produces large false image differences. Future comparisons must capture
+  selected paired draw indices or sample once per guest presentation.
+
+Next: capture yuzu and ruzu at the presentation boundary across the complete
+visible transition, identify the first presentation where yuzu contains the
+horizontal cyan trails, then capture only the corresponding 68-draw frame and
+binary-search its outputs. Do not continue selecting candidate shaders from a
+four-frame prefix.
+
+### 2026-07-13 - draw 136 localization, native NDC, and exact AF1B80 IR parity
+
+The missing blue trails are now localized within the captured four-frame
+transition prefix. Draw index 135 produces byte-identical yuzu/ruzu output.
+The following draw, index 136 (`VS 0xAF1B30 / FS 0xAF2C30`), modifies 250,230
+u32 pixels in yuzu but zero pixels in ruzu; ruzu's attachment remains exactly
+the draw-135 image. Shader bytes, both BC4 textures, CBUFs, samplers, indexed
+quad geometry, the first 360 fixed-state bytes, and dynamic viewport/scissor/
+blend/depth state were captured and match.
+
+- **INVALIDATED:** missing `VK_EXT_depth_clip_control` as the complete root
+  cause. This was a real upstream divergence: ruzu applied a shader-side depth
+  conversion while yuzu enables native NDC and chains
+  `PipelineViewportDepthClipControlCreateInfoEXT`. The extension, feature,
+  shader profile, and both pipeline construction paths are now ported. The
+  regenerated vertex SPIR-V no longer contains the extra final position-depth
+  store, but the blue trails remain absent.
+- **INVALIDATED:** forcing `0.5` into the suspected CBUF words at offsets
+  `0xEC/0xFC`. The diagnostic patch does not change the output. Keep it gated
+  by `RUZU_PATCH_AF1B_CBUF_ADDR` until the investigation is cleaned up; do not
+  treat it as a fix.
+- **FIXED upstream divergence:** `LDC.B64` emitted two scalar CBUF reads plus
+  an address add. It now emits one `GetCbufU32x2` and two component extracts,
+  matching upstream. Exact live IR counts are now yuzu/ruzu-identical for
+  `GetCbufU32x2=10`, `CompositeExtractU32x2=20`, and `IAdd32=12`.
+- **FIXED upstream divergence:** upstream constant propagation rewrites
+  `BitCastF32U32(GetCbufU32)` to a typed `GetCbufF32`; ruzu omitted that
+  branch. The literal fold and focused regression test are now ported.
+
+Next: rebuild and regenerate the post-optimization `AF1B80` IR. The expected
+typed-CBUF counts are yuzu's `GetCbufF32=144`, `BitCastF32U32=108`; then
+resolve the remaining six scalar `GetCbufU32` versus yuzu's three before
+returning to Vulkan execution. If the IR becomes structurally equivalent and
+draw 136 still writes zero pixels, compare the generated vertex SPIR-V data
+flow and rasterization/query state rather than revisiting already matched
+resources.
+
+### 2026-07-13 - FIXED: draw 136 lost the live vertex-buffer invalidation
+
+The zero-pixel draw was not caused by its shader, CBUF, texture, sampler,
+vertex/index bytes, topology, or fixed pipeline state. The common Vulkan
+buffer cache only emits `vkCmdBindVertexBuffers*` when the channel-owned
+`VertexBufferN` dirty flag is set. Ruzu adapted the live Maxwell engine through
+a copied `DrawCall::dirty_flags` array and propagated consumed bits back after
+the draw. When `FlushWork` submitted the command buffer during that draw,
+`Scheduler::InvalidateState` correctly raised the live vertex flags for the
+new command buffer; the post-draw snapshot propagation then cleared them again.
+The next draw therefore executed on a fresh command buffer without a vertex
+binding and rasterized zero fragments.
+
+Upstream ownership/order re-established:
+
+- `Scheduler::SubmitExecution` invalidates command-buffer state before
+  submission; ruzu's `flush_impl` now does the same.
+- the Vulkan draw adapter exposes the stable channel-owned dirty flags to the
+  common buffer cache, matching upstream's persistent `Maxwell3D*`;
+- geometry flags consumed through that live adapter are no longer replayed
+  from the stale draw snapshot. Snapshot propagation remains for render-target
+  and texture flags that still use the split Rust adaptation.
+
+Deterministic validation without any `RUZU_FORCE_*` option:
+
+- draw 135 SHA-256 remains
+  `881d361da7c0e443090b277a19975b41c9c6fd4c8f0abae862726c359f688417`;
+- draw 136 changes to
+  `bcb87591fad43afd52e7ae283cb5011a4b158db60f919c6ef191b4079c83289d`;
+- draw 136 now changes exactly 684,400 bytes instead of zero.
+
+Invalidated hypotheses retained:
+
+- **INVALIDATED:** the scheduler was not connected to the state tracker. The
+  pointer is installed during rasterizer construction.
+- **INVALIDATED:** a missing scheduler invalidation was the complete cause.
+  The missing call was a real parity defect, but the new invalidation was still
+  erased by stale snapshot propagation until ownership was corrected.
+- **INVALIDATED:** quad/triangle path switching immediately between draws 135
+  and 136. Both are indexed triangle draws using the same stream, index buffer,
+  stride, and attribute layout.
+- **INVALIDATED:** stale guest vertex data. Vulkan readback contains the
+  expected `(0,0), (1,0), (0,1), (1,1)` quad.
+
+Remaining visual work: confirm the corrected draw produces the same visible
+blue-trail composition as yuzu. If the complete presented transition still
+differs, continue after draw 136; do not reopen the now-proven zero-rasterization
+inputs above.
+
+### 2026-07-14 - FIXED producer-side A32 ASIMD corruption for the transition CBUF
+
+The transition draw's CBUF mismatch was traced upstream of Vulkan to its A32
+guest producer. At the first differing frame, yuzu and ruzu entered the same
+producer block with identical PC, LR, general registers, and source pointer,
+but yuzu's source vector at guest `0x748F7A40..0x748F7A4B` contained three
+`0x41700001` lanes while ruzu initially produced zeros/corrupt pointer bits.
+
+Disassembly of the live MK8D code identified three missing rdynarmic frontend
+families on this exact path:
+
+- `VZIP.32 Q9,Q8` / `VZIP.32 Q10,Q11` at runtime `0x8E5580/0x8E5584`;
+- `VRSQRTE.F32` at `0x6E0DBC`, `0x6E0DCC`, and `0x6E0DD0`;
+- `VCEQ.F32 #0` at `0x6E0DC4`, `0x6E0DD4`, and `0x6E0DD8`, whose masks feed the following `VBSL` instructions.
+
+`VZIP` was also being stolen by the broad `ASIMD_VMLA_scalar` decoder rule.
+After porting `VZIP`, the producer changed from zeros to corrupt floating-point
+data but still differed. Porting `VRSQRTE` restored two lanes. Porting the full
+upstream `CompareWithZero` group (`VCGT/VCGE/VCEQ/VCLE/VCLT`) restored the
+selection masks and the final lane. The adjacent upstream `VRECPE` frontend and
+ARM64 emitter were ported in the same local parity slice.
+
+Deterministic oracle result:
+
+- yuzu final writes: `0x4170000141700001`, `0x0000000041700001`;
+- ruzu final writes after the fixes: `0x4170000141700001`,
+  `0x0000000041700001`;
+- the preceding ruzu state at runtime `0x8E4000` now contains the same all-one
+  float lanes as yuzu instead of `0x03800000`/garbage lanes.
+
+Invalidated hypotheses retained:
+
+- **INVALIDATED for this CBUF mismatch:** descriptor upload timing or guest CBUF
+  ring overwrite as the root cause. The divergence already existed in the
+  producer's source structure before pipeline lookup or descriptor upload.
+- **INVALIDATED as sufficient:** `VZIP` alone. It removed the first gross
+  corruption but left the normalized-vector function incorrect.
+- **INVALIDATED as sufficient:** `VRSQRTE` alone. It restored two lanes, while
+  the missing `VCEQ #0` masks still selected an incorrect third lane in `VBSL`.
+
+Remaining visual work: rebuild without changing this JIT slice and run the
+15-second MK8D transition. The memory oracle is fixed, but the blue trails must
+still be confirmed visually before declaring the user-visible issue resolved.
+After visual confirmation, remove or isolate the temporary A32 memory-watch
+instrumentation; do not remove the production ASIMD ports or their regressions.
+
+Visual confirmation completed: `/tmp/ruzu-asimd-visual-8.png` captures the
+previously missing broad horizontal cyan trails across the MK8D transition.
+The 10-second capture shows the completed title image and the 12/14-second
+captures show `Press L+R to start`. The temporary source-range watcher,
+fastmem forced-fallback, extended FPR trace, device-write backtrace, and
+no-block-linking diagnostic switch were removed after this confirmation.
+The committed/env-gated generic trace infrastructure that predates this slice
+was left unchanged. This user-visible transition issue is **FIXED**.

@@ -8,7 +8,22 @@
 //! redundant Vulkan dynamic state commands.
 
 use crate::control::channel_state::ChannelState;
-use crate::engines::maxwell_3d::PrimitiveTopology;
+use crate::dirty_flags::{fill_block, setup_dirty_flags, DirtyTables};
+use crate::engines::maxwell_3d::{
+    PrimitiveTopology, BLEND_BASE, BLEND_COLOR_BASE, BLEND_PER_TARGET_BASE,
+    BLEND_PER_TARGET_ENABLED, BLEND_PER_TARGET_STRIDE, COLOR_MASK_BASE, COLOR_MASK_COMMON,
+    CULL_FACE, CULL_TEST_ENABLE, DEPTH_BIAS, DEPTH_BIAS_CLAMP, DEPTH_BOUNDS_BASE,
+    DEPTH_BOUNDS_ENABLE, DEPTH_TEST_ENABLE, DEPTH_TEST_FUNC, DEPTH_WRITE_ENABLE, FRONT_FACE,
+    LINE_WIDTH_ALIASED, LINE_WIDTH_SMOOTH, LOGIC_OP, POLYGON_OFFSET_FILL_ENABLE,
+    POLYGON_OFFSET_LINE_ENABLE, POLYGON_OFFSET_POINT_ENABLE, PRIMITIVE_RESTART_BASE,
+    RASTERIZE_ENABLE, SCISSOR_BASE, SCISSOR_STRIDE, SLOPE_SCALE_DEPTH_BIAS, STENCIL_BACK_FUNC_MASK,
+    STENCIL_BACK_MASK, STENCIL_BACK_OP_BASE, STENCIL_BACK_REF, STENCIL_ENABLE,
+    STENCIL_FRONT_FUNC_MASK, STENCIL_FRONT_MASK, STENCIL_FRONT_OP_BASE, STENCIL_FRONT_REF,
+    STENCIL_TWO_SIDE_ENABLE, VERTEX_ATTRIB_BASE, VERTEX_STREAM_BASE, VERTEX_STREAM_INSTANCE_BASE,
+    VERTEX_STREAM_STRIDE, VIEWPORT_BASE, VIEWPORT_CLIP_CONTROL, VIEWPORT_SCALE_OFFSET_ENABLED,
+    VIEWPORT_STRIDE, VP_TRANSFORM_BASE, VP_TRANSFORM_STRIDE, WINDOW_ORIGIN,
+};
+use std::ptr::NonNull;
 
 // ---------------------------------------------------------------------------
 // Dirty flag indices — port of Vulkan::Dirty enum
@@ -22,17 +37,17 @@ use crate::engines::maxwell_3d::PrimitiveTopology;
 /// to preserve behavioral parity with flag table setup.
 pub mod dirty {
     // Common entries (from VideoCommon::Dirty)
-    pub const RENDER_TARGETS: u8 = 0;
-    pub const COLOR_BUFFER_0: u8 = 1;
-    pub const COLOR_BUFFER_7: u8 = 8;
-    pub const ZETA_BUFFER: u8 = 9;
-    pub const VERTEX_BUFFERS: u8 = 10;
-    pub const VERTEX_BUFFER_0: u8 = 11;
-    pub const VERTEX_BUFFER_31: u8 = 42;
-    pub const RESCALE_VIEWPORTS: u8 = 43;
-    pub const RESCALE_SCISSORS: u8 = 44;
-    pub const DEPTH_BIAS_GLOBAL: u8 = 45;
-    pub const LAST_COMMON_ENTRY: u8 = 46;
+    pub const RENDER_TARGETS: u8 = crate::dirty_flags::flags::RENDER_TARGETS;
+    pub const COLOR_BUFFER_0: u8 = crate::dirty_flags::flags::COLOR_BUFFER0;
+    pub const COLOR_BUFFER_7: u8 = crate::dirty_flags::flags::COLOR_BUFFER7;
+    pub const ZETA_BUFFER: u8 = crate::dirty_flags::flags::ZETA_BUFFER;
+    pub const VERTEX_BUFFERS: u8 = crate::dirty_flags::flags::VERTEX_BUFFERS;
+    pub const VERTEX_BUFFER_0: u8 = crate::dirty_flags::flags::VERTEX_BUFFER0;
+    pub const VERTEX_BUFFER_31: u8 = crate::dirty_flags::flags::VERTEX_BUFFER31;
+    pub const RESCALE_VIEWPORTS: u8 = crate::dirty_flags::flags::RESCALE_VIEWPORTS;
+    pub const RESCALE_SCISSORS: u8 = crate::dirty_flags::flags::RESCALE_SCISSORS;
+    pub const DEPTH_BIAS_GLOBAL: u8 = crate::dirty_flags::flags::DEPTH_BIAS_GLOBAL;
+    pub const LAST_COMMON_ENTRY: u8 = crate::dirty_flags::flags::LAST_COMMON_ENTRY;
 
     // Vulkan-specific entries
     pub const VERTEX_INPUT: u8 = LAST_COMMON_ENTRY;
@@ -80,6 +95,199 @@ pub mod dirty {
 /// Total number of dirty flags.
 const NUM_FLAGS: usize = dirty::LAST as usize;
 
+fn set(tables: &mut DirtyTables, table: usize, offset: u32, flag: u8) {
+    tables[table][offset as usize] = flag;
+}
+
+fn setup_dirty_viewports(tables: &mut DirtyTables) {
+    fill_block(
+        &mut tables[0],
+        VP_TRANSFORM_BASE as usize,
+        16 * VP_TRANSFORM_STRIDE as usize,
+        dirty::VIEWPORTS,
+    );
+    fill_block(
+        &mut tables[0],
+        VIEWPORT_BASE as usize,
+        16 * VIEWPORT_STRIDE as usize,
+        dirty::VIEWPORTS,
+    );
+    set(tables, 0, VIEWPORT_SCALE_OFFSET_ENABLED, dirty::VIEWPORTS);
+    set(tables, 1, WINDOW_ORIGIN, dirty::VIEWPORTS);
+}
+
+fn setup_dirty_scissors(tables: &mut DirtyTables) {
+    fill_block(
+        &mut tables[0],
+        SCISSOR_BASE as usize,
+        16 * SCISSOR_STRIDE as usize,
+        dirty::SCISSORS,
+    );
+}
+
+fn setup_dirty_depth_bias(tables: &mut DirtyTables) {
+    for offset in [DEPTH_BIAS, DEPTH_BIAS_CLAMP, SLOPE_SCALE_DEPTH_BIAS] {
+        set(tables, 0, offset, dirty::DEPTH_BIAS);
+    }
+}
+
+fn setup_dirty_blend_constants(tables: &mut DirtyTables) {
+    fill_block(
+        &mut tables[0],
+        BLEND_COLOR_BASE as usize,
+        4,
+        dirty::BLEND_CONSTANTS,
+    );
+}
+
+fn setup_dirty_depth_bounds(tables: &mut DirtyTables) {
+    fill_block(
+        &mut tables[0],
+        DEPTH_BOUNDS_BASE as usize,
+        2,
+        dirty::DEPTH_BOUNDS,
+    );
+}
+
+fn setup_dirty_stencil_properties(tables: &mut DirtyTables) {
+    set(
+        tables,
+        0,
+        STENCIL_TWO_SIDE_ENABLE,
+        dirty::STENCIL_PROPERTIES,
+    );
+    for (offset, flag) in [
+        (STENCIL_FRONT_REF, dirty::STENCIL_REFERENCE),
+        (STENCIL_FRONT_MASK, dirty::STENCIL_WRITE_MASK),
+        (STENCIL_FRONT_FUNC_MASK, dirty::STENCIL_COMPARE),
+        (STENCIL_BACK_REF, dirty::STENCIL_REFERENCE),
+        (STENCIL_BACK_MASK, dirty::STENCIL_WRITE_MASK),
+        (STENCIL_BACK_FUNC_MASK, dirty::STENCIL_COMPARE),
+    ] {
+        set(tables, 0, offset, flag);
+        set(tables, 1, offset, dirty::STENCIL_PROPERTIES);
+    }
+}
+
+fn setup_dirty_line_width(tables: &mut DirtyTables) {
+    set(tables, 0, LINE_WIDTH_SMOOTH, dirty::LINE_WIDTH);
+    set(tables, 0, LINE_WIDTH_ALIASED, dirty::LINE_WIDTH);
+}
+
+fn setup_dirty_cull_mode(tables: &mut DirtyTables) {
+    set(tables, 0, CULL_FACE, dirty::CULL_MODE);
+    set(tables, 0, CULL_TEST_ENABLE, dirty::CULL_MODE);
+}
+
+fn setup_dirty_state_enable(tables: &mut DirtyTables) {
+    for (offset, flag) in [
+        (DEPTH_BOUNDS_ENABLE, dirty::DEPTH_BOUNDS_ENABLE),
+        (DEPTH_TEST_ENABLE, dirty::DEPTH_TEST_ENABLE),
+        (DEPTH_WRITE_ENABLE, dirty::DEPTH_WRITE_ENABLE),
+        (STENCIL_ENABLE, dirty::STENCIL_TEST_ENABLE),
+        (PRIMITIVE_RESTART_BASE, dirty::PRIMITIVE_RESTART_ENABLE),
+        (RASTERIZE_ENABLE, dirty::RASTERIZER_DISCARD_ENABLE),
+        (POLYGON_OFFSET_POINT_ENABLE, dirty::DEPTH_BIAS_ENABLE),
+        (POLYGON_OFFSET_LINE_ENABLE, dirty::DEPTH_BIAS_ENABLE),
+        (POLYGON_OFFSET_FILL_ENABLE, dirty::DEPTH_BIAS_ENABLE),
+        (LOGIC_OP, dirty::LOGIC_OP_ENABLE),
+        (VIEWPORT_CLIP_CONTROL, dirty::DEPTH_CLAMP_ENABLE),
+    ] {
+        set(tables, 0, offset, flag);
+        set(tables, 1, offset, dirty::STATE_ENABLE);
+    }
+}
+
+fn setup_dirty_stencil_op(tables: &mut DirtyTables) {
+    for base in [STENCIL_FRONT_OP_BASE, STENCIL_BACK_OP_BASE] {
+        fill_block(&mut tables[0], base as usize, 4, dirty::STENCIL_OP);
+    }
+    set(tables, 1, STENCIL_TWO_SIDE_ENABLE, dirty::STENCIL_OP);
+}
+
+fn setup_dirty_blending(tables: &mut DirtyTables) {
+    set(tables, 0, COLOR_MASK_COMMON, dirty::BLENDING);
+    set(tables, 1, COLOR_MASK_COMMON, dirty::COLOR_MASK);
+    set(tables, 0, BLEND_PER_TARGET_ENABLED, dirty::BLENDING);
+    set(tables, 1, BLEND_PER_TARGET_ENABLED, dirty::BLEND_EQUATIONS);
+    fill_block(&mut tables[0], COLOR_MASK_BASE as usize, 8, dirty::BLENDING);
+    fill_block(
+        &mut tables[1],
+        COLOR_MASK_BASE as usize,
+        8,
+        dirty::COLOR_MASK,
+    );
+    fill_block(&mut tables[0], BLEND_BASE as usize, 17, dirty::BLENDING);
+    fill_block(
+        &mut tables[1],
+        BLEND_BASE as usize,
+        17,
+        dirty::BLEND_EQUATIONS,
+    );
+    fill_block(
+        &mut tables[1],
+        BLEND_BASE as usize + 9,
+        8,
+        dirty::BLEND_ENABLE,
+    );
+    fill_block(
+        &mut tables[0],
+        BLEND_PER_TARGET_BASE as usize,
+        8 * BLEND_PER_TARGET_STRIDE as usize,
+        dirty::BLENDING,
+    );
+    fill_block(
+        &mut tables[1],
+        BLEND_PER_TARGET_BASE as usize,
+        8 * BLEND_PER_TARGET_STRIDE as usize,
+        dirty::BLEND_EQUATIONS,
+    );
+}
+
+fn setup_dirty_viewport_swizzles(tables: &mut DirtyTables) {
+    for index in 0..16u32 {
+        set(
+            tables,
+            1,
+            VP_TRANSFORM_BASE + index * VP_TRANSFORM_STRIDE + 6,
+            dirty::VIEWPORT_SWIZZLES,
+        );
+    }
+}
+
+fn setup_dirty_vertex_attributes(tables: &mut DirtyTables) {
+    for index in 0..32u32 {
+        set(
+            tables,
+            0,
+            VERTEX_ATTRIB_BASE + index,
+            dirty::VERTEX_ATTRIBUTE_0 + index as u8,
+        );
+    }
+    fill_block(
+        &mut tables[1],
+        VERTEX_ATTRIB_BASE as usize,
+        32,
+        dirty::VERTEX_INPUT,
+    );
+}
+
+fn setup_dirty_vertex_bindings(tables: &mut DirtyTables) {
+    for index in 0..32u32 {
+        let flag = dirty::VERTEX_BINDING_0 + index as u8;
+        set(
+            tables,
+            0,
+            VERTEX_STREAM_INSTANCE_BASE + index,
+            dirty::VERTEX_INPUT,
+        );
+        set(tables, 1, VERTEX_STREAM_INSTANCE_BASE + index, flag);
+        let divisor = VERTEX_STREAM_BASE + index * VERTEX_STREAM_STRIDE + 3;
+        set(tables, 0, divisor, dirty::VERTEX_INPUT);
+        set(tables, 1, divisor, flag);
+    }
+}
+
 /// Backing store for dirty flags — a simple boolean array.
 /// Port of `Tegra::Engines::Maxwell3D::DirtyState::Flags`.
 pub type DirtyFlags = [bool; 256];
@@ -109,6 +317,7 @@ struct StencilProperties {
 /// corresponding Vulkan dynamic state command needs to be recorded.
 pub struct StateTracker {
     flags: DirtyFlags,
+    channel_flags: Option<NonNull<DirtyFlags>>,
     invalidation_flags: DirtyFlags,
     current_topology: Option<PrimitiveTopology>,
     bound_channel_id: Option<i32>,
@@ -132,6 +341,7 @@ impl StateTracker {
 
         Self {
             flags,
+            channel_flags: None,
             invalidation_flags,
             current_topology: None,
             bound_channel_id: None,
@@ -143,10 +353,19 @@ impl StateTracker {
     }
 
     /// Port of `StateTracker::InvalidateCommandBufferState`.
+    fn active_flags_mut(&mut self) -> &mut DirtyFlags {
+        match self.channel_flags {
+            Some(mut flags) => unsafe { flags.as_mut() },
+            None => &mut self.flags,
+        }
+    }
+
     pub fn invalidate_command_buffer_state(&mut self) {
+        let invalidation_flags = self.invalidation_flags;
+        let flags = self.active_flags_mut();
         for i in 0..256 {
-            if self.invalidation_flags[i] {
-                self.flags[i] = true;
+            if invalidation_flags[i] {
+                flags[i] = true;
             }
         }
         self.current_topology = None;
@@ -155,7 +374,7 @@ impl StateTracker {
 
     /// Port of `StateTracker::InvalidateState`.
     pub fn invalidate_state(&mut self) {
-        for flag in self.flags.iter_mut() {
+        for flag in self.active_flags_mut().iter_mut() {
             *flag = true;
         }
         self.current_topology = None;
@@ -164,22 +383,58 @@ impl StateTracker {
 
     /// Port of `StateTracker::SetupTables`.
     ///
-    /// Upstream installs dirty-flag lookup tables into
-    /// `channel_state.maxwell_3d->dirty.tables`. The Rust Maxwell3D owner now
-    /// has dirty table storage, but this Vulkan owner has not yet ported the
-    /// Vulkan-specific table population helpers.
-    pub fn setup_tables(&mut self, channel_state: &ChannelState) {
+    /// Installs the common and Vulkan-specific lookup tables into the bound
+    /// channel's `maxwell_3d->dirty.tables`, in upstream order.
+    pub fn setup_tables(&mut self, channel_state: &mut ChannelState) {
         self.bound_channel_id = Some(channel_state.bind_id);
+        let Some(maxwell_3d) = channel_state.maxwell_3d.as_mut() else {
+            return;
+        };
+        let tables = maxwell_3d.dirty_tables_mut();
+        for table in tables.iter_mut() {
+            table.fill(crate::dirty_flags::flags::NULL_ENTRY);
+        }
+        setup_dirty_flags(tables);
+        setup_dirty_viewports(tables);
+        setup_dirty_scissors(tables);
+        setup_dirty_depth_bias(tables);
+        setup_dirty_blend_constants(tables);
+        setup_dirty_depth_bounds(tables);
+        setup_dirty_stencil_properties(tables);
+        setup_dirty_line_width(tables);
+        setup_dirty_cull_mode(tables);
+        setup_dirty_state_enable(tables);
+        set(tables, 0, DEPTH_TEST_FUNC, dirty::DEPTH_COMPARE_OP);
+        set(tables, 0, FRONT_FACE, dirty::FRONT_FACE);
+        set(tables, 0, WINDOW_ORIGIN, dirty::FRONT_FACE);
+        setup_dirty_stencil_op(tables);
+        setup_dirty_blending(tables);
+        setup_dirty_viewport_swizzles(tables);
+        setup_dirty_vertex_attributes(tables);
+        setup_dirty_vertex_bindings(tables);
+        set(tables, 0, LOGIC_OP + 1, dirty::LOGIC_OP);
     }
 
     /// Port of `StateTracker::ChangeChannel`.
     ///
     /// Upstream switches `flags` to point at the bound channel's live
-    /// `maxwell_3d->dirty.flags`. The current Rust port still keeps
-    /// backend-local dirty flags in this owner, so the channel switch is
-    /// reduced to tracking the active channel boundary.
-    pub fn change_channel(&mut self, channel_state: &ChannelState) {
+    /// `maxwell_3d->dirty.flags`. The local array remains only as the upstream
+    /// `default_flags` fallback used while no channel is bound.
+    pub fn change_channel(&mut self, channel_state: &mut ChannelState) {
         self.bound_channel_id = Some(channel_state.bind_id);
+        self.channel_flags = channel_state
+            .maxwell_3d
+            .as_mut()
+            .map(|maxwell| NonNull::from(maxwell.dirty_flags_mut()));
+    }
+
+    /// Clear the borrowed channel flag pointer before its owner can be released.
+    pub fn release_channel(&mut self, channel_id: i32) {
+        if self.bound_channel_id == Some(channel_id) {
+            self.channel_flags = None;
+            self.bound_channel_id = None;
+            self.flags.fill(true);
+        }
     }
 
     #[cfg(test)]
@@ -189,19 +444,20 @@ impl StateTracker {
 
     /// Port of `StateTracker::InvalidateViewports`.
     pub fn invalidate_viewports(&mut self) {
-        self.flags[dirty::VIEWPORTS as usize] = true;
+        self.active_flags_mut()[dirty::VIEWPORTS as usize] = true;
     }
 
     /// Port of `StateTracker::InvalidateScissors`.
     pub fn invalidate_scissors(&mut self) {
-        self.flags[dirty::SCISSORS as usize] = true;
+        self.active_flags_mut()[dirty::SCISSORS as usize] = true;
     }
 
     // -- Exchange helper (read-and-clear) --
 
     fn exchange(&mut self, id: u8) -> bool {
-        let is_dirty = self.flags[id as usize];
-        self.flags[id as usize] = false;
+        let flags = self.active_flags_mut();
+        let is_dirty = flags[id as usize];
+        flags[id as usize] = false;
         is_dirty
     }
 
@@ -521,12 +777,68 @@ mod tests {
     #[test]
     fn setup_and_change_channel_track_bound_channel_owner() {
         let mut tracker = StateTracker::new();
-        let channel = ChannelState::new(9);
+        let mut channel = ChannelState::new(9);
+        channel.maxwell_3d = Some(Box::new(crate::engines::maxwell_3d::Maxwell3D::new()));
+        channel
+            .maxwell_3d
+            .as_mut()
+            .unwrap()
+            .dirty_flags_mut()
+            .fill(false);
 
-        tracker.setup_tables(&channel);
+        tracker.setup_tables(&mut channel);
         assert_eq!(tracker.bound_channel_id_for_test(), Some(9));
 
-        tracker.change_channel(&channel);
+        let tables = channel.maxwell_3d.as_ref().unwrap().dirty_tables();
+        assert_eq!(tables[0][VP_TRANSFORM_BASE as usize], dirty::VIEWPORTS);
+        assert_eq!(tables[1][WINDOW_ORIGIN as usize], dirty::VIEWPORTS);
+        assert_eq!(tables[0][SCISSOR_BASE as usize], dirty::SCISSORS);
+        assert_eq!(tables[0][DEPTH_BIAS as usize], dirty::DEPTH_BIAS);
+        assert_eq!(tables[0][BLEND_COLOR_BASE as usize], dirty::BLEND_CONSTANTS);
+        assert_eq!(tables[0][DEPTH_BOUNDS_BASE as usize], dirty::DEPTH_BOUNDS);
+        assert_eq!(
+            tables[1][STENCIL_FRONT_REF as usize],
+            dirty::STENCIL_PROPERTIES
+        );
+        assert_eq!(tables[0][LINE_WIDTH_SMOOTH as usize], dirty::LINE_WIDTH);
+        assert_eq!(tables[0][CULL_FACE as usize], dirty::CULL_MODE);
+        assert_eq!(tables[1][DEPTH_TEST_ENABLE as usize], dirty::STATE_ENABLE);
+        assert_eq!(tables[0][DEPTH_TEST_FUNC as usize], dirty::DEPTH_COMPARE_OP);
+        assert_eq!(tables[0][WINDOW_ORIGIN as usize], dirty::FRONT_FACE);
+        assert_eq!(tables[0][STENCIL_FRONT_OP_BASE as usize], dirty::STENCIL_OP);
+        assert_eq!(tables[1][COLOR_MASK_BASE as usize], dirty::COLOR_MASK);
+        assert_eq!(tables[1][BLEND_BASE as usize + 9], dirty::BLEND_ENABLE);
+        assert_eq!(
+            tables[1][VP_TRANSFORM_BASE as usize + 6],
+            dirty::VIEWPORT_SWIZZLES
+        );
+        assert_eq!(
+            tables[0][VERTEX_ATTRIB_BASE as usize],
+            dirty::VERTEX_ATTRIBUTE_0
+        );
+        assert_eq!(
+            tables[1][VERTEX_STREAM_BASE as usize + 3],
+            dirty::VERTEX_BINDING_0
+        );
+        assert_eq!(tables[0][LOGIC_OP as usize + 1], dirty::LOGIC_OP);
+
+        tracker.change_channel(&mut channel);
+        tracker.invalidate_state();
         assert_eq!(tracker.bound_channel_id_for_test(), Some(9));
+        let flags = channel.maxwell_3d.as_mut().unwrap().dirty_flags_mut();
+        assert!(flags[crate::dirty_flags::flags::VERTEX_BUFFERS as usize]);
+        assert!(flags[crate::dirty_flags::flags::VERTEX_BUFFER0 as usize]);
+        flags[dirty::VIEWPORTS as usize] = false;
+        flags[dirty::SCISSORS as usize] = false;
+        tracker.invalidate_viewports();
+        tracker.invalidate_scissors();
+        let flags = channel.maxwell_3d.as_mut().unwrap().dirty_flags_mut();
+        assert!(flags[dirty::VIEWPORTS as usize]);
+        assert!(flags[dirty::SCISSORS as usize]);
+
+        tracker.release_channel(9);
+        assert_eq!(tracker.bound_channel_id_for_test(), None);
+        channel.maxwell_3d = None;
+        assert!(tracker.touch_viewports());
     }
 }

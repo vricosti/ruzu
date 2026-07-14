@@ -56,10 +56,12 @@ pub mod update_descriptor;
 pub mod vk_rasterizer;
 
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use ash::vk;
 use ash::vk::Handle;
+use common::cityhash::city_hash64;
 use log::{debug, info, trace, warn};
 use thiserror::Error;
 
@@ -307,6 +309,7 @@ fn scissor_state(draw: &DrawCall, index: usize) -> vk::Rect2D {
 use blit_image::BlitImageHelper;
 use buffer_cache::{BufferCache as DirectBufferCache, BufferCacheRuntime, VulkanCommonBufferCache};
 use descriptor_pool::{DescriptorBankInfo, DescriptorPool};
+use fixed_pipeline_state::FixedPipelineState;
 use graphics_pipeline::GraphicsDescriptorBinding;
 use pipeline_cache::PipelineCache as VulkanPipelineCache;
 use query_cache::QueryCache as VulkanQueryCache;
@@ -379,12 +382,29 @@ struct DeviceMemoryAccessAdapter {
 
 /// Draw-local Maxwell state exposed to the common buffer cache.
 ///
-/// Upstream keeps a permanent `Maxwell3D*` in `BufferCache`; the split Rust
-/// renderer installs an immutable snapshot for each draw, matching the
-/// existing OpenGL backend adaptation without moving state ownership into the
-/// Vulkan runtime.
+/// Register values remain snapshotted for the split Rust renderer, but dirty
+/// flags point at the stable channel-owned `Maxwell3D` storage. Upstream keeps
+/// a permanent `Maxwell3D*` in `BufferCache`; using a copied flag array loses
+/// invalidations raised by `DeleteBuffer` between draws.
 struct VulkanDrawStateEngineAdapter {
     draw: DrawCall,
+    dirty_flags: Option<std::ptr::NonNull<[bool; 256]>>,
+}
+
+impl VulkanDrawStateEngineAdapter {
+    fn dirty_flags(&self) -> &[bool; 256] {
+        match self.dirty_flags {
+            Some(flags) => unsafe { flags.as_ref() },
+            None => &self.draw.dirty_flags,
+        }
+    }
+
+    fn dirty_flags_mut(&mut self) -> &mut [bool; 256] {
+        match self.dirty_flags.as_mut() {
+            Some(flags) => unsafe { flags.as_mut() },
+            None => &mut self.draw.dirty_flags,
+        }
+    }
 }
 
 fn geometry_dirty_flag_index(flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) -> u8 {
@@ -399,6 +419,14 @@ fn geometry_dirty_flag_index(flag: crate::buffer_cache::buffer_cache_base::Dirty
             crate::dirty_flags::flags::VERTEX_BUFFER0.saturating_add(index as u8)
         }
     }
+}
+
+fn is_geometry_dirty_flag(index: usize) -> bool {
+    index == crate::dirty_flags::flags::INDEX_BUFFER as usize
+        || index == crate::dirty_flags::flags::VERTEX_BUFFERS as usize
+        || (crate::dirty_flags::flags::VERTEX_BUFFER0 as usize
+            ..=crate::dirty_flags::flags::VERTEX_BUFFER31 as usize)
+            .contains(&index)
 }
 
 impl crate::buffer_cache::buffer_cache_base::EngineState for VulkanDrawStateEngineAdapter {
@@ -434,12 +462,17 @@ impl crate::buffer_cache::buffer_cache_base::EngineState for VulkanDrawStateEngi
 
     fn is_dirty(&self, flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) -> bool {
         let index = geometry_dirty_flag_index(flag);
-        self.draw.dirty_flags[index as usize]
+        self.dirty_flags()[index as usize]
     }
 
     fn clear_dirty(&mut self, flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) {
         let index = geometry_dirty_flag_index(flag);
-        self.draw.dirty_flags[index as usize] = false;
+        self.dirty_flags_mut()[index as usize] = false;
+    }
+
+    fn set_dirty(&mut self, flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) {
+        let index = geometry_dirty_flag_index(flag);
+        self.dirty_flags_mut()[index as usize] = true;
     }
 
     fn get_vertex_stream(
@@ -586,6 +619,9 @@ pub struct RasterizerVulkan {
 
     // Draw counter for periodic flush (zuyu: 7 draws → dispatch, 4096 → flush)
     draw_counter: u32,
+    transition_sequence_active: bool,
+    transition_sequence_index: u32,
+    transition_final_index: u32,
     /// Monotonic draw sequence used only by env-gated diagnostics.
     draw_sequence: u64,
     /// Draws dropped because pipeline compilation failed (diagnostic).
@@ -624,7 +660,11 @@ impl RasterizerVulkan {
         width: u32,
         height: u32,
         supported_spirv_version: u32,
+        descriptor_aliasing_supported: bool,
+        shader_float_controls_supported: bool,
+        float_controls_properties: vk::PhysicalDeviceFloatControlsProperties,
         shader_demote_to_helper_invocation_supported: bool,
+        depth_clip_control_supported: bool,
         extended_dynamic_state_supported: bool,
         extended_dynamic_state2_supported: bool,
         topology_list_primitive_restart_supported: bool,
@@ -636,6 +676,7 @@ impl RasterizerVulkan {
         max_viewports: u32,
         max_vertex_input_bindings: u32,
         vertex_attribute_divisor_supported: bool,
+        provoking_vertex_supported: bool,
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<MaxwellDeviceMemoryManager>,
         memory_allocator: &mut MemoryAllocator,
@@ -708,10 +749,31 @@ impl RasterizerVulkan {
         let mut render_pass_cache = Box::new(RenderPassCache::new(device.clone()));
 
         // Create shader recompiler pipeline cache
+        let float_control = float_controls_properties;
         let profile = Profile {
             supported_spirv: supported_spirv_version,
             unified_descriptor_binding: true,
+            support_descriptor_aliasing: descriptor_aliasing_supported,
+            support_float_controls: shader_float_controls_supported,
+            support_separate_denorm_behavior: float_control.denorm_behavior_independence
+                == vk::ShaderFloatControlsIndependence::ALL,
+            support_separate_rounding_mode: float_control.rounding_mode_independence
+                == vk::ShaderFloatControlsIndependence::ALL,
+            support_fp16_denorm_preserve: float_control.shader_denorm_preserve_float16 != 0,
+            support_fp32_denorm_preserve: float_control.shader_denorm_preserve_float32 != 0,
+            support_fp16_denorm_flush: float_control.shader_denorm_flush_to_zero_float16 != 0,
+            support_fp32_denorm_flush: float_control.shader_denorm_flush_to_zero_float32 != 0,
+            support_fp16_signed_zero_nan_preserve: float_control
+                .shader_signed_zero_inf_nan_preserve_float16
+                != 0,
+            support_fp32_signed_zero_nan_preserve: float_control
+                .shader_signed_zero_inf_nan_preserve_float32
+                != 0,
+            support_fp64_signed_zero_nan_preserve: float_control
+                .shader_signed_zero_inf_nan_preserve_float64
+                != 0,
             support_demote_to_helper_invocation: shader_demote_to_helper_invocation_supported,
+            support_native_ndc: depth_clip_control_supported,
             ..Profile::default()
         };
         let shader_cache = ShaderPipelineCache::new(profile.clone());
@@ -749,6 +811,7 @@ impl RasterizerVulkan {
             max_viewports,
             max_vertex_input_bindings,
             vertex_attribute_divisor_supported,
+            provoking_vertex_supported,
         );
 
         // Create buffer cache
@@ -873,6 +936,9 @@ impl RasterizerVulkan {
             readback_mapped,
             readback_size,
             draw_counter: 0,
+            transition_sequence_active: false,
+            transition_sequence_index: 0,
+            transition_final_index: 0,
             draw_sequence: 0,
             draw_skipped_pipeline: 0,
             draw_offscreen_fallback: 0,
@@ -905,6 +971,7 @@ impl RasterizerVulkan {
         &mut self,
         draw: &DrawCall,
         dirty_flags: &mut [bool; 256],
+        engine_dirty_flags: Option<std::ptr::NonNull<[bool; 256]>>,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
     ) {
@@ -940,12 +1007,90 @@ impl RasterizerVulkan {
             .map(|target| target.render_pass)
             .unwrap_or(self.default_render_pass);
 
+        if std::env::var_os("RUZU_DUMP_TRANSITION_BEFORE").is_some()
+            && self.transition_sequence_active
+            && draw.render_targets[0].address == 0x524C_10000
+            && std::env::var("RUZU_DUMP_TRANSITION_INDEX")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                == Some(self.transition_sequence_index)
+        {
+            let directory = std::path::Path::new("/tmp/ruzu-transition-seq");
+            let _ = std::fs::create_dir_all(directory);
+            let path = directory.join(format!(
+                "{:02}_before_vs{:06X}_fs{:06X}.bin",
+                self.transition_sequence_index,
+                draw.shader_stages[1].offset,
+                draw.shader_stages[5].offset,
+            ));
+            if self
+                .texture_cache
+                .debug_dump_image_at_gpu_native(0x524C_10000, &path)
+            {
+                log::info!(
+                    "[TRANSITION_BEFORE] index={} path={}",
+                    self.transition_sequence_index,
+                    path.display(),
+                );
+            }
+        }
+
+        // Diagnostic for the three known MK8D blue-streak producers. This is
+        // intentionally before pipeline lookup so failed/first-use attempts
+        // are visible rather than only draws that reached descriptor binding.
+        let blue_trace_attempt = if std::env::var_os("RUZU_TRACE_BLUE_STREAK_ATTEMPTS").is_some()
+            && draw.render_targets[0].address == 0x524C_10000
+            && matches!(
+                (draw.shader_stages[1].offset, draw.shader_stages[5].offset),
+                (0x67CD30, 0x6B3E30)
+                    | (0x6A2730, 0x6A3E30)
+                    | (0x6A4030, 0x6B3E30)
+                    | (0xAF1B30, 0xAF2C30)
+            ) {
+            static ATTEMPT: AtomicU32 = AtomicU32::new(0);
+            let attempt = ATTEMPT.fetch_add(1, Ordering::Relaxed);
+            let cbuf = draw.cb_bindings[0][10];
+            let mut bytes = [0u8; 0x70];
+            if cbuf.enabled && cbuf.address != 0 {
+                read_gpu(cbuf.address, &mut bytes);
+            }
+            let words = bytes
+                .chunks_exact(4)
+                .map(|word| f32::from_le_bytes(word.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            log::info!(
+                "[BLUE_ATTEMPT_PRE] attempt={} draw={} active={} sequence={} vs=0x{:X} fs=0x{:X} cbuf=0x{:X} values={:?}",
+                attempt,
+                self.draw_counter,
+                self.transition_sequence_active,
+                self.transition_sequence_index,
+                draw.shader_stages[1].offset,
+                draw.shader_stages[5].offset,
+                cbuf.address,
+                words,
+            );
+            Some((attempt, std::time::Instant::now()))
+        } else {
+            None
+        };
+
         // 3. Compile or lookup cached pipeline
         let pipeline_result = self
             .pipeline_cache
             .current_graphics_pipeline_with_shared_cache(draw, render_pass, &mut self.shader_cache);
+        if let Some((attempt, started)) = blue_trace_attempt {
+            log::info!(
+                "[BLUE_ATTEMPT_POST] attempt={} lookup_us={} result={} built={}",
+                attempt,
+                started.elapsed().as_micros(),
+                pipeline_result.is_some(),
+                pipeline_result
+                    .as_ref()
+                    .is_some_and(|(pipeline, _)| pipeline.is_built()),
+            );
+        }
         let (
-            pipeline,
+            pipeline_waiter,
             pipeline_layout,
             descriptor_set_layout,
             descriptor_bindings,
@@ -955,38 +1100,21 @@ impl RasterizerVulkan {
             uniform_buffer_sizes,
             uses_render_area,
             uses_rescaling_uniform,
+            fixed_state,
         ) = match pipeline_result {
-            Some((gp, _fixed_state)) => {
-                let Some(pipeline) = gp.pipeline_handle() else {
-                    self.draw_skipped_pipeline = self.draw_skipped_pipeline.wrapping_add(1);
-                    if self.draw_skipped_pipeline <= 16
-                        || self.draw_skipped_pipeline.is_power_of_two()
-                    {
-                        log::warn!(
-                            "[DRAW_SKIP] #{} pipeline build failed asynchronously (draw={} rt0=0x{:X} fmt={} topology={:?} indexed={})",
-                            self.draw_skipped_pipeline,
-                            self.draw_counter,
-                            draw.render_targets[0].address,
-                            draw.render_targets[0].format,
-                            draw.topology,
-                            draw.indexed,
-                        );
-                    }
-                    return;
-                };
-                (
-                    pipeline,
-                    gp.pipeline_layout,
-                    gp.descriptor_set_layout,
-                    gp.descriptor_bindings.clone(),
-                    gp.descriptor_bank_info,
-                    gp.stage_infos.clone(),
-                    gp.enabled_uniform_buffer_masks,
-                    gp.uniform_buffer_sizes,
-                    gp.uses_render_area,
-                    gp.uses_rescaling_uniform,
-                )
-            }
+            Some((gp, fixed_state)) => (
+                gp.build_waiter(),
+                gp.pipeline_layout,
+                gp.descriptor_set_layout,
+                gp.descriptor_bindings.clone(),
+                gp.descriptor_bank_info,
+                gp.stage_infos.clone(),
+                gp.enabled_uniform_buffer_masks,
+                gp.uniform_buffer_sizes,
+                gp.uses_render_area,
+                gp.uses_rescaling_uniform,
+                fixed_state,
+            ),
             None => {
                 self.draw_skipped_pipeline = self.draw_skipped_pipeline.wrapping_add(1);
                 // A skipped draw leaves the previous frame's pixels in place;
@@ -1007,6 +1135,48 @@ impl RasterizerVulkan {
                 return;
             }
         };
+
+        let requested_transition_index = std::env::var("RUZU_DUMP_TRANSITION_INDEX")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok());
+        if std::env::var_os("RUZU_DUMP_TRANSITION_RESOURCES").is_some()
+            && self.transition_sequence_active
+            && requested_transition_index == Some(self.transition_sequence_index)
+            && draw.render_targets[0].address == 0x524C_10000
+        {
+            let mut bytes = Vec::with_capacity(FixedPipelineState::XFB_STATE_OFFSET);
+            bytes.extend_from_slice(&fixed_state.raw1.to_le_bytes());
+            bytes.extend_from_slice(&fixed_state.raw2.to_le_bytes());
+            bytes.extend_from_slice(&fixed_state.color_formats);
+            bytes.extend_from_slice(&fixed_state.alpha_test_ref.to_le_bytes());
+            bytes.extend_from_slice(&fixed_state.point_size.to_le_bytes());
+            for value in fixed_state.viewport_swizzles {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            bytes.extend_from_slice(
+                &fixed_state
+                    .attribute_types_or_enabled_divisors
+                    .to_le_bytes(),
+            );
+            bytes.extend_from_slice(&fixed_state.dynamic_state.raw1.to_le_bytes());
+            bytes.extend_from_slice(&fixed_state.dynamic_state.raw2.to_le_bytes());
+            for value in fixed_state.attachments {
+                bytes.extend_from_slice(&value.raw.to_le_bytes());
+            }
+            for value in fixed_state.attributes {
+                bytes.extend_from_slice(&value.raw.to_le_bytes());
+            }
+            for value in fixed_state.binding_divisors {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            for value in fixed_state.vertex_strides {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            debug_assert_eq!(bytes.len(), FixedPipelineState::XFB_STATE_OFFSET);
+            let resource_directory = std::path::Path::new("/tmp/ruzu-transition-resources");
+            let _ = std::fs::create_dir_all(resource_directory);
+            let _ = std::fs::write(resource_directory.join("fixed-state.bin"), bytes);
+        }
 
         // 4. Ensure we're inside a render pass
         let cmd = self.scheduler.command_buffer();
@@ -1062,18 +1232,6 @@ impl RasterizerVulkan {
             extent,
         };
 
-        // 4. Bind pipeline
-        unsafe {
-            self.device
-                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-        }
-        self.push_graphics_push_constants(
-            cmd,
-            pipeline_layout,
-            draw,
-            uses_render_area,
-            uses_rescaling_uniform,
-        );
         let draw_params = make_draw_params(draw);
         // Serialize every common-buffer-cache access on this draw
         // (uniform/storage descriptor binding AND the geometry binding below)
@@ -1097,6 +1255,7 @@ impl RasterizerVulkan {
         self.common_buffer_cache
             .set_engine_state(Box::new(VulkanDrawStateEngineAdapter {
                 draw: draw.clone(),
+                dirty_flags: engine_dirty_flags,
             }));
         self.bind_graphics_descriptors(
             cmd,
@@ -1115,15 +1274,22 @@ impl RasterizerVulkan {
         // 5. Bind vertex/index buffers. The common path is the upstream
         // owner and tracks CPU/GPU writes; keep legacy quad assembly until
         // BufferCacheRuntime ports the upstream conversion passes.
-        let use_common_geometry = !matches!(
-            draw.topology,
-            PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip
-        );
+        let use_common_geometry = std::env::var_os("RUZU_LEGACY_GEOMETRY").is_none()
+            && !matches!(
+                draw.topology,
+                PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip
+            );
         if use_common_geometry {
             self.common_buffer_cache
                 .update_graphics_buffers(draw_params.is_indexed);
             self.common_buffer_cache
                 .bind_host_geometry_buffers(draw_params.is_indexed);
+            if std::env::var_os("RUZU_LEGACY_VERTEX_ONLY").is_some() {
+                self.bind_vertex_buffers(cmd, draw, read_gpu);
+            }
+            if draw_params.is_indexed && std::env::var_os("RUZU_LEGACY_INDEX_ONLY").is_some() {
+                self.bind_index_buffer(cmd, draw, draw_params, read_gpu);
+            }
             dirty_flags[crate::dirty_flags::flags::INDEX_BUFFER as usize] = false;
             dirty_flags[crate::dirty_flags::flags::VERTEX_BUFFERS as usize] = false;
             for index in crate::dirty_flags::flags::VERTEX_BUFFER0
@@ -1146,6 +1312,28 @@ impl RasterizerVulkan {
         // binding would still let a concurrent CPU-write free a slot the draw
         // depends on before it is recorded. RAII drops them on every exit,
         // including the early-return trace-stub path.
+
+        // Upstream `GraphicsPipeline::ConfigureImpl` resolves and snapshots
+        // every guest resource before `ConfigureDraw` records the wait for an
+        // asynchronously-built pipeline. Waiting before descriptor/geometry
+        // preparation lets the guest recycle a uniform-buffer ring while the
+        // pipeline builds; MK8D then observes occurrence 13 data while drawing
+        // occurrence 4 and its short-lived transition effects disappear.
+        let Some(pipeline) = pipeline_waiter.pipeline_handle() else {
+            self.draw_skipped_pipeline = self.draw_skipped_pipeline.wrapping_add(1);
+            if self.draw_skipped_pipeline <= 16 || self.draw_skipped_pipeline.is_power_of_two() {
+                log::warn!(
+                    "[DRAW_SKIP] #{} pipeline build failed asynchronously after resource preparation (draw={} rt0=0x{:X} fmt={} topology={:?} indexed={})",
+                    self.draw_skipped_pipeline,
+                    self.draw_counter,
+                    draw.render_targets[0].address,
+                    draw.render_targets[0].format,
+                    draw.topology,
+                    draw.indexed,
+                );
+            }
+            return;
+        };
 
         // Texture/buffer materialization can enqueue upload copies and
         // barriers through `Scheduler::record_with_upload`. Upstream records
@@ -1174,6 +1362,18 @@ impl RasterizerVulkan {
             &render_pass_clears,
             &rp_images,
             &rp_image_ranges,
+        );
+
+        unsafe {
+            self.device
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        }
+        self.push_graphics_push_constants(
+            cmd,
+            pipeline_layout,
+            draw,
+            uses_render_area,
+            uses_rescaling_uniform,
         );
 
         // 6. Update dynamic states via dirty flags. Upstream requests the
@@ -1258,9 +1458,11 @@ impl RasterizerVulkan {
                 );
             }
             log::info!(
-                "[VK_DRAW] seq={} draw={} vp=({:.0},{:.0} {:.0}x{:.0}) topology={:?} guest_indexed={} vk_indexed={} vertices={} instances={} first_index={} base_vertex={} base_instance={} vertex_first={} vertex_count={} index_first={} index_count={} index_format={:?} index_addr=0x{:X} streams=[{}] attribs=[{}] rt_count={} rt0_addr=0x{:X} rt0={}x{} fmt={} zeta_enable={} zeta_addr=0x{:X} zeta={}x{} zeta_fmt={} depth_mode={:?} depth_test={} depth_write={} depth_func={:?} stencil={} prim_restart={} rasterize={} cull_enable={} cull_face={:?} front_face={:?} window_flip_y={} uses_render_area={} uses_rescaling_uniform={} logic_op={} blend0={} color=({:?},{:?},{:?}) alpha=({:?},{:?},{:?}) mask={:?}",
+                "[VK_DRAW] seq={} draw={} vs=0x{:X} fs=0x{:X} vp=({:.0},{:.0} {:.0}x{:.0}) topology={:?} guest_indexed={} vk_indexed={} vertices={} instances={} first_index={} base_vertex={} base_instance={} vertex_first={} vertex_count={} index_first={} index_count={} index_format={:?} index_addr=0x{:X} streams=[{}] attribs=[{}] rt_count={} rt0_addr=0x{:X} rt0={}x{} fmt={} zeta_enable={} zeta_addr=0x{:X} zeta={}x{} zeta_fmt={} depth_mode={:?} depth_test={} depth_write={} depth_func={:?} stencil={} prim_restart={} rasterize={} cull_enable={} cull_face={:?} front_face={:?} window_flip_y={} uses_render_area={} uses_rescaling_uniform={} logic_op={} blend0={} color=({:?},{:?},{:?}) alpha=({:?},{:?},{:?}) mask={:?}",
                 self.draw_sequence,
                 self.draw_counter,
+                draw.shader_stages[1].offset,
+                draw.shader_stages[5].offset,
                 {
                     let vp = viewport_state(draw, 0);
                     vp.x
@@ -1329,7 +1531,6 @@ impl RasterizerVulkan {
             self.texture_cache
                 .dump_image_if_requested(self.draw_counter, draw.shader_stages[5].offset);
             self.draw_counter += 1;
-            self.state_tracker.invalidate_state();
             return;
         }
         self.scheduler.note_guest_draw();
@@ -1356,11 +1557,92 @@ impl RasterizerVulkan {
             }
         }
 
+        if std::env::var_os("RUZU_DUMP_TRANSITION_SEQUENCE").is_some()
+            && draw.render_targets[0].address == 0x524C_10000
+        {
+            let vs = draw.shader_stages[1].offset;
+            let fs = draw.shader_stages[5].offset;
+            if !self.transition_sequence_active && vs == 0xAF1B30 && fs == 0xAF2C30 {
+                self.transition_sequence_active = true;
+            }
+            if self.transition_sequence_active && self.transition_sequence_index < 4096 {
+                let index = self.transition_sequence_index;
+                let requested_indices = std::env::var("RUZU_DUMP_TRANSITION_INDEX").ok();
+                let should_dump = requested_indices.as_deref().is_none_or(|requested| {
+                    requested
+                        .split(',')
+                        .filter_map(|value| value.trim().parse::<u32>().ok())
+                        .any(|requested| requested == index)
+                });
+                if should_dump {
+                    let directory = std::path::Path::new("/tmp/ruzu-transition-seq");
+                    let _ = std::fs::create_dir_all(directory);
+                    let path = directory.join(format!("{index:02}_vs{vs:06X}_fs{fs:06X}.bin"));
+                    if self
+                        .texture_cache
+                        .debug_dump_image_at_gpu_native(0x524C_10000, &path)
+                    {
+                        log::info!(
+                            "[TRANSITION_SEQUENCE] index={} vs=0x{:X} fs=0x{:X} path={}",
+                            index,
+                            vs,
+                            fs,
+                            path.display()
+                        );
+                    }
+                }
+                self.transition_sequence_index += 1;
+            }
+        }
+
+        if std::env::var_os("RUZU_DUMP_TRANSITION_FINAL").is_some()
+            && self.transition_sequence_active
+            && draw.render_targets[0].address == 0x501D_00000
+            && draw.shader_stages[1].offset == 0x10A30
+            && draw.shader_stages[5].offset == 0x10F30
+        {
+            let index = self.transition_final_index;
+            let requested_indices = std::env::var("RUZU_DUMP_TRANSITION_FINAL_INDEX").ok();
+            let should_dump = requested_indices.as_deref().is_none_or(|requested| {
+                requested
+                    .split(',')
+                    .filter_map(|value| value.trim().parse::<u32>().ok())
+                    .any(|requested| requested == index)
+            });
+            if should_dump {
+                let directory = std::path::Path::new("/tmp/ruzu-transition-final");
+                let _ = std::fs::create_dir_all(directory);
+                let path = directory.join(format!(
+                    "{index:03}_target{:04}.bin",
+                    self.transition_sequence_index
+                ));
+                let source_directory = std::path::Path::new("/tmp/ruzu-transition-final-source");
+                let _ = std::fs::create_dir_all(source_directory);
+                let source_path = source_directory.join(format!(
+                    "{index:03}_target{:04}.bin",
+                    self.transition_sequence_index
+                ));
+                let _ = self
+                    .texture_cache
+                    .debug_dump_image_at_gpu_native(0x524C_10000, &source_path);
+                if self
+                    .texture_cache
+                    .debug_dump_image_at_gpu_native(0x501D_00000, &path)
+                {
+                    log::info!(
+                        "[TRANSITION_FINAL] index={} target_draw_index={} path={}",
+                        index,
+                        self.transition_sequence_index,
+                        path.display()
+                    );
+                }
+            }
+            self.transition_final_index += 1;
+        }
+
         self.texture_cache
             .dump_image_if_requested(self.draw_counter, draw.shader_stages[5].offset);
         self.draw_counter += 1;
-        // Mark state dirty for next draw (conservative — real tracking per-register later)
-        self.state_tracker.invalidate_state();
     }
 
     fn push_graphics_push_constants(
@@ -1624,7 +1906,7 @@ impl RasterizerVulkan {
             // Legacy batch path: no live engine to propagate consumed dirty
             // flags back to, so consume a per-draw copy.
             let mut dirty_flags = draw.dirty_flags;
-            self.draw(draw, &mut dirty_flags, read_gpu, &read_gpu_unsafe);
+            self.draw(draw, &mut dirty_flags, None, read_gpu, &read_gpu_unsafe);
         }
 
         // Read back rendered pixels
@@ -2322,6 +2604,39 @@ impl RasterizerVulkan {
             read_gpu(addr, &mut bytes);
             u32::from_le_bytes(bytes)
         };
+        if std::env::var_os("RUZU_TRACE_AF1B_CBUF").is_some()
+            && draw.shader_stages[1].offset == 0xAF1B30
+            && draw.shader_stages[5].offset == 0xAF2C30
+            && draw.render_targets[0].address == 0x524C_10000
+        {
+            static OCCURRENCE: AtomicU32 = AtomicU32::new(0);
+            let occurrence = OCCURRENCE.fetch_add(1, Ordering::Relaxed);
+            let cbuf = draw.cb_bindings[0][3];
+            let size = (cbuf.size as usize).min(0x300);
+            let mut bytes = vec![0u8; size];
+            if cbuf.enabled && cbuf.address != 0 && size != 0 {
+                read_gpu(cbuf.address, &mut bytes);
+            }
+            let word = |offset: usize| {
+                bytes
+                    .get(offset..offset + 4)
+                    .map(|value| u32::from_le_bytes(value.try_into().unwrap()))
+                    .unwrap_or(0)
+            };
+            log::info!(
+                "[AF1B_CBUF] occurrence={} sequence={} addr=0x{:X} size=0x{:X} hash=0x{:016X} wEC=0x{:08X} wFC=0x{:08X} w160=0x{:08X} w238=0x{:08X} w23C=0x{:08X}",
+                occurrence,
+                self.transition_sequence_index,
+                cbuf.address,
+                cbuf.size,
+                city_hash64(&bytes),
+                word(0xEC),
+                word(0xFC),
+                word(0x160),
+                word(0x238),
+                word(0x23C),
+            );
+        }
         let read_stage_handle = |stage: usize,
                                  cbuf_index: u32,
                                  cbuf_offset: u32,
@@ -2428,6 +2743,199 @@ impl RasterizerVulkan {
                 .base
                 .fill_graphics_image_views(&mut sampled_views, false);
         }
+        let requested_transition_index = std::env::var("RUZU_DUMP_TRANSITION_INDEX")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok());
+        if std::env::var_os("RUZU_DUMP_TRANSITION_RESOURCES").is_some()
+            && self.transition_sequence_active
+            && requested_transition_index == Some(self.transition_sequence_index)
+            && draw.render_targets[0].address == 0x524C_10000
+        {
+            let resource_directory = std::path::Path::new("/tmp/ruzu-transition-resources");
+            let _ = std::fs::create_dir_all(resource_directory);
+            let mut metadata = format!(
+                "index={} vs=0x{:X} fs=0x{:X}\n",
+                self.transition_sequence_index,
+                draw.shader_stages[1].offset,
+                draw.shader_stages[5].offset,
+            );
+            metadata.push_str(&format!(
+                "topology={:?} indexed={} vertex_first={} vertex_count={} index_addr=0x{:X} index_first={} index_count={} index_format={:?} base_vertex={} base_instance={} instances={}\n",
+                draw.topology,
+                draw.indexed,
+                draw.vertex_first,
+                draw.vertex_count,
+                draw.index_buffer_addr,
+                draw.index_buffer_first,
+                draw.index_buffer_count,
+                draw.index_format,
+                draw.base_vertex,
+                draw.base_instance,
+                draw.instance_count,
+            ));
+            metadata.push_str(&format!(
+                "enabled_uniform_buffer_masks={enabled_uniform_buffer_masks:08X?}\n"
+            ));
+            let viewport = draw.viewport_transforms[0];
+            let scissor = draw.scissors[0];
+            metadata.push_str(&format!(
+                "viewport_scale_offset={} viewport0={},{},{},{},{},{} swizzle=0x{:X}\n",
+                draw.viewport_scale_offset_enabled,
+                viewport.translate_x,
+                viewport.scale_x,
+                viewport.translate_y,
+                viewport.scale_y,
+                viewport.translate_z,
+                viewport.scale_z,
+                viewport.swizzle,
+            ));
+            metadata.push_str(&format!(
+                "surface_clip={},{},{},{} window_origin={}\n",
+                draw.surface_clip.x,
+                draw.surface_clip.y,
+                draw.surface_clip.width,
+                draw.surface_clip.height,
+                u32::from(draw.window_origin_lower_left),
+            ));
+            metadata.push_str(&format!(
+                "scissor0={},{},{},{},{}\n",
+                u32::from(scissor.enabled),
+                scissor.min_x,
+                scissor.min_y,
+                scissor.max_x,
+                scissor.max_y,
+            ));
+            metadata.push_str(&format!(
+                "blend_color={},{},{},{} depth_bias={},{},{}\n",
+                draw.blend_color.r,
+                draw.blend_color.g,
+                draw.blend_color.b,
+                draw.blend_color.a,
+                draw.rasterizer.depth_bias,
+                draw.rasterizer.depth_bias_clamp,
+                draw.rasterizer.slope_scale_depth_bias,
+            ));
+            for (stage, info) in stage_infos.iter().enumerate() {
+                let Some(info) = info else {
+                    continue;
+                };
+                metadata.push_str(&format!(
+                    "stage{stage}_cbuf_descriptors={:?} used_sizes={:X?}\n",
+                    info.constant_buffer_descriptors, info.constant_buffer_used_sizes,
+                ));
+            }
+            for (slot, stream) in draw.vertex_streams.iter().enumerate() {
+                if !stream.enabled || stream.address == 0 {
+                    continue;
+                }
+                let limit = draw.vertex_stream_limits[slot].address;
+                let size = limit
+                    .checked_sub(stream.address)
+                    .and_then(|value| value.checked_add(1))
+                    .unwrap_or(0)
+                    .min(0x10_0000) as usize;
+                metadata.push_str(&format!(
+                    "stream{slot}=addr=0x{:X} limit=0x{:X} size=0x{:X} stride={} frequency={} instance={}\n",
+                    stream.address,
+                    limit,
+                    size,
+                    stream.stride,
+                    stream.frequency,
+                    draw.vertex_stream_instances[slot],
+                ));
+                if size != 0 {
+                    let mut bytes = vec![0u8; size];
+                    read_gpu(stream.address, &mut bytes);
+                    let _ = std::fs::write(
+                        resource_directory.join(format!("vertex-{slot}.bin")),
+                        bytes,
+                    );
+                }
+            }
+            for (slot, attrib) in draw.vertex_attribs.iter().enumerate() {
+                if attrib.constant
+                    || attrib.size == crate::engines::maxwell_3d::VertexAttribSize::Invalid
+                {
+                    continue;
+                }
+                metadata.push_str(&format!("attrib{slot}={attrib:?}\n"));
+            }
+            if draw.indexed && draw.index_buffer_addr != 0 && draw.index_buffer_count != 0 {
+                let index_size = draw.index_format.size_bytes() as usize;
+                let byte_count =
+                    draw.index_buffer_first
+                        .saturating_add(draw.index_buffer_count) as usize
+                        * index_size;
+                let mut bytes = vec![0u8; byte_count];
+                read_gpu(draw.index_buffer_addr, &mut bytes);
+                let _ = std::fs::write(resource_directory.join("index.bin"), bytes);
+            }
+            let resolved_views = sampled_views
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, resolved)| {
+                    if !resolved.id.is_valid() || resolved.id == NULL_IMAGE_VIEW_ID {
+                        metadata.push_str(&format!("view{slot}=null\n"));
+                        return None;
+                    }
+                    let view = self.texture_cache.base.slot_image_views.get(resolved.id);
+                    let image = self.texture_cache.base.slot_images.get(view.image_id);
+                    metadata.push_str(&format!(
+                        "view{slot}=id{} image{} gpu=0x{:X} format={:?} type={:?} size={:?} range={:?} swizzle={:?}\n",
+                        resolved.id.index,
+                        view.image_id.index,
+                        image.gpu_addr,
+                        view.format,
+                        view.view_type,
+                        view.size,
+                        view.range,
+                        view.swizzle,
+                    ));
+                    Some((slot, view.image_id))
+                })
+                .collect::<Vec<_>>();
+            for (slot, sampler_id) in sampled_samplers.iter().copied().enumerate() {
+                let tsc = self.texture_cache.base.slot_samplers.get(sampler_id);
+                metadata.push_str(&format!(
+                    "sampler{slot}=id{} raw={:016X?} wrap={}/{}/{} filter={}/{}/{} compare={}/{} reduction={} lod={}/{} bias={} aniso={}\n",
+                    sampler_id.index,
+                    tsc.raw,
+                    tsc.wrap_u(),
+                    tsc.wrap_v(),
+                    tsc.wrap_p(),
+                    tsc.mag_filter(),
+                    tsc.min_filter(),
+                    tsc.mipmap_filter(),
+                    tsc.depth_compare_enabled(),
+                    tsc.depth_compare_func(),
+                    tsc.reduction_filter(),
+                    tsc.min_lod(),
+                    tsc.max_lod(),
+                    tsc.lod_bias(),
+                    tsc.computed_max_anisotropy(),
+                ));
+            }
+            for (stage, bindings) in draw.cb_bindings.iter().enumerate() {
+                for (slot, binding) in bindings.iter().enumerate() {
+                    if !binding.enabled || binding.address == 0 || binding.size == 0 {
+                        continue;
+                    }
+                    let mut bytes = vec![0u8; binding.size.min(0x1000) as usize];
+                    read_gpu(binding.address, &mut bytes);
+                    let path = resource_directory.join(format!("cbuf-s{stage}-b{slot}.bin"));
+                    let _ = std::fs::write(path, bytes);
+                    metadata.push_str(&format!(
+                        "cbuf-s{stage}-b{slot}=gpu=0x{:X} size=0x{:X}\n",
+                        binding.address, binding.size,
+                    ));
+                }
+            }
+            for (slot, image_id) in resolved_views {
+                let path = resource_directory.join(format!("view-{slot}.bin"));
+                let _ = self.texture_cache.debug_dump_image_native(image_id, &path);
+            }
+            let _ = std::fs::write(resource_directory.join("metadata.txt"), metadata);
+        }
         let requires_feedback_barrier = unsafe {
             let _texture_lock = (*texture_cache).base.mutex.lock();
             (*texture_cache).base.check_feedback_loop(&sampled_views)
@@ -2529,6 +3037,9 @@ impl RasterizerVulkan {
                 queued_buffers.next().is_none(),
                 "buffer-cache descriptor stream contains entries not consumed by the pipeline layout"
             );
+            if std::env::var_os("RUZU_FORCE_DIRECT_UBO_DESCRIPTORS").is_some() {
+                common_uniform_buffer_infos.clear();
+            }
         }
         let mut sampled_cursor = 0usize;
         let mut common_uniform_cursor = 0usize;
@@ -2579,6 +3090,33 @@ impl RasterizerVulkan {
                         let (buffer, offset, range) = if let Some((gpu_va, size)) = descriptor_info
                         {
                             let size = size.min(0x10000).max(4);
+                            let uniform_stage = binding.uniform_stage.unwrap_or(u32::MAX);
+                            let uniform_index = binding
+                                .uniform_index
+                                .unwrap_or(u32::MAX)
+                                .saturating_add(element);
+                            let blue_cbuf_override =
+                                std::env::var_os("RUZU_OVERRIDE_BLUE_CBUF_DIR")
+                                    .filter(|_| {
+                                        draw.shader_stages[1].offset == 0x67CD30
+                                            && draw.shader_stages[5].offset == 0x6B3E30
+                                            && uniform_stage == 0
+                                            && matches!(uniform_index, 8 | 10)
+                                    })
+                                    .and_then(|directory| {
+                                        std::fs::read(
+                                            std::path::Path::new(&directory)
+                                                .join(format!("cbuf-s0-b{uniform_index}.bin")),
+                                        )
+                                        .ok()
+                                    });
+                            let read_uniform = |address: u64, destination: &mut [u8]| {
+                                read_gpu(address, destination);
+                                if let Some(bytes) = blue_cbuf_override.as_deref() {
+                                    let copy_size = destination.len().min(bytes.len());
+                                    destination[..copy_size].copy_from_slice(&bytes[..copy_size]);
+                                }
+                            };
                             let trace_cbuf_rt = std::env::var("RUZU_TRACE_VK_CBUF_RT")
                                 .ok()
                                 .and_then(|value| {
@@ -2588,13 +3126,8 @@ impl RasterizerVulkan {
                                 && trace_cbuf_rt
                                     .is_none_or(|target| target == draw.render_targets[0].address)
                             {
-                                let stage = binding.uniform_stage.unwrap_or(u32::MAX);
-                                let index = binding
-                                    .uniform_index
-                                    .unwrap_or(u32::MAX)
-                                    .saturating_add(element);
                                 let mut bytes = vec![0u8; size.min(0x80) as usize];
-                                read_gpu(gpu_va, &mut bytes);
+                                read_uniform(gpu_va, &mut bytes);
                                 let mut floats = Vec::with_capacity(bytes.len() / 4);
                                 for chunk in bytes.chunks_exact(4) {
                                     floats.push(f32::from_le_bytes([
@@ -2606,8 +3139,8 @@ impl RasterizerVulkan {
                                     self.draw_counter,
                                     draw.render_targets[0].address,
                                     binding.binding,
-                                    stage,
-                                    index,
+                                    uniform_stage,
+                                    uniform_index,
                                     gpu_va,
                                     size,
                                     floats
@@ -2619,14 +3152,14 @@ impl RasterizerVulkan {
                                         .bind_mapped_uniform_buffer(
                                             gpu_va,
                                             size,
-                                            read_gpu,
+                                            &read_uniform,
                                             &mut self.staging_pool,
                                         )
                                         .unwrap_or_else(|| {
                                             self.buffer_cache.get_or_upload_fresh(
                                                 gpu_va,
                                                 size,
-                                                read_gpu,
+                                                &read_uniform,
                                                 &mut self.staging_pool,
                                                 upload_cmd,
                                             )
@@ -3034,6 +3567,7 @@ impl RasterizerInterface for RasterizerVulkan {
             warn!("RasterizerVulkan::draw skipped: no bound channel memory manager");
             return;
         };
+        let engine_dirty_flags = draw_view.dirty_flags_ptr();
         let draw_call = draw_view.draw_call_snapshot(draw_state.draw_indexed, instance_count);
         let read_gpu = |gpu_va: u64, output: &mut [u8]| {
             memory_manager.lock().read_block(gpu_va, output);
@@ -3045,13 +3579,26 @@ impl RasterizerInterface for RasterizerVulkan {
                 .read_block_unsafe(gpu_va, output)
         };
         let mut dirty_flags = draw_call.dirty_flags;
-        self.draw(&draw_call, &mut dirty_flags, &read_gpu, &read_gpu_unsafe);
+        self.draw(
+            &draw_call,
+            &mut dirty_flags,
+            engine_dirty_flags,
+            &read_gpu,
+            &read_gpu_unsafe,
+        );
         // Upstream backends consume `maxwell3d->dirty.flags` in place (e.g.
         // TextureCache::UpdateRenderTargets clears Dirty::RenderTargets on the
         // live engine). The snapshot in `draw_call` is a copy, so propagate
         // the flags the backend consumed back to the engine — otherwise every
         // draw re-runs the full render-target resolution.
         for (index, dirty) in dirty_flags.iter().enumerate() {
+            // The common buffer cache consumes geometry flags directly through
+            // `VulkanDrawStateEngineAdapter`, matching upstream's persistent
+            // `Maxwell3D*`. Replaying the pre-draw snapshot here would erase a
+            // command-buffer invalidation raised during the draw's FlushWork.
+            if engine_dirty_flags.is_some() && is_geometry_dirty_flag(index) {
+                continue;
+            }
             if !dirty && draw_call.dirty_flags[index] {
                 draw_view.clear_dirty_flag(index as u8);
             }
@@ -3698,7 +4245,7 @@ impl RasterizerInterface for RasterizerVulkan {
         }
     }
 
-    fn initialize_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
+    fn initialize_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
         self.channel_caches.create_channel(channel);
         self.texture_cache.create_channel(channel);
         self.buffer_cache.create_channel(channel);
@@ -3708,7 +4255,7 @@ impl RasterizerInterface for RasterizerVulkan {
         self.state_tracker.setup_tables(channel);
     }
 
-    fn bind_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
+    fn bind_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
         self.channel_caches.bind_to_channel(channel.bind_id);
         self.texture_cache.bind_to_channel(channel.bind_id);
         self.buffer_cache.bind_to_channel(channel.bind_id);
@@ -3731,6 +4278,7 @@ impl RasterizerInterface for RasterizerVulkan {
     }
 
     fn release_channel(&mut self, channel_id: i32) {
+        self.state_tracker.release_channel(channel_id);
         self.channel_caches.erase_channel(channel_id);
         self.texture_cache.erase_channel(channel_id);
         self.buffer_cache.erase_channel(channel_id);
@@ -4513,6 +5061,18 @@ mod tests {
             geometry_dirty_flag_index(DirtyFlag::VertexBuffer(7)),
             crate::dirty_flags::flags::VERTEX_BUFFER0 + 7
         );
+        assert!(is_geometry_dirty_flag(
+            crate::dirty_flags::flags::INDEX_BUFFER as usize
+        ));
+        assert!(is_geometry_dirty_flag(
+            crate::dirty_flags::flags::VERTEX_BUFFERS as usize
+        ));
+        assert!(is_geometry_dirty_flag(
+            crate::dirty_flags::flags::VERTEX_BUFFER31 as usize
+        ));
+        assert!(!is_geometry_dirty_flag(
+            crate::dirty_flags::flags::RENDER_TARGETS as usize
+        ));
     }
 
     #[test]

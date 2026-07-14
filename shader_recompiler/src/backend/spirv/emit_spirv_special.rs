@@ -55,23 +55,43 @@ fn convert_depth_mode(ctx: &mut SpirvEmitContext) {
 pub fn emit_prologue(ctx: &mut SpirvEmitContext) {
     log::trace!("SPIR-V: emit_prologue");
     if ctx.stage == ShaderStage::VertexB {
+        let default_position = ctx
+            .builder
+            .composite_construct(
+                ctx.f32_vec4_type,
+                None,
+                vec![
+                    ctx.const_zero_f32,
+                    ctx.const_zero_f32,
+                    ctx.const_zero_f32,
+                    ctx.const_one_f32,
+                ],
+            )
+            .unwrap();
         if let Some(position_var) = output_position(ctx) {
-            let default_position = ctx
-                .builder
-                .composite_construct(
-                    ctx.f32_vec4_type,
-                    None,
-                    vec![
-                        ctx.const_zero_f32,
-                        ctx.const_zero_f32,
-                        ctx.const_zero_f32,
-                        ctx.const_one_f32,
-                    ],
-                )
-                .unwrap();
             ctx.builder
                 .store(position_var, default_position, None, vec![])
                 .unwrap();
+        }
+        // Rust currently materializes each generic output as a vec4. This is
+        // the direct counterpart of upstream's output_generics traversal and
+        // DefaultVarying(...): every declared varying starts as (0,0,0,1).
+        for index in 0..32u32 {
+            if let Some(&output_var) = ctx.output_vars.get(&index) {
+                ctx.builder
+                    .store(output_var, default_position, None, vec![])
+                    .unwrap();
+            }
+        }
+    }
+    if matches!(ctx.stage, ShaderStage::VertexB | ShaderStage::Geometry) {
+        if let Some(point_size) = ctx.runtime_info.fixed_state_point_size {
+            if ctx.output_point_size != 0 {
+                let value = ctx.constant_f32(point_size);
+                ctx.builder
+                    .store(ctx.output_point_size, value, None, vec![])
+                    .unwrap();
+            }
         }
     }
 }

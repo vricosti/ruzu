@@ -563,6 +563,11 @@ impl Scheduler {
     fn flush_impl(&mut self, signal_semaphores: &[vk::Semaphore]) -> u64 {
         self.request_outside_renderpass();
         self.dispatch_work();
+        // Port of upstream `Scheduler::SubmitExecution`: bindings and dynamic
+        // state recorded in this command buffer do not carry into the next
+        // one. Mark the command-buffer-scoped state dirty before submission so
+        // the next draw re-emits it after `allocate_new_context`.
+        self.invalidate_state();
 
         // End command buffers
         unsafe {

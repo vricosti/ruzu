@@ -360,13 +360,21 @@ impl Device {
                 name.to_string_lossy().into_owned()
             })
             .collect();
+        let has_driver_properties = device_properties.api_version >= vk::API_VERSION_1_2
+            || supported_extensions.contains("VK_KHR_driver_properties");
+        let has_shader_float_controls = device_properties.api_version >= vk::API_VERSION_1_2
+            || supported_extensions.contains("VK_KHR_shader_float_controls");
         let mut driver_properties = vk::PhysicalDeviceDriverProperties::default();
-        if device_properties.api_version >= vk::API_VERSION_1_2
-            || supported_extensions.contains("VK_KHR_driver_properties")
-        {
-            let mut properties2 = vk::PhysicalDeviceProperties2::builder()
-                .push_next(&mut driver_properties)
-                .build();
+        let mut float_controls_properties = vk::PhysicalDeviceFloatControlsProperties::default();
+        if has_driver_properties || has_shader_float_controls {
+            let mut properties2_builder = vk::PhysicalDeviceProperties2::builder();
+            if has_driver_properties {
+                properties2_builder = properties2_builder.push_next(&mut driver_properties);
+            }
+            if has_shader_float_controls {
+                properties2_builder = properties2_builder.push_next(&mut float_controls_properties);
+            }
+            let mut properties2 = properties2_builder.build();
             unsafe {
                 instance.get_physical_device_properties2(physical, &mut properties2);
             }
@@ -400,8 +408,10 @@ impl Device {
             supported_extensions.contains("VK_EXT_extended_dynamic_state");
         let has_extended_dynamic_state2 =
             supported_extensions.contains("VK_EXT_extended_dynamic_state2");
+        let has_depth_clip_control = supported_extensions.contains("VK_EXT_depth_clip_control");
         let has_vertex_attribute_divisor =
             supported_extensions.contains("VK_EXT_vertex_attribute_divisor");
+        let has_provoking_vertex = supported_extensions.contains("VK_EXT_provoking_vertex");
         let has_shader_demote_to_helper_invocation = supported_extensions
             .contains("VK_EXT_shader_demote_to_helper_invocation")
             || device_properties.api_version >= vk::API_VERSION_1_3;
@@ -417,8 +427,11 @@ impl Device {
             vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
         let mut extended_dynamic_state2_features =
             vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default();
+        let mut depth_clip_control_features =
+            vk::PhysicalDeviceDepthClipControlFeaturesEXT::default();
         let mut vertex_attribute_divisor_features =
             vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT::default();
+        let mut provoking_vertex_features = vk::PhysicalDeviceProvokingVertexFeaturesEXT::default();
         let mut shader_demote_features =
             vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures::default();
         {
@@ -440,9 +453,15 @@ impl Device {
                 features2_builder =
                     features2_builder.push_next(&mut extended_dynamic_state2_features);
             }
+            if has_depth_clip_control {
+                features2_builder = features2_builder.push_next(&mut depth_clip_control_features);
+            }
             if has_vertex_attribute_divisor {
                 features2_builder =
                     features2_builder.push_next(&mut vertex_attribute_divisor_features);
+            }
+            if has_provoking_vertex {
+                features2_builder = features2_builder.push_next(&mut provoking_vertex_features);
             }
             if has_shader_demote_to_helper_invocation {
                 features2_builder = features2_builder.push_next(&mut shader_demote_features);
@@ -464,8 +483,14 @@ impl Device {
             && extended_dynamic_state_features.extended_dynamic_state != 0;
         let supports_extended_dynamic_state2 = has_extended_dynamic_state2
             && extended_dynamic_state2_features.extended_dynamic_state2 != 0;
+        let supports_depth_clip_control =
+            has_depth_clip_control && depth_clip_control_features.depth_clip_control != 0;
         let supports_vertex_attribute_divisor = has_vertex_attribute_divisor
             && vertex_attribute_divisor_features.vertex_attribute_instance_rate_divisor != 0;
+        // Upstream requires both features before enabling VK_EXT_provoking_vertex.
+        let supports_provoking_vertex = has_provoking_vertex
+            && provoking_vertex_features.provoking_vertex_last != 0
+            && provoking_vertex_features.transform_feedback_preserves_provoking_vertex != 0;
         let supports_shader_demote_to_helper_invocation = has_shader_demote_to_helper_invocation
             && shader_demote_features.shader_demote_to_helper_invocation != 0;
         log::info!(
@@ -493,12 +518,16 @@ impl Device {
             "VK_EXT_primitive_topology_list_restart",
             "VK_EXT_extended_dynamic_state",
             "VK_EXT_extended_dynamic_state2",
+            "VK_EXT_depth_clip_control",
             "VK_EXT_vertex_attribute_divisor",
             "VK_EXT_shader_demote_to_helper_invocation",
         ] {
             if supported_extensions.contains(name) {
                 enabled_extensions.push(CString::new(name).unwrap());
             }
+        }
+        if supports_provoking_vertex {
+            enabled_extensions.push(CString::new("VK_EXT_provoking_vertex").unwrap());
         }
         let enabled_extension_ptrs: Vec<*const std::os::raw::c_char> = enabled_extensions
             .iter()
@@ -533,9 +562,18 @@ impl Device {
             vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::builder()
                 .extended_dynamic_state2(supports_extended_dynamic_state2)
                 .build();
+        let mut enabled_depth_clip_control_features =
+            vk::PhysicalDeviceDepthClipControlFeaturesEXT::builder()
+                .depth_clip_control(supports_depth_clip_control)
+                .build();
         let mut enabled_vertex_attribute_divisor_features =
             vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT::builder()
                 .vertex_attribute_instance_rate_divisor(supports_vertex_attribute_divisor)
+                .build();
+        let mut enabled_provoking_vertex_features =
+            vk::PhysicalDeviceProvokingVertexFeaturesEXT::builder()
+                .provoking_vertex_last(true)
+                .transform_feedback_preserves_provoking_vertex(true)
                 .build();
         let mut enabled_shader_demote_features =
             vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures::builder()
@@ -559,8 +597,14 @@ impl Device {
             if has_extended_dynamic_state2 {
                 builder = builder.push_next(&mut enabled_extended_dynamic_state2_features);
             }
+            if supports_depth_clip_control {
+                builder = builder.push_next(&mut enabled_depth_clip_control_features);
+            }
             if supports_vertex_attribute_divisor {
                 builder = builder.push_next(&mut enabled_vertex_attribute_divisor_features);
+            }
+            if supports_provoking_vertex {
+                builder = builder.push_next(&mut enabled_provoking_vertex_features);
             }
             if supports_shader_demote_to_helper_invocation {
                 builder = builder.push_next(&mut enabled_shader_demote_features);
@@ -619,15 +663,18 @@ impl Device {
                 primitive_topology_list_restart: has_primitive_topology_list_restart,
                 extended_dynamic_state: supports_extended_dynamic_state,
                 extended_dynamic_state2: supports_extended_dynamic_state2,
+                depth_clip_control: supports_depth_clip_control,
                 vertex_attribute_divisor: supports_vertex_attribute_divisor,
+                provoking_vertex: supports_provoking_vertex,
                 shader_demote_to_helper_invocation: supports_shader_demote_to_helper_invocation,
+                shader_float_controls: has_shader_float_controls,
                 swapchain: supported_extensions.contains("VK_KHR_swapchain"),
                 ..DeviceExtensions::default()
             },
             device_properties,
             driver_properties,
             subgroup_properties: vk::PhysicalDeviceSubgroupProperties::default(),
-            float_controls_properties: vk::PhysicalDeviceFloatControlsProperties::default(),
+            float_controls_properties,
             push_descriptor_properties: vk::PhysicalDevicePushDescriptorPropertiesKHR::default(),
             subgroup_size_control_properties:
                 vk::PhysicalDeviceSubgroupSizeControlProperties::default(),
@@ -815,6 +862,12 @@ impl Device {
     /// Returns the driver ID.
     pub fn get_driver_id(&self) -> vk::DriverId {
         self.driver_properties.driver_id
+    }
+
+    /// Returns whether multiple typed views may alias one descriptor binding.
+    /// Matches upstream `Device::IsDescriptorAliasingSupported`.
+    pub fn is_descriptor_aliasing_supported(&self) -> bool {
+        self.driver_properties.driver_id != vk::DriverId::QUALCOMM_PROPRIETARY
     }
 
     /// Returns true if clocks should be boosted.

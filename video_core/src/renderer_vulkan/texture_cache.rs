@@ -3363,6 +3363,30 @@ impl TextureCache {
         Some((image_base, staging_bytes))
     }
 
+    pub fn debug_dump_image_at_gpu_native(
+        &mut self,
+        gpu_addr: u64,
+        path: &std::path::Path,
+    ) -> bool {
+        let Some(image_id) = self
+            .base
+            .slot_images
+            .iter()
+            .find(|(_, image)| image.gpu_addr == gpu_addr)
+            .map(|(id, _)| id)
+        else {
+            return false;
+        };
+        self.debug_dump_image_native(image_id, path)
+    }
+
+    pub fn debug_dump_image_native(&mut self, image_id: ImageId, path: &std::path::Path) -> bool {
+        let Some((_image_base, bytes)) = self.download_image_to_host_staging(image_id) else {
+            return false;
+        };
+        std::fs::write(path, bytes).is_ok()
+    }
+
     /// Port of the Vulkan texture-cache owner `EraseChannel` edge.
     pub fn erase_channel(&mut self, channel_id: i32) {
         self.channel_caches.erase_channel(channel_id);
@@ -5268,7 +5292,7 @@ impl TextureCache {
             return true;
         }
         let mut upload = vec![0u8; staging_size];
-        let mut copies = if image_base.flags.contains(ImageFlagBits::CONVERTED) {
+        let copies = if image_base.flags.contains(ImageFlagBits::CONVERTED) {
             let mut unswizzled = vec![0u8; image_base.unswizzled_size_bytes as usize];
             let mut copies = unswizzle_image(
                 &(),
@@ -5978,6 +6002,49 @@ impl TextureCache {
             return;
         };
         self.image_dump_seen = self.image_dump_seen.saturating_add(1);
+        // RUZU_DUMP_VK_IMAGE_EVERY=N: periodic numbered dumps (never one-shot),
+        // so a single run can sample an image (e.g. a downsampled glow buffer)
+        // across many frames and let the caller pick the frame of interest.
+        if let Some(every) = std::env::var("RUZU_DUMP_VK_IMAGE_EVERY")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&every| every > 0)
+        {
+            if self.image_dump_seen % every != 0 {
+                return;
+            }
+            if let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) {
+                let bytes = decode_debug_dump_to_rgba8(&bytes, &image_base.info);
+                let base = std::path::PathBuf::from(&path);
+                let stem = base
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("vk_image")
+                    .to_string();
+                let numbered =
+                    base.with_file_name(format!("{stem}_{:06}.ppm", self.image_dump_seen));
+                if write_rgba_like_ppm(
+                    &numbered,
+                    &bytes,
+                    image_base.info.size.width.max(1),
+                    image_base.info.size.height.max(1),
+                )
+                .is_ok()
+                {
+                    log::info!(
+                        "[VK_IMAGE_DUMP] periodic #{} image_id={} {}x{} format={:?} gpu=0x{:X} to {}",
+                        self.image_dump_seen,
+                        image_id.index,
+                        image_base.info.size.width,
+                        image_base.info.size.height,
+                        image_base.info.format,
+                        image_base.gpu_addr,
+                        numbered.display()
+                    );
+                }
+            }
+            return;
+        }
         let target_seen = std::env::var("RUZU_DUMP_VK_IMAGE_AT")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())

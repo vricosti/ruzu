@@ -5,11 +5,24 @@
 //! `backend/spirv/emit_spirv_floating_point.cpp`.
 
 use super::spirv_emit_context::SpirvEmitContext;
-use rspirv::spirv::Word;
+use crate::ir::instruction::Inst;
+use crate::ir::types::FpControl;
+use rspirv::spirv::{Decoration, Word};
+
+/// Port of the local `Decorate` helper in
+/// `emit_spirv_floating_point.cpp`.
+fn decorate(ctx: &mut SpirvEmitContext, inst: &Inst, result: Word) -> Word {
+    if FpControl::from_u32(inst.flags).no_contraction {
+        ctx.builder
+            .decorate(result, Decoration::NoContraction, vec![]);
+    }
+    result
+}
 
 /// FPAdd32: `OpFAdd` F32.
-pub fn emit_fp_add_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
-    ctx.builder.f_add(ctx.f32_type, None, a, b).unwrap()
+pub fn emit_fp_add_32(ctx: &mut SpirvEmitContext, inst: &Inst, a: Word, b: Word) -> Word {
+    let result = ctx.builder.f_add(ctx.f32_type, None, a, b).unwrap();
+    decorate(ctx, inst, result)
 }
 
 /// FPSub32: `OpFSub` F32.
@@ -18,8 +31,9 @@ pub fn emit_fp_sub_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
 }
 
 /// FPMul32: `OpFMul` F32.
-pub fn emit_fp_mul_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
-    ctx.builder.f_mul(ctx.f32_type, None, a, b).unwrap()
+pub fn emit_fp_mul_32(ctx: &mut SpirvEmitContext, inst: &Inst, a: Word, b: Word) -> Word {
+    let result = ctx.builder.f_mul(ctx.f32_type, None, a, b).unwrap();
+    decorate(ctx, inst, result)
 }
 
 /// FPDiv32: `OpFDiv` F32.
@@ -28,9 +42,10 @@ pub fn emit_fp_div_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
 }
 
 /// FPFma32: `OpExtInst Fma` F32.
-pub fn emit_fp_fma_32(ctx: &mut SpirvEmitContext, a: Word, b: Word, c: Word) -> Word {
+pub fn emit_fp_fma_32(ctx: &mut SpirvEmitContext, inst: &Inst, a: Word, b: Word, c: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
-    ctx.builder
+    let result = ctx
+        .builder
         .ext_inst(
             ctx.f32_type,
             None,
@@ -42,7 +57,8 @@ pub fn emit_fp_fma_32(ctx: &mut SpirvEmitContext, a: Word, b: Word, c: Word) -> 
                 rspirv::dr::Operand::IdRef(c),
             ],
         )
-        .unwrap()
+        .unwrap();
+    decorate(ctx, inst, result)
 }
 
 /// FPNeg32: `OpFNegate` F32.
@@ -418,8 +434,9 @@ pub fn emit_fp_is_nan_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 // ── FP64 arithmetic ──────────────────────────────────────────────────────
 
 /// FPAdd64: `OpFAdd` F64.
-pub fn emit_fp_add_64(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
-    ctx.builder.f_add(ctx.f64_type, None, a, b).unwrap()
+pub fn emit_fp_add_64(ctx: &mut SpirvEmitContext, inst: &Inst, a: Word, b: Word) -> Word {
+    let result = ctx.builder.f_add(ctx.f64_type, None, a, b).unwrap();
+    decorate(ctx, inst, result)
 }
 
 /// FPSub64: `OpFSub` F64.
@@ -428,14 +445,16 @@ pub fn emit_fp_sub_64(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
 }
 
 /// FPMul64: `OpFMul` F64.
-pub fn emit_fp_mul_64(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
-    ctx.builder.f_mul(ctx.f64_type, None, a, b).unwrap()
+pub fn emit_fp_mul_64(ctx: &mut SpirvEmitContext, inst: &Inst, a: Word, b: Word) -> Word {
+    let result = ctx.builder.f_mul(ctx.f64_type, None, a, b).unwrap();
+    decorate(ctx, inst, result)
 }
 
 /// FPFma64: `OpExtInst Fma` F64.
-pub fn emit_fp_fma_64(ctx: &mut SpirvEmitContext, a: Word, b: Word, c: Word) -> Word {
+pub fn emit_fp_fma_64(ctx: &mut SpirvEmitContext, inst: &Inst, a: Word, b: Word, c: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
-    ctx.builder
+    let result = ctx
+        .builder
         .ext_inst(
             ctx.f64_type,
             None,
@@ -447,7 +466,8 @@ pub fn emit_fp_fma_64(ctx: &mut SpirvEmitContext, a: Word, b: Word, c: Word) -> 
                 rspirv::dr::Operand::IdRef(c),
             ],
         )
-        .unwrap()
+        .unwrap();
+    decorate(ctx, inst, result)
 }
 
 /// FPNeg64: `OpFNegate` F64.
@@ -495,4 +515,108 @@ pub fn emit_fp_max_64(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
             vec![rspirv::dr::Operand::IdRef(a), rspirv::dr::Operand::IdRef(b)],
         )
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::opcodes::Opcode;
+    use crate::ir::program::Program;
+    use crate::ir::types::ShaderStage;
+    use crate::ir::value::Value;
+    use crate::profile::Profile;
+    use crate::runtime_info::RuntimeInfo;
+    use rspirv::dr::Operand;
+
+    #[test]
+    fn fp_no_contraction_flag_decorates_spirv_result() {
+        let program = Program::new(ShaderStage::Fragment);
+        let profile = Profile::default();
+        let runtime_info = RuntimeInfo::default();
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &runtime_info);
+        ctx.builder
+            .begin_function(
+                ctx.void_type,
+                None,
+                rspirv::spirv::FunctionControl::NONE,
+                ctx.void_fn_type,
+            )
+            .unwrap();
+        ctx.builder.begin_block(None).unwrap();
+
+        let inst = Inst::with_flags(
+            Opcode::FPAdd32,
+            vec![Value::ImmF32(0.0), Value::ImmF32(1.0)],
+            FpControl {
+                no_contraction: true,
+                ..FpControl::default()
+            }
+            .to_u32(),
+        );
+        let zero = ctx.const_zero_f32;
+        let one = ctx.const_one_f32;
+        let result = emit_fp_add_32(&mut ctx, &inst, zero, one);
+
+        assert!(ctx
+            .builder
+            .module_ref()
+            .annotations
+            .iter()
+            .any(|annotation| {
+                matches!(
+                    annotation.operands.as_slice(),
+                    [Operand::IdRef(id), Operand::Decoration(Decoration::NoContraction)]
+                        if *id == result
+                )
+            }));
+    }
+
+    #[test]
+    fn fp64_no_contraction_flag_decorates_spirv_results() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.info.uses_fp64 = true;
+        let profile = Profile::default();
+        let runtime_info = RuntimeInfo::default();
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &runtime_info);
+        ctx.builder
+            .begin_function(
+                ctx.void_type,
+                None,
+                rspirv::spirv::FunctionControl::NONE,
+                ctx.void_fn_type,
+            )
+            .unwrap();
+        ctx.builder.begin_block(None).unwrap();
+        let control = FpControl {
+            no_contraction: true,
+            ..FpControl::default()
+        };
+        let inst = Inst::with_flags(
+            Opcode::FPAdd64,
+            vec![Value::ImmF64(0.0), Value::ImmF64(1.0)],
+            control.to_u32(),
+        );
+        let zero = ctx.builder.constant_bit64(ctx.f64_type, 0.0f64.to_bits());
+        let one = ctx.builder.constant_bit64(ctx.f64_type, 1.0f64.to_bits());
+        let results = [
+            emit_fp_add_64(&mut ctx, &inst, zero, one),
+            emit_fp_mul_64(&mut ctx, &inst, zero, one),
+            emit_fp_fma_64(&mut ctx, &inst, zero, one, one),
+        ];
+
+        for result in results {
+            assert!(ctx
+                .builder
+                .module_ref()
+                .annotations
+                .iter()
+                .any(|annotation| {
+                    matches!(
+                        annotation.operands.as_slice(),
+                        [Operand::IdRef(id), Operand::Decoration(Decoration::NoContraction)]
+                            if *id == result
+                    )
+                }));
+        }
+    }
 }

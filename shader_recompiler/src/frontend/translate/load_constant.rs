@@ -122,14 +122,14 @@ pub fn ldc(tv: &mut TranslatorVisitor, insn: u64) {
         LdcSize::S16 => tv.ir.get_cbuf_s16(cb_index, byte_offset),
         LdcSize::B32 => tv.ir.get_cbuf_u32(cb_index, byte_offset),
         LdcSize::B64 => {
-            // 64-bit: load two consecutive 32-bit words into aligned register pair.
-            // Upstream throws on unaligned dest_reg.
             if dest_reg & 1 != 0 {
                 panic!("LDC.B64: unaligned destination register {}", dest_reg);
             }
-            let lo = tv.ir.get_cbuf_u32(cb_index.clone(), byte_offset.clone());
-            let offset_hi = tv.ir.iadd_32(byte_offset, Value::ImmU32(4));
-            let hi = tv.ir.get_cbuf_u32(cb_index, offset_hi);
+            let vector = tv.ir.get_cbuf_u32x2(cb_index, byte_offset);
+            let lo = tv
+                .ir
+                .composite_extract_u32x2(vector.clone(), Value::ImmU32(0));
+            let hi = tv.ir.composite_extract_u32x2(vector, Value::ImmU32(1));
             tv.set_x(dest_reg, lo);
             tv.set_x(dest_reg + 1, hi);
             return;
@@ -137,4 +137,41 @@ pub fn ldc(tv: &mut TranslatorVisitor, insn: u64) {
     };
 
     tv.set_x(dest_reg, result);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{basic_block::Block, opcodes::Opcode, program::Program, types::ShaderStage};
+
+    #[test]
+    fn ldc_b64_uses_one_vector_cbuf_load_like_upstream() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+        let insn =
+            2u64 | (255u64 << 8) | (0x20u64 << 20) | (3u64 << 36) | (LdcSize::B64 as u64) << 48;
+
+        ldc(&mut tv, insn);
+
+        let opcodes: Vec<_> = tv.ir.program.blocks[0]
+            .iter()
+            .map(|inst| inst.opcode)
+            .collect();
+        assert_eq!(
+            opcodes
+                .iter()
+                .filter(|opcode| **opcode == Opcode::GetCbufU32x2)
+                .count(),
+            1
+        );
+        assert_eq!(
+            opcodes
+                .iter()
+                .filter(|opcode| **opcode == Opcode::CompositeExtractU32x2)
+                .count(),
+            2
+        );
+        assert!(!opcodes.contains(&Opcode::GetCbufU32));
+    }
 }

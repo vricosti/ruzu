@@ -30,6 +30,7 @@ use crate::surface::{
     is_pixel_format_integer, is_pixel_format_signed_integer, pixel_format_from_render_target_format,
 };
 use shader_recompiler::backend::bindings::Bindings;
+use shader_recompiler::environment::Environment;
 use shader_recompiler::host_translate_info::HostTranslateInfo;
 use shader_recompiler::runtime_info::{
     AttributeType, CompareFunction, InputTopology, TessPrimitive, TessSpacing,
@@ -163,6 +164,36 @@ pub struct GraphicsPipeline {
     is_built: Arc<AtomicBool>,
 }
 
+/// Synchronization state captured by the draw configuration path while the
+/// pipeline cache remains mutably borrowed by its owner.
+///
+/// Upstream records a closure capturing `GraphicsPipeline*` after
+/// `ConfigureImpl` has snapshotted all guest resources. The Rust owner cannot
+/// retain that reference across the remaining rasterizer preparation, so this
+/// cloneable handle preserves the same wait point without moving resource
+/// preparation ahead of pipeline lookup.
+#[derive(Clone)]
+pub struct PipelineBuildWaiter {
+    pipeline: Arc<Mutex<vk::Pipeline>>,
+    build_condvar: Arc<Condvar>,
+    build_mutex: Arc<Mutex<()>>,
+    is_built: Arc<AtomicBool>,
+}
+
+impl PipelineBuildWaiter {
+    pub fn pipeline_handle(&self) -> Option<vk::Pipeline> {
+        if !self.is_built.load(Ordering::Acquire) {
+            let lock = self.build_mutex.lock().unwrap();
+            let _guard = self
+                .build_condvar
+                .wait_while(lock, |_| !self.is_built.load(Ordering::Relaxed))
+                .unwrap();
+        }
+        let pipeline = *self.pipeline.lock().unwrap();
+        (pipeline != vk::Pipeline::null()).then_some(pipeline)
+    }
+}
+
 // Vulkan pipeline objects are opaque device handles. Upstream builds them on
 // worker threads and transfers the resulting `unique_ptr<GraphicsPipeline>` to
 // the pipeline cache; the Rust preload path mirrors that ownership transfer.
@@ -212,13 +243,20 @@ impl GraphicsPipeline {
     }
 
     /// Upstream `GraphicsPipeline::ConfigureDraw` waits for async pipeline
-    /// creation before binding the handle. The current Rust draw path still
-    /// performs configure/bind outside this object, so expose the same wait at
-    /// the handle boundary until `ConfigureDraw` ownership is ported.
+    /// creation only after `ConfigureImpl` has prepared guest resources.
+    /// Return a cloneable waiter so the rasterizer can preserve that ordering
+    /// while configure/bind ownership remains outside this object.
+    pub fn build_waiter(&self) -> PipelineBuildWaiter {
+        PipelineBuildWaiter {
+            pipeline: Arc::clone(&self.pipeline),
+            build_condvar: Arc::clone(&self.build_condvar),
+            build_mutex: Arc::clone(&self.build_mutex),
+            is_built: Arc::clone(&self.is_built),
+        }
+    }
+
     pub fn pipeline_handle(&self) -> Option<vk::Pipeline> {
-        self.wait_for_build();
-        let pipeline = *self.pipeline.lock().unwrap();
-        (pipeline != vk::Pipeline::null()).then_some(pipeline)
+        self.build_waiter().pipeline_handle()
     }
 
     fn wait_for_build(&self) {
@@ -270,6 +308,7 @@ pub struct GraphicsPipelineCache {
     max_viewports: u32,
     max_vertex_input_bindings: u32,
     vertex_attribute_divisor_supported: bool,
+    provoking_vertex_supported: bool,
 }
 
 impl GraphicsPipelineCache {
@@ -289,6 +328,7 @@ impl GraphicsPipelineCache {
         max_viewports: u32,
         max_vertex_input_bindings: u32,
         vertex_attribute_divisor_supported: bool,
+        provoking_vertex_supported: bool,
     ) -> Self {
         Self {
             device,
@@ -308,6 +348,7 @@ impl GraphicsPipelineCache {
             max_vertex_input_bindings: max_vertex_input_bindings
                 .min(crate::engines::maxwell_3d::NUM_VERTEX_ARRAYS),
             vertex_attribute_divisor_supported,
+            provoking_vertex_supported,
         }
     }
 
@@ -380,6 +421,7 @@ impl GraphicsPipelineCache {
             max_viewports: self.max_viewports,
             max_vertex_input_bindings: self.max_vertex_input_bindings,
             vertex_attribute_divisor_supported: self.vertex_attribute_divisor_supported,
+            provoking_vertex_supported: self.provoking_vertex_supported,
         }
     }
 
@@ -851,21 +893,26 @@ impl GraphicsPipelineCache {
             let cfg_offset = env.start_address().wrapping_add(std::mem::size_of::<
                 shader_recompiler::program_header::ProgramHeader,
             >() as u32);
-            let compiled = shader_recompiler::compile_shader_from_env_with_bindings_and_host_info(
-                &code,
-                cfg_offset,
-                env,
-                &self.profile,
-                &runtime_info,
-                &mut bindings,
-                &self.host_info,
-            );
+            let mut compiled =
+                shader_recompiler::compile_shader_from_env_with_bindings_and_host_info(
+                    &code,
+                    cfg_offset,
+                    env,
+                    &self.profile,
+                    &runtime_info,
+                    &mut bindings,
+                    &self.host_info,
+                );
+            override_spirv_if_requested(stage_index, cfg_offset, &mut compiled.spirv_words);
             dump_spirv_if_requested(stage_index, cfg_offset, &compiled.spirv_words);
             if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
                 log::info!(
-                    "[VK_SHADER_DISK_COMPILE] env_index={} stage={:?} spirv_words={}",
+                    "[VK_SHADER_DISK_COMPILE] env_index={} stage={:?} start=0x{:X} texture_bound={} proprietary={} spirv_words={}",
                     env_index,
                     stage,
+                    env.start_address(),
+                    env.texture_bound_buffer(),
+                    env.is_proprietary_driver(),
                     compiled.spirv_words.len()
                 );
             }
@@ -984,7 +1031,7 @@ impl GraphicsPipelineCache {
         }
         let base_offset = env.generic_environment().cached_instruction_start();
         let compile_start = Instant::now();
-        let compiled = shader_recompiler::compile_shader_from_env_with_bindings_and_host_info(
+        let mut compiled = shader_recompiler::compile_shader_from_env_with_bindings_and_host_info(
             &code,
             base_offset,
             env,
@@ -993,6 +1040,7 @@ impl GraphicsPipelineCache {
             bindings,
             &self.host_info,
         );
+        override_spirv_if_requested(stage_index, base_offset, &mut compiled.spirv_words);
         if trace {
             eprintln!(
                 "[VK_SHADER_ENV_COMPILE] stage_index={} compile_done elapsed_ms={} spirv_words={} cbufs={} textures={}",
@@ -1050,14 +1098,18 @@ impl GraphicsPipelineCache {
         }
 
         let runtime_info = make_runtime_info(draw, fixed_state, ShaderStage::Fragment, None);
-        let compiled =
-            self.shader_cache
-                .get_or_compile(&code, ShaderStage::Fragment, &runtime_info);
+        let mut compiled = self
+            .shader_cache
+            .get_or_compile(&code, ShaderStage::Fragment, &runtime_info)
+            .clone();
+        override_spirv_if_requested(4, stage_info.offset, &mut compiled.spirv_words);
         dump_spirv_if_requested(4, stage_info.offset, &compiled.spirv_words);
-        Some(compiled.clone())
+        Some(compiled)
     }
 
     fn create_shader_module(&self, spirv_words: &[u32]) -> Option<vk::ShaderModule> {
+        let override_words = override_spirv_by_hash_if_requested(spirv_words);
+        let spirv_words = override_words.as_deref().unwrap_or(spirv_words);
         let create_info = vk::ShaderModuleCreateInfo::builder()
             .code(spirv_words)
             .build();
@@ -1223,12 +1275,24 @@ impl GraphicsPipelineCache {
             .build();
 
         let num_viewports = self.max_viewports.max(1);
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        let mut depth_clip_control = vk::PipelineViewportDepthClipControlCreateInfoEXT::builder()
+            .negative_one_to_one(fixed_state.ndc_minus_one_to_one());
+        let mut viewport_state_builder = vk::PipelineViewportStateCreateInfo::builder()
             .viewport_count(num_viewports)
-            .scissor_count(num_viewports)
-            .build();
+            .scissor_count(num_viewports);
+        if self.profile.support_native_ndc {
+            viewport_state_builder = viewport_state_builder.push_next(&mut depth_clip_control);
+        }
+        let viewport_state = viewport_state_builder.build();
 
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+        let mut provoking_vertex =
+            vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT::builder()
+                .provoking_vertex_mode(if fixed_state.provoking_vertex_last() {
+                    vk::ProvokingVertexModeEXT::LAST_VERTEX
+                } else {
+                    vk::ProvokingVertexModeEXT::FIRST_VERTEX
+                });
+        let mut rasterization_builder = vk::PipelineRasterizationStateCreateInfo::builder()
             .depth_clamp_enable(false)
             .rasterizer_discard_enable(false)
             .polygon_mode(vk::PolygonMode::FILL)
@@ -1238,8 +1302,11 @@ impl GraphicsPipelineCache {
             .depth_bias_constant_factor(draw.rasterizer.depth_bias)
             .depth_bias_slope_factor(draw.rasterizer.slope_scale_depth_bias)
             .depth_bias_clamp(draw.rasterizer.depth_bias_clamp)
-            .line_width(draw.rasterizer.line_width_smooth.max(1.0))
-            .build();
+            .line_width(draw.rasterizer.line_width_smooth.max(1.0));
+        if self.provoking_vertex_supported {
+            rasterization_builder = rasterization_builder.push_next(&mut provoking_vertex);
+        }
+        let rasterization = rasterization_builder.build();
 
         let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1)
@@ -1409,12 +1476,24 @@ impl GraphicsPipelineCache {
             .build();
 
         let num_viewports = self.max_viewports.max(1);
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        let mut depth_clip_control = vk::PipelineViewportDepthClipControlCreateInfoEXT::builder()
+            .negative_one_to_one(fixed_state.ndc_minus_one_to_one());
+        let mut viewport_state_builder = vk::PipelineViewportStateCreateInfo::builder()
             .viewport_count(num_viewports)
-            .scissor_count(num_viewports)
-            .build();
+            .scissor_count(num_viewports);
+        if self.profile.support_native_ndc {
+            viewport_state_builder = viewport_state_builder.push_next(&mut depth_clip_control);
+        }
+        let viewport_state = viewport_state_builder.build();
 
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+        let mut provoking_vertex =
+            vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT::builder()
+                .provoking_vertex_mode(if fixed_state.provoking_vertex_last() {
+                    vk::ProvokingVertexModeEXT::LAST_VERTEX
+                } else {
+                    vk::ProvokingVertexModeEXT::FIRST_VERTEX
+                });
+        let mut rasterization_builder = vk::PipelineRasterizationStateCreateInfo::builder()
             .depth_clamp_enable(!fixed_state.dynamic_state.depth_clamp_disabled())
             .rasterizer_discard_enable(!fixed_state.dynamic_state.rasterize_enable())
             .polygon_mode(maxwell_to_vk::polygon_mode(fixed_state.polygon_mode()))
@@ -1427,8 +1506,11 @@ impl GraphicsPipelineCache {
                 fixed_state.dynamic_state.front_face(),
             ))
             .depth_bias_enable(fixed_state.dynamic_state.depth_bias_enable())
-            .line_width(1.0)
-            .build();
+            .line_width(1.0);
+        if self.provoking_vertex_supported {
+            rasterization_builder = rasterization_builder.push_next(&mut provoking_vertex);
+        }
+        let rasterization = rasterization_builder.build();
 
         let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
             .rasterization_samples(
@@ -2144,6 +2226,18 @@ fn dump_spirv_if_requested(stage_index: usize, base_offset: u32, words: &[u32]) 
     let Some(dir) = std::env::var_os("RUZU_DUMP_SPIRV_DIR") else {
         return;
     };
+    if let Ok(requested) = std::env::var("RUZU_DUMP_SPIRV_BASE") {
+        let requested = requested.trim_start_matches("0x");
+        if !u32::from_str_radix(requested, 16).is_ok_and(|value| {
+            value == base_offset
+                || value.wrapping_add(std::mem::size_of::<
+                    shader_recompiler::program_header::ProgramHeader,
+                >() as u32)
+                    == base_offset
+        }) {
+            return;
+        }
+    }
     let dir = std::path::PathBuf::from(dir);
     if let Err(err) = std::fs::create_dir_all(&dir) {
         warn!(
@@ -2170,6 +2264,103 @@ fn dump_spirv_if_requested(stage_index: usize, base_offset: u32, words: &[u32]) 
             err
         );
     }
+}
+
+fn override_spirv_if_requested(stage_index: usize, base_offset: u32, words: &mut Vec<u32>) {
+    let (base_var, path_var) = match stage_index {
+        0 => (
+            "RUZU_OVERRIDE_VERTEX_SPIRV_BASE",
+            "RUZU_OVERRIDE_VERTEX_SPIRV_PATH",
+        ),
+        4 => (
+            "RUZU_OVERRIDE_FRAGMENT_SPIRV_BASE",
+            "RUZU_OVERRIDE_FRAGMENT_SPIRV_PATH",
+        ),
+        _ => return,
+    };
+    let Some(requested_base) = std::env::var(base_var)
+        .ok()
+        .and_then(|value| u32::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+    else {
+        return;
+    };
+    let code_base = requested_base.wrapping_add(std::mem::size_of::<
+        shader_recompiler::program_header::ProgramHeader,
+    >() as u32);
+    if requested_base != base_offset && code_base != base_offset {
+        return;
+    }
+    let Some(path) = std::env::var_os(path_var) else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        warn!(
+            "Failed to read SPIR-V override {}",
+            std::path::Path::new(&path).display()
+        );
+        return;
+    };
+    if bytes.len() % std::mem::size_of::<u32>() != 0 {
+        warn!(
+            "Ignoring non-word-aligned SPIR-V override {}",
+            std::path::Path::new(&path).display()
+        );
+        return;
+    }
+    words.clear();
+    words.extend(
+        bytes
+            .chunks_exact(std::mem::size_of::<u32>())
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap())),
+    );
+    log::info!(
+        "[SPIRV_OVERRIDE] stage={} base=0x{:X} words={} path={}",
+        stage_index,
+        base_offset,
+        words.len(),
+        std::path::Path::new(&path).display()
+    );
+}
+
+fn override_spirv_by_hash_if_requested(words: &[u32]) -> Option<Vec<u32>> {
+    let requested_hash = std::env::var("RUZU_OVERRIDE_SPIRV_HASH")
+        .ok()
+        .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())?;
+    let original_hash = hash_spirv(words);
+    if requested_hash != original_hash {
+        return None;
+    }
+    let path = std::env::var_os("RUZU_OVERRIDE_SPIRV_HASH_PATH")
+        .or_else(|| std::env::var_os("RUZU_OVERRIDE_FRAGMENT_SPIRV_PATH"))?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            warn!(
+                "Failed to read SPIR-V override {}: {}",
+                std::path::Path::new(&path).display(),
+                err
+            );
+            return None;
+        }
+    };
+    if bytes.len() % std::mem::size_of::<u32>() != 0 {
+        warn!(
+            "Ignoring non-word-aligned SPIR-V override {}",
+            std::path::Path::new(&path).display()
+        );
+        return None;
+    }
+    let replacement = bytes
+        .chunks_exact(std::mem::size_of::<u32>())
+        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    log::info!(
+        "[SPIRV_OVERRIDE] hash=0x{:016X} replacement_words={} path={}",
+        original_hash,
+        replacement.len(),
+        std::path::Path::new(&path).display()
+    );
+    Some(replacement)
 }
 
 fn build_vertex_input_state_from_state(
@@ -2214,7 +2405,6 @@ fn build_vertex_input_state_from_state(
             divisors.push(vk::VertexInputBindingDivisorDescriptionEXT { binding, divisor });
         }
     }
-
     let mut attributes = Vec::new();
     for (location, attrib) in fixed_state.attributes.iter().enumerate() {
         let attrib_type = VertexAttribType::from_raw(attrib.attrib_type());
@@ -2385,6 +2575,15 @@ mod tests {
         let a = vec![0x07230203u32, 0x00010000];
         let b = vec![0x07230203u32, 0x00020000];
         assert_ne!(hash_spirv(&a), hash_spirv(&b));
+    }
+
+    #[test]
+    fn pipeline_build_waiter_returns_completed_pipeline_handle() {
+        let pipeline = make_test_pipeline(GraphicsPipelineKey::default());
+        let expected = vk::Pipeline::from_raw(0x1234);
+        *pipeline.pipeline.lock().unwrap() = expected;
+
+        assert_eq!(pipeline.build_waiter().pipeline_handle(), Some(expected));
     }
 
     #[test]

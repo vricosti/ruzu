@@ -51,6 +51,38 @@ impl NvDispDisp0 {
 
         for (index, layer) in sorted_layers.iter().enumerate() {
             let address = self.nvmap().get_handle_address(layer.buffer_handle);
+            if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+                log::info!(
+                    "[RUZU_COMPOSITE] layer={} handle={} addr=0x{:X} offset=0x{:X} {}x{} stride={} format={} transform=0x{:X} crop=({},{})->({},{}) fences={}",
+                    index,
+                    layer.buffer_handle,
+                    address,
+                    layer.offset,
+                    layer.width,
+                    layer.height,
+                    layer.stride,
+                    layer.format as u32,
+                    layer.transform.bits(),
+                    layer.crop_rect.left,
+                    layer.crop_rect.top,
+                    layer.crop_rect.right,
+                    layer.crop_rect.bottom,
+                    layer.acquire_fence.num_fences
+                );
+                for (fence_index, fence) in layer.acquire_fence.fences
+                    [..layer.acquire_fence.num_fences as usize]
+                    .iter()
+                    .enumerate()
+                {
+                    log::info!(
+                        "[RUZU_COMPOSITE_FENCE] layer={} fence={} id={} value={}",
+                        index,
+                        fence_index,
+                        fence.id,
+                        fence.value
+                    );
+                }
+            }
             if common::trace::is_enabled(common::trace::cat::HWC) {
                 common::trace::emit_raw(
                     common::trace::cat::HWC,

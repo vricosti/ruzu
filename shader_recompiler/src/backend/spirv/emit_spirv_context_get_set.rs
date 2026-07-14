@@ -109,72 +109,221 @@ pub fn emit_set_sample_mask(_ctx: &mut SpirvEmitContext, _value: Word) {
 
 // ── IR-instruction dispatching helpers (called from spirv_emit_context) ───
 
-/// Dispatch GetCbufU32 / GetCbufF32 IR instructions.
+fn cbuf_element_index(
+    ctx: &mut SpirvEmitContext,
+    offset: ir::Value,
+    resolved_offset: Word,
+    element_size: u32,
+) -> Word {
+    if let ir::Value::ImmU32(offset) = offset {
+        return ctx.constant_u32(offset / element_size);
+    }
+    let shift = ctx.constant_u32(element_size.trailing_zeros());
+    ctx.builder
+        .shift_right_logical(ctx.u32_type, None, resolved_offset, shift)
+        .unwrap()
+}
+
+fn load_cbuf_view(
+    ctx: &mut SpirvEmitContext,
+    var: Word,
+    result_type: Word,
+    pointer_type: Word,
+    offset: ir::Value,
+    resolved_offset: Word,
+    element_size: u32,
+) -> Word {
+    let index = cbuf_element_index(ctx, offset, resolved_offset, element_size);
+    let zero = ctx.const_zero_u32;
+    let pointer = ctx
+        .builder
+        .access_chain(pointer_type, None, var, vec![zero, index])
+        .unwrap();
+    ctx.builder
+        .load(result_type, None, pointer, None, vec![])
+        .unwrap()
+}
+
+fn load_cbuf_u32x4_element(
+    ctx: &mut SpirvEmitContext,
+    var: Word,
+    offset: ir::Value,
+    resolved_offset: Word,
+    index_offset: u32,
+) -> Word {
+    let pointer_type = ctx.uniform_u32_vec4_ptr;
+    let vector_type = ctx.u32_vec4_type;
+    let vector = load_cbuf_view(
+        ctx,
+        var,
+        vector_type,
+        pointer_type,
+        offset,
+        resolved_offset,
+        16,
+    );
+    if let ir::Value::ImmU32(offset) = offset {
+        return ctx
+            .builder
+            .composite_extract(
+                ctx.u32_type,
+                None,
+                vector,
+                vec![(offset / 4) % 4 + index_offset],
+            )
+            .unwrap();
+    }
+    let two = ctx.constant_u32(2);
+    let word = ctx
+        .builder
+        .shift_right_logical(ctx.u32_type, None, resolved_offset, two)
+        .unwrap();
+    let three = ctx.constant_u32(3);
+    let mut component = ctx
+        .builder
+        .bitwise_and(ctx.u32_type, None, word, three)
+        .unwrap();
+    if index_offset != 0 {
+        let offset = ctx.constant_u32(index_offset);
+        component = ctx
+            .builder
+            .i_add(ctx.u32_type, None, component, offset)
+            .unwrap();
+    }
+    ctx.builder
+        .vector_extract_dynamic(ctx.u32_type, None, vector, component)
+        .unwrap()
+}
+
+/// Dispatch constant-buffer load IR instructions.
 pub fn emit_get_cbuf(ctx: &mut SpirvEmitContext, inst: &ir::Inst, block_idx: u32, inst_idx: u32) {
     let cbuf_idx = inst.arg(0).imm_u32();
-    let byte_offset = ctx.resolve_value(inst.arg(1));
+    let offset = *inst.arg(1);
+    let resolved_offset = ctx.resolve_value(&offset);
+    let definitions = ctx.cbufs.get(&cbuf_idx).copied().unwrap_or_default();
 
-    let result_type = match inst.opcode {
-        Opcode::GetCbufF32 => ctx.f32_type,
-        _ => ctx.u32_type,
-    };
-
-    if let Some(&cbuf_var) = ctx.cbuf_vars.get(&cbuf_idx) {
-        let four = ctx.builder.constant_bit32(ctx.u32_type, 4);
-        let word_index = ctx
-            .builder
-            .u_div(ctx.u32_type, None, byte_offset, four)
-            .unwrap();
-        let three = ctx.builder.constant_bit32(ctx.u32_type, 3);
-        let component = ctx
-            .builder
-            .bitwise_and(ctx.u32_type, None, word_index, three)
-            .unwrap();
-        let sixteen = ctx.builder.constant_bit32(ctx.u32_type, 16);
-        let index = ctx
-            .builder
-            .u_div(ctx.u32_type, None, byte_offset, sixteen)
-            .unwrap();
-        let zero = ctx.const_zero_u32;
-        let uniform_u32_vec4_ptr = ctx.uniform_u32_vec4_ptr;
-        let ptr = ctx
-            .builder
-            .access_chain(uniform_u32_vec4_ptr, None, cbuf_var, vec![zero, index])
-            .unwrap();
-        let vector = ctx
-            .builder
-            .load(ctx.u32_vec4_type, None, ptr, None, vec![])
-            .unwrap();
-        let loaded = if inst.arg(1).is_immediate() {
-            ctx.builder
-                .composite_extract(
-                    ctx.u32_type,
-                    None,
-                    vector,
-                    vec![(inst.arg(1).imm_u32() / 4) & 3],
+    let id = match inst.opcode {
+        Opcode::GetCbufF32 if ctx.profile.support_descriptor_aliasing => {
+            if definitions.f32_scalar == 0 {
+                ctx.const_zero_f32
+            } else {
+                load_cbuf_view(
+                    ctx,
+                    definitions.f32_scalar,
+                    ctx.f32_type,
+                    ctx.uniform_f32_ptr,
+                    offset,
+                    resolved_offset,
+                    4,
                 )
-                .unwrap()
-        } else {
-            ctx.builder
-                .vector_extract_dynamic(ctx.u32_type, None, vector, component)
-                .unwrap()
-        };
-
-        let id = if inst.opcode == Opcode::GetCbufF32 {
-            ctx.builder.bitcast(ctx.f32_type, None, loaded).unwrap()
-        } else {
-            loaded
-        };
-
-        ctx.set_value(block_idx, inst_idx, id);
-    } else {
-        let id = if inst.opcode == Opcode::GetCbufF32 {
-            ctx.const_zero_f32
-        } else {
-            ctx.const_zero_u32
-        };
-        ctx.set_value(block_idx, inst_idx, id);
-    }
+            }
+        }
+        Opcode::GetCbufU32 if ctx.profile.support_descriptor_aliasing => {
+            if definitions.u32_scalar == 0 {
+                ctx.const_zero_u32
+            } else {
+                load_cbuf_view(
+                    ctx,
+                    definitions.u32_scalar,
+                    ctx.u32_type,
+                    ctx.uniform_u32_ptr,
+                    offset,
+                    resolved_offset,
+                    4,
+                )
+            }
+        }
+        Opcode::GetCbufU32x2 if ctx.profile.support_descriptor_aliasing => {
+            if definitions.u32x2 == 0 {
+                ctx.builder.undef(ctx.u32_vec2_type, None)
+            } else {
+                load_cbuf_view(
+                    ctx,
+                    definitions.u32x2,
+                    ctx.u32_vec2_type,
+                    ctx.uniform_u32_vec2_ptr,
+                    offset,
+                    resolved_offset,
+                    8,
+                )
+            }
+        }
+        Opcode::GetCbufU8 | Opcode::GetCbufS8 | Opcode::GetCbufU16 | Opcode::GetCbufS16
+            if ctx.profile.support_descriptor_aliasing =>
+        {
+            let word = if definitions.u32_scalar == 0 {
+                ctx.const_zero_u32
+            } else {
+                load_cbuf_view(
+                    ctx,
+                    definitions.u32_scalar,
+                    ctx.u32_type,
+                    ctx.uniform_u32_ptr,
+                    offset,
+                    resolved_offset,
+                    4,
+                )
+            };
+            let (mask, width, signed) = match inst.opcode {
+                Opcode::GetCbufU8 => (3, 8, false),
+                Opcode::GetCbufS8 => (3, 8, true),
+                Opcode::GetCbufU16 => (2, 16, false),
+                Opcode::GetCbufS16 => (2, 16, true),
+                _ => unreachable!(),
+            };
+            let bit_offset = if let ir::Value::ImmU32(offset) = offset {
+                ctx.constant_u32((offset & mask) * 8)
+            } else {
+                let mask = ctx.constant_u32(mask);
+                let byte = ctx
+                    .builder
+                    .bitwise_and(ctx.u32_type, None, resolved_offset, mask)
+                    .unwrap();
+                let three = ctx.constant_u32(3);
+                ctx.builder
+                    .shift_left_logical(ctx.u32_type, None, byte, three)
+                    .unwrap()
+            };
+            let width = ctx.constant_u32(width);
+            if signed {
+                ctx.builder
+                    .bit_field_s_extract(ctx.u32_type, None, word, bit_offset, width)
+                    .unwrap()
+            } else {
+                ctx.builder
+                    .bit_field_u_extract(ctx.u32_type, None, word, bit_offset, width)
+                    .unwrap()
+            }
+        }
+        _ => {
+            if definitions.u32x4 == 0 {
+                if inst.opcode == Opcode::GetCbufF32 {
+                    ctx.const_zero_f32
+                } else if inst.opcode == Opcode::GetCbufU32x2 {
+                    ctx.builder.undef(ctx.u32_vec2_type, None)
+                } else {
+                    ctx.const_zero_u32
+                }
+            } else if inst.opcode == Opcode::GetCbufU32x2 {
+                let first =
+                    load_cbuf_u32x4_element(ctx, definitions.u32x4, offset, resolved_offset, 0);
+                let second =
+                    load_cbuf_u32x4_element(ctx, definitions.u32x4, offset, resolved_offset, 1);
+                ctx.builder
+                    .composite_construct(ctx.u32_vec2_type, None, vec![first, second])
+                    .unwrap()
+            } else {
+                let word =
+                    load_cbuf_u32x4_element(ctx, definitions.u32x4, offset, resolved_offset, 0);
+                if inst.opcode == Opcode::GetCbufF32 {
+                    ctx.builder.bitcast(ctx.f32_type, None, word).unwrap()
+                } else {
+                    word
+                }
+            }
+        }
+    };
+    ctx.set_value(block_idx, inst_idx, id);
 }
 
 /// Dispatch GetAttribute / GetAttributeU32 IR instructions.
@@ -480,6 +629,12 @@ pub fn emit_set_attribute_inst(
                 .access_chain(output_f32_ptr, None, output_var, vec![idx_const])
                 .unwrap();
             ctx.builder.store(ptr, val, None, vec![]).unwrap();
+        }
+    } else if attr == ir::value::Attribute::POINT_SIZE {
+        if ctx.output_point_size != 0 {
+            ctx.builder
+                .store(ctx.output_point_size, val, None, vec![])
+                .unwrap();
         }
     } else {
         log::trace!("SPIR-V: unhandled set_attribute {:?}", attr);

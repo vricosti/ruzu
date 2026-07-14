@@ -342,8 +342,8 @@ impl Gpu {
 
         if let Some(rasterizer) = self.rasterizer_handle() {
             let rasterizer = unsafe { rasterizer.as_mut() };
-            let channel_state = channel_state.lock();
-            rasterizer.bind_channel(&channel_state);
+            let mut channel_state = channel_state.lock();
+            rasterizer.bind_channel(&mut channel_state);
         }
     }
 
@@ -992,7 +992,7 @@ impl GpuChannelHandle for VideoGpuChannelHandle {
             let gpu = unsafe { &*self.gpu };
             if let Some(rasterizer) = gpu.rasterizer_handle() {
                 let rasterizer = unsafe { rasterizer.as_mut() };
-                rasterizer.bind_channel(&channel_state);
+                rasterizer.bind_channel(&mut channel_state);
             }
         }
     }
@@ -1013,9 +1013,9 @@ impl GpuChannelHandle for VideoGpuChannelHandle {
         if let Some(rasterizer) = gpu.rasterizer_handle() {
             let rasterizer = unsafe { rasterizer.as_mut() };
             channel_state.bind_rasterizer(rasterizer);
-            rasterizer.initialize_channel(&channel_state);
+            rasterizer.initialize_channel(&mut channel_state);
             if channel_state.memory_manager.is_some() {
-                rasterizer.bind_channel(&channel_state);
+                rasterizer.bind_channel(&mut channel_state);
             }
         }
     }
@@ -1325,13 +1325,16 @@ mod tests {
             _memory: &[u8],
         ) {
         }
-        fn initialize_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
+        fn initialize_channel(
+            &mut self,
+            channel: &mut crate::control::channel_state::ChannelState,
+        ) {
             self.initialized_channels
                 .lock()
                 .unwrap()
                 .push(channel.bind_id);
         }
-        fn bind_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
+        fn bind_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
             self.bound_channels.lock().unwrap().push(channel.bind_id);
         }
     }

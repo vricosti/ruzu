@@ -372,6 +372,8 @@ impl crate::buffer_cache::buffer_cache_base::EngineState for ComputeEngineAdapte
 
     fn clear_dirty(&mut self, _flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) {}
 
+    fn set_dirty(&mut self, _flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) {}
+
     fn get_vertex_stream(
         &self,
         _index: u32,
@@ -436,6 +438,8 @@ impl crate::buffer_cache::buffer_cache_base::EngineState for DrawStateEngineAdap
     }
 
     fn clear_dirty(&mut self, _flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) {}
+
+    fn set_dirty(&mut self, _flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) {}
 
     fn get_vertex_stream(
         &self,
@@ -8590,7 +8594,10 @@ impl RasterizerInterface for RasterizerOpenGL {
         }
     }
 
-    fn initialize_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
+    fn initialize_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
+        if let Some(maxwell_3d) = channel.maxwell_3d.as_mut() {
+            super::gl_state_tracker::StateTracker::setup_tables(maxwell_3d.dirty_tables_mut());
+        }
         self.shader_cache.create_channel(channel);
         self.query_cache.create_channel(channel);
         self.texture_cache.base.create_channel(channel);
@@ -8598,7 +8605,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         // buffer cache here. That owner is still partially reduced in Rust.
     }
 
-    fn bind_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
+    fn bind_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
         if self.buffer_cache.channel_state.is_none() {
             self.buffer_cache.channel_state = Some(Box::default());
         }
