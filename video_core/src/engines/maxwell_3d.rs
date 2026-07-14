@@ -250,6 +250,7 @@ pub(crate) const CULL_TEST_ENABLE: u32 = reg_index!(0x1918);
 pub(crate) const FRONT_FACE: u32 = reg_index!(0x191C);
 pub(crate) const PROVOKING_VERTEX: u32 = reg_index!(0x1684);
 pub(crate) const DEPTH_BOUNDS_ENABLE: u32 = reg_index!(0x19BC);
+pub(crate) const DEPTH_BOUNDS_BASE: u32 = reg_index!(0x0F9C);
 pub(crate) const CULL_FACE: u32 = reg_index!(0x1920);
 pub(crate) const FRAMEBUFFER_SRGB: u32 = reg_index!(0x15B8);
 pub(crate) const VIEWPORT_SCALE_OFFSET_ENABLED: u32 = reg_index!(0x192C);
@@ -2136,9 +2137,8 @@ pub struct DrawCall {
 /// Port of `Maxwell3D::DirtyState`.
 ///
 /// Upstream owns both the live dirty flags and the register-to-flag lookup
-/// tables inside the Maxwell3D owner. Until ruzu grows upstream's per-channel
-/// renderer setup hook, the OpenGL state tracker installs its full table set
-/// here so register writes reach the same dirty flags as upstream OpenGL.
+/// tables inside the Maxwell3D owner. The selected rasterizer populates the
+/// backend-specific tables from `InitializeChannel`.
 pub struct DirtyState {
     pub flags: [bool; 256],
     pub tables: dirty_flags::DirtyTables,
@@ -2150,7 +2150,6 @@ impl DirtyState {
         flags.fill(true);
         let mut tables =
             std::array::from_fn(|_| vec![dirty_flags::flags::NULL_ENTRY; ENGINE_REG_COUNT]);
-        crate::renderer_opengl::gl_state_tracker::StateTracker::setup_tables(&mut tables);
         Self { flags, tables }
     }
 }
@@ -2329,8 +2328,16 @@ impl Maxwell3D {
 
     fn initialize_register_defaults(&mut self) {
         for viewport in 0..16usize {
+            let base = VIEWPORT_BASE as usize + viewport * VIEWPORT_STRIDE as usize;
+            self.regs[base + 2] = f32::to_bits(0.0);
+            self.regs[base + 3] = f32::to_bits(1.0);
+        }
+
+        for viewport in 0..16usize {
             let base = VP_TRANSFORM_BASE as usize + viewport * VP_TRANSFORM_STRIDE as usize;
-            self.regs[base + 6] = 0x688;
+            // Port of Maxwell3D's constructor: PositiveX/Y/Z/W are packed in
+            // 3-bit fields at offsets 0, 4, 8, and 12 respectively.
+            self.regs[base + 6] = 0x6420;
         }
 
         self.regs[BLEND_BASE as usize + 1] = 1;
@@ -3602,6 +3609,10 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.dirty.flags[index as usize] = false;
     }
 
+    fn dirty_flags_ptr(&mut self) -> Option<std::ptr::NonNull<[bool; 256]>> {
+        Some(std::ptr::NonNull::from(&mut self.dirty.flags))
+    }
+
     fn with_rasterizer_mut(&mut self, f: &mut dyn FnMut(&mut dyn RasterizerInterface)) -> bool {
         Maxwell3D::with_rasterizer_mut(self, |rasterizer| f(rasterizer)).is_some()
     }
@@ -3825,6 +3836,18 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.engine_state()
     }
 
+    fn provoking_vertex_last(&self) -> bool {
+        self.provoking_vertex_last()
+    }
+
+    fn depth_bounds_enable(&self) -> bool {
+        self.depth_bounds_enable()
+    }
+
+    fn mandated_early_z(&self) -> bool {
+        self.mandated_early_z()
+    }
+
     fn alpha_test_enabled(&self) -> bool {
         self.alpha_test_enabled()
     }
@@ -3931,6 +3954,18 @@ impl dm::Maxwell3DAccess for Maxwell3D {
 }
 
 impl Maxwell3D {
+    pub(crate) fn dirty_flags_mut(&mut self) -> &mut [bool; 256] {
+        &mut self.dirty.flags
+    }
+
+    pub(crate) fn dirty_tables(&self) -> &dirty_flags::DirtyTables {
+        &self.dirty.tables
+    }
+
+    pub(crate) fn dirty_tables_mut(&mut self) -> &mut dirty_flags::DirtyTables {
+        &mut self.dirty.tables
+    }
+
     // ── Upstream-matching execution mask ─────────────────────────────────
 
     /// Determine whether a method triggers immediate execution (matching
@@ -4226,6 +4261,19 @@ impl Maxwell3D {
         let copy_size = data.len() as u32 * 4;
         let address = buffer_address.wrapping_add(offset as u64);
 
+        if std::env::var("RUZU_TRACE_CBDATA_ADDR")
+            .ok()
+            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+            == Some(buffer_address)
+        {
+            log::info!(
+                "[CBDATA_WRITE] buffer=0x{:X} offset=0x{:X} words={:08X?}",
+                buffer_address,
+                offset,
+                data,
+            );
+        }
+
         // Diagnostic (env-gated, behavior-preserving): detect when the guest
         // pushes NaN-patterned float words through the inline constant-buffer
         // upload. If a NaN-valued vertex transform cbuf is observed at draw
@@ -4396,7 +4444,7 @@ impl Maxwell3D {
                 size
             );
             self.trace_cbuf_bind_nan(stage_index, slot, address, size);
-            if (stage_index == 0 || stage_index == 4) && slot == 1 {
+            if (stage_index == 0 || stage_index == 4) && matches!(slot, 1 | 8 | 10) {
                 if let Some(memory_manager) = self.memory_manager.as_ref() {
                     memory_manager.lock().register_cbuf_write_watch(
                         stage_index,
@@ -7930,6 +7978,13 @@ mod tests {
     fn test_initialize_register_defaults_matches_upstream_boot_values() {
         let engine = Maxwell3D::new();
 
+        let viewport_0 = VIEWPORT_BASE as usize;
+        let viewport_15 = VIEWPORT_BASE as usize + 15 * VIEWPORT_STRIDE as usize;
+        assert_eq!(engine.regs[viewport_0 + 2], f32::to_bits(0.0));
+        assert_eq!(engine.regs[viewport_0 + 3], f32::to_bits(1.0));
+        assert_eq!(engine.regs[viewport_15 + 2], f32::to_bits(0.0));
+        assert_eq!(engine.regs[viewport_15 + 3], f32::to_bits(1.0));
+        assert_eq!(engine.regs[VP_TRANSFORM_BASE as usize + 6], 0x6420);
         assert_eq!(engine.regs[DEPTH_TEST_FUNC as usize], 0x207);
         assert_eq!(engine.regs[STENCIL_TWO_SIDE_ENABLE as usize], 1);
         assert_eq!(engine.regs[STENCIL_FRONT_FUNC_MASK as usize], 0xFFFF_FFFF);
@@ -7986,6 +8041,19 @@ mod tests {
     }
 
     #[test]
+    fn maxwell_access_delegates_fixed_pipeline_registers_to_live_engine() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(PROVOKING_VERTEX, 1);
+        engine.write_reg(DEPTH_BOUNDS_ENABLE, 1);
+        engine.write_reg(MANDATED_EARLY_Z, 1);
+
+        let access: &dyn dm::Maxwell3DAccess = &engine;
+        assert!(access.provoking_vertex_last());
+        assert!(access.depth_bounds_enable());
+        assert!(access.mandated_early_z());
+    }
+
+    #[test]
     fn test_process_dirty_registers_marks_flags_from_dirty_tables() {
         let mut engine = Maxwell3D::new();
         let method = 0x123usize;
@@ -8001,6 +8069,14 @@ mod tests {
         engine.write_reg(method as u32, 0xCAFE_BABE);
         assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
         assert!(engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
+    }
+
+    #[test]
+    fn dirty_tables_start_unowned_until_rasterizer_initialization() {
+        let engine = Maxwell3D::new();
+        assert!(engine.dirty_tables().iter().all(|table| table
+            .iter()
+            .all(|entry| *entry == dirty_flags::flags::NULL_ENTRY)));
     }
 
     #[test]

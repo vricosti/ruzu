@@ -296,10 +296,10 @@ pub trait RasterizerInterface {
     // ── Channel management ──────────────────────────────────────────────
 
     /// Initialize a GPU channel.
-    fn initialize_channel(&mut self, _channel: &ChannelState) {}
+    fn initialize_channel(&mut self, _channel: &mut ChannelState) {}
 
     /// Bind a GPU channel.
-    fn bind_channel(&mut self, _channel: &ChannelState) {}
+    fn bind_channel(&mut self, _channel: &mut ChannelState) {}
 
     /// Release a GPU channel.
     fn release_channel(&mut self, _channel_id: i32) {}

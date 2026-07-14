@@ -322,11 +322,11 @@ impl RasterizerInterface for RasterizerNull {
 
     // ── Channel management ──────────────────────────────────────────────
 
-    fn initialize_channel(&mut self, channel: &ChannelState) {
+    fn initialize_channel(&mut self, channel: &mut ChannelState) {
         self.channel_caches.create_channel(channel);
     }
 
-    fn bind_channel(&mut self, channel: &ChannelState) {
+    fn bind_channel(&mut self, channel: &mut ChannelState) {
         self.channel_caches.bind_to_channel(channel.bind_id);
     }
 
@@ -485,8 +485,8 @@ mod tests {
         channel.memory_manager = Some(memory_manager);
         channel.init(&gpu, 0x1234);
 
-        rast.initialize_channel(&channel);
-        rast.bind_channel(&channel);
+        rast.initialize_channel(&mut channel);
+        rast.bind_channel(&mut channel);
 
         assert_eq!(rast.channel_caches.program_id, 0x1234);
         assert_eq!(rast.channel_caches.gpu_memory, Some(expected_memory_id));

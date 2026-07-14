@@ -82,11 +82,7 @@ fn translate_cfg_to_program(
     sph: Option<&ProgramHeader>,
 ) -> Program {
     let mut structured = if std::env::var_os("RUZU_SHADER_FORCE_LINEAR_SYNTAX").is_some() {
-        structured_control_flow::StructuredSyntax {
-            syntax: linear_syntax_list(cfg_blocks),
-            actions: Vec::new(),
-            block_count: cfg_blocks.len(),
-        }
+        linear_structured_syntax(cfg_blocks)
     } else {
         structured_control_flow::structure_cfg_detailed(cfg_blocks)
     };
@@ -94,50 +90,43 @@ fn translate_cfg_to_program(
     let mut program = Program::new(stage);
     program.syntax_list = structured.syntax;
     program.blocks = (0..structured.block_count).map(|_| Block::new()).collect();
+    materialize_entry_prologue(&mut program);
     materialize_return_epilogues(&mut program);
 
-    for (idx, cfg_block) in cfg_blocks.iter().enumerate() {
-        program.block_mut(idx as u32).order = idx as u32;
-        let mut tv = TranslatorVisitor::new_with_sph(&mut program, idx as u32, sph.cloned());
-        for i in cfg_block.begin as usize..cfg_block.end as usize {
-            if i >= code.len() {
-                break;
-            }
-            // Skip Maxwell sched-control words. Each 32-byte SASS bundle is one
-            // 8-byte sched word followed by three 8-byte instructions. The
-            // bundle grid is anchored at the START OF THE CODE (`code[0]` is
-            // always a sched word), NOT at absolute offset 0 — MK8D ships
-            // shaders whose code starts at `abs % 32 == 16` (verified by
-            // memory dump 2026-07-09; see Location::phase).
-            if is_sched_control_word(i) {
-                continue;
-            }
-            if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some()
-                && maxwell_opcode_is_unknown(code[i])
-            {
-                eprintln!(
-                    "[SHADER_WORD_UNKNOWN] stage={:?} abs=0x{:X} index={} word=0x{:016X}",
-                    stage,
-                    base_offset + (i as u32 * 8),
-                    i,
-                    code[i]
-                );
-            }
-            tv.translate_instruction(code[i]);
-        }
-    }
-    for idx in cfg_blocks.len()..program.blocks.len() {
+    for idx in 0..program.blocks.len() {
         program.block_mut(idx as u32).order = idx as u32;
     }
-    materialize_structured_actions(&mut program, &structured.actions);
+    materialize_structured_actions(
+        &mut program,
+        &structured.actions,
+        cfg_blocks,
+        code,
+        stage,
+        base_offset,
+        sph,
+    );
     rebuild_syntax_successors(&mut program);
 
     if !program.blocks.is_empty() {
-        program.post_order_blocks = post_order(&program.blocks, 0);
+        // Upstream computes `PostOrder(program.syntax_list.front())`. The ASL
+        // root can be a synthetic block allocated after the original CFG
+        // blocks, so assuming block 0 drops that root and any conditions it
+        // defines from SSA construction.
+        program.post_order_blocks = post_order_from_syntax_root(&program);
         clear_unreachable_blocks(&mut program);
     }
 
     program
+}
+
+/// Upstream `TranslatePass` inserts `Prologue` at `first_block.begin()` after
+/// building the ASL. Rust allocates the program blocks after structuring, so
+/// emit it before translating any Maxwell instructions into the entry block.
+fn materialize_entry_prologue(program: &mut Program) {
+    let Some(SyntaxNode::Block(entry_block)) = program.syntax_list.first() else {
+        return;
+    };
+    Emitter::new(program, *entry_block).prologue();
 }
 
 /// Upstream `structured_control_flow.cpp` creates a dedicated return block and
@@ -159,15 +148,28 @@ fn materialize_return_epilogues(program: &mut Program) {
     }
 }
 
-fn linear_syntax_list(cfg_blocks: &[control_flow::CfgBlock]) -> Vec<SyntaxNode> {
-    let mut syntax = Vec::with_capacity(cfg_blocks.len() + 1);
-    for block in 0..cfg_blocks.len() {
-        syntax.push(SyntaxNode::Block(block as u32));
+fn linear_structured_syntax(
+    cfg_blocks: &[control_flow::CfgBlock],
+) -> structured_control_flow::StructuredSyntax {
+    if cfg_blocks.is_empty() {
+        return structured_control_flow::StructuredSyntax {
+            syntax: Vec::new(),
+            actions: Vec::new(),
+            block_count: 0,
+        };
     }
-    if !cfg_blocks.is_empty() {
-        syntax.push(SyntaxNode::Return);
+    structured_control_flow::StructuredSyntax {
+        syntax: vec![SyntaxNode::Block(0), SyntaxNode::Return],
+        actions: cfg_blocks
+            .iter()
+            .enumerate()
+            .map(|(cfg_block, _)| StructuredAction::TranslateCode {
+                block: 0,
+                cfg_block,
+            })
+            .collect(),
+        block_count: 1,
     }
-    syntax
 }
 
 fn materialize_condition(
@@ -194,12 +196,46 @@ fn materialize_condition(
     } else {
         get_pred
     };
-    append_inst(program, block, Inst::new(Opcode::ConditionRef, vec![value]))
+    value
 }
 
-fn materialize_structured_actions(program: &mut Program, actions: &[StructuredAction]) {
+fn materialize_structured_actions(
+    program: &mut Program,
+    actions: &[StructuredAction],
+    cfg_blocks: &[control_flow::CfgBlock],
+    code: &[u64],
+    stage: ShaderStage,
+    base_offset: u32,
+    sph: Option<&ProgramHeader>,
+) {
     for action in actions {
         match action {
+            StructuredAction::TranslateCode { block, cfg_block } => {
+                let Some(cfg_block) = cfg_blocks.get(*cfg_block) else {
+                    continue;
+                };
+                let mut tv = TranslatorVisitor::new_with_sph(program, *block, sph.cloned());
+                for i in cfg_block.begin as usize..cfg_block.end as usize {
+                    if i >= code.len() {
+                        break;
+                    }
+                    if is_sched_control_word(i) {
+                        continue;
+                    }
+                    if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some()
+                        && maxwell_opcode_is_unknown(code[i])
+                    {
+                        eprintln!(
+                            "[SHADER_WORD_UNKNOWN] stage={:?} abs=0x{:X} index={} word=0x{:016X}",
+                            stage,
+                            base_offset + (i as u32 * 8),
+                            i,
+                            code[i]
+                        );
+                    }
+                    tv.translate_instruction(code[i]);
+                }
+            }
             StructuredAction::SetVariable { block, id, expr } => {
                 let value = materialize_expr(program, *block, expr);
                 append_inst(
@@ -385,6 +421,14 @@ fn rebuild_syntax_successors(program: &mut Program) {
             }
         }
     }
+}
+
+fn post_order_from_syntax_root(program: &Program) -> Vec<u32> {
+    let entry = match program.syntax_list.first() {
+        Some(SyntaxNode::Block(block)) => *block,
+        _ => panic!("First node in abstract syntax list root is not a block"),
+    };
+    post_order(&program.blocks, entry)
 }
 
 fn append_inst(program: &mut Program, block: u32, inst: Inst) -> Value {
@@ -1227,7 +1271,7 @@ fn optimize_program_with_env(
 ) {
     ir_opt::ssa_rewrite_pass::ssa_rewrite_pass(program);
     ir_opt::identity_removal::identity_removal_pass(program);
-    ir_opt::constant_propagation::constant_propagation_pass(program);
+    ir_opt::constant_propagation::constant_propagation_pass_with_env(env, program);
     ir_opt::identity_removal::identity_removal_pass(program);
     ir_opt::position_pass::position_pass(env, program);
     ir_opt::global_memory_to_storage_buffer_pass::global_memory_to_storage_buffer_pass(
@@ -1550,13 +1594,12 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_empty_shader() {
+    #[should_panic]
+    fn empty_shader_without_terminator_is_rejected() {
         let profile = Profile::default();
         let code: Vec<u64> = vec![];
         let runtime_info = RuntimeInfo::default();
-        let compiled = compile_shader(&code, ShaderStage::VertexB, &profile, &runtime_info);
-        assert!(!compiled.spirv_words.is_empty()); // Should produce valid SPIR-V header at minimum
-        assert_eq!(compiled.stage, ShaderStage::VertexB);
+        let _ = compile_shader(&code, ShaderStage::VertexB, &profile, &runtime_info);
     }
 
     #[test]
@@ -1593,6 +1636,24 @@ mod tests {
         assert!(compiled
             .source
             .contains("layout(location=2)out ivec4 frag_color2;"));
+    }
+
+    #[test]
+    fn post_order_starts_at_synthetic_syntax_root() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        for _ in 0..3 {
+            program.add_block();
+        }
+        program.syntax_list = vec![
+            SyntaxNode::Block(2),
+            SyntaxNode::Block(0),
+            SyntaxNode::Return,
+        ];
+
+        rebuild_syntax_successors(&mut program);
+
+        assert_eq!(post_order_from_syntax_root(&program), vec![0, 2]);
+        assert_eq!(post_order(&program.blocks, 0), vec![0]);
     }
 
     #[test]
@@ -1657,17 +1718,16 @@ mod tests {
             None,
         );
 
-        assert_eq!(program.blocks.len(), 2);
-        assert_eq!(program.block(0).imm_successors, vec![1]);
-        assert_eq!(program.block(1).imm_predecessors, vec![0]);
-        assert_eq!(program.post_order_blocks, vec![1, 0]);
-        assert!(
-            program
-                .syntax_list
-                .iter()
-                .any(|node| matches!(node, SyntaxNode::Block(1))),
-            "syntax block indices must have matching IR blocks"
-        );
+        // Upstream TranslatePass keeps consecutive Code statements in the
+        // current IR block; Flow CFG block identity is not IR block identity.
+        assert_eq!(program.blocks.len(), 1);
+        assert!(program.block(0).imm_predecessors.is_empty());
+        assert!(program.block(0).imm_successors.is_empty());
+        assert_eq!(program.post_order_blocks, vec![0]);
+        assert!(matches!(
+            program.syntax_list.as_slice(),
+            [SyntaxNode::Block(0), SyntaxNode::Unreachable]
+        ));
     }
 
     #[test]
@@ -1683,6 +1743,10 @@ mod tests {
         }];
 
         let program = translate_cfg_to_program(&[0], ShaderStage::VertexB, 0, &cfg_blocks, None);
+        let entry_block = match program.syntax_list.first() {
+            Some(SyntaxNode::Block(block)) => *block,
+            _ => panic!("translation must start with an entry block"),
+        };
         let return_block = program
             .syntax_list
             .windows(2)
@@ -1692,6 +1756,7 @@ mod tests {
             })
             .expect("return syntax must have a preceding block");
 
+        assert_eq!(program.block(entry_block).front().opcode, Opcode::Prologue);
         assert_eq!(program.block(return_block).front().opcode, Opcode::Epilogue);
     }
 
@@ -1776,6 +1841,16 @@ mod tests {
         };
         let cond_inst = program.block(cond_ref.block).inst(cond_ref.inst);
         assert_eq!(cond_inst.opcode, Opcode::ConditionRef);
+        let condition_ref_count = program
+            .blocks
+            .iter()
+            .flat_map(|block| block.indexed_iter())
+            .filter(|(_, inst)| inst.opcode == Opcode::ConditionRef)
+            .count();
+        assert_eq!(
+            condition_ref_count, 1,
+            "upstream wraps a structured condition in exactly one ConditionRef"
+        );
         let Value::Inst(not_ref) = cond_inst.args[0] else {
             panic!("negated predicate should feed ConditionRef through LogicalNot");
         };

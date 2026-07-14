@@ -3,58 +3,10 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/integer_set_predicate.cpp
 
+use super::common_funcs::{extended_integer_compare, integer_compare, predicate_combine};
 use super::{bit, field, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::MaxwellOpcode;
 use crate::ir::value::{Pred, Value};
-
-/// Integer comparison.
-fn int_compare(tv: &mut TranslatorVisitor, cmp: u32, a: Value, b: Value, is_signed: bool) -> Value {
-    match cmp {
-        0 => tv.ir.imm_u1(false),
-        1 => {
-            if is_signed {
-                tv.ir.s_less_than(a, b)
-            } else {
-                tv.ir.u_less_than(a, b)
-            }
-        }
-        2 => tv.ir.i_equal(a, b),
-        3 => {
-            if is_signed {
-                tv.ir.s_less_than_equal(a, b)
-            } else {
-                tv.ir.u_less_than_equal(a, b)
-            }
-        }
-        4 => {
-            if is_signed {
-                tv.ir.s_greater_than(a, b)
-            } else {
-                tv.ir.u_greater_than(a, b)
-            }
-        }
-        5 => tv.ir.i_not_equal(a, b),
-        6 => {
-            if is_signed {
-                tv.ir.s_greater_than_equal(a, b)
-            } else {
-                tv.ir.u_greater_than_equal(a, b)
-            }
-        }
-        7 => tv.ir.imm_u1(true),
-        _ => panic!("Invalid integer compare op {}", cmp),
-    }
-}
-
-/// Combine comparison result with predicate via boolean op.
-fn combine_pred(tv: &mut TranslatorVisitor, result: Value, pred: Value, bool_op: u32) -> Value {
-    match bool_op {
-        0 => tv.ir.logical_and(result, pred), // AND
-        1 => tv.ir.logical_or(result, pred),  // OR
-        2 => tv.ir.logical_xor(result, pred), // XOR
-        _ => panic!("Invalid ISETP boolean op {}", bool_op),
-    }
-}
 
 pub fn isetp(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let src_a = tv.x(tv.src_a_reg(insn));
@@ -68,15 +20,16 @@ pub fn isetp(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let cmp_op = field(insn, 49, 3);
     let bool_op = field(insn, 45, 2);
     let is_signed = bit(insn, 48);
-    if x {
-        panic!("ISETP.X extended integer compare not implemented");
-    }
     let pred39 = tv.ir.get_pred(bop_pred, neg_bop_pred);
 
-    let cmp_result = int_compare(tv, cmp_op, src_a, src_b, is_signed);
-    let result_a = combine_pred(tv, cmp_result, pred39, bool_op);
+    let cmp_result = if x {
+        extended_integer_compare(tv, src_a, src_b, cmp_op, is_signed)
+    } else {
+        integer_compare(tv, src_a, src_b, cmp_op, is_signed)
+    };
+    let result_a = predicate_combine(tv, cmp_result, pred39, bool_op);
     let not_cmp = tv.ir.logical_not(cmp_result);
-    let result_b = combine_pred(tv, not_cmp, pred39, bool_op);
+    let result_b = predicate_combine(tv, not_cmp, pred39, bool_op);
 
     tv.ir.set_pred(dest_pred_a, result_a);
     tv.ir.set_pred(dest_pred_b, result_b);
@@ -121,11 +74,11 @@ mod tests {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
         let mut tv = TranslatorVisitor::new(&mut program, 0);
-        let result = int_compare(
+        let result = integer_compare(
             &mut tv,
-            7,
             Value::ImmU32(0x1234_5678),
             Value::ImmU32(0x9abc_def0),
+            7,
             false,
         );
 
@@ -137,11 +90,11 @@ mod tests {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
         let mut tv = TranslatorVisitor::new(&mut program, 0);
-        let result = int_compare(
+        let result = integer_compare(
             &mut tv,
-            0,
             Value::ImmU32(0x1234_5678),
             Value::ImmU32(0x9abc_def0),
+            0,
             false,
         );
 
@@ -149,7 +102,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Invalid ISETP boolean op 3")]
+    #[should_panic(expected = "Invalid boolean op 3")]
     fn isetp_rejects_invalid_boolean_op_like_upstream() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());

@@ -511,14 +511,17 @@ impl RasterizerVulkan {
     }
 
     /// Port of `RasterizerVulkan::InitializeChannel`.
-    pub fn initialize_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
+    pub fn initialize_channel(
+        &mut self,
+        channel: &mut crate::control::channel_state::ChannelState,
+    ) {
         self.channel_caches.create_channel(channel);
         self.query_cache.create_channel(channel);
         self.state_tracker.setup_tables(channel);
     }
 
     /// Port of `RasterizerVulkan::BindChannel`.
-    pub fn bind_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
+    pub fn bind_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
         self.channel_caches.bind_to_channel(channel.bind_id);
         self.query_cache.bind_to_channel(channel.bind_id);
         self.state_tracker.change_channel(channel);
@@ -531,6 +534,7 @@ impl RasterizerVulkan {
 
     /// Port of `RasterizerVulkan::ReleaseChannel`.
     pub fn release_channel(&mut self, channel_id: i32) {
+        self.state_tracker.release_channel(channel_id);
         self.channel_caches.erase_channel(channel_id);
         self.query_cache.erase_channel(channel_id);
         self.channel_memory_manager = None;
@@ -783,8 +787,8 @@ mod tests {
         channel.program_id = 0x4455;
         channel.memory_manager = Some(Arc::clone(&mm));
 
-        rasterizer.initialize_channel(&channel);
-        rasterizer.bind_channel(&channel);
+        rasterizer.initialize_channel(&mut channel);
+        rasterizer.bind_channel(&mut channel);
 
         let bound = rasterizer
             .query_cache

@@ -3,56 +3,10 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/integer_compare_and_set.cpp
 
+use super::common_funcs::{extended_integer_compare, integer_compare, predicate_combine};
 use super::{bit, field, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::MaxwellOpcode;
 use crate::ir::value::{Pred, Value};
-
-/// Integer comparison.
-fn int_compare(tv: &mut TranslatorVisitor, cmp: u32, a: Value, b: Value, is_signed: bool) -> Value {
-    match cmp {
-        1 => {
-            if is_signed {
-                tv.ir.s_less_than(a, b)
-            } else {
-                tv.ir.u_less_than(a, b)
-            }
-        }
-        2 => tv.ir.i_equal(a, b),
-        3 => {
-            if is_signed {
-                tv.ir.s_less_than_equal(a, b)
-            } else {
-                tv.ir.u_less_than_equal(a, b)
-            }
-        }
-        4 => {
-            if is_signed {
-                tv.ir.s_greater_than(a, b)
-            } else {
-                tv.ir.u_greater_than(a, b)
-            }
-        }
-        5 => tv.ir.i_not_equal(a, b),
-        6 => {
-            if is_signed {
-                tv.ir.s_greater_than_equal(a, b)
-            } else {
-                tv.ir.u_greater_than_equal(a, b)
-            }
-        }
-        _ => tv.ir.imm_u1(false),
-    }
-}
-
-/// Combine comparison result with predicate via boolean op.
-fn combine_pred(tv: &mut TranslatorVisitor, result: Value, pred: Value, bool_op: u32) -> Value {
-    match bool_op {
-        0 => tv.ir.logical_and(result, pred), // AND
-        1 => tv.ir.logical_or(result, pred),  // OR
-        2 => tv.ir.logical_xor(result, pred), // XOR
-        _ => result,
-    }
-}
 
 pub fn iset(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let dst = tv.dst_reg(insn);
@@ -63,11 +17,18 @@ pub fn iset(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let bool_op = field(insn, 45, 2);
     let is_signed = bit(insn, 48);
     let pred_idx = field(insn, 39, 3);
-    let pred39 = tv.ir.get_pred(Pred(pred_idx as u8), false);
-    let bf_mode = bit(insn, 52);
+    let neg_pred = bit(insn, 42);
+    let x = bit(insn, 43);
+    let bf_mode = bit(insn, 44);
+    let cc = bit(insn, 47);
+    let pred39 = tv.ir.get_pred(Pred(pred_idx as u8), neg_pred);
 
-    let cmp_result = int_compare(tv, cmp_op, src_a, src_b, is_signed);
-    let result = combine_pred(tv, cmp_result, pred39, bool_op);
+    let cmp_result = if x {
+        extended_integer_compare(tv, src_a, src_b, cmp_op, is_signed)
+    } else {
+        integer_compare(tv, src_a, src_b, cmp_op, is_signed)
+    };
+    let result = predicate_combine(tv, cmp_result, pred39, bool_op);
 
     let true_val = if bf_mode {
         Value::ImmU32(0x3F800000) // 1.0f
@@ -77,4 +38,63 @@ pub fn iset(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let output = tv.ir.select_u32(result, true_val, Value::ImmU32(0));
 
     tv.set_x(dst, output);
+    if cc {
+        if x {
+            panic!("ISET.CC + X");
+        }
+        let zero = tv.ir.imm_u32(0);
+        let is_zero = tv.ir.i_equal(output, zero);
+        tv.ir.set_z_flag(is_zero);
+        if bf_mode {
+            tv.ir.set_s_flag(tv.ir.imm_u1(false));
+        } else {
+            let is_nonzero = tv.ir.logical_not(is_zero);
+            tv.ir.set_s_flag(is_nonzero);
+        }
+        tv.ir.set_c_flag(tv.ir.imm_u1(false));
+        tv.ir.set_o_flag(tv.ir.imm_u1(false));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::basic_block::Block;
+    use crate::ir::opcodes::Opcode;
+    use crate::ir::program::Program;
+    use crate::ir::types::ShaderStage;
+
+    fn translated_select_true_value(insn: u64) -> Value {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+
+        iset(&mut tv, insn, MaxwellOpcode::ISET_reg);
+
+        let true_value = tv
+            .ir
+            .program
+            .block(0)
+            .iter()
+            .find_map(|inst| (inst.opcode == Opcode::SelectU32).then(|| inst.args[1]))
+            .expect("ISET must emit SelectU32");
+        true_value
+    }
+
+    #[test]
+    fn mk8d_transition_iset_words_use_integer_one_mask() {
+        for insn in [0x5B5A_0380_0087_0D05, 0x5B5A_0380_0087_0508] {
+            assert_eq!(translated_select_true_value(insn), Value::ImmU32(u32::MAX));
+        }
+    }
+
+    #[test]
+    fn iset_bf_is_bit_44_not_bit_52() {
+        let base = 0x5B4A_0380_0087_0D05;
+        assert_eq!(translated_select_true_value(base), Value::ImmU32(u32::MAX));
+        assert_eq!(
+            translated_select_true_value(base | (1 << 44)),
+            Value::ImmU32(0x3f80_0000)
+        );
+    }
 }

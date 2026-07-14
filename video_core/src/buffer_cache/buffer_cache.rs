@@ -508,6 +508,76 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             .as_ref()
             .and_then(|gm| gm.gpu_to_cpu_address(gpu_addr))
             .unwrap_or(gpu_addr);
+        let patch_addr = std::env::var("RUZU_PATCH_AF1B_CBUF_ADDR")
+            .ok()
+            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok());
+        let override_addr = std::env::var("RUZU_OVERRIDE_AF1B_CBUF_ADDR")
+            .ok()
+            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok());
+        if stage == 0 && index == 3 && std::env::var_os("RUZU_PATCH_AF1B_CBUF_SIGNATURE").is_some()
+        {
+            if let Some(ref dm) = self.device_memory {
+                let read_word = |offset: u64| {
+                    let mut bytes = [0u8; 4];
+                    dm.read_block_unsafe(device_addr + offset, &mut bytes);
+                    u32::from_le_bytes(bytes)
+                };
+                if read_word(0xEC) == 0
+                    && read_word(0xFC) == 0
+                    && read_word(0x160) == 255.0f32.to_bits()
+                    && read_word(0x238) == (-1.0f32).to_bits()
+                    && read_word(0x23C) == 869.1169f32.to_bits()
+                {
+                    dm.write_block_unsafe(device_addr + 0xEC, &0.5f32.to_le_bytes());
+                    dm.write_block_unsafe(device_addr + 0xFC, &0.5f32.to_le_bytes());
+                    self.memory_tracker
+                        .mark_region_as_cpu_modified(device_addr + 0xEC, 4);
+                    self.memory_tracker
+                        .mark_region_as_cpu_modified(device_addr + 0xFC, 4);
+                    log::warn!(
+                        "[AF1B_CBUF_SIGNATURE_PATCH] gpu=0x{:X} device=0x{:X}",
+                        gpu_addr,
+                        device_addr,
+                    );
+                }
+            }
+        }
+        if stage == 0 && index == 3 && override_addr == Some(gpu_addr) {
+            if let (Some(dm), Some(path)) = (
+                self.device_memory.as_ref(),
+                std::env::var_os("RUZU_OVERRIDE_AF1B_CBUF_PATH"),
+            ) {
+                if let Ok(bytes) = std::fs::read(path) {
+                    let size = bytes.len().min(size as usize);
+                    dm.write_block_unsafe(device_addr, &bytes[..size]);
+                    self.memory_tracker
+                        .mark_region_as_cpu_modified(device_addr, size as u64);
+                    log::warn!(
+                        "[AF1B_CBUF_OVERRIDE] gpu=0x{:X} device=0x{:X} size=0x{:X}",
+                        gpu_addr,
+                        device_addr,
+                        size,
+                    );
+                }
+            }
+        }
+        if index == 3 && patch_addr == Some(gpu_addr) {
+            log::warn!(
+                "[AF1B_CBUF_BIND] stage={} gpu=0x{:X} device=0x{:X} size=0x{:X}",
+                stage,
+                gpu_addr,
+                device_addr,
+                size,
+            );
+            if let Some(ref dm) = self.device_memory {
+                dm.write_block_unsafe(device_addr + 0xEC, &0.5f32.to_le_bytes());
+                dm.write_block_unsafe(device_addr + 0xFC, &0.5f32.to_le_bytes());
+                self.memory_tracker
+                    .mark_region_as_cpu_modified(device_addr + 0xEC, 4);
+                self.memory_tracker
+                    .mark_region_as_cpu_modified(device_addr + 0xFC, 4);
+            }
+        }
         self.bind_graphics_uniform_buffer_with_device_addr(stage, index, device_addr, size);
     }
 
@@ -1822,13 +1892,25 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 );
             }
             if binding.buffer_id.is_valid() {
+                let force_upload = std::env::var("RUZU_FORCE_VERTEX_UPLOAD_ADDR")
+                    .ok()
+                    .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+                    == Some(binding.device_addr);
+                if force_upload {
+                    self.memory_tracker
+                        .mark_region_as_cpu_modified(binding.device_addr, binding.size as u64);
+                }
                 self.touch_buffer(binding.buffer_id);
                 self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
             }
-            if !self
-                .engine_state
-                .as_ref()
-                .is_some_and(|state| state.is_dirty(DirtyFlag::VertexBuffer(index as u32)))
+            let force_bind = std::env::var_os("RUZU_FORCE_COMMON_VERTEX_BIND").is_some()
+                && binding.size == 0x20
+                && strides[index] == 8;
+            if !force_bind
+                && !self
+                    .engine_state
+                    .as_ref()
+                    .is_some_and(|state| state.is_dirty(DirtyFlag::VertexBuffer(index as u32)))
             {
                 continue;
             }
@@ -2067,6 +2149,36 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             if let (Some(ref dm), Some(ref mut rt)) = (&self.device_memory, &mut self.runtime) {
                 let mut write = |span: &mut [u8]| {
                     dm.read_block_unsafe(device_addr, span);
+                    if stage == 0
+                        && index == 3
+                        && std::env::var("RUZU_OVERRIDE_AF1B_CBUF_ADDR")
+                            .ok()
+                            .and_then(|value| {
+                                u64::from_str_radix(value.trim_start_matches("0x"), 16).ok()
+                            })
+                            == Some(device_addr)
+                    {
+                        if let Some(path) = std::env::var_os("RUZU_OVERRIDE_AF1B_CBUF_PATH") {
+                            if let Ok(bytes) = std::fs::read(path) {
+                                let size = span.len().min(bytes.len());
+                                span[..size].copy_from_slice(&bytes[..size]);
+                            }
+                        }
+                    }
+                    let patch_addr =
+                        std::env::var("RUZU_PATCH_AF1B_CBUF_ADDR")
+                            .ok()
+                            .and_then(|value| {
+                                u64::from_str_radix(value.trim_start_matches("0x"), 16).ok()
+                            });
+                    if stage == 0
+                        && index == 3
+                        && patch_addr == Some(device_addr)
+                        && span.len() >= 0x100
+                    {
+                        span[0xEC..0xF0].copy_from_slice(&0.5f32.to_le_bytes());
+                        span[0xFC..0x100].copy_from_slice(&0.5f32.to_le_bytes());
+                    }
                 };
                 if rt.with_mapped_uniform_buffer(stage, binding_index, size, &mut write) {
                     return;
@@ -3509,7 +3621,13 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let mut largest_copy: u64 = 0;
 
         let buffer_start = self.slot_buffers[buffer_id].cpu_addr();
-        let trace = std::env::var_os("RUZU_PROFILE_BUFFER_BIND").is_some();
+        let trace_target = std::env::var("RUZU_TRACE_BUFFER_ADDR")
+            .ok()
+            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+            .is_some_and(|target| {
+                target >= device_addr && target < device_addr.saturating_add(size as u64)
+            });
+        let trace = std::env::var_os("RUZU_PROFILE_BUFFER_BIND").is_some() || trace_target;
         if trace {
             log::info!(
                 "[BUFFER_BIND_PROFILE] synchronize start buffer_id={:?} buffer_start=0x{:X} device=0x{:X} size=0x{:X}",
@@ -3847,12 +3965,16 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         };
 
         // Clear any bindings that reference this buffer.
+        let mut dirty_index = false;
+        let mut dirty_vertex_buffers = Vec::new();
         if cs.index_buffer.buffer_id == buffer_id {
             cs.index_buffer.buffer_id = NULL_BUFFER_ID;
+            dirty_index = true;
         }
-        for binding in cs.vertex_buffers.iter_mut() {
+        for (index, binding) in cs.vertex_buffers.iter_mut().enumerate() {
             if binding.buffer_id == buffer_id {
                 binding.buffer_id = NULL_BUFFER_ID;
+                dirty_vertex_buffers.push(index as u32);
             }
         }
         for stage_buffers in cs.uniform_buffers.iter_mut() {
@@ -3893,6 +4015,18 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         cs.has_deleted_buffers = true;
         drop(cs); // release borrow before calling methods that need &mut self
+
+        if let Some(state) = self.engine_state.as_mut() {
+            if dirty_index {
+                state.set_dirty(DirtyFlag::IndexBuffer);
+            }
+            if !dirty_vertex_buffers.is_empty() {
+                state.set_dirty(DirtyFlag::VertexBuffers);
+                for index in dirty_vertex_buffers {
+                    state.set_dirty(DirtyFlag::VertexBuffer(index));
+                }
+            }
+        }
 
         // Mark the whole buffer as CPU-modified to stop tracking.
         if !do_not_mark {
@@ -4235,6 +4369,7 @@ pub struct RasterizerDownloadArea {
 mod tests {
     use super::super::word_manager::DeviceTracker;
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     struct DummyTracker;
     impl DeviceTracker for DummyTracker {
@@ -4251,6 +4386,62 @@ mod tests {
         const USE_MEMORY_MAPS: bool = false;
         const SEPARATE_IMAGE_BUFFER_BINDINGS: bool = false;
         const USE_MEMORY_MAPS_FOR_UPLOADS: bool = false;
+    }
+
+    struct TrackingEngineState {
+        dirty: Arc<Mutex<Vec<DirtyFlag>>>,
+    }
+
+    impl EngineState for TrackingEngineState {
+        fn get_index_buffer(&self) -> IndexBufferRef {
+            IndexBufferRef::default()
+        }
+
+        fn get_inline_index_draw_indexes(&self) -> &[u8] {
+            &[]
+        }
+
+        fn is_dirty(&self, flag: DirtyFlag) -> bool {
+            self.dirty.lock().unwrap().contains(&flag)
+        }
+
+        fn clear_dirty(&mut self, flag: DirtyFlag) {
+            self.dirty.lock().unwrap().retain(|dirty| *dirty != flag);
+        }
+
+        fn set_dirty(&mut self, flag: DirtyFlag) {
+            let mut dirty = self.dirty.lock().unwrap();
+            if !dirty.contains(&flag) {
+                dirty.push(flag);
+            }
+        }
+
+        fn get_vertex_stream(&self, _index: u32) -> VertexStreamInfo {
+            VertexStreamInfo::default()
+        }
+
+        fn get_vertex_stream_limit(&self, _index: u32) -> VertexStreamLimit {
+            VertexStreamLimit::default()
+        }
+
+        fn is_transform_feedback_enabled(&self) -> bool {
+            false
+        }
+
+        fn get_transform_feedback_buffer(&self, _index: u32) -> TransformFeedbackBufferInfo {
+            TransformFeedbackBufferInfo::default()
+        }
+
+        fn get_const_buffer(&self, _stage: usize, _cbuf_index: u32) -> ConstBufferInfo {
+            ConstBufferInfo::default()
+        }
+
+        fn get_compute_launch_info(&self) -> ComputeLaunchInfo {
+            ComputeLaunchInfo {
+                const_buffer_enable_mask: 0,
+                const_buffer_config: Vec::new(),
+            }
+        }
     }
 
     #[test]
@@ -4321,10 +4512,15 @@ mod tests {
         let tracker = DummyTracker;
         let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
         cache.channel_state = Some(Box::default());
+        let dirty = Arc::new(Mutex::new(Vec::new()));
+        cache.engine_state = Some(Box::new(TrackingEngineState {
+            dirty: dirty.clone(),
+        }));
         let buffer_id = cache.create_buffer(0x10000, 0x1000);
         let channel = cache.channel_state.as_mut().unwrap();
         channel.index_buffer.buffer_id = buffer_id;
         channel.vertex_buffers[0].buffer_id = buffer_id;
+        channel.vertex_buffers[7].buffer_id = buffer_id;
         channel.uniform_buffers[0][0].buffer_id = buffer_id;
         channel.storage_buffers[0][0].buffer_id = buffer_id;
 
@@ -4333,8 +4529,14 @@ mod tests {
         let channel = cache.channel_state.as_ref().unwrap();
         assert_eq!(channel.index_buffer.buffer_id, NULL_BUFFER_ID);
         assert_eq!(channel.vertex_buffers[0].buffer_id, NULL_BUFFER_ID);
+        assert_eq!(channel.vertex_buffers[7].buffer_id, NULL_BUFFER_ID);
         assert_eq!(channel.uniform_buffers[0][0].buffer_id, NULL_BUFFER_ID);
         assert_eq!(channel.storage_buffers[0][0].buffer_id, NULL_BUFFER_ID);
+        let dirty = dirty.lock().unwrap();
+        assert!(dirty.contains(&DirtyFlag::IndexBuffer));
+        assert!(dirty.contains(&DirtyFlag::VertexBuffers));
+        assert!(dirty.contains(&DirtyFlag::VertexBuffer(0)));
+        assert!(dirty.contains(&DirtyFlag::VertexBuffer(7)));
     }
 
     #[test]

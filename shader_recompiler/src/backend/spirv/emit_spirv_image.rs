@@ -114,11 +114,155 @@ pub fn emit_image_gradient(
 
 // ── IR-instruction dispatching helpers (called from spirv_emit_context) ───
 
+use crate::ir::program::Program;
 use crate::ir::types::TextureInstInfo;
 use crate::ir::value::Value;
 use crate::ir::{self, Opcode};
 use rspirv::dr::Operand;
 use rspirv::spirv;
+
+struct ImageOperands {
+    mask: spirv::ImageOperands,
+    operands: Vec<Operand>,
+}
+
+impl Default for ImageOperands {
+    fn default() -> Self {
+        Self {
+            mask: spirv::ImageOperands::NONE,
+            operands: Vec::new(),
+        }
+    }
+}
+
+impl ImageOperands {
+    fn for_sample(
+        ctx: &mut SpirvEmitContext,
+        program: &Program,
+        has_bias: bool,
+        has_lod: bool,
+        has_lod_clamp: bool,
+        lod: Word,
+        offset: Value,
+    ) -> Self {
+        let mut operands = Self::default();
+        if has_bias {
+            let bias = if has_lod_clamp {
+                ctx.builder
+                    .composite_extract(ctx.f32_type, None, lod, vec![0])
+                    .unwrap()
+            } else {
+                lod
+            };
+            operands.add(spirv::ImageOperands::BIAS, bias);
+        }
+        if has_lod {
+            let lod_value = if has_lod_clamp {
+                ctx.builder
+                    .composite_extract(ctx.f32_type, None, lod, vec![0])
+                    .unwrap()
+            } else {
+                lod
+            };
+            operands.add(spirv::ImageOperands::LOD, lod_value);
+        }
+        operands.add_offset(ctx, program, offset, false);
+        if has_lod_clamp {
+            let lod_clamp = if has_bias {
+                ctx.builder
+                    .composite_extract(ctx.f32_type, None, lod, vec![1])
+                    .unwrap()
+            } else {
+                lod
+            };
+            operands.add(spirv::ImageOperands::MIN_LOD, lod_clamp);
+        }
+        operands
+    }
+
+    fn add_offset(
+        &mut self,
+        ctx: &mut SpirvEmitContext,
+        program: &Program,
+        offset: Value,
+        runtime_offset_allowed: bool,
+    ) {
+        let offset = resolve_ir_value(program, offset);
+        if matches!(offset, Value::Void) {
+            return;
+        }
+        if let Some(components) = immediate_offset_components(program, offset) {
+            let offset_id = if components.len() == 1 {
+                ctx.constant_i32(components[0] as i32)
+            } else {
+                let component_ids = components
+                    .iter()
+                    .map(|&value| ctx.constant_i32(value as i32))
+                    .collect::<Vec<_>>();
+                let offset_type = ctx
+                    .builder
+                    .type_vector(ctx.i32_type, components.len() as u32);
+                ctx.builder.constant_composite(offset_type, component_ids)
+            };
+            self.add(spirv::ImageOperands::CONST_OFFSET, offset_id);
+        } else if runtime_offset_allowed {
+            let offset_id = ctx.resolve_value(&offset);
+            self.add(spirv::ImageOperands::OFFSET, offset_id);
+        }
+    }
+
+    fn add(&mut self, mask: spirv::ImageOperands, value: Word) {
+        self.mask |= mask;
+        self.operands.push(Operand::IdRef(value));
+    }
+
+    fn mask_optional(&self) -> Option<spirv::ImageOperands> {
+        (!self.mask.is_empty()).then_some(self.mask)
+    }
+}
+
+fn resolve_ir_value(program: &Program, mut value: Value) -> Value {
+    while let Value::Inst(inst_ref) = value {
+        let inst = program.block(inst_ref.block).inst(inst_ref.inst);
+        if inst.opcode != Opcode::Identity || inst.args.is_empty() {
+            break;
+        }
+        value = inst.args[0];
+    }
+    value
+}
+
+fn immediate_offset_components(program: &Program, offset: Value) -> Option<Vec<u32>> {
+    match resolve_ir_value(program, offset) {
+        Value::ImmU32(value) => Some(vec![value]),
+        Value::Inst(inst_ref) => {
+            let inst = program.block(inst_ref.block).inst(inst_ref.inst);
+            let component_count = match inst.opcode {
+                Opcode::CompositeConstructU32x2 => 2,
+                Opcode::CompositeConstructU32x3 => 3,
+                Opcode::CompositeConstructU32x4 => 4,
+                _ => return None,
+            };
+            inst.args
+                .iter()
+                .take(component_count)
+                .map(|&arg| match resolve_ir_value(program, arg) {
+                    Value::ImmU32(value) => Some(value),
+                    _ => None,
+                })
+                .collect()
+        }
+        _ => None,
+    }
+}
+
+fn decorate_sample(ctx: &mut SpirvEmitContext, info: TextureInstInfo, sample: Word) -> Word {
+    if info.relaxed_precision {
+        ctx.builder
+            .decorate(sample, spirv::Decoration::RelaxedPrecision, vec![]);
+    }
+    sample
+}
 
 /// Port of upstream `Texture`: load a combined image sampler, including
 /// descriptor-array indexing when `count > 1`.
@@ -170,6 +314,7 @@ fn texture_image(ctx: &mut SpirvEmitContext, descriptor_index: u32, index: Value
 /// Dispatch ImageSampleImplicitLod / ImageSampleExplicitLod IR instructions.
 pub fn emit_image_sample(
     ctx: &mut SpirvEmitContext,
+    program: &Program,
     inst: &ir::Inst,
     block_idx: u32,
     inst_idx: u32,
@@ -179,31 +324,69 @@ pub fn emit_image_sample(
     let coord = ctx.resolve_value(inst.arg(1));
 
     if let Some(sampled_image) = texture(ctx, desc_idx, *inst.arg(0)) {
-        let id = if inst.opcode == Opcode::ImageSampleExplicitLod && inst.args.len() > 3 {
+        let id = if inst.opcode == Opcode::ImageSampleExplicitLod {
             let lod = ctx.resolve_value(inst.arg(2));
+            let operands =
+                ImageOperands::for_sample(ctx, program, false, true, false, lod, *inst.arg(3));
             ctx.builder
                 .image_sample_explicit_lod(
                     ctx.f32_vec4_type,
                     None,
                     sampled_image,
                     coord,
-                    spirv::ImageOperands::LOD,
-                    vec![Operand::IdRef(lod)],
+                    operands.mask,
+                    operands.operands,
                 )
                 .unwrap()
-        } else {
+        } else if ctx.stage == crate::stage::Stage::Fragment {
+            let bias_lc = if info.has_bias || info.has_lod_clamp {
+                ctx.resolve_value(inst.arg(2))
+            } else {
+                0
+            };
+            let operands = ImageOperands::for_sample(
+                ctx,
+                program,
+                info.has_bias,
+                false,
+                info.has_lod_clamp,
+                bias_lc,
+                *inst.arg(3),
+            );
             ctx.builder
                 .image_sample_implicit_lod(
                     ctx.f32_vec4_type,
                     None,
                     sampled_image,
                     coord,
+                    operands.mask_optional(),
+                    operands.operands,
+                )
+                .unwrap()
+        } else {
+            let lod = ctx.constant_f32(0.0);
+            let operands = ImageOperands::for_sample(
+                ctx,
+                program,
+                false,
+                true,
+                info.has_lod_clamp,
+                lod,
+                *inst.arg(3),
+            );
+            ctx.builder
+                .image_sample_explicit_lod(
+                    ctx.f32_vec4_type,
                     None,
-                    vec![],
+                    sampled_image,
+                    coord,
+                    operands.mask,
+                    operands.operands,
                 )
                 .unwrap()
         };
 
+        let id = decorate_sample(ctx, info, id);
         ctx.set_value(block_idx, inst_idx, id);
     } else {
         let zero = ctx.const_zero_f32;
@@ -218,6 +401,7 @@ pub fn emit_image_sample(
 /// Dispatch ImageSampleDrefImplicitLod / ImageSampleDrefExplicitLod IR instructions.
 pub fn emit_image_sample_dref(
     ctx: &mut SpirvEmitContext,
+    program: &Program,
     inst: &ir::Inst,
     block_idx: u32,
     inst_idx: u32,
@@ -228,8 +412,10 @@ pub fn emit_image_sample_dref(
     let dref = ctx.resolve_value(inst.arg(2));
 
     if let Some(sampled_image) = texture(ctx, desc_idx, *inst.arg(0)) {
-        let id = if inst.opcode == Opcode::ImageSampleDrefExplicitLod && inst.args.len() > 3 {
+        let id = if inst.opcode == Opcode::ImageSampleDrefExplicitLod {
             let lod = ctx.resolve_value(inst.arg(3));
+            let operands =
+                ImageOperands::for_sample(ctx, program, false, true, false, lod, *inst.arg(4));
             ctx.builder
                 .image_sample_dref_explicit_lod(
                     ctx.f32_type,
@@ -237,11 +423,25 @@ pub fn emit_image_sample_dref(
                     sampled_image,
                     coord,
                     dref,
-                    spirv::ImageOperands::LOD,
-                    vec![Operand::IdRef(lod)],
+                    operands.mask,
+                    operands.operands,
                 )
                 .unwrap()
-        } else {
+        } else if ctx.stage == crate::stage::Stage::Fragment {
+            let bias_lc = if info.has_bias || info.has_lod_clamp {
+                ctx.resolve_value(inst.arg(3))
+            } else {
+                0
+            };
+            let operands = ImageOperands::for_sample(
+                ctx,
+                program,
+                info.has_bias,
+                false,
+                info.has_lod_clamp,
+                bias_lc,
+                *inst.arg(4),
+            );
             ctx.builder
                 .image_sample_dref_implicit_lod(
                     ctx.f32_type,
@@ -249,12 +449,28 @@ pub fn emit_image_sample_dref(
                     sampled_image,
                     coord,
                     dref,
+                    operands.mask_optional(),
+                    operands.operands,
+                )
+                .unwrap()
+        } else {
+            let lod = ctx.constant_f32(0.0);
+            let operands =
+                ImageOperands::for_sample(ctx, program, false, true, false, lod, *inst.arg(4));
+            ctx.builder
+                .image_sample_dref_explicit_lod(
+                    ctx.f32_type,
                     None,
-                    vec![],
+                    sampled_image,
+                    coord,
+                    dref,
+                    operands.mask,
+                    operands.operands,
                 )
                 .unwrap()
         };
 
+        let id = decorate_sample(ctx, info, id);
         ctx.set_value(block_idx, inst_idx, id);
     } else {
         let id = ctx.builder.undef(ctx.f32_type, None);
@@ -386,5 +602,35 @@ pub fn emit_image_gather_inst(
             .composite_construct(ctx.f32_vec4_type, None, vec![zero, zero, zero, zero])
             .unwrap();
         ctx.set_value(block_idx, inst_idx, id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::basic_block::Block;
+    use crate::ir::instruction::Inst;
+    use crate::ir::types::ShaderStage;
+    use crate::ir::value::InstRef;
+
+    #[test]
+    fn constant_sample_offset_follows_identity_values() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let block = program.block_mut(0);
+        block.append_inst(Inst::new(Opcode::Identity, vec![Value::ImmU32(1)]));
+        block.append_inst(Inst::new(Opcode::Identity, vec![Value::ImmU32(u32::MAX)]));
+        block.append_inst(Inst::new(
+            Opcode::CompositeConstructU32x2,
+            vec![
+                Value::Inst(InstRef { block: 0, inst: 0 }),
+                Value::Inst(InstRef { block: 0, inst: 1 }),
+            ],
+        ));
+
+        assert_eq!(
+            immediate_offset_components(&program, Value::Inst(InstRef { block: 0, inst: 2 })),
+            Some(vec![1, u32::MAX])
+        );
     }
 }

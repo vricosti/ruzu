@@ -62,6 +62,10 @@ impl Expr {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StructuredAction {
+    TranslateCode {
+        block: u32,
+        cfg_block: usize,
+    },
     SetVariable {
         block: u32,
         id: u32,
@@ -166,7 +170,7 @@ pub(crate) fn structure_cfg_detailed(cfg_blocks: &[CfgBlock]) -> StructuredSynta
     let mut pass = GotoPass::new(cfg_blocks);
     pass.run();
 
-    let mut translator = TranslatePass::new(cfg_blocks.len());
+    let mut translator = TranslatePass::new();
     translator.visit(pass.root_children(), None, None);
     translator.finish()
 }
@@ -779,11 +783,11 @@ struct TranslatePass {
 }
 
 impl TranslatePass {
-    fn new(original_block_count: usize) -> Self {
+    fn new() -> Self {
         Self {
             syntax: Vec::new(),
             actions: Vec::new(),
-            next_block: original_block_count as u32,
+            next_block: 0,
         }
     }
 
@@ -832,8 +836,11 @@ impl TranslatePass {
             match statement {
                 Statement::Label { .. } => {}
                 Statement::Code { block } => {
-                    self.syntax.push(SyntaxNode::Block(*block as u32));
-                    current_block = Some(*block as u32);
+                    let ir_block = self.ensure_block(&mut current_block);
+                    self.actions.push(StructuredAction::TranslateCode {
+                        block: ir_block,
+                        cfg_block: *block,
+                    });
                 }
                 Statement::SetVariable { id, op } => {
                     let block = self.ensure_block(&mut current_block);
@@ -1006,27 +1013,40 @@ mod tests {
         cfg_block.branch_false = Some(1);
         let syntax = structure_cfg(&[cfg_block, block(EndClass::Return, Condition::always())]);
 
-        assert!(matches!(
-            syntax.as_slice(),
-            [
-                SyntaxNode::Block(0),
-                SyntaxNode::If { .. },
-                SyntaxNode::Return,
-                SyntaxNode::EndIf { merge: 1 },
-                SyntaxNode::Block(1),
-                SyntaxNode::Return
-            ]
-        ));
+        assert!(
+            matches!(
+                syntax.as_slice(),
+                [
+                    SyntaxNode::Block(0),
+                    SyntaxNode::If { .. },
+                    SyntaxNode::Block(2),
+                    SyntaxNode::Block(3),
+                    SyntaxNode::Return,
+                    SyntaxNode::EndIf { merge: 1 },
+                    SyntaxNode::Block(1),
+                    SyntaxNode::Block(4),
+                    SyntaxNode::Return
+                ]
+            ),
+            "{syntax:#?}"
+        );
     }
 
     #[test]
     fn unconditional_exit_still_returns() {
         let syntax = structure_cfg(&[block(EndClass::Exit, Condition::always())]);
 
-        assert!(matches!(
-            syntax.as_slice(),
-            [SyntaxNode::Block(0), SyntaxNode::Return]
-        ));
+        assert!(
+            matches!(
+                syntax.as_slice(),
+                [
+                    SyntaxNode::Block(0),
+                    SyntaxNode::Block(1),
+                    SyntaxNode::Return
+                ]
+            ),
+            "{syntax:#?}"
+        );
     }
 
     #[test]
@@ -1040,33 +1060,46 @@ mod tests {
         );
         branch.branch_true = Some(2);
         branch.branch_false = Some(1);
+        let branch_cond = branch.cond;
 
-        let syntax = structure_cfg(&[
+        let structured = structure_cfg_detailed(&[
             branch,
             block(EndClass::Branch, Condition::always()),
             block(EndClass::Return, Condition::always()),
         ]);
 
-        assert!(matches!(
-            syntax.as_slice(),
-            [
-                SyntaxNode::Block(0),
-                SyntaxNode::If {
-                    cond: Value::ImmU1(false),
-                    body: 1,
-                    merge: 2,
-                },
-                SyntaxNode::Block(1),
-                SyntaxNode::EndIf { merge: 2 },
-                SyntaxNode::Block(2),
-                SyntaxNode::Return,
-            ]
-        ));
+        assert!(
+            matches!(
+                structured.syntax.as_slice(),
+                [
+                    SyntaxNode::Block(0),
+                    SyntaxNode::If {
+                        body: 2,
+                        merge: 1,
+                        ..
+                    },
+                    SyntaxNode::Block(2),
+                    SyntaxNode::EndIf { merge: 1 },
+                    SyntaxNode::Block(1),
+                    SyntaxNode::Block(3),
+                    SyntaxNode::Return,
+                ]
+            ),
+            "{:#?}",
+            structured.syntax
+        );
+        assert!(structured.actions.iter().any(|action| matches!(
+            action,
+            StructuredAction::Condition {
+                expr: Expr::Not(inner),
+                ..
+            } if matches!(inner.as_ref(), Expr::Identity(cond) if *cond == branch_cond)
+        )));
     }
 
     #[test]
     fn loop_emits_continue_block_once_like_upstream_visit() {
-        let mut pass = TranslatePass::new(1);
+        let mut pass = TranslatePass::new();
         pass.visit(
             &[Statement::Loop {
                 cond: Expr::true_value(),

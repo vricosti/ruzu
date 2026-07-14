@@ -22599,3 +22599,287 @@ Upstream files:
 - Re-read upstream `PresentManager::Present`, `Scheduler::WaitWorker`, and `Swapchain::AcquireNextImage` line by line.
 - `yuzu.app`'s active configuration and log both report `async_presentation=false` on this Mac.
 - Release MK8D run logged `threaded=false`, completed synchronous acquire/present cycles, and passed 28,000 render-pass begins during the observation window without a presentation stall.
+
+## 2026-07-11 - `shader_recompiler/src/pipeline_cache.rs` vs upstream `frontend/maxwell/translate_program.cpp` and `frontend/ir/post_order.cpp`
+
+### Intentional differences
+- Rust passes the index of the first `SyntaxNode::Block` to its index-based `post_order`; upstream passes the corresponding block pointer through `program.syntax_list.front()`. The traversal root and successor ordering are equivalent.
+- Rust preserves unreachable block indices and clears their instructions because `Value::Inst` stores block indices; upstream erases unreachable block pointers from `program.blocks`. This pre-existing representation adaptation is unchanged.
+
+### Unintentional differences (to fix)
+- None after this pass. Rust previously hardcoded block 0 as the post-order root. It now starts at the first ASL syntax block, preserving synthetic root blocks and matching upstream `PostOrder(program.syntax_list.front())`.
+
+### Missing items
+- None in the reviewed post-order root selection slice.
+
+### Binary layout verification
+- N/A: this changes in-memory IR graph traversal only.
+
+### Verification
+- Re-read upstream `TranslateProgram`, `IR::PostOrder`, and `SsaRewritePass::TryRemoveTrivialPhi` after implementation.
+- Focused pipeline-cache tests pass, including a regression where synthetic block 2 is the syntax root and owns the `2 -> 0` edge. The test process has a pre-existing worker teardown hang after reporting all 17 results and requires external termination.
+- Fresh-cache MK8D IR for VertexB `0x6A2780` / hash `E2795AB19A7C6DF4` includes synthetic block 60 in post-order and preserves its `60 -> 0` edge. Its start-block predicate values become `UndefU1`, matching upstream's explicit undefined replacement for predecessor-less Phi nodes.
+- A 15-second fresh-cache MK8D run completed shader compilation with no unresolved IR reference or shader compiler panic. The visual blue-streak transition mismatch remains, so this parity fix is not claimed as the complete rendering fix.
+
+## 2026-07-12 - `scripts/capture_yuzu_shader.py` reference-capture tooling
+
+### Intentional differences
+- This is diagnostic tooling, not an emulator subsystem port. It uses LLDB and
+  an injected helper dylib to call upstream `Shader::IR::DumpProgram` without
+  editing the read-only upstream source tree.
+
+### Unintentional differences (to fix)
+- None. Pipeline selection reads the upstream Vulkan graphics key's six
+  contiguous `u64` unique hashes and filters VertexB/fragment slots 1 and 5.
+
+### Missing items
+- Fixed pipeline state, descriptor contents, and vertex-buffer payload capture
+  are not yet implemented; the current tool captures Maxwell dumps (through
+  yuzu's existing setting), translated IR, and SPIR-V.
+
+### Binary layout verification
+- PASS: the target `GraphicsPipelineCacheKey` begins with
+  `std::array<u64, 6> unique_hashes` upstream; the LLDB reader consumes exactly
+  48 little-endian bytes. SPIR-V is copied from libc++ `std::vector<u32>`'s
+  begin/end pointers on the active arm64 build.
+## 2026-07-11 — ruzu_cmd/src/main.rs vs yuzu/bootmanager.cpp
+
+### Intentional differences
+- The SDL frontend has no Qt `LoadProgress` signal; disk-resource loading remains synchronous without a progress dialog.
+- Vulkan context ownership is managed by the Rust renderer rather than explicit `gpu.ObtainContext()` / `gpu.ReleaseContext()` calls.
+
+### Unintentional differences (to fix)
+- None after this change. Disk resources are now loaded and worker requests drained before `gpu.start()` and `CpuManager::on_gpu_ready()`, matching upstream startup ordering.
+
+### Missing items
+- User-visible disk-resource loading progress callbacks are not yet exposed by `ruzu-cmd`.
+
+### Binary layout verification
+- N/A: startup lifecycle ordering only.
+
+## 2026-07-12 - shader_recompiler structured control flow and SPIR-V prologue vs upstream structured_control_flow.cpp and emit_spirv.cpp
+
+### Intentional differences
+- Rust records `TranslateCode`, condition, and variable operations as ordered `StructuredAction` values because the `Program` block vector is allocated after the statement-tree pass. Upstream emits through `IREmitter` while visiting the intrusive statement tree. Action order and IR-block ownership now match.
+- Rust block and instruction references remain stable integer slots rather than upstream intrusive pointers.
+
+### Unintentional differences (to fix)
+- None after this pass. Rust previously equated Flow CFG block identity with IR block identity. `Statement::Code` now translates into the current dynamically allocated IR block, matching `TranslatePass::Visit`.
+- None after this pass. Rust previously omitted the entry `Prologue`; it now materializes it in the first ASL block before translated Maxwell instructions, while dedicated return blocks retain `Epilogue`.
+- None after this pass. SPIR-V vertex prologue emission now initializes Position and every declared generic output and applies fixed pipeline point size like upstream.
+- None after this pass. The SPIR-V backend no longer emits an artificial anonymous entry block and branch before the first ASL block.
+
+### Missing items
+- `StructuredSyntax` remains an index/action representation rather than upstream's pointer-owned `IR::AbstractSyntaxList`, but the reviewed `TranslatePass::Visit(Code)`, entry/return ownership, and SPIR-V function-entry behavior now match.
+- Geometry-passthrough lowering and other previously documented `TranslateProgram` pass gaps are outside this slice.
+
+### Binary layout verification
+- N/A: this changes in-memory shader IR and generated SPIR-V, not guest-visible raw structures.
+
+### Verification
+- Re-read upstream `TranslatePass::Visit`, `MergeBlock`, `BuildASL`, `TranslateProgram`, `EmitPrologue`, and `DefineMain` after implementation.
+- Focused structured-control-flow, pipeline-cache, and backend tests pass; `cargo check -p shader_recompiler` and the release `ruzu-cmd` build pass.
+- Hash-matched MK8D transition VertexB shaders now have exactly the same IR block counts as yuzu: `150`, `158`, and `108`; their `OpBranchConditional` and `OpSelectionMerge` counts also match.
+
+## 2026-07-12 - shader_recompiler floating-point add and SPIR-V floating-point emission vs upstream floating_point_add.cpp and emit_spirv_floating_point.cpp
+
+### Intentional differences
+- Rust raises `panic!("FADD CC")` where upstream throws `NotImplementedException`; both reject the same unsupported encoding at translation time.
+- Rust passes `&Inst` explicitly to the SPIR-V floating-point emitters because it does not use upstream's generated emitter signatures. The local `decorate` helper remains owned by `emit_spirv_floating_point.rs` and applies the same instruction flags.
+
+### Unintentional differences (to fix)
+- None in the reviewed FP32 slice. `FADD` and `FADD32I` previously discarded upstream rounding, FTZ, CC validation, and `no_contraction` state. They now construct the literal upstream `FpControl` before emitting `FPAdd32`.
+- None in the reviewed FP32 SPIR-V slice. `FPAdd32`, `FPMul32`, and `FPFma32` now apply `Decoration::NoContraction` when the IR instruction requests it, matching upstream's local `Decorate` helper.
+
+### Missing items
+- The Rust SPIR-V dispatch does not yet lower the existing FP16 and FP64 add/multiply/FMA opcodes through complete upstream-equivalent paths. Their `NoContraction` coverage belongs to that broader missing backend slice; this change does not claim those widths complete.
+- Full upstream floating-point execution-mode/profile plumbing (`SignedZeroInfNanPreserve` and related device-dependent controls) remains a separate structural device-profile slice.
+
+### Binary layout verification
+- N/A: this changes IR flags and generated SPIR-V instructions, not serialized guest-visible structures.
+
+### Verification
+- Re-read upstream `floating_point_add.cpp` and `emit_spirv_floating_point.cpp` after implementation and compared field decoding, validation, control construction, decoration ownership, and operation ordering line by line.
+- Focused frontend and SPIR-V decoration tests pass.
+- A directly instrumented yuzu build localized the first divergent MK8D transition pass to fragment shader `AF7B30`. Replacing only that SPIR-V made ruzu exact; after this native fix, the complete 1920x1080 `A2B10G10R10` intermediate matches yuzu byte-for-byte without substitution: SHA-256 `7cc395c79066732352e4aa4d6639ae7bccd243c135f5ea97ba94f72fb2d195ae`.
+- The full 260-test crate run reaches all tests but has the pre-existing `backend::glsl::emit_glsl::tests::precolor_appends_all_phi_moves_before_references_and_recounts_uses` failure and then waits over 60 seconds in `pipeline_cache::tests::translate_program_from_env_uses_environment_metadata`; it was terminated after recording both unrelated failures.
+
+## 2026-07-12 - shader_recompiler FP64 arithmetic vs upstream double_add.cpp, double_multiply.cpp, double_fused_multiply_add.cpp, ir_emitter.cpp, and emit_spirv_floating_point.cpp
+
+### Intentional differences
+- Rust raises a translation-time panic for the unsupported DADD/DMUL/DFMA `CC` encodings where upstream throws `NotImplementedException`; both reject the same bit before emitting IR.
+- Rust exposes width-specific `fp_*_64_with_control` emitter methods because its IR emitter is not the type-dispatched C++ template interface. Opcode, operands, and serialized `FpControl` flags match upstream.
+
+### Unintentional differences (to fix)
+- None after this pass. DADD, DMUL, and DFMA previously discarded the encoded rounding mode, `CC` validation, `no_contraction`, and `FmzMode::None`; all are now forwarded literally.
+- None after this pass. FPAdd64, FPMul64, and FPFma64 existed as helpers but were absent from SPIR-V instruction dispatch and did not apply `NoContraction`. They are now dispatched and use the same local decoration rule as upstream.
+
+### Missing items
+- No missing item in the reviewed DADD/DMUL/DFMA FP64 slice. Other FP64 opcodes were not part of this comparison.
+
+### Binary layout verification
+- N/A: the change affects in-memory IR flags and generated SPIR-V only.
+
+### Verification
+- Re-read all five upstream owners after implementation and compared bit fields, validation order, operand modifiers, control construction, IR opcode ownership, and SPIR-V decoration.
+- The three frontend control tests and the FP64 SPIR-V `NoContraction` test pass.
+
+## 2026-07-12 - video_core channel dirty-table lifecycle (`maxwell_3d.rs`, `rasterizer_interface.rs`, OpenGL/Vulkan rasterizers, `state_tracker.rs`) vs upstream Maxwell3D, RasterizerInterface, gl/vk_rasterizer, and vk_state_tracker
+
+### Intentional differences
+- Rust clears the borrowed channel dirty-flag pointer in `release_channel` before erasing backend channel caches. Upstream `GPU::Impl::ReleaseChannel` is still `UNIMPLEMENTED()`, while ruzu exposes and executes a real release lifecycle; clearing the pointer is required to preserve Rust memory safety.
+- `Option<NonNull<DirtyFlags>>` represents upstream's switchable `DirtyState::Flags*`; the local array is the equivalent of upstream `default_flags` while no channel is bound.
+
+### Unintentional differences (to fix)
+- None in the reviewed pointer lifecycle. The bound pointer is now cleared before its owning `Maxwell3D` can be destroyed.
+- None in direct invalidation. `invalidate_viewports` and `invalidate_scissors` now write the active channel flags rather than the fallback local array.
+
+### Missing items
+- None in the reviewed state-tracker table and channel lifecycle slice. `Maxwell3D::DirtyState` now starts with unassigned tables, and the selected OpenGL or Vulkan rasterizer installs its own complete table set during `initialize_channel`.
+
+### Binary layout verification
+- N/A: dirty tables and pointers are host-side state only.
+
+### Verification
+- Re-read upstream `vk_state_tracker.h`, `vk_state_tracker.cpp`, and `gpu.cpp`. Upstream intentionally shares the engine `DirtyState::Flags` with renderer and texture-cache consumers; the reviewed `Exchange` calls use distinct Vulkan indices and the same three common rescale/depth-bias indices as Rust.
+- The focused lifecycle test passes after binding, active-channel invalidation, release, destruction of the former `Maxwell3D`, and fallback flag access.
+- Re-read upstream OpenGL/Vulkan `InitializeChannel` and all Vulkan `SetupDirty*` helpers after implementation. Rust now preserves the same backend ownership, helper order, register ranges, table-0/table-1 overlaps, and flag indices. Focused unowned-table, OpenGL-table, Vulkan-table, and engine dirty-processing tests pass.
+
+## 2026-07-13 - shader_recompiler/src/ir_opt/constant_propagation.rs vs shader_recompiler/ir_opt/constant_propagation_pass.cpp
+
+### Intentional differences
+- Rust masks the shifted `BitFieldInsert` value with the destination field mask. The local C++ source only clears the destination field in `base` before OR-ing the unmasked `insert`; masking is required by the IR/SPIR-V bit-field-insert contract when `insert` contains set bits above `bits`.
+- Rust uses `assert!` for the same undefined immediate combinations for which upstream throws `LogicError`. Both abort the current shader compilation rather than folding an undefined result.
+
+### Unintentional differences (to fix)
+- None in this reviewed fold. The previous Rust implementation allowed high bits from `insert` to leak outside the selected field.
+
+### Missing items
+- None in the reviewed `BitFieldInsert` immediate fold. Other missing constant-propagation folds remain tracked by the earlier full-pass audit.
+
+### Binary layout verification
+- N/A: this changes an in-memory IR constant fold and no serialized structure.
+
+### Verification
+- Re-read upstream `constant_propagation_pass.cpp` cases for `BitFieldUExtract`, `BitFieldSExtract`, and `BitFieldInsert` after implementation.
+- Added a regression for `base=0x12345670`, `insert=0xff`, `offset=0`, `bits=4`; the folded result is `0x1234567f` and preserves all bits outside the destination field.
+- `cargo test -p shader_recompiler --release bitfield_insert_masks_bits_outside_the_inserted_field` passes.
+
+## 2026-07-13 - shader_recompiler integer compare helpers, ISET, and ISETP vs upstream common_funcs.cpp, integer_compare_and_set.cpp, and integer_set_predicate.cpp
+
+### Intentional differences
+- Rust represents upstream `CompareOp` and `BooleanOp` bit fields as decoded `u32` values at this frontend boundary. Invalid values panic where upstream throws `NotImplementedException`; both reject the shader during translation.
+- Rust uses width-specific IR-emitter methods (`s_less_than`, `u_less_than`, and `select_u1`) instead of upstream's overloaded methods. The emitted comparison signedness and operand order match.
+
+### Unintentional differences (to fix)
+- None in the reviewed ISET/ISETP slice after this pass. ISET previously decoded `bf` from bit 52 instead of upstream bit 44, omitted `neg_pred`, `X`, and `CC`, and duplicated an incomplete comparison implementation. ISETP likewise omitted extended comparison through carry and Z flags.
+
+### Missing items
+- `PredicateOperation`, `IsCompareOpOrdered`, and `FloatingPointCompare` from upstream `common_funcs.cpp` are still implemented or duplicated in other frontend modules rather than owned by `common_funcs.rs`. Consolidating those existing floating-point helpers is a separate ownership slice; this pass only moved the three helpers required by ISET/ISETP.
+
+### Binary layout verification
+- N/A: these translators decode Maxwell instruction bit fields and emit in-memory IR; no host struct is serialized by raw copy.
+
+### Verification
+- Re-read upstream `common_funcs.h/.cpp`, `integer_compare_and_set.cpp`, and `integer_set_predicate.cpp` after implementation. Field positions, comparison selection, predicate combination, result masks, CC updates, and destination ordering match line by line.
+- Focused ISET and ISETP tests pass, including the two live MK8D words `0x5B5A038000870D05` and `0x5B5A038000870508` and a regression proving that `bf` is bit 44 rather than bit 52.
+- The regenerated MK8D transition IR now emits upstream's integer true mask `0xFFFFFFFF` instead of `0x3F800000`. The resulting captured framebuffer is unchanged because this shader subsequently reduces both nonzero values to the same predicate; this correction is upstream parity but is **INSUFFICIENT** to restore the blue trails.
+
+## 2026-07-13 - Vulkan native NDC support vs upstream vulkan_device.cpp, vk_pipeline_cache.cpp, and vk_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust builds the Vulkan feature query and device-create `pNext` chains explicitly with ash builders instead of upstream's macro-generated `FeatureChain`; the queried feature, extension suitability condition, enabled feature, and ordering semantics are equivalent.
+- The `depth_clip_control_supported` capability is passed through the existing rasterizer/pipeline-cache constructors because the reduced Rust backend does not retain upstream's full `Vulkan::Device` owner in those objects.
+
+### Unintentional differences (to fix)
+- None after this pass. Rust previously declared `DeviceExtensions::depth_clip_control` but never queried or enabled `VK_EXT_depth_clip_control`, never set `Profile::support_native_ndc`, and never chained `PipelineViewportDepthClipControlCreateInfoEXT` into graphics pipelines.
+
+### Missing items
+- Other feature-chain entries still absent from the reduced Vulkan device initialization are outside this slice and remain discoverable through their false `DeviceExtensions` fields.
+
+### Binary layout verification
+- N/A: Vulkan structures are initialized through ash's typed `repr(C)` builders and passed directly to the driver; no structure is serialized.
+
+### Verification
+- Re-read upstream `Device::RemoveUnsuitableExtensions`, Vulkan shader-profile construction, and `GraphicsPipeline` viewport-state construction after implementation. Rust now queries `depthClipControl`, enables only a supported extension/feature pair, exposes the same capability to the shader profile, and supplies `negativeOneToOne` from the fixed pipeline key on both live and disk-rebuilt pipeline paths.
+- `cargo check -p video_core` passes.
+
+## 2026-07-13 - shader_recompiler LDC.B64 and typed CBUF folding vs upstream load_constant.cpp and constant_propagation_pass.cpp
+
+### Intentional differences
+- Rust uses a panic for an unaligned `LDC.B64` destination where upstream throws `NotImplementedException`; both reject the same encoding before writing either destination register.
+- Rust represents the upstream typed `IR::U32x2` value through its generic `Value` plus `CompositeExtractU32x2` opcodes. The emitted opcode and component ordering are identical.
+
+### Unintentional differences (to fix)
+- None after this pass. Rust previously lowered `LDC.B64` to two scalar `GetCbufU32` reads and an extra `IAdd32`; it now emits one `GetCbufU32x2` and extracts components 0 and 1 exactly like upstream.
+- None after this pass. Rust previously left `BitCastF32U32(GetCbufU32)` intact; it now replaces the bitcast with `GetCbufF32(binding, offset)` exactly like upstream `FoldBitCast`.
+
+### Missing items
+- Other constant-propagation folds remain covered by the existing full-pass audit; no item is missing in these two reviewed branches.
+
+### Binary layout verification
+- N/A: these changes affect in-memory IR opcodes and generated SPIR-V, not a raw serialized structure.
+
+### Verification
+- Re-read upstream `frontend/maxwell/translate/load_constant.cpp` and `ir_opt/constant_propagation_pass.cpp` after implementation and compared validation, load width, extraction order, destination writes, and typed-CBUF replacement arguments line by line.
+- The live MK8D `AF1B80` IR changed from `0 GetCbufU32x2 / 20 scalar GetCbufU32 / 22 IAdd32` to `10 GetCbufU32x2 / 20 CompositeExtractU32x2 / 12 IAdd32`, exactly matching yuzu for those opcodes.
+- Focused `LDC.B64` and typed-CBUF-fold tests pass.
+
+## 2026-07-13 - Vulkan scheduler/geometry dirty lifecycle vs vk_scheduler.cpp and buffer_cache.h
+
+### Intentional differences
+- Rust still snapshots non-geometry draw state into `DrawCall` because the reduced renderer does not yet retain upstream's complete persistent `Maxwell3D*` interface. Render-target and texture dirty-bit consumption is therefore propagated to the channel after the draw.
+- Geometry state uses a stable `NonNull<[bool; 256]>` bridge to the channel-owned flags. This is the narrow Rust representation of upstream's persistent `Maxwell3D*`; it preserves the same owner and mutation order without moving the engine into the renderer.
+
+### Unintentional differences (to fix)
+- None in the reviewed scheduler invalidation edge. `Scheduler::flush_impl` now calls `invalidate_state` after ending pending render-pass/chunk work and before ending/submitting the command buffers, matching upstream `SubmitExecution`.
+- None in the reviewed geometry dirty lifecycle. Index/vertex flags consumed directly by the common buffer cache are no longer cleared a second time from a stale pre-draw snapshot after a command-buffer invalidation.
+
+### Missing items
+- The remaining non-geometry snapshot bridge should disappear when the Vulkan rasterizer owns the complete upstream `Maxwell3D*`/texture-cache integration. This pass does not claim that larger structural migration complete.
+
+### Binary layout verification
+- N/A: this changes host-side dirty-state ownership and command ordering only.
+
+### Verification
+- Re-read upstream `Scheduler::SubmitExecution`, `Scheduler::InvalidateState`, `BufferCache::UpdateGraphicsBuffers`, and `BufferCache::BindHostVertexBuffers` after implementation. Invalidation ordering and direct mutation of `maxwell3d->dirty.flags` now match.
+- The focused geometry dirty-index test covers the exact live-owned range and excludes render-target flags that still use snapshot propagation.
+- MK8D transition draw 136 changes exactly 684,400 bytes without diagnostic force-binding; before the fix it changed zero. Draw 135 remains unchanged, proving the correction restores the missing draw rather than perturbing the preceding pass.
+
+## 2026-07-14 - externals/rdynarmic A32 ASIMD zip/estimate/compare-zero slice vs Dynarmic A32 ASIMD and ARM64 emitters
+
+### Intentional differences
+- Rust spells the generated A32 decoder table as ordered mask/value matches. The specific `VTRN`, `VUZP`, `VZIP`, compare-zero, `VRECPE`, and `VRSQRTE` rules must precede the older broad scalar masks; this preserves the precedence of upstream's generated decoder.
+- Rust emits the Oaknut `FRECPE`/`FRSQRTE` instructions through local instruction-word helpers. Their 4S/2D words are assembler-verified and implement the same `EmitTwoOpArranged<32/64>` operation.
+- Rust's shared `raise_exception` helper is currently ARM-specific and therefore advances the PC by the architectural 4-byte ARM instruction size directly; upstream stores the same value in `TranslatorVisitor::current_instruction_size`. Thumb translation remains owned by its existing size-aware paths.
+
+### Unintentional differences (to fix)
+- None in this reviewed slice after the pass. The Rust frontend previously omitted `VZIP`, all five ASIMD compare-with-zero instructions, `VRECPE`, and `VRSQRTE`; its ARM64 backend also omitted floating-point vector reciprocal and reciprocal-square-root estimates.
+- None after the undefined-encoding audit. The newly added compare-zero, `VRECPE`, and `VRSQRTE` handlers previously emitted `A32ExceptionRaised` but returned `true` without `UpdateUpperLocationDescriptor`, `BranchWritePC`, or `CheckHalt(ReturnToDispatch)`. They now call the shared ARM `undefined_instruction`/`raise_exception` path and stop translation exactly like upstream.
+
+### Missing items
+- The 16-bit floating-point reciprocal/reciprocal-square-root estimate ARM64 emitters remain unimplemented, matching the explicit upstream `ASSERT_FALSE` implementations.
+
+### Binary layout verification
+- N/A: this slice decodes guest instruction words and emits JIT code; no shared host structure is serialized.
+
+### Verification
+- Re-read upstream `frontend/A32/decoder/asimd.inc`, `frontend/A32/translate/impl/asimd_two_regs_misc.cpp`, `ir/ir_emitter.cpp`, and `backend/arm64/emit_arm64_vector_floating_point.cpp` after implementation. Validation, register selection, comparison operand order, FPCR-control arguments, and write ordering match line by line.
+- Focused decoder/translation tests cover MK8D's `VZIP.32`, `VRSQRTE.F32`, and `VCEQ.F32 #0` words. A JIT execution test verifies zero and negative-zero comparison masks, and instruction tests verify `FRECPE`/`FRSQRTE` 4S/2D encodings.
+- The undefined-size regression test covers compare-zero, `VRECPE`, and `VRSQRTE` and verifies the full upstream exception contract: upper-location update, PC write, `A32ExceptionRaised`, `false`, and `CheckHalt(ReturnToDispatch)`.
+- Runtime comparison is bit-identical at the traced MK8D producer: both yuzu and ruzu write `0x4170000141700001` followed by `0x0000000041700001` to guest `0x748F7A40..0x748F7A4B`.
+- A clean 18-second run visually captures the restored horizontal cyan trails at 8 seconds and reaches the title/`Press L+R` state normally.
+- Full `cargo test -p rdynarmic --release` remains blocked by the pre-existing, independently reproducible `backend::arm64::a32_core::tests::run_existing_block_calls_arm64_prelude` failure (`CACHE_INVALIDATION` returned instead of an empty halt reason). The modified frontend/backend tests all pass.
+## 2026-07-14 — core/src/hle/service/server_manager.rs vs core/hle/service/server_manager.{h,cpp}
+
+### Intentional differences
+- Rust mirrors a guest-owned `KSession` into the host service process by object id because the current `MultiWait` bridge resolves waitables through per-process registries; upstream stores direct `KServerSession*` pointers. The bridge now reads the server endpoint's parent id under a bounded mutex scope and releases that mutex before resolving the parent session.
+
+### Unintentional differences (to fix)
+- None in this deadlock-fix slice. The previous `if let Some(parent_id) = server_session.lock().unwrap().get_parent_id()` extended the temporary `KServerSession` guard through the entire body, creating `server -> parent` lock ordering against `CloseHandle`'s `parent -> server`. This was removed.
+
+### Missing items
+- The broader Rust per-process object-id bridge remains structurally different from upstream's direct kernel-object pointers and is outside this local lifecycle fix.
+
+### Binary layout verification
+- N/A: no serialized or guest-visible structure changed.

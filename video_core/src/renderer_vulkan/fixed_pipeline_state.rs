@@ -1326,7 +1326,9 @@ impl FixedPipelineState {
         self.set_tessellation_primitive(draw.tessellation_primitive);
         self.set_tessellation_spacing(draw.tessellation_spacing);
         self.set_tessellation_clockwise(draw.tessellation_clockwise);
-        self.set_patch_control_points_minus_one(draw.patch_vertices.saturating_sub(1));
+        // Upstream subtracts from u32 and assigns the low five bits to the
+        // bitfield. Preserve that bit pattern when the reset value is zero.
+        self.set_patch_control_points_minus_one(draw.patch_vertices.wrapping_sub(1));
         self.set_msaa_mode_raw(draw.anti_alias_samples_mode);
         self.set_alpha_test_func(if draw.alpha_test_enabled {
             draw.alpha_test_func
@@ -1968,6 +1970,19 @@ mod tests {
         draw.rasterizer.polygon_offset_line_enable = true;
         state.refresh(&draw, &DynamicFeatures::default());
         assert!(state.dynamic_state.depth_bias_enable());
+    }
+
+    #[test]
+    fn refresh_preserves_zero_patch_vertices_wrapping_bit_pattern() {
+        let mut draw = make_test_draw_call();
+        draw.patch_vertices = 0;
+
+        let mut state = FixedPipelineState::default();
+        state.refresh(&draw, &DynamicFeatures::default());
+
+        // Upstream assigns `(u32{0} - 1)` to a five-bit bitfield.
+        assert_eq!(state.patch_control_points_minus_one(), 0x1f);
+        assert_eq!(state.patch_control_points(), 32);
     }
 
     #[test]

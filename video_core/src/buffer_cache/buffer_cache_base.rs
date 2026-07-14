@@ -1010,6 +1010,9 @@ pub trait EngineState {
     /// Clear a dirty flag.
     fn clear_dirty(&mut self, flag: DirtyFlag);
 
+    /// Set a dirty flag.
+    fn set_dirty(&mut self, flag: DirtyFlag);
+
     // -- Vertex streams --
 
     /// Return vertex stream info for a given index.
