@@ -1977,8 +1977,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     }
 
     fn bind_host_draw_indirect_buffers(&mut self) {
-        // Upstream: synchronize count + indirect buffers.
-        // current_draw_indirect is engine state not yet ported.
+        let include_count = self
+            .current_draw_indirect
+            .is_some_and(|params| params.include_count);
         let Some(ref cs) = self.channel_state else {
             return;
         };
@@ -1986,12 +1987,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let indirect_binding = cs.indirect_buffer_binding;
         drop(cs);
 
-        self.touch_buffer(count_binding.buffer_id);
-        self.synchronize_buffer(
-            count_binding.buffer_id,
-            count_binding.device_addr,
-            count_binding.size,
-        );
+        if include_count {
+            self.touch_buffer(count_binding.buffer_id);
+            self.synchronize_buffer(
+                count_binding.buffer_id,
+                count_binding.device_addr,
+                count_binding.size,
+            );
+        }
         self.touch_buffer(indirect_binding.buffer_id);
         self.synchronize_buffer(
             indirect_binding.buffer_id,

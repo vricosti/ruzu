@@ -47,51 +47,51 @@ struct Maxwell3DPtr(*mut Maxwell3D);
 unsafe impl Send for Maxwell3DPtr {}
 
 impl Maxwell3DPtr {
-    unsafe fn draw_arrays_indirect(self, extended: bool, parameters: &[u32]) {
+    unsafe fn draw_arrays_indirect(self, extended: bool, parameters: &mut [u32]) {
         (&mut *self.0).hle_draw_arrays_indirect(extended, parameters);
     }
 
-    unsafe fn draw_indexed_indirect(self, extended: bool, parameters: &[u32]) {
+    unsafe fn draw_indexed_indirect(self, extended: bool, parameters: &mut [u32]) {
         (&mut *self.0).hle_draw_indexed_indirect(extended, parameters);
     }
 
-    unsafe fn multi_draw_indexed_indirect_count(self, parameters: &[u32]) {
+    unsafe fn multi_draw_indexed_indirect_count(self, parameters: &mut [u32]) {
         (&mut *self.0).hle_multi_draw_indexed_indirect_count(parameters);
     }
 
-    unsafe fn draw_indirect_byte_count(self, parameters: &[u32]) {
+    unsafe fn draw_indirect_byte_count(self, parameters: &mut [u32]) {
         (&mut *self.0).hle_draw_indirect_byte_count(parameters);
     }
 
-    unsafe fn multi_layer_clear(self, parameters: &[u32]) {
+    unsafe fn multi_layer_clear(self, parameters: &mut [u32]) {
         (&mut *self.0).hle_multi_layer_clear(parameters);
     }
 
-    unsafe fn c713c83d8f63ccf3(self, parameters: &[u32]) {
+    unsafe fn c713c83d8f63ccf3(self, parameters: &mut [u32]) {
         (&mut *self.0).hle_c713c83d8f63ccf3(parameters);
     }
 
-    unsafe fn set_raster_bounding_box(self, parameters: &[u32]) {
+    unsafe fn set_raster_bounding_box(self, parameters: &mut [u32]) {
         (&mut *self.0).hle_set_raster_bounding_box(parameters);
     }
 
-    unsafe fn clear_const_buffer(self, base_size: usize, parameters: &[u32]) {
+    unsafe fn clear_const_buffer(self, base_size: usize, parameters: &mut [u32]) {
         (&mut *self.0).hle_clear_const_buffer(base_size, parameters);
     }
 
-    unsafe fn clear_memory(self, parameters: &[u32], zero_memory: &mut Vec<u32>) {
+    unsafe fn clear_memory(self, parameters: &mut [u32], zero_memory: &mut Vec<u32>) {
         (&mut *self.0).hle_clear_memory(parameters, zero_memory);
     }
 
-    unsafe fn transform_feedback_setup(self, parameters: &[u32]) {
+    unsafe fn transform_feedback_setup(self, parameters: &mut [u32]) {
         (&mut *self.0).hle_transform_feedback_setup(parameters);
     }
 
-    unsafe fn d7333d26e0a93ede(self, parameters: &[u32]) {
+    unsafe fn d7333d26e0a93ede(self, parameters: &mut [u32]) {
         (&mut *self.0).hle_d7333d26e0a93ede(parameters);
     }
 
-    unsafe fn bind_shader(self, parameters: &[u32]) {
+    unsafe fn bind_shader(self, parameters: &mut [u32]) {
         (&mut *self.0).hle_bind_shader(parameters);
     }
 }
@@ -105,7 +105,7 @@ struct HleDrawArraysIndirect {
 }
 
 impl CachedMacro for HleDrawArraysIndirect {
-    fn execute(&mut self, parameters: &[u32], _method: u32) {
+    fn execute(&mut self, parameters: &mut [u32], _method: u32) {
         let Some(maxwell3d) = self.maxwell3d else {
             log::warn!("HLE_DrawArraysIndirect: missing Maxwell3D owner");
             return;
@@ -123,7 +123,7 @@ struct HleDrawIndexedIndirect {
 }
 
 impl CachedMacro for HleDrawIndexedIndirect {
-    fn execute(&mut self, parameters: &[u32], _method: u32) {
+    fn execute(&mut self, parameters: &mut [u32], _method: u32) {
         let Some(maxwell3d) = self.maxwell3d else {
             log::warn!("HLE_DrawIndexedIndirect: missing Maxwell3D owner");
             return;
@@ -140,7 +140,7 @@ struct HleMultiLayerClear {
 }
 
 impl CachedMacro for HleMultiLayerClear {
-    fn execute(&mut self, parameters: &[u32], _method: u32) {
+    fn execute(&mut self, parameters: &mut [u32], _method: u32) {
         let Some(maxwell3d) = self.maxwell3d else {
             log::warn!("HLE_MultiLayerClear: missing Maxwell3D owner");
             return;
@@ -157,7 +157,7 @@ struct HleMultiDrawIndexedIndirectCount {
 }
 
 impl CachedMacro for HleMultiDrawIndexedIndirectCount {
-    fn execute(&mut self, parameters: &[u32], _method: u32) {
+    fn execute(&mut self, parameters: &mut [u32], _method: u32) {
         let Some(maxwell3d) = self.maxwell3d else {
             log::warn!("HLE_MultiDrawIndexedIndirectCount: missing Maxwell3D owner");
             return;
@@ -174,7 +174,7 @@ struct HleDrawIndirectByteCount {
 }
 
 impl CachedMacro for HleDrawIndirectByteCount {
-    fn execute(&mut self, parameters: &[u32], _method: u32) {
+    fn execute(&mut self, parameters: &mut [u32], _method: u32) {
         let Some(maxwell3d) = self.maxwell3d else {
             log::warn!("HLE_DrawIndirectByteCount: missing Maxwell3D owner");
             return;
@@ -191,7 +191,7 @@ struct HleC713C83d8f63Ccf3 {
 }
 
 impl CachedMacro for HleC713C83d8f63Ccf3 {
-    fn execute(&mut self, parameters: &[u32], _method: u32) {
+    fn execute(&mut self, parameters: &mut [u32], _method: u32) {
         let Some(maxwell3d) = self.maxwell3d else {
             log::warn!("HLE_C713C83D8F63CCF3: missing Maxwell3D owner");
             return;
@@ -208,7 +208,7 @@ struct HleD7333d26e0a93Ede {
 }
 
 impl CachedMacro for HleD7333d26e0a93Ede {
-    fn execute(&mut self, parameters: &[u32], _method: u32) {
+    fn execute(&mut self, parameters: &mut [u32], _method: u32) {
         let Some(maxwell3d) = self.maxwell3d else {
             log::warn!("HLE_D7333D26E0A93EDE: missing Maxwell3D owner");
             return;
@@ -225,7 +225,7 @@ struct HleBindShader {
 }
 
 impl CachedMacro for HleBindShader {
-    fn execute(&mut self, parameters: &[u32], _method: u32) {
+    fn execute(&mut self, parameters: &mut [u32], _method: u32) {
         let Some(maxwell3d) = self.maxwell3d else {
             log::warn!("HLE_BindShader: missing Maxwell3D owner");
             return;
@@ -242,7 +242,7 @@ struct HleSetRasterBoundingBox {
 }
 
 impl CachedMacro for HleSetRasterBoundingBox {
-    fn execute(&mut self, parameters: &[u32], _method: u32) {
+    fn execute(&mut self, parameters: &mut [u32], _method: u32) {
         let Some(maxwell3d) = self.maxwell3d else {
             log::warn!("HLE_SetRasterBoundingBox: missing Maxwell3D owner");
             return;
@@ -260,7 +260,7 @@ struct HleClearConstBuffer {
 }
 
 impl CachedMacro for HleClearConstBuffer {
-    fn execute(&mut self, parameters: &[u32], _method: u32) {
+    fn execute(&mut self, parameters: &mut [u32], _method: u32) {
         let Some(maxwell3d) = self.maxwell3d else {
             log::warn!(
                 "HLE_ClearConstBuffer(base_size=0x{:X}): missing Maxwell3D owner",
@@ -281,7 +281,7 @@ struct HleClearMemory {
 }
 
 impl CachedMacro for HleClearMemory {
-    fn execute(&mut self, parameters: &[u32], _method: u32) {
+    fn execute(&mut self, parameters: &mut [u32], _method: u32) {
         let Some(maxwell3d) = self.maxwell3d else {
             log::warn!("HLE_ClearMemory: missing Maxwell3D owner");
             return;
@@ -298,7 +298,7 @@ struct HleTransformFeedbackSetup {
 }
 
 impl CachedMacro for HleTransformFeedbackSetup {
-    fn execute(&mut self, parameters: &[u32], _method: u32) {
+    fn execute(&mut self, parameters: &mut [u32], _method: u32) {
         let Some(maxwell3d) = self.maxwell3d else {
             log::warn!("HLE_TransformFeedbackSetup: missing Maxwell3D owner");
             return;

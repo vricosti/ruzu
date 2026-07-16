@@ -402,7 +402,7 @@ impl CachedMacro for MacroInterpreterImpl {
     /// Execute the macro with the given parameters.
     ///
     /// Port of `MacroInterpreterImpl::Execute`.
-    fn execute(&mut self, parameters: &[u32], method: u32) {
+    fn execute(&mut self, parameters: &mut [u32], method: u32) {
         self.reset();
         self.current_method = method;
 
@@ -479,7 +479,7 @@ mod tests {
         // We only need 1 parameter since $r1 is set from params[0].
         // But the exit delay slot also runs, so we need the parameter count to match.
         // With Move operations, next_parameter_index stays at 1.
-        program.execute(&[0x42], 0);
+        program.execute(&mut [0x42], 0);
     }
 
     #[test]

@@ -98,8 +98,28 @@ pub fn emit_set_frag_color(
 }
 
 /// Emit SetFragDepth.
-pub fn emit_set_frag_depth(_ctx: &mut SpirvEmitContext, _value: Word) {
-    log::trace!("SPIR-V: emit_set_frag_depth");
+pub fn emit_set_frag_depth(ctx: &mut SpirvEmitContext, value: Word) {
+    let value = if ctx.runtime_info.convert_depth_mode && !ctx.profile.support_native_ndc {
+        let half = ctx.constant_f32(0.5);
+        ctx.builder
+            .ext_inst(
+                ctx.f32_type,
+                None,
+                ctx.glsl_ext,
+                50, /* Fma */
+                vec![
+                    rspirv::dr::Operand::IdRef(value),
+                    rspirv::dr::Operand::IdRef(half),
+                    rspirv::dr::Operand::IdRef(half),
+                ],
+            )
+            .unwrap()
+    } else {
+        value
+    };
+    ctx.builder
+        .store(ctx.frag_depth, value, None, vec![])
+        .unwrap();
 }
 
 /// Emit SetSampleMask.
@@ -689,8 +709,8 @@ pub fn emit_set_frag_depth_inst(
     _block_idx: u32,
     _inst_idx: u32,
 ) {
-    let _val = ctx.resolve_value(inst.arg(0));
-    log::trace!("SPIR-V: SetFragDepth not fully implemented (need depth output builtin)");
+    let value = ctx.resolve_value(inst.arg(0));
+    emit_set_frag_depth(ctx, value);
 }
 
 // ── System value emission (matches upstream Emit* functions) ──────────────

@@ -415,6 +415,7 @@ impl Device {
         let has_shader_demote_to_helper_invocation = supported_extensions
             .contains("VK_EXT_shader_demote_to_helper_invocation")
             || device_properties.api_version >= vk::API_VERSION_1_3;
+        let has_draw_indirect_count = supported_extensions.contains("VK_KHR_draw_indirect_count");
         let mut shader_float16_int8_features =
             vk::PhysicalDeviceShaderFloat16Int8Features::default();
         let mut portability_subset_features =
@@ -521,6 +522,7 @@ impl Device {
             "VK_EXT_depth_clip_control",
             "VK_EXT_vertex_attribute_divisor",
             "VK_EXT_shader_demote_to_helper_invocation",
+            "VK_KHR_draw_indirect_count",
         ] {
             if supported_extensions.contains(name) {
                 enabled_extensions.push(CString::new(name).unwrap());
@@ -667,6 +669,7 @@ impl Device {
                 vertex_attribute_divisor: supports_vertex_attribute_divisor,
                 provoking_vertex: supports_provoking_vertex,
                 shader_demote_to_helper_invocation: supports_shader_demote_to_helper_invocation,
+                draw_indirect_count: has_draw_indirect_count,
                 shader_float_controls: has_shader_float_controls,
                 swapchain: supported_extensions.contains("VK_KHR_swapchain"),
                 ..DeviceExtensions::default()
@@ -1106,6 +1109,10 @@ impl Device {
 
     pub fn is_khr_push_descriptor_supported(&self) -> bool {
         self.extensions.push_descriptor
+    }
+
+    pub fn is_khr_draw_indirect_count_supported(&self) -> bool {
+        self.extensions.draw_indirect_count
     }
 
     pub fn is_ext_transform_feedback_supported(&self) -> bool {

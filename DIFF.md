@@ -22870,6 +22870,27 @@ Upstream files:
 - Runtime comparison is bit-identical at the traced MK8D producer: both yuzu and ruzu write `0x4170000141700001` followed by `0x0000000041700001` to guest `0x748F7A40..0x748F7A4B`.
 - A clean 18-second run visually captures the restored horizontal cyan trails at 8 seconds and reaches the title/`Press L+R` state normally.
 - Full `cargo test -p rdynarmic --release` remains blocked by the pre-existing, independently reproducible `backend::arm64::a32_core::tests::run_existing_block_calls_arm64_prelude` failure (`CACHE_INVALIDATION` returned instead of an empty halt reason). The modified frontend/backend tests all pass.
+
+## 2026-07-16 - externals/rdynarmic A32 ASIMD structure loads/stores and exception lifecycle vs Dynarmic A32 frontend
+
+### Intentional differences
+- Rust keeps the ordered ASIMD mask/value rules in `frontend/a32/decoder.rs` rather than generating them from `decoder/asimd.inc`. The masks include every fixed upstream bit and preserve the more-specific all-lanes precedence.
+- Rust factors the common single-structure `index`/`inc`/alignment decoding into a file-local helper. The helper remains in the ASIMD translator owner and performs the same guards in the same order as both upstream handlers.
+
+### Unintentional differences (to fix)
+- None after this pass. The old multiple-structure decoder mask ignored bit 23 and swallowed VLD/VST single-structure instructions; the corrected masks also include fixed bit 20 so UNALLOCATED encodings cannot execute a load/store handler.
+- None after this pass. `VLD{1-4}` all-lanes and VLD/VST single-element now reproduce upstream element size, lane selection, register increment, memory order, writeback and exception classification.
+- None after this pass. ARM UDF and ASIMD validation failures now use the shared upstream-equivalent `RaiseException` lifecycle, including upper-location update, `PC + 4`, exact exception kind and `CheckHalt(ReturnToDispatch)`.
+
+### Missing items
+- The pre-existing x64 reciprocal-estimate helpers remain numerically approximate and do not yet reproduce upstream FPCR/FPSR behavior. Apple Silicon uses the ARM64 native estimate instructions, so this does not affect the validated MK8D path; a separate x64-oracle pass is required.
+
+### Binary layout verification
+- N/A: these changes decode guest instructions and emit IR; no shared raw structure is serialized.
+
+### Verification
+- Re-read upstream `decoder/asimd.inc`, `asimd_load_store_structures.cpp`, `asimd_two_regs_scalar.cpp`, `asimd_three_regs.cpp`, and `a32_translate_impl.cpp`. Decoder fixed bits, validation order, memory iteration, writeback and exception lifecycle match line by line.
+- Focused tests cover the MK8D all-lanes opcode, immediate/no-writeback variants, VLD/VST single-element IR, exact exception kinds and full exception terminal lifecycle.
 ## 2026-07-14 — core/src/hle/service/server_manager.rs vs core/hle/service/server_manager.{h,cpp}
 
 ### Intentional differences
@@ -22883,3 +22904,148 @@ Upstream files:
 
 ### Binary layout verification
 - N/A: no serialized or guest-visible structure changed.
+
+## 2026-07-15 - video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp
+
+### Intentional differences
+- Rust passes the scheduler's last known completed GPU tick into the reduced Vulkan texture-cache runtime so its explicit Vulkan-resource retirement queue can retire safely. Upstream obtains completion through its scheduler/runtime ownership internally.
+
+### Unintentional differences (to fix)
+- None in the reviewed `RasterizerVulkan::TickFrame` locking slice. Rust previously called `texture_cache.tick_frame()` without holding `texture_cache.mutex`; CPU invalidation paths could consequently unregister and erase an image while the texture-cache garbage collector was traversing its LRU list. The call is now enclosed by the same texture-cache mutex as upstream lines 769-772.
+
+### Missing items
+- The Rust texture-cache GC still snapshots eligible LRU object IDs before cleanup instead of using upstream `ForEachItemBelow`'s mutation-safe live traversal. This is a separate iteration-API adaptation and was not used to mask the concurrent deletion fixed here.
+
+### Binary layout verification
+- N/A: this changes host-side synchronization only.
+
+### Verification
+- Re-read upstream `RasterizerVulkan::TickFrame` and all adjacent CPU invalidation/unmap paths after implementation. Both sides now serialize `TextureCache::TickFrame` against `WriteMemory` and `UnmapMemory` with the texture-cache-owned mutex.
+- `cargo fmt --all -- --check` and `git diff --check` pass. Runtime attract-mode validation follows in the active investigation.
+
+## 2026-07-15 - shader_recompiler SPIR-V fragment depth vs emit_spirv_context_get_set.cpp and spirv_emit_context.cpp
+
+### Intentional differences
+- Rust stores the `FragDepth` output ID directly on `SpirvEmitContext`; this is the direct field equivalent of upstream `EmitContext::frag_depth`.
+
+### Unintentional differences (to fix)
+- None after this pass. Rust previously collected `stores_frag_depth` but discarded every `SetFragDepth` value. It now declares the `FragDepth` builtin, adds `DepthReplacing`, emits the store, and applies the same conditional depth-mode FMA as upstream.
+
+### Missing items
+- None in the reviewed `FragDepth` output slice.
+
+### Binary layout verification
+- N/A: this changes generated SPIR-V only.
+
+### Verification
+- Re-read upstream `EmitContext::DefineOutputs`, fragment entry-point execution-mode setup, and `EmitSetFragDepth` after implementation. Declaration, interface ownership, execution mode, conversion condition, and store ordering match.
+- `cargo test -p shader_recompiler fragment_depth_declares_builtin_mode_and_store -- --nocapture` passes.
+
+## 2026-07-15 - Vulkan diagnostic hot-path cleanup vs renderer_vulkan upstream
+
+### Intentional differences
+- The submit timing counters remain available behind the cached
+  `RUZU_PROFILE_VK_SUBMIT` switch. They do not execute atomic/counting work
+  when profiling is disabled.
+
+### Unintentional differences (to fix)
+- None in this cleanup slice. The temporary always-on render-pass, pipeline
+  cache, pipeline-creation, and blue-transition diagnostics had no upstream
+  equivalent and added work to every draw or submission. They were removed;
+  the remaining attract investigation uses bounded, exact one-shot captures.
+
+### Missing items
+- None. This entry only removes investigation instrumentation from production
+  hot paths.
+
+### Binary layout verification
+- N/A: no guest-visible or serialized structure changed.
+
+### Verification
+- Re-checked upstream `vk_scheduler.cpp`, `vk_pipeline_cache.cpp`, and
+  `vk_graphics_pipeline.cpp`; none contains the removed ruzu-specific counters
+  or per-draw logs.
+- `cargo check -p video_core`, `cargo fmt --all`, and `git diff --check` pass.
+
+## 2026-07-15 - Vulkan indirect draws and macro parameter refresh vs upstream macro/draw/Vulkan paths
+
+### Intentional differences
+- Rust passes a `Maxwell3DIndirectView` across the object-safe rasterizer trait
+  instead of letting `RasterizerVulkan` retain a direct `Maxwell3D*`. The view
+  exposes the same draw state, indirect parameters, and channel dirty flags at
+  the same call boundary.
+- Rust loads `VK_KHR_draw_indirect_count` through ash's extension wrapper;
+  upstream calls the promoted/KHR entry point through its Vulkan wrapper.
+
+### Unintentional differences (to fix)
+- None in the reviewed non-byte-count indexed/array indirect paths. The prior
+  Vulkan rasterizer could only issue direct draws, and macro parameter refresh
+  updated storage different from the slice consumed by the macro.
+
+### Missing items
+- `DrawIndirectByteCountEXT` still requires the transform-feedback extension
+  path. HLE byte-count macros retain their upstream direct fallback, so the
+  unsupported Vulkan branch is not selected by this slice.
+- The Rust ownership adaptation keeps the private HLE bodies on `Maxwell3D`
+  behind thin `macro_hle.rs` wrappers. Behavior and ordering match upstream,
+  but moving private register access behind a narrow owner interface would be
+  needed for strict method-body placement parity with `macro_hle.cpp`.
+
+### Binary layout verification
+- N/A: indirect parameters are host-side state; guest indirect command bytes
+  are read from their original GPU addresses without serialization changes.
+
+### Verification
+- Re-read upstream `macro_hle.cpp` (`HLE_DrawArraysIndirect`,
+  `HLE_DrawIndexedIndirect`, `HLE_MultiDrawIndexedIndirectCount`),
+  `draw_manager.cpp::ProcessDrawIndirect`,
+  `vk_rasterizer.cpp::DrawIndirect`, and the buffer-cache indirect binding
+  paths after implementation.
+- `cargo test -p video_core --lib hle_ -- --nocapture` passes all 17 focused
+  HLE tests; the mutable macro-parameter regression also passes.
+- `cargo check -p video_core` passes.
+
+## 2026-07-15 - video_core/src/renderer_vulkan/mod.rs MustFlushRegion vs vk_rasterizer.cpp
+
+### Intentional differences
+- Rust obtains GPU accuracy through the shared settings guard and uses the
+  split Vulkan texture-cache base object. Query order and cache mutex ownership
+  remain the same as upstream.
+
+### Unintentional differences (to fix)
+- None after this pass. The live Vulkan rasterizer previously returned `false`
+  unconditionally, preventing `MemoryManager::IsMemoryDirty` from observing
+  GPU-modified pushbuffer regions.
+
+### Missing items
+- None in `MustFlushRegion` for the cache types exposed by the current Rust
+  rasterizer trait. The trait does not yet carry upstream's `CacheType` mask,
+  so the Rust method always checks the equivalent of `CacheType::All`.
+
+### Binary layout verification
+- N/A: this is cache-state querying and synchronization only.
+
+### Verification
+- Re-read upstream `RasterizerVulkan::MustFlushRegion` and
+  `MemoryManager::IsMemoryDirty`; buffer-first early return, high-accuracy
+  texture gating, and lock order now match.
+- `cargo check -p video_core` and the focused HLE test set pass.
+## 2026-07-15 - video_core/src/buffer_cache/buffer_cache.rs vs video_core/buffer_cache/buffer_cache.h
+
+### Intentional differences
+- Rust resolves the backend buffer handle from `BufferId` after the common cache returns the binding; ownership and offset calculation remain equivalent to upstream.
+
+### Unintentional differences (to fix)
+- None in the audited indirect-buffer update, synchronization, offset, and Vulkan command path.
+
+### Missing items
+- The transform-feedback byte-count indirect path remains unavailable until the corresponding Vulkan transform-feedback runtime is ported.
+
+### Binary layout verification
+- PASS: indexed indirect commands retain the upstream five-`u32` layout, one-command count, and zero stride used by `HLE_DrawIndexedIndirect`.
+
+The audit fixed one local divergence: `BindHostDrawIndirectBuffers` previously synchronized the count binding unconditionally. It now touches and synchronizes that binding only when `include_count` is set, before always synchronizing the indirect binding, matching upstream lines 758-768. The old MK8D transition resource/CBUF dump blocks were also removed from the live Vulkan draw loop; they were diagnostics, not upstream behavior.
+
+### Verification
+- `cargo build --release --bin ruzu-cmd`, the focused FragDepth test, and all 17 focused video-core HLE tests pass.
+- A clean 30-second MK8D Vulkan run with the SDL dummy audio driver reaches `submit#2048` without panic or pipeline-creation failure. This is a startup non-regression check; it does not establish that the remaining attract-mode rendering issue is fixed.

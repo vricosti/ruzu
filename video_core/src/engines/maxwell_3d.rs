@@ -2656,14 +2656,19 @@ impl Maxwell3D {
         if !self.current_macro_dirty {
             return;
         }
-        self.refresh_parameters_impl();
+        let mut parameters = std::mem::take(&mut self.macro_params);
+        self.refresh_parameters_impl(&mut parameters);
+        self.macro_params = parameters;
     }
 
     pub fn any_parameters_dirty(&self) -> bool {
         self.current_macro_dirty
     }
 
-    fn refresh_parameters_impl(&mut self) {
+    fn refresh_parameters_impl(&mut self, parameters: &mut [u32]) {
+        if !self.current_macro_dirty {
+            return;
+        }
         let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
             return;
         };
@@ -2681,7 +2686,7 @@ impl Maxwell3D {
             let memory_manager = memory_manager.lock();
             memory_manager.read_block(segment_addr, &mut bytes);
             for (word_index, chunk) in bytes.chunks_exact(4).enumerate() {
-                self.macro_params[current_index + word_index] =
+                parameters[current_index + word_index] =
                     u32::from_le_bytes(chunk.try_into().expect("4-byte chunk"));
             }
             current_index += word_count;
@@ -3632,6 +3637,26 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         true
     }
 
+    fn draw_indirect_rasterizer(
+        &mut self,
+        draw_state: &dm::DrawState,
+        indirect_params: &dm::IndirectParams,
+    ) -> bool {
+        let Some(handle) = self.rasterizer else {
+            return false;
+        };
+        unsafe {
+            handle.with_mut(|rasterizer| {
+                rasterizer.draw_indirect(dm::Maxwell3DIndirectView::live(
+                    draw_state,
+                    indirect_params,
+                    self,
+                ));
+            });
+        }
+        true
+    }
+
     fn clear_rasterizer(&mut self, layer_count: u32) -> bool {
         let Some(handle) = self.rasterizer else {
             return false;
@@ -4523,8 +4548,32 @@ impl Maxwell3D {
         num_vertices
     }
 
-    pub(crate) fn hle_multi_layer_clear(&mut self, parameters: &[u32]) {
-        self.refresh_parameters();
+    /// Estimate the index-buffer range consumed by an indirect draw.
+    ///
+    /// Port of `Maxwell3D::EstimateIndexBufferSize`.
+    fn estimate_index_buffer_size(&self) -> usize {
+        let start_address = self.index_buffer_addr();
+        let end_address = <Self as dm::Maxwell3DAccess>::index_buffer_addr_end(self);
+        let byte_size = self.index_buffer_format().size_bytes() as usize;
+        let max_sizes = [u8::MAX as usize, u16::MAX as usize, u32::MAX as usize];
+        let log2_byte_size = byte_size.ilog2() as usize;
+        let cap = self
+            .max_current_vertices()
+            .saturating_mul(4)
+            .saturating_mul(byte_size as u32) as usize;
+        let lower_cap = (end_address.saturating_sub(start_address) as usize).min(cap);
+        let max_layout_size = (byte_size as u64).saturating_mul(max_sizes[log2_byte_size] as u64);
+        let layout_elements = self.memory_manager.as_ref().map_or(0, |memory_manager| {
+            memory_manager
+                .lock()
+                .get_memory_layout_size_bounded(start_address, max_layout_size) as usize
+                / byte_size
+        });
+        layout_elements.min(lower_cap)
+    }
+
+    pub(crate) fn hle_multi_layer_clear(&mut self, parameters: &mut [u32]) {
+        self.refresh_parameters_impl(parameters);
         let Some(&clear_surface) = parameters.first() else {
             return;
         };
@@ -4539,8 +4588,8 @@ impl Maxwell3D {
         });
     }
 
-    pub(crate) fn hle_c713c83d8f63ccf3(&mut self, parameters: &[u32]) {
-        self.refresh_parameters();
+    pub(crate) fn hle_c713c83d8f63ccf3(&mut self, parameters: &mut [u32]) {
+        self.refresh_parameters_impl(parameters);
         let Some(&param0) = parameters.first() else {
             return;
         };
@@ -4552,8 +4601,8 @@ impl Maxwell3D {
         self.regs[CB_CONFIG_BASE as usize + 3] = offset;
     }
 
-    pub(crate) fn hle_set_raster_bounding_box(&mut self, parameters: &[u32]) {
-        self.refresh_parameters();
+    pub(crate) fn hle_set_raster_bounding_box(&mut self, parameters: &mut [u32]) {
+        self.refresh_parameters_impl(parameters);
         let Some(&raster_mode) = parameters.first() else {
             return;
         };
@@ -4563,8 +4612,8 @@ impl Maxwell3D {
         self.regs[RASTER_BOUNDING_BOX as usize] = (raster_mode & 0xFFFF_F00F) | (pad << 4);
     }
 
-    pub(crate) fn hle_clear_const_buffer(&mut self, base_size: usize, parameters: &[u32]) {
-        self.refresh_parameters();
+    pub(crate) fn hle_clear_const_buffer(&mut self, base_size: usize, parameters: &mut [u32]) {
+        self.refresh_parameters_impl(parameters);
         if parameters.len() < 3 {
             return;
         }
@@ -4580,8 +4629,8 @@ impl Maxwell3D {
         self.process_cb_multi_data(&zeroes);
     }
 
-    pub(crate) fn hle_d7333d26e0a93ede(&mut self, parameters: &[u32]) {
-        self.refresh_parameters();
+    pub(crate) fn hle_d7333d26e0a93ede(&mut self, parameters: &mut [u32]) {
+        self.refresh_parameters_impl(parameters);
         let Some(&index) = parameters.first() else {
             return;
         };
@@ -4593,8 +4642,8 @@ impl Maxwell3D {
         self.regs[CB_CONFIG_BASE as usize + 2] = address << 8;
     }
 
-    pub(crate) fn hle_bind_shader(&mut self, parameters: &[u32]) {
-        self.refresh_parameters();
+    pub(crate) fn hle_bind_shader(&mut self, parameters: &mut [u32]) {
+        self.refresh_parameters_impl(parameters);
         if parameters.len() < 5 {
             return;
         }
@@ -4630,8 +4679,8 @@ impl Maxwell3D {
         self.process_cb_bind(bind_group_id);
     }
 
-    pub(crate) fn hle_clear_memory(&mut self, parameters: &[u32], zero_memory: &mut Vec<u32>) {
-        self.refresh_parameters();
+    pub(crate) fn hle_clear_memory(&mut self, parameters: &mut [u32], zero_memory: &mut Vec<u32>) {
+        self.refresh_parameters_impl(parameters);
         if parameters.len() < 3 {
             return;
         }
@@ -4653,8 +4702,8 @@ impl Maxwell3D {
         );
     }
 
-    pub(crate) fn hle_transform_feedback_setup(&mut self, parameters: &[u32]) {
-        self.refresh_parameters();
+    pub(crate) fn hle_transform_feedback_setup(&mut self, parameters: &mut [u32]) {
+        self.refresh_parameters_impl(parameters);
         if parameters.len() < 2 {
             return;
         }
@@ -4681,13 +4730,43 @@ impl Maxwell3D {
         });
     }
 
-    pub(crate) fn hle_draw_arrays_indirect(&mut self, extended: bool, parameters: &[u32]) {
+    pub(crate) fn hle_draw_arrays_indirect(&mut self, extended: bool, parameters: &mut [u32]) {
         if parameters.len() < 5 {
             return;
         }
 
-        self.refresh_parameters();
         let topology = PrimitiveTopology::from_raw(parameters[0]);
+        if self.any_parameters_dirty() && topology.is_hle_safe() {
+            let indirect_start_address = self.get_macro_address(1);
+            let params = self.draw_manager.get_indirect_params_mut();
+            params.is_byte_count = false;
+            params.is_indexed = false;
+            params.include_count = false;
+            params.count_start_address = 0;
+            params.indirect_start_address = indirect_start_address;
+            params.buffer_size = 4 * std::mem::size_of::<u32>();
+            params.max_draw_counts = 1;
+            params.stride = 0;
+
+            if extended {
+                self.engine_state = EngineHint::OnHleMacro;
+                self.set_hle_replacement_attribute_type(
+                    0,
+                    0x640,
+                    HleReplacementAttributeType::BaseInstance,
+                );
+            }
+            self.with_draw_manager(|draw_manager, this| {
+                draw_manager.draw_array_indirect(topology, this);
+            });
+            if extended {
+                self.engine_state = EngineHint::None;
+                self.replace_table.clear();
+            }
+            return;
+        }
+
+        self.refresh_parameters_impl(parameters);
         let instance_count = self.regs[0xD1B] & parameters[2];
         let vertex_first = parameters[3];
         let vertex_count = parameters[1];
@@ -4728,13 +4807,58 @@ impl Maxwell3D {
         }
     }
 
-    pub(crate) fn hle_draw_indexed_indirect(&mut self, extended: bool, parameters: &[u32]) {
+    pub(crate) fn hle_draw_indexed_indirect(&mut self, extended: bool, parameters: &mut [u32]) {
         if parameters.len() < 6 {
             return;
         }
 
-        self.refresh_parameters();
         let topology = PrimitiveTopology::from_raw(parameters[0]);
+        if self.any_parameters_dirty() && topology.is_hle_safe() {
+            let estimate = self.estimate_index_buffer_size() as u32;
+            let indirect_start_address = self.get_macro_address(1);
+            let element_base = parameters[4];
+            let base_instance = parameters[5];
+            self.regs[VERTEX_ID_BASE as usize] = element_base;
+            self.regs[GLOBAL_BASE_VERTEX_INDEX as usize] = element_base;
+            self.regs[GLOBAL_BASE_INSTANCE_INDEX as usize] = base_instance;
+            self.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize] = true;
+            if extended {
+                self.engine_state = EngineHint::OnHleMacro;
+                self.set_hle_replacement_attribute_type(
+                    0,
+                    0x640,
+                    HleReplacementAttributeType::BaseVertex,
+                );
+                self.set_hle_replacement_attribute_type(
+                    0,
+                    0x644,
+                    HleReplacementAttributeType::BaseInstance,
+                );
+            }
+            let params = self.draw_manager.get_indirect_params_mut();
+            params.is_byte_count = false;
+            params.is_indexed = true;
+            params.include_count = false;
+            params.count_start_address = 0;
+            params.indirect_start_address = indirect_start_address;
+            params.buffer_size = 5 * std::mem::size_of::<u32>();
+            params.max_draw_counts = 1;
+            params.stride = 0;
+            self.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize] = true;
+            self.with_draw_manager(|draw_manager, this| {
+                draw_manager.draw_indexed_indirect(topology, 0, estimate, this);
+            });
+            self.regs[VERTEX_ID_BASE as usize] = 0;
+            self.regs[GLOBAL_BASE_VERTEX_INDEX as usize] = 0;
+            self.regs[GLOBAL_BASE_INSTANCE_INDEX as usize] = 0;
+            if extended {
+                self.engine_state = EngineHint::None;
+                self.replace_table.clear();
+            }
+            return;
+        }
+
+        self.refresh_parameters_impl(parameters);
         let instance_count = self.regs[0xD1B] & parameters[2];
         let index_first = parameters[3];
         let index_count = parameters[1];
@@ -4782,12 +4906,11 @@ impl Maxwell3D {
         }
     }
 
-    pub(crate) fn hle_multi_draw_indexed_indirect_count(&mut self, parameters: &[u32]) {
+    pub(crate) fn hle_multi_draw_indexed_indirect_count(&mut self, parameters: &mut [u32]) {
         if parameters.len() < 5 {
             return;
         }
 
-        self.refresh_parameters();
         let start_indirect = parameters[0] as usize;
         let end_indirect = parameters[1] as usize;
         if start_indirect >= end_indirect {
@@ -4795,6 +4918,45 @@ impl Maxwell3D {
         }
 
         let topology = PrimitiveTopology::from_raw(parameters[2]);
+        if topology.is_hle_safe() {
+            let padding = parameters[3] as usize;
+            let indirect_words = 5 + padding;
+            let draw_count = end_indirect - start_indirect;
+            let estimate = self.estimate_index_buffer_size() as u32;
+            let count_start_address = self.get_macro_address(4);
+            let indirect_start_address = self.get_macro_address(5);
+            self.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize] = true;
+            let params = self.draw_manager.get_indirect_params_mut();
+            params.is_byte_count = false;
+            params.is_indexed = true;
+            params.include_count = true;
+            params.count_start_address = count_start_address;
+            params.indirect_start_address = indirect_start_address;
+            params.buffer_size = indirect_words * std::mem::size_of::<u32>() * draw_count;
+            params.max_draw_counts = draw_count;
+            params.stride = indirect_words * std::mem::size_of::<u32>();
+            self.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize] = true;
+            self.engine_state = EngineHint::OnHleMacro;
+            self.set_hle_replacement_attribute_type(
+                0,
+                0x640,
+                HleReplacementAttributeType::BaseVertex,
+            );
+            self.set_hle_replacement_attribute_type(
+                0,
+                0x644,
+                HleReplacementAttributeType::BaseInstance,
+            );
+            self.set_hle_replacement_attribute_type(0, 0x648, HleReplacementAttributeType::DrawId);
+            self.with_draw_manager(|draw_manager, this| {
+                draw_manager.draw_indexed_indirect(topology, 0, estimate, this);
+            });
+            self.engine_state = EngineHint::None;
+            self.replace_table.clear();
+            return;
+        }
+
+        self.refresh_parameters_impl(parameters);
         let padding = parameters[3] as usize;
         let max_draws = parameters[4] as usize;
         let indirect_words = 5 + padding;
@@ -4847,12 +5009,12 @@ impl Maxwell3D {
         self.replace_table.clear();
     }
 
-    pub(crate) fn hle_draw_indirect_byte_count(&mut self, parameters: &[u32]) {
+    pub(crate) fn hle_draw_indirect_byte_count(&mut self, parameters: &mut [u32]) {
         if parameters.len() < 3 {
             return;
         }
 
-        self.refresh_parameters();
+        self.refresh_parameters_impl(parameters);
         let topology = PrimitiveTopology::from_raw(parameters[0]);
         self.regs[DRAW_BEGIN as usize] = parameters[0];
         self.regs[DRAW_AUTO_STRIDE as usize] = parameters[1];
@@ -5072,7 +5234,12 @@ impl Maxwell3D {
         self.executing_macro = 0;
 
         let entry = ((method - MACRO_REGISTERS_START) >> 1) % 128;
-        let params = self.macro_params.clone();
+        // Upstream passes a const reference to the channel-owned
+        // `macro_params`, and `RefreshParameters` updates that same storage
+        // before an HLE fallback or LLE execution consumes it. Move the
+        // vector into this call so Rust can update the exact parameter slice
+        // without creating an immutable/mutable alias or a stale clone.
+        let mut params = std::mem::take(&mut self.macro_params);
         let macro_method = self.macro_positions[entry as usize];
         if {
             static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5146,8 +5313,8 @@ impl Maxwell3D {
             };
         self.macro_engine.execute(
             macro_method,
-            &params,
-            move || unsafe { (&mut *self_ptr.0).refresh_parameters() },
+            &mut params,
+            move |parameters| unsafe { (&mut *self_ptr.0).refresh_parameters_impl(parameters) },
             compile,
         );
 
@@ -5289,7 +5456,7 @@ impl Maxwell3D {
             return;
         }
         let method = self.executing_macro;
-        let params = self.macro_params.clone();
+        let mut params = std::mem::take(&mut self.macro_params);
         let entry = ((method - MACRO_METHODS_START) >> 1) % 128;
         let macro_method = self.macro_positions[entry as usize];
         let self_raw = std::ptr::from_mut(self);
@@ -5297,8 +5464,8 @@ impl Maxwell3D {
         self.macro_engine.set_maxwell_3d(self_raw);
         self.macro_engine.execute(
             macro_method,
-            &params,
-            move || unsafe { (&mut *self_ptr.0).refresh_parameters() },
+            &mut params,
+            move |parameters| unsafe { (&mut *self_ptr.0).refresh_parameters_impl(parameters) },
             |code| {
                 let mut program = MacroInterpreterImpl::new(code.to_vec());
                 let writer_ptr = self_ptr;
@@ -8371,7 +8538,7 @@ mod tests {
         // parameters[2] is the vec4 count upstream (macro_hle.cpp:457 passes
         // parameters[2] * 4 as the u32-count amount). parameters[2]=4 means
         // 4 vec4 entries = 16 u32 = 64 bytes written.
-        engine.hle_clear_const_buffer(0x5F00, &[0x12, 0x3456, 4]);
+        engine.hle_clear_const_buffer(0x5F00, &mut [0x12, 0x3456, 4]);
 
         assert_eq!(engine.regs[CB_CONFIG_BASE as usize], 0x5F00);
         assert_eq!(engine.regs[(CB_CONFIG_BASE + 1) as usize], 0x12);
@@ -8385,7 +8552,7 @@ mod tests {
         engine.regs[SHADOW_SCRATCH_BASE as usize + 43] = 0x1234_5678;
         engine.regs[SHADOW_SCRATCH_BASE as usize + 48] = 0x6000;
 
-        engine.hle_d7333d26e0a93ede(&[1]);
+        engine.hle_d7333d26e0a93ede(&mut [1]);
 
         assert_eq!(engine.regs[CB_CONFIG_BASE as usize], 0x6000);
         assert_eq!(engine.regs[(CB_CONFIG_BASE + 1) as usize], 0x12);
@@ -8397,7 +8564,7 @@ mod tests {
         let mut engine = Maxwell3D::new();
         engine.regs[SHADOW_SCRATCH_BASE as usize + 24] = 0x89AB_CDEF;
 
-        engine.hle_c713c83d8f63ccf3(&[0xC000_0010]);
+        engine.hle_c713c83d8f63ccf3(&mut [0xC000_0010]);
 
         assert_eq!(engine.regs[CB_CONFIG_BASE as usize], 0x7000);
         assert_eq!(engine.regs[(CB_CONFIG_BASE + 1) as usize], 0x89);
@@ -8411,7 +8578,7 @@ mod tests {
         engine.regs[CONSERVATIVE_RASTER_ENABLE as usize] = 0xF3;
         engine.regs[SHADOW_SCRATCH_BASE as usize + 52] = 0xA5;
 
-        engine.hle_set_raster_bounding_box(&[0x1234_5678]);
+        engine.hle_set_raster_bounding_box(&mut [0x1234_5678]);
 
         assert_eq!(
             engine.regs[RASTER_BOUNDING_BOX as usize],
@@ -8428,7 +8595,7 @@ mod tests {
         let rt_index = 2usize;
         engine.regs[RT_BASE as usize + rt_index * RT_STRIDE as usize + RT_OFF_DEPTH as usize] = 3;
 
-        engine.hle_multi_layer_clear(&[(rt_index as u32) << 6]);
+        engine.hle_multi_layer_clear(&mut [(rt_index as u32) << 6]);
 
         assert_eq!(engine.regs[CLEAR_SURFACE as usize], (rt_index as u32) << 6);
         assert_eq!(calls.lock().unwrap().clear_layers, vec![3]);
@@ -8439,7 +8606,7 @@ mod tests {
         let mut engine = Maxwell3D::new();
         engine.dirty.flags.fill(false);
 
-        engine.hle_bind_shader(&[1, 0xAAAA, 0x240, 0, 0x1234_5600]);
+        engine.hle_bind_shader(&mut [1, 0xAAAA, 0x240, 0, 0x1234_5600]);
 
         let pipeline_base = (PIPELINE_BASE + PIPELINE_STRIDE) as usize;
         assert_eq!(engine.regs[pipeline_base + 1], 0x240);
@@ -8462,7 +8629,7 @@ mod tests {
         engine.regs[SHADOW_SCRATCH_BASE as usize + 29] = 0xAAAA;
         engine.dirty.flags.fill(false);
 
-        engine.hle_bind_shader(&[1, 0xAAAA, 0x240, 0, 0x1234_5600]);
+        engine.hle_bind_shader(&mut [1, 0xAAAA, 0x240, 0, 0x1234_5600]);
 
         let pipeline_base = (PIPELINE_BASE + PIPELINE_STRIDE) as usize;
         assert_eq!(engine.regs[pipeline_base + 1], 0);
@@ -8570,7 +8737,7 @@ mod tests {
     fn test_hle_clear_memory_sets_upload_regs_and_launches_dma() {
         let mut engine = Maxwell3D::new();
         let mut zero_memory = Vec::new();
-        engine.hle_clear_memory(&[0x44, 0x5566, 0x20], &mut zero_memory);
+        engine.hle_clear_memory(&mut [0x44, 0x5566, 0x20], &mut zero_memory);
 
         assert_eq!(engine.regs[UPLOAD_REGS_BASE], 0x20);
         assert_eq!(engine.regs[UPLOAD_REGS_BASE + 1], 1);
@@ -8593,7 +8760,7 @@ mod tests {
             engine.regs[base + TRANSFORM_FEEDBACK_BUFFER_START_OFFSET as usize] = 0x7FFF;
         }
 
-        engine.hle_transform_feedback_setup(&[0x12, 0x3456_7800]);
+        engine.hle_transform_feedback_setup(&mut [0x12, 0x3456_7800]);
 
         assert_eq!(engine.regs[TRANSFORM_FEEDBACK_ENABLED as usize], 1);
         for index in 0..4usize {
@@ -8620,8 +8787,10 @@ mod tests {
         let mut engine = Maxwell3D::new();
         engine.regs[0xD1B] = 0xFF;
 
-        engine
-            .hle_draw_arrays_indirect(true, &[PrimitiveTopology::Triangles as u32, 6, 0x22, 4, 7]);
+        engine.hle_draw_arrays_indirect(
+            true,
+            &mut [PrimitiveTopology::Triangles as u32, 6, 0x22, 4, 7],
+        );
 
         let draws = engine.take_draw_calls();
         assert_eq!(draws.len(), 1);
@@ -8644,7 +8813,7 @@ mod tests {
 
         engine.hle_draw_indexed_indirect(
             true,
-            &[PrimitiveTopology::Triangles as u32, 12, 0x03, 5, 9, 11],
+            &mut [PrimitiveTopology::Triangles as u32, 12, 0x03, 5, 9, 11],
         );
 
         let draws = engine.take_draw_calls();
@@ -8668,10 +8837,10 @@ mod tests {
     fn test_hle_multi_draw_indexed_indirect_count_fallback_emits_draw_sequence() {
         let mut engine = Maxwell3D::new();
 
-        engine.hle_multi_draw_indexed_indirect_count(&[
+        engine.hle_multi_draw_indexed_indirect_count(&mut [
             0,
             2,
-            PrimitiveTopology::Triangles as u32,
+            PrimitiveTopology::Quads as u32,
             0,
             2,
             6,
@@ -8704,10 +8873,37 @@ mod tests {
     }
 
     #[test]
+    fn test_hle_multi_draw_indexed_indirect_count_uses_upstream_indirect_state() {
+        let mut engine = Maxwell3D::new();
+        engine.macro_addresses = vec![0, 0, 0, 0, 0xAA00, 0xBB00];
+
+        engine.hle_multi_draw_indexed_indirect_count(&mut [
+            0,
+            4,
+            PrimitiveTopology::Triangles as u32,
+            1,
+            4,
+        ]);
+
+        let params = engine.draw_manager.get_indirect_params();
+        assert!(params.is_indexed);
+        assert!(params.include_count);
+        assert!(!params.is_byte_count);
+        assert_eq!(params.count_start_address, 0xAA00);
+        assert_eq!(params.indirect_start_address, 0xBB00);
+        assert_eq!(params.buffer_size, 4 * 6 * std::mem::size_of::<u32>());
+        assert_eq!(params.max_draw_counts, 4);
+        assert_eq!(params.stride, 6 * std::mem::size_of::<u32>());
+        assert!(engine.take_draw_calls().is_empty());
+        assert_eq!(engine.engine_state, EngineHint::None);
+        assert!(engine.replace_table.is_empty());
+    }
+
+    #[test]
     fn test_hle_draw_indirect_byte_count_fallback_emits_draw_array() {
         let mut engine = Maxwell3D::new();
 
-        engine.hle_draw_indirect_byte_count(&[PrimitiveTopology::TriangleStrip as u32, 4, 16]);
+        engine.hle_draw_indirect_byte_count(&mut [PrimitiveTopology::TriangleStrip as u32, 4, 16]);
 
         let draws = engine.take_draw_calls();
         assert_eq!(draws.len(), 1);

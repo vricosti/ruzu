@@ -85,10 +85,6 @@ pub struct Scheduler {
 
     /// Render pass state.
     rp_state: RenderPassState,
-    /// Diagnostic: framebuffer of the most recently ENDED render pass, for
-    /// classifying begins as reentry (same fb) vs fb_switch in [RP_STATS].
-    last_ended_framebuffer: vk::Framebuffer,
-
     /// Upstream scheduler-local state invalidated by helper draws.
     state: SchedulerState,
 
@@ -135,7 +131,8 @@ struct SubmitJob {
 }
 
 fn submit_profile_enabled() -> bool {
-    std::env::var_os("RUZU_PROFILE_VK_SUBMIT").is_some()
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_VK_SUBMIT").is_some())
 }
 
 struct SubmitWorker {
@@ -328,7 +325,6 @@ impl Scheduler {
             upload_cmdbuf: vk::CommandBuffer::null(),
             current_tick: AtomicU64::new(0),
             rp_state: RenderPassState::default(),
-            last_ended_framebuffer: vk::Framebuffer::null(),
             state: SchedulerState::default(),
             fence,
             timeline_semaphore,
@@ -393,32 +389,6 @@ impl Scheduler {
             }
             // Different render pass — end current one first
             self.request_outside_renderpass();
-        }
-
-        // Diagnostic: classify why a new render pass begins (always-on
-        // counters; [RP_STATS] printed every 4096 begins). "reentry" =
-        // same framebuffer as the previous pass (we were forced outside,
-        // e.g. by an upload barrier, and come straight back) — avoidable
-        // cost; "fb_switch" = genuinely different target.
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static BEGINS: AtomicU64 = AtomicU64::new(0);
-            static REENTRY: AtomicU64 = AtomicU64::new(0);
-            static FB_SWITCH: AtomicU64 = AtomicU64::new(0);
-            let begins = BEGINS.fetch_add(1, Ordering::Relaxed) + 1;
-            if self.last_ended_framebuffer == framebuffer {
-                REENTRY.fetch_add(1, Ordering::Relaxed);
-            } else if self.last_ended_framebuffer != vk::Framebuffer::null() {
-                FB_SWITCH.fetch_add(1, Ordering::Relaxed);
-            }
-            if begins % 4096 == 0 {
-                eprintln!(
-                    "[RP_STATS] begins={} reentry={} fb_switch={}",
-                    begins,
-                    REENTRY.load(Ordering::Relaxed),
-                    FB_SWITCH.load(Ordering::Relaxed),
-                );
-            }
         }
 
         let rp_begin = vk::RenderPassBeginInfo::builder()
@@ -500,7 +470,6 @@ impl Scheduler {
                 );
             }
         }
-        self.last_ended_framebuffer = self.rp_state.framebuffer;
         self.rp_state = RenderPassState::default();
     }
 
@@ -527,7 +496,9 @@ impl Scheduler {
         }
 
         let chunk = std::mem::replace(&mut self.current_chunk, CommandChunk::new());
-        self.current_submit_command_count += chunk.commands.len();
+        if submit_profile_enabled() {
+            self.current_submit_command_count += chunk.commands.len();
+        }
         for cmd in chunk.commands {
             cmd(self.current_cmdbuf, self.upload_cmdbuf);
         }

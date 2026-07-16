@@ -9,7 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ash::vk;
 use ash::vk::Handle;
@@ -58,6 +58,59 @@ use crate::vulkan_common::vulkan_device::{
     query_device_memory_info, query_device_memory_usage, DeviceMemoryInfo,
 };
 use crate::vulkan_common::vulkan_memory_allocator::{AllocatedImage, MemoryAllocator, MemoryUsage};
+
+struct ImageDumpConfig {
+    path: std::path::PathBuf,
+    draw: Option<u32>,
+    fragment_offset: Option<u32>,
+    gpu_address: Option<u64>,
+    image_id: Option<ImageId>,
+    width: Option<u32>,
+    height: Option<u32>,
+    every: Option<u64>,
+    at: u64,
+}
+
+fn image_dump_config() -> Option<&'static ImageDumpConfig> {
+    static CONFIG: OnceLock<Option<ImageDumpConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let path = std::env::var_os("RUZU_DUMP_VK_IMAGE_FRAME")?;
+            let parse_u32 = |name: &str| {
+                std::env::var(name)
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+            };
+            let parse_hex_u32 = |name: &str| {
+                std::env::var(name)
+                    .ok()
+                    .and_then(|value| u32::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+            };
+            let parse_hex_u64 = |name: &str| {
+                std::env::var(name)
+                    .ok()
+                    .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+            };
+            Some(ImageDumpConfig {
+                path: path.into(),
+                draw: parse_u32("RUZU_DUMP_VK_IMAGE_DRAW"),
+                fragment_offset: parse_hex_u32("RUZU_DUMP_VK_IMAGE_FS"),
+                gpu_address: parse_hex_u64("RUZU_DUMP_VK_IMAGE_GPU"),
+                image_id: parse_u32("RUZU_DUMP_VK_IMAGE_ID").map(|index| ImageId { index }),
+                width: parse_u32("RUZU_DUMP_VK_IMAGE_WIDTH"),
+                height: parse_u32("RUZU_DUMP_VK_IMAGE_HEIGHT"),
+                every: std::env::var("RUZU_DUMP_VK_IMAGE_EVERY")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|&every| every > 0),
+                at: std::env::var("RUZU_DUMP_VK_IMAGE_AT")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(1),
+            })
+        })
+        .as_ref()
+}
 
 fn convert_border_color(color: [f32; 4]) -> vk::BorderColor {
     if color == [0.0, 0.0, 0.0, 0.0] {
@@ -5949,54 +6002,39 @@ impl TextureCache {
         if self.image_dumped {
             return;
         }
-        if std::env::var("RUZU_DUMP_VK_IMAGE_DRAW")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .is_some_and(|target| target != draw_counter)
-        {
-            return;
-        }
-        if std::env::var("RUZU_DUMP_VK_IMAGE_FS")
-            .ok()
-            .and_then(|value| u32::from_str_radix(value.trim_start_matches("0x"), 16).ok())
-            .is_some_and(|target| target != fragment_offset)
-        {
-            return;
-        }
-        let Some(path) = std::env::var_os("RUZU_DUMP_VK_IMAGE_FRAME") else {
+        // The disabled hot path is one OnceLock load; environment parsing happens once.
+        let Some(config) = image_dump_config() else {
             return;
         };
+        if config.draw.is_some_and(|target| target != draw_counter)
+            || config
+                .fragment_offset
+                .is_some_and(|target| target != fragment_offset)
+        {
+            return;
+        }
         // RUZU_DUMP_VK_IMAGE_GPU=0xADDR selects the image by guest address
         // (handy for render targets that are never bound as textures).
-        let image_id = if let Some(target) = std::env::var("RUZU_DUMP_VK_IMAGE_GPU")
-            .ok()
-            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
-        {
-            let target_width = std::env::var("RUZU_DUMP_VK_IMAGE_WIDTH")
-                .ok()
-                .and_then(|value| value.parse::<u32>().ok());
-            let target_height = std::env::var("RUZU_DUMP_VK_IMAGE_HEIGHT")
-                .ok()
-                .and_then(|value| value.parse::<u32>().ok());
+        let image_id = if let Some(target) = config.gpu_address {
             let found = self
                 .base
                 .slot_images
                 .iter()
                 .find(|(_, img)| {
                     img.gpu_addr == target
-                        && target_width.is_none_or(|width| img.info.size.width == width)
-                        && target_height.is_none_or(|height| img.info.size.height == height)
+                        && config
+                            .width
+                            .is_none_or(|width| img.info.size.width == width)
+                        && config
+                            .height
+                            .is_none_or(|height| img.info.size.height == height)
                 })
                 .map(|(id, _)| id);
             match found {
                 Some(id) => id,
                 None => return,
             }
-        } else if let Some(id) = std::env::var("RUZU_DUMP_VK_IMAGE_ID")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .map(|index| ImageId { index })
-        {
+        } else if let Some(id) = config.image_id {
             id
         } else {
             return;
@@ -6005,17 +6043,13 @@ impl TextureCache {
         // RUZU_DUMP_VK_IMAGE_EVERY=N: periodic numbered dumps (never one-shot),
         // so a single run can sample an image (e.g. a downsampled glow buffer)
         // across many frames and let the caller pick the frame of interest.
-        if let Some(every) = std::env::var("RUZU_DUMP_VK_IMAGE_EVERY")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|&every| every > 0)
-        {
+        if let Some(every) = config.every {
             if self.image_dump_seen % every != 0 {
                 return;
             }
             if let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) {
                 let bytes = decode_debug_dump_to_rgba8(&bytes, &image_base.info);
-                let base = std::path::PathBuf::from(&path);
+                let base = &config.path;
                 let stem = base
                     .file_stem()
                     .and_then(|s| s.to_str())
@@ -6045,11 +6079,7 @@ impl TextureCache {
             }
             return;
         }
-        let target_seen = std::env::var("RUZU_DUMP_VK_IMAGE_AT")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(1);
-        if self.image_dump_seen < target_seen {
+        if self.image_dump_seen < config.at {
             return;
         }
         let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) else {
@@ -6058,9 +6088,9 @@ impl TextureCache {
         // Debug dumps need CPU-visible RGBA-like bytes. Packed/BCn images are
         // downloaded in their native representation, so expand them here.
         let bytes = decode_debug_dump_to_rgba8(&bytes, &image_base.info);
-        let path = std::path::PathBuf::from(path);
+        let path = &config.path;
         if let Err(err) = write_rgba_like_ppm(
-            &path,
+            path,
             &bytes,
             image_base.info.size.width.max(1),
             image_base.info.size.height.max(1),

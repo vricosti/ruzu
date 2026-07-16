@@ -383,7 +383,8 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
                 | vk::BufferUsageFlags::UNIFORM_BUFFER
                 | vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::INDEX_BUFFER
-                | vk::BufferUsageFlags::VERTEX_BUFFER,
+                | vk::BufferUsageFlags::VERTEX_BUFFER
+                | vk::BufferUsageFlags::INDIRECT_BUFFER,
         ) else {
             return;
         };

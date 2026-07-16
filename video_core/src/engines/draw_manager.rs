@@ -1704,24 +1704,48 @@ impl Default for Maxwell3DClearView<'static> {
 /// Upstream reaches this through `maxwell3d->draw_manager->GetIndirectParams()`
 /// and `maxwell3d->regs` from the rasterizer's `Maxwell3D*`.
 pub struct Maxwell3DIndirectView<'a> {
-    draw_state: &'a DrawState,
+    draw_view: Maxwell3DDrawView<'a>,
     indirect_params: &'a IndirectParams,
 }
 
 impl<'a> Maxwell3DIndirectView<'a> {
     pub fn new(draw_state: &'a DrawState, indirect_params: &'a IndirectParams) -> Self {
         Self {
-            draw_state,
+            draw_view: Maxwell3DDrawView::new(draw_state),
+            indirect_params,
+        }
+    }
+
+    pub fn live(
+        draw_state: &'a DrawState,
+        indirect_params: &'a IndirectParams,
+        maxwell3d: &'a mut dyn Maxwell3DAccess,
+    ) -> Self {
+        Self {
+            draw_view: Maxwell3DDrawView::live(draw_state, maxwell3d),
             indirect_params,
         }
     }
 
     pub fn draw_state(&self) -> &'a DrawState {
-        self.draw_state
+        self.draw_view.draw_state()
     }
 
     pub fn params(&self) -> &'a IndirectParams {
         self.indirect_params
+    }
+
+    pub fn draw_call_snapshot(&self) -> DrawCall {
+        self.draw_view
+            .draw_call_snapshot(self.indirect_params.is_indexed, 1)
+    }
+
+    pub fn dirty_flags_ptr(&mut self) -> Option<std::ptr::NonNull<[bool; 256]>> {
+        self.draw_view.dirty_flags_ptr()
+    }
+
+    pub fn clear_dirty_flag(&mut self, index: u8) {
+        self.draw_view.clear_dirty_flag(index);
     }
 }
 

@@ -270,7 +270,7 @@ impl MethodAddress {
 /// Port of the `Tegra::CachedMacro` abstract class.
 pub trait CachedMacro: Send {
     /// Execute the macro with the given parameters and method.
-    fn execute(&mut self, parameters: &[u32], method: u32);
+    fn execute(&mut self, parameters: &mut [u32], method: u32);
 }
 
 // ── MacroEngine ──────────────────────────────────────────────────────────────
@@ -350,12 +350,12 @@ impl MacroEngine {
     pub fn execute<F, R>(
         &mut self,
         method: u32,
-        parameters: &[u32],
+        parameters: &mut [u32],
         mut refresh_parameters: R,
         compile_fn: F,
     ) where
         F: FnOnce(&[u32]) -> Box<dyn CachedMacro>,
-        R: FnMut(),
+        R: FnMut(&mut [u32]),
     {
         if let Some(cache_info) = self.macro_cache.get_mut(&method) {
             if cache_info.has_hle_program {
@@ -363,7 +363,7 @@ impl MacroEngine {
                     hle.execute(parameters, method);
                 }
             } else if let Some(ref mut lle) = cache_info.lle_program {
-                refresh_parameters();
+                refresh_parameters(parameters);
                 lle.execute(parameters, method);
             }
             return;
@@ -451,7 +451,7 @@ impl MacroEngine {
                 hle.execute(parameters, method);
             }
         } else if let Some(ref mut lle) = entry.lle_program {
-            refresh_parameters();
+            refresh_parameters(parameters);
             lle.execute(parameters, method);
         }
     }
@@ -536,6 +536,34 @@ mod tests {
     }
 
     #[test]
+    fn execute_refreshes_the_parameter_slice_consumed_by_lle() {
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingMacro(Arc<Mutex<Vec<u32>>>);
+
+        impl CachedMacro for RecordingMacro {
+            fn execute(&mut self, parameters: &mut [u32], _method: u32) {
+                *self.0.lock().unwrap() = parameters.to_vec();
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_by_macro = Arc::clone(&seen);
+        let mut engine = MacroEngine::new();
+        engine.add_code(0x100, 0xDEAD_BEEF);
+        let mut parameters = [0];
+        engine.execute(
+            0x100,
+            &mut parameters,
+            |parameters| parameters[0] = 0xCAFE_BABE,
+            move |_| Box::new(RecordingMacro(seen_by_macro)),
+        );
+
+        assert_eq!(parameters, [0xCAFE_BABE]);
+        assert_eq!(*seen.lock().unwrap(), vec![0xCAFE_BABE]);
+    }
+
+    #[test]
     fn macro_engine_execute_rebases_mid_method_inside_uploaded_blob() {
         let mut engine = MacroEngine::new();
         engine.add_code(0x100, 0x11111111);
@@ -546,13 +574,13 @@ mod tests {
         let captured_compile = std::sync::Arc::clone(&captured);
         engine.execute(
             0x101,
-            &[0],
-            || {},
+            &mut [0],
+            |_| {},
             move |code| {
                 *captured_compile.lock().unwrap() = code.to_vec();
                 struct NoopMacro;
                 impl CachedMacro for NoopMacro {
-                    fn execute(&mut self, _parameters: &[u32], _method: u32) {}
+                    fn execute(&mut self, _parameters: &mut [u32], _method: u32) {}
                 }
                 Box::new(NoopMacro)
             },
@@ -572,13 +600,13 @@ mod tests {
         let captured_compile = std::sync::Arc::clone(&captured);
         engine.execute(
             0x100,
-            &[0],
-            || {},
+            &mut [0],
+            |_| {},
             move |code| {
                 *captured_compile.lock().unwrap() = code.to_vec();
                 struct NoopMacro;
                 impl CachedMacro for NoopMacro {
-                    fn execute(&mut self, _parameters: &[u32], _method: u32) {}
+                    fn execute(&mut self, _parameters: &mut [u32], _method: u32) {}
                 }
                 Box::new(NoopMacro)
             },

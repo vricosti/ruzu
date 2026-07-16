@@ -151,6 +151,7 @@ pub struct SpirvEmitContext {
     pub tess_coord: spirv::Word,
     pub input_position: spirv::Word,
     pub output_point_size: spirv::Word,
+    pub frag_depth: spirv::Word,
 
     // ── Rescaling / render area push constants ───────────────────────
     pub rescaling_uniform_constant: spirv::Word,
@@ -337,6 +338,7 @@ impl SpirvEmitContext {
             tess_coord: 0,
             input_position: 0,
             output_point_size: 0,
+            frag_depth: 0,
             rescaling_uniform_constant: 0,
             rescaling_push_constants: 0,
             rescaling_downfactor_member_index: 0,
@@ -605,6 +607,21 @@ impl SpirvEmitContext {
                         vec![Operand::LiteralBit32(index as u32)],
                     );
                     self.output_vars.insert(index as u32, var);
+                    self.interfaces.push(var);
+                }
+                if info.stores_frag_depth {
+                    let ptr_type =
+                        self.builder
+                            .type_pointer(None, spirv::StorageClass::Output, self.f32_type);
+                    let var =
+                        self.builder
+                            .variable(ptr_type, None, spirv::StorageClass::Output, None);
+                    self.builder.decorate(
+                        var,
+                        spirv::Decoration::BuiltIn,
+                        vec![Operand::BuiltIn(spirv::BuiltIn::FragDepth)],
+                    );
+                    self.frag_depth = var;
                     self.interfaces.push(var);
                 }
             }
@@ -1435,6 +1452,10 @@ impl SpirvEmitContext {
         if self.stage == ShaderStage::Fragment {
             self.builder
                 .execution_mode(main_fn, spirv::ExecutionMode::OriginUpperLeft, vec![]);
+            if program.info.stores_frag_depth {
+                self.builder
+                    .execution_mode(main_fn, spirv::ExecutionMode::DepthReplacing, vec![]);
+            }
         }
         self.setup_float_controls(program, main_fn);
     }
@@ -2581,11 +2602,71 @@ mod tests {
     use super::*;
     use crate::backend::bindings::Bindings;
     use crate::ir::basic_block::Block;
+    use crate::ir::emitter::Emitter;
     use crate::ir::instruction::Inst;
     use crate::ir::opcodes::Opcode;
     use crate::ir::types::ShaderStage;
     use crate::ir::types::Type;
     use crate::ir::value::{Attribute, InstRef, Value};
+
+    #[test]
+    fn fragment_depth_declares_builtin_mode_and_store() {
+        let mut program = ir::Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            emitter.set_frag_depth(Value::ImmF32(0.25));
+        }
+        program.info.stores_frag_depth = true;
+        program.syntax_list = vec![ir::SyntaxNode::Block(0), ir::SyntaxNode::Return];
+
+        let profile = Profile::default();
+        let runtime_info = RuntimeInfo {
+            convert_depth_mode: true,
+            ..RuntimeInfo::default()
+        };
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &runtime_info);
+        ctx.emit_program(&program);
+
+        let frag_depth = ctx.frag_depth;
+        let module = ctx.builder.module_ref();
+        assert_ne!(frag_depth, 0);
+        assert!(module.annotations.iter().any(|inst| {
+            matches!(
+                inst.operands.as_slice(),
+                [
+                    Operand::IdRef(id),
+                    Operand::Decoration(spirv::Decoration::BuiltIn),
+                    Operand::BuiltIn(spirv::BuiltIn::FragDepth)
+                ] if *id == frag_depth
+            )
+        }));
+        assert!(module.execution_modes.iter().any(|inst| {
+            matches!(
+                inst.operands.as_slice(),
+                [
+                    Operand::IdRef(_),
+                    Operand::ExecutionMode(spirv::ExecutionMode::DepthReplacing)
+                ]
+            )
+        }));
+        assert!(module.functions.iter().any(|function| {
+            function.blocks.iter().any(|block| {
+                block.instructions.iter().any(|inst| {
+                    inst.class.opcode == spirv::Op::Store
+                        && matches!(inst.operands.first(), Some(Operand::IdRef(id)) if *id == frag_depth)
+                })
+            })
+        }));
+        assert!(module.functions.iter().any(|function| {
+            function.blocks.iter().any(|block| {
+                block
+                    .instructions
+                    .iter()
+                    .any(|inst| inst.class.opcode == spirv::Op::ExtInst)
+            })
+        }));
+    }
 
     #[test]
     fn descriptor_aliasing_uses_typed_scalar_cbuf_view() {
