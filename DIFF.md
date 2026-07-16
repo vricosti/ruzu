@@ -23049,3 +23049,57 @@ The audit fixed one local divergence: `BindHostDrawIndirectBuffers` previously s
 ### Verification
 - `cargo build --release --bin ruzu-cmd`, the focused FragDepth test, and all 17 focused video-core HLE tests pass.
 - A clean 30-second MK8D Vulkan run with the SDL dummy audio driver reaches `submit#2048` without panic or pipeline-creation failure. This is a startup non-regression check; it does not establish that the remaining attract-mode rendering issue is fixed.
+## 2026-07-16 - rdynarmic A32 ASIMD load/store single & UNALLOCATED decode-table + exception lifecycle
+
+Upstream references: `frontend/A32/decoder/{asimd,thumb32,vfp}.inc` and their
+`*.h` matchers; `translate/impl/{asimd_load_store_structures,a32_translate_impl,a32_exception_generating,thumb32_control}.cpp`.
+Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.rs, translate/{mod,asimd,thumb32,thumb32_control,exception}.rs}`.
+
+### Intentional differences
+- Ruzu's decoder is a hand-written ordered `match`, not dynarmic's sorted table.
+  To preserve semantics it replicates dynarmic's matcher rules per family:
+  ASIMD/ARM use most-specific-mask-wins (`asimd.h` sorts by `count_ones(mask)`),
+  so UNALLOCATED arms are given tighter masks placed ahead of the looser real
+  arms; Thumb32/VFP use first-match in source order (`thumb32.h`/`vfp.h`
+  `find_if`), so UNALLOCATED arms are placed at the same relative position as
+  upstream, ahead of the instruction they shadow.
+- The shared `raise_exception`/`undefined_/unpredictable_/decode_error` helpers
+  advance PC by 4, equal to `current_instruction_size` for ARM and Thumb32
+  (both 32-bit). Documented as unsafe to reuse unchanged for 16-bit Thumb16.
+
+### Unintentional differences (to fix) — resolved by this change
+- Implemented `v8_VLD_all_lanes` (broadcast), `v8_VST_single`, `v8_VLD_single`;
+  tightened VST/VLD-multiple masks to `0xFFB0` (bit23+bit20) so single-structure
+  and reserved encodings are no longer swallowed (fixes `0xF4E32CBF` VLD1r being
+  silently dropped → MK8D logo wedge).
+- Reserved ASIMD load/store encodings (`type==0b1011`, `type[3:2]==0b11`,
+  single-store `sz==0b11`) now route to `arm_UDF` (UndefinedInstruction), matching
+  upstream's most-specific matcher; they previously produced `DecodeError`.
+- `arm_udf`, ARM `Unknown`, Thumb32 `Unknown`, `thumb32_udf`, and
+  `thumb32_unpredictable` now run the full `RaiseException` lifecycle
+  (UpdateUpperLocationDescriptor + BranchWritePC(PC+4) + terminal) instead of a
+  bare opcode; `arm_udf`/`thumb32_udf` were also raising the wrong exception kind.
+- Thumb32 `SSAT`/`USAT` reserved encoding (`0xFF70_F0F0 / 0xF320_0010`) and VFP
+  VSTM/VLDM reserved addressing mode (P=0,U=0,W=0) now route to UDF ahead of the
+  real arms.
+- Thumb32 `MSR_reg`/`MRS_reg` had every exception kind reversed and returned
+  `true` after emitting only the opcode; now: MSR mask==0 / n==PC and MRS d==PC →
+  Unpredictable; MSR write_spsr / MRS read_spsr → Undefined, all `false` via the
+  shared helpers.
+
+### Missing items
+- Thumb16 has no shared exception helper yet (would need PC+2); its paths are
+  untouched here.
+
+### Binary layout verification
+- N/A: instruction decode/translation only, no serialized structures.
+
+### Verification
+- `cargo test -p rdynarmic --lib frontend::a32`: 173 pass, including new decode
+  tests (reserved load/store, thumb32 SSAT, VFP VSTM — with variable Rn/Rd/imm and
+  cond combinations plus valid neighbours) and IR-level tests asserting exact
+  exception kind + UpdateUpperLocationDescriptor + PC write + terminal for
+  `arm_udf`, `thumb32_udf`, thumb32 `Unknown`, and MSR/MRS.
+- Release `ruzu-cmd` boots MK8D past the logo to a correct title screen with 0 ARM
+  exceptions over a 100s run (non-regression on executed code only; reserved-
+  encoding correctness is established by the unit tests, not the game run).
