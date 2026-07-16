@@ -418,6 +418,7 @@ impl RendererVulkan {
             device.get_max_vertex_input_bindings(),
             device.is_ext_vertex_attribute_divisor_supported(),
             device.is_ext_provoking_vertex_supported(),
+            device.is_khr_draw_indirect_count_supported(),
             syncpoints,
             Arc::clone(&device_memory),
             memory_allocator.as_mut(),

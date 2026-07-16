@@ -221,6 +221,10 @@ impl Drop for GraphicsPipeline {
 }
 
 impl GraphicsPipeline {
+    pub(crate) fn key(&self) -> &GraphicsPipelineKey {
+        &self.key
+    }
+
     /// Port of `GraphicsPipeline::AddTransition`.
     pub fn add_transition(&mut self, transition_key: GraphicsPipelineKey) {
         self.transition_keys.push(transition_key);
@@ -1414,7 +1418,6 @@ impl GraphicsPipelineCache {
             .subpass(0)
             .build();
 
-        let vk_create_start = Instant::now();
         let result = match unsafe {
             self.device
                 .create_graphics_pipelines(pipeline_cache, &[pipeline_info], None)
@@ -1425,7 +1428,6 @@ impl GraphicsPipelineCache {
                 None
             }
         };
-        record_vk_pipeline_create("runtime", vk_create_start.elapsed());
         result
     }
 
@@ -1619,7 +1621,6 @@ impl GraphicsPipelineCache {
             .subpass(0)
             .build();
 
-        let vk_create_start = Instant::now();
         let result = match unsafe {
             self.device
                 .create_graphics_pipelines(pipeline_cache, &[pipeline_info], None)
@@ -1633,37 +1634,7 @@ impl GraphicsPipelineCache {
                 None
             }
         };
-        record_vk_pipeline_create("from_state", vk_create_start.elapsed());
         result
-    }
-}
-
-/// Diagnostic: cumulative time spent inside `vkCreateGraphicsPipelines`
-/// (MoltenVK compiles MTLRenderPipelineState synchronously in this call).
-/// Prints running totals every 32 creations; slow ones (>100ms) print
-/// immediately.
-fn record_vk_pipeline_create(site: &'static str, elapsed: std::time::Duration) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    static TOTAL_US: AtomicU64 = AtomicU64::new(0);
-    static COUNT_RUNTIME: AtomicU64 = AtomicU64::new(0);
-    static COUNT_FROM_STATE: AtomicU64 = AtomicU64::new(0);
-    let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    let total_us = TOTAL_US.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed)
-        + elapsed.as_micros() as u64;
-    match site {
-        "runtime" => COUNT_RUNTIME.fetch_add(1, Ordering::Relaxed),
-        _ => COUNT_FROM_STATE.fetch_add(1, Ordering::Relaxed),
-    };
-    if elapsed.as_millis() > 100 || count % 32 == 0 {
-        eprintln!(
-            "[VK_PIPELINE_CREATE] site={site} last_ms={} count={} (runtime={} from_state={}) total_ms={}",
-            elapsed.as_millis(),
-            count,
-            COUNT_RUNTIME.load(Ordering::Relaxed),
-            COUNT_FROM_STATE.load(Ordering::Relaxed),
-            total_us / 1000,
-        );
     }
 }
 

@@ -130,7 +130,7 @@ impl CachedMacro for MacroJitX64Impl {
     /// Execute the JIT-compiled macro.
     ///
     /// Port of `MacroJITx64Impl::Execute`.
-    fn execute(&mut self, _parameters: &[u32], _method: u32) {
+    fn execute(&mut self, _parameters: &mut [u32], _method: u32) {
         // Stubbed — actual execution requires a generated native code buffer and a
         // function pointer to the compiled program (Xbyak in upstream;
         // dynasm-rs or cranelift in a full Rust port).
