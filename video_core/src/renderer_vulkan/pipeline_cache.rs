@@ -336,19 +336,19 @@ pub struct PipelineCache {
 }
 
 impl PipelineCache {
-    fn create_vulkan_pipeline_cache(&self, initial_data: &[u8]) -> vk::PipelineCache {
+    fn create_vulkan_pipeline_cache(
+        &self,
+        initial_data: &[u8],
+    ) -> Result<vk::PipelineCache, vk::Result> {
         let cache_ci = vk::PipelineCacheCreateInfo::builder()
             .initial_data(initial_data)
             .build();
-        unsafe {
-            self.device
-                .create_pipeline_cache(&cache_ci, None)
-                .unwrap_or(vk::PipelineCache::null())
-        }
+        unsafe { self.device.create_pipeline_cache(&cache_ci, None) }
     }
 
     fn create_empty_vulkan_pipeline_cache(&self) -> vk::PipelineCache {
         self.create_vulkan_pipeline_cache(&[])
+            .expect("failed to create an empty Vulkan pipeline cache")
     }
 
     /// Port of `PipelineCache::PipelineCache`.
@@ -1038,6 +1038,10 @@ impl PipelineCache {
     ///
     /// Serializes the Vulkan pipeline cache to disk.
     pub fn serialize_vulkan_pipeline_cache(&self, filename: &std::path::Path) {
+        if self.vulkan_pipeline_cache == vk::PipelineCache::null() {
+            log::error!("Refusing to serialize a null Vulkan pipeline cache");
+            return;
+        }
         let data = unsafe {
             self.device
                 .get_pipeline_cache_data(self.vulkan_pipeline_cache)
@@ -1088,7 +1092,24 @@ impl PipelineCache {
             }
         };
 
-        self.create_vulkan_pipeline_cache(cache_data)
+        match self.create_vulkan_pipeline_cache(cache_data) {
+            Ok(cache) => cache,
+            Err(err) => {
+                log::warn!(
+                    "Vulkan rejected driver pipeline cache data from {}: {}; recreating it empty",
+                    filename.display(),
+                    err
+                );
+                if let Err(remove_err) = std::fs::remove_file(filename) {
+                    log::warn!(
+                        "Failed to remove rejected Vulkan pipeline cache {}: {}",
+                        filename.display(),
+                        remove_err
+                    );
+                }
+                self.create_empty_vulkan_pipeline_cache()
+            }
+        }
     }
 }
 

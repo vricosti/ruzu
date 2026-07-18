@@ -265,6 +265,19 @@ impl Swapchain {
             return Ok(());
         }
 
+        // Drain all in-flight GPU work (including asynchronous presentations on
+        // the old swapchain) before destroying it. On MoltenVK a present's
+        // completion callback runs on an IOGPU dispatch thread and touches the
+        // swapchain; destroying the swapchain while such a present is in flight
+        // is a use-after-free (`MVKSwapchain::beginPresentation`). Upstream is
+        // protected by its present-fence bookkeeping; here we wait for device
+        // idle, matching the `WaitIdle`-before-recreate pattern upstream uses.
+        // This only runs on (infrequent) swapchain recreation, e.g. window
+        // resize, so the stall is acceptable.
+        unsafe {
+            let _ = self.device.device_wait_idle();
+        }
+
         self.destroy();
         self.create_swapchain(&capabilities)?;
         self.create_semaphores()?;

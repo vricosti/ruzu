@@ -1021,6 +1021,7 @@ impl RasterizerVulkan {
             uses_render_area,
             uses_rescaling_uniform,
             fixed_state,
+            unique_hashes,
         ) = match pipeline_result {
             Some((gp, fixed_state)) => (
                 gp.build_waiter(),
@@ -1034,6 +1035,7 @@ impl RasterizerVulkan {
                 gp.uses_render_area,
                 gp.uses_rescaling_uniform,
                 fixed_state,
+                gp.key().unique_hashes,
             ),
             None => {
                 self.draw_skipped_pipeline = self.draw_skipped_pipeline.wrapping_add(1);
@@ -1055,6 +1057,109 @@ impl RasterizerVulkan {
                 return;
             }
         };
+        if std::env::var_os("RUZU_TRACE_ATTRACT_HDR_INVENTORY").is_some()
+            && draw.render_targets[0].format == 0xE0
+        {
+            static INVENTORY: std::sync::OnceLock<
+                std::sync::Mutex<std::collections::HashSet<(u64, u64)>>,
+            > = std::sync::OnceLock::new();
+            let mut inventory = INVENTORY
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+                .lock()
+                .unwrap();
+            if inventory.insert((unique_hashes[1], unique_hashes[5])) {
+                let indirect_count = indirect_params.as_ref().map(|params| {
+                    let mut bytes = [0u8; 4];
+                    read_gpu(params.indirect_start_address, &mut bytes);
+                    u32::from_le_bytes(bytes)
+                });
+                eprintln!(
+                    "[ATTRACT_HDR_INVENTORY] vs_hash=0x{:016X} fs_hash=0x{:016X} vs=0x{:X} fs=0x{:X} rt0=0x{:X} indexed={} indirect={} count={} indirect_count={:?} instances={}",
+                    unique_hashes[1],
+                    unique_hashes[5],
+                    draw.shader_stages[1].offset,
+                    draw.shader_stages[5].offset,
+                    draw.render_targets[0].address,
+                    draw.indexed,
+                    indirect_params.is_some(),
+                    draw.index_buffer_count,
+                    indirect_count,
+                    draw.instance_count,
+                );
+            }
+        }
+        if std::env::var_os("RUZU_TRACE_ATTRACT_POST_INVENTORY").is_some()
+            && draw.render_targets[0].address == 0x524C10000
+        {
+            static POST_INVENTORY: std::sync::OnceLock<
+                std::sync::Mutex<std::collections::HashSet<(u64, u64)>>,
+            > = std::sync::OnceLock::new();
+            let mut inventory = POST_INVENTORY
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+                .lock()
+                .unwrap();
+            if inventory.insert((unique_hashes[1], unique_hashes[5])) {
+                eprintln!(
+                    "[ATTRACT_POST_INVENTORY] vs_hash=0x{:016X} fs_hash=0x{:016X} vs=0x{:X} fs=0x{:X} indexed={} count={} instances={}",
+                    unique_hashes[1],
+                    unique_hashes[5],
+                    draw.shader_stages[1].offset,
+                    draw.shader_stages[5].offset,
+                    draw.indexed,
+                    draw.index_buffer_count,
+                    draw.instance_count,
+                );
+            }
+        }
+        if std::env::var_os("RUZU_TRACE_B200_SOURCE_LIFECYCLE").is_some()
+            && (draw.render_targets[0].address == 0x558FC0000
+                || (draw.shader_stages[1].offset == 0xB20030
+                    && draw.shader_stages[5].offset == 0xB21430
+                    && draw.render_targets[0].address == 0x524C10000))
+        {
+            eprintln!(
+                "[B200_SOURCE_DRAW] seq={} draw={} rt0=0x{:X} vs_hash=0x{:016X} fs_hash=0x{:016X} vs=0x{:X} fs=0x{:X} indexed={} count={} instances={}",
+                self.draw_sequence,
+                self.draw_counter,
+                draw.render_targets[0].address,
+                unique_hashes[1],
+                unique_hashes[5],
+                draw.shader_stages[1].offset,
+                draw.shader_stages[5].offset,
+                draw.indexed,
+                draw.index_buffer_count,
+                draw.instance_count,
+            );
+        }
+        if std::env::var_os("RUZU_DUMP_ATTRACT_B200_FIXED_STATE").is_some()
+            && draw.shader_stages[1].offset == 0xB20030
+            && draw.shader_stages[5].offset == 0xB21430
+            && draw.render_targets[0].address == 0x524C10000
+        {
+            static DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let mut bytes = Vec::with_capacity(fixed_state.serialized_size());
+                fixed_state.write_prefix_bytes(&mut bytes);
+                if let Err(err) = std::fs::write("/tmp/ruzu-attract-b200-fixed-state.bin", bytes) {
+                    log::warn!("Failed to dump B200 fixed pipeline state: {err}");
+                }
+            }
+        }
+        if std::env::var_os("RUZU_DUMP_ATTRACT_POST_BOUNDARY").is_some()
+            && draw.render_targets[0].address == 0x524C10000
+            && draw.shader_stages[1].offset == 0x6A1830
+            && draw.shader_stages[5].offset == 0x93C230
+        {
+            static BEFORE_DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !BEFORE_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                self.texture_cache.debug_dump_image_at_gpu_native(
+                    draw.render_targets[0].address,
+                    std::path::Path::new("/tmp/ruzu-attract-post-before.raw"),
+                );
+            }
+        }
 
         // 4. Ensure we're inside a render pass
         let cmd = self.scheduler.command_buffer();
@@ -1145,6 +1250,9 @@ impl RasterizerVulkan {
             &enabled_uniform_buffer_masks,
             &uniform_buffer_sizes,
             draw,
+            indirect_params.is_some(),
+            unique_hashes,
+            &fixed_state,
             read_gpu,
             read_gpu_unsafe,
         );
@@ -1231,6 +1339,19 @@ impl RasterizerVulkan {
             }
             return;
         };
+        if std::env::var_os("RUZU_TRACE_B200_VK_HANDLE").is_some()
+            && draw.shader_stages[1].offset == 0xB20030
+            && draw.shader_stages[5].offset == 0xB21430
+            && draw.render_targets[0].address == 0x524C10000
+        {
+            eprintln!(
+                "[B200_VK_HANDLE] seq={} draw={} pipeline=0x{:X} cmd=0x{:X}",
+                self.draw_sequence,
+                self.draw_counter,
+                pipeline.as_raw(),
+                cmd.as_raw(),
+            );
+        }
 
         // Texture/buffer materialization can enqueue upload copies and
         // barriers through `Scheduler::record_with_upload`. Upstream records
@@ -1238,6 +1359,33 @@ impl RasterizerVulkan {
         // the chunk. This reduced backend emits vkCmdDraw directly, so flush
         // the preparation chunk before entering the render pass for the draw.
         self.scheduler.dispatch_work();
+
+        // Diagnostic only: test whether B200 observes writes that were not
+        // made visible by the producer's normal render-pass/copy teardown.
+        // This deliberately uses a global memory dependency so a positive
+        // result can be narrowed to the owning upstream lifecycle edge.
+        if std::env::var_os("RUZU_B200_FORCE_SHADER_READ_BARRIER").is_some()
+            && draw.shader_stages[1].offset == 0xB20030
+            && draw.shader_stages[5].offset == 0xB21430
+            && draw.render_targets[0].address == 0x524C10000
+        {
+            self.scheduler.request_outside_renderpass();
+            let barrier = vk::MemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .build();
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[barrier],
+                    &[],
+                    &[],
+                );
+            }
+        }
 
         // Build clear values indexed by attachment: one per colour attachment
         // (ignored by the LOAD colour attachments, but the array must be long
@@ -1260,6 +1408,24 @@ impl RasterizerVulkan {
             &rp_images,
             &rp_image_ranges,
         );
+        if std::env::var_os("RUZU_TRACE_B200_SOURCE_LIFECYCLE").is_some()
+            && (draw.render_targets[0].address == 0x558FC0000
+                || (draw.shader_stages[1].offset == 0xB20030
+                    && draw.shader_stages[5].offset == 0xB21430
+                    && draw.render_targets[0].address == 0x524C10000))
+        {
+            eprintln!(
+                "[B200_SOURCE_RENDERPASS] seq={} rt0=0x{:X} framebuffer=0x{:X} renderpass=0x{:X} images={:?}",
+                self.draw_sequence,
+                draw.render_targets[0].address,
+                framebuffer.as_raw(),
+                render_pass.as_raw(),
+                rp_images
+                    .iter()
+                    .map(|image| image.as_raw())
+                    .collect::<Vec<_>>(),
+            );
+        }
 
         unsafe {
             self.device
@@ -1510,8 +1676,174 @@ impl RasterizerVulkan {
             }
         }
 
+        if std::env::var_os("RUZU_DUMP_ATTRACT_HDR_BOUNDARY").is_some() {
+            static DEPTH_DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            static COLOR_OCCURRENCE: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            if draw.shader_stages[1].offset == 0xDE0A30
+                && draw.shader_stages[5].offset == 0xDE0D30
+                && !DEPTH_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                let dumped = self.texture_cache.debug_dump_image_at_gpu_native(
+                    draw.zeta.address,
+                    std::path::Path::new("/tmp/ruzu-attract-depth-after-writer.raw"),
+                );
+                eprintln!(
+                    "[ATTRACT_HDR_BOUNDARY] depth gpu=0x{:X} dumped={}",
+                    draw.zeta.address, dumped
+                );
+            }
+            if draw.shader_stages[1].offset == 0xDE0030
+                && draw.shader_stages[5].offset == 0xDE0630
+                && draw.render_targets[0].address == 0x520510000
+            {
+                let occurrence =
+                    COLOR_OCCURRENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let target = std::env::var("RUZU_DUMP_ATTRACT_HDR_BOUNDARY_AT")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0);
+                if occurrence == target {
+                    let dumped = self.texture_cache.debug_dump_image_at_gpu_native(
+                        draw.render_targets[0].address,
+                        std::path::Path::new("/tmp/ruzu-attract-color-after-writer.raw"),
+                    );
+                    eprintln!(
+                        "[ATTRACT_HDR_BOUNDARY] color occurrence={} gpu=0x{:X} dumped={}",
+                        occurrence, draw.render_targets[0].address, dumped
+                    );
+                    let depth_dumped = self.texture_cache.debug_dump_image_at_gpu_native(
+                        draw.zeta.address,
+                        std::path::Path::new("/tmp/ruzu-attract-depth-at-color.raw"),
+                    );
+                    eprintln!(
+                        "[ATTRACT_HDR_BOUNDARY] depth_at_color occurrence={} gpu=0x{:X} dumped={}",
+                        occurrence, draw.zeta.address, depth_dumped
+                    );
+                }
+            }
+        }
+
         self.texture_cache
             .dump_image_if_requested(self.draw_counter, draw.shader_stages[5].offset);
+        if std::env::var_os("RUZU_DUMP_ATTRACT_POST_BOUNDARY").is_some()
+            && draw.render_targets[0].address == 0x524C10000
+        {
+            let target_vs = std::env::var("RUZU_DUMP_ATTRACT_POST_VS")
+                .ok()
+                .and_then(|value| u32::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0);
+            let target_fs = std::env::var("RUZU_DUMP_ATTRACT_POST_FS")
+                .ok()
+                .and_then(|value| u32::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0);
+            if draw.shader_stages[1].offset == target_vs
+                && draw.shader_stages[5].offset == target_fs
+            {
+                static OCCURRENCE: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let occurrence = OCCURRENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let target = std::env::var("RUZU_DUMP_ATTRACT_POST_AT")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0);
+                if occurrence == target {
+                    let dumped = self.texture_cache.debug_dump_image_at_gpu_native(
+                        draw.render_targets[0].address,
+                        std::path::Path::new("/tmp/ruzu-attract-post-output.raw"),
+                    );
+                    self.texture_cache.debug_dump_image_at_gpu_native(
+                        0x520510000,
+                        std::path::Path::new("/tmp/ruzu-attract-post-source0.raw"),
+                    );
+                    self.texture_cache.debug_dump_image_at_gpu_native(
+                        0x521680000,
+                        std::path::Path::new("/tmp/ruzu-attract-post-source1.raw"),
+                    );
+                    eprintln!(
+                        "[ATTRACT_POST_BOUNDARY] occurrence={} vs=0x{:X} fs=0x{:X} dumped={}",
+                        occurrence, target_vs, target_fs, dumped
+                    );
+                }
+            }
+        }
+        if std::env::var_os("RUZU_DUMP_ATTRACT_POST_STAGES").is_some()
+            && draw.render_targets[0].address == 0x524C10000
+        {
+            let stages: [(u32, u32); 8] = [
+                (0x231430, 0x231630),
+                (0xAF1B30, 0xAF2C30),
+                (0xB20030, 0xB21430),
+                (0x67CD30, 0x6B3E30),
+                (0x6A2730, 0x6A3E30),
+                (0x6A4030, 0x6B3E30),
+                (0xB21730, 0xB22530),
+                (0xAF1B30, 0xAF4730),
+            ];
+            static DUMPED: [std::sync::atomic::AtomicBool; 8] =
+                [const { std::sync::atomic::AtomicBool::new(false) }; 8];
+            for (index, &(vs, fs)) in stages.iter().enumerate() {
+                if draw.shader_stages[1].offset == vs
+                    && draw.shader_stages[5].offset == fs
+                    && !DUMPED[index].swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    let path = format!("/tmp/ruzu-attract-post-stage-{index}.raw");
+                    self.texture_cache.debug_dump_image_at_gpu_native(
+                        draw.render_targets[0].address,
+                        std::path::Path::new(&path),
+                    );
+                    if index == 2 {
+                        self.texture_cache.debug_dump_image_at_gpu_native(
+                            0x5582E0000,
+                            std::path::Path::new("/tmp/ruzu-attract-b200-view1-after.raw"),
+                        );
+                    }
+                    eprintln!(
+                        "[ATTRACT_POST_STAGE] index={} vs=0x{:X} fs=0x{:X}",
+                        index, vs, fs
+                    );
+                }
+            }
+        }
+        if std::env::var_os("RUZU_DUMP_TONEMAP_RESOURCES").is_some()
+            && draw.shader_stages[1].offset == 0x1BD530
+            && draw.shader_stages[5].offset == 0x1D1C30
+            && draw.render_targets[0].address == 0x524C10000
+        {
+            static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let occurrence = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let target = std::env::var("RUZU_DUMP_TONEMAP_AT")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1);
+            if occurrence == target {
+                let output = self.texture_cache.debug_dump_image_at_gpu_native(
+                    0x524C10000,
+                    std::path::Path::new("/tmp/ruzu-tonemap-output.raw"),
+                );
+                let source0 = self.texture_cache.debug_dump_image_at_gpu_native(
+                    0x520510000,
+                    std::path::Path::new("/tmp/ruzu-tonemap-src0.raw"),
+                );
+                let source1 = self.texture_cache.debug_dump_image_at_gpu_native(
+                    0x521680000,
+                    std::path::Path::new("/tmp/ruzu-tonemap-src1.raw"),
+                );
+                let lut = self.texture_cache.debug_dump_image_at_cpu_native(
+                    0x50E0D000,
+                    std::path::Path::new("/tmp/ruzu-tonemap-lut.raw"),
+                );
+                log::info!(
+                    "[VK_TONEMAP_DUMP] occurrence={} output={} source0={} source1={} lut={}",
+                    occurrence,
+                    output,
+                    source0,
+                    source1,
+                    lut
+                );
+            }
+        }
         self.draw_counter += 1;
     }
 
@@ -2426,6 +2758,9 @@ impl RasterizerVulkan {
              as usize],
         uniform_buffer_sizes: &crate::buffer_cache::buffer_cache_base::UniformBufferSizes,
         draw: &DrawCall,
+        is_indirect: bool,
+        unique_hashes: [u64; crate::shader_cache::NUM_PROGRAMS],
+        fixed_state: &FixedPipelineState,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
     ) {
@@ -2587,6 +2922,221 @@ impl RasterizerVulkan {
                 .base
                 .fill_graphics_image_views(&mut sampled_views, false);
         }
+        if std::env::var_os("RUZU_TRACE_ATTRACT_HDR_WRITER").is_some()
+            && draw.shader_stages[1].offset == 0xDE0030
+            && draw.shader_stages[5].offset == 0xDE0630
+            && draw.render_targets[0].address == 0x520510000
+        {
+            static OCCURRENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let occurrence = OCCURRENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if occurrence < 64 {
+                eprintln!(
+                    "[ATTRACT_HDR_WRITER] occurrence={} indexed={} indirect={} index_first={} index_count={} instances={}",
+                    occurrence,
+                    draw.indexed,
+                    is_indirect,
+                    draw.index_buffer_first,
+                    draw.index_buffer_count,
+                    draw.instance_count,
+                );
+            }
+        }
+        let dump_attract_hdr_writer = std::env::var_os("RUZU_DUMP_ATTRACT_HDR_WRITER_FIRST")
+            .is_some()
+            && draw.shader_stages[1].offset == 0xDE0030
+            && draw.shader_stages[5].offset == 0xDE0630
+            && draw.render_targets[0].address == 0x520510000;
+        let dump_attract_b200 = std::env::var_os("RUZU_DUMP_ATTRACT_B200_FIRST").is_some()
+            && draw.shader_stages[1].offset == 0xB20030
+            && draw.shader_stages[5].offset == 0xB21430
+            && draw.render_targets[0].address == 0x524C10000;
+        let dump_attract_scene = std::env::var_os("RUZU_DUMP_ATTRACT_SCENE_FIRST").is_some()
+            && unique_hashes[1] == 0x4B39_BEE4_EF34_54FC
+            && unique_hashes[5] == 0xAE22_0188_1378_A23C;
+        if dump_attract_hdr_writer || dump_attract_b200 || dump_attract_scene {
+            static DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let directory = if dump_attract_b200 {
+                    std::path::Path::new("/tmp/ruzu-attract-b200-first")
+                } else if dump_attract_scene {
+                    std::path::Path::new("/tmp/ruzu-attract-scene-first")
+                } else {
+                    std::path::Path::new("/tmp/ruzu-attract-hdr-writer-first")
+                };
+                let _ = std::fs::create_dir_all(directory);
+                let mut metadata = format!(
+                    "vs_hash=0x{:016X} fs_hash=0x{:016X} vs=0x{:X} fs=0x{:X} topology={:?} indexed={} indirect={} instances={}\n",
+                    unique_hashes[1],
+                    unique_hashes[5],
+                    draw.shader_stages[1].offset,
+                    draw.shader_stages[5].offset,
+                    draw.topology,
+                    draw.indexed,
+                    is_indirect,
+                    draw.instance_count,
+                );
+                metadata.push_str(&format!(
+                    "rt0=0x{:X} {}x{} format=0x{:X} zeta=0x{:X} {}x{} format=0x{:X}\n",
+                    draw.render_targets[0].address,
+                    draw.render_targets[0].width,
+                    draw.render_targets[0].height,
+                    draw.render_targets[0].format,
+                    draw.zeta.address,
+                    draw.zeta.width,
+                    draw.zeta.height,
+                    draw.zeta.format,
+                ));
+                metadata.push_str(&format!(
+                    "index=0x{:X} first={} count={} format={:?} base_vertex={} base_instance={}\n",
+                    draw.index_buffer_addr,
+                    draw.index_buffer_first,
+                    draw.index_buffer_count,
+                    draw.index_format,
+                    draw.base_vertex,
+                    draw.base_instance,
+                ));
+                metadata.push_str(&format!(
+                    "rasterize={} cull={}/{:?} front={:?} depth_test={} depth_write={} depth_func={:?} blend0={:?} color_mask0={:?}\n",
+                    draw.rasterize_enable,
+                    draw.rasterizer.cull_enable,
+                    draw.rasterizer.cull_face,
+                    draw.rasterizer.front_face,
+                    draw.depth_stencil.depth_test_enable,
+                    draw.depth_stencil.depth_write_enable,
+                    draw.depth_stencil.depth_func,
+                    draw.blend[0],
+                    draw.color_masks[0],
+                ));
+                let viewport = draw.viewport_transforms[0];
+                let scissor = draw.scissors[0];
+                metadata.push_str(&format!(
+                    "viewport={},{},{},{},{},{} swizzle=0x{:X} scissor={},{},{},{},{}\n",
+                    viewport.translate_x,
+                    viewport.scale_x,
+                    viewport.translate_y,
+                    viewport.scale_y,
+                    viewport.translate_z,
+                    viewport.scale_z,
+                    viewport.swizzle,
+                    scissor.enabled,
+                    scissor.min_x,
+                    scissor.min_y,
+                    scissor.max_x,
+                    scissor.max_y,
+                ));
+                for (slot, stream) in draw.vertex_streams.iter().enumerate() {
+                    if !stream.enabled || stream.address == 0 {
+                        continue;
+                    }
+                    let limit = draw.vertex_stream_limits[slot].address;
+                    let size = limit
+                        .checked_sub(stream.address)
+                        .and_then(|value| value.checked_add(1))
+                        .unwrap_or(0)
+                        .min(0x10_0000) as usize;
+                    metadata.push_str(&format!(
+                        "stream{slot}=0x{:X} limit=0x{:X} size=0x{:X} stride={} frequency={} instance={}\n",
+                        stream.address,
+                        limit,
+                        size,
+                        stream.stride,
+                        stream.frequency,
+                        draw.vertex_stream_instances[slot],
+                    ));
+                    if size != 0 {
+                        let mut bytes = vec![0u8; size];
+                        read_gpu(stream.address, &mut bytes);
+                        let _ = std::fs::write(directory.join(format!("vertex-{slot}.bin")), bytes);
+                    }
+                }
+                if draw.indexed && draw.index_buffer_addr != 0 && draw.index_buffer_count != 0 {
+                    let size = draw
+                        .index_buffer_first
+                        .saturating_add(draw.index_buffer_count)
+                        as usize
+                        * draw.index_format.size_bytes() as usize;
+                    let mut bytes = vec![0u8; size];
+                    read_gpu(draw.index_buffer_addr, &mut bytes);
+                    let _ = std::fs::write(directory.join("index.bin"), bytes);
+                }
+                for (stage, bindings) in draw.cb_bindings.iter().enumerate() {
+                    for (slot, binding) in bindings.iter().enumerate() {
+                        if !binding.enabled || binding.address == 0 || binding.size == 0 {
+                            continue;
+                        }
+                        let mut bytes = vec![0u8; binding.size.min(0x1000) as usize];
+                        read_gpu(binding.address, &mut bytes);
+                        let _ = std::fs::write(
+                            directory.join(format!("cbuf-s{stage}-b{slot}.bin")),
+                            bytes,
+                        );
+                        metadata.push_str(&format!(
+                            "cbuf-s{stage}-b{slot}=0x{:X} size=0x{:X}\n",
+                            binding.address, binding.size,
+                        ));
+                    }
+                }
+                let views = sampled_views
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, sampled)| {
+                        if !sampled.id.is_valid() || sampled.id == NULL_IMAGE_VIEW_ID {
+                            metadata.push_str(&format!("view{slot}=null\n"));
+                            return None;
+                        }
+                        let view = self.texture_cache.base.slot_image_views.get(sampled.id);
+                        let image = self.texture_cache.base.slot_images.get(view.image_id);
+                        metadata.push_str(&format!(
+                            "view{slot}=id{} image{} gpu=0x{:X} format={:?} type={:?} size={:?} range={:?} swizzle={:?}\n",
+                            sampled.id.index,
+                            view.image_id.index,
+                            image.gpu_addr,
+                            view.format,
+                            view.view_type,
+                            view.size,
+                            view.range,
+                            view.swizzle,
+                        ));
+                        Some((slot, view.image_id))
+                    })
+                    .collect::<Vec<_>>();
+                for (slot, sampler_id) in sampled_samplers.iter().copied().enumerate() {
+                    let sampler = self.texture_cache.base.slot_samplers.get(sampler_id);
+                    metadata.push_str(&format!(
+                        "sampler{slot}=id{} raw={:016X?}\n",
+                        sampler_id.index, sampler.raw,
+                    ));
+                }
+                if dump_attract_b200 {
+                    let mut bytes = vec![0u8; 0x50000];
+                    read_gpu(0x5582E0000, &mut bytes);
+                    let _ = std::fs::write(directory.join("guest-view-1.bin"), bytes);
+                }
+                if draw.tex_header_pool_addr != 0 {
+                    let mut bytes = vec![0u8; 0x10000];
+                    read_gpu(draw.tex_header_pool_addr, &mut bytes);
+                    let _ = std::fs::write(directory.join("tic.bin"), bytes);
+                }
+                if draw.tex_sampler_pool_addr != 0 {
+                    let mut bytes = vec![0u8; 0x10000];
+                    read_gpu(draw.tex_sampler_pool_addr, &mut bytes);
+                    let _ = std::fs::write(directory.join("tsc.bin"), bytes);
+                }
+                let mut fixed_state_bytes = Vec::with_capacity(fixed_state.serialized_size());
+                fixed_state.write_prefix_bytes(&mut fixed_state_bytes);
+                let _ = std::fs::write(directory.join("fixed-state.bin"), fixed_state_bytes);
+                let mut views = views;
+                views.sort_by_key(|(slot, _)| *slot != 1);
+                for (slot, image_id) in views {
+                    let _ = self.texture_cache.debug_dump_image_native(
+                        image_id,
+                        &directory.join(format!("view-{slot}.bin")),
+                    );
+                }
+                let _ = std::fs::write(directory.join("metadata.txt"), metadata);
+            }
+        }
         let requires_feedback_barrier = unsafe {
             let _texture_lock = (*texture_cache).base.mutex.lock();
             (*texture_cache).base.check_feedback_loop(&sampled_views)
@@ -2699,6 +3249,52 @@ impl RasterizerVulkan {
         for binding in descriptor_bindings {
             match binding.descriptor_type {
                 vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::STORAGE_BUFFER => {
+                    if binding.descriptor_type == vk::DescriptorType::UNIFORM_BUFFER
+                        && std::env::var("RUZU_TRACE_VK_CBUF_FS")
+                            .ok()
+                            .and_then(|value| {
+                                u32::from_str_radix(value.trim_start_matches("0x"), 16).ok()
+                            })
+                            .is_some_and(|target| draw.shader_stages[5].offset == target)
+                    {
+                        if let Some((stage, index)) =
+                            binding.uniform_stage.zip(binding.uniform_index)
+                        {
+                            for element in 0..binding.descriptor_count {
+                                let index = index.saturating_add(element) as usize;
+                                if let Some(cbuf) = draw
+                                    .cb_bindings
+                                    .get(stage as usize)
+                                    .and_then(|bindings| bindings.get(index))
+                                    .filter(|cbuf| {
+                                        cbuf.enabled && cbuf.address != 0 && cbuf.size != 0
+                                    })
+                                {
+                                    let mut bytes = vec![0u8; (cbuf.size as usize).min(0x80)];
+                                    read_gpu(cbuf.address, &mut bytes);
+                                    let floats = bytes
+                                        .chunks_exact(4)
+                                        .map(|chunk| {
+                                            f32::from_le_bytes([
+                                                chunk[0], chunk[1], chunk[2], chunk[3],
+                                            ])
+                                        })
+                                        .collect::<Vec<_>>();
+                                    log::info!(
+                                        "[VK_CBUF_PRECACHE] draw={} fs=0x{:X} binding={} stage={} index={} addr=0x{:X} size={} f32={:?}",
+                                        self.draw_counter,
+                                        draw.shader_stages[5].offset,
+                                        binding.binding,
+                                        stage,
+                                        index,
+                                        cbuf.address,
+                                        cbuf.size,
+                                        floats
+                                    );
+                                }
+                            }
+                        }
+                    }
                     let start = buffer_infos.len();
                     for element in 0..binding.descriptor_count {
                         if binding.descriptor_type == vk::DescriptorType::STORAGE_BUFFER {

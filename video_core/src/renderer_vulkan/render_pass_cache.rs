@@ -201,28 +201,9 @@ impl RenderPassCache {
         }
         let subpass = subpass.build();
 
-        let dependency = vk::SubpassDependency::builder()
-            .src_subpass(vk::SUBPASS_EXTERNAL)
-            .dst_subpass(0)
-            .src_stage_mask(
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
-            )
-            .dst_stage_mask(
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
-            )
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(
-                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            )
-            .build();
-
         let render_pass_info = vk::RenderPassCreateInfo::builder()
             .attachments(&attachments)
             .subpasses(std::slice::from_ref(&subpass))
-            .dependencies(std::slice::from_ref(&dependency))
             .build();
 
         unsafe { self.device.create_render_pass(&render_pass_info, None) }

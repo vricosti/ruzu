@@ -61,7 +61,7 @@ impl DescriptorBankInfo {
             && self.texture_buffers >= subset.texture_buffers
             && self.image_buffers >= subset.image_buffers
             && self.textures >= subset.textures
-            && self.images >= subset.image_buffers
+            && self.images >= subset.images
     }
 }
 
@@ -432,6 +432,24 @@ mod tests {
         };
         assert!(big.is_superset(&small));
         assert!(!small.is_superset(&big));
+    }
+
+    #[test]
+    fn bank_info_superset_checks_storage_images_independently() {
+        let bank = DescriptorBankInfo {
+            image_buffers: 8,
+            images: 1,
+            score: 9,
+            ..DescriptorBankInfo::default()
+        };
+        let request = DescriptorBankInfo {
+            image_buffers: 1,
+            images: 2,
+            score: 3,
+            ..DescriptorBankInfo::default()
+        };
+
+        assert!(!bank.is_superset(&request));
     }
 
     #[test]

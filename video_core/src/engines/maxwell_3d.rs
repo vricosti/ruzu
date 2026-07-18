@@ -5318,6 +5318,27 @@ impl Maxwell3D {
             compile,
         );
 
+        if std::env::var_os("RUZU_TRACE_ATTRACT_HDR_MACRO").is_some()
+            && self.shader_program_addresses()[1] == 0x400DE0030
+            && self.shader_program_addresses()[5] == 0x400DE0630
+        {
+            let draw = self.draw_manager.get_draw_state();
+            let live_index = dm::Maxwell3DAccess::index_buffer(self);
+            eprintln!(
+                "[ATTRACT_HDR_MACRO] macro=0x{:X} params={:08X?} draw_mode={:?} draw_indexed={} draw_first={} draw_count={} regs_first={} regs_count={} instances={} dirty={}",
+                macro_method,
+                &params[..params.len().min(16)],
+                draw.draw_mode,
+                draw.draw_indexed,
+                draw.index_buffer.first,
+                draw.index_buffer.count,
+                live_index.first,
+                live_index.count,
+                draw.instance_count,
+                self.current_macro_dirty,
+            );
+        }
+
         // Upstream calls draw_manager->DrawDeferred() here.
         if std::env::var_os("RUZU_TRACE_DRAW_DEFERRED").is_some() {
             let state = self.draw_manager.get_draw_state();

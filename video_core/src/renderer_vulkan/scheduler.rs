@@ -7,6 +7,7 @@
 //! manages render pass state, and submits to the GPU queue.
 
 use ash::vk;
+use ash::vk::Handle;
 use log::{debug, trace};
 use std::collections::VecDeque;
 use std::ptr::NonNull;
@@ -415,6 +416,17 @@ impl Scheduler {
             images: images.to_vec(),
             image_ranges: image_ranges.to_vec(),
         };
+        if std::env::var_os("RUZU_TRACE_B200_SOURCE_LIFECYCLE").is_some() {
+            eprintln!(
+                "[B200_SCHED_BEGIN] framebuffer=0x{:X} renderpass=0x{:X} images={:?}",
+                framebuffer.as_raw(),
+                renderpass.as_raw(),
+                images
+                    .iter()
+                    .map(|image| image.as_raw())
+                    .collect::<Vec<_>>(),
+            );
+        }
     }
 
     /// End the current render pass if inside one.
@@ -424,6 +436,18 @@ impl Scheduler {
         }
 
         trace!("Scheduler: ending render pass");
+        if std::env::var_os("RUZU_TRACE_B200_SOURCE_LIFECYCLE").is_some() {
+            eprintln!(
+                "[B200_SCHED_END] framebuffer=0x{:X} renderpass=0x{:X} images={:?}",
+                self.rp_state.framebuffer.as_raw(),
+                self.rp_state.renderpass.as_raw(),
+                self.rp_state
+                    .images
+                    .iter()
+                    .map(|image| image.as_raw())
+                    .collect::<Vec<_>>(),
+            );
+        }
         unsafe {
             self.device.cmd_end_render_pass(self.current_cmdbuf);
             let barriers: Vec<_> = self

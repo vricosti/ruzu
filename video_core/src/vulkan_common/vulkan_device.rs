@@ -24,6 +24,19 @@ use super::vulkan_wrapper::{LogicalDevice, VulkanError};
 pub const GUEST_WARP_SIZE: u32 = 32;
 const ONE_GIB: u64 = 1024 * 1024 * 1024;
 
+fn pnext_chain_has_unique_structure_types(mut next: *const std::ffi::c_void) -> bool {
+    let mut structure_types = Vec::new();
+    while !next.is_null() {
+        let node = unsafe { &*next.cast::<vk::BaseOutStructure>() };
+        if structure_types.contains(&node.s_type) {
+            return false;
+        }
+        structure_types.push(node.s_type);
+        next = node.p_next.cast();
+    }
+    true
+}
+
 // ---------------------------------------------------------------------------
 // FormatType — port of `Vulkan::FormatType`
 // ---------------------------------------------------------------------------
@@ -327,8 +340,6 @@ impl Device {
         // Query basic properties
         let mut device_properties = unsafe { instance.get_physical_device_properties(physical) };
 
-        let device_features = unsafe { instance.get_physical_device_features(physical) };
-
         // Query queue families
         let queue_families =
             unsafe { instance.get_physical_device_queue_family_properties(physical) };
@@ -416,12 +427,24 @@ impl Device {
             .contains("VK_EXT_shader_demote_to_helper_invocation")
             || device_properties.api_version >= vk::API_VERSION_1_3;
         let has_draw_indirect_count = supported_extensions.contains("VK_KHR_draw_indirect_count");
+        let mut storage_16bit_features = vk::PhysicalDevice16BitStorageFeatures::default();
+        let mut shader_atomic_int64_features =
+            vk::PhysicalDeviceShaderAtomicInt64Features::default();
+        let mut shader_draw_parameters_features =
+            vk::PhysicalDeviceShaderDrawParametersFeatures::default();
         let mut shader_float16_int8_features =
             vk::PhysicalDeviceShaderFloat16Int8Features::default();
+        let mut uniform_buffer_standard_layout_features =
+            vk::PhysicalDeviceUniformBufferStandardLayoutFeatures::default();
+        let mut variable_pointers_features = vk::PhysicalDeviceVariablePointersFeatures::default();
+        let mut storage_8bit_features = vk::PhysicalDevice8BitStorageFeatures::default();
+        let mut host_query_reset_features = vk::PhysicalDeviceHostQueryResetFeatures::default();
         let mut portability_subset_features =
             vk::PhysicalDevicePortabilitySubsetFeaturesKHR::default();
         let mut timeline_semaphore_features =
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+        let mut subgroup_size_control_features =
+            vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
         let mut primitive_topology_list_restart_features =
             vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT::default();
         let mut extended_dynamic_state_features =
@@ -435,10 +458,18 @@ impl Device {
         let mut provoking_vertex_features = vk::PhysicalDeviceProvokingVertexFeaturesEXT::default();
         let mut shader_demote_features =
             vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures::default();
-        {
+        let mut features2 = {
             let mut features2_builder = vk::PhysicalDeviceFeatures2::builder()
+                .push_next(&mut storage_16bit_features)
+                .push_next(&mut shader_atomic_int64_features)
+                .push_next(&mut shader_draw_parameters_features)
                 .push_next(&mut shader_float16_int8_features)
-                .push_next(&mut timeline_semaphore_features);
+                .push_next(&mut uniform_buffer_standard_layout_features)
+                .push_next(&mut variable_pointers_features)
+                .push_next(&mut storage_8bit_features)
+                .push_next(&mut host_query_reset_features)
+                .push_next(&mut timeline_semaphore_features)
+                .push_next(&mut subgroup_size_control_features);
             if has_portability_subset {
                 features2_builder = features2_builder.push_next(&mut portability_subset_features);
             }
@@ -467,11 +498,12 @@ impl Device {
             if has_shader_demote_to_helper_invocation {
                 features2_builder = features2_builder.push_next(&mut shader_demote_features);
             }
-            let mut features2 = features2_builder.build();
-            unsafe {
-                instance.get_physical_device_features2(physical, &mut features2);
-            }
+            features2_builder.build()
+        };
+        unsafe {
+            instance.get_physical_device_features2(physical, &mut features2);
         }
+        let device_features = features2.features;
 
         let supports_shader_float16 = shader_float16_int8_features.shader_float16 != 0;
         let supports_shader_int8 = shader_float16_int8_features.shader_int8 != 0;
@@ -522,6 +554,7 @@ impl Device {
             "VK_EXT_depth_clip_control",
             "VK_EXT_vertex_attribute_divisor",
             "VK_EXT_shader_demote_to_helper_invocation",
+            "VK_EXT_shader_stencil_export",
             "VK_KHR_draw_indirect_count",
         ] {
             if supported_extensions.contains(name) {
@@ -536,86 +569,17 @@ impl Device {
             .map(|name| name.as_ptr())
             .collect();
 
-        // Upstream builds a full extension list and VkPhysicalDeviceFeatures2 chain here.
-        // This keeps the mandatory WSI/portability extensions while the larger feature
-        // chain is ported file-by-file.
-        let mut enabled_timeline_semaphore_features =
-            vk::PhysicalDeviceTimelineSemaphoreFeatures::builder()
-                .timeline_semaphore(supports_timeline_semaphore)
-                .build();
-        let mut enabled_shader_float16_int8_features =
-            vk::PhysicalDeviceShaderFloat16Int8Features::builder()
-                .shader_float16(supports_shader_float16)
-                .shader_int8(supports_shader_int8)
-                .build();
-        let mut enabled_portability_subset_features = portability_subset_features;
-        let mut enabled_primitive_topology_list_restart_features =
-            vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT::builder()
-                .primitive_topology_list_restart(supports_primitive_topology_list_restart)
-                .primitive_topology_patch_list_restart(
-                    supports_primitive_topology_patch_list_restart,
-                )
-                .build();
-        let mut enabled_extended_dynamic_state_features =
-            vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::builder()
-                .extended_dynamic_state(supports_extended_dynamic_state)
-                .build();
-        let mut enabled_extended_dynamic_state2_features =
-            vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::builder()
-                .extended_dynamic_state2(supports_extended_dynamic_state2)
-                .build();
-        let mut enabled_depth_clip_control_features =
-            vk::PhysicalDeviceDepthClipControlFeaturesEXT::builder()
-                .depth_clip_control(supports_depth_clip_control)
-                .build();
-        let mut enabled_vertex_attribute_divisor_features =
-            vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT::builder()
-                .vertex_attribute_instance_rate_divisor(supports_vertex_attribute_divisor)
-                .build();
-        let mut enabled_provoking_vertex_features =
-            vk::PhysicalDeviceProvokingVertexFeaturesEXT::builder()
-                .provoking_vertex_last(true)
-                .transform_feedback_preserves_provoking_vertex(true)
-                .build();
-        let mut enabled_shader_demote_features =
-            vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures::builder()
-                .shader_demote_to_helper_invocation(supports_shader_demote_to_helper_invocation)
-                .build();
-        let device_create_info = {
-            let mut builder = vk::DeviceCreateInfo::builder()
-                .push_next(&mut enabled_shader_float16_int8_features);
-            if supports_timeline_semaphore {
-                builder = builder.push_next(&mut enabled_timeline_semaphore_features);
-            }
-            if has_portability_subset {
-                builder = builder.push_next(&mut enabled_portability_subset_features);
-            }
-            if has_primitive_topology_list_restart {
-                builder = builder.push_next(&mut enabled_primitive_topology_list_restart_features);
-            }
-            if has_extended_dynamic_state {
-                builder = builder.push_next(&mut enabled_extended_dynamic_state_features);
-            }
-            if has_extended_dynamic_state2 {
-                builder = builder.push_next(&mut enabled_extended_dynamic_state2_features);
-            }
-            if supports_depth_clip_control {
-                builder = builder.push_next(&mut enabled_depth_clip_control_features);
-            }
-            if supports_vertex_attribute_divisor {
-                builder = builder.push_next(&mut enabled_vertex_attribute_divisor_features);
-            }
-            if supports_provoking_vertex {
-                builder = builder.push_next(&mut enabled_provoking_vertex_features);
-            }
-            if supports_shader_demote_to_helper_invocation {
-                builder = builder.push_next(&mut enabled_shader_demote_features);
-            }
-            builder
-                .queue_create_infos(&queue_create_infos)
-                .enabled_extension_names(&enabled_extension_ptrs)
-                .build()
-        };
+        // Match upstream: reuse the exact feature chain returned by
+        // vkGetPhysicalDeviceFeatures2. Rebuilding it loses core/promoted features and
+        // copying an individual node also copies its linked pNext chain.
+        let mut device_create_info = vk::DeviceCreateInfo::builder()
+            .queue_create_infos(&queue_create_infos)
+            .enabled_extension_names(&enabled_extension_ptrs)
+            .build();
+        device_create_info.p_next = (&features2 as *const vk::PhysicalDeviceFeatures2).cast();
+        debug_assert!(pnext_chain_has_unique_structure_types(
+            device_create_info.p_next
+        ));
 
         let logical = LogicalDevice::create(&instance, physical, &device_create_info)?;
         let graphics_queue = logical.get_queue(graphics_family);
@@ -659,6 +623,17 @@ impl Device {
                 driver_properties: supported_extensions.contains("VK_KHR_driver_properties"),
                 memory_budget: has_memory_budget,
                 shader_float16_int8: supported_extensions.contains("VK_KHR_shader_float16_int8"),
+                bit16_storage: storage_16bit_features.storage_buffer16_bit_access != 0,
+                shader_atomic_int64: shader_atomic_int64_features.shader_buffer_int64_atomics != 0,
+                shader_draw_parameters: shader_draw_parameters_features.shader_draw_parameters != 0,
+                uniform_buffer_standard_layout: uniform_buffer_standard_layout_features
+                    .uniform_buffer_standard_layout
+                    != 0,
+                variable_pointer: variable_pointers_features.variable_pointers != 0,
+                host_query_reset: host_query_reset_features.host_query_reset != 0,
+                bit8_storage: storage_8bit_features.storage_buffer8_bit_access != 0,
+                timeline_semaphore: supports_timeline_semaphore,
+                subgroup_size_control: subgroup_size_control_features.subgroup_size_control != 0,
                 // MoltenVK devices are portability-subset devices. Upstream's generic
                 // feature chain enables supported feature structs before device creation;
                 // keep the extension visible here for the same ownership boundary.
@@ -671,6 +646,8 @@ impl Device {
                 shader_demote_to_helper_invocation: supports_shader_demote_to_helper_invocation,
                 draw_indirect_count: has_draw_indirect_count,
                 shader_float_controls: has_shader_float_controls,
+                shader_stencil_export: supported_extensions
+                    .contains("VK_EXT_shader_stencil_export"),
                 swapchain: supported_extensions.contains("VK_KHR_swapchain"),
                 ..DeviceExtensions::default()
             },
@@ -1505,5 +1482,25 @@ mod tests {
         );
         assert_eq!(driver_name_from_id(vk::DriverId::MESA_NVK), Some("NVK"));
         assert_eq!(driver_name_from_id(vk::DriverId::from_raw(-1)), None);
+    }
+
+    #[test]
+    fn feature_chain_rejects_duplicate_structure_types() {
+        let mut duplicate = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+        let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+        timeline.p_next =
+            (&mut duplicate as *mut vk::PhysicalDeviceTimelineSemaphoreFeatures).cast();
+
+        assert!(!pnext_chain_has_unique_structure_types(
+            (&timeline as *const vk::PhysicalDeviceTimelineSemaphoreFeatures).cast()
+        ));
+
+        let mut float16_int8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+        timeline.p_next =
+            (&mut float16_int8 as *mut vk::PhysicalDeviceShaderFloat16Int8Features).cast();
+
+        assert!(pnext_chain_has_unique_structure_types(
+            (&timeline as *const vk::PhysicalDeviceTimelineSemaphoreFeatures).cast()
+        ));
     }
 }
