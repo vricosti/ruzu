@@ -1,0 +1,49 @@
+# GTK4 launcher — Rust counterpart of the upstream Qt frontend at
+# `/Users/vricosti/Dev/emulators/zuyu/src/yuzu` (the `yuzu` GUI application).
+#
+# Upstream builds a `yuzu` executable from `src/yuzu`; this crate builds the
+# equivalent `ruzu` executable, using GTK4 instead of Qt.
+[package]
+name = "ruzu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ruzu"
+path = "src/main.rs"
+
+[dependencies]
+# gtk4-rs bindings. The `gtk4` crate is imported under the `gtk` alias, which
+# is the convention used throughout the gtk4-rs ecosystem/examples. The
+# `v4_10` feature unlocks `FileDialog`, `AlertDialog`, and `FileLauncher`
+# (used by the File menu); the bundled Homebrew GTK is 4.22.
+gtk = { version = "0.9", package = "gtk4", features = ["v4_10"] }
+log = { workspace = true }
+env_logger = { workspace = true }
+
+# ruzu's data-directory resolver, for "Open ruzu Folder" (upstream uses
+# `Common::FS::GetYuzuPathString(YuzuPath::YuzuDir)`).
+common = { path = "../common" }
+
+# Emulator core, for the in-process boot / EmuWindow (Phase 1). Renamed to
+# `ruzu_core` because the crate's package name `core` shadows the std `core`
+# crate — the same rename `ruzu_cmd` uses.
+ruzu_core = { package = "core", path = "../core" }
+
+# Video/audio subsystems, created in the boot subsystem factory (Phase 1b),
+# mirroring `ruzu_cmd`'s Vulkan boot path.
+video_core = { workspace = true }
+audio_core = { path = "../audio_core" }
+parking_lot = { workspace = true }
+
+# macOS-only: embed a CAMetalLayer into the GTK window's NSView so the Vulkan
+# (MoltenVK) renderer can present into the launcher window, like upstream's
+# `GRenderWindow` embeds a render surface into the Qt window. `objc` matches
+# the version already used by `ruzu_cmd`.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+cocoa = "0.25"
+core-graphics = "0.23"
+core-foundation = "0.9"
