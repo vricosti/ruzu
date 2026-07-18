@@ -23103,3 +23103,155 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Release `ruzu-cmd` boots MK8D past the logo to a correct title screen with 0 ARM
   exceptions over a 100s run (non-regression on executed code only; reserved-
   encoding correctness is established by the unit tests, not the game run).
+
+## 2026-07-17 - video_core/src/vulkan_common/vulkan_device.rs vs video_core/vulkan_common/vulkan_device.{h,cpp}
+
+### Intentional differences
+- Rust uses `ash` builders to link the feature structures, then assigns the
+  resulting `VkPhysicalDeviceFeatures2` chain directly to
+  `VkDeviceCreateInfo::pNext`. This preserves upstream's single queried-and-
+  enabled chain without reproducing the C++ `SetNext` helper.
+- A debug assertion walks `VkBaseOutStructure` and rejects duplicate `sType`
+  values. This is a local guard for Rust copies retaining stale `pNext` links.
+
+### Unintentional differences (to fix)
+- None in the audited feature-chain lifecycle. Ruzu previously queried one
+  chain but rebuilt a partial second chain for device creation. It consequently
+  disabled supported core/promoted features and duplicated timeline-semaphore
+  and float16/int8 nodes through a copied portability-subset `pNext` chain.
+- `VK_EXT_shader_stencil_export` is now enabled when advertised, matching the
+  shader capability emitted by the backend and upstream's extension list.
+
+### Missing items
+- The rest of upstream's extension/property structures, mandatory/recommended
+  suitability checks, and driver-specific feature removal policy remain to be
+  ported. This pass covers every feature whose absence was reported by Vulkan
+  validation for the current MoltenVK/MK8D path.
+
+### Binary layout verification
+- PASS: the feature structures are Vulkan ABI types from `ash`; the exact chain
+  returned by `vkGetPhysicalDeviceFeatures2` is reused for `vkCreateDevice`.
+
+### Verification
+- `cargo test -p video_core feature_chain_rejects_duplicate_structure_types --lib` passes.
+- MoltenVK 1.4.2 + `VK_LAYER_KHRONOS_validation` no longer reports duplicate
+  feature structures or missing `uniformBufferStandardLayout`,
+  `ShaderDrawParameters`, `imageCubeArray`,
+  `vertexPipelineStoresAndAtomics`, `independentBlend`, `depthClamp`, or shader
+  stencil-export support.
+- A normal B200 dump remains byte-characteristically equivalent to the previous
+  bad output (RGB means approximately 16/14/14 after 8-bit conversion). This
+  correction is required parity work but does not fix the attract-mode color
+  issue.
+
+## 2026-07-18 - video_core/src/vulkan_common/vulkan_library.rs vs video_core/vulkan_common/vulkan_library.{h,cpp}
+
+### Intentional differences
+- A non-bundled development `ruzu-cmd` cannot discover its own
+  `Contents/Frameworks` directory. It therefore tries the MoltenVK embedded in
+  the local upstream `zuyu/build/bin/yuzu.app` after the explicit
+  `LIBVULKAN_PATH` and current-application bundle paths. This keeps the
+  development CLI on the same known-working driver as upstream yuzu.app.
+
+### Unintentional differences (to fix)
+- None in the active macOS lookup order. The previous development path searched
+  VulkanSDK, Homebrew, Xcode DerivedData, and Android-emulator installations,
+  allowing `ruzu-cmd` to select a different MoltenVK from yuzu.app. Those
+  fallbacks and the SDK ICD mutation were removed.
+
+### Missing items
+- A packaged `ruzu.app` remains the faithful deployment endpoint. Its own
+  `Contents/Frameworks/libMoltenVK.dylib` already takes precedence and does not
+  use the local yuzu development fallback.
+
+### Binary layout verification
+- N/A: this changes only dynamic-library selection.
+
+### Verification
+- Re-read upstream `Vulkan::OpenLibrary`: macOS tries `LIBVULKAN_PATH`, bundled
+  `libvulkan.1.dylib`, then bundled `libMoltenVK.dylib`.
+- SHA-256 for the retained yuzu.app MoltenVK is
+  `1a92315f32f71a7dd05a8b82001ab25759fb686934971fd3e253697c851d4dfa`.
+- Removed the selectable VulkanSDK MoltenVK dylib and ICD manifest while
+  retaining the SDK loader, headers, and libraries required for development.
+
+## 2026-07-17 - video_core/src/renderer_vulkan/graphics_pipeline.rs vs video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+
+### Intentional differences
+- Rust shares `dynamic_states_for_fixed_state` between live compilation and
+  disk-cache reconstruction instead of spelling the same Vulkan state list at
+  both call sites. The helper preserves upstream's order and feature gates.
+
+### Unintentional differences (to fix)
+- None after this change. The live pipeline constructor previously omitted
+  `VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT` under extended dynamic
+  state, as well as the already-modelled EDS2-extra/EDS3 states. The fixed
+  pipeline state follows upstream and stores zero vertex strides when EDS1 is
+  active. The omission therefore made Vulkan ignore the guest stride passed to
+  `vkCmdBindVertexBuffers2` and use a static stride of zero. Live and disk
+  constructors now use the same complete upstream list.
+
+### Missing items
+- The device currently leaves EDS2-extra, EDS3, and dynamic vertex input
+  feature bits disabled until their matching rasterizer command paths are
+  fully ported. This change does not enable unsupported command paths.
+
+### Binary layout verification
+- N/A: no serialized structure layout changed. The existing
+  `FixedPipelineState` prefix and feature bits are unchanged.
+
+### Verification
+- Re-read upstream `GraphicsPipeline::MakePipeline` dynamic-state construction
+  in `vk_graphics_pipeline.cpp`; `dynamic_states_for_fixed_state` has the same
+  base states, ordering, and EDS1/EDS2/EDS2-extra/EDS3 feature gates.
+- `cargo test -p video_core extended_dynamic_state_declares_stride_for_static_vertex_input --lib`
+  passes and covers the exact EDS1/static-vertex-input contract used by MK8D's
+  B200 post-process draw.
+- Runtime evidence localizes the first divergent output to B200: post-process
+  stage 1 is byte-identical to yuzu, all three B200 input images are identical
+  after canonical-size comparison/upload staging, and stage 2 (B200's output)
+  diverges. The pre-fix Vulkan API dump shows guest stride 8 supplied through
+  `vkCmdBindVertexBuffers2`; the pre-fix live pipeline lacked the corresponding
+  dynamic-state declaration. A 2026-07-18 post-stage comparison confirms the
+  normal B200 outputs are visually equivalent; byte hashes differ because the
+  animated checker pattern was captured at different phases.
+
+## 2026-07-18 - video_core/src/renderer_vulkan/pipeline_cache.rs vs video_core/renderer_vulkan/vk_pipeline_cache.cpp
+
+### Intentional differences
+- Rust represents `vkCreatePipelineCache` failure with `Result` and, when
+  persisted driver data is rejected, removes that file and retries with an
+  empty cache. This is the Rust equivalent of upstream's exception-based
+  Vulkan wrapper invariant: `PipelineCache` never owns a null driver-cache
+  handle.
+- `serialize_vulkan_pipeline_cache` defensively refuses a null handle. The
+  branch is unreachable after successful construction, but prevents an unsafe
+  `vkGetPipelineCacheData(VK_NULL_HANDLE)` call if the invariant regresses.
+
+### Unintentional differences (to fix)
+- None after this change. Rust previously converted every
+  `vkCreatePipelineCache` error to `VK_NULL_HANDLE` and later passed that handle
+  to `vkGetPipelineCacheData`. Two macOS crash reports fault in
+  `MVKPipelineCache::writeData` at address `0x98`, directly on that path.
+
+### Missing items
+- None in this cache-handle lifecycle slice.
+
+### Binary layout verification
+- PASS: the on-disk magic, cache-version prefix, and opaque Vulkan driver bytes
+  are unchanged.
+
+### Verification
+- Re-read upstream `PipelineCache::LoadVulkanPipelineCache`,
+  `LoadDiskResources`, and `SerializeVulkanPipelineCache` in
+  `vk_pipeline_cache.cpp`. Upstream waits for pipeline workers and only
+  serializes a valid `vk::PipelineCache` wrapper.
+- Re-read Rust `load_disk_resources` and `ThreadWorker::wait_for_requests`; the
+  worker completion barrier already matches upstream. The invalid null-handle
+  fallback was the remaining lifecycle divergence on the observed crash path.
+- `cargo test -p video_core renderer_vulkan::pipeline_cache --lib` passes: 16
+  tests.
+- `cargo build --release --bin ruzu-cmd` passes.
+- A release MK8D startup with the existing 6503-entry cache completes
+  `load_disk_resources`, serializes the driver cache, reaches `System: running`,
+  and exits only through the 15-second timeout.

@@ -1231,7 +1231,9 @@ fn main() {
     // GPU/CPU execution. Starting the guest first lets pipeline workers contend
     // with presentation and can hide entire early animations behind the cache
     // build (MK8D's first-logo transition).
-    if *common::settings::values().use_disk_shader_cache.get_value() {
+    if *common::settings::values().use_disk_shader_cache.get_value()
+        && std::env::var_os("RUZU_SKIP_DISK_SHADER_CACHE").is_none()
+    {
         if let Some(gpu_any) = system.gpu_core() {
             if let Some(gpu) = gpu_any.as_any().downcast_ref::<video_core::gpu::Gpu>() {
                 let mut renderer_guard = gpu.renderer();

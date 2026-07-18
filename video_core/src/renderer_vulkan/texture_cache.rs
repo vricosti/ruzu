@@ -64,6 +64,7 @@ struct ImageDumpConfig {
     draw: Option<u32>,
     fragment_offset: Option<u32>,
     gpu_address: Option<u64>,
+    cpu_address: Option<u64>,
     image_id: Option<ImageId>,
     width: Option<u32>,
     height: Option<u32>,
@@ -96,6 +97,7 @@ fn image_dump_config() -> Option<&'static ImageDumpConfig> {
                 draw: parse_u32("RUZU_DUMP_VK_IMAGE_DRAW"),
                 fragment_offset: parse_hex_u32("RUZU_DUMP_VK_IMAGE_FS"),
                 gpu_address: parse_hex_u64("RUZU_DUMP_VK_IMAGE_GPU"),
+                cpu_address: parse_hex_u64("RUZU_DUMP_VK_IMAGE_CPU"),
                 image_id: parse_u32("RUZU_DUMP_VK_IMAGE_ID").map(|index| ImageId { index }),
                 width: parse_u32("RUZU_DUMP_VK_IMAGE_WIDTH"),
                 height: parse_u32("RUZU_DUMP_VK_IMAGE_HEIGHT"),
@@ -3433,11 +3435,43 @@ impl TextureCache {
         self.debug_dump_image_native(image_id, path)
     }
 
-    pub fn debug_dump_image_native(&mut self, image_id: ImageId, path: &std::path::Path) -> bool {
-        let Some((_image_base, bytes)) = self.download_image_to_host_staging(image_id) else {
+    pub fn debug_dump_image_at_cpu_native(
+        &mut self,
+        cpu_addr: u64,
+        path: &std::path::Path,
+    ) -> bool {
+        let Some(image_id) = self
+            .base
+            .slot_images
+            .iter()
+            .find(|(_, image)| image.cpu_addr == cpu_addr)
+            .map(|(id, _)| id)
+        else {
             return false;
         };
-        std::fs::write(path, bytes).is_ok()
+        self.debug_dump_image_native(image_id, path)
+    }
+
+    pub fn debug_dump_image_native(&mut self, image_id: ImageId, path: &std::path::Path) -> bool {
+        let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) else {
+            return false;
+        };
+        let written = std::fs::write(path, bytes).is_ok();
+        if written {
+            log::info!(
+                "[VK_NATIVE_DUMP] image_id={} format={:?} size={}x{}x{} levels={} gpu=0x{:X} cpu=0x{:X} path={}",
+                image_id.index,
+                image_base.info.format,
+                image_base.info.size.width,
+                image_base.info.size.height,
+                image_base.info.size.depth,
+                image_base.info.resources.levels,
+                image_base.gpu_addr,
+                image_base.cpu_addr,
+                path.display()
+            );
+        }
+        written
     }
 
     /// Port of the Vulkan texture-cache owner `EraseChannel` edge.
@@ -6034,6 +6068,25 @@ impl TextureCache {
                 Some(id) => id,
                 None => return,
             }
+        } else if let Some(target) = config.cpu_address {
+            let found = self
+                .base
+                .slot_images
+                .iter()
+                .find(|(_, img)| {
+                    img.cpu_addr == target
+                        && config
+                            .width
+                            .is_none_or(|width| img.info.size.width == width)
+                        && config
+                            .height
+                            .is_none_or(|height| img.info.size.height == height)
+                })
+                .map(|(id, _)| id);
+            match found {
+                Some(id) => id,
+                None => return,
+            }
         } else if let Some(id) = config.image_id {
             id
         } else {
@@ -6085,6 +6138,16 @@ impl TextureCache {
         let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) else {
             return;
         };
+        if let Some(path) = std::env::var_os("RUZU_DUMP_VK_IMAGE_NATIVE_FRAME") {
+            if let Err(err) = std::fs::write(&path, &bytes) {
+                log::warn!(
+                    "TextureCacheVulkan: failed to dump native image_id={} to {}: {}",
+                    image_id.index,
+                    std::path::Path::new(&path).display(),
+                    err
+                );
+            }
+        }
         // Debug dumps need CPU-visible RGBA-like bytes. Packed/BCn images are
         // downloaded in their native representation, so expand them here.
         let bytes = decode_debug_dump_to_rgba8(&bytes, &image_base.info);
@@ -6506,6 +6569,15 @@ impl TextureCache {
         if !view_base.image_id.is_valid() || view_base.image_id == NULL_IMAGE_ID {
             return None;
         }
+        let trace_b200_source = std::env::var_os("RUZU_TRACE_B200_SOURCE_LIFECYCLE").is_some()
+            && self.base.slot_images[view_base.image_id].gpu_addr == 0x558FC0000;
+        if trace_b200_source {
+            let image = &self.base.slot_images[view_base.image_id];
+            eprintln!(
+                "[B200_SOURCE_MATERIALIZE_BEGIN] image_id={} view_id={} gpu=0x{:X} flags={:?}",
+                view_base.image_id.index, view_id.index, image.gpu_addr, image.flags,
+            );
+        }
         self.finish_pending_backend_insertion_with_reader(view_base.image_id, read_gpu_unsafe);
         self.finish_pending_join_copies_with_reader(read_gpu_unsafe);
         if self.images.contains_key(&view_base.image_id)
@@ -6518,6 +6590,19 @@ impl TextureCache {
             }
         }
         if let Some(view) = self.image_view_handle(view_id, texture_type) {
+            if trace_b200_source {
+                let image_handle = self
+                    .image_views
+                    .get(&view_id)
+                    .map(|entry| entry.image_handle());
+                eprintln!(
+                    "[B200_SOURCE_MATERIALIZE_HIT] image_id={} view_id={} image={:?} view=0x{:X}",
+                    view_base.image_id.index,
+                    view_id.index,
+                    image_handle.map(|image| image.as_raw()),
+                    view.as_raw(),
+                );
+            }
             return Some(view);
         }
         let image_base = self.base.slot_images.get(view_base.image_id).clone();
@@ -6544,7 +6629,21 @@ impl TextureCache {
         self.ensure_image(view_base.image_id, &image_base, format, aspect)
             .ok()?;
         self.ensure_image_view(view_id).ok()?;
-        self.image_view_handle(view_id, texture_type)
+        let view = self.image_view_handle(view_id, texture_type);
+        if trace_b200_source {
+            let image_handle = self
+                .image_views
+                .get(&view_id)
+                .map(|entry| entry.image_handle());
+            eprintln!(
+                "[B200_SOURCE_MATERIALIZE_NEW] image_id={} view_id={} image={:?} view={:?}",
+                view_base.image_id.index,
+                view_id.index,
+                image_handle.map(|image| image.as_raw()),
+                view.map(|handle| handle.as_raw()),
+            );
+        }
+        view
     }
 
     fn create_sampler_from_tsc(&self, tsc: &TscEntry) -> Result<vk::Sampler, vk::Result> {
