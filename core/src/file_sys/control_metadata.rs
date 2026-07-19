@@ -201,8 +201,16 @@ impl NACP {
 
     /// Get the language entry for the current language setting.
     /// Falls back to the first non-empty entry, then AmericanEnglish.
+    ///
+    /// Upstream selects the entry using `Settings::values.language_index`; a
+    /// hardcoded index 0 means Japanese (the first Switch language code), so a
+    /// title like "Mario Kart 8 Deluxe" would come back as its Japanese
+    /// (katakana) name. `settings::values().language_index` is a `Language`
+    /// enum whose ordinal matches the Switch language-code index used by
+    /// `LANGUAGE_TO_CODES`.
     pub fn get_language_entry(&self) -> &LanguageEntry {
-        self.get_language_entry_with_index(0)
+        let index = (*common::settings::values().language_index.get_value()) as usize;
+        self.get_language_entry_with_index(index)
     }
 
     /// Get the language entry for a specific language index (system setting).
