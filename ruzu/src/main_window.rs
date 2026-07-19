@@ -103,14 +103,6 @@ impl GMainWindow {
         stack.set_hexpand(true);
         stack.set_vexpand(true);
 
-        let game_list_placeholder = gtk::Label::builder()
-            .label("Game list — not yet implemented")
-            .hexpand(true)
-            .vexpand(true)
-            .build();
-        game_list_placeholder.add_css_class("dim-label");
-        stack.add_named(&game_list_placeholder, Some(PAGE_GAME_LIST));
-
         let loading_screen = Rc::new(LoadingScreen::new());
         stack.add_named(loading_screen.widget(), Some(PAGE_LOADING));
 
@@ -122,7 +114,8 @@ impl GMainWindow {
         render_bg.set_vexpand(true);
         stack.add_named(&render_bg, Some(PAGE_RENDER));
 
-        stack.set_visible_child_name(PAGE_GAME_LIST);
+        // The game list page (PAGE_GAME_LIST) is added after `this` exists so its
+        // row-activate handler can boot via the window; see below.
         root.append(&stack);
 
         // --- Status bar (upstream `QStatusBar`) -------------------------------
@@ -162,6 +155,16 @@ impl GMainWindow {
             render: RefCell::new(None),
             render_size: Cell::new((0, 0)),
         });
+
+        // Game list page: activating a row boots that game in-process.
+        let game_list = crate::game_list::build(glib::clone!(
+            #[weak(rename_to = w)]
+            this,
+            #[upgrade_or_default]
+            move |path: String| w.boot_game(path)
+        ));
+        this.stack.add_named(&game_list, Some(PAGE_GAME_LIST));
+        this.stack.set_visible_child_name(PAGE_GAME_LIST);
 
         // Keep the embedded render surface sized to the central stack as the
         // window is resized. GTK4 has no widget `size-allocate` signal, so poll

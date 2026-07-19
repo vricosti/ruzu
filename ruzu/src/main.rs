@@ -17,6 +17,8 @@ use gtk::{gio, glib};
 mod boot;
 mod emu_window;
 mod file_menu;
+mod config_import;
+mod game_list;
 mod loading_screen;
 mod main_window;
 #[cfg(target_os = "macos")]
@@ -42,6 +44,10 @@ fn set_main_window(window: Rc<GMainWindow>) {
 fn main() -> glib::ExitCode {
     env_logger::init();
 
+    // Migrate an existing yuzu configuration on first run (guarded by a marker
+    // so it happens exactly once, not on every startup).
+    config_import::import_yuzu_config_once();
+
     // Upstream constructs `QApplication app(argc, argv)`. We register handling
     // of file arguments ourselves later (open a game passed on the command
     // line), so declare HANDLES_OPEN even though the handler is not wired yet.
@@ -55,6 +61,10 @@ fn main() -> glib::ExitCode {
     // macOS (quartz) GDK backend, the menu model set here is bridged into the
     // native global menu bar at the top of the screen.
     app.connect_startup(|app| {
+        // Use a dark theme, matching yuzu.
+        if let Some(settings) = gtk::Settings::default() {
+            settings.set_gtk_application_prefer_dark_theme(true);
+        }
         main_window::init_app_menu(app);
     });
 
