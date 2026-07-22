@@ -119,6 +119,21 @@ pub fn predicate_combine(
     }
 }
 
+/// Port of upstream `PredicateOperation`.
+pub fn predicate_operation(
+    v: &mut TranslatorVisitor<'_>,
+    result: Value,
+    predicate_op: u32,
+) -> Value {
+    match predicate_op {
+        0 => v.ir.imm_u1(false),
+        1 => v.ir.imm_u1(true),
+        2 => v.ir.i_equal(result, v.ir.imm_u32(0)),
+        3 => v.ir.i_not_equal(result, v.ir.imm_u32(0)),
+        _ => panic!("Invalid predicate operation {predicate_op}"),
+    }
+}
+
 /// Apply FP saturation (clamp to [0.0, 1.0]).
 pub fn apply_fp_saturate(v: &mut TranslatorVisitor<'_>, value: Value, saturate: bool) -> Value {
     if saturate {

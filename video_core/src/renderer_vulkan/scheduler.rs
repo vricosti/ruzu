@@ -392,21 +392,18 @@ impl Scheduler {
             self.request_outside_renderpass();
         }
 
-        let rp_begin = vk::RenderPassBeginInfo::builder()
-            .render_pass(renderpass)
-            .framebuffer(framebuffer)
-            .render_area(render_area)
-            .clear_values(clear_values)
-            .build();
-
         trace!("Scheduler: beginning render pass");
-        unsafe {
-            self.device.cmd_begin_render_pass(
-                self.current_cmdbuf,
-                &rp_begin,
-                vk::SubpassContents::INLINE,
-            );
-        }
+        let device = self.device.clone();
+        let clear_values = clear_values.to_vec();
+        self.record(move |cmdbuf| unsafe {
+            let rp_begin = vk::RenderPassBeginInfo::builder()
+                .render_pass(renderpass)
+                .framebuffer(framebuffer)
+                .render_area(render_area)
+                .clear_values(&clear_values)
+                .build();
+            device.cmd_begin_render_pass(cmdbuf, &rp_begin, vk::SubpassContents::INLINE);
+        });
 
         self.rp_state = RenderPassState {
             renderpass,
@@ -448,13 +445,14 @@ impl Scheduler {
                     .collect::<Vec<_>>(),
             );
         }
-        unsafe {
-            self.device.cmd_end_render_pass(self.current_cmdbuf);
-            let barriers: Vec<_> = self
-                .rp_state
-                .images
+        let images = std::mem::take(&mut self.rp_state.images);
+        let image_ranges = std::mem::take(&mut self.rp_state.image_ranges);
+        let device = self.device.clone();
+        self.record(move |cmdbuf| unsafe {
+            device.cmd_end_render_pass(cmdbuf);
+            let barriers: Vec<_> = images
                 .iter()
-                .zip(self.rp_state.image_ranges.iter())
+                .zip(image_ranges.iter())
                 .filter_map(|(&image, &subresource_range)| {
                     (image != vk::Image::null()).then(|| {
                         vk::ImageMemoryBarrier::builder()
@@ -481,8 +479,8 @@ impl Scheduler {
                 })
                 .collect();
             if !barriers.is_empty() {
-                self.device.cmd_pipeline_barrier(
-                    self.current_cmdbuf,
+                device.cmd_pipeline_barrier(
+                    cmdbuf,
                     vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
                         | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
                         | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
@@ -493,13 +491,22 @@ impl Scheduler {
                     &barriers,
                 );
             }
-        }
+        });
         self.rp_state = RenderPassState::default();
     }
 
     /// Whether we are currently inside a render pass.
     pub fn is_inside_renderpass(&self) -> bool {
         self.rp_state.inside_renderpass
+    }
+
+    /// Port of upstream `Scheduler::UpdateGraphicsPipeline`.
+    pub fn update_graphics_pipeline(&mut self, pipeline: vk::Pipeline) -> bool {
+        if self.state.graphics_pipeline == pipeline {
+            return false;
+        }
+        self.state.graphics_pipeline = pipeline;
+        true
     }
 
     /// Port of upstream `Scheduler::InvalidateState`.

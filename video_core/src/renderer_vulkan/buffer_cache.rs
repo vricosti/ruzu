@@ -964,8 +964,6 @@ pub struct BufferCache {
     /// the texture cache's sentenced resources (upstream
     /// `DelayedDestructionRing` with `TICKS_TO_DESTROY`).
     sentenced: Vec<SentencedBuffer>,
-    /// Scheduler tick observed at the last `tick_frame`.
-    current_tick: u64,
 
     /// Null buffer for unbound vertex/index slots.
     null_buffer: vk::Buffer,
@@ -1010,7 +1008,6 @@ impl BufferCache {
             channel_caches: ChannelSetupCaches::new(),
             cache: HashMap::new(),
             sentenced: Vec::new(),
-            current_tick: 0,
             null_buffer,
             null_memory,
         })
@@ -1034,7 +1031,7 @@ impl BufferCache {
     /// rasterizer with the GPU-completed tick (`Scheduler::known_gpu_tick`),
     /// like `TextureCache::tick_frame`. Destruction only happens once the GPU
     /// has passed the submission that could last reference a buffer.
-    pub fn tick_frame(&mut self, gpu_tick: u64) {
+    pub fn tick_frame(&mut self, gpu_tick: u64, retire_tick: u64) {
         let mut index = 0;
         while index < self.sentenced.len() {
             let retire_tick = self.sentenced[index].retire_tick;
@@ -1049,11 +1046,10 @@ impl BufferCache {
             }
         }
         // Finalize buffers sentenced during this frame: their last possible
-        // use is covered by the next submission after this frame boundary.
-        let finalize_tick = self.current_tick.saturating_add(1);
+        // use is covered by the pending submission after this frame boundary.
         for sentenced in &mut self.sentenced {
             if sentenced.retire_tick == u64::MAX {
-                sentenced.retire_tick = finalize_tick;
+                sentenced.retire_tick = retire_tick;
             }
         }
     }

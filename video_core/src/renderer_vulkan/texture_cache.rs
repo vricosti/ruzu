@@ -617,10 +617,10 @@ impl Image {
         let device = runtime.device().clone();
         let scheduler = runtime.scheduler();
         scheduler.request_outside_renderpass();
-        scheduler.record_with_upload(move |_render_cmd, upload_cmd| unsafe {
+        scheduler.record(move |cmd| unsafe {
             copy_buffer_to_image(
                 &device,
-                upload_cmd,
+                cmd,
                 staging_buffer,
                 image,
                 aspect,
@@ -1231,30 +1231,9 @@ impl TextureCacheRuntime {
     }
 
     fn insert_upload_memory_barrier(&mut self) {
-        // Upstream records upload transfers through the scheduler and the
-        // barrier helper is empty because CopyBufferToImage's post-barrier is
-        // in the same command stream. The Rust scheduler has a dedicated
-        // upload command buffer submitted before the render command buffer, so
-        // add the acquire side here to keep later render/texture commands
-        // ordered after staging uploads.
-        let device = self.device.clone();
-        let scheduler = self.scheduler();
-        scheduler.request_outside_renderpass();
-        scheduler.record(move |cmd| unsafe {
-            let barrier = vk::MemoryBarrier::builder()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-                .build();
-            device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[barrier],
-                &[],
-                &[],
-            );
-        });
+        // Upstream Vulkan keeps this empty: `Image::UploadMemory` records
+        // `CopyBufferToImage`, including its post-copy barrier, in the same
+        // scheduler stream as its consumers.
     }
 
     fn transition_image_layout(&mut self, image: &mut Image) {
@@ -3450,6 +3429,53 @@ impl TextureCache {
             return false;
         };
         self.debug_dump_image_native(image_id, path)
+    }
+
+    /// Dump the image backing the color attachment currently bound in `slot`.
+    ///
+    /// GPU addresses may have several live cache aliases. Diagnostics that
+    /// search by address can therefore select a stale image instead of the
+    /// framebuffer attachment used by the draw being inspected.
+    pub fn debug_dump_bound_color_rgba(
+        &mut self,
+        slot: usize,
+        path: &std::path::Path,
+    ) -> bool {
+        let Some(&view_id) = self.base.render_targets.color_buffer_ids.get(slot) else {
+            return false;
+        };
+        if !view_id.is_valid() || view_id == NULL_IMAGE_VIEW_ID {
+            return false;
+        }
+        let image_id = self.base.slot_image_views[view_id].image_id;
+        if !image_id.is_valid() || image_id == NULL_IMAGE_ID {
+            return false;
+        }
+        let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) else {
+            return false;
+        };
+        let bytes = decode_debug_dump_to_rgba8(&bytes, &image_base.info);
+        let written = write_rgba_like_ppm(
+            path,
+            &bytes,
+            image_base.info.size.width.max(1),
+            image_base.info.size.height.max(1),
+        )
+        .is_ok();
+        if written {
+            log::info!(
+                "[VK_BOUND_COLOR_DUMP] slot={} view_id={} image_id={} format={:?} size={}x{} gpu=0x{:X} path={}",
+                slot,
+                view_id.index,
+                image_id.index,
+                image_base.info.format,
+                image_base.info.size.width,
+                image_base.info.size.height,
+                image_base.gpu_addr,
+                path.display(),
+            );
+        }
+        written
     }
 
     pub fn debug_dump_image_native(&mut self, image_id: ImageId, path: &std::path::Path) -> bool {
@@ -5985,7 +6011,7 @@ impl TextureCache {
     fn prepare_render_target_image_for_render(
         &mut self,
         image_id: ImageId,
-        cmd: vk::CommandBuffer,
+        _cmd: vk::CommandBuffer,
     ) {
         let Some((image, old_layout, aspect)) = self
             .images
@@ -5997,7 +6023,19 @@ impl TextureCache {
         if old_layout == vk::ImageLayout::GENERAL {
             return;
         }
-        self.transition_layout(cmd, image, old_layout, vk::ImageLayout::GENERAL, aspect);
+        let device = self.runtime.device().clone();
+        let scheduler = self.runtime.scheduler();
+        scheduler.request_outside_renderpass();
+        scheduler.record(move |cmdbuf| unsafe {
+            cmd_transition_layout(
+                &device,
+                cmdbuf,
+                image,
+                old_layout,
+                vk::ImageLayout::GENERAL,
+                aspect,
+            );
+        });
         if let Some(target) = self.images.get_mut(&image_id) {
             target.layout = vk::ImageLayout::GENERAL;
             target.exchange_initialization();
@@ -6188,6 +6226,9 @@ impl TextureCache {
             return;
         };
         self.present_source_seen = self.present_source_seen.saturating_add(1);
+        static PRESENT_STARTED: std::sync::OnceLock<std::time::Instant> =
+            std::sync::OnceLock::new();
+        let present_started = PRESENT_STARTED.get_or_init(std::time::Instant::now);
         // RUZU_DUMP_VK_PRESENT_SOURCE_EVERY=N: periodic timeline dumps to
         // numbered files instead of a single one-shot dump.
         if let Some(every) = std::env::var("RUZU_DUMP_VK_PRESENT_SOURCE_EVERY")
@@ -6225,9 +6266,23 @@ impl TextureCache {
         }
         let target_present = std::env::var("RUZU_DUMP_VK_PRESENT_SOURCE_AT")
             .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(1);
-        if self.present_source_seen < target_present {
+            .and_then(|value| value.parse::<u64>().ok());
+        let target_after_ms = std::env::var("RUZU_DUMP_VK_PRESENT_SOURCE_AFTER_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok());
+        let marker = std::env::var_os("RUZU_DUMP_VK_PRESENT_SOURCE_MARKER");
+        let marker_reached = marker
+            .as_ref()
+            .map(|path| std::path::Path::new(path).exists())
+            .unwrap_or(false);
+        let reached_target = target_present
+            .map(|target| self.present_source_seen >= target)
+            .unwrap_or(false)
+            || target_after_ms
+                .map(|target| present_started.elapsed().as_millis() >= u128::from(target))
+                .unwrap_or(target_present.is_none() && marker.is_none())
+            || marker_reached;
+        if !reached_target {
             return;
         }
         let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) else {
@@ -6279,16 +6334,17 @@ impl TextureCache {
         else {
             return;
         };
-        let Some(image_id) = self
+        let image_ids = self
             .base
             .slot_images
             .iter()
-            .find(|(_, image)| image.gpu_addr == target_gpu)
+            .filter(|(_, image)| image.gpu_addr == target_gpu)
             .map(|(id, _)| id)
-        else {
+            .collect::<Vec<_>>();
+        if image_ids.is_empty() {
             return;
-        };
-        let path = {
+        }
+        let base_path = {
             let base = std::path::PathBuf::from(path);
             if std::env::var("RUZU_DUMP_VK_PRESENT_SOURCE_EVERY")
                 .ok()
@@ -6306,22 +6362,32 @@ impl TextureCache {
                 base
             }
         };
-        let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) else {
-            return;
-        };
-        let bytes = decode_debug_dump_to_rgba8(&bytes, &image_base.info);
-        let width = image_base.info.size.width.max(1);
-        let height = image_base.info.size.height.max(1);
-        if write_rgba_like_ppm(&path, &bytes, width, height).is_ok() {
-            log::info!(
-                "[VK_PRESENT_EXTRA] dumped image_id={} gpu=0x{:X} {}x{} format={:?} to {}",
-                image_id.index,
-                image_base.gpu_addr,
-                width,
-                height,
-                image_base.info.format,
-                path.display()
-            );
+        for image_id in image_ids {
+            let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) else {
+                continue;
+            };
+            let bytes = decode_debug_dump_to_rgba8(&bytes, &image_base.info);
+            let width = image_base.info.size.width.max(1);
+            let height = image_base.info.size.height.max(1);
+            let stem = base_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("present_extra");
+            let path = base_path.with_file_name(format!(
+                "{stem}_id{}_{}x{}_{:?}.ppm",
+                image_id.index, width, height, image_base.info.format
+            ));
+            if write_rgba_like_ppm(&path, &bytes, width, height).is_ok() {
+                log::info!(
+                    "[VK_PRESENT_EXTRA] dumped image_id={} gpu=0x{:X} {}x{} format={:?} to {}",
+                    image_id.index,
+                    image_base.gpu_addr,
+                    width,
+                    height,
+                    image_base.info.format,
+                    path.display()
+                );
+            }
         }
     }
 
@@ -6578,16 +6644,19 @@ impl TextureCache {
                 view_base.image_id.index, view_id.index, image.gpu_addr, image.flags,
             );
         }
-        self.finish_pending_backend_insertion_with_reader(view_base.image_id, read_gpu_unsafe);
-        self.finish_pending_join_copies_with_reader(read_gpu_unsafe);
-        if self.images.contains_key(&view_base.image_id)
-            && self.base.slot_images[view_base.image_id]
-                .flags
-                .contains(ImageFlagBits::CPU_MODIFIED)
+        if !self
+            .finish_pending_backend_insertion_with_reader(view_base.image_id, read_gpu_unsafe)
         {
-            if self.refresh_contents_with_reader(view_base.image_id, read_gpu_unsafe) {
-                self.register_completed_backend_image(view_base.image_id);
-            }
+            return None;
+        }
+        self.finish_pending_join_copies_with_reader(read_gpu_unsafe);
+        if !self.prepare_image_with_reader(
+            view_base.image_id,
+            false,
+            false,
+            read_gpu_unsafe,
+        ) {
+            return None;
         }
         if let Some(view) = self.image_view_handle(view_id, texture_type) {
             if trace_b200_source {
@@ -6614,11 +6683,6 @@ impl TextureCache {
                 "TextureCacheVulkan: sampled image type {:?} is not materialized yet",
                 image_base.info.image_type
             );
-            return None;
-        }
-        if image_base.flags.contains(ImageFlagBits::CPU_MODIFIED)
-            && !self.refresh_contents_with_reader(view_base.image_id, read_gpu_unsafe)
-        {
             return None;
         }
         let format = self.runtime.surface_format(image_base.info.format);
@@ -6672,7 +6736,9 @@ impl TextureCache {
             .anisotropy_enable(max_anisotropy > 1.0)
             .max_anisotropy(max_anisotropy)
             .compare_enable(tsc.depth_compare_enabled() != 0)
-            .compare_op(vk::CompareOp::ALWAYS)
+            .compare_op(maxwell_to_vk::sampler::depth_compare_function(
+                crate::textures::texture::DepthCompareFunc::from_raw(tsc.depth_compare_func()),
+            ))
             .min_lod(if mipmap_filter == TextureMipmapFilter::None {
                 0.0
             } else {
@@ -6815,6 +6881,27 @@ impl TextureCache {
         new_layout: vk::ImageLayout,
         aspect: vk::ImageAspectFlags,
     ) {
+        unsafe {
+            cmd_transition_layout(
+                self.runtime.device(),
+                cmd,
+                image,
+                old_layout,
+                new_layout,
+                aspect,
+            );
+        }
+    }
+}
+
+unsafe fn cmd_transition_layout(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+    aspect: vk::ImageAspectFlags,
+) {
         let (src_access, src_stage, dst_access, dst_stage) = match (old_layout, new_layout) {
             (vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL) => (
                 vk::AccessFlags::empty(),
@@ -6883,18 +6970,15 @@ impl TextureCache {
             .dst_access_mask(dst_access)
             .build();
 
-        unsafe {
-            self.runtime.device().cmd_pipeline_barrier(
-                cmd,
-                src_stage,
-                dst_stage,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-        }
-    }
+        device.cmd_pipeline_barrier(
+            cmd,
+            src_stage,
+            dst_stage,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier],
+        );
 }
 
 fn pixel_format_to_vk(format: PixelFormat) -> vk::Format {
@@ -7124,6 +7208,26 @@ mod tests {
     use super::*;
     use crate::texture_cache::types::{Extent3D, Offset3D, SubresourceExtent, SubresourceLayers};
     use ash::vk::Handle;
+
+    #[test]
+    fn sampled_view_prepares_image_before_resolving_backend_view() {
+        let source = include_str!("texture_cache.rs");
+        let function = source
+            .split("pub fn materialize_sampled_image_view")
+            .nth(1)
+            .expect("materialize_sampled_image_view must exist")
+            .split("fn create_sampler_from_tsc")
+            .next()
+            .expect("materialize_sampled_image_view must precede sampler creation");
+        let prepare = function
+            .find("prepare_image_with_reader")
+            .expect("sampled images must follow upstream PrepareImageView");
+        let resolve = function
+            .find("image_view_handle")
+            .expect("sampled image view must be resolved");
+
+        assert!(prepare < resolve, "PrepareImageView must precede Handle");
+    }
 
     #[test]
     fn render_target_framebuffer_preserves_sparse_rt_slot_map() {

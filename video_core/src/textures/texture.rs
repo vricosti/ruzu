@@ -737,6 +737,22 @@ pub enum DepthCompareFunc {
     Always = 7,
 }
 
+impl DepthCompareFunc {
+    /// Decode the three-bit TSC depth-comparison field.
+    pub const fn from_raw(raw: u32) -> Self {
+        match raw & 0x7 {
+            0 => Self::Never,
+            1 => Self::Less,
+            2 => Self::Equal,
+            3 => Self::LessEqual,
+            4 => Self::Greater,
+            5 => Self::NotEqual,
+            6 => Self::GreaterEqual,
+            _ => Self::Always,
+        }
+    }
+}
+
 // ── Texture Filter ───────────────────────────────────────────────────────────
 
 /// Texture minification / magnification filter.
