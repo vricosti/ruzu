@@ -1576,16 +1576,6 @@ impl TextureCacheRuntime {
                 copies.len(),
             );
         }
-        if std::env::var_os("RUZU_TRACE_VK_JOIN_COPY").is_some() {
-            log::warn!(
-                "[VK_JOIN_COPY] runtime.CopyImage dst={} src={} copies={} dst_fmt={:?} src_fmt={:?}",
-                dst.image_id.index,
-                src.image_id.index,
-                copies.len(),
-                dst.base.info.format,
-                src.base.info.format
-            );
-        }
         let aspect = dst.aspect_mask();
         debug_assert_eq!(aspect, src.aspect_mask());
         let vk_copies = copies
@@ -3596,20 +3586,6 @@ impl TextureCache {
             extent.width = extent.width.min(width);
             extent.height = extent.height.min(height);
             let view_handle = self.image_views.get(&view_id)?.render_target();
-            if std::env::var_os("RUZU_TRACE_VK_RT_FRAMEBUFFER").is_some() {
-                log::info!(
-                    "[VK_RT_FRAMEBUFFER_VIEW] color view_id={} image_id={} view_gpu=0x{:X} image_gpu=0x{:X} view_size={}x{} image_size={}x{} range={:?}",
-                    view_id.index,
-                    view.image_id.index,
-                    view.gpu_addr,
-                    self.base.slot_images[view.image_id].gpu_addr,
-                    view.size.width,
-                    view.size.height,
-                    width,
-                    height,
-                    view.range,
-                );
-            }
             colors.push((rt_index, view_id, format));
             color_views.push(view_handle);
         }
@@ -3686,19 +3662,6 @@ impl TextureCache {
             let depth_image_id = self.base.slot_image_views[depth_id].image_id;
             self.base.slot_images[depth_image_id].cpu_addr
         };
-
-        if std::env::var_os("RUZU_TRACE_VK_RT_FRAMEBUFFER").is_some() {
-            log::info!(
-                "[VK_RT_FRAMEBUFFER] colors={} depth={} extent={}x{} base_size={}x{} rt0_cpu=0x{:X}",
-                colors.len(),
-                depth_view.is_some(),
-                extent.width,
-                extent.height,
-                base_size.width,
-                base_size.height,
-                rt0_cpu,
-            );
-        }
 
         // A resized/reformatted surface invalidates any framebuffer that
         // referenced its old image view.
@@ -3810,20 +3773,8 @@ impl TextureCache {
                     ImageInfo::from_render_target_info(&rt, render_targets.anti_alias_samples_mode);
                 let guest_size =
                     crate::texture_cache::util::calculate_guest_size_in_bytes(&info) as u64;
-                let cpu_addr = gpu_to_cpu(rt.address, guest_size).unwrap_or_else(|| {
-                    if std::env::var_os("RUZU_TRACE_RT").is_some() {
-                        log::info!(
-                            "[RT] miss translate color={} target={} gpu=0x{:X} {}x{} fmt=0x{:X}; using virtual-invalid fallback",
-                            index,
-                            index,
-                            rt.address,
-                            rt.width,
-                            rt.height,
-                            rt.format
-                        );
-                    }
-                    self.base.resolve_or_allocate_cpu_addr(rt.address, guest_size)
-                });
+                let cpu_addr = gpu_to_cpu(rt.address, guest_size)
+                    .unwrap_or_else(|| self.base.resolve_or_allocate_cpu_addr(rt.address, guest_size));
                 let image_id = self.find_or_insert_render_target_image_with_retry(
                     &info,
                     rt.address,
@@ -3837,22 +3788,6 @@ impl TextureCache {
                     rt.address,
                 );
                 self.base.bind_color_render_target(index, view_id);
-
-                if std::env::var_os("RUZU_TRACE_RT").is_some() {
-                    let image = &self.base.slot_images[image_id];
-                    log::info!(
-                        "[RT] color={} target={} gpu=0x{:X} cpu=0x{:X} {}x{} fmt=0x{:X} image={} views={}",
-                        index,
-                        index,
-                        rt.address,
-                        cpu_addr,
-                        rt.width,
-                        rt.height,
-                        rt.format,
-                        image_id.index,
-                        image.image_view_ids.len()
-                    );
-                }
             }
 
             if dirty_depth_target {
@@ -3865,15 +3800,6 @@ impl TextureCache {
                     let guest_size =
                         crate::texture_cache::util::calculate_guest_size_in_bytes(&info) as u64;
                     let cpu_addr = gpu_to_cpu(zeta.address, guest_size).unwrap_or_else(|| {
-                        if std::env::var_os("RUZU_TRACE_RT").is_some() {
-                            log::info!(
-                                "[RT] miss translate zeta gpu=0x{:X} {}x{} fmt=0x{:X}; using virtual-invalid fallback",
-                                zeta.address,
-                                zeta.width,
-                                zeta.height,
-                                zeta.format
-                            );
-                        }
                         self.base.resolve_or_allocate_cpu_addr(zeta.address, guest_size)
                     });
                     let image_id = self.find_or_insert_render_target_image_with_retry(
@@ -5591,24 +5517,10 @@ impl TextureCache {
         if pending.is_empty() {
             return;
         }
-        let trace_join_copy = std::env::var_os("RUZU_TRACE_VK_JOIN_COPY").is_some();
-        if trace_join_copy {
-            log::warn!("[VK_JOIN_COPY] drain pending={}", pending.len());
-        }
         let mut pending = pending.into_iter();
         while let Some(mut join) = pending.next() {
             if !self.base_image_exists(join.new_image_id) {
                 continue;
-            }
-            if trace_join_copy {
-                log::warn!(
-                    "[VK_JOIN_COPY] join_tail new={} copies={} left_alias={} right_alias={} bad_overlap={}",
-                    join.new_image_id.index,
-                    join.copies.len(),
-                    join.left_aliased_ids.len(),
-                    join.right_aliased_ids.len(),
-                    join.bad_overlap_ids.len()
-                );
             }
 
             let can_rescale = Self::prepare_pending_join_sibling_rescale_gate(
@@ -5663,15 +5575,6 @@ impl TextureCache {
                             copies,
                             modification_tick,
                         } => {
-                            if trace_join_copy {
-                                log::warn!(
-                                    "[VK_JOIN_COPY] copy dst={} src={} copies={} can_rescale={}",
-                                    join.new_image_id.index,
-                                    src_id.index,
-                                    copies.len(),
-                                    can_rescale
-                                );
-                            }
                             if !self.copy_join_image(join.new_image_id, src_id, &copies) {
                                 panic!(
                                     "TextureCacheVulkan: unsupported pending join copy: dst={} src={}",
@@ -6635,15 +6538,6 @@ impl TextureCache {
         if !view_base.image_id.is_valid() || view_base.image_id == NULL_IMAGE_ID {
             return None;
         }
-        let trace_b200_source = std::env::var_os("RUZU_TRACE_B200_SOURCE_LIFECYCLE").is_some()
-            && self.base.slot_images[view_base.image_id].gpu_addr == 0x558FC0000;
-        if trace_b200_source {
-            let image = &self.base.slot_images[view_base.image_id];
-            eprintln!(
-                "[B200_SOURCE_MATERIALIZE_BEGIN] image_id={} view_id={} gpu=0x{:X} flags={:?}",
-                view_base.image_id.index, view_id.index, image.gpu_addr, image.flags,
-            );
-        }
         if !self
             .finish_pending_backend_insertion_with_reader(view_base.image_id, read_gpu_unsafe)
         {
@@ -6659,19 +6553,6 @@ impl TextureCache {
             return None;
         }
         if let Some(view) = self.image_view_handle(view_id, texture_type) {
-            if trace_b200_source {
-                let image_handle = self
-                    .image_views
-                    .get(&view_id)
-                    .map(|entry| entry.image_handle());
-                eprintln!(
-                    "[B200_SOURCE_MATERIALIZE_HIT] image_id={} view_id={} image={:?} view=0x{:X}",
-                    view_base.image_id.index,
-                    view_id.index,
-                    image_handle.map(|image| image.as_raw()),
-                    view.as_raw(),
-                );
-            }
             return Some(view);
         }
         let image_base = self.base.slot_images.get(view_base.image_id).clone();
@@ -6693,21 +6574,7 @@ impl TextureCache {
         self.ensure_image(view_base.image_id, &image_base, format, aspect)
             .ok()?;
         self.ensure_image_view(view_id).ok()?;
-        let view = self.image_view_handle(view_id, texture_type);
-        if trace_b200_source {
-            let image_handle = self
-                .image_views
-                .get(&view_id)
-                .map(|entry| entry.image_handle());
-            eprintln!(
-                "[B200_SOURCE_MATERIALIZE_NEW] image_id={} view_id={} image={:?} view={:?}",
-                view_base.image_id.index,
-                view_id.index,
-                image_handle.map(|image| image.as_raw()),
-                view.map(|handle| handle.as_raw()),
-            );
-        }
-        view
+        self.image_view_handle(view_id, texture_type)
     }
 
     fn create_sampler_from_tsc(&self, tsc: &TscEntry) -> Result<vk::Sampler, vk::Result> {
