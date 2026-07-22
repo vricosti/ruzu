@@ -45,6 +45,18 @@ static CBUF_DEVICE_WATCH_RANGES: parking_lot::Mutex<Vec<CbufDeviceWatchRange>> =
     parking_lot::const_mutex(Vec::new());
 static CBUF_DEVICE_WATCH_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
 
+fn cbuf_device_watch_filter_matches(stage: usize, slot: usize) -> bool {
+    let stage_matches = std::env::var("RUZU_TRACE_CBUF_STAGE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_none_or(|target| target == stage);
+    let slot_matches = std::env::var("RUZU_TRACE_CBUF_SLOT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_none_or(|target| target == slot);
+    stage_matches && slot_matches
+}
+
 pub fn register_cbuf_device_write_watch(
     stage: usize,
     slot: usize,
@@ -52,7 +64,10 @@ pub fn register_cbuf_device_write_watch(
     device_address: DAddr,
     size: u32,
 ) {
-    if std::env::var_os("RUZU_TRACE_CBUF_DEVICE_WRITES").is_none() || size == 0 {
+    if std::env::var_os("RUZU_TRACE_CBUF_DEVICE_WRITES").is_none()
+        || !cbuf_device_watch_filter_matches(stage, slot)
+        || size == 0
+    {
         return;
     }
 
@@ -239,6 +254,8 @@ pub fn trace_cbuf_device_watch_range(source: &str, d_address: DAddr, size: u64) 
 pub type MarkRegionCachingFn = Box<dyn Fn(u64, usize, bool) + Send + Sync>;
 pub type InvalidateRegionFn = Box<dyn Fn(DAddr, usize) + Send + Sync>;
 pub type FlushRegionFn = Box<dyn Fn(DAddr, usize) + Send + Sync>;
+type SharedInvalidateRegionFn = Arc<dyn Fn(DAddr, usize) + Send + Sync>;
+type SharedFlushRegionFn = Arc<dyn Fn(DAddr, usize) + Send + Sync>;
 
 /// Port of `Core::DeviceMemoryManager<MaxwellDeviceTraits>`.
 ///
@@ -263,13 +280,13 @@ pub struct MaxwellDeviceMemoryManager {
     /// Optional callback invoked after device writes. Mirrors upstream
     /// `DeviceMemoryManager<Traits>::WriteBlock`, which writes to backing
     /// memory and then calls `device_inter->InvalidateRegion(address, size)`.
-    invalidate_region: Mutex<Option<InvalidateRegionFn>>,
+    invalidate_region: Mutex<Option<SharedInvalidateRegionFn>>,
 
     /// Optional callback invoked before safe device reads. Mirrors upstream
     /// `DeviceMemoryManager<Traits>::ReadBlock`, which calls
     /// `device_inter->FlushRegion(address, size)` before copying from backing
     /// memory. Unsafe reads intentionally skip this callback.
-    flush_region: Mutex<Option<FlushRegionFn>>,
+    flush_region: Mutex<Option<SharedFlushRegionFn>>,
 
     /// SMMU address-space allocator. Mirrors upstream
     /// `DeviceMemoryManagerAllocator::main_allocator`.
@@ -973,11 +990,11 @@ impl MaxwellDeviceMemoryManager {
     }
 
     pub fn set_invalidate_region(&self, callback: InvalidateRegionFn) {
-        *self.invalidate_region.lock().unwrap() = Some(callback);
+        *self.invalidate_region.lock().unwrap() = Some(Arc::from(callback));
     }
 
     pub fn set_flush_region(&self, callback: FlushRegionFn) {
-        *self.flush_region.lock().unwrap() = Some(callback);
+        *self.flush_region.lock().unwrap() = Some(Arc::from(callback));
     }
 
     /// Allocate `size` bytes of device-virtual address space. Returns a
@@ -1493,7 +1510,8 @@ impl MaxwellDeviceMemoryManager {
         if size == 0 {
             return;
         }
-        if let Some(callback) = self.invalidate_region.lock().unwrap().as_ref() {
+        let invalidate_region = self.invalidate_region.lock().unwrap().clone();
+        if let Some(callback) = invalidate_region {
             callback(d_address, size);
         }
         let start_page = d_address >> SMMU_PAGE_BITS;
@@ -1619,7 +1637,8 @@ impl MaxwellDeviceMemoryManager {
     /// upstream-style continuity segments. Returns `true` if every segment was
     /// mapped.
     pub fn smmu_read_block(&self, d_address: DAddr, output: &mut [u8]) -> bool {
-        if let Some(callback) = self.flush_region.lock().unwrap().as_ref() {
+        let flush_region = self.flush_region.lock().unwrap().clone();
+        if let Some(callback) = flush_region {
             callback(d_address, output.len());
         }
         self.smmu_read_block_unsafe(d_address, output)
@@ -1700,7 +1719,8 @@ impl MaxwellDeviceMemoryManager {
     /// Port of upstream `Core::DeviceMemoryManager<Traits>::WriteBlock`.
     pub fn smmu_write_block(&self, d_address: DAddr, data: &[u8]) -> bool {
         let all_mapped = self.smmu_write_block_unsafe(d_address, data);
-        if let Some(callback) = self.invalidate_region.lock().unwrap().as_ref() {
+        let invalidate_region = self.invalidate_region.lock().unwrap().clone();
+        if let Some(callback) = invalidate_region {
             callback(d_address, data.len());
         }
         all_mapped
@@ -2833,5 +2853,30 @@ mod tests {
         assert!(mgr.smmu_read_block(0x8004, &mut output));
         assert_eq!(*flushes.lock().unwrap(), vec![(0x8004, 4)]);
         assert_eq!(output, [0xA5; 4]);
+    }
+
+    #[test]
+    fn cache_callbacks_run_without_holding_callback_mutexes() {
+        let mgr = Arc::new(MaxwellDeviceMemoryManager::default());
+        let backing = vec![0xA5u8; 0x1000];
+        install_test_physical_base(&mgr, backing.as_ptr());
+        smmu_map_test_backing(&mgr, 0x8000, backing.as_ptr(), 0x4000_0000, backing.len());
+
+        let weak = Arc::downgrade(&mgr);
+        mgr.set_flush_region(Box::new(move |_, _| {
+            weak.upgrade()
+                .unwrap()
+                .set_flush_region(Box::new(|_, _| {}));
+        }));
+        let mut output = [0u8; 4];
+        assert!(mgr.smmu_read_block(0x8000, &mut output));
+
+        let weak = Arc::downgrade(&mgr);
+        mgr.set_invalidate_region(Box::new(move |_, _| {
+            weak.upgrade()
+                .unwrap()
+                .set_invalidate_region(Box::new(|_, _| {}));
+        }));
+        assert!(mgr.smmu_write_block(0x8000, &[1, 2, 3, 4]));
     }
 }

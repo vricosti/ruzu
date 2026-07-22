@@ -193,13 +193,10 @@ impl<'a> TranslatorVisitor<'a> {
                 self.ir.get_cbuf_u32(binding, offset)
             }
             SrcType::Immediate => {
-                let imm = field(insn, 20, 19);
-                let sign_ext = if imm & (1 << 18) != 0 {
-                    imm | !((1u32 << 19) - 1)
-                } else {
-                    imm
-                };
-                Value::ImmU32(sign_ext)
+                // Maxwell encodes the sign separately in bit 56. This is
+                // upstream `TranslatorVisitor::GetImm20`, not a signed
+                // 19-bit field.
+                self.get_imm20(insn)
             }
         }
     }

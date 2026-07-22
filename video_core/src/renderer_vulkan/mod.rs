@@ -1240,7 +1240,7 @@ impl RasterizerVulkan {
                 draw: draw.clone(),
                 dirty_flags: engine_dirty_flags,
             }));
-        self.bind_graphics_descriptors(
+        let descriptor_set = self.bind_graphics_descriptors(
             cmd,
             pipeline_layout,
             descriptor_set_layout,
@@ -1353,13 +1353,6 @@ impl RasterizerVulkan {
             );
         }
 
-        // Texture/buffer materialization can enqueue upload copies and
-        // barriers through `Scheduler::record_with_upload`. Upstream records
-        // the draw itself through the scheduler, preserving command order in
-        // the chunk. This reduced backend emits vkCmdDraw directly, so flush
-        // the preparation chunk before entering the render pass for the draw.
-        self.scheduler.dispatch_work();
-
         // Diagnostic only: test whether B200 observes writes that were not
         // made visible by the producer's normal render-pass/copy teardown.
         // This deliberately uses a global memory dependency so a positive
@@ -1370,13 +1363,14 @@ impl RasterizerVulkan {
             && draw.render_targets[0].address == 0x524C10000
         {
             self.scheduler.request_outside_renderpass();
-            let barrier = vk::MemoryBarrier::builder()
-                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .build();
-            unsafe {
-                self.device.cmd_pipeline_barrier(
-                    cmd,
+            let device = self.device.clone();
+            self.scheduler.record(move |cmdbuf| unsafe {
+                let barrier = vk::MemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .build();
+                device.cmd_pipeline_barrier(
+                    cmdbuf,
                     vk::PipelineStageFlags::ALL_COMMANDS,
                     vk::PipelineStageFlags::FRAGMENT_SHADER,
                     vk::DependencyFlags::empty(),
@@ -1384,7 +1378,7 @@ impl RasterizerVulkan {
                     &[],
                     &[],
                 );
-            }
+            });
         }
 
         // Build clear values indexed by attachment: one per colour attachment
@@ -1427,13 +1421,10 @@ impl RasterizerVulkan {
             );
         }
 
-        unsafe {
-            self.device
-                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-        }
         self.push_graphics_push_constants(
-            cmd,
+            pipeline,
             pipeline_layout,
+            descriptor_set,
             draw,
             uses_render_area,
             uses_rescaling_uniform,
@@ -1442,7 +1433,7 @@ impl RasterizerVulkan {
         // 6. Update dynamic states via dirty flags. Upstream requests the
         // render pass in `GraphicsPipeline::ConfigureDraw` before
         // `RasterizerVulkan::UpdateDynamicStates`.
-        self.update_dynamic_states(cmd, draw);
+        self.update_dynamic_states(draw);
 
         if should_trace_vk_draw(self.draw_sequence, draw.render_targets[0].address) {
             let rt0 = draw.render_targets[0];
@@ -1604,19 +1595,19 @@ impl RasterizerVulkan {
                 warn!("RasterizerVulkan::draw_indirect byte-count path requires VK_EXT_transform_feedback");
                 return;
             }
-            unsafe {
-                if let Some((count_buffer, count_offset)) = count {
-                    if count_buffer == vk::Buffer::null() {
-                        warn!("RasterizerVulkan::draw_indirect skipped: missing count buffer");
-                        return;
-                    }
-                    let Some(draw_indirect_count) = self.draw_indirect_count.as_ref() else {
-                        warn!("RasterizerVulkan::draw_indirect skipped: VK_KHR_draw_indirect_count is unavailable");
-                        return;
-                    };
+            if let Some((count_buffer, count_offset)) = count {
+                if count_buffer == vk::Buffer::null() {
+                    warn!("RasterizerVulkan::draw_indirect skipped: missing count buffer");
+                    return;
+                }
+                let Some(draw_indirect_count) = self.draw_indirect_count.clone() else {
+                    warn!("RasterizerVulkan::draw_indirect skipped: VK_KHR_draw_indirect_count is unavailable");
+                    return;
+                };
+                self.scheduler.record(move |cmdbuf| unsafe {
                     if params.is_indexed {
                         draw_indirect_count.cmd_draw_indexed_indirect_count(
-                            cmd,
+                            cmdbuf,
                             buffer,
                             offset as vk::DeviceSize,
                             count_buffer,
@@ -1626,7 +1617,7 @@ impl RasterizerVulkan {
                         );
                     } else {
                         draw_indirect_count.cmd_draw_indirect_count(
-                            cmd,
+                            cmdbuf,
                             buffer,
                             offset as vk::DeviceSize,
                             count_buffer,
@@ -1635,45 +1626,52 @@ impl RasterizerVulkan {
                             params.stride as u32,
                         );
                     }
-                } else if params.is_indexed {
-                    self.device.cmd_draw_indexed_indirect(
-                        cmd,
-                        buffer,
-                        offset as vk::DeviceSize,
-                        params.max_draw_counts as u32,
-                        params.stride as u32,
-                    );
-                } else {
-                    self.device.cmd_draw_indirect(
-                        cmd,
-                        buffer,
-                        offset as vk::DeviceSize,
-                        params.max_draw_counts as u32,
-                        params.stride as u32,
-                    );
-                }
+                });
+            } else {
+                let device = self.device.clone();
+                self.scheduler.record(move |cmdbuf| unsafe {
+                    if params.is_indexed {
+                        device.cmd_draw_indexed_indirect(
+                            cmdbuf,
+                            buffer,
+                            offset as vk::DeviceSize,
+                            params.max_draw_counts as u32,
+                            params.stride as u32,
+                        );
+                    } else {
+                        device.cmd_draw_indirect(
+                            cmdbuf,
+                            buffer,
+                            offset as vk::DeviceSize,
+                            params.max_draw_counts as u32,
+                            params.stride as u32,
+                        );
+                    }
+                });
             }
         } else if draw_params.is_indexed {
-            unsafe {
-                self.device.cmd_draw_indexed(
-                    cmd,
+            let device = self.device.clone();
+            self.scheduler.record(move |cmdbuf| unsafe {
+                device.cmd_draw_indexed(
+                    cmdbuf,
                     draw_params.num_vertices,
                     draw_params.num_instances,
                     draw_params.first_index,
                     draw_params.base_vertex,
                     draw_params.base_instance,
                 );
-            }
+            });
         } else {
-            unsafe {
-                self.device.cmd_draw(
-                    cmd,
+            let device = self.device.clone();
+            self.scheduler.record(move |cmdbuf| unsafe {
+                device.cmd_draw(
+                    cmdbuf,
                     draw_params.num_vertices,
                     draw_params.num_instances,
                     draw_params.base_vertex as u32,
                     draw_params.base_instance,
                 );
-            }
+            });
         }
 
         if std::env::var_os("RUZU_DUMP_ATTRACT_HDR_BOUNDARY").is_some() {
@@ -1681,6 +1679,10 @@ impl RasterizerVulkan {
                 std::sync::atomic::AtomicBool::new(false);
             static COLOR_OCCURRENCE: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
+            static COLOR_STARTED: std::sync::OnceLock<std::time::Instant> =
+                std::sync::OnceLock::new();
+            static COLOR_DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
             if draw.shader_stages[1].offset == 0xDE0A30
                 && draw.shader_stages[5].offset == 0xDE0D30
                 && !DEPTH_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -1700,14 +1702,25 @@ impl RasterizerVulkan {
             {
                 let occurrence =
                     COLOR_OCCURRENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let target = std::env::var("RUZU_DUMP_ATTRACT_HDR_BOUNDARY_AT")
+                let started = COLOR_STARTED.get_or_init(std::time::Instant::now);
+                let target_occurrence = std::env::var("RUZU_DUMP_ATTRACT_HDR_BOUNDARY_AT")
                     .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(0);
-                if occurrence == target {
-                    let dumped = self.texture_cache.debug_dump_image_at_gpu_native(
-                        draw.render_targets[0].address,
-                        std::path::Path::new("/tmp/ruzu-attract-color-after-writer.raw"),
+                    .and_then(|value| value.parse::<u64>().ok());
+                let target_after_ms = std::env::var("RUZU_DUMP_ATTRACT_HDR_BOUNDARY_AFTER_MS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok());
+                let reached_target = target_occurrence
+                    .map(|target| occurrence == target)
+                    .unwrap_or(false)
+                    || target_after_ms
+                        .map(|target| started.elapsed().as_millis() >= u128::from(target))
+                        .unwrap_or(target_occurrence.is_none() && occurrence == 0);
+                if reached_target
+                    && !COLOR_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    let dumped = self.texture_cache.debug_dump_bound_color_rgba(
+                        0,
+                        std::path::Path::new("/tmp/ruzu-attract-color-after-writer.ppm"),
                     );
                     eprintln!(
                         "[ATTRACT_HDR_BOUNDARY] color occurrence={} gpu=0x{:X} dumped={}",
@@ -1770,8 +1783,10 @@ impl RasterizerVulkan {
         }
         if std::env::var_os("RUZU_DUMP_ATTRACT_POST_STAGES").is_some()
             && draw.render_targets[0].address == 0x524C10000
+            && std::env::var_os("RUZU_DUMP_ATTRACT_POST_MARKER")
+                .is_none_or(|marker| std::path::Path::new(&marker).exists())
         {
-            let stages: [(u32, u32); 8] = [
+            let stages: [(u32, u32); 12] = [
                 (0x231430, 0x231630),
                 (0xAF1B30, 0xAF2C30),
                 (0xB20030, 0xB21430),
@@ -1780,9 +1795,13 @@ impl RasterizerVulkan {
                 (0x6A4030, 0x6B3E30),
                 (0xB21730, 0xB22530),
                 (0xAF1B30, 0xAF4730),
+                (0x681D30, 0x673E30),
+                (0x674030, 0x6B3E30),
+                (0x675130, 0x6B3E30),
+                (0x672630, 0x673C30),
             ];
-            static DUMPED: [std::sync::atomic::AtomicBool; 8] =
-                [const { std::sync::atomic::AtomicBool::new(false) }; 8];
+            static DUMPED: [std::sync::atomic::AtomicBool; 12] =
+                [const { std::sync::atomic::AtomicBool::new(false) }; 12];
             for (index, &(vs, fs)) in stages.iter().enumerate() {
                 if draw.shader_stages[1].offset == vs
                     && draw.shader_stages[5].offset == fs
@@ -1848,54 +1867,67 @@ impl RasterizerVulkan {
     }
 
     fn push_graphics_push_constants(
-        &self,
-        cmd: vk::CommandBuffer,
+        &mut self,
+        pipeline: vk::Pipeline,
         pipeline_layout: vk::PipelineLayout,
+        descriptor_set: Option<vk::DescriptorSet>,
         draw: &DrawCall,
         uses_render_area: bool,
         uses_rescaling_uniform: bool,
     ) {
         let rescaling = RescalingPushConstant::new();
-        unsafe {
-            self.device.cmd_push_constants(
-                cmd,
+        let rescaling_data = *rescaling.data();
+        let render_area = [
+            draw.surface_clip.width as f32,
+            draw.surface_clip.height as f32,
+            0.0,
+            0.0,
+        ];
+        let bind_pipeline = self.scheduler.update_graphics_pipeline(pipeline);
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            if bind_pipeline {
+                device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            }
+            device.cmd_push_constants(
+                cmdbuf,
                 pipeline_layout,
                 vk::ShaderStageFlags::ALL_GRAPHICS,
                 RESCALING_LAYOUT_WORDS_OFFSET,
-                bytes_of(rescaling.data()),
+                bytes_of(&rescaling_data),
             );
-        }
 
-        if uses_rescaling_uniform {
-            let scale_down_factor = 1.0f32;
-            unsafe {
-                self.device.cmd_push_constants(
-                    cmd,
+            if uses_rescaling_uniform {
+                let scale_down_factor = 1.0f32;
+                device.cmd_push_constants(
+                    cmdbuf,
                     pipeline_layout,
                     vk::ShaderStageFlags::ALL_GRAPHICS,
                     RESCALING_LAYOUT_DOWN_FACTOR_OFFSET,
                     bytes_of(&scale_down_factor),
                 );
             }
-        }
 
-        if uses_render_area {
-            let render_area = [
-                draw.surface_clip.width as f32,
-                draw.surface_clip.height as f32,
-                0.0,
-                0.0,
-            ];
-            unsafe {
-                self.device.cmd_push_constants(
-                    cmd,
+            if uses_render_area {
+                device.cmd_push_constants(
+                    cmdbuf,
                     pipeline_layout,
                     vk::ShaderStageFlags::ALL_GRAPHICS,
                     RENDERAREA_LAYOUT_OFFSET,
                     bytes_of(&render_area),
                 );
             }
-        }
+            if let Some(descriptor_set) = descriptor_set {
+                device.cmd_bind_descriptor_sets(
+                    cmdbuf,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline_layout,
+                    0,
+                    &[descriptor_set],
+                    &[],
+                );
+            }
+        });
     }
 
     /// Clear framebuffer.
@@ -2131,45 +2163,46 @@ impl RasterizerVulkan {
 
     // ── Dynamic state update methods ──────────────────────────────────────
 
-    fn update_dynamic_states(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
-        self.update_viewports(cmd, draw);
-        self.update_scissors(cmd, draw);
-        self.update_depth_bias(cmd, draw);
-        self.update_blend_constants(cmd, draw);
-        self.update_depth_bounds(cmd, draw);
-        self.update_stencil_faces(cmd, draw);
-        self.update_line_width(cmd, draw);
+    fn update_dynamic_states(&mut self, draw: &DrawCall) {
+        self.update_viewports(draw);
+        self.update_scissors(draw);
+        self.update_depth_bias(draw);
+        self.update_blend_constants(draw);
+        self.update_depth_bounds(draw);
+        self.update_stencil_faces(draw);
+        self.update_line_width(draw);
         if self.extended_dynamic_state_supported {
-            self.update_cull_mode(cmd, draw);
-            self.update_depth_compare_op(cmd, draw);
-            self.update_front_face(cmd, draw);
-            self.update_stencil_op(cmd, draw);
+            self.update_cull_mode(draw);
+            self.update_depth_compare_op(draw);
+            self.update_front_face(draw);
+            self.update_stencil_op(draw);
 
             if self.state_tracker.touch_state_enable() {
-                self.update_depth_bounds_test_enable(cmd, draw);
-                self.update_depth_test_enable(cmd, draw);
-                self.update_depth_write_enable(cmd, draw);
-                self.update_stencil_test_enable(cmd, draw);
+                self.update_depth_bounds_test_enable(draw);
+                self.update_depth_test_enable(draw);
+                self.update_depth_write_enable(draw);
+                self.update_stencil_test_enable(draw);
                 if self.extended_dynamic_state2_supported {
-                    self.update_primitive_restart_enable(cmd, draw);
-                    self.update_rasterizer_discard_enable(cmd, draw);
-                    self.update_depth_bias_enable(cmd, draw);
+                    self.update_primitive_restart_enable(draw);
+                    self.update_rasterizer_discard_enable(draw);
+                    self.update_depth_bias_enable(draw);
                 }
             }
         }
     }
 
-    fn update_primitive_restart_enable(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn update_primitive_restart_enable(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_primitive_restart_enable() {
             return;
         }
-        unsafe {
-            self.device
-                .cmd_set_primitive_restart_enable(cmd, draw.primitive_restart.enabled);
-        }
+        let enabled = draw.primitive_restart.enabled;
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_primitive_restart_enable(cmdbuf, enabled);
+        });
     }
 
-    fn update_cull_mode(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn update_cull_mode(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_cull_mode() {
             return;
         }
@@ -2178,62 +2211,68 @@ impl RasterizerVulkan {
         } else {
             vk::CullModeFlags::NONE
         };
-        unsafe {
-            self.device.cmd_set_cull_mode(cmd, cull_mode);
-        }
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_cull_mode(cmdbuf, cull_mode);
+        });
     }
 
-    fn update_depth_bounds_test_enable(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn update_depth_bounds_test_enable(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_depth_bounds_test_enable() {
             return;
         }
-        unsafe {
-            self.device
-                .cmd_set_depth_bounds_test_enable(cmd, draw.depth_bounds_enable);
-        }
+        let enabled = draw.depth_bounds_enable;
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_depth_bounds_test_enable(cmdbuf, enabled);
+        });
     }
 
-    fn update_depth_test_enable(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn update_depth_test_enable(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_depth_test_enable() {
             return;
         }
-        unsafe {
-            self.device
-                .cmd_set_depth_test_enable(cmd, draw.depth_stencil.depth_test_enable);
-        }
+        let enabled = draw.depth_stencil.depth_test_enable;
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_depth_test_enable(cmdbuf, enabled);
+        });
     }
 
-    fn update_depth_write_enable(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn update_depth_write_enable(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_depth_write_enable() {
             return;
         }
-        unsafe {
-            self.device
-                .cmd_set_depth_write_enable(cmd, draw.depth_stencil.depth_write_enable);
-        }
+        let enabled = draw.depth_stencil.depth_write_enable;
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_depth_write_enable(cmdbuf, enabled);
+        });
     }
 
-    fn update_stencil_test_enable(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn update_stencil_test_enable(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_stencil_test_enable() {
             return;
         }
-        unsafe {
-            self.device
-                .cmd_set_stencil_test_enable(cmd, draw.depth_stencil.stencil_enable);
-        }
+        let enabled = draw.depth_stencil.stencil_enable;
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_stencil_test_enable(cmdbuf, enabled);
+        });
     }
 
-    fn update_rasterizer_discard_enable(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn update_rasterizer_discard_enable(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_rasterizer_discard_enable() {
             return;
         }
-        unsafe {
-            self.device
-                .cmd_set_rasterizer_discard_enable(cmd, !draw.rasterize_enable);
-        }
+        let enabled = !draw.rasterize_enable;
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_rasterizer_discard_enable(cmdbuf, enabled);
+        });
     }
 
-    fn update_depth_bias_enable(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn update_depth_bias_enable(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_depth_bias_enable() {
             return;
         }
@@ -2254,24 +2293,24 @@ impl RasterizerVulkan {
             | PrimitiveTopology::TriangleStripAdjacency
             | PrimitiveTopology::Patches => draw.rasterizer.polygon_offset_fill_enable,
         };
-        unsafe {
-            self.device.cmd_set_depth_bias_enable(cmd, enabled);
-        }
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_depth_bias_enable(cmdbuf, enabled);
+        });
     }
 
-    fn update_depth_compare_op(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn update_depth_compare_op(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_depth_compare_op() {
             return;
         }
-        unsafe {
-            self.device.cmd_set_depth_compare_op(
-                cmd,
-                maxwell_to_vk::comparison_op(draw.depth_stencil.depth_func),
-            );
-        }
+        let op = maxwell_to_vk::comparison_op(draw.depth_stencil.depth_func);
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_depth_compare_op(cmdbuf, op);
+        });
     }
 
-    fn update_front_face(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn update_front_face(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_front_face() {
             return;
         }
@@ -2283,29 +2322,32 @@ impl RasterizerVulkan {
                 vk::FrontFace::CLOCKWISE
             };
         }
-        unsafe {
-            self.device.cmd_set_front_face(cmd, front_face);
-        }
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_front_face(cmdbuf, front_face);
+        });
     }
 
-    fn update_stencil_op(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn update_stencil_op(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_stencil_op() {
             return;
         }
-        let front = &draw.depth_stencil.front;
-        unsafe {
-            if draw.depth_stencil.stencil_two_side {
-                let back = &draw.depth_stencil.back;
-                self.device.cmd_set_stencil_op(
-                    cmd,
+        let front = draw.depth_stencil.front;
+        let back = draw.depth_stencil.back;
+        let two_side = draw.depth_stencil.stencil_two_side;
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            if two_side {
+                device.cmd_set_stencil_op(
+                    cmdbuf,
                     vk::StencilFaceFlags::FRONT,
                     maxwell_to_vk::stencil_op(front.fail_op),
                     maxwell_to_vk::stencil_op(front.zpass_op),
                     maxwell_to_vk::stencil_op(front.zfail_op),
                     maxwell_to_vk::comparison_op(front.func),
                 );
-                self.device.cmd_set_stencil_op(
-                    cmd,
+                device.cmd_set_stencil_op(
+                    cmdbuf,
                     vk::StencilFaceFlags::BACK,
                     maxwell_to_vk::stencil_op(back.fail_op),
                     maxwell_to_vk::stencil_op(back.zpass_op),
@@ -2313,8 +2355,8 @@ impl RasterizerVulkan {
                     maxwell_to_vk::comparison_op(back.func),
                 );
             } else {
-                self.device.cmd_set_stencil_op(
-                    cmd,
+                device.cmd_set_stencil_op(
+                    cmdbuf,
                     vk::StencilFaceFlags::FRONT_AND_BACK,
                     maxwell_to_vk::stencil_op(front.fail_op),
                     maxwell_to_vk::stencil_op(front.zpass_op),
@@ -2322,10 +2364,10 @@ impl RasterizerVulkan {
                     maxwell_to_vk::comparison_op(front.func),
                 );
             }
-        }
+        });
     }
 
-    fn update_viewports(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn update_viewports(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_viewports() {
             return;
         }
@@ -2341,17 +2383,17 @@ impl RasterizerVulkan {
         } else {
             viewport_state(draw, 0)
         };
-        unsafe {
-            if draw.viewport_scale_offset_enabled {
-                let viewports = std::array::from_fn::<_, { NUM_VIEWPORTS }, _>(|index| {
-                    viewport_state(draw, index)
-                });
-                self.device
-                    .cmd_set_viewport(cmd, 0, &viewports[..self.max_viewports as usize]);
-            } else {
-                self.device.cmd_set_viewport(cmd, 0, &[viewport]);
-            }
-        }
+        let viewports = if draw.viewport_scale_offset_enabled {
+            std::array::from_fn::<_, { NUM_VIEWPORTS }, _>(|index| viewport_state(draw, index))
+                [..self.max_viewports as usize]
+                .to_vec()
+        } else {
+            vec![viewport]
+        };
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_viewport(cmdbuf, 0, &viewports);
+        });
         if std::env::var_os("RUZU_TRACE_VK_DYNAMIC_STATE").is_some() {
             log::info!(
                 "[VK_DYNAMIC] viewport scale_offset={} x={} y={} w={} h={} min_depth={} max_depth={}",
@@ -2366,7 +2408,7 @@ impl RasterizerVulkan {
         }
     }
 
-    fn update_scissors(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn update_scissors(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_scissors() {
             return;
         }
@@ -2386,17 +2428,17 @@ impl RasterizerVulkan {
         } else {
             scissor_state(draw, 0)
         };
-        unsafe {
-            if draw.viewport_scale_offset_enabled {
-                let scissors = std::array::from_fn::<_, { NUM_VIEWPORTS }, _>(|index| {
-                    scissor_state(draw, index)
-                });
-                self.device
-                    .cmd_set_scissor(cmd, 0, &scissors[..self.max_viewports as usize]);
-            } else {
-                self.device.cmd_set_scissor(cmd, 0, &[scissor]);
-            }
-        }
+        let scissors = if draw.viewport_scale_offset_enabled {
+            std::array::from_fn::<_, { NUM_VIEWPORTS }, _>(|index| scissor_state(draw, index))
+                [..self.max_viewports as usize]
+                .to_vec()
+        } else {
+            vec![scissor]
+        };
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_scissor(cmdbuf, 0, &scissors);
+        });
         if std::env::var_os("RUZU_TRACE_VK_DYNAMIC_STATE").is_some() {
             log::info!(
                 "[VK_DYNAMIC] scissor scale_offset={} x={} y={} w={} h={}",
@@ -2409,38 +2451,57 @@ impl RasterizerVulkan {
         }
     }
 
-    fn update_depth_bias(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn update_depth_bias(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_depth_bias() {
             return;
         }
-        unsafe {
-            self.device.cmd_set_depth_bias(
-                cmd,
-                draw.rasterizer.depth_bias,
-                draw.rasterizer.depth_bias_clamp,
-                draw.rasterizer.slope_scale_depth_bias,
-            );
-        }
+        let constant = draw.rasterizer.depth_bias;
+        let clamp = draw.rasterizer.depth_bias_clamp;
+        let slope = draw.rasterizer.slope_scale_depth_bias;
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_depth_bias(cmdbuf, constant, clamp, slope);
+        });
     }
 
-    fn update_blend_constants(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn update_blend_constants(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_blend_constants() {
             return;
         }
-        unsafe {
-            self.device.cmd_set_blend_constants(
-                cmd,
-                &[
-                    draw.blend_color.r,
-                    draw.blend_color.g,
-                    draw.blend_color.b,
-                    draw.blend_color.a,
-                ],
-            );
-        }
+        let blend_constants = [
+            draw.blend_color.r,
+            draw.blend_color.g,
+            draw.blend_color.b,
+            draw.blend_color.a,
+        ];
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_blend_constants(cmdbuf, &blend_constants);
+        });
     }
 
-    fn update_stencil_faces(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn record_stencil_reference(&mut self, face: vk::StencilFaceFlags, value: u32) {
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_stencil_reference(cmdbuf, face, value);
+        });
+    }
+
+    fn record_stencil_write_mask(&mut self, face: vk::StencilFaceFlags, value: u32) {
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_stencil_write_mask(cmdbuf, face, value);
+        });
+    }
+
+    fn record_stencil_compare_mask(&mut self, face: vk::StencilFaceFlags, value: u32) {
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_stencil_compare_mask(cmdbuf, face, value);
+        });
+    }
+
+    fn update_stencil_faces(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_stencil_properties() {
             return;
         }
@@ -2457,138 +2518,113 @@ impl RasterizerVulkan {
             update_compare_masks = true;
         }
 
-        let front = &draw.depth_stencil.front;
-        let back = &draw.depth_stencil.back;
+        let front = draw.depth_stencil.front;
+        let back = draw.depth_stencil.back;
 
         if update_references {
-            unsafe {
-                if draw.depth_stencil.stencil_two_side && front.ref_value != back.ref_value {
-                    if self
-                        .state_tracker
-                        .check_stencil_reference_front(front.ref_value)
-                    {
-                        self.device.cmd_set_stencil_reference(
-                            cmd,
-                            vk::StencilFaceFlags::FRONT,
-                            front.ref_value,
-                        );
-                    }
-                    if self
-                        .state_tracker
-                        .check_stencil_reference_back(back.ref_value)
-                    {
-                        self.device.cmd_set_stencil_reference(
-                            cmd,
-                            vk::StencilFaceFlags::BACK,
-                            back.ref_value,
-                        );
-                    }
-                } else if self
+            if draw.depth_stencil.stencil_two_side && front.ref_value != back.ref_value {
+                if self
                     .state_tracker
                     .check_stencil_reference_front(front.ref_value)
                 {
-                    self.device.cmd_set_stencil_reference(
-                        cmd,
-                        vk::StencilFaceFlags::FRONT_AND_BACK,
-                        front.ref_value,
-                    );
+                    self.record_stencil_reference(vk::StencilFaceFlags::FRONT, front.ref_value);
                 }
+                if self
+                    .state_tracker
+                    .check_stencil_reference_back(back.ref_value)
+                {
+                    self.record_stencil_reference(vk::StencilFaceFlags::BACK, back.ref_value);
+                }
+            } else if self
+                .state_tracker
+                .check_stencil_reference_front(front.ref_value)
+            {
+                self.record_stencil_reference(
+                    vk::StencilFaceFlags::FRONT_AND_BACK,
+                    front.ref_value,
+                );
             }
         }
 
         if update_write_mask {
-            unsafe {
-                if draw.depth_stencil.stencil_two_side && front.write_mask != back.write_mask {
-                    if self
-                        .state_tracker
-                        .check_stencil_write_mask_front(front.write_mask)
-                    {
-                        self.device.cmd_set_stencil_write_mask(
-                            cmd,
-                            vk::StencilFaceFlags::FRONT,
-                            front.write_mask,
-                        );
-                    }
-                    if self
-                        .state_tracker
-                        .check_stencil_write_mask_back(back.write_mask)
-                    {
-                        self.device.cmd_set_stencil_write_mask(
-                            cmd,
-                            vk::StencilFaceFlags::BACK,
-                            back.write_mask,
-                        );
-                    }
-                } else if self
+            if draw.depth_stencil.stencil_two_side && front.write_mask != back.write_mask {
+                if self
                     .state_tracker
                     .check_stencil_write_mask_front(front.write_mask)
                 {
-                    self.device.cmd_set_stencil_write_mask(
-                        cmd,
-                        vk::StencilFaceFlags::FRONT_AND_BACK,
+                    self.record_stencil_write_mask(
+                        vk::StencilFaceFlags::FRONT,
                         front.write_mask,
                     );
                 }
+                if self
+                    .state_tracker
+                    .check_stencil_write_mask_back(back.write_mask)
+                {
+                    self.record_stencil_write_mask(vk::StencilFaceFlags::BACK, back.write_mask);
+                }
+            } else if self
+                .state_tracker
+                .check_stencil_write_mask_front(front.write_mask)
+            {
+                self.record_stencil_write_mask(
+                    vk::StencilFaceFlags::FRONT_AND_BACK,
+                    front.write_mask,
+                );
             }
         }
 
         if update_compare_masks {
-            unsafe {
-                if draw.depth_stencil.stencil_two_side && front.func_mask != back.func_mask {
-                    if self
-                        .state_tracker
-                        .check_stencil_compare_mask_front(front.func_mask)
-                    {
-                        self.device.cmd_set_stencil_compare_mask(
-                            cmd,
-                            vk::StencilFaceFlags::FRONT,
-                            front.func_mask,
-                        );
-                    }
-                    if self
-                        .state_tracker
-                        .check_stencil_compare_mask_back(back.func_mask)
-                    {
-                        self.device.cmd_set_stencil_compare_mask(
-                            cmd,
-                            vk::StencilFaceFlags::BACK,
-                            back.func_mask,
-                        );
-                    }
-                } else if self
+            if draw.depth_stencil.stencil_two_side && front.func_mask != back.func_mask {
+                if self
                     .state_tracker
                     .check_stencil_compare_mask_front(front.func_mask)
                 {
-                    self.device.cmd_set_stencil_compare_mask(
-                        cmd,
-                        vk::StencilFaceFlags::FRONT_AND_BACK,
+                    self.record_stencil_compare_mask(
+                        vk::StencilFaceFlags::FRONT,
                         front.func_mask,
                     );
                 }
+                if self
+                    .state_tracker
+                    .check_stencil_compare_mask_back(back.func_mask)
+                {
+                    self.record_stencil_compare_mask(vk::StencilFaceFlags::BACK, back.func_mask);
+                }
+            } else if self
+                .state_tracker
+                .check_stencil_compare_mask_front(front.func_mask)
+            {
+                self.record_stencil_compare_mask(
+                    vk::StencilFaceFlags::FRONT_AND_BACK,
+                    front.func_mask,
+                );
             }
         }
 
         self.state_tracker.clear_stencil_reset();
     }
 
-    fn update_depth_bounds(&mut self, cmd: vk::CommandBuffer, _draw: &DrawCall) {
+    fn update_depth_bounds(&mut self, _draw: &DrawCall) {
         if !self.state_tracker.touch_depth_bounds() {
             return;
         }
         // Depth bounds test not currently used, but set safe defaults
-        unsafe {
-            self.device.cmd_set_depth_bounds(cmd, 0.0, 1.0);
-        }
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_depth_bounds(cmdbuf, 0.0, 1.0);
+        });
     }
 
-    fn update_line_width(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
+    fn update_line_width(&mut self, draw: &DrawCall) {
         if !self.state_tracker.touch_line_width() {
             return;
         }
-        unsafe {
-            self.device
-                .cmd_set_line_width(cmd, draw.rasterizer.line_width_smooth.max(1.0));
-        }
+        let width = draw.rasterizer.line_width_smooth.max(1.0);
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_set_line_width(cmdbuf, width);
+        });
     }
 
     // ── Buffer binding ────────────────────────────────────────────────────
@@ -2763,11 +2799,11 @@ impl RasterizerVulkan {
         fixed_state: &FixedPipelineState,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
-    ) {
+    ) -> Option<vk::DescriptorSet> {
         if descriptor_set_layout == vk::DescriptorSetLayout::null()
             || descriptor_bindings.is_empty()
         {
-            return;
+            return None;
         }
 
         let texture_cache: *mut TextureCache = &mut self.texture_cache;
@@ -2795,7 +2831,7 @@ impl RasterizerVulkan {
             Ok(set) => set,
             Err(err) => {
                 warn!("RasterizerVulkan: failed to allocate graphics descriptor set: {err:?}");
-                return;
+                return None;
             }
         };
 
@@ -2929,8 +2965,8 @@ impl RasterizerVulkan {
         {
             static OCCURRENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let occurrence = OCCURRENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if occurrence < 64 {
-                eprintln!(
+            if occurrence < 64 || occurrence % 60 == 0 {
+                log::info!(
                     "[ATTRACT_HDR_WRITER] occurrence={} indexed={} indirect={} index_first={} index_count={} instances={}",
                     occurrence,
                     draw.indexed,
@@ -3599,15 +3635,8 @@ impl RasterizerVulkan {
 
         unsafe {
             self.device.update_descriptor_sets(&writes, &[]);
-            self.device.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                pipeline_layout,
-                0,
-                &[descriptor_set],
-                &[],
-            );
         }
+        Some(descriptor_set)
     }
 
     // ── Framebuffer resize ────────────────────────────────────────────────
@@ -4118,11 +4147,10 @@ impl RasterizerInterface for RasterizerVulkan {
             return;
         }
 
-        let cmd = self.scheduler.command_buffer();
-        unsafe {
-            self.device
-                .cmd_clear_attachments(cmd, &attachments, &[clear_rect]);
-        }
+        let device = self.device.clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_clear_attachments(cmdbuf, &attachments, &[clear_rect]);
+        });
         if std::env::var_os("RUZU_TRACE_VK_CLEAR").is_some() {
             log::info!(
                 "[VK_CLEAR] flags=0x{:X} color={:?} depth={} stencil={} area={}x{} rect=({}, {}) {}x{} scissor={} layers={}",
@@ -4527,12 +4555,13 @@ impl RasterizerInterface for RasterizerVulkan {
     }
 
     fn fragment_barrier(&mut self) {
-        self.scheduler.dispatch_work();
+        // Upstream `RasterizerVulkan::FragmentBarrier` ends the active render
+        // pass. `Scheduler::request_outside_renderpass` emits the attachment
+        // write barrier needed before a later texture read.
+        self.scheduler.request_outside_renderpass();
     }
 
-    fn tiled_cache_barrier(&mut self) {
-        self.scheduler.dispatch_work();
-    }
+    fn tiled_cache_barrier(&mut self) {}
 
     fn flush_commands(&mut self) {
         self.scheduler.flush();
@@ -4549,7 +4578,12 @@ impl RasterizerInterface for RasterizerVulkan {
         self.state_tracker.invalidate_command_buffer_state();
         self.staging_pool.new_frame();
         {
-            let tick = self.scheduler.current_tick();
+            // Upstream ResourcePool stamps descriptor sets with
+            // MasterSemaphore::CurrentTick(), which is the tick assigned to
+            // the next submission. Rust's `current_tick()` is the last
+            // submitted tick, so use `pending_tick()` for the same lifetime:
+            // this frame's command buffer can still reference these sets.
+            let tick = self.scheduler.pending_tick();
             let scheduler = &self.scheduler;
             self.descriptor_pool
                 .end_frame(tick, &|t| scheduler.is_free(t));
@@ -4563,7 +4597,8 @@ impl RasterizerInterface for RasterizerVulkan {
             let _texture_guard = (*texture_mutex).lock();
             self.texture_cache.tick_frame(known_gpu_tick);
         }
-        self.buffer_cache.tick_frame(known_gpu_tick);
+        self.buffer_cache
+            .tick_frame(known_gpu_tick, self.scheduler.pending_tick());
         unsafe {
             let _lo_buf = common::lock_order::guard("buffer_cache");
             let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;

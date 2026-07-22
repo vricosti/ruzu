@@ -1027,14 +1027,22 @@ mod tests {
 
     #[test]
     fn test_depth_compare_function() {
-        assert_eq!(
-            sampler::depth_compare_function(DepthCompareFunc::Never),
-            vk::CompareOp::NEVER
-        );
-        assert_eq!(
-            sampler::depth_compare_function(DepthCompareFunc::Always),
-            vk::CompareOp::ALWAYS
-        );
+        let expected = [
+            vk::CompareOp::NEVER,
+            vk::CompareOp::LESS,
+            vk::CompareOp::EQUAL,
+            vk::CompareOp::LESS_OR_EQUAL,
+            vk::CompareOp::GREATER,
+            vk::CompareOp::NOT_EQUAL,
+            vk::CompareOp::GREATER_OR_EQUAL,
+            vk::CompareOp::ALWAYS,
+        ];
+        for (raw, expected) in expected.into_iter().enumerate() {
+            assert_eq!(
+                sampler::depth_compare_function(DepthCompareFunc::from_raw(raw as u32)),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -23255,3 +23255,275 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - A release MK8D startup with the existing 6503-entry cache completes
   `load_disk_resources`, serializes the driver cache, reaches `System: running`,
   and exits only through the 15-second timeout.
+## 2026-07-19 - video_core/src/engines/maxwell_dma.rs vs video_core/engines/maxwell_dma.cpp
+
+### Intentional differences
+- Rust makes the cached-write destruction edge explicit with
+  `invalidate_gpu_region`; upstream obtains the same notification from the
+  `GpuGuestMemoryScoped` destructor.
+
+### Unintentional differences (to fix)
+- None after this change. DMA CPU fallbacks previously called the rasterizer
+  directly with GPU virtual addresses. They now delegate through
+  `MemoryManager::flush_region` / `invalidate_region`, matching upstream
+  `GpuGuestMemory` and translating each mapped GPU range to device-address
+  segments before notifying the rasterizer.
+
+### Missing items
+- None in this GPU-address notification slice.
+
+### Binary layout verification
+- N/A: register and DMA payload layouts are unchanged.
+
+### Verification
+- Re-read upstream `MaxwellDMA` fallback copies in `maxwell_dma.cpp`,
+  `GpuGuestMemory` in `gpu_guest_memory.h`, and
+  `MemoryManager::FlushRegion` / `InvalidateRegion` in `memory_manager.cpp`.
+- `test_single_line_const_a_clear_calls_accelerated_buffer_clear_then_fallback`
+  and `test_dma_fallback_flushes_source_and_invalidates_destination` pass with
+  non-identity GPU-VA-to-DAddr mappings and assert the translated DAddr ranges.
+- A release MK8D run no longer emits the out-of-range memory-tracker
+  notifications produced by forwarding GPU virtual addresses directly.
+
+## 2026-07-19 - video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust decodes the packed three-bit TSC comparison field through
+  `DepthCompareFunc::from_raw`; the resulting eight-way mapping is identical
+  to upstream's typed `tsc.depth_compare_func` value.
+
+### Unintentional differences (to fix)
+- None after this change in sampler depth comparison. Rust previously created
+  every comparison sampler with `VK_COMPARE_OP_ALWAYS`; it now uses
+  `MaxwellToVK::Sampler::DepthCompareFunction`, as upstream does.
+
+### Missing items
+- This entry covers only depth-compare selection and does not claim complete
+  `Sampler` parity for unrelated reduction, border-color, or device-quirk
+  paths.
+
+### Binary layout verification
+- N/A: the TSC bit layout and serialized cache formats are unchanged.
+
+### Verification
+- Re-read upstream `Sampler::Sampler` in `vk_texture_cache.cpp` and
+  `MaxwellToVK::Sampler::DepthCompareFunction` in `maxwell_to_vk.cpp`.
+- `test_depth_compare_function` covers all eight encoded comparison values.
+- A post-fix MK8D filmstrip through presentation 5700 still shows the race
+  scene overexposed with a dark floor. The sampler divergence is fixed, but
+  the hypothesis that it caused the active race/attract rendering defect is
+  therefore invalidated.
+
+## 2026-07-19 - MK8D character-selection Vulkan diagnostics
+
+### Intentional differences
+- `ruzu_cmd` can inject environment-gated L+R/A input and optionally create a
+  marker after a selected A attempt. This is SDL diagnostic automation; the
+  upstream Qt frontend is excluded from the Rust port and has no equivalent.
+- The Vulkan texture cache can trigger a one-shot present dump from that marker
+  or a relative diagnostic delay, resolve the exact currently bound color
+  `ImageView`, and enumerate every cached `ImageId` alias at a requested GPU
+  address. These paths are disabled unless their `RUZU_*` variables are set and
+  do not modify guest-visible state or normal rendering order.
+
+### Unintentional differences (to fix)
+- None introduced by the diagnostic paths.
+
+### Missing items
+- The active MK8D defect remains: the character-selection UI is correct while
+  Mario, the kart, and the pedestal are severely overexposed. The historical
+  `0x520510000` B10G11R11 target contains only the blue menu background at the
+  captured boundaries, so it is not the 3D preview surface and must not be used
+  as the sole attribution point.
+
+### Binary layout verification
+- N/A: diagnostics only; no guest or serialized layout changed.
+
+### Verification
+- `cargo build --release --bin ruzu-cmd` passes with the project FFmpeg
+  `PKG_CONFIG_PATH`.
+- Marker-triggered dumps select the actual 1920x1080 B10G11R11 `ImageId`
+  instead of the stale 480x270 alias previously returned by address-only
+  `.find(...)`.
+- The reference ruzu frame is
+  `ruzu-mk8d-shadow-sampler-filmstrip-20260719-142312/present_002400.png`;
+  the yuzu reference is
+  `screenshots/yuzu/MK8D/Capture d’écran 2026-07-19 à 14.39.31.png`.
+
+## 2026-07-19 - video_core/src/host1x/gpu_device_memory_manager.rs vs core/device_memory_manager.h/.inc and video_core/host1x/gpu_device_memory_manager.h/.cpp
+
+### Intentional differences
+- Rust stores the bound rasterizer flush/invalidate interfaces as cloned
+  `Arc<dyn Fn>` callbacks. Upstream stores one stable `DeviceInterface*`.
+  Cloning the callback while holding its registration mutex preserves the
+  stable-interface lifetime without holding that Rust-only mutex during the
+  rasterizer call.
+
+### Unintentional differences (to fix)
+- None after this change. Rust previously invoked `FlushRegion` and
+  `InvalidateRegion` while retaining the callback registration mutex. This
+  allowed an ABBA deadlock when a Host1x safe read held that mutex and waited
+  for the Vulkan buffer cache while the GPU draw held the buffer cache and
+  attempted another safe device read. Upstream performs the interface call
+  directly and has no callback-registration mutex in that call chain.
+
+### Missing items
+- None in the callback lifetime/ordering slice; this entry does not claim
+  completion of the surrounding SMMU implementation.
+
+### Binary layout verification
+- N/A: callback ownership only; no guest-visible or serialized layout changed.
+
+### Verification
+- Re-read upstream `DeviceMemoryManager::BindInterface`, `ReadBlock`,
+  `WriteBlock`, and the Maxwell specialization header/translation unit.
+- `cargo test -p video_core --lib gpu_device_memory_manager` passes: 38 tests.
+- The focused regression
+  `cache_callbacks_run_without_holding_callback_mutexes` passes and replaces
+  both callbacks recursively from inside their invocation, which would
+  deadlock with the previous lock lifetime.
+
+## 2026-07-21 - shader_recompiler/src/frontend/translate/logic_operation_three_input.rs, common_funcs.rs, and mod.rs vs shader_recompiler/frontend/maxwell/translate/impl/logic_operation_three_input.cpp, common_funcs.cpp, and impl.cpp
+
+### Intentional differences
+- Rust evaluates LUT values not covered by its direct fast paths through a
+  generic truth-table decomposition instead of upstream's generated 256-case
+  `ApplyLUT` switch. The Boolean result is equivalent; LUT `0xF8`, used by the
+  affected MK8D shaders, now has the exact upstream expression
+  `a | (b & c)`.
+- Upstream reports unsupported `LOP3 CC` and `LOP3 X` forms by throwing
+  `NotImplementedException`; Rust panics and the pipeline compilation boundary
+  catches the failure, preserving the existing Rust exception adaptation.
+
+### Unintentional differences (to fix)
+- None after this change. Rust previously read the LUT from bits 28-35 for all
+  LOP3 forms. It now uses bits 28-35 only for `LOP3_reg` and bits 48-55 for
+  `LOP3_cbuf` and `LOP3_imm`, matching upstream `GetLut48`.
+- Rust previously decoded the immediate as a signed 19-bit field. It now uses
+  `get_imm20`, where bit 56 supplies the sign exactly as upstream `GetImm20`.
+- The upstream `CC` and register-form `X` validation and the register-form
+  predicate result were omitted. They are now ported with the same field
+  positions and ordering.
+
+### Missing items
+- None in this LOP3 translation slice. This entry does not claim completion of
+  unrelated Maxwell instructions.
+
+### Binary layout verification
+- N/A: instruction fields are decoded from the existing 64-bit Maxwell word;
+  no serialized or shared structure layout changed.
+
+### Verification
+- Re-read upstream `ApplyLUT`, `LOP3`, `GetLut48`, `LOP3_reg`, `LOP3_cbuf`,
+  `LOP3_imm`, `PredicateOperation`, and `GetImm20` after implementation.
+- The four MK8D words `0x3CF8218FFFF70003`, `0x3CF8210FFFF70102`,
+  `0x3CF8208FFFF70401`, and `0x3CF8200FFFF70500` decode LUT `0xF8` from bits
+  48-55 instead of the unrelated `0xFF` field at bits 28-35.
+- Focused tests verify the field selection and emitted `BitwiseAnd32` plus
+  `BitwiseOr32` expression. Post-optimization IR for both affected fragment
+  shaders retains dynamic packed outputs rather than four constant
+  `0xFFFFFFFF` values.
+- The complete release suite runs 282 tests; all LOP3 and translation tests
+  pass. The unrelated, unchanged GLSL precolor test
+  `precolor_appends_all_phi_moves_before_references_and_recounts_uses` still
+  fails because its expected use count is 1 while the implementation reports
+  2.
+- An aligned MK8D character-selection run renders Mario and the kart with the
+  expected colors; the user confirmed the visual result.
+
+## 2026-07-22 - video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp
+
+### Intentional differences
+- None in the fragment/tiled cache barrier slice.
+
+### Unintentional differences (to fix)
+- None after this change. Rust previously replayed pending scheduler commands
+  for both guest barriers. Upstream `FragmentBarrier` instead requests an
+  outside-render-pass context, which ends the active render pass and emits its
+  attachment visibility barrier; upstream `TiledCacheBarrier` is empty.
+
+### Missing items
+- None in these two rasterizer methods. This entry does not claim completion
+  of the surrounding Vulkan scheduler or compute pipeline.
+
+### Binary layout verification
+- N/A: command ordering only; no serialized or guest-visible layout changed.
+
+### Verification
+- Re-read upstream `RasterizerVulkan::FragmentBarrier`,
+  `RasterizerVulkan::TiledCacheBarrier`, and `Scheduler::EndRenderPass` after
+  implementation.
+
+## 2026-07-22 - video_core/src/renderer_vulkan/{scheduler.rs,mod.rs,texture_cache.rs} vs video_core/renderer_vulkan/{vk_scheduler.cpp,vk_rasterizer.cpp,vk_graphics_pipeline.cpp,vk_texture_cache.cpp}
+
+### Intentional differences
+- Rust scheduler records boxed closures and replays each chunk synchronously
+  before handing queue submission to `SubmitWorker`; upstream moves the whole
+  chunk replay to `Scheduler::WorkerThread`. Commands now share the same
+  logical `Scheduler::Record` stream, but worker ownership is still different.
+- Pipeline construction is awaited by the Rust producer before recording the
+  configure closure. Upstream records a worker-side wait in
+  `GraphicsPipeline::ConfigureDraw`.
+
+### Unintentional differences (to fix)
+- The legacy quad/quad-strip geometry path still uploads through the reduced
+  backend's separate upload command buffer. Upstream records those buffer
+  operations in the single scheduler stream. The common buffer-cache geometry
+  path does not have this divergence.
+
+### Missing items
+- Full upstream scheduler worker ownership, including worker-side pipeline
+  waits and removal of the reduced backend's second upload command buffer.
+
+### Binary layout verification
+- N/A: command recording and execution ordering only.
+
+### Verification
+- Re-read upstream `Scheduler::RequestRenderpass`,
+  `RequestOutsideRenderPassOperationContext`, `UpdateGraphicsPipeline`,
+  `RasterizerVulkan::PrepareDraw`, `Draw`, `DrawIndirect`,
+  `GraphicsPipeline::ConfigureDraw`, `Image::UploadMemory`,
+  `TextureCacheRuntime::TransitionImageLayout`, and the empty
+  `InsertUploadMemoryBarrier` after implementation.
+- Render-pass begin/end, pipeline and descriptor binding, push constants,
+  dynamic state, clears, direct/indirect draws, image upload, and image-layout
+  transitions are now recorded in scheduler order instead of being emitted
+  directly around queued operations.
+- `cargo check -p video_core`, the three focused Vulkan scheduler tests, and a
+  release `ruzu-cmd` build passed during this slice.
+- MK8D reaches the character-selection screen without a new Vulkan crash.
+  Correctly aligned captures with exactly three automated A presses show that
+  Mario remains white under `dispatch_work`, `flush`, and `finish`; therefore
+  this real ordering-parity fix is not the root cause of that material defect.
+
+## 2026-07-22 - video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Upstream calls `PrepareImageView` directly from `VisitImageView`. The split
+  Rust cache cannot perform backend uploads or image copies from the common
+  metadata owner, so Vulkan performs the equivalent preparation when it
+  materializes the resolved sampled view.
+
+### Unintentional differences (to fix)
+- None after this change. Vulkan previously refreshed CPU-modified sampled
+  images conditionally but omitted upstream's unconditional
+  `RefreshContents -> SynchronizeAliases -> LRU Touch` sequence.
+
+### Missing items
+- None in the sampled-image preparation slice. This entry does not claim
+  completion of the surrounding texture-cache runtime.
+
+### Binary layout verification
+- N/A: image lifecycle and copy ordering only.
+
+### Verification
+- Re-read upstream `FillImageViews`, `VisitImageView`, `PrepareImageView`,
+  `PrepareImage`, and `SynchronizeAliases` after implementation.
+- Added a focused ordering-contract test requiring sampled-image preparation
+  before backend image-view resolution.
+- Release `ruzu-cmd` builds successfully. An MK8D character-selection run with
+  exactly three automated A presses restored Mario, kart, lighting, and
+  pedestal colors that were previously white/saturated.
+- The focused test passes. The full `video_core` suite was attempted, but four
+  pre-existing `shader_cache` tests remained running past 60 seconds and the
+  suite hit its timeout; no failure from this texture-cache slice was reported.

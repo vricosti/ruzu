@@ -15,6 +15,8 @@ use sdl2::sys as sdl;
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+// Used only by the commented-out schedule_auto_{lr,a}_if_requested diagnostics.
+// use std::time::Duration;
 
 use hid_core::frontend::emulated_controller::set_simple_npad_button;
 use hid_core::hid_types::{KeyboardKeyIndex, NpadButton};
@@ -25,6 +27,102 @@ use ruzu_core::frontend::framebuffer_layout::{
 // SDL_TOUCH_MOUSEID is defined in SDL_touch.h as ((Uint32)-1).
 // It is not exported by sdl2-sys as a Rust constant, so we define it here.
 const SDL_TOUCH_MOUSEID: u32 = u32::MAX;
+
+// Environment-gated automated L+R / A input, kept commented out for future
+// title-screen / character-select diagnostics. Re-enable by uncommenting these
+// two functions and their call sites in `main.rs`.
+/*
+/// Schedule an environment-gated L+R press for frontend diagnostics.
+///
+/// This uses the same simple Player1 NPad bridge as keyboard events, avoiding
+/// host accessibility/automation permissions while testing title-screen input.
+pub fn schedule_auto_lr_if_requested() {
+    let Some(delay_ms) = std::env::var("RUZU_AUTO_LR_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let repeat_count = std::env::var("RUZU_AUTO_LR_REPEAT_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let repeat_ms = std::env::var("RUZU_AUTO_LR_REPEAT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2_000);
+
+    let _ = std::thread::Builder::new()
+        .name("AutoInput".to_string())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            for attempt in 1..=repeat_count {
+                log::info!("[AUTO_INPUT] pressing L+R attempt={attempt}/{repeat_count}");
+                set_simple_npad_button(NpadButton::L, true);
+                set_simple_npad_button(NpadButton::R, true);
+                std::thread::sleep(Duration::from_millis(350));
+                set_simple_npad_button(NpadButton::R, false);
+                set_simple_npad_button(NpadButton::L, false);
+                if attempt != repeat_count {
+                    std::thread::sleep(Duration::from_millis(repeat_ms));
+                }
+            }
+        });
+}
+
+/// Schedule environment-gated A presses for frontend diagnostics.
+///
+/// This is kept separate from the L+R trigger so a test can select the first
+/// highlighted Mii after the title-screen input has been accepted.
+pub fn schedule_auto_a_if_requested() {
+    let Some(delay_ms) = std::env::var("RUZU_AUTO_A_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let repeat_count = std::env::var("RUZU_AUTO_A_REPEAT_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let repeat_ms = std::env::var("RUZU_AUTO_A_REPEAT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2_000);
+    let marker = std::env::var_os("RUZU_AUTO_A_MARKER");
+    let marker_attempt = std::env::var("RUZU_AUTO_A_MARKER_ATTEMPT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(repeat_count);
+    let marker_delay_ms = std::env::var("RUZU_AUTO_A_MARKER_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(500);
+
+    let _ = std::thread::Builder::new()
+        .name("AutoInputA".to_string())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            for attempt in 1..=repeat_count {
+                log::info!("[AUTO_INPUT] pressing A attempt={attempt}/{repeat_count}");
+                set_simple_npad_button(NpadButton::A, true);
+                std::thread::sleep(Duration::from_millis(350));
+                set_simple_npad_button(NpadButton::A, false);
+                if attempt == marker_attempt {
+                    if let Some(path) = marker.as_ref() {
+                        std::thread::sleep(Duration::from_millis(marker_delay_ms));
+                        let _ = std::fs::write(path, b"ready\n");
+                    }
+                }
+                if attempt != repeat_count {
+                    std::thread::sleep(Duration::from_millis(repeat_ms));
+                }
+            }
+        });
+}
+*/
 
 /// A no-op graphics context used as a placeholder.
 /// Maps to C++ `DummyContext` in `emu_window_sdl2.h`.

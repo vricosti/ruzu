@@ -1309,6 +1309,10 @@ fn main() {
         signal(15, 0);
     }
 
+    // Kept for future title-screen / character-select input diagnostics; see the
+    // commented-out schedule_auto_{lr,a}_if_requested in emu_window_sdl2.rs.
+    // emu_window::emu_window_sdl2::schedule_auto_lr_if_requested();
+    // emu_window::emu_window_sdl2::schedule_auto_a_if_requested();
     log::info!("Entering main event loop");
     let poll_events_loop = std::env::var_os("RUZU_POLL_EVENTS_LOOP").is_some();
     match &mut emu_window {

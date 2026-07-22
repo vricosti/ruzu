@@ -367,6 +367,23 @@ impl MaxwellDMA {
         Some(unsafe { handle.with_mut(f) })
     }
 
+    /// Notify the rasterizer about a GPU-virtual source range.
+    ///
+    /// Upstream performs this through `GpuGuestMemory`, which delegates to
+    /// `MemoryManager::FlushRegion` and translates the range to `DAddr`
+    /// segments before reaching the rasterizer.
+    fn flush_gpu_region(&self, gpu_addr: u64, size: u64) {
+        self.memory_manager.lock().flush_region(gpu_addr, size);
+    }
+
+    /// Notify the rasterizer about a GPU-virtual destination range.
+    ///
+    /// This is the explicit Rust counterpart of the cached-write
+    /// `GpuGuestMemoryScoped` destructor used by upstream DMA fallbacks.
+    fn invalidate_gpu_region(&self, gpu_addr: u64, size: u64) {
+        self.memory_manager.lock().invalidate_region(gpu_addr, size);
+    }
+
     fn release_semaphore(&mut self) {
         let semaphore_type = self.launch_semaphore_type();
         match semaphore_type {
@@ -515,10 +532,8 @@ impl MaxwellDMA {
         let src_addr = self.src_addr();
         let dst_addr = self.dst_addr();
 
-        self.with_rasterizer_mut(|rasterizer| {
-            rasterizer.flush_region(src_addr, src_size as u64);
-            rasterizer.invalidate_region(dst_addr, dst_size as u64);
-        });
+        self.flush_gpu_region(src_addr, src_size as u64);
+        self.invalidate_gpu_region(dst_addr, dst_size as u64);
 
         let src = Self::read_gpu_range(read_gpu, src_addr, src_size);
         let mut dst = vec![0u8; dst_size];
@@ -625,10 +640,8 @@ impl MaxwellDMA {
         let src_addr = self.src_addr();
         let dst_addr = self.dst_addr();
 
-        self.with_rasterizer_mut(|rasterizer| {
-            rasterizer.flush_region(src_addr, src_size as u64);
-            rasterizer.invalidate_region(dst_addr, dst_size as u64);
-        });
+        self.flush_gpu_region(src_addr, src_size as u64);
+        self.invalidate_gpu_region(dst_addr, dst_size as u64);
 
         let src = Self::read_gpu_range(read_gpu, src_addr, src_size);
         let mut dst = vec![0u8; dst_size];
@@ -715,10 +728,8 @@ impl MaxwellDMA {
         let src_addr = self.src_addr();
         let dst_addr = self.dst_addr();
 
-        self.with_rasterizer_mut(|rasterizer| {
-            rasterizer.flush_region(src_addr, src_size as u64);
-            rasterizer.invalidate_region(dst_addr, dst_size as u64);
-        });
+        self.flush_gpu_region(src_addr, src_size as u64);
+        self.invalidate_gpu_region(dst_addr, dst_size as u64);
 
         let src = Self::read_gpu_range(read_gpu, src_addr, src_size);
         let mut intermediate = vec![0u8; mid_size];
@@ -805,6 +816,33 @@ impl MaxwellDMA {
     }
 
     fn collect_launch_writes(&mut self, read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
+        if let Some(target) = std::env::var("RUZU_TRACE_DMA_DADDR")
+            .ok()
+            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+        {
+            let memory_manager = self.memory_manager.lock();
+            if let Some(dst_device) = memory_manager.gpu_to_cpu_address(self.dst_addr()) {
+                let distance = dst_device.abs_diff(target);
+                if distance < 0x40_000 {
+                    log::warn!(
+                        "[DMA_DADDR] target=0x{:X} src_gpu=0x{:X} src_dev={:?} dst_gpu=0x{:X} dst_dev=0x{:X} launch=0x{:08X} line_length={} line_count={} pitch_in={} pitch_out={} src_pitch={} dst_pitch={} remap={}",
+                        target,
+                        self.src_addr(),
+                        memory_manager.gpu_to_cpu_address(self.src_addr()),
+                        self.dst_addr(),
+                        dst_device,
+                        self.launch_dma(),
+                        self.line_length(),
+                        self.line_count(),
+                        self.pitch_in(),
+                        self.pitch_out(),
+                        self.launch_src_is_pitch(),
+                        self.launch_dst_is_pitch(),
+                        self.launch_remap_enable(),
+                    );
+                }
+            }
+        }
         if self.launch_data_transfer_type() != LAUNCH_DATA_TRANSFER_NON_PIPELINED {
             self.stop_unimplemented_dma_path("data_transfer_type is not NON_PIPELINED");
         }
@@ -833,9 +871,7 @@ impl MaxwellDMA {
                 for _ in 0..ll {
                     data.extend_from_slice(&value.to_le_bytes());
                 }
-                self.with_rasterizer_mut(|rasterizer| {
-                    rasterizer.invalidate_region(dst_addr, data.len() as u64);
-                });
+                self.invalidate_gpu_region(dst_addr, data.len() as u64);
                 log::debug!(
                     "MaxwellDMA: single-line remap CONST_A clear executed {} words value=0x{:X} dst=0x{:X}",
                     ll,
@@ -862,16 +898,12 @@ impl MaxwellDMA {
                     let mut data = Vec::with_capacity(ll as usize);
                     for offset in (0..ll).step_by(16) {
                         let source = convert_linear_2_blocklinear_addr(src_addr + offset as u64);
-                        self.with_rasterizer_mut(|rasterizer| {
-                            rasterizer.flush_region(source, 16);
-                        });
+                        self.flush_gpu_region(source, 16);
                         let mut chunk = [0u8; 16];
                         read_gpu(source, &mut chunk);
                         data.extend_from_slice(&chunk);
                     }
-                    self.with_rasterizer_mut(|rasterizer| {
-                        rasterizer.invalidate_region(dst_addr, ll as u64);
-                    });
+                    self.invalidate_gpu_region(dst_addr, ll as u64);
                     log::debug!(
                         "MaxwellDMA: single-line blocklinear->pitch copy executed {} bytes src=0x{:X} -> dst=0x{:X}",
                         ll,
@@ -886,18 +918,14 @@ impl MaxwellDMA {
                 }
 
                 if is_src_pitch && !is_dst_pitch {
-                    self.with_rasterizer_mut(|rasterizer| {
-                        rasterizer.flush_region(src_addr, ll as u64);
-                    });
+                    self.flush_gpu_region(src_addr, ll as u64);
                     let mut writes = Vec::with_capacity((ll / 16) as usize);
                     for offset in (0..ll).step_by(16) {
                         let source = src_addr + offset as u64;
                         let dest = convert_linear_2_blocklinear_addr(dst_addr + offset as u64);
                         let mut data = vec![0u8; 16];
                         read_gpu(source, &mut data);
-                        self.with_rasterizer_mut(|rasterizer| {
-                            rasterizer.invalidate_region(dest, 16);
-                        });
+                        self.invalidate_gpu_region(dest, 16);
                         writes.push(PendingWrite { gpu_va: dest, data });
                     }
                     log::debug!(
@@ -921,12 +949,8 @@ impl MaxwellDMA {
                 return vec![];
             }
 
-            self.with_rasterizer_mut(|rasterizer| {
-                rasterizer.flush_region(src_addr, ll as u64);
-            });
-            self.with_rasterizer_mut(|rasterizer| {
-                rasterizer.invalidate_region(dst_addr, ll as u64);
-            });
+            self.flush_gpu_region(src_addr, ll as u64);
+            self.invalidate_gpu_region(dst_addr, ll as u64);
 
             let mut data = vec![0u8; ll as usize];
             read_gpu(src_addr, &mut data);
@@ -988,14 +1012,10 @@ impl MaxwellDMA {
         // target contents may still live only in the texture cache, so flush
         // the source range through the rasterizer before the CPU fallback copy.
         if src_span != 0 {
-            self.with_rasterizer_mut(|rasterizer| {
-                rasterizer.flush_region(src_addr, src_span);
-            });
+            self.flush_gpu_region(src_addr, src_span);
         }
         if dst_span != 0 {
-            self.with_rasterizer_mut(|rasterizer| {
-                rasterizer.invalidate_region(dst_addr, dst_span);
-            });
+            self.invalidate_gpu_region(dst_addr, dst_span);
         }
 
         let dst_size = dst_span as usize;
@@ -1273,6 +1293,25 @@ mod tests {
         MaxwellDMA::new(Arc::new(Mutex::new(MemoryManager::new(0))))
     }
 
+    fn bind_memory_rasterizer(
+        eng: &mut MaxwellDMA,
+        rasterizer: &dyn RasterizerInterface,
+        mappings: &[(u64, u64)],
+    ) {
+        eng.bind_rasterizer(rasterizer);
+        let mut memory_manager = eng.memory_manager.lock();
+        memory_manager.bind_rasterizer(rasterizer);
+        for &(gpu_addr, device_addr) in mappings {
+            memory_manager.map(
+                gpu_addr,
+                device_addr,
+                0x1000,
+                PteKind::PITCH.raw() as u32,
+                false,
+            );
+        }
+    }
+
     fn write_dma_params(eng: &mut MaxwellDMA, base: u32, params: dma::Parameters) {
         eng.write_reg(base, params.block_size.raw);
         eng.write_reg(base + 1, params.width);
@@ -1497,7 +1536,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
         let mut rasterizer = TestRasterizer::new(Arc::clone(&calls));
         rasterizer.accelerate_buffer_clear = true;
-        eng.bind_rasterizer(&rasterizer);
+        bind_memory_rasterizer(&mut eng, &rasterizer, &[(0x8000, 0x1_8000)]);
 
         eng.write_reg(DST_ADDR_HIGH, 0);
         eng.write_reg(DST_ADDR_LOW, 0x8000);
@@ -1520,7 +1559,7 @@ mod tests {
         );
         let calls = calls.lock();
         assert_eq!(calls.dma_buffer_clears, vec![(0x8000, 4, 0x1122_3344)]);
-        assert_eq!(calls.invalidations, vec![(0x8000, 16)]);
+        assert_eq!(calls.invalidations, vec![(0x1_8000, 16)]);
     }
 
     #[test]
@@ -2010,7 +2049,11 @@ mod tests {
         let mut eng = new_test_engine();
         let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
         let rasterizer = TestRasterizer::new(Arc::clone(&calls));
-        eng.bind_rasterizer(&rasterizer);
+        bind_memory_rasterizer(
+            &mut eng,
+            &rasterizer,
+            &[(0x1000, 0x2_1000), (0x8000, 0x2_8000)],
+        );
 
         eng.write_reg(SRC_ADDR_HIGH, 0);
         eng.write_reg(SRC_ADDR_LOW, 0x1000);
@@ -2030,8 +2073,8 @@ mod tests {
 
         assert_eq!(writes.len(), 1);
         let calls = calls.lock();
-        assert_eq!(calls.flushes, vec![(0x1000, 40)]);
-        assert_eq!(calls.invalidations, vec![(0x8000, 72)]);
+        assert_eq!(calls.flushes, vec![(0x2_1000, 40)]);
+        assert_eq!(calls.invalidations, vec![(0x2_8000, 72)]);
     }
 
     #[test]
