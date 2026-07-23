@@ -9,7 +9,6 @@
 //! Register writes are stored in a flat array and side-effect methods (clear,
 //! draw begin/end) are triggered on specific register writes.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -34,15 +33,6 @@ use shader_recompiler::shader_info::ReplaceConstant;
 struct Maxwell3DPtr(*mut Maxwell3D);
 
 unsafe impl Send for Maxwell3DPtr {}
-
-static MAXWELL3D_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
-static CBUF_BIND_SCAN_COUNT: AtomicU64 = AtomicU64::new(0);
-
-fn should_trace_dma_flow() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some())
-}
 
 impl Maxwell3DPtr {
     unsafe fn call_method(self, address: u32, value: u32) {
@@ -2404,10 +2394,6 @@ impl Maxwell3D {
     }
 
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
-        if std::env::var_os("RUZU_TRACE_RASTERIZER_BIND").is_some() {
-            let ptr = rasterizer as *const dyn RasterizerInterface;
-            log::info!("Maxwell3D::bind_rasterizer rasterizer_ptr={:p}", ptr);
-        }
         self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
         self.upload_state.bind_rasterizer(rasterizer);
     }
@@ -2727,50 +2713,14 @@ impl Maxwell3D {
     }
 
     fn process_inline_upload_word(&mut self, data: u32, is_last_call: bool) {
-        if should_trace_dma_flow() {
-            let trace_idx = MAXWELL3D_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-            if trace_idx < 160 {
-                log::info!(
-                    "Maxwell3D::process_inline_upload_word data=0x{:X} last={} target=0x{:X} size={} linear={}",
-                    data,
-                    is_last_call,
-                    self.upload_registers().dest.address(),
-                    self.upload_registers().line_length_in * self.upload_registers().line_count,
-                    self.launch_dma_is_linear()
-                );
-            }
-        }
         let regs = self.upload_registers();
         self.upload_state
             .process_data_word(&regs, data, is_last_call);
     }
 
     fn process_inline_upload_multi(&mut self, data: &[u32]) {
-        if should_trace_dma_flow() {
-            let trace_idx = MAXWELL3D_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-            if trace_idx < 160 {
-                log::info!(
-                    "Maxwell3D::process_inline_upload_multi words={} first=0x{:X} target=0x{:X} size={} linear={}",
-                    data.len(),
-                    data.first().copied().unwrap_or(0),
-                    self.upload_registers().dest.address(),
-                    self.upload_registers().line_length_in * self.upload_registers().line_count,
-                    self.launch_dma_is_linear()
-                );
-            }
-        }
         if self.memory_manager.is_none() {
             return;
-        }
-        let rasterizer_handle = self.rasterizer;
-        if std::env::var_os("RUZU_TRACE_INLINE_TO_MEMORY").is_some() {
-            log::info!(
-                "Maxwell3D::process_inline_upload_multi rasterizer_present={} rasterizer_ptr={:?} target=0x{:X} words={}",
-                rasterizer_handle.is_some(),
-                rasterizer_handle.map(|handle| handle.debug_data_ptr()),
-                self.upload_registers().dest.address(),
-                data.len()
-            );
         }
         let regs = self.upload_registers();
         self.upload_state.process_data_multi(&regs, data);
@@ -4052,23 +4002,6 @@ impl Maxwell3D {
             return;
         }
 
-        if std::env::var_os("RUZU_TRACE_PIPELINE_REGS").is_some() {
-            let pipeline_end = PIPELINE_BASE + PIPELINE_STRIDE * NUM_SHADER_PROGRAMS as u32;
-            if method >= PIPELINE_BASE && method < pipeline_end {
-                let rel = method - PIPELINE_BASE;
-                let stage = rel / PIPELINE_STRIDE;
-                let field = rel % PIPELINE_STRIDE;
-                log::info!(
-                    "Maxwell3D::pipeline_reg_write stage={} field=0x{:X} method=0x{:X} old=0x{:08X} new=0x{:08X}",
-                    stage,
-                    field,
-                    method,
-                    self.regs[idx],
-                    argument
-                );
-            }
-        }
-
         self.regs[idx] = argument;
 
         for table in &self.dirty.tables {
@@ -4090,26 +4023,6 @@ impl Maxwell3D {
         nonshadow_argument: u32,
         is_last_call: bool,
     ) {
-        if should_trace_dma_flow() {
-            match method {
-                WAIT_FOR_IDLE
-                | REPORT_SEMAPHORE_QUERY
-                | SYNC_INFO
-                | LAUNCH_DMA
-                | FRAGMENT_BARRIER
-                | INVALIDATE_TEXTURE_DATA_CACHE
-                | TILED_CACHE_BARRIER => {
-                    log::info!(
-                        "Maxwell3D::process_method_call method=0x{:X} arg=0x{:X} nonshadow=0x{:X} last={}",
-                        method,
-                        argument,
-                        nonshadow_argument,
-                        is_last_call
-                    );
-                }
-                _ => {}
-            }
-        }
         match method {
             WAIT_FOR_IDLE => {
                 let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.wait_for_idle());
@@ -4164,90 +4077,17 @@ impl Maxwell3D {
             }
             INVALIDATE_TEXTURE_DATA_CACHE => {
                 let _ = self.with_rasterizer_mut(|rasterizer| {
-                    if std::env::var_os("RUZU_TRACE_GL_FENCE_FLOW").is_some() {
-                        log::info!("Maxwell3D::invalidate_texture_data_cache invalidate begin");
-                    }
                     rasterizer.invalidate_gpu_cache();
-                    if std::env::var_os("RUZU_TRACE_GL_FENCE_FLOW").is_some() {
-                        log::info!("Maxwell3D::invalidate_texture_data_cache wait_idle begin");
-                    }
                     rasterizer.wait_for_idle();
-                    if std::env::var_os("RUZU_TRACE_GL_FENCE_FLOW").is_some() {
-                        log::info!("Maxwell3D::invalidate_texture_data_cache end");
-                    }
                 });
             }
             TILED_CACHE_BARRIER => {
                 let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.tiled_cache_barrier());
             }
             _ => {
-                let trace_all_draw_methods = std::env::var_os("RUZU_TRACE_DRAW_METHODS").is_some();
-                let trace_index_buffer_regs =
-                    std::env::var_os("RUZU_TRACE_INDEX_BUFFER_REGS").is_some();
-                let is_index_buffer_reg = (IB_BASE..=IB_BASE + IB_OFF_COUNT).contains(&method);
-                let trace_draw_method = (trace_all_draw_methods
-                    && (method == DRAW_BEGIN
-                        || method == DRAW_END
-                        || method == VB_FIRST
-                        || method == VB_COUNT
-                        || method == IB_BASE
-                        || method == IB_BASE + IB_OFF_FIRST
-                        || method == IB_BASE + IB_OFF_COUNT))
-                    || (trace_index_buffer_regs && (is_index_buffer_reg || method == DRAW_END));
-                if trace_draw_method {
-                    let state = self.draw_manager.get_draw_state();
-                    let ib_base = IB_BASE as usize;
-                    eprintln!(
-                        "[DRAW_METHOD_BEFORE] method=0x{:X} arg=0x{:X} last={} mode={:?} inst_count={} indexed={} vb_first={} vb_count={} ib_first={} ib_count={} ib_regs=[addr={:08X}_{:08X} limit={:08X}_{:08X} fmt=0x{:X} first={} count={}] execute_on={} shader_addrs={:X?}",
-                        method,
-                        argument,
-                        is_last_call,
-                        state.draw_mode,
-                        state.instance_count,
-                        state.draw_indexed,
-                        state.vertex_buffer.first,
-                        state.vertex_buffer.count,
-                        state.index_buffer.first,
-                        state.index_buffer.count,
-                        self.regs[ib_base + IB_OFF_ADDR_HIGH as usize],
-                        self.regs[ib_base + IB_OFF_ADDR_LOW as usize],
-                        self.regs[ib_base + IB_OFF_LIMIT_HIGH as usize],
-                        self.regs[ib_base + IB_OFF_LIMIT_LOW as usize],
-                        self.regs[ib_base + IB_OFF_FORMAT as usize],
-                        self.regs[ib_base + IB_OFF_FIRST as usize],
-                        self.regs[ib_base + IB_OFF_COUNT as usize],
-                        self.execute_on,
-                        self.shader_program_addresses(),
-                    );
-                }
                 self.with_draw_manager(|draw_manager, this| {
                     draw_manager.process_method_call(method, argument, this);
                 });
-                if trace_draw_method {
-                    let state = self.draw_manager.get_draw_state();
-                    let ib_base = IB_BASE as usize;
-                    eprintln!(
-                        "[DRAW_METHOD_AFTER] method=0x{:X} mode={:?} inst_count={} indexed={} vb_first={} vb_count={} ib_first={} ib_count={} ib_state_fmt={:?} ib_regs=[addr={:08X}_{:08X} limit={:08X}_{:08X} fmt=0x{:X} first={} count={}] execute_on={} shader_addrs={:X?}",
-                        method,
-                        state.draw_mode,
-                        state.instance_count,
-                        state.draw_indexed,
-                        state.vertex_buffer.first,
-                        state.vertex_buffer.count,
-                        state.index_buffer.first,
-                        state.index_buffer.count,
-                        state.index_buffer.format,
-                        self.regs[ib_base + IB_OFF_ADDR_HIGH as usize],
-                        self.regs[ib_base + IB_OFF_ADDR_LOW as usize],
-                        self.regs[ib_base + IB_OFF_LIMIT_HIGH as usize],
-                        self.regs[ib_base + IB_OFF_LIMIT_LOW as usize],
-                        self.regs[ib_base + IB_OFF_FORMAT as usize],
-                        self.regs[ib_base + IB_OFF_FIRST as usize],
-                        self.regs[ib_base + IB_OFF_COUNT as usize],
-                        self.execute_on,
-                        self.shader_program_addresses(),
-                    );
-                }
             }
         }
     }
@@ -4286,38 +4126,6 @@ impl Maxwell3D {
         let copy_size = data.len() as u32 * 4;
         let address = buffer_address.wrapping_add(offset as u64);
 
-        if std::env::var("RUZU_TRACE_CBDATA_ADDR")
-            .ok()
-            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
-            == Some(buffer_address)
-        {
-            log::info!(
-                "[CBDATA_WRITE] buffer=0x{:X} offset=0x{:X} words={:08X?}",
-                buffer_address,
-                offset,
-                data,
-            );
-        }
-
-        // Diagnostic (env-gated, behavior-preserving): detect when the guest
-        // pushes NaN-patterned float words through the inline constant-buffer
-        // upload. If a NaN-valued vertex transform cbuf is observed at draw
-        // time but no NaN word is logged here, the NaN was produced elsewhere
-        // (CPU-written memory, DMA, or compute) rather than the pushbuffer.
-        if std::env::var_os("RUZU_TRACE_CBDATA_NAN").is_some() {
-            for (i, value) in data.iter().enumerate() {
-                // IEEE-754 f32 NaN: exponent all ones, mantissa nonzero.
-                if (value & 0x7F80_0000) == 0x7F80_0000 && (value & 0x007F_FFFF) != 0 {
-                    log::warn!(
-                        "[CBDATA_NAN] cbuf addr=0x{:X} word_off=0x{:X} raw=0x{:08X}",
-                        address.wrapping_add(i as u64 * 4),
-                        offset + i as u32 * 4,
-                        value
-                    );
-                }
-            }
-        }
-
         if let Some(memory_manager) = self.memory_manager.as_ref().cloned() {
             let mut bytes = Vec::with_capacity(copy_size as usize);
             for value in data {
@@ -4329,107 +4137,6 @@ impl Maxwell3D {
 
         // Increment the current buffer position.
         self.regs[cb_base + 3] = offset.wrapping_add(copy_size);
-    }
-
-    fn trace_cbuf_bind_nan(&self, stage_index: usize, slot: usize, address: u64, size: u32) {
-        if std::env::var_os("RUZU_TRACE_CBUF_BIND_NAN").is_none() {
-            return;
-        }
-        let scan_count = CBUF_BIND_SCAN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        let scan_every = std::env::var("RUZU_TRACE_CBUF_BIND_SCAN_EVERY")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(1)
-            .max(1);
-        if scan_count % scan_every != 0 {
-            return;
-        }
-
-        let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
-            log::warn!(
-                "[CBUF_BIND_SCAN] stage={} slot={} addr=0x{:X} size=0x{:X} skipped=no_memory_manager",
-                stage_index,
-                slot,
-                address,
-                size
-            );
-            return;
-        };
-
-        let scan_size = size.min(0x1_0000) as usize;
-        if scan_size < 4 {
-            log::info!(
-                "[CBUF_BIND_SCAN] stage={} slot={} addr=0x{:X} size=0x{:X} scan=0x{:X} nan_words=0",
-                stage_index,
-                slot,
-                address,
-                size,
-                scan_size
-            );
-            return;
-        }
-
-        let mut bytes = vec![0u8; scan_size];
-        let read_ok = memory_manager.lock().read_block_unsafe(address, &mut bytes);
-        let mut nan_words = 0usize;
-        let mut first_nan = None;
-        let mut checksum = 0u64;
-        let mut nonzero_words = 0usize;
-        let verbose_nan_words = std::env::var_os("RUZU_TRACE_CBUF_BIND_NAN_VERBOSE").is_some();
-
-        for (word_index, chunk) in bytes.chunks_exact(4).enumerate() {
-            let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            checksum = checksum.wrapping_mul(16777619) ^ value as u64;
-            if value != 0 {
-                nonzero_words += 1;
-            }
-            if (value & 0x7F80_0000) == 0x7F80_0000 && (value & 0x007F_FFFF) != 0 {
-                nan_words += 1;
-                first_nan.get_or_insert((word_index, value));
-                if verbose_nan_words {
-                    log::warn!(
-                        "[CBUF_BIND_NAN] stage={} slot={} addr=0x{:X} word_off=0x{:X} raw=0x{:08X}",
-                        stage_index,
-                        slot,
-                        address.wrapping_add(word_index as u64 * 4),
-                        word_index * 4,
-                        value
-                    );
-                }
-            }
-        }
-
-        let first_nan_guest = first_nan.and_then(|(word_index, value)| {
-            let gpu_nan_addr = address.wrapping_add(word_index as u64 * 4);
-            let memory_manager = self.memory_manager.as_ref()?;
-            let memory_manager = memory_manager.lock();
-            let device_addr = memory_manager.gpu_to_cpu_address(gpu_nan_addr)?;
-            let backing = memory_manager
-                .device_memory()
-                .smmu_cpu_backing_for_address(device_addr)?;
-            Some((
-                gpu_nan_addr,
-                device_addr,
-                backing.asid(),
-                backing.virtual_address(),
-                value,
-            ))
-        });
-
-        log::info!(
-            "[CBUF_BIND_SCAN] stage={} slot={} addr=0x{:X} size=0x{:X} scan=0x{:X} read_ok={} nonzero_words={} nan_words={} first_nan={:?} first_nan_guest={:?} checksum=0x{:X}",
-            stage_index,
-            slot,
-            address,
-            size,
-            scan_size,
-            read_ok,
-            nonzero_words,
-            nan_words,
-            first_nan,
-            first_nan_guest,
-            checksum
-        );
     }
 
     /// Handle CB_BIND trigger for a shader stage. Matches upstream `ProcessCBBind`.
@@ -4468,17 +4175,6 @@ impl Maxwell3D {
                 address,
                 size
             );
-            self.trace_cbuf_bind_nan(stage_index, slot, address, size);
-            if (stage_index == 0 || stage_index == 4) && matches!(slot, 1 | 8 | 10) {
-                if let Some(memory_manager) = self.memory_manager.as_ref() {
-                    memory_manager.lock().register_cbuf_write_watch(
-                        stage_index,
-                        slot,
-                        address,
-                        size,
-                    );
-                }
-            }
             let _ = self.with_rasterizer_mut(|rasterizer| {
                 rasterizer.bind_graphics_uniform_buffer(stage_index, slot as u32, address, size)
             });
@@ -5190,9 +4886,6 @@ impl Maxwell3D {
     /// Handle sync point. Matches upstream `ProcessSyncPoint`.
     fn process_sync_point(&mut self) {
         let sync_point = self.regs[SYNC_INFO as usize] & 0xFFFF;
-        if std::env::var_os("RUZU_TRACE_GPU_SUBMIT").is_some() {
-            log::info!("Maxwell3D::process_sync_point sync_point={}", sync_point);
-        }
         log::debug!("Maxwell3D: sync_point {}", sync_point);
         let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.signal_sync_point(sync_point));
     }
@@ -5241,68 +4934,14 @@ impl Maxwell3D {
         // without creating an immutable/mutable alias or a stale clone.
         let mut params = std::mem::take(&mut self.macro_params);
         let macro_method = self.macro_positions[entry as usize];
-        if {
-            static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *F.get_or_init(|| std::env::var_os("RUZU_TRACE_MACRO_CALL").is_some())
-        } {
-            eprintln!(
-                "[MACRO_CALL] trigger=0x{:X} entry={} macro_start=0x{:X} param_count={} params={:08X?} addrs={:X?} segments={:X?} dirty={}",
-                method,
-                entry,
-                macro_method,
-                params.len(),
-                params,
-                self.macro_addresses,
-                self.macro_segments,
-                self.current_macro_dirty,
-            );
-        }
-        if should_trace_dma_flow() {
-            let trace_idx = MAXWELL3D_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-            if trace_idx < 128 {
-                log::info!(
-                    "Maxwell3D::call_macro_method entry={} macro_start=0x{:X} param_count={} params={:08X?} dirty={}",
-                    entry,
-                    macro_method,
-                    params.len(),
-                    params,
-                    self.current_macro_dirty
-                );
-            }
-        } else if macro_method == 0x14F {
-            log::info!(
-                "Maxwell3D::call_macro_method trace entry={} macro_start=0x{:X} params={:08X?} addrs={:X?} segments={:X?} dirty={}",
-                entry,
-                macro_method,
-                params,
-                self.macro_addresses,
-                self.macro_segments,
-                self.current_macro_dirty
-            );
-        }
         let self_raw = std::ptr::from_mut(self);
         let self_ptr = Maxwell3DPtr(self_raw);
         self.macro_engine.set_maxwell_3d(self_raw);
-        // Macro register-write trace. `RUZU_TRACE_MACRO_WRITE=1` prints every
-        // method+value pair the macro interpreter emits via `call_method`.
-        // Used to diagnose missing shader-pipeline configuration writes for
-        // MK8D — see project_mk8d_shader_uninitialized_2026_05_14.md.
-        let trace_macro_writes = {
-            static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *F.get_or_init(|| std::env::var_os("RUZU_TRACE_MACRO_WRITE").is_some())
-        };
-        let macro_start_for_trace = macro_method;
         let compile =
             move |code: &[u32]| -> Box<dyn crate::macro_engine::macro_engine::CachedMacro> {
                 let mut program = MacroInterpreterImpl::new(code.to_vec());
                 let writer_ptr = self_ptr;
                 program.set_method_writer(move |address, value, _is_last_call| {
-                    if trace_macro_writes {
-                        eprintln!(
-                            "[MACRO_WRITE] macro_start=0x{:X} method=0x{:X} value=0x{:08X}",
-                            macro_start_for_trace, address, value
-                        );
-                    }
                     unsafe {
                         writer_ptr.call_method(address, value);
                     }
@@ -5318,57 +4957,10 @@ impl Maxwell3D {
             compile,
         );
 
-        if std::env::var_os("RUZU_TRACE_ATTRACT_HDR_MACRO").is_some()
-            && self.shader_program_addresses()[1] == 0x400DE0030
-            && self.shader_program_addresses()[5] == 0x400DE0630
-        {
-            let draw = self.draw_manager.get_draw_state();
-            let live_index = dm::Maxwell3DAccess::index_buffer(self);
-            eprintln!(
-                "[ATTRACT_HDR_MACRO] macro=0x{:X} params={:08X?} draw_mode={:?} draw_indexed={} draw_first={} draw_count={} regs_first={} regs_count={} instances={} dirty={}",
-                macro_method,
-                &params[..params.len().min(16)],
-                draw.draw_mode,
-                draw.draw_indexed,
-                draw.index_buffer.first,
-                draw.index_buffer.count,
-                live_index.first,
-                live_index.count,
-                draw.instance_count,
-                self.current_macro_dirty,
-            );
-        }
-
         // Upstream calls draw_manager->DrawDeferred() here.
-        if std::env::var_os("RUZU_TRACE_DRAW_DEFERRED").is_some() {
-            let state = self.draw_manager.get_draw_state();
-            eprintln!(
-                "[DRAW_DEFERRED_BEFORE] macro_method=0x{:X} mode={:?} inst_count={} indexed={} vb_first={} vb_count={} ib_first={} ib_count={} shader_addrs={:X?}",
-                macro_method,
-                state.draw_mode,
-                state.instance_count,
-                state.draw_indexed,
-                state.vertex_buffer.first,
-                state.vertex_buffer.count,
-                state.index_buffer.first,
-                state.index_buffer.count,
-                self.shader_program_addresses(),
-            );
-        }
         self.with_draw_manager(|draw_manager, this| {
             draw_manager.draw_deferred(this);
         });
-        if std::env::var_os("RUZU_TRACE_DRAW_DEFERRED").is_some() {
-            let state = self.draw_manager.get_draw_state();
-            eprintln!(
-                "[DRAW_DEFERRED_AFTER] macro_method=0x{:X} mode={:?} inst_count={} indexed={} shader_addrs={:X?}",
-                macro_method,
-                state.draw_mode,
-                state.instance_count,
-                state.draw_indexed,
-                self.shader_program_addresses(),
-            );
-        }
 
         self.macro_params.clear();
         self.macro_addresses.clear();
@@ -5508,17 +5100,6 @@ impl EngineInterface for Maxwell3D {
     /// Write a single value to the register identified by `method`.
     /// Matches upstream `Maxwell3D::CallMethod`.
     fn call_method(&mut self, method: u32, method_argument: u32, is_last_call: bool) {
-        if should_trace_dma_flow() {
-            let trace_idx = MAXWELL3D_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-            if trace_idx < 96 {
-                log::info!(
-                    "Maxwell3D::call_method method=0x{:X} arg=0x{:X} last={}",
-                    method,
-                    method_argument,
-                    is_last_call
-                );
-            }
-        }
         // It is an error to write to a register other than the current macro's
         // ARG register before it has finished execution.
         if self.executing_macro != 0 {
