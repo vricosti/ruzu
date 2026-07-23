@@ -790,11 +790,6 @@ impl Gpu {
     /// Notify rasterizer of a CPU write.
     /// Matches upstream `GPU::Impl::OnCPUWrite(DAddr, u64)`.
     pub fn on_cpu_write(&self, _addr: DAddr, _size: u64) -> bool {
-        crate::host1x::gpu_device_memory_manager::trace_cbuf_device_watch_range(
-            "gpu_on_cpu_write",
-            _addr,
-            _size,
-        );
         let trace = should_trace_cpu_write(_addr, _size);
         if trace {
             log::warn!(
