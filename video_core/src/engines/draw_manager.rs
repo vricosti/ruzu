@@ -329,10 +329,17 @@ pub trait Maxwell3DAccess {
     }
 
     /// Dispatch a draw-texture operation through the bound rasterizer.
-    fn draw_texture_rasterizer(&mut self) -> bool {
+    fn draw_texture_rasterizer(
+        &mut self,
+        draw_state: &DrawState,
+        draw_texture_state: DrawTextureState,
+    ) -> bool {
         let mut dispatched = false;
         self.with_rasterizer_mut(&mut |rasterizer| {
-            rasterizer.draw_texture();
+            rasterizer.draw_texture(Maxwell3DDrawTextureView::new(
+                draw_state,
+                draw_texture_state,
+            ));
             dispatched = true;
         });
         dispatched
@@ -631,6 +638,11 @@ pub trait Maxwell3DAccess {
         0
     }
 
+    /// Read `regs.zpass_pixel_count_enable`.
+    fn zpass_pixel_count_enabled(&self) -> bool {
+        false
+    }
+
     /// Read texture header pool base address.
     fn tex_header_pool_address(&self) -> u64;
 
@@ -726,6 +738,7 @@ pub struct Maxwell3DDrawRegisters {
     pub transform_feedback_state: crate::transform_feedback::TransformFeedbackState,
     pub shader_config_enabled: [bool; NUM_SHADER_PROGRAMS],
     pub descriptor_sync_regs: crate::texture_cache::texture_cache_base::DescriptorSyncRegs,
+    pub zpass_pixel_count_enabled: bool,
     pub window_origin_lower_left: bool,
     pub window_origin_flip_y: bool,
     pub viewport0_scale_y: f32,
@@ -783,6 +796,7 @@ impl Default for Maxwell3DDrawRegisters {
             transform_feedback_state: Default::default(),
             shader_config_enabled: [false, true, false, false, false, false],
             descriptor_sync_regs: Default::default(),
+            zpass_pixel_count_enabled: false,
             window_origin_lower_left: false,
             window_origin_flip_y: false,
             viewport0_scale_y: 0.0,
@@ -862,6 +876,7 @@ impl Maxwell3DDrawRegisters {
                 tex_sampler_addr: maxwell3d.tex_sampler_pool_address(),
                 tex_sampler_limit: maxwell3d.tex_sampler_pool_limit(),
             },
+            zpass_pixel_count_enabled: maxwell3d.zpass_pixel_count_enabled(),
             window_origin_lower_left: maxwell3d.window_origin_lower_left(),
             window_origin_flip_y: maxwell3d.window_origin_flip_y(),
             viewport0_scale_y: maxwell3d.viewport_transform_scale_y(0),
@@ -1349,6 +1364,13 @@ impl<'a> Maxwell3DDrawView<'a> {
         }
     }
 
+    pub fn zpass_pixel_count_enabled(&self) -> bool {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.zpass_pixel_count_enabled(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.zpass_pixel_count_enabled,
+        }
+    }
+
     pub fn window_origin_lower_left(&self) -> bool {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.window_origin_lower_left(),
@@ -1793,6 +1815,67 @@ pub struct DrawTextureState {
     pub src_y1: f32,
     pub src_sampler: u32,
     pub src_texture: u32,
+}
+
+/// Draw-texture-time Maxwell3D view passed to rasterizers.
+///
+/// Upstream rasterizers read both `DrawManager::GetDrawTextureState()` and
+/// live Maxwell3D registers through their persistent `Maxwell3D*`. Rust
+/// carries the same data through the existing draw-view boundary instead of
+/// storing a movable engine pointer in the backend.
+pub struct Maxwell3DDrawTextureView<'a> {
+    draw_texture_state: DrawTextureState,
+    draw_view: Maxwell3DDrawView<'a>,
+}
+
+impl<'a> Maxwell3DDrawTextureView<'a> {
+    pub fn new(draw_state: &'a DrawState, draw_texture_state: DrawTextureState) -> Self {
+        Self {
+            draw_texture_state,
+            draw_view: Maxwell3DDrawView::new(draw_state),
+        }
+    }
+
+    pub fn live(
+        draw_state: &'a DrawState,
+        draw_texture_state: DrawTextureState,
+        maxwell3d: &'a mut dyn Maxwell3DAccess,
+    ) -> Self {
+        Self {
+            draw_texture_state,
+            draw_view: Maxwell3DDrawView::live(draw_state, maxwell3d),
+        }
+    }
+
+    pub fn draw_texture_state(&self) -> DrawTextureState {
+        self.draw_texture_state
+    }
+
+    pub fn draw_call_snapshot(&self) -> DrawCall {
+        self.draw_view.draw_call_snapshot(false, 1)
+    }
+
+    pub fn render_targets(&self) -> Maxwell3DRenderTargets {
+        self.draw_view.render_targets()
+    }
+
+    pub fn descriptor_sync_regs(
+        &self,
+    ) -> crate::texture_cache::texture_cache_base::DescriptorSyncRegs {
+        self.draw_view.descriptor_sync_regs()
+    }
+
+    pub fn dirty_flags(&self) -> [bool; 256] {
+        self.draw_view.dirty_flags()
+    }
+
+    pub fn clear_dirty_flag(&mut self, index: u8) {
+        self.draw_view.clear_dirty_flag(index);
+    }
+
+    pub fn zpass_pixel_count_enabled(&self) -> bool {
+        self.draw_view.zpass_pixel_count_enabled()
+    }
 }
 
 /// Raw draw-texture register payload from `Maxwell3D`.
@@ -2349,7 +2432,7 @@ impl DrawManager {
             (regs.dy_dv as f32 / 4_294_967_296.0) * dst_height + self.draw_texture_state.src_y0;
         self.draw_texture_state.src_sampler = regs.src_sampler;
         self.draw_texture_state.src_texture = regs.src_texture;
-        maxwell3d.draw_texture_rasterizer();
+        maxwell3d.draw_texture_rasterizer(&self.draw_state, self.draw_texture_state);
     }
 
     /// Update topology based on topology control mode and override.

@@ -412,6 +412,7 @@ const CLEAR_REPORT_VALUE: u32 = reg_index!(0x1530);
 pub(crate) const ZETA_ENABLE: u32 = reg_index!(0x1538);
 /// Upstream `regs.anti_alias_samples_mode`.
 pub(crate) const ANTI_ALIAS_SAMPLES_MODE: u32 = reg_index!(0x15D0);
+const ZPASS_PIXEL_COUNT_ENABLE: u32 = reg_index!(0x1514);
 pub(crate) const ZETA_BASE: u32 = reg_index!(0x0FE0);
 pub(crate) const ZETA_SIZE_BASE: u32 = reg_index!(0x1228);
 /// Render enable block base: +0 addr_high, +1 addr_low, +2 mode.
@@ -3607,6 +3608,26 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         true
     }
 
+    fn draw_texture_rasterizer(
+        &mut self,
+        draw_state: &dm::DrawState,
+        draw_texture_state: dm::DrawTextureState,
+    ) -> bool {
+        let Some(handle) = self.rasterizer else {
+            return false;
+        };
+        unsafe {
+            handle.with_mut(|rasterizer| {
+                rasterizer.draw_texture(dm::Maxwell3DDrawTextureView::live(
+                    draw_state,
+                    draw_texture_state,
+                    self,
+                ));
+            });
+        }
+        true
+    }
+
     fn clear_rasterizer(&mut self, layer_count: u32) -> bool {
         let Some(handle) = self.rasterizer else {
             return false;
@@ -3897,6 +3918,10 @@ impl dm::Maxwell3DAccess for Maxwell3D {
 
     fn anti_alias_samples_mode(&self) -> u32 {
         self.anti_alias_samples_mode()
+    }
+
+    fn zpass_pixel_count_enabled(&self) -> bool {
+        self.regs[ZPASS_PIXEL_COUNT_ENABLE as usize] != 0
     }
 
     fn tex_header_pool_address(&self) -> u64 {
@@ -4941,10 +4966,8 @@ impl Maxwell3D {
             move |code: &[u32]| -> Box<dyn crate::macro_engine::macro_engine::CachedMacro> {
                 let mut program = MacroInterpreterImpl::new(code.to_vec());
                 let writer_ptr = self_ptr;
-                program.set_method_writer(move |address, value, _is_last_call| {
-                    unsafe {
-                        writer_ptr.call_method(address, value);
-                    }
+                program.set_method_writer(move |address, value, _is_last_call| unsafe {
+                    writer_ptr.call_method(address, value);
                 });
                 let reader_ptr = self_ptr;
                 program.set_method_reader(move |method| unsafe { reader_ptr.read_reg(method) });
@@ -5316,7 +5339,10 @@ mod tests {
                 .draw_registers
                 .push(draw_view.registers());
         }
-        fn draw_texture(&mut self) {
+        fn draw_texture(
+            &mut self,
+            _draw_texture_view: crate::engines::draw_manager::Maxwell3DDrawTextureView<'_>,
+        ) {
             self.calls.lock().unwrap().draw_texture += 1;
         }
         fn clear(

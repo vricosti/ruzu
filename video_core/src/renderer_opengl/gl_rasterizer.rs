@@ -3328,10 +3328,12 @@ impl RasterizerOpenGL {
         }
 
         let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
-        let framebuffer_view = unsafe {
-            let _texture_lock = (*texture_cache).base.mutex.lock();
-            (*texture_cache).try_find_framebuffer_image_view(config, framebuffer_addr)
-        };
+        // Match upstream's scoped_lock lifetime: the selected image/view must
+        // remain owned by the same slot until all returned handles and size
+        // metadata have been consumed.
+        let _texture_lock = unsafe { (*texture_cache).base.mutex.lock() };
+        let framebuffer_view =
+            unsafe { (*texture_cache).try_find_framebuffer_image_view(config, framebuffer_addr) };
 
         let Some(framebuffer_view) = framebuffer_view else {
             if trace_present_path {
@@ -7673,7 +7675,10 @@ impl RasterizerInterface for RasterizerOpenGL {
         self.tick_gpu_work();
     }
 
-    fn draw_texture(&mut self) {
+    fn draw_texture(
+        &mut self,
+        _draw_texture_view: crate::engines::draw_manager::Maxwell3DDrawTextureView<'_>,
+    ) {
         debug!("RasterizerOpenGL::draw_texture");
         self.tick_gpu_work();
     }

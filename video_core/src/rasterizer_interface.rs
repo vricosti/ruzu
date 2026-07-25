@@ -108,7 +108,10 @@ pub trait RasterizerInterface {
     fn draw_indirect(&mut self, _indirect_view: Maxwell3DIndirectView<'_>) {}
 
     /// Dispatch a draw texture invocation.
-    fn draw_texture(&mut self);
+    fn draw_texture(
+        &mut self,
+        draw_texture_view: crate::engines::draw_manager::Maxwell3DDrawTextureView<'_>,
+    );
 
     /// Clear the current framebuffer.
     fn clear(&mut self, clear_view: Maxwell3DClearView<'_>, layer_count: u32);

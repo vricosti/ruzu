@@ -44,8 +44,9 @@ use crate::textures::workers::ThreadWorker;
 use shader_recompiler::shader_info::{ImageFormat, TextureType};
 
 use super::blit_image::{
-    BlitFramebufferInfo, BlitImageHelper, ConversionImageView, Filter as BlitFilter,
-    Offset2D as BlitOffset2D, Operation as BlitOperation, Region2D as BlitRegion2D,
+    BlitFramebufferInfo, BlitImageHelper, ConversionImageView, Extent3D as BlitExtent3D,
+    Filter as BlitFilter, Offset2D as BlitOffset2D, Operation as BlitOperation,
+    Region2D as BlitRegion2D,
 };
 use super::compute_pass::{AstcDecoderPass, MsaaCopyPass};
 use super::descriptor_pool::{DescriptorBankInfo as PoolDescriptorBankInfo, DescriptorPool};
@@ -233,7 +234,7 @@ impl Image {
             let framebuffer = match runtime.create_blit_color_framebuffer(
                 self.handle(),
                 view,
-                self.format,
+                self.base.info.format,
                 extent,
             ) {
                 Ok(framebuffer) => framebuffer,
@@ -408,7 +409,7 @@ impl Image {
             let framebuffer = match runtime.create_blit_depth_stencil_framebuffer(
                 self.handle(),
                 view,
-                self.format,
+                self.base.info.format,
                 extent,
             ) {
                 Ok(framebuffer) => framebuffer,
@@ -819,10 +820,21 @@ pub struct RenderTargetFramebuffer {
     pub num_color: u32,
     pub has_depth: bool,
     pub has_stencil: bool,
+    pub is_rescaled: bool,
     pub images: Vec<vk::Image>,
     pub image_ranges: Vec<vk::ImageSubresourceRange>,
     pub image_ids: Vec<ImageId>,
     rt_map: [u8; NUM_RT],
+}
+
+/// Vulkan resources returned by upstream
+/// `TextureCache::GetImageView(draw_texture_state.src_texture)`.
+#[derive(Debug, Clone, Copy)]
+pub struct DrawTextureSource {
+    pub image_view: vk::ImageView,
+    pub image: vk::Image,
+    pub size: BlitExtent3D,
+    pub is_rescaled: bool,
 }
 
 impl RenderTargetFramebuffer {
@@ -854,13 +866,6 @@ impl RenderTargetFramebuffer {
             num_images,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct RenderTargetImageInfo {
-    pub image: vk::Image,
-    pub width: u32,
-    pub height: u32,
 }
 
 pub struct FramebufferImageViewVulkan {
@@ -1078,6 +1083,8 @@ pub struct TextureCacheRuntime {
     sentenced_resources: Vec<SentencedVkResource>,
     current_tick: u64,
     optimal_bcn_supported: bool,
+    optimal_astc_supported: bool,
+    image_format_list_supported: bool,
     custom_border_color_supported: bool,
 }
 
@@ -1095,6 +1102,8 @@ impl TextureCacheRuntime {
         render_pass_cache: &mut RenderPassCache,
         descriptor_pool: &mut DescriptorPool,
         compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
+        image_format_list_supported: bool,
+        optimal_astc_supported: bool,
         custom_border_color_supported: bool,
     ) -> Self {
         let device_memory_info = query_device_memory_info(&instance, physical_device);
@@ -1136,7 +1145,7 @@ impl TextureCacheRuntime {
             None
         };
         let shader_stencil_export_supported = blit_image_helper.shader_stencil_export_supported();
-        Self {
+        let mut runtime = Self {
             device,
             instance,
             physical_device,
@@ -1158,7 +1167,45 @@ impl TextureCacheRuntime {
             sentenced_resources: Vec::new(),
             current_tick: 0,
             optimal_bcn_supported,
+            optimal_astc_supported,
+            image_format_list_supported,
             custom_border_color_supported,
+        };
+        runtime.initialize_view_formats();
+        runtime
+    }
+
+    /// Port of `TextureCacheRuntime`'s `view_formats` initialization.
+    ///
+    /// Upstream creates each backend image in its `ImageInfo` format and
+    /// advertises every compatible view format through
+    /// `VkImageFormatListCreateInfo`. Views may then reinterpret the same
+    /// allocation without recreating the image and losing GPU-only contents.
+    fn initialize_view_formats(&mut self) {
+        if !self.image_format_list_supported {
+            return;
+        }
+        for image_index in 0..crate::surface::MAX_PIXEL_FORMAT {
+            // SAFETY: `PixelFormat` is contiguous from zero through
+            // `MAX_PIXEL_FORMAT`, matching upstream's enum/table contract.
+            let image_format =
+                unsafe { std::mem::transmute::<u32, PixelFormat>(image_index as u32) };
+            let mut formats = Vec::new();
+            if crate::surface::is_pixel_format_astc(image_format) && !self.optimal_astc_supported {
+                formats.push(vk::Format::A8B8G8R8_UNORM_PACK32);
+            }
+            for view_index in 0..crate::surface::MAX_PIXEL_FORMAT {
+                // SAFETY: same contiguous enum invariant as above.
+                let view_format =
+                    unsafe { std::mem::transmute::<u32, PixelFormat>(view_index as u32) };
+                if crate::surface::is_view_compatible(image_format, view_format, false, true) {
+                    let format = self.surface_format_info(view_format).format;
+                    if format != vk::Format::UNDEFINED && !formats.contains(&format) {
+                        formats.push(format);
+                    }
+                }
+            }
+            self.view_formats[image_index] = formats;
         }
     }
 
@@ -1980,9 +2027,13 @@ impl TextureCacheRuntime {
         if self.is_format_supported(wanted_format, wanted_usage, optimal) {
             return wanted_format;
         }
-        for &format in surface_format_alternatives(wanted_format) {
-            if self.is_format_supported(format, wanted_usage, optimal) {
-                return format;
+        if let Some(alternatives) =
+            crate::vulkan_common::vulkan_device::format_alternatives(wanted_format)
+        {
+            for &format in alternatives {
+                if self.is_format_supported(format, wanted_usage, optimal) {
+                    return format;
+                }
             }
         }
         wanted_format
@@ -2205,7 +2256,7 @@ impl TextureCacheRuntime {
     fn create_scaled_image(
         &mut self,
         info: &ImageInfo,
-        format: vk::Format,
+        _format: vk::Format,
     ) -> Result<AllocatedImage, vk::Result> {
         let is_2d = info.image_type == ImageType::E2D;
         let mut scaled_info = info.clone();
@@ -2213,7 +2264,7 @@ impl TextureCacheRuntime {
         if is_2d {
             scaled_info.size.height = self.resolution.scale_up_u32(info.size.height);
         }
-        self.create_image_from_info(&scaled_info, format)
+        self.create_image_from_info(&scaled_info)
     }
 
     fn blit_scale(
@@ -2384,14 +2435,19 @@ impl TextureCacheRuntime {
         });
     }
 
-    fn create_image_from_info(
-        &mut self,
-        info: &ImageInfo,
-        format: vk::Format,
-    ) -> Result<AllocatedImage, vk::Result> {
-        let mut format_info = self.surface_format_info(info.format);
-        format_info.format = format;
-        let image_info = make_image_create_info(info, format_info);
+    fn create_image_from_info(&mut self, info: &ImageInfo) -> Result<AllocatedImage, vk::Result> {
+        let format_info = self.surface_format_info(info.format);
+        let mut image_info = make_image_create_info(info, format_info);
+        let view_formats = self.view_formats[info.format as usize].clone();
+        let mut format_list = vk::ImageFormatListCreateInfo::builder()
+            .view_formats(&view_formats)
+            .build();
+        apply_image_format_list(
+            &mut image_info,
+            &mut format_list,
+            &view_formats,
+            self.image_format_list_supported,
+        );
         self.memory_allocator()
             .create_owned_image(&image_info)
             .map_err(|err| err.result)
@@ -2563,12 +2619,11 @@ impl TextureCacheRuntime {
         &mut self,
         image: vk::Image,
         view: vk::ImageView,
-        format: vk::Format,
+        format: PixelFormat,
         extent: vk::Extent2D,
     ) -> Result<BlitFramebufferInfo, vk::Result> {
         let mut rp_key = RenderPassKey::default();
         rp_key.color_formats[0] = format;
-        rp_key.num_color_attachments = 1;
         rp_key.samples = vk::SampleCountFlags::TYPE_1;
         let render_pass = self.render_pass_cache().get(&rp_key)?;
         let framebuffer = self.create_framebuffer(render_pass, &[view], extent)?;
@@ -2596,7 +2651,7 @@ impl TextureCacheRuntime {
         &mut self,
         image: vk::Image,
         view: vk::ImageView,
-        format: vk::Format,
+        format: PixelFormat,
         extent: vk::Extent2D,
     ) -> Result<BlitFramebufferInfo, vk::Result> {
         let rp_key = RenderPassKey {
@@ -2781,10 +2836,6 @@ pub struct TextureCache {
     /// upstream `slot_images` ownership.
     images: HashMap<ImageId, Image>,
 
-    /// Compatibility index for frontend/present paths that still arrive with a
-    /// CPU address. This is not the owning identity.
-    render_target_cpu_map: HashMap<u64, ImageId>,
-
     /// Assembled framebuffers keyed by the bound render-target set.
     framebuffers_by_render_targets: HashMap<RenderTargets, Framebuffer>,
 
@@ -2820,6 +2871,8 @@ impl TextureCache {
         render_pass_cache: &mut RenderPassCache,
         descriptor_pool: &mut DescriptorPool,
         compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
+        image_format_list_supported: bool,
+        optimal_astc_supported: bool,
         custom_border_color_supported: bool,
     ) -> Self {
         let mut base = CommonTextureCache::new(device_memory);
@@ -2835,6 +2888,8 @@ impl TextureCache {
             render_pass_cache,
             descriptor_pool,
             compute_pass_descriptor_queue,
+            image_format_list_supported,
+            optimal_astc_supported,
             custom_border_color_supported,
         );
         base.configure_device_memory_budget(runtime.get_device_local_memory());
@@ -2844,7 +2899,6 @@ impl TextureCache {
             channel_caches: ChannelSetupCaches::new(),
             framebuffers: HashMap::new(),
             images: HashMap::new(),
-            render_target_cpu_map: HashMap::new(),
             framebuffers_by_render_targets: HashMap::new(),
             image_views: HashMap::new(),
             samplers: HashMap::new(),
@@ -3426,11 +3480,7 @@ impl TextureCache {
     /// GPU addresses may have several live cache aliases. Diagnostics that
     /// search by address can therefore select a stale image instead of the
     /// framebuffer attachment used by the draw being inspected.
-    pub fn debug_dump_bound_color_rgba(
-        &mut self,
-        slot: usize,
-        path: &std::path::Path,
-    ) -> bool {
+    pub fn debug_dump_bound_color_rgba(&mut self, slot: usize, path: &std::path::Path) -> bool {
         let Some(&view_id) = self.base.render_targets.color_buffer_ids.get(slot) else {
             return false;
         };
@@ -3530,7 +3580,6 @@ impl TextureCache {
         // a single RT0 address with a synthesised depth buffer.
         let color_ids = self.base.render_targets.color_buffer_ids;
         let depth_id = self.base.render_targets.depth_buffer_id;
-
         // Upstream treats a render target with format 0 as DISABLED (the
         // per-target binding above already bound ImageViewId::default() for
         // it) and still renders depth-only — shadow maps and depth pre-pass
@@ -3550,7 +3599,7 @@ impl TextureCache {
         let base_size = self.base.render_targets.size;
 
         let mut recreated = false;
-        let mut colors: Vec<(usize, ImageViewId, vk::Format)> = Vec::new();
+        let mut colors: Vec<(usize, ImageViewId, PixelFormat)> = Vec::new();
         let mut color_views: Vec<vk::ImageView> = Vec::new();
         let mut extent = vk::Extent2D {
             width: base_size.width.max(1),
@@ -3565,28 +3614,26 @@ impl TextureCache {
             if !view.image_id.is_valid() || view.image_id == NULL_IMAGE_ID {
                 continue;
             }
-            let format = self.runtime.surface_format(view.format);
             let width = view.size.width.max(1);
             let height = view.size.height.max(1);
+            let image_format = self
+                .runtime
+                .surface_format(self.base.slot_images[view.image_id].info.format);
+            let image_aspect = image_aspect_mask(self.base.slot_images[view.image_id].info.format);
             // Per-draw fast path: only clone the ImageBase (six Vecs) and run
             // the full `ensure_image` when the backend image actually needs
             // (re)creation.
-            if !self.backend_image_matches(view.image_id, format, vk::ImageAspectFlags::COLOR) {
+            if !self.backend_image_matches(view.image_id, image_format, image_aspect) {
                 let image_base = self.base.slot_images[view.image_id].clone();
                 recreated |= self
-                    .ensure_image(
-                        view.image_id,
-                        &image_base,
-                        format,
-                        vk::ImageAspectFlags::COLOR,
-                    )
+                    .ensure_image(view.image_id, &image_base, image_format, image_aspect)
                     .ok()?;
             }
             self.ensure_image_view(view_id).ok()?;
             extent.width = extent.width.min(width);
             extent.height = extent.height.min(height);
             let view_handle = self.image_views.get(&view_id)?.render_target();
-            colors.push((rt_index, view_id, format));
+            colors.push((rt_index, view_id, view.format));
             color_views.push(view_handle);
         }
 
@@ -3594,16 +3641,14 @@ impl TextureCache {
             // The common cache did not register a colour view; fall back to
             // resolving RT0 directly by GPU address (parity with prior behaviour).
             let gpu_memory = self.base.channel_gpu_memory.as_ref()?.lock();
-            let cpu_addr = gpu_memory.gpu_to_cpu_address(rt0.address).or_else(|| {
+            let _cpu_addr = gpu_memory.gpu_to_cpu_address(rt0.address).or_else(|| {
                 let approx = (rt0.width as u64)
                     .saturating_mul(rt0.height as u64)
                     .saturating_mul(4);
                 gpu_memory.gpu_to_cpu_address_range(rt0.address, approx)
             })?;
             drop(gpu_memory);
-            let format = self.runtime.surface_format(
-                crate::surface::pixel_format_from_render_target_format(rt0.format),
-            );
+            let pixel_format = crate::surface::pixel_format_from_render_target_format(rt0.format);
             let width = rt0.width.max(1);
             let height = rt0.height.max(1);
             let image_id = self.base.render_targets.color_buffer_ids[0];
@@ -3612,8 +3657,10 @@ impl TextureCache {
             }
             let image_id = self.base.slot_image_views[image_id].image_id;
             let image_base = self.base.slot_images[image_id].clone();
+            let image_format = self.runtime.surface_format(image_base.info.format);
+            let image_aspect = image_aspect_mask(image_base.info.format);
             recreated |= self
-                .ensure_image(image_id, &image_base, format, vk::ImageAspectFlags::COLOR)
+                .ensure_image(image_id, &image_base, image_format, image_aspect)
                 .ok()?;
             self.ensure_image_view(self.base.render_targets.color_buffer_ids[0])
                 .ok()?;
@@ -3623,29 +3670,36 @@ impl TextureCache {
                 .image_views
                 .get(&self.base.render_targets.color_buffer_ids[0])?
                 .render_target();
-            colors.push((0, self.base.render_targets.color_buffer_ids[0], format));
+            colors.push((
+                0,
+                self.base.render_targets.color_buffer_ids[0],
+                pixel_format,
+            ));
             color_views.push(view_handle);
         }
 
-        let mut depth_format = vk::Format::UNDEFINED;
+        let mut depth_format = PixelFormat::Invalid;
         let mut depth_view: Option<vk::ImageView> = None;
         if depth_id.is_valid() && depth_id != NULL_IMAGE_VIEW_ID {
             let view = self.base.slot_image_views[depth_id].clone();
             if view.image_id.is_valid() && view.image_id != NULL_IMAGE_ID {
-                let format = self.runtime.surface_format(view.format);
-                let aspect = image_aspect_mask(view.format);
+                let image_format = self
+                    .runtime
+                    .surface_format(self.base.slot_images[view.image_id].info.format);
+                let image_aspect =
+                    image_aspect_mask(self.base.slot_images[view.image_id].info.format);
                 let width = view.size.width.max(1);
                 let height = view.size.height.max(1);
-                if !self.backend_image_matches(view.image_id, format, aspect) {
+                if !self.backend_image_matches(view.image_id, image_format, image_aspect) {
                     let image_base = self.base.slot_images[view.image_id].clone();
                     recreated |= self
-                        .ensure_image(view.image_id, &image_base, format, aspect)
+                        .ensure_image(view.image_id, &image_base, image_format, image_aspect)
                         .ok()?;
                 }
                 self.ensure_image_view(depth_id).ok()?;
                 extent.width = extent.width.min(width);
                 extent.height = extent.height.min(height);
-                depth_format = format;
+                depth_format = view.format;
                 depth_view = Some(self.image_views.get(&depth_id)?.render_target());
             }
         }
@@ -3675,14 +3729,11 @@ impl TextureCache {
         if !self.framebuffers_by_render_targets.contains_key(&key) {
             let mut rp_key = RenderPassKey::default();
             let max_colors = rp_key.color_formats.len();
-            let mut num_attachments = 0usize;
             for (rt_index, _, fmt) in colors.iter().take(max_colors) {
                 if *rt_index < max_colors {
                     rp_key.color_formats[*rt_index] = *fmt;
-                    num_attachments = num_attachments.max(*rt_index + 1);
                 }
             }
-            rp_key.num_color_attachments = num_attachments as u8;
             rp_key.depth_format = depth_format;
             let samples = colors
                 .first()
@@ -3717,6 +3768,7 @@ impl TextureCache {
             num_color: fb.num_color_buffers,
             has_depth: fb.has_depth,
             has_stencil: fb.has_stencil,
+            is_rescaled: fb.is_rescaled,
             images: fb.images[..fb.num_images].to_vec(),
             image_ranges: fb.image_ranges[..fb.num_images].to_vec(),
             image_ids: fb.image_ids.clone(),
@@ -3773,8 +3825,10 @@ impl TextureCache {
                     ImageInfo::from_render_target_info(&rt, render_targets.anti_alias_samples_mode);
                 let guest_size =
                     crate::texture_cache::util::calculate_guest_size_in_bytes(&info) as u64;
-                let cpu_addr = gpu_to_cpu(rt.address, guest_size)
-                    .unwrap_or_else(|| self.base.resolve_or_allocate_cpu_addr(rt.address, guest_size));
+                let cpu_addr = gpu_to_cpu(rt.address, guest_size).unwrap_or_else(|| {
+                    self.base
+                        .resolve_or_allocate_cpu_addr(rt.address, guest_size)
+                });
                 let image_id = self.find_or_insert_render_target_image_with_retry(
                     &info,
                     rt.address,
@@ -3800,7 +3854,8 @@ impl TextureCache {
                     let guest_size =
                         crate::texture_cache::util::calculate_guest_size_in_bytes(&info) as u64;
                     let cpu_addr = gpu_to_cpu(zeta.address, guest_size).unwrap_or_else(|| {
-                        self.base.resolve_or_allocate_cpu_addr(zeta.address, guest_size)
+                        self.base
+                            .resolve_or_allocate_cpu_addr(zeta.address, guest_size)
                     });
                     let image_id = self.find_or_insert_render_target_image_with_retry(
                         &info,
@@ -4098,7 +4153,6 @@ impl TextureCache {
             // tick. Dependent framebuffers are evicted by the caller's
             // `recreated` path (`evict_rt_framebuffers`).
             if let Some(old) = self.images.remove(&image_id) {
-                self.render_target_cpu_map.remove(&old.base.cpu_addr);
                 self.runtime.sentence_image(old);
             }
             let removed_view_ids: Vec<_> = self
@@ -4113,15 +4167,11 @@ impl TextureCache {
             }
             let image = self.make_image(image_id, image_base, format, aspect)?;
             self.base.slot_images[image_id].flags = image.base.flags;
-            self.render_target_cpu_map
-                .insert(image_base.cpu_addr, image_id);
             self.images.insert(image_id, image);
             return Ok(true);
         }
         let image = self.make_image(image_id, image_base, format, aspect)?;
         self.base.slot_images[image_id].flags = image.base.flags;
-        self.render_target_cpu_map
-            .insert(image_base.cpu_addr, image_id);
         self.images.insert(image_id, image);
         Ok(false)
     }
@@ -4133,9 +4183,7 @@ impl TextureCache {
         format: vk::Format,
         aspect: vk::ImageAspectFlags,
     ) -> Result<Image, vk::Result> {
-        let image = self
-            .runtime
-            .create_image_from_info(&image_base.info, format)?;
+        let image = self.runtime.create_image_from_info(&image_base.info)?;
         let image_handle = image.handle();
         let mut base = image_base.clone();
         self.apply_backend_image_flags(&mut base);
@@ -4224,8 +4272,6 @@ impl TextureCache {
             return;
         }
         for deletion in pending {
-            self.render_target_cpu_map
-                .retain(|_, &mut image_id| image_id != deletion.image_id);
             for view_id in deletion.image_view_ids {
                 self.remove_framebuffers_for_view(view_id);
                 if let Some(view) = self.image_views.remove(&view_id) {
@@ -4575,7 +4621,6 @@ impl TextureCache {
         if aliases.is_empty() {
             return true;
         }
-
         let mut most_recent_tick = image_snapshot.modification_tick;
         let mut any_modified = image_snapshot.flags.contains(ImageFlagBits::GPU_MODIFIED);
         let mut any_rescaled = image_snapshot.flags.contains(ImageFlagBits::RESCALED);
@@ -4683,8 +4728,8 @@ impl TextureCache {
             return None;
         }
         let image_base = self.base.slot_images[image_id].clone();
-        let aspect = image_view_aspect_mask(&view_base);
-        let format = self.runtime.surface_format(view_base.format);
+        let aspect = image_aspect_mask(image_base.info.format);
+        let format = self.runtime.surface_format(image_base.info.format);
         if aspect.is_empty()
             || self
                 .ensure_image(image_id, &image_base, format, aspect)
@@ -4734,12 +4779,11 @@ impl TextureCache {
             let color_views;
             let depth_view;
             if is_color {
-                rp_key.color_formats[0] = format;
-                rp_key.num_color_attachments = 1;
+                rp_key.color_formats[0] = view_base.format;
                 color_views = vec![view_handle];
                 depth_view = None;
             } else {
-                rp_key.depth_format = format;
+                rp_key.depth_format = view_base.format;
                 color_views = Vec::new();
                 depth_view = Some(view_handle);
             }
@@ -5829,8 +5873,6 @@ impl TextureCache {
             self.base.unregister_image(image_id);
         }
         let view_ids = self.base.slot_images[image_id].image_view_ids.clone();
-        self.render_target_cpu_map
-            .retain(|_, &mut target_id| target_id != image_id);
         for view_id in view_ids {
             self.remove_framebuffers_for_view(view_id);
             if let Some(view) = self.image_views.remove(&view_id) {
@@ -5890,13 +5932,6 @@ impl TextureCache {
         self.async_buffers_death_ring.clear();
     }
 
-    pub fn prepare_render_target_for_render(&mut self, cpu_addr: u64, cmd: vk::CommandBuffer) {
-        let Some(&image_id) = self.render_target_cpu_map.get(&cpu_addr) else {
-            return;
-        };
-        self.prepare_render_target_image_for_render(image_id, cmd);
-    }
-
     pub fn prepare_render_targets_for_render(
         &mut self,
         image_ids: &[ImageId],
@@ -5945,10 +5980,12 @@ impl TextureCache {
         }
     }
 
-    pub fn prepare_framebuffer_for_present(&mut self, cpu_addr: u64, cmd: vk::CommandBuffer) {
-        let Some(&image_id) = self.render_target_cpu_map.get(&cpu_addr) else {
-            return;
-        };
+    pub fn prepare_framebuffer_for_present(
+        &mut self,
+        image_id: ImageId,
+        cpu_addr: u64,
+        cmd: vk::CommandBuffer,
+    ) {
         let (image, old_layout) = self
             .images
             .get(&image_id)
@@ -6294,32 +6331,6 @@ impl TextureCache {
         }
     }
 
-    pub fn rt0_image_info(
-        &self,
-        render_targets: &crate::engines::draw_manager::Maxwell3DRenderTargets,
-    ) -> Option<RenderTargetImageInfo> {
-        let rt0 = render_targets.render_targets[0];
-        if rt0.address == 0 {
-            return None;
-        }
-        let gpu_memory = self.base.channel_gpu_memory.as_ref()?.lock();
-        let cpu_addr = gpu_memory.gpu_to_cpu_address(rt0.address).or_else(|| {
-            let approx_size = (rt0.width as u64)
-                .saturating_mul(rt0.height as u64)
-                .saturating_mul(4);
-            gpu_memory.gpu_to_cpu_address_range(rt0.address, approx_size)
-        })?;
-        drop(gpu_memory);
-
-        let image_id = *self.render_target_cpu_map.get(&cpu_addr)?;
-        let target = self.images.get(&image_id)?;
-        Some(RenderTargetImageInfo {
-            image: target.handle(),
-            width: target.base.info.size.width.max(1),
-            height: target.base.info.size.height.max(1),
-        })
-    }
-
     /// Port-facing subset of upstream `TextureCache<P>::TryFindFramebufferImageView`.
     pub fn try_find_framebuffer_image_view(
         &mut self,
@@ -6327,44 +6338,19 @@ impl TextureCache {
         cpu_addr: u64,
     ) -> Option<FramebufferImageViewVulkan> {
         self.finish_pending_backend_deletions();
-        if let Some(framebuffer_view) = self.base.try_find_framebuffer_image_view(config, cpu_addr)
-        {
-            self.ensure_image_view(framebuffer_view.view_id).ok()?;
-            let view = self.image_views.get(&framebuffer_view.view_id)?;
-            let target_image = view.image_handle();
-            let image_view = view.handle(TextureType::Color2D);
-            return Some(FramebufferImageViewVulkan {
-                width: framebuffer_view.view.size.width,
-                height: framebuffer_view.view.size.height,
-                common: framebuffer_view,
-                image: target_image,
-                image_view,
-            });
-        }
-
-        // Compatibility path while present still arrives by CPU address. The
-        // owning backend identity remains ImageId/ImageViewId; this only
-        // bridges display acceleration when the common CPU-range lookup cannot
-        // see a freshly backend-completed render target yet.
-        let image_id = *self.render_target_cpu_map.get(&cpu_addr)?;
-        let (&view_id, view) = self
-            .image_views
-            .iter()
-            .find(|(_, view)| view.base.image_id == image_id)?;
-        let framebuffer_view = FramebufferImageView {
-            view_id,
-            view: view.base.clone(),
-            scaled: self
-                .images
-                .get(&image_id)
-                .is_some_and(|image| image.is_rescaled()),
-        };
+        let framebuffer_view = self
+            .base
+            .try_find_framebuffer_image_view(config, cpu_addr)?;
+        self.ensure_image_view(framebuffer_view.view_id).ok()?;
+        let view = self.image_views.get(&framebuffer_view.view_id)?;
+        let target_image = view.image_handle();
+        let image_view = view.handle(TextureType::Color2D);
         Some(FramebufferImageViewVulkan {
             width: framebuffer_view.view.size.width,
             height: framebuffer_view.view.size.height,
             common: framebuffer_view,
-            image: view.image_handle(),
-            image_view: view.handle(TextureType::Color2D),
+            image: target_image,
+            image_view,
         })
     }
 
@@ -6518,6 +6504,44 @@ impl TextureCache {
         Some(sampler)
     }
 
+    /// Resolve and materialize the graphics TIC selected by Maxwell's
+    /// draw-texture state.
+    ///
+    /// This is the backend half of upstream `TextureCache::GetImageView(u32)`:
+    /// the common cache visits the graphics descriptor table, then the Vulkan
+    /// cache prepares the image and returns its render-target view.
+    pub fn draw_texture_source(
+        &mut self,
+        index: u32,
+        read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
+        cmd: vk::CommandBuffer,
+    ) -> Option<DrawTextureSource> {
+        let mut selected = [crate::texture_cache::texture_cache_base::ImageViewInOut {
+            index,
+            blacklist: false,
+            id: NULL_IMAGE_VIEW_ID,
+        }];
+        self.base.fill_graphics_image_views(&mut selected, false);
+        let view_id = selected[0].id;
+        if !view_id.is_valid() || view_id == NULL_IMAGE_VIEW_ID {
+            return None;
+        }
+        self.materialize_sampled_image_view(view_id, TextureType::Color2D, read_gpu_unsafe, cmd)?;
+        let view = self.image_views.get(&view_id)?;
+        let image_id = view.base.image_id;
+        let image = self.images.get(&image_id)?;
+        Some(DrawTextureSource {
+            image_view: view.render_target(),
+            image: view.image_handle(),
+            size: BlitExtent3D {
+                width: view.base.size.width,
+                height: view.base.size.height,
+                depth: view.base.size.depth,
+            },
+            is_rescaled: image.is_rescaled(),
+        })
+    }
+
     /// Materialize a common `ImageViewId` into a Vulkan image/view when the
     /// partial backend has not already created one. This is the Vulkan-owned
     /// half of upstream `ImageView::Handle(desc.type)` and intentionally stays
@@ -6538,18 +6562,11 @@ impl TextureCache {
         if !view_base.image_id.is_valid() || view_base.image_id == NULL_IMAGE_ID {
             return None;
         }
-        if !self
-            .finish_pending_backend_insertion_with_reader(view_base.image_id, read_gpu_unsafe)
-        {
+        if !self.finish_pending_backend_insertion_with_reader(view_base.image_id, read_gpu_unsafe) {
             return None;
         }
         self.finish_pending_join_copies_with_reader(read_gpu_unsafe);
-        if !self.prepare_image_with_reader(
-            view_base.image_id,
-            false,
-            false,
-            read_gpu_unsafe,
-        ) {
+        if !self.prepare_image_with_reader(view_base.image_id, false, false, read_gpu_unsafe) {
             return None;
         }
         if let Some(view) = self.image_view_handle(view_id, texture_type) {
@@ -6656,7 +6673,7 @@ impl TextureCache {
         &self,
         render_pass: vk::RenderPass,
         color_views: &[vk::ImageView],
-        colors: &[(usize, ImageViewId, vk::Format)],
+        colors: &[(usize, ImageViewId, PixelFormat)],
         depth_view: Option<vk::ImageView>,
         extent: vk::Extent2D,
         depth_id: ImageViewId,
@@ -6769,83 +6786,83 @@ unsafe fn cmd_transition_layout(
     new_layout: vk::ImageLayout,
     aspect: vk::ImageAspectFlags,
 ) {
-        let (src_access, src_stage, dst_access, dst_stage) = match (old_layout, new_layout) {
-            (vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL) => (
-                vk::AccessFlags::empty(),
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-            ),
-            (vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) => (
-                vk::AccessFlags::empty(),
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            ),
-            (vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL) => (
-                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags::TRANSFER_READ,
-                vk::PipelineStageFlags::TRANSFER,
-            ),
-            (vk::ImageLayout::UNDEFINED, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL) => (
-                vk::AccessFlags::empty(),
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
-            ),
-            (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) => (
-                vk::AccessFlags::TRANSFER_READ,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            ),
-            (vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::GENERAL) => (
-                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags::SHADER_READ,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-            ),
-            (vk::ImageLayout::GENERAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) => (
-                vk::AccessFlags::SHADER_READ,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            ),
-            _ => (
-                vk::AccessFlags::empty(),
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::AccessFlags::empty(),
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            ),
-        };
+    let (src_access, src_stage, dst_access, dst_stage) = match (old_layout, new_layout) {
+        (vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL) => (
+            vk::AccessFlags::empty(),
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+        ),
+        (vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) => (
+            vk::AccessFlags::empty(),
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        ),
+        (vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL) => (
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags::TRANSFER_READ,
+            vk::PipelineStageFlags::TRANSFER,
+        ),
+        (vk::ImageLayout::UNDEFINED, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL) => (
+            vk::AccessFlags::empty(),
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+        ),
+        (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) => (
+            vk::AccessFlags::TRANSFER_READ,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        ),
+        (vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::GENERAL) => (
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+        ),
+        (vk::ImageLayout::GENERAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) => (
+            vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        ),
+        _ => (
+            vk::AccessFlags::empty(),
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::AccessFlags::empty(),
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+        ),
+    };
 
-        let barrier = vk::ImageMemoryBarrier::builder()
-            .old_layout(old_layout)
-            .new_layout(new_layout)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: aspect,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .src_access_mask(src_access)
-            .dst_access_mask(dst_access)
-            .build();
+    let barrier = vk::ImageMemoryBarrier::builder()
+        .old_layout(old_layout)
+        .new_layout(new_layout)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: aspect,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .src_access_mask(src_access)
+        .dst_access_mask(dst_access)
+        .build();
 
-        device.cmd_pipeline_barrier(
-            cmd,
-            src_stage,
-            dst_stage,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[barrier],
-        );
+    device.cmd_pipeline_barrier(
+        cmd,
+        src_stage,
+        dst_stage,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &[barrier],
+    );
 }
 
 fn pixel_format_to_vk(format: PixelFormat) -> vk::Format {
@@ -6872,31 +6889,6 @@ fn pixel_format_to_vk(format: PixelFormat) -> vk::Format {
         PixelFormat::S8UintD24Unorm => vk::Format::D24_UNORM_S8_UINT,
         PixelFormat::D32FloatS8Uint => vk::Format::D32_SFLOAT_S8_UINT,
         _ => vk::Format::R8G8B8A8_UNORM,
-    }
-}
-
-fn surface_format_alternatives(format: vk::Format) -> &'static [vk::Format] {
-    match format {
-        vk::Format::S8_UINT => &[
-            vk::Format::D16_UNORM_S8_UINT,
-            vk::Format::D24_UNORM_S8_UINT,
-            vk::Format::D32_SFLOAT_S8_UINT,
-        ],
-        vk::Format::D24_UNORM_S8_UINT => &[
-            vk::Format::D32_SFLOAT_S8_UINT,
-            vk::Format::D16_UNORM_S8_UINT,
-        ],
-        vk::Format::D16_UNORM_S8_UINT => &[
-            vk::Format::D24_UNORM_S8_UINT,
-            vk::Format::D32_SFLOAT_S8_UINT,
-        ],
-        vk::Format::R5G6B5_UNORM_PACK16 => &[vk::Format::R5G6B5_UNORM_PACK16],
-        vk::Format::R16G16B16_SFLOAT => &[vk::Format::R16G16B16A16_SFLOAT],
-        vk::Format::R16G16B16_SSCALED => &[vk::Format::R16G16B16A16_SSCALED],
-        vk::Format::R8G8B8_SSCALED => &[vk::Format::R8G8B8A8_SSCALED],
-        vk::Format::R32G32B32_SFLOAT => &[vk::Format::R32G32B32A32_SFLOAT],
-        vk::Format::A4B4G4R4_UNORM_PACK16_EXT => &[vk::Format::R4G4B4A4_UNORM_PACK16],
-        _ => &[],
     }
 }
 
@@ -7077,6 +7069,31 @@ mod tests {
     use ash::vk::Handle;
 
     #[test]
+    fn compatible_reinterpretation_uses_mutable_image_format_list() {
+        assert!(crate::surface::is_view_compatible(
+            PixelFormat::A2B10G10R10Unorm,
+            PixelFormat::A8B8G8R8Unorm,
+            false,
+            true,
+        ));
+
+        let formats = [
+            vk::Format::A2B10G10R10_UNORM_PACK32,
+            vk::Format::A8B8G8R8_UNORM_PACK32,
+        ];
+        let mut format_list = vk::ImageFormatListCreateInfo::builder()
+            .view_formats(&formats)
+            .build();
+        let mut image_info = vk::ImageCreateInfo::default();
+        apply_image_format_list(&mut image_info, &mut format_list, &formats, true);
+
+        assert!(image_info
+            .flags
+            .contains(vk::ImageCreateFlags::MUTABLE_FORMAT));
+        assert!(!image_info.p_next.is_null());
+    }
+
+    #[test]
     fn sampled_view_prepares_image_before_resolving_backend_view() {
         let source = include_str!("texture_cache.rs");
         let function = source
@@ -7116,6 +7133,7 @@ mod tests {
             num_color: 2,
             has_depth: false,
             has_stencil: false,
+            is_rescaled: false,
             images: vec![vk::Image::from_raw(1), vk::Image::from_raw(2)],
             image_ranges: vec![color_range, color_range],
             image_ids: vec![ImageId { index: 1 }, ImageId { index: 2 }],
@@ -7836,6 +7854,21 @@ fn make_image_create_info(
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .build()
+}
+
+fn apply_image_format_list(
+    image_info: &mut vk::ImageCreateInfo,
+    format_list: &mut vk::ImageFormatListCreateInfo,
+    view_formats: &[vk::Format],
+    image_format_list_supported: bool,
+) {
+    if view_formats.len() <= 1 {
+        return;
+    }
+    image_info.flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
+    if image_format_list_supported {
+        image_info.p_next = (format_list as *mut vk::ImageFormatListCreateInfo).cast();
+    }
 }
 
 fn image_aspect_mask(format: PixelFormat) -> vk::ImageAspectFlags {

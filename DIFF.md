@@ -23527,3 +23527,62 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - The focused test passes. The full `video_core` suite was attempted, but four
   pre-existing `shader_cache` tests remained running past 60 seconds and the
   suite hit its timeout; no failure from this texture-cache slice was reported.
+## 2026-07-25 — video_core/src/renderer_vulkan/mod.rs and vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.h/.cpp
+
+### Intentional differences
+- `renderer_vulkan/mod.rs` is now only the Rust module index and public re-export surface. The upstream declarations and definitions share `vk_rasterizer.h/.cpp`; Rust keeps the `RasterizerVulkan` type, its constructor, helpers, trait implementation, destructor, and tests together in `vk_rasterizer.rs`.
+- Rasterizer entry points receive short-lived Maxwell draw views because ruzu does not store upstream's persistent `Maxwell3D*` in the backend. The views preserve the register/state reads at the same call boundary.
+- `GpuTickGuard` is the Rust `Drop` equivalent of upstream's `SCOPE_EXIT { gpu.TickWork(); }`.
+
+### Unintentional differences (to fix)
+- The legacy `render_draw_calls`/offscreen readback compatibility entry point has no direct upstream `RasterizerVulkan` equivalent. It remains used by ruzu's legacy `GpuContext` batch path and requires removal together with that caller, not relocation back to `mod.rs`.
+- Several pre-existing trait methods still have reduced behavior compared with upstream, including conditional rendering and some cache/barrier hooks. This structural move intentionally did not alter those execution paths.
+
+### Missing items
+- No ownership item from `mod.rs` remains: `mod.rs` contains no rasterizer method implementation.
+- Behavioral completion of the reduced hooks listed above remains separate from this ownership correction.
+
+### Binary layout verification
+- N/A: this change moves Rust source ownership only and does not change serialized or guest-visible layouts.
+
+## 2026-07-25 — Vulkan/OpenGL AccelerateDisplay lock lifetime vs vk_rasterizer.cpp/gl_rasterizer.cpp
+
+### Intentional differences
+- Rust uses a raw pointer to acquire the recursive texture-cache mutex without retaining a borrow of the complete rasterizer. The mutex still protects the same operation range as upstream.
+
+### Unintentional differences (fixed)
+- Fixed: Vulkan and OpenGL released `texture_cache.mutex` immediately after `TryFindFramebufferImageView`. Upstream holds the scoped lock until every returned image/view handle and size has been consumed. Vulkan could therefore observe a recycled `ImageId` between lookup and `PrepareFramebufferForPresent`.
+- The Vulkan failure was captured directly: `ImageId 15` selected for display changed from the 1920x1080 framebuffer to a 1620x1540 texture atlas for one presentation, then back to 1920x1080. The lock now prevents deletion/slot reuse across the complete operation.
+
+### Missing items
+- None for this lock-ordering slice.
+
+### Binary layout verification
+- N/A: synchronization lifetime only.
+
+### Verification
+- Re-read both upstream `RasterizerVulkan::AccelerateDisplay` and `RasterizerOpenGL::AccelerateDisplay`.
+- `cargo test -p video_core --lib --no-run` passes.
+- A 200-presentation MK8D burst synchronized to the ninth A press contained only 1920x1080 8-bit display images after the fix; the pre-fix burst contained the 1620x1540 atlas corruption.
+
+## 2026-07-25 — video_core/src/renderer_vulkan/{texture_cache.rs,vk_rasterizer.rs,renderer_vulkan.rs} vs video_core/renderer_vulkan/vk_texture_cache.cpp
+
+### Intentional differences
+- Rust deduplicates identical `VkFormat` values in each compatible-view list. Upstream stores one entry per compatible `PixelFormat`; duplicate Vulkan formats do not change the allowed view set.
+- Vulkan capability booleans are forwarded from the existing Rust `Device` owner into `TextureCacheRuntime` instead of retaining an upstream-style `Device&`.
+
+### Unintentional differences (fixed)
+- Fixed: render-target and blit-framebuffer materialization passed the image-view format to `ensure_image`. Binding an `A8B8G8R8` view of an `A2B10G10R10` image therefore destroyed and recreated the backend image repeatedly, losing GPU-only contents. Upstream always creates `Image` from `ImageInfo::format` and applies the reinterpretation only to `ImageView`.
+- Fixed: `TextureCacheRuntime::view_formats` was allocated but never populated, and images were never created with `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT` / `VkImageFormatListCreateInfo`. The runtime now builds the same compatible-format table as upstream and chains it during image creation.
+- Fixed: scaled and ordinary images now derive their creation format exclusively from `ImageInfo`, matching upstream `MakeImage`; callers cannot substitute a view format.
+
+### Missing items
+- None for mutable image-format creation and compatible image-view reinterpretation. This entry does not claim completion of the surrounding texture-cache runtime.
+
+### Binary layout verification
+- N/A: Vulkan object creation and view ownership only.
+
+### Verification
+- Re-read upstream `TextureCacheRuntime` construction, `MakeImageCreateInfo`, `MakeImage`, `Image::Image`, and `ImageView::ImageView` after implementation.
+- `cargo check -p video_core` passes.
+- Focused regression test `compatible_reinterpretation_uses_mutable_image_format_list` passes and verifies that `A2B10G10R10`/`A8B8G8R8` reinterpretation uses a mutable image plus a non-null format-list chain.

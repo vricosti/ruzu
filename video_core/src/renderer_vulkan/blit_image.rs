@@ -160,10 +160,26 @@ fn update_one_texture_descriptor_set(
     sampler: vk::Sampler,
     image_view: vk::ImageView,
 ) {
+    update_one_texture_descriptor_set_with_layout(
+        device,
+        descriptor_set,
+        sampler,
+        image_view,
+        vk::ImageLayout::GENERAL,
+    );
+}
+
+fn update_one_texture_descriptor_set_with_layout(
+    device: &ash::Device,
+    descriptor_set: vk::DescriptorSet,
+    sampler: vk::Sampler,
+    image_view: vk::ImageView,
+    image_layout: vk::ImageLayout,
+) {
     let image_info = vk::DescriptorImageInfo {
         sampler,
         image_view,
-        image_layout: vk::ImageLayout::GENERAL,
+        image_layout,
     };
     let write = vk::WriteDescriptorSet::builder()
         .dst_set(descriptor_set)
@@ -793,16 +809,114 @@ impl BlitImageHelper {
     /// Port of `BlitImageHelper::BlitColor` (explicit image + sampler variant).
     pub fn blit_color_with_sampler(
         &mut self,
-        _dst_framebuffer: vk::Framebuffer,
-        _src_image_view: vk::ImageView,
-        _src_image: vk::Image,
-        _src_sampler: vk::Sampler,
+        dst_framebuffer: BlitFramebufferInfo,
+        src_image_view: vk::ImageView,
+        src_image: vk::Image,
+        src_sampler: vk::Sampler,
         dst_region: &Region2D,
         src_region: &Region2D,
-        _src_size: &Extent3D,
-    ) {
-        let _push_constants = compute_push_constants(src_region, dst_region);
-        // Similar to blit_color but uses the provided sampler directly
+        src_size: &Extent3D,
+    ) -> bool {
+        let key = BlitImagePipelineKey {
+            renderpass: dst_framebuffer.render_pass,
+            operation: Operation::SrcCopy as u32,
+        };
+        let pipeline = match self.find_or_emplace_color_pipeline(&key) {
+            Ok(pipeline) => pipeline,
+            Err(err) => {
+                log::warn!("BlitImageHelper: failed to create draw-texture pipeline: {err:?}");
+                return false;
+            }
+        };
+        let descriptor_set = {
+            let descriptor_pool = unsafe { self.descriptor_pool.as_ref() };
+            match descriptor_pool
+                .allocate(self.one_texture_set_layout, &Self::ONE_TEXTURE_BANK_INFO)
+            {
+                Ok(set) => set,
+                Err(err) => {
+                    log::warn!(
+                        "BlitImageHelper: failed to allocate draw-texture descriptor set: {err:?}"
+                    );
+                    return false;
+                }
+            }
+        };
+        update_one_texture_descriptor_set_with_layout(
+            &self.device,
+            descriptor_set,
+            src_sampler,
+            src_image_view,
+            vk::ImageLayout::READ_ONLY_OPTIMAL,
+        );
+
+        let layout = self.one_texture_pipeline_layout;
+        let dst_region = *dst_region;
+        let src_region = *src_region;
+        let src_size = *src_size;
+        let device = self.device.clone();
+        let scheduler = unsafe { self.scheduler.as_mut() };
+        scheduler.request_outside_renderpass();
+        scheduler.record(move |cmdbuf| unsafe {
+            let access = vk::AccessFlags::COLOR_ATTACHMENT_READ
+                | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | vk::AccessFlags::SHADER_READ;
+            let barrier = vk::ImageMemoryBarrier::builder()
+                .src_access_mask(access)
+                .dst_access_mask(access)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(src_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .build();
+            device.cmd_pipeline_barrier(
+                cmdbuf,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+
+            let begin = vk::RenderPassBeginInfo::builder()
+                .render_pass(dst_framebuffer.render_pass)
+                .framebuffer(dst_framebuffer.framebuffer)
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: dst_framebuffer.render_area,
+                })
+                .build();
+            device.cmd_begin_render_pass(cmdbuf, &begin, vk::SubpassContents::INLINE);
+            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmdbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            bind_blit_state(
+                &device,
+                cmdbuf,
+                layout,
+                dst_region,
+                src_region,
+                Some(src_size),
+            );
+            device.cmd_draw(cmdbuf, 3, 1, 0, 0);
+            device.cmd_end_render_pass(cmdbuf);
+        });
+        true
     }
 
     /// Port of `BlitImageHelper::BlitDepthStencil`.

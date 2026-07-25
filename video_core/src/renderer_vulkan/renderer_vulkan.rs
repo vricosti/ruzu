@@ -413,6 +413,8 @@ impl RendererVulkan {
             device.must_emulate_scaled_formats(),
             device.is_ext_shader_stencil_export_supported(),
             device.is_timeline_semaphore_supported(),
+            device.is_khr_image_format_list_supported(),
+            device.is_optimal_astc_supported(),
             device.is_ext_custom_border_color_supported(),
             device.get_max_viewports(),
             device.get_max_vertex_input_bindings(),
@@ -1050,6 +1052,10 @@ impl RendererBase for RendererVulkan {
 
     fn set_gpu_ticks_getter(&mut self, getter: crate::renderer_base::GpuTicksGetter) {
         self.rasterizer.set_gpu_ticks_getter(getter);
+    }
+
+    fn set_gpu_tick_callback(&mut self, callback: crate::renderer_base::GpuTickCallback) {
+        self.rasterizer.set_gpu_tick_callback(callback);
     }
 }
 

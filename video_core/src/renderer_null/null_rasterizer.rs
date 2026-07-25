@@ -129,7 +129,10 @@ impl RasterizerInterface for RasterizerNull {
         trace!("RasterizerNull::draw (no-op)");
     }
 
-    fn draw_texture(&mut self) {
+    fn draw_texture(
+        &mut self,
+        _draw_texture_view: crate::engines::draw_manager::Maxwell3DDrawTextureView<'_>,
+    ) {
         trace!("RasterizerNull::draw_texture (no-op)");
     }
 
@@ -347,7 +350,10 @@ mod tests {
         let ds = crate::engines::draw_manager::DrawState::default();
         rast.draw(crate::engines::draw_manager::Maxwell3DDrawView::new(&ds), 1);
         rast.draw(crate::engines::draw_manager::Maxwell3DDrawView::new(&ds), 4);
-        rast.draw_texture();
+        rast.draw_texture(crate::engines::draw_manager::Maxwell3DDrawTextureView::new(
+            &ds,
+            crate::engines::draw_manager::DrawTextureState::default(),
+        ));
         rast.clear(
             crate::engines::draw_manager::Maxwell3DClearView::new(
                 crate::engines::draw_manager::ClearState::default(),

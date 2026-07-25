@@ -1272,7 +1272,11 @@ mod tests {
             _instance_count: u32,
         ) {
         }
-        fn draw_texture(&mut self) {}
+        fn draw_texture(
+            &mut self,
+            _draw_texture_view: crate::engines::draw_manager::Maxwell3DDrawTextureView<'_>,
+        ) {
+        }
         fn clear(
             &mut self,
             _clear_view: crate::engines::draw_manager::Maxwell3DClearView<'_>,

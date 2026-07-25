@@ -1171,7 +1171,11 @@ mod tests {
             _instance_count: u32,
         ) {
         }
-        fn draw_texture(&mut self) {}
+        fn draw_texture(
+            &mut self,
+            _draw_texture_view: crate::engines::draw_manager::Maxwell3DDrawTextureView<'_>,
+        ) {
+        }
         fn clear(&mut self, _clear_view: Maxwell3DClearView<'_>, _layer_count: u32) {}
         fn dispatch_compute(&mut self) {}
         fn reset_counter(&mut self, _query_type: u32) {}

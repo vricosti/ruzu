@@ -852,13 +852,25 @@ impl TextureCacheBase {
         if std::env::var_os("RUZU_TRACE_PRESENT_IMG").is_some() {
             let image = &self.slot_images[image_id];
             log::warn!(
-                "[PRESENT_IMG] cpu=0x{:X} candidates={} chosen_image={} view_id={} num_views_on_image={} all_image_ids={:?}",
+                "[PRESENT_IMG] cpu=0x{:X} gpu=0x{:X} candidates={} chosen_image={} view_id={} \
+                 num_views_on_image={} all_image_ids={:?} tick={} flags={:?} aliases={} overlaps={} \
+                 format={:?} size={}x{} guest_size={} unswizzled_size={}",
                 cpu_addr,
+                image.gpu_addr,
                 valid_image_ids.len(),
                 image_id.index,
                 view_id.index,
                 image.image_view_ids.len(),
                 valid_image_ids.iter().map(|i| i.index).collect::<Vec<_>>(),
+                image.modification_tick,
+                image.flags,
+                image.aliased_images.len(),
+                image.overlapping_images.len(),
+                image.info.format,
+                image.info.size.width,
+                image.info.size.height,
+                image.guest_size_bytes,
+                image.unswizzled_size_bytes,
             );
         }
         if common::trace::is_enabled(common::trace::cat::PRESENT_IMAGE_SELECT) {
@@ -1069,7 +1081,16 @@ impl TextureCacheBase {
 #[cfg(test)]
 mod tests {
     use super::TextureCacheBase;
+    use crate::framebuffer_config::FramebufferConfig;
     use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+    use crate::surface::PixelFormat;
+    use crate::texture_cache::image_base::ImageBase;
+    use crate::texture_cache::image_info::ImageInfo;
+    use crate::texture_cache::image_view_base::ImageViewBase;
+    use crate::texture_cache::image_view_info::ImageViewInfo;
+    use crate::texture_cache::types::{
+        Extent3D, ImageId, ImageType, ImageViewType, SubresourceRange,
+    };
     use std::sync::Arc;
 
     #[test]
@@ -1096,5 +1117,53 @@ mod tests {
         assert_eq!(cache.minimum_memory, 2 * 1024 * 1024 * 1024);
         assert_eq!(cache.expected_memory, 6_012_954_215);
         assert_eq!(cache.critical_memory, 7_730_941_133);
+    }
+
+    #[test]
+    fn framebuffer_lookup_uses_most_recent_image_for_shared_cpu_address() {
+        fn insert_presentable_image(
+            cache: &mut TextureCacheBase,
+            gpu_addr: u64,
+            cpu_addr: u64,
+            width: u32,
+            height: u32,
+            modification_tick: u64,
+        ) -> ImageId {
+            let info = ImageInfo {
+                format: PixelFormat::A8B8G8R8Unorm,
+                image_type: ImageType::E2D,
+                size: Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                },
+                ..ImageInfo::default()
+            };
+            let mut image = ImageBase::new(info.clone(), gpu_addr, cpu_addr);
+            image.modification_tick = modification_tick;
+            let image_id = cache.slot_images.insert(image);
+            let view_info = ImageViewInfo::for_render_target(
+                ImageViewType::E2D,
+                PixelFormat::A8B8G8R8Unorm,
+                SubresourceRange::default(),
+            );
+            let view = ImageViewBase::new(&view_info, &info, image_id, gpu_addr);
+            let view_id = cache.slot_image_views.insert(view);
+            cache.slot_images[image_id].insert_view(view_info, view_id);
+            cache.register_image(image_id);
+            image_id
+        }
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let cpu_addr = 0x2b71_e000;
+        let old_id = insert_presentable_image(&mut cache, 0x5205_1000, cpu_addr, 1920, 1080, 10);
+        let recent_id = insert_presentable_image(&mut cache, 0x5205_1000, cpu_addr, 480, 270, 20);
+
+        let selected = cache
+            .try_find_framebuffer_image_view(&FramebufferConfig::default(), cpu_addr)
+            .expect("a registered framebuffer image must be found");
+
+        assert_eq!(selected.view.image_id, recent_id);
+        assert_ne!(selected.view.image_id, old_id);
     }
 }
