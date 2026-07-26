@@ -23511,3 +23511,63 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   `refresh_stages_hashes_enabled_vertexb_shader_for_bound_channel` reproduces
   the hang when run alone with a 90-second timeout. Two existing
   `texture_cache` tests also fail before the gate is interrupted.
+
+## 2026-07-26 — core/src/hle/kernel/k_priority_queue.rs vs core/hle/kernel/k_priority_queue.h
+
+### Intentional differences
+- Upstream owns one intrusive `QueueEntry` per `KThread` and core. Rust stores
+  entries and thread properties by thread id, so its existing repair path
+  rebuilds a root-visible list when stale detached links are detected.
+
+### Unintentional differences (fixed)
+- The repair path retained any id with cached properties, even when that
+  thread's current priority, affinity, or active core belonged to another
+  queue. Removing one thread could therefore resurrect an unrelated thread in
+  an old priority bucket. Rebuilt scheduled and suggested lists now retain
+  only members that satisfy the same priority/core/affinity ownership used by
+  upstream `PushBack`, `Remove`, and `ChangeCore`.
+
+### Binary layout verification
+- N/A: the priority queue is host-only scheduler state.
+
+### Verification
+- Re-read upstream `KPerCoreQueue::Remove`, private `KPriorityQueue::Remove`,
+  `ChangePriority`, `ChangeAffinityMask`, and `ChangeCore`.
+- Added a deterministic 50,000-operation parity regression covering valid
+  push, remove, priority, affinity, core, and front/back transitions. It
+  verifies list ownership, bidirectional links, duplicate membership, and the
+  per-core availability bitset used to select the scheduled front.
+- Before the ownership filter was added, that regression failed
+  deterministically at operation 1,903 by finding thread 10, whose current
+  priority was 14, resurrected in priority bucket 49 while thread 22 was being
+  removed. The corrected implementation completes all 50,000 operations.
+- A focused regression reconstructs the detached `QueueEntry` link responsible
+  for that failure and verifies that removing thread 22 from priority 49 cannot
+  move thread 10 out of priority 14. Replacing the ownership predicate with
+  the previous `thread_props.contains_key` check makes this test fail with
+  priority 49 incorrectly returning `Some(10)`; restoring the fix makes it
+  pass.
+- All 20 `k_priority_queue::tests` pass in release mode.
+- An env-gated validator added to `zuyu-instrumented` checked yuzu's intrusive
+  queue immediately after each RUNNABLE transition. Its first 16 reported
+  transitions all had the exact scheduled/suggested ownership implied by the
+  thread affinity and active core, with no invalid report before yuzu's
+  unrelated offscreen-renderer `SIGSEGV` at 3.5 seconds.
+- MK8D runs using software rendering opened no `/dev/dri` device. A normal
+  OpenGL run reached the title sequence through present 2,000 without
+  `BreakLoopNullPc`, `0x068A001C`, `PQ_STALE`, or `PQ_RECOVER`. A diagnostic
+  run that temporarily skipped llvmpipe's pathological indirect draw reached
+  the attract-mode loading frame at present 2,500; that draw bypass has been
+  removed. A separate Vulkan/lavapipe run queued 256 frames before being
+  closed at 54 seconds and emitted none of the fault markers.
+- The full `cargo test -p core --release` gate remains broken outside this
+  slice: one hardware-timer test, one memory-block-manager test, and three
+  page-table copy tests fail before the test process terminates with
+  `SIGSEGV`.
+
+### Missing items
+- Apple Silicon must run this isolated change through the title-to-attract
+  transition; that host is not available locally.
+- A full real-time cinematic validation is still unavailable on this Linux
+  host because the AMD hardware path has repeatedly timed out its kernel GFX
+  ring and software rendering does not reach the transition at usable speed.

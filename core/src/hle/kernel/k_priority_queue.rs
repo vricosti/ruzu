@@ -315,6 +315,8 @@ impl KPerCoreQueue {
     pub fn remove_all_matching(
         &mut self,
         core: i32,
+        priority: i32,
+        scheduled: bool,
         member_id: u64,
         entries: &mut EntryMap,
         thread_props: &HashMap<u64, ThreadProps>,
@@ -336,13 +338,24 @@ impl KPerCoreQueue {
             seen.push(id);
 
             current = entries.get(&id).and_then(|e| e[c].get_next());
-            if id != member_id && thread_props.contains_key(&id) {
+            if id != member_id
+                && thread_props.get(&id).is_some_and(|props| {
+                    props.priority == priority
+                        && props.affinity & (1u64 << core) != 0
+                        && (props.active_core == core) == scheduled
+                })
+            {
                 kept.push(id);
             }
         }
 
         for (&id, per_core) in entries.iter() {
-            if id == member_id || kept.contains(&id) || !thread_props.contains_key(&id) {
+            let belongs_to_queue = thread_props.get(&id).is_some_and(|props| {
+                props.priority == priority
+                    && props.affinity & (1u64 << core) != 0
+                    && (props.active_core == core) == scheduled
+            });
+            if id == member_id || kept.contains(&id) || !belongs_to_queue {
                 continue;
             }
             let entry = &per_core[c];
@@ -496,6 +509,7 @@ impl KPriorityQueueImpl {
 
     pub fn remove_all_member(
         &mut self,
+        scheduled: bool,
         member_id: u64,
         entries: &mut EntryMap,
         thread_props: &HashMap<u64, ThreadProps>,
@@ -504,6 +518,8 @@ impl KPriorityQueueImpl {
             for core in 0..NUM_CORES as i32 {
                 if self.queues[priority as usize].remove_all_matching(
                     core,
+                    priority,
+                    scheduled,
                     member_id,
                     entries,
                     thread_props,
@@ -793,6 +809,8 @@ impl KPriorityQueue {
         if active_core >= 0 {
             if scheduled_queue.queues[priority as usize].remove_all_matching(
                 active_core,
+                priority,
+                true,
                 member_id,
                 entries,
                 thread_props,
@@ -806,6 +824,8 @@ impl KPriorityQueue {
             let core = get_next_core(&mut affinity);
             if suggested_queue.queues[priority as usize].remove_all_matching(
                 core,
+                priority,
+                false,
                 member_id,
                 entries,
                 thread_props,
@@ -822,8 +842,8 @@ impl KPriorityQueue {
             entries,
             thread_props,
         } = self;
-        scheduled_queue.remove_all_member(member_id, entries, thread_props);
-        suggested_queue.remove_all_member(member_id, entries, thread_props);
+        scheduled_queue.remove_all_member(true, member_id, entries, thread_props);
+        suggested_queue.remove_all_member(false, member_id, entries, thread_props);
     }
 
     // -- Public mutators (properties passed directly) --
@@ -1095,6 +1115,8 @@ impl KPriorityQueue {
             if prev_core >= 0 {
                 if scheduled_queue.queues[priority as usize].remove_all_matching(
                     prev_core,
+                    priority,
+                    true,
                     member_id,
                     entries,
                     thread_props,
@@ -1131,6 +1153,93 @@ impl Default for KPriorityQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    fn assert_queue_invariants(pq: &KPriorityQueue, iteration: usize, operation: &str) {
+        let mut scheduled_memberships = HashSet::new();
+        let mut suggested_memberships = HashSet::new();
+
+        for core in 0..NUM_CORES as i32 {
+            for priority in HIGHEST_PRIORITY..=LOWEST_PRIORITY {
+                for (scheduled, queue) in
+                    [(true, &pq.scheduled_queue), (false, &pq.suggested_queue)]
+                {
+                    let root = &queue.queues[priority as usize].roots[core as usize];
+                    let mut current = root.get_next();
+                    let priority_available = queue.available_priorities[core as usize].bits
+                        & (1u64 << (63 - priority))
+                        != 0;
+                    assert_eq!(
+                        priority_available,
+                        current.is_some(),
+                        "iteration {iteration}: availability bit disagrees with core {core} \
+                         priority {priority} after {operation}"
+                    );
+                    let mut previous = None;
+                    let mut seen = HashSet::new();
+
+                    while let Some(thread_id) = current {
+                        assert!(
+                            seen.insert(thread_id),
+                            "cycle in core {core} priority {priority}"
+                        );
+                        let props = pq.thread_props.get(&thread_id).unwrap_or_else(|| {
+                            panic!(
+                                "iteration {iteration}: queue member {thread_id} on core \
+                                     {core} priority {priority} must have cached properties after \
+                                     {operation}"
+                            )
+                        });
+                        assert_eq!(
+                            props.priority, priority,
+                            "iteration {iteration}: thread {thread_id} is linked in the wrong \
+                             priority bucket on core {core} after {operation}"
+                        );
+                        assert_ne!(props.affinity & (1u64 << core), 0);
+                        assert_eq!(scheduled, props.active_core == core);
+
+                        let entry = &pq.entries[&thread_id][core as usize];
+                        assert_eq!(entry.get_prev(), previous);
+                        let memberships = if scheduled {
+                            &mut scheduled_memberships
+                        } else {
+                            &mut suggested_memberships
+                        };
+                        assert!(
+                            memberships.insert((thread_id, core)),
+                            "duplicate membership for thread {thread_id} on core {core}"
+                        );
+
+                        previous = Some(thread_id);
+                        current = entry.get_next();
+                    }
+
+                    assert_eq!(root.get_prev(), previous);
+                }
+            }
+        }
+
+        for (&thread_id, props) in &pq.thread_props {
+            for core in 0..NUM_CORES as i32 {
+                let in_affinity = props.affinity & (1u64 << core) != 0;
+                assert_eq!(
+                    scheduled_memberships.contains(&(thread_id, core)),
+                    in_affinity && props.active_core == core
+                );
+                assert_eq!(
+                    suggested_memberships.contains(&(thread_id, core)),
+                    in_affinity && props.active_core != core
+                );
+            }
+        }
+    }
+
+    fn next_random(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        *state
+    }
 
     #[test]
     fn test_bitset64() {
@@ -1365,6 +1474,26 @@ mod tests {
     }
 
     #[test]
+    fn remove_does_not_resurrect_detached_member_from_another_priority() {
+        let mut pq = KPriorityQueue::new();
+        pq.push_back(10, 14, 0, 0b0001, false, None);
+        pq.push_back(22, 49, 0, 0b0001, false, None);
+
+        // Upstream leaves the removed intrusive QueueEntry's links stale, but
+        // its queue identity is fixed by the owning thread's current priority.
+        // Reproduce such a detached link into the member being removed from a
+        // different bucket. The Rust repair path must not treat that link alone
+        // as proof that thread 10 belongs to priority 49.
+        pq.entries.get_mut(&10).unwrap()[0].set_next(Some(22));
+
+        pq.remove(22, 49, 0, 0b0001, false);
+
+        assert_eq!(pq.get_scheduled_front_at_priority(0, 14), Some(10));
+        assert_eq!(pq.get_scheduled_front_at_priority(0, 49), None);
+        assert_eq!(pq.get_thread_props(10).unwrap().priority, 14);
+    }
+
+    #[test]
     fn test_remove_scheduled_front_without_props_ignores_stale_member_links() {
         let mut pq = KPriorityQueue::new();
         pq.push_back(89, 59, 2, 0b0100, false, None);
@@ -1399,5 +1528,124 @@ mod tests {
         assert!(pq.remove_scheduled_front_without_props(1, 89));
         assert_eq!(pq.get_scheduled_front(1), Some(90));
         assert_ne!(pq.get_suggested_front(2), Some(89));
+    }
+
+    #[test]
+    fn valid_upstream_operation_sequences_preserve_queue_membership() {
+        let mut pq = KPriorityQueue::new();
+        let mut random = 0x4D4B_3844_5051_5545;
+
+        for iteration in 0..50_000 {
+            let value = next_random(&mut random);
+            let thread_id = 1 + ((value >> 8) % 64);
+            let existing = pq.thread_props.get(&thread_id).cloned();
+
+            let operation = match (value % 6, existing) {
+                (0, None) => {
+                    let priority = ((value >> 16) % 64) as i32;
+                    let affinity = 1u64 << ((value >> 24) % NUM_CORES as u64);
+                    let active_core = affinity.trailing_zeros() as i32;
+                    pq.push_back(thread_id, priority, active_core, affinity, false, None);
+                    format!(
+                        "push tid={thread_id} priority={priority} core={active_core} \
+                         affinity={affinity:#x}"
+                    )
+                }
+                (1, Some(props)) => {
+                    pq.remove(
+                        thread_id,
+                        props.priority,
+                        props.active_core,
+                        props.affinity,
+                        false,
+                    );
+                    format!(
+                        "remove tid={thread_id} priority={} core={} affinity={:#x}",
+                        props.priority, props.active_core, props.affinity
+                    )
+                }
+                (2, Some(props)) => {
+                    let new_priority = ((value >> 16) % 64) as i32;
+                    pq.change_priority(
+                        props.priority,
+                        false,
+                        thread_id,
+                        new_priority,
+                        props.active_core,
+                        props.affinity,
+                        false,
+                    );
+                    format!(
+                        "change_priority tid={thread_id} {}->{new_priority} core={} affinity={:#x}",
+                        props.priority, props.active_core, props.affinity
+                    )
+                }
+                (3, Some(props)) => {
+                    let new_affinity = ((value >> 24) & 0xF).max(1);
+                    let new_core = new_affinity.trailing_zeros() as i32;
+                    pq.change_affinity_mask(
+                        props.active_core,
+                        props.affinity,
+                        thread_id,
+                        new_core,
+                        new_affinity,
+                        props.priority,
+                        false,
+                    );
+                    format!(
+                        "change_affinity tid={thread_id} core={}->{new_core} affinity={:#x}->{new_affinity:#x} priority={}",
+                        props.active_core, props.affinity, props.priority
+                    )
+                }
+                (4, Some(props)) => {
+                    let allowed_cores: Vec<i32> = (0..NUM_CORES as i32)
+                        .filter(|core| props.affinity & (1u64 << core) != 0)
+                        .collect();
+                    let new_core = allowed_cores[((value >> 32) as usize) % allowed_cores.len()];
+                    pq.change_core(
+                        props.active_core,
+                        thread_id,
+                        new_core,
+                        props.priority,
+                        false,
+                        value & (1 << 40) != 0,
+                    );
+                    format!(
+                        "change_core tid={thread_id} {}->{new_core} priority={} affinity={:#x}",
+                        props.active_core, props.priority, props.affinity
+                    )
+                }
+                (5, Some(props)) => {
+                    if value & (1 << 40) == 0 {
+                        pq.move_to_scheduled_front(
+                            thread_id,
+                            props.priority,
+                            props.active_core,
+                            false,
+                        );
+                        format!(
+                            "move_front tid={thread_id} priority={} core={}",
+                            props.priority, props.active_core
+                        )
+                    } else {
+                        pq.move_to_scheduled_back(
+                            thread_id,
+                            props.priority,
+                            props.active_core,
+                            false,
+                        );
+                        format!(
+                            "move_back tid={thread_id} priority={} core={}",
+                            props.priority, props.active_core
+                        )
+                    }
+                }
+                _ => format!("noop tid={thread_id}"),
+            };
+
+            assert_queue_invariants(&pq, iteration, &operation);
+        }
+
+        assert_queue_invariants(&pq, 50_000, "final validation");
     }
 }
