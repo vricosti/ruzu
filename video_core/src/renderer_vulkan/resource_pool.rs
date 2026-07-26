@@ -54,6 +54,20 @@ impl ResourcePool {
         }
     }
 
+    /// Construct a pool whose tick source is supplied by its owner.
+    ///
+    /// The Rust scheduler currently owns the upstream `MasterSemaphore`
+    /// equivalent directly. This keeps the upstream resource-pool algorithm
+    /// while allowing that scheduler-owned timeline to drive reuse.
+    pub fn new_with_external_ticks(grow_step: usize) -> Self {
+        ResourcePool {
+            master_semaphore: None,
+            grow_step,
+            hint_iterator: 0,
+            ticks: Vec::new(),
+        }
+    }
+
     /// Port of `ResourcePool::CommitResource`.
     ///
     /// Finds and returns the index of a free resource slot, growing
@@ -67,31 +81,37 @@ impl ResourcePool {
 
         // Refresh semaphore to query updated results
         ms.refresh();
-        let gpu_tick = ms.known_gpu_tick();
+        self.commit_resource_with_ticks(ms.known_gpu_tick(), ms.current_tick(), allocate_fn)
+    }
 
+    /// `CommitResource` using ticks supplied by the owning scheduler.
+    pub fn commit_resource_with_ticks(
+        &mut self,
+        gpu_tick: u64,
+        current_tick: u64,
+        allocate_fn: &mut dyn FnMut(usize, usize),
+    ) -> usize {
         // Search helper: finds a free slot in [begin..end)
-        let search =
-            |ticks: &mut [u64], begin: usize, end: usize, current_tick: u64| -> Option<usize> {
-                for iterator in begin..end {
-                    if gpu_tick >= ticks[iterator] {
-                        ticks[iterator] = current_tick;
-                        return Some(iterator);
-                    }
+        let search = |ticks: &mut [u64], begin: usize, end: usize| -> Option<usize> {
+            for iterator in begin..end {
+                if gpu_tick >= ticks[iterator] {
+                    ticks[iterator] = current_tick;
+                    return Some(iterator);
                 }
-                None
-            };
+            }
+            None
+        };
 
-        let current_tick = ms.current_tick();
         let ticks_len = self.ticks.len();
         let hint = self.hint_iterator;
 
         // Try to find a free resource from the hinted position to the end.
-        let found = search(&mut self.ticks, hint, ticks_len, current_tick);
+        let found = search(&mut self.ticks, hint, ticks_len);
         let found = match found {
             Some(idx) => idx,
             None => {
                 // Search from beginning to the hinted position.
-                match search(&mut self.ticks, 0, hint, current_tick) {
+                match search(&mut self.ticks, 0, hint) {
                     Some(idx) => idx,
                     None => {
                         // Both searches failed, the pool is full; handle it.
@@ -138,5 +158,25 @@ mod tests {
         assert_eq!(pool.grow_step, 0);
         assert_eq!(pool.hint_iterator, 0);
         assert!(pool.ticks.is_empty());
+    }
+
+    #[test]
+    fn external_ticks_reuse_only_completed_resources() {
+        let mut pool = ResourcePool::new_with_external_ticks(2);
+        let mut allocations = Vec::new();
+        {
+            let mut allocate = |begin, end| allocations.push((begin, end));
+            assert_eq!(pool.commit_resource_with_ticks(0, 1, &mut allocate), 0);
+            assert_eq!(pool.commit_resource_with_ticks(0, 1, &mut allocate), 1);
+            assert_eq!(pool.commit_resource_with_ticks(0, 2, &mut allocate), 2);
+            assert_eq!(pool.commit_resource_with_ticks(0, 2, &mut allocate), 3);
+        }
+        assert_eq!(allocations, [(0, 2), (2, 4)]);
+
+        {
+            let mut allocate = |begin, end| allocations.push((begin, end));
+            assert_eq!(pool.commit_resource_with_ticks(1, 3, &mut allocate), 0);
+        }
+        assert_eq!(allocations, [(0, 2), (2, 4)]);
     }
 }

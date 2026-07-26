@@ -23471,3 +23471,43 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   `--features no_execute_support` pass.
 - The focused MK8D syscall comparison reduced `mprotect` calls from 47,330 to
   3,232 over the same ten-second launch interval.
+
+## 2026-07-26 — video_core/src/renderer_vulkan/{resource_pool,command_pool,scheduler,renderer_vulkan,vk_rasterizer}.rs vs video_core/renderer_vulkan/{vk_resource_pool,vk_command_pool,vk_scheduler}.{h,cpp}
+
+### Intentional differences
+- Upstream's `CommandPool` reads completion and submission ticks through its
+  owned `MasterSemaphore`. The current Rust scheduler owns the equivalent
+  timeline/fence state directly, so `CommandPool` and `ResourcePool` accept
+  those two ticks from the scheduler while preserving upstream's reuse
+  predicate, tick tagging, circular hint, and grow-step behavior.
+- Rust explicitly resets recycled command buffers before `begin_command_buffer`;
+  upstream's Vulkan wrapper owns that lifecycle around `CommandBuffer::Begin`,
+  while the Rust port uses raw `ash` handles.
+
+### Unintentional differences (fixed)
+- Both Vulkan scheduler construction paths previously created one raw command
+  pool and allocated two new buffers on every flush. The scheduler now owns the
+  existing `CommandPool` port and recycles completed buffers in upstream's
+  four-buffer pool batches.
+- The no-timeline fallback previously reported the current submission tick as
+  completed even while its fence was unsignalled. It now exposes only the
+  preceding tick until that fence signals, preventing in-flight reuse.
+
+### Missing items
+- The scheduler still owns timeline/fence state directly instead of completing
+  upstream's `MasterSemaphore` ownership structure. The external-tick adapter
+  is limited to that existing structural gap.
+
+### Binary layout verification
+- N/A: this slice changes Vulkan handle ownership and tick-based lifecycle only.
+
+### Verification
+- Re-read upstream `vk_resource_pool.{h,cpp}`, `vk_command_pool.{h,cpp}`, and
+  `vk_scheduler.{h,cpp}` after implementation.
+- Focused `external_ticks_reuse_only_completed_resources` and
+  `command_buffer_pool_size` tests pass; `cargo check -p video_core` passes.
+- The full `cargo test -p video_core` gate is blocked outside this slice: four
+  `shader_cache` tests spin indefinitely, and
+  `refresh_stages_hashes_enabled_vertexb_shader_for_bound_channel` reproduces
+  the hang when run alone with a 90-second timeout. Two existing
+  `texture_cache` tests also fail before the gate is interrupted.

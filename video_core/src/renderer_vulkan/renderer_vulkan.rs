@@ -297,20 +297,10 @@ impl RendererVulkan {
             physical_properties.limits.buffer_image_granularity,
             false,
         ));
-        let scheduler_command_pool = unsafe {
-            let pool_info = vk::CommandPoolCreateInfo::builder()
-                .queue_family_index(device.get_graphics_family())
-                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-                .build();
-            device
-                .get_logical()
-                .create_command_pool(&pool_info, None)
-                .map_err(VulkanError::new)?
-        };
         let scheduler = Scheduler::new(
             device.get_logical().clone(),
             device.get_graphics_queue(),
-            scheduler_command_pool,
+            device.get_graphics_family(),
             device.is_timeline_semaphore_supported(),
         )
         .map_err(VulkanError::new)?;

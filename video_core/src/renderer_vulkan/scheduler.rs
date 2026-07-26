@@ -14,6 +14,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+use super::command_pool::CommandPool;
 use super::state_tracker::StateTracker;
 
 /// Type-erased Vulkan command closure.
@@ -66,7 +67,7 @@ struct SchedulerState {
 pub struct Scheduler {
     device: ash::Device,
     queue: vk::Queue,
-    command_pool: vk::CommandPool,
+    command_pool: CommandPool,
 
     /// Current chunk being recorded to.
     current_chunk: CommandChunk,
@@ -238,7 +239,7 @@ impl Scheduler {
     pub fn new(
         device: ash::Device,
         queue: vk::Queue,
-        command_pool: vk::CommandPool,
+        graphics_family: u32,
         timeline_semaphore_supported: bool,
     ) -> Result<Self, vk::Result> {
         let fence_info = vk::FenceCreateInfo::builder()
@@ -289,9 +290,9 @@ impl Scheduler {
             };
 
         let mut scheduler = Self {
+            command_pool: CommandPool::new_with_external_ticks(device.clone(), graphics_family),
             device,
             queue,
-            command_pool,
             current_chunk: CommandChunk::new(),
             current_cmdbuf: vk::CommandBuffer::null(),
             upload_cmdbuf: vk::CommandBuffer::null(),
@@ -613,19 +614,23 @@ impl Scheduler {
     }
 
     fn allocate_new_context(&mut self) -> Result<(), vk::Result> {
-        let alloc_info = vk::CommandBufferAllocateInfo::builder()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(2)
-            .build();
-        let cmd_buffers = unsafe { self.device.allocate_command_buffers(&alloc_info)? };
-        self.current_cmdbuf = cmd_buffers[0];
-        self.upload_cmdbuf = cmd_buffers[1];
+        let known_gpu_tick = self.known_gpu_tick();
+        let pending_tick = self.pending_tick();
+        self.current_cmdbuf = self
+            .command_pool
+            .commit_with_ticks(known_gpu_tick, pending_tick);
+        self.upload_cmdbuf = self
+            .command_pool
+            .commit_with_ticks(known_gpu_tick, pending_tick);
 
         let begin_info = vk::CommandBufferBeginInfo::builder()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
             .build();
         unsafe {
+            self.device
+                .reset_command_buffer(self.current_cmdbuf, vk::CommandBufferResetFlags::empty())?;
+            self.device
+                .reset_command_buffer(self.upload_cmdbuf, vk::CommandBufferResetFlags::empty())?;
             self.device
                 .begin_command_buffer(self.current_cmdbuf, &begin_info)?;
             self.device
@@ -663,9 +668,17 @@ impl Scheduler {
                     .unwrap_or(0)
             };
         }
-        // Legacy single-submission fallback: at most one submission is in
-        // flight, matching the pre-timeline retirement behaviour.
-        self.current_tick()
+        // Legacy single-submission fallback: the current tick remains in
+        // flight until the fence is signalled. Older ticks completed before
+        // that submission because this path waits on the same fence before
+        // each queue submit.
+        let current_tick = self.current_tick();
+        if current_tick == 0 || unsafe { self.device.get_fence_status(self.fence).unwrap_or(false) }
+        {
+            current_tick
+        } else {
+            current_tick - 1
+        }
     }
 
     /// Returns true when the GPU has completed `tick`.
@@ -761,7 +774,6 @@ impl Drop for Scheduler {
                     .ok();
             }
             self.device.destroy_fence(self.fence, None);
-            self.device.destroy_command_pool(self.command_pool, None);
         }
     }
 }

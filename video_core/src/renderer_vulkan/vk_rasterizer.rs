@@ -674,17 +674,6 @@ impl RasterizerVulkan {
             width, height
         );
 
-        // Create command pool
-        let pool_info = vk::CommandPoolCreateInfo::builder()
-            .queue_family_index(queue_family_index)
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-            .build();
-        let command_pool = unsafe {
-            device
-                .create_command_pool(&pool_info, None)
-                .map_err(|e| RendererError::InitFailed(format!("command pool: {:?}", e)))?
-        };
-
         // Create state tracker
         let mut state_tracker = Box::new(StateTracker::new());
 
@@ -693,7 +682,7 @@ impl RasterizerVulkan {
             Scheduler::new(
                 device.clone(),
                 graphics_queue,
-                command_pool,
+                queue_family_index,
                 timeline_semaphore_supported,
             )
             .map_err(|e| RendererError::InitFailed(format!("scheduler: {:?}", e)))?,

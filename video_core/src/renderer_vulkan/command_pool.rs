@@ -60,15 +60,38 @@ impl CommandPool {
         }
     }
 
+    /// Scheduler-owned-timeline variant of `CommandPool::CommandPool`.
+    pub fn new_with_external_ticks(device: ash::Device, graphics_family: u32) -> Self {
+        CommandPool {
+            device,
+            graphics_family,
+            resource_pool: ResourcePool::new_with_external_ticks(COMMAND_BUFFER_POOL_SIZE),
+            pools: Vec::new(),
+        }
+    }
+
     /// Port of `CommandPool::Commit`.
     ///
     /// Returns the next available command buffer.
     pub fn commit(&mut self) -> vk::CommandBuffer {
+        self.commit_impl(None)
+    }
+
+    /// `CommandPool::Commit` driven by the owning scheduler's timeline.
+    pub fn commit_with_ticks(
+        &mut self,
+        known_gpu_tick: u64,
+        current_tick: u64,
+    ) -> vk::CommandBuffer {
+        self.commit_impl(Some((known_gpu_tick, current_tick)))
+    }
+
+    fn commit_impl(&mut self, ticks: Option<(u64, u64)>) -> vk::CommandBuffer {
         let device = self.device.clone();
         let graphics_family = self.graphics_family;
         let pools = &mut self.pools;
 
-        let index = self.resource_pool.commit_resource(&mut |_begin, _end| {
+        let mut allocate = |_begin, _end| {
             // Command buffers are going to be committed, recorded, executed every
             // single usage cycle. They are also going to be reset when committed.
             let pool_ci = vk::CommandPoolCreateInfo::builder()
@@ -98,7 +121,16 @@ impl CommandPool {
             };
 
             pools.push(Pool { handle, cmdbufs });
-        });
+        };
+        let index = if let Some((known_gpu_tick, current_tick)) = ticks {
+            self.resource_pool.commit_resource_with_ticks(
+                known_gpu_tick,
+                current_tick,
+                &mut allocate,
+            )
+        } else {
+            self.resource_pool.commit_resource(&mut allocate)
+        };
 
         let pool_index = index / COMMAND_BUFFER_POOL_SIZE;
         let sub_index = index % COMMAND_BUFFER_POOL_SIZE;
