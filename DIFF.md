@@ -23290,3 +23290,152 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Re-read upstream `RasterizerVulkan::AccelerateInlineToMemory` in `vk_rasterizer.h/.cpp`; memory writes and cache-lock ordering now match.
 - `cargo check -p video_core` and the 8 focused `renderer_vulkan::vk_rasterizer::tests` pass.
 - Five 30-second release runs completed without a panic. The full `video_core` suite was stopped after four pre-existing `shader_cache` tests remained active for more than 60 seconds.
+
+## 2026-07-26 — externals/rdynarmic/src/common/math_util.rs vs externals/dynarmic/src/dynarmic/common/math_util.{h,cpp}
+
+### Intentional differences
+- Rust builds the two immutable lookup tables with `const fn`; upstream builds
+  function-local static arrays with lambdas. Table indices, integer arithmetic,
+  truncation, and returned values are identical.
+
+### Binary layout verification
+- N/A: the lookup tables are internal values and are not serialized.
+
+### Verification
+- Re-read both upstream lookup-table generators after implementation.
+- Added boundary-value tests for reciprocal inputs 256, 384, and 511 and
+  reciprocal-square-root inputs 128, 256, 384, and 511.
+
+## 2026-07-26 — externals/rdynarmic/src/common/fp/{fpcr,fpsr,info,unpacked,process_exception,process_nan,rounding_mode}.rs vs externals/dynarmic/src/dynarmic/common/fp counterparts
+
+### Intentional differences
+- Rust's `FloatFormat` trait replaces the three upstream `FPInfo<u16/u32/u64>`
+  specializations while preserving every width, mask, exponent, and constructor
+  used by the estimate operations.
+- Rust setters use snake-case methods and explicit bit operations in place of
+  `mcl::bit` fields.
+
+### Missing items
+- `unpacked.rs` currently ports `FPUnpack` and its prerequisites. Upstream
+  `FPRound` remains owned by this file but is outside the reciprocal-estimate
+  dependency slice.
+- `process_nan.rs` currently ports unary `FPProcessNaN`; the binary and ternary
+  helpers are not dependencies of these unary estimate operations.
+
+### Binary layout verification
+- N/A: these wrappers are passed by value within Rust; guest-visible FPCR/FPSR
+  storage remains the existing `u32` JIT-state fields.
+
+### Verification
+- Re-read the upstream control/status masks, format constants, unpack ordering,
+  exception dispatch, and unary NaN processing after implementation.
+- Focused tests cover standard-ASIMD FPCR construction, signaling-NaN
+  quieting, IOC, and DZC.
+
+## 2026-07-26 — externals/rdynarmic/src/common/fp/op/{fp_recip_estimate,fp_rsqrt_estimate}.rs vs externals/dynarmic/src/dynarmic/common/fp/op/{FPRecipEstimate,FPRSqrtEstimate}.{h,cpp}
+
+### Intentional differences
+- Rust uses the shared `FloatFormat` trait instead of C++ template
+  specialization; branch and update ordering is unchanged.
+
+### Binary layout verification
+- PASS: operations accept and return the exact raw `u16`, `u32`, or `u64`
+  floating-point bit patterns used upstream.
+
+### Verification
+- Re-read both upstream operations after implementation and compared every
+  special-value branch, exponent adjustment, LUT shift, FPCR query, and FPSR
+  update.
+- A deterministic differential digest over 480,000 FP16/FP32/FP64 evaluations
+  and eight FPCR configurations matches code compiled directly from the pinned
+  upstream C++ sources: `0x4cb292e1d75f95e7`.
+
+## 2026-07-26 — externals/rdynarmic/src/backend/x64/emit_context.rs vs externals/dynarmic/src/dynarmic/backend/x64/{emit_x64.h,a32_emit_x64.cpp,a64_emit_x64.cpp}
+
+### Intentional differences
+- Rust uses one architecture-tagged `EmitContext` instead of the two upstream
+  derived context classes. `fpcr` dispatches through that existing tag while
+  preserving each upstream implementation's ownership and result.
+
+### Binary layout verification
+- PASS: `fpsr_exc_offset` uses `offset_of_fpsr_exc` from the corresponding
+  `A32JitState` or `A64JitState`; no offset is duplicated as a literal.
+
+### Verification
+- Re-read upstream `A32EmitContext::FPCR` and `A64EmitContext::FPCR`.
+  Controlled FPCR and `ASIMDStandardValue` selection match their branch order.
+
+## 2026-07-26 — externals/rdynarmic/src/backend/x64/fp_helpers.rs vs externals/dynarmic/src/dynarmic/common/fp/op/{FPRecipEstimate,FPRSqrtEstimate}.{h,cpp}
+
+### Intentional differences
+- Rust exposes thin `extern "C"` wrappers because generated x64 code cannot
+  call generic Rust functions directly. The wrappers reconstruct FPCR/FPSR,
+  call the common owner, and write the sticky exception field back.
+- FP16 wrappers retain the backend's existing `u64` host-call ABI and narrow
+  the input/output to the upstream `u16` bit pattern.
+
+### Binary layout verification
+- PASS: wrappers receive raw FP bit patterns and an aligned pointer to the
+  existing `u32` `fpsr_exc` JIT-state field.
+
+### Verification
+- Focused wrapper tests verify ARM's estimate for `1.0`, DZC for zero, IOC for
+  negative reciprocal-square-root input, and preservation of prior sticky bits.
+
+## 2026-07-26 — externals/rdynarmic/src/backend/x64/emit_floating_point.rs vs externals/dynarmic/src/dynarmic/backend/x64/emit_x64_floating_point.cpp
+
+### Intentional differences
+- The Rust safe path always calls the bit-exact common implementation. Upstream
+  also contains host-instruction fast paths, but falls back to the same common
+  operations for values requiring architectural handling.
+
+### Binary layout verification
+- PASS: scalar calls pass operand, FPCR value, and the architecture-specific
+  `fpsr_exc` address in the same ABI argument order as upstream.
+
+### Verification
+- Re-read upstream `EmitFPRecipEstimate` and `EmitFPRSqrtEstimate`; the safe
+  fallback inputs, FPCR source, FPSR target, and return ownership match.
+
+## 2026-07-26 — externals/rdynarmic/src/backend/x64/{emit_vector_helpers,emit_fp_vector_convert}.rs vs externals/dynarmic/src/dynarmic/backend/x64/emit_x64_vector_floating_point.cpp
+
+### Intentional differences
+- Rust uses named `extern "C"` lane helpers in place of upstream's templated
+  lambdas. Both iterate lanes in ascending order over the same 128-bit vector.
+
+### Binary layout verification
+- PASS: `emit_two_op_fallback` reproduces upstream's result and operand
+  16-byte stack slots after `ABI_SHADOW_SPACE`, passes FPCR as argument three,
+  and passes the `fpsr_exc` pointer as argument four.
+
+### Verification
+- Re-read upstream `EmitTwoOpFallbackWithoutRegAlloc`,
+  `EmitFPVectorRecipEstimate*`, and `EmitFPVectorRSqrtEstimate*`.
+- Focused vector tests verify lane results and cumulative DZC/IOC updates.
+
+## 2026-07-26 — externals/rdynarmic/src/backend/x64/emit_vector_misc.rs vs externals/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp
+
+### Binary layout verification
+- PASS: each operation still consumes and produces four packed `u32` lanes.
+
+### Verification
+- Re-read upstream `EmitVectorUnsignedRecipEstimate` and
+  `EmitVectorUnsignedRecipSqrtEstimate`. The validity masks, 9-bit extraction,
+  LUT calls, implied leading bit, and final shift now match literally.
+
+## 2026-07-26 — externals/rxbyak/src/assembler.rs vs externals/rxbyak/src/{code_array.rs,platform/unix.rs}
+
+### Unintentional differences (fixed)
+- `alloc_exec_mem` was changed to allocate non-executable `RW` pages, while
+  `set_protect_mode_re` and `set_protect_mode_rw` still assumed an `RWX`
+  allocation and did nothing. Executing the first generated instruction
+  therefore raised `SIGSEGV`. Both methods now delegate to the existing
+  `CodeBuffer::protect_rx` and `protect_rw` ownership boundary.
+
+### Binary layout verification
+- N/A: this changes page permissions only.
+
+### Verification
+- Re-read `CodeAssembler::ready`, `CodeBuffer::protect_rx/protect_rw`, and the
+  Unix `mprotect` adapter after implementation. The JIT cache now follows the
+  intended `RW` while emitting, `RX` while executing lifecycle.
