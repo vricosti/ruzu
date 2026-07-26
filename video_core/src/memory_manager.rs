@@ -17,7 +17,7 @@ use crate::invalidation_accumulator::InvalidationAccumulator;
 use crate::pte_kind::PteKind;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // ── Constants ───────────────────────────────────────────────────────────

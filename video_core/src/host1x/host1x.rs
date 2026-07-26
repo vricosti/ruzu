@@ -450,6 +450,21 @@ impl Host1xCoreInterface for Host1x {
         self.memory_manager.smmu_track_continuity(d_address, size);
     }
 
+    fn smmu_track_continuity_registered(
+        &self,
+        d_address: u64,
+        virtual_address: u64,
+        size: usize,
+        asid: u32,
+    ) {
+        self.memory_manager.smmu_track_continuity_registered(
+            d_address,
+            virtual_address,
+            size,
+            asid,
+        );
+    }
+
     fn smmu_unmap(&self, d_address: u64, size: usize) {
         self.memory_manager.smmu_unmap(d_address, size);
     }

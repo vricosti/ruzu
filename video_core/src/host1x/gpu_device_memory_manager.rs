@@ -893,7 +893,7 @@ impl MaxwellDeviceMemoryManager {
             );
         }
         if track {
-            self.smmu_track_continuity_registered(d_address, virtual_address, size, &memory);
+            self.smmu_track_continuity_registered(d_address, virtual_address, size, asid);
         }
     }
 
@@ -1103,31 +1103,55 @@ impl MaxwellDeviceMemoryManager {
         }
     }
 
-    fn smmu_track_continuity_registered(
+    pub fn smmu_track_continuity_registered(
         &self,
         d_address: DAddr,
         virtual_address: u64,
         size: usize,
-        memory: &Arc<Mutex<Memory>>,
+        asid: u32,
     ) {
         if size == 0 {
             return;
         }
+        let Some(memory) = self.smmu_registered_memory(asid) else {
+            log::error!(
+                "SMMU continuity tracking requested with unregistered ASID {} at daddr=0x{:X} vaddr=0x{:X} size=0x{:X}",
+                asid,
+                d_address,
+                virtual_address,
+                size
+            );
+            return;
+        };
         let start_page = d_address >> SMMU_PAGE_BITS;
         let num_pages = smmu_num_pages_for_size(size) as usize;
         let memory = memory.lock().unwrap();
         let mut continuity = self.smmu_continuity_tracker.lock().unwrap();
-        let mut last_ptr = 0usize;
+        let mut last_physical_page = None;
         let mut page_count = 1u32;
         for index in (0..num_pages).rev() {
             let current_vaddr = virtual_address.wrapping_add((index as u64) << SMMU_PAGE_BITS);
-            let new_ptr = memory.get_pointer_silent(current_vaddr) as usize;
-            if new_ptr + SMMU_PAGE_SIZE as usize == last_ptr {
+            let host_ptr = memory.get_pointer_silent(current_vaddr) as usize;
+            let physical_page = self
+                .smmu_compressed_physical_from_device_memory(host_ptr)
+                .map(|compressed| (compressed - 1) as u64)
+                .or_else(|| {
+                    memory
+                        .current_physical_address(current_vaddr)
+                        .and_then(|address| {
+                            address.checked_sub(ruzu_core::device_memory::dram_memory_map::BASE)
+                        })
+                        .map(|offset| offset >> SMMU_PAGE_BITS)
+                });
+            if physical_page
+                .and_then(|page| page.checked_add(1))
+                .is_some_and(|next_page| Some(next_page) == last_physical_page)
+            {
                 page_count += 1;
             } else {
                 page_count = 1;
             }
-            last_ptr = new_ptr;
+            last_physical_page = physical_page;
             continuity.insert(start_page + index as u64, page_count);
         }
     }
@@ -2047,6 +2071,58 @@ mod tests {
             mgr.smmu_continuity_tracker.lock().unwrap().get(&0x8),
             Some(&2)
         );
+    }
+
+    #[test]
+    fn smmu_map_does_not_merge_contiguous_aliases_of_discontiguous_physical_pages() {
+        let device_memory = DeviceMemory::with_size(0x10000);
+        let mgr = MaxwellDeviceMemoryManager::new_with_device_memory(&device_memory);
+        let first_target = dram_memory_map::BASE + 0x2000;
+        let second_target = dram_memory_map::BASE + 0x5000;
+        let mut aliases = vec![0u8; 0x2000];
+
+        unsafe {
+            std::ptr::write_bytes(device_memory.get_pointer(first_target), 0x11, 0x1000);
+            std::ptr::write_bytes(
+                device_memory.get_pointer(first_target + PAGE_SIZE),
+                0xEE,
+                0x1000,
+            );
+            std::ptr::write_bytes(device_memory.get_pointer(second_target), 0x22, 0x1000);
+        }
+
+        let mut memory = unsafe {
+            Memory::new(
+                SystemRef::null(),
+                &device_memory as *const DeviceMemory,
+                &device_memory.buffer as *const common::host_memory::HostMemory,
+            )
+        };
+        let mut page_table = Box::new(PageTable::new());
+        page_table.resize(36, PAGE_BITS as usize);
+        page_table.map_pages(
+            0x4000_0000 >> PAGE_BITS,
+            1,
+            first_target,
+            PageType::Memory,
+            aliases.as_mut_ptr() as usize,
+        );
+        page_table.map_pages(
+            0x4000_1000 >> PAGE_BITS,
+            1,
+            second_target,
+            PageType::Memory,
+            unsafe { aliases.as_mut_ptr().add(PAGE_SIZE as usize) } as usize,
+        );
+        memory.set_current_page_table(&mut *page_table);
+
+        let asid = mgr.smmu_register_process(Some(Arc::new(Mutex::new(memory))));
+        mgr.smmu_map(0x8000, 0x4000_0000, 0x2000, asid, true);
+
+        let mut output = vec![0u8; 0x2000];
+        assert!(mgr.smmu_read_block_unsafe(0x8000, &mut output));
+        assert!(output[..0x1000].iter().all(|&value| value == 0x11));
+        assert!(output[0x1000..].iter().all(|&value| value == 0x22));
     }
 
     #[test]

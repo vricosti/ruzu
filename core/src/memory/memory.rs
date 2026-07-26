@@ -3061,6 +3061,15 @@ mod rasterizer_download_tests {
 
         fn smmu_track_continuity(&self, _d_address: u64, _size: usize) {}
 
+        fn smmu_track_continuity_registered(
+            &self,
+            _d_address: u64,
+            _virtual_address: u64,
+            _size: usize,
+            _asid: u32,
+        ) {
+        }
+
         fn smmu_unmap(&self, _d_address: u64, _size: usize) {}
 
         fn smmu_lookup(&self, _d_address: u64) -> usize {

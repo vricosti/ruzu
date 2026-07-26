@@ -303,6 +303,12 @@ impl Container {
             session.asid,
             self.system,
         ));
+        host1x.smmu_track_continuity_registered(
+            start_region,
+            region_start as u64,
+            region_size,
+            session.asid,
+        );
         session.has_preallocated_area = true;
 
         if std::env::var_os("RUZU_TRACE_NVMAP_PREALLOC").is_some() {

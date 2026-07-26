@@ -78,6 +78,18 @@ pub trait Host1xCoreInterface: Any + Send + Sync {
     /// upstream continuity tracking.
     fn smmu_track_continuity(&self, d_address: u64, size: usize);
 
+    /// Recompute continuity from the CPU backing registered for `asid`.
+    ///
+    /// Mirrors upstream `DeviceMemoryManager::TrackContinuity(address,
+    /// virtual_address, size, asid)`.
+    fn smmu_track_continuity_registered(
+        &self,
+        d_address: u64,
+        virtual_address: u64,
+        size: usize,
+        asid: u32,
+    );
+
     /// Remove SMMU page-table mappings covering `[d_address, d_address +
     /// size)`. Mirrors upstream `DeviceMemoryManager<Traits>::Unmap`.
     fn smmu_unmap(&self, d_address: u64, size: usize);
