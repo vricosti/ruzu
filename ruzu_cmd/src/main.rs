@@ -475,8 +475,6 @@ fn main() {
         std::env::var_os("RUZU_PROFILE_MAKE_SHADER_INFO_STALL").is_some();
     let want_shader_register_stall_profile =
         std::env::var_os("RUZU_PROFILE_SHADER_REGISTER_STALL").is_some();
-    let want_update_cached_stall_profile =
-        std::env::var_os("RUZU_PROFILE_UPDATE_CACHED_STALL").is_some();
     let want_rasterizer_mark_cached_stall_profile =
         std::env::var_os("RUZU_PROFILE_RASTERIZER_MARK_CACHED_STALL").is_some();
     if want_ipc_profile
@@ -506,7 +504,6 @@ fn main() {
         || want_refresh_stages_stall_profile
         || want_make_shader_info_stall_profile
         || want_shader_register_stall_profile
-        || want_update_cached_stall_profile
         || want_rasterizer_mark_cached_stall_profile
     {
         extern "C" fn profile_signal(_signum: libc::c_int) {
@@ -538,7 +535,6 @@ fn main() {
             video_core::shader_cache::dump_refresh_stages_stall_profile();
             video_core::shader_cache::dump_make_shader_info_stall_profile();
             video_core::shader_cache::dump_shader_register_stall_profile();
-            video_core::host1x::gpu_device_memory_manager::dump_update_cached_stall_profile();
             ruzu_core::memory::memory::dump_rasterizer_mark_cached_stall_profile();
         }
         unsafe {
@@ -576,7 +572,6 @@ fn main() {
             video_core::shader_cache::dump_refresh_stages_stall_profile();
             video_core::shader_cache::dump_make_shader_info_stall_profile();
             video_core::shader_cache::dump_shader_register_stall_profile();
-            video_core::host1x::gpu_device_memory_manager::dump_update_cached_stall_profile();
             ruzu_core::memory::memory::dump_rasterizer_mark_cached_stall_profile();
         }
         unsafe {

@@ -1673,6 +1673,7 @@ mod tests {
             vertex_count: 0,
             indexed: false,
             index_buffer_addr: 0,
+            index_buffer_addr_end: 0,
             index_buffer_count: 0,
             index_buffer_first: 0,
             index_format: IndexFormat::UnsignedInt,

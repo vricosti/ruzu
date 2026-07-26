@@ -23586,3 +23586,161 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Re-read upstream `TextureCacheRuntime` construction, `MakeImageCreateInfo`, `MakeImage`, `Image::Image`, and `ImageView::ImageView` after implementation.
 - `cargo check -p video_core` passes.
 - Focused regression test `compatible_reinterpretation_uses_mutable_image_format_list` passes and verifies that `A2B10G10R10`/`A8B8G8R8` reinterpretation uses a mutable image plus a non-null format-list chain.
+
+## 2026-07-25 — video_core/src/{buffer_cache/buffer_cache.rs,renderer_vulkan/buffer_cache.rs,vulkan_common/vulkan_device.rs} vs video_core/{buffer_cache/buffer_cache.h,renderer_vulkan/vk_buffer_cache.cpp,vulkan_common/vulkan_device.cpp}
+
+### Intentional differences
+- Rust snapshots the inline-index vector before borrowing the backend runtime.
+  This is a borrow-checking adaptation; the copied bytes, staging allocation,
+  copy range, barrier request, and operation order match upstream.
+
+### Unintentional differences (fixed)
+- Fixed: inline-index draws allocated an index buffer but synchronized address
+  zero instead of uploading `inline_index_draw_indexes`. The Vulkan cache now
+  copies the inline bytes into upload staging and records the same
+  staging-to-index-buffer copy as upstream.
+- Fixed: MoltenVK's reported vertex attribute and binding limits were not
+  capped to 16. The upstream MoltenVK driver quirk is now applied before the
+  limits are consumed by pipeline and buffer-cache construction.
+- Fixed: `BindVertexBuffers` did not clamp the binding range against
+  `GetMaxVertexInputBindings`, allowing `vkCmdBindVertexBuffers2` to receive
+  unsupported bindings and produce undefined vertex fetches.
+
+### Missing items
+- Vulkan buffer usage tracking and upload reordering remain reduced compared
+  with upstream. Upload reordering is currently disabled, so this does not
+  alter the ordering of the corrected inline-index copy.
+
+### Binary layout verification
+- N/A: buffer uploads, Vulkan limits, and binding ranges only.
+
+### Verification
+- Re-read upstream `BufferCache::BindHostIndexBuffer`,
+  `BufferCache::BindHostVertexBuffers`, `BufferCacheRuntime::BindVertexBuffers`,
+  and the MoltenVK device-limit quirk after implementation.
+- Focused test `vertex_binding_count_is_capped_to_the_device_limit` passes.
+- `cargo check -p video_core --lib` and the release `ruzu-cmd` build pass.
+- A 175-second MK8D run reached Mario Kart Stadium without the previous giant
+  black/multicolored triangles. Major scene geometry, racers, crowd, banners,
+  and effects render; the remaining dark ground/stadium materials are a
+  separate sampled-image/material issue.
+
+## 2026-07-25 — video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp
+
+### Intentional differences
+- Rust obtains the recursive texture-cache lock through a raw pointer so the
+  guard does not retain a borrow of the complete rasterizer. Lock ownership and
+  lifetime still match upstream `std::scoped_lock`.
+
+### Unintentional differences (fixed)
+- Fixed: `RasterizerVulkan::clear` called render-target update, alias
+  synchronization, and clear recording without holding `texture_cache.mutex`.
+  Concurrent CPU invalidation could erase an image between clearing its stored
+  value and occupancy bit, causing `SlotVectorIter` to observe a freed slot and
+  panic. The lock now starts immediately before render-target update and is
+  retained through the clear command, matching upstream.
+
+### Missing items
+- None for the texture-cache lock lifetime of `Clear`.
+
+### Binary layout verification
+- N/A: synchronization only.
+
+### Verification
+- Re-read upstream `RasterizerVulkan::Clear` after implementation.
+- `cargo check -p video_core --lib` and a release `ruzu-cmd` build pass.
+- The MK8D legacy-geometry repro previously panicked in
+  `TextureCache::base_image_exists` near 10 seconds. It passed that point and
+  reached presentation 9000 after the lock correction with no `SlotVector`
+  panic.
+
+## 2026-07-26 — video_core/src/buffer_cache/buffer_cache.rs vs video_core/buffer_cache/buffer_cache.h
+
+### Intentional differences
+- Rust passes both `begin` and the loop cursor to `expand_begin` instead of
+  capturing them in a lambda. Both values are mutated in the same order as
+  upstream.
+
+### Unintentional differences (fixed)
+- Fixed: `ResolveOverlaps` expanded the beginning of a stream buffer through a
+  temporary copy of the scan address and discarded the updated cursor.
+  Upstream mutates the loop's `device_addr`, causing the newly included
+  left-hand range to be rescanned. Rust now mutates `scan_addr` directly, so
+  every old buffer in that range is discovered, joined, and copied into the
+  expanded buffer instead of being replaced by zero-filled storage.
+
+### Missing items
+- None for the stream-leap rescan behavior. This entry does not claim complete
+  parity for the surrounding buffer cache.
+
+### Binary layout verification
+- N/A: buffer overlap discovery and lifecycle ordering only.
+
+### Verification
+- Re-read upstream `BufferCache<P>::ResolveOverlaps` after implementation and
+  compared the cursor mutation, loop increment, and expansion ordering.
+- Added regression test `stream_leap_rescans_buffers_in_expanded_left_range`.
+- The focused regression test passes and the release `ruzu-cmd` build
+  completes successfully.
+
+## 2026-07-26 — video_core/src/vulkan_common/vulkan_device.rs vs video_core/vulkan_common/vulkan_device.{h,cpp}
+
+### Intentional differences
+- Rust constructs the Vulkan feature `pNext` chain explicitly rather than
+  through upstream's `FOR_EACH_VK_FEATURE_EXT` macro.
+
+### Unintentional differences (fixed)
+- Fixed: `VK_EXT_index_type_uint8` was enumerated but never enabled on the
+  logical device, and `VkPhysicalDeviceIndexTypeUint8FeaturesEXT` was absent
+  from the queried/enabled feature chain. The renderer could consequently
+  issue `VK_INDEX_TYPE_UINT8_EXT` bindings without enabling the extension.
+  Rust now loads the extension, chains its feature structure, and exposes the
+  actual `indexTypeUint8` feature bit through `DeviceExtensions`, matching
+  upstream.
+
+### Missing items
+- The Vulkan buffer-cache runtime still needs upstream's `Uint8Pass` fallback
+  when `indexTypeUint8` is unavailable. This does not affect MoltenVK when its
+  advertised feature bit is enabled, but remains a portability gap.
+
+### Binary layout verification
+- N/A: Vulkan feature-chain construction only.
+
+### Verification
+- Re-read upstream `FOR_EACH_VK_FEATURE_EXT`, `Device::GetSuitability`, and
+  logical-device creation after implementation.
+- `cargo check -p video_core --lib` passes.
+
+## 2026-07-26 — Vulkan renderer diagnostic cleanup
+
+### Intentional differences
+- `RUZU_VK_SUBMIT_WORKER` remains available because it selects the functional
+  Vulkan submission mode; it is not a trace, profiler, or dump switch.
+
+### Unintentional differences (fixed)
+- Removed the temporary vertex-format support trace, lighting image-view dump,
+  shader-target draw trace, and their unused R16 debug decoder.
+- Removed the `RUZU_LEGACY_GEOMETRY` diagnostic bypass. Non-quad draws now
+  always use the common buffer-cache geometry path, while quad conversion
+  remains on its existing dedicated path.
+- Removed the temporary buffer-bind, SSBO-bind, vertex-input, present-readback,
+  submit-profile, DMA-image, texture-upload, image-write, swapchain, present
+  layer, raw-present, and Vulkan image-dump instrumentation.
+- Removed the associated hot-path counters, environment checks, GPU readbacks,
+  staging allocations, image decoders, PPM writers, and dead diagnostic APIs;
+  disabling a trace no longer leaves per-draw or per-submit bookkeeping.
+
+### Missing items
+- None for this diagnostic cleanup.
+
+### Binary layout verification
+- N/A.
+
+### Verification
+- Re-read upstream `vk_scheduler.cpp`, `vk_present_manager.cpp`,
+  `vk_swapchain.cpp`, `vk_texture_cache.cpp`, and `maxwell_dma.cpp`; all
+  functional command ordering, barriers, copies, waits, and transitions remain.
+- `video_core/src/renderer_vulkan` now reads only
+  `RUZU_VK_SUBMIT_WORKER`; the removed diagnostic symbols have no remaining
+  Rust references.
+- `cargo check -p video_core --lib` passes.

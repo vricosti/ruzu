@@ -103,9 +103,10 @@ pub fn build<F: Fn(String) + 'static>(on_activate: F) -> gtk::Widget {
     log::info!("Game list: found {} game(s)", games.len());
     for game in games {
         // Decode the control-data icon (JPEG) into a texture on the main thread.
-        let icon = game.icon.as_ref().and_then(|bytes| {
-            gdk::Texture::from_bytes(&glib::Bytes::from(bytes.as_slice())).ok()
-        });
+        let icon = game
+            .icon
+            .as_ref()
+            .and_then(|bytes| gdk::Texture::from_bytes(&glib::Bytes::from(bytes.as_slice())).ok());
         store.append(&GameEntry::new(
             &game.name,
             &game.kind,
@@ -297,10 +298,7 @@ impl MetadataReader {
             content_provider: Some(content_provider),
             filesystem_controller: Some(Arc::new(Mutex::new(controller))),
         };
-        Self {
-            vfs,
-            loader_system,
-        }
+        Self { vfs, loader_system }
     }
 
     /// Return `(title, icon_jpeg)` for the game at `path`; either may be `None`.
@@ -376,7 +374,10 @@ fn read_game_dirs() -> Vec<(PathBuf, bool)> {
             if !path.starts_with('/') {
                 return None;
             }
-            Some((PathBuf::from(path), deep.get(&index).copied().unwrap_or(false)))
+            Some((
+                PathBuf::from(path),
+                deep.get(&index).copied().unwrap_or(false),
+            ))
         })
         .collect()
 }

@@ -10,7 +10,7 @@
 //! physical-base-relative device-address table model is still being ported.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use common::address_space::FlatAllocator64;
@@ -31,7 +31,6 @@ pub const PAGE_SIZE: u64 = 1 << PAGE_BITS;
 
 /// Device address type (matches upstream `DAddr`).
 pub type DAddr = u64;
-
 
 /// Fallback callback signature for `MaxwellDeviceMethods::MarkRegionCaching`.
 /// `(address, size, caching)`. The upstream inline method forwards through
@@ -530,62 +529,6 @@ impl SmmuRegisteredProcesses {
 
 fn align_smmu_size(size: usize) -> u64 {
     ((size as u64) + SMMU_PAGE_SIZE - 1) & !(SMMU_PAGE_SIZE - 1)
-}
-
-static UPDATE_CACHED_LAST_STAGE: AtomicU64 = AtomicU64::new(0);
-static UPDATE_CACHED_COUNTS: [AtomicU64; 10] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-
-fn record_update_cached_stage(stage: usize) {
-    if std::env::var_os("RUZU_PROFILE_UPDATE_CACHED_STALL").is_none() {
-        return;
-    }
-    UPDATE_CACHED_LAST_STAGE.store(stage as u64, Ordering::Relaxed);
-    if let Some(counter) = UPDATE_CACHED_COUNTS.get(stage) {
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-pub fn dump_update_cached_stall_profile() {
-    if UPDATE_CACHED_COUNTS[0].load(Ordering::Relaxed) == 0 {
-        return;
-    }
-    const NAMES: [&str; 10] = [
-        "enter",
-        "after_range",
-        "before_cached_pages_lock",
-        "after_cached_pages_lock",
-        "after_page_loop",
-        "after_counts_drop",
-        "before_callback_lock",
-        "after_callback_lock",
-        "after_callbacks",
-        "exit",
-    ];
-    let last_stage = UPDATE_CACHED_LAST_STAGE.load(Ordering::Relaxed) as usize;
-    let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
-    eprintln!(
-        "[UPDATE_CACHED_STALL_PROFILE] last_stage={} ({})",
-        last_stage, last_stage_name
-    );
-    for (index, name) in NAMES.iter().enumerate() {
-        eprintln!(
-            "[UPDATE_CACHED_STALL_PROFILE]   {:02} {:<28} {}",
-            index,
-            name,
-            UPDATE_CACHED_COUNTS[index].load(Ordering::Relaxed)
-        );
-    }
 }
 
 /// Implement the texture-cache `GpuMemoryReader` adapter so descriptor
@@ -1547,14 +1490,12 @@ impl MaxwellDeviceMemoryManager {
     ///   atomic fetch-add semantics. Upstream comment: "Assume delta is
     ///   either -1 or 1" — same here.
     pub fn update_pages_cached_count(&self, addr: DAddr, size: usize, delta: i32) {
-        record_update_cached_stage(0);
         if size == 0 {
             return;
         }
 
         let page_begin = addr >> PAGE_BITS;
         let page_end = (addr + size as u64 + PAGE_SIZE - 1) >> PAGE_BITS;
-        record_update_cached_stage(1);
 
         // Pending-batch tracking for grouped MarkRegionCaching calls.
         // `uncache_*` accumulates pages that just transitioned to count==0.
@@ -1572,9 +1513,7 @@ impl MaxwellDeviceMemoryManager {
         // invalidating the shader cache (this thread already holds the
         // shader-cache lock via ShaderCache::register).
         let mut callbacks: Vec<(Option<usize>, u64, usize, bool)> = Vec::new();
-        record_update_cached_stage(2);
         let counter_guard = ScopedRangeLock::new(&self.cached_pages_guard, addr, size as u64);
-        record_update_cached_stage(3);
 
         fn flush_callbacks(
             callbacks: &mut Vec<(Option<usize>, u64, usize, bool)>,
@@ -1689,16 +1628,11 @@ impl MaxwellDeviceMemoryManager {
             &mut cache_begin,
             &mut cache_bytes,
         );
-        record_update_cached_stage(4);
         drop(counter_guard);
-        record_update_cached_stage(5);
 
         if callbacks.is_empty() {
-            record_update_cached_stage(9);
             return;
         }
-        record_update_cached_stage(6);
-        record_update_cached_stage(7);
         for (memory, address, size, caching) in callbacks {
             if let Some(memory_raw) = memory {
                 // SAFETY: `memory_raw` points at the `Memory` value inside the
@@ -1728,8 +1662,6 @@ impl MaxwellDeviceMemoryManager {
                 }
             }
         }
-        record_update_cached_stage(8);
-        record_update_cached_stage(9);
     }
 }
 

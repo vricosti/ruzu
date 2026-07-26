@@ -70,10 +70,6 @@ pub struct Scheduler {
 
     /// Current chunk being recorded to.
     current_chunk: CommandChunk,
-    /// Diagnostic count accumulated across dispatches for the current submit.
-    current_submit_command_count: usize,
-    /// Diagnostic count of guest draws encoded into the current submit.
-    current_submit_draw_count: usize,
 
     /// Current primary command buffer.
     current_cmdbuf: vk::CommandBuffer,
@@ -127,13 +123,6 @@ struct SubmitJob {
     upload_cmdbuf: vk::CommandBuffer,
     signal_semaphores: Vec<vk::Semaphore>,
     tick: u64,
-    command_count: usize,
-    draw_count: usize,
-}
-
-fn submit_profile_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_VK_SUBMIT").is_some())
 }
 
 struct SubmitWorker {
@@ -224,25 +213,10 @@ impl SubmitWorker {
                 .signal_semaphores(&all_signals)
                 .push_next(&mut timeline_info)
                 .build();
-            let submit_start = submit_profile_enabled().then(std::time::Instant::now);
             let submit_result = unsafe {
                 let _submit_lock = submit_mutex.lock().unwrap();
                 device.queue_submit(queue, &[submit_info], vk::Fence::null())
             };
-            if let Some(start) = submit_start {
-                let elapsed_us = start.elapsed().as_micros() as u64;
-                if elapsed_us >= 100_000 || !job.signal_semaphores.is_empty() || job.draw_count != 0
-                {
-                    eprintln!(
-                        "[VK_SUBMIT_PROFILE] tick={} elapsed_us={} commands={} draws={} binary_signals={}",
-                        job.tick,
-                        elapsed_us,
-                        job.command_count,
-                        job.draw_count,
-                        job.signal_semaphores.len(),
-                    );
-                }
-            }
             if let Err(error) = submit_result {
                 log::error!(
                     "Vulkan submit worker failed to submit tick {}: {:?}",
@@ -320,8 +294,6 @@ impl Scheduler {
             queue,
             command_pool,
             current_chunk: CommandChunk::new(),
-            current_submit_command_count: 0,
-            current_submit_draw_count: 0,
             current_cmdbuf: vk::CommandBuffer::null(),
             upload_cmdbuf: vk::CommandBuffer::null(),
             current_tick: AtomicU64::new(0),
@@ -344,12 +316,6 @@ impl Scheduler {
 
     pub fn set_state_tracker(&mut self, state_tracker: NonNull<StateTracker>) {
         self.state_tracker = Some(state_tracker);
-    }
-
-    pub fn note_guest_draw(&mut self) {
-        if submit_profile_enabled() {
-            self.current_submit_draw_count += 1;
-        }
     }
 
     /// Record a command that only needs the render command buffer.
@@ -504,9 +470,6 @@ impl Scheduler {
         }
 
         let chunk = std::mem::replace(&mut self.current_chunk, CommandChunk::new());
-        if submit_profile_enabled() {
-            self.current_submit_command_count += chunk.commands.len();
-        }
         for cmd in chunk.commands {
             cmd(self.current_cmdbuf, self.upload_cmdbuf);
         }
@@ -584,8 +547,6 @@ impl Scheduler {
                 upload_cmdbuf: self.upload_cmdbuf,
                 signal_semaphores: signal_semaphores.to_vec(),
                 tick,
-                command_count: self.current_submit_command_count,
-                draw_count: self.current_submit_draw_count,
             });
             if !signal_semaphores.is_empty() || submit_worker_sync_mode() {
                 // BINARY semaphores (e.g. the present manager's render_ready)
@@ -618,35 +579,17 @@ impl Scheduler {
                 .signal_semaphores(&all_signals)
                 .push_next(&mut timeline_info)
                 .build();
-            let submit_start = submit_profile_enabled().then(std::time::Instant::now);
             let submit_result = unsafe {
                 let _submit_lock = self.submit_mutex.lock().unwrap();
                 self.device
                     .queue_submit(self.queue, &[submit_info], vk::Fence::null())
             };
-            if let Some(start) = submit_start {
-                let elapsed_us = start.elapsed().as_micros() as u64;
-                if elapsed_us >= 100_000
-                    || !signal_semaphores.is_empty()
-                    || self.current_submit_draw_count != 0
-                {
-                    eprintln!(
-                        "[VK_SUBMIT_PROFILE] tick={} elapsed_us={} commands={} draws={} binary_signals={}",
-                        tick,
-                        elapsed_us,
-                        self.current_submit_command_count,
-                        self.current_submit_draw_count,
-                        signal_semaphores.len(),
-                    );
-                }
-            }
             let _ = submit_result;
         } else {
             let submit_info = vk::SubmitInfo::builder()
                 .command_buffers(&cmd_buffers)
                 .signal_semaphores(signal_semaphores)
                 .build();
-            let submit_start = submit_profile_enabled().then(std::time::Instant::now);
             unsafe {
                 self.device
                     .wait_for_fences(&[self.fence], true, u64::MAX)
@@ -657,27 +600,9 @@ impl Scheduler {
                     .queue_submit(self.queue, &[submit_info], self.fence)
                     .ok();
             }
-            if let Some(start) = submit_start {
-                let elapsed_us = start.elapsed().as_micros() as u64;
-                if elapsed_us >= 100_000
-                    || !signal_semaphores.is_empty()
-                    || self.current_submit_draw_count != 0
-                {
-                    eprintln!(
-                        "[VK_SUBMIT_PROFILE] tick={} elapsed_us={} commands={} draws={} binary_signals={}",
-                        tick,
-                        elapsed_us,
-                        self.current_submit_command_count,
-                        self.current_submit_draw_count,
-                        signal_semaphores.len(),
-                    );
-                }
-            }
         }
 
         debug!("Scheduler: flushed at tick {}", tick);
-        self.current_submit_command_count = 0;
-        self.current_submit_draw_count = 0;
         self.allocate_new_context().ok();
         tick
     }

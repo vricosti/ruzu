@@ -6,7 +6,7 @@
 //! Top-level Vulkan renderer that owns the device, swapchain, present manager,
 //! blit screens, rasterizer, and optional turbo mode.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use ash::vk;
@@ -33,38 +33,6 @@ use super::present::util::{create_wrapped_image, create_wrapped_image_view, down
 use super::present_manager::{Frame, PresentManager};
 use super::scheduler::Scheduler;
 use super::swapchain::Swapchain;
-
-static VK_COMPOSITE_COUNT: AtomicU64 = AtomicU64::new(0);
-static VK_COMPOSITE_TOTAL_US: AtomicU64 = AtomicU64::new(0);
-static VK_COMPOSITE_MAX_US: AtomicU64 = AtomicU64::new(0);
-static VK_COMPOSITE_CAPTURE_US: AtomicU64 = AtomicU64::new(0);
-static VK_COMPOSITE_SCREENSHOT_US: AtomicU64 = AtomicU64::new(0);
-static VK_COMPOSITE_LAYOUT_US: AtomicU64 = AtomicU64::new(0);
-static VK_COMPOSITE_GET_FRAME_US: AtomicU64 = AtomicU64::new(0);
-static VK_COMPOSITE_SWAPCHAIN_EXTENT_US: AtomicU64 = AtomicU64::new(0);
-static VK_COMPOSITE_SWAPCHAIN_INFO_US: AtomicU64 = AtomicU64::new(0);
-static VK_COMPOSITE_DRAW_US: AtomicU64 = AtomicU64::new(0);
-static VK_COMPOSITE_FLUSH_US: AtomicU64 = AtomicU64::new(0);
-static VK_COMPOSITE_PRESENT_US: AtomicU64 = AtomicU64::new(0);
-static VK_COMPOSITE_TICK_US: AtomicU64 = AtomicU64::new(0);
-
-fn vk_composite_profile_enabled() -> bool {
-    std::env::var_os("RUZU_PROFILE_VK_COMPOSITE").is_some()
-}
-
-fn elapsed_us(start: std::time::Instant) -> u64 {
-    start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
-}
-
-fn update_max(target: &AtomicU64, value: u64) {
-    let mut current = target.load(Ordering::Relaxed);
-    while value > current {
-        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(next) => current = next,
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Constants (from renderer_vulkan.cpp anonymous namespace)
@@ -264,8 +232,6 @@ pub struct RendererVulkan {
     applet_frame: Frame,
     /// Whether turbo mode is enabled.
     turbo_mode_enabled: bool,
-    /// One-shot diagnostic dump for the presented framebuffer.
-    present_frame_dumped: bool,
 }
 
 unsafe impl Send for RendererVulkan {}
@@ -453,7 +419,6 @@ impl RendererVulkan {
             dummy_context: VulkanDummyContext,
             applet_frame: Frame::default(),
             turbo_mode_enabled: false,
-            present_frame_dumped: false,
         };
         renderer.report(telemetry_session);
         Ok(renderer)
@@ -475,69 +440,18 @@ impl RendererVulkan {
     /// 8. Notify GPU of frame end
     /// 9. Tick rasterizer frame
     pub fn composite_impl(&mut self, framebuffers: &[FramebufferConfig]) {
-        let profile = vk_composite_profile_enabled();
-        let composite_start = profile.then(std::time::Instant::now);
-        let trace_present = std::env::var_os("RUZU_TRACE_PRESENT").is_some();
-        if trace_present {
-            log::info!(
-                "[PRESENT] RendererVulkan::Composite enter layers={} current_frame={} shown={}",
-                framebuffers.len(),
-                self.base_data.current_frame,
-                self.window_shown.load(Ordering::Relaxed)
-            );
-        }
         let _frame_displayed = FrameDisplayedNotifyGuard::new(&self.frame_displayed_notify);
         if framebuffers.is_empty() {
-            if trace_present {
-                log::info!("[PRESENT] RendererVulkan::Composite skip empty layers");
-            }
             return;
         }
-        let phase_start = profile.then(std::time::Instant::now);
         self.render_applet_capture_layer(framebuffers);
-        if let Some(start) = phase_start {
-            VK_COMPOSITE_CAPTURE_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
-        }
         if !should_present_window(&self.window_shown) {
-            if trace_present {
-                log::info!("[PRESENT] RendererVulkan::Composite skip hidden window");
-            }
             return;
         }
-        let phase_start = profile.then(std::time::Instant::now);
-        let layout = self.current_framebuffer_layout_for_present(trace_present);
-        if let Some(start) = phase_start {
-            VK_COMPOSITE_LAYOUT_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
-        }
-        let phase_start = profile.then(std::time::Instant::now);
+        let layout = self.current_framebuffer_layout_for_present();
         self.render_screenshot(framebuffers);
-        self.dump_present_frame_if_requested(framebuffers, &layout);
-        if let Some(start) = phase_start {
-            VK_COMPOSITE_SCREENSHOT_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
-        }
 
-        let phase_start = profile.then(std::time::Instant::now);
         let frame_index = self.present_manager.get_render_frame_index();
-        if let Some(start) = phase_start {
-            VK_COMPOSITE_GET_FRAME_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
-        }
-        if trace_present {
-            let phase_start = profile.then(std::time::Instant::now);
-            let swapchain_extent = self.swapchain.lock().unwrap().get_extent();
-            if let Some(start) = phase_start {
-                VK_COMPOSITE_SWAPCHAIN_EXTENT_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
-            }
-            log::info!(
-                "[PRESENT] RendererVulkan::Composite draw frame_index={} swapchain={}x{} layout={}x{} image_count={}",
-                frame_index,
-                swapchain_extent.width,
-                swapchain_extent.height,
-                layout.width,
-                layout.height,
-                self.swapchain.lock().unwrap().get_image_count()
-            );
-        }
-        let phase_start = profile.then(std::time::Instant::now);
         // Upstream reads these swapchain getters without a lock
         // (renderer_vulkan.cpp:163). Locking `swapchain_mutex` here stalled
         // the GPU thread behind the present thread, which holds that mutex
@@ -547,10 +461,6 @@ impl RendererVulkan {
         // both values in atomics updated at swapchain (re)creation.
         let swapchain_image_count = self.present_manager.swapchain_image_count();
         let swapchain_image_view_format = self.present_manager.swapchain_image_view_format();
-        if let Some(start) = phase_start {
-            VK_COMPOSITE_SWAPCHAIN_INFO_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
-        }
-        let phase_start = profile.then(std::time::Instant::now);
         self.blit_swapchain.draw_to_present_frame(
             &mut self.rasterizer,
             &mut self.scheduler,
@@ -563,71 +473,15 @@ impl RendererVulkan {
             swapchain_image_count,
             swapchain_image_view_format,
         );
-        if let Some(start) = phase_start {
-            VK_COMPOSITE_DRAW_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
-        }
 
         let render_ready = self.present_manager.frame(frame_index).render_ready;
-        let phase_start = profile.then(std::time::Instant::now);
         self.scheduler.flush_with_signal(render_ready);
-        if let Some(start) = phase_start {
-            VK_COMPOSITE_FLUSH_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
-        }
-        if trace_present {
-            log::info!(
-                "[PRESENT] RendererVulkan::Composite flushed frame_index={}",
-                frame_index
-            );
-        }
-        let phase_start = profile.then(std::time::Instant::now);
         self.present_manager
             .present(frame_index, &mut self.scheduler);
-        if let Some(start) = phase_start {
-            VK_COMPOSITE_PRESENT_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
-        }
         self.base_data.current_frame += 1;
 
-        let phase_start = profile.then(std::time::Instant::now);
         (self.frame_end_notify)();
         self.rasterizer.tick_frame();
-        if let Some(start) = phase_start {
-            VK_COMPOSITE_TICK_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
-        }
-        if let Some(start) = composite_start {
-            let total_us = elapsed_us(start);
-            let count = VK_COMPOSITE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            VK_COMPOSITE_TOTAL_US.fetch_add(total_us, Ordering::Relaxed);
-            update_max(&VK_COMPOSITE_MAX_US, total_us);
-            if count <= 8 || count % 60 == 0 || total_us >= 100_000 {
-                let total = VK_COMPOSITE_TOTAL_US.load(Ordering::Relaxed);
-                let avg = total / count.max(1);
-                eprintln!(
-                    "[VK_COMPOSITE_PROFILE] count={} total_us={} avg_us={} max_us={} last_us={} capture_us={} layout_us={} screenshot_us={} get_frame_us={} swapchain_extent_us={} swapchain_info_us={} draw_us={} flush_us={} present_us={} tick_us={}",
-                    count,
-                    total,
-                    avg,
-                    VK_COMPOSITE_MAX_US.load(Ordering::Relaxed),
-                    total_us,
-                    VK_COMPOSITE_CAPTURE_US.load(Ordering::Relaxed),
-                    VK_COMPOSITE_LAYOUT_US.load(Ordering::Relaxed),
-                    VK_COMPOSITE_SCREENSHOT_US.load(Ordering::Relaxed),
-                    VK_COMPOSITE_GET_FRAME_US.load(Ordering::Relaxed),
-                    VK_COMPOSITE_SWAPCHAIN_EXTENT_US.load(Ordering::Relaxed),
-                    VK_COMPOSITE_SWAPCHAIN_INFO_US.load(Ordering::Relaxed),
-                    VK_COMPOSITE_DRAW_US.load(Ordering::Relaxed),
-                    VK_COMPOSITE_FLUSH_US.load(Ordering::Relaxed),
-                    VK_COMPOSITE_PRESENT_US.load(Ordering::Relaxed),
-                    VK_COMPOSITE_TICK_US.load(Ordering::Relaxed),
-                );
-            }
-        }
-        if trace_present {
-            log::info!(
-                "[PRESENT] RendererVulkan::Composite exit frame_index={} current_frame={}",
-                frame_index,
-                self.base_data.current_frame
-            );
-        }
     }
 
     /// Port of `RendererVulkan::GetAppletCaptureBuffer`.
@@ -831,63 +685,6 @@ impl RendererVulkan {
             .store(false, Ordering::Relaxed);
     }
 
-    /// Diagnostic-only capture of the presented framebuffer.
-    ///
-    /// This intentionally reuses the same owner and readback path as upstream
-    /// `RendererVulkan::RenderToBuffer`; it is gated by environment variables
-    /// and does not affect normal presentation.
-    fn dump_present_frame_if_requested(
-        &mut self,
-        framebuffers: &[FramebufferConfig],
-        layout: &FramebufferLayout,
-    ) {
-        if self.present_frame_dumped {
-            return;
-        }
-        let Some(path) = std::env::var_os("RUZU_DUMP_PRESENT_FRAME") else {
-            return;
-        };
-        let target_frame = std::env::var("RUZU_DUMP_PRESENT_FRAME_AT")
-            .ok()
-            .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(300);
-        if self.base_data.current_frame < target_frame {
-            return;
-        }
-
-        let buffer_size = layout.width as vk::DeviceSize * layout.height as vk::DeviceSize * 4;
-        let dst_buffer = self.render_to_buffer(
-            framebuffers,
-            layout,
-            vk::Format::B8G8R8A8_UNORM,
-            buffer_size,
-        );
-        let path = std::path::PathBuf::from(path);
-        match write_bgra_ppm(
-            &path,
-            dst_buffer.mapped_slice(),
-            layout.width,
-            layout.height,
-        ) {
-            Ok(()) => {
-                self.present_frame_dumped = true;
-                log::info!(
-                    "[PRESENT] dumped presented frame to {} at frame {}",
-                    path.display(),
-                    self.base_data.current_frame
-                );
-            }
-            Err(err) => {
-                self.present_frame_dumped = true;
-                log::error!(
-                    "[PRESENT] failed to dump presented frame to {}: {}",
-                    path.display(),
-                    err
-                );
-            }
-        }
-    }
-
     /// Port of `RendererVulkan::RenderAppletCaptureLayer`.
     ///
     /// Renders framebuffers to the applet capture frame at 1280x720
@@ -952,7 +749,7 @@ impl RendererVulkan {
     /// the WSI layer waits for a drawable. Upstream does not block
     /// `RendererVulkan::Composite` on a swapchain query for layout; if the
     /// mutex is busy, use the frontend-provided layout for this frame.
-    fn current_framebuffer_layout_for_present(&self, trace_present: bool) -> FramebufferLayout {
+    fn current_framebuffer_layout_for_present(&self) -> FramebufferLayout {
         let layout = self.framebuffer_layout.read().unwrap().clone();
         let Ok(swapchain) = self.swapchain.try_lock() else {
             return layout;
@@ -966,17 +763,6 @@ impl RendererVulkan {
         }
 
         let updated = default_frame_layout(extent.width, extent.height);
-        if trace_present {
-            log::info!(
-                "[PRESENT] RendererVulkan::Composite sync layout from surface old={}x{} new={}x{} screen={}x{}",
-                layout.width,
-                layout.height,
-                updated.width,
-                updated.height,
-                updated.screen.get_width(),
-                updated.screen.get_height()
-            );
-        }
         *self.framebuffer_layout.write().unwrap() = updated.clone();
         updated
     }
@@ -1057,6 +843,13 @@ impl RendererBase for RendererVulkan {
     fn set_gpu_tick_callback(&mut self, callback: crate::renderer_base::GpuTickCallback) {
         self.rasterizer.set_gpu_tick_callback(callback);
     }
+
+    fn set_invalidate_gpu_cache_callback(
+        &mut self,
+        callback: crate::renderer_base::InvalidateGpuCacheCallback,
+    ) {
+        self.rasterizer.set_invalidate_gpu_cache_callback(callback);
+    }
 }
 
 fn map_window_type(
@@ -1109,34 +902,6 @@ fn capture_framebuffer_layout() -> FramebufferLayout {
 
 fn should_present_window(window_shown: &AtomicBool) -> bool {
     window_shown.load(Ordering::Relaxed)
-}
-
-fn write_bgra_ppm(
-    path: &std::path::Path,
-    bgra: &[u8],
-    width: u32,
-    height: u32,
-) -> std::io::Result<()> {
-    use std::io::Write;
-
-    let pixel_count = width as usize * height as usize;
-    let required_len = pixel_count * 4;
-    if bgra.len() < required_len {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "BGRA buffer is smaller than framebuffer dimensions",
-        ));
-    }
-
-    let mut output =
-        Vec::with_capacity(format!("P6\n{} {}\n255\n", width, height).len() + pixel_count * 3);
-    write!(&mut output, "P6\n{} {}\n255\n", width, height)?;
-    for pixel in bgra[..required_len].chunks_exact(4) {
-        output.push(pixel[2]);
-        output.push(pixel[1]);
-        output.push(pixel[0]);
-    }
-    std::fs::write(path, output)
 }
 
 struct FrameDisplayedNotifyGuard {
@@ -1257,18 +1022,6 @@ mod tests {
         }
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn write_bgra_ppm_converts_to_rgb() {
-        let path =
-            std::env::temp_dir().join(format!("ruzu-test-present-dump-{}.ppm", std::process::id()));
-        let bgra = [0x03, 0x02, 0x01, 0xFF, 0x30, 0x20, 0x10, 0x80];
-        write_bgra_ppm(&path, &bgra, 2, 1).unwrap();
-        let data = std::fs::read(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(&data[..11], b"P6\n2 1\n255\n");
-        assert_eq!(&data[11..], &[0x01, 0x02, 0x03, 0x10, 0x20, 0x30]);
     }
 
     #[test]

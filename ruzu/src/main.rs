@@ -15,9 +15,9 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 
 mod boot;
+mod config_import;
 mod emu_window;
 mod file_menu;
-mod config_import;
 mod game_list;
 mod loading_screen;
 mod main_window;

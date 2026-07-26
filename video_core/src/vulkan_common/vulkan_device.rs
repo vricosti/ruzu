@@ -391,6 +391,12 @@ impl Device {
             }
             device_properties = properties2.properties;
         }
+        if driver_properties.driver_id == vk::DriverId::MOLTENVK {
+            log::warn!(
+                "MoltenVK breaks with more than 16 vertex attributes/bindings; capping both limits"
+            );
+            cap_moltenvk_vertex_input_limits(&mut device_properties.limits);
+        }
         let has_memory_budget = supported_extensions.contains("VK_EXT_memory_budget");
         let is_integrated = device_properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
         let (memory_properties, memory_budget_properties) =
@@ -420,6 +426,7 @@ impl Device {
         let has_extended_dynamic_state2 =
             supported_extensions.contains("VK_EXT_extended_dynamic_state2");
         let has_depth_clip_control = supported_extensions.contains("VK_EXT_depth_clip_control");
+        let has_index_type_uint8 = supported_extensions.contains("VK_EXT_index_type_uint8");
         let has_vertex_attribute_divisor =
             supported_extensions.contains("VK_EXT_vertex_attribute_divisor");
         let has_provoking_vertex = supported_extensions.contains("VK_EXT_provoking_vertex");
@@ -453,6 +460,8 @@ impl Device {
             vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default();
         let mut depth_clip_control_features =
             vk::PhysicalDeviceDepthClipControlFeaturesEXT::default();
+        let mut index_type_uint8_features =
+            vk::PhysicalDeviceIndexTypeUint8FeaturesEXT::default();
         let mut vertex_attribute_divisor_features =
             vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT::default();
         let mut provoking_vertex_features = vk::PhysicalDeviceProvokingVertexFeaturesEXT::default();
@@ -488,6 +497,9 @@ impl Device {
             if has_depth_clip_control {
                 features2_builder = features2_builder.push_next(&mut depth_clip_control_features);
             }
+            if has_index_type_uint8 {
+                features2_builder = features2_builder.push_next(&mut index_type_uint8_features);
+            }
             if has_vertex_attribute_divisor {
                 features2_builder =
                     features2_builder.push_next(&mut vertex_attribute_divisor_features);
@@ -518,6 +530,8 @@ impl Device {
             && extended_dynamic_state2_features.extended_dynamic_state2 != 0;
         let supports_depth_clip_control =
             has_depth_clip_control && depth_clip_control_features.depth_clip_control != 0;
+        let supports_index_type_uint8 =
+            has_index_type_uint8 && index_type_uint8_features.index_type_uint8 != 0;
         let supports_vertex_attribute_divisor = has_vertex_attribute_divisor
             && vertex_attribute_divisor_features.vertex_attribute_instance_rate_divisor != 0;
         // Upstream requires both features before enabling VK_EXT_provoking_vertex.
@@ -552,6 +566,7 @@ impl Device {
             "VK_EXT_extended_dynamic_state",
             "VK_EXT_extended_dynamic_state2",
             "VK_EXT_depth_clip_control",
+            "VK_EXT_index_type_uint8",
             "VK_EXT_vertex_attribute_divisor",
             "VK_EXT_shader_demote_to_helper_invocation",
             "VK_EXT_shader_stencil_export",
@@ -641,6 +656,7 @@ impl Device {
                 extended_dynamic_state: supports_extended_dynamic_state,
                 extended_dynamic_state2: supports_extended_dynamic_state2,
                 depth_clip_control: supports_depth_clip_control,
+                index_type_uint8: supports_index_type_uint8,
                 vertex_attribute_divisor: supports_vertex_attribute_divisor,
                 provoking_vertex: supports_provoking_vertex,
                 shader_demote_to_helper_invocation: supports_shader_demote_to_helper_invocation,
@@ -1402,6 +1418,11 @@ fn driver_name_from_id(driver_id: vk::DriverId) -> Option<&'static str> {
     }
 }
 
+fn cap_moltenvk_vertex_input_limits(limits: &mut vk::PhysicalDeviceLimits) {
+    limits.max_vertex_input_attributes = limits.max_vertex_input_attributes.min(16);
+    limits.max_vertex_input_bindings = limits.max_vertex_input_bindings.min(16);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1482,6 +1503,18 @@ mod tests {
         );
         assert_eq!(driver_name_from_id(vk::DriverId::MESA_NVK), Some("NVK"));
         assert_eq!(driver_name_from_id(vk::DriverId::from_raw(-1)), None);
+    }
+
+    #[test]
+    fn moltenvk_vertex_input_limits_match_upstream_quirk() {
+        let mut limits = vk::PhysicalDeviceLimits::default();
+        limits.max_vertex_input_attributes = 31;
+        limits.max_vertex_input_bindings = 31;
+
+        cap_moltenvk_vertex_input_limits(&mut limits);
+
+        assert_eq!(limits.max_vertex_input_attributes, 16);
+        assert_eq!(limits.max_vertex_input_bindings, 16);
     }
 
     #[test]

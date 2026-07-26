@@ -9,7 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use ash::vk;
 use ash::vk::Handle;
@@ -59,61 +59,6 @@ use crate::vulkan_common::vulkan_device::{
     query_device_memory_info, query_device_memory_usage, DeviceMemoryInfo,
 };
 use crate::vulkan_common::vulkan_memory_allocator::{AllocatedImage, MemoryAllocator, MemoryUsage};
-
-struct ImageDumpConfig {
-    path: std::path::PathBuf,
-    draw: Option<u32>,
-    fragment_offset: Option<u32>,
-    gpu_address: Option<u64>,
-    cpu_address: Option<u64>,
-    image_id: Option<ImageId>,
-    width: Option<u32>,
-    height: Option<u32>,
-    every: Option<u64>,
-    at: u64,
-}
-
-fn image_dump_config() -> Option<&'static ImageDumpConfig> {
-    static CONFIG: OnceLock<Option<ImageDumpConfig>> = OnceLock::new();
-    CONFIG
-        .get_or_init(|| {
-            let path = std::env::var_os("RUZU_DUMP_VK_IMAGE_FRAME")?;
-            let parse_u32 = |name: &str| {
-                std::env::var(name)
-                    .ok()
-                    .and_then(|value| value.parse::<u32>().ok())
-            };
-            let parse_hex_u32 = |name: &str| {
-                std::env::var(name)
-                    .ok()
-                    .and_then(|value| u32::from_str_radix(value.trim_start_matches("0x"), 16).ok())
-            };
-            let parse_hex_u64 = |name: &str| {
-                std::env::var(name)
-                    .ok()
-                    .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
-            };
-            Some(ImageDumpConfig {
-                path: path.into(),
-                draw: parse_u32("RUZU_DUMP_VK_IMAGE_DRAW"),
-                fragment_offset: parse_hex_u32("RUZU_DUMP_VK_IMAGE_FS"),
-                gpu_address: parse_hex_u64("RUZU_DUMP_VK_IMAGE_GPU"),
-                cpu_address: parse_hex_u64("RUZU_DUMP_VK_IMAGE_CPU"),
-                image_id: parse_u32("RUZU_DUMP_VK_IMAGE_ID").map(|index| ImageId { index }),
-                width: parse_u32("RUZU_DUMP_VK_IMAGE_WIDTH"),
-                height: parse_u32("RUZU_DUMP_VK_IMAGE_HEIGHT"),
-                every: std::env::var("RUZU_DUMP_VK_IMAGE_EVERY")
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .filter(|&every| every > 0),
-                at: std::env::var("RUZU_DUMP_VK_IMAGE_AT")
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(1),
-            })
-        })
-        .as_ref()
-}
 
 fn convert_border_color(color: [f32; 4]) -> vk::BorderColor {
     if color == [0.0, 0.0, 0.0, 0.0] {
@@ -1609,20 +1554,6 @@ impl TextureCacheRuntime {
         if copies.is_empty() {
             return;
         }
-        if trace_image_write(dst.base.gpu_addr) {
-            log::info!(
-                "[VK_IMAGE_WRITE] op=CopyImage dst_id={} dst_gpu=0x{:X} dst_cpu=0x{:X} dst_fmt={:?} src_id={} src_gpu=0x{:X} src_cpu=0x{:X} src_fmt={:?} copies={}",
-                dst.image_id.index,
-                dst.base.gpu_addr,
-                dst.base.cpu_addr,
-                dst.base.info.format,
-                src.image_id.index,
-                src.base.gpu_addr,
-                src.base.cpu_addr,
-                src.base.info.format,
-                copies.len(),
-            );
-        }
         let aspect = dst.aspect_mask();
         debug_assert_eq!(aspect, src.aspect_mask());
         let vk_copies = copies
@@ -1675,29 +1606,6 @@ impl TextureCacheRuntime {
         filter: BlitFilter,
         operation: BlitOperation,
     ) -> bool {
-        if trace_image_write(dst.base.gpu_addr) {
-            log::info!(
-                "[VK_IMAGE_WRITE] op=BlitImage dst_view={} dst_image={} dst_gpu=0x{:X} dst_fmt={:?} src_view={} src_image={} src_gpu=0x{:X} src_fmt={:?} dst_region=({},{})->({},{}) src_region=({},{})->({},{}) filter={:?} operation={:?}",
-                dst.view_id.index,
-                dst.base.image_id.index,
-                dst.base.gpu_addr,
-                dst.base.format,
-                src.view_id.index,
-                src.base.image_id.index,
-                src.base.gpu_addr,
-                src.base.format,
-                dst_region.start.x,
-                dst_region.start.y,
-                dst_region.end.x,
-                dst_region.end.y,
-                src_region.start.x,
-                src_region.start.y,
-                src_region.end.x,
-                src_region.end.y,
-                filter,
-                operation,
-            );
-        }
         let aspect_mask = image_aspect_mask(src.base.format);
         if aspect_mask != image_aspect_mask(dst.base.format) {
             log::warn!(
@@ -2852,10 +2760,6 @@ pub struct TextureCache {
     async_buffers_death_ring: Vec<StagingBuffer>,
 
     texture_decode_worker: ThreadWorker,
-    present_source_dumped: bool,
-    present_source_seen: u64,
-    image_dumped: bool,
-    image_dump_seen: u64,
 }
 
 impl TextureCache {
@@ -2906,10 +2810,6 @@ impl TextureCache {
             async_buffers: VecDeque::new(),
             async_buffers_death_ring: Vec::new(),
             texture_decode_worker: ThreadWorker::new_named(1, "TextureDecoder"),
-            present_source_dumped: false,
-            present_source_seen: 0,
-            image_dumped: false,
-            image_dump_seen: 0,
         }
     }
 
@@ -3114,16 +3014,7 @@ impl TextureCache {
         is_upload: bool,
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
     ) -> bool {
-        let trace_dma = std::env::var_os("RUZU_TRACE_DMA_IMAGE").is_some();
         if buffer == vk::Buffer::null() || image_id == NULL_IMAGE_ID || !image_id.is_valid() {
-            if trace_dma {
-                log::info!(
-                    "[DMA_IMAGE] texture copy invalid input upload={} image_id={} buffer=0x{:X}",
-                    is_upload,
-                    image_id.index,
-                    buffer.as_raw()
-                );
-            }
             return false;
         }
         let Some(copy) = self
@@ -3131,70 +3022,19 @@ impl TextureCache {
             .dma_buffer_image_copy_descriptor(copy_info, buffer_operand, image_operand, image_id)
             .map(|result| result.copy)
         else {
-            if trace_dma {
-                log::info!(
-                    "[DMA_IMAGE] texture copy descriptor failed upload={} image_id={} len={}x{} buffer_addr=0x{:X} image_addr=0x{:X}",
-                    is_upload,
-                    image_id.index,
-                    copy_info.length_x,
-                    copy_info.length_y,
-                    buffer_operand.address,
-                    image_operand.address
-                );
-            }
             return false;
         };
 
         if is_upload {
-            let image_base_for_trace = &self.base.slot_images[image_id];
-            if trace_image_write(image_base_for_trace.gpu_addr) {
-                log::info!(
-                    "[VK_IMAGE_WRITE] op=DmaBufferToImage image_id={} image_gpu=0x{:X} image_cpu=0x{:X} fmt={:?} buffer_addr=0x{:X} image_addr=0x{:X} len={}x{} pitch={} height={}",
-                    image_id.index,
-                    image_base_for_trace.gpu_addr,
-                    image_base_for_trace.cpu_addr,
-                    image_base_for_trace.info.format,
-                    buffer_operand.address,
-                    image_operand.address,
-                    copy_info.length_x,
-                    copy_info.length_y,
-                    buffer_operand.pitch,
-                    buffer_operand.height,
-                );
-            }
             if !self.prepare_image_with_reader(image_id, true, false, read_gpu_unsafe) {
-                if trace_dma {
-                    log::info!(
-                        "[DMA_IMAGE] texture upload prepare failed image_id={} buffer_addr=0x{:X} image_addr=0x{:X}",
-                        image_id.index,
-                        buffer_operand.address,
-                        image_operand.address
-                    );
-                }
                 return false;
             }
         } else {
             if !self.prepare_image_with_reader(image_id, false, false, read_gpu_unsafe) {
-                if trace_dma {
-                    log::info!(
-                        "[DMA_IMAGE] texture download prepare failed image_id={} buffer_addr=0x{:X} image_addr=0x{:X}",
-                        image_id.index,
-                        buffer_operand.address,
-                        image_operand.address
-                    );
-                }
                 return false;
             }
             let bpp = crate::surface::bytes_per_block(self.base.slot_images[image_id].info.format);
             if buffer_offset as usize % bpp as usize != 0 {
-                if trace_dma {
-                    log::info!(
-                        "[DMA_IMAGE] texture download unaligned buffer offset image_id={} offset={} bpp={}",
-                        image_id.index,
-                        buffer_offset,
-                        bpp
-                    );
-                }
                 return false;
             }
         }
@@ -3209,23 +3049,9 @@ impl TextureCache {
                     .ensure_image(image_id, &image_base, format, aspect)
                     .is_err()
             {
-                if trace_dma {
-                    log::info!(
-                        "[DMA_IMAGE] texture upload ensure image failed image_id={} format={:?} aspect={:?}",
-                        image_id.index,
-                        format,
-                        aspect
-                    );
-                }
                 return false;
             }
             let Some(mut image) = self.images.remove(&image_id) else {
-                if trace_dma {
-                    log::info!(
-                        "[DMA_IMAGE] texture upload missing backend image image_id={}",
-                        image_id.index
-                    );
-                }
                 return false;
             };
             image.base = image_base;
@@ -3233,15 +3059,6 @@ impl TextureCache {
             self.base.slot_images[image_id].flags = image.base.flags;
             self.base.slot_images[image_id].has_scaled = image.base.has_scaled;
             self.images.insert(image_id, image);
-            if trace_dma {
-                log::info!(
-                    "[DMA_IMAGE] texture upload image_id={} buffer=0x{:X} offset={} uploaded={}",
-                    image_id.index,
-                    buffer.as_raw(),
-                    buffer_offset,
-                    uploaded
-                );
-            }
             uploaded
         } else {
             let size = buffer_operand.pitch.saturating_mul(buffer_operand.height) as usize;
@@ -3253,16 +3070,6 @@ impl TextureCache {
                 buffer_operand.address,
                 size,
             );
-            if trace_dma {
-                log::info!(
-                    "[DMA_IMAGE] texture download image_id={} buffer=0x{:X} offset={} size={} downloaded={}",
-                    image_id.index,
-                    buffer.as_raw(),
-                    buffer_offset,
-                    size,
-                    downloaded
-                );
-            }
             downloaded
         }
     }
@@ -3277,16 +3084,7 @@ impl TextureCache {
         address: u64,
         size: usize,
     ) -> bool {
-        let trace_dma = std::env::var_os("RUZU_TRACE_DMA_IMAGE").is_some();
         if size == 0 || buffer == vk::Buffer::null() || !self.base_image_exists(image_id) {
-            if trace_dma {
-                log::info!(
-                    "[DMA_IMAGE] download into buffer invalid input image_id={} buffer=0x{:X} size={}",
-                    image_id.index,
-                    buffer.as_raw(),
-                    size
-                );
-            }
             return false;
         }
 
@@ -3299,14 +3097,6 @@ impl TextureCache {
                 .ensure_image(image_id, &image_base, format, aspect)
                 .is_err()
         {
-            if trace_dma {
-                log::info!(
-                    "[DMA_IMAGE] download into buffer ensure image failed image_id={} format={:?} aspect={:?}",
-                    image_id.index,
-                    format,
-                    aspect
-                );
-            }
             return false;
         }
 
@@ -3324,13 +3114,6 @@ impl TextureCache {
             .runtime
             .download_staging_buffer(size as vk::DeviceSize, true)
         else {
-            if trace_dma {
-                log::info!(
-                    "[DMA_IMAGE] download into buffer staging allocation failed image_id={} size={}",
-                    image_id.index,
-                    size
-                );
-            }
             let _ = self.base.slot_buffer_downloads.take(slot);
             let _ = self.base.uncommitted_downloads.pop();
             return false;
@@ -3340,12 +3123,6 @@ impl TextureCache {
         self.uncommitted_async_buffers.push(download_map);
 
         let Some(mut image) = self.images.remove(&image_id) else {
-            if trace_dma {
-                log::info!(
-                    "[DMA_IMAGE] download into buffer missing backend image image_id={}",
-                    image_id.index
-                );
-            }
             let _ = self.base.slot_buffer_downloads.take(slot);
             let _ = self.base.uncommitted_downloads.pop();
             if let Some(mut download_map) = self.uncommitted_async_buffers.pop() {
@@ -3367,15 +3144,6 @@ impl TextureCache {
         self.images.insert(image_id, image);
 
         if !downloaded {
-            if trace_dma {
-                log::info!(
-                    "[DMA_IMAGE] download into buffer copy failed image_id={} buffer=0x{:X} staging=0x{:X} size={}",
-                    image_id.index,
-                    buffer.as_raw(),
-                    download_map.buffer.as_raw(),
-                    size
-                );
-            }
             let _ = self.base.slot_buffer_downloads.take(slot);
             let _ = self.base.uncommitted_downloads.pop();
             if let Some(mut download_map) = self.uncommitted_async_buffers.pop() {
@@ -3384,16 +3152,6 @@ impl TextureCache {
             return false;
         }
 
-        if trace_dma {
-            log::info!(
-                "[DMA_IMAGE] download into buffer queued image_id={} address=0x{:X} size={} async_buffer_id={} staging=0x{:X}",
-                image_id.index,
-                address,
-                size,
-                async_buffer_id,
-                download_buffer.as_raw()
-            );
-        }
         true
     }
 
@@ -3439,105 +3197,6 @@ impl TextureCache {
         let staging_bytes =
             unsafe { std::slice::from_raw_parts(staging.mapped, staging_size) }.to_vec();
         Some((image_base, staging_bytes))
-    }
-
-    pub fn debug_dump_image_at_gpu_native(
-        &mut self,
-        gpu_addr: u64,
-        path: &std::path::Path,
-    ) -> bool {
-        let Some(image_id) = self
-            .base
-            .slot_images
-            .iter()
-            .find(|(_, image)| image.gpu_addr == gpu_addr)
-            .map(|(id, _)| id)
-        else {
-            return false;
-        };
-        self.debug_dump_image_native(image_id, path)
-    }
-
-    pub fn debug_dump_image_at_cpu_native(
-        &mut self,
-        cpu_addr: u64,
-        path: &std::path::Path,
-    ) -> bool {
-        let Some(image_id) = self
-            .base
-            .slot_images
-            .iter()
-            .find(|(_, image)| image.cpu_addr == cpu_addr)
-            .map(|(id, _)| id)
-        else {
-            return false;
-        };
-        self.debug_dump_image_native(image_id, path)
-    }
-
-    /// Dump the image backing the color attachment currently bound in `slot`.
-    ///
-    /// GPU addresses may have several live cache aliases. Diagnostics that
-    /// search by address can therefore select a stale image instead of the
-    /// framebuffer attachment used by the draw being inspected.
-    pub fn debug_dump_bound_color_rgba(&mut self, slot: usize, path: &std::path::Path) -> bool {
-        let Some(&view_id) = self.base.render_targets.color_buffer_ids.get(slot) else {
-            return false;
-        };
-        if !view_id.is_valid() || view_id == NULL_IMAGE_VIEW_ID {
-            return false;
-        }
-        let image_id = self.base.slot_image_views[view_id].image_id;
-        if !image_id.is_valid() || image_id == NULL_IMAGE_ID {
-            return false;
-        }
-        let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) else {
-            return false;
-        };
-        let bytes = decode_debug_dump_to_rgba8(&bytes, &image_base.info);
-        let written = write_rgba_like_ppm(
-            path,
-            &bytes,
-            image_base.info.size.width.max(1),
-            image_base.info.size.height.max(1),
-        )
-        .is_ok();
-        if written {
-            log::info!(
-                "[VK_BOUND_COLOR_DUMP] slot={} view_id={} image_id={} format={:?} size={}x{} gpu=0x{:X} path={}",
-                slot,
-                view_id.index,
-                image_id.index,
-                image_base.info.format,
-                image_base.info.size.width,
-                image_base.info.size.height,
-                image_base.gpu_addr,
-                path.display(),
-            );
-        }
-        written
-    }
-
-    pub fn debug_dump_image_native(&mut self, image_id: ImageId, path: &std::path::Path) -> bool {
-        let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) else {
-            return false;
-        };
-        let written = std::fs::write(path, bytes).is_ok();
-        if written {
-            log::info!(
-                "[VK_NATIVE_DUMP] image_id={} format={:?} size={}x{}x{} levels={} gpu=0x{:X} cpu=0x{:X} path={}",
-                image_id.index,
-                image_base.info.format,
-                image_base.info.size.width,
-                image_base.info.size.height,
-                image_base.info.size.depth,
-                image_base.info.resources.levels,
-                image_base.gpu_addr,
-                image_base.cpu_addr,
-                path.display()
-            );
-        }
-        written
     }
 
     /// Port of the Vulkan texture-cache owner `EraseChannel` edge.
@@ -5316,25 +4975,6 @@ impl TextureCache {
             );
             return false;
         }
-        let trace_upload = std::env::var_os("RUZU_TRACE_VK_TEXTURE_UPLOAD").is_some();
-        if trace_upload {
-            let guest_nonzero = guest.iter().filter(|&&b| b != 0).count();
-            log::warn!(
-                "[VK_TEXTURE_UPLOAD] start image_id={} gpu=0x{:X} cpu=0x{:X} fmt={:?} type={:?} size={}x{}x{} guest_size={} staging_size={} flags={:?} guest_nonzero={}",
-                image_id.index,
-                image_base.gpu_addr,
-                image_base.cpu_addr,
-                image_base.info.format,
-                image_base.info.image_type,
-                image_base.info.size.width,
-                image_base.info.size.height,
-                image_base.info.size.depth,
-                guest_size,
-                staging_size,
-                image_base.flags,
-                guest_nonzero,
-            );
-        }
         if image_base.flags.contains(ImageFlagBits::ACCELERATED_UPLOAD) {
             if staging_size < guest.len() {
                 log::warn!(
@@ -5356,14 +4996,6 @@ impl TextureCache {
             let uploaded = self
                 .runtime
                 .accelerate_image_upload(&mut image, staging, &swizzles);
-            if trace_upload {
-                log::warn!(
-                    "[VK_TEXTURE_UPLOAD] accelerated image_id={} copies={} uploaded={}",
-                    image_id.index,
-                    swizzles.len(),
-                    uploaded,
-                );
-            }
             self.base.slot_images[image_id].flags = image.base.flags;
             self.base.slot_images[image_id].has_scaled = image.base.has_scaled;
             self.images.insert(image_id, image);
@@ -5395,15 +5027,6 @@ impl TextureCache {
                 &mut upload,
             )
         };
-        if trace_upload {
-            let upload_nonzero = upload.iter().filter(|&&b| b != 0).count();
-            log::warn!(
-                "[VK_TEXTURE_UPLOAD] staged image_id={} copies={} upload_nonzero={}",
-                image_id.index,
-                copies.len(),
-                upload_nonzero,
-            );
-        }
         unsafe {
             std::ptr::copy_nonoverlapping(upload.as_ptr(), staging.mapped, upload.len());
         }
@@ -5413,13 +5036,6 @@ impl TextureCache {
         image.base = self.base.slot_images[image_id].clone();
         let uploaded =
             image.upload_memory(&mut self.runtime, staging.buffer, staging.offset, &copies);
-        if trace_upload {
-            log::warn!(
-                "[VK_TEXTURE_UPLOAD] submitted image_id={} uploaded={}",
-                image_id.index,
-                uploaded,
-            );
-        }
         self.base.slot_images[image_id].flags = image.base.flags;
         self.base.slot_images[image_id].has_scaled = image.base.has_scaled;
         self.images.insert(image_id, image);
@@ -5980,12 +5596,7 @@ impl TextureCache {
         }
     }
 
-    pub fn prepare_framebuffer_for_present(
-        &mut self,
-        image_id: ImageId,
-        cpu_addr: u64,
-        cmd: vk::CommandBuffer,
-    ) {
+    pub fn prepare_framebuffer_for_present(&mut self, image_id: ImageId, cmd: vk::CommandBuffer) {
         let (image, old_layout) = self
             .images
             .get(&image_id)
@@ -6005,328 +5616,6 @@ impl TextureCache {
             if let Some(target) = self.images.get_mut(&image_id) {
                 target.layout = vk::ImageLayout::GENERAL;
                 target.exchange_initialization();
-            }
-        }
-        self.dump_present_source_if_requested(cpu_addr, image_id);
-    }
-
-    pub fn dump_image_if_requested(&mut self, draw_counter: u32, fragment_offset: u32) {
-        if self.image_dumped {
-            return;
-        }
-        // The disabled hot path is one OnceLock load; environment parsing happens once.
-        let Some(config) = image_dump_config() else {
-            return;
-        };
-        if config.draw.is_some_and(|target| target != draw_counter)
-            || config
-                .fragment_offset
-                .is_some_and(|target| target != fragment_offset)
-        {
-            return;
-        }
-        // RUZU_DUMP_VK_IMAGE_GPU=0xADDR selects the image by guest address
-        // (handy for render targets that are never bound as textures).
-        let image_id = if let Some(target) = config.gpu_address {
-            let found = self
-                .base
-                .slot_images
-                .iter()
-                .find(|(_, img)| {
-                    img.gpu_addr == target
-                        && config
-                            .width
-                            .is_none_or(|width| img.info.size.width == width)
-                        && config
-                            .height
-                            .is_none_or(|height| img.info.size.height == height)
-                })
-                .map(|(id, _)| id);
-            match found {
-                Some(id) => id,
-                None => return,
-            }
-        } else if let Some(target) = config.cpu_address {
-            let found = self
-                .base
-                .slot_images
-                .iter()
-                .find(|(_, img)| {
-                    img.cpu_addr == target
-                        && config
-                            .width
-                            .is_none_or(|width| img.info.size.width == width)
-                        && config
-                            .height
-                            .is_none_or(|height| img.info.size.height == height)
-                })
-                .map(|(id, _)| id);
-            match found {
-                Some(id) => id,
-                None => return,
-            }
-        } else if let Some(id) = config.image_id {
-            id
-        } else {
-            return;
-        };
-        self.image_dump_seen = self.image_dump_seen.saturating_add(1);
-        // RUZU_DUMP_VK_IMAGE_EVERY=N: periodic numbered dumps (never one-shot),
-        // so a single run can sample an image (e.g. a downsampled glow buffer)
-        // across many frames and let the caller pick the frame of interest.
-        if let Some(every) = config.every {
-            if self.image_dump_seen % every != 0 {
-                return;
-            }
-            if let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) {
-                let bytes = decode_debug_dump_to_rgba8(&bytes, &image_base.info);
-                let base = &config.path;
-                let stem = base
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("vk_image")
-                    .to_string();
-                let numbered =
-                    base.with_file_name(format!("{stem}_{:06}.ppm", self.image_dump_seen));
-                if write_rgba_like_ppm(
-                    &numbered,
-                    &bytes,
-                    image_base.info.size.width.max(1),
-                    image_base.info.size.height.max(1),
-                )
-                .is_ok()
-                {
-                    log::info!(
-                        "[VK_IMAGE_DUMP] periodic #{} image_id={} {}x{} format={:?} gpu=0x{:X} to {}",
-                        self.image_dump_seen,
-                        image_id.index,
-                        image_base.info.size.width,
-                        image_base.info.size.height,
-                        image_base.info.format,
-                        image_base.gpu_addr,
-                        numbered.display()
-                    );
-                }
-            }
-            return;
-        }
-        if self.image_dump_seen < config.at {
-            return;
-        }
-        let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) else {
-            return;
-        };
-        if let Some(path) = std::env::var_os("RUZU_DUMP_VK_IMAGE_NATIVE_FRAME") {
-            if let Err(err) = std::fs::write(&path, &bytes) {
-                log::warn!(
-                    "TextureCacheVulkan: failed to dump native image_id={} to {}: {}",
-                    image_id.index,
-                    std::path::Path::new(&path).display(),
-                    err
-                );
-            }
-        }
-        // Debug dumps need CPU-visible RGBA-like bytes. Packed/BCn images are
-        // downloaded in their native representation, so expand them here.
-        let bytes = decode_debug_dump_to_rgba8(&bytes, &image_base.info);
-        let path = &config.path;
-        if let Err(err) = write_rgba_like_ppm(
-            path,
-            &bytes,
-            image_base.info.size.width.max(1),
-            image_base.info.size.height.max(1),
-        ) {
-            log::warn!(
-                "TextureCacheVulkan: failed to dump image_id={} to {}: {}",
-                image_id.index,
-                path.display(),
-                err
-            );
-            return;
-        }
-        self.image_dumped = true;
-        log::info!(
-            "[VK_IMAGE_DUMP] dumped image_id={} {}x{} format={:?} gpu=0x{:X} cpu=0x{:X} bytes={} to {}",
-            image_id.index,
-            image_base.info.size.width,
-            image_base.info.size.height,
-            image_base.info.format,
-            image_base.gpu_addr,
-            image_base.cpu_addr,
-            bytes.len(),
-            path.display()
-        );
-    }
-
-    fn dump_present_source_if_requested(&mut self, cpu_addr: u64, image_id: ImageId) {
-        if self.present_source_dumped {
-            return;
-        }
-        let Some(path) = std::env::var_os("RUZU_DUMP_VK_PRESENT_SOURCE_FRAME") else {
-            return;
-        };
-        self.present_source_seen = self.present_source_seen.saturating_add(1);
-        static PRESENT_STARTED: std::sync::OnceLock<std::time::Instant> =
-            std::sync::OnceLock::new();
-        let present_started = PRESENT_STARTED.get_or_init(std::time::Instant::now);
-        // RUZU_DUMP_VK_PRESENT_SOURCE_EVERY=N: periodic timeline dumps to
-        // numbered files instead of a single one-shot dump.
-        if let Some(every) = std::env::var("RUZU_DUMP_VK_PRESENT_SOURCE_EVERY")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|&every| every > 0)
-        {
-            if self.present_source_seen % every != 0 {
-                return;
-            }
-            let numbered = {
-                let base = std::path::PathBuf::from(&path);
-                let stem = base
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("present_source")
-                    .to_string();
-                base.with_file_name(format!("{stem}_{:06}.ppm", self.present_source_seen))
-            };
-            if let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) {
-                let width = image_base.info.size.width.max(1);
-                let height = image_base.info.size.height.max(1);
-                if write_rgba_like_ppm(&numbered, &bytes, width, height).is_ok() {
-                    log::info!(
-                        "[VK_PRESENT_SOURCE] periodic dump #{} addr=0x{:X} image_id={} to {}",
-                        self.present_source_seen,
-                        cpu_addr,
-                        image_id.index,
-                        numbered.display()
-                    );
-                }
-            }
-            self.dump_present_extra_image_if_requested(self.present_source_seen);
-            return;
-        }
-        let target_present = std::env::var("RUZU_DUMP_VK_PRESENT_SOURCE_AT")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok());
-        let target_after_ms = std::env::var("RUZU_DUMP_VK_PRESENT_SOURCE_AFTER_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok());
-        let marker = std::env::var_os("RUZU_DUMP_VK_PRESENT_SOURCE_MARKER");
-        let marker_reached = marker
-            .as_ref()
-            .map(|path| std::path::Path::new(path).exists())
-            .unwrap_or(false);
-        let reached_target = target_present
-            .map(|target| self.present_source_seen >= target)
-            .unwrap_or(false)
-            || target_after_ms
-                .map(|target| present_started.elapsed().as_millis() >= u128::from(target))
-                .unwrap_or(target_present.is_none() && marker.is_none())
-            || marker_reached;
-        if !reached_target {
-            return;
-        }
-        let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) else {
-            log::warn!(
-                "[VK_PRESENT_SOURCE] dump failed addr=0x{:X} image_id={}",
-                cpu_addr,
-                image_id.index
-            );
-            self.present_source_dumped = true;
-            return;
-        };
-        let width = image_base.info.size.width.max(1);
-        let height = image_base.info.size.height.max(1);
-        let path = std::path::PathBuf::from(path);
-        match write_rgba_like_ppm(&path, &bytes, width, height) {
-            Ok(()) => {
-                log::info!(
-                    "[VK_PRESENT_SOURCE] dumped source addr=0x{:X} image_id={} {}x{} format={:?} bytes={} to {}",
-                    cpu_addr,
-                    image_id.index,
-                    width,
-                    height,
-                    image_base.info.format,
-                    bytes.len(),
-                    path.display()
-                );
-            }
-            Err(err) => {
-                log::warn!(
-                    "[VK_PRESENT_SOURCE] dump write failed addr=0x{:X} image_id={} path={} err={}",
-                    cpu_addr,
-                    image_id.index,
-                    path.display(),
-                    err
-                );
-            }
-        }
-        self.dump_present_extra_image_if_requested(self.present_source_seen);
-        self.present_source_dumped = true;
-    }
-
-    fn dump_present_extra_image_if_requested(&mut self, present_seen: u64) {
-        let Some(path) = std::env::var_os("RUZU_DUMP_VK_PRESENT_EXTRA_FRAME") else {
-            return;
-        };
-        let Some(target_gpu) = std::env::var("RUZU_DUMP_VK_PRESENT_EXTRA_GPU")
-            .ok()
-            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
-        else {
-            return;
-        };
-        let image_ids = self
-            .base
-            .slot_images
-            .iter()
-            .filter(|(_, image)| image.gpu_addr == target_gpu)
-            .map(|(id, _)| id)
-            .collect::<Vec<_>>();
-        if image_ids.is_empty() {
-            return;
-        }
-        let base_path = {
-            let base = std::path::PathBuf::from(path);
-            if std::env::var("RUZU_DUMP_VK_PRESENT_SOURCE_EVERY")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .filter(|&every| every > 0)
-                .is_some()
-            {
-                let stem = base
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("present_extra")
-                    .to_string();
-                base.with_file_name(format!("{stem}_{present_seen:06}.ppm"))
-            } else {
-                base
-            }
-        };
-        for image_id in image_ids {
-            let Some((image_base, bytes)) = self.download_image_to_host_staging(image_id) else {
-                continue;
-            };
-            let bytes = decode_debug_dump_to_rgba8(&bytes, &image_base.info);
-            let width = image_base.info.size.width.max(1);
-            let height = image_base.info.size.height.max(1);
-            let stem = base_path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or("present_extra");
-            let path = base_path.with_file_name(format!(
-                "{stem}_id{}_{}x{}_{:?}.ppm",
-                image_id.index, width, height, image_base.info.format
-            ));
-            if write_rgba_like_ppm(&path, &bytes, width, height).is_ok() {
-                log::info!(
-                    "[VK_PRESENT_EXTRA] dumped image_id={} gpu=0x{:X} {}x{} format={:?} to {}",
-                    image_id.index,
-                    image_base.gpu_addr,
-                    width,
-                    height,
-                    image_base.info.format,
-                    path.display()
-                );
             }
         }
     }
@@ -7192,21 +6481,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_b10g11r11_handles_channel_widths_and_hdr_values() {
-        let one_r = 15u32 << 6;
-        let half_g = (14u32 << 6) << 11;
-        let two_b = (16u32 << 5) << 22;
-        let decoded = decode_b10g11r11_to_rgba8(&(one_r | half_g | two_b).to_le_bytes());
-
-        // Reinhard mapping: 1 -> 0.5, 0.5 -> 1/3, 2 -> 2/3.
-        assert_eq!(decoded, [128, 85, 170, 255]);
-        assert_eq!(
-            decode_b10g11r11_to_rgba8(&0u32.to_le_bytes()),
-            [0, 0, 0, 255]
-        );
-    }
-
-    #[test]
     fn ranged_barrier_range_matches_upstream_min_max_layers() {
         let mut range = RangedBarrierRange::default();
 
@@ -7879,152 +7153,6 @@ fn image_aspect_mask(format: PixelFormat) -> vk::ImageAspectFlags {
         SurfaceType::DepthStencil => vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
         SurfaceType::Invalid => vk::ImageAspectFlags::empty(),
     }
-}
-
-fn trace_image_write(gpu_addr: u64) -> bool {
-    if std::env::var_os("RUZU_TRACE_VK_IMAGE_WRITES").is_some() {
-        return true;
-    }
-    std::env::var("RUZU_TRACE_VK_IMAGE_WRITES_GPU")
-        .ok()
-        .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
-        .is_some_and(|target| target == gpu_addr)
-}
-
-/// Unpack little-endian A2B10G10R10 (R in low 10 bits, then G, B, A in top 2)
-/// into RGBA8 so debug dumps show true colors.
-fn decode_a2b10g10r10_to_rgba8(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    for chunk in bytes.chunks_exact(4) {
-        let v = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let r = (v & 0x3FF) >> 2;
-        let g = ((v >> 10) & 0x3FF) >> 2;
-        let b = ((v >> 20) & 0x3FF) >> 2;
-        let a = ((v >> 30) & 0x3) * 85;
-        out.extend_from_slice(&[r as u8, g as u8, b as u8, a as u8]);
-    }
-    out
-}
-
-fn decode_unsigned_float(bits: u32, mantissa_bits: u32) -> f32 {
-    let mantissa_mask = (1 << mantissa_bits) - 1;
-    let mantissa = bits & mantissa_mask;
-    let exponent = bits >> mantissa_bits;
-    match exponent {
-        0 => (mantissa as f32) * 2.0f32.powi(1 - 15 - mantissa_bits as i32),
-        0x1f => {
-            if mantissa == 0 {
-                f32::INFINITY
-            } else {
-                f32::NAN
-            }
-        }
-        _ => {
-            (1.0 + mantissa as f32 / (1 << mantissa_bits) as f32)
-                * 2.0f32.powi(exponent as i32 - 15)
-        }
-    }
-}
-
-/// Decode Vulkan `B10G11R11_UFLOAT_PACK32` and apply a Reinhard curve so
-/// values above 1.0 remain distinguishable in the 8-bit diagnostic dump.
-fn decode_b10g11r11_to_rgba8(bytes: &[u8]) -> Vec<u8> {
-    fn to_u8(value: f32) -> u8 {
-        if value.is_nan() {
-            return 0;
-        }
-        let mapped = if value.is_infinite() {
-            1.0
-        } else {
-            value.max(0.0) / (1.0 + value.max(0.0))
-        };
-        (mapped * 255.0).round() as u8
-    }
-
-    let mut out = Vec::with_capacity(bytes.len());
-    for chunk in bytes.chunks_exact(4) {
-        let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let r = decode_unsigned_float(value & 0x7ff, 6);
-        let g = decode_unsigned_float((value >> 11) & 0x7ff, 6);
-        let b = decode_unsigned_float((value >> 22) & 0x3ff, 5);
-        out.extend_from_slice(&[to_u8(r), to_u8(g), to_u8(b), 255]);
-    }
-    out
-}
-
-fn decode_debug_dump_to_rgba8(bytes: &[u8], info: &ImageInfo) -> Vec<u8> {
-    match info.format {
-        PixelFormat::R8Unorm => bytes
-            .iter()
-            .flat_map(|&value| [value, value, value, 255])
-            .collect(),
-        PixelFormat::A2B10G10R10Unorm | PixelFormat::A2B10G10R10Uint => {
-            decode_a2b10g10r10_to_rgba8(bytes)
-        }
-        PixelFormat::B10G11R11Float => decode_b10g11r11_to_rgba8(bytes),
-        format if crate::surface::is_pixel_format_bcn(format) => {
-            let mut copies = full_download_copies(info);
-            let mut decoded_len = 0usize;
-            for copy in &copies {
-                decoded_len += copy.image_extent.width as usize
-                    * copy.image_extent.height as usize
-                    * copy.image_subresource.num_layers as usize
-                    * crate::texture_cache::decode_bc::converted_bytes_per_block(format) as usize;
-            }
-            let mut decoded = vec![0u8; decoded_len];
-            convert_image(bytes, info, &mut decoded, &mut copies);
-            match crate::texture_cache::decode_bc::converted_bytes_per_block(format) {
-                1 => decoded
-                    .into_iter()
-                    .flat_map(|v| [v, v, v, 255])
-                    .collect::<Vec<u8>>(),
-                2 => decoded
-                    .chunks_exact(2)
-                    .flat_map(|px| [px[0], px[1], 0, 255])
-                    .collect::<Vec<u8>>(),
-                4 => decoded,
-                _ => bytes.to_vec(),
-            }
-        }
-        _ => bytes.to_vec(),
-    }
-}
-
-fn write_rgba_like_ppm(
-    path: &std::path::Path,
-    rgba: &[u8],
-    width: u32,
-    height: u32,
-) -> std::io::Result<()> {
-    use std::io::Write;
-
-    let pixel_count = width as usize * height as usize;
-    let required_len = pixel_count * 4;
-    if rgba.len() < required_len {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "RGBA-like buffer is smaller than framebuffer dimensions",
-        ));
-    }
-
-    let mut output =
-        Vec::with_capacity(format!("P6\n{} {}\n255\n", width, height).len() + pixel_count * 3);
-    write!(&mut output, "P6\n{} {}\n255\n", width, height)?;
-    for pixel in rgba[..required_len].chunks_exact(4) {
-        output.extend_from_slice(&pixel[..3]);
-    }
-    std::fs::write(path, output)?;
-    if std::env::var_os("RUZU_DUMP_VK_IMAGE_ALPHA").is_some() {
-        let alpha_path = path.with_extension("alpha.ppm");
-        let mut alpha_output =
-            Vec::with_capacity(format!("P6\n{} {}\n255\n", width, height).len() + pixel_count * 3);
-        write!(&mut alpha_output, "P6\n{} {}\n255\n", width, height)?;
-        for pixel in rgba[..required_len].chunks_exact(4) {
-            alpha_output.extend_from_slice(&[pixel[3], pixel[3], pixel[3]]);
-        }
-        std::fs::write(alpha_path, alpha_output)?;
-    }
-    Ok(())
 }
 
 fn image_view_aspect_mask(

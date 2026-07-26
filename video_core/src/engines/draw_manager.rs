@@ -963,6 +963,7 @@ impl<'a> Maxwell3DDrawView<'a> {
                     vertex_count: self.draw_state.vertex_buffer.count,
                     indexed: draw_indexed,
                     index_buffer_addr: registers.index_buffer_gpu_addr,
+                    index_buffer_addr_end: registers.index_buffer_gpu_addr_end,
                     index_buffer_count: self.draw_state.index_buffer.count,
                     index_buffer_first: self.draw_state.index_buffer.first,
                     index_format: self.draw_state.index_buffer.format,
@@ -1529,6 +1530,7 @@ fn build_draw_call_snapshot(
         vertex_count: draw_state.vertex_buffer.count,
         indexed: draw_indexed,
         index_buffer_addr: maxwell3d.index_buffer_addr(),
+        index_buffer_addr_end: maxwell3d.index_buffer_addr_end(),
         index_buffer_count: draw_state.index_buffer.count,
         index_buffer_first: draw_state.index_buffer.first,
         index_format: draw_state.index_buffer.format,
@@ -2001,6 +2003,7 @@ impl DrawManager {
             vertex_count: draw_state.vertex_buffer.count,
             indexed: draw_indexed,
             index_buffer_addr: maxwell3d.index_buffer_addr(),
+            index_buffer_addr_end: maxwell3d.index_buffer_addr_end(),
             index_buffer_count: draw_state.index_buffer.count,
             index_buffer_first: draw_state.index_buffer.first,
             index_format: draw_state.index_buffer.format,
@@ -2475,18 +2478,6 @@ impl DrawManager {
         self.compat_draw_calls.push(draw_call);
 
         let should_execute = maxwell3d.should_execute();
-        let trace_process_draw = std::env::var_os("RUZU_TRACE_PROCESS_DRAW").is_some();
-        if trace_process_draw {
-            eprintln!(
-                "[PROCESS_DRAW] indexed={} instances={} should_execute={} ib_count={} vb_count={} shader_addrs={:X?}",
-                draw_indexed,
-                instance_count,
-                should_execute,
-                self.draw_state.index_buffer.count,
-                self.draw_state.vertex_buffer.count,
-                maxwell3d.shader_program_addresses(),
-            );
-        }
 
         if should_execute {
             // `draw_state.draw_indexed` is already kept in sync with the
@@ -2496,10 +2487,7 @@ impl DrawManager {
             // reference to the rasterizer so the rasterizer never sees a
             // stale value.
             self.draw_state.draw_indexed = draw_indexed;
-            let rasterizer_present = maxwell3d.draw_rasterizer(&self.draw_state, instance_count);
-            if trace_process_draw {
-                eprintln!("[PROCESS_DRAW] rasterizer_present={}", rasterizer_present);
-            }
+            maxwell3d.draw_rasterizer(&self.draw_state, instance_count);
         }
     }
 
@@ -2576,6 +2564,8 @@ mod tests {
         let draw_state = DrawState::default();
         let mut registers = Maxwell3DDrawRegisters::default();
         registers.shader_program_addresses = [0x1000, 0x2000, 0, 0, 0, 0];
+        registers.index_buffer_gpu_addr = 0x4000;
+        registers.index_buffer_gpu_addr_end = 0x4fff;
         registers.descriptor_sync_regs.tex_header_addr = 0x3000;
         registers.window_origin_lower_left = true;
         registers.window_origin_flip_y = true;
@@ -2590,6 +2580,9 @@ mod tests {
             view.shader_program_addresses(),
             [0x1000, 0x2000, 0, 0, 0, 0]
         );
+        let draw = view.draw_call_snapshot(true, 1);
+        assert_eq!(draw.index_buffer_addr, 0x4000);
+        assert_eq!(draw.index_buffer_addr_end, 0x4fff);
         assert_eq!(view.descriptor_sync_regs().tex_header_addr, 0x3000);
         assert!(view.window_origin_lower_left());
         assert!(view.window_origin_flip_y());

@@ -44,40 +44,6 @@ static NEXT_MEMORY_MANAGER_ID: AtomicUsize = AtomicUsize::new(1);
 /// Device address type.
 pub type DAddr = u64;
 
-fn parse_trace_addr_list(name: &str) -> Option<Vec<u64>> {
-    let spec = std::env::var(name).ok()?;
-    let values = spec
-        .split(',')
-        .filter_map(|raw| {
-            let value = raw.trim();
-            if value.is_empty() {
-                return None;
-            }
-            if let Some(hex) = value
-                .strip_prefix("0x")
-                .or_else(|| value.strip_prefix("0X"))
-            {
-                u64::from_str_radix(hex, 16).ok()
-            } else {
-                value.parse::<u64>().ok()
-            }
-        })
-        .collect::<Vec<_>>();
-    (!values.is_empty()).then_some(values)
-}
-
-fn should_trace_cpu_write(addr: DAddr, size: u64) -> bool {
-    static TARGETS: std::sync::OnceLock<Option<Vec<u64>>> = std::sync::OnceLock::new();
-    let Some(targets) = TARGETS
-        .get_or_init(|| parse_trace_addr_list("RUZU_TRACE_CPU_WRITE_ADDRS"))
-        .as_deref()
-    else {
-        return false;
-    };
-    let end = addr.saturating_add(size);
-    targets.iter().any(|&target| addr <= target && target < end)
-}
-
 /// Render target format enumeration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -263,9 +229,6 @@ impl Gpu {
         // Extract rasterizer from renderer.
         // Upstream: rasterizer = renderer->ReadRasterizer();
         let rasterizer_ptr = renderer.read_rasterizer();
-        if std::env::var_os("RUZU_TRACE_RASTERIZER_BIND").is_some() {
-            log::info!("Gpu::bind_renderer rasterizer_ptr={:p}", rasterizer_ptr);
-        }
         *self.rasterizer.lock().unwrap() =
             Some(RasterizerHandle::from_ref(unsafe { &*rasterizer_ptr }));
         // Upstream also does:
@@ -313,6 +276,11 @@ impl Gpu {
                 let gpu = &*(gpu_ptr as *const Self);
                 gpu.tick_work();
             }));
+            let gpu_ptr = self as *const Self as usize;
+            renderer.set_invalidate_gpu_cache_callback(Arc::new(move || unsafe {
+                let gpu = &*(gpu_ptr as *const Self);
+                gpu.invalidate_gpu_cache();
+            }));
             if let Some(writer) = self.guest_memory_writer.lock().unwrap().clone() {
                 renderer.set_guest_memory_writer(writer);
             }
@@ -352,9 +320,6 @@ impl Gpu {
     }
 
     pub fn set_guest_memory_reader(&self, reader: crate::renderer_base::DeviceMemoryReader) {
-        if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
-            log::info!("[PRESENT] GPU::set_guest_memory_reader");
-        }
         // This is a guest/device-memory bridge for GPU command and compatibility paths.
         // The OpenGL present path owns its upstream-shaped MaxwellDeviceMemoryManager
         // reader from RendererOpenGL::new; replacing it here would make
@@ -461,49 +426,9 @@ impl Gpu {
 
     /// Write guest memory at the given CPU/device address.
     pub fn write_guest_memory(&self, addr: u64, data: &[u8]) {
-        // Cache env-var lookups behind OnceLock — `write_guest_memory` runs
-        // on the GPU hot path; before this fix `getenv` showed 7%+ CPU.
-        fn trace_guest_write() -> bool {
-            use std::sync::OnceLock;
-            static CACHED: OnceLock<bool> = OnceLock::new();
-            *CACHED.get_or_init(|| std::env::var_os("RUZU_TRACE_GUEST_WRITE").is_some())
-        }
-        fn trace_guest_write_40037000() -> bool {
-            use std::sync::OnceLock;
-            static CACHED: OnceLock<bool> = OnceLock::new();
-            *CACHED.get_or_init(|| std::env::var_os("RUZU_TRACE_GUEST_WRITE_40037000").is_some())
-        }
         let Some(writer) = self.guest_memory_writer.lock().unwrap().clone() else {
-            if trace_guest_write() {
-                log::info!(
-                    "GPU_WRITE DROPPED addr=0x{:X} size={} (no writer set)",
-                    addr,
-                    data.len()
-                );
-            }
             return;
         };
-        if trace_guest_write() {
-            let head: Vec<String> = data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
-            log::info!(
-                "GPU_WRITE addr=0x{:X} size={} head={}",
-                addr,
-                data.len(),
-                head.join("")
-            );
-        }
-        if trace_guest_write_40037000()
-            && addr <= 0x4003_7000
-            && addr.saturating_add(data.len() as u64) > 0x4003_7000
-        {
-            let head: Vec<String> = data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
-            log::info!(
-                "GPU_WRITE_40037000 hit addr=0x{:X} size={} head={}",
-                addr,
-                data.len(),
-                head.join("")
-            );
-        }
         writer(addr, data);
     }
 
@@ -602,8 +527,6 @@ impl Gpu {
             let gpu = unsafe { &*(gpu_addr as *const Gpu) };
             if let Some(rasterizer) = gpu.rasterizer_handle() {
                 unsafe { rasterizer.as_mut() }.flush_region(addr, size as u64);
-            } else if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
-                log::info!("[PRESENT] Gpu::request_flush sync callback: no rasterizer bound");
             }
         }))
     }
@@ -721,14 +644,6 @@ impl Gpu {
     /// Push GPU command entries to be processed.
     /// Matches upstream `GPU::Impl::PushGPUEntries(s32, CommandList&&)`.
     pub fn push_gpu_entries(&self, channel: i32, entries: CommandList) {
-        if std::env::var_os("RUZU_TRACE_GPU_SUBMIT").is_some() {
-            log::info!(
-                "Gpu::push_gpu_entries channel={} lists={} prefetch={}",
-                channel,
-                entries.command_lists.len(),
-                entries.prefetch_command_list.len()
-            );
-        }
         self.gpu_thread
             .lock()
             .unwrap()
@@ -790,25 +705,10 @@ impl Gpu {
     /// Notify rasterizer of a CPU write.
     /// Matches upstream `GPU::Impl::OnCPUWrite(DAddr, u64)`.
     pub fn on_cpu_write(&self, _addr: DAddr, _size: u64) -> bool {
-        let trace = should_trace_cpu_write(_addr, _size);
-        if trace {
-            log::warn!(
-                "[CPU_WRITE_TRACE] on_cpu_write begin addr=0x{:X} size=0x{:X}",
-                _addr,
-                _size
-            );
-        }
         let Some(rasterizer) = self.rasterizer_handle() else {
-            if trace {
-                log::warn!("[CPU_WRITE_TRACE] on_cpu_write no_rasterizer");
-            }
             return false;
         };
-        let result = unsafe { rasterizer.as_mut() }.on_cpu_write(_addr, _size);
-        if trace {
-            log::warn!("[CPU_WRITE_TRACE] on_cpu_write end result={}", result);
-        }
-        result
+        unsafe { rasterizer.as_mut() }.on_cpu_write(_addr, _size)
     }
 
     /// Flush and invalidate a region.
@@ -832,37 +732,13 @@ impl Gpu {
     /// composition runs from the Host1x guest-syncpoint callback once every
     /// fence has reached its target value.
     pub fn request_composite(&self, layers: Vec<FramebufferConfig>) {
-        if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
-            log::info!("[PRESENT] GPU::request_composite layers={}", layers.len());
-            for (index, layer) in layers.iter().take(4).enumerate() {
-                log::info!(
-                    "[PRESENT] layer{} addr=0x{:X} offset=0x{:X} {}x{} stride={} format=0x{:X}",
-                    index,
-                    layer.address,
-                    layer.offset,
-                    layer.width,
-                    layer.height,
-                    layer.stride,
-                    layer.pixel_format.0
-                );
-            }
-        }
-
         self.request_composite_with_fences(layers, Vec::new());
     }
 
     fn composite_layers(&self, layers: &[FramebufferConfig]) {
         let mut renderer_guard = self.renderer.lock().unwrap();
         if let Some(ref mut renderer) = *renderer_guard {
-            if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
-                log::info!(
-                    "[PRESENT] GPU sync callback calling renderer.composite layers={}",
-                    layers.len()
-                );
-            }
             renderer.composite(layers);
-        } else if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
-            log::info!("[PRESENT] GPU sync callback has no renderer");
         }
     }
 
@@ -892,13 +768,6 @@ impl Gpu {
             let current_request_counter = gpu.allocate_request_swap_counter(valid_fences.len());
             for fence in valid_fences {
                 let layers = layers.clone();
-                if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
-                    log::info!(
-                        "[PRESENT] waiting fence id={} value={} before composite",
-                        fence.id,
-                        fence.value
-                    );
-                }
                 host1x.register_guest_action(
                     fence.id as u32,
                     fence.value,

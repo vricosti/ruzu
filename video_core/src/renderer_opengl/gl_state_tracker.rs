@@ -379,7 +379,7 @@ pub mod dirty {
     // OpenGL-specific entries
     pub const FIRST: u8 = LAST_COMMON_ENTRY;
 
-    pub const VERTEX_FORMATS: u8 = FIRST;
+    pub const VERTEX_FORMATS: u8 = FIRST + 1;
     pub const VERTEX_FORMAT_0: u8 = VERTEX_FORMATS + 1;
     pub const VERTEX_FORMAT_31: u8 = VERTEX_FORMAT_0 + 31;
 
@@ -795,6 +795,7 @@ mod tests {
         StateTracker::setup_tables(&mut tables);
 
         assert_eq!(dirty::FIRST, crate::dirty_flags::flags::LAST_COMMON_ENTRY);
+        assert_eq!(dirty::VERTEX_FORMATS, dirty::FIRST + 1);
         assert_eq!(
             tables[0][COLOR_MASK_COMMON as usize],
             dirty::COLOR_MASK_COMMON

@@ -99,7 +99,7 @@ main()                                    yuzu_cmd/src/main.rs
 
 ## 3. Memory Architecture
 
-### 3.1 Guest Address Space (AArch32 example — MK8D)
+### 3.1 Guest Address Space (AArch32 example)
 
 ```
 0x00000000 ┌──────────────────────┐
@@ -555,7 +555,7 @@ For MK8D (32-bit): rtld at 0x200000, main at 0x206000, subsdk0-4 and sdk follow 
 
 ---
 
-## 9. Runtime Data Flow (MK8D boot example)
+## 9. Runtime Data Flow (boot example)
 
 ```
 1. rtld (runtime linker) starts at PC=0x200000

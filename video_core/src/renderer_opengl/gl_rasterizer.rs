@@ -559,7 +559,6 @@ struct GlDrawDebugFlags {
     trace_draw_summary: bool,
     trace_rt: bool,
     trace_texture_descriptors: bool,
-    trace_ssbo_bind: bool,
     trace_bind_textures: bool,
     dump_bound_textures: bool,
     disable_sampler_bind: bool,
@@ -607,7 +606,6 @@ impl GlDrawDebugFlags {
             trace_draw_summary: std::env::var_os("RUZU_TRACE_DRAW_SUMMARY").is_some(),
             trace_rt: std::env::var_os("RUZU_TRACE_RT").is_some(),
             trace_texture_descriptors: std::env::var_os("RUZU_TRACE_TEXTURE_DESCRIPTORS").is_some(),
-            trace_ssbo_bind: std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some(),
             trace_bind_textures: std::env::var_os("RUZU_TRACE_BIND_TEXTURES").is_some(),
             dump_bound_textures: std::env::var_os("RUZU_DUMP_BOUND_TEXTURES").is_some(),
             disable_sampler_bind: std::env::var_os("RUZU_DISABLE_SAMPLER_BIND").is_some(),
@@ -4085,7 +4083,6 @@ impl RasterizerInterface for RasterizerOpenGL {
                         &mut views,
                         &mut sampler_ids,
                         use_stage_gpu_reader,
-                        gl_debug.trace_ssbo_bind,
                         move |gpu_addr| {
                             mm_for_ssbo_addr
                                 .as_ref()

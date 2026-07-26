@@ -2055,6 +2055,7 @@ pub struct DrawCall {
     pub vertex_count: u32,
     pub indexed: bool,
     pub index_buffer_addr: u64,
+    pub index_buffer_addr_end: u64,
     pub index_buffer_count: u32,
     pub index_buffer_first: u32,
     pub index_format: IndexFormat,

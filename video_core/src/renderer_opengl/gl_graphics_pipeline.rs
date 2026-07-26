@@ -615,7 +615,6 @@ impl GraphicsPipeline {
         &self,
         buffer_cache: &mut BufferCache<P, DT>,
         stage: usize,
-        trace_ssbo_bind: bool,
     ) where
         P: BufferCacheParams,
         DT: DeviceTracker,
@@ -629,15 +628,6 @@ impl GraphicsPipeline {
             return;
         }
 
-        if trace_ssbo_bind && !info.storage_buffers_descriptors.is_empty() {
-            log::info!(
-                "[SSBO_CONFIG] pipeline={} stage={} descriptors={} base_binding={}",
-                self.program_pipeline_handle(),
-                stage,
-                info.storage_buffers_descriptors.len(),
-                self.base_storage_bindings[stage]
-            );
-        }
         for (ssbo_index, desc) in info.storage_buffers_descriptors.iter().enumerate() {
             assert_eq!(
                 desc.count, 1,
@@ -660,7 +650,6 @@ impl GraphicsPipeline {
         &self,
         buffer_cache: &mut BufferCache<P, DT>,
         stage: usize,
-        trace_ssbo_bind: bool,
         mut gpu_to_cpu_address: A,
         mut get_memory_layout_size: L,
         mut read_block: R,
@@ -680,15 +669,6 @@ impl GraphicsPipeline {
             return;
         }
 
-        if trace_ssbo_bind && !info.storage_buffers_descriptors.is_empty() {
-            log::info!(
-                "[SSBO_CONFIG] pipeline={} stage={} descriptors={} base_binding={}",
-                self.program_pipeline_handle(),
-                stage,
-                info.storage_buffers_descriptors.len(),
-                self.base_storage_bindings[stage]
-            );
-        }
         for (ssbo_index, desc) in info.storage_buffers_descriptors.iter().enumerate() {
             assert_eq!(
                 desc.count, 1,
@@ -893,7 +873,6 @@ impl GraphicsPipeline {
         views: &mut Vec<ImageViewInOut>,
         sampler_ids: &mut Vec<SamplerId>,
         use_gpu_reader: bool,
-        trace_ssbo_bind: bool,
         mut gpu_to_cpu_address: A,
         mut get_memory_layout_size: L,
         mut read_block: B,
@@ -923,13 +902,12 @@ impl GraphicsPipeline {
                 self.bind_stage_storage_buffers_with_gpu_reader(
                     buffer_cache,
                     stage,
-                    trace_ssbo_bind,
                     &mut gpu_to_cpu_address,
                     &mut get_memory_layout_size,
                     &mut read_block,
                 );
             } else {
-                self.bind_stage_storage_buffers(buffer_cache, stage, trace_ssbo_bind);
+                self.bind_stage_storage_buffers(buffer_cache, stage);
             }
             record_detail(33, stage as u64, 0);
             record_detail(34, stage as u64, storage_descriptor_count);
@@ -1067,7 +1045,6 @@ impl GraphicsPipeline {
         views: &mut Vec<ImageViewInOut>,
         sampler_ids: &mut Vec<SamplerId>,
         use_gpu_reader: bool,
-        trace_ssbo_bind: bool,
         gpu_to_cpu_address: A,
         get_memory_layout_size: L,
         read_block: B,
@@ -1098,7 +1075,6 @@ impl GraphicsPipeline {
             views,
             sampler_ids,
             use_gpu_reader,
-            trace_ssbo_bind,
             gpu_to_cpu_address,
             get_memory_layout_size,
             read_block,
@@ -1155,7 +1131,6 @@ impl GraphicsPipeline {
         views: &mut Vec<ImageViewInOut>,
         sampler_ids: &mut Vec<SamplerId>,
         use_gpu_reader: bool,
-        trace_ssbo_bind: bool,
         gpu_to_cpu_address: A,
         get_memory_layout_size: L,
         read_block: B,
@@ -1192,7 +1167,6 @@ impl GraphicsPipeline {
             views,
             sampler_ids,
             use_gpu_reader,
-            trace_ssbo_bind,
             gpu_to_cpu_address,
             get_memory_layout_size,
             read_block,
@@ -1241,7 +1215,6 @@ impl GraphicsPipeline {
         views: &mut Vec<ImageViewInOut>,
         sampler_ids: &mut Vec<SamplerId>,
         use_gpu_reader: bool,
-        trace_ssbo_bind: bool,
         gpu_to_cpu_address: A,
         get_memory_layout_size: L,
         read_block: B,
@@ -1285,7 +1258,6 @@ impl GraphicsPipeline {
             views,
             sampler_ids,
             use_gpu_reader,
-            trace_ssbo_bind,
             gpu_to_cpu_address,
             get_memory_layout_size,
             read_block,

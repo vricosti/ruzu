@@ -38,7 +38,10 @@ pub fn import_yuzu_config_once() {
     // Record that the one-time check ran, even when nothing was imported, so it
     // does not repeat on subsequent startups.
     if let Err(e) = fs::create_dir_all(&ruzu_dir) {
-        log::warn!("Could not create ruzu config dir {}: {e}", ruzu_dir.display());
+        log::warn!(
+            "Could not create ruzu config dir {}: {e}",
+            ruzu_dir.display()
+        );
         return;
     }
     if let Err(e) = fs::write(&marker, b"imported\n") {
@@ -66,7 +69,10 @@ fn yuzu_config_dir() -> Option<PathBuf> {
 /// Copy any config files that yuzu has and ruzu does not yet have.
 fn import_from(yuzu_dir: &Path, ruzu_dir: &Path) {
     if let Err(e) = fs::create_dir_all(ruzu_dir) {
-        log::warn!("Could not create ruzu config dir {}: {e}", ruzu_dir.display());
+        log::warn!(
+            "Could not create ruzu config dir {}: {e}",
+            ruzu_dir.display()
+        );
         return;
     }
 
@@ -84,7 +90,11 @@ fn import_from(yuzu_dir: &Path, ruzu_dir: &Path) {
         match fs::copy(&src, &dst) {
             Ok(_) => {
                 imported += 1;
-                log::info!("Imported yuzu config {} -> {}", src.display(), dst.display());
+                log::info!(
+                    "Imported yuzu config {} -> {}",
+                    src.display(),
+                    dst.display()
+                );
             }
             Err(e) => log::warn!("Failed to import {}: {e}", src.display()),
         }

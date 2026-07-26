@@ -50,7 +50,8 @@ pub mod dirty {
     pub const LAST_COMMON_ENTRY: u8 = crate::dirty_flags::flags::LAST_COMMON_ENTRY;
 
     // Vulkan-specific entries
-    pub const VERTEX_INPUT: u8 = LAST_COMMON_ENTRY;
+    pub const FIRST: u8 = LAST_COMMON_ENTRY;
+    pub const VERTEX_INPUT: u8 = FIRST + 1;
     pub const VERTEX_ATTRIBUTE_0: u8 = VERTEX_INPUT + 1;
     pub const VERTEX_ATTRIBUTE_31: u8 = VERTEX_ATTRIBUTE_0 + 31;
     pub const VERTEX_BINDING_0: u8 = VERTEX_ATTRIBUTE_31 + 1;
@@ -706,6 +707,8 @@ mod tests {
     #[test]
     fn test_new_all_dirty() {
         let tracker = StateTracker::new();
+        assert_eq!(dirty::FIRST, crate::dirty_flags::flags::LAST_COMMON_ENTRY);
+        assert_eq!(dirty::VERTEX_INPUT, dirty::FIRST + 1);
         assert!(tracker.flags[dirty::VIEWPORTS as usize]);
         assert!(tracker.flags[dirty::SCISSORS as usize]);
         assert!(tracker.flags[dirty::VERTEX_INPUT as usize]);

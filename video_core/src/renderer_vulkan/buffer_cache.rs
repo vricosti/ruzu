@@ -110,6 +110,7 @@ pub struct BufferCacheRuntime {
     null_memory: vk::DeviceMemory,
     null_buffer_size: vk::DeviceSize,
     extended_dynamic_state_supported: bool,
+    max_vertex_input_bindings: u32,
 }
 
 impl BufferCacheRuntime {
@@ -121,6 +122,7 @@ impl BufferCacheRuntime {
         staging_pool: &mut StagingBufferPool,
         guest_descriptor_queue: &mut UpdateDescriptorQueue,
         extended_dynamic_state_supported: bool,
+        max_vertex_input_bindings: u32,
     ) -> Self {
         let (null_buffer, null_memory, null_buffer_size) =
             create_runtime_null_buffer(&device, &instance, physical_device);
@@ -138,6 +140,7 @@ impl BufferCacheRuntime {
             null_memory,
             null_buffer_size,
             extended_dynamic_state_supported,
+            max_vertex_input_bindings,
         }
     }
 
@@ -641,7 +644,11 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         bindings: &HostBindings,
         buffers: &mut common::slot_vector::SlotVector<BufferBase>,
     ) {
-        let binding_count = bindings.max_index.saturating_sub(bindings.min_index) as usize;
+        let binding_count = vertex_binding_count(
+            bindings.min_index,
+            bindings.max_index,
+            self.max_vertex_input_bindings,
+        ) as usize;
         if binding_count == 0 {
             return;
         }
@@ -669,71 +676,8 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             });
             strides.push(bindings.strides[index]);
         }
-        if std::env::var_os("RUZU_READBACK_COMMON_VERTEX").is_some()
-            && offsets.first() == Some(&0xB000)
-            && sizes.first() == Some(&0x20)
-            && strides.first() == Some(&8)
-            && !{
-                static LAST_BUFFER: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-                LAST_BUFFER.swap(vk_buffers[0].as_raw(), std::sync::atomic::Ordering::Relaxed)
-                    == vk_buffers[0].as_raw()
-            }
-        {
-            if let Some(staging) = self.staging_pool().request_download_buffer(0x20, false) {
-                let src_buffer = vk_buffers[0];
-                let dst_buffer = staging.buffer;
-                let src_offset = offsets[0];
-                let dst_offset = staging.offset;
-                let device = self.device.clone();
-                self.scheduler().request_outside_renderpass();
-                self.scheduler().record(move |cmdbuf| unsafe {
-                    device.cmd_copy_buffer(
-                        cmdbuf,
-                        src_buffer,
-                        dst_buffer,
-                        &[vk::BufferCopy {
-                            src_offset,
-                            dst_offset,
-                            size: 0x20,
-                        }],
-                    );
-                });
-                self.scheduler().finish();
-                let bytes = unsafe { std::slice::from_raw_parts(staging.mapped, 0x20) };
-                log::warn!(
-                    "[COMMON_VERTEX_READBACK] buffer=0x{:X} offset=0x{:X} bytes={:02X?}",
-                    src_buffer.as_raw(),
-                    src_offset,
-                    bytes
-                );
-            }
-        }
         let first_binding = bindings.min_index;
         let dynamic_stride = self.extended_dynamic_state_supported;
-        if std::env::var_os("RUZU_COMMON_VERTEX_BIND_IMMEDIATE").is_some() {
-            let cmdbuf = self.scheduler().command_buffer();
-            unsafe {
-                if dynamic_stride {
-                    self.device.cmd_bind_vertex_buffers2(
-                        cmdbuf,
-                        first_binding,
-                        &vk_buffers,
-                        &offsets,
-                        Some(&sizes),
-                        Some(&strides),
-                    );
-                } else {
-                    self.device.cmd_bind_vertex_buffers(
-                        cmdbuf,
-                        first_binding,
-                        &vk_buffers,
-                        &offsets,
-                    );
-                }
-            }
-            return;
-        }
         let device = self.device.clone();
         self.scheduler().record(move |cmdbuf| unsafe {
             if dynamic_stride {
@@ -765,25 +709,13 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
 
     fn bind_storage_buffer(
         &mut self,
-        stage: usize,
-        binding_index: u32,
+        _stage: usize,
+        _binding_index: u32,
         buffer: &mut BufferBase,
         offset: u32,
         size: u32,
-        is_written: bool,
+        _is_written: bool,
     ) {
-        if std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some() {
-            log::info!(
-                "[VK_SSBO_DESCRIPTOR] stage={} index={} gpu_handle={} vk_buffer=0x{:X} offset=0x{:X} size=0x{:X} written={}",
-                stage,
-                binding_index,
-                buffer.gpu_handle,
-                self.resolve_buffer(buffer.gpu_handle).as_raw(),
-                offset,
-                size,
-                is_written,
-            );
-        }
         self.bind_buffer_descriptor(buffer.gpu_handle, offset, size);
     }
 
@@ -1638,6 +1570,12 @@ fn post_copy_barrier(device: &ash::Device, cmd: vk::CommandBuffer) {
     }
 }
 
+fn vertex_binding_count(min_index: u32, max_index: u32, device_max: u32) -> u32 {
+    let min_binding = min_index.min(device_max);
+    let max_binding = max_index.min(device_max);
+    max_binding.saturating_sub(min_binding)
+}
+
 fn find_device_local_memory(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -1659,6 +1597,13 @@ fn find_device_local_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertex_binding_count_is_capped_to_the_device_limit() {
+        assert_eq!(vertex_binding_count(0, 32, 16), 16);
+        assert_eq!(vertex_binding_count(12, 20, 16), 4);
+        assert_eq!(vertex_binding_count(16, 32, 16), 0);
+    }
 
     #[test]
     fn buffer_cache_params_match_upstream_vulkan() {

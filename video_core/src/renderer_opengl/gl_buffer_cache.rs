@@ -63,19 +63,6 @@ where
     }
 }
 
-fn parse_env_u64(name: &str) -> Option<u64> {
-    let value = std::env::var(name).ok()?;
-    let trimmed = value.trim();
-    if let Some(hex) = trimmed
-        .strip_prefix("0x")
-        .or_else(|| trimmed.strip_prefix("0X"))
-    {
-        u64::from_str_radix(hex, 16).ok()
-    } else {
-        trimmed.parse::<u64>().ok()
-    }
-}
-
 pub fn load_extra_functions<F>(load_fn: &mut F)
 where
     F: FnMut(&'static str) -> *const c_void,
@@ -918,43 +905,6 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
                 offset as isize,
                 size as isize,
             );
-            if std::env::var_os("RUZU_DUMP_GL_UBO_BIND").is_some() {
-                use std::sync::atomic::{AtomicUsize, Ordering};
-                static DUMPS: AtomicUsize = AtomicUsize::new(0);
-                let dump_index = DUMPS.fetch_add(1, Ordering::Relaxed);
-                if dump_index >= 32 {
-                    return;
-                }
-                let dump_size = (size as usize).min(0x240);
-                let mut bytes = vec![0u8; dump_size];
-                gl::GetNamedBufferSubData(
-                    gpu_handle,
-                    offset as isize,
-                    dump_size as isize,
-                    bytes.as_mut_ptr().cast(),
-                );
-                let words: Vec<String> = bytes
-                    .chunks_exact(4)
-                    .take(40)
-                    .map(|chunk| {
-                        format!(
-                            "{:08X}",
-                            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                        )
-                    })
-                    .collect();
-                log::info!(
-                    "[GL_UBO_BIND] #{} stage={} binding={} local_binding={} handle={} offset=0x{:X} size=0x{:X} words={}",
-                    dump_index,
-                    stage,
-                    binding,
-                    binding_index,
-                    gpu_handle,
-                    offset,
-                    size,
-                    words.join(" ")
-                );
-            }
         }
         log::trace!(
             "GL bind_uniform_buffer stage={} binding={} handle={} offset=0x{:X} size=0x{:X}",
@@ -1015,61 +965,6 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
                 );
             } else {
                 gl::BindBufferRange(gl::SHADER_STORAGE_BUFFER, binding, 0, 0, 0);
-            }
-        }
-        if std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some() {
-            log::info!(
-                "[SSBO_BIND] stage={} binding={} local_binding={} handle={} offset=0x{:X} size=0x{:X} written={}",
-                stage,
-                binding,
-                binding_index,
-                buffer.gpu_handle,
-                offset,
-                size,
-                is_written
-            );
-        }
-        if std::env::var_os("RUZU_DUMP_SSBO_BIND").is_some() && buffer.gpu_handle != 0 && size != 0
-        {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static DUMPS: AtomicUsize = AtomicUsize::new(0);
-            let dump_index = DUMPS.fetch_add(1, Ordering::Relaxed);
-            let dump_limit = parse_env_u64("RUZU_DUMP_SSBO_BIND_LIMIT").unwrap_or(16) as usize;
-            if dump_index < dump_limit {
-                let dump_offset = parse_env_u64("RUZU_DUMP_SSBO_BIND_OFFSET").unwrap_or(0) as usize;
-                let dump_size_limit =
-                    parse_env_u64("RUZU_DUMP_SSBO_BIND_BYTES").unwrap_or(0x80) as usize;
-                let dump_size = size
-                    .saturating_sub(dump_offset as u32)
-                    .min(dump_size_limit as u32) as usize;
-                let mut bytes = vec![0u8; dump_size];
-                unsafe {
-                    gl::GetNamedBufferSubData(
-                        buffer.gpu_handle,
-                        (offset as usize + dump_offset) as isize,
-                        dump_size as isize,
-                        bytes.as_mut_ptr().cast(),
-                    );
-                }
-                let words: Vec<String> = bytes
-                    .chunks_exact(4)
-                    .map(|chunk| {
-                        format!(
-                            "{:08X}",
-                            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                        )
-                    })
-                    .collect();
-                log::info!(
-                    "[SSBO_DUMP] #{} stage={} binding={} handle={} offset=0x{:X} size=0x{:X} words={}",
-                    dump_index,
-                    stage,
-                    binding,
-                    buffer.gpu_handle,
-                    offset as usize + dump_offset,
-                    size,
-                    words.join(" ")
-                );
             }
         }
     }
@@ -1264,16 +1159,6 @@ mod tests {
     #[test]
     fn bindless_ssbo_layout() {
         assert_eq!(std::mem::size_of::<BindlessSSBO>(), 16);
-    }
-
-    #[test]
-    fn parse_env_u64_accepts_decimal_and_hex() {
-        std::env::set_var("RUZU_TEST_PARSE_ENV_U64_DEC", "256");
-        std::env::set_var("RUZU_TEST_PARSE_ENV_U64_HEX", "0x100");
-        assert_eq!(parse_env_u64("RUZU_TEST_PARSE_ENV_U64_DEC"), Some(256));
-        assert_eq!(parse_env_u64("RUZU_TEST_PARSE_ENV_U64_HEX"), Some(256));
-        std::env::remove_var("RUZU_TEST_PARSE_ENV_U64_DEC");
-        std::env::remove_var("RUZU_TEST_PARSE_ENV_U64_HEX");
     }
 
     #[test]

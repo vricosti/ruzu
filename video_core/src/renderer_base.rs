@@ -48,6 +48,7 @@ pub type ShaderCacheGpuReader = std::sync::Arc<dyn Fn(u64, &mut [u8]) + Send + S
 pub type GuestMemoryWriter = std::sync::Arc<dyn Fn(u64, &[u8]) + Send + Sync>;
 pub type GpuTicksGetter = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
 pub type GpuTickCallback = std::sync::Arc<dyn Fn() + Send + Sync>;
+pub type InvalidateGpuCacheCallback = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// Abstract renderer base trait.
 ///
@@ -102,6 +103,9 @@ pub trait RendererBase: Send {
 
     /// Install the callback used by rasterizer draw paths to process pending GPU sync work.
     fn set_gpu_tick_callback(&mut self, _callback: GpuTickCallback) {}
+
+    /// Install the callback implementing upstream `gpu.InvalidateGPUCache()`.
+    fn set_invalidate_gpu_cache_callback(&mut self, _callback: InvalidateGpuCacheCallback) {}
 
     /// Install a GPU VA → CPU VA translator used by rasterizer-side
     /// query writes. Mirrors upstream's `gpu_memory->Write<u64>(gpu_va,

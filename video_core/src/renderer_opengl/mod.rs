@@ -642,79 +642,6 @@ impl RendererOpenGL {
             }
         }
 
-        if std::env::var_os("RUZU_TRACE_PRESENT_READBACK").is_some() {
-            unsafe {
-                let width = self.framebuffer_layout.width;
-                let height = self.framebuffer_layout.height;
-                let sample_width = width.min(32) as i32;
-                let sample_height = height.min(32) as i32;
-                let mut old_pack_buffer = 0;
-                let mut old_pack_alignment = 0;
-                let mut old_pack_row_length = 0;
-                gl::GetIntegerv(gl::PIXEL_PACK_BUFFER_BINDING, &mut old_pack_buffer);
-                gl::GetIntegerv(gl::PACK_ALIGNMENT, &mut old_pack_alignment);
-                gl::GetIntegerv(gl::PACK_ROW_LENGTH, &mut old_pack_row_length);
-                gl::BindBuffer(gl::PIXEL_PACK_BUFFER, 0);
-                gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
-                gl::PixelStorei(gl::PACK_ROW_LENGTH, 0);
-                let max_x = width.saturating_sub(sample_width as u32) as i32;
-                let max_y = height.saturating_sub(sample_height as u32) as i32;
-                let origins = [
-                    (0, 0),
-                    (max_x / 2, max_y / 2),
-                    (max_x, max_y),
-                    (0, max_y),
-                    (max_x, 0),
-                ];
-                let mut gl_error = 0;
-                let mut summaries = Vec::with_capacity(origins.len());
-                for (origin_x, origin_y) in origins {
-                    let mut pixels = vec![0u8; (sample_width * sample_height * 4) as usize];
-                    gl::ReadPixels(
-                        origin_x,
-                        origin_y,
-                        sample_width,
-                        sample_height,
-                        gl::RGBA,
-                        gl::UNSIGNED_BYTE,
-                        pixels.as_mut_ptr() as *mut _,
-                    );
-                    gl_error |= gl::GetError();
-
-                    let mut rgb_nonzero = 0usize;
-                    let mut alpha_nonzero = 0usize;
-                    let mut rgba_sum = [0u64; 4];
-                    for px in pixels.chunks_exact(4) {
-                        rgb_nonzero += px[0..3].iter().filter(|&&byte| byte != 0).count();
-                        alpha_nonzero += usize::from(px[3] != 0);
-                        for component in 0..4 {
-                            rgba_sum[component] += px[component] as u64;
-                        }
-                    }
-                    let checksum = pixels
-                        .iter()
-                        .fold(0u64, |acc, &byte| acc.wrapping_mul(16777619) ^ byte as u64);
-                    summaries.push(format!(
-                        "@{},{} rgb={} a={} sum={:?} crc=0x{:X}",
-                        origin_x, origin_y, rgb_nonzero, alpha_nonzero, rgba_sum, checksum
-                    ));
-                }
-                gl::BindBuffer(gl::PIXEL_PACK_BUFFER, old_pack_buffer as u32);
-                gl::PixelStorei(gl::PACK_ALIGNMENT, old_pack_alignment);
-                gl::PixelStorei(gl::PACK_ROW_LENGTH, old_pack_row_length);
-
-                log::info!(
-                    "[PRESENT_READBACK] {}x{} sample={}x{} regions=[{}] gl_error=0x{:X}",
-                    width,
-                    height,
-                    sample_width,
-                    sample_height,
-                    summaries.join("; "),
-                    gl_error
-                );
-            }
-        }
-
         self.base_data.current_frame += 1;
 
         // Upstream: gpu.RendererFrameEndNotify() -> system.GetPerfStats().EndGameFrame()
@@ -924,6 +851,13 @@ impl RendererBase for RendererOpenGL {
 
     fn set_gpu_tick_callback(&mut self, callback: crate::renderer_base::GpuTickCallback) {
         self.rasterizer.set_gpu_tick_callback(callback);
+    }
+
+    fn set_invalidate_gpu_cache_callback(
+        &mut self,
+        callback: crate::renderer_base::InvalidateGpuCacheCallback,
+    ) {
+        self.rasterizer.set_invalidate_gpu_cache_callback(callback);
     }
 
     fn get_applet_capture_buffer(&mut self) -> Vec<u8> {
