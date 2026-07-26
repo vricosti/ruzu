@@ -23564,8 +23564,14 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   `BreakLoopNullPc`, `0x068A001C`, `PQ_STALE`, or `PQ_RECOVER`. A diagnostic
   run that temporarily skipped llvmpipe's pathological indirect draw reached
   the attract-mode loading frame at present 2,500; that draw bypass has been
-  removed. A separate Vulkan/lavapipe run queued 256 frames before being
-  closed at 54 seconds and emitted none of the fault markers.
+  removed. A subsequent unmodified Vulkan/lavapipe run under a locally
+  extracted Xvfb reached the animated title prompt, left the title
+  automatically, displayed the attract-mode loading screen at six minutes,
+  and rendered a complete Zelda-circuit cinematic frame. It emitted none of
+  the scheduler or bad-pointer fault markers. After the cinematic had started,
+  the GPU thread hit a separate `HLE_BindShader` out-of-range panic at 430
+  seconds following invalid `0xFFFFFFFF` macro parameters; that later GPU issue
+  does not precede or gate the title-to-attract transition fixed here.
 - The full `cargo test -p core --release` gate remains broken outside this
   slice: one hardware-timer test, one memory-block-manager test, and three
   page-table copy tests fail before the test process terminates with
@@ -23574,6 +23580,5 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ### Missing items
 - Apple Silicon must run this isolated change through the title-to-attract
   transition; that host is not available locally.
-- A full real-time cinematic validation is still unavailable on this Linux
-  host because the AMD hardware path has repeatedly timed out its kernel GFX
-  ring and software rendering does not reach the transition at usable speed.
+- Hardware-backed validation remains unavailable on this Linux host because
+  the AMD path has repeatedly timed out its kernel GFX ring.
