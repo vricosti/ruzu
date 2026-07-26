@@ -23650,3 +23650,112 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   transition; that host is not available locally.
 - Hardware-backed validation remains unavailable on this Linux host because
   the AMD path has repeatedly timed out its kernel GFX ring.
+
+## 2026-07-26 — rdynarmic x64 ABI and A32/A64 fastmem fallbacks
+
+### Intentional differences
+- The Rust ABI helpers return a `CallerSaveFrame` consumed by the matching pop
+  helper. Upstream recomputes the same frame from its register list; retaining
+  the emitted list prevents push/pop disagreement while preserving upstream's
+  register order, stack alignment, shadow space, and XMM offsets.
+- Upstream selects `vmovaps` when AVX is available and `movaps` otherwise.
+  `rxbyak` currently emits `movaps`; both preserve the same 128-bit XMM state.
+
+### Unintentional differences (fixed)
+- The A32 fastmem fallback saved only caller-save GPRs before invoking a Rust
+  memory callback. Upstream saves every register in `ABI_ALL_CALLER_SAVE`,
+  including `XMM0..XMM15` under SysV. A faulting access could therefore
+  replace a live FP constant with callback scratch data and corrupt later A32
+  calculations in the same JIT block. The shared ABI owner now preserves the
+  complete platform-specific caller-save set for both A32 and A64 fallbacks.
+- The A32 write fallback now uses upstream's alias-safe `RSI`/`RDX`
+  marshalling order and zero-extends the callback value to its access width.
+  Read results are likewise zero-extended after restoring caller-save state.
+
+### Missing items
+- A32 still emits a fallback beside each faulting fastmem instruction, whereas
+  upstream pre-generates one table indexed by ordering, width, address
+  register, and value register. The callbacks now have behavioral parity, but
+  this existing structural difference can increase generated code size.
+
+### Binary layout verification
+- PASS: the generated SysV frame contains nine 8-byte caller-save GPR slots,
+  the upstream 8-byte alignment adjustment, and sixteen aligned 16-byte XMM
+  slots. Windows uses its upstream seven-GPR, six-XMM set plus 32-byte shadow
+  space.
+
+### Verification
+- Re-read upstream `abi.{h,cpp}`, `a32_emit_x64_memory.cpp`, and
+  `a64_emit_x64_memory.cpp`, including frame calculation, register ordering,
+  callback argument aliases, ordering fences, and result extension.
+- The executable ABI regression loads distinct values into `xmm1` and
+  `xmm14`, calls a host function that clobbers both, and verifies their exact
+  restoration.
+- A 25-second Vulkan/null-audio MK8D run rendered the animated title prompt
+  correctly. Before the fix, the same guest block intermittently stored
+  negative infinity after a fastmem callback corrupted its live `1/255` XMM
+  constant. The user confirmed the corrected run.
+- The full release test binary remains blocked before reaching the x64 tests:
+  in serial mode it terminates with `SIGSEGV` in the existing ARM64 test
+  `run_performs_deferred_clear_cache_before_execution`. The ABI regression,
+  A64 x64 fallback-generation regression, and renamed scalar-lane differential
+  test pass independently.
+
+## 2026-07-26 — Vulkan image-view blacklist handling
+
+### Intentional differences
+- Upstream performs descriptor resolution and backend `ScaleDown(image)` in
+  templated `TextureCache<P>::FillImageViews`. Rust keeps descriptor traversal
+  in `TextureCacheBase` and performs the backend operation in the Vulkan
+  `TextureCache` wrapper, preserving the same retry and scale-rating order.
+
+### Unintentional differences (fixed)
+- Vulkan graphics and compute image-view resolution previously omitted
+  upstream's blacklist scale-down branch. Both wrappers now scale written
+  images down, reset `scale_rating`, and retry after invalidation.
+
+### Missing items
+- The compute wrapper is ready for the Vulkan compute-pipeline descriptor path;
+  that incomplete pipeline still needs to call it when compute image
+  descriptors are bound.
+
+### Binary layout verification
+- PASS: this change does not alter shared payload or descriptor layouts.
+
+## 2026-07-26 — Maxwell HLE bind-shader invalid-index guard
+
+### Intentional differences
+- Upstream indexes shadow scratch directly because valid macro parameters are
+  an invariant. Rust rejects the observed `u32::MAX` index before indexing, so
+  an earlier invalid macro stream is reported without panicking the GPU thread.
+
+### Unintentional differences (to fix)
+- The producer of the invalid refreshed macro parameter remains unidentified;
+  the guard contains the failure but does not establish upstream parity for
+  that producer.
+
+### Missing items
+- Trace the invalid macro parameter back to its guest-memory or macro-upload
+  source and remove the guard once the upstream invariant is restored.
+
+### Binary layout verification
+- PASS: register storage and macro parameter layouts are unchanged.
+
+## 2026-07-26 — rdynarmic x64 signed FP-to-fixed conversion
+
+### Intentional differences
+- Upstream uses generated helper lookup tables for unsupported rounding modes.
+  Rust calls width-specific helpers directly. Runtime SSE4.1 detection is
+  cfg-gated so the x64 owner remains compilable when parsed on ARM hosts.
+
+### Unintentional differences (fixed)
+- Signed 32-bit FP-to-fixed conversion previously ignored the IR rounding mode
+  and several saturation boundaries. The x64 fast path and helper path now
+  match upstream values across the differential input set.
+
+### Missing items
+- The direct Rust helpers still do not update every upstream FPSR exception
+  side effect; this is existing FP-status parity work outside the value fix.
+
+### Binary layout verification
+- PASS: no JIT-state or ABI layout changed in this slice.
