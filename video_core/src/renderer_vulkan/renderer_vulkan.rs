@@ -457,7 +457,6 @@ impl RendererVulkan {
         // the GPU thread behind the present thread, which holds that mutex
         // across `acquire_next_image` (MoltenVK blocks on the next drawable
         // — up to a vsync period per presented frame; measured at 37% of
-        // the GPU thread during MK8D loading). The PresentManager caches
         // both values in atomics updated at swapchain (re)creation.
         let swapchain_image_count = self.present_manager.swapchain_image_count();
         let swapchain_image_view_format = self.present_manager.swapchain_image_view_format();

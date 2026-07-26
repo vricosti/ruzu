@@ -45,7 +45,6 @@ pub mod commands {
 /// `GenerateRandomBytes` calls. We mirror that with a persistent
 /// `Mutex<Mt19937>`; resetting the state from the seed on each call — as
 /// the original port did — caused consecutive RNG calls to return
-/// identical byte sequences, which broke MK8D's PRNG-seeded boot.
 pub struct ModuleInterface {
     name: String,
     handlers: BTreeMap<u32, FunctionInfo>,

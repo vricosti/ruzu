@@ -97,7 +97,6 @@ impl KReadableEvent {
     pub fn is_signaled(&self) -> bool {
         // Upstream requires the scheduler lock here. The current Rust
         // MultiWait host fallback can still poll readable events outside that
-        // lock; keep the parity violation visible without aborting MK8D before
         // the wait path is made fully upstream-shaped.
         if std::env::var_os("RUZU_DIAG").is_some() {
             if let Some(scheduler_lock) = crate::hle::kernel::kernel::scheduler_lock() {

@@ -543,7 +543,6 @@ impl NvMapDevice {
             // Upstream uses ASSERT(...IsSuccess()) here and still returns the
             // original nvmap result to the guest if asserts are ignored. Do
             // not turn this diagnostic into a guest-visible nvmap failure:
-            // MK8D's caller treats that path as fatal and jumps through a null
             // callback. The page-table mismatch remains logged above.
         }
 

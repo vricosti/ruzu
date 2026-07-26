@@ -3923,7 +3923,6 @@ impl KThread {
             );
         }
         if self.get_state() == ThreadState::WAITING {
-            crate::hle::kernel::sleep_timing::observe_wake(self.thread_id);
             if let Some(wait_queue) = self.wait_queue.clone() {
                 if ct_trace {
                     log::info!("on_timer tid={} before_cancel_wait", self.thread_id);

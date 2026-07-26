@@ -2843,7 +2843,6 @@ impl KProcess {
         readable_event: Arc<Mutex<KReadableEvent>>,
     ) {
         // Narrow window debug: log the registration site for the object_ids
-        // that MK8D's freeze polls (339 + 388, plus a padding range to catch
         // siblings). Uses `#[track_caller]` so the log shows the caller file:
         // line, which identifies which HLE service owns the event.
         if matches!(object_id, 330..=400 | 600..=700) {

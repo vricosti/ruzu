@@ -728,7 +728,6 @@ impl BufferQueueProducer {
             static COUNT: AtomicU64 = AtomicU64::new(0);
             let n = COUNT.fetch_add(1, Ordering::Relaxed);
             // RUZU_TRACE_BQP_QUEUE_DENSE=1 — log every QueueBuffer call (not just
-            // powers of 2). Used to find exactly where MK8D stops queueing buffers.
             let dense = std::env::var_os("RUZU_TRACE_BQP_QUEUE_DENSE").is_some();
             if dense || n < 16 || n.is_power_of_two() {
                 log::info!("[BQP_QUEUE] #{} queue_buffer slot={}", n, slot);
@@ -1536,8 +1535,6 @@ impl Drop for BufferQueueProducer {
 //
 // Tracks which slot indices are passed to queue_buffer. If the same slot is
 // queued over and over, the game is pumping cached frames (e.g. stuck on a
-// loading screen) rather than producing new content. Used to confirm the MK8D
-// wedge diagnosis from project_mk8d_deterministic_wedge_2026_05_16.
 
 static BQP_SLOT_COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, u64>>> =
     std::sync::OnceLock::new();

@@ -2020,7 +2020,6 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         ),
         // Port of upstream `EmitShuffle{Index,Up,Down,Butterfly}` small-warp
         // path. The Rust IR's 3-arg variant omits upstream's `clamp` —
-        // we synthesise it as 31 (full warp) since MK8D shaders use the
         // standard 32-thread warp. `readInvocationARB` returns the value
         // from another lane.
         Opcode::ShuffleIndex => {

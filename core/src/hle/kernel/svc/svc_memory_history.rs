@@ -1,4 +1,4 @@
-//! Diagnostic memory-SVC history for late MK8D nvmap failures.
+//! Diagnostic memory-SVC history for targeted address investigations.
 //!
 //! This is intentionally Rust-only investigation tooling. It is inactive unless
 //! `RUZU_TRACE_MEM_HISTORY_TARGET=0x...` is set, and it does not affect guest

@@ -1641,7 +1641,6 @@ impl MaxwellDeviceMemoryManager {
                 // `rasterizer_mark_region_cached` takes `&self` and only
                 // performs atomic page-entry stores plus fastmem mprotect, so
                 // calling it without the mutex matches upstream's lock-free
-                // `MarkRegionCaching`. Taking the mutex here deadlocked MK8D:
                 // GPU thread (shader-cache lock held) waited on the Memory
                 // mutex held by a CPU core whose guest write was waiting on
                 // the shader-cache lock via ShaderCache::invalidate_region.

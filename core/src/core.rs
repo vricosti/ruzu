@@ -1160,7 +1160,6 @@ impl System {
         // allocates tid=1 as a Dummy — matching zuyu's startup ordering.
         // (Earlier we tried moving this after kernel.initialize() to avoid the
         //  race, but that placed dummies at tid 13-14 instead of zuyu's 1-2.
-        //  Restoring upstream order — see project_mk8d_thread_id_order_fix.)
         let system_ref_for_ct = SystemRef::from_ref(self);
         self.core_timing.initialize(move || {
             system_ref_for_ct.get().register_host_thread();

@@ -106,7 +106,6 @@ pub struct Scheduler {
     /// Submission worker ("VulkanWorker"), port of the submit half of
     /// upstream `Scheduler::WorkerThread`. On MoltenVK all Metal encoding
     /// happens inside vkQueueSubmit (measured ~40% of the GPU thread during
-    /// MK8D loading), so handing the submit to a worker moves that cost off
     /// the DMA-pusher critical path. Command recording (incl.
     /// end_command_buffer) stays on the GPU thread: Vulkan requires external
     /// sync on the command POOL for recording, and ending is cheap.

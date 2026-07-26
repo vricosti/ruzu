@@ -38,8 +38,7 @@ impl IAppletResource {
     /// IMPORTANT: this MUST NOT allocate a new KSharedMemory. The holder's
     /// page is the live page that the HID daemon writes to via
     /// `update_npad`/`update_controllers`/etc.; cloning it to a new page
-    /// would freeze the guest's view at the moment of the IPC call (see
-    /// project memory entry `project_mk8d_hid_shared_mem_root_cause_2026_05_02`).
+    /// would freeze the guest's view at the moment of the IPC call.
     fn create_shared_memory_object(
         &self,
         _ctx: &HLERequestContext,

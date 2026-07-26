@@ -50,7 +50,6 @@ pub trait KSharedMemoryBacking: Send + Sync {
 /// the port allocated a Box<SharedMemoryFormat> that was snapshot-copied into
 /// a fresh KSharedMemory at GetSharedMemoryHandle time, which left the guest
 /// with a stale zero-snapshot — see project memory entry
-/// `project_mk8d_hid_shared_mem_root_cause_2026_05_02`.)
 pub struct SharedMemoryHolder {
     /// Upstream: `bool is_owner`.
     is_owner: bool,

@@ -370,7 +370,6 @@ impl Services {
         // all services on host threads; ruzu's guest-core-fiber substitute
         // (RunOnGuestCoreProcess) has a wakeup race where a parked
         // ServerManager fiber is not reliably woken/scheduled when a freshly
-        // created session's first request arrives — wedging MK8D at `pl:u`
         // shared-font init in ~50% of boots (a RUNNABLE/parked fiber never
         // dispatched while all guest cores idle). The 8 host_service! managers
         // do not exhibit this; moving ns to a host thread removes the pl:u
@@ -432,7 +431,6 @@ impl Services {
         // Signal that all initial services have been spawned. The bsdsocket
         // host thread waits on this flag before calling start_additional_host_threads,
         // so its 2 extra dummy threads get tids AFTER all service init — matching
-        // zuyu's startup order (project_mk8d_thread_id_order_fix_2026_05_17).
         SERVICES_INIT_DONE.store(true, std::sync::atomic::Ordering::Release);
         Self {}
     }

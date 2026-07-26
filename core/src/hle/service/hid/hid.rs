@@ -95,7 +95,6 @@ pub fn loop_process(system: crate::core::SystemRef) {
     // `Settings::values.players[i].connected` being deserialised from
     // the saved config. ruzu_cmd has no config wiring yet, so the
     // EmulatedController fields default to `is_connected = false` and
-    // games that gate boot behaviour on a connected controller (MK8D
     // waits before calling `OpenLayer`) stall indefinitely.
     //
     // Mirror upstream's `Frontend::DefaultController::ReconfigureControllers`

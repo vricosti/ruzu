@@ -82,7 +82,6 @@ pub struct RasterizerNull {
     /// is a `Tegra::MemoryManager` that handles GPU VA → CPU VA
     /// translation internally. Ruzu's `guest_memory_writer` expects a
     /// CPU VA, so we must translate first via this hook. Without it,
-    /// MK8D's GPU semaphore_trigger commands write to unmapped CPU
     /// addresses (the GPU VA being passed verbatim to write_block).
     gpu_to_cpu: Option<GpuToCpuTranslator>,
 }

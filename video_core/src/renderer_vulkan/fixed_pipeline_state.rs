@@ -1280,7 +1280,6 @@ impl FixedPipelineState {
     /// dynamically at draw time (`update_dynamic_states`,
     /// `cmd_bind_vertex_buffers2`), so including their per-draw values in
     /// the pipeline key explodes one logical pipeline into hundreds of
-    /// variants (the MK8D disk-cache growth + perpetual runtime compiles).
     pub fn refresh(&mut self, draw: &DrawCall, features: &DynamicFeatures) {
         self.raw1 = 0;
         self.raw2 = 0;

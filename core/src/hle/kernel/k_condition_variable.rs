@@ -617,7 +617,6 @@ impl KConditionVariable {
 
         // RUZU_TRACE_UNLOCK=1 — log every ArbitrateUnlock with the
         // recovered next_owner, so we can confirm whether the unlock
-        // actually wakes the requeued CV waiter (MK8D wedge analysis).
         if std::env::var_os("RUZU_TRACE_UNLOCK").is_some() {
             let next_id = next_owner_thread
                 .as_ref()

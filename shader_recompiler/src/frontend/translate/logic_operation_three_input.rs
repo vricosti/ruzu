@@ -125,7 +125,7 @@ mod tests {
     use crate::ir::types::ShaderStage;
 
     #[test]
-    fn mk8d_packed_output_immediates_use_lut_48() {
+    fn regression_packed_output_immediates_use_lut_48() {
         let words = [
             0x3CF8_218F_FFF7_0003,
             0x3CF8_210F_FFF7_0102,
@@ -139,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn mk8d_packed_output_emits_a_or_b_and_c() {
+    fn regression_packed_output_emits_a_or_b_and_c() {
         let mut program = Program::new(ShaderStage::Fragment);
         let block = program.add_block();
         {

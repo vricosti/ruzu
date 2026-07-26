@@ -16,10 +16,8 @@ use std::fmt;
 /// 8, 16, 24 within each group.
 /// DIVERGENCE FROM UPSTREAM (documented): upstream `Location` assumes the
 /// sched-word grid is anchored at absolute offset 0 (`offset % 32 == 0`).
-/// Empirically (MK8D dumps, 2026-07-09) the grid is anchored at the START OF
 /// THE SHADER CODE (SPH base + 0x50): the first code word is always a sched
 /// word, then every 4th word. Games whose code starts 32-byte aligned match
-/// upstream's absolute grid, but MK8D also ships shaders whose code starts at
 /// `offset % 32 == 16`; the absolute grid then skips real instructions and
 /// decodes sched words. `phase` anchors the grid to the code start
 /// (`phase = code_start % 32`); phase 0 is exactly upstream behaviour.

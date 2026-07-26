@@ -11,8 +11,6 @@
 //! `KThreadLock` / `TrackedMutex<KProcess>`. Combined with
 //! cooperative fibers (which can yield while holding a sleeping mutex),
 //! this creates the entire class of AB-BA / self-lock deadlocks documented
-//! in `project_mk8d_arbitrate_unlock_deadlock.md` and
-//! `project_mk8d_lock_refactor_attempts_all_regressed.md`.
 //!
 //! `SyncCell<T>` is the upstream-faithful replacement: `UnsafeCell<T>`
 //! with two access paths:

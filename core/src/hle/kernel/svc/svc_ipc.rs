@@ -283,7 +283,6 @@ fn yield_after_inline_ipc_if_requested(system: &System) {
     // Diagnostic for ruzu's temporary inline HLE path. Upstream parks the
     // caller while a ServerManager host fiber handles the request, which
     // naturally gives other guest threads a scheduling opportunity. Keep this
-    // as an explicit experiment: cold MK8D boots are less stable when this
     // cooperative yield is promoted to the default before host-thread IPC
     // ownership is complete.
     if std::env::var_os("RUZU_YIELD_AFTER_IPC").is_none() {
@@ -431,7 +430,6 @@ fn send_sync_request_impl(
     OWNER_FAIL_STAGE.with(|s| s.set(""));
     // `RUZU_PROFILE_IPC_PHASES=1` — time each phase of send_sync_request_impl
     // so we can see which Mutex acquisition or sub-step is the bottleneck.
-    // Used in the MK8D wedge investigation to localize where 7ms/call goes
     // when the handler itself is <100us.
     let profile_phases = std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some();
     let phase_t0 = if profile_phases {
@@ -1268,7 +1266,6 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
     yield_after_inline_ipc_if_requested(system);
 
     // Inter-IPC OS-scheduler yield. Discovered while diagnosing
-    // host-thread IPC's flaky 25 %-success rate on MK8D: when the guest
     // core OS thread chains IPCs back-to-back, the Linux scheduler keeps
     // it on-CPU and host service OS threads (HLE:audio, HLE:nvservices,
     // ...) only get brief slivers of time. State that those threads
@@ -1278,15 +1275,12 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
     // A `std::thread::sleep(1µs)` between IPCs translates to a
     // `clock_nanosleep` syscall — guaranteed to release the CPU back to
     // the OS scheduler so other OS threads can run. Empirically this
-    // raises MK8D's host-thread reliability from ~50 % to 16/16 (100 %).
     // `std::thread::yield_now()` (`sched_yield`) is too weak: Linux can
     // reschedule the same thread if no equal-priority work is ready, so
     // it only buys ~50 % success.
     //
     // Cost: ~50-100 µs per IPC × ~5 000 boot IPCs ≈ 250-500 ms added to
-    // boot. Negligible compared to MK8D's 11-second boot when host-thread
     // routing is explicitly enabled. Do not apply it to the inline path:
-    // handlers already run on the guest core OS thread there, and MK8D can
     // issue hundreds of thousands of tight IPC polls during boot.
     //
     // `RUZU_HOST_THREAD_IPC_SLEEP_US=<n>` overrides the default 1 µs;

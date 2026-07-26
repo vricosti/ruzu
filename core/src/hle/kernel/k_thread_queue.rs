@@ -114,7 +114,6 @@ impl KThreadQueue {
             // got woken via the wrong path. Log the context, but do NOT clear
             // the wait: doing so resumes a thread from the wrong wait object
             // and can make it re-enter userspace with a stale TLS reply buffer
-            // (observed in MK8D as an nvdrv "SFCO" response being parsed as a
             // fresh request). Upstream would abort here; ruzu keeps running by
             // preserving the original wait.
             log::error!(

@@ -92,7 +92,6 @@ impl Fiber {
         // trampoline ends with `push %rbp; jmp *%rbx` which preserves that
         // invariant, so fiber-entry alignment is correct here.
         //
-        // Verified 2026-05-16: the MK8D ~60s SIGSEGV in `hash_one` came from
         // a downstream misalignment, NOT from this entry point. The fiber
         // stack itself is correctly aligned. Trace kept as a sanity check
         // for future fiber-related investigations.

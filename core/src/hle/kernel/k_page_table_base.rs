@@ -670,7 +670,6 @@ impl KPageTableBase {
     /// excludes from those (Shared, AliasCode, etc.). That caused
     /// `svcMapSharedMemory` to succeed at addresses past heap_end on
     /// AArch32, corrupting the page-table invariants and cascading into
-    /// the MK8D wedge — see `project_mk8d_can_contain_bug.md`.
     pub fn can_contain(&self, addr: usize, size: usize, state: SvcMemoryState) -> bool {
         use SvcMemoryState::*;
 
@@ -9282,7 +9281,6 @@ mod tests {
     }
 
     /// Set up an AArch32-shaped page table for `can_contain` parity tests.
-    /// Mirrors the layout MK8D's process exposes:
     ///   address_space   = [0x0000_0000, 0x1_0000_0000)
     ///   code            = [0x0020_0000, 0x4000_0000)        ← MapSmall
     ///   alias_code      = [0x0020_0000, 0x1_0000_0000)      ← MapSmall start..MapLarge end
@@ -9308,11 +9306,9 @@ mod tests {
     }
 
     /// Upstream `CanContain(Shared)` excludes addresses inside heap or alias —
-    /// this is the SVC #530 case that wedged MK8D when ruzu accepted it.
     #[test]
     fn can_contain_shared_rejects_address_in_alias_region() {
         let pt = aarch32_layout();
-        // The actual MK8D SVC #530 args.
         assert!(
             !pt.can_contain(0xB940_4000, 0x40000, SvcMemoryState::Shared),
             "Shared inside alias region must be rejected (matches upstream)"
@@ -9354,7 +9350,6 @@ mod tests {
         assert_eq!(pt.m_heap_region_end, 0xC000_0000);
         assert_eq!(pt.m_alias_region_start, pt.m_alias_region_end);
 
-        // This mirrors the failed MK8D retry candidate from the smoke run:
         // inside folded heap, so upstream CanContain(Shared) rejects it.
         assert!(!pt.can_contain(0xB900_4000, 0x0110_0000, SvcMemoryState::Shared));
 

@@ -1898,7 +1898,6 @@ fn graphics_pipeline_key_cache_hash(key: &GraphicsPipelineKey) -> u64 {
 /// previous hook that stays silent only for threads currently inside this
 /// function. An earlier version swapped the process-wide hook under a global
 /// mutex held for the entire compilation, which serialized the disk-cache
-/// preload to one pipeline at a time (measured on MK8D: 9 VkPipelineBuilder
 /// workers ~96% blocked on that mutex, 79s preload).
 fn catch_shader_exception<F, T>(f: F) -> std::thread::Result<T>
 where

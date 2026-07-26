@@ -91,7 +91,6 @@ pub fn query_process_memory(
 
     // RUZU_TRACE_QUERY_RET=N (or comma list, or "*"/"all") — log QueryMemory return values
     // for the matching tid(s). Used to compare against zuyu's equivalent trace and find
-    // why MK8D walks the memory map in ruzu but not zuyu.
     if let Some(target_str) = std::env::var_os("RUZU_TRACE_QUERY_RET") {
         let tid = system
             .current_thread()

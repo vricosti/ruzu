@@ -829,8 +829,6 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
                 cv_key,
                 get_arg32(args, 1) as i32,
             );
-            // RUZU_FORCE_WAIT_MASK_AFTER_SIGNAL=1 — Experiment for MK8D wedge
-            // (project_mk8d_unlock_site_found_2026_05_25 option D).
             // After signaling cv at `cv_key`, set WAIT_MASK (0x40000000) on the
             // paired mutex word at `cv_key - 8` (libnx AuxBufferInfo layout:
             // mutex@+0, padding@+4, cv@+8). This forces the next libnx
@@ -1854,8 +1852,7 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
         // Each line also carries a nanosecond timestamp `t_ns=...` measured
         // from a process-lifetime anchor (first call to `race_anchor`). Use
         // it to compute relative timing between SVCs across threads when
-        // analyzing parent/worker dispatch races (see
-        // project_mk8d_jit_not_the_problem_2026_05_17).
+        // analyzing parent/worker dispatch races.
         // Cache the env-var lookup. Cost was visible in perf samples on the
         // SVC dispatch hot path.
         fn trace_tid_svc_env() -> Option<&'static std::ffi::OsString> {
@@ -1946,22 +1943,6 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                 );
             }
         }
-        // RUZU_PROFILE_STARTTHREAD_GAP: log the elapsed time from
-        // svc::StartThread (parent) to the child's first SVC. Measures
-        // JIT-startup latency for the MK8D wedge investigation.
-        if std::env::var_os("RUZU_PROFILE_STARTTHREAD_GAP").is_some() {
-            if let Some(us) = super::startthread_gap::take_elapsed_us(tid) {
-                let name = SvcId::from_u32(imm)
-                    .map(|id| format!("{:?}", id))
-                    .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
-                log::warn!(
-                    "[STARTTHREAD_GAP] child_tid={} first_svc={} gap_us={}",
-                    tid,
-                    name,
-                    us
-                );
-            }
-        }
         if core_id < hardware_properties::NUM_CPU_CORES as usize {
             super::kernel::mark_svc_enter(core_id, tid, imm);
             core_id
@@ -2003,11 +1984,6 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
         }
     };
     record_svc_summary(tid, core_id, imm);
-    if tid >= 0 {
-        crate::hle::kernel::k_scheduler::record_start_thread_sched_first_svc(
-            tid as u64, core_id, imm,
-        );
-    }
     // PC-window SVC counter. By default counts on tid=73 (main game thread);
     // RUZU_TRACE_PC_TID=N overrides to count a different thread (e.g. tid=102
     // for the audio worker). Increment on every SVC entry and deactivate the
@@ -2265,7 +2241,6 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
     // (the dispatch_args after handler completion) for matching tid(s).
     // Pairs with RUZU_TRACE_TID_SVC (which logs ENTRY args). Diffing both
     // sides between ruzu and zuyu localizes the bug per
-    // project_mk8d_ruzu_det_wedge_vs_zuyu_2026_05_17.
     if let Some(target_str) = std::env::var_os("RUZU_TRACE_TID_SVC_RET") {
         let tid_ret = system
             .current_thread()
@@ -2447,7 +2422,6 @@ static WAKE_LATENCY: std::sync::OnceLock<std::sync::Mutex<WakeLatencyAgg>> =
 /// the tid of the woken thread. Enabled by `RUZU_PROFILE_WAKE_PER_TID=1`
 /// (independent of the aggregate `RUZU_PROFILE_WAKE`). Helps identify which
 /// thread suffers the slow-wake tail (e.g., the 26 ~1-sec wakes seen in
-/// project_mk8d_deterministic_wedge_2026_05_16).
 static WAKE_LATENCY_PER_TID: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<u64, WakeLatencyAgg>>,
 > = std::sync::OnceLock::new();
@@ -2744,7 +2718,6 @@ const SVC_SUMMARY_MAX_IMM: usize = 128;
 ///
 /// `RUZU_PROFILE_SVC_SUMMARY=1` records only in-memory atomic counters on the
 /// hot path and dumps via `dump_svc_summary_profile()`. This is intentionally
-/// separate from `RUZU_SVC_TRACE=1`, whose per-SVC stderr output changes MK8D
 /// timing enough to create false scheduler/audio conclusions.
 struct SvcSummaryProfile {
     start: std::time::Instant,
@@ -3168,7 +3141,6 @@ fn dump_svc_full_regs(system: &System, imm: u32, tid: i64, label: &str) {
 }
 
 fn maybe_dump_process_memory(system: &System, tid: i64) {
-    // Only count SVCs on the game's main thread (tid=73 in current MK8D run).
     if tid != 73 {
         return;
     }

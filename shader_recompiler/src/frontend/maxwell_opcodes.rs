@@ -1008,7 +1008,6 @@ mod tests {
     fn rejects_zero_and_unmapped_words() {
         assert_eq!(decode_opcode(0x0000_0000_0000_0000), None);
         // 0x001F_8000_FFE0_07FF and 0x6000_0000_0000_0000 are sched-control
-        // patterns seen in MK8D — they must not match any instruction.
         assert_eq!(decode_opcode(0x001F_8000_FFE0_07FF), None);
         assert_eq!(decode_opcode(0x6000_0000_0000_0000), None);
     }

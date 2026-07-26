@@ -213,7 +213,6 @@ impl System {
         // RUZU_PROFILE_AUDIO_EVENT=1: count fires + skips, log rate every 100 calls.
         // Measures whether `send_command_to_dsp` reaches this signal often enough
         // (target ~200 Hz for 5ms audio periods). 50× too low here would explain
-        // the MK8D wedge — see project_mk8d_audio_renderer_rate_2026_05_17.
         if std::env::var_os("RUZU_PROFILE_AUDIO_EVENT").is_some() {
             use std::sync::atomic::{AtomicU64, Ordering};
             use std::sync::OnceLock;

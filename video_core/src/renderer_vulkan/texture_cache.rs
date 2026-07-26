@@ -3244,7 +3244,6 @@ impl TextureCache {
         // it) and still renders depth-only — shadow maps and depth pre-pass
         // draws have no colour target at all. Only bail out when NOTHING is
         // bound. The old `rt0.format == 0 → None` early-out silently dropped
-        // every depth-only draw into the offscreen fallback (MK8D issues
         // 260k+ such draws during loading).
         let rt0 = render_targets.render_targets[0];
         let rt0_disabled = rt0.address == 0 || rt0.width == 0 || rt0.height == 0 || rt0.format == 0;

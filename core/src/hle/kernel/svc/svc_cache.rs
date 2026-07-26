@@ -87,7 +87,6 @@ pub fn flush_process_data_cache(
     drop(process);
 
     // Upstream `PerformCacheOperation` holds no memory-wide lock while it
-    // notifies the rasterizer. Guests (e.g. MK8D streaming during the attract
     // demo) issue thousands of small flushes per frame; holding the `Memory`
     // mutex across `on_cpu_write` serializes every guest-memory access in the
     // emulator behind rasterizer-lock contention. Collect the rasterizer

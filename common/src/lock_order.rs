@@ -4,14 +4,12 @@
 //! the singleton scheduler lock, the GMMU `MemoryManager` mutex, the OpenGL
 //! buffer/texture cache mutexes, …). When two of them are ever acquired in
 //! opposite orders on different code paths, a timing-sensitive AB-BA deadlock
-//! becomes possible — observed as the MK8D "black screen" wedge, which
 //! surfaces at different lock pairs run-to-run.
 //!
 //! This module records, per acquisition, an edge `held -> acquired` for every
 //! lock currently held by the calling thread. The first time an edge is seen
 //! in the *opposite* direction of one already recorded, it logs a one-shot
 //! `[LOCKORDER] INVERSION` line with a backtrace pointing at the offending
-//! acquisition. Running MK8D with `RUZU_LOCK_ORDER=1` therefore enumerates
 //! every lock-order inversion deterministically — no need to win the wedge
 //! race — so each can be fixed (consistent global order / reduced scope).
 //!

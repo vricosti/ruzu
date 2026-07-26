@@ -1947,7 +1947,6 @@ impl CpuManager {
         // registering thread — so without this, a fastmem fault on a guest
         // fiber runs the handler (FastmemPatchTable HashMap/SipHash lookup) on
         // the small fiber stack and can overflow it, producing a secondary
-        // SIGSEGV that kills the process (silent exit 139 at the MK8D
         // scene-transition texture burst). Each CPU-core OS thread needs its
         // own altstack.
         rdynarmic::backend::x64::exception_handler::register_thread_signal_stack();

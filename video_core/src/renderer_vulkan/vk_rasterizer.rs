@@ -560,7 +560,6 @@ pub struct RasterizerVulkan {
     // constructor returns `Self`, leaving those pointers dangling on the old
     // stack frame — observed as an UpdateDescriptorQueue whose `acquire()`
     // clamped the real instance while `add_buffer` grew a stale cursor until
-    // the payload overflowed (~80s into MK8D).
     descriptor_pool: Box<DescriptorPool>,
     desc_queue: Box<UpdateDescriptorQueue>,
     compute_pass_desc_queue: Box<UpdateDescriptorQueue>,
@@ -1053,7 +1052,6 @@ impl RasterizerVulkan {
                 self.draw_skipped_pipeline = self.draw_skipped_pipeline.wrapping_add(1);
                 // A skipped draw leaves the previous frame's pixels in place;
                 // with LOAD attachments this accumulates visibly (e.g. the
-                // MK8D title fog washing to white). Surface the loss.
                 if self.draw_skipped_pipeline <= 16 || self.draw_skipped_pipeline.is_power_of_two()
                 {
                     log::warn!(
@@ -1224,7 +1222,6 @@ impl RasterizerVulkan {
         // every guest resource before `ConfigureDraw` records the wait for an
         // asynchronously-built pipeline. Waiting before descriptor/geometry
         // preparation lets the guest recycle a uniform-buffer ring while the
-        // pipeline builds; MK8D then observes occurrence 13 data while drawing
         // occurrence 4 and its short-lived transition effects disappear.
         let Some(pipeline) = pipeline_waiter.pipeline_handle() else {
             self.draw_skipped_pipeline = self.draw_skipped_pipeline.wrapping_add(1);
@@ -4077,7 +4074,12 @@ impl RasterizerInterface for RasterizerVulkan {
                     .write_memory(cpu_addr, copy_size as u64);
             }
         }
-        self.texture_cache.base.write_memory(cpu_addr, copy_size);
+        unsafe {
+            let _lo_tex = common::lock_order::guard("texture_cache");
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            let _texture_guard = (*texture_mutex).lock();
+            self.texture_cache.base.write_memory(cpu_addr, copy_size);
+        }
         self.shader_cache.invalidate_region(cpu_addr, copy_size);
         self.query_cache.invalidate_region(cpu_addr, copy_size);
     }

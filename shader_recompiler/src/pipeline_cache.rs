@@ -1898,7 +1898,6 @@ mod tests {
     fn sched_control_skip_is_anchored_at_code_start() {
         // The sched grid is anchored at the start of the code slice
         // (`code[0]` is always a sched word), regardless of the code's
-        // absolute offset — MK8D ships shaders whose code starts at
         // `abs % 32 == 16` (verified by memory dump, 2026-07-09).
         assert!(is_sched_control_word(0));
         assert!(!is_sched_control_word(1));

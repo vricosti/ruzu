@@ -433,23 +433,22 @@ This document exists because earlier progress proved that a crate can be "substa
 
 <testing_commands>
 
-Manual test with Mario Kart 8 Deluxe (AArch32, title ID `0100152000022000`):
+Manual test with a Nintendo Switch title:
 
 ```bash
-cargo run --bin ruzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+cargo run --bin ruzu-cmd -- -g "/path/to/game.nsp"
 ```
 
 With debug logging:
 ```bash
-RUST_LOG=info cargo run --bin ruzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+RUST_LOG=info cargo run --bin ruzu-cmd -- -g "/path/to/game.nsp"
 ```
 
-With isolated data directories:
+With isolated cache and config directories:
 ```bash
-env XDG_DATA_HOME=/tmp/ruzu-data \
-    XDG_CACHE_HOME=/tmp/ruzu-cache \
+env XDG_CACHE_HOME=/tmp/ruzu-cache \
     XDG_CONFIG_HOME=/tmp/ruzu-config \
-    RUST_LOG=info cargo run --bin ruzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+    RUST_LOG=info cargo run --bin ruzu-cmd -- -g "/path/to/game.nsp"
 ```
 
 </testing_commands>

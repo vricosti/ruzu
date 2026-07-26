@@ -596,16 +596,16 @@ The following upstream directories are **intentionally not ported** and should n
 
 ## Testing ruzu-cmd
 
-### Manual test with Mario Kart 8 Deluxe (AArch32)
+### Manual test with a Nintendo Switch title
 
 ```bash
-cargo run --bin ruzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+cargo run --bin ruzu-cmd -- -g "/path/to/game.nsp"
 ```
 
 With debug logging:
 
 ```bash
-RUST_LOG=info cargo run --bin ruzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+RUST_LOG=info cargo run --bin ruzu-cmd -- -g "/path/to/game.nsp"
 ```
 
 With isolated cache and config (avoids polluting `~/.cache/ruzu` and `~/.config/ruzu`):
@@ -613,9 +613,7 @@ With isolated cache and config (avoids polluting `~/.cache/ruzu` and `~/.config/
 ```bash
 env XDG_CACHE_HOME=/tmp/ruzu-cache \
     XDG_CONFIG_HOME=/tmp/ruzu-config \
-    RUST_LOG=info cargo run --bin ruzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+    RUST_LOG=info cargo run --bin ruzu-cmd -- -g "/path/to/game.nsp"
 ```
 
-**Do NOT override `XDG_DATA_HOME`.** Ruzu's `PathManager` falls back to `$XDG_DATA_HOME/yuzu/nand` when its own `$XDG_DATA_HOME/ruzu/nand/system/Contents/registered` is empty (see `common/src/fs/path_util.rs::should_use_legacy_yuzu_root`). Pointing `XDG_DATA_HOME` at a fresh `/tmp` dir breaks that fallback: both the primary (`/tmp/.../ruzu/nand`) and the legacy (`/tmp/.../yuzu/nand`) are empty, so ruzu synthesizes placeholder system archives (e.g. MiiModel) and MK8D stalls during init. Letting `XDG_DATA_HOME` default to `~/.local/share` preserves access to the real 229-NCA yuzu NAND while still isolating cache/config.
-
-**Note:** MK8D is an ARM32 (AArch32) game — title ID `0100152000022000`.
+**Do NOT override `XDG_DATA_HOME`.** Ruzu's `PathManager` falls back to `$XDG_DATA_HOME/yuzu/nand` when its own `$XDG_DATA_HOME/ruzu/nand/system/Contents/registered` is empty (see `common/src/fs/path_util.rs::should_use_legacy_yuzu_root`). Pointing `XDG_DATA_HOME` at a fresh `/tmp` dir breaks that fallback: both the primary (`/tmp/.../ruzu/nand`) and the legacy (`/tmp/.../yuzu/nand`) are empty, so ruzu synthesizes placeholder system archives. Letting `XDG_DATA_HOME` default to `~/.local/share` preserves access to the real 229-NCA yuzu NAND while still isolating cache/config.

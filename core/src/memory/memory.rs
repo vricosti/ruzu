@@ -1553,7 +1553,6 @@ impl Memory {
         // `RUZU_TRACE_RAW_WRITE_VALUE=0xVALUE` — log a backtrace whenever
         // `write_raw` is called with a 4-byte value equal to VALUE,
         // regardless of address. Used to hunt for a "magic" sentinel
-        // value (e.g. 0x80000029 in MK8D task #112) without knowing
         // where it lands. Hot-path cost: 1 atomic load + 1 size check
         // + 1 value compare when enabled, 1 atomic load when not.
         {
@@ -2237,7 +2236,6 @@ impl Memory {
     /// on Linux — a single syscall reclaims the backing pages lazily instead of
     /// memset'ing every byte. This matches upstream's
     /// `DeviceMemory().buffer.ClearBackingRegion` path and avoids the O(size)
-    /// memset that was ~26% of ruzu's CPU during MK8D boot.
     /// Zero a region of physical memory (DeviceMemory backing buffer).
     /// Used by KPageTableBase pool-allocation callers that need to clear
     /// pages before mapping them into virtual address space (so the VA

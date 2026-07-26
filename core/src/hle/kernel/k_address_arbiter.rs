@@ -83,7 +83,6 @@ fn read_from_user(process_guard: &KProcess, address: u64) -> Option<i32> {
 ///
 /// The non-CAS variant was racy: two cores reading the same `current` and both
 /// writing `current-1` lost a decrement, corrupting the arbiter waiter counter
-/// and producing pthread-mutex contention drops (MK8D cv lost-wakeup, STK heap
 /// state corruption).
 fn decrement_if_less_than(process_guard: &KProcess, address: u64, value: i32) -> Option<i32> {
     loop {

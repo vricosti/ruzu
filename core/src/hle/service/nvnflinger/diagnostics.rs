@@ -2,7 +2,6 @@
 //!
 //! This is intentionally not an upstream-owned behavior port. It keeps a small
 //! in-memory history that can be dumped by nvmap failure diagnostics without
-//! enabling high-volume `log::info!` traces during MK8D boot.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -385,7 +385,6 @@ pub struct ShaderCache {
     /// Owning thread for this cache instance. First call to a mutating method
     /// stores the current thread id; subsequent calls assert it hasn't changed.
     /// Used to verify the "concurrent HashMap access" hypothesis behind the
-    /// MK8D ~60s SIGSEGV in `hash_one<GraphicsPipelineKey>` — if multiple
     /// thread ids touch the cache, the plain `HashMap` is unsafe.
     /// 0 = unowned; otherwise hash of `ThreadId`.
     owner_tid_hash: std::sync::atomic::AtomicU64,
@@ -445,7 +444,6 @@ impl ShaderCache {
     /// If a second thread touches the cache, panic with both thread ids so
     /// we can identify the concurrent caller.
     ///
-    /// This is the verification step for the MK8D `hash_one<GraphicsPipelineKey>`
     /// SIGSEGV hypothesis: if multiple threads access `graphics_cache`/`compute_cache`,
     /// the plain `HashMap` corrupts under concurrent insert/get, eventually
     /// jumping into stale code with wrong stack alignment.

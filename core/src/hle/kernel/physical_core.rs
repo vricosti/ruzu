@@ -558,7 +558,6 @@ impl PhysicalCore {
         // Env-gated IPI trace: `RUZU_TRACE_IPI=1` logs every interrupt()
         // call with target core and the JIT/thread running there. Used to
         // diagnose cross-core wake latency for newly-RUNNABLE threads (the
-        // MK8D wedge investigation). Format matches the SVC trace
         // elapsed_secs() prefix for inline correlation.
         if should_trace_ipi() {
             let t = crate::hle::kernel::trace_format::elapsed_secs();

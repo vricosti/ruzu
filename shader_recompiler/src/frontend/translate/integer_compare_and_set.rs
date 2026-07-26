@@ -82,7 +82,7 @@ mod tests {
     }
 
     #[test]
-    fn mk8d_transition_iset_words_use_integer_one_mask() {
+    fn regression_transition_iset_words_use_integer_one_mask() {
         for insn in [0x5B5A_0380_0087_0D05, 0x5B5A_0380_0087_0508] {
             assert_eq!(translated_select_true_value(insn), Value::ImmU32(u32::MAX));
         }

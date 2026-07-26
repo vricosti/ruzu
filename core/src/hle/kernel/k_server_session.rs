@@ -3300,7 +3300,6 @@ mod tests {
         // The waiter-wake assertion this test used to cover is now the
         // responsibility of the KSynchronizationObject intrusive-list path
         // (exercised by unit tests in k_synchronization_object and by the
-        // MK8D integration boot). Here we keep the dead-request cleanup
         // assertion, which is server-local behavior.
         let mut server = KServerSession::new();
         server.initialize(0x1000);
@@ -3617,7 +3616,6 @@ mod tests {
     // was deleted in the sync-object refactor — waiter storage is now on an
     // intrusive list populated by `wait()` through fiber-suspended stack
     // allocation, which can't be driven from a standalone unit test. The
-    // wake-up path is covered by MK8D integration and the raw-pointer list
     // unit tests in k_synchronization_object.
 
     #[test]

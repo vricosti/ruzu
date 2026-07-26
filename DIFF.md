@@ -78,9 +78,6 @@
 - Fixed: `AlignmentMatchingStorageImpl::read(...)` now reads the aligned core portion into the upstream-equivalent `aligned_core_buffer` offset. Rust previously used `buffer_gap` as the destination offset for both branches; for the common `BufferAlign=1` AES-CTR wrapper path this read aligned core bytes at the beginning of the caller buffer instead of after `offset_round_up_difference`, corrupting unaligned NCA reads such as the NPDM.
 - Fixed: AES-CTR NCA storage is wrapped in `AlignmentMatchingStorage<NcaHeader::CtrBlockSize, 1>` like upstream `NcaFileSystemDriver::CreateAesCtrStorage(...)`, instead of exposing bare `AesCtrStorage`.
 
-### Missing items
-- Further NCA storage-layer parity remains subject to separate audit if MK8D still exposes decrypted-content corruption.
-
 ### Intentional differences
 - Rust keeps `DmaPusher` wired through `Arc<Mutex<MemoryManager>>`, `SystemRef`, and raw owner pointers for the current split owner graph; upstream stores references directly in `DmaPusher`. This does not change the `DispatchCalls` / `Step` ordering audited here.
 - Rust has a `dispatch_calls_with_engine(...)` integration entry point in addition to the upstream-shaped `dispatch_calls(...)`; it now follows the same dispatch-entry subindex reset as upstream.
@@ -124,7 +121,6 @@
 - The broader backend split remains: ignored overlap deletion removes common-cache state inside `TextureCacheBase`, while backend OpenGL object cleanup is owned by the wrapper. The fixed upstream order prevents immediate `ImageId` reuse from observing stale backend objects, but this ownership split still needs an explicit backend deletion hook or further collapse toward upstream.
 
 ### Intentional differences
-- Rust command-line frontend installs a shared SIGUSR2 profile dumper when diagnostic profile environment variables are present. `RUZU_PROFILE_GPU_THREAD=1` now participates in that same gate so `video_core::gpu_thread::dump_gpu_thread_profile()` is reachable during manual MK8D runs.
 
 ### Unintentional differences (to fix)
 - Fixed: `RUZU_PROFILE_GPU_THREAD=1` created GPU-thread counters but did not activate the SIGUSR2 handler path that prints them. This made long-run GPU queue diagnostics silently incomplete.
@@ -138,7 +134,6 @@
 
 ### Intentional differences
 - Rust retains existing env-gated diagnostic logging around dispatch state; upstream has no equivalent diagnostic hook. This has no behavior effect when unset.
-- Rust adds `RUZU_TRACE_PULLER_RAW_HEADERS=1`, gated behind the existing selected-submit trace, to print raw command-list segment summaries and any decoded `SyncpointOperation` headers during the MK8D stall investigation. This has no behavior effect when unset.
 
 
 ### Missing items
@@ -2003,7 +1998,6 @@
 - Fixed: the fallback `Payload + HasTimeout` path is now covered by a test that runs while `GpuAccuracy::High` is active and verifies the payload and timestamp writes happen immediately.
 
 ### Missing items
-- The broader MK8D no-frame regression is still under validation. Previous traces showed `NvdrvSyncpointManager::is_fence_signalled id=1 value=2 -> false`, no `BQP::queue_buffer`, and repeated `NO_LAYERS`; this query fallback fix must be validated by a fresh MK8D run.
 - Mapped/query-cache parity for query types that do have `MaxwellToVideoCoreQuery(...)` mappings remains separate from this fallback entry.
 
 ### Intentional differences
@@ -2014,7 +2008,6 @@
 - Fixed: `ProcessSemaphoreTriggerMethod` acquire retry paths and `ProcessSemaphoreAcquire` previously called `release_fences(false)`. Upstream calls `ReleaseFences()` with the default `force = true`, so Rust now calls `release_fences(true)` in those paths.
 
 ### Missing items
-- The broader MK8D no-frame regression is still under verification. Previous traces showed submit#2 waiting on syncpoint value 2 with host value 1 and no `BQP::queue_buffer`; this Puller fix must be validated by relaunching MK8D.
 - A focused unit test for the semaphore retry loop is not kept because the method intentionally waits until guest memory changes; the direct fence acquire force behavior is covered by `fence_acquire_forces_fence_release`.
 
 ### Intentional differences
@@ -2022,7 +2015,6 @@
 
 ### Missing items
 - Broader `ProcessQueryGet` parity is still not fully closed: Rust keeps the existing fallback path for cases where no rasterizer is bound, while upstream always routes through `rasterizer->Query(...)` for Release and ReportOnly.
-- The current MK8D no-frame regression remains unresolved. Latest traces show the app reaches `dequeue_buffer` / `request_buffer` but does not reach `BQP::queue_buffer`; syncpoint submit#2 waits for value 2 while host value remains 1.
 
 ### Intentional differences
 - `Device` now stores the effective `ShaderBackend` selected from settings and applies the same GLASM support fallback to GLSL as upstream `Device::Device()`. Rust keeps the enum in `common::settings_enums::ShaderBackend`, but the selected backend is now owned by the OpenGL device as upstream does.
@@ -2192,7 +2184,6 @@
 - For one-side-compressed aliases, Rust interprets `ImageCopy::extent` the same way upstream `ImageBase::TryFindBase(...)` constructs it: compressed dimensions are already reduced to block units before the copy is emitted, so the fallback expands only the compressed GL rectangle by the block width/height while keeping the raw rectangle in texels.
 
 ### Unintentional differences (to fix)
-- Upstream currently has no explicit fallback after `glCopyImageSubData`; this Rust path compensates for observed Mesa `GL_INVALID_VALUE` on MK8D small-mip compressed/raw aliases. Keep it narrow unless another driver/API path proves broader handling is required.
 
 ### Missing items
 - No shader-based general raw/compressed conversion fallback is implemented. That is intentionally not added here because the observed alias copies are byte-compatible copies, not semantic pixel conversions.
@@ -2222,7 +2213,6 @@
 
 
 ### Missing items
-- AArch64 `CreateSharedMemory` dispatch is still not audited in this pass because MK8D v0 is AArch32 and the observed NVN allocation path reaches `CreateSharedMemory64From32`.
 
 ### Intentional differences
 - Rust stores `KSession::m_server` / `m_client` equivalents behind `Arc<Mutex<_>>` instead of upstream embedded endpoint members. This is the current Rust ownership adaptation for sharing session endpoints through handle tables while preserving the conceptual `KSession` owner.
@@ -2238,7 +2228,6 @@
 - Port upstream-shaped `PostDestroy(uintptr_t owner)` and owner-process `Close()` once the Rust kernel object lifecycle has matching `KAutoObject` owner hooks.
 
 ### Intentional differences
-- `ServerManager::default_host_thread_service_matches_from_flags(...)` is the single Rust migration-policy hook for service-name based host-thread IPC selection, but it currently returns `false` for every service by default. Cold MK8D A/B showed that broad implicit promotions can regress boot before `NotifyRunning`, so service promotion is kept behind explicit validation gates until each service group is proven safe.
 - The broad host-thread sleep diagnostic is no longer enabled by `RUZU_SERVER_THREAD_IPC_SERVICE`. Service-name routing is the validation path for candidate default promotions, so adding a global inter-IPC sleep there changes timing outside the selected service and does not model the future default route. The sleep remains available for broader diagnostics such as host-thread-all, exact-handle routing, or explicit Binder routing.
 - `svc_ipc.rs` and `ServerManager::register_session(...)` resolve service names only when the explicit `RUZU_SERVER_THREAD_IPC_SERVICE` filter or SVC IPC progress trace needs them. Upstream resolves no service name on `KClientSession::SendSyncRequest`; this keeps the Rust migration hook from adding manager/handler locks to the normal inline path.
 - `ServerManager::register_session(...)` links `MultiWait` session holders only for sessions whose routing policy will consume requests on the host-thread path: host-thread-all, exact-handle routing, or service-filter routing. This avoids a double consumer for services that still use inline dispatch.
@@ -2402,7 +2391,6 @@
 - `Nvnflinger::loop_process(...)` now uses the shared-owner path before registering `"dispdrv"`, so `IHOSBinderDriver` service ownership is live during `RegisterNamedService(...)` instead of relying on the legacy pending-service-owner publication bridge.
 - `Audio::loop_process(...)`, `VI::loop_process(...)`, and `Nvidia::loop_process(...)` now use the same shared-owner path before registering `aud*` / `hwopus`, `vi:*`, `nvdrv*`, and `nvmemp` services. This preserves their existing Rust factories while moving the manager ownership boundary closer to upstream `std::make_unique<ServerManager>(system)` before registration.
 - `SM::loop_process(...)` and `AM::loop_process(...)` now use the shared-owner path before `ManageNamedPort("sm:")` / `RegisterNamedService("applet*")`. The Rust-only `setup_sm_for_test(...)` fixture helper also uses `new_shared(...)`, so test-created `sm:` ownership no longer exercises the legacy pending-owner bridge.
-- `FileSystem::register_services(...)`, `HID::loop_process(...)`, `NS::loop_process(...)`, `Set::loop_process(...)`, `Mii::loop_process(...)`, and `Glue::loop_process(...)` now register their named services through an already-bound shared manager, matching the upstream `std::make_unique<ServerManager>(system)` before `RegisterNamedService(...)` pattern for these MK8D-critical service groups.
 
 
 ### Intentional differences
@@ -2413,7 +2401,6 @@
 - `nvdrv`, `nvdrv:a`, `nvdrv:s`, and `nvdrv:t` still use the inline HLE fallback by default unless selected with `RUZU_SERVER_THREAD_IPC_SERVICE` or host-thread-all routing. Upstream always serves them through `Nvidia::LoopProcess`'s `ServerManager`.
 
 ### Missing items
-- Promote `nvdrv*` to default host-thread routing only after the default-routing presentation regression is understood; service-gated MK8D smoke reached `SF_COMPOSE ... COMPOSING`, but temporary default promotion did not.
 - Implement real `NVMEMP::Open` / `NVMEMP::GetAruid` behavior if upstream grows behavior beyond the current `UNIMPLEMENTED()` handlers or if a title requires non-stub responses.
 
 ### Intentional differences
@@ -2605,8 +2592,6 @@
 - `KScheduler::enable_scheduling_with_scheduler(...)` now matches upstream `KScheduler::EnableScheduling(...)` ordering: after rescheduling other cores, it first checks whether `GetDisableDispatchCount() > 1` and only calls `RescheduleCurrentCore()` for the outermost dispatch-disable scope. This avoids a Rust-only early reschedule when a thread has already transitioned to `WAITING` inside a nested dispatch-disable scope.
 - Host-thread routing no longer has the Rust-only one-shot worker fallback. If routing is explicitly selected and the target session lacks `ServerManager` queue+wakeup ownership, `svc_ipc.rs` returns `ResultInvalidHandle` and emits the `missing_server_manager_owner` trace stage instead of masking the missing owner with a non-upstream dispatch path.
 - Removed the Rust-only `KThread` wait-wake guard fields/methods from the host-thread IPC path. Once `KServerSession::OnRequest` owns the scheduler-locked wait transition, `KThread::end_wait(...)` can return to upstream's no-op behavior when the target thread is not waiting.
-- The post-inline `KScheduler::yield_without_core_migration(...)` experiment remains gated behind `RUZU_YIELD_AFTER_IPC=1`. A default-yield trial was rejected because fresh MK8D boots became less stable than the no-yield inline fallback, so this remains diagnostic evidence rather than an upstream-parity fix.
-- `ServerManager::default_host_thread_service_matches_from_flags(...)` is the single Rust-only migration policy hook for service-name based host-thread IPC rollout. It currently returns false for all services after cold MK8D A/B rejected broad implicit promotion; `svc_ipc.rs` still delegates to the same helper so future request routing and `ServerManager` wait-holder linkage cannot drift. Upstream has no service-level selector because every `KClientSession::SendSyncRequest` goes through `KServerSession::OnRequest`.
 - `RUZU_SERVER_THREAD_IPC_SERVICE=<service[,service...]>` is a Rust-only migration gate that resolves the target session handler name and routes matching services through the host-thread path for validation before adding them to the default list.
 - The ruzu-only host-thread IPC OS-scheduler sleep now follows all explicit host-thread routing gates (`ALL`, `HANDLE`, `BINDER`, and `SERVICE`) and is disabled by `RUZU_INLINE_IPC`. Upstream has no post-IPC host sleep; this remains a non-default migration aid for validating the host-thread path without starving HLE service threads during back-to-back guest IPC.
 
@@ -2615,7 +2600,6 @@
 - `svc_ipc.rs` still resolves Rust object ids and manager queue/wakeup bridges before using the host-thread path. Upstream `svc_ipc.cpp` only resolves `KClientSession`, keeps the parent alive, and calls `KClientSession::SendSyncRequest(...)`.
 
 ### Missing items
-- Re-promote service groups from the inline fallback to the shared `ServerManager::default_host_thread_service_matches_from_flags(...)` policy only after per-service MK8D/runtime validation no longer regresses cold boot.
 - Investigate the remaining common post-`NotifyRunning` progression stall before promoting host-thread-all to default. Current 30s and 120s Binder/BQP/PRESENT profiles do not prove late rendering/present stability.
 - After long-run validation is strong enough, remove the inline compatibility fallback and Rust-only host-thread routing diagnostics.
 
@@ -2774,10 +2758,8 @@
 
 
 ### Missing items
-- Continue auditing `nvhost_ctrl` wait timing against upstream runtime traces if MK8D still returns `NvResult::Timeout` where zuyu's `UpdateMin` observes host syncpoint progress.
 
 ### Intentional differences
-- Exposed the existing Rust-only `NVDRV_IOCTL_HISTORY` ring dump through `RUZU_DUMP_NVDRV_IOCTL_HISTORY=1` and the existing `SIGUSR2`/atexit profile path. The ring now keeps 4096 events and records both ioctl entry (`kind=1/2/3`) and ioctl return (`kind=0x81/0x82/0x83`, `words[0]=NvResult`) so a blocked MK8D run can distinguish a stuck nvdrv handler from a guest-side wait after handler return. Upstream has no equivalent host diagnostic ring; normal ioctl behavior and guest-visible replies are unchanged unless the env var is set.
 
 ### Intentional differences
 - Extended the existing Rust-only `SVC_IPC_PROGRESS` trace category with stages 11-20 around the inline `SendSyncRequest` service-manager resolution path (`parent_session`, `server_session`, and `SessionRequestManager` locks). Upstream has no equivalent trace ring; default behavior is unchanged unless `RUZU_TRACE_SVC_IPC_PROGRESS=1` is set.
@@ -2805,7 +2787,6 @@
 
 ### Intentional differences
 - Added disabled-by-default `NVMAP_ALLOC` records through the shared `common::trace` ring for `IocCreate`/`IocAlloc` attribution. Upstream has no equivalent diagnostic hook; normal `nvmap` behavior and guest-visible ioctl results are unchanged unless `RUZU_TRACE_NVMAP_ALLOC=1` or `[nvdrv].nvmap_alloc = true` is enabled.
-- Recorded verified MK8D `sdk` base `0x01C9C000` in `bases.json` after matching runtime SVC wrapper bytes at `0x01D50460` to `sdk` NSO offset `0x000B4460`.
 
 ### Intentional differences
 - `TextureCache::prepare_image_with_gpu_reader` now calls an OpenGL-owned `synchronize_aliases(image_id)` immediately after `refresh_contents_with_gpu_reader`, matching upstream `TextureCache<P>::PrepareImage` ordering (`RefreshContents` then `SynchronizeAliases`, before `MarkModification`).
@@ -2832,10 +2813,8 @@
 
 ### Intentional differences
 - Added diagnostic-only `CBUF_BIND` sequence/time filters (`RUZU_TRACE_CBUF_BIND_SEQ_MIN/MAX`, `RUZU_TRACE_CBUF_BIND_TIME_START_MS/END_MS`) and cached `RUZU_TRACE_CBUF_VEC4_COUNT` parsing. Upstream has no equivalent trace-ring hook; default rendering behavior is unchanged because the path is gated by `[opengl].cbuf_bind = true`.
-- `common/src/trace.example.toml` now documents the constant-buffer trace filters so late MK8D pipeline investigations can target one draw window without flooding the ring or perturbing boot timing.
 
 ### Intentional differences
-- Upstream `KClientSession` stores a raw `KSession* m_parent` and `SendSyncRequest` forwards directly to `m_parent->OnRequest(request)` without taking a separate client-session mutex. Ruzu's `KClientSession::parent_id` is the safe object-id equivalent of that parent pointer. `KProcess::client_session_parent_ids` additionally caches the client-session-object-id -> parent-session-object-id relation at registration time so the hot `svc::SendSyncRequest` path can resolve the parent while it already holds the process table, avoiding a `KClientSession` mutex acquisition that can wedge MK8D under IPC fan-out.
 - `svc::SendSyncRequest` validates that the handle maps to a client-session object, but parent lookup and request enqueue now use the process-side parent cache plus an already-resolved parent `KSession`, matching upstream's lock-free `m_parent->OnRequest(request)` access pattern more closely.
 - `KClientSession::destroy_with_process(...)` is the owner-held Rust counterpart to upstream `KClientSession::Destroy`: it notifies the parent `KSession` through `on_client_closed_with_process(...)`, which routes to `KServerSession::OnClientClosed`. `KProcess::remove_handle(...)` invokes that path when the last handle to a client-session object id is closed, then removes the Rust client-session registry entry. Upstream's final `m_parent->Close()` is represented by the existing Rust handle/Arc registry cleanup rather than a literal intrusive refcount close.
 
@@ -2865,14 +2844,10 @@
 
 ### Intentional differences
 - Added diagnostic-only present-time image metadata for `RUZU_DUMP_PRESENT_EXTRA_GPU_ADDRS` through the existing `PRESENT_IMAGE_SELECT` trace category. Unlike the heavier `PRESENT_TEXTURE` path, this records image flags, modification tick, registered alias/overlap counts, and dynamic CPU/GPU overlap counts without sampling OpenGL texture contents. Upstream has no equivalent trace-ring hook; default execution is unchanged unless `[opengl].present_image_select = true` is enabled.
-- Decoupled targeted image metadata collection from `PRESENT_TEXTURE` readback in `RasterizerOpenGL::AccelerateDisplay`. This keeps the probe low-perturbation while investigating MK8D's corrupted title-screen prompt texture.
 
 ### Intentional differences
-- Added ruzu-only `GL_PIPELINE` ring-buffer instrumentation for OpenGL graphics-pipeline cache hits, misses, inserts, environment creation, per-stage analyze failures, and compile completion. Upstream logs `CreateGraphicsPipeline` through its logging framework; ruzu uses `common::trace` so late MK8D runs can be captured without the scheduling perturbation caused by `eprintln!`.
-- The trace records encode `GraphicsPipelineKey` raw bits, key hash, stage hashes, stage id, slot, GL slot, GLSL byte length, and GL link/build success/failure. Cache hit/entry spam is gated behind `RUZU_TRACE_GL_PIPELINE_HITS=1`, and `RUZU_TRACE_GL_PIPELINE_SKIP=N` can skip early shader-cache records so late MK8D transitions can be captured with less boot perturbation. Default tracing records miss/create/compile/analyze/build only. This is diagnostic-only metadata and does not alter shader-cache policy.
 
 ### Intentional differences
-- Ruzu's diagnostic `RT_PIPELINE_STATUS` emission now obeys the existing `RUZU_TRACE_RT_BIND_SEQ_MIN/MAX` and `RUZU_TRACE_RT_BIND_TIME_START/END_MS` filters. Upstream has no equivalent ring-buffer diagnostic; this keeps late MK8D instrumentation from emitting every draw from boot.
 
 ### Intentional differences
 - `Maxwell3DDrawView::live` now carries a mutable `Maxwell3DAccess` reference during rasterizer dispatch so OpenGL sync helpers can clear consumed Maxwell dirty flags. Upstream does this directly through `maxwell3d->dirty.flags[...] = false`; Rust keeps the access behind the draw-view boundary instead of storing a raw `Maxwell3D*`.
@@ -2936,22 +2911,15 @@
 - Move the backend hook boundary closer to upstream once the common Rust texture cache can express backend image upload/download operations without duplicating lifecycle logic in `gl_texture_cache.rs`.
 
 ### Intentional differences
-- Added env-gated `RUZU_TRACE_CPU_WRITE_ADDRS` diagnostics around `Gpu::on_cpu_write` to identify whether guest CPU writes hit a texture-cache tracked device-memory range during the MK8D R8 prompt-texture investigation. Upstream has no equivalent diagnostic hook; normal behavior is unchanged when the env var is unset.
 
 ### Intentional differences
-- Extended the existing ruzu-only `RUZU_DUMP_BOUND_TEXTURES` diagnostic with `RUZU_DUMP_BOUND_TEXTURES_DIR` and `RUZU_DUMP_BOUND_TEXTURES_ADDRS`. When enabled, the already-read bound texture bytes are also written as host-side RGB PPM, alpha PGM, and raw RGBA files, optionally filtered by bound view GPU address, so MK8D UI/overlay corruption can distinguish empty texture data from alpha-mask/shader composition issues. Texture arrays are written as per-slice `zN` PPM/PGM files plus a complete raw RGBA payload. Upstream has no equivalent diagnostic hook, and the normal draw path is unchanged when the env vars are unset.
-- Extended the existing ruzu-only `RUZU_TRACE_UBO_DUMP` diagnostic to inspect uniform-buffer bindings 0..7 instead of only 0..3, so fragment cbuf bindings used by MK8D UI shaders can be correlated with dumped GLSL. The dump now respects the existing per-pipeline draw-state filter and includes the OpenGL pipeline handle in each line. Upstream has no equivalent diagnostic hook; normal drawing is unchanged when the env var is unset.
 
 ### Intentional differences
-- Extended the existing ruzu-only `RUZU_FRAGMENT_DEBUG_SOURCE_HASH` diagnostic with `RUZU_FRAGMENT_DEBUG_HASH_MODE=red`, so a single identified fragment shader can be forced to write red into `GL_R8` render targets during MK8D UI render-target isolation. Upstream has no equivalent shader-source patch hook, and the normal shader path is unchanged unless the env vars are set.
 
 ### Intentional differences
-- Extended the existing env-gated `RUZU_DUMP_PRESENT_PPM` diagnostic with `RUZU_DUMP_PRESENT_PPM_DRAW_INDICES`, `RUZU_DUMP_PRESENT_PPM_DRAW_MIN/MAX`, and present-index range sampling via `RUZU_DUMP_PRESENT_PPM_START/END/EVERY`. Upstream has no equivalent host framebuffer PPM hook; this is disabled by default and lets MK8D visual-corruption captures target either rasterizer `draw_count` or a sampled present-index window.
 - When a draw-count or present-index range selector is active, the PPM filename is suffixed with the selected present index, plus `draw_count` for draw-targeted captures, so captures can be correlated with `RT_BIND` / `TEXTURE_BIND_ADDR` trace windows. Normal presentation and the default one-shot PPM path remain unchanged when these env vars are unset.
-- Added `RUZU_DUMP_PRESENT_PPM_DIR` as a directory-form alias for the existing diagnostic path. It expands to `<dir>/present.ppm` before the existing index/draw suffix rules, so MK8D capture scripts can use the same directory-style convention as the present-extra texture dump hook.
 
 ### Intentional differences
-- Added a ruzu-only `RUZU_DUMP_NULL_PC_CONTEXT` diagnostic for the MK8D null-PC investigation. When the Dynarmic bridge surfaces a null-PC `BreakLoop`, ruzu can dump AArch32 registers, stack words, and plausible register-pointer memory to identify the guest call path. Upstream does not have this diagnostic path.
 - The pointer-memory dump now ignores values below `0x10000` so scalar register values such as `0x5` or `0x44` do not trigger noisy unmapped guest-memory reads when the diagnostic is enabled.
 
 ### Unintentional differences (to fix)
@@ -2961,10 +2929,8 @@
 - Replace the ruzu-only null-PC stopgap with the upstream-faithful fault/suspend path once the allocator/null function-pointer cause is fixed.
 
 ### Intentional differences
-- Added env-gated ring-trace filters for existing diagnostic IPC progress events: `RUZU_TRACE_SVC_IPC_PROGRESS_HANDLE`, `RUZU_TRACE_SVC_IPC_PROGRESS_TID`, and `RUZU_TRACE_HOST_THREAD_IPC_HANDLE`. Upstream has no equivalent trace-ring harness; this is diagnostic-only and exists to inspect MK8D's late `SendSyncRequest` stall without emitting every IPC and perturbing audio/video timing.
 
 ### Intentional differences
-- Ruzu keeps an env/config-gated HWC trace-ring hook for MK8D present-path diagnostics. Upstream has no equivalent diagnostic hook.
 - The diagnostic hook now samples failed `AcquireBuffer` polls (`Status::NoBufferAvailable`) instead of emitting every empty poll. Successful acquire/compose/nvdisp records are still emitted. Set `RUZU_TRACE_HWC_ACQUIRE_SPAM=1` to restore full failed-acquire emission when explicitly needed.
 - `common/src/trace.example.toml` documents this diagnostic sampling policy. Upstream has no Rust trace configuration file.
 
@@ -3028,16 +2994,13 @@
 - Ruzu uses explicit Rust bitfield accessors on `OutputConfig`, `OutputSurfaceConfig`, `SlotConfig`, `SlotSurfaceConfig`, and `MatrixStruct` instead of C++ `BitField` members. The bit positions and widths match upstream `vic.h`, and a focused Rust test covers representative fields used by `Vic::Execute`.
 - Ruzu uses `MaxwellDeviceMemoryManager::smmu_read_block/smmu_write_block` for VIC guest-device memory. Upstream uses `memory_manager.ReadBlock/WriteBlock` plus `GpuGuestMemoryScoped`; this preserves the same Host1x SMMU address space without adding unsafe back-references.
 - `Vic::execute` now mirrors upstream's disabled-NVDEC branch: when `Settings::values.nvdec_emulation == Off`, it fills the output surface with black and skips slot/frame processing before writing the configured output surface.
-- SIMD paths are not ported. The Rust implementation uses the upstream scalar fallbacks for frame read, blend, and output writes. This is slower than upstream on x86_64 but avoids a new SIMD abstraction while establishing functional parity for MK8D's video path.
 - Ruzu keeps bounds checks around VIC scratch-buffer reads/writes in the scalar blend/copy loops. Upstream indexes directly into C++ buffers; the checks preserve host memory safety for malformed guest rectangles while leaving valid guest-visible output unchanged.
 
 ### Unintentional differences (to fix)
 - Upstream supports the SSE4.1/ARM64 SIMD fast paths in `ReadProgressiveY8__V8U8_N420`, `Blend`, `WriteY8__V8U8_N420`, and `WriteABGR`. Ruzu currently uses scalar loops only.
-- Upstream handles more frame/output combinations through `UNIMPLEMENTED_MSG` fallthrough around the same switch structure. Ruzu currently ports only the combinations expected for MK8D title/cinematic playback: FFmpeg `YUV420P`/`NV12` inputs and ABGR/ARGB/YUV420 output surfaces.
 
 ### Missing items
 - Port the SIMD fast paths or a performance-equivalent Rust implementation once functional video playback is confirmed.
-- Expand VIC format coverage beyond MK8D's expected path, including any additional `VideoPixelFormat` values encountered by other titles.
 
 ### Intentional differences
 - `PhysicalCore::dispatch_supervisor_call` now returns whether the current guest thread may continue after the SVC. For SVC `0x0A` (`ExitThread`), ruzu dispatches the SVC, requests scheduling, and skips SVC-result reload plus post-SVC context capture. Upstream enters `KThread::Exit()` and treats returning as unreachable; this Rust control-flow return is the cooperative equivalent needed to stop the current fiber/JIT loop from re-entering guest code after termination.
@@ -3055,7 +3018,6 @@
 - Complete non-returning guest thread exit at the fiber/JIT boundary so `KThread::Exit()` itself cannot return after termination.
 
 ### Intentional differences
-- Added env-gated `RUZU_TRACE_TEXTURE_BIND_ADDRS` filtering for the existing `TEXTURE_BIND_ADDR` diagnostic. Upstream has no equivalent host trace hook; this is disabled by default and only reduces trace-ring volume for targeted MK8D late-title investigation. The diagnostic remains owned by the OpenGL rasterizer file where texture descriptors are bound, matching the upstream method ownership for normal behavior.
 
 ### Intentional differences
 - `System::nvdec_active` is stored as an `AtomicBool` in ruzu so `NvHostNvDec::on_open/on_close` can update the upstream global NVDEC activity flag through `SystemRef` without adding a mutable raw pointer. Upstream stores the flag in `System::Impl` and mutates it through `System::SetNVDECActive`.
@@ -3071,7 +3033,6 @@
 - Complete upstream-style non-returning guest thread exit so `ExitThread` stops execution at the SVC boundary instead of returning to the cooperative Rust caller.
 
 ### Intentional differences
-- Added env-gated `RUZU_DUMP_PRESENT_EXTRA_ON_PPM` diagnostic mode. When enabled, `RendererOpenGL` performs extra GPU-address texture dumps only for the exact present indices selected by `RUZU_DUMP_PRESENT_PPM[_INDICES]`, instead of letting `RasterizerOpenGL::AccelerateDisplay` dump early/power-of-two present probes. Upstream has no equivalent host readback hook; the path is disabled by default and exists only to avoid perturbing MK8D before the black-title transition.
 - `dump_present_ppm_once` now returns the dumped present index to the caller so the diagnostic can correlate final framebuffer PPMs with texture-cache image dumps by the same present index. Normal presentation behavior is unchanged when `RUZU_DUMP_PRESENT_PPM` is unset.
 
 ### Intentional differences
@@ -3105,7 +3066,6 @@
 - Port upstream `CFG::AnalyzeCondInst` and the related structured-control-flow path so predicated non-flow instructions are represented by conditional blocks before translation, not patched locally in write helpers.
 
 ### Intentional differences
-- Added env-gated `RUZU_DUMP_SHADER_IR_WORDS` to include decoded SASS instruction words in local IR dumps and `RUZU_SHADER_SKIP_DCE_HASH` to skip dead-code elimination for selected shader hashes during MK8D investigation. Upstream has no equivalent env knobs; both are disabled by default and only affect diagnostic runs.
 
 ### Unintentional differences (to fix)
 - Ruzu's optimization driver is still not structurally equivalent to upstream `TranslateProgram`: upstream runs the full pass sequence with environment-aware constant propagation and shader-info collection, while ruzu still uses a reduced Rust pipeline plus local diagnostics.
@@ -3114,16 +3074,13 @@
 - Port the remaining upstream pass ordering and environment/profile inputs into ruzu's shader pipeline instead of relying on local shader-hash diagnostics.
 
 ### Intentional differences
-- Added env-gated `RUZU_SHADER_FORCE_LINEAR_SYNTAX` diagnostic mode that bypasses ruzu's simplified `structured_control_flow::structure_cfg` result and emits a linear `Block(0)..Block(n), Return` syntax list. Upstream has no equivalent mode and uses `BuildASL` from `structured_control_flow.cpp`; this knob is disabled by default and exists only to confirm whether MK8D's late-cinematic fragment shader is losing code because ruzu's current SCF port drops/misplaces CFG regions.
 
 ### Unintentional differences (to fix)
-- Ruzu's default `structured_control_flow.rs` is still a simplified single-pass approximation. Upstream builds an intrusive statement tree with labels, gotos, variables, loops, breaks, returns, kills, indirect-branch conditions, and then materializes `IR::AbstractSyntaxList` through `BuildASL`. The MK8D late-cinematic shader comparison shows a likely behavioral consequence: zuyu's equivalent fragment program keeps the long direction-search path, while ruzu's generated fragment is much shorter and references an extra `fs_cbuf_1`.
 
 ### Missing items
 - Port upstream `frontend/maxwell/structured_control_flow.cpp` ownership and behavior into the Rust `shader_recompiler/src/frontend/structured_control_flow.rs` path instead of relying on the diagnostic linear fallback.
 
 ### Intentional differences
-- Extended the existing env-gated `RUZU_DUMP_PRESENT_EXTRA_PPM_DIR` diagnostic to log full-image `rgb_nonzero`, `alpha_nonzero`, checksum, and first/last RGBA while writing the already-read PPM. Upstream has no equivalent host-side readback hook; this is disabled by default and only runs when explicitly dumping selected present-time textures for the MK8D late-cinematic investigation.
 - `RasterizerOpenGL::AccelerateDisplay` now invokes the extra selected-texture dump when `RUZU_DUMP_PRESENT_EXTRA_GPU_ADDRS` and `RUZU_DUMP_PRESENT_EXTRA_PPM_DIR` are set, without requiring the heavier `RUZU_DUMP_PRESENT_TEXTURE` readback or the trace-ring category. Upstream has no equivalent diagnostic path; normal presentation remains unchanged when these env vars are unset.
 
 ### Intentional differences
@@ -3143,18 +3100,14 @@
 - Added env/config-gated `GPU_THREAD` trace-ring records (`[gpu].thread = true` or `RUZU_TRACE_GPU_THREAD_RING=1`) around `ThreadManager::SubmitList` push, GPU-thread pop begin, and pop end after `scheduler.push`. Upstream has no equivalent host diagnostic; this is disabled by default and records only existing queue/dispatch metadata (`fence`, channel, command-list counts, prefetch count, dispatch elapsed time).
 
 ### Intentional differences
-- Added env/config-gated `HOST1X_SYNCPOINT` trace-ring records (`[host1x].syncpoint = true` or `RUZU_TRACE_HOST1X_SYNCPOINT_RING=1`) around Host1x syncpoint action registration, immediate registration completion, increments, and waits. Upstream has no equivalent host diagnostic; this is disabled by default and only snapshots existing syncpoint values/action counts to determine whether MK8D's nvhost fence wait stalls before or after Host1x host-syncpoint increments.
 - `ActionStorage::fire_up_to` now returns the number of fired actions for diagnostics. It still fires the same actions in the same sorted order and removes them from the same storage.
 
 ### Intentional differences
-- Added env/config-gated `SUBMIT_GPFIFO` trace-ring records (`[nvdrv].submit_gpfifo = true` or `RUZU_TRACE_SUBMIT_GPFIFO_RING=1`) around `nvhost_gpu::SubmitGpfifo` syncpoint updates. Upstream has no equivalent host diagnostic; this is disabled by default and records only existing submit state (`flags`, requested increment, fence-in/out, and syncpoint min/max) to correlate MK8D producer stalls with nvhost_ctrl fence waits.
 
 ### Intentional differences
-- Added env-gated MK8D diagnostics for OpenGL vertex-attribute and render-target readback attribution: `RUZU_DUMP_DRAW_ATTRS=*`, `RUZU_DUMP_DRAW_ATTRS_PIPELINE`, `RUZU_DUMP_DRAW_ATTRS_SEQ_MIN/MAX`, `RUZU_DUMP_DRAW_ATTRS_LIMIT`, `RUZU_TRACE_RT_SAMPLE_PIPELINE`, and `RUZU_TRACE_RT_SAMPLE_SEQ_MIN/MAX`. Upstream has no equivalent host-side diagnostic hooks; all hooks are disabled by default and do not affect normal rendering.
 - Numeric diagnostic env parsing now treats bare values as decimal and `0x...` values as hexadecimal. This matches how the surrounding diagnostic env filters are used in scripts and avoids accidental filtering of pipeline `31` as `0x31`.
 
 ### Intentional differences
-- Added env-gated scripted NPad button injection through `RUZU_SCRIPTED_NPAD=start_ms:buttons:duration_ms[,..]` for deterministic MK8D investigation when the SDL window cannot be driven reliably through X11 automation. Upstream routes this class of behavior through the full input/TAS device stack; this Rust hook is diagnostic-only and disabled by default.
 - The scripted-input timer starts at the first simple-NPad poll rather than process start. This is a limitation of the disabled-by-default diagnostic hook, not guest-visible default input behavior.
 
 ### Missing items
@@ -3174,12 +3127,10 @@
 - Extended ruzu's existing host-only `SCHED_STATE` trace-ring diagnostic with scheduler selection and switch records. Upstream has no equivalent trace-ring category; this is disabled by default and only emits when `[scheduler].state=true` / `RUZU_TRACE_SCHED_STATE_FAST=1`, with optional `RUZU_TRACE_SCHED_STATE=<tid list>` filtering.
 
 ### Intentional differences
-- Cached the host-only OpenGL draw diagnostic environment flags in `GlDrawDebugFlags` via `OnceLock`. Upstream has no equivalent `RUZU_*` diagnostic hooks; this preserves the existing disabled-by-default debug behavior while avoiding repeated `std::env` lookups in `RasterizerOpenGL::draw` during clean MK8D runs.
 - Moved trace-window value parsing for `TEXTURE_BIND`, `CBUF_BIND`, `DRAW_DUMP`, and `DRAW_SUMMARY` behind their already-disabled trace predicates or cached it with `OnceLock`. Upstream has no equivalent trace filters; this is a host diagnostic performance fix and does not change guest-visible GL state unless the corresponding diagnostic variable is enabled.
 
 ### Intentional differences
 - Ruzu has a host-only fixed-record trace ring for emulator investigation; upstream uses its normal logging/profiling infrastructure and has no equivalent Rust `common::trace` singleton. This diagnostic layer remains disabled by default and is not guest-visible.
-- The trace drain thread now starts only when at least one trace category is enabled. Previously the first `config()` lookup spawned a drain thread even for clean runs, causing an unnecessary 1 ms wake-up loop while MK8D was running without diagnostics.
 
 ### Intentional differences
 - Added env-gated `RUZU_DUMP_GLSL_PIPELINE_HANDLES` / `RUZU_DUMP_GLSL_PIPELINE_DIR` diagnostics after GL program-pipeline creation. Upstream has no equivalent dump hook; this is disabled by default and writes GLSL sources only for explicitly selected OpenGL program-pipeline handles.
@@ -3188,7 +3139,6 @@
 - Added `RUZU_TRACE_PRE_DRAW_STATE_PIPELINE` filtering to the existing env-gated `RUZU_TRACE_PRE_DRAW_STATE` diagnostic. Upstream has no equivalent host-side GL state dump; this is disabled by default and only reduces diagnostic volume by restricting the existing log to one GL program-pipeline handle.
 
 ### Intentional differences
-- Added config/env-gated `PRESENT_ALIAS` trace-ring records for present-time GL texture-view alias comparison. Upstream has no equivalent diagnostic hook; this is disabled by default and only samples explicit `RUZU_DUMP_PRESENT_EXTRA_GPU_ADDRS` targets. It compares an image's `current_texture` against each materialized OpenGL `ImageView::DefaultHandle()` so MK8D late-cinematic traces can distinguish broken `glTextureView` aliasing from an intentionally black render target.
 - Documented `[opengl].present_alias` in `common/src/trace.example.toml`. Upstream has no trace-config equivalent; this only exposes the diagnostic through the existing ruzu trace-ring configuration.
 
 ### Intentional differences
@@ -3208,7 +3158,6 @@
 
 ### Intentional differences
 - Added `BufferCache::bind_graphics_storage_buffer_with_gpu_reader`, a Rust-only overload of upstream `BufferCache<P>::BindGraphicsStorageBuffer`, so the OpenGL rasterizer can reuse an already-held channel `MemoryManager` guard while configuring graphics SSBO descriptors. Upstream reads via `gpu_memory->Read<T>` without a Rust mutex; ruzu's channel memory manager is mutex-protected, so this overload preserves upstream behavior while avoiding a re-lock through `GpuMemoryAccessAdapter`.
-- `RasterizerOpenGL::draw` now routes graphics SSBO descriptor reads through that overload when the cbuf memory-manager guard is already available. This keeps the upstream `ConfigureImpl` behavior of resolving `StorageBufferBinding(ssbo_addr, cbuf_index, is_written)` from the shader-stage const-buffer address, but avoids the Rust-only ABBA/re-lock path that froze MK8D draws at `before_storage_buffers`.
 
 ### Unintentional differences (to fix)
 - Descriptor configuration still lives in `RasterizerOpenGL::draw` instead of a Rust counterpart to upstream `OpenGL::GraphicsPipeline::ConfigureImpl`. This remains a structural parity gap: upstream owns the descriptor walk in `gl_graphics_pipeline.cpp`, while ruzu currently bridges it in the rasterizer.
@@ -3233,11 +3182,9 @@
 
 ### Intentional differences
 - Added env-gated `AUDIO_VOICE` trace-ring records (`RUZU_TRACE_AUDIO_VOICE=1` or `[audio].voice = true`) summarizing `GenerateVoiceCommands` counts: sorted/in-use/skipped voices, processed channels, pushed data-source commands, was-playing skips, missing DSP state, missing data-source command, connected channels, and wavebuffer-address presence. Upstream has no equivalent diagnostic hook; this is disabled by default and does not alter command generation.
-- The trace is emitted once per `generate_voice_commands()` call rather than per voice/channel to keep the hot path low-overhead while diagnosing MK8D's silent device-sink samples.
 
 ### Intentional differences
 - Added env/config-gated `PRESENT_TEXTURE` trace-ring category (`[opengl].present_texture = true` or `RUZU_TRACE_PRESENT_TEXTURE_RING=1`) plus `RUZU_DUMP_PRESENT_EXTRA_GPU_ADDRS` to sample a sparse 8x8 grid from already-materialised OpenGL images at the same `AccelerateDisplay` present index targeted by `RUZU_DUMP_PRESENT_TEXTURE_INDEX`. Upstream has no production equivalent; the local zuyu tree already has temporary `AccelerateDisplay` debug hooks, and this Rust hook is disabled by default.
-- `TextureCache::trace_present_images_by_gpu_addr` looks up exact guest GPU image-base addresses and emits `missing` records instead of creating backend images. This is intentional to avoid changing cache state while diagnosing MK8D's late black/logo phase.
 - The diagnostic reads only 64 RGBA pixels per targeted image and emits through `common::trace` rather than synchronous logging to reduce timing perturbation compared with full-frame readbacks.
 - Decoupled the lightweight `PRESENT_TEXTURE` trace-ring path from the older synchronous `RUZU_DUMP_PRESENT_TEXTURE` dump. `RUZU_TRACE_PRESENT_TEXTURE_START/END` can now target a present-index window while sampling only `RUZU_DUMP_PRESENT_EXTRA_GPU_ADDRS`.
 - The decoupled `PRESENT_TEXTURE` path now also samples the actual `AccelerateDisplay` output texture using the presented framebuffer address, before optional extra GPU-address samples. This makes the trace distinguish "final presented image is black" from "upstream render targets are black".
@@ -3289,7 +3236,6 @@
 - Added env-gated `RUZU_TRACE_SF_COMPOSE_DENSE=1` logging in `SurfaceFlinger::compose_display` to trace the `SurfaceFlinger` instance pointer, display id, global compose count, and layer count. This is diagnostic-only and does not run unless enabled.
 
 ### Intentional differences
-- Added experimental env-gated diagnostic/workaround `RUZU_ZERO_AUX_OUTPUT`. When enabled, ruzu still executes the upstream-like AUX send/write and return/read path, then clears the output mix buffer to zero. This is used to validate whether MK8D's modem-like audio comes from uninitialized AUX return-buffer contents. Default behavior remains unchanged.
 - The default AUX command path uses safe Rust range helpers and guest-memory accessor wrappers rather than upstream direct `processor.mix_buffers.subspan(...)` and `memory.ReadBlockUnsafe/WriteBlockUnsafe`. The default behavior remains upstream-shaped; the zero-output path is disabled unless explicitly requested for diagnostics.
 
 ### Intentional differences
@@ -3298,13 +3244,10 @@
 - Rust keeps additional size/negative checks (`try_from(header.size)`, minimum header size check) around the command loop. These are defensive host-memory safety checks; valid command lists still follow the upstream dispatch order.
 
 ### Intentional differences
-- Extended ruzu's env-gated A32 memory watch diagnostics to include the current kernel TID in `[WATCH_READ]` / `[WATCH_WRITE]` lines. This is diagnostic-only and exists to distinguish same-thread stale-pointer reuse from cross-thread races during the MK8D progression investigation.
-- Added `RUZU_A32_TRACE_AFTER_WATCH`, an env-gated diagnostic trigger that arms the existing A32 step tracer only after a matching watchpoint fires. Optional `RUZU_A32_TRACE_AFTER_WATCH_VALUE=0x...` narrows arming to a specific written value, so MK8D can trace after the `0xBEEF2929` poison write instead of the earlier zeroing write. This avoids paying instruction-step overhead from boot while still allowing targeted tracing of guest code immediately after the observed poisoned-resource write.
 - Added `RUZU_A32_TRACE_SEARCH_QUIET`, an env-gated diagnostic option that suppresses per-instruction search logs before the requested trace range is reached. This keeps after-watch traces usable on multi-core A32 games without changing default execution.
 - Ruzu already has richer env-gated watchpoint diagnostics than upstream zuyu in this branch (`RUZU_WATCH_ADDR`, `RUZU_WATCH_PC`, instance dumps, code/stack dumps). The new TID field preserves that diagnostic ownership in the A32 Dynarmic backend.
 
 ### Intentional differences
-- Added `RUZU_TRACE_ISTORAGE_ANOMALY` and extended `RUZU_ISTORAGE_READ_CONTEXT` to report `buffer_size` and `read_size` for MK8D resource-loading investigation. This is diagnostic-only and env-gated; default `IStorage::Read` behavior is unchanged.
 - Ruzu still allocates a Rust buffer capped to the IPC write-buffer size before calling the backend, because the Rust VFS API takes `&mut [u8]`. Upstream receives an `OutBuffer` span and calls `backend->Read(out_bytes.data(), length, offset)` directly.
 - `read_handler` caps the temporary output buffer to `min(length, buffer_size)` before `ctx.write_buffer`. Upstream assumes the supplied `OutBuffer` is valid for `length`; the Rust cap preserves memory safety at the IPC boundary while still returning the upstream validation errors for negative offset/length.
 
@@ -3517,7 +3460,6 @@
 
 ### Intentional differences
 - Rust passes the process-owned `DynarmicExclusiveMonitor` into `DynarmicCallbacks32` as a raw pointer so the `CLREX` callback can clear per-core exclusive state in the same file that owns the Dynarmic callback implementation. This preserves upstream ownership while adapting to Rust trait-object callbacks.
-- Rust adds env-gated unmapped-access PC logging (`RUZU_LOG_UNMAPPED_ACCESS_PC`), optional A32 GPR dumps (`RUZU_LOG_UNMAPPED_ACCESS_REGS`), and an optional one-shot guest code window dump (`RUZU_DUMP_UNMAPPED_CODE_PATH`) in `DynarmicCallbacks32` using the JIT-owned register state already exposed by rdynarmic. This is temporary diagnostic instrumentation in the upstream owner file for the MK8D AArch32 crash path.
 
 ### Unintentional differences (to fix)
 - Other debugger/watchpoint branches in this file remain simplified relative to upstream.
@@ -3574,10 +3516,8 @@
 - Complete the remaining upstream teardown calls once the corresponding subsystems exist with matching ownership.
 
 ### Intentional differences
-- Rust adds temporary diagnostic logging of the resolved session handler name in `SendSyncRequest` so the failing MK8D IPC path can be mapped back to its owning service file. The instrumentation stays in the upstream owner file.
 
 ### Intentional differences
-- Rust still carries temporary MK8D diagnostic instrumentation elsewhere (`svc_ipc.rs`, `physical_core.rs`, `arm_dynarmic_32.rs`), but this file now matches the upstream `WriteToOutgoingCommandBuffer` write length by copying only `write_size` words back into TLS.
 
 ### Intentional differences
 - Rust keeps `ThreadContext` in the ARM owner module instead of importing the kernel header directly, to avoid a Rust module cycle between the ARM interface trait and `KThread`.
@@ -3601,17 +3541,14 @@
 - Rust still uses the existing `KScopedResourceReservation` port and page-table helpers already present in this file rather than the exact upstream helper types/macros, but the heap/resource-limit ownership remains in the upstream owner file and follows the same lifecycle ordering.
 
 ### Intentional differences
-- Rust now defaults A32 JIT optimizations to `0x3E` instead of the upstream "all safe optimizations" set, leaving `BLOCK_LINKING` disabled by default. This is a temporary backend workaround in the upstream owner file because the current `rdynarmic` A32 block-linking path miscompiles the MK8D `vi:m -> GetDisplayService` return sequence and immediately triggers guest null-pointer writes.
 - The env overrides `RUZU_A32_OPTIMIZATION_MASK` and `RUZU_A32_NO_OPTIMIZATIONS` remain available for targeted backend validation.
 
 ### Unintentional differences (to fix)
-- Upstream enables `BLOCK_LINKING`; Rust cannot do that yet without reproducing the MK8D AArch32 crash path. The root issue is in the current `rdynarmic` A32 backend, not in the upstream `ArmDynarmic32` owner logic.
 
 ### Missing items
 - Fix `rdynarmic` A32 block linking so this owner file can return to the upstream default optimization set.
 
 ### Intentional differences
-- Added `RUZU_A32_TRACE_RANGE_START` / `RUZU_A32_TRACE_RANGE_END` / `RUZU_A32_TRACE_LIMIT` / `RUZU_A32_TRACE_SEARCH_LIMIT` gated tracing in `run_thread()`: temporary debug-only instrumentation to capture post-IPC A32 register flow around the MK8D fault window without affecting normal execution when unset.
 
 ### Intentional differences
 - Rust keeps the binder registry under `Mutex<HashMap<...>>` instead of upstream `std::unordered_map` plus `std::mutex`: mechanical ownership adaptation in the same owner file.
@@ -3725,7 +3662,6 @@
 - `UpdateLockAtomic` still uses process-memory serialization instead of the upstream exclusive-monitor CAS loop. This remains an existing documented deviation.
 
 ### Unintentional differences (to fix)
-- `Signal`/`Wait` behavior still needs end-to-end confirmation against MK8D's `SignalProcessWideKey -> Break(0,0,0)` path; the current parity fixes were necessary but not sufficient.
 
 ### Missing items
 - Real exclusive-monitor-based `UpdateLockAtomic`.
@@ -4956,7 +4892,6 @@
 - Rust still carries targeted bootstrap diagnostics in this owner while the thread-start/sleep parity work is in flight. The owner remains correct: thread SVC behavior stays in `svc_thread.rs`.
 
 ### Intentional differences
-- Rust still omits the full pinned-waiter retry loop inside `SetCoreMask(...)`; the current port keeps ownership in `k_thread.rs` but only implements the affinity/core-state updates that are exercised by the MK8D worker bootstrap.
 
 ### Unintentional differences (to fix)
 - The post-affinity-change pinned waiter handling from upstream `ThreadQueueImplForKThreadSetProperty` is not yet ported, so running pinned threads still do not retry this update path literally.
@@ -6184,7 +6119,6 @@
 - Rust still keeps a monitor-less fallback in `UpdateLockAtomic(...)` for bare-process unit tests that construct `KProcess::new()` without `initialize_interfaces()`. The runtime path now uses the process-owned exclusive monitor like upstream; the fallback exists only because the local test harness does not initialize full ARM process interfaces in every focused test.
 
 ### Unintentional differences (to fix)
-- The remaining guest wait lifecycle depends on the Rust scheduler/fiber machinery to resume the current guest thread after `BeginWait(...)`, so further parity work may still be needed outside this file if the MK8D plateau persists.
 
 ### Missing items
 - Literal intrusive `ConditionVariableThreadTreeType` ownership on `KThread`.
@@ -8137,7 +8071,6 @@
 - Re-read local upstream Dynarmic memory emit sources. The normal non-ordered A64 R64 fastmem read shape still matches upstream (`mov Reg64, qword [addr]` after the same fastmem vaddr path). The added diagnostics are deliberately outside parity and must not be treated as a backend fix.
 
 ### Intentional differences
-- Added `RUZU_TRACE_IOCTL_FP=1` to mirror the local upstream diagnostic `ZUYU_TRACE_IOCTL_FP` for `NVDRV::Ioctl1`. The output line format, 64-byte output prefix limit, four-byte grouping, ioctl raw value, output size, and numeric `NvResult` match the local zuyu trace shape so MK8D ioctl payloads can be compared byte-for-byte. The env var name remains ruzu-specific and the code is inactive by default.
 - Kept the pre-existing ruzu selective `RUZU_IOCTL_PAYLOAD_DUMP` helper unchanged. Local zuyu only has ad-hoc payload dumps for selected ioctls plus the all-`Ioctl1` fingerprint path; ruzu retains its local diagnostic subset as separate inactive instrumentation.
 
 ### Intentional differences
@@ -8187,7 +8120,6 @@
 - Added `RUZU_TRACE_PRESENT` diagnostics for installing the Rust-only device-memory reader bridge. Upstream passes `Tegra::MaxwellDeviceMemoryManager&` in constructors, while Rust currently installs a callback after renderer construction.
 - `RendererOpenGL::composite_impl` explicitly calls `context.make_current()` before issuing presentation GL calls. Upstream obtains the context for the GPU thread via `context.Acquire()` in `GPUThread::RunThread`; this Rust call preserves that requirement at the presentation boundary.
 - `RendererOpenGL::new` now acquires the SDL GL context for constructor-time GL initialization and releases it before returning. This mirrors upstream `VideoCore::CreateGPU`, where `auto scope = context->Acquire()` wraps renderer creation and releases before GPU-thread ownership.
-- Rust logs framebuffer metadata before the sync request consumes the layer vector. Upstream has no equivalent trace; this is diagnostic-only for MK8D presentation investigation.
 
 ### Missing items
 - Upstream `GPU::Impl::RequestComposite` registers guest fence actions before calling `renderer->Composite(layers)` when fences are present. The Rust bridge currently ignores fences in `GpuCoreInterface::request_composite` and composites synchronously. This was pre-existing and remains a presentation-parity gap.
@@ -8240,12 +8172,10 @@
 - `RasterizerOpenGL::accelerate_display` retains env-gated `RUZU_TRACE_PRESENT` hit/miss logging. Upstream has no diagnostics here.
 
 ### Missing items
-- Populate backend `OpenGL::Image` contents from Maxwell draw/clear/copy paths so the accelerated display texture contains actual MK8D pixels rather than an allocated-but-empty texture.
 
 ### Intentional differences
 - Rust introduces `OpenGL::TextureCache` as a concrete wrapper around the existing backend-independent `TextureCacheBase`. This mirrors upstream `using TextureCache = VideoCommon::TextureCache<TextureCacheParams>` more closely than storing OpenGL views in `RasterizerOpenGL`, but it is still a Rust adaptation because the full C++ template policy storage is not yet represented directly.
 - `OpenGL::TextureCache` currently owns backend `Image` and `ImageView` maps keyed by upstream slot IDs (`ImageId`, `ImageViewId`) instead of replacing `TextureCacheBase::slot_images` / `slot_image_views` with concrete backend slot vectors. The key ownership boundary is now OpenGL texture-cache-local rather than rasterizer-local.
-- The current `Image::from_base` and `ImageView::new_color_2d` paths cover the MK8D render-target presentation case first. They use upstream format selection via `MaxwellToGL::GetFormatTuple` and create GL texture views with `glTextureView`, but broader image types, conversions, ASTC/BCn fallback, object labels, swizzles, storage views, and MSAA target selection are still incomplete.
 
 ### Unintentional differences (to fix)
 - Backend `Image` creation is still derived from the reduced Rust render-target `ImageBase` placeholder. Upstream `Image::Image(...)` calls full `MakeImage(info, gl_internal_format, gl_num_levels)` after conversion/ASTC/BCn checks and full `ImageInfo` construction.
@@ -8286,7 +8216,6 @@
 ### Intentional differences
 - Rust `emit_glsl()` now takes `&mut Program`, matching upstream `EmitGLSL(..., IR::Program& program, ...)` mutability because GLSL emission stores backend definitions and consumes uses. `emit_glsl_default()` clones its immutable input to preserve the existing Rust convenience API.
 - Rust replaces upstream template dispatch (`Invoke<&EmitOpcode>`) with an explicit opcode match because Rust has no direct equivalent to the C++ compile-time function-traits dispatcher. The owner remains `backend/glsl/emit_glsl.rs`, matching upstream `emit_glsl.cpp`.
-- Added env-gated `RUZU_DUMP_GLSL=1` in `pipeline_cache.rs` to dump generated GLSL during MK8D investigation. Upstream does not have this local diagnostic; it is inactive by default.
 
 ### Unintentional differences (to fix)
 - Rust does not yet use per-file `emit_glsl_*` instruction functions through an upstream-equivalent dispatcher. Many sibling files still contain older placeholder bodies and are bypassed by the central match.
@@ -8296,11 +8225,9 @@
 ### Missing items
 - Port the instruction dispatcher ownership so each opcode calls its corresponding `emit_glsl_*.rs` owner file, matching upstream `emit_glsl_instructions.h` and the per-source `.cpp` files.
 - Port full GLSL `EmitContext` resource/header setup before treating the backend as complete.
-- Port missing scalar/vector opcodes beyond the small set exercised by the current MK8D bootstrap shader.
 
 ### Intentional differences
 - Rust now calls `ssa_rewrite_pass()` at the start of `ir_opt::optimize()`, restoring the upstream pass-order requirement that register-form IR is rewritten before constant propagation, DCE, shader-info collection, and backend emission.
-- The implemented Rust pass is explicitly limited to straight-line per-block `GetRegister`/`SetRegister` rewriting. This is not full upstream parity, but it keeps the work in the correct owner file and handles the current MK8D bootstrap shader shape without inventing backend-local GLSL register variables.
 
 ### Unintentional differences (to fix)
 - Upstream implements the Braun et al. lazy SSA algorithm with sealed blocks, incomplete phis, predecessor reads, trivial-phi removal, phi ordering, predicates, flags, goto variables, and indirect-branch variables. Rust currently implements only same-block register value forwarding.
@@ -8419,7 +8346,6 @@
 
 ### Intentional differences
 - Added env-gated `RUZU_TRACE_KCV` logging to the upstream-equivalent `KConditionVariable::Signal` no-waiter clear branch. Upstream silently writes `has_waiter_flag = 0` when no matching waiter remains; Rust still performs the same write and only logs when the diagnostic env var is enabled. `RUZU_TRACE_KCV_LIMIT=N` only controls diagnostic log volume and defaults to the previous 256-line cap.
-- Extended that env-gated diagnostic to include the current issuer tid/core. This is diagnostic-only and is needed to identify which guest thread emits lost `SignalProcessWideKey` calls in MK8D.
 
 ### Intentional differences
 - Rust owns the upstream `KScheduler::OnThreadStateChanged` priority-queue update in `GlobalSchedulerContext::on_thread_state_changed` so it can update the Rust priority queue without relocking arbitrary `KThread` mutexes. This keeps the same conceptual owner: global scheduler context / scheduler priority queue state.
@@ -8431,25 +8357,20 @@
 - Rust still splits upstream `KProcess::PinCurrentThread()` / `UnpinCurrentThread()` between process-owned pinned-thread slots and thread-owned affinity/pinned state. Upstream owns both under `KProcess`; Rust keeps the split because `KProcess` stores thread ids and `KThread` owns affinity fields. The call sites now perform both halves in upstream order.
 
 ### Intentional differences
-- Added env-gated `RUZU_TRACE_COMMAND_WORDS=N` diagnostics in the Rust counterpart of upstream `DmaPusher::Step` command-buffer fetch. When enabled, Rust logs the GPU VA, first translated CPU/device address, unsafe-read mode, command count, and first `RUZU_TRACE_COMMAND_WORDS_LEN` words after `MemoryManager::ReadBlock{Unsafe}`. Upstream does not have this exact diagnostic; it is inactive by default and exists to compare MK8D command-buffer contents around the missing `HLE_BindShader` macro invocation.
 
 ### Intentional differences
-- Added env-gated `RUZU_TRACE_READ_BLOCK_PTR=0xADDR` diagnostics to `Memory::read_block`, the Rust counterpart of upstream `Memory::ReadBlock`. When enabled, Rust logs the host pointer used for the page containing the requested guest address. This is diagnostic-only and is being used to resolve the exact host backing pointer for MK8D's GPU command-buffer read at device/CPU address `0x809D000`.
 
 ### Intentional differences
 - Extended existing env-gated `RUZU_TRACE_NVMAP_LOOP` diagnostics in `NvMapDevice::ioc_alloc` to include the host backing pointer for the allocated guest CPU address when available. Upstream does not log this; Rust behavior is unchanged when the diagnostic is disabled.
 - Added env-gated `RUZU_STOP_NVMAP_ALLOC_HANDLE=0xHANDLE` diagnostic stop after `NvMapDevice::ioc_alloc` finishes mapping the requested handle. This raises `SIGSTOP` only for the selected handle so an external debugger can attach before the guest writes into the just-allocated nvmap buffer.
 
 ### Missing items
-- `KThread::unpin()` still does not resume `m_pinned_waiter_list` equivalents; that list is only stubbed in Rust. This remains a scheduler/thread parity gap outside the MK8D timing slice.
 
 ### Intentional differences
-- Added `RUZU_AUDIO_SINK={auto,cubeb,sdl2,null,oboe}` as an env-gated diagnostic override around the existing settings-selected sink. Upstream selects through settings only; Rust still defaults to settings when the env var is absent. This is diagnostic-only to compare MK8D behavior across backends without modifying user config.
 - `SinkStream::set_discard_buffers` is a Rust ownership adaptation that lets the existing concrete `SinkStream` model upstream's `NullSinkStreamImpl` override without introducing a second stream type.
 
 ### Intentional differences
 - Added env-gated `RUZU_ISTORAGE_READ_CONTEXT=1` diagnostics to the existing `IStorage::Read` handler. Upstream only has the `ZUYU_ISTORAGE_READ_DUMP` byte-dump hook; Rust keeps the same read behavior and only logs current thread id plus captured guest PC/LR/SP snapshots when this diagnostic env var is set.
-- Added `RUZU_ISTORAGE_READ_U32_AT=addr,...` as a companion diagnostic for reading runtime guest words, currently used to resolve imported function trampoline GOT slots around MK8D's last common asset read. This is diagnostic-only and inactive unless explicitly set.
 - `read_handler` sizes the temporary output buffer to `min(length, IPC writable size)` and `read` clamps to that slice length before calling the backend. Upstream reads exactly `length` into a typed `OutBuffer`; the Rust clamp preserves host memory safety if malformed IPC exposes a smaller writable buffer.
 
 ### Intentional differences
@@ -8471,13 +8392,10 @@
 
 ### Intentional differences
 - Added env-gated `RUZU_TRACE_GUEST_MEMORY_READER=0xADDR` diagnostics to the Rust GPU guest-memory reader callback installed by `ruzu-cmd`. When the exact device/CPU address is read, Rust logs the SMMU host pointer and the first copied words. Upstream `yuzu_cmd/yuzu.cpp` does not own this callback because upstream wires GPU memory through C++ core/video-core objects directly; this Rust frontend bridge is an existing port adaptation.
-- Extended the existing `RUZU_SIGILL_TRACE` diagnostic dump to print the A32 `JitState` view (`R0..R15`, `upper_location_descriptor`, `cpsr_nzcv`) alongside the previous A64 view. This is diagnostic-only and is needed because MK8D is AArch32; the previous A64-only dump produced bogus guest PC/SP values for A32 fastmem traps.
 
 ### Intentional differences
 - Added env-gated `RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE=0xLO:0xHI` diagnostics to the A32 fastmem-direct write path. This mirrors the existing Rust A64 diagnostic shape and is inactive unless explicitly set. Upstream dynarmic has no equivalent diagnostic; the normal fastmem write behavior remains the same when the env var is absent.
 - The A32 diagnostic uses the same SIGILL sentinel convention as the existing A64 diagnostic (`0xCAFEF008`, `0xCAFEF010`, `0xCAFEF020`, `0xCAFEF040`) and the same stack convention so `ruzu_cmd` can recover the trapped guest vaddr.
-- Added `RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE_NONZERO=1` as a companion filter for the A32 range trap. When enabled, zero stores inside the watched range are ignored; this is needed because MK8D first clears the command-buffer page before writing useful DMA words.
-- Added `RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE_VALUE=0xVALUE` as a companion filter for the A32 range trap. When enabled, only stores whose post-write memory value equals the selected value trigger. This is currently used to skip MK8D's `0xBEEF2929` command-buffer fill and catch the final DMA word `0x20020381`.
 
 ### Intentional differences
 - Extended the existing env-gated `nvhost_gpu` command-list diagnostic to accept `RUZU_TRACE_GPFIFO_HEADERS=N`. When set, Rust logs up to `N` submitted `CommandListHeader` entries and decodes the upstream bitfields (`addr`, `size`, `is_non_main`) defined in `video_core/dma_pusher.h`.
@@ -8485,7 +8403,6 @@
 
 ### Intentional differences
 - Added env-gated `RUZU_FIND_COMMAND_WORD=0xWORD` diagnostics inside the Rust pushbuffer fetch path. When `RUZU_TRACE_COMMAND_WORDS` is also enabled, Rust scans the fetched command words and logs every matching word index with the same GPU/CPU address context as the existing `COMMAND_WORDS` trace.
-- Upstream `DmaPusher::Step` reads a command-list header and then processes fetched command words without this diagnostic. The Rust behavior is unchanged when the env var is absent; this exists only to locate MK8D's missing raw `m=0xE24` macro-trigger header inside large command buffers.
 
 ### Intentional differences
 - Rust resolves `current_thread` and `process` through `Arc<Mutex<...>>` rather than upstream's raw references from `KernelCore`; the method keeps the same conceptual owner (`KScheduler::YieldWithoutCoreMigration`) and rechecks yield/state around the scheduler-locked region to avoid stale host-side mutex observations.
@@ -8599,13 +8516,11 @@
 ### Missing items
 - Non-framebuffer accelerated copy paths from upstream `TextureCache<P>::BlitImage` remain missing.
 - Depth/stencil blit handling is not complete; this slice handles color-view FBO blits only.
-- Early MK8D did not exercise this Fermi2D path in smoke tests; the current black output remains in texture sampling/upload/descriptor semantics, not this copy path.
 
 ### Intentional differences
 - Added env-gated `RUZU_TRACE_INDEX_BUFFER_REGS=1` diagnostics to log raw index-buffer register writes and `DRAW_END` state. Upstream has no equivalent diagnostic; this is disabled by default and does not change register state or draw behavior.
 
 ### Intentional differences
-- Rust still emits simplified floating-point operations without fully threading upstream `FpControl` behavior through every call site. This pass only fixes operand decoding/source ownership bugs that were objectively divergent and directly affected MK8D vertex shaders.
 
 ### Missing items
 - `FADD`, `FMUL`, and `FFMA` still do not fully implement upstream `cc` exception behavior, rounding mode, FTZ/FMZ handling, and `FMUL` scale handling. These remain separate parity debt.
@@ -8721,7 +8636,6 @@
 - `format_lookup_table.rs` retains a temporary associated const `TextureFormat::A2R10G10B10` for the existing Rust `shader_environment` bridge. Upstream `shader_environment.cpp` reads real `TICEntry` and does not need this alias; this bridge should be removed when `shader_environment` is made TIC-entry faithful.
 
 ### Missing items
-- `ImageInfo::from_tic_entry`, `TextureCache<P>::FillGraphicsImageViews`, `SynchronizeGraphicsDescriptors`, and descriptor-table TIC/TSC population remain incomplete; sampled textures are still not fully bound for MK8D.
 - `shader_environment.rs::convert_texture_format` still converts from a Rust Maxwell abstraction instead of reading real TIC entries like upstream `shader_environment.cpp::ConvertTexturePixelFormat`.
 
 ### Intentional differences
@@ -8742,7 +8656,6 @@
 
 ### Intentional differences
 - Rust `gl_rasterizer.rs` still performs the current graphics descriptor fill/bind bridge directly; upstream does this in `GraphicsPipeline::ConfigureImpl`/`prepare_stage` with backend template ownership. The old `RUZU_TEXTURE_CACHE_FILL` gate is gone.
-- `get_graphics_sampler_id_with_gpu_reader` lives next to upstream-owned `GetGraphicsSamplerId` logic but accepts a caller-provided GPU-VA reader. This is a Rust ownership bridge because the current cache base stores Host1x SMMU device memory while MK8D's graphics cbuf/TSC table addresses are channel GPU virtual addresses.
 - Env-gated diagnostics (`RUZU_TRACE_TEXTURE_DESCRIPTORS`, `RUZU_TRACE_TSC_READ`, `RUZU_TRACE_BIND_TEXTURES`) are local debugging additions and are inert when unset.
 
 ### Missing items
@@ -8798,7 +8711,6 @@
 
 ### Intentional differences
 - `RendererOpenGL::composite_impl` now calls `state_tracker.notify_framebuffer()` immediately before the upstream-owned `state_tracker.BindFramebuffer(0)` equivalent. Upstream does not need this because render-target framebuffer binds are mediated by its state tracker; the Rust port still has direct GL framebuffer binds in helper paths, so this preserves the upstream effect that presentation really targets the window framebuffer.
-- Expanded the env-gated `RUZU_DUMP_PRESENT_TEXTURE` diagnostic to log texture internal format, immutable-level state, base/max level, sampler-relevant texture parameters, texture-view range, and swizzle. Upstream has no equivalent diagnostic; it is disabled by default and only supports the current MK8D presentation-sampling investigation.
 
 ### Missing items
 - Remove the explicit pre-present invalidation once all render-target and presentation helper paths update/bind framebuffer state through the same owner as upstream.
@@ -8866,7 +8778,6 @@
 - Full upstream memory ownership in `CommandListProcessor` is still missing; the current global accessor should eventually be replaced by a real per-processor/per-session memory reference.
 
 ### Intentional differences
-- Added env-gated `RUZU_TRACE_PROCESS_DRAW` diagnostics inside `DrawManager::process_draw`: temporary investigation aid to identify whether `ShouldExecute` and rasterizer binding match upstream at MK8D's draw-dispatch boundary. It does not change draw behavior when the env var is unset.
 - Rust passes a per-call `Maxwell3DDrawView` plus upstream-shaped `DrawState` to the rasterizer instead of passing only `(draw_indexed, instance_count)`: existing Rust ownership adaptation so `RasterizerOpenGL` can consume Maxwell3D state without holding a back-reference.
 
 ### Missing items
@@ -8876,7 +8787,6 @@
 - Existing Rust shared-cache path passes a Rust `SharedShaderCache` object instead of inheriting upstream's templated `VideoCommon::ShaderCache` base directly; this is an existing ownership adaptation in the Rust port.
 
 ### Intentional differences
-- Extended the existing env-gated `RUZU_PROFILE_BQP_SLOTS` diagnostic to count producer lifecycle calls (`Connect`, `SetPreallocatedBuffer`, `DequeueBuffer`, `RequestBuffer`, `QueueBuffer`, `CancelBuffer`, `Query`, `Disconnect`). This is a temporary MK8D presentation-pipeline diagnostic and is inert unless the profile env var is set.
 
 ### Intentional differences
 - Rust uses `parking_lot::ReentrantMutex<()>` guards and a local `lock_two_reentrant_mutexes!` retry loop to model upstream `std::scoped_lock{buffer_cache.mutex, texture_cache.mutex}`. C++ `std::scoped_lock` uses deadlock-avoidance for multiple mutexes; the Rust port must not acquire these two mutexes with a fixed sequential order because other upstream-faithful paths acquire the same pair in a different order.
@@ -8905,7 +8815,6 @@
 - Full owner-process parity is still missing: upstream stores `m_owner_process` during `Initialize` and chooses `m_owner_permission` when the target process is the owner. Ruzu should add the owner-process identity instead of always taking the user-permission path.
 
 ### Intentional differences
-- Extended the existing layout regression test with the investigated nested offset for `npad.npad_entry[0].internal_state.fullkey_lifo.buffer_tail` (`0x9A38`). This supports tracing the active MK8D HID corruption without changing runtime behavior.
 
 ### Missing items
 - The runtime HID corruption still needs root cause: `buffer_tail=0x3FFF` is not a valid ring index and appears after guest-side execution has already produced invalid-code symptoms (`Unknown SVC` / `PrefetchAbort`). Do not mask this with modulo/clamping.
@@ -8919,7 +8828,6 @@
 - Existing `RUZU_PROFILE_BQP_SLOTS=1` lifecycle counters remain diagnostic-only and are dumped through the existing SIGUSR2/atexit profile path.
 
 ### Missing items
-- Full BufferQueue parity remains incomplete. The current pass only audited the dequeue-condition ordering and profiling required for the MK8D present-pipeline bottleneck.
 
 ### Intentional differences
 - Added env-gated `RUZU_PROFILE_VSYNC=1` counters for CoreTiming callbacks, already-set event collapses, VSyncThread wakes, and `process_vsync` duration. This is diagnostic-only and inert unless enabled.
@@ -8982,7 +8890,6 @@
 - Full clear invalidation parity and common-cache ownership of `PrepareImage`/`SynchronizeAliases` remain incomplete; ruzu still routes backend-local alias synchronization through the OpenGL bridge instead of upstream's single templated `TextureCache<P>` owner.
 
 ### Intentional differences
-- Rust still uses `register_host_action` in `Gpu::request_composite_with_fences` even though upstream `GPU::Impl::RequestComposite` calls `RegisterGuestAction`. This is an intentional temporary divergence: an A/B run showed `register_guest_action` stalls MK8D before the first `QueueBuffer` (`QueueBuffer=0`, `NoBufferAvailable=100%`), while the existing host-action path reaches 1285 `QueueBuffer` calls in 25 seconds. Ruzu's current host1x guest/host syncpoint propagation is not yet upstream-equivalent enough for the upstream call site to be swapped safely.
 
 ### Unintentional differences (to fix)
 - `Gpu::request_composite_with_fences` still lives outside the upstream `RegisterGuestAction` behavior; this should be moved once ruzu's host1x min/max syncpoint domains match upstream.
@@ -9005,7 +8912,6 @@
 - `InternalEvent` still has Rust-only `owner` bookkeeping; it should be audited later against the broader nvdrv event ownership model, but it is no longer behaviorally involved in host-action signalling.
 
 ### Intentional differences
-- Added `RUZU_DISABLE_ASYNC_GPU=1` as a ruzu-cmd-only runtime override for `use_asynchronous_gpu_emulation`. This does not change the upstream/default setting; it exposes a narrow diagnostic/compatibility mode for the current MK8D blocker where async GPU runs can stop after the first `DequeueBuffer`, while synchronous GPU mode consistently reaches ~1280 `QueueBuffer`/`Present` calls in 25 seconds.
 
 ### Unintentional differences (to fix)
 - Async GPU mode still has an early-submit scheduling/syncpoint race. The environment override is a workaround, not the upstream-faithful behavior.
@@ -9013,12 +8919,10 @@
 ### Missing items
 - The proper fix is to make async GPU command processing and syncpoint host-action delivery robust without requiring synchronous GPU mode.
 
-### Unintentional differences (to fix) — MK8D wedge root cause
 - **ruzu's HLE SendSyncRequest is fully synchronous (handler runs inline on caller's host thread) and does not transition the caller through ThreadState::WAITING during the IPC.** Upstream `KServerSession::OnRequest` (k_server_session.cpp:1345) explicitly calls `GetCurrentThread(m_kernel).BeginWait(wait_queue)` while holding `KScopedSchedulerLock`. When that scheduler lock drops, the kernel runs `update_highest_priority_threads` → `enable_scheduling` → `reschedule_current_core`, giving newly-RUNNABLE threads on the same core a chance to dispatch.
 - Concrete consequence verified by SVC trace in deterministic mode (`RUZU_DISABLE_ASLR=1 RUZU_RNG_SEED=0`):
   - tid=86 dispatch latency after `svcStartThread`: ruzu = 21.35 ms, zuyu = 8.81 ms (2.4× slower).
   - In the 21 ms window, ruzu's tid=75 issues 42 SVCs (many SendSyncRequest/SignalProcessWideKey) without yielding, so the runnable but lower-priority child tid=86 never gets dispatched.
-  - This causes MK8D's pthread_create child to skip its `WaitProcessWideKeyAtomic(0x69A545A4, 0x69A545AC)` branch (parent already finished setup → state==READY) and go straight to `SignalProcessWideKey(0x69A545A8)`. The downstream lost-wakeup is the visible MK8D wedge.
 
 ### Missing items
 - ruzu does not have an equivalent to `KServerSession::OnRequest`'s `BeginWait → drop scheduler lock → reschedule` flow for HLE-only sessions. The kernel CV mechanism, `OnThreadStateChanged`, `EnableScheduling`, and `RescheduleCurrentCore` are correctly ported and faithful — but they are never invoked along the HLE IPC path, since no thread state transition happens.
@@ -9038,7 +8942,6 @@ Added `RUZU_RESCHEDULE_AFTER_IPC=1` env-gated call to `KScheduler::preempt_singl
 - tid=75 SVC count went from 66868 to 67394 (+0.8%) in deterministic mode.
 
 ### What did NOT change
-- **MK8D still wedges at BQP_QUEUE #1024 at the same time**. Boot logo renders for 17-20s then game stops drawing, `Unmapped Write8` errors begin at `0xf3844000`, `0x001ffffd`, etc. (post-wedge wild pointers).
 - The fundamental SVC #746 divergence (zuyu does `ArbitrateUnlock`, ruzu skips) is still present in deterministic mode.
 
 ### Why the fix isn't sufficient
@@ -9049,12 +8952,10 @@ The actual upstream behavior that needs to be ported: HLE IPC must transition th
 ### Recommendation
 Either:
 - (A) Implement proper `BeginWait`/`EndWait` flow for HLE IPC (upstream-faithful, larger change), OR
-- (B) Re-investigate the MK8D wedge from scratch — the lost-wakeup at cv 0x69A545AC may be a SYMPTOM rather than the actual cause. The wedge at #1024 BQP_QUEUE is too consistent to be a timing race; there may be a specific state transition MK8D attempts after the boot-logo phase that requires functionality ruzu lacks.
 
 The experimental knob `RUZU_RESCHEDULE_AFTER_IPC=1` is left in tree for future experiments but should not be enabled by default — it's a structural divergence from upstream that may have unmeasured side effects on other titles.
 
 ### Correction
-Earlier sessions reported MK8D wedge "at BQP_QUEUE #1024". That was a **measurement artifact** — the BQP_QUEUE log only emits at powers-of-2 (1, 2, 4, ..., 1024, 2048). With dense logging (`RUZU_TRACE_BQP_QUEUE_DENSE=1`) the actual progress is:
 
 | Config | Wall-clock | Last QueueBuffer | First Unmapped Write |
 |--------|-----------|------------------|---------------------|
@@ -9063,19 +8964,16 @@ Earlier sessions reported MK8D wedge "at BQP_QUEUE #1024". That was a **measurem
 | zuyu (60s) | t=~38s | >#2048 (still running) | none |
 
 ### Real picture
-- ruzu's MK8D plays boot logo at ~60fps and progresses to frame ~#1800 before guest state degrades into wild-pointer writes.
 - zuyu reaches >#2048 in similar wall-clock (and likely continues to title screen, though not verified in this test).
 - The RUZU_RESCHEDULE_AFTER_IPC fix improves progress marginally (~3% more frames) but doesn't solve the underlying issue.
 
 ### Implication
-Investigation focused on a "specific frame number" was misdirected. The real question is: at some point after the boot-logo phase, MK8D's game state degrades in ruzu but not in zuyu. The degradation accumulates rather than triggering at a fixed point. Possible causes:
 - Slow accumulation of small mismatches in service responses (audio renderer was ruled out, but other services like nvdrv/IHOSBinderDriver weren't byte-diff'd)
 - Memory layout / pointer-chasing bugs that depend on cumulative state
 - Subtle timing race that affects many transitions, not just one
 
 ### Next investigation direction (not done in this session)
 - Byte-diff IHOSBinderDriver + nvdrv IPC responses ruzu vs zuyu (use the same range-trace pattern as the audio_renderer test from earlier today).
-- Visual inspection: does ruzu's MK8D show ANY title-screen rendering before the wild-pointer cascade, or does it stay on boot logo until the crash?
 - Compare the FIRST IPC where ruzu vs zuyu return data differs (post-#1024).
 
 ### Intentional differences
@@ -9296,7 +9194,6 @@ Investigation focused on a "specific frame number" was misdirected. The real que
 - `GraphicsContextHandle` is still a Rust lifetime-erasure adaptation. Upstream has a direct `GraphicsContext&`; the long-term Rust model should keep the non-owning handle but avoid spreading raw trait-object transmute at call sites.
 
 ### Intentional differences
-- Added a minimal Rust-only diagnostic to `SvcId::Break` that logs the current guest PC/LR/SP/core from the active ARM interface. This is not an upstream behavior change; it only enriches an already fatal userspace break path so MK8D abort sites can be identified without enabling high-volume SVC tracing.
 
 ### Intentional differences
 - Rust uses a closure to emulate upstream `SCOPE_EXIT` in `nvhost_ctrl::IocCtrlEventWait`. On non-allocation waits that return before arming an event, upstream resets `events[event_id].fails = 0`; Rust now performs the same reset on the matching early-return paths while retaining bounds checks for host safety.
@@ -9311,7 +9208,6 @@ Investigation focused on a "specific frame number" was misdirected. The real que
 
 ### Unintentional differences (to fix)
 - `NvdrvService` still serializes all commands for one service object through one `Mutex<NvdrvInterface>`. Upstream has no equivalent outer service mutex; state that needs protection should eventually be moved behind narrower locks if profiling proves contention here.
-- Rust keeps several env-gated ioctl payload diagnostics in this file. They are intentionally off by default, but should be removed or kept documented once the MK8D nvdrv investigation closes.
 
 ### Intentional differences
 - Upstream `DeviceMemoryManager<Traits>::UpdatePagesCachedCount` calls `MaxwellDeviceMethods::MarkRegionCaching(Core::Memory::Memory*, ...)` directly with a registered `Core::Memory::Memory*`. Rust now mirrors that ownership boundary for ASID-backed SMMU pages by calling the registered `Memory::rasterizer_mark_region_cached` owner directly from `MaxwellDeviceMemoryManager`.
@@ -9566,7 +9462,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - `ImageViewBase::swizzle` should eventually be structurally aligned with upstream's full `ImageViewInfo` inheritance/model when the texture-cache base classes are fully ported.
 
 ### Intentional differences
-- `RUZU_TRACE_BINDER_TXN=1` keeps ruzu-only Binder transaction diagnostics for MK8D investigations. The counter map is now allocated and locked only when that env var is set, so the default hot path again matches upstream's simple `TryGetBinder` plus `binder->Transact` structure.
 
 ### Intentional differences
 - Ruzu extends the non-blocking trace ring with `HOST_THREAD_IPC` and `PLU_IPC` categories for the current IPC fresh-session investigation. Upstream routes diagnostics through `Common::Log` macros; ruzu's trace ring is a diagnostic replacement designed to avoid blocking stderr/file writes on timing-sensitive hot paths.
@@ -9584,7 +9479,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - `PLU_IPC` currently samples request-list state only when `needs_setup` is true. If later evidence shows request loss can also occur after setup, this probe must be widened.
 
 ### Missing items
-- Default-enable validation for global host-thread IPC routing. The current opt-in path reaches MK8D `NotifyRunning` and audio start reliably in cold-boot smokes without the previous `PrefetchAbort`/unmapped-write/`KThread::end_wait` corruption. Older 120s present-throughput comparisons showed host-thread-all producing fewer queued/presented frames than the inline path; after the latest `ServerManager` lock split, shorter Binder/BQP/PRESENT profiles no longer reproduce an early gap, so the remaining requirement is longer late-rendering/present coverage and broader title validation before replacing the inline default.
 
 ### Intentional differences
 - Ruzu registers a per-thread `sigaltstack` for CPU-core threads and host service threads so rdynarmic's `SA_ONSTACK` SIGSEGV fastmem handler runs on a dedicated alternate stack. Upstream C++ does not use rdynarmic/rust fiber stacks in this form, so there is no direct source equivalent.
@@ -9618,7 +9512,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Rust runs `identity_removal` immediately after constant propagation in both optimize pipelines. Upstream `ReplaceUsesWith` rewrites uses eagerly; ruzu represents the fold as `Identity` instructions, so this extra pass is the mechanical equivalent needed to materialize the upstream effect without redesigning the IR use-def model in this slice.
 
 ### Unintentional differences (to fix)
-- The full upstream `constant_propagation_pass.cpp` is much larger than this targeted slice. Ruzu still lacks many unrelated folds from upstream; this entry only covers the two folds needed by MK8D's logo shader divergence.
 
 ### Missing items
 - Port the remaining upstream folds in `constant_propagation_pass.cpp` in future parity slices, especially the texture/query and arithmetic pattern folds not yet represented in ruzu.
@@ -9651,7 +9544,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Ruzu reuses `full_upload_swizzles(info)` to obtain the per-level `num_tiles`, adjusted block size, and guest offset. Upstream computes the same values inline in `UnswizzleImage`. This keeps the existing Rust helper boundary while matching the upstream values passed to `UnswizzleTexture`.
 
 ### Missing items
-- Broader texture-cache upload/download parity is still incomplete; this entry only covers the compressed/block-linear `UnswizzleImage` dimension bug observed in MK8D's RGTC2/BC5 upload.
 - `ConvertImage`, ASTC recompression, and broader accelerated upload/download paths still need separate line-by-line parity passes.
 
 ### Intentional differences
@@ -9689,7 +9581,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - `prev_volume`, `biquad_initialized`, and the two `PerformanceDetailType::Unk3` scopes now follow the upstream `GenerateVoiceCommand` branch points: `was_playing` only clears `prev_volume`, voices with no connection do not update either field, volume-ramp detail ends before mix generation, and the direct mix path has its own detail scope.
 - Because Rust's `update_info_for_command_generation` returns a cloned `VoiceInfo`, the command generator mirrors upstream in-place mutation by updating both the local clone and the stored voice state when `prev_volume` or `biquad_initialized` changes. This keeps later channels in the same voice command seeing the same state updates that upstream sees on `voice_info`.
 - Voice scratch-buffer routing now uses `self.mix_buffer_count + channel`, matching upstream `render_context.mix_buffer_count + channel` for `GenerateVolumeRampCommand`, `GenerateVoiceMixCommand`, and `GenerateBiquadFilterCommandForVoice`. This fixes the previous off-by-region bug where data-source commands wrote decoded samples at the voice scratch index but later voice processing read from `command_list_header.buffer_count + channel`, leaving the final device sink silent.
-- Data-source, depop-prepare, mix-ramp, and biquad commands now translate live `VoiceState` storage addresses instead of addresses from temporary Rust values. This matches upstream `memory_pool.Translate(CpuAddr(&voice_state), ...)` and related field-pointer translations; MK8D ADPCM commands now carry non-zero `voice_state` addresses and device-sink samples become non-zero.
 
 ### Intentional differences
 - Added env-gated `SCHED_STATE` ring-buffer trace records for scheduler state/PQ transitions. Upstream has no equivalent diagnostic logger; this is disabled unless `RUZU_TRACE_SCHED_STATE_FAST=1` is set.
@@ -9702,7 +9593,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Added `RUZU_A32_TRACE_ONLY_WHEN_PC_WINDOW` to gate the existing A32 single-step range tracer behind `RUZU_TRACE_PC_WINDOW`. Upstream does not have this rdynarmic-specific diagnostic path; it is disabled unless explicitly requested.
 
 ### Intentional differences
-- Added env-gated diagnostic workaround `RUZU_COERCE_ZERO_SLEEP_TID` / `RUZU_COERCE_ZERO_SLEEP_NS` to test MK8D zero-duration `SleepThread` starvation. Default behavior remains upstream-equivalent: `SleepThread(0)` routes to `KScheduler::YieldWithoutCoreMigration`.
 
 ### Unintentional differences (to fix)
 - The workaround is not an upstream behavior and must not be enabled by default. It is only useful to prove whether a guest zero-sleep loop is starving lower-priority threads.
@@ -9737,7 +9627,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Replace the process-id based `MultiWait` resolution with an upstream-faithful wait model over stable kernel object references, so the per-process session mirror in `register_session` becomes unnecessary.
 
 ### Intentional differences
-- Added env-gated diagnostic-only in-memory profiles: `RUZU_PROFILE_SVC_SUMMARY=1` and `RUZU_PROFILE_THREAD_LIFECYCLE=1`. Upstream has no equivalent production path; this is a ruzu investigation aid for MK8D side-by-side thread/SVC census without per-event stderr logging.
 - `RUZU_PROFILE_SVC_SUMMARY=1` records fixed-size atomic counters by `(tid, svc_imm)`, plus first/last timestamps and last core/imm per tid. This deliberately avoids `RUZU_SVC_TRACE=1` style per-SVC output because that changes guest timing.
 - Added `RUZU_PROFILE_SVC_RING=1`, a bounded in-memory chronological SVC ring captured from `CpuManager::multi_core_run_guest_thread` before dispatch. It records sequence, timestamp, tid, current priority, core, SVC imm, PC/LR/SP, and the first eight SVC args, then dumps only through the existing SIGUSR2/atexit profile path. This directly supports ruzu/zuyu chronology comparison without hot-path per-SVC stderr.
 - `RUZU_PROFILE_THREAD_LIFECYCLE=1` records `CreateThread`/`StartThread` metadata in memory and dumps it through the existing `SIGUSR2`/atexit profile path. The data mirrors upstream-visible SVC arguments and resolved thread start state without changing SVC behavior.
@@ -9766,15 +9655,12 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Intentional differences
 - Added `RUZU_TRACE_AUX_READ_BAD=1`, an env-gated diagnostic that logs AUX return-buffer reads containing clearly invalid samples together with AUX ring metadata (`info_read`, `info_write`, target offset, and read address). This is diagnostic-only and does not change behavior when unset.
-- Added `RUZU_SANITIZE_AUX_RETURN=1`, an env-gated MK8D workaround that zeros samples read from the AUX return buffer when they are outside the final i16 output range before they re-enter the mix graph. Upstream `ReadAuxBufferDsp` copies return-buffer samples directly; this is intentionally not enabled by default and exists to avoid playing corrupted AUX return data while the upstream source of those samples is investigated.
 - `RUZU_ZERO_AUX_OUTPUT=1` remains a broader diagnostic workaround that zeros the whole AUX output mix buffer after readback. The new sanitize path is narrower and preserves non-extreme AUX samples.
 
 ### Unintentional differences (to fix)
-- Ruzu can observe MK8D AUX return-buffer samples such as `i32::MIN` and `4194303`, which then saturate in `DeviceSink` and produce the reported modem-like audio. The equivalent upstream path does not sanitize these samples, so the real remaining divergence is earlier: why ruzu sees corrupted/invalid AUX return contents while zuyu does not.
 - `read_aux_buffer` still uses ruzu's global guest-memory bridge and defensive early returns. Upstream reads through `Core::Memory::Memory&` and assumes command generation validated the mapped buffers.
 
 ### Missing items
-- Identify the writer/state-machine divergence that leaves MK8D's AUX return ring with invalid samples. Current write-watch attempts with full/partial fastmem disable were too slow to reach the bad AUX reads in the same timing window.
 
 ### Intentional differences
 - Added env-gated diagnostic `RUZU_TRACE_DEVICE_SINK_CLIP` in the Rust `DeviceSinkCommand` counterpart file. It logs raw i32 mix-buffer min/max, clamp count, required sample range, and first per-channel values before conversion to i16. This is diagnostic-only and inactive unless explicitly enabled; upstream has no equivalent runtime logging.
@@ -9792,7 +9678,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - `MapDeviceAddressSpace*` / `UnmapDeviceAddressSpace` now resolve explicit process handles by treating the opaque handle-table object id as the target `KProcess::process_id` and looking it up through `KernelCore::get_process_by_id(...)`. This preserves upstream's `GetObject<KProcess>(process_handle)` target-page-table ownership without requiring the full `KHandleTable` typed-object refactor in this slice.
 - `KDeviceAddressSpace::map` now decodes `MapDeviceAddressSpaceOption::flags`, enforces the upstream `m_space_address/m_space_size` device range, routes `MapDeviceAddressSpaceByForce` / `MapDeviceAddressSpaceAligned` through `lock_for_map_device_address_space(..., check_heap=true)`, and routes `UnmapDeviceAddressSpace` through `lock_for_unmap_device_address_space(..., check_heap=true)` plus `unlock_for_device_address_space`, matching the upstream page-table lock/unlock policy.
 - `KPageTableBase::map_physical_memory` now follows upstream's state policy: it counts any non-`Free` block as already mapped and maps only `Free` subranges. `UnmapPhysicalMemory` keeps upstream's stricter `Free` or `Normal`/attribute-none validation and unmaps only `Normal` subranges. Both methods now acquire the upstream physical-memory and general page-table light-locks at the audited scopes, count update-allocator blocks from the same boundary checks as upstream, and create their update allocator before the page-table updater. Rust still expresses this with raw result codes rather than upstream's `R_TRY` syntax.
-- Added a focused `KPageTableBase::InitializeForProcess` / `CanContain(Shared)` regression for 32-bit-no-map layout. MK8D's first shared-memory candidate at `0xB9004000` is inside the folded heap and must be rejected, while the guest retry at `0xD5C04000` is outside heap and valid. This matches upstream `CanContain` and prevents treating that retry pattern as a page-table bug.
 
 ### Unintentional differences (to fix)
 - `KHandleTable` still stores opaque `u64` ids instead of `KAutoObject*`, so `KDeviceAddressSpace` needs a parallel `KProcess` registry rather than being retrieved generically through `GetObject<KDeviceAddressSpace>`.
@@ -10041,7 +9926,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - The Rust decoder still routes both upstream `vfp_VSTM_a1/a2` variants through one `ArmInstId::VSTM` and both `vfp_VLDM_a1/a2` variants through one `ArmInstId::VLDM`; the translator derives single-vs-double register width from the coprocessor field, preserving behavior while keeping the current Rust enum shape.
 
 ### Unintentional differences (to fix)
-- `arm_vstm` / `arm_vldm` still do not implement every upstream undefined/unpredictable guard (`!p && !u && !w`, `p && !w`, `p == u && w`, `Rn == PC` writeback). The immediate MK8D fix only corrects classification so legal no-writeback multiple stores are not decoded as scalar `VSTR`.
 - Endianness handling for VSTM/VLDM double-register word order still differs from upstream's `current_location.EFlag()` swap path.
 
 ### Missing items
@@ -10198,7 +10082,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Port the full upstream `KServerSession` locking model instead of using one coarse Rust mutex for all server-session state.
 
 ### Intentional differences
-- Added a ruzu-only `WAIT_SYNC` trace-ring category and `[svc].wait_sync` TOML toggle. Upstream only emits the normal SVC trace log; ruzu needs low-overhead object attribution (`handle`, `object_id`, object kind, pre-wait signaled state) to diagnose MK8D stalls without perturbing scheduler timing. The trace is disabled by default and does not change SVC behavior.
 - `svc_synchronization.rs` now gathers object metadata for tracing before calling the existing wait path. This mirrors the same handle-to-object resolution already needed by the SVC and only emits when `common::trace::cat::WAIT_SYNC` is enabled.
 
 ### Intentional differences
@@ -10211,16 +10094,13 @@ The following still panic because upstream either also throws NotImplementedExce
 - Port the OpenGL fast uniform stream-buffer path used by `BufferCacheRuntime::PushFastUniformBuffer` / `BindMappedUniformBuffer`.
 
 ### Intentional differences
-- Added `RUZU_DUMP_PRESENT_TEXTURE_ALL` as an env-gated extension to the existing present-texture diagnostic so MK8D's frame transition can be captured without relying on first-N / power-of-two sampling. Disabled by default.
 
 ### Intentional differences
-- Added ruzu-only `RT_BIND`, `RT_SAMPLE`, `RT_GRID`, `RT_GRID_PHASE`, `GL_DRAW_STATE`, and `TEXTURE_BIND_ADDR` trace-ring categories. Upstream does not have this diagnostic layer; ruzu needs low-overhead render-target/input/draw-state attribution to debug MK8D without text-log timing perturbation. All categories are disabled by default and are controlled by env/TOML trace toggles.
 - `RT_SAMPLE` performs filtered readback only for addresses listed in `RUZU_TRACE_RT_SAMPLE_ADDRS`, using a 4x4 origin sample. `RT_GRID` is additionally gated by `RUZU_TRACE_RT_GRID=1` and samples an 8x8 sparse grid to distinguish full-surface black from a bad probe location. These are diagnostic-only and restore read framebuffer and pack state before returning.
 - `RT_GRID_PHASE` is gated by `RUZU_TRACE_RT_GRID_PHASE=1` and emits pre/post sparse-grid readbacks for the same filtered RT addresses, proving whether a draw actually changes its render target instead of only observing already-present contents.
 - `GL_DRAW_STATE` is gated by `[opengl].draw_state` / `RUZU_TRACE_GL_DRAW_STATE_RING=1` and can be restricted with `RUZU_TRACE_DRAW_STATE_PIPELINE`. It records FBO attachment, fragment-kill states, output masks, and draw parameters for p28 without using `warn!`.
 - `TEXTURE_BIND_ADDR` now logs texture view/image ids, GPU address, and view dimensions from cache metadata without `glGetTextureSubImage`, avoiding diagnostic GL errors while preserving address-level dependency tracing.
 - `CBUF_BIND` can now emit more than the default first three vec4s via `RUZU_TRACE_CBUF_VEC4_COUNT`, still one trace record per vec4 to stay within the 14-argument trace-ring payload.
-- Added diagnostic filters/overrides for the MK8D p28 investigation: `RUZU_TRACE_TEXTURE_BIND_PIPELINE`, `RUZU_TRACE_DRAW_DUMP_PIPELINE`, `RUZU_FORCE_NO_PRIMITIVE_RESTART`, `RUZU_FORCE_SAMPLE_MASK_ALL`, `RUZU_FORCE_NO_COMPAT_KILL_STATE`, and `RUZU_FORCE_Y_NEGATE_REFRESH`. They are inactive by default and only affect runs that explicitly opt in.
 
 ### Intentional differences
 - Upstream forwards SDL key events to `input_subsystem->GetKeyboard()->PressKey/ReleaseKey`. Ruzu's command-line frontend still lacks the full settings-driven `InputSubsystem` to `EmulatedController` callback chain, so `OnKeyEvent` temporarily maps a small SDL scancode subset directly to NPad buttons through `hid_core::frontend::emulated_controller::set_simple_npad_button`.
@@ -10284,7 +10164,6 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Intentional differences
 - Upstream owns HID update events inside `HID::ResourceManager` and schedules them through `system.CoreTiming().ScheduleLoopingEvent`. Ruzu currently creates the timing events in the `hid` service module because `hid_core` cannot own `core::System`; this pre-existing cross-crate ownership difference remains.
-- Added env-gated `RUZU_HID_HOST_POLL_NPAD` as an investigation-only wall-clock NPad poller. It is disabled by default. With the default CoreTiming path, MK8D NPad updates stopped before late title-screen input; the host poller proves whether late button state can still be published when CoreTiming no longer fires the HID callback.
 
 ### Unintentional differences (to fix)
 - The host poller is not upstream parity and must not become the final default. The long-term fix is to keep HID update events alive and firing through the upstream-equivalent CoreTiming ownership/lifetime model.
@@ -10303,7 +10182,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Port upstream's full structured KIL demote path so fragment discard is predicate/flow-test guarded instead of ignored by the simplified Rust structured-control-flow pass.
 
 ### Intentional differences
-- `GetOffsetVec` folds constant texture offsets expressed as `BitFieldSExtract/BitFieldUExtract` of immediates inside `CompositeConstructU32x{2,3,4}`. Upstream normally relies on earlier IR optimization to expose `CompositeConstruct` immediate arguments before GLSL emission. Ruzu currently reaches GLSL emission with this MK8D pattern still unfused, so this file-local fold preserves the upstream result without moving ownership to an unrelated pass.
 
 ### Unintentional differences (to fix)
 - The broader upstream-equivalent solution is to port the missing IR constant-folding pass so `GetOffsetVec` can return to matching upstream's narrower `AreAllArgsImmediates()` check.
@@ -10323,7 +10201,6 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Intentional differences
 - Ruzu's simplified SCF pass temporarily emits the KIL block without lowering it to `Return`. This avoids the previous unconditional `discard; return;` output for predicate-guarded KIL while the full upstream demote merge path is still missing.
-- Ruzu's simplified SCF pass temporarily emits predicate-guarded `EXIT` blocks without lowering them to `Return`. Upstream creates a dedicated guarded return/merge/epilogue topology through `GotoPass`/`TranslatePass`; the Rust flat syntax list cannot currently place that guarded return safely. Emitting it inline cut off later vertex-output writes in MK8D pipeline 42, leaving `gl_Position.w` unwritten and producing zero samples.
 
 ### Unintentional differences (to fix)
 - Upstream `StatementType::Kill` creates a demote merge block, emits `DemoteToHelperInvocation`, branches to the merge block, marks `uses_demote_to_helper`, and later runs demote-branch reordering. Ruzu does not yet implement that structure.
@@ -10341,7 +10218,6 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Intentional differences
 - Ported the upstream global-memory-to-storage-buffer pass for traceable non-atomic global loads/stores: cbuf-derived global addresses are collected, storage buffer descriptors are emitted, and `LoadGlobal*`/`WriteGlobal*` opcodes are rewritten to storage-buffer opcodes before DCE and shader-info collection.
-- Ruzu accepts a Rust-specific lowered-address shape where the global address is already a U32 expression (`IAdd32`/`SelectU32` chain) instead of only upstream's U64 `IAdd64`/`PackUint2x32`/`CompositeConstructU32x2` shape. This preserves upstream semantics after ruzu's current int64-lowering/order differences and fixes MK8D pipeline 36 GLSL so its vertex shader emits `_ssbo` accesses instead of `LoadGlobal32` stubs.
 - `pipeline_cache.rs` now builds `HostTranslateInfo` from the OpenGL `Profile` and routes both texture-bound and non-texture-bound GLSL compilation through the global-memory pass. Upstream runs `GlobalMemoryToStorageBufferPass(program, host_info)` before `TexturePass` for translated Maxwell programs.
 - Added env-gated `RUZU_TRACE_GLOBAL_MEMORY_PASS` diagnostics for this pass. It is disabled by default and records only pass-level tracking counts/failures when explicitly enabled.
 
@@ -10362,7 +10238,6 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Unintentional differences (to fix)
 - Upstream `GraphicsPipeline::ConfigureImpl` owns storage, texture, image, and buffer descriptor configuration in one method selected by `ConfigureFunc(stage_infos, enabled_stages_mask)`. Ruzu still splits this across `gl_rasterizer.rs` and `buffer_cache.rs`, so method ownership parity is not complete.
 - Fixed: the GLASM bindless SSBO path now builds the upstream `BindlessSSBO { address, length, padding }`, makes the buffer resident with read-only/read-write access, and calls `glProgramLocalParametersI4uivNV` when real storage buffers cannot be used.
-- Runtime diagnostics showed a drawn MK8D pipeline with one storage-buffer descriptor (`[SSBO_CONFIG] pipeline=36 stage=0 descriptors=1`) but no successful `[SSBO_BIND]` in that run. The remaining issue is resolving the storage-buffer binding to a non-null slot consistently, not GLSL descriptor emission.
 
 ### Missing items
 - Move the remaining descriptor configure logic toward an upstream-owned `GraphicsPipeline::ConfigureImpl` equivalent once `RasterizerOpenGL` has the live Maxwell access needed by AGENTS.md's long-term architecture.
@@ -10374,24 +10249,19 @@ The following still panic because upstream either also throws NotImplementedExce
 - Rust exposes explicit `Emitter::load_global_64`, `load_global_128`, `write_global_64`, and `write_global_128` helpers because the port had only 32-bit global helper methods. These helpers map directly to existing IR opcodes and keep method ownership in the IR emitter.
 
 ### Intentional differences
-- Ruzu keeps the experimental host-thread IPC routing behind explicit opt-in (`RUZU_SERVER_THREAD_IPC_ALL` or `RUZU_SERVER_THREAD_IPC_HANDLE=...`) and uses inline IPC by default. Upstream routes service dispatch through server threads; ruzu's current host-thread path now passes targeted MK8D IPC/audio smokes, but default promotion still requires broader validation and removal of Rust-only routing gates.
 
 ### Unintentional differences (to fix)
 - Full upstream server-thread IPC remains incomplete as the default path. The remaining gap is proving and then promoting the host-thread lifecycle as the sole consumer, not the basic queue/wakeup plumbing.
 
 ### Missing items
-- Finish the `ServerManager`/host-thread IPC audit so the upstream-shaped server-thread path can become default without regressing MK8D boot.
 
 ### Intentional differences
 - `IStorage::read` validates `offset` and `length` like upstream, but the backend read length is clamped to the actual Rust output slice length. Upstream passes `length` to `backend->Read(out_bytes.data(), length, offset)` because `OutBuffer` is expected to be valid by contract; the Rust VFS trait receives a safe slice, so asking it to read more than the slice length is invalid and can panic or corrupt through backend-specific implementations.
-- Ruzu still carries env-gated diagnostics (`RUZU_ISTORAGE_READ_DUMP`, `RUZU_ISTORAGE_READ_CONTEXT`, `RUZU_TRACE_ISTORAGE_ANOMALY`) for MK8D storage/read-state investigations. They are inactive by default and do not alter IPC payloads.
 
 ### Intentional differences
 - The non-TIPC default branch logs the service name, decoded command, and first eight command-buffer words in addition to `command_type`: upstream logs only `command_type={}` through `UNIMPLEMENTED_MSG`. This is an env-independent diagnostic expansion only; both paths then write the current outgoing command-buffer state.
 
 ### Intentional differences
-- The non-blocking `IPC_REQUEST`/`IPC_REPLY` trace cap is configurable through `RUZU_TRACE_IPC_RING_LIMIT`: upstream currently caps the diagnostic dump at the first 4000 records. Ruzu keeps 4000 as the default but allows long MK8D runs to capture late post-title IPC traffic without changing guest-visible IPC behavior.
-- `IPC_REQUEST` ring records include the emulated client thread id and therefore snapshot one fewer command-buffer word. Upstream has no equivalent host trace; the thread id is needed to correlate MK8D producer stalls with the service/cmd loop that continues after `BufferQueueProducer::dequeue_buffer`.
 
 ### Intentional differences
 - Rust uses `AttributeType` from `runtime_info.rs` and allocates a temporary `String` for the converted assignment expression; upstream uses a `switch` and writes directly through `ctx.Add`. The emitted GLSL source now matches upstream for float, unsigned-integer, and signed-integer fragment color outputs.
@@ -10402,7 +10272,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - `Maxwell3D` exposes small accessor methods for `alpha_test_enabled`, `alpha_test_func`, and `alpha_test_ref` because upstream OpenGL reads `maxwell3d->regs.*` directly while ruzu routes shader-cache state through Rust methods.
 
 ### Intentional differences
-- Ruzu keeps the existing diagnostic `log::info!` lines for the system-data lookup path; upstream only logs the command parameters at debug level. This is temporary investigation logging for MK8D/MiiModel attribution and does not change IPC payloads.
 
 ### Intentional differences
 - `NPad::set_supported_npad_style_set`, `set_supported_npad_id_type`, and `set_npad_handheld_activation_mode` now call `on_update()` on success, matching upstream's setter ordering. Ruzu still cannot call upstream's `hid_core.SetSupportedStyleTag` from `SetSupportedNpadStyleSet` because `NPad` does not yet own a live `HidCore` reference.
@@ -10419,7 +10288,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Replace the temporary one-entry `on_update()` shared-memory write with upstream's full per-aruid/per-npad style-specific LIFO update loop.
 
 ### Intentional differences
-- Added `RUZU_TRACE_HOST1X_VIDEO` to the non-blocking trace system so MK8D video-background investigation can capture NVDEC/VIC submits, NVDEC executes, FFmpeg decode API activity, and VIC executes without high-volume synchronous logging.
 - `nvhost_nvdec_common::submit` now emits diagnostic metadata for NVDEC/VIC command buffers before pushing entries to Host1x. Upstream only logs the submit count; this extra trace is env-gated and does not change ioctl payloads or command submission ordering.
 - `Nvdec::execute`, `Vic::execute`, and `FFmpeg::DecodeApi` emit env-gated diagnostic records around their existing behavior. The added trace records are host-only diagnostics and do not alter guest-visible results.
 
@@ -10436,7 +10304,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Broader scheduler parity still needs audit around dummy-thread dispatch timing and host-thread service loops; this slice only ports the missing dummy wait hook and fixes the dummy initial state required by that hook.
 
 ### Intentional differences
-- Added env/config-gated `IPC_INVALID` trace-ring category (`[ipc].invalid = true` or `RUZU_TRACE_IPC_INVALID=1`) that emits only when `ServiceFramework` receives a non-TIPC invalid command type. Upstream only logs `UNIMPLEMENTED_MSG`; ruzu needs low-overhead attribution for the MK8D late `nvdrv` invalid-command wedge without synchronous stderr perturbation.
 - Added `HLERequestContext::tls_address()` getter for diagnostics. It exposes existing context state only; it does not alter parsing, dispatch, or writeback.
 
 ### Intentional differences
@@ -10463,7 +10330,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Added env/config-gated `IPC_REPLY_WAKE` trace-ring category (`[ipc].reply_wake = true` or `RUZU_TRACE_IPC_REPLY_WAKE=1`) emitted before HLE `KServerSession::SendReplyHLE` wakes the client thread. Upstream has no equivalent host diagnostic; the trace is disabled by default and records only existing kernel state.
 
 ### Intentional differences
-- Extended existing env-gated diagnostics with `RUZU_TRACE_DRAW_SUMMARY_SEQ_MIN`, `RUZU_TRACE_DRAW_SUMMARY_SEQ_MAX`, and `RUZU_DUMP_PRESENT_TEXTURE_INDEX`. These are local debugging filters for MK8D late-frame present/RT readbacks and are disabled by default.
 - `RUZU_TRACE_RT_READBACK` now reuses the existing RT sample draw filter (`RUZU_TRACE_RT_SAMPLE_PIPELINE`, `RUZU_TRACE_RT_SAMPLE_SEQ_MIN`, `RUZU_TRACE_RT_SAMPLE_SEQ_MAX`) to avoid heavy unfiltered readbacks. Upstream has no equivalent env-gated diagnostic path.
 
 ### Intentional differences
@@ -10480,7 +10346,6 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Intentional differences
 - Added env/config-gated `BQP` trace-ring category (`[nvnflinger].bqp = true` or `RUZU_TRACE_BQP_RING=1`) to attribute `BufferQueueProducer` dequeue, queue, commit, return, and cancel stages without synchronous logging. The records include the current emulated thread id so producer stalls can be correlated with SVC/IPC traces. Upstream has no equivalent diagnostic hook; this is disabled by default and only records existing producer state.
-- Existing legacy `RUZU_TRACE_BQP` / `RUZU_TRACE_BQP_QUEUE_DENSE` logging remains untouched for compatibility with old scripts, but MK8D late-title investigation should prefer the non-blocking trace ring to avoid timing perturbation.
 
 ### Intentional differences
 - `NPad::get_applet_detailed_ui_type` returns `AppletDetailedUiType::default()` if ruzu has no active applet-resource backing yet. Upstream dereferences `applet_resource_holder.applet_resource` because the frontend/service lifecycle guarantees it; ruzu still has partial HID lifecycle wiring, so the fallback avoids panicking before the resource is attached.
@@ -10496,31 +10361,15 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Intentional differences
 - Extended the existing env-gated `TEXTURE_BIND_ADDR` diagnostic so `RUZU_TRACE_TEXTURE_BIND_PIPELINE=<pipeline>` filters address-only texture bind records the same way it already filters full `TEXTURE_BIND` readback records. Upstream has no equivalent diagnostic hook; this path is disabled by default and records only already-selected view metadata, including the GL texture handle and shader texture descriptor flags selected for the bind.
-- Added env-gated `RUZU_TRACE_RT_BIND_SEQ_MIN/MAX` and `RUZU_TRACE_RT_BIND_TIME_START_MS/END_MS` around the existing `RT_BIND` trace-ring diagnostic. Upstream has no equivalent diagnostic hook; this is disabled by default and only reduces diagnostic volume so late-title MK8D runs can target the 70-80s cinematic window without perturbing the boot path.
-- Added env-gated `RUZU_TRACE_RT_SAMPLE_MATCH_SKIP` / `RUZU_TRACE_RT_SAMPLE_MATCH_LIMIT` around the existing RT readback diagnostic. Upstream has no equivalent persistent diagnostic window; this is disabled by default and only gates host-side `glReadPixels` sampling for MK8D late-title investigation where global `draw_seq` varies between runs.
-- Added env-gated `RUZU_TRACE_RT_SAMPLE_TIME_START_MS/END_MS` around the existing RT readback diagnostic. Upstream has no equivalent diagnostic hook; this is disabled by default and only prevents early boot readbacks from perturbing MK8D when targeting the 70-80s cinematic window.
-- Added env-gated `RUZU_TRACE_TEXTURE_GRID_ADDRS` plus `RUZU_TRACE_TEXTURE_GRID_SEQ_MIN/MAX` sparse texture readback for MK8D late-title investigation. Upstream has no equivalent diagnostic hook; this is disabled by default and reads only a 4x4 pixel grid from explicitly targeted bound texture GPU addresses.
-- Added env-gated `RUZU_TRACE_TEXTURE_GRID_TIME_START_MS/END_MS` around the sparse texture readback diagnostic. Upstream has no equivalent diagnostic hook; this is disabled by default and only narrows MK8D late-title input-texture sampling to the user-observed 70-80s cinematic interval.
 - Extended the texture-grid diagnostic to read depth/stencil-backed depth components with `GL_DEPTH_COMPONENT`/`GL_FLOAT` instead of forcing RGBA readback. Upstream has no equivalent diagnostic hook; this is disabled by default and only affects targeted investigation runs.
-- Added env/config-gated `RT_DEPTH_ATTACH` trace-ring records for OpenGL FBO depth/stencil attachment attribution. Upstream has no equivalent diagnostic hook; this is disabled by default and records already-created FBO/view/image/attachment metadata plus framebuffer completeness for MK8D zeta-target verification.
 - Added env/config-gated `RT_ZETA_BIND` trace-ring records for per-draw Maxwell zeta/depth-state snapshot attribution. Upstream has no equivalent diagnostic hook; this is disabled by default and records whether the draw selected a zeta target plus the guest depth-test/write/function/mode bits before framebuffer lookup, which is needed to distinguish missing zeta state from framebuffer-cache reuse without perturbing GL state via `glGet*`.
-- Added `RUZU_TRACE_RT_ZETA_BIND_PIPELINE` so zeta/depth snapshot attribution can be restricted to specific GL pipelines such as `4,20,21`. Upstream has no equivalent diagnostic hook; this is disabled unless `RT_ZETA_BIND` is enabled and reduces trace volume for MK8D 70-80s runs.
-- Cached the env parsing for the high-frequency `RT_BIND`, `RT_SAMPLE`, and `TEXTURE_GRID` diagnostic filters with `OnceLock`. Upstream has no equivalent diagnostics; this preserves diagnostic semantics while avoiding repeated `std::env` lookups on every draw in long MK8D runs.
-- Extended `RUZU_TRACE_DRAW_STATE_SEQ_MIN/MAX` to gate non-indexed `GL_DRAW_STATE` diagnostic records as well as indexed records. Upstream has no equivalent diagnostic hook; this is disabled by default and prevents late-window MK8D traces from dumping early non-indexed draw state.
-- Added `RUZU_TRACE_DRAW_STATE_TIME_START_MS/END_MS` and centralized indexed/non-indexed `GL_DRAW_STATE` filtering through one helper. Upstream has no equivalent diagnostic hook; this is disabled by default and allows MK8D's 70-80s / post-black-cinematic window to be captured without relying on unstable `draw_seq` values.
-- Added `RUZU_TRACE_IMAGE_VIEW_ADDRS` to filter the existing env-gated `IMAGE_VIEW` trace-ring diagnostic by image-view GPU address. Upstream has no equivalent diagnostic hook; this is disabled by default and only reduces trace volume when investigating a specific texture-cache entry such as MK8D's late-title `0x5568E0000` cinematic candidate.
-- Extended `IMAGE_VIEW` diagnostics with a separate `stage=swizzle` record carrying the raw TIC/image-view swizzle bytes and the GL swizzle calculated by the same `ApplySwizzle` logic as upstream. Upstream has no equivalent trace hook; the runtime swizzle behavior remains unchanged, the existing lifecycle record keeps its fixed 14-argument layout, and this only makes alpha/source-channel attribution visible for MK8D's black cinematic path.
 - Documented the `[opengl].image_view` trace toggle in `common/src/trace.example.toml` so the new swizzle record can be enabled through the same trace-config mechanism as the other OpenGL diagnostics. Upstream has no trace-config equivalent; this is disabled by default.
-- Added `RUZU_TRACE_RT_BIND_ADDRS` to filter the existing env-gated `RT_BIND` trace-ring diagnostic by render-target 0 GPU address. Upstream has no equivalent diagnostic hook; this is disabled by default and lets MK8D traces isolate the draw pipeline that produces a specific sampled render target without enabling broad RT logging.
-- Extended the existing env-gated `CBUF_BIND` diagnostic so `RUZU_TRACE_CBUF_BIND_PIPELINE` accepts comma-separated pipeline handles, for example `3,4,32`. Upstream has no equivalent diagnostic hook; this is disabled by default and only reduces trace volume when capturing late MK8D compositor constants.
-- Extended the existing env-gated `RUZU_DUMP_DRAW_ATTRS` diagnostic with `RUZU_DUMP_DRAW_ATTRS_ATTR_COUNT` so MK8D title/UI pipelines can inspect attributes beyond attr0/attr1 when their generated GLSL consumes higher locations. Upstream has no equivalent diagnostic hook; default behavior remains two attributes and the path is disabled unless explicitly enabled.
 
 ### Intentional differences
 - Ruzu implements the `BC1_RGBA_*`, `BC2_*`, `BC3_*`, `BC4_UNORM`/`BC4_SNORM`, and `BC5_UNORM`/`BC5_SNORM` software decoder paths directly in Rust for now. `BC6H_*` and `BC7_*` are routed through a C++ shim around upstream's `bc_decoder.h` implementation so `DecompressBCn` no longer falls back to zero-filled output for those formats.
 - The Rust `BC4_UNORM`/`BC4_SNORM` block decoder clamps the copy rectangle at the partial right/bottom edge before writing into the output slice. Upstream passes `x`, `y`, `width`, and `height` into `bcn::DecodeBc4`, which performs the equivalent edge-aware write inside the decoder.
 
 ### Intentional differences
-- Added env-gated `RUZU_DUMP_TEXTURE_UPLOAD_DIR` upload-staging dumps filtered by `RUZU_TRACE_TEXTURE_UPLOAD_ADDRS`. Upstream has no equivalent diagnostic path; this is disabled by default and writes only targeted host-side staging bytes so MK8D title/UI texture uploads can be inspected without continuous present-time GL readbacks.
 - For targeted `BC4_UNORM` uploads, the diagnostic also writes a decoded grayscale PGM using the same local `decompress_bcn` path. This is host-only inspection output and does not change the uploaded GL payload.
 
 ### Intentional differences
@@ -10535,7 +10384,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Added env-gated `RUZU_TRACE_ZERO_PC_SAVE` logging in `PhysicalCore::save_context` for user threads whose JIT context is saved with `pc=0`. Upstream does not need this diagnostic hook; it is disabled by default and does not change saved context contents.
 
 ### Unintentional differences (to fix)
-- The MK8D 125s dump shows ruzu can stay in inline `SendSyncRequest` on core 1 with `scheduler.current=78`, `highest=104`, `pq_front=104`, and `needs_scheduling=true`; upstream parks the caller and schedules through the owning server manager instead of blocking the core in inline HLE IPC.
 - With `RUZU_RESCHEDULE_AFTER_IPC=1`, ruzu advances past that scheduler starvation point but can then select `tid=96` with `pc=0`, `lr=0x00A325B8`. `RUZU_TRACE_ZERO_PC_SAVE=1` shows `PhysicalCore::save_context` repeatedly saving this zero-PC context, and `RUZU_PC_PROBE=0` shows rdynarmic returning `HaltReason(BREAK_LOOP)` at `pc=0` rather than `PrefetchAbort`; ruzu therefore keeps the thread runnable and spins.
 
 ### Missing items
@@ -10543,12 +10391,9 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Intentional differences
 - Ruzu's `CpuManager::multi_core_run_guest_thread` performs the Rust-side halt handling around `PhysicalCore::run_loop`, while upstream keeps the `HaltReason` classification inside `PhysicalCore::RunThread`. This ownership split already exists in the Rust port; the behavior here is kept aligned with upstream's `PhysicalCore::RunThread` halt policy.
-- Added a defensive `BreakLoopNullPc` classification: when rdynarmic reports `BreakLoop` with `pc=0`, ruzu requests `SuspendType::Debug` instead of continuing the thread. Upstream would normally reach the same non-continuable path through `PrefetchAbort` for an invalid executable address; this compensates for the current backend classification observed in MK8D traces.
-- Extended the env-gated `RUZU_DUMP_NULL_PC_CONTEXT` diagnostic for the MK8D `lr=0x00A325B8` trampoline path to dump the relocalized indirect-call table slot and target words. Upstream has no equivalent diagnostic harness; this is inactive unless the env var is set.
 
 ### Unintentional differences (to fix)
 - Halt classification ownership still differs structurally: upstream's `PhysicalCore::RunThread` owns breakpoint/prefetch/data-abort/svc/interrupt handling, while ruzu splits loop control between `PhysicalCore::run_loop` and `CpuManager::multi_core_run_guest_thread`.
-- The root cause of MK8D's `pc=0`, `lr=0x00A325B8` guest path is still unresolved. The new guard prevents a host CPU spin/audio underrun but does not explain why the guest reaches a null branch target.
 
 ### Missing items
 - Move more halt handling back toward the upstream `PhysicalCore::RunThread` ownership shape when the Rust scheduler/core loop split is unwound.
@@ -10578,7 +10423,6 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Unintentional differences (to fix)
 - Ruzu still defaults to the inline HLE IPC fallback for normal sessions unless host-thread routing is explicitly selected. Upstream routes through kernel session objects and the owning server manager instead of completing HLE service work inside `svc_ipc.cpp`.
-- The helper uses `KScheduler::schedule_raw_if_needed(...)` as a narrow mitigation rather than porting the full upstream `BeginWait` / `EndWait` lifecycle for inline sessions. This restores scheduler opportunities observed missing in MK8D but is not the final structural parity target.
 
 ### Missing items
 - Complete upstream-shaped host-thread/server-manager IPC routing and remove the inline fallback mitigation once all service handlers are safe under that ownership model.
@@ -10610,8 +10454,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - `svc_dispatch.rs` now routes A32/A64 `QueryMemory` through `svc_query_memory::query_memory(...)`, and `svc_query_memory.rs` now serializes `KMemoryInfo::get_svc_memory_info()`. This matches upstream's `QueryMemory -> QueryProcessMemory -> KMemoryInfo::GetSvcMemoryInfo()` path and removes the older local partial `query_memory_info` conversion.
 - `KMemoryInfo::get_svc_memory_info()` masks memory attributes and permissions with the user masks, preserving ipc/device counts, matching upstream `KMemoryInfo::GetSvcMemoryInfo()`.
 - `svc_ipc.rs` keeps host-thread IPC routing env-gated. `IHOSBinderDriver` is validated through `RUZU_SERVER_THREAD_IPC_SERVICE=IHOSBinderDriver` or broader explicit routing, not through an implicit default route.
-- Added env-gated diagnostics for MK8D investigation: `RUZU_TRACE_IOCALLOC_CTX=1` in `nvdrv_interface.rs` prints the nvmap alloc IPC buffer descriptors, `RUZU_TRACE_PHYS_MEMORY=1` in `svc_physical_memory.rs` prints Map/UnmapPhysicalMemory calls and results, and `RUZU_TRACE_INVALID_HANDLE_SVC=1` in `svc_dispatch.rs` logs only SVC returns whose result register is `ResultInvalidHandle`. These are inactive by default and do not change guest-visible behavior.
-- `RUZU_TRACE_IOCALLOC_CTX` is strictly opt-in; the previous automatic low-address trigger was removed because MK8D's known `0x068B0000` allocator path made clean runs emit stack/ioctl dumps even with `RUST_LOG=off`.
 
 ### Unintentional differences (to fix)
 - `svc_dispatch.rs` still owns A32/A64 SVC dispatch glue directly rather than matching upstream's generated/typed SVC wrapper layout.
@@ -10621,8 +10463,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Complete upstream-shaped IPC lifecycle so the legacy inline fallback and service-name routing knobs can be removed.
 
 ### Intentional differences
-- Added Rust-only, env-gated diagnostic history for memory SVCs and IPC map-alias setup. `RUZU_TRACE_MEM_HISTORY_TARGET=0x...` records nearby `QueryMemory`, `SetHeapSize`, `MapMemory`, `UnmapMemory`, `MapPhysicalMemory`, `UnmapPhysicalMemory`, and `KServerSession::SetupForIpc` map-alias events into an in-memory ring and dumps it only when `nvmap::IocAlloc` detects a CPU range that cannot be locked for device mapping. `RUZU_TRACE_MEM_HISTORY_RADIUS=0x...` optionally widens the nearby-event filter from its default 32 MiB radius. Memory-SVC records also include the last captured guest PC/LR for the current core, and `SetHeapSize` records snapshot the target page-table state after the heap transition. This is investigation tooling for the MK8D late `0x068B0000` failure and does not alter guest-visible SVC, IPC, or nvmap results.
-- The same memory-history ring is also dumped from the existing SIGUSR1 kernel thread dump path. This keeps normal runs free of hot-path I/O while allowing a blocked MK8D process to be inspected with `kill -USR1 <pid>` before it is terminated.
 - `nvmap.rs` continues after `lock_for_map_device_address_space` failure, matching upstream's release behavior where this is an `ASSERT(...)` rather than a guest-visible nvmap error. Heavy ioctl/memory/nvnflinger history dumps are opt-in through `RUZU_DUMP_NVMAP_LOCK_FAILURE=1`.
 
 ### Intentional differences
@@ -10633,7 +10473,6 @@ The following still panic because upstream either also throws NotImplementedExce
 
 
 ### Intentional differences
-- Added `RUZU_EXIT_ON_NULL_PC=1`, a Rust-only diagnostic escape hatch for MK8D runs that reach the known null-PC guest fatal path. When the env var is set and `BreakLoopNullPc` is detected, ruzu exits with code `101` after logging the existing context instead of leaving the host window alive with a suspended guest thread. This is inactive by default and is only test harness behavior.
 
 ### Intentional differences
 - Ruzu's preallocated-heap and ASID lookup paths run from `NvMap::pin_handle` / `unmap_mapped_handle` through the shared `ContainerSessionStore` narrow view. Upstream stores a full `Container& core`; Rust stores only the session/preallocation state needed for `core.GetSession(session_id)->mapper->{Map,Unmap}(...)` and `core.GetSession(session_id)->asid` to avoid an unsafe self-reference cycle while preserving `NvMap` method ownership.
@@ -10673,7 +10512,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - The Rust callback captures the existing non-owning `RasterizerHandle` and calls `RasterizerInterface::invalidate_region(addr, size)` after `MaxwellDeviceMemoryManager::smmu_write_block(...)`, matching upstream `DeviceMemoryManager<Traits>::WriteBlock(...) -> device_inter->InvalidateRegion(address, size)`.
 - `Host1x` now owns a Host1x-local `MemoryManager` with upstream constructor geometry `address_space_bits=32`, `split_address=0`, `big_page_bits=12`, `page_bits=12`, and the same shared `MaxwellDeviceMemoryManager` owner returned by `Host1x::MemoryManager()`. `Gpu::bind_renderer` can downcast the opaque `Host1xCoreInterface` back to `video_core::Host1x` and call `bind_gmmu_rasterizer(...)`.
 - `Host1x` now owns a `FlatAllocator` equivalent to upstream `Common::FlatAllocator<u32, 0, 32>` and exposes opaque core-facing helpers for the `NvMap::PinHandle(low_area_pin)` map/free sequence: allocate low Host1x GMMU VA, map it to the existing `d_address`, then unmap/free it on handle teardown.
-- Added diagnostic `RUZU_DISABLE_HOST1X_INVALIDATE_BIND=1` to isolate this new ownership edge during MK8D runtime testing. Upstream has no such knob; default behavior remains the upstream-equivalent binding.
 - `GPU::bind_renderer` reaches `host1x.GMMU().BindRasterizer(rasterizer)` through a downcast from the core-facing `Host1xCoreInterface` to the concrete `video_core::host1x::Host1x`. This preserves upstream behavior without exposing the concrete video-core type through the `core` crate interface.
 
 
@@ -10698,7 +10536,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Complete full `TextureCache<P>::UpdateRenderTargets` parity, including dirty-flag handling, rescale render-target updates, draw-buffer updates, and per-method Maxwell dirty flag clearing.
 
 ### Intentional differences
-- Added an env-gated OpenGL render-target probe for the existing `RT_SAMPLE` trace category. `RUZU_TRACE_RT_PROBE_X/Y` read one selected pixel after the sparse RT sample readback so MK8D title-screen corruption can be localized without dumping full render targets each frame.
 - The `RT_SAMPLE` formatter now reports `probe=(x,y)` and `probe_rgba` instead of the previous first sampled pixel. Upstream has no equivalent ring-buffer diagnostic.
 
 ### Intentional differences
@@ -10716,7 +10553,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Thread a `Core::Memory::Memory`-equivalent handle through the Rust audio renderer command path so data-source decode can match upstream ownership without global state.
 
 ### Intentional differences
-- Added an env/TOML-gated `BINDER_TXN` ring-buffer trace category (`[nvnflinger] binder = true` / `RUZU_TRACE_BINDER_TXN_RING=1`) that records `IHOSBinderDriver::TransactParcel` entry/reply/missing-binder stages with binder id, transaction id, flags, and parcel sizes. Upstream only has normal logging in this path; ruzu needs low-overhead late-boot attribution for MK8D without perturbing scheduling.
 - `common/src/trace.example.toml` documents the new `[nvnflinger] binder` toggle alongside existing nvnflinger diagnostics.
 - `common/src/trace.rs` accepts both `[output] file_path` and the already-documented `[output] file` key for the trace sink path. Upstream has no equivalent Rust trace ring; this keeps ruzu's diagnostic configuration internally consistent.
 
@@ -10743,11 +10579,9 @@ The following still panic because upstream either also throws NotImplementedExce
 - Wire full `controller_data[aruid][npad_id]` ownership into `NPad::OnUpdate`; ruzu still writes a temporary fixed Player1 Fullkey state.
 
 ### Intentional differences
-- Added an env/TOML-gated `MII_SERVICE` ring-buffer trace category (`RUZU_TRACE_MII_SERVICE=1` / `[mii] service = true`) that records Mii `CharInfo`/`CoreData` IPC attribution with command id, result, source/index/count, create id, nickname words, and compact visible traits. Upstream has no equivalent trace ring; this is a disabled-by-default diagnostic for the MK8D late Mii/null-PC investigation.
 - `IDatabaseService::{Get,Get1,Get2,Get3,UpdateLatest,UpdateLatest1,BuildRandom,BuildDefault,Convert,ConvertCoreDataToCharInfo,ConvertCharInfoToCoreData}` now emits the diagnostic only after following the same upstream result path and before serializing the reply. Normal response layout and service behavior are unchanged when the category is disabled.
 
 ### Intentional differences
-- `RUZU_DUMP_PRESENT_TEXTURE` / `RUZU_DUMP_PRESENT_EXTRA_PPM_DIR` are local diagnostic hooks with no upstream production equivalent. When `RUZU_TRACE_PRESENT_TEXTURE_START` or `RUZU_TRACE_PRESENT_TEXTURE_END` is set, the extra present dump hook now respects the same present-index window before performing GL readback. This keeps late-MK8D cinematic diagnostics from forcing an early `present=0` readback that can perturb boot timing.
 - `RUZU_DUMP_PRESENT_EXTRA_PPM_EVERY=N` optionally throttles extra image PPM readback before any GL readback or disk write. This is diagnostic-only and avoids dumping every presented frame once the selected present window starts.
 
 ### Intentional differences
@@ -10766,8 +10600,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - `TXD.LC` remains a panic before IR emission, matching the current upstream GLSL backend behavior for lod-clamp gradient samples.
 
 ### Intentional differences
-- Added disabled-by-default MK8D attribution diagnostics for `nvmap::IocCreate` / `IocAlloc`: `RUZU_TRACE_NVMAP_CALLER`, `RUZU_TRACE_NVMAP_STACK`, `RUZU_TRACE_NVMAP_STACK_FRAMES`, `RUZU_TRACE_NVMAP_STACK_POINTERS`, `RUZU_TRACE_NVMAP_STACK_CODE`, and `RUZU_TRACE_NVMAP_STACK_HANDLE`. Upstream has no equivalent host diagnostic; normal ioctl behavior and guest-visible payloads are unchanged unless the env vars are enabled.
-- Registered the verified MK8D `subsdk0` load base in `bases.json` (`0x01512000`) after byte-pattern matching runtime PCs `0x0151FC2C` / `0x0151FC94` to `subsdk0` `.text` offsets `0xDC2C` / `0xDC94`. This is investigation metadata only.
 
 
 ### Intentional differences
@@ -10848,9 +10680,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Continue reducing the split between `send_reply_with_message(...)` and `send_reply_hle_unlocked(...)` once `KServerSession` no longer needs a broad Rust mutex around state that upstream protects with lighter-weight kernel locks.
 
 ### Intentional differences
-- `RUZU_DUMP_PRESENT_TEXTURE_PPM_DIR`, optional `RUZU_DUMP_PRESENT_TEXTURE_INDEX`, and optional `RUZU_DUMP_PRESENT_TEXTURE_PPM_EVERY` add a disabled-by-default, throttled diagnostic PPM dump of the exact `FramebufferTextureInfo.display_texture` returned by `RasterizerOpenGL::accelerate_display(...)`. Upstream has no production PPM writer; this hook is colocated with the existing present readback diagnostics so MK8D red/black output can be captured at the same point where nvnflinger receives the texture handle.
-- `RUZU_TRACE_RT_READBACK=1` now includes the RT0 guest address/format/size and red/black/white sample counters in the existing disabled-by-default readback line. Upstream has no equivalent production log; this is diagnostic-only and lets MK8D present-image corruption be tied to a specific Maxwell render-target writer without changing GL state or returned textures.
-- `RUZU_TRACE_DRAW_SUMMARY_RT_ADDR=0x...` narrows the existing disabled-by-default draw-summary log to one RT0 guest address. Upstream has no equivalent production filter; this avoids broad draw logging while identifying the pipeline/programs that write a known corrupted MK8D render target.
 - `RasterizerOpenGL::draw(...)` now installs the pipeline uniform-buffer state, base uniform bindings, base storage bindings, and storage-buffer enable flag before descriptor walking, matching upstream `GraphicsPipeline::ConfigureImpl(...)` ordering before `BindGraphicsStorageBuffer(...)` and image descriptor collection. The code still lives in the rasterizer while ruzu lacks upstream's `GraphicsPipeline` ownership of the caches.
 - `RasterizerOpenGL::draw(...)` returns before cache locks, descriptor binding, render-target preparation, and framebuffer binding when the placeholder Rust `GraphicsPipeline` has no compiled GL programs after the lazy build attempt. This preserves upstream `PrepareDraw(...)` behavior where `CurrentGraphicsPipeline()` returning null exits before cache/FBO state is touched.
 
@@ -10890,7 +10719,6 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Unintentional differences (to fix)
 - The Rust texture-cache split still defers `JoinImages(...)` backend copies/deletes instead of executing the full upstream tail inside one templated owner. The snapshot restores the upstream `GpuModified` copy decision for deferred copies, but the larger owner split remains.
-- MK8D texture `0x5218D0000` still samples red after this change because the copied mip source `0x521984000` is itself uploaded from guest bytes `80 ff ff ff`; the next divergence to isolate is whether that guest content should have been downloaded from an overlapping GPU image before upload, or overwritten by a later render-target operation.
 
 ### Missing items
 - Port the remaining upstream `JoinImages(...)`/overlap lifecycle in one owner or an equivalent backend hook sequence: synchronous `RefreshContents`, bad-overlap download interactions, exact descriptor-table/dirty-flag invalidation after rescale, and delete/register ordering without exposing intermediate states.
@@ -10909,7 +10737,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Port upstream backend-specific `OpenGL::Buffer` ownership more completely, or otherwise document and finish the shared-`BufferBase` adaptation for all buffer view lifecycle paths.
 
 ### Intentional differences
-- Ruzu still keeps the simplified `structure_cfg(...)` + later `materialize_syntax_conditions(...)` split. Upstream's `GotoPass::EliminateAsConditional` negates forward-goto conditions as part of a full statement-tree transformation, but the current Rust flat-CFG structurer does not model that tree. Keeping the raw branch condition in this reduced path preserves the generated block order currently used by MK8D; applying the upstream negation locally was tested and inverted rendered textures.
 - `pipeline_cache.rs` has an env-gated IR dump hook for the OpenGL environment compile path. Upstream has no equivalent diagnostic; it is inactive unless `RUZU_DUMP_SHADER_IR_DIR` is set and is used only to compare generated CFG/syntax/GLSL while the full SCF port is incomplete.
 
 ### Unintentional differences (to fix)
@@ -10940,7 +10767,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Finish migrating default HLE IPC dispatch to the upstream-shaped `ServerManager::LoopProcess` host-thread path, then remove the inline fallback for regular service sessions.
 
 ### Intentional differences
-- Added env-gated diagnostic tracing for exact guest-memory write values via `RUZU_TRACE_MEMORY_W_VALUE`. It is inactive by default and exists only to attribute MK8D's bad `nvmap::IocAlloc` guest address payload (`0x068B0000` vs yuzu's mapped `0x680xxxxx` region) across `write_8/16/32/64` and block-copy paths.
 
 
 ### Missing items
@@ -10957,23 +10783,19 @@ The following still panic because upstream either also throws NotImplementedExce
 
 
 ### Intentional differences
-- Added env-gated ring-trace coverage for scalar Mii commands (`IsUpdated`, `GetCount`, `SetInterfaceVersion`, `IsFullDatabase`) so MK8D's early Mii command sequence can be compared against upstream without old synchronous `eprintln` perturbation.
 
 ### Missing items
 - N/A for this diagnostic pass.
 
 ### Intentional differences
-- Added env-gated ring-trace coverage for `IProfileCommon::Get` and `GetBase` responses (`[account] profile = true`) to correlate MK8D's account profile payload with the later Mii command divergence.
 
 ### Missing items
 - N/A for this diagnostic pass.
 
 ### Intentional differences
-- `RUZU_DUMP_NULL_PC_CONTEXT` also dumps `svc_memory_history`: Rust-only diagnostic hook for MK8D null-PC/page-table investigation. It is env-gated and inactive by default, so guest-visible behavior is unchanged.
 
 
 ### Intentional differences
-- Ruzu keeps the pre-page-table A32 fastmem path as the default and gates the upstream-shaped page-table fastmem path behind `RUZU_A32_PAGE_TABLE_FASTMEM=1`. Upstream passes both `page_table->pointers.data()` and `fastmem_arena` into Dynarmic, but the current rdynarmic A32 page-table fastmem path makes MK8D stop submitting active audio voices at the title transition. Keeping the stable path as default avoids a runtime regression while preserving an opt-in validation path.
 - When `RUZU_A32_PAGE_TABLE_FASTMEM=1` is enabled, rdynarmic loads the A32 page table and fastmem base into reserved host registers. This path is diagnostic/validation-only until the backend issues below are fixed.
 
 ### Unintentional differences (to fix)
@@ -10981,7 +10803,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - rdynarmic A32 still lacks the full upstream page-table memory path for writes and upstream's exact misalignment detection path (`detect_misaligned_access_via_page_table` / `only_detect_misalignment_via_page_table_on_page_boundary`).
 
 ### Missing items
-- Fix the rdynarmic A32 page-table fastmem runtime regression that makes MK8D drop from `AUDIO_VOICE in_use=2 active=2` to `in_use=0 active=0` around `present=755`.
 - Complete rdynarmic A32 page-table fast writes without exhausting GPR allocation.
 - Port the exact upstream A32 page-table misalignment detection path.
 
@@ -11036,7 +10857,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - OpenGL rasterizer GPU-reader closures now delegate directly to `MemoryManager::read_block`, matching upstream `ReadBlock` ownership for sparse/reserved page walking and zero fill, instead of pre-rejecting when `GpuToCpuAddress(gpu_addr)` has no start-page mapping.
 
 ### Missing items
-- Broader MK8D overexposure/present-color parity remains under investigation; the OpenGL 10-bit format table was checked against upstream and was not changed in this slice.
 
 ### Intentional differences
 - Rust now routes `UtilShaders` through `TextureCacheRuntime` and the shared renderer/rasterizer `ProgramManagerHandle`; this supersedes the earlier direct `TextureCache` ownership while preserving the same `CopyImageMSAA` dispatch responsibility.
@@ -11239,7 +11059,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Backend `Image&` ownership remains split, so `transition_image_layout` cannot yet take the exact upstream OpenGL `Image&` type.
 
 ### Intentional differences
-- `KReadableEvent::is_signaled()` keeps upstream's scheduler-lock contract as an opt-in `RUZU_DIAG` diagnostic instead of a fatal `debug_assert!`. Upstream `KReadableEvent::IsSignaled()` asserts `KScheduler::IsSchedulerLockedByCurrentThread(m_kernel)` unconditionally; Rust temporarily allows the read because the current `MultiWait`/service host fallback can still poll readable events outside the scheduler lock and otherwise aborts MK8D before GPU parity testing can run.
 - Rust reads `is_signaled` from `AtomicBool` rather than upstream's plain `bool m_is_signaled`, matching the existing Rust ownership adaptation where wait code may inspect the flag without taking the `Arc<Mutex<KReadableEvent>>` object lock while the scheduler lock is held.
 
 ### Unintentional differences (to fix)
@@ -11358,8 +11177,6 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Missing items
 - The Rust generic staging handle stores GL sync pointers in `buffer_cache_base.rs`; a stricter structural port would keep OpenGL-specific destruction entirely inside an OpenGL-owned wrapper once the runtime interface can return backend-associated staging types.
-- Runtime validation with MK8D on 2026-06-13 did not show a staging-path panic or missing GL handle, but the display still becomes blank. The active symptom in `screenshots/tmp/mk8d-20260613-214358-staging-overlap-ruzu.log` is `SF_COMPOSE ... NO_LAYERS` repeated for display 3 after only one visible `COMPOSING display_id=0 layers=1`, with only sparse BufferQueue activity. The next parity slice should therefore move to VI/NVNFlinger/BufferQueue presentation ownership before treating this as only a texture-cache rendering bug.
-- Follow-up runtime probes `screenshots/tmp/mk8d-20260613-214839-binder-bqp.log` and `screenshots/tmp/mk8d-20260613-215252-syncpoint-puller.log` narrowed the blank-screen path further: the BufferQueue receives `Connect`, three `SetPreallocatedBuffer` calls, `DequeueBuffer`, and `RequestBuffer`, but no `QueueBuffer` before timeout. The first GPU fence submit reaches `GLRasterizer::signal_sync_point id=1` and increments host syncpoint 1 to 1. The second frame submit advances nvdrv max to 2 using `increment_value` and pushes 11 command lists, but the log does not reach a puller/rasterizer syncpoint increment before `nvhost_ctrl` waits on fence `{id=1,value=2}`. The next parity slice should therefore inspect `video_core::{gpu_thread,dma_pusher,scheduler,puller}` command-list execution against upstream before returning to VI/NVNFlinger or texture-cache presentation.
 
 ### Intentional differences
 - Rust `RasterizerOpenGL::draw(...)` must access `Tegra::MemoryManager` through `Arc<parking_lot::Mutex<MemoryManager>>`, while upstream `RasterizerOpenGL::Draw(...)` reads `gpu_memory` directly without a host-side `MemoryManager` mutex.
@@ -11369,7 +11186,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Fixed: Rust previously held the channel `MemoryManager` mutex across a large part of `RasterizerOpenGL::draw(...)`, including texture-cache and buffer-cache setup. Those downstream paths can also resolve GPU addresses through the same channel memory manager, so the first real Maxwell3D draw could self-deadlock at `DRAW_END` before the GPU pusher reached the synthetic syncpoint increment command list. Upstream has no equivalent draw-wide `MemoryManager` lock.
 
 ### Missing items
-- Runtime validation confirmed MK8D no longer stops at submit #2 `DRAW_END`: after rebuilding `ruzu-cmd`, submit #2 continued into later command lists and `BufferQueueProducer::QueueBuffer` appeared. Remaining visual issues should be treated as downstream texture/render-target/presentation parity, not the earlier draw-wide `MemoryManager` lock.
 
 ### Intentional differences
 - `BufferCacheRuntime::clear_buffer(...)` now calls `glClearNamedBufferSubData(..., GL_R32UI, ..., GL_RED_INTEGER, GL_UNSIGNED_INT, ...)`. The local upstream source passes `GL_RED`, but runtime validation showed the driver rejects that combination with `GL_INVALID_OPERATION in glClearNamedBufferSubData(integer vs non-integer)`. The behavioral intent is still the upstream `u32` clear; `GL_RED_INTEGER` is the spec-valid external format for the integer internal format `GL_R32UI`.
@@ -11379,7 +11195,6 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ## Intent
 
-Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` after MK8D present traces showed `AccelerateDisplay` returning valid OpenGL textures while `WindowAdaptPass::DrawToFramebuffer()` left the backbuffer black.
 
 ## Intentional differences
 
@@ -11429,7 +11244,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust `visit_image_view(...)` resolves a TIC descriptor when the descriptor table reports `is_new == false` but the matching cached `ImageViewId` is still invalid or `CORRUPT_ID`. Upstream `VisitImageView(...)` only resolves on `is_new`; the Rust guard is required because the Rust shader environment can probe the shared descriptor table for texture types before `FillImageViews(...)` populates the image-view id cache. The guard mirrors the existing Rust sampler-id recovery path and prevents a `CORRUPT_ID` from flowing into OpenGL texture binding as handle zero.
 
 ### Unintentional differences (to fix)
-- Fixed: sampled texture descriptors whose TIC had already been read by a shader descriptor probe could keep `graphics_image_view_ids[index] == CORRUPT_ID`, causing `glBindTextures` to bind texture handle 0. MK8D then rendered the final backbuffer pass (`pipeline=5`) with a null source texture and presented black frames.
 
 ### Missing items
 - Audit whether Rust shader-environment descriptor probing should use a separate owner or explicitly avoid mutating the texture-cache descriptor table, closer to upstream ownership.
@@ -11437,10 +11251,8 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Rust keeps a fallback inline `TextureCacheChannelInfo` (`self.channel_state`) for reduced tests that construct `TextureCacheBase` without creating/binding a channel. Upstream stores `channel_state` as the active channel pointer from `ChannelSetupCaches<TextureCacheChannelInfo>`. Runtime paths must use `current_channel_state(_mut)` so the Rust fallback remains test-only.
 - Rust `SynchronizeGraphicsDescriptors(...)` / `SynchronizeComputeDescriptors(...)` receive register snapshots from the caller instead of reading `maxwell3d->regs` / `kepler_compute->regs` directly, preserving the existing Rust borrowing boundary.
-- Env-gated diagnostic logging remains under `RUZU_TRACE_DESCRIPTOR_SYNC` / `RUZU_TRACE_VISIT_RESULT` for the MK8D texture investigation. It has no behavior effect when unset.
 
 ### Unintentional differences (to fix)
-- Fixed: descriptor synchronization and sampler descriptor reads wrote/read `self.channel_state`, while image-view resolution used `current_channel_state(_mut)`. With a real bound channel, `SynchronizeGraphicsDescriptors(...)` resized the fallback table but `FillGraphicsImageViews(...)` read the active channel table, whose TIC limit stayed `0`. MK8D TIC indices 798-808 were rejected, producing `NULL_IMAGE_VIEW_ID` and OpenGL texture handle 0 for the final prompt/backbuffer pass.
 - Fixed: graphics and compute sampler descriptor reads now use the same active channel state as their limit checks and cached sampler-id updates.
 
 ### Missing items
@@ -11452,7 +11264,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust stores pending fence operations together with their fence object in one queue entry, while upstream stores `pending_operations` and `fences` as parallel queues. The release order remains one operation batch per fence.
 
 ### Unintentional differences (to fix)
-- Fixed: async-capable Rust `FenceManager::signal_fence(...)` notified the fence thread before the caller performed `flush_commands()`. Upstream queues the fence, pushes it, flushes commands if needed, then unlocks/notifies. The Rust ordering could let the fence thread wait on an OpenGL fence before the queued commands were flushed, matching the MK8D freeze after the title animation.
 - Fixed: `signal_sync_point(...)`, `signal_reference(...)`, and forced async `wait_pending_fences(...)` now route through the same upstream-shaped flush/invalidate ordering.
 
 ### Missing items
@@ -11460,8 +11271,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Vulkan rasterizer remains structurally reduced, but its `signal_fence(...)` call now follows the same generic manager ordering.
 
 ### Intentional differences
-- Rust keeps env-gated diagnostic logging around `svc::WaitSynchronization` for MK8D wait-wedge investigation. This has no behavior effect when unset.
-- Fixed diagnostic targeting only: replaced the hardcoded `tid=73|102` filter with `RUZU_TRACE_WAITSYNC_TID=<tid>[,<tid>...]`, because MK8D thread ids vary between runs.
 
 
 ### Missing items
@@ -11469,7 +11278,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Intentional differences
 - Rust stores the upstream `NvEventsLock()` protected state in two mutexes (`events_mask` and `events`) instead of one combined lock. This preserves the existing Rust ownership split, but all paths that need both locks must acquire them in a single consistent order.
-- Existing env-gated event-wait diagnostics and fallback tracing remain local instrumentation for the MK8D syncpoint investigation.
 
 ### Unintentional differences (to fix)
 - Fixed: `IocCtrlEventWait(...)` acquired `events` before `events_mask`, while event register/unregister/free paths acquire `events_mask` before `events`. Upstream uses one `NvEventsLock()` for this state, so Rust's mixed order could deadlock concurrent nvhost-ctrl event ioctls. `IocCtrlEventWait(...)` now uses `events_mask -> events`.
@@ -11478,7 +11286,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Existing non-upstream `wait_host_stalled(...)` fallback behavior remains to audit separately; this entry only fixes lock ordering around the upstream event-table critical section.
 
 ### Intentional differences
-- Rust keeps env-gated submit/syncpoint diagnostics around `SubmitGPFIFOImpl(...)` for MK8D title-screen investigation. `RUZU_TRACE_SUBMIT_AFTER=<fence_value>` only expands existing `[SP_TRACE]` logging after the requested fence value and has no behavior effect.
 
 
 ### Missing items
@@ -11497,7 +11304,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - The generic texture-cache base still has reduced async-download behavior, but OpenGL uses `renderer_opengl/gl_texture_cache.rs`, which already owns its backend async-buffer queue. A separate texture-cache audit remains needed before claiming the subsystem complete.
 
 ### Intentional differences
-- Rust keeps env-gated diagnostic logging under `RUZU_TRACE_GL_FENCE_FLOW=1` to trace `SignalFence`, `SignalSyncPoint`, pending-fence release, and async release-thread progress during the MK8D title-screen stall investigation. This has no behavior effect when unset.
 - Rust carries a host-only `trace_id` in pending fences so a queued fence can be correlated with its later release in logs.
 
 
@@ -11505,28 +11311,24 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Existing `FenceManager` parity audit remains open for previously modified flush/invalidate callback threading and async wait behavior; this entry does not claim the subsystem is complete.
 
 ### Intentional differences
-- Rust keeps env-gated diagnostic logging under `RUZU_TRACE_GL_FENCE_FLOW=1` around the upstream `invalidate_texture_data_cache` path to distinguish `InvalidateGPUCache`, `WaitForIdle`, and return-to-command-stream progress during the MK8D stall investigation. This has no behavior effect when unset.
 
 
 ### Missing items
 - Existing Maxwell3D parity audit remains open; this entry only covers the diagnostic inserted around the already-ported method branch.
 
 ### Intentional differences
-- Rust keeps env-gated diagnostic logging under `RUZU_TRACE_GL_FENCE_FLOW=1` around `invalidate_gpu_cache` and `wait_for_idle` to localize the MK8D syncpoint stall. This has no behavior effect when unset.
 
 
 ### Missing items
 - Existing OpenGL rasterizer parity audit remains open; this entry only covers diagnostic probes around already-ported methods.
 
 ### Intentional differences
-- Rust keeps env-gated diagnostic logging under `RUZU_TRACE_GPU_SUBMIT=1` in `SubmitGPFIFOImpl` to print flags, computed increment, input/output fences, and command-list sizes for MK8D submit/max-vs-host divergence. This has no behavior effect when unset.
 
 
 ### Missing items
 - Existing `nvhost_gpu` stub warnings (`AllocGPFIFOEx2`, `AllocateObjectContext`, `SetErrorNotifier`) still need a separate upstream-parity audit; this entry does not claim the device is complete.
 
 ### Intentional differences
-- Rust adds an env-gated diagnostic selector `RUZU_TRACE_PULLER_SUBMIT_RANGE=start:end` for the existing puller submit trace, so late MK8D submits can be inspected without logging every earlier submit. This has no behavior effect when unset.
 - Rust scheduler checks this diagnostic selector before setting `ACTIVE_SUBMIT_IDX`; upstream has no equivalent diagnostic hook.
 
 
@@ -11534,35 +11336,30 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Existing DMA pusher and scheduler parity audits remain open; this entry only covers the trace-window diagnostic.
 
 ### Intentional differences
-- Rust adds env-gated diagnostic logging under `RUZU_TRACE_GL_PIPELINE_STALL=1` around the already-ported `GraphicsPipeline::ConfigureImpl` slices: descriptor collection, image-view fill/materialization, render-target update, and framebuffer bind. This has no behavior effect when unset and exists only to localize the MK8D idle-cinematic stall.
 
 
 ### Missing items
 - Existing graphics-pipeline parity audit remains open; this entry only covers diagnostic probes around existing Rust bridge methods.
 
 ### Intentional differences
-- Rust adds env-gated diagnostic logging under `RUZU_TRACE_TEXTURE_FILL_STALL=1` around the already-ported `TextureCache<P>::FillImageViews` / `VisitImageView` flow. This has no behavior effect when unset and exists only to distinguish retry-loop, TIC-read, and image-view-creation stalls during the MK8D idle-cinematic investigation.
 
 
 ### Missing items
 - Existing texture-cache parity audit remains open; this entry only covers diagnostic probes around existing descriptor/image-view resolution methods.
 
 ### Intentional differences
-- Rust adds env-gated diagnostic logging under `RUZU_TRACE_GL_TEXTURE_CACHE_STALL=1` around the OpenGL wrapper for `TextureCache<P>::FillGraphicsImageViews`, including backend insertion and pending join-copy drains. This has no behavior effect when unset and exists only to localize the MK8D idle-cinematic stall after base descriptor resolution returns.
 
 
 ### Missing items
 - Existing OpenGL texture-cache parity audit remains open; this entry only covers diagnostic probes around the backend wrapper.
 
 ### Intentional differences
-- Rust keeps env-gated `RUZU_TRACE_GL_TEXTURE_CACHE_STALL=1` diagnostics around `RefreshContents` / `UploadImageContents` stages so the MK8D idle-cinematic stall can be localized. This has no behavior effect when unset.
 - Rust still stops on unsupported MSAA upload through `stop_unimplemented_msaa_upload` instead of silently logging and transitioning layout; this follows the local no-debt policy for unimplemented behavior and records state before panic.
 - Rust exposes a `GpuReaderPair` for OpenGL texture-cache refreshes because the Rust texture cache stores `MemoryManager` behind a mutex and explicit reader closures are used where upstream directly owns `gpu_memory`. This preserves upstream behavior in bound refresh paths: accelerated upload uses the safe `ReadBlock` equivalent, while normal upload and join/render-target backend completion use the unsafe-read equivalent matching `GpuGuestMemory<UnsafeRead>`.
 - Rust's explicit-reader API still falls back to the safe reader when a caller can only provide one closure. Current bound-channel paths used by `PrepareImage`, `RefreshContents`, `UpdateRenderTargets`, pending backend insertions, and pending join-copy refreshes provide both readers.
 
 
 ### Missing items
-- Existing OpenGL texture-cache parity audit remains open; this entry covers the `TextureCache<P>::RefreshContents` CPU-modified consumption order, the `UploadImageContents` safe-vs-unsafe reader split, the `FindRenderTargetView` / `JoinImages` backend-completion reader used by MK8D, and additional diagnostics only.
 
 ### Intentional differences
 - Rust groups `ImageViewType::E2DArray | E2D | Rect` in one match arm and explicitly checks `E2DArray` to apply `flat_range.extent.layers = 1`; upstream uses `[[fallthrough]]` from the `e2DArray` case into the shared `e2D` / `Rect` body. The resulting ownership and operation order match upstream.
@@ -11580,21 +11377,17 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Broader texture-cache parity remains open. This entry covers the `UnswizzleImage` block-linear level/layer traversal only; other texture-cache upload/download copy rectangle paths still need their own audits.
 
 ### Intentional differences
-- Rust adds `ReleaseSync::realtime_pacing` and enables it only for `NullSink` render streams. This keeps the null sink silent like upstream `NullSinkStreamImpl::AppendBuffer`, but forces `WaitFreeSpace` to sleep for the 5 ms audio period after the render stream starts. Without a real backend callback and with discarded buffers, ruzu was signaling the audio rendered event at about 16 kHz during MK8D, far above the expected 5 ms render cadence.
 - The pacing hook is hosted in `sink_stream.rs` because `AudioRenderer::Main` waits through the shared `ReleaseSync` without holding the `SinkStream` lock; `null_sink.rs` owns enabling the behavior for the null render stream.
 
 
 ### Missing items
-- Broader audio renderer timing parity still needs runtime validation with a real host backend. This entry covers the null-sink path requested for MK8D runs only.
 
 
 
 ### Missing items
-- Upstream `MapPhysicalMemoryUnsafe`, `UnmapPhysicalMemoryUnsafe`, and `SetUnsafeLimit` bodies remain unimplemented in `svc_physical_memory.cpp`; Rust keeps the same not-implemented behavior. This entry only removes the dispatcher-level fake success that let MK8D continue with a page-table range still marked `Free`.
 
 ### Intentional differences
 - Rust drains `pending_registrations` and ensures kernel port registration immediately before `link_deferred()`. This is a Rust owner-graph bridge for the existing pending-registration queue and named-port process registration; upstream can register directly into the intrusive lists before `LinkDeferred()`.
-- Rust keeps a fallback `wakeup_event.wait_timeout(...)` path only for the defensive case where `SystemRef::kernel()` is unavailable. Normal MK8D service threads now use `MultiWait::wait_any(kernel)` like upstream.
 - Rust re-links the wakeup holder after clearing it inside `consume_wakeup_holder(...)` because `wait_any()` returns a holder that has been removed from the Rust wait list. Upstream clears the event and continues because its `MultiWaitHolder`/intrusive-list mechanics preserve the expected holder lifetime around `WaitAny`.
 
 ### Unintentional differences (to fix)
@@ -11608,7 +11401,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust keeps the existing unaligned `VfsFile::read()` adapter that reads the aligned backing range and copies the requested subspan. Upstream `AesCtrStorage::Read()` asserts block-aligned size/offset, and higher layers are expected to provide aligned requests.
 
 ### Unintentional differences (to fix)
-- Fixed: `AesCtrStorage` no longer stores `Mutex<AesCipher>` and no longer serializes all AES-CTR decrypt/encrypt operations for a shared storage object. Upstream `AesCtrStorage::Read()` performs no lock around `m_base_storage->Read`, `SetIV`, or `Transcode`; the previous Rust mutex could make concurrent MK8D content streaming materially slower than upstream.
 - Fixed: stale comments claiming AES-CTR currently read/wrote without encryption were removed; the Rust implementation already decrypts/encrypts and now documents that behavior accurately.
 
 ### Missing items
@@ -11664,8 +11456,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Unintentional differences (to fix)
 - Fixed partially: Rust now records branch targets for stack-token terminators `SYNC`, `BRK`, and `CONT`, and connects conditional terminators to both the popped stack target and the fall-through block. Previously these terminators only fell through, losing the upstream `Stack::Pop(Token)` target entirely.
-- Still wrong: Rust mutates one global analysis stack while discovering block starts. Upstream stores stack state per block/path and `Stack::Pop` returns both a target and a path-local stack with the token removed. The Rust global truncation loses `SSY` tokens needed by conditional fall-through paths; preserving them globally improves the MK8D prompt shader IR but breaks other shaders because the simplified SCF pass emits invalid nested syntax.
-- Still wrong: Rust `structure_cfg` does not port upstream `GotoPass` transforms (`EliminateAsConditional`, `EliminateAsLoop`, `MoveOutward`, `MoveInward`, `Lift`, `IndirectlyRelated` handling). This is the next required parity slice for MK8D title/prompt rendering.
 
 ### Missing items
 - Full upstream `Flow::CFG` label/block worklist with path-local stack propagation.
@@ -11682,7 +11472,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Fixed: Rust had a `debug_assert!` requiring a CPU-modified image to be untracked after `mark_refresh_contents_consumed`. Upstream `RefreshContents` clears `ImageFlagBits::CpuModified` and immediately calls `TrackImage(image, image_id)`, so an image may be tracked before the upload path continues.
 
 ### Intentional differences
-- Rust keeps opt-in `RUZU_DUMP_SSBO_BIND*` diagnostics around `BufferCacheRuntime::bind_storage_buffer`. Upstream has no equivalent debug environment controls; this is local investigation instrumentation for MK8D prompt SSBO contents and is inactive unless explicitly enabled.
 - Rust accepts decimal or `0x` hex values for `RUZU_DUMP_SSBO_BIND_LIMIT`, `RUZU_DUMP_SSBO_BIND_OFFSET`, and `RUZU_DUMP_SSBO_BIND_BYTES`, matching the existing ruzu debug-env style in adjacent OpenGL code.
 
 ### Intentional differences
@@ -11696,16 +11485,13 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Full upstream `GotoPass`/`TranslatePass` parity is still missing for complex goto lifting, loop shaping, break handling, and return-block epilogue topology.
 
 ### Intentional differences
-- Rust keeps opt-in `RUZU_TRACE_TEXTURE_BIND_LOG` diagnostics in the OpenGL draw path. Upstream has no equivalent environment-controlled human-readable texture-bind logging; this is local MK8D investigation instrumentation and is inactive by default.
 - The human-readable texture-bind log now follows the same draw-sequence and pipeline filter as the existing `TEXTURE_BIND` raw trace. This keeps diagnostic output bounded without changing normal rendering behavior.
 
 ### Intentional differences
-- Rust keeps a local raw-compressed copy fallback for OpenGL copies such as `Bc3Unorm` <-> `R32G32B32A32Uint`. Upstream's OpenGL runtime does not have this explicit fallback in `TextureCacheRuntime::CopyImage`; this is an adaptation for GL-driver-invalid raw/compressed transfer shapes observed in MK8D.
 - For raw-compressed pairs accepted by `raw_compressed_copy_fallback_format`, Rust now performs the fallback before calling `glCopyImageSubData`. This avoids deliberately issuing a GL-invalid copy and then recovering from the debug callback/error state.
 
 ### Unintentional differences (to fix)
 - Fixed: Rust's compressed-block fallback lookup used `compressed_copy_fallback_format(dst_format, dst_format)` internally. It now compares `dst_format` and `src_format`, matching the fallback decision made before the copy loop.
-- Fixed: Rust previously called `glCopyImageSubData` first for raw-compressed fallback pairs, producing `GL_INVALID_VALUE` for MK8D copies like `Bc3Unorm` <-> `R32G32B32A32Uint` 1x1 block transfers. Rust now handles those known pairs directly through the implemented fallback path.
 
 ### Missing items
 - Full upstream-equivalent copy policy remains broader than this slice. Any future raw/compressed pair not accepted by `raw_compressed_copy_fallback_format` still needs a proven implementation rather than a silent approximation.
@@ -11732,7 +11518,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Fixed: `IHidServer::StartLrAssignmentMode` and `StopLrAssignmentMode` previously wrote `npad_resource.SetLrAssignmentMode` directly and always returned success. Upstream delegates to `NPad::{Start,Stop}LrAssignmentMode`, which first calls `GetLrAssignmentMode`, only writes when the state changes, and propagates lookup errors.
 
 ### Missing items
-- `NPad::SetNpadMode` remains a known incomplete parity area: Rust still lacks upstream controller ownership needed for JoyConDual split/merge (`controller_data`, `DisconnectNpad`, `UpdateControllerAt`, and `HidCore::GetFirstDisconnectedNpadId`). This is still relevant to MK8D prompt/controller-assignment behavior and must not be considered complete.
 
 ### Intentional differences
 - Rust stores `HIDCore` in `NPad` as `Option<Arc<parking_lot::Mutex<HIDCore>>>` so unit tests can keep using `NPad::new()` without constructing a full resource manager. The runtime path uses `NPad::new_with_hid_core(...)`, matching upstream ownership where `NPad` is constructed with `Core::HID::HIDCore&`.
@@ -11757,19 +11542,16 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Fixed: Rust previously missed upstream's OpenGL copy-bind dirty marker for non-zero uniform offsets when `SupportsNonZeroUniformOffset()` is false. Rust now re-dirties that UBO index in the same condition.
 
 ### Missing items
-- The NV assembly-shader UBO copy-buffer path (`copy_uniforms`, `copy_compute_uniforms`, and `glBindBufferRangeNV`/`glProgramBufferParametersIuivNV` exact behavior) is still not represented in Rust. This is not the active MK8D path on this test machine, but it remains a renderer parity item tied to the broader GLASM backend.
 
 ### Intentional differences
 - Rust keeps GLSL header construction in `EmitContext::setup_extensions(program)` rather than C++ `EmitContext::SetupExtensions()`, matching the existing Rust file organization.
 
 ### Unintentional differences (to fix)
-- Fixed: Rust did not emit `#extension GL_EXT_texture_shadow_lod : enable` when `program.info.uses_shadow_lod` and `profile.support_gl_texture_shadow_lod` were both true. Upstream emits that extension under the same guard. Without it, MK8D cinematic shaders failed to compile on `textureLod(sampler2DArrayShadow, vec4, float)`.
 
 ### Missing items
 - Other upstream GLSL extension guards in `SetupExtensions()` still need a broader audit against Rust `setup_extensions`; this slice fixes only the confirmed shadow-lod cinematic failure.
 
 ### Intentional differences
-- Rust has opt-in async trace instrumentation for MK8D render-target/source attribution. This diagnostic code has no upstream equivalent and is guarded by `RUZU_TRACE_TEXTURE_BIND_RING`.
 - The sampled-texture diagnostic now skips `glGetTextureSubImage(... RGBA ...)` for compressed, depth, or multisample textures. This avoids GL debug spam from the diagnostic probe and does not affect rendering or upstream-owned rasterizer behavior.
 
 ### Missing items
@@ -11814,7 +11596,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Rust adds `initialize_from_env()` and a `log::Log` facade bridge so existing `log::info!` / `log::warn!` call sites enqueue through the yuzu-style asynchronous logging backend instead of `env_logger` writing synchronously from runtime threads. Upstream has native `LOG_*` macros wired directly to `Common::Log::Impl::PushEntry`; this bridge is the Rust equivalent needed while many ported call sites use the Rust `log` facade.
 - Rust accepts `RUZU_LOG_FILTER` in upstream class-filter syntax and a simple `RUST_LOG=<level>` compatibility form. Upstream reads `Settings::values.log_filter`; ruzu-cmd settings plumbing is not complete enough to source that value yet.
-- Rust defaults the facade filter to `*:Warning` when neither `RUZU_LOG_FILTER` nor `RUST_LOG` is set. This avoids reintroducing broad `Info` logging overhead during MK8D runtime tests while preserving opt-in `Info`/`Debug` behavior.
 - Rust enables the console backend by default to match `yuzu_cmd/yuzu.cpp` and adds `RUZU_LOG_COLOR=0` as a local escape hatch for silent/redirected test runs.
 - Rust leaves `common::trace` as the separate fixed-record ring trace path for high-frequency diagnostics. This mirrors the current Rust investigation infrastructure and is intentionally not used for arbitrary text logs.
 
@@ -11831,24 +11612,20 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - The scan uses `read_block_unsafe` to avoid introducing a cache flush in the diagnostic path. This keeps the normal disabled path identical and limits enabled-path side effects while still exposing memory contents visible through the GMMU/device memory path.
 
 ### Missing items
-- No upstream method is missing in this slice. This is instrumentation for the MK8D cinematic black-frame investigation.
 
 ### Intentional differences
 - Rust adds env-gated diagnostic `RUZU_TRACE_PRESENT_TEXTURE_SAMPLE`. When enabled, `WindowAdaptPass::draw_to_framebuffer` samples configured layer textures through a temporary read framebuffer and logs `[PRESENT_TEXTURE_SAMPLE]` with texture size, source framebuffer metadata, nonzero pixel counts, RGBA sums, checksums, framebuffer status, and GL error state. `RUZU_TRACE_PRESENT_TEXTURE_SAMPLE_EVERY` throttles this probe. Upstream proceeds directly from `ConfigureDraw` to the final present draw.
 - Existing `RUZU_TRACE_PRESENT_PHASES` and `RUZU_TRACE_PRESENT_DRAW` remain disabled by default and continue to instrument the final framebuffer/present state only when requested. `RUZU_TRACE_PRESENT_PHASES_EVERY` throttles the framebuffer sampling probe.
 
 ### Missing items
-- No upstream present behavior is missing in this slice. This is instrumentation for determining whether MK8D cinematic black frames are already black in the layer texture or become black during final present composition.
 
 ### Intentional differences
-- Rust adds env-gated diagnostic `RUZU_TRACE_CBUF_WRITES`. When enabled, `Maxwell3D::process_cb_bind` registers watched cbuf ranges for stage 0/4 slot 1, and `MemoryManager::{write_block,write_block_unsafe,copy_block}` logs `[CBUF_WATCH_WRITE]` when a GPU-VA write intersects those ranges. Upstream has no such watchlist; this is temporary instrumentation for the MK8D cinematic black-frame investigation.
 - `RUZU_TRACE_CBUF_WRITE_LIMIT` caps emitted write-hit lines. This keeps the diagnostic usable without changing the disabled/default path.
 
 ### Missing items
 - The watchlist only covers writes that flow through `video_core::MemoryManager` GPU-VA write APIs. Direct CPU-side mapped stores outside this path would still need a lower-level device-memory or guest-memory trap if this probe produces no hit.
 
 ### Intentional differences
-- Rust adds env-gated diagnostic `RUZU_TRACE_CBUF_DEVICE_WRITES`. When enabled, `Maxwell3D::process_cb_bind` registers stage 0/4 slot 1 cbuf ranges through the bound `MemoryManager`, which records both the GPU virtual range and the translated device-address range. `MaxwellDeviceMemoryManager::{write_u8,write_u16,write_u32,write_u64,smmu_write_block_unsafe}` logs `[CBUF_DEVICE_WATCH_WRITE]` when a device-address write intersects those translated ranges. Upstream has no such watchlist; this is temporary instrumentation for the MK8D cinematic black-frame investigation.
 - `RUZU_TRACE_CBUF_DEVICE_WRITE_LIMIT` caps emitted write-hit lines. This keeps the diagnostic usable without changing the disabled/default path.
 
 ### Missing items
@@ -11856,7 +11633,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Intentional differences
 - Rust extends the temporary `RUZU_TRACE_CBUF_DEVICE_WRITES` diagnostic with `[CBUF_DEVICE_WATCH_RANGE]` logging from `Gpu::on_cpu_write`. Upstream `GPU::Impl::OnCPUWrite` directly forwards to `rasterizer->OnCPUWrite(addr, size)`; Rust logs only when the CPU-notified device-address range intersects a watched cbuf range, then preserves the normal forwarding behavior.
-- The range-only hook records device-address overlap even when the CPU write path does not expose the written payload at the video_core layer. This is needed to distinguish direct CPU/JIT stores from device-memory API writes in the MK8D cinematic black-frame investigation.
 
 ### Missing items
 - If this range-only CPU notification hits, a follow-up core-memory/JIT-side payload trace by guest VA is still required to identify the exact instruction/value producer.
@@ -11884,19 +11660,16 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust keeps the existing out-of-range guard for invalid device addresses above the 34-bit tracked range, because the C++ `std::array` access would be undefined behavior while Rust would otherwise panic. This entry extends that diagnostic with an env-gated `RUZU_TRACE_MEMTRACK_OOR_BT=1` backtrace to identify the caller that supplied the invalid address.
 
 ### Missing items
-- The producer of intermittent device addresses above `SMMU_VA_LIMIT` is still not identified because the instrumented MK8D rerun did not reproduce `[MEMTRACK_OOR]`.
 
 ### Intentional differences
 - Rust adds env-gated stderr tracing for `RUZU_TRACE_SYNCPOINT_AFTER=N` around host1x syncpoint action registration, host/guest increments, and host/guest waits. This is diagnostic-only and mirrors the same upstream-owned methods: `Register*Action`, `Increment*`, and `Wait*`.
 
 ### Missing items
-- No host1x syncpoint behavior was changed. The MK8D trace showed host increments reaching each armed target and `WaitHost` fallback completing.
 
 ### Intentional differences
 - Rust adds env-gated stderr tracing for `RUZU_TRACE_SYNCPOINT_AFTER=N` around `IocCtrlEventWait` begin/signalled/armed/fallback states. This is diagnostic-only and stays in the upstream-owned `nvhost_ctrl` method.
 
 ### Missing items
-- No `IocCtrlEventWait` behavior was changed. The MK8D trace showed the suspected cinematic wait was transient: host actions were armed, host syncpoints incremented to the target, and fallback `WaitHost` calls completed.
 
 ### Intentional differences
 - Rust keeps native `Vec<u8>` / `VectorVfsFile` construction instead of the C++ `std::array` template helper, while preserving the same `PackBFTTF` ownership and byte transform.
@@ -11988,8 +11761,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Verification
 - Animus short launch (`/tmp/ruzu_animus_after_scoped_schedlock_1781822781.log`) — no `svcBreak`/panic/SIGSEGV in 8s; still logs `Puller::ProcessBindMethod unsupported engine 0x0000`.
 - Animus short launch after pinned-waiter port (`/tmp/ruzu_animus_after_pinned_waiters_1781823487.log`) — no `svcBreak`/panic/SIGSEGV in 8s; remaining stall still shows core2 `current=highest=82` with `needs=true`.
-- MK8D short launch (`/tmp/ruzu_mk8d_after_scoped_schedlock_1781822806.log`) — no `svcBreak`/panic/SIGSEGV in 55s; existing `BreakLoopNullPc` diagnostic still appears.
-- MK8D manual launch after the scoped scheduler-lock change reached normal startup logs until user kill; no new panic/SIGSEGV was observed before termination, existing `BreakLoopNullPc` still appeared.
 
 ### Intentional differences
 - Converted the existing `RUZU_TRACE_CORE_DISPATCH` diagnostic from synchronous `eprintln!` to throttled async `SCHED_STATE` trace records. This is diagnostic-only and preserves the existing Rust control flow.
@@ -12071,7 +11842,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Verification
 - Animus run for 90s with `RUZU_TRACE_UNMAPPED_READ=1 RUZU_TRACE_A64_EXCEPTION=1`: timed out normally with no `UNMAPPED_READ`, no `PrefetchAbort`, no panic. This removes the earlier crash pattern at `pc=0x84677504`, `vaddr=0xFFFFFFFFFFFFFFE0`, `x19=0x7201`.
-- MK8D boot regression run for 75s: timed out normally with no panic, no prefetch/data abort marker, no unmapped marker, and no unsupported-engine marker in the filtered log.
 
 ### Intentional differences
 - Added env-gated async trace categories `UNMAPPED_READ` (`RUZU_TRACE_UNMAPPED_READ`) and `A64_EXCEPTION_CTX` (`RUZU_TRACE_A64_EXCEPTION`) to capture A64 guest register context during the Animus unmapped-read investigation. Upstream has no equivalent diagnostic ring; these are disabled by default and do not change emulation behavior.
@@ -12106,7 +11876,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Verification
 - Animus run for 90s with `RUZU_TRACE_UNMAPPED_READ=1 RUZU_TRACE_A64_EXCEPTION=1`: timed out normally with no `UNMAPPED_READ`, `A64_EXCEPTION`, abort, panic, or unsupported-engine marker.
-- MK8D boot regression run for 75s: timed out normally with no panic, abort, unmapped marker, or unsupported-engine marker.
 
 ### Intentional differences
 - Ported the single/double FP multiply-by-indexed-element subset used by ANIMUS (`FMLA_elt_4`, `FMLS_elt_4`, `FMUL_elt_4`, `FMULX_elt_4`) into the matching Rust-owned file. Rust uses `DecodedInst` field extraction and existing IR builder names; behavior and reserved-value checks match upstream `FPMultiplyByElement`.
@@ -12322,7 +12091,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Behavioral parity verified
 - Upstream `KThread::BeginWait` calls `SetState(ThreadState::Waiting)`, and `SetState` clears the debug wait reason. Wait owners that need a reason set it after `BeginWait`; `KSynchronizationObject::Wait` does this for `Synchronization`.
-- MK8D SIGUSR1 dumps were showing `RUNNABLE wait=Sleep` / `RUNNABLE wait=Synchronization`; this was stale debug wait-reason state, not proof that the raw scheduler state still carried a wait.
 
 ### Binary layout verification
 - Thread debug/scheduler bookkeeping only; no guest raw-copied payload or serialized ABI layout changed.
@@ -12340,7 +12108,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Behavioral parity verified
 - Re-read yuzu `svc_lock.cpp`: `ArbitrateLock` itself only validates arguments and forwards to `KConditionVariable::WaitForAddress`; this change is diagnostic-only and leaves the SVC behavior unchanged.
-- MK8D LOCK_PI run `/tmp/ruzu_mk8d_lockcv_clean3_1781974103.log` shows `UNMAPPED=0`, confirming the previous `Unmapped Read32 @ ...1b0` flood was produced by the diagnostic path.
 
 ### Binary layout verification
 - Diagnostic memory reads only; no guest raw-copied payload or serialized ABI layout changed.
@@ -12363,7 +12130,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Verification
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
 - `cargo run -p ruzu_cmd --bin ruzu-cmd -- --help` shows `[default: vulkan]` on macOS.
-- MK8D Vulkan runtime validation: MoltenVK loads, the Apple M2 Pro Vulkan device is created, the swapchain is created, and the remaining observed blocker is `ArmDynarmic32::run_thread: JIT not available`.
 
 ## 2026-06-21 — ruzu_cmd/src/emu_window/emu_window_sdl2_vk.rs vs yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp
 
@@ -12382,7 +12148,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Verification
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime validation creates a 2560x1440 Metal-backed swapchain from the SDL drawable size on the tested Retina display.
 
 ## 2026-06-21 — video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp
 
@@ -12407,7 +12172,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Verification
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime validation reaches `Vulkan renderer initialized`, binds the renderer to `Gpu`, and starts the GPU thread before hitting the separate AArch32 JIT-not-available blocker.
 
 ## 2026-06-21 — video_core/src/renderer_vulkan/swapchain.rs vs video_core/renderer_vulkan/vk_swapchain.h and video_core/renderer_vulkan/vk_swapchain.cpp
 
@@ -12433,7 +12197,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Verification
 - Re-read upstream `vk_swapchain.h` and `vk_swapchain.cpp`.
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime validation creates a MoltenVK swapchain: 3 images, 2560x1440, `B8G8R8A8_UNORM`, FIFO.
 
 ## 2026-06-21 — video_core/src/renderer_vulkan/present_manager.rs vs video_core/renderer_vulkan/vk_present_manager.h and video_core/renderer_vulkan/vk_present_manager.cpp
 
@@ -12460,7 +12223,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Verification
 - Re-read upstream `vk_present_manager.h` and `vk_present_manager.cpp`.
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime validation still loads MoltenVK, creates the Apple M2 Pro Vulkan device, creates the swapchain, and reaches `Vulkan renderer initialized`; the remaining runtime blocker is AArch32 JIT allocation/availability, not this present-manager frame allocation change.
 
 ## 2026-06-21 — video_core/build.rs and video_core/src/host_shaders/spirv_shaders.rs vs video_core/host_shaders/CMakeLists.txt
 
@@ -12527,7 +12289,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Verification
 - Re-read upstream `present/window_adapt_pass.cpp`.
 - `cargo check -p video_core`
-- MK8D Vulkan runtime validation still reaches `Vulkan renderer initialized`; the remaining runtime blocker is AArch32 JIT `CantAlloc`.
 
 ## 2026-06-21 — video_core/src/renderer_vulkan/blit_screen.rs vs video_core/renderer_vulkan/vk_blit_screen.h/.cpp
 
@@ -12607,7 +12368,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `timeout 120s cargo check -p video_core`
 - `timeout 120s cargo test -p video_core host_shaders::spirv_shaders::tests::generated_vulkan_shaders_are_spirv_modules`
 - `timeout 120s cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D runtime was not executed in this pass because the documented NSP paths under `/Users/vricosti/Games/...` and `/home/vricosti/Games/...` do not exist in the current filesystem.
 
 ## 2026-06-22 — video_core/src/renderer_vulkan/blit_image.rs, video_core/build.rs, and video_core/src/host_shaders/spirv_shaders.rs vs video_core/renderer_vulkan/blit_image.h/.cpp and video_core/host_shaders/*_spv.h
 
@@ -12679,7 +12439,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `vulkan_library.h` and `vulkan_library.cpp`.
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
 - `cargo test -p video_core vulkan_library::tests::test_open_library_does_not_panic -- --nocapture`
-- MK8D Vulkan run loads MoltenVK, exposes `VK_EXT_metal_surface`, creates the Apple M2 Pro Vulkan device, and reaches `Vulkan renderer initialized`. The run was stopped after validation; the remaining observed failure is unrelated AArch32 JIT code-buffer allocation (`CantAlloc`).
 
 ## 2026-06-21 — video_core/src/vulkan_common/vulkan_memory_allocator.rs vs video_core/vulkan_common/vulkan_memory_allocator.h/.cpp
 
@@ -12739,7 +12498,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `renderer_vulkan.cpp` and `vk_blit_screen.h/.cpp` after implementation.
 - `cargo check -p video_core`
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime with `timeout 30s`: MoltenVK loads, a 2560x1440 swapchain is created, and `Vulkan renderer initialized` is reached. No new Vulkan panic/validation failure appeared. The run still stops at the known native macOS ARM64 CPU blocker: `rdynarmic x64 backend is not executable on host architecture aarch64`, followed by `JIT not available` and repeated `SF_COMPOSE ... NO_LAYERS`.
 
 ## 2026-06-21 — video_core/src/renderer_vulkan/present/util.rs vs video_core/renderer_vulkan/present/util.h/.cpp
 
@@ -12864,7 +12622,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo check -p video_core`
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
 - `cargo test -p video_core host_shaders::spirv_shaders::tests::generated_present_shaders_are_spirv_modules`
-- MK8D Vulkan runtime with `timeout 30s`: MoltenVK loads, the swapchain is created, and `Vulkan renderer initialized` is reached. The run still stops at the known native macOS ARM64 CPU blocker: `rdynarmic x64 backend is not executable on host architecture aarch64`, followed by `JIT not available` and `SF_COMPOSE ... NO_LAYERS`.
 
 ## 2026-06-22 — video_core/build.rs and video_core/src/host_shaders/spirv_shaders.rs vs video_core/host_shaders/fxaa_*_spv.h generation
 
@@ -12900,7 +12657,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Unintentional differences (to fix)
 - Temporary `Frame::image` memory is still owned indirectly by `MemoryAllocator`'s dedicated allocation list rather than by an upstream-equivalent RAII image wrapper attached to the temporary frame.
 - `RenderScreenshot` constructs a full-screen `FramebufferLayout` from the simplified renderer-base screenshot layout. Upstream stores the complete frontend `Layout::FramebufferLayout`.
-- `GetAppletCaptureBuffer` can only return real data after `RenderAppletCaptureLayer` has created and populated `applet_frame.image`; native macOS ARM64 MK8D runtime still cannot reach real application layers because the AArch32 CPU backend is unavailable.
 - `RendererBase` signature changed to `&mut self` for correctness, but OpenGL/Null implementations still return their existing stub/zero behavior.
 
 ### Missing items
@@ -12917,7 +12673,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `present/util.cpp` `DownloadColorImage` and the Rust `present/util.rs` equivalent.
 - `cargo check -p video_core`
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime with `timeout 30s`: MoltenVK loads, the 2560x1440 swapchain is created, and `Vulkan renderer initialized` is reached. No new Vulkan panic or validation failure appeared. Runtime still stops at the known native macOS ARM64 CPU blocker: `rdynarmic x64 backend is not executable on host architecture aarch64`, then `JIT not available` and repeated `SF_COMPOSE ... NO_LAYERS`.
 
 ## 2026-06-22 — video_core/src/renderer_vulkan/blit_screen.rs, video_core/src/renderer_vulkan/renderer_vulkan.rs, and video_core/src/renderer_vulkan/present/layer.rs vs video_core/renderer_vulkan/vk_blit_screen.h/.cpp and video_core/renderer_vulkan/present/layer.h/.cpp
 
@@ -12945,7 +12700,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `vk_blit_screen.h/.cpp` and `present/layer.h/.cpp`.
 - `cargo check -p video_core`
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime with `timeout 30s`: MoltenVK loads, the 2560x1440 swapchain is created, and `Vulkan renderer initialized` is reached. No new Vulkan panic or validation failure appeared. Runtime still stops at the known native macOS ARM64 CPU blocker: `rdynarmic x64 backend is not executable on host architecture aarch64`, then `JIT not available` and repeated `SF_COMPOSE ... NO_LAYERS`.
 
 ## 2026-06-22 — video_core/src/renderer_vulkan/blit_screen.rs vs video_core/renderer_vulkan/vk_blit_screen.h/.cpp
 
@@ -12972,7 +12726,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `renderer_vulkan.cpp` capture/applet paths that call `BlitScreen::CreateFramebuffer`.
 - `cargo check -p video_core`
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime validation: MoltenVK loads, the 2560x1440 swapchain is created, and `Vulkan renderer initialized` is reached. The remaining blocker is `rdynarmic x64 backend is not executable on host architecture aarch64`, followed by `JIT not available` and repeated `SF_COMPOSE ... NO_LAYERS`, so this synchronization slice does not yet exercise real layer drawing.
 
 ## 2026-06-22 — video_core/src/renderer_vulkan/present_manager.rs and renderer_vulkan.rs vs video_core/renderer_vulkan/vk_present_manager.h/.cpp and renderer_vulkan.cpp
 
@@ -12998,7 +12751,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `vk_present_manager.h`, `vk_present_manager.cpp`, and `renderer_vulkan.cpp`.
 - `cargo check -p video_core`
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime was stopped by `timeout 45s`; backend `vulkan`, swapchain creation, and renderer initialization were logged without panic/Vulkan initialization failure. The compositor still reported repeated `SF_COMPOSE ... NO_LAYERS`, so the present path was not exercised with real queued layers.
 
 ## 2026-06-22 — video_core/src/renderer_vulkan/present_manager.rs and swapchain.rs vs video_core/renderer_vulkan/vk_present_manager.cpp and vk_swapchain.h/.cpp
 
@@ -13025,7 +12777,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `vk_present_manager.cpp`, `vk_swapchain.h`, and `vk_swapchain.cpp`.
 - `cargo check -p video_core`
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime was stopped by `timeout 45s`; backend `vulkan`, swapchain creation, and renderer initialization were logged. No swapchain-recreation warning/error was observed, and the compositor remained at `SF_COMPOSE ... NO_LAYERS`, so the recreated present path still awaits real queued layers.
 
 ## 2026-06-22 — video_core/src/renderer_vulkan/renderer_vulkan.rs and vulkan_common/vulkan_device.rs vs video_core/renderer_vulkan/vk_present_manager.cpp and vulkan_common/vulkan_device.h/.cpp
 
@@ -13049,7 +12800,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `vk_present_manager.cpp` and `vulkan_device.h/.cpp`.
 - `cargo check -p video_core`
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime was stopped by `timeout 45s`; backend `vulkan`, swapchain creation, and renderer initialization were logged with no Vulkan initialization regression. The compositor still reported `SF_COMPOSE ... NO_LAYERS`, so the blit/copy branch was not exercised by queued layers.
 
 ## 2026-06-21 — video_core/src/renderer_vulkan/scheduler.rs vs video_core/renderer_vulkan/vk_scheduler.h/.cpp
 
@@ -13068,15 +12818,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Full `MasterSemaphore` integration with queue submission.
 - Worker-thread command chunk execution parity.
 - Command-pool recycling/retirement parity.
-
-### Binary layout verification
-- No binary payload layout affected. Vulkan host synchronization only.
-
-### Verification
-- Re-read upstream `vk_scheduler.h` and `vk_scheduler.cpp`.
-- `cargo check -p video_core`
-- `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- `timeout 45s cargo run -p ruzu_cmd --bin ruzu-cmd -- --renderer vulkan -g "...Mario Kart 8 Deluxe..."` exited with `124`; no panic or Vulkan scheduler error appeared in `/tmp/ruzu_run.log`.
 
 ## 2026-06-21 — video_core/src/renderer_vulkan/present/layer.rs vs video_core/renderer_vulkan/present/layer.h/.cpp
 
@@ -13102,7 +12843,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `present/layer.cpp`.
 - `cargo check -p video_core`
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime reached timeout without panic/Vulkan errors; VI still reports `NO_LAYERS`, so this path remains not exercised by real layer submission.
 
 ## 2026-06-21 — video_core/src/renderer_vulkan/present/layer.rs vs video_core/renderer_vulkan/present/layer.h/.cpp
 
@@ -13123,12 +12863,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Binary layout verification
 - PASS: staging upload uses upstream byte counts: `stride * height * bytes_per_pixel`, per-image raw offset, block height log2 `4`, and Tegra tiled size via `calculate_size(true, bpp, stride, height, 1, 4, 0)`.
-
-### Verification
-- Re-read upstream `present/layer.h` and `present/layer.cpp`.
-- `cargo check -p video_core`
-- `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- `timeout 45s cargo run -p ruzu_cmd --bin ruzu-cmd -- --renderer vulkan -g "...Mario Kart 8 Deluxe..."` exited with `124`; no panic or Vulkan error appeared in `/tmp/ruzu_run.log`, but the run still reported repeated `SF_COMPOSE ... NO_LAYERS`, so real layer upload was not exercised.
 
 ## 2026-06-21 — video_core/src/vulkan_common/vulkan_memory_allocator.rs vs video_core/vulkan_common/vulkan_memory_allocator.h/.cpp
 
@@ -13151,7 +12885,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `vulkan_memory_allocator.h`.
 - `cargo check -p video_core`
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime reached timeout without mapped-buffer/Vulkan allocation errors in `/tmp/ruzu_run.log`.
 
 ## 2026-06-21 — video_core/src/renderer_vulkan/renderer_vulkan.rs and ruzu_cmd/src/main.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp
 
@@ -13173,8 +12906,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `renderer_vulkan.cpp` constructor and `present/layer.h`.
 - `cargo check -p video_core`
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime reached timeout without Host1x memory-manager resolution failure or renderer initialization failure.
-- MK8D Vulkan runtime validation was stopped after a controlled 45s timeout. The run did not hit a Vulkan initialization crash; it reached service/vsync activity, then reported `ArmDynarmic32::run_thread: JIT not available` and repeated `SF_COMPOSE ... NO_LAYERS`, so the active runtime gap remains layer production/upload rather than this composite ordering change alone.
 
 ## 2026-06-21 — video_core/src/renderer_vulkan/blit_screen.rs vs video_core/renderer_vulkan/vk_blit_screen.h/.cpp
 
@@ -13199,7 +12930,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `vk_blit_screen.h` and `vk_blit_screen.cpp`.
 - `cargo check -p video_core`
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime validation was stopped after a controlled 45s timeout. The observed compositor state remained `NO_LAYERS`, consistent with `WindowAdaptPass::Draw` being recorded with empty layer arrays until `Layer::ConfigureDraw`/framebuffer upload is connected.
 
 ## 2026-06-21 — video_core/src/renderer_vulkan/present/window_adapt_pass.rs vs video_core/renderer_vulkan/present/window_adapt_pass.cpp
 
@@ -13248,7 +12978,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `present/layer.cpp`.
 - `cargo check -p video_core`
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime was stopped by `timeout 45s`; no Vulkan descriptor/layout error appeared in captured output, but the game still reported repeated `SF_COMPOSE ... NO_LAYERS`, so this path was not exercised with real application layers.
 
 ## 2026-06-21 — video_core/src/renderer_vulkan/blit_screen.rs vs video_core/renderer_vulkan/vk_blit_screen.h/.cpp
 
@@ -13273,7 +13002,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `vk_blit_screen.cpp` and `present/window_adapt_pass.cpp`.
 - `cargo check -p video_core`
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime was stopped by `timeout 45s`; the compositor still had `NO_LAYERS`, so the new non-empty layer draw path awaits a title path that reaches queued buffers.
 
 ## 2026-06-22 — externals/rdynarmic/src/jit.rs and externals/rxbyak/src/platform/unix.rs vs core/arm/dynarmic CPU backend usage
 
@@ -13283,7 +13011,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Unintentional differences (to fix)
 - Upstream C++ selects CPU backends through platform/build feature availability. Rust still exposes the x64 rdynarmic API on non-x86_64 targets and fails at runtime instead of selecting a real AArch64-host backend at construction time.
-- Native macOS ARM64 still has no AArch32 guest CPU backend in this tree. MK8D is AArch32, so Vulkan can initialize but the application cannot execute far enough to create compositor layers.
 
 ### Missing items
 - A faithful AArch32-on-AArch64 CPU backend for macOS, or a supported Rosetta/x86_64 build path that runs the existing x64 backend end-to-end.
@@ -13296,7 +13023,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `core/arm/dynarmic/arm_dynarmic_32.cpp` and `core/arm/nce/arm_nce.cpp` to confirm the upstream backend split: Dynarmic for JIT-backed execution and NCE as an AArch64/Linux-specific path.
 - `cargo check -p rdynarmic`
 - `cargo check -p ruzu_cmd --bin ruzu-cmd`
-- MK8D Vulkan runtime with `timeout 45s`: MoltenVK loads, the 2560x1440 swapchain is created, and `Vulkan renderer initialized` is reached. The run then reports `rdynarmic x64 backend is not executable on host architecture aarch64` for all four AArch32 cores, followed by `JIT not available` and repeated `SF_COMPOSE ... NO_LAYERS`.
 
 ## 2026-06-21 — video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp
 
@@ -13777,7 +13503,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Complete A64-specific callback trampoline setup, then construct A32/A64 ARM64 owners from `A32Jit::new` / `A64Jit::new` on `target_arch = "aarch64"`.
 - Use the `StackLayout` frame for the remaining upstream prelude state operations: FPCR save/restore, cycle counting, spills, and return-stack-buffer initialization.
 - Add ARM64 IR emitters for the A32 and A64 frontends, then select them from `A32Jit::new` / `A64Jit::new` on `target_arch = "aarch64"`.
-- Re-run MK8D after the A32 ARM64 host backend is wired, because MK8D is AArch32 guest code and cannot run through the current x64-only `A32Jit`.
 
 ### Binary layout verification
 - `backend::arm64::jit_state` has tests verifying `A32JitState` and `A64JitState` alignment, size, and field offsets against upstream ARM64 Dynarmic headers, including the 16-byte aligned vector-register fields.
@@ -14394,7 +14119,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Missing items
 - Port shared page-table and fastmem memory helpers so the A32 wrappers can use non-callback memory configurations.
 - Port wrapped fallback and memory-abort handling in the shared memory helper.
-- Continue remaining A32 ARM64 opcode emitters beyond memory operations before selecting the ARM64 backend for MK8D on Apple Silicon.
 
 ### Binary layout verification
 - No new raw serialized structs were introduced.
@@ -14464,7 +14188,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Missing items
 - Continue remaining ARM64 A32/A64 opcode emitters outside the CPSR flag family.
-- Port shared page-table/fastmem/wrapped ARM64 memory paths before using this backend as the default for MK8D on Apple Silicon.
 - Wire A32 `hook_isb` through the public configuration surface if local callers require upstream-equivalent ISB callback behavior.
 
 ### Binary layout verification
@@ -14533,7 +14256,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Missing items
 - Port the full ARM64 fastmem read/write path and patch metadata.
 - Add page-table tests for ordered 128-bit accesses, misalignment fallback, non-mirrored address-space rejection, and pointer masking.
-- Continue remaining ARM64 A32/A64 opcode emitters before selecting this backend by default for MK8D on Apple Silicon.
 
 ### Binary layout verification
 - No new guest-visible structs were introduced.
@@ -14603,7 +14325,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Missing items
 - Replace the aarch64 dummy x64 inner with an explicit backend-owner representation once the ARM64 A32 path is stable enough to refactor safely.
 - Add a public ARM64 A64 wrapper if/when A64 guest execution is required on Apple Silicon.
-- Complete the generic A32 coprocessor surface and remaining ARM64 A32 opcode emitters uncovered by MK8D runtime execution.
 - Decide whether the public Rust A32 API should grow fallible variants or whether ARM64 backend emission should be made non-fallible like upstream before removing the temporary `.expect(...)` adapters.
 
 ### Binary layout verification
@@ -14632,7 +14353,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Missing items
 - Revisit the `null_jit` code-cache branch if the Rust port adds an explicit no-page-table A32 construction path.
-- Remove the local page-table fastmem environment gate once ARM64/x64 page-table fastmem behavior matches upstream for MK8D.
 
 ### Binary layout verification
 - No guest-visible structs or serialized payloads changed.
@@ -14644,7 +14364,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Runtime log before this fix showed all four A32 cores failing with `ARM64 code_cache_size > 128 MiB not currently supported: 536870912`.
 - `cargo fmt --all`
 - `timeout 180s cargo check --bin ruzu-cmd` passes with existing warnings outside this tranche.
-- MK8D runtime after this fix creates the ARM64 A32 JIT with `code_cache_size=134217728` and proceeds to the next missing ARM64 emitter instead of failing backend construction.
 
 ## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs add/sub tranche vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
 
@@ -14663,7 +14382,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Missing items
 - Port `ADC`/`ADCS`/`SBC`/`SBCS` instruction encoders and dynamic-carry add/sub emission.
 - Port overflow pseudo-op emission for add and the remaining associated pseudo-ops used by upstream data-processing operations.
-- Continue porting the rest of `emit_arm64_data_processing.cpp` in upstream-owned slices as MK8D exposes missing opcodes.
 
 ### Binary layout verification
 - No guest-visible structs or serialized payloads changed.
@@ -14675,7 +14393,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read Rust `externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs`, `emit_arm64.rs`, and `inst.rs`.
 - `cargo fmt --all`
 - `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
-- MK8D runtime proceeds past the previous `Sub32` missing-emitter failure and reaches the next missing conditional-block prologue.
 
 ## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64.rs conditional block entry vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64.cpp
 
@@ -14690,7 +14407,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Missing items
 - Add focused conditional-block machine-code tests once the ARM64 block-construction helpers can build a minimal conditional block without depending on broader translation state.
-- Continue porting missing ARM64 emitters exposed after the conditional prologue no longer blocks MK8D.
 
 ### Binary layout verification
 - No guest-visible structs or serialized payloads changed.
@@ -14715,7 +14431,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - The Rust test uses target descriptor zero so `emit_mov_x_imm` is one instruction and the emitted order is easy to audit; broader nonzero descriptor materialization is covered by the existing `emit_mov_x_imm` path, not a dedicated `PushRSB` variant test.
 
 ### Missing items
-- Continue validating `PopRSBHint` behavior under MK8D now that `PushRSB` no longer blocks compilation.
 - If runtime exposes RSB mismatch behavior, compare ARM64 `emit_arm64_a32.rs::emit_pop_rsb_hint` again against upstream `emit_arm64_a32.cpp`.
 
 ### Binary layout verification
@@ -14743,7 +14458,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - The Rust `A32CallbackContext::new` now accepts raw pointers like the existing A64 callback context; this is a lifetime-preserving backend adaptation, not instruction-identical C++ object layout.
 
 ### Missing items
-- None for the previously blocking A32 ARM64 callback prelude subset used by MK8D: normal, wrapped, exclusive read/write callbacks, SVC, exception, ISB, ticks, and CNTPCT are installed.
 - Continue comparing deeper prelude ordering if future runtime behavior points to callback ABI or exclusive-monitor divergence.
 
 ### Binary layout verification
@@ -14756,7 +14470,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo fmt --all`
 - `timeout 120s cargo test -p rdynarmic constructor_installs_full_callback_trampolines` passes.
 - `timeout 120s cargo check -p rdynarmic` passes with existing warnings outside this tranche.
-- MK8D runtime proceeds past the previous `ARM64 prelude trampoline is not emitted yet: ReadMemory32` failure and reaches the next missing data-processing emitter.
 
 ## 2026-06-24 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs least-significant extractors vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
 
@@ -14770,7 +14483,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - No dedicated machine-code test exists yet for all three IR extractors because the current ARM64 emitter tests are still sparse for generic IR blocks.
 
 ### Missing items
-- Port adjacent upstream data-processing emitters exposed next by MK8D, especially `MostSignificantWord`, `MostSignificantBit`, shifts, bitfield, and extension operations.
 - Add focused IR-emission tests for these extractors once the local ARM64 block test helpers cover minimal data-processing blocks consistently.
 
 ### Binary layout verification
@@ -14961,7 +14673,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Upstream saves host FPCR, derives guest FPCR from A32 FPSCR bits in `upper_location_descriptor`, installs it before entering guest code, and restores host FPCR on exit. Rust still lacks this FPCR save/set/restore sequence.
 - Upstream initializes the return-stack-buffer entries to `return_to_dispatcher` when the optimization is enabled. Rust still lacks this RSB initialization in the ARM64 prelude.
 - Upstream initializes page-table and fastmem host registers from config before entering guest code. Rust still lacks this prelude setup.
-- A64 ARM64 prelude parity is not covered by this tranche; this only advances the public A32 ARM64 path needed by MK8D-class AArch32 games.
 
 ### Missing items
 - Reorder ARM64 A32 prelude emission so callback trampolines are emitted first, then `run_code` / `step_code` / dispatcher entries can branch to `prelude_info.*` exactly like upstream.
@@ -15476,7 +15187,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Intentional differences
 - Added the Rust ARM64 scalar floating-point emitter file under the same backend ownership as upstream `emit_arm64_floating_point.cpp`.
-- Ported the subset required by current A32/MK8D regressions: `FPCompare32/64`, `FPMul32/64`, `FPSub32/64`, `FPSingleToFixedU32`, `FPDoubleToFixedU32`, `FPFixedU32ToSingle`, and `FPFixedU32ToDouble`.
 - Preserved upstream-style ordering for the ported operations: realize operands/results, emit the host FP instruction, and use explicit FPSR manager access for conversion paths that need FPCR rounding mode state.
 - Rust returns `Result` errors for invalid rounding modes where C++ uses asserts/templates.
 
@@ -15624,7 +15334,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Unintentional differences (to fix)
 - `FPFixedS32ToSingle`, `FPFixedS32ToDouble`, and the existing U32 fixed-to-FP helper still reject `fbits != 0`; upstream emits fixed-point `SCVTF`/`UCVTF` encodings for nonzero fractional bits.
-- Broader scalar FP coverage remains incomplete; these changes only cover the opcodes reached by the current MK8D ARM64 backend run.
 
 ### Missing items
 - Fixed-point `SCVTF`/`UCVTF` encoders and emitter paths for nonzero `fbits`.
@@ -15651,11 +15360,9 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Unintentional differences (to fix)
 - `A32CoprocSendTwoWords`, `A32CoprocLoadWords`, and `A32CoprocStoreWords` remain local no-op stubs after consuming args; upstream contains fuller coprocessor action handling where configured.
-- Broader ARM64 scalar FP coverage remains incomplete; the next observed MK8D blocker after these changes is `FPDoubleToFixedS32`.
 
 ### Missing items
 - `FPDoubleToFixedS32` and related signed fixed-point conversion emitters in `backend/arm64/emit_arm64_floating_point.rs`.
-- Remaining upstream ARM64 backend opcodes not yet reached by the current MK8D run.
 
 ### Binary layout verification
 - N/A: host AArch64 code emission and IR bookkeeping only; no guest-visible raw layout or serialized payload changed.
@@ -15679,11 +15386,9 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Unintentional differences (to fix)
 - Nonzero `fbits` for 32-bit FP-to-fixed remains unsupported in Rust, while upstream handles `TowardsZero` fixed-point encodings and asserts `fbits == 0` only for the other rounding modes.
-- Broader ARM64 FP vector opcode coverage remains incomplete; this slice only covers min/max opcodes now reached by MK8D.
 
 ### Missing items
 - Fixed-point `FCVTZS`/`FCVTZU` immediate-fbits encoders and emitter paths for FP-to-fixed nonzero `fbits`.
-- Remaining upstream ARM64 scalar/vector FP opcodes not yet reached by the current MK8D run.
 
 ### Binary layout verification
 - N/A: host AArch64 code emission only; no guest-visible raw layout or serialized payload changed.
@@ -15695,7 +15400,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo fmt -p rdynarmic --check` passes.
 - `timeout 120s cargo test -q -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words --lib -- --exact --nocapture` passes.
 - `timeout 120s cargo test -q -p rdynarmic backend::arm64::emit_arm64_vector_floating_point --lib -- --nocapture` passes; this filter currently has no focused unit tests and serves as a compile check.
-- MK8D run with isolated data/cache/config directories advances past prior `FPDoubleToFixedS32` and `FPVectorMin32` blockers; `timeout 120s cargo run --bin ruzu-cmd -- -g "/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"` exits with timeout code 124 and no `not ported`/panic lines in the filtered log.
 
 ## 2026-06-25 — externals/rdynarmic ARM64 FP vector paired add vs externals/dynarmic/src/dynarmic
 
@@ -15704,11 +15408,9 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `backend/arm64/inst.rs`: keeps explicit Rust AArch64 encoder helpers for vector `FADDP` and scalar-from-vector `FADDP`; instruction words were checked against Apple AArch64 assembler output.
 
 ### Unintentional differences (to fix)
-- Broader ARM64 FP vector opcode coverage remains incomplete; after this slice MK8D advances to `FPVectorFromSignedFixed32`, which is not yet routed.
 
 ### Missing items
 - `FPVectorFromSignedFixed32` and likely the related signed/unsigned fixed-to-vector-FP opcodes in `backend/arm64/emit_arm64_vector_floating_point.rs`.
-- Remaining upstream ARM64 vector FP opcodes not yet reached by the current MK8D run.
 
 ### Binary layout verification
 - N/A: host AArch64 code emission only; no guest-visible raw layout or serialized payload changed.
@@ -15719,7 +15421,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo fmt -p rdynarmic --check` passes.
 - `timeout 120s cargo test -q -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words --lib -- --exact --nocapture` passes.
 - `timeout 120s cargo test -q -p rdynarmic backend::arm64::emit_arm64_vector_floating_point --lib -- --nocapture` passes; this filter currently has no focused unit tests and serves as a compile check.
-- MK8D run with isolated data/cache/config directories advances past prior `FPVectorPairedAddLower32`; `timeout 300s cargo run --bin ruzu-cmd -- -g "/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"` exits with code 134 at the next missing ARM64 JIT opcode, `FPVectorFromSignedFixed32`.
 
 ## 2026-06-25 — externals/rdynarmic ARM64 FP vector fixed/compare and A32 vector get-set parity vs externals/dynarmic/src/dynarmic
 
@@ -15735,7 +15436,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Missing items
 - Vulkan portability-enumeration instance setup must be fixed for macOS/MoltenVK before the renderer can present instead of running with `NO_LAYERS`.
-- Remaining ARM64 backend opcodes may still be incomplete beyond the currently exercised MK8D path.
 
 ### Binary layout verification
 - N/A: host AArch64 code emission and IR optimization only; no guest-visible raw layout or serialized payload changed.
@@ -15748,7 +15448,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `timeout 120s cargo test -q -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words --lib -- --exact --nocapture` passes.
 - `timeout 120s cargo test -q -p rdynarmic ir::opt::a32_get_set_elimination::tests::test_double_vector_set_forwards_inserted_zero_upper_value --lib -- --exact --nocapture` passes.
 - `git -C externals/rdynarmic diff --check` passes.
-- MK8D run with isolated data/cache/config directories advances past `FPVectorFromSignedFixed32`, `FPVectorGreater32`, and the `VectorTranspose32` regalloc panic; `timeout 300s cargo run --bin ruzu-cmd -- -g "/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"` exits with timeout code 124 and no filtered `not ported`/panic lines. The log still contains `Required instance extension VK_KHR_portability_enumeration is not available`.
 
 ## 2026-06-26 — externals/rdynarmic A32 get-set elimination CPSR/PC parity vs externals/dynarmic/src/dynarmic
 
@@ -15761,7 +15460,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - The existing `A32SetCpsrNZC(..., A32GetCFlag)` rewrite still mutates the instruction in place, while upstream invalidates it and inserts a fresh `SetCpsrNZ` via `IREmitter`. Existing tests cover use counts and ordering, but the structural difference remains to review separately.
 
 ### Missing items
-- Remaining MK8D runtime still loops with `NO_LAYERS`; this slice only fixes the early A32 JIT `GET_SET_ELIMINATION` stall before SVCs.
 
 ### Binary layout verification
 - N/A: IR opcode classification and optimization only; no guest-visible raw layout or serialized payload changed.
@@ -15773,8 +15471,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo fmt -p rdynarmic --check` passes.
 - `cargo test -p rdynarmic test_register_pass_ignores_pc_without_stalling -- --nocapture` passes.
 - `cargo test -p rdynarmic test_update_upper_location_descriptor_blocks_cflag_forwarding -- --nocapture` passes.
-- MK8D with `RUZU_A32_OPTIMIZATION_MASK=0x08 RUZU_TRACE_A32_SVC_PC=1 timeout -k 5s 45s cargo run --bin ruzu-cmd -- -g "/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"` reaches `svc=29`; before the PC fix the same mask reached `svc=0`.
-- MK8D with default A32 optimizations and `RUZU_TRACE_A32_SVC_PC=1 timeout -k 5s 45s cargo run --bin ruzu-cmd -- -g "/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"` reaches `svc=663`; before this slice default optimizations reached `svc=0`.
 
 ## 2026-06-26 — video_core/src/renderer_vulkan/mod.rs and scheduler.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp, vk_fence_manager.cpp, vk_scheduler.h
 
@@ -15811,11 +15507,9 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Unintentional differences (to fix)
 - ARM64 JIT opcode coverage remains incomplete relative to upstream Dynarmic; this slice only fixes the currently hit transpose use-accounting bug and missing scalar `FPAbs32/64`.
-- The release MK8D run no longer crashes in this slice, but it was stopped by timeout and has not yet been verified as fully presenting gameplay.
 
 ### Missing items
 - Continue porting missing ARM64 JIT opcodes and backend behavior as runtime or parity audit exposes them.
-- Complete ARM64 backend parity audit against upstream Dynarmic beyond the currently exercised MK8D path.
 
 ### Binary layout verification
 - N/A: host AArch64 code emission and regalloc diagnostics only; no guest-visible raw struct layout or serialized payload changed.
@@ -15826,7 +15520,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read local Rust counterparts in `externals/rdynarmic/src/backend/arm64/emit_arm64_vector.rs`, `externals/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs`, `externals/rdynarmic/src/backend/arm64/emit_arm64.rs`, `externals/rdynarmic/src/backend/arm64/inst.rs`, and `externals/rdynarmic/src/backend/arm64/reg_alloc.rs`.
 - `cargo fmt -p rdynarmic --check` passes.
 - `cargo test -p rdynarmic encodes_known_arm64_words -- --nocapture` passes.
-- MK8D release run with isolated data/cache/config directories and `timeout -k 5s 120s` exits with timeout code 124, without the previous `VectorTranspose32` regalloc panic and without the previous missing `FPAbs32` error. The log reaches repeated `SurfaceFlinger` composition and continued guest `svc::MapMemory` calls.
 
 ## 2026-06-26 — externals/rdynarmic ARM64 scalar FPRoundInt parity vs externals/dynarmic/src/dynarmic
 
@@ -15838,11 +15531,9 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Unintentional differences (to fix)
 - `FPRoundInt16` remains unimplemented, matching upstream ARM64's current `ASSERT_FALSE("Unimplemented")` path.
-- ARM64 JIT opcode coverage remains incomplete relative to upstream Dynarmic outside the currently exercised MK8D path.
 
 ### Missing items
 - Continue runtime-driven and audit-driven ARM64 backend parity work until Apple Silicon runs games without JIT fallback failures.
-- Verify the visible presentation path end-to-end; the latest MK8D run reaches buffer queue/release and display 0 composition, but gameplay presentation has not been visually confirmed.
 
 ### Binary layout verification
 - N/A: host AArch64 code emission only; no guest-visible raw struct layout or serialized payload changed.
@@ -15853,7 +15544,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo fmt -p rdynarmic --check` passes.
 - `cargo test -p rdynarmic encodes_known_arm64_words -- --nocapture` passes.
 - `git -C externals/rdynarmic diff --check` passes.
-- MK8D release run with isolated data/cache/config directories and `timeout -k 5s 180s` exits with timeout code 124, without the previous `FPRoundInt32` missing-opcode failure. The log reaches `BQP_QUEUE #256`, `BQC_RELEASE #256`, repeated `SurfaceFlinger` composition on display 0 with one layer, and syncpoint increments beyond 800.
 
 ## 2026-06-26 — ruzu_cmd SDL2 Vulkan framebuffer layout and Vulkan present tracing vs yuzu_cmd/emu_window and video_core/renderer_vulkan
 
@@ -15870,7 +15560,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Missing items
 - Refactor Vulkan frontend ownership so `RendererVulkan`/`PresentManager` can mirror upstream references more directly, including surface recreation on `VK_ERROR_SURFACE_LOST_KHR`.
-- Continue visual/runtime validation beyond successful swapchain presentation; MK8D now reaches repeated `queue_present` success, but full gameplay correctness is not proven.
 
 ### Binary layout verification
 - N/A: frontend layout state and host Vulkan presentation diagnostics only; no guest-visible raw struct layout or serialized payload changed.
@@ -15882,7 +15571,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo fmt -p ruzu_cmd -p video_core` passes.
 - `cargo check -p ruzu_cmd -p video_core` passes.
 - `git diff --check` passes.
-- MK8D release run with isolated data/cache/config directories, `RUZU_TRACE_PRESENT=1`, and `timeout -k 5s 160s` exits with timeout code 124, without panic or missing-opcode failure. The log records 637 `Swapchain::Present ok` events and 637 `RendererVulkan::Composite exit` events, with `RendererVulkan::Composite draw ... swapchain=2560x1440 layout=2560x1440 image_count=3`.
 
 ## 2026-06-26 — video_core/src/renderer_vulkan/renderer_vulkan.rs diagnostic present dump vs video_core/renderer_vulkan/renderer_vulkan.cpp
 
@@ -15918,7 +15606,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - None for runtime behavior; this is diagnostic-only host logging.
 
 ### Missing items
-- Continue investigating why the current MK8D Apple Silicon run dequeues one preallocated buffer but does not reach `QueueBuffer` in the observed 240s run.
 
 ### Binary layout verification
 - N/A: host-side logging only; no guest-visible raw struct layout or serialized payload changed.
@@ -16013,7 +15700,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Missing items
 - Revalidate A32 page-table fastmem on Linux/x64 and remove the platform-specific default gate if it matches upstream behavior there.
 - Implement or explicitly rule out a true Apple Silicon fastmem arena strategy that can preserve guest 4 KiB granularity on a 16 KiB host page system.
-- Continue runtime validation past audio renderer startup until MK8D reaches layer queue/present on macOS/aarch64.
 
 ### Binary layout verification
 - N/A: JIT configuration policy only; no guest-visible raw struct layout or serialized payload changed.
@@ -16021,8 +15707,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Verification
 - Re-read upstream `core/arm/dynarmic/arm_dynarmic_32.cpp` around `ArmDynarmic32::MakeJit`, including `config.page_table`, `absolute_offset_page_table`, misalignment config, and `config.fastmem_pointer`.
 - Re-read local `core/src/arm/dynarmic/arm_dynarmic_32.rs` around A32 JIT configuration and page-table gating.
-- MK8D macOS/aarch64 run with `RUZU_A32_PAGE_TABLE_FASTMEM=1` for 75 seconds timed out without panic, produced `page_table_pointer=Some(...)`, avoided the previous `0x02003E2C` A32 memory hot loop, and progressed to `IAudioRendererManager::OpenAudioRenderer`, audio renderer initialization with `voices=96`, and `IAudioRenderer::Start`.
-- MK8D macOS/aarch64 run without `RUZU_A32_PAGE_TABLE_FASTMEM` for 35 seconds timed out without panic and produced `page_table_pointer=Some(...)` on all four A32 JIT cores, proving the Apple Silicon default path is active.
 
 ## 2026-06-26 — core/src/arm/dynarmic/arm_dynarmic_32.rs CNTPCT callback vs core/arm/dynarmic/dynarmic_cp15.cpp
 
@@ -16044,7 +15728,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo fmt -p core --check` passes.
 - `git diff --check` passes.
 - `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
-- MK8D macOS/aarch64 direct run for 35 seconds timed out without panic; the previous default `[A32_CNTPCT]` log is absent, and the run still reaches nvdrv GPU initialization plus `SurfaceFlinger` composition on display 0.
 
 ## 2026-06-26 — core/src/hle/service/nvnflinger/surface_flinger.rs hot-path compose diagnostics vs core/hle/service/nvnflinger/surface_flinger.cpp
 
@@ -16067,7 +15750,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `git diff --check` passes.
 - `cargo check -p core` passes with existing workspace warnings.
 - `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
-- MK8D macOS/aarch64 direct run for 25 seconds timed out without panic; `[SF_COMPOSE]` was absent from the rebuilt release log by default.
 
 ## 2026-06-26 — core/src/hle/service/vi/conductor.rs hot-path vsync diagnostics vs core/hle/service/vi/conductor.cpp
 
@@ -16091,7 +15773,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `git diff --check` passes.
 - `cargo check -p core` passes with existing workspace warnings.
 - `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
-- MK8D macOS/aarch64 direct run for 25 seconds timed out without panic; `[SC_CB]`, `[VSYNC_THREAD]`, and `[VSYNC]` were absent from the rebuilt release log by default.
 
 ## 2026-06-26 — core/src/hle/service/nvdrv/nvdrv.rs hot-path ioctl diagnostics vs core/hle/service/nvdrv/nvdrv.cpp
 
@@ -16114,7 +15795,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `git diff --check` passes.
 - `cargo check -p core` passes with existing workspace warnings.
 - `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
-- MK8D macOS/aarch64 direct run for 25 seconds timed out without panic; `[NVDRV_IOCTL1]` was absent from the rebuilt release log by default.
 
 ## 2026-06-26 — core/src/arm/dynarmic/arm_dynarmic_32.rs JIT config diagnostic vs core/arm/dynarmic/arm_dynarmic_32.cpp
 
@@ -16137,7 +15817,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `git diff --check` passes.
 - `cargo check -p core` passes with existing workspace warnings.
 - `cargo build --release --bin ruzu-cmd` passes with existing workspace warnings.
-- MK8D macOS/aarch64 direct run for 12 seconds timed out without panic; `ArmDynarmic32: page_table_pointer=...` was absent from the rebuilt release log by default.
 
 ## 2026-06-26 — externals/rdynarmic/src/backend/arm64/emit_arm64_a64.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a64.cpp
 
@@ -19807,12 +19486,10 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Unintentional differences (to fix)
 - `frontend/structured_control_flow.rs` does not faithfully port upstream `TranslatePass`. It can produce an `If` node immediately after `EndIf` without the upstream merge `Block`, which makes normal SPIR-V traversal hit a detached `OpSelectionMerge`. The correct fix is a faithful `BuildASL`/`TranslatePass` port that creates merge/header/continue blocks and materializes `VisitExpr` into the current IR block.
-- Storage buffer loads remain structurally incomplete in `emit_spirv_memory.rs`; `LoadStorage128` is still not dispatched/implemented and MK8D reaches this missing opcode after the current shader fixes.
 - `ImageSampleDrefImplicitLod` / explicit dref are now emitted for the main sampled-image path, but bias/lod-clamp/offset/sparse handling is still incomplete compared with upstream `ImageOperands`.
 
 ### Missing items
 - Faithful SPIR-V structured-control traversal is only partially ported. `DefineMain` now allocates labels, traverses `syntax_list`, emits branches/merge instructions, and emits `Phi`/`ConditionRef`, but it depends on a faithful ASL producer that is not yet present.
-- Missing or incomplete SPIR-V opcode coverage observed while running MK8D: storage-buffer loads (`LoadStorage128` first), full image operands, and broader storage/global memory ops.
 - `PatchPhiNodes`/`DeferredOpPhi` is not fully mirrored. Current Rust resolves PHI operands at emit time after pre-emitting PHI first in each block; a stricter port should reserve/patch PHI operands like upstream.
 
 ### Binary layout verification
@@ -19823,14 +19500,11 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `EmitImageSampleDrefImplicitLod` / `EmitImageSampleDrefExplicitLod` in `shader_recompiler/backend/spirv/emit_spirv_image.cpp`.
 - Re-read upstream `EmitFPClamp32` in `shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp` and `EmitCompositeConstructF32x3` in `shader_recompiler/backend/spirv/emit_spirv_composite.cpp`.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D normal structured run no longer hits the original invalid `mix` path first, but now exposes the ASL/TranslatePass divergence as `DetachedInstruction(OpSelectionMerge)` on `VertexB base_AF5980 hash_4F9AE8F67223BFDA`.
-- MK8D diagnostic run with `RUZU_SHADER_FORCE_LINEAR_SYNTAX=1` progresses past the earlier `ImageGather`, `ImageQuery`, invalid-select, missing `FPClamp32`, missing `CompositeConstructF32x3`, and missing `ImageSampleDrefImplicitLod` blockers, reaching `submit#1024` before exposing the next missing storage-buffer opcode (`LoadStorage128`).
 
 ## 2026-07-03 — video_core/src/renderer_vulkan/render_pass_cache.rs and graphics_pipeline.rs vs video_core/renderer_vulkan/vk_render_pass_cache.cpp and vk_graphics_pipeline.cpp
 
 ### Intentional differences
 - Rust still uses classic `VkRenderPass`/`VkFramebuffer` objects while upstream has moved more work toward dynamic-rendering style helpers in adjacent paths. This slice follows upstream `RenderPassCache::Get` and `CreateGraphicsPipeline` behavior within the existing Rust render-pass backend.
-- Diagnostic-only traces remain env-gated (`RUZU_TRACE_VK_VERTEX_INPUT`, `RUZU_TRACE_VK_TEXTURE_UPLOAD`, `RUZU_DUMP_VK_PRESENT_SOURCE_FRAME`) to inspect MK8D black-frame state. They do not change behavior unless explicitly enabled.
 
 ### Unintentional differences (to fix)
 - No remaining difference for render-pass color attachment slot ownership in this slice. Rust now preserves upstream RT slot indices in `pColorAttachments`, uses `VK_ATTACHMENT_UNUSED` for holes, and compacts only the framebuffer attachment array.
@@ -19838,7 +19512,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Missing items
 - The broader Vulkan backend is still not fully upstream-faithful: compute dispatch is stubbed in `renderer_vulkan/mod.rs::dispatch_compute`, and `PipelineCache::current_compute_pipeline` returns `None`.
-- MK8D remains black after this slice. Verified draws reach the 1920x1080 backbuffers with plausible fullscreen vertex/index data and non-fallback descriptors, but the presented source image is still all zero. Current evidence points beyond render-pass slotting/blend state into shader opcode coverage, compute, or upstream-incomplete descriptor/image semantics.
 
 ### Binary layout verification
 - N/A: Vulkan pipeline/render-pass state only; no guest ABI or raw-copied structure changed.
@@ -19847,7 +19520,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `RenderPassCache::Get` in `video_core/renderer_vulkan/vk_render_pass_cache.cpp`: it iterates all eight color formats, stores `VK_ATTACHMENT_UNUSED` for invalid slots, increments `num_attachments` to `index + 1` for valid slots, and compacts only actual attachment descriptions.
 - Re-read upstream `CreateGraphicsPipeline` in `video_core/renderer_vulkan/vk_graphics_pipeline.cpp`: it creates `cb_attachments` up to `NumAttachments(key.state)`, derives `colorWriteMask` from each attachment mask, and uses each attachment's blend factors/equations.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D verification command: `RUST_LOG=info timeout 30s target/release/ruzu-cmd -g "/Users/vricosti/Games/Emulators/Switch/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"` runs without Rust pipeline creation failures, but the dumped present source and final frame are still fully black (`nonzero 0`).
 
 ## 2026-07-03 — shader_recompiler/src/backend/spirv/spirv_emit_context.rs and emit_spirv_context_get_set.rs vs shader_recompiler/backend/spirv/spirv_emit_context.cpp and emit_spirv_context_get_set.cpp
 
@@ -19872,7 +19544,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Added `fragment_position_load_declares_frag_coord_input`, which asserts a fragment shader loading `Position.W` declares the input as `BuiltIn FragCoord` and not `BuiltIn Position`.
 - `cargo test -p shader_recompiler fragment_position_load_declares_frag_coord_input -- --nocapture` passes.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D SPIR-V dump for `stage5_base_010F80` now contains `OpDecorate %gl_FragCoord BuiltIn FragCoord` and loads `Position.W` from `%gl_FragCoord`; the previous `1 / 0` sequence is gone. MK8D is still black, so this fixed a real shader bug but not the remaining final-blit failure.
 
 ## 2026-07-03 — video_core/src/host1x/{host1x.rs,nvdec.rs,vic.rs,codecs/*} vs video_core/host1x/{host1x.*,nvdec.*,vic.*,codecs/*}
 
@@ -19880,7 +19551,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust passes the Host1x GMMU as `Arc<parking_lot::Mutex<MemoryManager>>` instead of C++ references/pointers. This preserves the upstream owner (`Host1x::GMMU()`) while adapting lifetime and synchronization to the current Rust service/device ownership.
 
 ### Unintentional differences (to fix)
-- No remaining difference for NVDEC/VIC guest-memory ownership in this slice. Rust now routes decoder and VIC reads/writes through the Host1x GMMU, matching upstream `host1x.GMMU()`. The previous Rust path used the GPU SMMU/`MaxwellDeviceMemoryManager`, which rejected low video addresses and caused `failed to read picture`, `failed to read ConfigStruct`, and `Unmapped Device ReadBlock` during MK8D video playback.
 
 ### Missing items
 - Broader Host1x/NVDEC/VIC parity remains incomplete outside this memory-owner slice, including exact hardware-decoder selection and remaining codec/VIC edge cases.
@@ -19892,7 +19562,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream Host1x/NVDEC/VIC construction and decode flow: decoder paths are handed `host1x.GMMU()` rather than the GPU SMMU.
 - `rg` confirms Host1x codecs/VIC no longer call `smmu_read_block`/`smmu_write_block` or depend on `MaxwellDeviceMemoryManager` for video frame/config reads.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D no longer logs `failed to read picture`, `failed to read ConfigStruct`, or `Unmapped Device ReadBlock` after this slice.
 
 ## 2026-07-03 — shader_recompiler/src/backend/spirv/{spirv_emit_context.rs,emit_spirv_context_get_set.rs} vs shader_recompiler/backend/spirv/{spirv_emit_context.cpp,emit_spirv_context_get_set.cpp}
 
@@ -19914,12 +19583,10 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `EmitGetAttribute` in `emit_spirv_context_get_set.cpp`.
 - Re-read upstream `CastAttributeType`/`MakeRuntimeInfo` in `video_core/renderer_vulkan/vk_pipeline_cache.cpp`.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D no longer emits MoltenVK `Vertex attribute type mismatch`/pipeline initialization failures after this slice.
 
 ## 2026-07-03 — video_core/src/host1x/ffmpeg/ffmpeg_shim.c vs video_core/host1x/ffmpeg/ffmpeg.cpp
 
 ### Intentional differences
-- Rust keeps upstream's H264 software special path as the first attempt, but falls back from `avcodec_send_frame`/`avcodec_receive_packet` to packet-based software decode when the host FFmpeg returns `AVERROR(EINVAL)`. Current Homebrew FFmpeg on macOS rejects the upstream software decoder `send_frame` call with `Invalid argument`; without the fallback MK8D video decode never produces usable frames. This is a host-library compatibility adaptation, not a replacement scheduler/decoder architecture.
 
 ### Unintentional differences (to fix)
 - No remaining difference for the successful upstream path: when `avcodec_send_frame` does not return `AVERROR(EINVAL)`, Rust preserves upstream send/receive behavior.
@@ -19934,7 +19601,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `DecoderContext::SendPacket`/receive logic in `video_core/host1x/ffmpeg/ffmpeg.cpp`.
 - Re-read upstream preferred GPU decoder list and confirmed VideoToolbox is not part of the upstream selection.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D no longer logs `FFmpeg::DecoderContext::send_packet: Invalid argument`; remaining `EAGAIN` receive events are packet-order/availability events, not the previous hard send failure.
 
 ## 2026-07-03 — video_core/src/renderer_vulkan/scheduler.rs and mod.rs vs video_core/renderer_vulkan/vk_scheduler.cpp and vk_rasterizer.cpp
 
@@ -19947,7 +19613,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Missing items
 - The broader scheduler is still not fully upstream-faithful: Rust direct-records several graphics commands instead of recording the entire draw path through `Scheduler::Record`, and does not implement upstream's worker-thread chunk submission model.
-- MK8D remains black after these ordering/barrier fixes; forced clear after draw proves the render target/present path can write, while a forced constant fragment sample still presented black, pointing to remaining draw/rasterization or earlier intermediate-pass issues.
 
 ### Binary layout verification
 - N/A: Vulkan command scheduling only; no guest ABI or raw-copied structure changed.
@@ -19956,7 +19621,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `Scheduler::SubmitExecution` in `video_core/renderer_vulkan/vk_scheduler.cpp`: it records a `VkMemoryBarrier` with `srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT`, `dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT`, stage `TRANSFER -> ALL_COMMANDS`, then ends upload/render command buffers and submits.
 - Re-read upstream `RasterizerVulkan::PrepareDraw` and `GraphicsPipeline::ConfigureDraw`: render pass request happens inside pipeline configure before `UpdateDynamicStates` and before the recorded draw.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D present-source dump after this slice is still fully black (`nonzero 0`).
 
 ## 2026-07-03 — shader_recompiler/src/backend/spirv/emit_spirv_special.rs and spirv_emit_context.rs vs shader_recompiler/backend/spirv/emit_spirv_special.cpp and emit_spirv.cpp
 
@@ -19969,7 +19633,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Missing items
 - `SetFixedPipelinePointSize`, default generic varying initialization, fragment `AlphaTest`, `EmitEmitVertex`, and `EmitEndPrimitive` remain incomplete compared with upstream `emit_spirv_special.cpp`.
-- MK8D's observed final vertex shader did not set `convert_depth_mode`, so this fixes a real backend parity gap but did not change the current black-frame result.
 
 ### Binary layout verification
 - N/A: SPIR-V emission only; no guest ABI or raw-copied structure changed.
@@ -19978,7 +19641,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `EmitPrologue`, `EmitEpilogue`, and `ConvertDepthMode` in `shader_recompiler/backend/spirv/emit_spirv_special.cpp`.
 - Re-read upstream SPIR-V main emission path to confirm prologue/epilogue opcodes are real emitted instructions, not no-ops.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D present-source dump after this slice is still fully black (`nonzero 0`).
 
 ## 2026-07-03 — video_core/src/renderer_vulkan/buffer_cache.rs and mod.rs vs video_core/renderer_vulkan/vk_buffer_cache.cpp and vk_graphics_pipeline.cpp
 
@@ -19991,7 +19653,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Missing items
 - Full upstream ownership is still missing: Rust does not yet port the complete `VideoCommon::BufferCache<P>` host binding aggregation before calling the Vulkan runtime, and still handles vertex/index binding from `renderer_vulkan/mod.rs`.
 - The index-buffer path still direct-binds from the reduced backend and has not been compared as a full `BufferCacheRuntime::BindIndexBuffer` port in this slice.
-- MK8D remains black after this fix. `image_id=1` is nonzero, but the presented backbuffer source remains all zero, so the remaining fault is after intermediate rendering and before/inside the final backbuffer writes.
 
 ### Binary layout verification
 - N/A: Vulkan command binding only; no guest ABI or raw-copied structure changed.
@@ -20000,8 +19661,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `BufferCacheRuntime::BindVertexBuffer` and `BindVertexBuffers` in `video_core/renderer_vulkan/vk_buffer_cache.cpp`: when extended dynamic state is supported, upstream records `BindVertexBuffers2EXT` with offsets, sizes, and strides; otherwise it falls back to `BindVertexBuffers`.
 - Re-read upstream `GraphicsPipeline::ConfigureImpl` in `video_core/renderer_vulkan/vk_graphics_pipeline.cpp`: buffer-cache host geometry binding happens before render-target update and draw configuration.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D verification with `RUZU_DUMP_VK_PRESENT_SOURCE_FRAME=/tmp/ruzu_mk8d_finalturn_present.ppm RUZU_DUMP_VK_PRESENT_SOURCE_AT=3 timeout 10s target/release/ruzu-cmd -g ...` still dumps a fully black present source (`nonzero 0`).
-- MK8D diagnostic dump of `image_id=1` remains nonzero (`nonzero 1071119`), confirming intermediate rendering contains data while final presentation source is black.
 
 ## 2026-07-03 — shader_recompiler/src/pipeline_cache.rs and video_core/src/renderer_vulkan/{fixed_pipeline_state.rs,graphics_pipeline.rs} vs shader_recompiler/frontend/maxwell/structured_control_flow.cpp and video_core/renderer_vulkan/{fixed_pipeline_state.cpp,vk_pipeline_cache.cpp}
 
@@ -20015,7 +19674,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Missing items
 - `RuntimeInfo` hashing is intentionally limited to fields currently carried by the Rust `RuntimeInfo`; any future runtime field that affects emission must be added to the hash at the same time it is ported.
-- Broader shader/frontend parity gaps remain documented in earlier entries, including incomplete special-op emission paths unrelated to this MK8D final-blit depth conversion.
 
 ### Binary layout verification
 - N/A: shader IR/SPIR-V and Vulkan fixed-pipeline state only; no raw-copied guest ABI payload changed.
@@ -20028,7 +19686,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p shader_recompiler pipeline_cache::tests::pipeline_cache_keys_runtime_info_that_affects_emission` passes.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::graphics_pipeline::tests::runtime_info_convert_depth_mode_tracks_fixed_pipeline_ndc_mode` passes.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D run with SPIR-V/present-source dumps now emits the vertex epilogue conversion (`gl_Position.z = (z + w) * 0.5`) in `stage1_base_010A80`, and `/tmp/ruzu_mk8d_epilogue.ppm` is no longer black (`385161` non-black pixels, bbox `x[211..1707] y[322..755]`). The captured frame shows the Mario Kart 8 Deluxe logo.
 
 ## 2026-07-03 — core/src/hle/service/am/service/library_applet_creator.rs vs core/hle/service/am/service/library_applet_creator.{h,cpp}
 
@@ -20039,7 +19696,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Unintentional differences (to fix)
 - The guest applet path (`CreateGuestApplet` with `CreateProcess(system, program_id, Firmware1400, Firmware1700)`) is not ported in this slice. Rust currently falls through to the frontend path, matching upstream only when frontend applet mode is not LLE or guest process creation fails.
-- Rust does not store a concrete `frontend` object on `Applet`, so later `ILibraryAppletAccessor::Start`, `PushInteractiveInData`, and exit paths cannot call `FrontendExecute*` yet. This is the next AM parity prerequisite if MK8D proceeds into the Mii/profile applet flow.
 - `ShouldCreateGuestApplet` is represented with the same applet-id list but without settings-backed per-applet mode values. It currently treats all listed applets as frontend/HLE applets.
 
 ### Missing items
@@ -20091,7 +19747,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Unintentional differences (to fix)
 - No remaining difference for queue host synchronization in this slice. Rust now locks the shared submit mutex around scheduler `queue_submit`, present-manager copy/blit `queue_submit`, and swapchain `queue_present`, matching upstream `std::scoped_lock scheduler.submit_mutex` in `PresentManager::CopyToSwapchainImpl` and `Swapchain::Present`.
-- The MK8D black-window symptom is not proven fixed by this synchronization change. Internal readback diagnostics performed before this DIFF entry showed the frame image and swapchain image contained the MK8D logo before `vkQueuePresentKHR`, so remaining black-window investigation is in the SDL/Cocoa/Metal visible-surface path or macOS capture/foreground behavior rather than guest rendering or swapchain copy contents.
 
 ### Missing items
 - Upstream scheduler still has broader `MasterSemaphore`/worker-thread semantics not fully represented by the current simplified Rust scheduler. This entry covers only queue submit/present host synchronization.
@@ -20128,7 +19783,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo test -p rdynarmic backend::arm64::fast_hash::tests::composite_keys_mix_all_writes` passes.
 - `cargo check -p rdynarmic` passes.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D non-profiled run after gating diagnostics: `RUST_LOG=info timeout 130s ./target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, has no JIT profile lines, reaches `BQP_QUEUE #4096` at ~100.55s and `SP_TRACE submit#8192` at ~100.50s. The comparable run before gating/fast-hash reached only `BQP_QUEUE #2048` at ~122.15s.
 
 ## 2026-07-03 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h, video_core/renderer_vulkan/vk_texture_cache.*, video_core/vulkan_common/vulkan_device.*
 
@@ -20169,10 +19823,7 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Verification
 - Re-read upstream `yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp`: window creation, WM-info lookup, `SDL_Metal_CreateView`, `SDL_Metal_GetLayer`, `OnResize`, `OnMinimalClientAreaChangeRequest`, and `SDL_PumpEvents` ordering is preserved.
-- MK8D diagnostics before this entry proved `RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_present_late.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800` captures a non-black 2560x1440 Mario Kart 8 Deluxe logo, so the black-window symptom is not caused by guest rendering or final framebuffer composition.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes after the macOS window raise/show adaptation.
-- MK8D verification after this entry: `RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_raise_present.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 timeout 75s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, reaches `BQP_QUEUE #2048` / `BQC_RELEASE #2048`, and dumps a non-black 2560x1440 Mario Kart 8 Deluxe logo.
-- MK8D verification after adding `finishLaunching`/`unhide`: `RUZU_TRACE_PRESENT=1 RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_appkit_finish.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 timeout 75s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, continuously reports `Swapchain::AcquireNextImage ok` / `Swapchain::Present ok`, and dumps a non-black frame (`2560x1440`, `nonblack=2140125`, bbox `x[37..2559] y[0..1439]`).
 - Pinball non-regression after this entry: `RUST_LOG=info timeout 35s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` exits by timeout, opens/starts the audio renderer, and reaches `BQP_QUEUE #1024` / `BQC_RELEASE #1024` without crash.
 
 ## 2026-07-03 — ruzu_cmd/src/{main.rs,emu_window/emu_window_sdl2_vk.rs} vs yuzu_cmd/{yuzu.cpp,emu_window/emu_window_sdl2_vk.cpp}
@@ -20194,7 +19845,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `yuzu.cpp`: after `system.Run()`, the main thread stays in `while (emu_window->IsOpen()) { emu_window->WaitEvent(); }`.
 - Re-read upstream `emu_window_sdl2_vk.cpp`: Vulkan window initialization still matches the default Rust `wait_event` path; the new polling method is not used unless the diagnostic environment variable is set.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D diagnostic with `RUZU_POLL_EVENTS_LOOP=1 RUZU_TRACE_PRESENT=1 RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_poll_window.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 timeout 85s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` reaches frame 1800 at ~40.4s, dumps a non-black frame (`2560x1440`, `nonblack=2140125`, bbox `x[37..2559] y[0..1439]`), and continues presenting through frame 3959 before a later SIGSEGV. The late crash is not resolved by this frontend diagnostic.
 
 ## 2026-07-03 — ruzu_cmd/src/emu_window/emu_window_sdl2_vk.rs vs yuzu/{qt_common.cpp,yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp}
 
@@ -20216,8 +19866,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp`: the command-line Vulkan frontend passes `SDL_Metal_GetLayer(SDL_Metal_CreateView(render_window))` as the render surface.
 - Re-read upstream `yuzu/qt_common.cpp`: the Qt frontend checks whether the native view's layer is a `CAMetalLayer`, creates one if necessary, sets `wantsLayer`, and uses that layer as `render_surface`.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D validation after this entry: `unset VK_ICD_FILENAMES; RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_metal_present.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 RUZU_DUMP_SWAPCHAIN_FRAME=/tmp/ruzu_mk8d_metal_swapchain.ppm RUZU_DUMP_SWAPCHAIN_FRAME_AT=1800 timeout 75s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, logs no non-`CAMetalLayer` error, and both dumps are non-black `2560x1440` frames (`nonblack=2140125`, bbox `x[37..2559] y[0..1439]`).
-- MK8D no-readback progress validation after this entry: `unset VK_ICD_FILENAMES; RUST_LOG=info target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` was sampled/killed after 35s and reached `submit#2048` at ~26.3s without relying on `RUZU_DUMP_PRESENT_FRAME` or `RUZU_DUMP_SWAPCHAIN_FRAME`.
 
 ## 2026-07-03 — ruzu_cmd/src/emu_window/emu_window_sdl2_vk.rs vs yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp
 
@@ -20238,8 +19886,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp`: window flags are `SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI`, and the Metal layer is created later with `SDL_Metal_CreateView`.
 - Re-read local SDL 2.0.37 source: `SDL_Metal_CreateView` marks an existing window as `SDL_WINDOW_METAL` and clears `SDL_WINDOW_VULKAN` if needed; creating the window with `SDL_WINDOW_METAL` avoids that late transition.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D no-readback progress validation: `unset VK_ICD_FILENAMES; RUST_LOG=info target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` was sampled/killed after 35s and reached `submit#2048` at ~27.9s with no non-`CAMetalLayer` error.
-- MK8D swapchain validation: `unset VK_ICD_FILENAMES; RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_metalflag_present.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 RUZU_DUMP_SWAPCHAIN_FRAME=/tmp/ruzu_mk8d_metalflag_swapchain.ppm RUZU_DUMP_SWAPCHAIN_FRAME_AT=1800 timeout 75s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, and both dumps are non-black `2560x1440` frames (`nonblack=2140125`, bbox `x[37..2559] y[0..1439]`).
 - Pinball non-regression: `unset VK_ICD_FILENAMES; RUST_LOG=info timeout 30s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` exits by timeout, loads the SDK Vulkan loader through the SDK ICD, opens/starts the audio renderer, and reports no Vulkan initialization failure.
 
 ## 2026-07-03 — ruzu_cmd/src/emu_window/emu_window_sdl2_vk.rs vs yuzu/{qt_common.cpp,yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp}
@@ -20262,7 +19908,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `yuzu/qt_common.cpp`: the Qt frontend ensures the native view's layer is a `CAMetalLayer` before assigning `render_surface`.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
 - Trace validation: `RUZU_TRACE_MACOS_WINDOW=1 RUST_LOG=info timeout 8s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` logs `visible=true`, `miniaturized=false`, `drawable=2560x1440`, and `contents_scale=2`.
-- MK8D capture attempt: `RUZU_TRACE_MACOS_WINDOW=1 RUST_LOG=info target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` logs `visible=true`, `miniaturized=false`, `drawable=2560x1440`, reaches `submit#2048` at ~26s, but `screencapture -l <window_number>` fails with `could not create image from window`.
 ## 2026-07-03 — ruzu_cmd/src/emu_window/emu_window_sdl2.rs vs yuzu_cmd/emu_window/emu_window_sdl2.cpp
 
 ### Intentional differences
@@ -20300,8 +19945,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `vk_rasterizer.h`: `wfi_event` is owned by `RasterizerVulkan`.
 - Re-read upstream `query_cache/query_cache.h`: `QueryCacheBase::NotifyWFI` is the base hook used by Vulkan wait-for-idle.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D validation after this entry: `RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_wfi_fix.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 timeout 90s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` reaches `BQP_QUEUE #2048` at ~44.5s and dumps a non-black 2560x1440 Mario Kart 8 Deluxe logo. This is faster than the previous ~58s to the same queue point.
-- MK8D present-path validation after this entry: `RUZU_TRACE_PRESENT=1 RUST_LOG=info timeout 55s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` reaches continuous `Swapchain::AcquireNextImage ok`, `Swapchain::Present ok`, and `PresentManager::CopyToSwapchain presented` logs through `current_frame=2628`, proving the renderer submits non-error swapchain presents after the WFI change.
 - Pinball non-regression after this entry: `RUST_LOG=info timeout 35s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` opens and starts the audio renderer, reaches `BQP_QUEUE #1024` / `BQC_RELEASE #1024`, and exits only by timeout.
 
 ## 2026-07-03 — video_core/src/renderer_vulkan/{swapchain.rs,present_manager.rs,renderer_vulkan.rs} vs video_core/renderer_vulkan/{vk_swapchain.cpp,vk_present_manager.cpp,renderer_vulkan.cpp}
@@ -20315,7 +19958,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 
 ### Missing items
 - Full upstream ownership parity would store/reach the scheduler from `Swapchain` rather than threading it through present calls. The current implementation is behaviorally faithful for acquire ordering but remains an ownership adaptation.
-- `PresentManager::CopyToSwapchain` still recreates the existing surface via `swapchain.recreate(...)`; upstream recreates the platform surface after `VK_ERROR_SURFACE_LOST_KHR` with `CreateSurface(instance, render_window.GetWindowInfo())`. This is not exercised by the current MK8D/Pinball traces.
 
 ### Binary layout verification
 - N/A: Vulkan presentation scheduling only; no guest ABI or raw-copied payload changed.
@@ -20324,7 +19966,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `vk_swapchain.cpp`: `AcquireNextImage` waits the previous `resource_ticks[image_index]` through the scheduler and immediately replaces it with `scheduler.CurrentTick()`.
 - Re-read upstream `vk_present_manager.cpp`: `CopyToSwapchainImpl` loops on `swapchain.AcquireNextImage()` and recreates the swapchain on stale/suboptimal acquisition; Rust now passes the scheduler into the same acquisition point.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes after this change.
-- MK8D validation after this entry: `RUZU_TRACE_PRESENT=1 RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_swap_tick.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 timeout 70s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, remains actively presenting with `Swapchain::AcquireNextImage ok` / `Swapchain::Present ok`, and reaches `BQP_QUEUE #1024` at ~26.2s / `BQC_RELEASE #1024` at ~26.3s.
 - Pinball non-regression after this entry: `RUST_LOG=info timeout 30s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` opens and starts the audio renderer, reaches `BQP_QUEUE #1024` / `BQC_RELEASE #1024`, and exits only by timeout.
 
 ## 2026-07-03 — video_core/src/vulkan_common/vulkan_library.rs vs video_core/vulkan_common/vulkan_library.cpp
@@ -20347,8 +19988,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `vulkan_common/vulkan_library.cpp`: macOS checks only `LIBVULKAN_PATH`, bundled `libvulkan.1.dylib`, and bundled `libMoltenVK.dylib` through `Common::DynamicLibrary`.
 - Before this entry, loading `/Users/vricosti/Dev/emulators/VulkanSDK/1.4.350.1/macOS/lib/libvulkan.1.dylib` failed device creation because the loader could not enumerate `VK_EXT_metal_surface`.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D short validation: `unset VK_ICD_FILENAMES; RUST_LOG=info timeout 8s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` loads `/Users/vricosti/Dev/emulators/VulkanSDK/1.4.350.1/macOS/lib/libvulkan.1.dylib`, logs `Using Vulkan ICD manifest from /Users/vricosti/Dev/emulators/VulkanSDK/1.4.350.1/macOS/share/vulkan/icd.d/MoltenVK_icd.json`, and no longer reports missing `VK_EXT_metal_surface`.
-- MK8D frame validation: `unset VK_ICD_FILENAMES; RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_sdk_loader.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 timeout 75s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, dumps a non-black `2560x1440` frame (`nonblack=2140125`, bbox `x[37..2559] y[0..1439]`), and reports no Vulkan extension initialization failure.
 - Pinball non-regression: `unset VK_ICD_FILENAMES; RUST_LOG=info timeout 30s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` exits by timeout, loads the SDK Vulkan loader through the SDK ICD, opens/starts the audio renderer, and reports no Vulkan initialization failure.
 
 ## 2026-07-03 — video_core/src/renderer_vulkan/present_manager.rs vs video_core/renderer_vulkan/vk_present_manager.cpp
@@ -20370,7 +20009,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Verification
 - Re-read upstream `vk_present_manager.cpp`: `CopyToSwapchainImpl` transitions the swapchain image to transfer destination, blits/copies the `Frame` image into it, transitions it to `PRESENT_SRC_KHR`, then submits the present command buffer with the same wait/signal semaphores.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D swapchain validation: `unset VK_ICD_FILENAMES; RUST_LOG=info RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_present_1800.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 RUZU_DUMP_SWAPCHAIN_FRAME=/tmp/ruzu_mk8d_swapchain_1800.ppm RUZU_DUMP_SWAPCHAIN_FRAME_AT=1800 timeout 75s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout. Both dumps are `2560x1440`, `nonblack=2140125`, bbox `x[37..2559] y[0..1439]`, proving the image written to the acquired swapchain image is non-black at frame 1800.
 - Pinball non-regression with the diagnostic disabled: `unset VK_ICD_FILENAMES; unset RUZU_DUMP_SWAPCHAIN_FRAME; RUST_LOG=info timeout 30s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` exits by timeout, loads the SDK Vulkan loader through the SDK ICD, opens/starts the audio renderer, and reports no Vulkan initialization failure.
 
 ## 2026-07-03 — ruzu_cmd/src/emu_window/emu_window_sdl2_vk.rs vs yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp
@@ -20394,9 +20032,7 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `yuzu/qt_common.cpp`: the Qt frontend uses Cocoa window-system type, verifies/replaces the native view layer with a `CAMetalLayer`, and relies on Qt/AppKit native window setup rather than command-line SDL ordering.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
 - Pinball non-regression: `unset VK_ICD_FILENAMES RUZU_DUMP_PRESENT_FRAME RUZU_DUMP_SWAPCHAIN_FRAME RUZU_TRACE_PRESENT RUZU_TRACE_MACOS_WINDOW; RUST_LOG=info timeout 25s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` exits by timeout, loads the SDK Vulkan loader through the SDK ICD, opens/starts the audio renderer, and reports no Vulkan initialization failure.
-- MK8D validation: `unset VK_ICD_FILENAMES RUZU_DUMP_PRESENT_FRAME RUZU_DUMP_SWAPCHAIN_FRAME RUZU_TRACE_PRESENT RUZU_TRACE_MACOS_WINDOW; RUST_LOG=info timeout 70s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, loads the SDK Vulkan loader through the SDK ICD, creates a `2560x1440` FIFO swapchain, starts the audio renderer at ~2.5s, and reaches `submit#2048` at ~26.3s.
 - AppKit diagnostic validation: `RUZU_TRACE_MACOS_WINDOW=1 timeout 6s target/release/ruzu-cmd -g /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` logs the same pointer for `layer` and `view_layer`, `layer_matches_view=true`, `drawable=2560x1440`, and `contents_scale=2`. In this terminal-launched session the window still reports `key=false main=false`, so activation parity with a bundled app is not proven.
-- MK8D swapchain visual validation after the AppKit changes: `RUZU_DUMP_PRESENT_FRAME=/tmp/ruzu_mk8d_current_present.ppm RUZU_DUMP_PRESENT_FRAME_AT=1800 RUZU_DUMP_SWAPCHAIN_FRAME=/tmp/ruzu_mk8d_current_swapchain.ppm RUZU_DUMP_SWAPCHAIN_FRAME_AT=1800 timeout 75s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout; both dumps are `2560x1440`, `nonblack=2140125`, bbox `x[37..2559] y[0..1439]`, and the swapchain PNG shows the full Mario Kart 8 Deluxe logo.
 
 ## 2026-07-03 — scripts/run_ruzu_cmd_app_macos.sh vs yuzu app-bundle launch path
 
@@ -20418,7 +20054,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `yuzu_cmd/emu_window/emu_window_sdl2_vk.cpp`: command-line SDL creates `SDL_Metal_GetLayer(SDL_Metal_CreateView(render_window))`, but upstream's working GUI path is `yuzu.app`, not an unbundled Rust CLI binary.
 - Re-read upstream `yuzu/qt_common.cpp`: the Qt app-bundle path uses Cocoa window-system info and a `CAMetalLayer`, relying on normal app-bundle/LaunchServices activation.
 - Pinball LaunchServices validation: `RUZU_APP_LOG=/tmp/ruzu_pinball_app5.log timeout 12s scripts/run_ruzu_cmd_app_macos.sh /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` creates/launches `target/release/ruzu-cmd.app`, writes logs through `open --stdout/--stderr`, creates a `2560x1440` Vulkan swapchain, and starts the audio renderer.
-- MK8D LaunchServices validation: `RUZU_APP_LOG=/tmp/ruzu_mk8d_app_ls.log timeout 90s scripts/run_ruzu_cmd_app_macos.sh "...Mario Kart 8 Deluxe..."` creates a `2560x1440` FIFO swapchain, starts the audio renderer at ~3.6s, reaches `submit#2048` at ~34.9s and `submit#4096` at ~57.8s.
 - AppKit activation validation: `RUZU_TRACE_MACOS_WINDOW=1 RUZU_APP_LOG=/tmp/ruzu_pinball_app_trace.log timeout 8s scripts/run_ruzu_cmd_app_macos.sh /Users/vricosti/Dev/emulators/SpaceCadetPinball-NX/build/SpaceCadetPinball.nro` logs `key=true main=true`, `layer_matches_view=true`, and `drawable=2560x1440` under LaunchServices. The same diagnostic under direct CLI launch logged `key=false main=false`, proving the remaining visible-window issue was launch-lifecycle related rather than a Vulkan swapchain-content issue.
 
 ## 2026-07-03 — core/src/core.rs, core/src/hle/kernel/kernel.rs, video_core/src/gpu.rs, ruzu_cmd/src/emu_window/emu_window_sdl2.rs vs core/core.cpp, core/hle/kernel/kernel.cpp, video_core/gpu.cpp, yuzu_cmd/emu_window/emu_window_sdl2.cpp
@@ -20454,7 +20089,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Intentional differences
 - Rust still stores Vulkan texture-cache runtime state in the split `TextureCacheRuntime` / `TextureCache` backend rather than upstream's templated `TextureCache<P>` owning `Vulkan::Sampler` directly in `slot_samplers`. The sampler creation behavior is kept in the Vulkan texture-cache owner and remains traceable to upstream `Vulkan::Sampler::Sampler`.
 - Rust passes `custom_border_color_supported` from the renderer/device setup into `TextureCacheRuntime` because the current constructor receives raw `ash::Device` handles rather than the full upstream `Vulkan::Device` object.
-- Diagnostic-only draw skipping and texture/present dump environment hooks remain in the renderer while MK8D is being investigated. They are gated by `RUZU_*` environment variables and do not change default rendering behavior.
 
 ### Unintentional differences (to fix)
 - None for sampler border-color fallback: Rust now matches upstream by using `VK_BORDER_COLOR_FLOAT_CUSTOM_EXT` and `VkSamplerCustomBorderColorCreateInfoEXT` only when custom border colors are supported; otherwise it uses the upstream `ConvertBorderColor` fallback.
@@ -20475,7 +20109,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo test -p video_core convert_border_color_matches_upstream_fallback --lib` passes.
 - `cargo test -p video_core image_usage_flags_use_resolved_format_info_storage_bit --lib` passes.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D validation without disabling accelerated Vulkan display: `RUST_LOG=info RUZU_TRACE_VK_PRESENT=1 RUZU_DUMP_VK_PRESENT_SOURCE_FRAME=/tmp/ruzu_mk8d_border_check/source.ppm RUZU_DUMP_VK_PRESENT_SOURCE_AT=150 RUZU_DUMP_VK_PRESENT_EXTRA_GPU=0x524C10000 RUZU_DUMP_VK_PRESENT_EXTRA_FRAME=/tmp/ruzu_mk8d_border_check/hdr.ppm timeout 12s target/release/ruzu-cmd -g "...Mario Kart 8 Deluxe..."` exits by timeout, logs repeated `AccelerateDisplay hit` for 1920x1080 A8B8G8R8Unorm views, and dumps non-black present/HDR frames.
 - Direct VulkanSDK/MoltenVK format-property query on this machine reports `A2B10G10R10_UNORM_PACK32` and `A2B10G10R10_UINT_PACK32` support `SAMPLED_IMAGE | TRANSFER_DST | TRANSFER_SRC | COLOR_ATTACHMENT | STORAGE_IMAGE`, so the earlier hypothesis that MoltenVK rejects A2B10G10R10 storage usage is not true for the installed SDK/device.
 
 ## 2026-07-04 — video_core/src/renderer_vulkan/fixed_pipeline_state.rs vs video_core/renderer_vulkan/fixed_pipeline_state.h/cpp
@@ -20521,7 +20154,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `buffer_cache.h`: `BindHostGraphicsUniformBuffer` uses the stream-buffer path for small uniform buffers on Vulkan (`runtime.BindMappedUniformBuffer`, then `device_memory.ReadBlockUnsafe`) instead of relying on an address-stable cached buffer.
 - Re-read upstream `vk_graphics_pipeline.cpp`: `GraphicsPipeline::Configure` sets uniform-buffer state and calls `buffer_cache.UpdateGraphicsBuffers()` / `BindHostStageBuffers(stage)` before descriptor updates.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D regression: before this fix, the post-transition present dump had `maxsat=118 colored=595` and the isolated `RUZU_SKIP_VK_DRAW_RT=0x524C10000 RUZU_SKIP_VK_DRAW_GE=5` case had `maxsat=4 colored=0`, producing grayscale/white logo silhouettes. After forcing fresh uniform uploads, the normal post-transition dump reports `maxsat=247 colored=214970`, and the isolated draws 1+3 dump reports `maxsat=255 colored=197830`; visual inspection confirms the logo and lens flares remain colored.
 
 ## 2026-07-04 — video_core/src/buffer_cache/buffer_cache.rs, video_core/src/buffer_cache/buffer_cache_base.rs, video_core/src/renderer_vulkan/buffer_cache.rs, video_core/src/renderer_vulkan/graphics_pipeline.rs, video_core/src/renderer_vulkan/mod.rs vs video_core/buffer_cache/buffer_cache.h and video_core/renderer_vulkan/vk_buffer_cache.h/cpp
 
@@ -20552,7 +20184,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust now routes active graphics UBO descriptors through `VulkanCommonBufferCache::set_uniform_buffers_state`, `bind_graphics_uniform_buffer`, `update_graphics_buffers`, `bind_host_stage_buffers`, then consumes `UpdateDescriptorQueue::Buffer` entries for Vulkan descriptor writes. The old direct upload remains as a fallback if the common path does not produce an entry.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passed before the compute-UBO signature cleanup; a focused `cargo check -p video_core` passed after that cleanup.
-- MK8D 75-second Vulkan regression run with `RUZU_DUMP_VK_PRESENT_SOURCE_FRAME=/tmp/ruzu-buffer-cache-port2/present.ppm RUZU_DUMP_VK_PRESENT_SOURCE_EVERY=1000` reached 5000 presented frames without crash. Dumps stayed colored: `present_001000.ppm maxsat=255 colored=209328`, `present_002000.ppm maxsat=248 colored=208890`, `present_003000.ppm maxsat=255 colored=209368`, `present_004000.ppm maxsat=255 colored=209210`, `present_005000.ppm maxsat=224 colored=213777`.
 
 ## 2026-07-04 — buffer-cache review follow-up vs video_core/buffer_cache/buffer_cache.h and video_core/renderer_vulkan/vk_buffer_cache.cpp
 
@@ -20609,7 +20240,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ## 2026-07-04 — video_core/renderer_vulkan/pipeline_cache.rs and graphics_pipeline.rs vs renderer_vulkan/vk_pipeline_cache.cpp and vk_graphics_pipeline.cpp
 
 ### Intentional differences
-- Rust keeps live draw-path pipeline creation bound to the `TextureCache` framebuffer render pass passed by `RasterizerVulkan::draw`. A trial state-derived live render pass caused visibly wrong MK8D colors because the reduced Rust `FixedPipelineState -> RenderPassKey` path does not yet include the full upstream/device-aware framebuffer/render-pass model. The state-derived render-pass path is retained only for disk-preload reconstruction.
 - Rust serializes/deserializes `GraphicsPipelineKey` and `FixedPipelineState` with explicit little-endian field writes instead of raw `reinterpret_cast`/`std::memcmp` over C++ object bytes. This avoids relying on Rust layout before `TransformFeedbackState` is ported while preserving upstream field order for the represented prefix.
 - Disk-loaded graphics pipelines are still not queued for rebuild. Rust now owns upstream-shaped `workers` and `serialization_thread`, but the graphics/compute constructors are not yet split enough to safely run the actual builds through those workers.
 - Rust currently parses disk-loaded graphics keys/environments but does not insert the rebuilt graphics pipelines into `graphics_cache`. This is a temporary correctness guard: upstream inserts only pipelines produced by the full `CreateGraphicsPipeline` constructor, while Rust's disk path still uses a reduced state-only constructor that is not behaviorally equivalent and can produce incorrect live rendering if cached.
@@ -20639,15 +20269,12 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Re-read upstream `vk_graphics_pipeline.cpp`: `GraphicsPipeline` derives its render pass from `MakeRenderPassKey(key.state)` through `RenderPassCache`; `GraphicsPipeline::MakePipeline` also owns vertex bindings/divisors, topology/tessellation adjustment, viewport pNext chains, rasterization pNext chains, multisample/depth/blend state, dynamic state list, and final pipeline creation.
 - Rust now parses `vulkan.bin` through `load_pipelines`, reads graphics keys with explicit field order, skips reduced graphics preload insertion for correctness, and serializes newly compiled live graphics environments through `serialize_pipeline`.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D regression: using a state-derived render pass for live draws produced visibly wrong colors; after restoring live draw pipeline creation to use the `TextureCache` framebuffer render pass, frame 360 renders with normal colors again at `/tmp/ruzu-mk8d-color-restore-1783166012/frame_360.png`.
 - Added focused tests:
 - `cargo test -p video_core renderer_vulkan::graphics_pipeline::tests::state_vertex_input_keeps_upstream_binding_order_and_divisors -- --nocapture`
 - `cargo test -p video_core renderer_vulkan::graphics_pipeline::tests::state_dynamic_states_follow_upstream_extension_order -- --nocapture`
 - `cargo test -p video_core renderer_vulkan::pipeline_cache::tests::graphics_key_dynamic_features_filter_checks_all_upstream_flags -- --nocapture`
 - `cargo test -p video_core state_ -- --nocapture` also runs those tests, but currently exposes unrelated pre-existing failures in `renderer_opengl::gl_graphics_pipeline::tests::bind_draw_framebuffer_owns_upstream_state_tracker_bind_slice` and `shader_environment::tests::graphics_environment_reads_live_maxwell_state_after_construction`.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes after the state-only constructor updates.
-- MK8D frame 360 after these updates remains correctly colored at `/tmp/ruzu-mk8d-state-preload-1783167301/frame_360.png`; the first-logo delay is still present at ~10.5s, so the objective is not complete.
-- MK8D frame 120 after adding the full six-bit disk-cache dynamic-feature filter remains correctly colored at `/tmp/ruzu-mk8d-feature-filter-long-1783168123/frame_120.png`.
 
 ## 2026-07-04 — video_core/src/renderer_vulkan/pipeline_cache.rs vs video_core/renderer_vulkan/vk_pipeline_cache.cpp
 
@@ -20734,7 +20361,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Worker-backed preload statistics/progress and `vulkan_pipelines.bin` validation.
 
 ### Binary layout verification
-- FAIL: `load_pipelines` can parse the small Rust-regenerated MK8D cache after the runtime program-id fix, but the previous attempt to parse the larger yuzu-generated cache hit `invalid ShaderStage discriminant 1235222924`, indicating remaining cache binary-layout divergence. The destructive delete path is disabled until this is fixed.
 
 ## 2026-07-04 — video_core/src/renderer_vulkan/graphics_pipeline.rs + video_core/src/renderer_vulkan/pipeline_cache.rs vs video_core/renderer_vulkan/vk_graphics_pipeline.cpp + video_core/renderer_vulkan/maxwell_to_vk.cpp
 
@@ -20761,7 +20387,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pipeline_cache -- --nocapture` passes: 12 tests.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::graphics_pipeline::tests::disk_state_ -- --nocapture` passes: 3 tests.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D 12s run at `/tmp/ruzu_mk8d_color_guard_1783176656` logs `Total Pipeline Count: 312 (built=0, skipped=312)` and dumps color-correct `/tmp/ruzu_mk8d_color_guard_1783176656/present_000720.png`.
 
 ## 2026-07-04 — video_core/src/renderer_vulkan/graphics_pipeline.rs + video_core/src/renderer_vulkan/fixed_pipeline_state.rs + video_core/src/engines/draw_manager.rs + video_core/src/engines/maxwell_3d.rs vs video_core/renderer_vulkan/vk_graphics_pipeline.cpp + video_core/renderer_vulkan/fixed_pipeline_state.cpp/.h
 
@@ -20790,7 +20415,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pipeline_cache -- --nocapture` passes: 12 tests.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D 12s run at `/tmp/ruzu_mk8d_color_recheck_1783177851` logs `Total Pipeline Count: 350 (built=0, skipped=350)` and dumps color-correct `/tmp/ruzu_mk8d_color_recheck_1783177851/present_000720.png`; sampled dumps keep high saturation (`max_sat` around 238-243), so the previous black-and-white symptom is not reproduced on the default path.
 
 ## 2026-07-04 — video_core/src/renderer_vulkan/pipeline_cache.rs vs video_core/renderer_vulkan/vk_pipeline_cache.cpp
 
@@ -20851,7 +20475,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pipeline_cache -- --nocapture` passes: 13 tests.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D 12s run at `/tmp/ruzu_mk8d_fixed_state_full_1783180004` logs `Total Pipeline Count: 390 (built=0, skipped=390)` and dumps color-correct `/tmp/ruzu_mk8d_fixed_state_full_1783180004/present_000720.png`; sampled dumps keep high saturation (`max_sat` around 238-243).
 
 ## 2026-07-04 — video_core/src/renderer_vulkan/compute_pipeline.rs + video_core/src/renderer_vulkan/pipeline_cache.rs vs video_core/renderer_vulkan/vk_compute_pipeline.cpp/.h + video_core/renderer_vulkan/vk_pipeline_cache.cpp
 
@@ -20881,9 +20504,7 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pipeline_cache -- --nocapture` passes: 13 tests.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D 12s run at `/tmp/ruzu_mk8d_compute_preload_1783180549` remains stable and color-correct (`present_000720.ppm` max saturation 238). The local MK8D cache reports `Total Pipeline Count: 410 (built=0, skipped=410)`, so this run did not exercise an actual compute-cache entry.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D 12s run at `/tmp/ruzu_mk8d_state_recheck_1783179220` logs `Total Pipeline Count: 370 (built=0, skipped=370)` and dumps color-correct `/tmp/ruzu_mk8d_state_recheck_1783179220/present_000720.png`; sampled dumps keep high saturation (`max_sat` around 238-243).
 
 ## 2026-07-04 — video_core/src/renderer_vulkan/pipeline_cache.rs vs video_core/renderer_vulkan/vk_pipeline_cache.cpp
 
@@ -20912,7 +20533,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pipeline_cache -- --nocapture` passes: 13 tests.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo check -p video_core` passes.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D color investigation run `/tmp/ruzu_mk8d_color_weird_1783181198` dumps color-correct `/tmp/ruzu_mk8d_color_weird_1783181198/final_360.png` at about 10s/frame360; source/final saturation remains high (`maxsat` 241-255), so the internal Vulkan output did not reproduce the reported black-and-white/color-loss issue.
 
 ## 2026-07-04 — video_core/src/renderer_vulkan/graphics_pipeline.rs + video_core/src/renderer_vulkan/pipeline_cache.rs + shader_recompiler/src/pipeline_cache.rs vs video_core/renderer_vulkan/vk_pipeline_cache.cpp
 
@@ -20922,7 +20542,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust dual-vertex disk rebuild uses the current Rust `merge_dual_vertex_programs(program_va, program_vb)` helper. Upstream passes the VertexB environment as a third argument to `MergeDualVertexPrograms(program_va, program_vb, env)`; the Rust helper does not currently expose that parameter.
 
 ### Unintentional differences (to fix)
-- Most cached graphics entries still skip or fail under the reduced constructor and incomplete SPIR-V/backend support. Latest MK8D run rebuilt 89 of 585 parsed entries and skipped 496.
 - MoltenVK still reports repeated `VK_ERROR_INITIALIZATION_FAILED: Render pipeline compile failed`, so some preloaded pipelines are not valid on this backend even when shader translation succeeds.
 - Async worker ownership remains incomplete: successful disk rebuilds are inserted, but translation/module/pipeline creation is not yet split into upstream `BuiltPipeline` worker phases.
 
@@ -20941,8 +20560,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `cargo fmt --all` passes.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pipeline_cache -- --nocapture` passes: 15 tests.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D 12s run `/tmp/ruzu_mk8d_colors_1783183310` reports `Total Pipeline Count: 585 (built=89, skipped=496)`, logs one clean skipped shader compiler failure for `SPIR-V: unresolved IR value reference block=0 inst=90`, and does not print `thread 'main' panicked`.
-- MK8D frame 360 remains color-correct: `/tmp/ruzu_mk8d_colors_1783183310/final_360.png` visually matches the yuzu reference logo, and source/swapchain/final saturation is consistent (`avg_sat≈0.094-0.096`, `max_sat=1.0`).
 
 ## 2026-07-04 — video_core/src/renderer_vulkan/pipeline_cache.rs + video_core/src/renderer_vulkan/graphics_pipeline.rs + video_core/src/renderer_vulkan/compute_pipeline.rs vs video_core/renderer_vulkan/vk_pipeline_cache.cpp
 
@@ -20954,7 +20571,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 ### Unintentional differences (to fix)
 - Runtime graphics/compute creation is still synchronous. Upstream passes `thread_worker` into `GraphicsPipeline` / `ComputePipeline` constructors so final pipeline creation can remain pending and `BuiltPipeline` can gate use of unbuilt pipelines.
 - Disk worker jobs still build the full Rust reduced pipeline synchronously inside each worker job; the finer upstream split of shader translation, shader module creation, and final `VkPipeline` build is not represented as `BuiltPipeline` state yet.
-- Many graphics cache entries still skip/fail under MoltenVK or reduced-constructor limitations. Latest worker-preload MK8D run rebuilt 89 of 624 parsed entries and skipped 535.
 
 ### Missing items
 - Port runtime async `GraphicsPipeline` / `ComputePipeline` constructors and true `is_built=false` lifecycle.
@@ -20973,8 +20589,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::graphics_pipeline -- --nocapture` passes: 13 tests.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core compute_pipeline -- --nocapture` passes: 17 tests.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D 18s run `/tmp/ruzu_mk8d_worker_preload_1783183919` reports `Total Pipeline Count: 624 (built=89, skipped=535)`, reaches frame 360 at about 13.94s total wall time, and dumps color-correct `/tmp/ruzu_mk8d_worker_preload_1783183919/final_360.png`.
-- MK8D sample `/tmp/ruzu_mk8d_worker_sample_1783184015/sample.txt` samples the actual `ruzu-cmd` child process at about 14s; the sampled hot spots no longer include `shader_recompiler`, `structure_cfg`, or `ssa_rewrite`, but still show `RasterizerVulkan::draw` / `PipelineCache::current_graphics_pipeline_with_shared_cache`.
 
 ## 2026-07-04 — video_core/src/renderer_vulkan/render_pass_cache.rs vs video_core/renderer_vulkan/vk_graphics_pipeline.cpp + video_core/renderer_vulkan/maxwell_to_vk.cpp
 
@@ -21027,9 +20641,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core renderer_vulkan::graphics_pipeline -- --nocapture` passes: 13 tests.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo test -p video_core pipeline_cache -- --nocapture` passes: 15 tests.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D async verification run `/tmp/ruzu_mk8d_async_verify_1783188689` reports `Total Pipeline Count: 904 (built=90, skipped=814)`, first `BQC_RELEASE #0` at `15.602s`, present dump `#360` at `18.733s`, and present dump `#2400` at `35.994s`.
-- Visual verification of `/tmp/ruzu_mk8d_async_verify_1783188689/present_000360.png` and `/tmp/ruzu_mk8d_async_verify_1783188689/present_002400.png` shows the color-correct first MK8D logo in both frames. The color-loss issue is not reproduced, but the first-logo timing issue is still unresolved.
-- MK8D sample `/tmp/ruzu_mk8d_async_verify_1783188689/sample.txt` no longer shows shader translation as the dominant cost (`shader_recompiler` appears once, `structure_cfg` and `ssa_rewrite` do not appear). The sampled guest producer path is instead dominated by `BufferQueueProducer::dequeue_buffer -> wait_for_free_slot_then_relock`, so the next investigation slice is BufferQueue/HWC/fence pacing or the producer-side reason it cannot advance to `queue_buffer` fast enough.
 
 ## 2026-07-05 — video_core/src/renderer_vulkan/buffer_cache.rs + video_core/src/renderer_vulkan/mod.rs vs video_core/buffer_cache/buffer_cache.h + video_core/renderer_vulkan/vk_buffer_cache.h
 
@@ -21055,7 +20666,6 @@ Restore present-pipeline parity for `ProgramManager::BindPresentPrograms()` afte
 - Rust `RendererVulkan::bind_graphics_descriptors` now uses `bind_mapped_uniform_buffer` for `UNIFORM_BUFFER` fallback descriptors before falling back to `get_or_upload_fresh`.
 - `cargo fmt --all` passes.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D run `/tmp/ruzu_mk8d_uniform_1783208495` still shows the first logo at present-source dump `source_001800.ppm` around `47.079s`; the UBO allocation fix reduces one sampled Vulkan allocation source but does not resolve the first-logo delay.
 
 ## 2026-07-05 — video_core/src/renderer_vulkan/present_manager.rs vs video_core/renderer_vulkan/vk_present_manager.cpp
 
@@ -21121,7 +20731,6 @@ Upstream files:
 - None for this slice.
 
 ### Missing items
-- None for this slice. This did not port new upstream kernel behavior; it only reduced diagnostic overhead while investigating MK8D first-logo timing.
 
 ### Binary layout verification
 - N/A: no guest ABI, serialized payload, or raw-copied structure was changed.
@@ -21129,7 +20738,6 @@ Upstream files:
 ### Verification
 - Re-read the corresponding upstream scheduler/thread files conceptually for ownership: these trace helpers remain ruzu-only instrumentation and do not replace upstream scheduler/thread behavior.
 - `cargo build --release --bin ruzu-cmd` passes after the changes.
-- MK8D timing runs still reproduce the first-logo delay, so these caches are not treated as the root-cause fix; they only make subsequent measurements less intrusive.
 
 ## 2026-07-05 — core/src/hle/kernel/k_scheduler.rs vs core/hle/kernel/k_scheduler.cpp + core/hle/kernel/k_priority_queue.h
 
@@ -21157,7 +20765,6 @@ Upstream files:
 - Added focused queue tests for moving a suggested thread to the front and moving the current thread to active core `-1`.
 - `cargo test -p core hle::kernel::k_scheduler::tests -- --nocapture` passes: 14 tests.
 - `cargo build --release --bin ruzu-cmd` passes.
-- MK8D follow-up run `/tmp/ruzu_mk8d_affinity_1783251489` shows the hot sampled threads have single-core affinities (`0x1`, `0x2`, `0x4`) and no suggested fronts for idle cores, so this parity fix does not resolve the first-logo delay by itself.
 
 ## 2026-07-05 — core/src/hle/kernel/kernel.rs diagnostic dump vs upstream kernel diagnostics
 
@@ -21175,7 +20782,6 @@ Upstream files:
 
 ### Verification
 - `cargo build --release --bin ruzu-cmd` passes.
-- MK8D diagnostic run `/tmp/ruzu_mk8d_affinity_1783251489` confirmed the sampled workers are pinned by guest affinity, invalidating the earlier scheduler-migration hypothesis for that window.
 
 ## 2026-07-05 — core/src/core_timing.rs vs core/core_timing.cpp + core/core_timing.h
 
@@ -21200,11 +20806,9 @@ Upstream files:
 - `cargo test -p core core_timing::tests::timer_thread_wakes_for_earlier_new_event -- --nocapture`
 - Broad filtered `cargo test -p core core_timing -- --nocapture` still hits an unrelated existing nvdrv test panic in `nvdrv.rs:55`, while the CoreTiming tests themselves pass.
 - `cargo build --release --bin ruzu-cmd` passes.
-- MK8D run `/tmp/ruzu_mk8d_coretiming_1783252114` shows the expected pacing improvement (`VSYNC_PROFILE callbacks=2721` in about 45.9s, roughly 59 Hz), but present dumps still show the first logo later, so this parity fix is necessary but not the complete first-logo solution.
 ## 2026-07-05 — core/src/hle/kernel/svc/svc_thread.rs vs core/hle/kernel/svc/svc_thread.cpp
 
 ### Intentional differences
-- Rust includes env-gated diagnostics in `SleepThread` for MK8D first-logo investigation: `RUZU_TRACE_MK8D_LOGO_STATE=1` scans the current A32 context and stack for plausible MK8D loading objects and logs changes to fields around `+0x4300..+0x4319`, including the `+0x430C/+0x430D` phase mask used by the `0x40000` progress-bit writer.
 - Rust already had other env-gated `SleepThread` probes (`RUZU_TRACE_SLEEP*`, Mii wait/resource probes). These are diagnostic-only and inactive by default; upstream has no equivalent instrumentation.
 
 ### Unintentional differences (to fix)
@@ -21217,12 +20821,10 @@ Upstream files:
 - N/A: diagnostic logging only, no guest ABI or serialized layout.
 
 ### Verification
-- Re-read upstream `core/hle/kernel/svc/svc_thread.cpp`: `SleepThread` has no state inspection and simply handles positive sleeps or the three yield values. Rust's added MK8D state scan is gated by `RUZU_TRACE_MK8D_LOGO_STATE` and therefore does not alter normal execution.
 
 ## 2026-07-05 — externals/rdynarmic/src/backend/arm64/a32_address_space.rs + externals/rdynarmic/src/jit.rs vs upstream dynarmic ARM64 A32 address-space diagnostics
 
 ### Intentional differences
-- Added ruzu-only env-gated diagnostics for MK8D first-logo investigation:
   `RUZU_TRACE_A32_MEM_PC_RANGE=0xLO-0xHI` filters existing A32 memory-callback
   PC logs, and `RUZU_BLOCK_COUNT_PC=0xLO-0xHI` is now wired into the ARM64 A32
   `A32AddressSpace::get_or_emit` path used on Apple Silicon.
@@ -21249,13 +20851,10 @@ Upstream files:
 - `cargo check -p rdynarmic` passes.
 - `cargo build --release --bin ruzu-cmd` passes with the existing pkg-config
   paths for SDL2/FFmpeg.
-- MK8D run `/tmp/ruzu_mk8d_memrange_1783254424` with
   `RUZU_TRACE_A32_MEM_PC_RANGE=0x00B92000-0x00B94000` produced no memory-callback
   hits in that range.
-- MK8D run `/tmp/ruzu_mk8d_blockcount_sig_1783254811` with
   `RUZU_BLOCK_COUNT_PC=0x00B92000-0x00B94000` produced `core=0: 8073` hits in
   the ARM64 A32 dispatcher/get-or-emit path by the periodic dump.
-- MK8D run `/tmp/ruzu_mk8d_prologue_sig_1783255047` with both
   `RUZU_BLOCK_COUNT_PC` and `RUZU_BLOCK_PROLOGUE_COUNT_PC` for
   `0x00B92000-0x00B94000` produced dispatcher counts
   `core0=17310/core1=1278/core2=30` versus prologue counts
@@ -21332,7 +20931,6 @@ Upstream files:
 - `cargo test -p rdynarmic backend::arm64::inst::tests::encodes_known_arm64_words -- --nocapture` passes.
 - `cargo check -p rdynarmic` passes.
 - `cargo build --release --bin ruzu-cmd` passes.
-- MK8D run `/tmp/ruzu_mk8d_dynaddsub_1783258481` still shows the first-logo
   state transition is too slow (`w4314=7 -> 3` at about `47.27s`), so this is a
   real upstream-fidelity/performance fix but not the complete first-logo
   solution.
@@ -21357,7 +20955,6 @@ Upstream files:
 - N/A: diagnostics only.
 
 ### Verification
-- Used the IR dump to verify A32 GetSetElimination is active for MK8D hot block
   `0x00B92E04`: post-opt IR retains only live cross-block register state and
   direct link terminals.
 - Used the ARM64 block dump to verify generated hot-block size improved from
@@ -21405,7 +21002,6 @@ Upstream files:
   exclusive read/write callbacks when diagnostics are disabled.
 - `cargo check -p core` passes.
 - `cargo build --release --bin ruzu-cmd` passes.
-- MK8D impact still needs a follow-up run after this change.
 
 ## 2026-07-05 — externals/rdynarmic/src/jit.rs + externals/rdynarmic/src/backend/arm64/emit_arm64.rs + ruzu_cmd/src/main.rs vs upstream ARM64 A32 code-cache diagnostics
 
@@ -21435,7 +21031,6 @@ Upstream files:
   behavior and does not change generated code unless the env var is enabled.
 - `cargo check -p rdynarmic` passes.
 - `PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/sdl2/lib/pkgconfig cargo build --release --bin ruzu-cmd` passes.
-- MK8D diagnostic run `/tmp/ruzu_mk8d_toppc_1783259411` with
   `RUZU_BLOCK_PROLOGUE_TOP_PC=0x00206000-0x01C9C000` identified the Yaz0
   decompressor as the dominant first-logo hot path:
   `0x00B92E14` ≈ `114.7M` entries and `0x00B92E04` ≈ `113.7M` entries.
@@ -21520,7 +21115,6 @@ Upstream files:
   `backend/arm64/a32_address_space.cpp::A32AddressSpace::GetEmitConfig`.
 - `cargo check -p core` passes.
 - `cargo check -p rdynarmic` passes.
-- MK8D timing impact still needs a follow-up run.
 
 ## 2026-07-05 — externals/rdynarmic/src/backend/arm64/emit_arm64_memory.rs vs upstream ARM64 memory emitter diagnostics
 
@@ -21553,7 +21147,6 @@ Upstream files:
   wrapped write fallback only when explicitly requested.
 - `cargo check -p rdynarmic` passes.
 - `cargo build --release --bin ruzu-cmd` passes.
-- MK8D diagnostic run `/tmp/ruzu_mk8d_inlinewatch_long_1783262034` used the
   hook to attribute the first-logo state writers without forcing all A32 memory
   stores through callbacks.
 
@@ -21589,10 +21182,6 @@ Upstream files:
 ## 2026-07-05 — core/src/hle/kernel/svc/svc_thread.rs vs upstream core/hle/kernel/svc/svc_thread.cpp
 
 ### Intentional differences
-- Extended the existing ruzu-only MK8D first-logo diagnostic with
-  `RUZU_TRACE_MK8D_LOGO_TABLE=1`. When combined with
-  `RUZU_TRACE_MK8D_LOGO_STATE=1`, positive `SleepThread` calls can now dump
-  the 12-entry resource table for plausible MK8D logo-state objects in states
   `7` and `0xA`, including handles, offsets, resource pointers, and
   `resource+0x8AC` data pointers. The dump is throttled to about once per
   second and is inactive by default.
@@ -21613,10 +21202,7 @@ Upstream files:
 - Re-read upstream `core/hle/kernel/svc/svc_thread.cpp`: positive sleeps call
   the scheduler sleep path; yield magic values take their dedicated paths.
   The Rust diagnostic is outside upstream behavior and is gated by
-  `RUZU_TRACE_MK8D_LOGO_STATE`/`RUZU_TRACE_MK8D_LOGO_TABLE`.
 - `cargo build --release --bin ruzu-cmd` passes.
-- MK8D runs `/tmp/ruzu_mk8d_table3_1783263948` and
-  `/tmp/ruzu_mk8d_widetop_1783264237` used this diagnostic to show that state
   `7` can clear while a later state `0xA` plateau remains, invalidating the
   earlier assumption that only state `7` explains the first-logo delay.
 
@@ -21638,7 +21224,6 @@ Upstream files:
   patching when the diagnostic range matches.
 
 ### Missing items
-- None for this diagnostic slice. Remaining MK8D first-logo work is now
   focused on rdynarmic ARM64 A32 generated-code quality, not on adding more
   relink plumbing.
 
@@ -21652,7 +21237,6 @@ Upstream files:
   `AddressSpace::relink_for_descriptor`.
 - `cargo check -p rdynarmic` passes.
 - `cargo build --release --bin ruzu-cmd` passes.
-- MK8D diagnostic run `/tmp/ruzu_mk8d_relink_1783264782` captured
   `0x00B92E14` post-relink. The dumped bytes show direct branches to
   `0x00B92E04` and `0x00B92E18`, invalidating the hypothesis that the hottest
   Yaz0 inner loop returns to the dispatcher every iteration.
@@ -21693,11 +21277,9 @@ Upstream files:
   exposes cached `GetExtent()`; expensive surface capability queries are part
   of swapchain creation/recreation, not per-frame layout selection.
 - `cargo build --release --bin ruzu-cmd` passes.
-- MK8D run `/tmp/ruzu_mk8d_trylayout_1783277701` with
   `RUZU_PROFILE_VK_COMPOSITE=1` showed `VSYNC_PROFILE callbacks=2074
   already_set=2 thread_wakes=2072 process=2072`, average `process_vsync`
   `259us`, and no recurring ~1s layout stalls. Before this change,
-  `/tmp/ruzu_mk8d_vkcomp2_1783277448` accumulated ~18.8s in layout locking
   with repeated ~1s composite spikes.
 
 ## 2026-07-08 — video_core/src/renderer_vulkan/compute_pipeline.rs vs upstream video_core/renderer_vulkan/vk_compute_pipeline.cpp
@@ -21764,7 +21346,6 @@ Upstream files:
 - Re-read upstream `vk_pipeline_cache.cpp`: `CACHE_VERSION` is passed to both
   `LoadPipelines` and Vulkan driver-cache load/save, so a semantic/layout change
   is invalidated by advancing this single version.
-- MK8D A/B: the old version-13 cache loaded 9,992 entries, skipped 6,792 and
   rendered a black title background; a freshly generated cache loaded 431
   entries, skipped only 3 and rendered the complete title background.
 
@@ -21793,7 +21374,6 @@ Upstream files:
 - Re-read upstream `FixedPipelineState::Size()` and
   `GraphicsPipelineCacheKey::operator==`/`Hash` in `vk_pipeline_cache.cpp`.
 - `cargo test -p video_core --lib fixed_pipeline_state::tests::`: 27 passed.
-- Two consecutive MK8D boots loaded the same 97 entries (`built=96`,
   `skipped=1`); `vulkan.bin` remained exactly 339416 bytes and emitted no
   `PIPELINE_KEY_DIFF`, fixing the approximately 100-entry growth per boot.
 
@@ -21847,7 +21427,6 @@ Upstream files:
 - Re-read upstream `TranslatePass::Visit`, especially the `If`, `Loop`, and
   final fallthrough handling.
 - `loop_emits_continue_block_once_like_upstream_visit` passes.
-- MK8D preload SPIR-V duplicate-label failures dropped from 31 modules to 0.
 
 ## 2026-07-10 — shader_recompiler/src/pipeline_cache.rs loop CFG reconstruction vs upstream BuildASL loop branches
 
@@ -21872,7 +21451,6 @@ Upstream files:
 ### Verification
 - Re-read upstream loop handling in `structured_control_flow.cpp`.
 - `loop_cfg_routes_continue_through_header_not_body` passes.
-- The remaining MK8D `spirv-val` failure (`OpPhi` incoming count 2 vs one
   predecessor) is eliminated; all 92 dumped preload modules validate.
 
 ## 2026-07-10 — video_core/src/renderer_vulkan/graphics_pipeline.rs vs upstream video_core/renderer_vulkan/vk_pipeline_cache.cpp
@@ -21898,7 +21476,6 @@ Upstream files:
 ### Verification
 - Re-read both graphics pipeline creation loops in upstream
   `vk_pipeline_cache.cpp` (normal build and exception-dump path).
-- Full MK8D cache loads `97 built, 0 skipped` and runs without Metal device
   loss. Disk `stage4_base_010F80` and live `stage5_base_010F80` emit identical
   SPIR-V hash `4BD624006F4172DE`.
 
@@ -21935,7 +21512,6 @@ Upstream files:
   early return in both implementations.
 - `cargo test -p video_core --lib fixed_pipeline_state::tests:: --release`
   passes, including a disabled-blend color-mask disk round-trip regression.
-- MK8D v15 cold/warm framebuffer sources at present frame 600 are byte-for-byte
   identical (`ImageMagick compare AE=0`); warm preload builds all 100 entries
   and the captured swapchain is colored.
 
@@ -21962,7 +21538,6 @@ Upstream files:
 - Re-read upstream `Vulkan::BufferCacheParams` and its
   `MemoryTrackerBase<Tegra::MaxwellDeviceMemoryManager>` alias.
 - `cargo check -p video_core` passes.
-- MK8D prompt pages transition to `RasterizerCachedMemory`; subsequent guest
   writes reach `BufferCache::OnCPUWrite`.
 
 ## 2026-07-10 — core/src/memory/memory.rs vs upstream core/memory.cpp HandleRasterizerWrite
@@ -21996,7 +21571,6 @@ Upstream files:
   `DeviceMemoryManager::ApplyOpOnPointer`.
 - The three focused `smmu_apply_op_on_host_pointer` tests pass, including
   multiple aliases with an intra-page offset.
-- MK8D trace: each prompt write resolved one SMMU alias and every animated
   SSBO synchronization uploaded the dirty page (960/960 in 30 seconds).
 
 ## 2026-07-10 — externals/rdynarmic/src/backend/arm64/emit_arm64_memory.rs vs upstream dynarmic backend/arm64/emit_arm64_memory.cpp
@@ -22118,7 +21692,6 @@ Upstream files:
 - None introduced by this diagnostic slice.
 
 ### Missing items
-- The active MK8D white-attract investigation still needs the bloom draw inputs and alias-copy regions compared against upstream.
 
 ### Binary layout verification
 - N/A: no serialized or guest-visible layout changed.
@@ -22164,7 +21737,6 @@ Upstream files:
 ## 2026-07-10 - local Vulkan review parity cleanups
 
 ### Intentional differences
-- `RUZU_TRACE_SHADER_WORDS` and `RUZU_TRACE_VK_TEXTURE_HANDLE` remain opt-in Rust diagnostics. The latter no longer embeds one MK8D shader address/instance-count filter.
 
 ### Unintentional differences (fixed)
 - Fixed: `BlitFramebufferInfo` now sizes image and subresource arrays as `NUM_RT + 1` instead of a literal, preserving the upstream color-plus-depth attachment invariant.
@@ -22290,7 +21862,6 @@ Upstream files:
 - N/A: no raw guest or disk payload changed.
 
 ### Verification
-- A/B at MK8D present frame 5000 proved that direct `gpu_va -> VkBuffer` reuse retained stale title geometry, while common `UpdateGraphicsBuffers`/`BindHostGeometryBuffers` produced stable scene geometry.
 - Enabling the common mapped-uniform stream made attract geometry and textures recognizable; that upstream path is now the default.
 
 ## 2026-07-10 — `video_core/src/renderer_vulkan/fixed_pipeline_state.rs` vs `video_core/renderer_vulkan/fixed_pipeline_state.cpp`
@@ -22383,7 +21954,6 @@ Upstream files:
 ### Verification
 - Re-read upstream `common/settings.h`, `vk_swapchain.h`, and `vk_swapchain.cpp`. Non-Android asynchronous presentation now defaults to false, and both swapchain creation and present-mode refresh use the live settings as upstream does.
 - `cargo test -p video_core --lib choose_swap_present_mode -- --nocapture` passes.
-- MK8D runs used `RUZU_AUDIO_SINK=null`; the corrected default is active (`PresentManager::Present ... threaded=false`). The remaining periodic one-second Vulkan submit is documented in `TODO.md` and is not attributed to this fixed settings divergence.
 ## 2026-07-10 - Vulkan submit diagnostics vs vk_scheduler.cpp and vk_present_manager.cpp
 
 ### Intentional differences
@@ -22401,7 +21971,6 @@ Upstream files:
 ### Verification
 - Re-read upstream `vk_scheduler.h/.cpp`, `vk_present_manager.h/.cpp`, and `vk_swapchain.h/.cpp`; no control-flow or lifecycle ordering was changed.
 - `cargo check -p video_core --lib` and the release `ruzu-cmd` build pass.
-- MK8D profiling runs used `RUZU_AUDIO_SINK=null`.
 
 ## 2026-07-11 - `shader_recompiler/src/frontend/translate/floating_point_min_max.rs` and `ir/emitter.rs` vs `shader_recompiler/frontend/maxwell/translate/impl/floating_point_min_max.cpp` and `frontend/ir/ir_emitter.cpp`
 
@@ -22419,7 +21988,6 @@ Upstream files:
 
 ### Verification
 - Re-read upstream `floating_point_min_max.cpp` and `ir_emitter.cpp` after implementation.
-- `cargo test -p shader_recompiler fmnmx -- --nocapture` passes, including the live MK8D word `0x5C6013800057FF03`.
 
 ## 2026-07-11 - structured kill/demote path vs `shader_recompiler/frontend/maxwell/structured_control_flow.cpp`, `ir_opt/collect_shader_info_pass.cpp`, and `backend/spirv/emit_spirv_control_flow.cpp`
 
@@ -22439,7 +22007,6 @@ Upstream files:
 ### Verification
 - Re-read all three upstream implementations after the Rust changes.
 - `cargo test -p shader_recompiler cfg_translation_materializes_kill_as_demote -- --nocapture` and `cargo test -p shader_recompiler collect_info_records_demote_usage_like_upstream -- --nocapture` pass.
-- Release MK8D smoke run with `RUZU_AUDIO_SINK=null` produced no `MismatchedTerminator` or shader panic.
 
 ## 2026-07-11 - Maxwell condition flags, CSET/CSETP, I2I, and LEA vs upstream shader recompiler
 
@@ -22449,7 +22016,6 @@ Upstream files:
 
 ### Unintentional differences (to fix)
 - None in this slice. `CSET`/`CSETP` and all five LEA variants were decoded but not dispatched; `condition_code_set.rs` was a stale panic stub despite flag IR support.
-- The prior `I2I` translation ignored selector, destination conversion, saturation, validation, and `CC`. This was guest-visible in MK8D: three `I2I.CC` instructions write `RZ` solely to feed `NEU` into the flare vertex shader's following `CSETP` instructions.
 - `LEA.HI` previously used a shift-left/high-word approximation and omitted upstream validation. It now uses the literal logical-right-shift/low-word sequence and validates `X`, predicate, and `CC` fields.
 
 ### Missing items
@@ -22460,7 +22026,6 @@ Upstream files:
 
 ### Verification
 - Re-read upstream `frontend/ir/ir_emitter.h/.cpp`, `translate/impl/condition_code_set.cpp`, `integer_to_integer_conversion.cpp`, and `load_effective_address.cpp` after implementation.
-- `cargo test -p shader_recompiler mk8d_i2i_cc_feeds_csetp_through_ssa -- --nocapture` passes with live MK8D words `0x5CE0800000270AFF` and `0x50A0038000070D1F`; SSA plus DCE removes all flag access opcodes before backend emission.
 - The apparent `LEA_hi_cbuf` words in the captured flare shader are scheduler-control words (`index % 4 == 0`), so LEA parity is a corrected incidental divergence, not the diagnosed flare root cause.
 
 ## 2026-07-11 - `backend/spirv/emit_spirv_integer.rs` pseudo flags vs upstream `backend/spirv/emit_spirv_integer.cpp`
@@ -22479,8 +22044,6 @@ Upstream files:
 
 ### Verification
 - Re-read upstream `emit_spirv_integer.cpp`: `SetZeroFlag` and `SetSignFlag` are now called for `BitwiseAnd32`, `BitwiseOr32`, `BitwiseXor32`, `BitFieldSExtract`, and `BitFieldUExtract` as upstream does.
-- Release MK8D disk-cache smoke test changed from dozens of `SPIR-V: unresolved IR value reference` pipeline rejections and a live GPU-thread panic to zero unresolved references and zero panics.
-- A subsequent 45-second MK8D run with `RUZU_AUDIO_SINK=null` presented more than 1,000 frames without shader compilation failure.
 
 ## 2026-07-11 - `floating_point_range_reduction.rs` vs upstream `floating_point_range_reduction.cpp`
 
@@ -22498,7 +22061,6 @@ Upstream files:
 
 ### Verification
 - Re-read upstream `floating_point_range_reduction.cpp` after implementation.
-- `cargo test -p shader_recompiler mk8d_flare_rro_reg_is_dispatched -- --nocapture` passes with live flare word `0x5C90000000370003`.
 - The captured flare VertexB shader executes five `RRO_reg` instructions and now has zero decoded non-scheduler opcodes missing from the translator dispatcher.
 
 ## 2026-07-11 - `integer_short_multiply_add.rs` XMAD vs upstream `integer_short_multiply_add.cpp`
@@ -22517,7 +22079,6 @@ Upstream files:
 
 ### Verification
 - Re-read upstream `integer_short_multiply_add.cpp` after implementation; register, register-constant, constant-register, and immediate layouts now use their upstream bit fields and source ownership.
-- `cargo test -p shader_recompiler mk8d_attract_xmad_cbcc_ports_half_and_psl_semantics -- --nocapture` passes with live attract word `0x5B30079800C70D1D`.
 
 ## 2026-07-11 - Vulkan clear ordering vs upstream `vk_rasterizer.cpp`
 
@@ -22598,7 +22159,6 @@ Upstream files:
 ### Verification
 - Re-read upstream `PresentManager::Present`, `Scheduler::WaitWorker`, and `Swapchain::AcquireNextImage` line by line.
 - `yuzu.app`'s active configuration and log both report `async_presentation=false` on this Mac.
-- Release MK8D run logged `threaded=false`, completed synchronous acquire/present cycles, and passed 28,000 render-pass begins during the observation window without a presentation stall.
 
 ## 2026-07-11 - `shader_recompiler/src/pipeline_cache.rs` vs upstream `frontend/maxwell/translate_program.cpp` and `frontend/ir/post_order.cpp`
 
@@ -22618,8 +22178,6 @@ Upstream files:
 ### Verification
 - Re-read upstream `TranslateProgram`, `IR::PostOrder`, and `SsaRewritePass::TryRemoveTrivialPhi` after implementation.
 - Focused pipeline-cache tests pass, including a regression where synthetic block 2 is the syntax root and owns the `2 -> 0` edge. The test process has a pre-existing worker teardown hang after reporting all 17 results and requires external termination.
-- Fresh-cache MK8D IR for VertexB `0x6A2780` / hash `E2795AB19A7C6DF4` includes synthetic block 60 in post-order and preserves its `60 -> 0` edge. Its start-block predicate values become `UndefU1`, matching upstream's explicit undefined replacement for predecessor-less Phi nodes.
-- A 15-second fresh-cache MK8D run completed shader compilation with no unresolved IR reference or shader compiler panic. The visual blue-streak transition mismatch remains, so this parity fix is not claimed as the complete rendering fix.
 
 ## 2026-07-12 - `scripts/capture_yuzu_shader.py` reference-capture tooling
 
@@ -22679,7 +22237,6 @@ Upstream files:
 ### Verification
 - Re-read upstream `TranslatePass::Visit`, `MergeBlock`, `BuildASL`, `TranslateProgram`, `EmitPrologue`, and `DefineMain` after implementation.
 - Focused structured-control-flow, pipeline-cache, and backend tests pass; `cargo check -p shader_recompiler` and the release `ruzu-cmd` build pass.
-- Hash-matched MK8D transition VertexB shaders now have exactly the same IR block counts as yuzu: `150`, `158`, and `108`; their `OpBranchConditional` and `OpSelectionMerge` counts also match.
 
 ## 2026-07-12 - shader_recompiler floating-point add and SPIR-V floating-point emission vs upstream floating_point_add.cpp and emit_spirv_floating_point.cpp
 
@@ -22701,7 +22258,6 @@ Upstream files:
 ### Verification
 - Re-read upstream `floating_point_add.cpp` and `emit_spirv_floating_point.cpp` after implementation and compared field decoding, validation, control construction, decoration ownership, and operation ordering line by line.
 - Focused frontend and SPIR-V decoration tests pass.
-- A directly instrumented yuzu build localized the first divergent MK8D transition pass to fragment shader `AF7B30`. Replacing only that SPIR-V made ruzu exact; after this native fix, the complete 1920x1080 `A2B10G10R10` intermediate matches yuzu byte-for-byte without substitution: SHA-256 `7cc395c79066732352e4aa4d6639ae7bccd243c135f5ea97ba94f72fb2d195ae`.
 - The full 260-test crate run reaches all tests but has the pre-existing `backend::glsl::emit_glsl::tests::precolor_appends_all_phi_moves_before_references_and_recounts_uses` failure and then waits over 60 seconds in `pipeline_cache::tests::translate_program_from_env_uses_environment_metadata`; it was terminated after recording both unrelated failures.
 
 ## 2026-07-12 - shader_recompiler FP64 arithmetic vs upstream double_add.cpp, double_multiply.cpp, double_fused_multiply_add.cpp, ir_emitter.cpp, and emit_spirv_floating_point.cpp
@@ -22782,8 +22338,6 @@ Upstream files:
 
 ### Verification
 - Re-read upstream `common_funcs.h/.cpp`, `integer_compare_and_set.cpp`, and `integer_set_predicate.cpp` after implementation. Field positions, comparison selection, predicate combination, result masks, CC updates, and destination ordering match line by line.
-- Focused ISET and ISETP tests pass, including the two live MK8D words `0x5B5A038000870D05` and `0x5B5A038000870508` and a regression proving that `bf` is bit 44 rather than bit 52.
-- The regenerated MK8D transition IR now emits upstream's integer true mask `0xFFFFFFFF` instead of `0x3F800000`. The resulting captured framebuffer is unchanged because this shader subsequently reduces both nonzero values to the same predicate; this correction is upstream parity but is **INSUFFICIENT** to restore the blue trails.
 
 ## 2026-07-13 - Vulkan native NDC support vs upstream vulkan_device.cpp, vk_pipeline_cache.cpp, and vk_graphics_pipeline.cpp
 
@@ -22822,7 +22376,6 @@ Upstream files:
 
 ### Verification
 - Re-read upstream `frontend/maxwell/translate/load_constant.cpp` and `ir_opt/constant_propagation_pass.cpp` after implementation and compared validation, load width, extraction order, destination writes, and typed-CBUF replacement arguments line by line.
-- The live MK8D `AF1B80` IR changed from `0 GetCbufU32x2 / 20 scalar GetCbufU32 / 22 IAdd32` to `10 GetCbufU32x2 / 20 CompositeExtractU32x2 / 12 IAdd32`, exactly matching yuzu for those opcodes.
 - Focused `LDC.B64` and typed-CBUF-fold tests pass.
 
 ## 2026-07-13 - Vulkan scheduler/geometry dirty lifecycle vs vk_scheduler.cpp and buffer_cache.h
@@ -22844,7 +22397,6 @@ Upstream files:
 ### Verification
 - Re-read upstream `Scheduler::SubmitExecution`, `Scheduler::InvalidateState`, `BufferCache::UpdateGraphicsBuffers`, and `BufferCache::BindHostVertexBuffers` after implementation. Invalidation ordering and direct mutation of `maxwell3d->dirty.flags` now match.
 - The focused geometry dirty-index test covers the exact live-owned range and excludes render-target flags that still use snapshot propagation.
-- MK8D transition draw 136 changes exactly 684,400 bytes without diagnostic force-binding; before the fix it changed zero. Draw 135 remains unchanged, proving the correction restores the missing draw rather than perturbing the preceding pass.
 
 ## 2026-07-14 - externals/rdynarmic A32 ASIMD zip/estimate/compare-zero slice vs Dynarmic A32 ASIMD and ARM64 emitters
 
@@ -22865,9 +22417,7 @@ Upstream files:
 
 ### Verification
 - Re-read upstream `frontend/A32/decoder/asimd.inc`, `frontend/A32/translate/impl/asimd_two_regs_misc.cpp`, `ir/ir_emitter.cpp`, and `backend/arm64/emit_arm64_vector_floating_point.cpp` after implementation. Validation, register selection, comparison operand order, FPCR-control arguments, and write ordering match line by line.
-- Focused decoder/translation tests cover MK8D's `VZIP.32`, `VRSQRTE.F32`, and `VCEQ.F32 #0` words. A JIT execution test verifies zero and negative-zero comparison masks, and instruction tests verify `FRECPE`/`FRSQRTE` 4S/2D encodings.
 - The undefined-size regression test covers compare-zero, `VRECPE`, and `VRSQRTE` and verifies the full upstream exception contract: upper-location update, PC write, `A32ExceptionRaised`, `false`, and `CheckHalt(ReturnToDispatch)`.
-- Runtime comparison is bit-identical at the traced MK8D producer: both yuzu and ruzu write `0x4170000141700001` followed by `0x0000000041700001` to guest `0x748F7A40..0x748F7A4B`.
 - A clean 18-second run visually captures the restored horizontal cyan trails at 8 seconds and reaches the title/`Press L+R` state normally.
 - Full `cargo test -p rdynarmic --release` remains blocked by the pre-existing, independently reproducible `backend::arm64::a32_core::tests::run_existing_block_calls_arm64_prelude` failure (`CACHE_INVALIDATION` returned instead of an empty halt reason). The modified frontend/backend tests all pass.
 
@@ -22883,14 +22433,12 @@ Upstream files:
 - None after this pass. ARM UDF and ASIMD validation failures now use the shared upstream-equivalent `RaiseException` lifecycle, including upper-location update, `PC + 4`, exact exception kind and `CheckHalt(ReturnToDispatch)`.
 
 ### Missing items
-- The pre-existing x64 reciprocal-estimate helpers remain numerically approximate and do not yet reproduce upstream FPCR/FPSR behavior. Apple Silicon uses the ARM64 native estimate instructions, so this does not affect the validated MK8D path; a separate x64-oracle pass is required.
 
 ### Binary layout verification
 - N/A: these changes decode guest instructions and emit IR; no shared raw structure is serialized.
 
 ### Verification
 - Re-read upstream `decoder/asimd.inc`, `asimd_load_store_structures.cpp`, `asimd_two_regs_scalar.cpp`, `asimd_three_regs.cpp`, and `a32_translate_impl.cpp`. Decoder fixed bits, validation order, memory iteration, writeback and exception lifecycle match line by line.
-- Focused tests cover the MK8D all-lanes opcode, immediate/no-writeback variants, VLD/VST single-element IR, exact exception kinds and full exception terminal lifecycle.
 ## 2026-07-14 — core/src/hle/service/server_manager.rs vs core/hle/service/server_manager.{h,cpp}
 
 ### Intentional differences
@@ -23044,11 +22592,9 @@ Upstream files:
 ### Binary layout verification
 - PASS: indexed indirect commands retain the upstream five-`u32` layout, one-command count, and zero stride used by `HLE_DrawIndexedIndirect`.
 
-The audit fixed one local divergence: `BindHostDrawIndirectBuffers` previously synchronized the count binding unconditionally. It now touches and synchronizes that binding only when `include_count` is set, before always synchronizing the indirect binding, matching upstream lines 758-768. The old MK8D transition resource/CBUF dump blocks were also removed from the live Vulkan draw loop; they were diagnostics, not upstream behavior.
 
 ### Verification
 - `cargo build --release --bin ruzu-cmd`, the focused FragDepth test, and all 17 focused video-core HLE tests pass.
-- A clean 30-second MK8D Vulkan run with the SDL dummy audio driver reaches `submit#2048` without panic or pipeline-creation failure. This is a startup non-regression check; it does not establish that the remaining attract-mode rendering issue is fixed.
 ## 2026-07-16 - rdynarmic A32 ASIMD load/store single & UNALLOCATED decode-table + exception lifecycle
 
 Upstream references: `frontend/A32/decoder/{asimd,thumb32,vfp}.inc` and their
@@ -23071,7 +22617,6 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Implemented `v8_VLD_all_lanes` (broadcast), `v8_VST_single`, `v8_VLD_single`;
   tightened VST/VLD-multiple masks to `0xFFB0` (bit23+bit20) so single-structure
   and reserved encodings are no longer swallowed (fixes `0xF4E32CBF` VLD1r being
-  silently dropped → MK8D logo wedge).
 - Reserved ASIMD load/store encodings (`type==0b1011`, `type[3:2]==0b11`,
   single-store `sz==0b11`) now route to `arm_UDF` (UndefinedInstruction), matching
   upstream's most-specific matcher; they previously produced `DecodeError`.
@@ -23100,7 +22645,6 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   cond combinations plus valid neighbours) and IR-level tests asserting exact
   exception kind + UpdateUpperLocationDescriptor + PC write + terminal for
   `arm_udf`, `thumb32_udf`, thumb32 `Unknown`, and MSR/MRS.
-- Release `ruzu-cmd` boots MK8D past the logo to a correct title screen with 0 ARM
   exceptions over a 100s run (non-regression on executed code only; reserved-
   encoding correctness is established by the unit tests, not the game run).
 
@@ -23126,7 +22670,6 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - The rest of upstream's extension/property structures, mandatory/recommended
   suitability checks, and driver-specific feature removal policy remain to be
   ported. This pass covers every feature whose absence was reported by Vulkan
-  validation for the current MoltenVK/MK8D path.
 
 ### Binary layout verification
 - PASS: the feature structures are Vulkan ABI types from `ash`; the exact chain
@@ -23205,7 +22748,6 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   in `vk_graphics_pipeline.cpp`; `dynamic_states_for_fixed_state` has the same
   base states, ordering, and EDS1/EDS2/EDS2-extra/EDS3 feature gates.
 - `cargo test -p video_core extended_dynamic_state_declares_stride_for_static_vertex_input --lib`
-  passes and covers the exact EDS1/static-vertex-input contract used by MK8D's
   B200 post-process draw.
 - Runtime evidence localizes the first divergent output to B200: post-process
   stage 1 is byte-identical to yuzu, all three B200 input images are identical
@@ -23252,7 +22794,6 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - `cargo test -p video_core renderer_vulkan::pipeline_cache --lib` passes: 16
   tests.
 - `cargo build --release --bin ruzu-cmd` passes.
-- A release MK8D startup with the existing 6503-entry cache completes
   `load_disk_resources`, serializes the driver cache, reaches `System: running`,
   and exits only through the 15-second timeout.
 ## 2026-07-19 - video_core/src/engines/maxwell_dma.rs vs video_core/engines/maxwell_dma.cpp
@@ -23282,7 +22823,6 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - `test_single_line_const_a_clear_calls_accelerated_buffer_clear_then_fallback`
   and `test_dma_fallback_flushes_source_and_invalidates_destination` pass with
   non-identity GPU-VA-to-DAddr mappings and assert the translated DAddr ranges.
-- A release MK8D run no longer emits the out-of-range memory-tracker
   notifications produced by forwarding GPU virtual addresses directly.
 
 ## 2026-07-19 - video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.cpp
@@ -23309,12 +22849,10 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Re-read upstream `Sampler::Sampler` in `vk_texture_cache.cpp` and
   `MaxwellToVK::Sampler::DepthCompareFunction` in `maxwell_to_vk.cpp`.
 - `test_depth_compare_function` covers all eight encoded comparison values.
-- A post-fix MK8D filmstrip through presentation 5700 still shows the race
   scene overexposed with a dark floor. The sampler divergence is fixed, but
   the hypothesis that it caused the active race/attract rendering defect is
   therefore invalidated.
 
-## 2026-07-19 - MK8D character-selection Vulkan diagnostics
 
 ### Intentional differences
 - `ruzu_cmd` can inject environment-gated L+R/A input and optionally create a
@@ -23325,30 +22863,6 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   `ImageView`, and enumerate every cached `ImageId` alias at a requested GPU
   address. These paths are disabled unless their `RUZU_*` variables are set and
   do not modify guest-visible state or normal rendering order.
-
-### Unintentional differences (to fix)
-- None introduced by the diagnostic paths.
-
-### Missing items
-- The active MK8D defect remains: the character-selection UI is correct while
-  Mario, the kart, and the pedestal are severely overexposed. The historical
-  `0x520510000` B10G11R11 target contains only the blue menu background at the
-  captured boundaries, so it is not the 3D preview surface and must not be used
-  as the sole attribution point.
-
-### Binary layout verification
-- N/A: diagnostics only; no guest or serialized layout changed.
-
-### Verification
-- `cargo build --release --bin ruzu-cmd` passes with the project FFmpeg
-  `PKG_CONFIG_PATH`.
-- Marker-triggered dumps select the actual 1920x1080 B10G11R11 `ImageId`
-  instead of the stale 480x270 alias previously returned by address-only
-  `.find(...)`.
-- The reference ruzu frame is
-  `ruzu-mk8d-shadow-sampler-filmstrip-20260719-142312/present_002400.png`;
-  the yuzu reference is
-  `screenshots/yuzu/MK8D/Capture d’écran 2026-07-19 à 14.39.31.png`.
 
 ## 2026-07-19 - video_core/src/host1x/gpu_device_memory_manager.rs vs core/device_memory_manager.h/.inc and video_core/host1x/gpu_device_memory_manager.h/.cpp
 
@@ -23389,7 +22903,6 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Rust evaluates LUT values not covered by its direct fast paths through a
   generic truth-table decomposition instead of upstream's generated 256-case
   `ApplyLUT` switch. The Boolean result is equivalent; LUT `0xF8`, used by the
-  affected MK8D shaders, now has the exact upstream expression
   `a | (b & c)`.
 - Upstream reports unsupported `LOP3 CC` and `LOP3 X` forms by throwing
   `NotImplementedException`; Rust panics and the pipeline compilation boundary
@@ -23416,7 +22929,6 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ### Verification
 - Re-read upstream `ApplyLUT`, `LOP3`, `GetLut48`, `LOP3_reg`, `LOP3_cbuf`,
   `LOP3_imm`, `PredicateOperation`, and `GetImm20` after implementation.
-- The four MK8D words `0x3CF8218FFFF70003`, `0x3CF8210FFFF70102`,
   `0x3CF8208FFFF70401`, and `0x3CF8200FFFF70500` decode LUT `0xF8` from bits
   48-55 instead of the unrelated `0xFF` field at bits 28-35.
 - Focused tests verify the field selection and emitted `BitwiseAnd32` plus
@@ -23428,7 +22940,6 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   `precolor_appends_all_phi_moves_before_references_and_recounts_uses` still
   fails because its expected use count is 1 while the implementation reports
   2.
-- An aligned MK8D character-selection run renders Mario and the kart with the
   expected colors; the user confirmed the visual result.
 
 ## 2026-07-22 - video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp
@@ -23489,12 +23000,6 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   dynamic state, clears, direct/indirect draws, image upload, and image-layout
   transitions are now recorded in scheduler order instead of being emitted
   directly around queued operations.
-- `cargo check -p video_core`, the three focused Vulkan scheduler tests, and a
-  release `ruzu-cmd` build passed during this slice.
-- MK8D reaches the character-selection screen without a new Vulkan crash.
-  Correctly aligned captures with exactly three automated A presses show that
-  Mario remains white under `dispatch_work`, `flush`, and `finish`; therefore
-  this real ordering-parity fix is not the root cause of that material defect.
 
 ## 2026-07-22 - video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h
 
@@ -23521,7 +23026,6 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   `PrepareImage`, and `SynchronizeAliases` after implementation.
 - Added a focused ordering-contract test requiring sampled-image preparation
   before backend image-view resolution.
-- Release `ruzu-cmd` builds successfully. An MK8D character-selection run with
   exactly three automated A presses restored Mario, kart, lighting, and
   pedestal colors that were previously white/saturated.
 - The focused test passes. The full `video_core` suite was attempted, but four
@@ -23563,7 +23067,6 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ### Verification
 - Re-read both upstream `RasterizerVulkan::AccelerateDisplay` and `RasterizerOpenGL::AccelerateDisplay`.
 - `cargo test -p video_core --lib --no-run` passes.
-- A 200-presentation MK8D burst synchronized to the ninth A press contained only 1920x1080 8-bit display images after the fix; the pre-fix burst contained the 1620x1540 atlas corruption.
 
 ## 2026-07-25 — video_core/src/renderer_vulkan/{texture_cache.rs,vk_rasterizer.rs,renderer_vulkan.rs} vs video_core/renderer_vulkan/vk_texture_cache.cpp
 
@@ -23620,7 +23123,6 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   and the MoltenVK device-limit quirk after implementation.
 - Focused test `vertex_binding_count_is_capped_to_the_device_limit` passes.
 - `cargo check -p video_core --lib` and the release `ruzu-cmd` build pass.
-- A 175-second MK8D run reached Mario Kart Stadium without the previous giant
   black/multicolored triangles. Major scene geometry, racers, crowd, banners,
   and effects render; the remaining dark ground/stadium materials are a
   separate sampled-image/material issue.
@@ -23649,7 +23151,6 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ### Verification
 - Re-read upstream `RasterizerVulkan::Clear` after implementation.
 - `cargo check -p video_core --lib` and a release `ruzu-cmd` build pass.
-- The MK8D legacy-geometry repro previously panicked in
   `TextureCache::base_image_exists` near 10 seconds. It passed that point and
   reached presentation 9000 after the lock correction with no `SlotVector`
   panic.
@@ -23711,6 +23212,32 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   logical-device creation after implementation.
 - `cargo check -p video_core --lib` passes.
 
+## 2026-07-26 — title-specific diagnostic cleanup
+
+### Intentional differences
+- Generic low-overhead trace categories remain available where they are not
+  tied to one title or investigation.
+
+### Unintentional differences (fixed)
+- Removed title-specific logo state/caller/table probes and fixed-address
+  memory inspection from `svc_thread.rs`.
+- Removed experimental thread-start delays, forced rescheduling, lifecycle
+  profiling, sleep timing profiling, and start-to-first-SVC profiling.
+- Renamed retained instruction regression tests according to the behavior they
+  verify and removed title-specific source comments.
+
+### Missing items
+- None for this cleanup.
+
+### Binary layout verification
+- N/A.
+
+### Verification
+- Re-read upstream `svc_thread.cpp`; `StartThread` and `SleepThread` now retain
+  only the functional port behavior plus generic logging/error handling.
+- Verified that Rust sources and this audit file contain no remaining
+  title-specific identifier or comment targeted by this cleanup.
+
 ## 2026-07-26 — Vulkan renderer diagnostic cleanup
 
 ### Intentional differences
@@ -23744,3 +23271,22 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   `RUZU_VK_SUBMIT_WORKER`; the removed diagnostic symbols have no remaining
   Rust references.
 - `cargo check -p video_core --lib` passes.
+
+## 2026-07-26 — video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp
+
+### Intentional differences
+- Rust uses the existing lock-order guard and raw mutex pointer pattern to keep the recursive texture-cache guard alive across the mutable cache call.
+
+### Unintentional differences (to fix)
+- Fixed: `accelerate_inline_to_memory` did not lock the texture cache around `write_memory`; upstream does, because that call can unregister and delete image slots.
+
+### Missing items
+- None for this fix.
+
+### Binary layout verification
+- PASS: no binary layout is involved.
+
+### Verification
+- Re-read upstream `RasterizerVulkan::AccelerateInlineToMemory` in `vk_rasterizer.h/.cpp`; memory writes and cache-lock ordering now match.
+- `cargo check -p video_core` and the 8 focused `renderer_vulkan::vk_rasterizer::tests` pass.
+- Five 30-second release runs completed without a panic. The full `video_core` suite was stopped after four pre-existing `shader_cache` tests remained active for more than 60 seconds.

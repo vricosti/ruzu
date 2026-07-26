@@ -676,7 +676,6 @@ impl NvdrvService {
         );
         // `RUZU_TRACE_IOCTL_TID=N` — log each Ioctl1 invocation from tid=N with
         // the resolved ioctl_nr. Used in Phase-2 zuyu/ruzu diff to identify
-        // which exact nvdrv command MK8D's main thread calls in ruzu but not
         // in zuyu. One-liner per call; env-gated so default has zero cost.
         if let Some(filter) = std::env::var_os("RUZU_TRACE_IOCTL_TID") {
             if let Ok(target_tid) = filter.to_string_lossy().parse::<u64>() {
@@ -1349,7 +1348,6 @@ pub fn dump_nvdrv_ioctl_history(reason: &str) {
 // Output (top entries by total time):
 //   [NVDRV_IOCTL_PROFILE] ioctl=0xC0304808 kind=1 count=691 total=4836.7ms avg=7000us max=20100us
 //
-// Built in response to the MK8D wedge investigation closing on
 // "nvdrv handle 0xB01EC consumes 66% of game runtime at avg 7ms/call". This
 // profiler answers "which specific ioctl_nr blows the budget".
 

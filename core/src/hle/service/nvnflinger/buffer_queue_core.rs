@@ -44,7 +44,6 @@ pub struct BufferQueueCore {
     /// `dequeue_condition` only blocks that host thread. Ruzu's default IPC
     /// path runs the handler inline on the calling guest core's fiber;
     /// blocking the host condvar there freezes every other guest fiber
-    /// multiplexed on that core (measured: MK8D pins its loading workers to
     /// core 1 alongside the graphics producer, and the frozen core stretched
     /// the first logo from ~3-4s to ~80s — see TODO.md 2026-07-05 ROOT
     /// CAUSE). Guest callers therefore park in the kernel (`begin_wait` +

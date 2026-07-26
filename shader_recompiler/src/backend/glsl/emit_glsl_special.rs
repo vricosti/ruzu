@@ -84,7 +84,6 @@ pub fn emit_fragment_alpha_test(ctx: &mut EmitContext) {
         return;
     }
     // RUZU_DISABLE_ALPHA_TEST=1 — diagnostic kill-switch: skip the emulated
-    // alpha-test discard entirely (MK8D black-3D investigation).
     if std::env::var_os("RUZU_DISABLE_ALPHA_TEST").is_some() {
         return;
     }

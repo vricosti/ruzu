@@ -51,11 +51,9 @@ pub enum MemoryPermission {
 /// is incorrect, and depending on timing can also miss the patch entirely
 /// and let SIGSEGV propagate to the kernel).
 ///
-/// MK8D demonstrates the failure: the audio renderer workbuffer is
 /// mapped via `svc::MapSharedMemory(handle, vaddr, size, Read)` and the
 /// state-machine wedge at sdk PC `0x01EEA9A8` performs `lda r0, [r0]`
 /// on a pointer into that region, killing the process intermittently.
-/// See [[mk8d-wedge-table-fastmem-invisible-2026-05-29]].
 ///
 /// The proper upstream-correct fix is to change rdynarmic's ordered-load
 /// codegen to `mfence + mov` (write-free) instead of `lock xadd`. Until

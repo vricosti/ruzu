@@ -2821,7 +2821,6 @@ unsafe fn emit_rt_grid_phase(
                     );
                 }
                 // Also read vec4 indices 33-34 (bytes 528..560) — the sprite
-                // rect transform the MK8D world quads read (vs_cbuf3[33/34]).
                 let mut hi = [0f32; 8];
                 if size >= 560 {
                     gl::GetNamedBufferSubData(
@@ -3796,7 +3795,6 @@ impl RasterizerInterface for RasterizerOpenGL {
         // is eventually bound via `state_tracker.BindFramebuffer`). If we bind
         // the draw framebuffer first and then early-return on a pipeline miss,
         // the next swap presents that FBO's stale (often black) texture —
-        // observed as MK8D's "1-of-3 flinger buffers stays black" symptom.
         let step = profile_draw_timing.then(Instant::now);
         record_gl_draw_stage(draw_seq, 3);
         trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_pipeline", draw_seq);
@@ -8276,7 +8274,6 @@ impl RasterizerInterface for RasterizerOpenGL {
         // threads invoking on_cpu_write via the JIT memory-write
         // trampoline race with the GPU thread using the same caches
         // for rendering — observed as a `hashbrown::Tag::full` SIGSEGV
-        // ~60s into MK8D (see project_mk8d_deterministic_wedge_2026_05_16).
         //
         // See on_cache_invalidation above for why the locks are taken
         // through raw pointers.

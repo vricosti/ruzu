@@ -774,12 +774,11 @@ mod tests {
     }
 
     #[test]
-    fn mk8d_i2i_cc_feeds_csetp_through_ssa() {
+    fn regression_i2i_cc_feeds_csetp_through_ssa() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
         {
             let mut tv = TranslatorVisitor::new(&mut program, 0);
-            // Live MK8D flare shader words at 0x675F18 and 0x676088.
             tv.translate_instruction(0x5CE0_8000_0027_0AFF);
             tv.translate_instruction(0x50A0_0380_0007_0D1F);
         }
@@ -809,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn mk8d_flare_rro_reg_is_dispatched() {
+    fn regression_flare_rro_reg_is_dispatched() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
         let mut tv = TranslatorVisitor::new(&mut program, 0);
@@ -843,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn mk8d_attract_xmad_cbcc_ports_half_and_psl_semantics() {
+    fn regression_attract_xmad_cbcc_ports_half_and_psl_semantics() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
         let mut tv = TranslatorVisitor::new(&mut program, 0);

@@ -470,7 +470,6 @@ mod tests {
     /// (`>= NUM_HIGH_PAGES * HIGHER_PAGE_SIZE`, i.e. above `SMMU_VA_LIMIT`)
     /// must not panic the GPU thread. Upstream indexes a fixed `std::array`
     /// (silent UB); ruzu's bounds-checked `Vec` would panic, so the iteration
-    /// guards skip out-of-range pages instead. Observed in MK8D: a buffer with
     /// device address ~24 GiB reached `for_each_download_range_and_clear`.
     #[test]
     fn test_out_of_range_address_does_not_panic() {

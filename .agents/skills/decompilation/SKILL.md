@@ -1,6 +1,6 @@
 ---
 name: decompilation
-description: Use this skill when investigating Nintendo Switch binaries (NSP/NCA/NSO) — extracting code via hactool, parsing NSO format (sections, dynsym, dynstr, JMPREL), identifying which symbol a PLT call address resolves to, computing the correct NSO offset from a runtime PC, or diffing a guest binary's behavior. Trigger phrases include "decompile", "extract NSO", "what symbol is at PC ...", "which function does this PLT call", "MK8D / Switch / NSP / NCA / NSO", "GOT entry", "find imports", "audio renderer addresses", "PLT[N]". Strongly recommended whenever an investigation needs to map runtime addresses to imported symbol names — manual offset math is error-prone (PLT layout has multiple correct candidates and ARM PC+8 traps).
+description: Use this skill when investigating Nintendo Switch binaries (NSP/NCA/NSO) — extracting code via hactool, parsing NSO format (sections, dynsym, dynstr, JMPREL), identifying which symbol a PLT call address resolves to, computing the correct NSO offset from a runtime PC, or diffing a guest binary's behavior. Trigger phrases include "decompile", "extract NSO", "what symbol is at PC ...", "which function does this PLT call", "Switch / NSP / NCA / NSO", "GOT entry", "find imports", "audio renderer addresses", "PLT[N]". Strongly recommended whenever an investigation needs to map runtime addresses to imported symbol names — manual offset math is error-prone (PLT layout has multiple correct candidates and ARM PC+8 traps).
 ---
 
 # Decompilation skill — Nintendo Switch NSO

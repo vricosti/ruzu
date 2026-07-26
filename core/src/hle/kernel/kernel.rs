@@ -559,7 +559,6 @@ fn dump_thread_state(kernel: &KernelCore) {
     }
     // RUZU_POKE_ADDR=0x40037000:4:1 (addr:size_bytes:value_hex) — write a
     // test value into guest memory on SIGUSR1. Experimental harness for
-    // empirically unblocking the MK8D wedge. Size must be 4 (u32 write).
     let pokes: Vec<(u64, u32)> = std::env::var("RUZU_POKE_ADDR")
         .ok()
         .iter()
@@ -1013,7 +1012,6 @@ fn dump_thread_state(kernel: &KernelCore) {
             // The nnSdk SVC wrapper (e.g., `0x1D314F4`) is only one frame up
             // from the SVC stub; its caller's LR sits a few words deeper in
             // the stack. Walking these words reveals the game-level function
-            // driving the spin loop. See `project_mk8d_post_rng_wedge_2026_04_24.md`.
             for (core_id, sp) in &stacks_to_dump {
                 const STACK_WORDS: usize = 128;
                 let mut stack_words: Vec<u32> = Vec::with_capacity(STACK_WORDS);
@@ -1324,7 +1322,6 @@ fn dump_thread_state(kernel: &KernelCore) {
             }
         }
     }
-    crate::hle::kernel::svc::svc_thread::dump_thread_lifecycle_profile();
     eprintln!("=========================================");
     DUMP_REQUESTED.store(false, Ordering::Relaxed);
 }
@@ -2054,7 +2051,6 @@ impl KernelCore {
         // from host service threads (audio/nvservices/etc.) that were spawned
         // earlier finally getting OS-scheduled and registering child host
         // threads. The 2 extras land at zuyu tids 24 and 26. Without these,
-        // ruzu's MK8D main thread is +2 lower than zuyu's.
         // Allocate matching dummies for the first 2 services only.
         let is_sm_or_account = name == "sm" || name == "account";
         if is_sm_or_account {
@@ -2951,8 +2947,6 @@ impl KernelCore {
     pub fn create_new_thread_id(&self) -> u64 {
         let id = self.next_thread_id.fetch_add(1, Ordering::Relaxed);
         // RUZU_TRACE_THREAD_ID=1 — log every thread id allocation with caller
-        // location. Used to find why ruzu's MK8D main thread gets tid=73 vs
-        // zuyu's tid=75 (delta +2). See project_mk8d_ruzu_det_wedge_vs_zuyu_2026_05_17.
         if std::env::var_os("RUZU_TRACE_THREAD_ID").is_some() {
             let caller = std::panic::Location::caller();
             let bt = std::backtrace::Backtrace::force_capture();

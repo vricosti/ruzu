@@ -561,7 +561,6 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
 /// `tid`, guest `PC`, `LR`, and the bad `vaddr`/`size`/`value`. Pairs with
 /// the existing `Unmapped Write{N} @ 0x...` log emitted from
 /// `Memory::write_raw`; that one only tells us the address, this one tells
-/// us *who* / *from where* in the guest. Used to trace the MK8D post-boot
 /// corruption back to a specific call site in guest code.
 #[inline(always)]
 fn trace_unmapped_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
@@ -622,7 +621,6 @@ fn trace_unmapped_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: 
         &[tid, pc as u64, lr as u64, vaddr, size, value_lo, value_hi],
     );
     // Dump full GPRs + the struct backing memory at r6 (which holds the
-    // off-by-3 pointer in `[r6+0x10]` for the MK8D matrix-init path).
     // This is the same idea as RUZU_DUMP_INSTANCE_AT_PC but hooked at
     // unmapped-write time so we get the registers AT the faulting
     // instruction. Bounded to 5 hits to keep log compact.
@@ -644,7 +642,6 @@ fn trace_unmapped_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: 
         r[8], r[9], r[10], r[11], r[12], r[13], r[14]
     );
     // Dump first 64 bytes of struct at r6 (which holds count at +0xC and
-    // the bad array_base ptr at +0x10 for the MK8D matrix-init path).
     let mem = cb.mem();
     if r[6] >= 0x1000 {
         let mut hex = String::new();
@@ -1595,7 +1592,6 @@ fn maybe_scan_bl(cb: &DynarmicCallbacks32) {
 /// instruction go through the slow `write_8/16/32/64` callback — where
 /// `RUZU_TRACE_W_AT_VADDR=…` / WATCH_WRITE diagnostics fire. Used to
 /// surface stores that would otherwise be invisible to memory callbacks
-/// (e.g. the unknown writer of `[struct+0x10]` in the MK8D matrix-init
 /// chain, task #112) without paying the global `RUZU_NO_FASTMEM`
 /// slowdown.
 ///
@@ -1651,7 +1647,6 @@ fn maybe_trap_fastmem_page(fastmem_pointer: Option<*mut u8>, core_index: usize) 
     // touch it RE-applies PROT_READ|PROT_WRITE — undoing the trap. So we
     // spawn a small re-applier thread that keeps the page PROT_READ for
     // a configurable duration (default ~30 s) and bails out after that.
-    // 30 s is plenty for the MK8D matrix-init window to fire.
     let fastmem_addr = fastmem_pointer as usize;
     let duration_ms = std::env::var("RUZU_FASTMEM_TRAP_DURATION_MS")
         .ok()
@@ -2338,7 +2333,6 @@ impl UserCallbacks for DynarmicCallbacks32 {
                 // Upstream logs non-NoExecute A32 exceptions but does not
                 // return a guest exception unless the debugger is active.
                 // Do not halt here; otherwise benign Dynarmic callbacks (for
-                // example around NEON-heavy MK8D code) suspend the guest
                 // thread as a fake PrefetchAbort.
             }
         }
@@ -2676,7 +2670,6 @@ impl ArmDynarmic32 {
         // routes the write through the slow callback path, which makes the
         // existing `RUZU_TRACE_W_AT_VADDR=…` / WATCH_WRITE diagnostics
         // fire on stores that would otherwise be invisible. Used to
-        // identify the writer of `[struct+0x10]` in the MK8D matrix-init
         // call chain (task #112) without paying the global `NO_FASTMEM`
         // slowdown.
         maybe_trap_fastmem_page(fastmem_pointer, core_index);

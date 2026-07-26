@@ -122,7 +122,7 @@ rt_sample = false
 # texture_bind.
 texture_bind_addr = false
 # Filtered OpenGL draw-state attribution. Use RUZU_TRACE_DRAW_STATE_PIPELINE
-# to restrict this to one program pipeline, e.g. 28 for the MK8D p28 pass.
+# to restrict this to one program pipeline.
 draw_state = false
 # Texture-cache image/view lifecycle attribution. Use
 # RUZU_TRACE_IMAGE_VIEW_ADDRS=0x... to restrict this to specific guest GPU

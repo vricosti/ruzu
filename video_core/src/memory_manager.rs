@@ -112,7 +112,6 @@ pub struct GpuMemoryManager {
     /// nvdrv (CPU) path holds `Arc<Mutex<MemoryManager>>` while the GPU
     /// thread holds the rasterizer lock during draws and then locks this
     /// memory manager — invoking the rasterizer inline here deadlocks (ABBA,
-    /// observed in MK8D). `None` (the default) keeps the inline behavior for
     /// GPU-thread-side callers.
     deferred_rasterizer_ops: Option<Vec<DeferredRasterizerOp>>,
 }

@@ -516,7 +516,6 @@ impl Gpu {
     /// and returns the fence number. The caller is expected to either call
     /// `wait_for_sync_operation(fence)` to block on completion, or let the
     /// GPU thread drain it asynchronously via `tick_work`. This is the path
-    /// MK8D / STK / Switch homebrew use to drain GPU writes before reading
     /// a framebuffer from CPU memory (e.g. before QueueBuffer).
     pub fn request_flush(&self, addr: DAddr, size: usize) -> u64 {
         // Capture &Gpu as a raw `usize` so the closure is Send. The Gpu
@@ -898,7 +897,6 @@ impl GpuMemoryManagerHandle for VideoGpuMemoryManagerHandle {
     // notifications AFTER releasing the memory-manager mutex. The GPU thread
     // takes the rasterizer lock during draws and then locks this memory
     // manager for address translation, so invoking the rasterizer while the
-    // mutex is held deadlocks (ABBA, observed wedging MK8D). Upstream
     // `Tegra::MemoryManager` has no mutex, so its inline rasterizer calls
     // never nest a cache lock under a memory-manager lock.
     fn map(&self, gpu_addr: u64, device_addr: u64, size: u64, kind: u32, is_big_pages: bool) {

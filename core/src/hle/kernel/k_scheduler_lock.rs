@@ -206,7 +206,6 @@ fn default_enable_scheduling(cores_needing_scheduling: u64) {
             // condvar/sleep waiter to RUNNABLE and set needs_scheduling on
             // its core, but the sleeping core never received the IPI — it
             // only resumed when some unrelated event happened to interrupt
-            // it. During MK8D's loading spinner (cores mostly asleep) this
             // degraded every timeout-paced wake to ~seconds of latency and
             // read as a mid-loading freeze.
             super::k_scheduler::KScheduler::reschedule_cores(cores_needing_scheduling);

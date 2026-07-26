@@ -13,7 +13,7 @@ Extracts, for each main-thread SVC:
 Compares ruzu tid=73 vs zuyu tid=75 and prints the first point where a field differs.
 
 Usage:
-  python3 scripts/svc_diff.py /tmp/mk8d-buf2.log traces/zuyu_full_5s_trace.log \
+  python3 scripts/svc_diff.py /tmp/ruzu-svc.log traces/zuyu_full_5s_trace.log \
       [--limit N] [--rsp {tls,buf}] [--no-rsp-gate] [--semantic-only]
 
 --rsp selects which ruzu response view is compared against zuyu's TLS_RSP:

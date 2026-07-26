@@ -104,9 +104,8 @@ fn process_stream_callback(
 
 impl CubebSink {
     pub fn new(target_device_name: &str) -> Self {
-        // RUZU_CUBEB_BACKEND env override — useful to bypass pulse-rust on
-        // pipewire-pulse systems where it oscillates Drained↔Started (see
-        // project_mk8d_audio_pipewire_drain_2026_05_17).
+        // RUZU_CUBEB_BACKEND env override is useful to bypass pulse-rust on
+        // pipewire-pulse systems where it oscillates Drained↔Started.
         let backend_cstring = std::env::var("RUZU_CUBEB_BACKEND")
             .ok()
             .and_then(|s| std::ffi::CString::new(s).ok());
@@ -234,8 +233,7 @@ impl Sink for CubebSink {
         // stereo stream we only see/fill half the bytes cubeb actually
         // allocated, return `nframes/channels` to cubeb, and produce audio
         // at `1/channels` of real-time — observed as ~65 Hz audio-event rate
-        // instead of zuyu's ~200 Hz on this host. (See
-        // project_mk8d_real_cause_cubeb_backend_2026_05_17.)
+        // instead of zuyu's ~200 Hz on this host.
         //
         // Fix: extend the slice from `nframes` elements to the real
         // `nframes * device_channels` elements via raw pointer reslice. This

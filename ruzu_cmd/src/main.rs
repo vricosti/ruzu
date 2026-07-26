@@ -450,9 +450,6 @@ fn main() {
     let want_svc_per_tid = std::env::var_os("RUZU_PROFILE_SVC_PER_TID").is_some();
     let want_svc_summary = std::env::var_os("RUZU_PROFILE_SVC_SUMMARY").is_some();
     let want_svc_ring = std::env::var_os("RUZU_PROFILE_SVC_RING").is_some();
-    let want_thread_lifecycle = std::env::var_os("RUZU_PROFILE_THREAD_LIFECYCLE").is_some();
-    let want_startthread_sched_profile =
-        std::env::var_os("RUZU_PROFILE_STARTTHREAD_SCHED").is_some();
     let want_nvdrv_ioctl_profile = std::env::var_os("RUZU_PROFILE_NVDRV_IOCTL").is_some();
     let want_nvdrv_ioctl_history = std::env::var_os("RUZU_DUMP_NVDRV_IOCTL_HISTORY").is_some();
     let want_ipc_service_profile = std::env::var_os("RUZU_PROFILE_IPC_SERVICE").is_some();
@@ -484,8 +481,6 @@ fn main() {
         || want_svc_per_tid
         || want_svc_summary
         || want_svc_ring
-        || want_thread_lifecycle
-        || want_startthread_sched_profile
         || want_nvdrv_ioctl_profile
         || want_nvdrv_ioctl_history
         || want_ipc_service_profile
@@ -512,8 +507,6 @@ fn main() {
             ruzu_core::hle::kernel::svc_dispatch::dump_svc_per_tid_profile();
             ruzu_core::hle::kernel::svc_dispatch::dump_svc_summary_profile();
             ruzu_core::hle::kernel::svc_dispatch::dump_svc_ring_profile();
-            ruzu_core::hle::kernel::svc::svc_thread::dump_thread_lifecycle_profile();
-            ruzu_core::hle::kernel::k_scheduler::dump_start_thread_sched_profile();
             ruzu_core::hle::kernel::svc_dispatch::dump_wake_latency();
             ruzu_core::hle::kernel::svc_dispatch::dump_gap_profile();
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
@@ -549,8 +542,6 @@ fn main() {
             ruzu_core::hle::kernel::svc_dispatch::dump_svc_per_tid_profile();
             ruzu_core::hle::kernel::svc_dispatch::dump_svc_summary_profile();
             ruzu_core::hle::kernel::svc_dispatch::dump_svc_ring_profile();
-            ruzu_core::hle::kernel::svc::svc_thread::dump_thread_lifecycle_profile();
-            ruzu_core::hle::kernel::k_scheduler::dump_start_thread_sched_profile();
             ruzu_core::hle::kernel::svc_dispatch::dump_wake_latency();
             ruzu_core::hle::kernel::svc_dispatch::dump_gap_profile();
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
@@ -890,7 +881,6 @@ fn main() {
         // while it holds rasterizer cache locks; taking the global Memory
         // mutex there deadlocks against CPU/DSP threads that hold the mutex
         // during guest writes which re-enter the rasterizer (`on_cpu_write`)
-        // — the MK8D freeze. Upstream's equivalent accesses are raw-pointer
         // and lock-free; every `Memory` method used below takes `&self`. The
         // pointee lives inside the `Arc<Mutex<..>>` allocation, which the
         // system keeps alive for the whole emulation session.
@@ -1181,7 +1171,6 @@ fn main() {
         // Install GPU VA → CPU VA translator on the renderer so
         // rasterizer-side query writes (e.g. semaphore_trigger) translate
         // GPU VAs into CPU VAs before reaching `guest_memory_writer`.
-        // Without this, MK8D's GPU semaphore writes go to unmapped CPU
         // addresses (the GPU VA is passed straight through).
         //
         // SAFETY: `gpu_ptr` points to the Box<Gpu> we're about to move
@@ -1225,7 +1214,6 @@ fn main() {
     // Upstream loads and fully builds the disk pipeline cache before starting
     // GPU/CPU execution. Starting the guest first lets pipeline workers contend
     // with presentation and can hide entire early animations behind the cache
-    // build (MK8D's first-logo transition).
     if *common::settings::values().use_disk_shader_cache.get_value()
         && std::env::var_os("RUZU_SKIP_DISK_SHADER_CACHE").is_none()
     {
@@ -1276,8 +1264,6 @@ fn main() {
     // Starts CPU threads running in background via CpuManager.
     // -----------------------------------------------------------------------
     // RUZU_BOOT_DELAY_MS=NNN: Diagnostic — sleep before starting the guest CPU
-    // threads. Investigating MK8D wedge per
-    // project_mk8d_lost_wakeup_cv_69a545ac_2026_05_21: ruzu starts tid=75
     // ~595ms earlier than zuyu, causing pthread_create-child to skip the
     // wait branch (state=READY already set by parent before child runs).
     if let Ok(ms_str) = std::env::var("RUZU_BOOT_DELAY_MS") {

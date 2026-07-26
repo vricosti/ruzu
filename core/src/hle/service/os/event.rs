@@ -173,7 +173,6 @@ impl Event {
     /// lazily as a real kernel event/readable-event pair when first requested.
     pub fn copy_handle(&self, ctx: &HLERequestContext) -> Option<Handle> {
         let readable_event = self.create_kernel_bridge_from_context(ctx)?;
-        // Diagnostic — when an MK8D-style freeze happens on `object_id=N`,
         // logging the full backtrace at copy_handle correlates the
         // [EVENT_REG] log with the calling service (e.g. `vi::
         // application_display_service::get_display_vsync_event`). Off by

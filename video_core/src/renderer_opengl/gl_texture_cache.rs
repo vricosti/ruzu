@@ -4698,7 +4698,6 @@ impl TextureCache {
         // rewrites the copies to the converted layout (RGBA8 offsets/sizes,
         // tight row_length/image_height). Uploading the raw unswizzled bytes
         // with unconverted copies leaves the GL_RGBA8 texture empty
-        // (GL_INVALID_OPERATION: out-of-bounds PBO access -- MK8D splash text
         // and demo assets).
         let copies = if base_image.flags.contains(ImageFlagBits::CONVERTED) {
             trace_gl_texture_cache_stall!(
@@ -7552,7 +7551,6 @@ impl TextureCache {
     /// Upstream keys framebuffers by the complete `RenderTargets` object and
     /// attaches every color target before selecting draw buffers. The previous
     /// Rust path bound only the first mapped render target, which is not
-    /// equivalent for MK8D's multi-pass composition.
     pub fn framebuffer_for_render_targets_from_snapshot(
         &mut self,
         _render_targets: &Maxwell3DRenderTargets,
@@ -8751,10 +8749,8 @@ impl TextureCache {
             return None;
         }
 
-        // EXPERIMENT: when MK8D wants to draw to flinger buffer #2 or #3
         // (0x502570000 / 0x502DE0000), redirect to the FIRST flinger buffer
         // (0x501D00000) to test the "late parent textures reject FS writes"
-        // hypothesis from [[mk8d-black-screen-2026-05-21-evening]]. If MK8D
         // ends up rendering visible content when we redirect, the bug is in
         // the late-created parent textures.
         let force_first_flinger = std::env::var_os("RUZU_FBO_FORCE_FIRST_FLINGER").is_some();

@@ -214,7 +214,6 @@ fn command_words_find_value() -> Option<u32> {
 /// Per-submit method-dispatch trace gate. `RUZU_TRACE_PULLER_SUBMITS=N` logs
 /// every dispatch_method/dispatch_multi_method call for the first N submits
 /// crossing `Scheduler::push`. Used to find missing GPU-method dispatches in
-/// the wedge between MK8D's 2nd and 3rd SubmitGPFIFO ioctls.
 pub static CURRENT_SUBMIT_INDEX: AtomicU64 = AtomicU64::new(0);
 
 /// Index of the submit currently being dispatched by `Scheduler::push`, or

@@ -92,7 +92,6 @@ mod tests {
         assert_ne!(a.next_u32(), b.next_u32());
     }
 
-    /// The bug the MK8D investigation uncovered: two consecutive small
     /// generations must NOT produce identical sequences. Before the fix,
     /// `generate_random_bytes` reset state from the seed on every call,
     /// so two 8-byte calls in a row returned identical bytes. Regression

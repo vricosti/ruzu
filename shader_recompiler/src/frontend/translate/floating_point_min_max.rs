@@ -51,12 +51,11 @@ mod tests {
     use crate::ir::types::ShaderStage;
 
     #[test]
-    fn fmnmx_mk8d_particle_word_keeps_ftz_separate_from_abs_b() {
+    fn fmnmx_regression_particle_word_keeps_ftz_separate_from_abs_b() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
         let mut tv = TranslatorVisitor::new(&mut program, 0);
 
-        // Live MK8D flare vertex shader instruction at 0x6754d0.
         fmnmx(&mut tv, 0x5C60_1380_0057_FF03, MaxwellOpcode::FMNMX_reg);
 
         let block = &tv.ir.program.blocks[0];

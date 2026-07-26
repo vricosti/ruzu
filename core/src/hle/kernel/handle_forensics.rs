@@ -1,5 +1,5 @@
-//! Silent in-memory forensics for the MK8D boot-time InvalidHandle abort
-//! (task #123). Synchronous eprintln tracing of CloseHandle perturbs timing
+//! Silent in-memory forensics for timing-sensitive invalid-handle failures.
+//! Synchronous eprintln tracing of CloseHandle perturbs timing
 //! enough to make the race vanish (5/5 boots with tracing vs abort without),
 //! so this module records handle-related SVCs into a bounded in-memory ring
 //! and only prints when the failing SVC actually fires
