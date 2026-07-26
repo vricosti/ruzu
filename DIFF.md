@@ -23548,6 +23548,12 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   priority 49 incorrectly returning `Some(10)`; restoring the fix makes it
   pass.
 - All 20 `k_priority_queue::tests` pass in release mode.
+- The exact module was also cross-compiled as an
+  `aarch64-unknown-linux-gnu` test binary and run under `qemu-aarch64`; all 20
+  tests pass there, including the 50,000-operation regression. This module has
+  no architecture- or OS-specific conditional path. The same module and test
+  bodies also compile to Rust metadata for `aarch64-apple-darwin`; runtime
+  execution still requires the Apple host.
 - An env-gated validator added to `zuyu-instrumented` checked yuzu's intrusive
   queue immediately after each RUNNABLE transition. Its first 16 reported
   transitions all had the exact scheduled/suggested ownership implied by the
