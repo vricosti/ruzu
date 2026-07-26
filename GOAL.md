@@ -32,6 +32,7 @@ Use:
 
 - release builds;
 - Vulkan for both emulators;
+- an unlocked, active desktop session with the emulator window visible;
 - the same host, GPU, Vulkan driver, resolution, game version, update, DLC,
   audio backend, and controller configuration;
 - one emulator process at a time;
@@ -97,8 +98,23 @@ Launch ruzu with normal audio:
 cd "$RUZU_ROOT"
 rm -f /tmp/ruzu-mk8d-menu-complete
 RUST_LOG=error \
-target/release/ruzu-cmd --renderer vulkan -g "$MK8D_ROM"
+gnome-session-inhibit \
+  --inhibit idle \
+  --reason "MK8D performance benchmark" \
+  target/release/ruzu-cmd --renderer vulkan -g "$MK8D_ROM"
 ```
+
+Before accepting a run, verify that the desktop session is not locked:
+
+```bash
+loginctl show-session "$XDG_SESSION_ID" -p Active -p IdleHint -p LockedHint
+```
+
+`Active=yes` and `LockedHint=no` are required. A locked or hidden session can
+throttle both ruzu and yuzu to roughly one presented frame per second, making
+boot timing, input calibration, and profiles invalid. `gnome-session-inhibit`
+prevents a currently unlocked GNOME session from becoming idle during the run;
+it does not unlock an already locked session.
 
 Before benchmarking, inspect the environment and disable every unrelated
 `RUZU_TRACE_*`, `RUZU_PROFILE_*`, dump, validation, and debug variable. Keep
