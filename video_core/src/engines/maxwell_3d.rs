@@ -2657,6 +2657,7 @@ impl Maxwell3D {
         if !self.current_macro_dirty {
             return;
         }
+        let original_first = parameters.first().copied();
         let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
             return;
         };
@@ -2678,6 +2679,16 @@ impl Maxwell3D {
                     u32::from_le_bytes(chunk.try_into().expect("4-byte chunk"));
             }
             current_index += word_count;
+        }
+        if parameters.first().copied() == Some(u32::MAX) {
+            log::error!(
+                "[MACRO_REFRESH_INVALID] submit={:?} original_first={:?} params={:08X?} segments={:X?} addresses={:X?}",
+                crate::dma_pusher::current_submit_traced(),
+                original_first,
+                parameters,
+                self.macro_segments,
+                self.macro_addresses
+            );
         }
     }
 
@@ -4371,6 +4382,16 @@ impl Maxwell3D {
         }
 
         let index = parameters[0] as usize;
+        if parameters[0] == u32::MAX {
+            log::error!(
+                "[BIND_SHADER_INVALID] parameters={:08X?} dirty={} segments={:X?} addresses={:X?}",
+                parameters,
+                self.current_macro_dirty,
+                self.macro_segments,
+                self.macro_addresses
+            );
+            return;
+        }
         if parameters[1].wrapping_sub(self.regs[SHADOW_SCRATCH_BASE as usize + 28 + index]) == 0 {
             return;
         }
@@ -8263,6 +8284,17 @@ mod tests {
         let pipeline_base = (PIPELINE_BASE + PIPELINE_STRIDE) as usize;
         assert_eq!(engine.regs[pipeline_base + 1], 0);
         assert!(!engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
+    }
+
+    #[test]
+    fn test_hle_bind_shader_rejects_invalid_macro_index() {
+        let mut engine = Maxwell3D::new();
+        engine.dirty.flags.fill(false);
+
+        engine.hle_bind_shader(&mut [u32::MAX, 0xAAAA, 0x240, 0, 0x1234_5600]);
+
+        assert!(!engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
+        assert_eq!(engine.regs[CB_CONFIG_BASE as usize], 0);
     }
 
     #[test]
