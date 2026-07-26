@@ -2091,7 +2091,14 @@ impl KernelCore {
         thread_name: String,
         func: Box<dyn FnOnce() + Send>,
     ) -> std::thread::JoinHandle<()> {
+        use super::k_resource_limit::LimitableResource;
+        use super::k_scoped_resource_reservation::KScopedResourceReservation;
+
         let kernel_ptr = self as *const KernelCore as usize;
+        let resource_limit = process.lock().unwrap().resource_limit.clone();
+        let mut thread_reservation =
+            KScopedResourceReservation::new(resource_limit, LimitableResource::ThreadCountMax, 1);
+        assert!(thread_reservation.succeeded());
 
         let thread = Arc::new(KThreadLock::new(KThread::new()));
         {
@@ -2109,10 +2116,17 @@ impl KernelCore {
             assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
             thread_guard.bind_self_reference(&thread);
         }
+        thread_reservation.commit();
+
         process
             .lock()
             .unwrap()
             .register_thread_object(Arc::clone(&thread));
+        let object_id = {
+            let thread = thread.lock().unwrap();
+            thread.get_object_id()
+        };
+        self.register_kernel_object(object_id);
 
         std::thread::Builder::new()
             .name(thread_name.clone())
@@ -2132,6 +2146,18 @@ impl KernelCore {
                     log::info!("Host service thread '{}' started", thread_name);
                     func();
                     log::info!("Host service thread '{}' exited", thread_name);
+
+                    let (object_id, parent, resource_limit_release_hint) = {
+                        let mut thread = thread.lock().unwrap();
+                        let object_id = thread.get_object_id();
+                        let parent = thread.parent.as_ref().and_then(Weak::upgrade);
+                        let resource_limit_release_hint = thread.resource_limit_release_hint;
+                        thread.finalize();
+                        (object_id, parent, resource_limit_release_hint)
+                    };
+                    KThread::post_destroy(parent, resource_limit_release_hint);
+                    kernel.unregister_kernel_object(object_id);
+                    kernel.set_current_emu_thread(None);
                 }
             })
             .expect("Failed to spawn host service thread")
@@ -2150,9 +2176,26 @@ impl KernelCore {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         {
             let mut process_guard = process.lock().unwrap();
-            let rc = process_guard.initialize(&[], 0, 0, 0, 0, 0, None, false);
+            let rc = process_guard.initialize(
+                &[],
+                0,
+                0,
+                0,
+                0,
+                0,
+                self.get_system_resource_limit(),
+                false,
+            );
             assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
             process_guard.bind_self_reference(&process);
+            // KProcess owns a KernelCore reference upstream and can always
+            // reach the global scheduler. Preserve that dependency explicitly
+            // in Rust so host dummy threads can use KSynchronizationObject::Wait
+            // instead of MultiWait's polling fallback.
+            let dummy_core = (hardware_properties::NUM_CPU_CORES - 1) as usize;
+            if let Some(scheduler) = self.scheduler(dummy_core) {
+                process_guard.attach_scheduler(scheduler);
+            }
         }
 
         self.register_process(Arc::clone(&process));
@@ -3323,6 +3366,88 @@ mod tests {
             .as_ref()
             .and_then(Weak::upgrade)
             .is_some());
+    }
+
+    #[test]
+    fn run_on_host_core_process_wires_dummy_thread_to_scheduler() {
+        use super::super::k_resource_limit::LimitableResource;
+
+        let mut kernel = KernelCore::new();
+        kernel.initialize();
+        kernel.initialize_system_resource_limit(16 * 1024 * 1024, 0);
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let host_thread = kernel.run_on_host_core_process(
+            "host-svc-test",
+            Box::new(move || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }),
+        );
+        ready_rx.recv().unwrap();
+
+        let process = kernel.host_service_processes.lock().unwrap()[0].clone();
+        let thread = {
+            let process = process.lock().unwrap();
+            let process_scheduler = process
+                .scheduler
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .expect("host process should inherit the dummy core scheduler");
+            assert!(Arc::ptr_eq(
+                &process_scheduler,
+                kernel
+                    .scheduler((hardware_properties::NUM_CPU_CORES - 1) as usize)
+                    .unwrap()
+            ));
+            assert!(process.global_scheduler_context.is_some());
+            process.thread_objects.values().next().cloned()
+        };
+        let thread = thread.expect("host service process should retain its live dummy thread");
+
+        let thread = thread.lock().unwrap();
+        let object_id = thread.get_object_id();
+        let thread_id = thread.get_thread_id();
+        assert!(thread.is_dummy_thread());
+        assert!(thread.scheduler.as_ref().and_then(Weak::upgrade).is_some());
+        assert!(thread
+            .global_scheduler_context
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some());
+        drop(thread);
+        assert_eq!(
+            kernel
+                .get_system_resource_limit()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_current_value(LimitableResource::ThreadCountMax),
+            1
+        );
+
+        release_tx.send(()).unwrap();
+        host_thread.join().unwrap();
+
+        let process = process.lock().unwrap();
+        assert!(process.thread_objects.is_empty());
+        assert!(process.get_thread_by_thread_id(thread_id).is_none());
+        drop(process);
+        assert!(!kernel
+            .registered_objects
+            .lock()
+            .unwrap()
+            .contains(&object_id));
+        assert_eq!(
+            kernel
+                .get_system_resource_limit()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_current_value(LimitableResource::ThreadCountMax),
+            0
+        );
     }
 
     #[test]

@@ -3033,6 +3033,7 @@ impl KThread {
             let active_core = self.core_id;
             let affinity = self.physical_affinity_mask.get_affinity_mask();
             let is_dummy = self.thread_type == ThreadType::Dummy;
+            let self_reference = self.self_reference.as_ref().and_then(Weak::upgrade);
 
             if should_trace_ct_fire() {
                 log::info!(
@@ -3055,6 +3056,7 @@ impl KThread {
                 active_core,
                 affinity,
                 is_dummy,
+                self_reference,
                 self.process_schedule_count.clone(),
             );
             if should_trace_ct_fire() {
@@ -3813,8 +3815,7 @@ impl KThread {
         // If the thread has an owner process, unregister it.
         if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
             let mut process = parent.lock().unwrap();
-            process.thread_objects.remove(&self.object_id);
-            process.unregister_thread(self.thread_id);
+            process.unregister_thread_object(self.thread_id, self.object_id);
 
             // If the thread has a local region, delete it.
             if self.tls_address.get() != 0 {
@@ -3873,6 +3874,23 @@ impl KThread {
         // Upstream: KSynchronizationObject::Finalize()
         // Clears the synchronization object state so no dangling waiters remain.
         self.sync_object = super::k_synchronization_object::SynchronizationObjectState::new();
+    }
+
+    /// Release the owner resources after the final thread reference closes.
+    /// Matches upstream `KThread::PostDestroy()` (k_thread.cpp:337-345).
+    pub fn post_destroy(parent: Option<Arc<ProcessLock>>, resource_limit_release_hint: bool) {
+        let Some(parent) = parent else {
+            return;
+        };
+        let resource_limit = parent.lock().unwrap().resource_limit.clone();
+        if let Some(resource_limit) = resource_limit {
+            let hint_value = if resource_limit_release_hint { 0 } else { 1 };
+            resource_limit.lock().unwrap().release_with_hint(
+                super::k_resource_limit::LimitableResource::ThreadCountMax,
+                1,
+                hint_value,
+            );
+        }
     }
 
     /// Is the thread signaled?
@@ -4697,6 +4715,7 @@ mod tests {
 
         let process_guard = process.lock().unwrap();
         assert!(process_guard.get_thread_by_object_id(22).is_none());
+        assert!(process_guard.get_thread_by_thread_id(11).is_none());
         assert!(!process_guard.thread_list.contains(&11));
     }
 

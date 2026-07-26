@@ -23472,6 +23472,74 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - The focused MK8D syscall comparison reduced `mprotect` calls from 47,330 to
   3,232 over the same ten-second launch interval.
 
+## 2026-07-26 — core/src/hle/kernel/{kernel,global_scheduler_context,k_process,k_thread}.rs vs core/hle/kernel/{kernel,global_scheduler_context,k_process,k_scheduler,k_thread}.{h,cpp}
+
+### Intentional differences
+- Upstream stores pending dummy waiters as `KThread*` in a `std::set`. Rust
+  stores the equivalent strong ownership as
+  `HashMap<object_id, Arc<KThreadLock>>`; the object ID replaces pointer
+  identity while the `Arc` keeps the exact thread alive until scheduler-lock
+  release.
+- Upstream `KProcess` owns a `KernelCore&`, so an initialized host process can
+  reach the global scheduler implicitly. Rust keeps those dependencies as
+  explicit weak/shared fields and attaches the scheduler for upstream's dummy
+  core before registering the thread.
+- `KThread::commit_state_transition` forwards an upgraded self-reference
+  because Rust cannot pass upstream's always-valid raw `KThread*` through the
+  non-intrusive priority queue.
+- `KThread::PostDestroy` receives a captured `Arc<ProcessLock>` rather than
+  upstream's pointer-and-hint packed integer. Dropping that final captured
+  `Arc` provides the corresponding owner `Close()` lifetime release.
+
+### Unintentional differences (fixed)
+- Host-core processes previously had no scheduler or
+  `GlobalSchedulerContext`. Their dummy threads therefore could not use the
+  kernel synchronization bridge and `MultiWait` fell back to a 100-us polling
+  loop.
+- Pending dummy wakeups previously retained only IDs and attempted to resolve
+  them through the global scheduler thread list. Upstream never adds dummy
+  threads to that list; wakeups now retain and invoke the dummy thread
+  directly.
+- Dummy waiter registration, removal, and wakeup now assert that the scheduler
+  lock is held, matching the three upstream `ASSERT` preconditions.
+- `RunHostThreadFunc` now registers the dummy's kernel object after process
+  registration, matching upstream `KThread::Register`.
+- Host-thread creation now reserves and commits `ThreadCountMax`; callback
+  completion finalizes both process thread indexes, releases the reservation
+  with upstream's post-destroy hint, and unregisters the kernel object.
+- `KThread::Finalize` previously removed the process object-id index but left
+  the thread-id index pointing at the finalized thread. Process-owned
+  unregistration now removes both indexes atomically.
+
+### Missing items
+- Rust-only priority-queue recovery helpers remain in
+  `GlobalSchedulerContext`; removing them requires completing the wider
+  scheduler parity slice.
+- The existing Rust `KThread::Finalize` waiter-cleanup block is not yet wrapped
+  in upstream's `KScopedSchedulerLock`; changing that lock order requires a
+  separate synchronization audit.
+
+### Binary layout verification
+- N/A: this slice changes scheduler ownership and wakeup lifecycle only.
+
+### Verification
+- Re-read upstream `RunHostThreadFunc`, `RunOnHostCoreProcess`,
+  `GlobalSchedulerContext::{Register,Unregister}DummyThreadForWakeup`,
+  `WakeupWaitingDummyThreads`, `KScheduler::OnThreadStateChanged`,
+  `KThread::{Finalize,PostDestroy}`, and `KProcess::UnregisterThread`.
+- The host-process integration test verifies scheduler/GSC inheritance by its
+  live dummy thread, `ThreadCountMax` reservation/release, both process-index
+  removals, and kernel-object cleanup. The dummy-wakeup test verifies direct
+  strong ownership without global thread-list registration.
+- Release gates pass for all 7 `GlobalSchedulerContext` tests, all 7
+  `KernelCore` tests, and the focused `KThread::Finalize` regression. The
+  transition and host-lifecycle regressions also pass with debug assertions
+  enabled.
+- The full `cargo test -p core --release` gate remains broken outside this
+  slice: existing page-table/process/session tests fail and the test binary
+  later terminates in `physical_core` with `SIGSEGV`, including with one test
+  thread.
+
 ## 2026-07-26 — video_core/src/renderer_vulkan/{resource_pool,command_pool,scheduler,renderer_vulkan,vk_rasterizer}.rs vs video_core/renderer_vulkan/{vk_resource_pool,vk_command_pool,vk_scheduler}.{h,cpp}
 
 ### Intentional differences

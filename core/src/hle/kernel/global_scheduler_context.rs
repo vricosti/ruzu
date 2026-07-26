@@ -5,7 +5,7 @@
 //! GlobalSchedulerContext: the global scheduler context that manages the
 //! priority queue of threads and the scheduler lock.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -123,7 +123,7 @@ pub struct GlobalSchedulerContext {
     pub m_scheduler_lock: KAbstractSchedulerLock,
 
     /// Dummy threads pending wakeup on lock release.
-    m_woken_dummy_threads: Mutex<HashSet<u64>>,
+    m_woken_dummy_threads: Mutex<HashMap<u64, Arc<KThreadLock>>>,
     /// All thread pointers that are alive.
     ///
     /// Upstream stores intrusive `KThread*` entries and can identify a thread
@@ -139,7 +139,7 @@ impl GlobalSchedulerContext {
             m_scheduler_update_needed: std::sync::atomic::AtomicBool::new(false),
             m_priority_queue: KPriorityQueue::new(),
             m_scheduler_lock: KAbstractSchedulerLock::new(),
-            m_woken_dummy_threads: Mutex::new(HashSet::new()),
+            m_woken_dummy_threads: Mutex::new(HashMap::new()),
             m_thread_list: Mutex::new(Vec::new()),
         }
     }
@@ -206,6 +206,7 @@ impl GlobalSchedulerContext {
         active_core: i32,
         affinity: u64,
         is_dummy: bool,
+        thread: Option<Arc<KThreadLock>>,
         process_schedule_count: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
     ) {
         if should_trace_sched_state(thread_id) {
@@ -300,7 +301,8 @@ impl GlobalSchedulerContext {
                 .store(true, Ordering::Release);
 
             if is_dummy {
-                self.register_dummy_thread_for_wakeup(thread_id);
+                let thread = thread.expect("dummy thread must own a self reference");
+                self.register_dummy_thread_for_wakeup(thread_id, thread);
             }
 
             if should_trace_sched_state(thread_id) {
@@ -612,11 +614,16 @@ impl GlobalSchedulerContext {
         &self.m_scheduler_lock
     }
 
-    pub fn register_dummy_thread_for_wakeup(&self, thread_id: u64) {
-        self.m_woken_dummy_threads.lock().unwrap().insert(thread_id);
+    pub fn register_dummy_thread_for_wakeup(&self, thread_id: u64, thread: Arc<KThreadLock>) {
+        debug_assert!(self.is_locked());
+        self.m_woken_dummy_threads
+            .lock()
+            .unwrap()
+            .insert(thread_id, thread);
     }
 
     pub fn unregister_dummy_thread_for_wakeup(&self, thread_id: u64) {
+        debug_assert!(self.is_locked());
         self.m_woken_dummy_threads
             .lock()
             .unwrap()
@@ -624,19 +631,15 @@ impl GlobalSchedulerContext {
     }
 
     pub fn wakeup_waiting_dummy_threads(&self) {
-        let thread_ids: Vec<u64> = {
-            let set = self.m_woken_dummy_threads.lock().unwrap();
-            set.iter().copied().collect()
+        debug_assert!(self.is_locked());
+        let threads = {
+            let mut threads = self.m_woken_dummy_threads.lock().unwrap();
+            std::mem::take(&mut *threads)
         };
 
-        let thread_list = self.m_thread_list.lock().unwrap();
-        for thread_id in &thread_ids {
-            if let Some(thread) = thread_list.iter().find(|(id, _)| *id == *thread_id) {
-                thread.1.lock().unwrap().dummy_thread_end_wait();
-            }
+        for thread in threads.into_values() {
+            thread.lock().unwrap().dummy_thread_end_wait();
         }
-
-        self.m_woken_dummy_threads.lock().unwrap().clear();
     }
 
     /// Helper: extract PQ-relevant properties from a locked KThread.
@@ -661,7 +664,7 @@ impl Default for GlobalSchedulerContext {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use super::GlobalSchedulerContext;
     use crate::hle::kernel::k_thread::{KThread, KThreadLock, ThreadState};
@@ -698,6 +701,58 @@ mod tests {
     }
 
     #[test]
+    fn dummy_state_transitions_hold_thread_directly_until_scheduler_unlock() {
+        let mut gsc = GlobalSchedulerContext::new();
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+
+        gsc.m_scheduler_lock.lock();
+        gsc.on_thread_state_changed(
+            0x33,
+            ThreadState::WAITING,
+            ThreadState::RUNNABLE,
+            65,
+            3,
+            0b1000,
+            true,
+            Some(Arc::clone(&thread)),
+            None,
+        );
+
+        assert!(gsc.get_thread_list().is_empty());
+        assert_eq!(Arc::strong_count(&thread), 2);
+
+        gsc.on_thread_state_changed(
+            0x33,
+            ThreadState::RUNNABLE,
+            ThreadState::WAITING,
+            65,
+            3,
+            0b1000,
+            true,
+            Some(Arc::clone(&thread)),
+            None,
+        );
+        assert_eq!(Arc::strong_count(&thread), 1);
+
+        gsc.on_thread_state_changed(
+            0x33,
+            ThreadState::WAITING,
+            ThreadState::RUNNABLE,
+            65,
+            3,
+            0b1000,
+            true,
+            Some(Arc::clone(&thread)),
+            None,
+        );
+        gsc.wakeup_waiting_dummy_threads();
+        gsc.m_scheduler_lock.unlock();
+
+        assert!(gsc.m_woken_dummy_threads.lock().unwrap().is_empty());
+        assert_eq!(Arc::strong_count(&thread), 1);
+    }
+
+    #[test]
     fn state_change_remove_increments_process_scheduled_count_after_props_are_removed() {
         let mut gsc = GlobalSchedulerContext::new();
         let scheduled_count = Arc::new(AtomicI64::new(0));
@@ -710,6 +765,7 @@ mod tests {
             2,
             0b0100,
             false,
+            None,
             Some(Arc::clone(&scheduled_count)),
         );
         assert_eq!(scheduled_count.load(Ordering::Relaxed), 1);
@@ -722,6 +778,7 @@ mod tests {
             2,
             0b0100,
             false,
+            None,
             None,
         );
 
@@ -742,6 +799,7 @@ mod tests {
             2,
             0b0100,
             false,
+            None,
             Some(Arc::clone(&scheduled_count)),
         );
         gsc.on_thread_priority_changed(100, 44, 29, 2, 0b0100, false, false, 100);

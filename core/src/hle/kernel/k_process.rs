@@ -2742,6 +2742,12 @@ impl KProcess {
         }
     }
 
+    pub fn unregister_thread_object(&mut self, thread_id: u64, object_id: u64) {
+        self.thread_objects.remove(&object_id);
+        self.thread_objects_by_thread_id.remove(&thread_id);
+        self.unregister_thread(thread_id);
+    }
+
     pub fn get_thread_by_object_id(&self, object_id: u64) -> Option<Arc<KThreadLock>> {
         self.thread_objects.get(&object_id).cloned()
     }
