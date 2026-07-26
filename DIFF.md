@@ -23439,3 +23439,35 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Re-read `CodeAssembler::ready`, `CodeBuffer::protect_rx/protect_rw`, and the
   Unix `mprotect` adapter after implementation. The JIT cache now follows the
   intended `RW` while emitting, `RX` while executing lifecycle.
+
+## 2026-07-26 — externals/rdynarmic x64 code-cache protection vs upstream Dynarmic x64 code-cache protection
+
+### Intentional differences
+- Rust exposes upstream's `DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT` CMake option as
+  the disabled-by-default Cargo feature `no_execute_support`.
+- `rxbyak::CodeAssembler::set_protect_mode_rwe` forwards to the existing
+  `CodeBuffer` protection owner because Rust rxbyak does not expose Xbyak's
+  C++ `CodeArray::PROTECT_RWE` enum.
+
+### Unintentional differences (fixed)
+- The default Rust path changed the entire x64 code cache between RW and RX for
+  every emission. Upstream leaves the cache RWX when
+  `DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT` is disabled; Rust now does the same.
+- A32 and A64 protection calls now belong to
+  `BlockOfCode::enable_writing`/`disable_writing`, matching upstream method
+  ownership and making them no-ops in the default configuration.
+
+### Missing items
+- Apple Hardened Runtime entitlement handling remains outside this x64
+  code-cache slice; native Apple Silicon execution uses the ARM64 backend.
+
+### Binary layout verification
+- N/A: this changes host virtual-memory permissions only.
+
+### Verification
+- Re-read upstream `CMakeLists.txt`, `block_of_code.{h,cpp}`,
+  `a32_emit_x64.cpp`, and `a64_emit_x64.cpp` after implementation.
+- `cargo check -p rdynarmic --release` and the same check with
+  `--features no_execute_support` pass.
+- The focused MK8D syscall comparison reduced `mprotect` calls from 47,330 to
+  3,232 over the same ten-second launch interval.
