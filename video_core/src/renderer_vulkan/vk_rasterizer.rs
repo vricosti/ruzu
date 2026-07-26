@@ -2466,7 +2466,6 @@ impl RasterizerVulkan {
         unsafe {
             let _texture_lock = (*texture_cache).base.mutex.lock();
             (*texture_cache)
-                .base
                 .fill_graphics_image_views(&mut graphics_views, has_storage_image_descriptors);
         }
         let sampled_views = graphics_views
@@ -4542,6 +4541,23 @@ mod tests {
             map_topology(PrimitiveTopology::TriangleStrip),
             vk::PrimitiveTopology::TRIANGLE_STRIP
         );
+    }
+
+    #[test]
+    fn graphics_descriptors_use_vulkan_texture_cache_view_wrapper() {
+        let source = include_str!("vk_rasterizer.rs");
+        let function = source
+            .split("fn bind_graphics_descriptors")
+            .nth(1)
+            .expect("bind_graphics_descriptors must exist")
+            .split("// ── Framebuffer resize")
+            .next()
+            .expect("bind_graphics_descriptors boundary must exist");
+
+        assert!(function.contains("(*texture_cache)\n                .fill_graphics_image_views"));
+        assert!(!function.contains(
+            "(*texture_cache)\n                .base\n                .fill_graphics_image_views"
+        ));
     }
 
     #[test]

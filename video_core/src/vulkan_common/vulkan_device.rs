@@ -460,8 +460,7 @@ impl Device {
             vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default();
         let mut depth_clip_control_features =
             vk::PhysicalDeviceDepthClipControlFeaturesEXT::default();
-        let mut index_type_uint8_features =
-            vk::PhysicalDeviceIndexTypeUint8FeaturesEXT::default();
+        let mut index_type_uint8_features = vk::PhysicalDeviceIndexTypeUint8FeaturesEXT::default();
         let mut vertex_attribute_divisor_features =
             vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT::default();
         let mut provoking_vertex_features = vk::PhysicalDeviceProvokingVertexFeaturesEXT::default();

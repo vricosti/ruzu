@@ -5792,6 +5792,77 @@ impl TextureCache {
         Some(sampler)
     }
 
+    /// Vulkan-backed wrapper for `TextureCache<P>::FillGraphicsImageViews`.
+    ///
+    /// `TextureCacheBase` resolves TIC descriptors and base image-view slots.
+    /// The upstream blacklist branch also calls `ScaleDown(image)`, which is
+    /// backend-specific, so the Vulkan wrapper owns that part.
+    pub fn fill_graphics_image_views(
+        &mut self,
+        views: &mut [crate::texture_cache::texture_cache_base::ImageViewInOut],
+        has_blacklists: bool,
+    ) {
+        loop {
+            self.base.fill_graphics_image_views(views, has_blacklists);
+            self.finish_pending_backend_deletions();
+            if self.base.has_deleted_images {
+                continue;
+            }
+            if !has_blacklists {
+                break;
+            }
+
+            let mut has_blacklisted = false;
+            for view in views.iter() {
+                if !view.blacklist || !view.id.is_valid() || view.id == NULL_IMAGE_VIEW_ID {
+                    continue;
+                }
+                let image_id = self.base.slot_image_views[view.id].image_id;
+                if !image_id.is_valid() || image_id == NULL_IMAGE_ID {
+                    continue;
+                }
+                has_blacklisted |= self.scale_down_image(image_id, false);
+                self.base.slot_images[image_id].scale_rating = 0;
+            }
+            if !self.base.has_deleted_images && !has_blacklisted {
+                break;
+            }
+        }
+    }
+
+    /// Vulkan-backed wrapper for `TextureCache<P>::FillComputeImageViews`.
+    ///
+    /// Upstream always enables blacklist handling for compute image views;
+    /// written images must be scaled down before use.
+    pub fn fill_compute_image_views(
+        &mut self,
+        views: &mut [crate::texture_cache::texture_cache_base::ImageViewInOut],
+    ) {
+        loop {
+            self.base.fill_compute_image_views(views);
+            self.finish_pending_backend_deletions();
+            if self.base.has_deleted_images {
+                continue;
+            }
+
+            let mut has_blacklisted = false;
+            for view in views.iter() {
+                if !view.blacklist || !view.id.is_valid() || view.id == NULL_IMAGE_VIEW_ID {
+                    continue;
+                }
+                let image_id = self.base.slot_image_views[view.id].image_id;
+                if !image_id.is_valid() || image_id == NULL_IMAGE_ID {
+                    continue;
+                }
+                has_blacklisted |= self.scale_down_image(image_id, false);
+                self.base.slot_images[image_id].scale_rating = 0;
+            }
+            if !self.base.has_deleted_images && !has_blacklisted {
+                break;
+            }
+        }
+    }
+
     /// Resolve and materialize the graphics TIC selected by Maxwell's
     /// draw-texture state.
     ///
@@ -5809,7 +5880,7 @@ impl TextureCache {
             blacklist: false,
             id: NULL_IMAGE_VIEW_ID,
         }];
-        self.base.fill_graphics_image_views(&mut selected, false);
+        self.fill_graphics_image_views(&mut selected, false);
         let view_id = selected[0].id;
         if !view_id.is_valid() || view_id == NULL_IMAGE_VIEW_ID {
             return None;
@@ -6399,6 +6470,45 @@ mod tests {
             .expect("sampled image view must be resolved");
 
         assert!(prepare < resolve, "PrepareImageView must precede Handle");
+    }
+
+    #[test]
+    fn image_view_wrappers_apply_upstream_blacklist_scale_down() {
+        let source = include_str!("texture_cache.rs");
+        for (method, next) in [
+            (
+                "pub fn fill_graphics_image_views",
+                "/// Vulkan-backed wrapper for `TextureCache<P>::FillComputeImageViews`.",
+            ),
+            (
+                "pub fn fill_compute_image_views",
+                "/// Resolve and materialize the graphics TIC selected by Maxwell's",
+            ),
+        ] {
+            let body = source
+                .split(method)
+                .nth(1)
+                .expect("Vulkan image-view wrapper must exist")
+                .split(next)
+                .next()
+                .expect("Vulkan image-view wrapper boundary must exist");
+            let blacklist = body
+                .find("view.blacklist")
+                .expect("written image views must be blacklisted");
+            let scale_down = body
+                .find("scale_down_image(image_id, false)")
+                .expect("blacklisted image must use backend ScaleDown");
+            let reset_rating = body
+                .find("scale_rating = 0")
+                .expect("blacklisted image scale rating must be reset");
+            let retry = body
+                .find("!self.base.has_deleted_images && !has_blacklisted")
+                .expect("view resolution must retry after scale invalidation");
+
+            assert!(blacklist < scale_down);
+            assert!(scale_down < reset_rating);
+            assert!(reset_rating < retry);
+        }
     }
 
     #[test]
