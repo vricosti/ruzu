@@ -128,6 +128,46 @@ impl ResourcePool {
         found
     }
 
+    /// Fallible Rust adaptation of `CommitResource`.
+    ///
+    /// Upstream propagates allocation failures through exceptions from the
+    /// virtual `Allocate` call. Rust callers that allocate Vulkan resources
+    /// need the same behavior through `Result`.
+    pub fn try_commit_resource_with_ticks<E>(
+        &mut self,
+        gpu_tick: u64,
+        current_tick: u64,
+        allocate_fn: &mut dyn FnMut(usize, usize) -> Result<(), E>,
+    ) -> Result<usize, E> {
+        let search = |ticks: &mut [u64], begin: usize, end: usize| -> Option<usize> {
+            for iterator in begin..end {
+                if gpu_tick >= ticks[iterator] {
+                    ticks[iterator] = current_tick;
+                    return Some(iterator);
+                }
+            }
+            None
+        };
+
+        let ticks_len = self.ticks.len();
+        let hint = self.hint_iterator;
+        let found =
+            search(&mut self.ticks, hint, ticks_len).or_else(|| search(&mut self.ticks, 0, hint));
+        let found = if let Some(found) = found {
+            found
+        } else {
+            let old_capacity = self.ticks.len();
+            let new_capacity = old_capacity + self.grow_step;
+            allocate_fn(old_capacity, new_capacity)?;
+            self.ticks.resize(new_capacity, 0);
+            self.ticks[old_capacity] = current_tick;
+            old_capacity
+        };
+
+        self.hint_iterator = (found + 1) % self.ticks.len();
+        Ok(found)
+    }
+
     // --- Private ---
 
     /// Port of `ResourcePool::ManageOverflow`.
@@ -178,5 +218,21 @@ mod tests {
             assert_eq!(pool.commit_resource_with_ticks(1, 3, &mut allocate), 0);
         }
         assert_eq!(allocations, [(0, 2), (2, 4)]);
+    }
+
+    #[test]
+    fn failed_growth_does_not_publish_resource_slots() {
+        let mut pool = ResourcePool::new_with_external_ticks(2);
+        let error = pool
+            .try_commit_resource_with_ticks(0, 1, &mut |_, _| Err::<(), _>("allocation failed"))
+            .unwrap_err();
+        assert_eq!(error, "allocation failed");
+        assert!(pool.ticks.is_empty());
+
+        let index = pool
+            .try_commit_resource_with_ticks(0, 1, &mut |_, _| Ok::<(), &str>(()))
+            .unwrap();
+        assert_eq!(index, 0);
+        assert_eq!(pool.ticks.len(), 2);
     }
 }

@@ -2020,6 +2020,7 @@ dependencies = [
  "raw-window-handle 0.6.2",
  "rspirv",
  "shader_recompiler",
+ "smallvec",
  "spirv",
  "thiserror",
  "vulkano",

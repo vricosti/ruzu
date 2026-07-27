@@ -22,7 +22,8 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{complete_sync_request, HLERequestContext};
 
 fn should_trace_reply_receive_debug() -> bool {
-    std::env::var_os("RUZU_TRACE_REPLY_RECV").is_some()
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_REPLY_RECV").is_some())
 }
 
 fn ipc_timeout_tick_from_ns(current_tick: i64, timeout_ns: i64) -> i64 {
@@ -37,9 +38,10 @@ fn ipc_timeout_tick_from_ns(current_tick: i64, timeout_ns: i64) -> i64 {
 }
 
 fn should_trace_sync_handle(session_handle: Handle) -> bool {
-    std::env::var("RUZU_LOG_SVC_SYNC_HANDLE")
-        .ok()
-        .and_then(|value| {
+    static TARGET: OnceLock<Option<Handle>> = OnceLock::new();
+    TARGET
+        .get_or_init(|| {
+            let value = std::env::var("RUZU_LOG_SVC_SYNC_HANDLE").ok()?;
             let trimmed = value.trim_start_matches("0x").trim_start_matches("0X");
             u32::from_str_radix(trimmed, 16)
                 .ok()
@@ -48,30 +50,97 @@ fn should_trace_sync_handle(session_handle: Handle) -> bool {
         .is_some_and(|target| target == session_handle)
 }
 
+struct HostThreadIpcConfig {
+    inline: bool,
+    all: bool,
+    handles_configured: bool,
+    handles: Vec<Handle>,
+    service_filter: Option<String>,
+    binder: bool,
+    disable_binder: bool,
+    sleep_us: u64,
+}
+
+fn host_thread_ipc_config() -> &'static HostThreadIpcConfig {
+    static CONFIG: OnceLock<HostThreadIpcConfig> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let handles_spec = std::env::var_os("RUZU_SERVER_THREAD_IPC_HANDLE");
+        let handles = handles_spec
+            .as_ref()
+            .map(|spec| {
+                spec.to_string_lossy()
+                    .split(',')
+                    .filter_map(|raw| {
+                        let value = raw.trim();
+                        if value.is_empty() {
+                            return None;
+                        }
+                        let hex = value
+                            .strip_prefix("0x")
+                            .or_else(|| value.strip_prefix("0X"))
+                            .unwrap_or(value);
+                        u32::from_str_radix(hex, 16)
+                            .ok()
+                            .or_else(|| value.parse().ok())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        HostThreadIpcConfig {
+            inline: std::env::var_os("RUZU_INLINE_IPC").is_some(),
+            all: std::env::var_os("RUZU_SERVER_THREAD_IPC_ALL").is_some(),
+            handles_configured: handles_spec.is_some(),
+            handles,
+            service_filter: std::env::var("RUZU_SERVER_THREAD_IPC_SERVICE").ok(),
+            binder: std::env::var_os("RUZU_SERVER_THREAD_IPC_BINDER").is_some(),
+            disable_binder: std::env::var_os("RUZU_DISABLE_SERVER_THREAD_IPC_BINDER").is_some(),
+            sleep_us: std::env::var("RUZU_HOST_THREAD_IPC_SLEEP_US")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1),
+        }
+    })
+}
+
+fn yield_after_ipc_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_YIELD_AFTER_IPC").is_some())
+}
+
+fn inline_ipc_reschedule_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_DISABLE_INLINE_IPC_RESCHEDULE").is_none())
+}
+
+fn profile_ipc_phases_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some())
+}
+
+fn trace_svc_ipc_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_SVC_IPC").is_some())
+}
+
+fn dump_ssr_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_DUMP_SSR").is_some())
+}
+
+fn profile_ipc_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_IPC").is_some())
+}
+
 fn should_use_host_thread_ipc(session_handle: Handle) -> bool {
-    if std::env::var_os("RUZU_INLINE_IPC").is_some() {
+    let config = host_thread_ipc_config();
+    if config.inline {
         return false;
     }
-    if std::env::var_os("RUZU_SERVER_THREAD_IPC_ALL").is_some() {
+    if config.all {
         return true;
     }
-    let Some(spec) = std::env::var_os("RUZU_SERVER_THREAD_IPC_HANDLE") else {
-        return false;
-    };
-    spec.to_string_lossy().split(',').any(|raw| {
-        let value = raw.trim();
-        if value.is_empty() {
-            return false;
-        }
-        let hex = value
-            .strip_prefix("0x")
-            .or_else(|| value.strip_prefix("0X"))
-            .unwrap_or(value);
-        u32::from_str_radix(hex, 16)
-            .ok()
-            .or_else(|| value.parse::<u32>().ok())
-            .is_some_and(|target| target == session_handle)
-    })
+    config.handles.contains(&session_handle)
 }
 
 fn should_use_host_thread_ipc_for_service(
@@ -81,7 +150,7 @@ fn should_use_host_thread_ipc_for_service(
     if should_use_host_thread_ipc(session_handle) {
         return true;
     }
-    if std::env::var_os("RUZU_INLINE_IPC").is_some() {
+    if host_thread_ipc_config().inline {
         return false;
     }
 
@@ -95,15 +164,23 @@ fn should_use_host_thread_ipc_for_service(
 }
 
 fn should_resolve_host_thread_service_name() -> bool {
-    std::env::var_os("RUZU_INLINE_IPC").is_none()
-        && std::env::var_os("RUZU_SERVER_THREAD_IPC_SERVICE").is_some()
+    let config = host_thread_ipc_config();
+    should_resolve_host_thread_service_name_from_flags(
+        config.inline,
+        config.service_filter.is_some(),
+    )
+}
+
+fn should_resolve_host_thread_service_name_from_flags(inline: bool, service_filter: bool) -> bool {
+    !inline && service_filter
 }
 
 fn default_host_thread_service_matches(service_name: &str) -> bool {
+    let config = host_thread_ipc_config();
     default_host_thread_service_matches_from_flags(
         service_name,
-        std::env::var_os("RUZU_INLINE_IPC").is_some(),
-        std::env::var_os("RUZU_DISABLE_SERVER_THREAD_IPC_BINDER").is_some(),
+        config.inline,
+        config.disable_binder,
     )
 }
 
@@ -120,10 +197,10 @@ fn default_host_thread_service_matches_from_flags(
 }
 
 fn host_thread_service_filter_matches(service_name: &str) -> bool {
-    let Some(spec) = std::env::var_os("RUZU_SERVER_THREAD_IPC_SERVICE") else {
+    let Some(spec) = host_thread_ipc_config().service_filter.as_deref() else {
         return false;
     };
-    spec.to_string_lossy().split(',').any(|raw| {
+    spec.split(',').any(|raw| {
         let value = raw.trim();
         !value.is_empty() && (value == "*" || value == service_name)
     })
@@ -144,12 +221,13 @@ fn host_thread_ipc_sleep_enabled_from_flags(
 }
 
 fn host_thread_ipc_sleep_enabled() -> bool {
+    let config = host_thread_ipc_config();
     host_thread_ipc_sleep_enabled_from_flags(
-        std::env::var_os("RUZU_SERVER_THREAD_IPC_ALL").is_some(),
-        std::env::var_os("RUZU_SERVER_THREAD_IPC_HANDLE").is_some(),
-        std::env::var_os("RUZU_SERVER_THREAD_IPC_BINDER").is_some(),
-        std::env::var_os("RUZU_SERVER_THREAD_IPC_SERVICE").is_some(),
-        std::env::var_os("RUZU_INLINE_IPC").is_some(),
+        config.all,
+        config.handles_configured,
+        config.binder,
+        config.service_filter.is_some(),
+        config.inline,
     )
 }
 
@@ -285,7 +363,7 @@ fn yield_after_inline_ipc_if_requested(system: &System) {
     // naturally gives other guest threads a scheduling opportunity. Keep this
     // cooperative yield is promoted to the default before host-thread IPC
     // ownership is complete.
-    if std::env::var_os("RUZU_YIELD_AFTER_IPC").is_none() {
+    if !yield_after_ipc_enabled() {
         return;
     }
     let current_process = system.current_process_arc();
@@ -302,7 +380,7 @@ fn yield_after_inline_ipc_if_requested(system: &System) {
 }
 
 fn reschedule_after_inline_ipc_if_needed(system: &System) {
-    if std::env::var_os("RUZU_DISABLE_INLINE_IPC_RESCHEDULE").is_some() {
+    if !inline_ipc_reschedule_enabled() {
         return;
     }
     let Some(kernel) = system.kernel() else {
@@ -431,7 +509,7 @@ fn send_sync_request_impl(
     // `RUZU_PROFILE_IPC_PHASES=1` — time each phase of send_sync_request_impl
     // so we can see which Mutex acquisition or sub-step is the bottleneck.
     // when the handler itself is <100us.
-    let profile_phases = std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some();
+    let profile_phases = profile_ipc_phases_enabled();
     let phase_t0 = if profile_phases {
         Some(std::time::Instant::now())
     } else {
@@ -1006,8 +1084,8 @@ fn send_sync_request_impl(
     let service_manager = system.service_manager().unwrap();
     context.set_service_manager(service_manager);
 
-    let trace_svc_ipc = std::env::var_os("RUZU_TRACE_SVC_IPC").is_some();
-    let dump_ssr = std::env::var_os("RUZU_DUMP_SSR").is_some();
+    let trace_svc_ipc = trace_svc_ipc_enabled();
+    let dump_ssr = dump_ssr_enabled();
     let trace_handler_context = (log::log_enabled!(log::Level::Trace) || trace_svc_ipc || dump_ssr)
         .then(|| {
             let manager = request_manager.lock().unwrap();
@@ -1224,13 +1302,13 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
         None
     };
 
-    let dump_ssr = std::env::var_os("RUZU_DUMP_SSR").is_some();
+    let dump_ssr = dump_ssr_enabled();
     let ssr_tid = if dump_ssr {
         system.current_thread_id().unwrap_or(0)
     } else {
         0
     };
-    let result = if std::env::var_os("RUZU_PROFILE_IPC").is_some() {
+    let result = if profile_ipc_enabled() {
         // `RUZU_PROFILE_IPC=1` — measure wall-clock time per SendSyncRequest
         // and dump a per-handle histogram (count, total_us, avg_us, max_us)
         // on a SIGUSR1 or process exit. Used to find HLE handlers that are
@@ -1286,10 +1364,7 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
     // `RUZU_HOST_THREAD_IPC_SLEEP_US=<n>` overrides the default 1 µs;
     // set to `0` to disable entirely (for performance investigation).
     if host_thread_ipc_sleep_enabled() {
-        let us = std::env::var("RUZU_HOST_THREAD_IPC_SLEEP_US")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1);
+        let us = host_thread_ipc_config().sleep_us;
         if us > 0 {
             std::thread::sleep(std::time::Duration::from_micros(us));
         }
@@ -1420,7 +1495,8 @@ static IPC_SERVICE_PROFILE: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 fn ipc_service_profile_enabled() -> bool {
-    std::env::var_os("RUZU_PROFILE_IPC_SERVICE").is_some()
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_IPC_SERVICE").is_some())
 }
 
 fn record_ipc_service_profile(service: &str, command: u32, elapsed: std::time::Duration) {
@@ -2425,7 +2501,7 @@ fn reply_and_receive_impl(
 mod reply_receive_tests {
     use super::{
         default_host_thread_service_matches_from_flags, host_thread_ipc_sleep_enabled_from_flags,
-        ipc_timeout_tick_from_ns, should_resolve_host_thread_service_name,
+        ipc_timeout_tick_from_ns, should_resolve_host_thread_service_name_from_flags,
     };
 
     #[test]
@@ -2458,26 +2534,15 @@ mod reply_receive_tests {
 
     #[test]
     fn service_name_resolution_is_only_for_explicit_service_filter() {
-        unsafe {
-            std::env::remove_var("RUZU_INLINE_IPC");
-            std::env::remove_var("RUZU_SERVER_THREAD_IPC_SERVICE");
-        }
-        assert!(!should_resolve_host_thread_service_name());
-
-        unsafe {
-            std::env::set_var("RUZU_SERVER_THREAD_IPC_SERVICE", "pl:u");
-        }
-        assert!(should_resolve_host_thread_service_name());
-
-        unsafe {
-            std::env::set_var("RUZU_INLINE_IPC", "1");
-        }
-        assert!(!should_resolve_host_thread_service_name());
-
-        unsafe {
-            std::env::remove_var("RUZU_INLINE_IPC");
-            std::env::remove_var("RUZU_SERVER_THREAD_IPC_SERVICE");
-        }
+        assert!(!should_resolve_host_thread_service_name_from_flags(
+            false, false
+        ));
+        assert!(should_resolve_host_thread_service_name_from_flags(
+            false, true
+        ));
+        assert!(!should_resolve_host_thread_service_name_from_flags(
+            true, true
+        ));
     }
 
     #[test]

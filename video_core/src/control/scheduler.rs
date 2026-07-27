@@ -8,12 +8,20 @@
 //! lock.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
 use super::channel_state::ChannelState;
 use crate::dma_pusher::CommandList;
+
+static TRACE_PULLER_SUBMIT_RANGE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+#[inline]
+fn trace_puller_submit_range_enabled() -> bool {
+    *TRACE_PULLER_SUBMIT_RANGE_ENABLED
+        .get_or_init(|| std::env::var_os("RUZU_TRACE_PULLER_SUBMIT_RANGE").is_some())
+}
 
 // ---------------------------------------------------------------------------
 // Scheduler
@@ -83,7 +91,7 @@ impl Scheduler {
         dma_pusher.push(entries);
 
         let traced_idx = if crate::dma_pusher::puller_trace_submits_limit().is_some()
-            || std::env::var_os("RUZU_TRACE_PULLER_SUBMIT_RANGE").is_some()
+            || trace_puller_submit_range_enabled()
         {
             let idx = crate::dma_pusher::CURRENT_SUBMIT_INDEX
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

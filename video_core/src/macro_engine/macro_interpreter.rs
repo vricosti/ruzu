@@ -11,8 +11,21 @@ use super::macro_engine::{
     NUM_MACRO_REGISTERS,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 
 static MACRO_14F_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static TRACE_MACRO_14F_ENABLED: OnceLock<bool> = OnceLock::new();
+static TRACE_MACRO_FLOW_ENABLED: OnceLock<bool> = OnceLock::new();
+
+#[inline]
+fn trace_macro_14f_enabled() -> bool {
+    *TRACE_MACRO_14F_ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_MACRO_14F").is_some())
+}
+
+#[inline]
+fn trace_macro_flow_enabled() -> bool {
+    *TRACE_MACRO_FLOW_ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_MACRO_FLOW").is_some())
+}
 
 // ── MacroInterpreterImpl ─────────────────────────────────────────────────────
 
@@ -346,9 +359,8 @@ impl MacroInterpreterImpl {
     /// Port of `MacroInterpreterImpl::Send`.
     fn send(&mut self, value: u32) {
         let address = self.method_address.address();
-        let trace_macro_14f =
-            self.current_method == 0x14F && std::env::var_os("RUZU_TRACE_MACRO_14F").is_some();
-        let trace_macro_flow = std::env::var_os("RUZU_TRACE_MACRO_FLOW").is_some();
+        let trace_macro_14f = self.current_method == 0x14F && trace_macro_14f_enabled();
+        let trace_macro_flow = trace_macro_flow_enabled();
         if trace_macro_14f || trace_macro_flow {
             let idx = MACRO_14F_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if idx < 2048 {

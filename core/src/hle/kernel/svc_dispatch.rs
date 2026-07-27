@@ -39,6 +39,27 @@ use crate::hle::kernel::svc::svc_tick;
 use crate::hle::kernel::svc::svc_transfer_memory;
 use crate::hle::kernel::svc::svc_types::MemoryPermission;
 
+fn trace_cv_timeout_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_CV_TIMEOUT").is_some())
+}
+
+fn force_wait_mask_after_signal_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_FORCE_WAIT_MASK_AFTER_SIGNAL").is_some())
+}
+
+fn log_svc_sync_handle_target() -> Option<u32> {
+    static TARGET: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        let value = std::env::var("RUZU_LOG_SVC_SYNC_HANDLE").ok()?;
+        let trimmed = value.trim_start_matches("0x").trim_start_matches("0X");
+        u32::from_str_radix(trimmed, 16)
+            .ok()
+            .or_else(|| value.parse().ok())
+    })
+}
+
 fn decode_memory_permission(raw: u32) -> MemoryPermission {
     match raw {
         0 => MemoryPermission::None,
@@ -801,7 +822,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             let timeout = gather64(args, 3, 4) as i64;
             // RUZU_TRACE_CV_TIMEOUT=1 — log the full 64-bit timeout so we can
             // tell infinite (-1) from a 4.3s u32-truncated value (0xFFFFFFFF).
-            if std::env::var_os("RUZU_TRACE_CV_TIMEOUT").is_some() {
+            if trace_cv_timeout_enabled() {
                 log::info!(
                     "[CV_TIMEOUT] tid={} mutex=0x{:X} cv=0x{:X} tag=0x{:X} args[3]=0x{:X} args[4]=0x{:X} timeout_i64={} (={}ms)",
                     system
@@ -842,7 +863,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             //
             // Limitation: only fires for cv_key-8 layout; some games use
             // separate mutex+cv addresses where -8 won't be the mutex.
-            if std::env::var_os("RUZU_FORCE_WAIT_MASK_AFTER_SIGNAL").is_some() && cv_key >= 8 {
+            if force_wait_mask_after_signal_enabled() && cv_key >= 8 {
                 let mutex_addr = cv_key - 8;
                 let process_arc = system.current_process_arc().clone();
                 {
@@ -916,15 +937,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         }
         Some(SvcId::SendSyncRequest) => {
             let session_handle = get_arg32(args, 0);
-            let log_handle = std::env::var("RUZU_LOG_SVC_SYNC_HANDLE")
-                .ok()
-                .and_then(|value| {
-                    let trimmed = value.trim_start_matches("0x").trim_start_matches("0X");
-                    u32::from_str_radix(trimmed, 16)
-                        .ok()
-                        .or_else(|| value.parse::<u32>().ok())
-                });
-            if log_handle.is_some_and(|target| target == session_handle) {
+            if log_svc_sync_handle_target().is_some_and(|target| target == session_handle) {
                 log::info!(
                     "svc::SendSyncRequest pre handle={:#x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x}",
                     session_handle,
@@ -940,7 +953,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             }
             let result = svc_ipc::send_sync_request(system, session_handle);
             set_arg32(args, 0, result.get_inner_value());
-            if log_handle.is_some_and(|target| target == session_handle) {
+            if log_svc_sync_handle_target().is_some_and(|target| target == session_handle) {
                 log::info!(
                     "svc::SendSyncRequest post handle={:#x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x}",
                     session_handle,
@@ -2241,18 +2254,12 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
     // (the dispatch_args after handler completion) for matching tid(s).
     // Pairs with RUZU_TRACE_TID_SVC (which logs ENTRY args). Diffing both
     // sides between ruzu and zuyu localizes the bug per
-    if let Some(target_str) = std::env::var_os("RUZU_TRACE_TID_SVC_RET") {
+    if let Some((all, tids)) = trace_tid_svc_ret_targets() {
         let tid_ret = system
             .current_thread()
             .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
             .unwrap_or(0);
-        let s = target_str.to_string_lossy();
-        let want = s == "*"
-            || s == "all"
-            || s.split(',')
-                .filter_map(|p| p.trim().parse::<u64>().ok())
-                .any(|t| t == tid_ret);
-        if want {
+        if *all || tids.contains(&tid_ret) {
             // Use raw hex for SVC id to match zuyu's symmetric trace format.
             log::info!(
                 "[TID_SVC_RET] tid={} svc=0x{:02X} ret=[0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}]",
@@ -2316,7 +2323,27 @@ struct GapAggEntry {
 }
 
 fn gap_profile_enabled() -> bool {
-    std::env::var_os("RUZU_PROFILE_GAP").is_some()
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_GAP").is_some())
+}
+
+fn trace_tid_svc_ret_targets() -> Option<&'static (bool, Vec<u64>)> {
+    static TARGETS: std::sync::OnceLock<Option<(bool, Vec<u64>)>> = std::sync::OnceLock::new();
+    TARGETS
+        .get_or_init(|| {
+            let raw = std::env::var_os("RUZU_TRACE_TID_SVC_RET")?;
+            let raw = raw.to_string_lossy();
+            let all = raw == "*" || raw == "all";
+            let tids = if all {
+                Vec::new()
+            } else {
+                raw.split(',')
+                    .filter_map(|value| value.trim().parse().ok())
+                    .collect()
+            };
+            Some((all, tids))
+        })
+        .as_ref()
 }
 
 fn gap_on_svc_entry(tid: u64) {
@@ -2438,7 +2465,8 @@ struct WakeLatencyAgg {
 }
 
 pub fn record_wake_emit(tid: u64) {
-    if std::env::var_os("RUZU_PROFILE_WAKE").is_none() {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_WAKE").is_some()) {
         return;
     }
     let map = WAKE_PENDING.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -2477,7 +2505,8 @@ fn consume_wake_latency(tid: u64) {
     }
 
     // Per-tid breakdown (lets us find which thread suffers the slow-wake tail).
-    if std::env::var_os("RUZU_PROFILE_WAKE_PER_TID").is_some() {
+    static PER_TID_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *PER_TID_ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_WAKE_PER_TID").is_some()) {
         let agg = WAKE_LATENCY_PER_TID
             .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
         let mut g = agg.lock().unwrap();
@@ -3144,20 +3173,23 @@ fn maybe_dump_process_memory(system: &System, tid: i64) {
     if tid != 73 {
         return;
     }
-    let target = match std::env::var("RUZU_DUMP_AT_SVC") {
-        Ok(v) => match v.parse::<u64>() {
-            Ok(n) => n,
-            Err(_) => return,
-        },
-        Err(_) => return,
+    static CONFIG: std::sync::OnceLock<Option<(u64, String)>> = std::sync::OnceLock::new();
+    let Some((target, path)) = CONFIG
+        .get_or_init(|| {
+            let target = std::env::var("RUZU_DUMP_AT_SVC").ok()?.parse().ok()?;
+            let path = std::env::var("RUZU_DUMP_PATH")
+                .unwrap_or_else(|_| format!("/tmp/ruzu-mem-svc{}.bin", target));
+            Some((target, path))
+        })
+        .as_ref()
+    else {
+        return;
     };
     let count = SVC_COUNTER_TID73.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-    if count != target {
+    if count != *target {
         return;
     }
 
-    let path = std::env::var("RUZU_DUMP_PATH")
-        .unwrap_or_else(|_| format!("/tmp/ruzu-mem-svc{}.bin", target));
     eprintln!(
         "[DUMP] writing process memory snapshot at SVC #{} to {}",
         target, path

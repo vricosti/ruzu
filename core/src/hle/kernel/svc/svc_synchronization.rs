@@ -13,7 +13,8 @@ use crate::hle::kernel::svc_common::{Handle, ARGUMENT_HANDLE_COUNT_MAX};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 fn should_trace_wait_sync() -> bool {
-    std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some()
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some())
 }
 
 fn trace_wait_sync_record(

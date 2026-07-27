@@ -12,7 +12,8 @@ use crate::hle::kernel::svc_common::Handle;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 fn should_trace_sync_debug() -> bool {
-    std::env::var_os("RUZU_TRACE_SYNC").is_some()
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_SYNC").is_some())
 }
 
 fn lock_trace_target() -> Option<u64> {

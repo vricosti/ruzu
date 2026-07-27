@@ -29,6 +29,7 @@ use shader_recompiler::host_translate_info::HostTranslateInfo;
 use shader_recompiler::{Profile, RuntimeInfo};
 
 use super::compute_pipeline::ComputePipeline;
+use super::descriptor_pool::DescriptorPool;
 use super::fixed_pipeline_state::FixedPipelineState;
 use super::graphics_pipeline::{GraphicsPipeline, GraphicsPipelineCache, GraphicsPipelineKey};
 
@@ -305,6 +306,7 @@ fn get_total_pipeline_workers() -> usize {
 /// objects, with disk serialization support.
 pub struct PipelineCache {
     device: ash::Device,
+    descriptor_pool: NonNull<DescriptorPool>,
     use_asynchronous_shaders: bool,
     use_vulkan_pipeline_cache: bool,
     channel_caches: ChannelSetupCaches<ChannelInfo>,
@@ -354,6 +356,7 @@ impl PipelineCache {
     /// Port of `PipelineCache::PipelineCache`.
     pub fn new(
         device: ash::Device,
+        descriptor_pool: &mut DescriptorPool,
         use_asynchronous_shaders: bool,
         use_vulkan_pipeline_cache: bool,
         shader_cache: shader_recompiler::PipelineCache,
@@ -375,6 +378,7 @@ impl PipelineCache {
     ) -> Self {
         let mut pipeline_cache = PipelineCache {
             device: device.clone(),
+            descriptor_pool: NonNull::from(descriptor_pool),
             use_asynchronous_shaders,
             use_vulkan_pipeline_cache,
             channel_caches: ChannelSetupCaches::new(),
@@ -607,7 +611,7 @@ impl PipelineCache {
             .code(&compiled.spirv_words)
             .build();
         let spv_module = unsafe { self.device.create_shader_module(&create_info, None).ok()? };
-        ComputePipeline::new_with_worker(
+        let mut pipeline = ComputePipeline::new_with_worker(
             self.device.clone(),
             compiled.info,
             spv_module,
@@ -620,7 +624,14 @@ impl PipelineCache {
                 key.unique_hash
             );
             None
-        })
+        })?;
+        if let Err(error) =
+            pipeline.initialize_descriptor_allocator(unsafe { self.descriptor_pool.as_ref() })
+        {
+            log::warn!("Failed to create compute descriptor allocator: {error:?}");
+            return None;
+        }
+        Some(pipeline)
     }
 
     fn create_compute_pipeline_from_file_environment(
@@ -745,14 +756,21 @@ impl PipelineCache {
     ) -> Option<GraphicsPipeline> {
         self.main_pools.release_contents();
         let pipeline_cache = self.vulkan_pipeline_cache;
-        self.graphics_pipeline_cache.build_pipeline_keyed(
+        let mut pipeline = self.graphics_pipeline_cache.build_pipeline_keyed(
             draw,
             render_pass,
             pipeline_cache,
             read_gpu,
             key,
             fixed_state,
-        )
+        )?;
+        if let Err(error) =
+            pipeline.initialize_descriptor_allocator(unsafe { self.descriptor_pool.as_ref() })
+        {
+            log::warn!("Failed to create graphics descriptor allocator: {error:?}");
+            return None;
+        }
+        Some(pipeline)
     }
 
     fn create_graphics_pipeline_with_shared_cache(
@@ -767,7 +785,7 @@ impl PipelineCache {
         let pipeline_cache = self.vulkan_pipeline_cache;
         let mut environments = GraphicsEnvironments::default();
         shared_cache.get_graphics_environments(&mut environments, &key.unique_hashes);
-        let pipeline = if self.use_asynchronous_shaders {
+        let mut pipeline = if self.use_asynchronous_shaders {
             self.graphics_pipeline_cache
                 .build_pipeline_keyed_from_environments_async(
                     draw,
@@ -789,6 +807,12 @@ impl PipelineCache {
                     fixed_state,
                 )?
         };
+        if let Err(error) =
+            pipeline.initialize_descriptor_allocator(unsafe { self.descriptor_pool.as_ref() })
+        {
+            log::warn!("Failed to create graphics descriptor allocator: {error:?}");
+            return None;
+        }
         if !self.pipeline_cache_filename.as_os_str().is_empty() {
             let key_bytes = key.to_cache_bytes();
             let filename = self.pipeline_cache_filename.clone();
@@ -1004,16 +1028,30 @@ impl PipelineCache {
         let mut skipped_count = skipped.get() + job_skipped.load(Ordering::Relaxed);
         for result in build_results.lock().unwrap().drain(..) {
             match result {
-                DiskPipelineBuildResult::Compute(key, pipeline) => {
+                DiskPipelineBuildResult::Compute(key, mut pipeline) => {
                     if self.compute_cache.contains_key(&key) {
+                        skipped_count += 1;
+                    } else if let Err(error) = pipeline
+                        .initialize_descriptor_allocator(unsafe { self.descriptor_pool.as_ref() })
+                    {
+                        log::warn!(
+                            "Failed to create cached compute descriptor allocator: {error:?}"
+                        );
                         skipped_count += 1;
                     } else {
                         self.compute_cache.insert(key, pipeline);
                         built += 1;
                     }
                 }
-                DiskPipelineBuildResult::Graphics(key, pipeline) => {
+                DiskPipelineBuildResult::Graphics(key, mut pipeline) => {
                     if self.graphics_cache.contains_key(&key) {
+                        skipped_count += 1;
+                    } else if let Err(error) = pipeline
+                        .initialize_descriptor_allocator(unsafe { self.descriptor_pool.as_ref() })
+                    {
+                        log::warn!(
+                            "Failed to create cached graphics descriptor allocator: {error:?}"
+                        );
                         skipped_count += 1;
                     } else {
                         self.graphics_cache.insert(key, pipeline);

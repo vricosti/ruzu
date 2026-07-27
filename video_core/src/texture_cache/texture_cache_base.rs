@@ -17,8 +17,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use common::hash::BuildIdentityHasher;
 use common::lru_cache::LeastRecentlyUsedCache;
 use parking_lot::{Mutex as ParkingMutex, ReentrantMutex};
+use smallvec::SmallVec;
 
 use common::slot_vector::SlotVector;
 
@@ -119,7 +121,7 @@ impl AsyncDecodeContext {
 /// GPU page table: maps a 20-bit-shifted GPU address to a vec of image ids.
 ///
 /// Port of `VideoCommon::TextureCacheGPUMap`.
-pub type TextureCacheGPUMap = HashMap<u64, Vec<ImageId>>;
+pub type TextureCacheGPUMap = HashMap<u64, Vec<ImageId>, BuildIdentityHasher>;
 
 // ── DescriptorSyncRegs ─────────────────────────────────────────────────
 
@@ -352,7 +354,7 @@ pub struct TextureCacheBase {
     pub framebuffers: HashMap<RenderTargets, FramebufferId>,
 
     // Page tables
-    pub page_table: HashMap<u64, Vec<ImageMapId>>,
+    pub page_table: HashMap<u64, Vec<ImageMapId>, BuildIdentityHasher>,
     pub sparse_views: HashMap<ImageId, Vec<ImageMapId>>,
 
     // Memory tracking
@@ -587,7 +589,7 @@ impl TextureCacheBase {
             slot_buffer_downloads: SlotVector::new(),
             render_targets: RenderTargets::default(),
             framebuffers: HashMap::new(),
-            page_table: HashMap::new(),
+            page_table: HashMap::default(),
             sparse_views: HashMap::new(),
             has_deleted_images: false,
             is_rescaling: false,
@@ -768,7 +770,7 @@ impl TextureCacheBase {
         };
 
         let mut images = self.collect_images_in_region(cpu_addr, size);
-        images.retain(|&image_id| self.slot_images[image_id].is_safe_download());
+        images.retain(|image_id| self.slot_images[*image_id].is_safe_download());
         if images.is_empty() {
             return;
         }
@@ -915,20 +917,42 @@ impl TextureCacheBase {
     /// the backend-specific image table — the base callback-based path can't
     /// borrow that table without interior mutability, so the wrapper does the
     /// full loop in user code instead.
-    pub fn collect_images_in_region(&self, cpu_addr: u64, size: usize) -> Vec<ImageId> {
-        let mut image_ids = Vec::new();
-        let mut seen = HashSet::new();
+    pub fn collect_images_in_region(
+        &mut self,
+        cpu_addr: u64,
+        size: usize,
+    ) -> SmallVec<[ImageId; 32]> {
+        let mut image_ids = SmallVec::new();
+        let mut map_ids = SmallVec::<[ImageMapId; 32]>::new();
+        let page_table = &self.page_table;
+        let slot_map_views = &mut self.slot_map_views;
+        let slot_images = &mut self.slot_images;
         Self::for_each_cpu_page(cpu_addr, size, |page| {
-            if let Some(map_ids) = self.page_table.get(&page) {
-                for &map_id in map_ids {
-                    let map = &self.slot_map_views[map_id];
-                    if !map.overlaps(cpu_addr, size) || !seen.insert(map.image_id) {
-                        continue;
-                    }
-                    image_ids.push(map.image_id);
+            let Some(page_map_ids) = page_table.get(&page) else {
+                return;
+            };
+            for &map_id in page_map_ids {
+                let map = &mut slot_map_views[map_id];
+                if map.picked || !map.overlaps(cpu_addr, size) {
+                    continue;
                 }
+                map.picked = true;
+                map_ids.push(map_id);
+
+                let image = &mut slot_images[map.image_id];
+                if image.flags.contains(ImageFlagBits::PICKED) {
+                    continue;
+                }
+                image.flags.insert(ImageFlagBits::PICKED);
+                image_ids.push(map.image_id);
             }
         });
+        for &image_id in &image_ids {
+            slot_images[image_id].flags.remove(ImageFlagBits::PICKED);
+        }
+        for map_id in map_ids {
+            slot_map_views[map_id].picked = false;
+        }
         image_ids
     }
 
@@ -937,33 +961,37 @@ impl TextureCacheBase {
     /// `ForEachSparseImageInRegion`; the caller selects which per-channel GPU
     /// page table to inspect.
     pub fn collect_images_in_gpu_region(
-        &self,
+        &mut self,
         gpu_addr: GPUVAddr,
         size: usize,
         sparse: bool,
-    ) -> Vec<ImageId> {
+    ) -> SmallVec<[ImageId; 8]> {
         let Some(table_index) = self.current_gpu_page_table_index(sparse) else {
-            return Vec::new();
+            return SmallVec::new();
         };
         let Some(table) = self.gpu_page_table_storage.get(table_index) else {
-            return Vec::new();
+            return SmallVec::new();
         };
 
-        let mut image_ids = Vec::new();
-        let mut seen = HashSet::new();
+        let mut image_ids = SmallVec::new();
+        let slot_images = &mut self.slot_images;
         Self::for_each_gpu_page(gpu_addr, size, |page| {
             if let Some(ids) = table.get(&page) {
                 for &image_id in ids {
-                    if !seen.insert(image_id) {
+                    let image = &mut slot_images[image_id];
+                    if image.flags.contains(ImageFlagBits::PICKED)
+                        || !image.overlaps_gpu(gpu_addr, size)
+                    {
                         continue;
                     }
-                    if !self.slot_images[image_id].overlaps_gpu(gpu_addr, size) {
-                        continue;
-                    }
+                    image.flags.insert(ImageFlagBits::PICKED);
                     image_ids.push(image_id);
                 }
             }
         });
+        for &image_id in &image_ids {
+            slot_images[image_id].flags.remove(ImageFlagBits::PICKED);
+        }
         image_ids
     }
 
@@ -1080,7 +1108,7 @@ impl TextureCacheBase {
 
 #[cfg(test)]
 mod tests {
-    use super::TextureCacheBase;
+    use super::{TextureCacheBase, TextureCacheGPUMap};
     use crate::framebuffer_config::FramebufferConfig;
     use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
     use crate::surface::PixelFormat;
@@ -1091,7 +1119,24 @@ mod tests {
     use crate::texture_cache::types::{
         Extent3D, ImageId, ImageType, ImageViewType, SubresourceRange,
     };
+    use std::hash::{BuildHasher, Hash, Hasher};
     use std::sync::Arc;
+
+    fn finish_hash(build_hasher: &impl BuildHasher, value: u64) -> u64 {
+        let mut hasher = build_hasher.build_hasher();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn texture_page_tables_use_upstream_identity_hash() {
+        let key = 0x1234_5678_9abc_def0;
+        let gpu_page_table = TextureCacheGPUMap::default();
+        assert_eq!(finish_hash(gpu_page_table.hasher(), key), key);
+
+        let cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        assert_eq!(finish_hash(cache.page_table.hasher(), key), key);
+    }
 
     #[test]
     fn texture_cache_mutex_is_reentrant() {

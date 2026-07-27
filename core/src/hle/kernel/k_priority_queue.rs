@@ -385,46 +385,6 @@ impl KPerCoreQueue {
         self.get_front(core).is_none()
     }
 
-    /// Remove `member_id` only when it is the root-visible front element.
-    ///
-    /// This is a Rust-port repair path for split-brain queue state: if the
-    /// cached thread properties are already gone, the member's stored links may
-    /// no longer describe this list. Trust the root, not the stale member entry.
-    pub fn remove_front_matching(
-        &mut self,
-        core: i32,
-        member_id: u64,
-        entries: &mut EntryMap,
-    ) -> bool {
-        let c = core as usize;
-        if self.roots[c].get_next() != Some(member_id) {
-            return false;
-        }
-
-        let tail_id = self.roots[c].get_prev().filter(|&tail| tail != member_id);
-        let next_id = entries
-            .get(&member_id)
-            .and_then(|e| e[c].get_next())
-            .filter(|&next| next != member_id)
-            .or(tail_id);
-
-        self.roots[c].set_next(next_id);
-        if let Some(nid) = next_id {
-            if let Some(ne) = entries.get_mut(&nid) {
-                ne[c].set_prev(None);
-            }
-        } else {
-            self.roots[c].set_prev(None);
-        }
-
-        if let Some(e) = entries.get_mut(&member_id) {
-            e[c].set_prev(None);
-            e[c].set_next(None);
-        }
-
-        self.get_front(core).is_none()
-    }
-
     pub fn get_front(&self, core: i32) -> Option<u64> {
         self.roots[core as usize].get_next()
     }
@@ -486,47 +446,6 @@ impl KPriorityQueueImpl {
 
         if self.queues[priority as usize].remove(core, member_id, entries) {
             self.available_priorities[core as usize].clear_bit(priority);
-        }
-    }
-
-    pub fn remove_scheduled_front_without_props(
-        &mut self,
-        core: i32,
-        member_id: u64,
-        entries: &mut EntryMap,
-    ) -> bool {
-        debug_assert!(is_valid_core(core));
-        for priority in HIGHEST_PRIORITY..=LOWEST_PRIORITY {
-            if self.queues[priority as usize].get_front(core) == Some(member_id) {
-                if self.queues[priority as usize].remove_front_matching(core, member_id, entries) {
-                    self.available_priorities[core as usize].clear_bit(priority);
-                }
-                return true;
-            }
-        }
-        false
-    }
-
-    pub fn remove_all_member(
-        &mut self,
-        scheduled: bool,
-        member_id: u64,
-        entries: &mut EntryMap,
-        thread_props: &HashMap<u64, ThreadProps>,
-    ) {
-        for priority in HIGHEST_PRIORITY..=LOWEST_PRIORITY {
-            for core in 0..NUM_CORES as i32 {
-                if self.queues[priority as usize].remove_all_matching(
-                    core,
-                    priority,
-                    scheduled,
-                    member_id,
-                    entries,
-                    thread_props,
-                ) {
-                    self.available_priorities[core as usize].clear_bit(priority);
-                }
-            }
         }
     }
 
@@ -835,17 +754,6 @@ impl KPriorityQueue {
         }
     }
 
-    fn purge_member_from_all_queues(&mut self, member_id: u64) {
-        let Self {
-            scheduled_queue,
-            suggested_queue,
-            entries,
-            thread_props,
-        } = self;
-        scheduled_queue.remove_all_member(true, member_id, entries, thread_props);
-        suggested_queue.remove_all_member(false, member_id, entries, thread_props);
-    }
-
     // -- Public mutators (properties passed directly) --
 
     /// Push a thread to the back of its queues (scheduled for active core, suggested for others).
@@ -944,19 +852,6 @@ impl KPriorityQueue {
         // Keep entries around (they'll be reused on next push).
         // Remove props since thread is no longer in PQ.
         self.thread_props.remove(&member_id);
-    }
-
-    /// Remove a stale scheduled-queue head when the Rust-side property cache
-    /// has already been dropped. Upstream's intrusive queue cannot observe this
-    /// split-brain state; it is specific to the non-intrusive Rust port.
-    pub fn remove_scheduled_front_without_props(&mut self, core: i32, member_id: u64) -> bool {
-        let removed_front = self.scheduled_queue.remove_scheduled_front_without_props(
-            core,
-            member_id,
-            &mut self.entries,
-        );
-        self.purge_member_from_all_queues(member_id);
-        removed_front
     }
 
     pub fn move_to_scheduled_front(
@@ -1491,43 +1386,6 @@ mod tests {
         assert_eq!(pq.get_scheduled_front_at_priority(0, 14), Some(10));
         assert_eq!(pq.get_scheduled_front_at_priority(0, 49), None);
         assert_eq!(pq.get_thread_props(10).unwrap().priority, 14);
-    }
-
-    #[test]
-    fn test_remove_scheduled_front_without_props_ignores_stale_member_links() {
-        let mut pq = KPriorityQueue::new();
-        pq.push_back(89, 59, 2, 0b0100, false, None);
-        pq.push_back(90, 59, 2, 0b0100, false, None);
-        assert_eq!(pq.get_scheduled_front(2), Some(89));
-
-        // Reproduce the Rust-only split-brain state seen in ANIMUS: the
-        // scheduled queue root still names 89 as front, but the per-member
-        // links and property cache no longer describe that membership.
-        pq.thread_props.remove(&89);
-        pq.entries.get_mut(&89).unwrap()[2].set_prev(Some(90));
-        pq.entries.get_mut(&89).unwrap()[2].set_next(None);
-
-        assert!(pq.remove_scheduled_front_without_props(2, 89));
-        assert_eq!(pq.get_scheduled_front(2), Some(90));
-    }
-
-    #[test]
-    fn test_remove_scheduled_front_without_props_purges_all_member_occurrences() {
-        let mut pq = KPriorityQueue::new();
-        pq.push_back(89, 59, 1, 0b0110, false, None);
-        pq.push_back(90, 59, 1, 0b0010, false, None);
-        assert_eq!(pq.get_scheduled_front(1), Some(89));
-
-        // Simulate the Rust-only split-brain shape observed in ANIMUS: props
-        // are gone, but the id is still visible in scheduled and suggested
-        // queues. Removing the scheduled front must purge both sides so a later
-        // migration cannot rediscover the stale member.
-        pq.thread_props.remove(&89);
-        pq.suggested_queue.push_back(59, 2, 89, &mut pq.entries);
-
-        assert!(pq.remove_scheduled_front_without_props(1, 89));
-        assert_eq!(pq.get_scheduled_front(1), Some(90));
-        assert_ne!(pq.get_suggested_front(2), Some(89));
     }
 
     #[test]

@@ -2327,6 +2327,7 @@ impl ArmDynarmic64 {
                 fastmem_address_space_bits: 39,
                 silently_mirror_fastmem: false,
                 fastmem_exclusive_access: fastmem_pointer.is_some() && !exclusive_monitor.is_null(),
+                recompile_on_exclusive_fastmem_failure: true,
                 recompile_on_fastmem_failure: true,
                 page_table_present: page_table_pointer.is_some(),
                 page_table_address_space_bits: 39,

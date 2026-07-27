@@ -39,6 +39,7 @@ struct GpuThreadProfile {
 }
 
 static GPU_THREAD_PROFILE: std::sync::OnceLock<GpuThreadProfile> = std::sync::OnceLock::new();
+static GPU_THREAD_PROFILE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 fn trace_gpu_thread_submit(
     stage: u64,
@@ -65,23 +66,22 @@ fn trace_gpu_thread_submit(
 }
 
 fn profile_enabled() -> bool {
-    std::env::var_os("RUZU_PROFILE_GPU_THREAD").is_some()
+    *GPU_THREAD_PROFILE_ENABLED
+        .get_or_init(|| std::env::var_os("RUZU_PROFILE_GPU_THREAD").is_some())
 }
 
 fn profile() -> &'static GpuThreadProfile {
     GPU_THREAD_PROFILE.get_or_init(GpuThreadProfile::default)
 }
 
-fn inc(counter: &AtomicU64) {
+#[inline]
+fn with_profile(update: impl FnOnce(&GpuThreadProfile)) {
     if profile_enabled() {
-        counter.fetch_add(1, Ordering::Relaxed);
+        update(profile());
     }
 }
 
 fn record_submit_elapsed(elapsed: std::time::Duration) {
-    if !profile_enabled() {
-        return;
-    }
     let profile = profile();
     let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
     profile.done_submit.fetch_add(1, Ordering::Relaxed);
@@ -106,15 +106,15 @@ pub fn dump_gpu_thread_profile() {
     let Some(profile) = GPU_THREAD_PROFILE.get() else {
         return;
     };
-    eprintln!("[GPU_THREAD_PROFILE] command counts:");
-    eprintln!(
+    log::warn!("[GPU_THREAD_PROFILE] command counts:");
+    log::warn!(
         "[GPU_THREAD_PROFILE]   push SubmitList={} GpuTick={} FlushRegion={} InvalidateRegion={}",
         profile.push_submit.load(Ordering::Relaxed),
         profile.push_tick.load(Ordering::Relaxed),
         profile.push_flush.load(Ordering::Relaxed),
         profile.push_invalidate.load(Ordering::Relaxed)
     );
-    eprintln!(
+    log::warn!(
         "[GPU_THREAD_PROFILE]   pop  SubmitList={} GpuTick={} FlushRegion={} InvalidateRegion={}",
         profile.pop_submit.load(Ordering::Relaxed),
         profile.pop_tick.load(Ordering::Relaxed),
@@ -128,7 +128,7 @@ pub fn dump_gpu_thread_profile() {
     } else {
         total_submit_us / done_submit
     };
-    eprintln!(
+    log::warn!(
         "[GPU_THREAD_PROFILE]   done SubmitList={} total_us={} avg_us={} max_us={}",
         done_submit,
         total_submit_us,
@@ -416,10 +416,18 @@ impl ThreadManager {
     fn push_command(&self, command_data: CommandData, mut block: bool) -> u64 {
         if profile_enabled() {
             match &command_data {
-                CommandData::SubmitList(_) => inc(&profile().push_submit),
-                CommandData::GpuTick(_) => inc(&profile().push_tick),
-                CommandData::FlushRegion(_) => inc(&profile().push_flush),
-                CommandData::InvalidateRegion(_) => inc(&profile().push_invalidate),
+                CommandData::SubmitList(_) => {
+                    profile().push_submit.fetch_add(1, Ordering::Relaxed);
+                }
+                CommandData::GpuTick(_) => {
+                    profile().push_tick.fetch_add(1, Ordering::Relaxed);
+                }
+                CommandData::FlushRegion(_) => {
+                    profile().push_flush.fetch_add(1, Ordering::Relaxed);
+                }
+                CommandData::InvalidateRegion(_) => {
+                    profile().push_invalidate.fetch_add(1, Ordering::Relaxed);
+                }
                 CommandData::FlushAndInvalidateRegion(_) | CommandData::None => {}
             }
         }
@@ -504,7 +512,9 @@ fn run_thread(
 
         match next.data {
             CommandData::SubmitList(submit) => {
-                inc(&profile().pop_submit);
+                with_profile(|profile| {
+                    profile.pop_submit.fetch_add(1, Ordering::Relaxed);
+                });
                 let list_count = submit.entries.command_lists.len();
                 let prefetch_count = submit.entries.prefetch_command_list.len();
                 trace_gpu_thread_submit(
@@ -515,32 +525,40 @@ fn run_thread(
                     prefetch_count,
                     0,
                 );
-                let start = std::time::Instant::now();
+                let start = profile_enabled().then(std::time::Instant::now);
                 scheduler.push(submit.channel, submit.entries);
-                let elapsed = start.elapsed();
-                record_submit_elapsed(elapsed);
+                let elapsed = start.map(|start| start.elapsed());
+                if let Some(elapsed) = elapsed {
+                    record_submit_elapsed(elapsed);
+                }
                 trace_gpu_thread_submit(
                     3,
                     next.fence,
                     submit.channel,
                     list_count,
                     prefetch_count,
-                    elapsed.as_micros() as u64,
+                    elapsed.map_or(0, |elapsed| elapsed.as_micros() as u64),
                 );
             }
             CommandData::GpuTick(_) => {
-                inc(&profile().pop_tick);
+                with_profile(|profile| {
+                    profile.pop_tick.fetch_add(1, Ordering::Relaxed);
+                });
                 gpu.tick_work();
             }
             CommandData::FlushRegion(flush) => {
-                inc(&profile().pop_flush);
+                with_profile(|profile| {
+                    profile.pop_flush.fetch_add(1, Ordering::Relaxed);
+                });
                 // Upstream: rasterizer->FlushRegion(flush.addr, flush.size)
                 if let Some(rasterizer) = rasterizer {
                     unsafe { rasterizer.as_mut() }.flush_region(flush.addr, flush.size);
                 }
             }
             CommandData::InvalidateRegion(inv) => {
-                inc(&profile().pop_invalidate);
+                with_profile(|profile| {
+                    profile.pop_invalidate.fetch_add(1, Ordering::Relaxed);
+                });
                 // Upstream: rasterizer->OnCacheInvalidation(inv.addr, inv.size)
                 if let Some(rasterizer) = rasterizer {
                     unsafe { rasterizer.as_mut() }.on_cache_invalidation(inv.addr, inv.size);

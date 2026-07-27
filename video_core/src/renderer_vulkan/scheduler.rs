@@ -7,9 +7,9 @@
 //! manages render pass state, and submits to the GPU queue.
 
 use ash::vk;
-use ash::vk::Handle;
 use log::{debug, trace};
 use std::collections::VecDeque;
+use std::mem::{align_of, size_of, MaybeUninit};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -17,27 +17,178 @@ use std::sync::{Arc, Condvar, Mutex};
 use super::command_pool::CommandPool;
 use super::state_tracker::StateTracker;
 
-/// Type-erased Vulkan command closure.
-///
-/// Replaces zuyu's placement-new CommandChunk arena with boxed closures.
-/// The two `vk::CommandBuffer` args are (render_cmdbuf, upload_cmdbuf).
-type VkCommand = Box<dyn FnOnce(vk::CommandBuffer, vk::CommandBuffer) + Send>;
+const COMMAND_CHUNK_CAPACITY: usize = 0x8000;
+const NO_COMMAND: usize = usize::MAX;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CommandHeader {
+    next: usize,
+    payload_offset: usize,
+    execute: unsafe fn(*mut u8, vk::CommandBuffer, vk::CommandBuffer),
+    drop_payload: unsafe fn(*mut u8),
+}
+
+#[repr(C, align(64))]
+struct CommandStorage([MaybeUninit<u8>; COMMAND_CHUNK_CAPACITY]);
 
 /// Batch of recorded Vulkan commands (zuyu: CommandChunk, 32KB arena).
 struct CommandChunk {
-    commands: Vec<VkCommand>,
+    storage: Box<CommandStorage>,
+    first: usize,
+    last: usize,
+    command_offset: usize,
+    submit: Option<SubmitRequest>,
 }
 
 impl CommandChunk {
     fn new() -> Self {
+        // The payload is an arena of `MaybeUninit<u8>` and has no initialized
+        // value invariant. Allocate it directly on the heap so creating or
+        // moving a chunk never copies or zeroes 32 KiB.
+        let storage = unsafe { Box::<CommandStorage>::new_uninit().assume_init() };
         Self {
-            commands: Vec::with_capacity(64),
+            storage,
+            first: NO_COMMAND,
+            last: NO_COMMAND,
+            command_offset: 0,
+            submit: None,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.commands.is_empty()
+        self.first == NO_COMMAND && self.submit.is_none()
     }
+
+    fn command_layout<T>(&self) -> Option<(usize, usize, usize)> {
+        assert!(
+            align_of::<T>() <= align_of::<CommandStorage>(),
+            "Vulkan scheduler command alignment exceeds the command arena"
+        );
+        let header_offset = self
+            .command_offset
+            .next_multiple_of(align_of::<CommandHeader>());
+        let payload_offset = header_offset
+            .checked_add(size_of::<CommandHeader>())?
+            .next_multiple_of(align_of::<T>());
+        let end_offset = payload_offset.checked_add(size_of::<T>())?;
+        (end_offset <= COMMAND_CHUNK_CAPACITY).then_some((
+            header_offset,
+            payload_offset,
+            end_offset,
+        ))
+    }
+
+    fn record<T>(&mut self, command: T) -> Result<(), T>
+    where
+        T: FnOnce(vk::CommandBuffer, vk::CommandBuffer) + Send + 'static,
+    {
+        let Some((header_offset, payload_offset, end_offset)) = self.command_layout::<T>() else {
+            return Err(command);
+        };
+        let base = self.storage.0.as_mut_ptr().cast::<u8>();
+        let header = CommandHeader {
+            next: NO_COMMAND,
+            payload_offset,
+            execute: execute_command::<T>,
+            drop_payload: drop_command::<T>,
+        };
+        unsafe {
+            base.add(header_offset)
+                .cast::<CommandHeader>()
+                .write(header);
+            base.add(payload_offset).cast::<T>().write(command);
+            if self.last != NO_COMMAND {
+                (*base.add(self.last).cast::<CommandHeader>()).next = header_offset;
+            } else {
+                self.first = header_offset;
+            }
+        }
+        self.last = header_offset;
+        self.command_offset = end_offset;
+        Ok(())
+    }
+
+    fn pop_header(&mut self) -> Option<CommandHeader> {
+        if self.first == NO_COMMAND {
+            return None;
+        }
+        let header_offset = self.first;
+        let header = unsafe {
+            self.storage
+                .0
+                .as_ptr()
+                .cast::<u8>()
+                .add(header_offset)
+                .cast::<CommandHeader>()
+                .read()
+        };
+        self.first = header.next;
+        if self.first == NO_COMMAND {
+            self.last = NO_COMMAND;
+        }
+        Some(header)
+    }
+
+    fn execute_all(
+        &mut self,
+        cmdbuf: vk::CommandBuffer,
+        upload_cmdbuf: vk::CommandBuffer,
+    ) -> Option<SubmitRequest> {
+        while let Some(header) = self.pop_header() {
+            let payload = unsafe {
+                self.storage
+                    .0
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(header.payload_offset)
+            };
+            unsafe {
+                (header.execute)(payload, cmdbuf, upload_cmdbuf);
+            }
+        }
+        self.command_offset = 0;
+        self.submit.take()
+    }
+}
+
+impl Drop for CommandChunk {
+    fn drop(&mut self) {
+        while let Some(header) = self.pop_header() {
+            let payload = unsafe {
+                self.storage
+                    .0
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(header.payload_offset)
+            };
+            unsafe {
+                (header.drop_payload)(payload);
+            }
+        }
+    }
+}
+
+unsafe fn execute_command<T>(
+    payload: *mut u8,
+    cmdbuf: vk::CommandBuffer,
+    upload_cmdbuf: vk::CommandBuffer,
+) where
+    T: FnOnce(vk::CommandBuffer, vk::CommandBuffer),
+{
+    let command = unsafe { payload.cast::<T>().read() };
+    command(cmdbuf, upload_cmdbuf);
+}
+
+unsafe fn drop_command<T>(payload: *mut u8) {
+    unsafe {
+        payload.cast::<T>().drop_in_place();
+    }
+}
+
+struct SubmitRequest {
+    signal_semaphores: Vec<vk::Semaphore>,
+    tick: u64,
 }
 
 /// Current render pass state tracked by the scheduler.
@@ -66,20 +217,13 @@ struct SchedulerState {
 /// and submits to the GPU queue with tick-based synchronization.
 pub struct Scheduler {
     device: ash::Device,
-    queue: vk::Queue,
-    command_pool: CommandPool,
 
     /// Current chunk being recorded to.
     current_chunk: CommandChunk,
 
-    /// Current primary command buffer.
-    current_cmdbuf: vk::CommandBuffer,
-
-    /// Upload command buffer for staging transfers.
-    upload_cmdbuf: vk::CommandBuffer,
-
     /// Tick-based synchronization (simplified MasterSemaphore).
-    current_tick: AtomicU64,
+    current_tick: Arc<AtomicU64>,
+    submitted_tick: Arc<AtomicU64>,
 
     /// Render pass state.
     rp_state: RenderPassState,
@@ -104,59 +248,56 @@ pub struct Scheduler {
     /// installed by the rasterizer once both owners are allocated.
     state_tracker: Option<NonNull<StateTracker>>,
 
-    /// Submission worker ("VulkanWorker"), port of the submit half of
-    /// upstream `Scheduler::WorkerThread`. On MoltenVK all Metal encoding
-    /// happens inside vkQueueSubmit (measured ~40% of the GPU thread during
-    /// the DMA-pusher critical path. Command recording (incl.
-    /// end_command_buffer) stays on the GPU thread: Vulkan requires external
-    /// sync on the command POOL for recording, and ending is cheap.
-    /// `None` on the legacy no-timeline fence path (single submission in
-    /// flight cannot pipeline).
-    submit_worker: Option<Arc<SubmitWorker>>,
-    submit_worker_thread: Option<std::thread::JoinHandle<()>>,
+    /// Port of upstream `Scheduler::WorkerThread`: owns command-buffer
+    /// recording, command-pool rotation, and queue submission.
+    worker: Option<Arc<SchedulerWorker>>,
+    worker_thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// One queued submission for the worker: both command buffers are fully
-/// recorded and ended; the worker only calls vkQueueSubmit.
-struct SubmitJob {
-    render_cmdbuf: vk::CommandBuffer,
-    upload_cmdbuf: vk::CommandBuffer,
-    signal_semaphores: Vec<vk::Semaphore>,
-    tick: u64,
-}
-
-struct SubmitWorker {
-    state: Mutex<SubmitWorkerState>,
+struct SchedulerWorker {
+    state: Mutex<SchedulerWorkerState>,
     job_cv: Condvar,
-    /// Signalled whenever the queue drains to empty (for `wait_worker`).
     drained_cv: Condvar,
     stop: std::sync::atomic::AtomicBool,
 }
 
-struct SubmitWorkerState {
-    jobs: VecDeque<SubmitJob>,
-    /// Jobs removed from `jobs` whose `vkQueueSubmit` has not returned yet.
+struct SchedulerWorkerState {
+    chunks: VecDeque<CommandChunk>,
+    chunk_reserve: Vec<CommandChunk>,
     in_flight: usize,
 }
 
-impl SubmitWorkerState {
+impl SchedulerWorkerState {
     fn is_drained(&self) -> bool {
-        self.jobs.is_empty() && self.in_flight == 0
+        self.chunks.is_empty() && self.in_flight == 0
+    }
+
+    fn pop_front(&mut self) -> Option<CommandChunk> {
+        let chunk = self.chunks.pop_front()?;
+        self.in_flight += 1;
+        Some(chunk)
     }
 }
 
-fn submit_worker_sync_mode() -> bool {
-    static SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SYNC.get_or_init(|| {
-        std::env::var("RUZU_VK_SUBMIT_WORKER").is_ok_and(|v| v.eq_ignore_ascii_case("sync"))
-    })
+struct WorkerContext {
+    device: ash::Device,
+    queue: vk::Queue,
+    command_pool: CommandPool,
+    current_cmdbuf: vk::CommandBuffer,
+    upload_cmdbuf: vk::CommandBuffer,
+    timeline_semaphore: Option<vk::Semaphore>,
+    fence: vk::Fence,
+    submit_mutex: Arc<Mutex<()>>,
+    current_tick: Arc<AtomicU64>,
+    submitted_tick: Arc<AtomicU64>,
 }
 
-impl SubmitWorker {
+impl SchedulerWorker {
     fn new() -> Self {
         Self {
-            state: Mutex::new(SubmitWorkerState {
-                jobs: VecDeque::new(),
+            state: Mutex::new(SchedulerWorkerState {
+                chunks: VecDeque::new(),
+                chunk_reserve: Vec::new(),
                 in_flight: 0,
             }),
             job_cv: Condvar::new(),
@@ -165,12 +306,20 @@ impl SubmitWorker {
         }
     }
 
-    fn push(&self, job: SubmitJob) {
-        self.state.lock().unwrap().jobs.push_back(job);
+    fn push(&self, chunk: CommandChunk) {
+        self.state.lock().unwrap().chunks.push_back(chunk);
         self.job_cv.notify_one();
     }
 
-    /// Block until every queued submission has been handed to the driver.
+    fn acquire_chunk(&self) -> CommandChunk {
+        self.state
+            .lock()
+            .unwrap()
+            .chunk_reserve
+            .pop()
+            .unwrap_or_else(CommandChunk::new)
+    }
+
     fn wait_drained(&self) {
         let mut state = self.state.lock().unwrap();
         while !state.is_drained() {
@@ -178,34 +327,121 @@ impl SubmitWorker {
         }
     }
 
-    fn run(
-        &self,
-        device: ash::Device,
-        queue: vk::Queue,
-        timeline: vk::Semaphore,
-        submit_mutex: Arc<Mutex<()>>,
-    ) {
+    fn run(&self, mut context: WorkerContext) {
         loop {
-            let job = {
+            let chunk = {
                 let mut state = self.state.lock().unwrap();
                 loop {
-                    if let Some(job) = state.jobs.pop_front() {
-                        state.in_flight += 1;
-                        break job;
+                    if let Some(chunk) = state.pop_front() {
+                        break Some(chunk);
                     }
                     if self.stop.load(Ordering::Acquire) {
-                        return;
+                        break None;
                     }
                     state = self.job_cv.wait(state).unwrap();
                 }
             };
+            let Some(mut chunk) = chunk else {
+                break;
+            };
 
-            let cmd_buffers = [job.upload_cmdbuf, job.render_cmdbuf];
-            let mut all_signals = Vec::with_capacity(1 + job.signal_semaphores.len());
+            let submit = chunk.execute_all(context.current_cmdbuf, context.upload_cmdbuf);
+            if let Some(submit) = submit {
+                if let Err(error) = context.submit_execution(&submit) {
+                    log::error!(
+                        "Vulkan worker failed to submit tick {}: {error:?}",
+                        submit.tick
+                    );
+                }
+                if let Err(error) = context.allocate_worker_command_buffer() {
+                    log::error!(
+                        "Vulkan worker failed to rotate command buffers after tick {}: {error:?}",
+                        submit.tick
+                    );
+                }
+            }
+
+            let mut state = self.state.lock().unwrap();
+            state.in_flight -= 1;
+            state.chunk_reserve.push(chunk);
+            if state.is_drained() {
+                self.drained_cv.notify_all();
+            }
+        }
+        context.wait_for_gpu();
+    }
+}
+
+impl WorkerContext {
+    fn known_gpu_tick(&self) -> u64 {
+        if let Some(timeline) = self.timeline_semaphore {
+            return unsafe {
+                self.device
+                    .get_semaphore_counter_value(timeline)
+                    .unwrap_or(0)
+            };
+        }
+        let submitted_tick = self.submitted_tick.load(Ordering::SeqCst);
+        if submitted_tick == 0
+            || unsafe { self.device.get_fence_status(self.fence).unwrap_or(false) }
+        {
+            submitted_tick
+        } else {
+            submitted_tick - 1
+        }
+    }
+
+    fn allocate_worker_command_buffer(&mut self) -> Result<(), vk::Result> {
+        let known_gpu_tick = self.known_gpu_tick();
+        let pending_tick = self.current_tick.load(Ordering::SeqCst) + 1;
+        self.current_cmdbuf = self
+            .command_pool
+            .commit_with_ticks(known_gpu_tick, pending_tick);
+        self.upload_cmdbuf = self
+            .command_pool
+            .commit_with_ticks(known_gpu_tick, pending_tick);
+        let begin_info = vk::CommandBufferBeginInfo::builder()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
+            .build();
+        unsafe {
+            self.device
+                .reset_command_buffer(self.current_cmdbuf, vk::CommandBufferResetFlags::empty())?;
+            self.device
+                .reset_command_buffer(self.upload_cmdbuf, vk::CommandBufferResetFlags::empty())?;
+            self.device
+                .begin_command_buffer(self.current_cmdbuf, &begin_info)?;
+            self.device
+                .begin_command_buffer(self.upload_cmdbuf, &begin_info)?;
+        }
+        Ok(())
+    }
+
+    fn submit_execution(&self, submit: &SubmitRequest) -> Result<(), vk::Result> {
+        unsafe {
+            let write_barrier = vk::MemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                .build();
+            self.device.cmd_pipeline_barrier(
+                self.upload_cmdbuf,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[write_barrier],
+                &[],
+                &[],
+            );
+            self.device.end_command_buffer(self.upload_cmdbuf)?;
+            self.device.end_command_buffer(self.current_cmdbuf)?;
+        }
+
+        let cmd_buffers = [self.upload_cmdbuf, self.current_cmdbuf];
+        if let Some(timeline) = self.timeline_semaphore {
+            let mut all_signals = Vec::with_capacity(1 + submit.signal_semaphores.len());
             all_signals.push(timeline);
-            all_signals.extend_from_slice(&job.signal_semaphores);
+            all_signals.extend_from_slice(&submit.signal_semaphores);
             let mut signal_values = vec![0u64; all_signals.len()];
-            signal_values[0] = job.tick;
+            signal_values[0] = submit.tick;
             let mut timeline_info =
                 vk::TimelineSemaphoreSubmitInfo::builder().signal_semaphore_values(&signal_values);
             let submit_info = vk::SubmitInfo::builder()
@@ -213,22 +449,52 @@ impl SubmitWorker {
                 .signal_semaphores(&all_signals)
                 .push_next(&mut timeline_info)
                 .build();
-            let submit_result = unsafe {
-                let _submit_lock = submit_mutex.lock().unwrap();
-                device.queue_submit(queue, &[submit_info], vk::Fence::null())
+            let _submit_lock = self.submit_mutex.lock().unwrap();
+            let result = unsafe {
+                self.device
+                    .queue_submit(self.queue, &[submit_info], vk::Fence::null())
             };
-            if let Err(error) = submit_result {
-                log::error!(
-                    "Vulkan submit worker failed to submit tick {}: {:?}",
-                    job.tick,
-                    error
-                );
+            if result.is_ok() {
+                self.submitted_tick.store(submit.tick, Ordering::SeqCst);
             }
+            result
+        } else {
+            let submit_info = vk::SubmitInfo::builder()
+                .command_buffers(&cmd_buffers)
+                .signal_semaphores(&submit.signal_semaphores)
+                .build();
+            let result = unsafe {
+                self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+                self.device.reset_fences(&[self.fence])?;
+                let _submit_lock = self.submit_mutex.lock().unwrap();
+                self.device
+                    .queue_submit(self.queue, &[submit_info], self.fence)
+            };
+            if result.is_ok() {
+                self.submitted_tick.store(submit.tick, Ordering::SeqCst);
+            }
+            result
+        }
+    }
 
-            let mut state = self.state.lock().unwrap();
-            state.in_flight -= 1;
-            if state.is_drained() {
-                self.drained_cv.notify_all();
+    fn wait_for_gpu(&self) {
+        let tick = self.current_tick.load(Ordering::SeqCst);
+        if tick == 0 {
+            return;
+        }
+        unsafe {
+            if let Some(timeline) = self.timeline_semaphore {
+                let semaphores = [timeline];
+                let values = [tick];
+                let wait_info = vk::SemaphoreWaitInfo::builder()
+                    .semaphores(&semaphores)
+                    .values(&values)
+                    .build();
+                self.device.wait_semaphores(&wait_info, u64::MAX).ok();
+            } else {
+                self.device
+                    .wait_for_fences(&[self.fence], true, u64::MAX)
+                    .ok();
             }
         }
     }
@@ -264,50 +530,42 @@ impl Scheduler {
         };
 
         let submit_mutex = Arc::new(Mutex::new(()));
-        // Port of upstream's Scheduler worker thread ("VulkanWorker"):
-        // vkQueueSubmit runs off the GPU thread, which on MoltenVK reclaims
-        // ~40% of it (all Metal encoding happens inside submit; measured
-        // vkQueueSubmit 1182→0 samples on the GPU thread). Default ON like
-        // upstream; RUZU_VK_SUBMIT_WORKER=0 forces synchronous submits and
-        // =sync drains after every push (debug modes).
-        let worker_enabled =
-            !std::env::var("RUZU_VK_SUBMIT_WORKER").is_ok_and(|v| v == "0" || v == "off");
-        let (submit_worker, submit_worker_thread) =
-            if let (true, Some(timeline)) = (worker_enabled, timeline_semaphore) {
-                let worker = Arc::new(SubmitWorker::new());
-                let thread_worker = Arc::clone(&worker);
-                let thread_device = device.clone();
-                let thread_mutex = Arc::clone(&submit_mutex);
-                let handle = std::thread::Builder::new()
-                    .name("VulkanWorker".into())
-                    .spawn(move || {
-                        thread_worker.run(thread_device, queue, timeline, thread_mutex);
-                    })
-                    .expect("Failed to spawn Vulkan submit worker");
-                (Some(worker), Some(handle))
-            } else {
-                (None, None)
-            };
-
-        let mut scheduler = Self {
-            command_pool: CommandPool::new_with_external_ticks(device.clone(), graphics_family),
-            device,
+        let current_tick = Arc::new(AtomicU64::new(0));
+        let submitted_tick = Arc::new(AtomicU64::new(0));
+        let worker = Arc::new(SchedulerWorker::new());
+        let mut worker_context = WorkerContext {
+            device: device.clone(),
             queue,
-            current_chunk: CommandChunk::new(),
+            command_pool: CommandPool::new_with_external_ticks(device.clone(), graphics_family),
             current_cmdbuf: vk::CommandBuffer::null(),
             upload_cmdbuf: vk::CommandBuffer::null(),
-            current_tick: AtomicU64::new(0),
+            timeline_semaphore,
+            fence,
+            submit_mutex: Arc::clone(&submit_mutex),
+            current_tick: Arc::clone(&current_tick),
+            submitted_tick: Arc::clone(&submitted_tick),
+        };
+        worker_context.allocate_worker_command_buffer()?;
+        let thread_worker = Arc::clone(&worker);
+        let worker_thread = std::thread::Builder::new()
+            .name("VulkanWorker".into())
+            .spawn(move || thread_worker.run(worker_context))
+            .expect("Failed to spawn Vulkan scheduler worker");
+
+        Ok(Self {
+            device,
+            current_chunk: CommandChunk::new(),
+            current_tick,
+            submitted_tick,
             rp_state: RenderPassState::default(),
             state: SchedulerState::default(),
             fence,
             timeline_semaphore,
             submit_mutex,
             state_tracker: None,
-            submit_worker,
-            submit_worker_thread,
-        };
-        scheduler.allocate_new_context()?;
-        Ok(scheduler)
+            worker: Some(worker),
+            worker_thread: Some(worker_thread),
+        })
     }
 
     pub fn submit_mutex(&self) -> Arc<Mutex<()>> {
@@ -320,11 +578,7 @@ impl Scheduler {
 
     /// Record a command that only needs the render command buffer.
     pub fn record(&mut self, cmd: impl FnOnce(vk::CommandBuffer) + Send + 'static) {
-        self.current_chunk
-            .commands
-            .push(Box::new(move |render_cmd, _upload_cmd| {
-                cmd(render_cmd);
-            }));
+        self.record_with_upload(move |render_cmd, _upload_cmd| cmd(render_cmd));
     }
 
     /// Record a command that needs both render and upload command buffers.
@@ -332,7 +586,14 @@ impl Scheduler {
         &mut self,
         cmd: impl FnOnce(vk::CommandBuffer, vk::CommandBuffer) + Send + 'static,
     ) {
-        self.current_chunk.commands.push(Box::new(cmd));
+        let command = match self.current_chunk.record(cmd) {
+            Ok(()) => return,
+            Err(command) => command,
+        };
+        self.dispatch_work();
+        if self.current_chunk.record(command).is_err() {
+            panic!("Vulkan scheduler command exceeds the 32 KiB command chunk");
+        }
     }
 
     /// Begin a render pass if not already inside one with matching parameters.
@@ -463,27 +724,23 @@ impl Scheduler {
         }
     }
 
-    /// Execute all pending commands in the current chunk directly on the command buffer.
+    /// Port of upstream `Scheduler::DispatchWork`.
     pub fn dispatch_work(&mut self) {
         if self.current_chunk.is_empty() {
             return;
         }
 
-        let chunk = std::mem::replace(&mut self.current_chunk, CommandChunk::new());
-        for cmd in chunk.commands {
-            cmd(self.current_cmdbuf, self.upload_cmdbuf);
-        }
+        let worker = self.worker.as_ref().expect("scheduler worker must exist");
+        let next_chunk = worker.acquire_chunk();
+        let chunk = std::mem::replace(&mut self.current_chunk, next_chunk);
+        worker.push(chunk);
     }
 
     /// Port of upstream `Scheduler::WaitWorker`.
     ///
-    /// Command chunks are replayed synchronously in the current Rust
-    /// scheduler, while queue submission may run on `SubmitWorker`; both
-    /// stages must be drained before a synchronous presentation consumes the
-    /// submitted binary semaphore.
     pub fn wait_worker(&mut self) {
         self.dispatch_work();
-        if let Some(worker) = self.submit_worker.as_ref() {
+        if let Some(worker) = self.worker.as_ref() {
             worker.wait_drained();
         }
     }
@@ -504,106 +761,21 @@ impl Scheduler {
 
     fn flush_impl(&mut self, signal_semaphores: &[vk::Semaphore]) -> u64 {
         self.request_outside_renderpass();
-        self.dispatch_work();
-        // Port of upstream `Scheduler::SubmitExecution`: bindings and dynamic
-        // state recorded in this command buffer do not carry into the next
-        // one. Mark the command-buffer-scoped state dirty before submission so
-        // the next draw re-emits it after `allocate_new_context`.
         self.invalidate_state();
-
-        // End command buffers
-        unsafe {
-            let write_barrier = vk::MemoryBarrier::builder()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-                .build();
-            self.device.cmd_pipeline_barrier(
-                self.upload_cmdbuf,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[write_barrier],
-                &[],
-                &[],
-            );
-            self.device.end_command_buffer(self.upload_cmdbuf).ok();
-            self.device.end_command_buffer(self.current_cmdbuf).ok();
-        }
-
-        // Submit both command buffers (upload first, then render)
-        let cmd_buffers = [self.upload_cmdbuf, self.current_cmdbuf];
-
         let tick = self.current_tick.fetch_add(1, Ordering::SeqCst) + 1;
-        if let Some(worker) = self.submit_worker.as_ref() {
-            // Hand the fully recorded pair to the submit worker: on MoltenVK
-            // vkQueueSubmit performs all Metal encoding, so this moves ~40%
-            // of the GPU thread's loading-phase cost off the critical path
-            // (upstream runs its whole chunk replay + submit on
-            // Scheduler::WorkerThread). Timeline waiters are unaffected
-            // (wait-before-signal is legal for timeline semaphores and jobs
-            // are FIFO).
-            worker.push(SubmitJob {
-                render_cmdbuf: self.current_cmdbuf,
-                upload_cmdbuf: self.upload_cmdbuf,
-                signal_semaphores: signal_semaphores.to_vec(),
-                tick,
-            });
-            if !signal_semaphores.is_empty() || submit_worker_sync_mode() {
-                // BINARY semaphores (e.g. the present manager's render_ready)
-                // do NOT allow wait-before-signal: the consumer may submit a
-                // batch waiting on them as soon as we return, so the signal
-                // must already be queued. Drain the worker on this path only —
-                // it fires per presented frame, while the high-volume
-                // syncpoint-fence flushes stay fully asynchronous.
-                // RUZU_VK_SUBMIT_WORKER=sync drains after every push: a
-                // debugging mode that keeps the submit on the worker THREAD
-                // but removes the deferral WINDOW, to bisect the corruption
-                // race between "window" and "thread" causes.
-                worker.wait_drained();
-            }
-        } else if let Some(timeline) = self.timeline_semaphore {
-            // Upstream `MasterSemaphore::SubmitQueue`: signal the timeline
-            // semaphore with this submission's tick and pipeline submissions
-            // without waiting on the previous one. Each flush records into
-            // freshly allocated command buffers, so nothing here is reused
-            // while the GPU is still executing.
-            let mut all_signals = Vec::with_capacity(1 + signal_semaphores.len());
-            all_signals.push(timeline);
-            all_signals.extend_from_slice(signal_semaphores);
-            let mut signal_values = vec![0u64; all_signals.len()];
-            signal_values[0] = tick;
-            let mut timeline_info =
-                vk::TimelineSemaphoreSubmitInfo::builder().signal_semaphore_values(&signal_values);
-            let submit_info = vk::SubmitInfo::builder()
-                .command_buffers(&cmd_buffers)
-                .signal_semaphores(&all_signals)
-                .push_next(&mut timeline_info)
-                .build();
-            let submit_result = unsafe {
-                let _submit_lock = self.submit_mutex.lock().unwrap();
-                self.device
-                    .queue_submit(self.queue, &[submit_info], vk::Fence::null())
-            };
-            let _ = submit_result;
-        } else {
-            let submit_info = vk::SubmitInfo::builder()
-                .command_buffers(&cmd_buffers)
-                .signal_semaphores(signal_semaphores)
-                .build();
-            unsafe {
-                self.device
-                    .wait_for_fences(&[self.fence], true, u64::MAX)
-                    .ok();
-                self.device.reset_fences(&[self.fence]).ok();
-                let _submit_lock = self.submit_mutex.lock().unwrap();
-                self.device
-                    .queue_submit(self.queue, &[submit_info], self.fence)
-                    .ok();
-            }
+        self.current_chunk.submit = Some(SubmitRequest {
+            signal_semaphores: signal_semaphores.to_vec(),
+            tick,
+        });
+        self.dispatch_work();
+        if !signal_semaphores.is_empty() {
+            self.worker
+                .as_ref()
+                .expect("scheduler worker must exist")
+                .wait_drained();
         }
-
         debug!("Scheduler: flushed at tick {}", tick);
-        self.allocate_new_context().ok();
+        self.rp_state = RenderPassState::default();
         tick
     }
 
@@ -611,43 +783,6 @@ impl Scheduler {
     pub fn finish(&mut self) {
         let tick = self.flush();
         self.wait(tick);
-    }
-
-    fn allocate_new_context(&mut self) -> Result<(), vk::Result> {
-        let known_gpu_tick = self.known_gpu_tick();
-        let pending_tick = self.pending_tick();
-        self.current_cmdbuf = self
-            .command_pool
-            .commit_with_ticks(known_gpu_tick, pending_tick);
-        self.upload_cmdbuf = self
-            .command_pool
-            .commit_with_ticks(known_gpu_tick, pending_tick);
-
-        let begin_info = vk::CommandBufferBeginInfo::builder()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
-            .build();
-        unsafe {
-            self.device
-                .reset_command_buffer(self.current_cmdbuf, vk::CommandBufferResetFlags::empty())?;
-            self.device
-                .reset_command_buffer(self.upload_cmdbuf, vk::CommandBufferResetFlags::empty())?;
-            self.device
-                .begin_command_buffer(self.current_cmdbuf, &begin_info)?;
-            self.device
-                .begin_command_buffer(self.upload_cmdbuf, &begin_info)?;
-        }
-        self.rp_state = RenderPassState::default();
-        Ok(())
-    }
-
-    /// Get the current command buffer for direct recording.
-    pub fn command_buffer(&self) -> vk::CommandBuffer {
-        self.current_cmdbuf
-    }
-
-    /// Get the upload command buffer.
-    pub fn upload_command_buffer(&self) -> vk::CommandBuffer {
-        self.upload_cmdbuf
     }
 
     /// Get the current tick value.
@@ -672,12 +807,13 @@ impl Scheduler {
         // flight until the fence is signalled. Older ticks completed before
         // that submission because this path waits on the same fence before
         // each queue submit.
-        let current_tick = self.current_tick();
-        if current_tick == 0 || unsafe { self.device.get_fence_status(self.fence).unwrap_or(false) }
+        let submitted_tick = self.submitted_tick.load(Ordering::SeqCst);
+        if submitted_tick == 0
+            || unsafe { self.device.get_fence_status(self.fence).unwrap_or(false) }
         {
-            current_tick
+            submitted_tick
         } else {
-            current_tick - 1
+            submitted_tick - 1
         }
     }
 
@@ -700,11 +836,12 @@ impl Scheduler {
                     .unwrap_or(false)
             };
         }
-        if tick < self.current_tick() {
-            return true;
-        }
-        if tick > self.current_tick() {
+        let submitted_tick = self.submitted_tick.load(Ordering::SeqCst);
+        if tick > submitted_tick {
             return false;
+        }
+        if tick < submitted_tick {
+            return true;
         }
         unsafe { self.device.get_fence_status(self.fence).unwrap_or(false) }
     }
@@ -735,6 +872,7 @@ impl Scheduler {
             }
             return;
         }
+        self.wait_worker();
         unsafe {
             self.device
                 .wait_for_fences(&[self.fence], true, u64::MAX)
@@ -745,13 +883,11 @@ impl Scheduler {
 
 impl Drop for Scheduler {
     fn drop(&mut self) {
-        // Drain and stop the submit worker before waiting on / destroying
-        // the timeline semaphore: pending jobs still reference it.
-        if let Some(worker) = self.submit_worker.take() {
+        if let Some(worker) = self.worker.take() {
             worker.wait_drained();
             worker.stop.store(true, Ordering::Release);
             worker.job_cv.notify_all();
-            if let Some(handle) = self.submit_worker_thread.take() {
+            if let Some(handle) = self.worker_thread.take() {
                 let _ = handle.join();
             }
         }
@@ -797,14 +933,139 @@ mod tests {
     }
 
     #[test]
-    fn submit_worker_is_not_drained_while_submit_is_in_flight() {
-        let mut state = SubmitWorkerState {
-            jobs: VecDeque::new(),
+    fn scheduler_worker_is_not_drained_while_chunk_is_in_flight() {
+        let mut state = SchedulerWorkerState {
+            chunks: VecDeque::new(),
+            chunk_reserve: Vec::new(),
             in_flight: 1,
         };
         assert!(!state.is_drained());
 
         state.in_flight = 0;
         assert!(state.is_drained());
+    }
+
+    #[test]
+    fn command_chunk_executes_commands_in_record_order() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut chunk = CommandChunk::new();
+        for value in [3, 1, 4] {
+            let order = Arc::clone(&order);
+            assert!(chunk
+                .record(move |_, _| {
+                    order.lock().unwrap().push(value);
+                })
+                .is_ok());
+        }
+
+        let submit = chunk.execute_all(vk::CommandBuffer::null(), vk::CommandBuffer::null());
+
+        assert!(submit.is_none());
+        assert_eq!(*order.lock().unwrap(), [3, 1, 4]);
+    }
+
+    #[test]
+    fn command_chunk_drops_unexecuted_commands_once() {
+        struct DropProbe(Arc<AtomicU64>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let drops = Arc::new(AtomicU64::new(0));
+        {
+            let mut chunk = CommandChunk::new();
+            let probe = DropProbe(Arc::clone(&drops));
+            assert!(chunk
+                .record(move |_, _| {
+                    std::hint::black_box(&probe);
+                })
+                .is_ok());
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+        }
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn command_chunk_reuses_arena_after_execution() {
+        let executions = Arc::new(AtomicU64::new(0));
+        let mut chunk = CommandChunk::new();
+        for expected in 1..=2 {
+            let command_executions = Arc::clone(&executions);
+            assert!(chunk
+                .record(move |_, _| {
+                    command_executions.fetch_add(1, Ordering::Relaxed);
+                })
+                .is_ok());
+            chunk.execute_all(vk::CommandBuffer::null(), vk::CommandBuffer::null());
+            assert_eq!(executions.load(Ordering::Relaxed), expected);
+            assert_eq!(chunk.command_offset, 0);
+        }
+    }
+
+    #[test]
+    fn command_chunk_preserves_command_alignment() {
+        #[repr(align(64))]
+        struct AlignedCapture(Arc<AtomicU64>);
+
+        let executions = Arc::new(AtomicU64::new(0));
+        let capture = AlignedCapture(Arc::clone(&executions));
+        let mut chunk = CommandChunk::new();
+        assert!(chunk
+            .record(move |_, _| {
+                capture.0.fetch_add(1, Ordering::Relaxed);
+            })
+            .is_ok());
+
+        chunk.execute_all(vk::CommandBuffer::null(), vk::CommandBuffer::null());
+        assert_eq!(executions.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn worker_queue_pops_chunks_fifo_and_tracks_in_flight() {
+        let mut first = CommandChunk::new();
+        first.submit = Some(SubmitRequest {
+            signal_semaphores: Vec::new(),
+            tick: 7,
+        });
+        let mut second = CommandChunk::new();
+        second.submit = Some(SubmitRequest {
+            signal_semaphores: Vec::new(),
+            tick: 8,
+        });
+        let mut state = SchedulerWorkerState {
+            chunks: VecDeque::from([first, second]),
+            chunk_reserve: Vec::new(),
+            in_flight: 0,
+        };
+
+        let first = state.pop_front().unwrap();
+        assert_eq!(first.submit.as_ref().unwrap().tick, 7);
+        assert_eq!(state.in_flight, 1);
+        let second = state.pop_front().unwrap();
+        assert_eq!(second.submit.as_ref().unwrap().tick, 8);
+        assert_eq!(state.in_flight, 2);
+    }
+
+    #[test]
+    fn command_chunk_rejects_a_command_past_upstream_capacity() {
+        let first = {
+            let payload = [0u8; 0x5000];
+            move |_, _| {
+                std::hint::black_box(payload);
+            }
+        };
+        let second = {
+            let payload = [0u8; 0x5000];
+            move |_, _| {
+                std::hint::black_box(payload);
+            }
+        };
+        let mut chunk = CommandChunk::new();
+
+        assert!(chunk.record(first).is_ok());
+        assert!(chunk.record(second).is_err());
     }
 }

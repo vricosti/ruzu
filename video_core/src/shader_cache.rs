@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
@@ -75,8 +75,37 @@ static SHADER_REGISTER_COUNTS: [AtomicU64; 10] = [
     AtomicU64::new(0),
 ];
 
+fn cached_env_flag(cache: &'static OnceLock<bool>, name: &'static str) -> bool {
+    *cache.get_or_init(|| std::env::var_os(name).is_some())
+}
+
+fn profile_refresh_stages_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    cached_env_flag(&ENABLED, "RUZU_PROFILE_REFRESH_STAGES_STALL")
+}
+
+fn profile_make_shader_info_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    cached_env_flag(&ENABLED, "RUZU_PROFILE_MAKE_SHADER_INFO_STALL")
+}
+
+fn profile_shader_register_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    cached_env_flag(&ENABLED, "RUZU_PROFILE_SHADER_REGISTER_STALL")
+}
+
+fn trace_shader_words_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    cached_env_flag(&ENABLED, "RUZU_TRACE_SHADER_WORDS")
+}
+
+fn trace_shader_analyze_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    cached_env_flag(&ENABLED, "RUZU_TRACE_SHADER_ANALYZE")
+}
+
 fn record_refresh_stages_stage(stage: usize) {
-    if std::env::var_os("RUZU_PROFILE_REFRESH_STAGES_STALL").is_none() {
+    if !profile_refresh_stages_enabled() {
         return;
     }
     REFRESH_STAGES_LAST_STAGE.store(stage as u64, Ordering::Relaxed);
@@ -109,12 +138,13 @@ pub fn dump_refresh_stages_stall_profile() {
     ];
     let last_stage = REFRESH_STAGES_LAST_STAGE.load(Ordering::Relaxed) as usize;
     let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
-    eprintln!(
+    log::warn!(
         "[REFRESH_STAGES_STALL_PROFILE] last_stage={} ({})",
-        last_stage, last_stage_name
+        last_stage,
+        last_stage_name
     );
     for (index, name) in NAMES.iter().enumerate() {
-        eprintln!(
+        log::warn!(
             "[REFRESH_STAGES_STALL_PROFILE]   {:02} {:<24} {}",
             index,
             name,
@@ -124,7 +154,7 @@ pub fn dump_refresh_stages_stall_profile() {
 }
 
 fn record_make_shader_info_stage(stage: usize) {
-    if std::env::var_os("RUZU_PROFILE_MAKE_SHADER_INFO_STALL").is_none() {
+    if !profile_make_shader_info_enabled() {
         return;
     }
     MAKE_SHADER_INFO_LAST_STAGE.store(stage as u64, Ordering::Relaxed);
@@ -151,12 +181,13 @@ pub fn dump_make_shader_info_stall_profile() {
     ];
     let last_stage = MAKE_SHADER_INFO_LAST_STAGE.load(Ordering::Relaxed) as usize;
     let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
-    eprintln!(
+    log::warn!(
         "[MAKE_SHADER_INFO_STALL_PROFILE] last_stage={} ({})",
-        last_stage, last_stage_name
+        last_stage,
+        last_stage_name
     );
     for (index, name) in NAMES.iter().enumerate() {
-        eprintln!(
+        log::warn!(
             "[MAKE_SHADER_INFO_STALL_PROFILE]   {:02} {:<24} {}",
             index,
             name,
@@ -166,7 +197,7 @@ pub fn dump_make_shader_info_stall_profile() {
 }
 
 fn record_shader_register_stage(stage: usize) {
-    if std::env::var_os("RUZU_PROFILE_SHADER_REGISTER_STALL").is_none() {
+    if !profile_shader_register_enabled() {
         return;
     }
     SHADER_REGISTER_LAST_STAGE.store(stage as u64, Ordering::Relaxed);
@@ -193,12 +224,13 @@ pub fn dump_shader_register_stall_profile() {
     ];
     let last_stage = SHADER_REGISTER_LAST_STAGE.load(Ordering::Relaxed) as usize;
     let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
-    eprintln!(
+    log::warn!(
         "[SHADER_REGISTER_STALL_PROFILE] last_stage={} ({})",
-        last_stage, last_stage_name
+        last_stage,
+        last_stage_name
     );
     for (index, name) in NAMES.iter().enumerate() {
-        eprintln!(
+        log::warn!(
             "[SHADER_REGISTER_STALL_PROFILE]   {:02} {:<28} {}",
             index,
             name,
@@ -424,8 +456,8 @@ impl ShaderCache {
                 continue;
             }
 
-            if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
-                eprintln!(
+            if trace_shader_words_enabled() {
+                log::warn!(
                     "[SHADER_STAGE_INFO] index={} program={:?} reg_program={:?} offset=0x{:X} base=0x{:X}",
                     index, program_type, stage_info.program_type, stage_info.offset, base_addr
                 );
@@ -438,12 +470,12 @@ impl ShaderCache {
                 memory.gpu_to_cpu_address(shader_addr)
             };
             record_refresh_stages_stage(9);
-            if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
+            if trace_shader_words_enabled() {
                 match cpu_shader_addr {
                     Some(cpu) => {
-                        eprintln!("[SHADER_VA] gpu=0x{:X} -> cpu=0x{:X}", shader_addr, cpu)
+                        log::warn!("[SHADER_VA] gpu=0x{:X} -> cpu=0x{:X}", shader_addr, cpu)
                     }
-                    None => eprintln!(
+                    None => log::warn!(
                         "[SHADER_VA] gpu=0x{:X} -> UNMAPPED (gpu_to_cpu_address returned None)",
                         shader_addr
                     ),
@@ -806,7 +838,7 @@ impl ShaderCache {
             stack: Vec::new(),
         }];
         let mut visited = HashSet::new();
-        let trace = std::env::var_os("RUZU_TRACE_SHADER_ANALYZE").is_some();
+        let trace = trace_shader_analyze_enabled();
         let mut steps = 0usize;
 
         while let Some(mut state) = pending.pop() {
@@ -816,7 +848,7 @@ impl ShaderCache {
                 }
                 steps += 1;
                 if trace && steps.is_power_of_two() {
-                    eprintln!(
+                    log::warn!(
                         "[SHADER_ANALYZE] slow_walk_progress steps={} visited={} pending={} pc=0x{:X} stack_depth={}",
                         steps,
                         visited.len(),
@@ -992,7 +1024,7 @@ impl ShaderCache {
             }
         }
         if trace {
-            eprintln!(
+            log::warn!(
                 "[SHADER_ANALYZE] slow_walk_done steps={} visited={} read_size=0x{:X}",
                 steps,
                 visited.len(),

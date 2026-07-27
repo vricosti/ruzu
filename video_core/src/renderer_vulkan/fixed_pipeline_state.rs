@@ -1931,6 +1931,26 @@ mod tests {
     }
 
     #[test]
+    fn radv_dynamic_feature_key_matches_upstream_capability_mask() {
+        let features = DynamicFeatures {
+            has_extended_dynamic_state: true,
+            has_extended_dynamic_state_2: true,
+            has_extended_dynamic_state_2_extra: true,
+            has_extended_dynamic_state_3_blend: false,
+            has_extended_dynamic_state_3_enables: true,
+            has_dynamic_vertex_input: true,
+        };
+        let mut state = FixedPipelineState::default();
+        state.refresh(&make_test_draw_call(), &features);
+
+        assert_eq!(state.raw1 & 0x3f, 0x37);
+        assert_eq!(
+            state.serialized_size(),
+            FixedPipelineState::ATTRIBUTES_OFFSET
+        );
+    }
+
+    #[test]
     fn refresh_captures_upstream_dynamic_state_refresh2_refresh3_fields() {
         let mut draw = make_test_draw_call();
         draw.rasterize_enable = false;

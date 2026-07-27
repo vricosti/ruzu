@@ -1814,7 +1814,8 @@ fn watched_pc_range() -> Option<(u64, u64)> {
 }
 
 fn maybe_trace_mem_callback_8(cb: &DynarmicCallbacks32, is_write: bool, vaddr: u64, value: u8) {
-    if std::env::var_os("RUZU_A32_MEM_CALLBACK_STATS").is_none() {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("RUZU_A32_MEM_CALLBACK_STATS").is_some()) {
         return;
     }
     let Some((pc_lo, pc_hi)) = watched_pc_range() else {
@@ -2609,6 +2610,7 @@ impl ArmDynarmic32 {
                     silently_mirror_fastmem: true,
                     fastmem_exclusive_access: fastmem_pointer.is_some()
                         && !exclusive_monitor.is_null(),
+                    recompile_on_exclusive_fastmem_failure: true,
                     recompile_on_fastmem_failure: true,
                     page_table_present: page_table_pointer.is_some(),
                     page_table_address_space_bits: 32,

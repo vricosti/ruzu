@@ -39,10 +39,39 @@ use super::types::*;
 
 macro_rules! trace_texture_fill_stall {
     ($($arg:tt)*) => {
-        if std::env::var_os("RUZU_TRACE_TEXTURE_FILL_STALL").is_some() {
-            eprintln!($($arg)*);
+        if trace_texture_fill_stall_enabled() {
+            log::warn!($($arg)*);
         }
     };
+}
+
+fn cached_env_flag(cache: &'static OnceLock<bool>, name: &'static str) -> bool {
+    *cache.get_or_init(|| std::env::var_os(name).is_some())
+}
+
+fn trace_texture_fill_stall_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    cached_env_flag(&ENABLED, "RUZU_TRACE_TEXTURE_FILL_STALL")
+}
+
+fn trace_visit_result_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    cached_env_flag(&ENABLED, "RUZU_TRACE_VISIT_RESULT")
+}
+
+fn trace_descriptor_sync_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    cached_env_flag(&ENABLED, "RUZU_TRACE_DESCRIPTOR_SYNC")
+}
+
+fn trace_render_target_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    cached_env_flag(&ENABLED, "RUZU_TRACE_RT")
+}
+
+fn trace_visit_tic_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    cached_env_flag(&ENABLED, "RUZU_TRACE_VISIT_TIC")
 }
 
 fn parse_u64_env_list(name: &str) -> Option<Vec<u64>> {
@@ -571,7 +600,7 @@ impl TextureCacheBase {
     /// fields + the appropriate GPU-memory owner so `find_image_view` can
     /// take `&mut self`.
     fn visit_image_view(&mut self, graphics: bool, index: u32) -> ImageViewId {
-        if std::env::var_os("RUZU_TRACE_VISIT_TIC").is_some() {
+        if trace_visit_tic_enabled() {
             let table = if graphics {
                 &self.current_channel_state().graphics_image_table
             } else {
@@ -604,7 +633,7 @@ impl TextureCacheBase {
                 &mut self.current_channel_state_mut().compute_image_table
             };
             if index > table.limit() {
-                if std::env::var_os("RUZU_TRACE_VISIT_RESULT").is_some() {
+                if trace_visit_result_enabled() {
                     log::warn!(
                         "[VISIT_RESULT] graphics={} index={} rejected limit={}",
                         graphics,
@@ -643,7 +672,7 @@ impl TextureCacheBase {
             descriptor.format(),
             is_new
         );
-        if std::env::var_os("RUZU_TRACE_VISIT_RESULT").is_some() {
+        if trace_visit_result_enabled() {
             log::warn!(
                 "[VISIT_RESULT] graphics={} index={} desc_addr=0x{:X} desc_fmt=0x{:X} is_new={}",
                 graphics,
@@ -678,7 +707,7 @@ impl TextureCacheBase {
                 index,
                 new_id.index
             );
-            if std::env::var_os("RUZU_TRACE_VISIT_RESULT").is_some() {
+            if trace_visit_result_enabled() {
                 log::warn!(
                     "[VISIT_RESULT] graphics={} index={} cached={} new_id={}",
                     graphics,
@@ -695,7 +724,7 @@ impl TextureCacheBase {
             cached_ids[index as usize] = new_id;
             return new_id;
         }
-        if std::env::var_os("RUZU_TRACE_VISIT_RESULT").is_some() {
+        if trace_visit_result_enabled() {
             log::warn!(
                 "[VISIT_RESULT] graphics={} index={} cached={} reused",
                 graphics,
@@ -946,7 +975,7 @@ impl TextureCacheBase {
     /// address and returns the null image on translation failure. Candidate
     /// reuse is then restricted to images registered in that CPU region.
     pub(crate) fn find_image(
-        &self,
+        &mut self,
         info: &super::image_info::ImageInfo,
         gpu_addr: GPUVAddr,
     ) -> Option<ImageId> {
@@ -964,7 +993,7 @@ impl TextureCacheBase {
     /// derives these from `runtime.HasBrokenTextureViewFormats()` and
     /// `runtime.HasNativeBgr()` before calling `IsSubresource`.
     pub(crate) fn find_image_with_caps(
-        &self,
+        &mut self,
         info: &super::image_info::ImageInfo,
         gpu_addr: GPUVAddr,
         options: RelaxedOptions,
@@ -990,7 +1019,7 @@ impl TextureCacheBase {
     /// compatible texture views, not just exact format matches, and chooses
     /// the most recently modified candidate when multiple images overlap.
     pub(crate) fn find_image_in_cpu_region_with_caps(
-        &self,
+        &mut self,
         info: &super::image_info::ImageInfo,
         gpu_addr: GPUVAddr,
         cpu_addr: u64,
@@ -1137,7 +1166,7 @@ impl TextureCacheBase {
         } else {
             regs.tex_sampler_limit
         };
-        if std::env::var_os("RUZU_TRACE_DESCRIPTOR_SYNC").is_some() {
+        if trace_descriptor_sync_enabled() {
             log::warn!(
                 "[DESC_SYNC] graphics tic_addr=0x{:X} tic_limit={} tsc_addr=0x{:X} tsc_limit={} via_header={}",
                 regs.tex_header_addr,
@@ -1402,7 +1431,7 @@ impl TextureCacheBase {
                 ImageInfo::from_render_target_info(&rt, render_targets.anti_alias_samples_mode);
             let guest_size = super::util::calculate_guest_size_in_bytes(&info) as u64;
             let cpu_addr = gpu_to_cpu(rt.address, guest_size).unwrap_or_else(|| {
-                if std::env::var_os("RUZU_TRACE_RT").is_some() {
+                if trace_render_target_enabled() {
                     log::info!(
                         "[RT] miss translate color={} target={} gpu=0x{:X} {}x{} fmt=0x{:X}; using virtual-invalid fallback",
                         index,
@@ -1429,7 +1458,7 @@ impl TextureCacheBase {
             );
             self.bind_color_render_target(index, view_id);
 
-            if std::env::var_os("RUZU_TRACE_RT").is_some() {
+            if trace_render_target_enabled() {
                 let image = &self.slot_images[image_id];
                 log::info!(
                     "[RT] color={} target={} gpu=0x{:X} cpu=0x{:X} {}x{} fmt=0x{:X} image={} views={}",
@@ -1452,7 +1481,7 @@ impl TextureCacheBase {
                 let info = ImageInfo::from_zeta_info(&zeta, render_targets.anti_alias_samples_mode);
                 let guest_size = super::util::calculate_guest_size_in_bytes(&info) as u64;
                 let cpu_addr = gpu_to_cpu(zeta.address, guest_size).unwrap_or_else(|| {
-                    if std::env::var_os("RUZU_TRACE_RT").is_some() {
+                    if trace_render_target_enabled() {
                         log::info!(
                             "[RT] miss translate zeta gpu=0x{:X} {}x{} fmt=0x{:X}; using virtual-invalid fallback",
                             zeta.address,
@@ -2640,7 +2669,7 @@ impl TextureCacheBase {
     }
 
     /// Port of `TextureCache<P>::FindDMAImage`.
-    pub fn find_dma_image(&self, info: &ImageInfo, gpu_addr: GPUVAddr) -> ImageId {
+    pub fn find_dma_image(&mut self, info: &ImageInfo, gpu_addr: GPUVAddr) -> ImageId {
         let size = super::util::calculate_guest_size_in_bytes(info) as u64;
         let Some(cpu_addr) = self.translated_cpu_addr(gpu_addr, size) else {
             return NULL_IMAGE_ID;
@@ -2780,13 +2809,23 @@ impl TextureCacheBase {
     /// Returns true if any image overlapping the given CPU address range has
     /// been modified from the GPU and not yet downloaded to guest memory.
     pub fn is_region_gpu_modified(&self, addr: u64, size: usize) -> bool {
-        self.collect_images_in_region(addr, size)
-            .into_iter()
-            .any(|image_id| {
-                self.slot_images[image_id]
-                    .flags
-                    .contains(ImageFlagBits::GPU_MODIFIED)
-            })
+        let mut is_modified = false;
+        Self::for_each_cpu_page(addr, size, |page| {
+            if is_modified {
+                return;
+            }
+            let Some(map_ids) = self.page_table.get(&page) else {
+                return;
+            };
+            is_modified = map_ids.iter().any(|&map_id| {
+                let map = &self.slot_map_views[map_id];
+                map.overlaps(addr, size)
+                    && self.slot_images[map.image_id]
+                        .flags
+                        .contains(ImageFlagBits::GPU_MODIFIED)
+            });
+        });
+        is_modified
     }
 }
 
@@ -4097,18 +4136,20 @@ mod tests {
         let first_id = cache.insert_image(&info, 0x4000);
         let second_id = cache.insert_image(&info, 0x8000);
 
-        let first = &cache.slot_images[first_id];
-        let second = &cache.slot_images[second_id];
-        assert_eq!(first.cpu_addr, !(1u64 << 40));
-        assert_ne!(first.cpu_addr, first.gpu_addr);
+        let first_cpu_addr = cache.slot_images[first_id].cpu_addr;
+        let first_gpu_addr = cache.slot_images[first_id].gpu_addr;
+        let first_guest_size_bytes = cache.slot_images[first_id].guest_size_bytes;
+        let second_cpu_addr = cache.slot_images[second_id].cpu_addr;
+        assert_eq!(first_cpu_addr, !(1u64 << 40));
+        assert_ne!(first_cpu_addr, first_gpu_addr);
         assert_eq!(
-            second.cpu_addr,
-            !(1u64 << 40) + common::alignment::align_up(first.guest_size_bytes as u64, 32)
+            second_cpu_addr,
+            !(1u64 << 40) + common::alignment::align_up(first_guest_size_bytes as u64, 32)
         );
-        assert_eq!(cache.collect_images_in_region(0x4000, 4), Vec::new());
+        assert!(cache.collect_images_in_region(0x4000, 4).is_empty());
         assert_eq!(
-            cache.collect_images_in_region(first.cpu_addr, 4),
-            vec![first_id]
+            cache.collect_images_in_region(first_cpu_addr, 4).as_slice(),
+            &[first_id]
         );
     }
 
@@ -4150,10 +4191,10 @@ mod tests {
 
         assert_eq!(cache.slot_images[image_id].cpu_addr, 0x9000_0000);
         assert_eq!(
-            cache.collect_images_in_region(0x9000_0000, 4),
-            vec![image_id]
+            cache.collect_images_in_region(0x9000_0000, 4).as_slice(),
+            &[image_id]
         );
-        assert_eq!(cache.collect_images_in_region(!(1u64 << 40), 4), Vec::new());
+        assert!(cache.collect_images_in_region(!(1u64 << 40), 4).is_empty());
     }
 
     #[test]
@@ -4393,8 +4434,10 @@ mod tests {
             .collect_images_in_gpu_region(0x4000, 4, false)
             .is_empty());
         assert_eq!(
-            cache.collect_images_in_gpu_region(0x8000, 4, false),
-            vec![touched_id]
+            cache
+                .collect_images_in_gpu_region(0x8000, 4, false)
+                .as_slice(),
+            &[touched_id]
         );
         assert!(cache.total_used_memory < initial_memory);
     }
@@ -4412,8 +4455,10 @@ mod tests {
         cache.run_garbage_collector();
 
         assert_eq!(
-            cache.collect_images_in_gpu_region(0x4000, 4, false),
-            vec![image_id]
+            cache
+                .collect_images_in_gpu_region(0x4000, 4, false)
+                .as_slice(),
+            &[image_id]
         );
         assert!(cache.slot_images[image_id]
             .flags
@@ -4559,8 +4604,10 @@ mod tests {
         let image_id = cache.insert_image(&info, 0x4000);
 
         assert_eq!(
-            cache.collect_images_in_gpu_region(0x4000, 4, false),
-            vec![image_id]
+            cache
+                .collect_images_in_gpu_region(0x4000, 4, false)
+                .as_slice(),
+            &[image_id]
         );
 
         cache.unregister_image(image_id);
@@ -4568,6 +4615,46 @@ mod tests {
         assert!(cache
             .collect_images_in_gpu_region(0x4000, 4, false)
             .is_empty());
+    }
+
+    #[test]
+    fn region_collection_deduplicates_and_clears_temporary_picked_flags() {
+        let mut cache = test_cache();
+        let info = test_color_info(1024, 512);
+        let image_id = cache
+            .slot_images
+            .insert(ImageBase::new(info, 0x80000, 0x80000));
+        cache.register_image(image_id);
+        let map_id = cache.slot_images[image_id].map_view_id;
+
+        assert!(
+            cache
+                .page_table
+                .values()
+                .filter(|map_ids| map_ids.contains(&map_id))
+                .count()
+                > 1
+        );
+        assert_eq!(
+            cache
+                .collect_images_in_region(0x80000, 0x20_0000)
+                .as_slice(),
+            &[image_id]
+        );
+        assert!(!cache.slot_map_views[map_id].picked);
+        assert!(!cache.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::PICKED));
+
+        assert_eq!(
+            cache
+                .collect_images_in_gpu_region(0x80000, 0x20_0000, false)
+                .as_slice(),
+            &[image_id]
+        );
+        assert!(!cache.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::PICKED));
     }
 
     #[test]
@@ -4652,8 +4739,10 @@ mod tests {
 
         cache.bind_to_channel(11);
         assert_eq!(
-            cache.collect_images_in_gpu_region(0x4000, 4, false),
-            vec![image_id]
+            cache
+                .collect_images_in_gpu_region(0x4000, 4, false)
+                .as_slice(),
+            &[image_id]
         );
 
         cache.bind_to_channel(12);
@@ -4711,8 +4800,10 @@ mod tests {
             2
         );
         assert_eq!(
-            cache.collect_images_in_gpu_region(0x8000, 4, false),
-            vec![new_id]
+            cache
+                .collect_images_in_gpu_region(0x8000, 4, false)
+                .as_slice(),
+            &[new_id]
         );
     }
 
@@ -4903,12 +4994,15 @@ mod tests {
         let cpu_addr = cache.slot_images[image_id].cpu_addr;
         let map_id = cache.slot_images[image_id].map_view_id;
         assert!(map_id.is_valid());
-        assert_eq!(cache.collect_images_in_region(cpu_addr, 4), vec![image_id]);
+        assert_eq!(
+            cache.collect_images_in_region(cpu_addr, 4).as_slice(),
+            &[image_id]
+        );
 
         cache.track_image(image_id);
         cache.unmap_memory(cpu_addr, 4);
 
-        assert_eq!(cache.collect_images_in_region(cpu_addr, 4), Vec::new());
+        assert!(cache.collect_images_in_region(cpu_addr, 4).is_empty());
         assert_eq!(cache.slot_images.size(), 1);
         assert_eq!(cache.slot_map_views.size(), 0);
         assert!(cache.page_table.is_empty());
@@ -5026,8 +5120,8 @@ mod tests {
             .flags
             .contains(ImageFlagBits::REGISTERED));
         assert_eq!(
-            cache.collect_images_in_region(0x2000, 4),
-            vec![inserted.image_id]
+            cache.collect_images_in_region(0x2000, 4).as_slice(),
+            &[inserted.image_id]
         );
         assert!(!cache.image_allocs_table.is_empty());
 

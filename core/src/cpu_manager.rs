@@ -124,34 +124,106 @@ impl Drop for RunningGuestThreadGuard {
     }
 }
 
-fn parse_hex_env_u64(name: &str) -> Option<u64> {
-    let value = std::env::var(name).ok()?;
-    let trimmed = value.trim();
-    let hex = trimmed
-        .strip_prefix("0x")
-        .or_else(|| trimmed.strip_prefix("0X"))
-        .unwrap_or(trimmed);
-    u64::from_str_radix(hex, 16).ok()
+fn pc_probe_address() -> Option<u64> {
+    static ADDRESS: OnceLock<Option<u64>> = OnceLock::new();
+    *ADDRESS.get_or_init(|| {
+        let value = std::env::var("RUZU_PC_PROBE").ok()?;
+        let trimmed = value.trim();
+        let hex = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        u64::from_str_radix(hex, 16).ok()
+    })
+}
+
+fn trace_thread_concurrency_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_THREAD_CONCURRENCY").is_some())
+}
+
+fn trace_jit_runs_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_JIT_RUNS").is_some())
+}
+
+fn serialize_jit_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_SERIALIZE_JIT").is_some())
+}
+
+fn post_svc_reschedule_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_DISABLE_POST_SVC_RESCHEDULE").is_none())
+}
+
+fn spin_trace_target_tid() -> Option<u64> {
+    static TARGET: OnceLock<Option<u64>> = OnceLock::new();
+    *TARGET.get_or_init(|| {
+        std::env::var_os("RUZU_SPIN_TRACE")?;
+        Some(
+            std::env::var("RUZU_SPIN_TRACE_TID")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(73),
+        )
+    })
+}
+
+fn log_thread_probe_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_LOG_THREAD_PROBE").is_some())
 }
 
 /// Returns true when `RUZU_TRACE_CORE_DISPATCH` is set AND the given core
 /// index is in the (optional) comma-separated allow list. `RUZU_TRACE_CORE_DISPATCH=1`
-/// (or any non-numeric value) enables all cores. `RUZU_TRACE_CORE_DISPATCH=1,2`
-/// enables cores 1 and 2 only.
+/// enables all cores. `RUZU_TRACE_CORE_DISPATCH=1,2` enables cores 1 and 2 only.
+fn parse_core_dispatch_filter(raw: &str) -> (bool, Vec<usize>) {
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
+        return (true, Vec::new());
+    }
+    (
+        false,
+        raw.split(',')
+            .filter_map(|value| value.trim().parse().ok())
+            .collect(),
+    )
+}
+
 fn should_trace_core_dispatch(core_index: usize) -> bool {
-    let Some(raw) = std::env::var_os("RUZU_TRACE_CORE_DISPATCH") else {
+    static FILTER: OnceLock<Option<(bool, Vec<usize>)>> = OnceLock::new();
+    let Some((all, cores)) = FILTER
+        .get_or_init(|| {
+            let raw = std::env::var_os("RUZU_TRACE_CORE_DISPATCH")?;
+            let raw = raw.to_string_lossy();
+            Some(parse_core_dispatch_filter(&raw))
+        })
+        .as_ref()
+    else {
         return false;
     };
-    let raw = raw.to_string_lossy();
-    let raw = raw.trim();
-    // "1" enables all cores (common shorthand). Empty also enables all.
-    if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
-        return true;
+    *all || cores.contains(&core_index)
+}
+
+#[cfg(test)]
+mod diagnostic_config_tests {
+    use super::parse_core_dispatch_filter;
+
+    #[test]
+    fn core_dispatch_filter_preserves_allow_list_indices() {
+        assert_eq!(
+            parse_core_dispatch_filter("0, 2, 96"),
+            (false, vec![0, 2, 96])
+        );
     }
-    // Otherwise treat as comma-separated allow list of core indices.
-    raw.split(',')
-        .filter_map(|s| s.trim().parse::<usize>().ok())
-        .any(|c| c == core_index)
+
+    #[test]
+    fn core_dispatch_filter_recognizes_all_aliases() {
+        for value in ["", "1", "all", "ALL"] {
+            assert_eq!(parse_core_dispatch_filter(value), (true, Vec::new()));
+        }
+    }
 }
 
 /// Emit one dispatch-loop event tagged with the phase and guest thread.
@@ -761,7 +833,7 @@ impl CpuManager {
             let mut t = thread_arc.lock().unwrap();
             &mut *t as *mut super::hle::kernel::k_thread::KThread
         };
-        let trace_thread_concurrency = std::env::var_os("RUZU_TRACE_THREAD_CONCURRENCY").is_some();
+        let trace_thread_concurrency = trace_thread_concurrency_enabled();
         let (thread_id_for_guard, thread_current_core, thread_active_core) =
             if trace_thread_concurrency {
                 let thread = thread_arc.lock().unwrap();
@@ -910,7 +982,7 @@ impl CpuManager {
             if !physical_core.enter_running(jit_ptr, thread_ptr) {
                 return;
             }
-            if std::env::var_os("RUZU_TRACE_JIT_RUNS").is_some() {
+            if trace_jit_runs_enabled() {
                 let n = JIT_RUN_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if n < 512 || n.is_multiple_of(1000) {
                     jit_ref.get_context(&mut thread_context);
@@ -931,7 +1003,7 @@ impl CpuManager {
                     );
                 }
             }
-            let _serialized_jit_guard = if std::env::var_os("RUZU_SERIALIZE_JIT").is_some() {
+            let _serialized_jit_guard = if serialize_jit_enabled() {
                 Some(
                     SERIALIZED_JIT_RUN
                         .get_or_init(|| Mutex::new(()))
@@ -1093,7 +1165,7 @@ impl CpuManager {
                                 current_thread_blocked,
                                 needs_scheduling,
                             );
-                            if std::env::var_os("RUZU_DISABLE_POST_SVC_RESCHEDULE").is_none() {
+                            if post_svc_reschedule_enabled() {
                                 super::hle::kernel::kernel::set_current_emu_thread(Some(
                                     thread_arc,
                                 ));
@@ -1136,11 +1208,7 @@ impl CpuManager {
                     // every halt for the configured tid (default 73).
                     // Bypasses the preemption-thread SIGUSR1 dump path which
                     // gets starved when the JIT thread saturates a host core.
-                    if std::env::var_os("RUZU_SPIN_TRACE").is_some() {
-                        let target_tid: u64 = std::env::var("RUZU_SPIN_TRACE_TID")
-                            .ok()
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(73);
+                    if let Some(target_tid) = spin_trace_target_tid() {
                         let cur_tid = thread_arc.lock().unwrap().get_thread_id() as u64;
                         if cur_tid == target_tid {
                             static SPIN_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -1181,7 +1249,7 @@ impl CpuManager {
                             tc.r[1],
                         );
                     }
-                    if std::env::var_os("RUZU_LOG_THREAD_PROBE").is_some()
+                    if log_thread_probe_enabled()
                         && THREAD_PROBE_HALT_COUNT.fetch_add(1, Ordering::Relaxed) < 400
                     {
                         let mut tc = crate::arm::arm_interface::ThreadContext::default();
@@ -1588,7 +1656,7 @@ impl CpuManager {
                         Self::reschedule_current_core_raw(kernel);
                         return;
                     }
-                    if let Some(probe_pc) = parse_hex_env_u64("RUZU_PC_PROBE") {
+                    if let Some(probe_pc) = pc_probe_address() {
                         let mut tc = crate::arm::arm_interface::ThreadContext::default();
                         jit_ref.get_context(&mut tc);
                         if tc.pc == probe_pc

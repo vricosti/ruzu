@@ -18,7 +18,7 @@ use crate::pte_kind::PteKind;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -51,6 +51,11 @@ enum EntryType {
 // ── Static ID generator ────────────────────────────────────────────────
 
 static UNIQUE_IDENTIFIER_GENERATOR: AtomicUsize = AtomicUsize::new(0);
+
+fn gpu_va_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_GPU_VA_TRACE").is_some())
+}
 
 // ── GpuMemoryManager (inner implementation) ─────────────────────────────
 
@@ -1135,7 +1140,7 @@ impl GpuMemoryManager {
 
     /// Upstream: `MemoryManager::WriteBlockUnsafe(gpu_dest, input, size)`.
     pub fn write_block_unsafe(&self, gpu_dest: u64, input: &[u8]) -> bool {
-        let trace = std::env::var_os("RUZU_GPU_VA_TRACE").is_some();
+        let trace = gpu_va_trace_enabled();
         self.write_block_impl(gpu_dest, input, &mut |addr, data| {
             if trace {
                 let head = data
@@ -1962,7 +1967,7 @@ impl MemoryManager {
 
     pub fn write_block_unsafe(&self, gpu_dest: u64, input: &[u8]) -> bool {
         let written = self.inner.write_block_unsafe(gpu_dest, input);
-        if !written && std::env::var_os("RUZU_GPU_VA_TRACE").is_some() {
+        if !written && gpu_va_trace_enabled() {
             log::info!(
                 "[GPU_VA_WRITEBLOCK] gpu_va=0x{:X} size={} unmapped_reason=no_writer",
                 gpu_dest,

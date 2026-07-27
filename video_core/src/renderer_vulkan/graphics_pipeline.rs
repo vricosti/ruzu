@@ -37,7 +37,7 @@ use shader_recompiler::runtime_info::{
 use shader_recompiler::shader_info::{Info as ShaderInfo, TextureType};
 use shader_recompiler::{CompiledShader, PipelineCache, Profile, RuntimeInfo, ShaderStage};
 
-use super::descriptor_pool::DescriptorBankInfo;
+use super::descriptor_pool::{DescriptorAllocator, DescriptorBankInfo, DescriptorPool};
 use super::fixed_pipeline_state::{DynamicFeatures, FixedPipelineState};
 use super::maxwell_to_vk;
 use super::pipeline_helper::{
@@ -149,9 +149,10 @@ pub struct GraphicsPipeline {
     pipeline: Arc<Mutex<vk::Pipeline>>,
     pub pipeline_layout: vk::PipelineLayout,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
-    pub descriptor_bindings: Vec<GraphicsDescriptorBinding>,
+    pub descriptor_bindings: Arc<Vec<GraphicsDescriptorBinding>>,
     pub descriptor_bank_info: DescriptorBankInfo,
-    pub stage_infos: [Option<ShaderInfo>; 5],
+    descriptor_allocator: Option<DescriptorAllocator>,
+    pub stage_infos: Arc<[Option<ShaderInfo>; 5]>,
     pub enabled_uniform_buffer_masks: [u32; NUM_STAGES as usize],
     pub uniform_buffer_sizes: UniformBufferSizes,
     pub uses_render_area: bool,
@@ -260,6 +261,36 @@ impl GraphicsPipeline {
 
     pub fn pipeline_handle(&self) -> Option<vk::Pipeline> {
         self.build_waiter().pipeline_handle()
+    }
+
+    /// Port of the `descriptor_allocator` initialization in
+    /// `GraphicsPipeline::GraphicsPipeline`.
+    pub fn initialize_descriptor_allocator(
+        &mut self,
+        descriptor_pool: &DescriptorPool,
+    ) -> Result<(), vk::Result> {
+        if self.descriptor_set_layout == vk::DescriptorSetLayout::null()
+            || self.descriptor_bindings.is_empty()
+        {
+            return Ok(());
+        }
+        self.descriptor_allocator = Some(
+            descriptor_pool.allocator(self.descriptor_set_layout, &self.descriptor_bank_info)?,
+        );
+        Ok(())
+    }
+
+    /// Port of `descriptor_allocator.Commit()` in
+    /// `GraphicsPipeline::ConfigureDraw`.
+    pub fn commit_descriptor_set(
+        &self,
+        known_gpu_tick: u64,
+        current_tick: u64,
+    ) -> Result<Option<vk::DescriptorSet>, vk::Result> {
+        self.descriptor_allocator
+            .as_ref()
+            .map(|allocator| allocator.commit(known_gpu_tick, current_tick))
+            .transpose()
     }
 
     fn wait_for_build(&self) {
@@ -533,9 +564,10 @@ impl GraphicsPipelineCache {
             pipeline: Arc::new(Mutex::new(pipeline)),
             pipeline_layout: descriptor_layout.pipeline_layout,
             descriptor_set_layout: descriptor_layout.descriptor_set_layout,
-            descriptor_bindings: descriptor_layout.bindings,
+            descriptor_bindings: Arc::new(descriptor_layout.bindings),
             descriptor_bank_info: descriptor_layout.bank_info,
-            stage_infos,
+            descriptor_allocator: None,
+            stage_infos: Arc::new(stage_infos),
             enabled_uniform_buffer_masks,
             uniform_buffer_sizes,
             uses_render_area,
@@ -602,9 +634,10 @@ impl GraphicsPipelineCache {
             pipeline: Arc::new(Mutex::new(pipeline)),
             pipeline_layout: descriptor_layout.pipeline_layout,
             descriptor_set_layout: descriptor_layout.descriptor_set_layout,
-            descriptor_bindings: descriptor_layout.bindings,
+            descriptor_bindings: Arc::new(descriptor_layout.bindings),
             descriptor_bank_info: descriptor_layout.bank_info,
-            stage_infos,
+            descriptor_allocator: None,
+            stage_infos: Arc::new(stage_infos),
             enabled_uniform_buffer_masks,
             uniform_buffer_sizes,
             uses_render_area,
@@ -698,9 +731,10 @@ impl GraphicsPipelineCache {
             pipeline,
             pipeline_layout: descriptor_layout.pipeline_layout,
             descriptor_set_layout: descriptor_layout.descriptor_set_layout,
-            descriptor_bindings: descriptor_layout.bindings,
+            descriptor_bindings: Arc::new(descriptor_layout.bindings),
             descriptor_bank_info: descriptor_layout.bank_info,
-            stage_infos,
+            descriptor_allocator: None,
+            stage_infos: Arc::new(stage_infos),
             enabled_uniform_buffer_masks,
             uniform_buffer_sizes,
             uses_render_area,
@@ -975,9 +1009,10 @@ impl GraphicsPipelineCache {
             pipeline: Arc::new(Mutex::new(pipeline)),
             pipeline_layout: descriptor_layout.pipeline_layout,
             descriptor_set_layout: descriptor_layout.descriptor_set_layout,
-            descriptor_bindings: descriptor_layout.bindings,
+            descriptor_bindings: Arc::new(descriptor_layout.bindings),
             descriptor_bank_info: descriptor_layout.bank_info,
-            stage_infos,
+            descriptor_allocator: None,
+            stage_infos: Arc::new(stage_infos),
             enabled_uniform_buffer_masks,
             uniform_buffer_sizes,
             uses_render_area,
@@ -2133,9 +2168,10 @@ mod tests {
             pipeline: Arc::new(Mutex::new(vk::Pipeline::null())),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
-            descriptor_bindings: Vec::new(),
+            descriptor_bindings: Arc::new(Vec::new()),
             descriptor_bank_info: DescriptorBankInfo::default(),
-            stage_infos: Default::default(),
+            descriptor_allocator: None,
+            stage_infos: Arc::new(Default::default()),
             enabled_uniform_buffer_masks: [0; NUM_STAGES as usize],
             uniform_buffer_sizes: [[0; NUM_GRAPHICS_UNIFORM_BUFFERS as usize]; NUM_STAGES as usize],
             uses_render_area: false,

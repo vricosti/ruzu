@@ -92,13 +92,18 @@ pub mod cv_stats {
 }
 
 fn trace_kcv(args: std::fmt::Arguments<'_>) {
-    if std::env::var_os("RUZU_TRACE_KCV").is_none() {
+    static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let Some(limit) = *LIMIT.get_or_init(|| {
+        std::env::var_os("RUZU_TRACE_KCV")?;
+        Some(
+            std::env::var("RUZU_TRACE_KCV_LIMIT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(256),
+        )
+    }) else {
         return;
-    }
-    let limit = std::env::var("RUZU_TRACE_KCV_LIMIT")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(256);
+    };
     let idx = TRACE_KCV_COUNT.fetch_add(1, Ordering::Relaxed);
     if idx < limit {
         log::info!("{}", args);
@@ -106,7 +111,8 @@ fn trace_kcv(args: std::fmt::Arguments<'_>) {
 }
 
 fn should_trace_kcv_wake() -> bool {
-    std::env::var_os("RUZU_TRACE_KCV_WAKE").is_some()
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_KCV_WAKE").is_some())
 }
 
 /// Returns Some(key) if the env var `RUZU_TRACE_CV_KEY=0xHEX` matches the
@@ -115,13 +121,16 @@ fn should_trace_kcv_wake() -> bool {
 /// of `RUZU_TRACE_KCV`. When set, every signal/wait/end_wait on that key
 /// is logged unconditionally.
 fn cv_key_trace_target() -> Option<u64> {
-    let raw = std::env::var("RUZU_TRACE_CV_KEY").ok()?;
-    let trimmed = raw.trim();
-    let trimmed = trimmed
-        .strip_prefix("0x")
-        .or_else(|| trimmed.strip_prefix("0X"))
-        .unwrap_or(trimmed);
-    u64::from_str_radix(trimmed, 16).ok()
+    static TARGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        let raw = std::env::var("RUZU_TRACE_CV_KEY").ok()?;
+        let trimmed = raw.trim();
+        let trimmed = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        u64::from_str_radix(trimmed, 16).ok()
+    })
 }
 
 fn should_trace_cv_key(cv_key: u64) -> bool {
@@ -129,13 +138,26 @@ fn should_trace_cv_key(cv_key: u64) -> bool {
 }
 
 fn lock_pi_addr_trace_target() -> Option<u64> {
-    let raw = std::env::var("RUZU_TRACE_LOCK_ADDR").ok()?;
-    let trimmed = raw.trim();
-    let trimmed = trimmed
-        .strip_prefix("0x")
-        .or_else(|| trimmed.strip_prefix("0X"))
-        .unwrap_or(trimmed);
-    u64::from_str_radix(trimmed, 16).ok()
+    static TARGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        let raw = std::env::var("RUZU_TRACE_LOCK_ADDR").ok()?;
+        let trimmed = raw.trim();
+        let trimmed = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        u64::from_str_radix(trimmed, 16).ok()
+    })
+}
+
+fn trace_ct_fire_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_CT_FIRE").is_some())
+}
+
+fn trace_unlock_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_UNLOCK").is_some())
 }
 
 fn should_trace_lock_pi(addr: u64) -> bool {
@@ -277,8 +299,7 @@ impl ThreadQueueImplForKConditionVariableWaitConditionVariable {
         // re-acquiring the process mutex, matching upstream's raw-pointer access
         // under the scheduler lock.
         if waiting_thread.is_waiting_for_condition_variable() {
-            if let Some(trace) = std::env::var_os("RUZU_TRACE_CT_FIRE") {
-                let _ = trace;
+            if trace_ct_fire_enabled() {
                 log::info!(
                     "ThreadQueueImpl CV cancel_wait tid={} before_parent",
                     waiting_thread.thread_id
@@ -617,7 +638,7 @@ impl KConditionVariable {
 
         // RUZU_TRACE_UNLOCK=1 — log every ArbitrateUnlock with the
         // recovered next_owner, so we can confirm whether the unlock
-        if std::env::var_os("RUZU_TRACE_UNLOCK").is_some() {
+        if trace_unlock_enabled() {
             let next_id = next_owner_thread
                 .as_ref()
                 .map(|t| t.lock().unwrap().get_thread_id());

@@ -23469,7 +23469,7 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   `a32_emit_x64.cpp`, and `a64_emit_x64.cpp` after implementation.
 - `cargo check -p rdynarmic --release` and the same check with
   `--features no_execute_support` pass.
-- The focused MK8D syscall comparison reduced `mprotect` calls from 47,330 to
+- The focused VMRD syscall comparison reduced `mprotect` calls from 47,330 to
   3,232 over the same ten-second launch interval.
 
 ## 2026-07-26 — core/src/hle/kernel/{kernel,global_scheduler_context,k_process,k_thread}.rs vs core/hle/kernel/{kernel,global_scheduler_context,k_process,k_scheduler,k_thread}.{h,cpp}
@@ -23627,7 +23627,7 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   transitions all had the exact scheduled/suggested ownership implied by the
   thread affinity and active core, with no invalid report before yuzu's
   unrelated offscreen-renderer `SIGSEGV` at 3.5 seconds.
-- MK8D runs using software rendering opened no `/dev/dri` device. A normal
+- VMRD runs using software rendering opened no `/dev/dri` device. A normal
   OpenGL run reached the title sequence through present 2,000 without
   `BreakLoopNullPc`, `0x068A001C`, `PQ_STALE`, or `PQ_RECOVER`. A diagnostic
   run that temporarily skipped llvmpipe's pathological indirect draw reached
@@ -23691,7 +23691,7 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - The executable ABI regression loads distinct values into `xmm1` and
   `xmm14`, calls a host function that clobbers both, and verifies their exact
   restoration.
-- A 25-second Vulkan/null-audio MK8D run rendered the animated title prompt
+- A 25-second Vulkan/null-audio VMRD run rendered the animated title prompt
   correctly. Before the fix, the same guest block intermittently stored
   negative infinity after a fastmem callback corrupted its live `1/255` XMM
   constant. The user confirmed the corrected run.
@@ -23759,3 +23759,753 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 
 ### Binary layout verification
 - PASS: no JIT-state or ABI layout changed in this slice.
+
+## 2026-07-27 — rdynarmic x64 A32/A64 fastmem fault recompilation
+
+### Intentional differences
+- Upstream inserts the do-not-fastmem marker and invalidates the block directly
+  from `FastmemCallback`. Rust only sets an atomic flag in the SIGSEGV/SEH
+  callback, then mutates the `HashSet` and block cache after generated code
+  returns. This preserves ordering at the next dispatch without performing
+  allocation or container mutation in a signal handler.
+
+### Unintentional differences (fixed)
+- `MemoryEmitConfig` disabled recompilation by default, while both upstream
+  A32 and A64 configs enable normal and exclusive fastmem recompilation.
+- A32 patch records discarded their instruction marker and forced
+  `recompile=false`; A64 recorded markers but never consumed them. Faulting
+  accesses therefore used callbacks on every execution instead of invalidating
+  and recompiling the exact source block.
+- Neither x64 backend completed upstream's `do_not_fastmem` lifecycle. Both now
+  identify accesses by `(LocationDescriptor, InstRef)`, preserve ordinary
+  versus exclusive fault policy, and invalidate only the exact descriptor
+  while retaining other state variants at the same PC.
+- The first deferred implementation scanned every fastmem patch and allocated
+  a result vector after every JIT execution slice, even when no fault occurred.
+  A table-level atomic pending flag now makes that common path O(1); the
+  per-entry scan only runs after the exception callback records a fault.
+
+### Binary layout verification
+- PASS: guest state and callback ABIs are unchanged. The added atomic flag is
+  private host-side patch metadata and is never serialized.
+
+### Verification
+- Re-read upstream `interface/A32/config.h`, `interface/A64/config.h`,
+  `backend/x64/emit_x64_memory.cpp.inc`, `backend/x64/emit_x64.cpp`,
+  `backend/x64/a32_emit_x64.cpp`, and the POSIX exception handler.
+- Linux/x64 regressions execute two A32 or A64 `LDR`s against a partly mapped
+  fastmem arena. They verify callback fallback and exact block invalidation,
+  then prove the second execution retains fastmem for the valid load while
+  only the faulting load uses its callback.
+- All 14 focused release tests selected by `fastmem` pass, including the
+  no-fault fast-path regression.
+- The full release suite remains blocked by the pre-existing ARM64 test
+  `run_performs_deferred_clear_cache_before_execution`, which terminates the
+  test process with `SIGSEGV` before reaching the x64 tests.
+
+## 2026-07-27 — Slot-vector occupancy checks in texture caches
+
+### Intentional differences
+- Upstream texture-cache alias paths index `SlotVector` directly and rely on
+  its debug validation. Rust's deferred backend work queues can retain an ID
+  until after its slot is erased, so their existing non-panicking existence
+  checks are retained.
+- `SlotVector::contains` exposes the existing occupancy bit through a safe
+  O(1) query. Upstream has no public equivalent because direct indexing is its
+  only required operation.
+
+### Unintentional differences (fixed)
+- Vulkan and OpenGL existence helpers previously found an ID by iterating all
+  occupied slots. During Vulkan alias synchronization this nested a full
+  slot-vector scan inside every alias check; a Linux/x64 VMRD profile measured
+  34.7% of process cycles in that scan. The helpers now query occupancy in
+  constant time.
+
+### Binary layout verification
+- PASS: `SlotVector`, `SlotId`, image objects, and guest-visible layouts are
+  unchanged; only a read-only method was added.
+
+### Verification
+- Re-read upstream `common/slot_vector.h` and
+  `video_core/texture_cache/texture_cache.h::SynchronizeAliases`.
+- `test_contains_tracks_occupied_slots` covers occupied, invalid,
+  out-of-capacity, and erased IDs.
+
+## 2026-07-27 — Maxwell3D clear dispatch parity
+
+### Intentional differences
+- Rust dispatches the rasterizer through `Maxwell3DAccess::clear_rasterizer`
+  to preserve the upstream `Maxwell3D` ownership boundary without creating
+  overlapping mutable borrows. The call order and conditional execution match
+  `DrawManager::Clear`.
+
+### Unintentional differences (fixed)
+- `DrawManager::Clear` performed the rasterizer clear and then allocated,
+  formatted, and filled a second full-size CPU framebuffer. Upstream only
+  invokes `rasterizer->Clear(layer_count)`. The Rust-only framebuffer producer,
+  its `Maxwell3D` storage, and its trait publication hook were removed.
+- Tests previously required the extra CPU framebuffer. They now verify the
+  upstream contract: a clear method write dispatches exactly once to the
+  rasterizer.
+
+### Binary layout verification
+- PASS: removed state was private host-only `Vec<u8>` storage and was never
+  guest-visible or serialized.
+
+### Verification
+- Re-read upstream `video_core/engines/draw_manager.{h,cpp}` and
+  `video_core/renderer_vulkan/vk_rasterizer.cpp`.
+- `test_call_method_clear_surface_routes_via_draw_manager_clear_owner` and
+  `test_clear_via_write_reg` pass in release mode.
+
+## 2026-07-27 — Vulkan scheduler worker ownership
+
+### Intentional differences
+- Upstream stores commands with placement-new in a 32 KiB arena and recycles
+  chunks. Rust boxes type-erased closures, accounts their dynamic size against
+  the same 32 KiB limit, and recycles the drained `Vec`-backed chunks through
+  the worker reserve.
+- `WorkerContext` owns the command pool and active command buffers so Vulkan's
+  externally synchronized pool is exclusively accessed by `VulkanWorker`.
+  Upstream keeps those fields on `Scheduler`, where only its worker uses them.
+- The Rust fence fallback tracks queued and submitted ticks separately because
+  its simplified semaphore owner lacks upstream `MasterSemaphore`'s fence
+  wait thread. Timeline-semaphore behavior and submission ordering are the
+  primary path.
+
+### Unintentional differences (fixed)
+- `Scheduler::dispatch_work` replayed every command closure synchronously on
+  the GPU thread; its `VulkanWorker` only called `vkQueueSubmit`. Upstream
+  moves the complete `CommandChunk` to `Scheduler::WorkerThread`, which
+  records commands, submits marked chunks, and rotates command buffers.
+- The legacy Vulkan buffer and texture paths exposed raw scheduler command
+  buffers and recorded copies, transitions, and bindings on the GPU thread.
+  They now use `Scheduler::record` or `record_with_upload`, leaving command
+  pool access exclusively on the worker and preserving stream order.
+- Legacy upload-buffer copies emitted an immediate post-copy barrier.
+  Upstream relies on the upload barrier in `SubmitExecution`; Rust now does
+  the same.
+- Rust chunks grew without the upstream 32 KiB dispatch boundary. Recording
+  now dispatches the current chunk before the next closure would exceed it.
+- Rust initially allocated a new command chunk after every dispatch. Consumed
+  chunks are now returned to the worker reserve and reused as upstream does.
+
+### Binary layout verification
+- PASS: all changed scheduler, queue, and command-size fields are host-only.
+  No guest-visible or serialized structure changed.
+
+### Verification
+- Re-read upstream `vk_scheduler.{h,cpp}`, `vk_buffer_cache.{h,cpp}`,
+  `vk_texture_cache.cpp`, and `vk_rasterizer.cpp` after implementation.
+- Scheduler tests cover command order, FIFO chunk dequeue/in-flight state,
+  and the 32 KiB dispatch boundary without requiring a Vulkan device.
+
+## 2026-07-27 — Vulkan descriptor resource ownership
+
+### Intentional differences
+- `DescriptorBank` is held through `Arc<Mutex<_>>` instead of
+  `unique_ptr` plus the pool’s shared mutex. This keeps allocator references
+  stable while preserving the upstream bank ownership and locking boundary.
+- `DescriptorAllocator` protects its resource-pool cursor and set pages with a
+  Rust mutex. The local renderer commits descriptors before queuing the Vulkan
+  command closure, while upstream performs the commit inside its worker
+  closure; both stamp the set with the tick of the pending submission.
+- `ResourcePool::try_commit_resource_with_ticks` returns allocation failures
+  through `Result`, matching exceptions propagated by upstream’s virtual
+  `Allocate`.
+
+### Unintentional differences (fixed)
+- Rust allocated a fresh descriptor set from a global pool on every draw and
+  retired or reset whole descriptor pools at frame boundaries. Upstream gives
+  each graphics pipeline, compute pipeline, blit helper, and compute pass a
+  persistent `DescriptorAllocator` that reuses individual sets after their
+  timeline tick completes.
+- Rust allocated descriptor sets one at a time. `DescriptorAllocator` now
+  grows in upstream’s `SETS_GROW_RATE` groups of 16, keeps the same
+  two-dimensional set indexing, and allocates a new Vulkan pool only after
+  `VK_ERROR_OUT_OF_POOL_MEMORY`.
+- `ComputePass` carried a second local `DescriptorBankInfo` type and did not
+  own an allocator. It now uses the descriptor-pool type and owns the
+  allocator alongside its descriptor-set layout.
+- `BlitImageHelper` retained a raw descriptor-pool pointer and allocated on
+  every operation. It now owns the upstream one-texture and two-texture
+  allocators.
+- The Rust `IsSuperset` storage-image comparison differed from the local C++
+  source. It now reproduces the upstream comparison exactly.
+
+### Binary layout verification
+- PASS: resource-pool ticks, descriptor banks, allocators, and Vulkan handles
+  are host-only state. No guest-visible or serialized layout changed.
+
+### Verification
+- Re-read `vk_resource_pool.{h,cpp}`, `vk_descriptor_pool.{h,cpp}`,
+  `vk_graphics_pipeline.{h,cpp}`, `vk_compute_pipeline.{h,cpp}`,
+  `blit_image.{h,cpp}`, and `vk_compute_pass.{h,cpp}` after implementation.
+- Descriptor-pool, resource-pool, and scheduler release tests pass. The
+  resource-pool regression verifies that failed growth publishes no slots and
+  completed ticks reuse existing slots without another allocation.
+
+## 2026-07-27 — Disabled shader and texture diagnostic overhead
+
+### Intentional differences
+- Rust-only environment-gated diagnostics cache their enable flags with
+  `OnceLock`; upstream has no equivalent diagnostics. Diagnostic output uses
+  the asynchronous logger instead of writing synchronously to stderr.
+- The GPU-thread profiler, macro-interpreter traces, and puller submit-range
+  trace now follow the same rule. Disabled profiling no longer initializes
+  counters or samples `Instant` around every submitted command list.
+
+### Binary layout verification
+- PASS: only process-local diagnostic flags and output routing changed.
+
+### Verification
+- Re-read upstream `video_core/shader_cache.{h,cpp}` and
+  `video_core/texture_cache/texture_cache.h`; neither source has these
+  diagnostics in its runtime paths.
+- `cargo check -p video_core` passes.
+
+## 2026-07-27 — Vulkan extended dynamic-state parity
+
+### Intentional differences
+- Ash exposes EDS2 and EDS3 commands through extension loader objects and
+  vertex-input dynamic state through a generated device function table.
+  These are captured by scheduler closures instead of the upstream Vulkan
+  wrapper methods; command ordering and arguments are unchanged.
+- Draw snapshots copy Maxwell dirty flags. After vertex-input emission, Rust
+  copies only the consumed Vulkan vertex-input flag range back to the stable
+  channel-owned flags, reproducing upstream's in-place mutation without
+  extending a mutable engine borrow across rasterizer calls.
+
+### Unintentional differences (fixed)
+- The device wrapper advertised only EDS1 and EDS2 to the pipeline cache even
+  when the driver exposed EDS2 logic-op, EDS3 enable, and vertex-input dynamic
+  features. On RADV this encoded feature mask `0x03` instead of upstream's
+  `0x37`, baking vertex attributes and other dynamic fields into thousands of
+  distinct graphics pipelines.
+- EDS3 and vertex-input feature structs were absent from the physical-device
+  query and logical-device feature chain. They are now queried, filtered by
+  the same relevant RADV/AMD driver workarounds, enabled, and passed through
+  the renderer to `PipelineCache`.
+- EDS2 was not removed when EDS1 was unavailable, and EDS3 was not removed
+  when EDS2 was unavailable. The upstream dependency ordering and old-RADV
+  EDS1/EDS2 blacklists are now applied before logical-device creation.
+- `RasterizerVulkan::UpdateDynamicStates` had no EDS2-extra, EDS3-enable, or
+  dynamic vertex-input commands. The missing update methods and their
+  state-tracker guards now follow `vk_rasterizer.cpp`.
+- The first vertex-input implementation could leave a newly dirtied binding
+  set in Maxwell after consuming it from the snapshot. The complete Vulkan
+  vertex-input dirty range is now synchronized back after each update.
+
+### Missing items
+- The broader upstream Qualcomm, ARM, and Intel driver blacklist set remains
+  outside this Linux/RADV slice; the pre-existing device wrapper does not yet
+  classify all of those driver families.
+
+### Binary layout verification
+- PASS: all added capabilities, loaders, and dirty-state synchronization are
+  host-only. The graphics pipeline disk key retains its upstream serialized
+  layout and now records the correct capability bits.
+
+### Verification
+- Re-read upstream `vulkan_device.{h,cpp}`,
+  `vk_rasterizer.{h,cpp}`, `vk_state_tracker.{h,cpp}`, and
+  `vk_pipeline_cache.cpp` after implementation.
+- A fresh RX 5700 XT RADV cache contained only feature mask `0x37`, matching
+  the yuzu cache from the same host; the previous ruzu cache used `0x03`.
+- `radv_dynamic_feature_key_matches_upstream_capability_mask` verifies the
+  feature bits and confirms dynamic vertex attributes are omitted from the
+  serialized key.
+
+## 2026-07-27 — Physical page clearing residency parity
+
+### Intentional differences
+- `KPageTableBase` reaches the system-owned `HostMemory` through its existing
+  `Memory::zero_phys_block` bridge because the Rust page table does not retain
+  the upstream `Core::System&`. Physical-address translation and clearing
+  remain owned by the memory subsystem.
+
+### Unintentional differences (fixed)
+- Page-group allocation callers correctly followed upstream's per-block
+  `ClearBackingRegion` control flow, but the Rust physical bridge implemented
+  it with `ptr::write_bytes`. Large guest heap allocations therefore faulted
+  every zero-filled DRAM page into the host working set. It now delegates to
+  `HostMemory::clear_backing_region`, matching yuzu's Linux `MADV_REMOVE`
+  behavior without materializing clean pages.
+
+### Binary layout verification
+- PASS: no guest layout, mapping, address translation, or fill value changed.
+  Only the Linux backing-store operation used to establish zero-filled pages
+  changed from eager writes to the upstream sparse-file discard.
+
+### Verification
+- Re-read upstream `common/host_memory.{h,cpp}`,
+  `core/hle/kernel/k_page_table_base.cpp`, and
+  `core/hle/kernel/k_memory_manager.cpp`.
+- `zero_phys_block_discards_resident_backing_pages` verifies with `mincore`
+  that resident pages are discarded and subsequently read back as zero.
+
+## 2026-07-27 — Production draw dispatch parity
+
+### Intentional differences
+- Rust unit tests retain the software-facing `DrawCall` snapshot queue behind
+  `cfg(test)` so existing Maxwell command-decoding tests can inspect submitted
+  draws. Production builds contain neither the queue nor snapshot construction.
+
+### Unintentional differences (fixed)
+- Production `DrawManager::process_draw` built and retained a 2,940-byte
+  compatibility snapshot for every guest draw. Upstream dispatches directly to
+  the rasterizer and owns no such queue. During VMRD this Rust-only queue grew
+  to 4,194,304 entries and one 12,331,253,760-byte allocation. The release path
+  now follows upstream and performs no compatibility capture.
+- Two `IndexBufferSmall` tests used topology encodings that disagreed with
+  `Maxwell3D::Regs::PrimitiveTopology`. Their raw values now use upstream's
+  `Triangles=0x4`, `Lines=0x1`, and `Patches=0xE` encodings.
+
+### Binary layout verification
+- PASS: compatibility snapshots are host-only test data. Guest register and
+  command layouts are unchanged.
+
+### Verification
+- Re-read upstream `video_core/engines/draw_manager.{h,cpp}` and
+  `video_core/engines/maxwell_3d.h` after implementation.
+- A release run reached the race grid with RSS stable near 3.1 GiB; the
+  previous path grew past 10 GiB and the allocation trace identified the
+  12,331,253,760-byte `Vec<DrawCall>` backing allocation.
+- Maxwell draw-capture tests continue to exercise the test-only queue.
+
+## 2026-07-27 — video_core/src/dma_pusher.rs vs video_core/dma_pusher.{h,cpp}
+
+### Intentional differences
+- Rust temporarily moves the reusable `Vec<CommandHeader>` out of
+  `DmaPusher` while calling `process_commands` to satisfy exclusive borrowing.
+  Upstream passes a span over its member `ScratchBuffer<CommandHeader>`;
+  storage, command order, and lifetime remain equivalent.
+- `CommandHeader` derives `Pod` and `Zeroable` so GPU command bytes can be read
+  directly into its one-word `repr(C)` storage.
+
+### Unintentional differences (fixed)
+- Rust allocated a temporary byte vector for every GPU command list, copied
+  each word into `command_headers`, then cloned the complete header vector
+  before dispatch. Upstream fills and reuses one
+  `ScratchBuffer<CommandHeader>` and passes its span directly to
+  `ProcessCommands`. Rust now resizes its existing scratch, reads into it in
+  place, and dispatches from the same allocation.
+- Rust materialized every non-incrementing command span as a new `Vec<u32>`.
+  The one-word `CommandHeader` slice is now viewed directly as `&[u32]`,
+  matching upstream's pointer into the command span.
+- Disabled diagnostics still scanned every fetched list for non-zero words,
+  incremented an atomic trace budget for every dispatched method, loaded the
+  active-submit trace index, and called the async-trace predicate multiple
+  times per method. These operations are now entered only when their
+  corresponding diagnostic is enabled.
+- The disabled `RUZU_TRACE_PULLER_RAW_HEADERS` check queried the process
+  environment for every fetched list. Its value is now cached once.
+
+### Binary layout verification
+- PASS: `CommandHeader` remains exactly one aligned `u32`; the regression test
+  verifies that two little-endian GPU words map directly to their expected
+  raw header values.
+
+### Verification
+- Re-read upstream `video_core/dma_pusher.{h,cpp}` after implementation.
+- All DMA/CDMA focused tests pass in release mode.
+
+## 2026-07-27 — video_core/src/memory_manager.rs vs video_core/memory_manager.{h,cpp}
+
+### Intentional differences
+- The Rust-only `RUZU_GPU_VA_TRACE` diagnostic uses the asynchronous logger;
+  upstream's equivalent local diagnostic uses its C++ logger.
+
+### Unintentional differences (fixed)
+- Rust queried the process environment for every unsafe GPU-memory write.
+  The enable flag is now initialized once, matching upstream's function-static
+  trace switch.
+
+### Binary layout verification
+- PASS: only a process-local diagnostic flag changed.
+
+### Verification
+- Re-read upstream `video_core/memory_manager.{h,cpp}` after implementation.
+- The focused `video_core` release build and DMA regression test pass.
+
+## 2026-07-27 — video_core/src/texture_cache/texture_cache.rs vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `RUZU_TRACE_VISIT_TIC` is a Rust-only diagnostic and remains routed through
+  the asynchronous logger.
+
+### Unintentional differences (fixed)
+- The disabled TIC-visit diagnostic queried the process environment from the
+  image-view lookup path. Its process-stable enable flag is now cached once.
+
+### Binary layout verification
+- PASS: only a process-local diagnostic flag changed.
+
+### Verification
+- Re-read upstream `video_core/texture_cache/texture_cache.h`; it has no
+  equivalent runtime diagnostic in `VisitImageView`.
+- The focused `video_core` release build and DMA regression test pass.
+
+## 2026-07-27 — video_core/src/buffer_cache/buffer_cache_base.rs vs video_core/buffer_cache/buffer_cache_base.h
+
+### Intentional differences
+- Rust stores `BufferId` values instead of upstream `Buffer*` pointers because
+  backend buffers are owned by `SlotVector`; inline capacity and binding order
+  remain equivalent.
+
+### Unintentional differences (fixed)
+- Rust `HostBindings` used four heap-backed `Vec`s even though upstream uses
+  `small_vector` with `NUM_VERTEX_BUFFERS` inline capacity. The fields now use
+  `SmallVec<[T; NUM_VERTEX_BUFFERS]>`, removing those allocations from common
+  vertex-buffer binding.
+
+### Binary layout verification
+- PASS: `HostBindings` is temporary host-side renderer state and is never
+  guest-visible or serialized.
+
+### Verification
+- Re-read upstream `video_core/buffer_cache/buffer_cache_base.h` and
+  `buffer_cache.h::BindHostVertexBuffers` after implementation.
+- `test_host_bindings_default` verifies that all four vectors retain the full
+  upstream vertex-buffer count without spilling to the heap.
+
+## 2026-07-27 — video_core/src/renderer_vulkan/graphics_pipeline.rs and vk_rasterizer.rs vs video_core/renderer_vulkan/vk_graphics_pipeline.{h,cpp} and vk_rasterizer.cpp
+
+### Intentional differences
+- Upstream keeps a stable `GraphicsPipeline*` while `PrepareDraw` configures
+  renderer-owned caches. Rust shares the pipeline's immutable descriptor
+  bindings and stage information through `Arc` because its split rasterizer
+  cannot retain a borrow into `PipelineCache` while mutating sibling fields.
+  The pipeline remains the sole owner that creates this immutable metadata.
+
+### Unintentional differences (fixed)
+- Rust deeply cloned the descriptor-binding vector and all five `ShaderInfo`
+  values for every draw after pipeline lookup. Upstream reads both directly
+  from the persistent `GraphicsPipeline`. Draw preparation now clones only
+  two shared handles and reads the original pipeline metadata.
+
+### Binary layout verification
+- PASS: descriptor bindings and shader information are immutable host-side
+  pipeline metadata; no graphics key or guest-visible layout changed.
+
+### Verification
+- Re-read upstream `vk_rasterizer.cpp::PrepareDraw` and
+  `vk_graphics_pipeline.{h,cpp}::ConfigureImpl` after implementation.
+- `cargo check -p video_core` passes; a release race profile is required to
+  confirm removal of the measured per-draw `Vec::clone` allocation.
+
+## 2026-07-27 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Rust temporarily moves the destination image's alias vector out of its slot
+  while mutating other image slots, then restores the same vector. This
+  satisfies exclusive borrowing while preserving upstream's direct iteration
+  over stable alias records.
+- `SynchronizeAliases` stores selected aliases by value in an inline
+  `SmallVec` instead of upstream's pointers because later cache mutations
+  require exclusive Rust access. Only aliases newer than the destination are
+  copied; the common empty selection remains allocation-free.
+
+### Unintentional differences (fixed)
+- Vulkan blits deeply cloned every `AliasedImage`, including each alias's
+  `ImageCopy` vector, merely to read alias IDs during resolve rescaling.
+  Upstream iterates the existing aliases by reference. Rust now does the same
+  work without allocating or cloning alias payloads.
+- `SynchronizeAliases` cloned the complete `ImageBase`, including all six
+  vectors, on every prepared image before checking whether synchronization was
+  needed. It now reads scalar state in place and uses the upstream inline
+  capacity of eight for only the selected newer aliases.
+
+### Binary layout verification
+- PASS: the existing alias vector and records are restored unchanged; no
+  guest-visible or serialized layout changed.
+
+### Verification
+- Re-read upstream `TextureCache<P>::BlitImage` in
+  `video_core/texture_cache/texture_cache.h` after implementation.
+- Re-read upstream `TextureCache<P>::SynchronizeAliases`; selection, flag
+  aggregation, tick update, sorting, rescaling, and copy order match.
+- The pre-fix race profile resolves the dominant remaining `Vec::clone`
+  monomorphization to `Vec<AliasedImage>` and `ImageBase` snapshots.
+
+## 2026-07-27 — video_core/src/renderer_vulkan/buffer_cache.rs vs video_core/renderer_vulkan/vk_buffer_cache.cpp
+
+### Intentional differences
+- Rust records an owned closure whose captured `SmallVec` values are boxed by
+  the scheduler. Upstream placement-news the equivalent moved small vectors
+  into its command chunk; binding values and command lifetime are unchanged.
+
+### Unintentional differences (fixed)
+- `BindVertexBuffers` allocated four heap vectors on every dirty binding set
+  for buffer handles, offsets, sizes, and strides. Upstream uses inline
+  `small_vector` storage with capacity 32 for these values and moves it into
+  the recorded command. Rust now uses the same inline capacity.
+
+### Binary layout verification
+- PASS: these vectors contain host Vulkan handles and command arguments only.
+
+### Verification
+- Re-read upstream `BufferCacheRuntime::BindVertexBuffers` in
+  `video_core/renderer_vulkan/vk_buffer_cache.cpp` after implementation.
+- The three focused Vulkan buffer-cache release tests pass.
+- A stable VMRD race profile no longer attributes heap-allocation samples to
+  `BufferCacheRuntime::bind_vertex_buffers`.
+
+## 2026-07-27 — core/src/hle/kernel/{global_scheduler_context.rs,k_priority_queue.rs,k_scheduler.rs,k_thread.rs} vs core/hle/kernel/k_{priority_queue,scheduler}.{h,cpp}
+
+### Intentional differences
+- Rust stores scheduler queue membership outside `KThread` and passes thread
+  properties to queue mutations explicitly. State transitions nevertheless
+  update that queue centrally under the scheduler lock before its unlock
+  callback, preserving upstream ordering.
+
+### Unintentional differences (fixed)
+- Scheduler front selection verified every queued thread by locking its
+  `KThread`, then scanned and cloned the complete global thread list whenever
+  a core had no scheduled member. Upstream trusts
+  `OnThreadStateChanged` to maintain queue membership and treats an empty
+  scheduled front as an idle core. Both scheduling paths now read
+  `KPriorityQueue::get_scheduled_front` directly.
+- The recovery scan attempted to repair queue membership during a read and
+  incremented process scheduling counters. Upstream mutates membership only
+  in state, priority, affinity, and migration callbacks; the read-side repair
+  and its port-specific queue helpers/tests were removed.
+
+### Binary layout verification
+- PASS: only host scheduler control flow and tests changed. Thread state,
+  priority-queue properties, guest context, and ABI layouts are unchanged.
+
+### Verification
+- Re-read upstream `KScheduler::UpdateHighestPriorityThreadsImpl`,
+  `KScheduler::OnThreadStateChanged`, and `KPriorityQueue::GetScheduledFront`.
+- A diagnostic VMRD run through the race emitted zero `PQ_RECOVER` and zero
+  `PQ_STALE` events, confirming that centralized state transitions maintain
+  the queue invariant and the scans only revisited genuinely idle cores.
+- In the matched post-change race profile, both recovery symbols disappear;
+  CPUCore_1 falls from 50.53% to 47.87% and CPUCore_2 from 30.47% to 28.73%.
+  Process totals remain unsuitable for this pair because the GPU thread varied
+  from 81.53% to 89.07% between samples.
+- The 5 global-scheduler-context, 18 priority-queue, 14 scheduler, and focused
+  waiting-thread release tests pass.
+
+## 2026-07-27 — core CPU/kernel diagnostic gates vs core/cpu_manager.cpp, core/arm/dynarmic/arm_dynarmic_32.cpp, and core/hle/kernel/{k_condition_variable.cpp,svc/*.cpp}
+
+### Intentional differences
+- The `RUZU_*` CPU, SVC, synchronization, condition-variable, and AArch32
+  callback diagnostics are Rust-only investigation tools with no upstream
+  equivalent. Their process-stable configuration is now parsed once with
+  `OnceLock`; enabled diagnostics retain their existing output and limits.
+
+### Unintentional differences (fixed)
+- Disabled diagnostics called `getenv` from guest dispatch, SVC, memory
+  callback, and synchronization hot paths. A matched race profile attributed
+  0.59% self time to `getenv` on both CPUCore_0 and CPUCore_1. Disabled paths
+  now perform only a cached flag or optional-value read.
+
+### Binary layout verification
+- PASS: only host-side diagnostic configuration changed; guest state, SVC
+  arguments, thread state, and ABI layouts are unchanged.
+
+### Verification
+- Re-read upstream CPU dispatch, AArch32 callbacks, condition-variable, lock,
+  address-arbiter, and synchronization implementations. None performs runtime
+  environment lookups in these paths.
+- `cargo check -p core` and both diagnostic-filter release tests pass.
+- The condition-variable module currently has 11 passing tests and 2
+  independent lifecycle failures returning the pre-existing default wait
+  result `0x7201`; both also fail when run alone.
+
+## 2026-07-27 — core/src/{memory/memory.rs,hle/kernel/k_hardware_timer.rs,hle/kernel/svc_dispatch.rs,hle/kernel/svc/svc_ipc.rs} vs core/{memory.cpp,hle/kernel/k_hardware_timer.cpp,hle/kernel/svc/svc_ipc.cpp}
+
+### Intentional differences
+- Rust-only memory, timer, SVC, and IPC investigation controls remain in their
+  owning modules. Their process-stable booleans, handle/service filters, and
+  sleep duration are parsed once; enabled behavior and routing decisions are
+  unchanged.
+- The host-thread IPC routing controls have no upstream equivalent while the
+  Rust HLE server ownership is incomplete. Consolidating their immutable
+  configuration does not change which path owns or executes an IPC request.
+
+### Unintentional differences (fixed)
+- Disabled diagnostics and routing overrides repeatedly queried the process
+  environment from `RasterizerMarkRegionCached`, timer callbacks, every SVC32
+  dispatch, and every synchronous IPC request. These reads appeared in the
+  post-fix profile after the first CPU diagnostic-cache pass and are now
+  removed from the steady-state paths.
+
+### Binary layout verification
+- PASS: guest memory mappings, timer tasks, SVC arguments, IPC buffers, and
+  handle representations are unchanged.
+
+### Verification
+- Re-read upstream `Memory::RasterizerMarkRegionCached`,
+  `KHardwareTimer::DoTask`, and `SendSyncRequestImpl`; their validation,
+  locking, execution, and return ordering are unchanged.
+- `cargo check -p core -p audio_core` and the four focused IPC routing tests
+  pass. Tests now exercise the routing predicate directly instead of mutating
+  process-global environment variables between assertions.
+- In matched 15-second race profiles, process utilization fell from 265.82%
+  after the first diagnostic-cache pass to 260.67%; context switches fell
+  from 811,030 to 780,668. `getenv` no longer appears above 0.1% self time.
+
+## 2026-07-27 — audio_core disabled diagnostic gates vs audio_core/adsp/apps/audio_renderer/{audio_renderer.cpp,command_list_processor.cpp} and audio_core/renderer/command/effect/aux_.cpp
+
+### Intentional differences
+- Audio timing, command, clipping, and auxiliary-buffer diagnostics are
+  Rust-only. Their enable flags are process configuration and are now cached
+  once in the same modules that own the diagnostic behavior.
+
+### Unintentional differences (fixed)
+- Disabled audio diagnostics called `getenv` for every render iteration,
+  renderer command, and auxiliary-buffer result. The race profile sampled
+  these reads on `DSP_AudioRender`; disabled paths now use cached booleans.
+
+### Binary layout verification
+- PASS: command payloads, mix buffers, auxiliary metadata, and audio renderer
+  state are unchanged.
+
+### Verification
+- Re-read upstream `AudioRenderer::Main`, `CommandListProcessor::Process`, and
+  `AuxCommand::Process`; command validation, processing, zero-fill, response,
+  and timing order are unchanged.
+- `cargo check -p audio_core` passes.
+- The matched race profile reaches the same race scene and shows lower
+  CPUCore_0/1/2 utilization (65.87%/45.80%/28.33% versus
+  68.02%/46.57%/29.18%) while GPU utilization remains effectively unchanged
+  at 94.40%. This confirms the cached audio/IPC diagnostics reduced CPU
+  overhead without changing guest progression.
+
+## 2026-07-27 — video_core/src/renderer_vulkan/scheduler.rs vs video_core/renderer_vulkan/vk_scheduler.{h,cpp}
+
+### Intentional differences
+- Upstream type-erases arena commands through a virtual `Command` base class.
+  Rust stores an adjacent header containing typed execute/drop function
+  pointers, followed by the closure payload. Both representations keep the
+  command and its captures entirely inside the 32 KiB chunk.
+- The Rust arena is heap-allocated with 64-byte alignment. Upstream owns each
+  equally heap-stable `CommandChunk` through `unique_ptr` and aligns each
+  placement-new command to its concrete type.
+
+### Unintentional differences (fixed)
+- Rust previously allocated every recorded Vulkan closure as
+  `Box<dyn FnOnce>` and kept the boxes in a `Vec`, while its 32 KiB accounting
+  only approximated upstream's arena capacity. Commands are now placement
+  written into the reusable chunk, linked in recording order, executed once,
+  and destroyed in place before the arena is reset.
+- Dropping a chunk with pending work now invokes each stored closure's concrete
+  destructor. This preserves capture ownership when shutdown or unwinding
+  prevents normal worker execution.
+
+### Binary layout verification
+- PASS: the arena contains host-only Rust closure payloads. No Vulkan, guest,
+  command-buffer, or serialized ABI structure changed.
+
+### Verification
+- Re-read upstream `Scheduler::CommandChunk::{Record,ExecuteAll}`,
+  `RecordWithUploadBuffer`, `DispatchWork`, and `AcquireNewChunk` after
+  implementation. Capacity, FIFO linking, overflow dispatch, destruction,
+  reset, and chunk recycling order match.
+- All 9 focused scheduler release tests pass, including command order,
+  destruction exactly once, arena reuse, 64-byte alignment, and capacity
+  rollover. `cargo check -p video_core --release` passes.
+
+## 2026-07-27 — video_core/src/texture_cache/texture_cache_base.rs vs video_core/texture_cache/texture_cache_base.h
+
+### Unintentional differences (fixed)
+- Upstream uses `Common::IdentityHash<u64>` for both the GPU and CPU texture
+  page tables. Rust previously used the standard SipHash builder, adding a
+  cryptographic hash to every page lookup on the GPU thread. Both tables now
+  use the existing `BuildIdentityHasher` counterpart.
+
+### Binary layout verification
+- PASS: only host-side hash-table policy changed. Texture descriptors, image
+  identifiers, guest addresses, and serialized structures are unchanged.
+
+### Verification
+- Re-read upstream `TextureCacheGPUMap`, `TextureCache::page_table`, and
+  `Common::IdentityHash`; the Rust key-to-hash mapping is identical for `u64`.
+- `texture_page_tables_use_upstream_identity_hash` verifies both Rust table
+  declarations and passes in release mode.
+- In matched 15-second VMRD race samples, process utilization fell from
+  231.73% to 218.00% and GPU-thread utilization from 91.53% to 82.20%;
+  CPUCore_0 remained effectively unchanged at 56.87% versus 56.40%.
+
+## 2026-07-27 — video_core/src/texture_cache/{texture_cache_base.rs,texture_cache.rs} vs video_core/texture_cache/{texture_cache_base.h,texture_cache.h}
+
+### Intentional differences
+- Upstream invokes a templated callback while temporary picked flags remain
+  set. Rust returns an inline `SmallVec` after discovery and clears the flags
+  before callers process the result, avoiding an arbitrary callback that
+  reborrows the cache. Page order, overlap filtering, deduplication, and flag
+  cleanup order match.
+- `IsRegionGpuModified` is exposed through a Rust rasterizer trait requiring
+  `&self`. Its read-only implementation stops doing useful work after the
+  first matching image and allocates no deduplication structure; upstream
+  obtains the same result through the mutable callback helper.
+
+### Unintentional differences (fixed)
+- CPU and GPU region collection allocated a `HashSet` and a `Vec` on every
+  call. Upstream uses `ImageMapView::picked`, `ImageFlagBits::Picked`, and
+  inline small vectors with capacities 32/32 for CPU maps/images and 8 for
+  GPU images. Rust now uses the same flags and capacities.
+- Rust image lookup helpers were immutable even though their upstream
+  counterparts mutate temporary collection flags. Their receivers now match
+  upstream mutability.
+
+### Binary layout verification
+- PASS: existing `ImageFlagBits::PICKED` and `ImageMapView::picked` fields are
+  reused. No guest, descriptor, Vulkan, or serialized structure changed.
+
+### Verification
+- Re-read upstream `ForEachCPUPage`, `ForEachGPUPage`,
+  `ForEachImageInRegion`, `ForEachImageInRegionGPU`,
+  `ForEachSparseImageInRegion`, `FindImage`, `FindDMAImage`, and
+  `IsRegionGpuModified` after implementation.
+- The multi-page regression verifies one result per image and cleanup of both
+  temporary markers. Five related registration, collection, unmapping, GC,
+  and lookup tests also pass when run directly.
+- In matched 15-second VMRD race samples, process utilization fell from
+  218.00% to 211.00% and GPU-thread utilization from 82.20% to 76.60%;
+  CPUCore_0/1/2 and the Vulkan worker remained within roughly 1.7 percentage
+  points. This localizes the gain to the collection path.
+- The 82-test texture-cache module reports 78 passing tests. Three unrelated
+  failures reproduce in isolation; one existing global-state test fails only
+  in the parallel module run.
+
+## 2026-07-27 — video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp and video_core/buffer_cache/buffer_cache.h
+
+### Intentional differences
+- Upstream `BufferCache` owns a live `Maxwell3D*` and reads draw-manager state,
+  registers, constant buffers, and dirty flags directly. The current Rust
+  ownership split still supplies `BufferCache` through an `EngineState` trait
+  object. The Vulkan adapter therefore retains a compact copy of only the
+  state consumed through that trait, while its dirty flags continue to refer
+  to the live engine flags.
+
+### Unintentional differences (fixed)
+- The Vulkan adapter previously cloned the complete `DrawCall`, duplicating
+  pipeline, render-target, viewport, shader, and dynamic-state data that
+  `BufferCache` never reads. It now copies only index-buffer, vertex-stream,
+  transform-feedback, constant-buffer, topology, and fallback dirty state.
+
+### Missing items
+- Replacing the `EngineState` snapshot with direct live Maxwell3D access still
+  requires the larger upstream ownership refactor. This change only removes
+  the redundant second full snapshot.
+
+### Binary layout verification
+- PASS: the adapter is host-only state. Guest structures, Vulkan structures,
+  descriptors, and serialized data are unchanged.
+
+### Verification
+- Re-read upstream `RasterizerVulkan::{PrepareDraw,Draw}`,
+  `BufferCache::{BindHostGeometryBuffers,BindHostIndexBuffer,
+  BindHostVertexBuffers,UpdateIndexBuffer,UpdateVertexBuffers}` after the
+  implementation.
+- The existing dirty-flag mapping test and the regression asserting that the
+  adapter is smaller than `DrawCall` pass in release mode.
+- `cargo check -p video_core --release` passes.
+- In a matched 15-second VMRD race sample, process utilization changed from
+  211.00% to 208.07%, while the GPU thread remained effectively unchanged at
+  76.60% versus 76.27%. The redundant copy is gone, but the original full
+  `DrawCall` snapshot remains the relevant measured divergence.

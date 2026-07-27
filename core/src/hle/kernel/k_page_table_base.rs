@@ -451,15 +451,14 @@ impl KPageTableBase {
     /// pool-allocation callers to clear newly-allocated pages BEFORE they
     /// are mapped into virtual address space — upstream's
     /// `ClearBackingRegion(m_system, block.GetAddress(), block.GetSize(), m_heap_fill_value)`
-    /// does the same. Translates each phys page to a host pointer through
-    /// DeviceMemory and writes zeros.
+    /// does the same. The physical address is translated to a HostMemory
+    /// backing offset so Linux can discard zero-filled pages with MADV_REMOVE.
     fn clear_fresh_backing_region_phys(&self, phys_addr: u64, size: usize) {
         if size == 0 {
             return;
         }
-        // The backing-buffer is owned by the System's DeviceMemory. Walk it
-        // through the existing Memory wrapper which already exposes
-        // `device_memory()` access via the m_memory pointer.
+        // The backing buffer is owned by the System's DeviceMemory. Reach it
+        // through the existing Memory wrapper.
         if let Some(memory) = &self.m_memory {
             memory.lock().unwrap().zero_phys_block(phys_addr, size);
         }

@@ -114,6 +114,16 @@ impl<T> SlotVector<T> {
         self.values.len() - self.free_list.len()
     }
 
+    /// Returns whether `id` names a currently occupied slot.
+    pub fn contains(&self, id: SlotId) -> bool {
+        if !id.is_valid() {
+            return false;
+        }
+        self.values
+            .get(id.index as usize)
+            .is_some_and(Option::is_some)
+    }
+
     /// Returns an iterator over `(SlotId, &T)` pairs for all occupied slots.
     pub fn iter(&self) -> SlotVectorIter<'_, T> {
         let first = self.find_first_set();
@@ -326,6 +336,19 @@ mod tests {
 
         let collected: Vec<i32> = sv.iter().map(|(_, v)| *v).collect();
         assert_eq!(collected, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_contains_tracks_occupied_slots() {
+        let mut sv = SlotVector::new();
+        let id = sv.insert(10);
+
+        assert!(sv.contains(id));
+        assert!(!sv.contains(SlotId::invalid()));
+        assert!(!sv.contains(SlotId { index: 1024 }));
+
+        sv.erase(id);
+        assert!(!sv.contains(id));
     }
 
     #[test]

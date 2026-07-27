@@ -184,6 +184,7 @@ pub struct DeviceExtensions {
     pub depth_clip_control: bool,
     pub extended_dynamic_state: bool,
     pub extended_dynamic_state2: bool,
+    pub extended_dynamic_state2_extra: bool,
     pub extended_dynamic_state3: bool,
     pub format_a4b4g4r4: bool,
     pub index_type_uint8: bool,
@@ -425,6 +426,10 @@ impl Device {
             supported_extensions.contains("VK_EXT_extended_dynamic_state");
         let has_extended_dynamic_state2 =
             supported_extensions.contains("VK_EXT_extended_dynamic_state2");
+        let has_extended_dynamic_state3 =
+            supported_extensions.contains("VK_EXT_extended_dynamic_state3");
+        let has_vertex_input_dynamic_state =
+            supported_extensions.contains("VK_EXT_vertex_input_dynamic_state");
         let has_depth_clip_control = supported_extensions.contains("VK_EXT_depth_clip_control");
         let has_index_type_uint8 = supported_extensions.contains("VK_EXT_index_type_uint8");
         let has_vertex_attribute_divisor =
@@ -458,6 +463,10 @@ impl Device {
             vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
         let mut extended_dynamic_state2_features =
             vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default();
+        let mut extended_dynamic_state3_features =
+            vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT::default();
+        let mut vertex_input_dynamic_state_features =
+            vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT::default();
         let mut depth_clip_control_features =
             vk::PhysicalDeviceDepthClipControlFeaturesEXT::default();
         let mut index_type_uint8_features = vk::PhysicalDeviceIndexTypeUint8FeaturesEXT::default();
@@ -493,6 +502,14 @@ impl Device {
                 features2_builder =
                     features2_builder.push_next(&mut extended_dynamic_state2_features);
             }
+            if has_extended_dynamic_state3 {
+                features2_builder =
+                    features2_builder.push_next(&mut extended_dynamic_state3_features);
+            }
+            if has_vertex_input_dynamic_state {
+                features2_builder =
+                    features2_builder.push_next(&mut vertex_input_dynamic_state_features);
+            }
             if has_depth_clip_control {
                 features2_builder = features2_builder.push_next(&mut depth_clip_control_features);
             }
@@ -523,10 +540,99 @@ impl Device {
             primitive_topology_list_restart_features.primitive_topology_list_restart != 0;
         let supports_primitive_topology_patch_list_restart =
             primitive_topology_list_restart_features.primitive_topology_patch_list_restart != 0;
-        let supports_extended_dynamic_state = has_extended_dynamic_state
+        let mut supports_extended_dynamic_state = has_extended_dynamic_state
             && extended_dynamic_state_features.extended_dynamic_state != 0;
-        let supports_extended_dynamic_state2 = has_extended_dynamic_state2
+        let mut supports_extended_dynamic_state2 = has_extended_dynamic_state2
             && extended_dynamic_state2_features.extended_dynamic_state2 != 0;
+        let mut supports_extended_dynamic_state2_extra = supports_extended_dynamic_state2
+            && extended_dynamic_state2_features.extended_dynamic_state2_logic_op != 0;
+        let mut dynamic_state3_blending = has_extended_dynamic_state3
+            && extended_dynamic_state3_features.extended_dynamic_state3_color_blend_enable != 0
+            && extended_dynamic_state3_features.extended_dynamic_state3_color_blend_equation != 0
+            && extended_dynamic_state3_features.extended_dynamic_state3_color_write_mask != 0;
+        let mut dynamic_state3_enables = has_extended_dynamic_state3
+            && extended_dynamic_state3_features.extended_dynamic_state3_depth_clamp_enable != 0
+            && extended_dynamic_state3_features.extended_dynamic_state3_logic_op_enable != 0;
+        let mut supports_vertex_input_dynamic_state = has_vertex_input_dynamic_state
+            && vertex_input_dynamic_state_features.vertex_input_dynamic_state != 0;
+
+        let driver_id = driver_properties.driver_id;
+        let is_radv = driver_id == vk::DriverId::MESA_RADV;
+        let is_amd_driver = matches!(
+            driver_id,
+            vk::DriverId::AMD_PROPRIETARY | vk::DriverId::AMD_OPEN_SOURCE
+        );
+        let masked_driver_version = (device_properties.driver_version << 3) >> 3;
+        if is_radv
+            && supports_extended_dynamic_state
+            && masked_driver_version < vk::make_api_version(0, 21, 2, 0)
+        {
+            log::warn!("RADV versions older than 21.2 have broken VK_EXT_extended_dynamic_state");
+            supports_extended_dynamic_state = false;
+            extended_dynamic_state_features.extended_dynamic_state = vk::FALSE;
+        }
+        if is_radv && supports_extended_dynamic_state2 {
+            if masked_driver_version < vk::make_api_version(0, 22, 3, 1) {
+                log::warn!(
+                    "RADV versions older than 22.3.1 have broken VK_EXT_extended_dynamic_state2"
+                );
+                supports_extended_dynamic_state2 = false;
+                supports_extended_dynamic_state2_extra = false;
+                extended_dynamic_state2_features.extended_dynamic_state2 = vk::FALSE;
+                extended_dynamic_state2_features.extended_dynamic_state2_logic_op = vk::FALSE;
+                extended_dynamic_state2_features.extended_dynamic_state2_patch_control_points =
+                    vk::FALSE;
+            }
+        }
+        if is_radv && has_extended_dynamic_state3 {
+            log::warn!("RADV has broken extendedDynamicState3ColorBlendEquation");
+            dynamic_state3_blending = false;
+            extended_dynamic_state3_features.extended_dynamic_state3_color_blend_enable = vk::FALSE;
+            extended_dynamic_state3_features.extended_dynamic_state3_color_blend_equation =
+                vk::FALSE;
+            if masked_driver_version < vk::make_api_version(0, 23, 1, 0) {
+                log::warn!("RADV versions older than 23.1.0 have broken depth clamp dynamic state");
+                dynamic_state3_enables = false;
+                extended_dynamic_state3_features.extended_dynamic_state3_depth_clamp_enable =
+                    vk::FALSE;
+            }
+        }
+        if is_amd_driver && has_extended_dynamic_state3 {
+            log::warn!("AMD drivers have broken extendedDynamicState3ColorBlendEquation");
+            dynamic_state3_blending = false;
+            extended_dynamic_state3_features.extended_dynamic_state3_color_blend_enable = vk::FALSE;
+            extended_dynamic_state3_features.extended_dynamic_state3_color_blend_equation =
+                vk::FALSE;
+        }
+        if is_radv
+            && supports_vertex_input_dynamic_state
+            && supported_extensions.contains("VK_KHR_fragment_shading_rate")
+        {
+            log::warn!("RADV has broken VK_EXT_vertex_input_dynamic_state on RDNA2 hardware");
+            supports_vertex_input_dynamic_state = false;
+            vertex_input_dynamic_state_features.vertex_input_dynamic_state = vk::FALSE;
+        }
+        if !supports_extended_dynamic_state && supports_extended_dynamic_state2 {
+            log::info!("Removing extendedDynamicState2 due to missing extendedDynamicState");
+            supports_extended_dynamic_state2 = false;
+            supports_extended_dynamic_state2_extra = false;
+            extended_dynamic_state2_features.extended_dynamic_state2 = vk::FALSE;
+            extended_dynamic_state2_features.extended_dynamic_state2_logic_op = vk::FALSE;
+            extended_dynamic_state2_features.extended_dynamic_state2_patch_control_points =
+                vk::FALSE;
+        }
+        if !supports_extended_dynamic_state2 && (dynamic_state3_blending || dynamic_state3_enables)
+        {
+            log::info!("Removing extendedDynamicState3 due to missing extendedDynamicState2");
+            dynamic_state3_blending = false;
+            dynamic_state3_enables = false;
+            extended_dynamic_state3_features.extended_dynamic_state3_color_blend_enable = vk::FALSE;
+            extended_dynamic_state3_features.extended_dynamic_state3_color_blend_equation =
+                vk::FALSE;
+            extended_dynamic_state3_features.extended_dynamic_state3_color_write_mask = vk::FALSE;
+            extended_dynamic_state3_features.extended_dynamic_state3_depth_clamp_enable = vk::FALSE;
+            extended_dynamic_state3_features.extended_dynamic_state3_logic_op_enable = vk::FALSE;
+        }
         let supports_depth_clip_control =
             has_depth_clip_control && depth_clip_control_features.depth_clip_control != 0;
         let supports_index_type_uint8 =
@@ -562,8 +668,6 @@ impl Device {
             "VK_KHR_portability_subset",
             "VK_KHR_shader_float16_int8",
             "VK_EXT_primitive_topology_list_restart",
-            "VK_EXT_extended_dynamic_state",
-            "VK_EXT_extended_dynamic_state2",
             "VK_EXT_depth_clip_control",
             "VK_EXT_index_type_uint8",
             "VK_EXT_vertex_attribute_divisor",
@@ -577,6 +681,18 @@ impl Device {
         }
         if supports_provoking_vertex {
             enabled_extensions.push(CString::new("VK_EXT_provoking_vertex").unwrap());
+        }
+        if supports_extended_dynamic_state {
+            enabled_extensions.push(CString::new("VK_EXT_extended_dynamic_state").unwrap());
+        }
+        if supports_extended_dynamic_state2 {
+            enabled_extensions.push(CString::new("VK_EXT_extended_dynamic_state2").unwrap());
+        }
+        if dynamic_state3_blending || dynamic_state3_enables {
+            enabled_extensions.push(CString::new("VK_EXT_extended_dynamic_state3").unwrap());
+        }
+        if supports_vertex_input_dynamic_state {
+            enabled_extensions.push(CString::new("VK_EXT_vertex_input_dynamic_state").unwrap());
         }
         let enabled_extension_ptrs: Vec<*const std::os::raw::c_char> = enabled_extensions
             .iter()
@@ -654,6 +770,9 @@ impl Device {
                 primitive_topology_list_restart: has_primitive_topology_list_restart,
                 extended_dynamic_state: supports_extended_dynamic_state,
                 extended_dynamic_state2: supports_extended_dynamic_state2,
+                extended_dynamic_state2_extra: supports_extended_dynamic_state2_extra,
+                extended_dynamic_state3: dynamic_state3_blending || dynamic_state3_enables,
+                vertex_input_dynamic_state: supports_vertex_input_dynamic_state,
                 depth_clip_control: supports_depth_clip_control,
                 index_type_uint8: supports_index_type_uint8,
                 vertex_attribute_divisor: supports_vertex_attribute_divisor,
@@ -696,11 +815,11 @@ impl Device {
             cant_blit_msaa: false,
             must_emulate_scaled_formats: false,
             must_emulate_bgr565: false,
-            dynamic_state3_blending: false,
-            dynamic_state3_enables: false,
+            dynamic_state3_blending,
+            dynamic_state3_enables,
             supports_conditional_barriers: false,
             device_access_memory,
-            sets_per_pool: 64,
+            sets_per_pool: if is_amd_driver { 96 } else { 64 },
             nvidia_arch: NvidiaArchitecture::AmpereOrNewer,
             supported_extensions,
             loaded_extensions: enabled_extensions
@@ -1121,6 +1240,10 @@ impl Device {
 
     pub fn is_ext_extended_dynamic_state2_supported(&self) -> bool {
         self.extensions.extended_dynamic_state2
+    }
+
+    pub fn is_ext_extended_dynamic_state2_extras_supported(&self) -> bool {
+        self.extensions.extended_dynamic_state2_extra
     }
 
     pub fn is_ext_extended_dynamic_state3_supported(&self) -> bool {

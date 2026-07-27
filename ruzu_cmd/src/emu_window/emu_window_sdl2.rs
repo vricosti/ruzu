@@ -15,8 +15,7 @@ use sdl2::sys as sdl;
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-// Used only by the commented-out schedule_auto_{lr,a}_if_requested diagnostics.
-// use std::time::Duration;
+use std::time::Duration;
 
 use hid_core::frontend::emulated_controller::set_simple_npad_button;
 use hid_core::hid_types::{KeyboardKeyIndex, NpadButton};
@@ -28,10 +27,6 @@ use ruzu_core::frontend::framebuffer_layout::{
 // It is not exported by sdl2-sys as a Rust constant, so we define it here.
 const SDL_TOUCH_MOUSEID: u32 = u32::MAX;
 
-// Environment-gated automated L+R / A input, kept commented out for future
-// title-screen / character-select diagnostics. Re-enable by uncommenting these
-// two functions and their call sites in `main.rs`.
-/*
 /// Schedule an environment-gated L+R press for frontend diagnostics.
 ///
 /// This uses the same simple Player1 NPad bridge as keyboard events, avoiding
@@ -122,7 +117,6 @@ pub fn schedule_auto_a_if_requested() {
             }
         });
 }
-*/
 
 /// A no-op graphics context used as a placeholder.
 /// Maps to C++ `DummyContext` in `emu_window_sdl2.h`.

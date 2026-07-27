@@ -4439,17 +4439,17 @@ mod tests {
         thread.set_state(ThreadState::RUNNABLE);
         thread.begin_wait();
         {
-            let mut gsc = gsc.lock().unwrap();
-            assert_eq!(gsc.get_scheduled_front_runnable(2), None);
+            let gsc = gsc.lock().unwrap();
+            assert_eq!(gsc.get_scheduled_front(2), None);
             gsc.m_scheduler_update_needed
                 .store(false, Ordering::Relaxed);
         }
 
         thread.set_base_priority(30);
 
-        let mut gsc = gsc.lock().unwrap();
+        let gsc = gsc.lock().unwrap();
         assert_eq!(thread.get_raw_state(), ThreadState::WAITING);
-        assert_eq!(gsc.get_scheduled_front_runnable(2), None);
+        assert_eq!(gsc.get_scheduled_front(2), None);
         assert!(!gsc.m_scheduler_update_needed.load(Ordering::Relaxed));
     }
 

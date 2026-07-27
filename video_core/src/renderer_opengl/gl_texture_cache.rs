@@ -5283,16 +5283,11 @@ impl TextureCache {
     }
 
     fn base_image_exists_in(base: &CommonTextureCache, image_id: ImageId) -> bool {
-        image_id.is_valid() && base.slot_images.iter().any(|(id, _)| id == image_id)
+        base.slot_images.contains(image_id)
     }
 
     fn base_image_view_exists(&self, image_view_id: ImageViewId) -> bool {
-        image_view_id.is_valid()
-            && self
-                .base
-                .slot_image_views
-                .iter()
-                .any(|(id, _)| id == image_view_id)
+        self.base.slot_image_views.contains(image_view_id)
     }
 
     fn finish_pending_join_copies(&mut self) {
@@ -6526,7 +6521,7 @@ impl TextureCache {
             }
         }
         let mut images = candidates;
-        images.retain(|&id| self.base.slot_images[id].is_safe_download());
+        images.retain(|id| self.base.slot_images[*id].is_safe_download());
         if images.is_empty() {
             if trace_cpu {
                 log::warn!(

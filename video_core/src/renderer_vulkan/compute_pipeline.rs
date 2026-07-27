@@ -13,6 +13,7 @@ use ash::vk;
 use common::thread_worker::ThreadWorker;
 use shader_recompiler::shader_info::Info as ShaderInfo;
 
+use super::descriptor_pool::{DescriptorAllocator, DescriptorBankInfo, DescriptorPool};
 use super::pipeline_helper::{RESCALING_LAYOUT_SIZE, RESCALING_LAYOUT_WORDS_OFFSET};
 
 // ---------------------------------------------------------------------------
@@ -53,6 +54,9 @@ pub struct ComputePipeline {
 
     /// Descriptor update template.
     descriptor_update_template: vk::DescriptorUpdateTemplate,
+
+    /// Upstream per-pipeline descriptor-set allocator.
+    descriptor_allocator: Option<DescriptorAllocator>,
 
     /// The compiled compute pipeline handle.
     pipeline: Arc<Mutex<vk::Pipeline>>,
@@ -182,6 +186,7 @@ impl ComputePipeline {
             descriptor_set_layout,
             pipeline_layout,
             descriptor_update_template,
+            descriptor_allocator: None,
             pipeline,
             uniform_buffer_sizes,
             build_condvar,
@@ -263,6 +268,48 @@ impl ComputePipeline {
 
     pub fn requires_descriptor_binding(&self) -> bool {
         info_requires_descriptor_binding(&self.info)
+    }
+
+    /// Port of the `descriptor_allocator` initialization in
+    /// `ComputePipeline::ComputePipeline`.
+    pub fn initialize_descriptor_allocator(
+        &mut self,
+        descriptor_pool: &DescriptorPool,
+    ) -> Result<(), vk::Result> {
+        if !self.requires_descriptor_binding() {
+            return Ok(());
+        }
+        let info = DescriptorBankInfo {
+            uniform_buffers: shader_recompiler::shader_info::num_descriptors(
+                &self.info.constant_buffer_descriptors,
+            ),
+            storage_buffers: shader_recompiler::shader_info::num_descriptors(
+                &self.info.storage_buffers_descriptors,
+            ),
+            texture_buffers: shader_recompiler::shader_info::num_descriptors(
+                &self.info.texture_buffer_descriptors,
+            ),
+            image_buffers: shader_recompiler::shader_info::num_descriptors(
+                &self.info.image_buffer_descriptors,
+            ),
+            textures: shader_recompiler::shader_info::num_descriptors(
+                &self.info.texture_descriptors,
+            ),
+            images: shader_recompiler::shader_info::num_descriptors(&self.info.image_descriptors),
+            score: 0,
+        };
+        let info = DescriptorBankInfo {
+            score: (info.uniform_buffers
+                + info.storage_buffers
+                + info.texture_buffers
+                + info.image_buffers
+                + info.textures
+                + info.images) as i32,
+            ..info
+        };
+        self.descriptor_allocator =
+            Some(descriptor_pool.allocator(self.descriptor_set_layout, &info)?);
+        Ok(())
     }
 
     fn wait_for_build(&self) {

@@ -14,11 +14,9 @@ use crate::engines::maxwell_3d::{
     IB_OFF_FIRST, INDEX_BUFFER16_FIRST, INDEX_BUFFER16_SUBSEQUENT, INDEX_BUFFER32_FIRST,
     INDEX_BUFFER32_SUBSEQUENT, INDEX_BUFFER8_FIRST, INDEX_BUFFER8_SUBSEQUENT,
     INLINE_INDEX_2X16_EVEN, INLINE_INDEX_4X8_INDEX0, MAX_CB_SLOTS, NUM_SHADER_PROGRAMS,
-    NUM_SHADER_STAGES, RT_FORMAT_A8B8G8R8_SRGB, RT_FORMAT_A8B8G8R8_UNORM, RT_FORMAT_B5G6R5_UNORM,
-    RT_FORMAT_R8_UNORM, TOPOLOGY_OVERRIDE, VB_COUNT, VB_FIRST, VERTEX_ARRAY_INSTANCE_FIRST,
+    NUM_SHADER_STAGES, TOPOLOGY_OVERRIDE, VB_COUNT, VB_FIRST, VERTEX_ARRAY_INSTANCE_FIRST,
     VERTEX_ARRAY_INSTANCE_SUBSEQUENT,
 };
-use crate::engines::Framebuffer;
 use crate::rasterizer_interface::RasterizerInterface;
 
 /// GPU virtual address type.
@@ -112,49 +110,6 @@ pub fn resolve_draw_topology(
     }
 
     draw_topology
-}
-
-fn format_clear_color(
-    format: u32,
-    color: [f32; 4],
-    clear_r: bool,
-    clear_g: bool,
-    clear_b: bool,
-    clear_a: bool,
-) -> [u8; 4] {
-    let r = if clear_r {
-        (color[0].clamp(0.0, 1.0) * 255.0) as u8
-    } else {
-        0
-    };
-    let g = if clear_g {
-        (color[1].clamp(0.0, 1.0) * 255.0) as u8
-    } else {
-        0
-    };
-    let b = if clear_b {
-        (color[2].clamp(0.0, 1.0) * 255.0) as u8
-    } else {
-        0
-    };
-    let a = if clear_a {
-        (color[3].clamp(0.0, 1.0) * 255.0) as u8
-    } else {
-        0
-    };
-
-    match format {
-        RT_FORMAT_A8B8G8R8_UNORM | RT_FORMAT_A8B8G8R8_SRGB => [r, g, b, a],
-        RT_FORMAT_R8_UNORM => [r, 0, 0, 255],
-        RT_FORMAT_B5G6R5_UNORM => [r, g, b, 255],
-        _ => {
-            log::trace!(
-                "DrawManager::clear RT format 0x{:X}, using RGBA8 layout for local framebuffer",
-                format
-            );
-            [r, g, b, a]
-        }
-    }
 }
 
 // `IndexFormat` is the upstream-faithful enum from
@@ -427,9 +382,6 @@ pub trait Maxwell3DAccess {
     fn clear_stencil(&self) -> i32 {
         0
     }
-
-    /// Publish a pending framebuffer.
-    fn set_pending_framebuffer(&mut self, framebuffer: Framebuffer);
 
     /// Read index buffer GPU virtual address.
     fn index_buffer_addr(&self) -> u64;
@@ -1871,6 +1823,10 @@ impl<'a> Maxwell3DDrawTextureView<'a> {
         self.draw_view.dirty_flags()
     }
 
+    pub fn dirty_flags_ptr(&mut self) -> Option<std::ptr::NonNull<[bool; 256]>> {
+        self.draw_view.dirty_flags_ptr()
+    }
+
     pub fn clear_dirty_flag(&mut self, index: u8) {
         self.draw_view.clear_dirty_flag(index);
     }
@@ -1920,6 +1876,7 @@ pub struct DrawManager {
     pub draw_state: DrawState,
     pub draw_texture_state: DrawTextureState,
     pub indirect_state: IndirectParams,
+    #[cfg(test)]
     compat_draw_calls: Vec<DrawCall>,
 }
 
@@ -1930,6 +1887,7 @@ impl DrawManager {
             draw_state: DrawState::default(),
             draw_texture_state: DrawTextureState::default(),
             indirect_state: IndirectParams::default(),
+            #[cfg(test)]
             compat_draw_calls: Vec::new(),
         }
     }
@@ -1955,15 +1913,18 @@ impl DrawManager {
     }
 
     /// Drain the temporary software-facing compatibility queue.
+    #[cfg(test)]
     pub fn take_compat_draw_calls(&mut self) -> Vec<DrawCall> {
         std::mem::take(&mut self.compat_draw_calls)
     }
 
     /// Push a temporary software-facing compatibility draw snapshot.
+    #[cfg(test)]
     pub fn push_compat_draw_call(&mut self, draw_call: DrawCall) {
         self.compat_draw_calls.push(draw_call);
     }
 
+    #[cfg(test)]
     fn build_compat_draw_call(
         &self,
         draw_state: &DrawState,
@@ -2134,62 +2095,7 @@ impl DrawManager {
     pub fn clear(&mut self, layer_count: u32, maxwell3d: &mut dyn Maxwell3DAccess) {
         if maxwell3d.should_execute() {
             maxwell3d.clear_rasterizer(layer_count);
-            self.produce_clear_framebuffer(maxwell3d);
         }
-    }
-
-    fn produce_clear_framebuffer(&mut self, maxwell3d: &mut dyn Maxwell3DAccess) {
-        let flags = maxwell3d.clear_surface_flags();
-        let rt_index = ((flags >> 6) & 0xF) as usize;
-        let clear_r = flags & (1 << 2) != 0;
-        let clear_g = flags & (1 << 3) != 0;
-        let clear_b = flags & (1 << 4) != 0;
-        let clear_a = flags & (1 << 5) != 0;
-
-        if !clear_r && !clear_g && !clear_b && !clear_a {
-            log::trace!("DrawManager::clear depth/stencil only, skipping local framebuffer");
-            return;
-        }
-
-        if rt_index >= 8 {
-            log::warn!("DrawManager::clear invalid RT index {}", rt_index);
-            return;
-        }
-
-        let gpu_va = maxwell3d.rt_address(rt_index);
-        let width = maxwell3d.rt_width(rt_index);
-        let height = maxwell3d.rt_height(rt_index);
-        let format = maxwell3d.rt_format(rt_index);
-
-        if width == 0 || height == 0 || gpu_va == 0 {
-            log::trace!(
-                "DrawManager::clear skipped local framebuffer (width={}, height={}, va=0x{:X})",
-                width,
-                height,
-                gpu_va
-            );
-            return;
-        }
-
-        let color = maxwell3d.clear_color_rgba();
-        let pixel = format_clear_color(format, color, clear_r, clear_g, clear_b, clear_a);
-
-        let pixel_count = width as usize * height as usize;
-        let mut pixels = vec![0u8; pixel_count * 4];
-        for i in 0..pixel_count {
-            let off = i * 4;
-            pixels[off] = pixel[0];
-            pixels[off + 1] = pixel[1];
-            pixels[off + 2] = pixel[2];
-            pixels[off + 3] = pixel[3];
-        }
-
-        maxwell3d.set_pending_framebuffer(Framebuffer {
-            gpu_va,
-            width,
-            height,
-            pixels,
-        });
     }
 
     /// Flush any deferred instanced draw calls.
@@ -2473,9 +2379,16 @@ impl DrawManager {
 
         self.update_topology(maxwell3d);
 
-        let draw_call =
-            self.build_compat_draw_call(&self.draw_state, draw_indexed, instance_count, maxwell3d);
-        self.compat_draw_calls.push(draw_call);
+        #[cfg(test)]
+        {
+            let draw_call = self.build_compat_draw_call(
+                &self.draw_state,
+                draw_indexed,
+                instance_count,
+                maxwell3d,
+            );
+            self.compat_draw_calls.push(draw_call);
+        }
 
         let should_execute = maxwell3d.should_execute();
 
@@ -2523,15 +2436,15 @@ mod tests {
 
     #[test]
     fn test_index_buffer_small_from_raw() {
-        // Topology = Triangles (0x5), count = 100, first = 0
-        let raw = (0x5u32 << 28) | (100u32 << 16) | 0;
+        // Topology = Triangles (0x4), count = 100, first = 0
+        let raw = (0x4u32 << 28) | (100u32 << 16) | 0;
         let ibs = IndexBufferSmall::from_raw(raw);
         assert_eq!(ibs.first, 0);
         assert_eq!(ibs.count, 100);
         assert_eq!(ibs.topology, PrimitiveTopology::Triangles);
 
-        // Topology = Lines (0x2), count = 50, first = 1234
-        let raw2 = (0x2u32 << 28) | (50u32 << 16) | 1234;
+        // Topology = Lines (0x1), count = 50, first = 1234
+        let raw2 = (0x1u32 << 28) | (50u32 << 16) | 1234;
         let ibs2 = IndexBufferSmall::from_raw(raw2);
         assert_eq!(ibs2.first, 1234);
         assert_eq!(ibs2.count, 50);
@@ -2540,12 +2453,12 @@ mod tests {
 
     #[test]
     fn test_index_buffer_small_max_values() {
-        // Max first (16 bits) = 0xFFFF, max count (12 bits) = 0xFFF, max topo (4 bits) = 0xF
-        let raw = 0xFFFF_FFFF;
+        // Max first/count and highest valid PrimitiveTopology value (Patches = 0xE).
+        let raw = 0xEFFF_FFFF;
         let ibs = IndexBufferSmall::from_raw(raw);
         assert_eq!(ibs.first, 0xFFFF);
         assert_eq!(ibs.count, 0xFFF);
-        assert_eq!(ibs.topology, PrimitiveTopology::Patches); // 0xF
+        assert_eq!(ibs.topology, PrimitiveTopology::Patches);
     }
 
     #[test]

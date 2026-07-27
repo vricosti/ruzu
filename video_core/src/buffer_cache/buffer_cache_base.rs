@@ -10,6 +10,7 @@
 use common::slot_vector::SlotId;
 use common::slot_vector::SlotVector;
 use common::types::VAddr;
+use smallvec::SmallVec;
 
 use super::buffer_base::BufferBase;
 use crate::engines::maxwell_3d::{IndexFormat, PrimitiveTopology};
@@ -153,13 +154,13 @@ pub const NULL_BINDING: Binding = Binding {
 /// Corresponds to the C++ `HostBindings<Buffer>` template struct.
 pub struct HostBindings {
     /// Indices of bound buffers (backend-specific handles obtained separately).
-    pub buffer_ids: Vec<BufferId>,
+    pub buffer_ids: SmallVec<[BufferId; NUM_VERTEX_BUFFERS as usize]>,
     /// Offsets within each buffer.
-    pub offsets: Vec<u64>,
+    pub offsets: SmallVec<[u64; NUM_VERTEX_BUFFERS as usize]>,
     /// Sizes of each binding.
-    pub sizes: Vec<u64>,
+    pub sizes: SmallVec<[u64; NUM_VERTEX_BUFFERS as usize]>,
     /// Strides for vertex buffers.
-    pub strides: Vec<u64>,
+    pub strides: SmallVec<[u64; NUM_VERTEX_BUFFERS as usize]>,
     /// Minimum bound vertex buffer index.
     pub min_index: u32,
     /// Maximum bound vertex buffer index.
@@ -169,10 +170,10 @@ pub struct HostBindings {
 impl Default for HostBindings {
     fn default() -> Self {
         Self {
-            buffer_ids: Vec::new(),
-            offsets: Vec::new(),
-            sizes: Vec::new(),
-            strides: Vec::new(),
+            buffer_ids: SmallVec::new(),
+            offsets: SmallVec::new(),
+            sizes: SmallVec::new(),
+            strides: SmallVec::new(),
             min_index: NUM_VERTEX_BUFFERS,
             max_index: 0,
         }
@@ -1076,9 +1077,19 @@ mod tests {
 
     #[test]
     fn test_host_bindings_default() {
-        let bindings = HostBindings::default();
+        let mut bindings = HostBindings::default();
         assert_eq!(bindings.min_index, NUM_VERTEX_BUFFERS);
         assert_eq!(bindings.max_index, 0);
         assert!(bindings.buffer_ids.is_empty());
+        for _ in 0..NUM_VERTEX_BUFFERS {
+            bindings.buffer_ids.push(NULL_BUFFER_ID);
+            bindings.offsets.push(0);
+            bindings.sizes.push(0);
+            bindings.strides.push(0);
+        }
+        assert!(!bindings.buffer_ids.spilled());
+        assert!(!bindings.offsets.spilled());
+        assert!(!bindings.sizes.spilled());
+        assert!(!bindings.strides.spilled());
     }
 }

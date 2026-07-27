@@ -31,7 +31,8 @@ use log::{debug, info, trace, warn};
 use thiserror::Error;
 
 use crate::buffer_cache::buffer_cache_base::{
-    DeviceMemoryAccess, GpuMemoryAccess, ObtainBufferOperation, ObtainBufferSynchronize,
+    ConstBufferInfo, DeviceMemoryAccess, GpuMemoryAccess, IndexBufferRef, ObtainBufferOperation,
+    ObtainBufferSynchronize, VertexStreamInfo as BufferVertexStreamInfo, VertexStreamLimit,
 };
 use crate::control::channel_state_cache::{ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches};
 use crate::engines::kepler_compute::DispatchCall;
@@ -294,7 +295,7 @@ use super::blit_image::BlitImageHelper;
 use super::buffer_cache::{
     BufferCache as DirectBufferCache, BufferCacheRuntime, VulkanCommonBufferCache,
 };
-use super::descriptor_pool::{DescriptorBankInfo, DescriptorPool};
+use super::descriptor_pool::DescriptorPool;
 use super::fixed_pipeline_state::FixedPipelineState;
 use super::graphics_pipeline::GraphicsDescriptorBinding;
 use super::pipeline_cache::PipelineCache as VulkanPipelineCache;
@@ -373,22 +374,75 @@ struct DeviceMemoryAccessAdapter {
 /// a permanent `Maxwell3D*` in `BufferCache`; using a copied flag array loses
 /// invalidations raised by `DeleteBuffer` between draws.
 struct VulkanDrawStateEngineAdapter {
-    draw: DrawCall,
+    index_buffer: IndexBufferRef,
+    inline_index_data: Vec<u8>,
+    topology: PrimitiveTopology,
+    index_format: crate::engines::maxwell_3d::IndexFormat,
+    vertex_streams: [BufferVertexStreamInfo; 32],
+    vertex_stream_limits: [VertexStreamLimit; 32],
+    transform_feedback_enabled: bool,
+    const_buffers: [[ConstBufferInfo; crate::engines::maxwell_3d::MAX_CB_SLOTS];
+        crate::engines::maxwell_3d::NUM_SHADER_STAGES],
+    fallback_dirty_flags: [bool; 256],
     dirty_flags: Option<std::ptr::NonNull<[bool; 256]>>,
 }
 
 impl VulkanDrawStateEngineAdapter {
+    fn from_draw(draw: &DrawCall, dirty_flags: Option<std::ptr::NonNull<[bool; 256]>>) -> Self {
+        let format_size_in_bytes = match draw.index_format {
+            crate::engines::maxwell_3d::IndexFormat::UnsignedByte => 1,
+            crate::engines::maxwell_3d::IndexFormat::UnsignedShort => 2,
+            crate::engines::maxwell_3d::IndexFormat::UnsignedInt => 4,
+        };
+        Self {
+            index_buffer: IndexBufferRef {
+                start_address: draw.index_buffer_addr,
+                end_address: draw.index_buffer_addr_end,
+                count: draw.index_buffer_count,
+                first: draw.index_buffer_first,
+                format_size_in_bytes,
+            },
+            inline_index_data: draw.inline_index_data.clone(),
+            topology: draw.topology,
+            index_format: draw.index_format,
+            vertex_streams: std::array::from_fn(|index| {
+                let stream = draw.vertex_streams[index];
+                BufferVertexStreamInfo {
+                    address: stream.address,
+                    stride: stream.stride,
+                    enable: u32::from(stream.enabled),
+                }
+            }),
+            vertex_stream_limits: std::array::from_fn(|index| VertexStreamLimit {
+                address: draw.vertex_stream_limits[index].address,
+            }),
+            transform_feedback_enabled: draw.transform_feedback_enabled,
+            const_buffers: std::array::from_fn(|stage| {
+                std::array::from_fn(|index| {
+                    let binding = draw.cb_bindings[stage][index];
+                    ConstBufferInfo {
+                        address: binding.address,
+                        size: binding.size,
+                        enabled: binding.enabled,
+                    }
+                })
+            }),
+            fallback_dirty_flags: draw.dirty_flags,
+            dirty_flags,
+        }
+    }
+
     fn dirty_flags(&self) -> &[bool; 256] {
         match self.dirty_flags {
             Some(flags) => unsafe { flags.as_ref() },
-            None => &self.draw.dirty_flags,
+            None => &self.fallback_dirty_flags,
         }
     }
 
     fn dirty_flags_mut(&mut self) -> &mut [bool; 256] {
         match self.dirty_flags.as_mut() {
             Some(flags) => unsafe { flags.as_mut() },
-            None => &mut self.draw.dirty_flags,
+            None => &mut self.fallback_dirty_flags,
         }
     }
 }
@@ -417,30 +471,19 @@ fn is_geometry_dirty_flag(index: usize) -> bool {
 
 impl crate::buffer_cache::buffer_cache_base::EngineState for VulkanDrawStateEngineAdapter {
     fn get_index_buffer(&self) -> crate::buffer_cache::buffer_cache_base::IndexBufferRef {
-        let format_size_in_bytes = match self.draw.index_format {
-            crate::engines::maxwell_3d::IndexFormat::UnsignedByte => 1,
-            crate::engines::maxwell_3d::IndexFormat::UnsignedShort => 2,
-            crate::engines::maxwell_3d::IndexFormat::UnsignedInt => 4,
-        };
-        crate::buffer_cache::buffer_cache_base::IndexBufferRef {
-            start_address: self.draw.index_buffer_addr,
-            end_address: self.draw.index_buffer_addr_end,
-            count: self.draw.index_buffer_count,
-            first: self.draw.index_buffer_first,
-            format_size_in_bytes,
-        }
+        self.index_buffer
     }
 
     fn get_inline_index_draw_indexes(&self) -> &[u8] {
-        &self.draw.inline_index_data
+        &self.inline_index_data
     }
 
     fn get_primitive_topology(&self) -> PrimitiveTopology {
-        self.draw.topology
+        self.topology
     }
 
     fn get_index_format(&self) -> crate::engines::maxwell_3d::IndexFormat {
-        self.draw.index_format
+        self.index_format
     }
 
     fn is_dirty(&self, flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) -> bool {
@@ -462,30 +505,24 @@ impl crate::buffer_cache::buffer_cache_base::EngineState for VulkanDrawStateEngi
         &self,
         index: u32,
     ) -> crate::buffer_cache::buffer_cache_base::VertexStreamInfo {
-        let Some(stream) = self.draw.vertex_streams.get(index as usize) else {
+        let Some(stream) = self.vertex_streams.get(index as usize) else {
             return crate::buffer_cache::buffer_cache_base::VertexStreamInfo::default();
         };
-        crate::buffer_cache::buffer_cache_base::VertexStreamInfo {
-            address: stream.address,
-            stride: stream.stride,
-            enable: u32::from(stream.enabled),
-        }
+        *stream
     }
 
     fn get_vertex_stream_limit(
         &self,
         index: u32,
     ) -> crate::buffer_cache::buffer_cache_base::VertexStreamLimit {
-        let Some(limit) = self.draw.vertex_stream_limits.get(index as usize) else {
+        let Some(limit) = self.vertex_stream_limits.get(index as usize) else {
             return crate::buffer_cache::buffer_cache_base::VertexStreamLimit::default();
         };
-        crate::buffer_cache::buffer_cache_base::VertexStreamLimit {
-            address: limit.address,
-        }
+        *limit
     }
 
     fn is_transform_feedback_enabled(&self) -> bool {
-        self.draw.transform_feedback_enabled
+        self.transform_feedback_enabled
     }
 
     fn get_transform_feedback_buffer(
@@ -500,17 +537,13 @@ impl crate::buffer_cache::buffer_cache_base::EngineState for VulkanDrawStateEngi
         stage: usize,
         cbuf_index: u32,
     ) -> crate::buffer_cache::buffer_cache_base::ConstBufferInfo {
-        let Some(stage_bindings) = self.draw.cb_bindings.get(stage) else {
+        let Some(stage_bindings) = self.const_buffers.get(stage) else {
             return crate::buffer_cache::buffer_cache_base::ConstBufferInfo::default();
         };
         let Some(binding) = stage_bindings.get(cbuf_index as usize) else {
             return crate::buffer_cache::buffer_cache_base::ConstBufferInfo::default();
         };
-        crate::buffer_cache::buffer_cache_base::ConstBufferInfo {
-            address: binding.address,
-            size: binding.size,
-            enabled: binding.enabled,
-        }
+        *binding
     }
 
     fn get_compute_launch_info(&self) -> crate::buffer_cache::buffer_cache_base::ComputeLaunchInfo {
@@ -610,6 +643,14 @@ pub struct RasterizerVulkan {
     draw_offscreen_fallback: u64,
     extended_dynamic_state_supported: bool,
     extended_dynamic_state2_supported: bool,
+    extended_dynamic_state2_extra_supported: bool,
+    extended_dynamic_state3_blending_supported: bool,
+    extended_dynamic_state3_enables_supported: bool,
+    vertex_input_dynamic_state_supported: bool,
+    must_emulate_scaled_formats: bool,
+    extended_dynamic_state2: Option<ash::extensions::ext::ExtendedDynamicState2>,
+    extended_dynamic_state3: Option<ash::extensions::ext::ExtendedDynamicState3>,
+    vertex_input_dynamic_state: Option<vk::ExtVertexInputDynamicStateFn>,
     draw_indirect_count: Option<ash::extensions::khr::DrawIndirectCount>,
     max_viewports: u32,
 
@@ -652,6 +693,10 @@ impl RasterizerVulkan {
         depth_clip_control_supported: bool,
         extended_dynamic_state_supported: bool,
         extended_dynamic_state2_supported: bool,
+        extended_dynamic_state2_extra_supported: bool,
+        extended_dynamic_state3_blending_supported: bool,
+        extended_dynamic_state3_enables_supported: bool,
+        vertex_input_dynamic_state_supported: bool,
         topology_list_primitive_restart_supported: bool,
         patch_list_primitive_restart_supported: bool,
         must_emulate_scaled_formats: bool,
@@ -770,6 +815,7 @@ impl RasterizerVulkan {
             .get_value();
         let pipeline_cache = VulkanPipelineCache::new(
             device.clone(),
+            descriptor_pool.as_mut(),
             use_asynchronous_shaders,
             use_vulkan_pipeline_cache,
             shader_cache,
@@ -777,15 +823,10 @@ impl RasterizerVulkan {
             render_pass_cache.as_mut(),
             extended_dynamic_state_supported,
             extended_dynamic_state2_supported,
-            // `extendedDynamicState2LogicOp` is not yet exposed by the Rust
-            // device wrapper. Keep the feature false so pipeline keys and disk
-            // cache filtering match the actually enabled command set.
-            false,
-            // Extended dynamic state 3 and vertex-input dynamic state are not
-            // enabled by this simplified Vulkan init path yet.
-            false,
-            false,
-            false,
+            extended_dynamic_state2_extra_supported,
+            extended_dynamic_state3_blending_supported,
+            extended_dynamic_state3_enables_supported,
+            vertex_input_dynamic_state_supported,
             must_emulate_scaled_formats,
             topology_list_primitive_restart_supported,
             patch_list_primitive_restart_supported,
@@ -878,6 +919,16 @@ impl RasterizerVulkan {
         )?;
         let draw_indirect_count = draw_indirect_count_supported
             .then(|| ash::extensions::khr::DrawIndirectCount::new(&instance, &device));
+        let extended_dynamic_state2 = extended_dynamic_state2_extra_supported
+            .then(|| ash::extensions::ext::ExtendedDynamicState2::new(&instance, &device));
+        let extended_dynamic_state3 = (extended_dynamic_state3_blending_supported
+            || extended_dynamic_state3_enables_supported)
+            .then(|| ash::extensions::ext::ExtendedDynamicState3::new(&instance, &device));
+        let vertex_input_dynamic_state = vertex_input_dynamic_state_supported.then(|| {
+            vk::ExtVertexInputDynamicStateFn::load(|name| unsafe {
+                std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr()))
+            })
+        });
 
         Ok(Self {
             device,
@@ -927,6 +978,14 @@ impl RasterizerVulkan {
             draw_offscreen_fallback: 0,
             extended_dynamic_state_supported,
             extended_dynamic_state2_supported,
+            extended_dynamic_state2_extra_supported,
+            extended_dynamic_state3_blending_supported,
+            extended_dynamic_state3_enables_supported,
+            vertex_input_dynamic_state_supported,
+            must_emulate_scaled_formats,
+            extended_dynamic_state2,
+            extended_dynamic_state3,
+            vertex_input_dynamic_state,
             draw_indirect_count,
             max_viewports: max_viewports.min(NUM_VIEWPORTS as u32).max(1),
             channel_memory_manager: None,
@@ -1006,6 +1065,8 @@ impl RasterizerVulkan {
             .unwrap_or(self.default_render_pass);
 
         // 3. Compile or lookup cached pipeline
+        let known_gpu_tick = self.scheduler.known_gpu_tick();
+        let pending_tick = self.scheduler.pending_tick();
         let pipeline_result = self
             .pipeline_cache
             .current_graphics_pipeline_with_shared_cache(draw, render_pass, &mut self.shader_cache);
@@ -1013,8 +1074,8 @@ impl RasterizerVulkan {
             pipeline_waiter,
             pipeline_layout,
             descriptor_set_layout,
+            descriptor_set,
             descriptor_bindings,
-            descriptor_bank_info,
             stage_infos,
             enabled_uniform_buffer_masks,
             uniform_buffer_sizes,
@@ -1023,20 +1084,31 @@ impl RasterizerVulkan {
             fixed_state,
             unique_hashes,
         ) = match pipeline_result {
-            Some((gp, fixed_state)) => (
-                gp.build_waiter(),
-                gp.pipeline_layout,
-                gp.descriptor_set_layout,
-                gp.descriptor_bindings.clone(),
-                gp.descriptor_bank_info,
-                gp.stage_infos.clone(),
-                gp.enabled_uniform_buffer_masks,
-                gp.uniform_buffer_sizes,
-                gp.uses_render_area,
-                gp.uses_rescaling_uniform,
-                fixed_state,
-                gp.key().unique_hashes,
-            ),
+            Some((gp, fixed_state)) => {
+                let descriptor_set = match gp.commit_descriptor_set(known_gpu_tick, pending_tick) {
+                    Ok(set) => set,
+                    Err(error) => {
+                        warn!(
+                            "RasterizerVulkan: failed to commit graphics descriptor set: {error:?}"
+                        );
+                        return;
+                    }
+                };
+                (
+                    gp.build_waiter(),
+                    gp.pipeline_layout,
+                    gp.descriptor_set_layout,
+                    descriptor_set,
+                    Arc::clone(&gp.descriptor_bindings),
+                    Arc::clone(&gp.stage_infos),
+                    gp.enabled_uniform_buffer_masks,
+                    gp.uniform_buffer_sizes,
+                    gp.uses_render_area,
+                    gp.uses_rescaling_uniform,
+                    fixed_state,
+                    gp.key().unique_hashes,
+                )
+            }
             None => {
                 self.draw_skipped_pipeline = self.draw_skipped_pipeline.wrapping_add(1);
                 // A skipped draw leaves the previous frame's pixels in place;
@@ -1057,10 +1129,9 @@ impl RasterizerVulkan {
             }
         };
         // 4. Ensure we're inside a render pass
-        let cmd = self.scheduler.command_buffer();
         let (framebuffer, extent, rp_images, rp_image_ranges) = if let Some(target) = target_fb {
             self.texture_cache
-                .prepare_render_targets_for_render(&target.image_ids, cmd);
+                .prepare_render_targets_for_render(&target.image_ids);
             (
                 target.framebuffer,
                 target.extent,
@@ -1130,11 +1201,9 @@ impl RasterizerVulkan {
             _bc_draw_buffer_guard,
             _bc_draw_texture_guard
         );
-        self.common_buffer_cache
-            .set_engine_state(Box::new(VulkanDrawStateEngineAdapter {
-                draw: draw.clone(),
-                dirty_flags: engine_dirty_flags,
-            }));
+        self.common_buffer_cache.set_engine_state(Box::new(
+            VulkanDrawStateEngineAdapter::from_draw(draw, engine_dirty_flags),
+        ));
         // Upstream `GraphicsPipeline::ConfigureImpl` updates all buffer
         // bindings once, then binds geometry before the per-stage buffers.
         // Keep the legacy path only for topologies whose Vulkan conversion
@@ -1144,12 +1213,11 @@ impl RasterizerVulkan {
             PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip
         );
         let descriptor_set = self.bind_graphics_descriptors(
-            cmd,
             pipeline_layout,
             descriptor_set_layout,
-            &descriptor_bindings,
-            &descriptor_bank_info,
-            &stage_infos,
+            descriptor_set,
+            descriptor_bindings.as_slice(),
+            stage_infos.as_ref(),
             &enabled_uniform_buffer_masks,
             &uniform_buffer_sizes,
             draw,
@@ -1173,9 +1241,9 @@ impl RasterizerVulkan {
                 dirty_flags[index as usize] = false;
             }
         } else {
-            self.bind_vertex_buffers(cmd, draw, read_gpu);
+            self.bind_vertex_buffers(draw, read_gpu);
             if draw_params.is_indexed {
-                self.bind_index_buffer(cmd, draw, draw_params, read_gpu);
+                self.bind_index_buffer(draw, draw_params, read_gpu);
             }
         }
         let indirect_binding = indirect_params.map(|params| {
@@ -1260,7 +1328,7 @@ impl RasterizerVulkan {
         // 6. Update dynamic states via dirty flags. Upstream requests the
         // render pass in `GraphicsPipeline::ConfigureDraw` before
         // `RasterizerVulkan::UpdateDynamicStates`.
-        self.update_dynamic_states(draw);
+        self.update_dynamic_states(draw, dirty_flags, engine_dirty_flags);
 
         // 7. Issue draw call
         if let Some((params, buffer, offset, count)) = indirect_binding {
@@ -1426,16 +1494,10 @@ impl RasterizerVulkan {
             self.scheduler.dispatch_work();
             return;
         }
-        let tick = self.scheduler.flush();
+        self.scheduler.flush();
         self.draw_counter = 0;
         self.state_tracker.invalidate_command_buffer_state();
         self.staging_pool.new_frame();
-        // The freshly submitted work still references this frame's
-        // descriptor sets; retire the pools against the submission tick
-        // instead of resetting them under the GPU.
-        let scheduler = &self.scheduler;
-        self.descriptor_pool
-            .end_frame(tick, &|t| scheduler.is_free(t));
     }
 
     /// Submit and wait for all GPU work to complete.
@@ -1445,7 +1507,6 @@ impl RasterizerVulkan {
         self.draw_counter = 0;
         self.state_tracker.invalidate_command_buffer_state();
         self.staging_pool.new_frame();
-        self.descriptor_pool.reset_pools();
     }
 
     fn should_wait_async_flushes(&self) -> bool {
@@ -1514,11 +1575,7 @@ impl RasterizerVulkan {
 
     /// Read back the offscreen framebuffer as RGBA8 pixels.
     pub fn read_framebuffer(&mut self) -> Vec<u8> {
-        let cmd = self.scheduler.command_buffer();
-
-        // Transition offscreen image for transfer
         self.texture_cache.transition_layout(
-            cmd,
             self.offscreen_image,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
@@ -1543,19 +1600,20 @@ impl RasterizerVulkan {
                 depth: 1,
             })
             .build();
-        unsafe {
-            self.device.cmd_copy_image_to_buffer(
-                cmd,
-                self.offscreen_image,
+        let device = self.device.clone();
+        let offscreen_image = self.offscreen_image;
+        let readback_buffer = self.readback_buffer;
+        self.scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_copy_image_to_buffer(
+                cmdbuf,
+                offscreen_image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                self.readback_buffer,
+                readback_buffer,
                 &[region],
             );
-        }
+        });
 
-        // Transition back
         self.texture_cache.transition_layout(
-            cmd,
             self.offscreen_image,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -1640,7 +1698,12 @@ impl RasterizerVulkan {
 
     // ── Dynamic state update methods ──────────────────────────────────────
 
-    fn update_dynamic_states(&mut self, draw: &DrawCall) {
+    fn update_dynamic_states(
+        &mut self,
+        draw: &DrawCall,
+        dirty_flags: &mut [bool; 256],
+        engine_dirty_flags: Option<NonNull<[bool; 256]>>,
+    ) {
         self.update_viewports(draw);
         self.update_scissors(draw);
         self.update_depth_bias(draw);
@@ -1664,8 +1727,236 @@ impl RasterizerVulkan {
                     self.update_rasterizer_discard_enable(draw);
                     self.update_depth_bias_enable(draw);
                 }
+                if self.extended_dynamic_state3_enables_supported {
+                    self.update_logic_op_enable(draw);
+                    self.update_depth_clamp_enable(draw);
+                }
+            }
+            if self.extended_dynamic_state2_extra_supported {
+                self.update_logic_op(draw);
+            }
+            if self.extended_dynamic_state3_blending_supported {
+                self.update_blending(draw);
             }
         }
+        if self.vertex_input_dynamic_state_supported {
+            self.update_vertex_input(draw, dirty_flags, engine_dirty_flags);
+        }
+    }
+
+    fn update_logic_op_enable(&mut self, draw: &DrawCall) {
+        if !self.state_tracker.touch_logic_op_enable() {
+            return;
+        }
+        let enabled = draw.logic_op.enabled;
+        let extension = self
+            .extended_dynamic_state3
+            .as_ref()
+            .expect("dynamic state 3 loader missing")
+            .clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            extension.cmd_set_logic_op_enable(cmdbuf, enabled);
+        });
+    }
+
+    fn update_depth_clamp_enable(&mut self, draw: &DrawCall) {
+        if !self.state_tracker.touch_depth_clamp_enable() {
+            return;
+        }
+        let enabled = draw.depth_clamp_enabled;
+        let extension = self
+            .extended_dynamic_state3
+            .as_ref()
+            .expect("dynamic state 3 loader missing")
+            .clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            extension.cmd_set_depth_clamp_enable(cmdbuf, enabled);
+        });
+    }
+
+    fn update_logic_op(&mut self, draw: &DrawCall) {
+        if !self.state_tracker.touch_logic_op() {
+            return;
+        }
+        let raw = draw.logic_op.op;
+        let op = if (0x1500..0x1510).contains(&raw) {
+            vk::LogicOp::from_raw((raw - 0x1500) as i32)
+        } else {
+            vk::LogicOp::NO_OP
+        };
+        let extension = self
+            .extended_dynamic_state2
+            .as_ref()
+            .expect("dynamic state 2 loader missing")
+            .clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            extension.cmd_set_logic_op(cmdbuf, op);
+        });
+    }
+
+    fn update_blending(&mut self, draw: &DrawCall) {
+        if !self.state_tracker.touch_blending() {
+            return;
+        }
+        let extension = self
+            .extended_dynamic_state3
+            .as_ref()
+            .expect("dynamic state 3 loader missing")
+            .clone();
+
+        if self.state_tracker.touch_color_mask() {
+            let masks = std::array::from_fn::<_, 8, _>(|index| {
+                let mask = draw.color_masks[index];
+                let mut flags = vk::ColorComponentFlags::empty();
+                if mask.r {
+                    flags |= vk::ColorComponentFlags::R;
+                }
+                if mask.g {
+                    flags |= vk::ColorComponentFlags::G;
+                }
+                if mask.b {
+                    flags |= vk::ColorComponentFlags::B;
+                }
+                if mask.a {
+                    flags |= vk::ColorComponentFlags::A;
+                }
+                flags
+            });
+            let extension = extension.clone();
+            self.scheduler.record(move |cmdbuf| unsafe {
+                extension.cmd_set_color_write_mask(cmdbuf, 0, &masks);
+            });
+        }
+
+        if self.state_tracker.touch_blend_enable() {
+            let enables = std::array::from_fn::<_, 8, _>(|index| draw.blend[index].enabled.into());
+            let extension = extension.clone();
+            self.scheduler.record(move |cmdbuf| unsafe {
+                extension.cmd_set_color_blend_enable(cmdbuf, 0, &enables);
+            });
+        }
+
+        if self.state_tracker.touch_blend_equations() {
+            let equations = std::array::from_fn::<_, 8, _>(|index| {
+                let blend = draw.blend[index];
+                vk::ColorBlendEquationEXT {
+                    src_color_blend_factor: maxwell_to_vk::blend_factor(blend.color_src),
+                    dst_color_blend_factor: maxwell_to_vk::blend_factor(blend.color_dst),
+                    color_blend_op: maxwell_to_vk::blend_equation(blend.color_op),
+                    src_alpha_blend_factor: maxwell_to_vk::blend_factor(blend.alpha_src),
+                    dst_alpha_blend_factor: maxwell_to_vk::blend_factor(blend.alpha_dst),
+                    alpha_blend_op: maxwell_to_vk::blend_equation(blend.alpha_op),
+                }
+            });
+            self.scheduler.record(move |cmdbuf| unsafe {
+                extension.cmd_set_color_blend_equation(cmdbuf, 0, &equations);
+            });
+        }
+    }
+
+    fn update_vertex_input(
+        &mut self,
+        draw: &DrawCall,
+        dirty_flags: &mut [bool; 256],
+        engine_dirty_flags: Option<NonNull<[bool; 256]>>,
+    ) {
+        use super::state_tracker::dirty;
+
+        if !dirty_flags[dirty::VERTEX_INPUT as usize] {
+            return;
+        }
+        dirty_flags[dirty::VERTEX_INPUT as usize] = false;
+
+        let mut bindings = Vec::with_capacity(32);
+        let mut attributes = Vec::with_capacity(32);
+        let mut highest_dirty_attr = 0usize;
+        for index in 0..32 {
+            if dirty_flags[dirty::VERTEX_ATTRIBUTE_0 as usize + index] {
+                highest_dirty_attr = index;
+            }
+        }
+        for index in 0..highest_dirty_attr {
+            let attribute = draw.vertex_attribs[index];
+            let binding = attribute.buffer_index;
+            dirty_flags[dirty::VERTEX_ATTRIBUTE_0 as usize + index] = false;
+            dirty_flags[dirty::VERTEX_BINDING_0 as usize + binding as usize] = true;
+            if !attribute.constant {
+                attributes.push((
+                    index as u32,
+                    binding,
+                    maxwell_to_vk::vertex_format(
+                        self.must_emulate_scaled_formats,
+                        attribute.attrib_type,
+                        attribute.size,
+                    ),
+                    attribute.offset,
+                ));
+            }
+        }
+        for index in 0..32 {
+            if !dirty_flags[dirty::VERTEX_BINDING_0 as usize + index] {
+                continue;
+            }
+            dirty_flags[dirty::VERTEX_BINDING_0 as usize + index] = false;
+            let stream = draw.vertex_streams[index];
+            let is_instanced = draw.vertex_stream_instances[index] != 0;
+            bindings.push((
+                index as u32,
+                stream.stride,
+                is_instanced,
+                if is_instanced { stream.frequency } else { 1 },
+            ));
+        }
+        if let Some(mut flags) = engine_dirty_flags {
+            unsafe {
+                flags.as_mut()[dirty::VERTEX_INPUT as usize..=dirty::VERTEX_BINDING_31 as usize]
+                    .copy_from_slice(
+                        &dirty_flags
+                            [dirty::VERTEX_INPUT as usize..=dirty::VERTEX_BINDING_31 as usize],
+                    );
+            }
+        }
+
+        let extension = self
+            .vertex_input_dynamic_state
+            .as_ref()
+            .expect("vertex input dynamic state loader missing")
+            .clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            let binding_descriptions = bindings
+                .into_iter()
+                .map(|(binding, stride, is_instanced, divisor)| {
+                    vk::VertexInputBindingDescription2EXT::builder()
+                        .binding(binding)
+                        .stride(stride)
+                        .input_rate(if is_instanced {
+                            vk::VertexInputRate::INSTANCE
+                        } else {
+                            vk::VertexInputRate::VERTEX
+                        })
+                        .divisor(divisor)
+                        .build()
+                })
+                .collect::<Vec<_>>();
+            let attribute_descriptions = attributes
+                .into_iter()
+                .map(|(location, binding, format, offset)| {
+                    vk::VertexInputAttributeDescription2EXT::builder()
+                        .location(location)
+                        .binding(binding)
+                        .format(format)
+                        .offset(offset)
+                        .build()
+                })
+                .collect::<Vec<_>>();
+            (extension.cmd_set_vertex_input_ext)(
+                cmdbuf,
+                binding_descriptions.len() as u32,
+                binding_descriptions.as_ptr(),
+                attribute_descriptions.len() as u32,
+                attribute_descriptions.as_ptr(),
+            );
+        });
     }
 
     fn update_primitive_restart_enable(&mut self, draw: &DrawCall) {
@@ -2078,13 +2369,7 @@ impl RasterizerVulkan {
 
     // ── Buffer binding ────────────────────────────────────────────────────
 
-    fn bind_vertex_buffers(
-        &mut self,
-        cmd: vk::CommandBuffer,
-        draw: &DrawCall,
-        read_gpu: &dyn Fn(u64, &mut [u8]),
-    ) {
-        let upload_cmd = self.scheduler.upload_command_buffer();
+    fn bind_vertex_buffers(&mut self, draw: &DrawCall, read_gpu: &dyn Fn(u64, &mut [u8])) {
         for (index, stream) in draw.vertex_streams.iter().enumerate() {
             if !stream.enabled || stream.address == 0 {
                 continue;
@@ -2108,7 +2393,6 @@ impl RasterizerVulkan {
                 continue;
             }
             self.buffer_cache.bind_vertex_buffer(
-                cmd,
                 index as u32,
                 stream.address,
                 size,
@@ -2116,26 +2400,23 @@ impl RasterizerVulkan {
                 self.extended_dynamic_state_supported,
                 read_gpu,
                 &mut self.staging_pool,
-                upload_cmd,
+                &mut self.scheduler,
             );
         }
     }
 
     fn bind_index_buffer(
         &mut self,
-        cmd: vk::CommandBuffer,
         draw: &DrawCall,
         draw_params: DrawParams,
         read_gpu: &dyn Fn(u64, &mut [u8]),
     ) {
-        let upload_cmd = self.scheduler.upload_command_buffer();
         if matches!(
             draw.topology,
             PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip
         ) {
             if draw.indexed {
                 self.buffer_cache.bind_quad_indexed_buffer(
-                    cmd,
                     draw.topology,
                     draw.index_format,
                     draw.base_vertex,
@@ -2144,16 +2425,15 @@ impl RasterizerVulkan {
                     draw.index_buffer_addr,
                     read_gpu,
                     &mut self.staging_pool,
-                    upload_cmd,
+                    &mut self.scheduler,
                 );
             } else {
                 self.buffer_cache.bind_quad_index_buffer(
-                    cmd,
                     draw.topology,
                     draw.vertex_first,
                     draw.vertex_count,
                     &mut self.staging_pool,
-                    upload_cmd,
+                    &mut self.scheduler,
                 );
             }
             return;
@@ -2177,23 +2457,21 @@ impl RasterizerVulkan {
             crate::engines::maxwell_3d::IndexFormat::UnsignedInt => vk::IndexType::UINT32,
         };
         self.buffer_cache.bind_index_buffer(
-            cmd,
             draw.index_buffer_addr,
             size,
             index_type,
             read_gpu,
             &mut self.staging_pool,
-            upload_cmd,
+            &mut self.scheduler,
         );
     }
 
     fn bind_graphics_descriptors(
         &mut self,
-        cmd: vk::CommandBuffer,
         _pipeline_layout: vk::PipelineLayout,
         descriptor_set_layout: vk::DescriptorSetLayout,
+        descriptor_set: Option<vk::DescriptorSet>,
         descriptor_bindings: &[GraphicsDescriptorBinding],
-        descriptor_bank_info: &DescriptorBankInfo,
         stage_infos: &[Option<ShaderInfo>; 5],
         enabled_uniform_buffer_masks: &[u32; crate::buffer_cache::buffer_cache_base::NUM_STAGES
              as usize],
@@ -2235,15 +2513,9 @@ impl RasterizerVulkan {
         }
 
         self.desc_queue.acquire();
-        let descriptor_set = match self
-            .descriptor_pool
-            .allocate(descriptor_set_layout, descriptor_bank_info)
-        {
-            Ok(set) => set,
-            Err(err) => {
-                warn!("RasterizerVulkan: failed to allocate graphics descriptor set: {err:?}");
-                return None;
-            }
+        let Some(descriptor_set) = descriptor_set else {
+            warn!("RasterizerVulkan: graphics pipeline has descriptors but no allocator");
+            return None;
         };
 
         let descriptor_count = descriptor_bindings
@@ -2253,7 +2525,6 @@ impl RasterizerVulkan {
         let mut buffer_infos = Vec::with_capacity(descriptor_count);
         let mut image_infos = Vec::with_capacity(descriptor_count);
         let mut writes = Vec::with_capacity(descriptor_bindings.len());
-        let upload_cmd = self.scheduler.upload_command_buffer();
         let via_header_index = matches!(
             draw.sampler_binding,
             crate::engines::maxwell_3d::SamplerBinding::ViaHeaderBinding
@@ -2644,7 +2915,6 @@ impl RasterizerVulkan {
                     view.id,
                     texture_type,
                     read_gpu_unsafe,
-                    cmd,
                 );
                 if is_written {
                     unsafe {
@@ -2737,7 +3007,7 @@ impl RasterizerVulkan {
                                                 size,
                                                 read_gpu,
                                                 &mut self.staging_pool,
-                                                upload_cmd,
+                                                &mut self.scheduler,
                                             )
                                         })
                                 } else {
@@ -2746,7 +3016,7 @@ impl RasterizerVulkan {
                                         size,
                                         read_gpu,
                                         &mut self.staging_pool,
-                                        upload_cmd,
+                                        &mut self.scheduler,
                                     )
                                 };
                             (buffer, offset, size)
@@ -2811,7 +3081,6 @@ impl RasterizerVulkan {
                                             shader_recompiler::shader_info::TextureType::Color2D,
                                         ),
                                     read_gpu_unsafe,
-                                    cmd,
                                 )
                                 .unwrap_or(self.offscreen_view);
                             let sampler_id = sampled_samplers
@@ -2976,9 +3245,8 @@ impl RasterizerVulkan {
         };
         let image_id = framebuffer_view.common.view.image_id;
         self.query_cache.notify_segment(false);
-        let cmd = self.scheduler.command_buffer();
         unsafe {
-            (*texture_cache).prepare_framebuffer_for_present(image_id, cmd);
+            (*texture_cache).prepare_framebuffer_for_present(image_id);
         }
         let resolution = common::settings::values().resolution_info.clone();
         let scaled_width = if framebuffer_view.common.scaled {
@@ -3142,6 +3410,7 @@ impl RasterizerInterface for RasterizerVulkan {
         let descriptor_sync_regs = draw_texture_view.descriptor_sync_regs();
         let mut dirty_flags = draw_texture_view.dirty_flags();
         let original_dirty_flags = dirty_flags;
+        let engine_dirty_flags = draw_texture_view.dirty_flags_ptr();
 
         let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
             log::warn!("RasterizerVulkan::draw_texture skipped: no bound channel memory manager");
@@ -3171,13 +3440,12 @@ impl RasterizerInterface for RasterizerVulkan {
             log::warn!("RasterizerVulkan::draw_texture skipped: no framebuffer");
             return;
         };
+        self.update_dynamic_states(&dynamic_state, &mut dirty_flags, engine_dirty_flags);
         for (index, dirty) in dirty_flags.iter().enumerate() {
             if !dirty && original_dirty_flags[index] {
                 draw_texture_view.clear_dirty_flag(index as u8);
             }
         }
-
-        self.update_dynamic_states(&dynamic_state);
         self.query_cache.counter_enable(
             QueryType::ZPassPixelCount64 as u32,
             draw_texture_view.zpass_pixel_count_enabled(),
@@ -3194,12 +3462,10 @@ impl RasterizerInterface for RasterizerVulkan {
             );
             return;
         };
-        let cmd = self.scheduler.command_buffer();
-        let Some(texture) = self.texture_cache.draw_texture_source(
-            draw_texture_state.src_texture,
-            &read_gpu_unsafe,
-            cmd,
-        ) else {
+        let Some(texture) = self
+            .texture_cache
+            .draw_texture_source(draw_texture_state.src_texture, &read_gpu_unsafe)
+        else {
             log::warn!(
                 "RasterizerVulkan::draw_texture skipped: invalid texture {}",
                 draw_texture_state.src_texture
@@ -3207,7 +3473,7 @@ impl RasterizerInterface for RasterizerVulkan {
             return;
         };
         self.texture_cache
-            .prepare_render_targets_for_render(&framebuffer.image_ids, cmd);
+            .prepare_render_targets_for_render(&framebuffer.image_ids);
 
         let cache_is_rescaling = self.texture_cache.base.is_rescaling;
         let src_rescaling = cache_is_rescaling && texture.is_rescaled;
@@ -3331,9 +3597,8 @@ impl RasterizerInterface for RasterizerVulkan {
         };
         let framebuffer = target.framebuffer;
         let render_area = target.extent;
-        let cmd = self.scheduler.command_buffer();
         self.texture_cache
-            .prepare_render_targets_for_render(&target.image_ids, cmd);
+            .prepare_render_targets_for_render(&target.image_ids);
         let clear_values = [
             vk::ClearValue {
                 color: vk::ClearColorValue {
@@ -3832,17 +4097,6 @@ impl RasterizerInterface for RasterizerVulkan {
         self.compute_pass_desc_queue.tick_frame();
         self.state_tracker.invalidate_command_buffer_state();
         self.staging_pool.new_frame();
-        {
-            // Upstream ResourcePool stamps descriptor sets with
-            // MasterSemaphore::CurrentTick(), which is the tick assigned to
-            // the next submission. Rust's `current_tick()` is the last
-            // submitted tick, so use `pending_tick()` for the same lifetime:
-            // this frame's command buffer can still reference these sets.
-            let tick = self.scheduler.pending_tick();
-            let scheduler = &self.scheduler;
-            self.descriptor_pool
-                .end_frame(tick, &|t| scheduler.is_free(t));
-        }
         // Retire delayed-destruction rings against GPU completion, not the
         // submission counter (pipelined submissions run ahead of the GPU).
         let known_gpu_tick = self.scheduler.known_gpu_tick();
@@ -4630,6 +4884,13 @@ mod tests {
         assert!(!is_geometry_dirty_flag(
             crate::dirty_flags::flags::RENDER_TARGETS as usize
         ));
+    }
+
+    #[test]
+    fn draw_state_adapter_does_not_duplicate_the_full_draw_snapshot() {
+        assert!(
+            std::mem::size_of::<VulkanDrawStateEngineAdapter>() < std::mem::size_of::<DrawCall>()
+        );
     }
 
     #[test]

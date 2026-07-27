@@ -12,6 +12,7 @@ use std::ptr::NonNull;
 use ash::vk;
 use ash::vk::Handle;
 use log::{debug, trace};
+use smallvec::SmallVec;
 
 use super::scheduler::Scheduler;
 use super::staging_buffer_pool::StagingBufferPool;
@@ -652,10 +653,10 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         if binding_count == 0 {
             return;
         }
-        let mut vk_buffers = Vec::with_capacity(binding_count);
-        let mut offsets = Vec::with_capacity(binding_count);
-        let mut sizes = Vec::with_capacity(binding_count);
-        let mut strides = Vec::with_capacity(binding_count);
+        let mut vk_buffers = SmallVec::<[vk::Buffer; 32]>::new();
+        let mut offsets = SmallVec::<[u64; 32]>::new();
+        let mut sizes = SmallVec::<[u64; 32]>::new();
+        let mut strides = SmallVec::<[u64; 32]>::new();
         for index in 0..binding_count {
             let buffer_id = bindings.buffer_ids[index];
             let mut buffer = if buffer_id.is_valid() {
@@ -1010,7 +1011,7 @@ impl BufferCache {
         size: vk::DeviceSize,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         staging_pool: &mut StagingBufferPool,
-        cmd: vk::CommandBuffer,
+        scheduler: &mut Scheduler,
     ) -> (vk::Buffer, vk::DeviceSize) {
         if size == 0 || gpu_va == 0 {
             return (self.null_buffer, 0);
@@ -1077,17 +1078,16 @@ impl BufferCache {
                 std::ptr::copy_nonoverlapping(host_data.as_ptr(), staging.mapped, size as usize);
             }
 
-            // Record copy command
             let copy_region = vk::BufferCopy {
                 src_offset: staging.offset,
                 dst_offset: 0,
                 size,
             };
-            unsafe {
-                self.device
-                    .cmd_copy_buffer(cmd, staging.buffer, buffer, &[copy_region]);
-                post_copy_barrier(&self.device, cmd);
-            }
+            let device = self.device.clone();
+            scheduler.request_outside_renderpass();
+            scheduler.record_with_upload(move |_cmdbuf, upload_cmdbuf| unsafe {
+                device.cmd_copy_buffer(upload_cmdbuf, staging.buffer, buffer, &[copy_region]);
+            });
         }
 
         trace!(
@@ -1125,12 +1125,12 @@ impl BufferCache {
         size: vk::DeviceSize,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         staging_pool: &mut StagingBufferPool,
-        cmd: vk::CommandBuffer,
+        scheduler: &mut Scheduler,
     ) -> (vk::Buffer, vk::DeviceSize) {
         if let Some(old) = self.cache.remove(&gpu_va) {
             self.sentence(old);
         }
-        self.get_or_upload(gpu_va, size, read_gpu, staging_pool, cmd)
+        self.get_or_upload(gpu_va, size, read_gpu, staging_pool, scheduler)
     }
 
     /// Bind a short-lived uniform buffer directly from the mapped staging
@@ -1161,7 +1161,7 @@ impl BufferCache {
         cache_key: u64,
         data: &[u8],
         staging_pool: &mut StagingBufferPool,
-        cmd: vk::CommandBuffer,
+        scheduler: &mut Scheduler,
     ) -> (vk::Buffer, vk::DeviceSize) {
         let size = data.len() as vk::DeviceSize;
         if size == 0 {
@@ -1212,15 +1212,17 @@ impl BufferCache {
         if let Some(staging) = staging_pool.request_upload_buffer(size) {
             unsafe {
                 std::ptr::copy_nonoverlapping(data.as_ptr(), staging.mapped, data.len());
-                let copy_region = vk::BufferCopy {
-                    src_offset: staging.offset,
-                    dst_offset: 0,
-                    size,
-                };
-                self.device
-                    .cmd_copy_buffer(cmd, staging.buffer, buffer, &[copy_region]);
-                post_copy_barrier(&self.device, cmd);
             }
+            let copy_region = vk::BufferCopy {
+                src_offset: staging.offset,
+                dst_offset: 0,
+                size,
+            };
+            let device = self.device.clone();
+            scheduler.request_outside_renderpass();
+            scheduler.record_with_upload(move |_cmdbuf, upload_cmdbuf| unsafe {
+                device.cmd_copy_buffer(upload_cmdbuf, staging.buffer, buffer, &[copy_region]);
+            });
         }
 
         if let Some(old) = self.cache.remove(&cache_key) {
@@ -1242,7 +1244,6 @@ impl BufferCache {
     /// Bind a vertex buffer at the given binding index.
     pub fn bind_vertex_buffer(
         &mut self,
-        cmd: vk::CommandBuffer,
         binding: u32,
         gpu_va: u64,
         size: vk::DeviceSize,
@@ -1250,13 +1251,14 @@ impl BufferCache {
         use_dynamic_stride: bool,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         staging_pool: &mut StagingBufferPool,
-        upload_cmd: vk::CommandBuffer,
+        scheduler: &mut Scheduler,
     ) {
-        let (buffer, offset) = self.get_or_upload(gpu_va, size, read_gpu, staging_pool, upload_cmd);
-        unsafe {
+        let (buffer, offset) = self.get_or_upload(gpu_va, size, read_gpu, staging_pool, scheduler);
+        let device = self.device.clone();
+        scheduler.record(move |cmdbuf| unsafe {
             if use_dynamic_stride {
-                self.device.cmd_bind_vertex_buffers2(
-                    cmd,
+                device.cmd_bind_vertex_buffers2(
+                    cmdbuf,
                     binding,
                     &[buffer],
                     &[offset],
@@ -1264,54 +1266,50 @@ impl BufferCache {
                     Some(&[stride]),
                 );
             } else {
-                self.device
-                    .cmd_bind_vertex_buffers(cmd, binding, &[buffer], &[offset]);
+                device.cmd_bind_vertex_buffers(cmdbuf, binding, &[buffer], &[offset]);
             }
-        }
+        });
     }
 
     /// Bind an index buffer.
     pub fn bind_index_buffer(
         &mut self,
-        cmd: vk::CommandBuffer,
         gpu_va: u64,
         size: vk::DeviceSize,
         index_type: vk::IndexType,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         staging_pool: &mut StagingBufferPool,
-        upload_cmd: vk::CommandBuffer,
+        scheduler: &mut Scheduler,
     ) {
-        let (buffer, offset) = self.get_or_upload(gpu_va, size, read_gpu, staging_pool, upload_cmd);
-        unsafe {
-            self.device
-                .cmd_bind_index_buffer(cmd, buffer, offset, index_type);
-        }
+        let (buffer, offset) = self.get_or_upload(gpu_va, size, read_gpu, staging_pool, scheduler);
+        let device = self.device.clone();
+        scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_bind_index_buffer(cmdbuf, buffer, offset, index_type);
+        });
     }
 
     /// Port-facing equivalent of `BufferCacheRuntime::BindQuadIndexBuffer`.
     pub fn bind_quad_index_buffer(
         &mut self,
-        cmd: vk::CommandBuffer,
         topology: PrimitiveTopology,
         first: u32,
         count: u32,
         staging_pool: &mut StagingBufferPool,
-        upload_cmd: vk::CommandBuffer,
+        scheduler: &mut Scheduler,
     ) {
         let indices = make_quad_array_indices(topology, first, count);
         let cache_key = quad_index_cache_key(topology, first, count, 0, 0, false);
         let data = indices_as_bytes(&indices);
-        let (buffer, offset) = self.get_or_upload_bytes(cache_key, data, staging_pool, upload_cmd);
-        unsafe {
-            self.device
-                .cmd_bind_index_buffer(cmd, buffer, offset, vk::IndexType::UINT32);
-        }
+        let (buffer, offset) = self.get_or_upload_bytes(cache_key, data, staging_pool, scheduler);
+        let device = self.device.clone();
+        scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_bind_index_buffer(cmdbuf, buffer, offset, vk::IndexType::UINT32);
+        });
     }
 
     /// Port-facing equivalent of `BufferCacheRuntime::BindIndexBuffer` for quad topologies.
     pub fn bind_quad_indexed_buffer(
         &mut self,
-        cmd: vk::CommandBuffer,
         topology: PrimitiveTopology,
         index_format: IndexFormat,
         base_vertex: i32,
@@ -1320,7 +1318,7 @@ impl BufferCache {
         gpu_va: u64,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         staging_pool: &mut StagingBufferPool,
-        upload_cmd: vk::CommandBuffer,
+        scheduler: &mut Scheduler,
     ) {
         let indices = make_quad_indexed_indices(
             topology,
@@ -1340,11 +1338,11 @@ impl BufferCache {
             true,
         );
         let data = indices_as_bytes(&indices);
-        let (buffer, offset) = self.get_or_upload_bytes(cache_key, data, staging_pool, upload_cmd);
-        unsafe {
-            self.device
-                .cmd_bind_index_buffer(cmd, buffer, offset, vk::IndexType::UINT32);
-        }
+        let (buffer, offset) = self.get_or_upload_bytes(cache_key, data, staging_pool, scheduler);
+        let device = self.device.clone();
+        scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_bind_index_buffer(cmdbuf, buffer, offset, vk::IndexType::UINT32);
+        });
     }
 
     /// Invalidate a cached buffer range (mark as stale).
@@ -1549,25 +1547,6 @@ fn quad_index_cache_key(
     key ^= gpu_va.rotate_left(17);
     key ^= (base_vertex as u64).rotate_left(7);
     key ^ if indexed { 1u64 << 55 } else { 0 }
-}
-
-/// Port of upstream `BufferCacheRuntime::PostCopyBarrier`.
-fn post_copy_barrier(device: &ash::Device, cmd: vk::CommandBuffer) {
-    let write_barrier = vk::MemoryBarrier::builder()
-        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-        .build();
-    unsafe {
-        device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::DependencyFlags::empty(),
-            std::slice::from_ref(&write_barrier),
-            &[],
-            &[],
-        );
-    }
 }
 
 fn vertex_binding_count(min_index: u32, max_index: u32, device_max: u32) -> u32 {

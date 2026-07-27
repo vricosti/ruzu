@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::engine_upload;
-use super::{ClassId, Engine, Framebuffer, PendingWrite, ENGINE_REG_COUNT};
+use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
 use crate::descriptor_table::{TicTable, TscTable};
 use crate::dirty_flags;
 use crate::engines::draw_manager as dm;
@@ -2156,8 +2156,6 @@ pub struct Maxwell3D {
     pub interface_state: EngineInterfaceState,
     /// Whether conditional rendering is active.
     execute_on: bool,
-    /// Pending framebuffer output from clear operations.
-    pending_framebuffer: Option<Framebuffer>,
     /// Upstream owner `DirtyState dirty`.
     dirty: DirtyState,
     /// Upstream owner `std::unique_ptr<DrawManager> draw_manager`.
@@ -2282,7 +2280,6 @@ impl Maxwell3D {
                 current_dma_segment: 0,
             },
             execute_on: true,
-            pending_framebuffer: None,
             dirty: DirtyState::new(),
             draw_manager: dm::DrawManager::new(),
             cb_bindings: [[ConstBufferBinding::default(); MAX_CB_SLOTS]; NUM_SHADER_STAGES],
@@ -3347,8 +3344,14 @@ impl Maxwell3D {
     // ── Draw call accessors ──────────────────────────────────────────────
 
     /// Drain accumulated draw call records.
+    #[cfg(test)]
     pub fn take_draw_calls(&mut self) -> Vec<DrawCall> {
         self.with_draw_manager(|draw_manager, _| draw_manager.take_compat_draw_calls())
+    }
+
+    #[cfg(not(test))]
+    pub fn take_draw_calls(&mut self) -> Vec<DrawCall> {
+        Vec::new()
     }
 
     // ── Instance / base vertex accessors ─────────────────────────────────
@@ -3958,10 +3961,6 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         } else {
             SamplerBinding::Independently
         }
-    }
-
-    fn set_pending_framebuffer(&mut self, framebuffer: crate::engines::Framebuffer) {
-        self.pending_framebuffer = Some(framebuffer);
     }
 }
 
@@ -5260,10 +5259,6 @@ impl Engine for Maxwell3D {
         <Self as EngineInterface>::call_method(self, method, value, true);
     }
 
-    fn take_framebuffer(&mut self) -> Option<Framebuffer> {
-        self.pending_framebuffer.take()
-    }
-
     fn execute_pending(&mut self, _read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
         std::mem::take(&mut self.pending_semaphore_writes)
     }
@@ -5539,95 +5534,16 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_clear_produces_framebuffer() {
-        let mut engine = Maxwell3D::new();
-        let rt0_base = RT_BASE as usize;
-
-        // Configure RT0: 4x2 pixels, A8B8G8R8_UNORM, address 0x1000.
-        engine.regs[rt0_base + RT_OFF_ADDRESS_HIGH as usize] = 0;
-        engine.regs[rt0_base + RT_OFF_ADDRESS_LOW as usize] = 0x1000;
-        engine.regs[rt0_base + RT_OFF_WIDTH as usize] = 4;
-        engine.regs[rt0_base + RT_OFF_HEIGHT as usize] = 2;
-        engine.regs[rt0_base + RT_OFF_FORMAT as usize] = RT_FORMAT_A8B8G8R8_UNORM;
-
-        // Set clear color to solid red (R=1, G=0, B=0, A=1).
-        let base = CLEAR_COLOR_BASE as usize;
-        engine.regs[base] = f32::to_bits(1.0);
-        engine.regs[base + 1] = f32::to_bits(0.0);
-        engine.regs[base + 2] = f32::to_bits(0.0);
-        engine.regs[base + 3] = f32::to_bits(1.0);
-
-        // Trigger clear: clear RGBA on RT0 (bits 2-5 set, RT index 0).
-        let flags = (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5); // R|G|B|A
-        engine.call_method(CLEAR_SURFACE, flags, true);
-
-        let fb = engine
-            .take_framebuffer()
-            .expect("Should produce framebuffer");
-        assert_eq!(fb.gpu_va, 0x1000);
-        assert_eq!(fb.width, 4);
-        assert_eq!(fb.height, 2);
-        assert_eq!(fb.pixels.len(), 4 * 2 * 4); // 32 bytes
-
-        // Every pixel should be [255, 0, 0, 255] (red).
-        for chunk in fb.pixels.chunks_exact(4) {
-            assert_eq!(chunk, &[255, 0, 0, 255]);
-        }
-    }
-
-    #[test]
     fn test_call_method_clear_surface_routes_via_draw_manager_clear_owner() {
         let mut engine = Maxwell3D::new();
         let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
         let rasterizer = TestRasterizer::new(calls.clone());
         engine.bind_rasterizer(&rasterizer);
 
-        let rt0_base = RT_BASE as usize;
-        engine.regs[rt0_base + RT_OFF_ADDRESS_HIGH as usize] = 0;
-        engine.regs[rt0_base + RT_OFF_ADDRESS_LOW as usize] = 0x1000;
-        engine.regs[rt0_base + RT_OFF_WIDTH as usize] = 4;
-        engine.regs[rt0_base + RT_OFF_HEIGHT as usize] = 2;
-        engine.regs[rt0_base + RT_OFF_FORMAT as usize] = RT_FORMAT_A8B8G8R8_UNORM;
-
-        let base = CLEAR_COLOR_BASE as usize;
-        engine.regs[base] = f32::to_bits(1.0);
-        engine.regs[base + 1] = f32::to_bits(0.0);
-        engine.regs[base + 2] = f32::to_bits(0.0);
-        engine.regs[base + 3] = f32::to_bits(1.0);
-
         let flags = (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5);
         engine.call_method(CLEAR_SURFACE, flags, true);
 
         assert_eq!(calls.lock().unwrap().clear_layers, vec![1]);
-        let fb = engine
-            .take_framebuffer()
-            .expect("DrawManager::clear should preserve the local framebuffer clear path");
-        assert_eq!(fb.gpu_va, 0x1000);
-        assert_eq!(fb.width, 4);
-        assert_eq!(fb.height, 2);
-    }
-
-    #[test]
-    fn test_clear_with_zero_dimensions_skipped() {
-        let mut engine = Maxwell3D::new();
-        // RT0 has zero width/height — clear should not produce framebuffer.
-        let flags = (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5);
-        engine.call_method(CLEAR_SURFACE, flags, true);
-        assert!(engine.take_framebuffer().is_none());
-    }
-
-    #[test]
-    fn test_clear_depth_only_skipped() {
-        let mut engine = Maxwell3D::new();
-        let rt0_base = RT_BASE as usize;
-        engine.regs[rt0_base + RT_OFF_ADDRESS_LOW as usize] = 0x1000;
-        engine.regs[rt0_base + RT_OFF_WIDTH as usize] = 4;
-        engine.regs[rt0_base + RT_OFF_HEIGHT as usize] = 2;
-        engine.regs[rt0_base + RT_OFF_FORMAT as usize] = RT_FORMAT_A8B8G8R8_UNORM;
-
-        // Only depth clear (bit 0), no color channels.
-        engine.call_method(CLEAR_SURFACE, 1, true);
-        assert!(engine.take_framebuffer().is_none());
     }
 
     #[test]
@@ -5641,60 +5557,17 @@ mod tests {
     }
 
     #[test]
-    fn test_take_framebuffer_returns_none_after_take() {
-        let mut engine = Maxwell3D::new();
-        let rt0_base = RT_BASE as usize;
-        engine.regs[rt0_base + RT_OFF_ADDRESS_LOW as usize] = 0x1000;
-        engine.regs[rt0_base + RT_OFF_WIDTH as usize] = 2;
-        engine.regs[rt0_base + RT_OFF_HEIGHT as usize] = 2;
-        engine.regs[rt0_base + RT_OFF_FORMAT as usize] = RT_FORMAT_A8B8G8R8_UNORM;
-
-        let base = CLEAR_COLOR_BASE as usize;
-        engine.regs[base] = f32::to_bits(0.0);
-        engine.regs[base + 1] = f32::to_bits(1.0);
-        engine.regs[base + 2] = f32::to_bits(0.0);
-        engine.regs[base + 3] = f32::to_bits(1.0);
-
-        let flags = (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5);
-        engine.call_method(CLEAR_SURFACE, flags, true);
-
-        assert!(engine.take_framebuffer().is_some());
-        // Second take should return None.
-        assert!(engine.take_framebuffer().is_none());
-    }
-
-    #[test]
     fn test_clear_via_write_reg() {
         let mut engine = Maxwell3D::new();
-        let rt0_base = RT_BASE;
-
-        // Write RT0 config via write_reg (as the command processor would).
-        engine.write_reg(rt0_base + RT_OFF_ADDRESS_LOW, 0x5000);
-        engine.write_reg(rt0_base + RT_OFF_WIDTH, 8);
-        engine.write_reg(rt0_base + RT_OFF_HEIGHT, 4);
-        engine.write_reg(rt0_base + RT_OFF_FORMAT, RT_FORMAT_A8B8G8R8_UNORM);
-
-        // Set clear color to blue.
-        engine.write_reg(CLEAR_COLOR_BASE, f32::to_bits(0.0));
-        engine.write_reg(CLEAR_COLOR_BASE + 1, f32::to_bits(0.0));
-        engine.write_reg(CLEAR_COLOR_BASE + 2, f32::to_bits(1.0));
-        engine.write_reg(CLEAR_COLOR_BASE + 3, f32::to_bits(1.0));
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let rasterizer = TestRasterizer::new(calls.clone());
+        engine.bind_rasterizer(&rasterizer);
 
         // Trigger clear via write_reg (this is the actual path).
         let flags = (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5);
         engine.write_reg(CLEAR_SURFACE, flags);
 
-        let fb = engine
-            .take_framebuffer()
-            .expect("Should produce framebuffer");
-        assert_eq!(fb.gpu_va, 0x5000);
-        assert_eq!(fb.width, 8);
-        assert_eq!(fb.height, 4);
-
-        // Every pixel: [0, 0, 255, 255] (blue).
-        for chunk in fb.pixels.chunks_exact(4) {
-            assert_eq!(chunk, &[0, 0, 255, 255]);
-        }
+        assert_eq!(calls.lock().unwrap().clear_layers, vec![1]);
     }
 
     // ── Draw state tracking tests ────────────────────────────────────────

@@ -168,7 +168,8 @@ impl KHardwareTimer {
     }
 
     pub fn register_absolute_task_by_id(&self, thread_id: u64, thread_ptr: usize, task_time: i64) {
-        if std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some() {
+        static TRACE_WAIT_SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TRACE_WAIT_SYNC.get_or_init(|| std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some()) {
             log::info!(
                 "KHardwareTimer::register_absolute_task_by_id tid={} task_time={} now_tick={}",
                 thread_id,
@@ -342,7 +343,8 @@ impl KHardwareTimer {
     /// Called by the CoreTiming callback.
     /// Matches upstream: `KHardwareTimer::DoTask()`
     fn do_task(&self) {
-        let trace = std::env::var_os("RUZU_TRACE_CT_FIRE").is_some();
+        static TRACE_CT_FIRE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let trace = *TRACE_CT_FIRE.get_or_init(|| std::env::var_os("RUZU_TRACE_CT_FIRE").is_some());
         if trace {
             log::info!("KHardwareTimer::do_task entry");
         }

@@ -234,7 +234,9 @@ impl CommandListProcessor {
             }
 
             if header.enabled != 0 {
-                let trace_mix_buffers = std::env::var_os("RUZU_TRACE_MIX_BUFFER_CLIP").is_some();
+                static TRACE_MIX_BUFFERS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let trace_mix_buffers = *TRACE_MIX_BUFFERS
+                    .get_or_init(|| std::env::var_os("RUZU_TRACE_MIX_BUFFER_CLIP").is_some());
                 let before_mix_stats = trace_mix_buffers.then(|| self.mix_buffer_trace_stats());
                 self.process_command(
                     &header,
@@ -267,7 +269,8 @@ impl CommandListProcessor {
     }
 
     fn process_command(&mut self, header: &CommandHeader, payload_addr: CpuAddr) {
-        if std::env::var_os("RUZU_TRACE_DSPCMD").is_some() {
+        static TRACE_DSP_COMMANDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TRACE_DSP_COMMANDS.get_or_init(|| std::env::var_os("RUZU_TRACE_DSPCMD").is_some()) {
             use std::sync::atomic::{AtomicU64, Ordering};
             static COUNTS: [AtomicU64; 32] = [
                 AtomicU64::new(0),

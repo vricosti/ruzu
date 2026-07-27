@@ -102,7 +102,7 @@ pub fn process_aux_command(payload: &AuxPayload, mix_buffers: &mut [i32], sample
             payload.write_offset,
             payload.update_count,
         );
-        if std::env::var_os("RUZU_ZERO_AUX_OUTPUT").is_some() {
+        if zero_aux_output_enabled() {
             mix_buffers[output_range.clone()].fill(0);
         }
         if read != sample_count as u32 {
@@ -277,7 +277,7 @@ fn write_aux_info(addr: CpuAddr, info: &AuxInfoDsp) -> bool {
         return false;
     }
     let ok = guest_write_block(addr as u64, aux_info_as_bytes(info));
-    if !ok && std::env::var_os("RUZU_PROFILE_AUX_DSP").is_some() {
+    if !ok && profile_aux_dsp_enabled() {
         let n = AUX_INFO_WRITE_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 1 || n % 5000 == 0 {
             log::info!("AUX_DSP info_write_fail count={} addr=0x{:X}", n, addr);
@@ -287,7 +287,7 @@ fn write_aux_info(addr: CpuAddr, info: &AuxInfoDsp) -> bool {
 }
 
 fn profile_aux_process(payload: &AuxPayload, sample_count: usize) {
-    if std::env::var_os("RUZU_PROFILE_AUX_DSP").is_none() {
+    if !profile_aux_dsp_enabled() {
         return;
     }
     let n = AUX_PROCESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -311,7 +311,7 @@ fn profile_aux_process(payload: &AuxPayload, sample_count: usize) {
 }
 
 fn profile_aux_write_result(written: u32, expected: u32) {
-    if std::env::var_os("RUZU_PROFILE_AUX_DSP").is_none() {
+    if !profile_aux_dsp_enabled() {
         return;
     }
     let counter = if written == expected {
@@ -332,7 +332,7 @@ fn profile_aux_write_result(written: u32, expected: u32) {
 }
 
 fn profile_aux_read_result(read: u32, expected: u32) {
-    if std::env::var_os("RUZU_PROFILE_AUX_DSP").is_none() {
+    if !profile_aux_dsp_enabled() {
         return;
     }
     let counter = if read == expected {
@@ -363,7 +363,7 @@ fn trace_bad_aux_read(
     samples: &[i32],
     info: &AuxInfoDsp,
 ) {
-    if std::env::var_os("RUZU_TRACE_AUX_READ_BAD").is_none() {
+    if !trace_bad_aux_read_enabled() {
         return;
     }
     let Some((index, value)) =
@@ -396,7 +396,7 @@ fn trace_bad_aux_read(
 }
 
 fn sanitize_bad_aux_return_samples(samples: &mut [i32]) {
-    if std::env::var_os("RUZU_SANITIZE_AUX_RETURN").is_none() {
+    if !sanitize_aux_return_enabled() {
         return;
     }
     for sample in samples {
@@ -404,6 +404,26 @@ fn sanitize_bad_aux_return_samples(samples: &mut [i32]) {
             *sample = 0;
         }
     }
+}
+
+fn zero_aux_output_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_ZERO_AUX_OUTPUT").is_some())
+}
+
+fn profile_aux_dsp_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_AUX_DSP").is_some())
+}
+
+fn trace_bad_aux_read_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_AUX_READ_BAD").is_some())
+}
+
+fn sanitize_aux_return_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_SANITIZE_AUX_RETURN").is_some())
 }
 
 fn aux_info_as_bytes(info: &AuxInfoDsp) -> &[u8] {

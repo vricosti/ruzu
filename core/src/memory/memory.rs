@@ -45,7 +45,10 @@ fn new_rasterizer_read_areas(
 }
 
 fn record_rasterizer_mark_cached_stage(stage: usize) {
-    if std::env::var_os("RUZU_PROFILE_RASTERIZER_MARK_CACHED_STALL").is_none() {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED
+        .get_or_init(|| std::env::var_os("RUZU_PROFILE_RASTERIZER_MARK_CACHED_STALL").is_some())
+    {
         return;
     }
     RASTERIZER_MARK_CACHED_LAST_STAGE.store(stage as u64, Ordering::Relaxed);
@@ -2250,8 +2253,6 @@ impl Memory {
             return;
         }
         let buffer = unsafe { &*self.buffer };
-        let dm = unsafe { &*self.device_memory };
-        let backing_base = buffer.backing_base_pointer() as usize;
         let backing_size = buffer.backing_size();
         // Translate phys → host pointer (DeviceMemory is identity-mapped
         // from `dram_memory_map::BASE` into the host backing buffer).
@@ -2274,10 +2275,7 @@ impl Memory {
             );
             return;
         }
-        let _ = dm; // silences unused warning if device_memory accessor not needed
-        unsafe {
-            std::ptr::write_bytes((backing_base + host_offset) as *mut u8, 0u8, size);
-        }
+        buffer.clear_backing_region(host_offset, size, 0);
     }
 
     /// Read a block from physical DeviceMemory backing.
@@ -2903,6 +2901,58 @@ mod cmpxchg16b_tests {
         let ok2 = unsafe { cmpxchg16b(slot.0.as_mut_ptr() as *mut u8, 0, 0, u64::MAX, u64::MAX) };
         assert!(ok2);
         assert_eq!(slot.0, [0, 0]);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod zero_phys_block_tests {
+    use super::{dram_memory_map, DeviceMemory, Memory};
+    use crate::core::{System, SystemRef};
+
+    #[test]
+    fn zero_phys_block_discards_resident_backing_pages() {
+        const OFFSET: usize = 0x4000;
+        const SIZE: usize = 0x4000;
+
+        let system = System::new_for_test();
+        let device_memory = Box::new(DeviceMemory::with_size(0x20_000));
+        let memory = unsafe {
+            Memory::new(
+                SystemRef::from_ref(&system),
+                &*device_memory,
+                &device_memory.buffer,
+            )
+        };
+        let pointer = unsafe { device_memory.buffer.backing_base_pointer().add(OFFSET) };
+        unsafe {
+            std::ptr::write_bytes(pointer, 0xA5, SIZE);
+        }
+
+        let mut residency = [0u8; SIZE / 0x1000];
+        let before = unsafe {
+            libc::mincore(
+                pointer.cast(),
+                SIZE,
+                residency.as_mut_ptr().cast::<libc::c_uchar>(),
+            )
+        };
+        assert_eq!(before, 0);
+        assert!(residency.iter().all(|entry| entry & 1 != 0));
+
+        memory.zero_phys_block(dram_memory_map::BASE + OFFSET as u64, SIZE);
+
+        residency.fill(0);
+        let after = unsafe {
+            libc::mincore(
+                pointer.cast(),
+                SIZE,
+                residency.as_mut_ptr().cast::<libc::c_uchar>(),
+            )
+        };
+        assert_eq!(after, 0);
+        assert!(residency.iter().all(|entry| entry & 1 == 0));
+        let bytes = unsafe { std::slice::from_raw_parts(pointer, SIZE) };
+        assert!(bytes.iter().all(|byte| *byte == 0));
     }
 }
 

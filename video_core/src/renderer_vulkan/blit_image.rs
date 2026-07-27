@@ -19,7 +19,9 @@ use crate::host_shaders::spirv_shaders::{
     VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV, VULKAN_COLOR_CLEAR_FRAG_SPV, VULKAN_COLOR_CLEAR_VERT_SPV,
     VULKAN_DEPTHSTENCIL_CLEAR_FRAG_SPV,
 };
-use crate::renderer_vulkan::descriptor_pool::{DescriptorBankInfo, DescriptorPool};
+use crate::renderer_vulkan::descriptor_pool::{
+    DescriptorAllocator, DescriptorBankInfo, DescriptorPool,
+};
 use crate::renderer_vulkan::scheduler::Scheduler;
 use crate::renderer_vulkan::shader_util::build_shader;
 use crate::texture_cache::types::NUM_RT;
@@ -448,12 +450,13 @@ fn ensure_conversion_pipeline(
 pub struct BlitImageHelper {
     device: ash::Device,
     scheduler: NonNull<Scheduler>,
-    descriptor_pool: NonNull<DescriptorPool>,
     shader_stencil_export_supported: bool,
 
     // Descriptor layouts
     one_texture_set_layout: vk::DescriptorSetLayout,
     two_textures_set_layout: vk::DescriptorSetLayout,
+    one_texture_descriptor_allocator: DescriptorAllocator,
+    two_textures_descriptor_allocator: DescriptorAllocator,
 
     // Pipeline layouts
     one_texture_pipeline_layout: vk::PipelineLayout,
@@ -677,14 +680,21 @@ impl BlitImageHelper {
             .expect("Failed to build convert_d24s8_to_abgr8.frag");
         let convert_s8d24_to_abgr8_frag = build_shader(&device, CONVERT_S8D24_TO_ABGR8_FRAG_SPV)
             .expect("Failed to build convert_s8d24_to_abgr8.frag");
+        let one_texture_descriptor_allocator = descriptor_pool
+            .allocator(one_texture_set_layout, &Self::ONE_TEXTURE_BANK_INFO)
+            .expect("Failed to create one-texture descriptor allocator");
+        let two_textures_descriptor_allocator = descriptor_pool
+            .allocator(two_textures_set_layout, &Self::TWO_TEXTURES_BANK_INFO)
+            .expect("Failed to create two-texture descriptor allocator");
 
         BlitImageHelper {
             device,
             scheduler: NonNull::from(scheduler),
-            descriptor_pool: NonNull::from(descriptor_pool),
             shader_stencil_export_supported,
             one_texture_set_layout,
             two_textures_set_layout,
+            one_texture_descriptor_allocator,
+            two_textures_descriptor_allocator,
             one_texture_pipeline_layout,
             two_textures_pipeline_layout,
             clear_color_pipeline_layout,
@@ -723,6 +733,14 @@ impl BlitImageHelper {
         }
     }
 
+    fn commit_descriptor(
+        &self,
+        allocator: &DescriptorAllocator,
+    ) -> Result<vk::DescriptorSet, vk::Result> {
+        let scheduler = unsafe { self.scheduler.as_ref() };
+        allocator.commit(scheduler.known_gpu_tick(), scheduler.pending_tick())
+    }
+
     pub fn shader_stencil_export_supported(&self) -> bool {
         self.shader_stencil_export_supported
     }
@@ -758,10 +776,7 @@ impl BlitImageHelper {
             self.nearest_sampler
         };
         let descriptor_set = {
-            let descriptor_pool = unsafe { self.descriptor_pool.as_ref() };
-            match descriptor_pool
-                .allocate(self.one_texture_set_layout, &Self::ONE_TEXTURE_BANK_INFO)
-            {
+            match self.commit_descriptor(&self.one_texture_descriptor_allocator) {
                 Ok(set) => set,
                 Err(err) => {
                     log::warn!(
@@ -829,10 +844,7 @@ impl BlitImageHelper {
             }
         };
         let descriptor_set = {
-            let descriptor_pool = unsafe { self.descriptor_pool.as_ref() };
-            match descriptor_pool
-                .allocate(self.one_texture_set_layout, &Self::ONE_TEXTURE_BANK_INFO)
-            {
+            match self.commit_descriptor(&self.one_texture_descriptor_allocator) {
                 Ok(set) => set,
                 Err(err) => {
                     log::warn!(
@@ -955,10 +967,7 @@ impl BlitImageHelper {
         let layout = self.two_textures_pipeline_layout;
         let sampler = self.nearest_sampler;
         let descriptor_set = {
-            let descriptor_pool = unsafe { self.descriptor_pool.as_ref() };
-            match descriptor_pool
-                .allocate(self.two_textures_set_layout, &Self::TWO_TEXTURES_BANK_INFO)
-            {
+            match self.commit_descriptor(&self.two_textures_descriptor_allocator) {
                 Ok(set) => set,
                 Err(err) => {
                     log::warn!(
@@ -1383,10 +1392,7 @@ impl BlitImageHelper {
         }
         let extent = conversion_extent(src_image_view);
         let descriptor_set = {
-            let descriptor_pool = unsafe { self.descriptor_pool.as_ref() };
-            match descriptor_pool
-                .allocate(self.one_texture_set_layout, &Self::ONE_TEXTURE_BANK_INFO)
-            {
+            match self.commit_descriptor(&self.one_texture_descriptor_allocator) {
                 Ok(set) => set,
                 Err(err) => {
                     log::warn!(
@@ -1466,10 +1472,7 @@ impl BlitImageHelper {
         }
         let extent = conversion_extent(src_image_view);
         let descriptor_set = {
-            let descriptor_pool = unsafe { self.descriptor_pool.as_ref() };
-            match descriptor_pool
-                .allocate(self.two_textures_set_layout, &Self::TWO_TEXTURES_BANK_INFO)
-            {
+            match self.commit_descriptor(&self.two_textures_descriptor_allocator) {
                 Ok(set) => set,
                 Err(err) => {
                     log::warn!(

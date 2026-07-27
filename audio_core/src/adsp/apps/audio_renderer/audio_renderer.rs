@@ -15,7 +15,13 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 fn should_trace_adsp_audio() -> bool {
-    std::env::var_os("RUZU_TRACE_ADSP_AUDIO").is_some()
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_ADSP_AUDIO").is_some())
+}
+
+fn should_profile_adsp() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_ADSP").is_some())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,7 +336,7 @@ impl AudioRenderer {
                     }
                     // Per-step timing profile. Enabled by `RUZU_PROFILE_ADSP=1`.
                     // Measures where each Render iteration spends its ~24ms.
-                    let profile = std::env::var_os("RUZU_PROFILE_ADSP").is_some();
+                    let profile = should_profile_adsp();
                     let prof_iter_start = std::time::Instant::now();
                     let mut prof_shutdown_check_us = 0u128;
                     let mut prof_timing_lock_us = 0u128;

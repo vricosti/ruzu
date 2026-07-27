@@ -9,7 +9,7 @@
 use ash::vk;
 use std::ptr::NonNull;
 
-use super::descriptor_pool::{DescriptorBankInfo as PoolDescriptorBankInfo, DescriptorPool};
+use super::descriptor_pool::{DescriptorAllocator, DescriptorBankInfo, DescriptorPool};
 use super::scheduler::Scheduler;
 use super::update_descriptor::ComputePassDescriptorQueue;
 use crate::host_shaders::spirv_shaders::ASTC_DECODER_COMP_SPV;
@@ -76,22 +76,6 @@ fn write_barrier_index() -> vk::MemoryBarrier {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DescriptorBankInfo
-// ---------------------------------------------------------------------------
-
-/// Port of `DescriptorBankInfo` struct used for descriptor allocation scoring.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DescriptorBankInfo {
-    pub uniform_buffers: u32,
-    pub storage_buffers: u32,
-    pub texture_buffers: u32,
-    pub image_buffers: u32,
-    pub textures: u32,
-    pub images: u32,
-    pub score: u32,
-}
-
 /// Bank info for input/output storage buffer passes (Uint8, QuadIndexed).
 const INPUT_OUTPUT_BANK_INFO: DescriptorBankInfo = DescriptorBankInfo {
     uniform_buffers: 0,
@@ -149,6 +133,7 @@ pub struct ComputePass {
     pub layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
+    pub descriptor_allocator: DescriptorAllocator,
     module: vk::ShaderModule,
 }
 
@@ -160,8 +145,10 @@ impl ComputePass {
     /// and SPIR-V code.
     pub fn new(
         device: &ash::Device,
+        descriptor_pool: &DescriptorPool,
         bindings: &[vk::DescriptorSetLayoutBinding],
         templates: &[vk::DescriptorUpdateTemplateEntry],
+        bank_info: &DescriptorBankInfo,
         push_constants: &[vk::PushConstantRange],
         code: &[u32],
         _optional_subgroup_size: Option<u32>,
@@ -172,6 +159,7 @@ impl ComputePass {
             .build();
         let descriptor_set_layout =
             unsafe { device.create_descriptor_set_layout(&layout_ci, None)? };
+        let descriptor_allocator = descriptor_pool.allocator(descriptor_set_layout, bank_info)?;
 
         // Create pipeline layout
         let set_layouts = [descriptor_set_layout];
@@ -233,6 +221,7 @@ impl ComputePass {
             layout,
             pipeline,
             descriptor_set_layout,
+            descriptor_allocator,
             module,
         })
     }
@@ -516,7 +505,6 @@ impl QueriesPrefixScanPass {
 /// GPU-accelerated ASTC texture decoding via compute shader.
 pub struct AstcDecoderPass {
     base: ComputePass,
-    descriptor_pool: NonNull<DescriptorPool>,
     compute_pass_descriptor_queue: NonNull<ComputePassDescriptorQueue>,
 }
 
@@ -574,15 +562,16 @@ impl AstcDecoderPass {
         }];
         let base = ComputePass::new(
             device,
+            descriptor_pool,
             &bindings,
             &templates,
+            &ASTC_BANK_INFO,
             &push_constants,
             ASTC_DECODER_COMP_SPV,
             None,
         )?;
         Ok(AstcDecoderPass {
             base,
-            descriptor_pool: NonNull::from(descriptor_pool),
             compute_pass_descriptor_queue: NonNull::from(compute_pass_descriptor_queue),
         })
     }
@@ -685,19 +674,11 @@ impl AstcDecoderPass {
             }
 
             let descriptor_set = {
-                let descriptor_pool = unsafe { self.descriptor_pool.as_ref() };
-                match descriptor_pool.allocate(
-                    self.base.descriptor_set_layout,
-                    &PoolDescriptorBankInfo {
-                        uniform_buffers: 0,
-                        storage_buffers: 1,
-                        texture_buffers: 0,
-                        image_buffers: 0,
-                        textures: 0,
-                        images: 1,
-                        score: 2,
-                    },
-                ) {
+                match self
+                    .base
+                    .descriptor_allocator
+                    .commit(scheduler.known_gpu_tick(), scheduler.pending_tick())
+                {
                     Ok(set) => set,
                     Err(err) => {
                         log::warn!(
@@ -817,7 +798,6 @@ pub struct MsaaCopyPass {
     base: ComputePass,
     modules: [vk::ShaderModule; 2],
     pipelines: [vk::Pipeline; 2],
-    descriptor_pool: NonNull<DescriptorPool>,
     compute_pass_descriptor_queue: NonNull<ComputePassDescriptorQueue>,
 }
 
@@ -855,8 +835,10 @@ impl MsaaCopyPass {
         }];
         let base = ComputePass::new(
             device,
+            descriptor_pool,
             &bindings,
             &templates,
+            &MSAA_BANK_INFO,
             &[],
             CONVERT_NON_MSAA_TO_MSAA_COMP_SPV,
             None,
@@ -914,7 +896,6 @@ impl MsaaCopyPass {
             base,
             modules: [module0, module1],
             pipelines: [pipeline0, pipeline1],
-            descriptor_pool: NonNull::from(descriptor_pool),
             compute_pass_descriptor_queue: NonNull::from(compute_pass_descriptor_queue),
         })
     }
@@ -925,6 +906,7 @@ impl MsaaCopyPass {
     pub fn copy_image(
         &mut self,
         device: &ash::Device,
+        scheduler: &Scheduler,
         cmdbuf: vk::CommandBuffer,
         dst_image: vk::Image,
         src_view: vk::ImageView,
@@ -936,23 +918,11 @@ impl MsaaCopyPass {
     ) {
         let pipeline_idx = if msaa_to_non_msaa { 1 } else { 0 };
         let msaa_pipeline = self.pipelines[pipeline_idx];
-        let descriptor_set = unsafe {
-            self.descriptor_pool
-                .as_ref()
-                .allocate(
-                    self.base.descriptor_set_layout,
-                    &PoolDescriptorBankInfo {
-                        uniform_buffers: 0,
-                        storage_buffers: 0,
-                        texture_buffers: 0,
-                        image_buffers: 0,
-                        textures: 0,
-                        images: 2,
-                        score: 2,
-                    },
-                )
-                .expect("MSAACopyPass descriptor allocation failed")
-        };
+        let descriptor_set = self
+            .base
+            .descriptor_allocator
+            .commit(scheduler.known_gpu_tick(), scheduler.pending_tick())
+            .expect("MSAACopyPass descriptor allocation failed");
         let descriptor_images = [
             vk::DescriptorImageInfo {
                 sampler: vk::Sampler::null(),
@@ -1039,6 +1009,16 @@ impl MsaaCopyPass {
 
     pub fn descriptor_set_layout(&self) -> vk::DescriptorSetLayout {
         self.base.descriptor_set_layout
+    }
+
+    pub fn commit_descriptor_set(
+        &self,
+        known_gpu_tick: u64,
+        current_tick: u64,
+    ) -> Result<vk::DescriptorSet, vk::Result> {
+        self.base
+            .descriptor_allocator
+            .commit(known_gpu_tick, current_tick)
     }
 }
 

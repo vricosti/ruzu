@@ -118,9 +118,7 @@ fn scheduled_front_with_pinned_thread(
     gsc: &mut super::global_scheduler_context::GlobalSchedulerContext,
     core_id: i32,
 ) -> Option<u64> {
-    let mut top_thread_id = gsc
-        .get_scheduled_front_runnable(core_id)
-        .or_else(|| gsc.recover_scheduled_front_from_runnable(core_id));
+    let mut top_thread_id = gsc.get_scheduled_front(core_id);
 
     // Upstream UpdateHighestPriorityThreadsImpl: if the top thread's
     // process has a pinned thread for this core, prefer that pinned thread
@@ -2142,8 +2140,8 @@ impl KScheduler {
     fn select_next_thread_from_pq(&mut self, process: &Arc<ProcessLock>) -> Option<u64> {
         let process_guard = process.lock().unwrap();
         let gsc = process_guard.global_scheduler_context.as_ref()?;
-        let mut gsc_guard = gsc.lock().unwrap();
-        let next_thread_id = gsc_guard.get_scheduled_front_runnable(self.core_id)?;
+        let gsc_guard = gsc.lock().unwrap();
+        let next_thread_id = gsc_guard.get_scheduled_front(self.core_id)?;
 
         // Handle yield: if the current thread yielded, try the next one.
         if let Some(yielded) = self.yielded_thread_id {

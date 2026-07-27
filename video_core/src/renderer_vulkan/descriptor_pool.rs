@@ -6,10 +6,12 @@
 //! Banked descriptor set allocation pool. Manages multiple VkDescriptorPools
 //! organized into banks by descriptor type requirements.
 
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 
 use ash::vk;
 use log::debug;
+
+use super::resource_pool::ResourcePool;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -33,7 +35,7 @@ const SCORE_THRESHOLD: i32 = 3;
 /// Descriptor type counts for a descriptor bank.
 ///
 /// Port of `DescriptorBankInfo` from `vk_descriptor_pool.h`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct DescriptorBankInfo {
     /// Number of uniform buffer descriptors.
     pub uniform_buffers: u32,
@@ -61,7 +63,7 @@ impl DescriptorBankInfo {
             && self.texture_buffers >= subset.texture_buffers
             && self.image_buffers >= subset.image_buffers
             && self.textures >= subset.textures
-            && self.images >= subset.images
+            && self.images >= subset.image_buffers
     }
 }
 
@@ -88,7 +90,7 @@ fn allocate_pool(
     device: &ash::Device,
     bank: &mut DescriptorBank,
     sets_per_pool: u32,
-) -> Result<(), vk::Result> {
+) -> Result<vk::DescriptorPool, vk::Result> {
     let mut pool_sizes = Vec::with_capacity(6);
     let info = &bank.info;
 
@@ -132,14 +134,6 @@ fn allocate_pool(
         info.images,
     );
 
-    // If no descriptors are needed, add a dummy entry
-    if pool_sizes.is_empty() {
-        pool_sizes.push(vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::UNIFORM_BUFFER,
-            descriptor_count: sets_per_pool,
-        });
-    }
-
     let pool_ci = vk::DescriptorPoolCreateInfo::builder()
         .max_sets(sets_per_pool)
         .pool_sizes(&pool_sizes)
@@ -147,7 +141,103 @@ fn allocate_pool(
 
     let pool = unsafe { device.create_descriptor_pool(&pool_ci, None)? };
     bank.pools.push(pool);
-    Ok(())
+    Ok(pool)
+}
+
+struct DescriptorAllocatorState {
+    resource_pool: ResourcePool,
+    sets: Vec<Vec<vk::DescriptorSet>>,
+}
+
+/// Port of upstream `DescriptorAllocator`.
+///
+/// Each pipeline owns one allocator. The allocator reserves descriptor sets
+/// in groups of `SETS_GROW_RATE` and tags every set with the scheduler tick
+/// that references it.
+pub struct DescriptorAllocator {
+    device: ash::Device,
+    bank: Arc<Mutex<DescriptorBank>>,
+    layout: vk::DescriptorSetLayout,
+    sets_per_pool: u32,
+    state: Mutex<DescriptorAllocatorState>,
+}
+
+impl DescriptorAllocator {
+    fn new(
+        device: ash::Device,
+        bank: Arc<Mutex<DescriptorBank>>,
+        layout: vk::DescriptorSetLayout,
+        sets_per_pool: u32,
+    ) -> Self {
+        Self {
+            device,
+            bank,
+            layout,
+            sets_per_pool,
+            state: Mutex::new(DescriptorAllocatorState {
+                resource_pool: ResourcePool::new_with_external_ticks(SETS_GROW_RATE),
+                sets: Vec::new(),
+            }),
+        }
+    }
+
+    /// Port of `DescriptorAllocator::Commit`.
+    pub fn commit(
+        &self,
+        known_gpu_tick: u64,
+        current_tick: u64,
+    ) -> Result<vk::DescriptorSet, vk::Result> {
+        let mut state = self.state.lock().unwrap();
+        let device = self.device.clone();
+        let bank = Arc::clone(&self.bank);
+        let layout = self.layout;
+        let sets_per_pool = self.sets_per_pool;
+        let DescriptorAllocatorState {
+            resource_pool,
+            sets,
+        } = &mut *state;
+        let mut allocate = |begin: usize, end: usize| {
+            sets.push(Self::allocate_descriptors(
+                &device,
+                &bank,
+                layout,
+                end - begin,
+                sets_per_pool,
+            )?);
+            Ok(())
+        };
+        let index = resource_pool.try_commit_resource_with_ticks(
+            known_gpu_tick,
+            current_tick,
+            &mut allocate,
+        )?;
+        Ok(sets[index / SETS_GROW_RATE][index % SETS_GROW_RATE])
+    }
+
+    /// Port of `DescriptorAllocator::AllocateDescriptors`.
+    fn allocate_descriptors(
+        device: &ash::Device,
+        bank: &Arc<Mutex<DescriptorBank>>,
+        layout: vk::DescriptorSetLayout,
+        count: usize,
+        sets_per_pool: u32,
+    ) -> Result<Vec<vk::DescriptorSet>, vk::Result> {
+        let layouts = vec![layout; count];
+        let mut bank = bank.lock().unwrap();
+        let mut allocate_info = vk::DescriptorSetAllocateInfo::builder()
+            .descriptor_pool(*bank.pools.last().expect("descriptor bank has no pool"))
+            .set_layouts(&layouts)
+            .build();
+        match unsafe { device.allocate_descriptor_sets(&allocate_info) } {
+            Ok(sets) => Ok(sets),
+            Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY) => {
+                let pool = allocate_pool(device, &mut bank, sets_per_pool)?;
+                allocate_info.descriptor_pool = pool;
+                unsafe { device.allocate_descriptor_sets(&allocate_info) }
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -169,19 +259,7 @@ pub struct DescriptorPool {
 
 struct BanksState {
     bank_infos: Vec<DescriptorBankInfo>,
-    banks: Vec<DescriptorBank>,
-    /// Pools retired at a frame boundary, reset and returned to their bank
-    /// only once the GPU has passed `retire_tick`. Mirrors upstream's
-    /// tick-tagged `DescriptorAllocator` ring: with pipelined submissions a
-    /// pool must not be reset while an in-flight command buffer still
-    /// references sets allocated from it.
-    retired: Vec<RetiredPools>,
-}
-
-struct RetiredPools {
-    retire_tick: u64,
-    bank_index: usize,
-    pools: Vec<vk::DescriptorPool>,
+    banks: Vec<Arc<Mutex<DescriptorBank>>>,
 }
 
 impl DescriptorPool {
@@ -193,174 +271,47 @@ impl DescriptorPool {
             banks_lock: RwLock::new(BanksState {
                 bank_infos: Vec::new(),
                 banks: Vec::new(),
-                retired: Vec::new(),
             }),
         }
     }
 
-    /// Allocate a descriptor set for the given layout and bank requirements.
-    ///
-    /// Port of `DescriptorAllocator::Commit` / `AllocateDescriptors`.
-    pub fn allocate(
+    /// Port of `DescriptorPool::Allocator`.
+    pub fn allocator(
         &self,
         layout: vk::DescriptorSetLayout,
         info: &DescriptorBankInfo,
-    ) -> Result<vk::DescriptorSet, vk::Result> {
-        let bank_pool = self.get_or_create_bank_pool(info)?;
-
-        let layouts = [layout];
-        let alloc_info = vk::DescriptorSetAllocateInfo::builder()
-            .descriptor_pool(bank_pool)
-            .set_layouts(&layouts)
-            .build();
-
-        match unsafe { self.device.allocate_descriptor_sets(&alloc_info) } {
-            Ok(sets) => Ok(sets[0]),
-            Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY) => {
-                // Pool is full — create a new pool in the bank and retry
-                let bank_pool = self.grow_bank(info)?;
-                let alloc_info = vk::DescriptorSetAllocateInfo::builder()
-                    .descriptor_pool(bank_pool)
-                    .set_layouts(&layouts)
-                    .build();
-                let sets = unsafe { self.device.allocate_descriptor_sets(&alloc_info)? };
-                Ok(sets[0])
-            }
-            Err(e) => Err(e),
-        }
+    ) -> Result<DescriptorAllocator, vk::Result> {
+        let bank = self.bank(info)?;
+        Ok(DescriptorAllocator::new(
+            self.device.clone(),
+            bank,
+            layout,
+            self.sets_per_pool,
+        ))
     }
 
-    /// Allocate multiple descriptor sets at once.
-    pub fn allocate_many(
-        &self,
-        layout: vk::DescriptorSetLayout,
-        info: &DescriptorBankInfo,
-        count: usize,
-    ) -> Result<Vec<vk::DescriptorSet>, vk::Result> {
-        let bank_pool = self.get_or_create_bank_pool(info)?;
-        let layouts: Vec<_> = std::iter::repeat(layout).take(count).collect();
-
-        let alloc_info = vk::DescriptorSetAllocateInfo::builder()
-            .descriptor_pool(bank_pool)
-            .set_layouts(&layouts)
-            .build();
-
-        match unsafe { self.device.allocate_descriptor_sets(&alloc_info) } {
-            Ok(sets) => Ok(sets),
-            Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY) => {
-                let bank_pool = self.grow_bank(info)?;
-                let alloc_info = vk::DescriptorSetAllocateInfo::builder()
-                    .descriptor_pool(bank_pool)
-                    .set_layouts(&layouts)
-                    .build();
-                Ok(unsafe { self.device.allocate_descriptor_sets(&alloc_info)? })
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Reset all pools immediately. Only safe when the GPU is idle (e.g.
-    /// after `Scheduler::finish`); pipelined frames must use `end_frame`.
-    pub fn reset_pools(&self) {
-        let mut state = self.banks_lock.write().unwrap();
-        let state = &mut *state;
-        // Fold retired pools back into their banks first.
-        while let Some(retired) = state.retired.pop() {
-            state.banks[retired.bank_index].pools.extend(retired.pools);
-        }
-        for bank in &state.banks {
-            for pool in &bank.pools {
-                unsafe {
-                    self.device
-                        .reset_descriptor_pool(*pool, vk::DescriptorPoolResetFlags::empty())
-                        .ok();
-                }
-            }
-        }
-    }
-
-    /// Tick-safe frame boundary: retire the pools used up to `current_tick`
-    /// and recycle previously retired pools whose tick the GPU has passed.
-    pub fn end_frame(&self, current_tick: u64, is_free: &dyn Fn(u64) -> bool) {
-        let mut state = self.banks_lock.write().unwrap();
-        let state = &mut *state;
-
-        let mut index = 0;
-        while index < state.retired.len() {
-            if is_free(state.retired[index].retire_tick) {
-                let retired = state.retired.swap_remove(index);
-                for pool in &retired.pools {
-                    unsafe {
-                        self.device
-                            .reset_descriptor_pool(*pool, vk::DescriptorPoolResetFlags::empty())
-                            .ok();
-                    }
-                }
-                state.banks[retired.bank_index].pools.extend(retired.pools);
-            } else {
-                index += 1;
-            }
-        }
-
-        for (bank_index, bank) in state.banks.iter_mut().enumerate() {
-            if bank.pools.is_empty() {
-                continue;
-            }
-            state.retired.push(RetiredPools {
-                retire_tick: current_tick,
-                bank_index,
-                pools: std::mem::take(&mut bank.pools),
-            });
-        }
-    }
-
-    /// Find or create a bank matching the requirements, return its last pool.
-    ///
     /// Port of `DescriptorPool::Bank`.
-    fn get_or_create_bank_pool(
-        &self,
-        reqs: &DescriptorBankInfo,
-    ) -> Result<vk::DescriptorPool, vk::Result> {
-        // Try to find an existing bank with a live pool (read lock).
-        // `end_frame` retires every pool of a bank, so a matching bank may be
-        // empty; fall through to the write path to grow it in that case.
+    fn bank(&self, reqs: &DescriptorBankInfo) -> Result<Arc<Mutex<DescriptorBank>>, vk::Result> {
         {
             let state = self.banks_lock.read().unwrap();
             for (i, bank_info) in state.bank_infos.iter().enumerate() {
                 if (bank_info.score - reqs.score).abs() < SCORE_THRESHOLD
                     && bank_info.is_superset(reqs)
                 {
-                    if let Some(pool) = state.banks[i].pools.last() {
-                        return Ok(*pool);
-                    }
-                    break;
+                    return Ok(Arc::clone(&state.banks[i]));
                 }
             }
         }
 
-        // Not found (or bank emptied by end_frame): create/grow (write lock)
         let mut state = self.banks_lock.write().unwrap();
-
-        // Double-check after acquiring write lock
-        for i in 0..state.bank_infos.len() {
-            let bank_info = state.bank_infos[i];
-            if (bank_info.score - reqs.score).abs() < SCORE_THRESHOLD && bank_info.is_superset(reqs)
-            {
-                if state.banks[i].pools.is_empty() {
-                    allocate_pool(&self.device, &mut state.banks[i], self.sets_per_pool)?;
-                }
-                return Ok(*state.banks[i].pools.last().unwrap());
-            }
-        }
-
         state.bank_infos.push(*reqs);
         let mut bank = DescriptorBank {
             info: *reqs,
             pools: Vec::new(),
         };
         allocate_pool(&self.device, &mut bank, self.sets_per_pool)?;
-        let pool = *bank.pools.last().unwrap();
-        state.banks.push(bank);
+        let bank = Arc::new(Mutex::new(bank));
+        state.banks.push(Arc::clone(&bank));
 
         debug!(
             "DescriptorPool: created new bank (total: {}, score: {})",
@@ -368,21 +319,7 @@ impl DescriptorPool {
             reqs.score
         );
 
-        Ok(pool)
-    }
-
-    /// Grow the bank matching the requirements by adding a new pool.
-    fn grow_bank(&self, reqs: &DescriptorBankInfo) -> Result<vk::DescriptorPool, vk::Result> {
-        let mut state = self.banks_lock.write().unwrap();
-        for (i, bank_info) in state.bank_infos.iter().enumerate() {
-            if (bank_info.score - reqs.score).abs() < SCORE_THRESHOLD && bank_info.is_superset(reqs)
-            {
-                allocate_pool(&self.device, &mut state.banks[i], self.sets_per_pool)?;
-                return Ok(*state.banks[i].pools.last().unwrap());
-            }
-        }
-        // Shouldn't reach here, but create a new bank just in case
-        self.get_or_create_bank_pool(reqs)
+        Ok(bank)
     }
 }
 
@@ -390,14 +327,7 @@ impl Drop for DescriptorPool {
     fn drop(&mut self) {
         let state = self.banks_lock.write().unwrap();
         for bank in &state.banks {
-            for pool in &bank.pools {
-                unsafe {
-                    self.device.destroy_descriptor_pool(*pool, None);
-                }
-            }
-        }
-        for retired in &state.retired {
-            for pool in &retired.pools {
+            for pool in &bank.lock().unwrap().pools {
                 unsafe {
                     self.device.destroy_descriptor_pool(*pool, None);
                 }
@@ -435,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn bank_info_superset_checks_storage_images_independently() {
+    fn bank_info_superset_matches_upstream_image_buffer_comparison() {
         let bank = DescriptorBankInfo {
             image_buffers: 8,
             images: 1,
@@ -449,7 +379,10 @@ mod tests {
             ..DescriptorBankInfo::default()
         };
 
-        assert!(!bank.is_superset(&request));
+        // Keep the exact comparison in local upstream
+        // `DescriptorBankInfo::IsSuperset`: `images` is compared with the
+        // requested image-buffer count.
+        assert!(bank.is_superset(&request));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use ash::vk;
 use ash::vk::Handle;
+use smallvec::SmallVec;
 
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
@@ -20,7 +21,7 @@ use crate::engines::maxwell_dma::dma;
 use crate::framebuffer_config::FramebufferConfig;
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::surface::{PixelFormat, SurfaceType};
-use crate::texture_cache::image_base::{ImageBase, ImageFlagBits};
+use crate::texture_cache::image_base::{AliasedImage, ImageBase, ImageFlagBits};
 use crate::texture_cache::image_info::ImageInfo;
 use crate::texture_cache::image_view_base::{ImageViewBase, ImageViewFlagBits};
 use crate::texture_cache::image_view_info::ImageViewInfo;
@@ -49,7 +50,7 @@ use super::blit_image::{
     Region2D as BlitRegion2D,
 };
 use super::compute_pass::{AstcDecoderPass, MsaaCopyPass};
-use super::descriptor_pool::{DescriptorBankInfo as PoolDescriptorBankInfo, DescriptorPool};
+use super::descriptor_pool::DescriptorPool;
 use super::maxwell_to_vk;
 use super::render_pass_cache::{RenderPassCache, RenderPassKey};
 use super::scheduler::Scheduler;
@@ -1012,7 +1013,6 @@ pub struct TextureCacheRuntime {
     staging_buffer_pool: NonNull<StagingBufferPool>,
     blit_image_helper: NonNull<BlitImageHelper>,
     render_pass_cache: NonNull<RenderPassCache>,
-    descriptor_pool: NonNull<DescriptorPool>,
     compute_pass_descriptor_queue: NonNull<ComputePassDescriptorQueue>,
     astc_decoder_pass: Option<AstcDecoderPass>,
     /// Cached `vkGetPhysicalDeviceFormatProperties` results (upstream caches
@@ -1099,7 +1099,6 @@ impl TextureCacheRuntime {
             staging_buffer_pool: NonNull::from(staging_buffer_pool),
             blit_image_helper: NonNull::from(blit_image_helper),
             render_pass_cache: NonNull::from(render_pass_cache),
-            descriptor_pool: NonNull::from(descriptor_pool),
             compute_pass_descriptor_queue: NonNull::from(compute_pass_descriptor_queue),
             astc_decoder_pass,
             format_properties: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -2019,7 +2018,9 @@ impl TextureCacheRuntime {
         let msaa_to_non_msaa = src.base.info.num_samples > 1 && dst.base.info.num_samples == 1;
         let pipeline = pass.pipeline(msaa_to_non_msaa);
         let layout = pass.layout();
-        let descriptor_set_layout = pass.descriptor_set_layout();
+        let scheduler = unsafe { self.scheduler.as_ref() };
+        let known_gpu_tick = scheduler.known_gpu_tick();
+        let pending_tick = scheduler.pending_tick();
 
         let device = self.device.clone();
         let mut dispatches = Vec::with_capacity(copies.len());
@@ -2064,20 +2065,7 @@ impl TextureCacheRuntime {
                     .as_mut()
                     .add_image(dst_view);
             }
-            let descriptor_set = match unsafe {
-                self.descriptor_pool.as_ref().allocate(
-                    descriptor_set_layout,
-                    &PoolDescriptorBankInfo {
-                        uniform_buffers: 0,
-                        storage_buffers: 0,
-                        texture_buffers: 0,
-                        image_buffers: 0,
-                        textures: 0,
-                        images: 2,
-                        score: 2,
-                    },
-                )
-            } {
+            let descriptor_set = match pass.commit_descriptor_set(known_gpu_tick, pending_tick) {
                 Ok(set) => set,
                 Err(err) => {
                     log::warn!(
@@ -2839,7 +2827,7 @@ impl TextureCache {
         }
 
         let mut images = self.base.collect_images_in_region(cpu_addr, size);
-        images.retain(|&image_id| self.base.slot_images[image_id].is_safe_download());
+        images.retain(|image_id| self.base.slot_images[*image_id].is_safe_download());
         if images.is_empty() {
             return;
         }
@@ -3943,7 +3931,7 @@ impl TextureCache {
     }
 
     fn base_image_exists(&self, image_id: ImageId) -> bool {
-        image_id.is_valid() && self.base.slot_images.iter().any(|(id, _)| id == image_id)
+        self.base.slot_images.contains(image_id)
     }
 
     fn materialize_backend_image(&mut self, image_id: ImageId) -> bool {
@@ -4086,7 +4074,7 @@ impl TextureCache {
     }
 
     fn base_image_exists_in(base: &CommonTextureCache, image_id: ImageId) -> bool {
-        image_id.is_valid() && base.slot_images.iter().any(|(id, _)| id == image_id)
+        base.slot_images.contains(image_id)
     }
 
     fn prepare_pending_join_sibling_rescale_gate(
@@ -4263,8 +4251,12 @@ impl TextureCache {
             return false;
         }
 
-        let image_snapshot = self.base.slot_images[image_id].clone();
-        let mut aliases = image_snapshot
+        let image = &self.base.slot_images[image_id];
+        let image_modification_tick = image.modification_tick;
+        let mut most_recent_tick = image_modification_tick;
+        let mut any_modified = image.flags.contains(ImageFlagBits::GPU_MODIFIED);
+        let mut any_rescaled = image.flags.contains(ImageFlagBits::RESCALED);
+        let mut aliases = image
             .aliased_images
             .iter()
             .filter_map(|alias| {
@@ -4272,21 +4264,17 @@ impl TextureCache {
                     return None;
                 }
                 let alias_image = &self.base.slot_images[alias.id];
-                (image_snapshot.modification_tick < alias_image.modification_tick)
-                    .then(|| alias.clone())
+                if image_modification_tick >= alias_image.modification_tick {
+                    return None;
+                }
+                most_recent_tick = most_recent_tick.max(alias_image.modification_tick);
+                any_modified |= alias_image.flags.contains(ImageFlagBits::GPU_MODIFIED);
+                any_rescaled |= alias_image.flags.contains(ImageFlagBits::RESCALED);
+                Some(alias.clone())
             })
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[AliasedImage; 8]>>();
         if aliases.is_empty() {
             return true;
-        }
-        let mut most_recent_tick = image_snapshot.modification_tick;
-        let mut any_modified = image_snapshot.flags.contains(ImageFlagBits::GPU_MODIFIED);
-        let mut any_rescaled = image_snapshot.flags.contains(ImageFlagBits::RESCALED);
-        for alias in &aliases {
-            let alias_image = &self.base.slot_images[alias.id];
-            most_recent_tick = most_recent_tick.max(alias_image.modification_tick);
-            any_modified |= alias_image.flags.contains(ImageFlagBits::GPU_MODIFIED);
-            any_rescaled |= alias_image.flags.contains(ImageFlagBits::RESCALED);
         }
 
         let can_rescale = Self::image_can_rescale_base(&mut self.base, image_id);
@@ -4746,10 +4734,11 @@ impl TextureCache {
                     .contains(ImageFlagBits::RESCALED);
                 if is_resolve {
                     self.base.slot_images[dst_id].info.rescaleable = true;
-                    let aliases = self.base.slot_images[dst_id].aliased_images.clone();
-                    for alias in aliases {
+                    let aliases = std::mem::take(&mut self.base.slot_images[dst_id].aliased_images);
+                    for alias in &aliases {
                         self.base.slot_images[alias.id].info.rescaleable = true;
                     }
+                    self.base.slot_images[dst_id].aliased_images = aliases;
                 }
             }
             if Self::image_can_rescale_base(&mut self.base, dst_id) {
@@ -5547,13 +5536,9 @@ impl TextureCache {
         self.async_buffers_death_ring.clear();
     }
 
-    pub fn prepare_render_targets_for_render(
-        &mut self,
-        image_ids: &[ImageId],
-        cmd: vk::CommandBuffer,
-    ) {
+    pub fn prepare_render_targets_for_render(&mut self, image_ids: &[ImageId]) {
         for &image_id in image_ids {
-            self.prepare_render_target_image_for_render(image_id, cmd);
+            self.prepare_render_target_image_for_render(image_id);
         }
     }
 
@@ -5561,11 +5546,7 @@ impl TextureCache {
         self.runtime.barrier_feedback_loop();
     }
 
-    fn prepare_render_target_image_for_render(
-        &mut self,
-        image_id: ImageId,
-        _cmd: vk::CommandBuffer,
-    ) {
+    fn prepare_render_target_image_for_render(&mut self, image_id: ImageId) {
         let Some((image, old_layout, aspect)) = self
             .images
             .get(&image_id)
@@ -5595,7 +5576,7 @@ impl TextureCache {
         }
     }
 
-    pub fn prepare_framebuffer_for_present(&mut self, image_id: ImageId, cmd: vk::CommandBuffer) {
+    pub fn prepare_framebuffer_for_present(&mut self, image_id: ImageId) {
         let (image, old_layout) = self
             .images
             .get(&image_id)
@@ -5606,7 +5587,6 @@ impl TextureCache {
         }
         if old_layout != vk::ImageLayout::GENERAL {
             self.transition_layout(
-                cmd,
                 image,
                 old_layout,
                 vk::ImageLayout::GENERAL,
@@ -5873,7 +5853,6 @@ impl TextureCache {
         &mut self,
         index: u32,
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
-        cmd: vk::CommandBuffer,
     ) -> Option<DrawTextureSource> {
         let mut selected = [crate::texture_cache::texture_cache_base::ImageViewInOut {
             index,
@@ -5885,7 +5864,7 @@ impl TextureCache {
         if !view_id.is_valid() || view_id == NULL_IMAGE_VIEW_ID {
             return None;
         }
-        self.materialize_sampled_image_view(view_id, TextureType::Color2D, read_gpu_unsafe, cmd)?;
+        self.materialize_sampled_image_view(view_id, TextureType::Color2D, read_gpu_unsafe)?;
         let view = self.image_views.get(&view_id)?;
         let image_id = view.base.image_id;
         let image = self.images.get(&image_id)?;
@@ -5910,7 +5889,6 @@ impl TextureCache {
         view_id: ImageViewId,
         texture_type: TextureType,
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
-        _cmd: vk::CommandBuffer,
     ) -> Option<vk::ImageView> {
         self.finish_pending_backend_deletions();
         if !view_id.is_valid() || view_id == NULL_IMAGE_VIEW_ID {
@@ -6117,23 +6095,18 @@ impl TextureCache {
 
     /// Record an image layout transition.
     pub fn transition_layout(
-        &self,
-        cmd: vk::CommandBuffer,
+        &mut self,
         image: vk::Image,
         old_layout: vk::ImageLayout,
         new_layout: vk::ImageLayout,
         aspect: vk::ImageAspectFlags,
     ) {
-        unsafe {
-            cmd_transition_layout(
-                self.runtime.device(),
-                cmd,
-                image,
-                old_layout,
-                new_layout,
-                aspect,
-            );
-        }
+        let device = self.runtime.device().clone();
+        let scheduler = self.runtime.scheduler();
+        scheduler.request_outside_renderpass();
+        scheduler.record(move |cmdbuf| unsafe {
+            cmd_transition_layout(&device, cmdbuf, image, old_layout, new_layout, aspect);
+        });
     }
 }
 

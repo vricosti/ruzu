@@ -20,6 +20,7 @@ spirv.workspace = true
 bitflags.workspace = true
 bytemuck.workspace = true
 libc = "0.2"
+smallvec = "1"
 
 [build-dependencies]
 cc = "1"
