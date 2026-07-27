@@ -203,8 +203,8 @@ impl NACP {
     /// Falls back to the first non-empty entry, then AmericanEnglish.
     ///
     /// Upstream selects the entry using `Settings::values.language_index`; a
-    /// hardcoded index 0 means Japanese (the first Switch language code), so a
-    /// title like "Mario Kart 8 Deluxe" would come back as its Japanese
+    /// hardcoded index 0 means Japanese (the first Switch language code), so 
+    /// some title would come back as its Japanese
     /// (katakana) name. `settings::values().language_index` is a `Language`
     /// enum whose ordinal matches the Switch language-code index used by
     /// `LANGUAGE_TO_CODES`.

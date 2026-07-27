@@ -1,8 +1,8 @@
-# Goal: MK8D in-race performance parity
+# Goal: VMRD in-race performance parity
 
 ## Objective
 
-Identify and fix why MK8D runs substantially slower in a race under ruzu than
+Identify and fix why VMRD runs substantially slower in a race under ruzu than
 under yuzu on the same machine.
 
 The investigation must compare equivalent in-race workloads. Boot and menu
@@ -25,7 +25,7 @@ Set these paths for the machine running the investigation:
 ```bash
 export RUZU_ROOT=/path/to/ruzu
 export YUZU_ROOT=/path/to/zuyu
-export MK8D_ROM=/path/to/MarioKart8Deluxe.nsp
+export VMRD_ROM=/path/to/VMRD.nsp
 ```
 
 Use:
@@ -68,7 +68,7 @@ export RUZU_AUTO_LR_REPEAT_COUNT=1
 export RUZU_AUTO_A_DELAY_MS=16000
 export RUZU_AUTO_A_REPEAT_COUNT=11
 export RUZU_AUTO_A_REPEAT_MS=2000
-export RUZU_AUTO_A_MARKER=/tmp/ruzu-mk8d-menu-complete
+export RUZU_AUTO_A_MARKER=/tmp/ruzu-VMRD-menu-complete
 export RUZU_AUTO_A_MARKER_ATTEMPT=11
 export RUZU_AUTO_A_MARKER_DELAY_MS=500
 ```
@@ -96,12 +96,12 @@ Launch ruzu with normal audio:
 
 ```bash
 cd "$RUZU_ROOT"
-rm -f /tmp/ruzu-mk8d-menu-complete
+rm -f /tmp/ruzu-VMRD-menu-complete
 RUST_LOG=error \
 gnome-session-inhibit \
   --inhibit idle \
-  --reason "MK8D performance benchmark" \
-  target/release/ruzu-cmd --renderer vulkan -g "$MK8D_ROM"
+  --reason "VMRD performance benchmark" \
+  target/release/ruzu-cmd --renderer vulkan -g "$VMRD_ROM"
 ```
 
 Before accepting a run, verify that the desktop session is not locked:
@@ -126,7 +126,7 @@ duration and the same scene. Keep raw artifacts under a per-run directory such
 as:
 
 ```text
-/tmp/mk8d-race-perf/
+/tmp/VMRD-race-perf/
   ruzu-before/run-01/
   yuzu/run-01/
   ruzu-after/run-01/
