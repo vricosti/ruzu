@@ -25022,3 +25022,78 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ### Verification
 - Re-read upstream `EmitVectorZeroExtend64` after implementation and compared
   lane semantics.
+## 2026-07-27 — externals/rdynarmic/src/backend/arm64/emit_arm64.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a64.cpp
+
+### Intentional differences
+- Rust emits the two AArch64 instruction words through the local `inst` encoder
+  instead of Oaknut's `LDR` and `AND` methods.
+
+### Unintentional differences (fixed)
+- `A64GetCFlag` was dispatched by the x64 backend but rejected by the ARM64
+  backend. The ARM64 emitter now loads `A64JitState::cpsr_nzcv` and masks
+  `1 << 29`, matching upstream's U1 representation and operation order.
+
+### Missing items
+- None for this targeted opcode.
+
+### Binary layout verification
+- PASS: `cpsr_nzcv` is accessed through `offset_of!(A64JitState, cpsr_nzcv)`;
+  no state layout changed.
+
+### Verification
+- Re-read upstream `EmitIR<IR::Opcode::A64GetCFlag>` after implementation.
+- `test_a64_adc_uses_carry_in` now runs on AArch64 and passes for both carry
+  states.
+## 2026-07-27 — externals/rdynarmic/src/backend/arm64/{emit_arm64_floating_point.rs,inst.rs} vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_floating_point.cpp
+
+### Intentional differences
+- Rust selects the signed/source-width instruction encoder with a match rather
+  than upstream's templated `EmitToFixed` helper.
+
+### Unintentional differences (fixed)
+- Scalar FP-to-32-bit-fixed conversion rejected every nonzero fractional-bit
+  count. It now accepts `fbits` 1 through 32 for `TowardsZero` and emits the
+  matching `FCVTZS` or `FCVTZU` W-from-S/D fixed-point instruction, preserving
+  upstream validation and FPSR loading order.
+
+### Missing items
+- The existing `ToOdd` limitation is unrelated to fixed-point conversion and
+  remains unchanged.
+
+### Binary layout verification
+- PASS: no state or serialized layout changed.
+
+### Verification
+- Re-read upstream `EmitToFixed<32, 32/64, signed>` after implementation.
+- The AArch64 execution regression validates `FCVTZS W0, S1, #8` with
+  `1.5f32`, producing 384.
+
+## 2026-07-27 — externals/rdynarmic/src/backend/arm64/{emit_arm64_vector_floating_point.rs,inst.rs} vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector_floating_point.cpp
+
+### Intentional differences
+- Rust uses explicit instruction encoders instead of Oaknut's arranged-vector
+  register overloads.
+- Invalid IR combinations return an emitter error instead of using upstream
+  assertions.
+
+### Unintentional differences (fixed)
+- `FPVectorRoundInt32` and `FPVectorRoundInt64` were not dispatched by the
+  ARM64 backend. They now emit `FRINTN/P/M/Z/A/X` for `V.4S` and `V.2D`,
+  preserve upstream's exact/FPCR checks, and load FPSR before emission.
+- `FPVectorSqrt32` and `FPVectorSqrt64` were not dispatched by the ARM64
+  backend. They now use the shared two-operand FP path and emit
+  `FSQRT V.4S/V.2D`, matching upstream FPCR and FPSR ordering.
+
+### Missing items
+- None for these targeted opcodes.
+
+### Binary layout verification
+- PASS: no state or serialized layout changed.
+
+### Verification
+- Re-read upstream `EmitIR<FPVectorRoundInt32/64>` after implementation.
+- Apple clang was used to verify all twelve host instruction encodings.
+- AArch64 execution tests pass for tie-even `FRINTN V.4S` and exact
+  `FRINTX V.2D`, including `FPSR.IXC`.
+- Re-read upstream `EmitIR<FPVectorSqrt32/64>` after implementation; the
+  AArch64 execution regression validates all four `V.4S` lanes.
