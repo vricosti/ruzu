@@ -33,6 +33,11 @@ fn should_trace_ipi() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_IPI").is_some())
 }
 
+fn should_trace_ipi_async() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_IPI_ASYNC").is_some())
+}
+
 pub enum PhysicalCoreExecutionControl {
     Continue,
     Yield,
@@ -146,7 +151,7 @@ impl PhysicalCore {
         jit: &mut dyn ArmInterface,
         thread_context: &mut ThreadContext,
     ) {
-        let _ = KScheduler::lock_thread_context_for_runtime(&main_thread);
+        let _ = KScheduler::lock_thread_context_for_runtime(&main_thread, self.m_core_index as i32);
         self.restore_thread_to_jit(jit, thread_context, &main_thread);
         *self.m_runtime.lock().unwrap() = Some(PhysicalCoreRuntime {
             m_current_thread: main_thread,
@@ -170,62 +175,21 @@ impl PhysicalCore {
             .capture_guest_context(thread_context);
     }
 
-    fn write_svc_return_registers_if_runnable(
-        &self,
-        jit: &mut dyn ArmInterface,
-        current_thread: &Arc<KThreadLock>,
-        svc_num: u32,
-        svc_args: &SvcArgs,
-    ) {
-        let current_thread_blocked = {
-            let thread = current_thread.lock().unwrap();
-            thread.get_raw_state() != super::k_thread::ThreadState::RUNNABLE
-        };
-        if current_thread_blocked {
-            log::trace!(
-                "dispatch_supervisor_call: svc=0x{:x} blocked current thread; deferring SVC return registers until wake",
-                svc_num
-            );
-        } else {
-            jit.set_svc_arguments(svc_args);
-        }
-    }
-
     pub fn dispatch_supervisor_call(
         &self,
-        jit: &mut dyn ArmInterface,
-        thread_context: &mut ThreadContext,
-        scheduler: &Arc<Mutex<KScheduler>>,
-        process: &Arc<ProcessLock>,
-        current_thread: &Arc<KThreadLock>,
         svc_num: u32,
-        svc_count: u32,
         is_64bit: bool,
         svc_args: &mut SvcArgs,
         system: &System,
     ) -> bool {
         svc_dispatch::call(system, svc_num, is_64bit, svc_args);
-        if svc_num == SvcId::ExitThread as u32 {
-            // Upstream `svc::ExitThread` enters `KThread::Exit()` and never
-            // returns to guest code. The cooperative Rust port must therefore
-            // not reload SVC results or capture a post-SVC context for the
-            // terminated thread; yield to the scheduler instead.
-            scheduler.lock().unwrap().request_schedule();
-            return false;
-        }
-        self.write_svc_return_registers_if_runnable(jit, current_thread, svc_num, svc_args);
-        log::trace!(
-            "dispatch_supervisor_call: before handoff (svc=0x{:x})",
-            svc_num
-        );
-        let _ = scheduler;
-        let _ = process;
-        self.handoff_after_svc(jit, thread_context, current_thread);
-        log::trace!(
-            "dispatch_supervisor_call: after handoff (svc=0x{:x})",
-            svc_num
-        );
-        true
+
+        // `Svc::Call` reloads return arguments through
+        // `kernel.CurrentPhysicalCore()` after the handler returns. A blocking
+        // SVC may resume this fiber on another host core, so `self` and `jit`
+        // can still refer to the entry core here. Upstream returns from
+        // `PhysicalCore::RunThread` without touching either one.
+        svc_num != SvcId::ExitThread as u32
     }
 
     pub fn run_loop<FSvc, FHalt>(
@@ -286,22 +250,10 @@ impl PhysicalCore {
                         PhysicalCoreExecutionControl::Continue => {}
                     }
 
-                    let continue_thread = self.dispatch_supervisor_call(
-                        jit,
-                        thread_context,
-                        scheduler,
-                        process,
-                        &super::kernel::get_current_thread_pointer()
-                            .expect("current thread must exist during SVC dispatch"),
-                        svc_num,
-                        svc_count,
-                        is_64bit,
-                        &mut svc_args,
-                        system,
-                    );
-                    if !continue_thread {
-                        return (iteration, svc_count, PhysicalCoreExecutionControl::Yield);
-                    }
+                    let continue_thread =
+                        self.dispatch_supervisor_call(svc_num, is_64bit, &mut svc_args, system);
+                    let _ = continue_thread;
+                    return (iteration, svc_count, PhysicalCoreExecutionControl::Yield);
                 }
                 PhysicalCoreExecutionEvent::Halted(halt_reason) => {
                     jit.get_context(thread_context);
@@ -545,6 +497,7 @@ impl PhysicalCore {
 
     /// Interrupt this core.
     /// Port of upstream `PhysicalCore::Interrupt()`.
+    #[track_caller]
     pub fn interrupt(&self) {
         let mut state = self.m_guard.lock().unwrap();
 
@@ -554,6 +507,39 @@ impl PhysicalCore {
 
         // Add interrupt flag.
         state.m_is_interrupted = true;
+
+        if should_trace_ipi_async() && common::trace::is_enabled(common::trace::cat::SCHED_STATE) {
+            static TRACE_COUNTS: [AtomicU64; crate::hardware_properties::NUM_CPU_CORES as usize] =
+                [const { AtomicU64::new(0) }; crate::hardware_properties::NUM_CPU_CORES as usize];
+            let trace_count = TRACE_COUNTS[self.m_core_index].fetch_add(1, Ordering::Relaxed);
+            if trace_count < 512 || trace_count.is_multiple_of(1_000) {
+                let caller = std::panic::Location::caller();
+                let source = if caller.file().ends_with("k_scheduler.rs") {
+                    1
+                } else if caller.file().ends_with("k_interrupt_manager.rs") {
+                    2
+                } else if caller.file().ends_with("kernel.rs") {
+                    3
+                } else {
+                    0
+                };
+                let running_tid = current_thread
+                    .map(|thread| unsafe { (*thread).get_thread_id() })
+                    .unwrap_or(0);
+                common::trace::emit_raw(
+                    common::trace::cat::SCHED_STATE,
+                    &[
+                        21,
+                        self.m_core_index as u64,
+                        source,
+                        caller.line() as u64,
+                        running_tid,
+                        arm_interface.is_some() as u64,
+                        trace_count,
+                    ],
+                );
+            }
+        }
 
         // Env-gated IPI trace: `RUZU_TRACE_IPI=1` logs every interrupt()
         // call with target core and the JIT/thread running there. Used to
@@ -915,7 +901,17 @@ mod tests {
 
     #[test]
     fn dispatch_supervisor_call_exit_thread_returns_false_without_handoff() {
-        let (physical_core, process, scheduler, current_thread, system) = test_context();
+        let (physical_core, process, scheduler, current_thread, _system) = test_context();
+        // This test exercises ExitThread ownership, not the initialized
+        // KernelCore/PhysicalCore graph used by `Svc::Call` to transfer
+        // arguments. Use a kernel-less System so the minimal fixture does not
+        // index the intentionally empty physical-core vector.
+        let mut system = System::new();
+        system.set_current_process_arc(process.clone());
+        system.set_scheduler_arc(scheduler.clone());
+        system.set_shared_process_memory(process.lock().unwrap().get_shared_memory());
+        system.set_runtime_program_id(1);
+        system.set_runtime_64bit(false);
         let mut thread_context = ThreadContext::default();
         let mut jit = TestArmInterface::new(VecDeque::new());
         physical_core.initialize_guest_runtime(
@@ -931,13 +927,7 @@ mod tests {
         let mut svc_args: SvcArgs = [0xDEAD; 8];
 
         let continue_thread = physical_core.dispatch_supervisor_call(
-            &mut jit,
-            &mut thread_context,
-            &scheduler,
-            &process,
-            &current_thread,
             SvcId::ExitThread as u32,
-            1,
             false,
             &mut svc_args,
             &system,
@@ -954,64 +944,6 @@ mod tests {
         assert_eq!(
             current_thread.lock().unwrap().get_state(),
             ThreadState::TERMINATED
-        );
-    }
-
-    #[test]
-    fn blocked_svc_defers_return_register_write_until_wake() {
-        let (physical_core, _process, _scheduler, current_thread, _system) = test_context();
-        let mut jit = TestArmInterface::new(VecDeque::new());
-        let svc_args: SvcArgs = [0x7201; 8];
-
-        current_thread
-            .lock()
-            .unwrap()
-            .set_state(ThreadState::WAITING);
-        physical_core.write_svc_return_registers_if_runnable(
-            &mut jit,
-            &current_thread,
-            SvcId::WaitProcessWideKeyAtomic as u32,
-            &svc_args,
-        );
-
-        assert_eq!(jit.set_svc_arguments_count, 0);
-    }
-
-    #[test]
-    fn dispatch_supervisor_call_returns_true_after_non_exit_svc_handoff() {
-        let (physical_core, process, scheduler, current_thread, system) = test_context();
-        let mut thread_context = ThreadContext::default();
-        let mut jit = TestArmInterface::new(VecDeque::new());
-        physical_core.initialize_guest_runtime(
-            current_thread.clone(),
-            &mut jit,
-            &mut thread_context,
-        );
-        crate::hle::kernel::kernel::set_current_emu_thread(Some(&current_thread));
-
-        jit.context.pc = 0x200ABC;
-        jit.context.r[0] = 0x1122;
-        let mut svc_args: SvcArgs = [0; 8];
-
-        let continue_thread = physical_core.dispatch_supervisor_call(
-            &mut jit,
-            &mut thread_context,
-            &scheduler,
-            &process,
-            &current_thread,
-            SvcId::GetSystemTick as u32,
-            1,
-            false,
-            &mut svc_args,
-            &system,
-        );
-        crate::hle::kernel::kernel::set_current_emu_thread(None);
-
-        assert!(continue_thread);
-        assert_eq!(jit.set_svc_arguments_count, 1);
-        assert_eq!(
-            current_thread.lock().unwrap().thread_context.r[15],
-            0x200ABC
         );
     }
 }

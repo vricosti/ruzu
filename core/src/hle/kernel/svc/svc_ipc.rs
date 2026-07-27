@@ -394,7 +394,7 @@ fn reschedule_after_inline_ipc_if_needed(system: &System) {
         &mut *scheduler as *mut crate::hle::kernel::k_scheduler::KScheduler
     };
     unsafe {
-        crate::hle::kernel::k_scheduler::KScheduler::schedule_raw_if_needed(sched_ptr);
+        crate::hle::kernel::k_scheduler::KScheduler::schedule_raw_if_needed(sched_ptr, 6);
     }
 }
 

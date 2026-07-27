@@ -456,20 +456,11 @@ impl GlobalSchedulerContext {
     pub fn preempt_threads(&mut self) {
         for core_id in 0..hardware_properties::NUM_CPU_CORES {
             let priority = PREEMPTION_PRIORITIES[core_id as usize] as i32;
-            let top_thread_id = self
-                .m_priority_queue
-                .get_scheduled_front_at_priority(core_id as i32, priority);
-            if let Some(top_id) = top_thread_id {
-                // Look up cached properties for this thread
-                let (t_priority, t_core, t_dummy) = self
-                    .m_priority_queue
-                    .get_thread_props(top_id)
-                    .map(|p| (p.priority, p.active_core, p.is_dummy))
-                    .unwrap_or((priority, core_id as i32, false));
-                let _ = self
-                    .m_priority_queue
-                    .move_to_scheduled_back(top_id, t_priority, t_core, t_dummy);
-            }
+            super::k_scheduler::KScheduler::rotate_scheduled_queue(
+                self,
+                core_id as i32,
+                priority,
+            );
         }
     }
 
@@ -535,7 +526,7 @@ mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::Arc;
 
-    use super::GlobalSchedulerContext;
+    use super::{GlobalSchedulerContext, PREEMPTION_PRIORITIES};
     use crate::hle::kernel::k_thread::{KThread, KThreadLock, ThreadState};
 
     #[test]
@@ -678,5 +669,46 @@ mod tests {
             gsc.m_priority_queue.get_thread_props(100).unwrap().priority,
             29
         );
+    }
+
+    #[test]
+    fn preempt_threads_rotates_each_core_queue_and_requests_scheduler_update() {
+        let mut gsc = GlobalSchedulerContext::new();
+        let scheduled_count = Arc::new(AtomicI64::new(0));
+        let priority = PREEMPTION_PRIORITIES[0] as i32;
+
+        gsc.m_priority_queue.push_back(
+            100,
+            priority,
+            0,
+            0b0001,
+            false,
+            Some(Arc::clone(&scheduled_count)),
+        );
+        gsc.m_priority_queue.push_back(
+            101,
+            priority,
+            0,
+            0b0001,
+            false,
+            Some(Arc::clone(&scheduled_count)),
+        );
+
+        assert_eq!(
+            gsc.m_priority_queue
+                .get_scheduled_front_at_priority(0, priority),
+            Some(100)
+        );
+        assert!(!gsc.m_scheduler_update_needed.load(Ordering::Acquire));
+
+        gsc.preempt_threads();
+
+        assert_eq!(
+            gsc.m_priority_queue
+                .get_scheduled_front_at_priority(0, priority),
+            Some(101)
+        );
+        assert_eq!(scheduled_count.load(Ordering::Relaxed), 2);
+        assert!(gsc.m_scheduler_update_needed.load(Ordering::Acquire));
     }
 }

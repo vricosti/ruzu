@@ -1947,13 +1947,14 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 5 => {
                     let _ = writeln!(
                         out,
-                        "[SCHED_STATE] t_us={} stage=switch cur={} next={} core={} has_gsc={} prev={}",
+                        "[SCHED_STATE] t_us={} stage=switch cur={} next={} core={} has_gsc={} prev={} host_tid={}",
                         timestamp_us,
                         top(1),
                         top(2),
                         rec.args[4] as i32,
                         rec.args[5] != 0,
                         top(6),
+                        rec.tid,
                     );
                 }
                 6 | 7 => {
@@ -1985,7 +1986,7 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                     };
                     let _ = writeln!(
                         out,
-                        "[SCHED_STATE] t_us={} stage={} cur={} target={} core={} target_active={} target_current={} target_prio={} has_ctx={} needs={}",
+                        "[SCHED_STATE] t_us={} stage={} cur={} target={} core={} target_active={} target_current={} target_prio={} has_ctx={} needs={} host_tid={}",
                         timestamp_us,
                         stage,
                         top(1),
@@ -1996,6 +1997,7 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                         rec.args[6] as i32,
                         rec.args[7] != 0,
                         rec.args[8] != 0,
+                        rec.tid,
                     );
                     if rec.args.len() > 9 {
                         let _ = writeln!(
@@ -2071,7 +2073,8 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                     };
                     let _ = writeln!(
                         out,
-                        "[SCHED_STATE] stage=thread_core_mismatch kind={} tid={} ptr=0x{:016X} entering_core={} owner_core={} thread_current={} thread_active={} scheduler_current={} thread_host=0x{:016X} scheduler_host=0x{:016X}",
+                        "[SCHED_STATE] t_us={} stage=thread_core_mismatch kind={} tid={} ptr=0x{:016X} entering_core={} owner_core={} thread_current={} thread_active={} scheduler_current={} thread_host=0x{:016X} scheduler_host=0x{:016X} host_tid={}",
+                        timestamp_us,
                         rec.args[1],
                         rec.args[2],
                         rec.args[3],
@@ -2082,6 +2085,120 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                         scheduler_current,
                         rec.args.get(9).copied().unwrap_or(0),
                         rec.args.get(10).copied().unwrap_or(0),
+                        rec.tid,
+                    );
+                }
+                18 => {
+                    let reason = match rec.args[1] {
+                        1 => "schedule_entry",
+                        2 => "retry",
+                        _ => "unknown",
+                    };
+                    let _ = writeln!(
+                        out,
+                        "[SCHED_STATE] t_us={} stage=needs_clear reason={} core={} scheduler_current={} fiber_current={} highest={} selected={} current_state=0x{:X} current_core={} active_core={} switch_from={}",
+                        timestamp_us,
+                        reason,
+                        rec.args[2] as i32,
+                        top(3),
+                        top(4),
+                        top(5),
+                        top(6),
+                        rec.args[7],
+                        rec.args[8] as i32,
+                        rec.args[9] as i32,
+                        rec.args[10] != 0,
+                    );
+                }
+                19 => {
+                    let action = match rec.args[1] {
+                        1 => "mutex_acquired",
+                        2 => "owner_acquired",
+                        3 => "unlock_begin",
+                        4 => "owner_mismatch",
+                        5 => "unlock_success",
+                        _ => "unknown",
+                    };
+                    let site = match rec.args[2] {
+                        1 => "switch_fiber",
+                        2 => "unload",
+                        3 => "runtime_init",
+                        4 => "runtime_unlock",
+                        5 => "switch_retry",
+                        _ => "unknown",
+                    };
+                    let _ = writeln!(
+                        out,
+                        "[SCHED_STATE] t_us={} stage=context_guard action={} site={} tid={} requester_core={} owner={} current_core={} active_core={} host_tid={}",
+                        timestamp_us,
+                        action,
+                        site,
+                        rec.args[3],
+                        rec.args[4] as i32,
+                        rec.args[5] as i32,
+                        rec.args[6] as i32,
+                        rec.args[7] as i32,
+                        rec.tid,
+                    );
+                }
+                20 => {
+                    let _ = writeln!(
+                        out,
+                        "[SCHED_STATE] t_us={} stage=refresh_highest core={} current={} previous={} raw_top={} selected={} needs_before={} needs_after={} interrupt={}",
+                        timestamp_us,
+                        rec.args[1] as i32,
+                        top(2),
+                        top(3),
+                        top(4),
+                        top(5),
+                        rec.args[6] != 0,
+                        rec.args[7] != 0,
+                        rec.args[8] != 0,
+                    );
+                }
+                21 => {
+                    let source = match rec.args[2] {
+                        1 => "k_scheduler",
+                        2 => "k_interrupt_manager",
+                        3 => "kernel",
+                        _ => "other",
+                    };
+                    let _ = writeln!(
+                        out,
+                        "[SCHED_STATE] t_us={} stage=physical_interrupt target_core={} source={} caller_line={} running_tid={} running_jit={} count={} host_tid={}",
+                        timestamp_us,
+                        rec.args[1],
+                        source,
+                        rec.args[3],
+                        rec.args[4],
+                        rec.args[5] != 0,
+                        rec.args[6],
+                        rec.tid,
+                    );
+                }
+                22 => {
+                    let source = match rec.args[1] {
+                        1 => "activate_raw",
+                        2 => "interrupt_raw",
+                        3 => "force_raw",
+                        4 => "reschedule_current_core",
+                        5 => "reschedule_current_core_impl",
+                        6 => "inline_ipc_raw",
+                        7 => "interrupt_select",
+                        _ => "unknown",
+                    };
+                    let phase = if rec.args[2] == 1 { "before" } else { "after" };
+                    let _ = writeln!(
+                        out,
+                        "[SCHED_STATE] t_us={} stage=reschedule_path source={} phase={} scheduler_core={} host_core={} guest_tid={} needs={} host_tid={}",
+                        timestamp_us,
+                        source,
+                        phase,
+                        rec.args[3] as i32,
+                        rec.args[4] as i32,
+                        top(5),
+                        rec.args[6] != 0,
+                        rec.tid,
                     );
                 }
                 _ => {

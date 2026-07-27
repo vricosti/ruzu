@@ -7,7 +7,7 @@
 //! ownership matching upstream.
 
 use bitflags::bitflags;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU16, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use super::k_process::KProcess;
@@ -35,6 +35,10 @@ use crate::hle::result::RESULT_SUCCESS;
 // Currently unused: we use BTreeSet externally instead of an intrusive tree.
 use super::k_process::ProcessLock;
 use common::tree::RBEntry;
+
+const TERMINATING_THREAD_PRIORITY: i32 =
+    crate::hle::kernel::svc_types::SYSTEM_THREAD_PRIORITY_HIGHEST - 1;
+pub(crate) const CONTEXT_GUARD_UNOWNED: i32 = -1;
 
 // Step 5b of the upstream-faithful sync refactor: KThread storage moves
 // from `Arc<KThreadLock>` to `Arc<KThreadLock>` where
@@ -596,6 +600,14 @@ pub struct KThread {
     /// Context guard for fiber switching.
     /// Upstream: `KSpinLock m_context_guard`
     pub context_guard: parking_lot::Mutex<()>,
+    /// Core currently owning `context_guard`, or `CONTEXT_GUARD_UNOWNED`.
+    ///
+    /// `context_guard` is locked with `try_lock` + `mem::forget` and released
+    /// with `force_unlock`, so the guard object itself carries no ownership
+    /// information. Track the owner atomically because `KThreadLock` is a
+    /// scheduler-serialized `SyncCell`, not a host mutex, and competing switch
+    /// fibers run on different host cores.
+    pub(crate) context_guard_owner: AtomicI32,
     /// Diagnostic: last lock/unlock sites of `context_guard`
     /// (`site@host_thread`), shown by the SIGUSR1 dump to attribute leaked
     /// guards (a thread whose guard stays locked wedges the switch fiber's
@@ -632,14 +644,6 @@ impl KThread {
         ctx.fpcr = self.thread_context.fpcr;
         ctx.fpsr = self.thread_context.fpsr;
         ctx.tpidr = self.thread_context.tpidr;
-
-        // Keep the A32 aliases coherent for the Rust-only runtime handoff path.
-        // Upstream A32 backends consume r[0..15] in SetContext(), while the
-        // Rust helper path also uses explicit fp/lr/sp/pc fields.
-        ctx.r[11] = ctx.fp;
-        ctx.r[13] = ctx.sp;
-        ctx.r[14] = ctx.lr;
-        ctx.r[15] = ctx.pc;
     }
 
     /// Diagnostic: record who locked/unlocked `context_guard` last
@@ -671,12 +675,6 @@ impl KThread {
         self.thread_context.fpcr = ctx.fpcr;
         self.thread_context.fpsr = ctx.fpsr;
         self.thread_context.tpidr = ctx.tpidr;
-
-        // Keep the A32 aliases coherent for scheduler/runtime save-restore.
-        self.thread_context.r[11] = ctx.fp;
-        self.thread_context.r[13] = ctx.sp;
-        self.thread_context.r[14] = ctx.lr;
-        self.thread_context.r[15] = ctx.pc;
     }
 
     /// Create a new KThread with default/zero-initialized state.
@@ -738,6 +736,7 @@ impl KThread {
             stack_parameters: StackParameters::default(),
             host_context: None,
             context_guard: parking_lot::Mutex::new(()),
+            context_guard_owner: AtomicI32::new(CONTEXT_GUARD_UNOWNED),
             context_guard_trace: parking_lot::Mutex::new(ContextGuardTrace::default()),
             thread_type: ThreadType::User,
             step_state: StepState::default(),
@@ -1854,7 +1853,6 @@ impl KThread {
         self.clear_cancellable();
         wait_queue.base_end_wait(self, result);
         self.waiting_lock_info = None;
-        self.apply_wait_result_to_context();
     }
 
     /// Cancel any outstanding synchronization wait: unlink every node this
@@ -1879,45 +1877,6 @@ impl KThread {
             ctx.clear();
         }
         self.clear_cancellable();
-    }
-
-    pub(crate) fn apply_wait_result_to_context(&mut self) {
-        // Rust's cooperative scheduler stores SVC wait results in the saved
-        // guest context when a thread is woken off-core. Upstream only stores
-        // m_wait_result here and lets the fiber resume the SVC wrapper.
-        //
-        // Do not apply a wait result to a never-started user thread. Its
-        // initial context has PC=entry, LR=0, R0=argument; clobbering R0 here
-        // makes the SDK thread trampoline treat ResultNoSynchronizationObject
-        // (0x7201, the default wait_result) as its startup argument.
-        if self.thread_context.lr == 0
-            && self.argument != 0
-            && self.thread_context.r[0] == self.argument as u64
-        {
-            return;
-        }
-        if common::trace::is_enabled(common::trace::cat::SCHED_STATE)
-            && crate::hle::kernel::k_scheduler::trace_tid_filter_matches(Some(self.thread_id))
-        {
-            common::trace::emit_raw(
-                common::trace::cat::SCHED_STATE,
-                &[
-                    15,
-                    self.thread_id,
-                    self.wait_result as u64,
-                    self.thread_context.pc,
-                    self.thread_context.sp,
-                    self.thread_context.r[0],
-                    self.thread_context.r[1],
-                    self.get_state().bits() as u64,
-                    self.wait_queue.is_some() as u64,
-                    self.wait_reason_for_debugging as u32 as u64,
-                    self.thread_context.r[19],
-                ],
-            );
-        }
-        self.thread_context.r[0] = self.wait_result as u64;
-        self.thread_context.r[1] = (self.synced_index as u32) as u64;
     }
 
     // -- Complex methods stubbed --
@@ -2898,7 +2857,6 @@ impl KThread {
             }
 
             // Raise priority to terminating priority.
-            const TERMINATING_THREAD_PRIORITY: i32 = -1; // SystemThreadPriorityHighest - 1
             self.increase_base_priority(TERMINATING_THREAD_PRIORITY);
 
             // If RUNNABLE, request an interrupt-driven reschedule like upstream
@@ -3305,7 +3263,6 @@ impl KThread {
     fn finalize_wait_transition(&mut self) {
         self.waiting_lock_info = None;
         self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::None);
-        self.apply_wait_result_to_context();
     }
 
     fn lock_scheduler(&self) -> Option<KScopedSchedulerLock<'static>> {
@@ -3949,7 +3906,6 @@ impl KThread {
                 // Upstream leaves timeout completion to CancelWait(); keep only
                 // the Rust-local cleanup that has no direct C++ field owner.
                 self.waiting_lock_info = None;
-                self.apply_wait_result_to_context();
                 if ct_trace {
                     log::info!("on_timer tid={} after_cancel_wait", self.thread_id);
                 }
@@ -4758,6 +4714,8 @@ mod tests {
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         let mut thread = KThread::new();
         thread.thread_id = 9;
+        thread.base_priority = 44;
+        thread.priority = 44;
         thread.scheduler = Some(Arc::downgrade(&scheduler));
         thread.set_state(ThreadState::RUNNABLE);
 
@@ -4770,6 +4728,14 @@ mod tests {
 
         thread.request_terminate();
 
+        assert_eq!(
+            thread.get_priority(),
+            crate::hle::kernel::svc_types::SYSTEM_THREAD_PRIORITY_HIGHEST - 1
+        );
+        assert_eq!(
+            thread.get_base_priority(),
+            crate::hle::kernel::svc_types::SYSTEM_THREAD_PRIORITY_HIGHEST - 1
+        );
         assert!(scheduler.lock().unwrap().needs_scheduling());
     }
 
@@ -4908,7 +4874,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_and_restore_guest_context_keep_a32_alias_registers_in_sync() {
+    fn capture_and_restore_guest_context_preserve_independent_registers() {
         let mut thread = KThread::new();
         let mut ctx = crate::arm::arm_interface::ThreadContext::default();
         ctx.fp = 0x1111;
@@ -4922,10 +4888,14 @@ mod tests {
 
         thread.capture_guest_context(&ctx);
 
-        assert_eq!(thread.thread_context.r[11], 0x1111);
-        assert_eq!(thread.thread_context.r[13], 0x2222);
-        assert_eq!(thread.thread_context.r[14], 0x3333);
-        assert_eq!(thread.thread_context.r[15], 0x4444);
+        assert_eq!(thread.thread_context.r[11], 0xAAAA);
+        assert_eq!(thread.thread_context.r[13], 0xBBBB);
+        assert_eq!(thread.thread_context.r[14], 0xCCCC);
+        assert_eq!(thread.thread_context.r[15], 0xDDDD);
+        assert_eq!(thread.thread_context.fp, 0x1111);
+        assert_eq!(thread.thread_context.sp, 0x2222);
+        assert_eq!(thread.thread_context.lr, 0x3333);
+        assert_eq!(thread.thread_context.pc, 0x4444);
 
         let mut restored = crate::arm::arm_interface::ThreadContext::default();
         thread.restore_guest_context(&mut restored);
@@ -4934,10 +4904,10 @@ mod tests {
         assert_eq!(restored.sp, 0x2222);
         assert_eq!(restored.lr, 0x3333);
         assert_eq!(restored.pc, 0x4444);
-        assert_eq!(restored.r[11], 0x1111);
-        assert_eq!(restored.r[13], 0x2222);
-        assert_eq!(restored.r[14], 0x3333);
-        assert_eq!(restored.r[15], 0x4444);
+        assert_eq!(restored.r[11], 0xAAAA);
+        assert_eq!(restored.r[13], 0xBBBB);
+        assert_eq!(restored.r[14], 0xCCCC);
+        assert_eq!(restored.r[15], 0xDDDD);
     }
 
     #[test]
@@ -4955,7 +4925,7 @@ mod tests {
     }
 
     #[test]
-    fn end_wait_recursively_acquires_scheduler_lock() {
+    fn internal_end_wait_does_not_overwrite_guest_registers() {
         let scheduler_lock = k_scheduler_lock::KAbstractSchedulerLock::new();
         let mut thread = KThread::new();
         thread.scheduler_lock_ptr =
@@ -4971,10 +4941,7 @@ mod tests {
         assert_eq!(thread.get_state(), ThreadState::RUNNABLE);
         assert!(!thread.has_wait_queue());
         assert_eq!(thread.get_wait_result(), RESULT_SUCCESS.get_inner_value());
-        assert_eq!(
-            thread.thread_context.r[0],
-            RESULT_SUCCESS.get_inner_value() as u64
-        );
-        assert_eq!(thread.thread_context.r[1], 3);
+        assert_eq!(thread.thread_context.r[0], 0x1701_D7);
+        assert_eq!(thread.thread_context.r[1], 0x2105_4000_48);
     }
 }
