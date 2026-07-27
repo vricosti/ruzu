@@ -24717,3 +24717,308 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ### Verification
 - Re-read upstream A32 x64 fastmem callback setup and patch ownership; no
   equivalent recompilation trace exists.
+
+## 2026-07-27 — externals/rdynarmic/src/{ir/emitter.rs,frontend/a64/translate/simd_{,scalar_}two_register_misc.rs,frontend/a64/translate/visitor.rs} vs externals/dynarmic/src/dynarmic/{ir/ir_emitter.cpp,frontend/A64/translate/impl/simd_{,scalar_}two_register_misc.cpp}
+
+### Intentional differences
+- Rust selects the saturated-narrow IR operation with a local enum instead of
+  an upstream C++ member-function pointer.
+- The scalar translator explicitly extracts element zero from the SIMD source
+  before zero-extension because Rust IR vector-register reads return `U128`;
+  this is the typed equivalent of upstream `V_scalar`.
+
+### Unintentional differences (fixed)
+- The decoder recognized `SQXTN`, `SQXTUN`, and `UQXTN`, and both host
+  backends implemented their IR opcodes, but the IR emitter helpers,
+  translators, and visitor dispatch were absent. All scalar and vector forms
+  now follow upstream size validation, destination-half selection, scalar
+  zeroing, saturation, and FPSR.QC behavior.
+
+### Missing items
+- This targeted parity slice does not audit unrelated instructions in the two
+  partially ported SIMD misc translator files.
+
+### Binary layout verification
+- PASS: the change adds translation and IR construction only; no serialized or
+  guest-visible structure layout changes.
+
+### Verification
+- Re-read the upstream IR helpers and both saturated-narrow translator helpers
+  after implementation.
+- Translation tests cover all three signedness families in scalar and vector
+  form. x64 execution tests cover the observed `SQXTN Vd.8B, Vn.8H` encoding,
+  scalar extraction, saturation, destination zeroing, and FPSR.QC.
+
+## 2026-07-27 — externals/rdynarmic/src/frontend/a64/translate/{visitor.rs,simd_three_different.rs,simd_vector_x_indexed_element.rs} vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/{impl.cpp,simd_three_different.cpp,simd_vector_x_indexed_element.cpp}
+
+### Intentional differences
+- Rust represents upstream's `Combine` helper with the equivalent local
+  `(index, Vec)` branch and selects signedness through a Rust enum.
+
+### Unintentional differences (fixed)
+- `Vpart` read behavior was owned locally by one translator. Its 64-bit read
+  form now lives with the other vector-register helpers and is reused by both
+  upstream owners.
+- `SMLAL`, `SMLSL`, `SMULL`, `UMLAL`, `UMLSL`, and `UMULL` by indexed element
+  decoded but had no translator or visitor dispatch. The complete upstream
+  `MultiplyLong` family is now present with matching reserved-size checks,
+  `H:L:M` index construction, `Q` source-half selection, widening signedness,
+  and accumulator ordering.
+
+### Missing items
+- Other integer indexed-element families in the partially ported upstream file
+  remain outside this targeted slice.
+
+### Binary layout verification
+- PASS: only translator ownership and IR construction changed.
+
+### Verification
+- Re-read upstream `Combine`, `MultiplyLong`, all six forwarding methods, and
+  the shared `Vpart` read helper after implementation.
+- Translation tests cover all six signed/unsigned behavior variants. The x64
+  execution regression covers `SMULL2 V19.4S, V18.8H, V0.H[2]`, including high
+  source-half selection and signed widening.
+
+## 2026-07-27 — externals/rdynarmic/src/frontend/a64/translate/{visitor.rs,simd_shift_by_immediate.rs,simd_two_register_misc.rs} vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/{impl.cpp,simd_shift_by_immediate.cpp,simd_two_register_misc.cpp}
+
+### Intentional differences
+- Rust passes rounding, narrowing, and signedness as enums/booleans to the
+  shared helper while preserving upstream's branch ordering.
+
+### Unintentional differences (fixed)
+- The immediate helper omitted upstream's 8- and 16-bit cases, preventing
+  element-sized rounding constants from being constructed.
+- The shared vector-part helper had no write form. Both read and write forms
+  now have the same ownership and low/high-half semantics as upstream.
+- `SQSHRN`, `SQRSHRN`, `SQSHRUN`, `SQRSHRUN`, `UQSHRN`, and `UQRSHRN` decoded
+  without visitor dispatch or translation. They now use the existing
+  `ShiftRightNarrowing` path with upstream's arithmetic/logical shift,
+  rounding correction, saturation signedness, FPSR.QC update, and destination
+  half selection.
+
+### Missing items
+- Other shift-by-immediate instructions outside the file's documented subset
+  remain outside this targeted slice.
+
+### Binary layout verification
+- PASS: the changes affect IR construction and vector-register writes only.
+
+### Verification
+- Re-read upstream `I`, both `Vpart` forms, `PerformRoundingCorrection`,
+  `ShiftRightNarrowing`, and all six forwarding methods after implementation.
+- Translation tests cover all six saturating variants. The x64 execution
+  regression covers `SQRSHRN V28.8B, V2.8H, #2`, including signed rounding,
+  saturation, upper-half zeroing, and FPSR.QC.
+
+## 2026-07-27 — externals/rdynarmic/src/{frontend/a64/translate/simd_three_different.rs,frontend/a64/translate/visitor.rs,backend/x64/emit_vector_misc.rs} vs externals/dynarmic/src/dynarmic/{frontend/A64/translate/impl/simd_three_different.cpp,backend/x64/emit_x64_vector.cpp}
+
+### Intentional differences
+- The x64 backend uses typed software fallbacks for absolute difference rather
+  than upstream's host-feature-selected packed min/max instruction sequences.
+
+### Unintentional differences (fixed)
+- `SABAL`, `SABDL`, `UABAL`, and `UABDL` decoded without translators or
+  dispatch. Their shared helper now matches upstream's source-half selection,
+  zero-extension layout, signedness, optional accumulation, and 128-bit
+  destination write.
+- The x64 signed absolute-difference fallback interpreted lanes as unsigned.
+  It now computes differences from signed `i8`, `i16`, and `i32` inputs while
+  preserving the unsigned magnitude bit pattern produced by upstream.
+
+### Missing items
+- Other three-different instruction families outside the module's documented
+  subset remain outside this targeted slice.
+
+### Binary layout verification
+- PASS: vector lane bit patterns are preserved and no serialized structures
+  changed.
+
+### Verification
+- Re-read upstream `AbsoluteDifferenceLong`, all four forwarding methods, and
+  the x64 signed packed min/max implementation after implementation.
+- Translation tests cover all four long forms. x64 execution tests cover the
+  observed unsigned byte-to-halfword form and signed `-128`/`127` crossing.
+
+## 2026-07-27 — externals/rdynarmic/src/frontend/a64/translate/{simd_three_same.rs,visitor.rs} vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_three_same.cpp
+
+### Intentional differences
+- Rust shares one signedness-aware absolute-difference helper across all four
+  methods; upstream shares the signed pair and spells out the unsigned pair.
+  The validation, operand ordering, IR operations, and write ordering match.
+
+### Unintentional differences (fixed)
+- `SABA`, `SABD`, `UABA`, and `UABD` decoded without translators or visitor
+  dispatch. They now match upstream's `size == 0b11` rejection, lane sizing,
+  signedness, optional destination accumulation, and destination write.
+
+### Missing items
+- Other three-same instructions outside this absolute-difference slice remain
+  outside this targeted implementation.
+
+### Binary layout verification
+- PASS: the change constructs IR and writes architectural vector registers;
+  no serialized structure layout changed.
+
+### Verification
+- Re-read upstream `SignedAbsoluteDifference`, `SABA`, `SABD`, `UABA`, and
+  `UABD` after implementation and compared their operation order.
+- Translation tests cover all four methods. x64 execution tests cover the
+  observed `UABD V28.8H, V28.8H, V6.8H` and signed accumulating `SABA`.
+
+## 2026-07-27 — externals/rdynarmic/src/frontend/a64/translate/{simd_three_same.rs,visitor.rs} vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_three_same.cpp
+
+### Intentional differences
+- Decoded instruction fields are extracted inside the Rust methods because
+  the generated Rust visitor receives `DecodedInst` rather than typed fields.
+
+### Unintentional differences (fixed)
+- `SHADD`, `SRHADD`, `UHADD`, and `URHADD` decoded without translators or
+  visitor dispatch. Their implementations now match upstream's reserved-size
+  check, signedness, rounded or truncating halving operation, and vector write.
+
+### Missing items
+- Halving subtraction and other three-same families remain outside this
+  targeted implementation.
+
+### Binary layout verification
+- PASS: only IR construction and architectural vector-register writes changed.
+
+### Verification
+- Re-read upstream `RoundingHalvingAdd`, `SHADD`, `SRHADD`, `UHADD`, and
+  `URHADD` after implementation and compared validation and operation order.
+- Translation tests cover all four methods. The x64 execution regression
+  distinguishes truncating `UHADD` from rounding `URHADD` on odd byte sums.
+
+## 2026-07-27 — externals/rdynarmic/src/backend/x64/a64_emit_x64.rs vs externals/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+
+### Intentional differences
+- Rust names upstream's local `gpr_order` lambda
+  `allocation_gpr_order` so all memory-base combinations can be unit-tested.
+
+### Unintentional differences (fixed)
+- The A64 register allocator reserved `R13` for fastmem but left `R14`
+  allocatable while it held the configured page-table pointer. Linked blocks
+  could overwrite `R14` and then fault in `page = [R14 + index * 8]`.
+- The allocator now follows upstream ordering exactly: remove `R14` when the
+  page table is configured, then remove `R13` when fastmem is configured.
+
+### Missing items
+- Runtime work may still expose independent A64 translator gaps after this
+  allocator corruption is removed.
+
+### Binary layout verification
+- PASS: no state or serialized layout changed.
+
+### Verification
+- Re-read upstream `A64EmitX64::Emit` after implementation and compared its
+  register-filter conditions and ordering.
+- The focused test covers no memory base, page table only, fastmem only, and
+  both bases, asserting the exact availability of `R13` and `R14`.
+
+## 2026-07-27 — externals/rdynarmic/src/frontend/a64/translate/{visitor.rs,simd_*.rs,load_store_{single_structure,multiple_structures}.rs} vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/{impl.cpp,simd_*.cpp,load_store_{single_structure,multiple_structures}.cpp}
+
+### Intentional differences
+- Rust exposes upstream's overloaded `V`, `V_scalar`, and `Vpart` helpers as
+  typed `v_read`/`v_write`, `v_scalar_read`/`v_scalar_write`, and
+  `vpart_read_64`/`vpart_write_64` methods.
+
+### Unintentional differences (fixed)
+- The previous shared helper treated vector operations as scalar accesses.
+  Vector translators now use the `V` equivalent, while scalar translators keep
+  the `V_scalar` equivalent and therefore extract element zero.
+- Interleaved single- and multiple-structure loads now preserve all existing
+  vector lanes before `VectorSetElement`, matching upstream.
+
+### Missing items
+- SIMD translator modules remain partial where their file headers already
+  identify an upstream subset; this helper correction does not expand those
+  unrelated instruction subsets.
+
+### Binary layout verification
+- PASS: architectural Q/D/S register width and upper-bit clearing follow
+  upstream `V` and `V_scalar`; no serialized layout changed.
+
+### Verification
+- Re-read upstream `TranslatorVisitor::{V,V_scalar,Vpart}` and both structure
+  load/store loops after implementation.
+- Translation tests reject the prior scalar zero-extension in interleaved
+  single- and multiple-structure loads.
+
+## 2026-07-27 — externals/rdynarmic/src/{common/fp/op/fp_round_int.rs,backend/x64/emit_{floating_point,fp_vector_convert}.rs,frontend/a64/translate/simd_two_register_misc.rs,ir/emitter.rs} vs externals/dynarmic/src/dynarmic/{common/fp/op/FPRoundInt.cpp,backend/x64/emit_x64_{floating_point,vector_floating_point}.cpp,frontend/A64/translate/impl/simd_two_register_misc.cpp,ir/ir_emitter.cpp}
+
+### Intentional differences
+- Rust selects const-generic fallback functions before emitting the host call,
+  replacing upstream's templated lambda dispatch while preserving FPCR/FPSR
+  arguments and per-lane evaluation order.
+- Integral results are encoded directly from the normalized integer magnitude;
+  this is equivalent to upstream `FPRound(..., TowardsZero)` for the exactly
+  representable integral result produced by `FPRoundInt`.
+
+### Unintentional differences (fixed)
+- Scalar and vector rounding fallbacks used host `round` operations, omitted
+  FPCR NaN/flush behavior, tie-even exactness, and FPSR.IXC updates.
+- All A64 vector FRINT variants decoded without visitor dispatch. Their
+  rounding modes, `exact` flags, half/single/double widths, and FPCR control now
+  match upstream.
+
+### Missing items
+- Host fast paths remain limited to SSE4.1-supported non-exact rounding modes;
+  all other cases use the bit-accurate common fallback.
+
+### Binary layout verification
+- PASS: FP inputs and outputs remain raw 16/32/64-bit IEEE bit patterns and
+  FPSR exception bits retain their existing state layout.
+
+### Verification
+- Re-read upstream `FPRoundInt`, scalar/vector x64 emitters, IR helper, and
+  A64 FRINT translators after implementation.
+- Unit and x64 execution tests cover ties, signed zero, inexact accumulation,
+  FPCR-controlled FRINTX, and scalar/vector result widths.
+
+## 2026-07-27 — externals/rdynarmic/src/frontend/a64/translate/{simd_three_different.rs,simd_vector_x_indexed_element.rs,visitor.rs} vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/{simd_three_different.cpp,simd_vector_x_indexed_element.cpp}
+
+### Intentional differences
+- Rust uses enums for upstream helper behavior and signedness parameters.
+
+### Unintentional differences (fixed)
+- `SADDW`, `SSUBW`, `UADDW`, and `USUBW` lacked translation and dispatch.
+  Source-half selection, widening, arithmetic, and destination writes now
+  follow upstream `WideOperation`.
+- Vector `SQDMULH_elt_2` and `SQRDMULH_elt_2` lacked translation and dispatch.
+  Their `H:L:M` index construction, vector widths, saturation, QC update, and
+  rounding selection now match upstream.
+
+### Missing items
+- Other instruction families in these partially ported files remain outside
+  this targeted slice.
+
+### Binary layout verification
+- PASS: only IR construction and architectural vector-register writes changed.
+
+### Verification
+- Re-read upstream `WideOperation`, `SQDMULH_elt_2`, and `SQRDMULH_elt_2`
+  after implementation.
+- Translation and x64 execution tests cover widening add and rounded
+  saturating high multiplication by an indexed halfword.
+
+## 2026-07-27 — externals/rdynarmic/src/backend/x64/emit_vector_arrangement.rs vs externals/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp
+
+### Intentional differences
+- Rust uses `PUNPCKLQDQ` with an explicit zero register; upstream selects
+  equivalent host-feature-specific sequences.
+
+### Unintentional differences (fixed)
+- `VectorZeroExtend64` incorrectly interpreted the low two 32-bit lanes as two
+  64-bit values. It now preserves the low 64-bit lane and clears the high
+  64-bit lane, matching the IR opcode contract.
+
+### Missing items
+- The fallback helper remains available for hosts that cannot use the emitted
+  sequence, although the normal x64 path does not call it.
+
+### Binary layout verification
+- PASS: the resulting U128 bit pattern is `[low_u64, 0]`.
+
+### Verification
+- Re-read upstream `EmitVectorZeroExtend64` after implementation and compared
+  lane semantics.
