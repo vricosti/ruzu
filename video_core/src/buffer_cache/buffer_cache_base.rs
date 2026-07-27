@@ -13,6 +13,8 @@ use common::types::VAddr;
 use smallvec::SmallVec;
 
 use super::buffer_base::BufferBase;
+use crate::control::channel_state::ChannelState;
+use crate::control::channel_state_cache::{ChannelCacheAccessor, ChannelInfo, FromChannelState};
 use crate::engines::maxwell_3d::{IndexFormat, PrimitiveTopology};
 
 // ---------------------------------------------------------------------------
@@ -188,6 +190,9 @@ impl Default for HostBindings {
 ///
 /// Corresponds to the C++ `BufferCacheChannelInfo` class.
 pub struct BufferCacheChannelInfo {
+    /// Upstream `BufferCacheChannelInfo : public ChannelInfo`.
+    pub channel_info: ChannelInfo,
+
     // -- Graphics bindings --
     pub index_buffer: Binding,
     pub vertex_buffers: [Binding; NUM_VERTEX_BUFFERS as usize],
@@ -244,9 +249,23 @@ pub struct BufferCacheChannelInfo {
         [[u32; NUM_GRAPHICS_UNIFORM_BUFFERS as usize]; NUM_STAGES as usize],
 }
 
+#[cfg(test)]
 impl Default for BufferCacheChannelInfo {
     fn default() -> Self {
+        Self::from_channel_info(ChannelInfo {
+            maxwell3d: 0,
+            kepler_compute: 0,
+            gpu_memory_index: 0,
+            gpu_memory: None,
+            program_id: 0,
+        })
+    }
+}
+
+impl BufferCacheChannelInfo {
+    fn from_channel_info(channel_info: ChannelInfo) -> Self {
         Self {
+            channel_info,
             index_buffer: Binding::default(),
             vertex_buffers: [Binding::default(); NUM_VERTEX_BUFFERS as usize],
             uniform_buffers: [[Binding::default(); NUM_GRAPHICS_UNIFORM_BUFFERS as usize];
@@ -295,6 +314,39 @@ impl Default for BufferCacheChannelInfo {
             uniform_buffer_binding_sizes: [[0; NUM_GRAPHICS_UNIFORM_BUFFERS as usize];
                 NUM_STAGES as usize],
         }
+    }
+}
+
+impl FromChannelState for BufferCacheChannelInfo {
+    fn from_channel_state(state: &ChannelState) -> Self {
+        Self::from_channel_info(ChannelInfo::from_channel_state(state))
+    }
+}
+
+impl ChannelCacheAccessor for BufferCacheChannelInfo {
+    fn maxwell3d_ref(&self) -> usize {
+        self.channel_info.maxwell3d
+    }
+
+    fn kepler_compute_ref(&self) -> usize {
+        self.channel_info.kepler_compute
+    }
+
+    fn gpu_memory_ref(&self) -> usize {
+        self.channel_info.gpu_memory_index
+    }
+
+    fn gpu_memory_arc(
+        &self,
+    ) -> Option<std::sync::Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>> {
+        self.channel_info
+            .gpu_memory
+            .as_ref()
+            .map(std::sync::Arc::clone)
+    }
+
+    fn program_id_val(&self) -> u64 {
+        self.channel_info.program_id
     }
 }
 
@@ -887,23 +939,6 @@ pub struct DrawIndirectParams {
     pub include_count: bool,
 }
 
-// ---------------------------------------------------------------------------
-// ConstBufferInfo — per-stage constant buffer binding from engine state
-// ---------------------------------------------------------------------------
-
-/// Information about a bound constant buffer from the Maxwell3D engine.
-///
-/// Upstream: `Tegra::Engines::Maxwell3D::State::ConstBufferInfo`
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ConstBufferInfo {
-    /// GPU virtual address of the constant buffer.
-    pub address: u64,
-    /// Size of the constant buffer in bytes.
-    pub size: u32,
-    /// Whether the constant buffer is enabled.
-    pub enabled: bool,
-}
-
 /// Information needed from the compute engine's launch description.
 ///
 /// Upstream: `kepler_compute->launch_description`
@@ -943,100 +978,10 @@ pub struct IndexBufferRef {
     pub format_size_in_bytes: u32,
 }
 
-/// Vertex stream register from Maxwell3D.
+/// Temporary bridge for the KeplerCompute launch description.
 ///
-/// Upstream: `maxwell3d->regs.vertex_streams[index]`
-#[derive(Debug, Clone, Copy, Default)]
-pub struct VertexStreamInfo {
-    /// GPU virtual address (computed from address_high:address_low).
-    pub address: u64,
-    /// Stride in bytes.
-    pub stride: u32,
-    /// Whether the stream is enabled (0 = disabled).
-    pub enable: u32,
-}
-
-/// Vertex stream limit from Maxwell3D.
-///
-/// Upstream: `maxwell3d->regs.vertex_stream_limits[index]`
-#[derive(Debug, Clone, Copy, Default)]
-pub struct VertexStreamLimit {
-    /// GPU virtual address of the end of the vertex buffer + 1.
-    pub address: u64,
-}
-
-/// Transform feedback buffer binding from Maxwell3D.
-///
-/// Upstream: `maxwell3d->regs.transform_feedback.buffers[index]`
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TransformFeedbackBufferInfo {
-    /// GPU virtual address.
-    pub address: u64,
-    /// Start offset within the buffer.
-    pub start_offset: u32,
-    /// Size of the transform feedback buffer in bytes.
-    pub size: u32,
-    /// Whether this buffer is enabled (0 = disabled).
-    pub enable: u32,
-}
-
-/// Aggregated engine state snapshot used by the buffer cache.
-///
-/// The buffer cache reads engine state at specific points during buffer updates.
-/// Rather than holding a reference to the engine, callers provide this snapshot.
-pub trait EngineState {
-    // -- Index buffer --
-
-    /// Return the current index buffer reference from the draw state.
-    fn get_index_buffer(&self) -> IndexBufferRef;
-
-    /// Return the inline index draw data, if any.
-    fn get_inline_index_draw_indexes(&self) -> &[u8];
-
-    /// Current primitive topology from `DrawManager::GetDrawState()`.
-    fn get_primitive_topology(&self) -> PrimitiveTopology {
-        PrimitiveTopology::Triangles
-    }
-
-    /// Current index format from `DrawManager::GetDrawState()`.
-    fn get_index_format(&self) -> IndexFormat {
-        IndexFormat::UnsignedInt
-    }
-
-    // -- Dirty flags --
-
-    /// Check if a dirty flag is set.
-    fn is_dirty(&self, flag: DirtyFlag) -> bool;
-
-    /// Clear a dirty flag.
-    fn clear_dirty(&mut self, flag: DirtyFlag);
-
-    /// Set a dirty flag.
-    fn set_dirty(&mut self, flag: DirtyFlag);
-
-    // -- Vertex streams --
-
-    /// Return vertex stream info for a given index.
-    fn get_vertex_stream(&self, index: u32) -> VertexStreamInfo;
-
-    /// Return vertex stream limit for a given index.
-    fn get_vertex_stream_limit(&self, index: u32) -> VertexStreamLimit;
-
-    // -- Transform feedback --
-
-    /// Whether transform feedback is enabled.
-    fn is_transform_feedback_enabled(&self) -> bool;
-
-    /// Return transform feedback buffer info for a given index.
-    fn get_transform_feedback_buffer(&self, index: u32) -> TransformFeedbackBufferInfo;
-
-    // -- Const buffers (graphics) --
-
-    /// Return const buffer info for a shader stage and cbuf index.
-    fn get_const_buffer(&self, stage: usize, cbuf_index: u32) -> ConstBufferInfo;
-
-    // -- Compute launch description --
-
+/// Graphics state is read directly from the channel-bound Maxwell3D.
+pub trait ComputeEngineState {
     /// Return compute launch info (const buffer enable mask + configs).
     fn get_compute_launch_info(&self) -> ComputeLaunchInfo;
 }

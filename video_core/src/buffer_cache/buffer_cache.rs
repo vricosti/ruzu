@@ -21,7 +21,13 @@ use common::slot_vector::{SlotId, SlotVector};
 use common::types::VAddr;
 use parking_lot::ReentrantMutex;
 
+use crate::control::channel_state::ChannelState;
+use crate::control::channel_state_cache::{
+    ChannelCacheAccessor, ChannelSetupCaches, FromChannelState,
+};
 use crate::delayed_destruction_ring::DelayedDestructionRing;
+use crate::engines::draw_manager::Maxwell3DAccess;
+use crate::engines::maxwell_3d::Maxwell3D;
 
 use super::buffer_base::BufferBase;
 use super::buffer_cache_base::*;
@@ -77,7 +83,7 @@ pub struct BufferCache<P: BufferCacheParams, DT: DeviceTracker> {
     pub mutex: ReentrantMutex<()>,
 
     // -- Channel state (upstream inherits from ChannelSetupCaches) --
-    pub channel_state: Option<Box<BufferCacheChannelInfo>>,
+    pub channel_caches: ChannelSetupCaches<BufferCacheChannelInfo>,
 
     // -- Backend runtime --
     /// The backend runtime that performs actual GPU operations (bind, copy, clear, etc.).
@@ -99,11 +105,13 @@ pub struct BufferCache<P: BufferCacheParams, DT: DeviceTracker> {
     /// Upstream: `Tegra::MaxwellDeviceMemoryManager& device_memory`.
     device_memory: Option<Box<dyn DeviceMemoryAccess>>,
 
-    // -- Engine state --
-    /// Engine state access (Maxwell3D + KeplerCompute).
+    // -- Compute engine state --
+    /// Temporary KeplerCompute launch-state bridge.
     ///
-    /// Upstream: `maxwell3d` and `kepler_compute` pointers set per-channel.
-    engine_state: Option<Box<dyn EngineState>>,
+    /// Graphics state is read directly from the channel-bound `Maxwell3D`,
+    /// matching upstream. The compute bridge remains until the KeplerCompute
+    /// owner exposes its live launch description through ChannelSetupCaches.
+    compute_engine_state: Option<Box<dyn ComputeEngineState>>,
 
     // -- Draw indirect state --
     /// Current draw indirect parameters.
@@ -184,11 +192,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         Self {
             mutex: ReentrantMutex::new(()),
-            channel_state: None,
+            channel_caches: ChannelSetupCaches::new(),
             runtime: None,
             gpu_memory: None,
             device_memory: None,
-            engine_state: None,
+            compute_engine_state: None,
             current_draw_indirect: None,
             slot_buffers,
             page_table: vec![SlotId::invalid(); PAGE_TABLE_SIZE],
@@ -252,11 +260,73 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         self.device_memory = Some(device_memory);
     }
 
-    /// Set the engine state accessor for Maxwell3D + KeplerCompute register access.
-    ///
-    /// Upstream: `maxwell3d` and `kepler_compute` are set per-channel.
-    pub fn set_engine_state(&mut self, engine_state: Box<dyn EngineState>) {
-        self.engine_state = Some(engine_state);
+    /// Port of inherited `ChannelSetupCaches::CreateChannel`.
+    pub fn create_channel(&mut self, channel: &ChannelState) {
+        self.channel_caches.create_channel(channel);
+    }
+
+    /// Port of inherited `ChannelSetupCaches::BindToChannel`.
+    pub fn bind_to_channel(&mut self, channel_id: i32) {
+        self.channel_caches.bind_to_channel(channel_id);
+    }
+
+    /// Port of inherited `ChannelSetupCaches::EraseChannel`.
+    pub fn erase_channel(&mut self, channel_id: i32) {
+        self.channel_caches.erase_channel(channel_id);
+    }
+
+    pub fn current_channel_state(&self) -> Option<&BufferCacheChannelInfo> {
+        self.channel_caches.current_channel_state()
+    }
+
+    pub fn current_channel_state_mut(&mut self) -> Option<&mut BufferCacheChannelInfo> {
+        self.channel_caches.current_channel_state_mut()
+    }
+
+    fn maxwell3d(&self) -> Option<&Maxwell3D> {
+        let address = self.channel_caches.maxwell3d?;
+        // ChannelState owns this boxed engine and outlives every registered
+        // cache entry. Bind/erase keeps the raw address synchronized.
+        (address != 0).then(|| unsafe { &*(address as *const Maxwell3D) })
+    }
+
+    fn maxwell3d_mut(&mut self) -> Option<&mut Maxwell3D> {
+        let address = self.channel_caches.maxwell3d?;
+        // GPU cache operations are serialized by the rasterizer/cache locks;
+        // no second cache operation may dereference this engine concurrently.
+        (address != 0).then(|| unsafe { &mut *(address as *mut Maxwell3D) })
+    }
+
+    fn geometry_dirty_flag(flag: DirtyFlag) -> usize {
+        match flag {
+            DirtyFlag::IndexBuffer => crate::dirty_flags::flags::INDEX_BUFFER as usize,
+            DirtyFlag::VertexBuffers => crate::dirty_flags::flags::VERTEX_BUFFERS as usize,
+            DirtyFlag::VertexBuffer(index) => {
+                (crate::dirty_flags::flags::VERTEX_BUFFER0 + index as u8) as usize
+            }
+        }
+    }
+
+    fn is_geometry_dirty(&self, flag: DirtyFlag) -> bool {
+        self.maxwell3d()
+            .is_some_and(|maxwell| maxwell.dirty_flags()[Self::geometry_dirty_flag(flag)])
+    }
+
+    fn clear_geometry_dirty(&mut self, flag: DirtyFlag) {
+        if let Some(maxwell) = self.maxwell3d_mut() {
+            maxwell.dirty_flags_mut()[Self::geometry_dirty_flag(flag)] = false;
+        }
+    }
+
+    fn set_geometry_dirty(&mut self, flag: DirtyFlag) {
+        if let Some(maxwell) = self.maxwell3d_mut() {
+            maxwell.dirty_flags_mut()[Self::geometry_dirty_flag(flag)] = true;
+        }
+    }
+
+    /// Set the temporary KeplerCompute launch-state bridge.
+    pub fn set_compute_engine_state(&mut self, engine_state: Box<dyn ComputeEngineState>) {
+        self.compute_engine_state = Some(engine_state);
     }
 
     /// Set the current draw indirect parameters.
@@ -279,13 +349,13 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// are not yet available in this port.
     pub fn tick_frame(&mut self) {
         // Homebrew console apps don't create or bind any channels, so this will be None.
-        if self.channel_state.is_none() {
+        if !self.channel_caches.has_current_channel_state() {
             return;
         }
 
         // Calculate hits and shots and move hit bits to the right (shift history window).
         // Upstream: std::reduce + std::copy_n to shift history arrays left by one.
-        if let Some(ref mut cs) = self.channel_state {
+        if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             let hits: u32 = cs.uniform_cache_hits.iter().copied().sum();
             let shots: u32 = cs.uniform_cache_shots.iter().copied().sum();
 
@@ -524,7 +594,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         device_addr: u64,
         size: u32,
     ) {
-        let Some(ref mut cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state_mut() else {
             return;
         };
         let binding = Binding {
@@ -541,7 +611,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::DisableGraphicsUniformBuffer`
     pub fn disable_graphics_uniform_buffer(&mut self, stage: usize, index: u32) {
-        let Some(ref mut cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state_mut() else {
             return;
         };
         if stage < NUM_STAGES as usize && (index as usize) < NUM_GRAPHICS_UNIFORM_BUFFERS as usize {
@@ -553,15 +623,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::UpdateGraphicsBuffers`
     pub fn update_graphics_buffers(&mut self, is_indexed: bool) {
-        if self.channel_state.is_none() {
+        if !self.channel_caches.has_current_channel_state() {
             return;
         }
         loop {
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.has_deleted_buffers = false;
             }
             self.do_update_graphics_buffers(is_indexed);
-            if let Some(ref cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state() {
                 if !cs.has_deleted_buffers {
                     break;
                 }
@@ -584,11 +654,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         mut is_within_gpu_address_range: impl FnMut(u64) -> bool,
         mut max_continuous_range: impl FnMut(u64, u64) -> u64,
     ) {
-        if self.channel_state.is_none() {
+        if !self.channel_caches.has_current_channel_state() {
             return;
         }
         loop {
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.has_deleted_buffers = false;
             }
             self.do_update_graphics_buffers_with_gpu_resolver(
@@ -597,7 +667,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 &mut is_within_gpu_address_range,
                 &mut max_continuous_range,
             );
-            if let Some(ref cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state() {
                 if !cs.has_deleted_buffers {
                     break;
                 }
@@ -611,15 +681,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::UpdateComputeBuffers`
     pub fn update_compute_buffers(&mut self) {
-        if self.channel_state.is_none() {
+        if !self.channel_caches.has_current_channel_state() {
             return;
         }
         loop {
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.has_deleted_buffers = false;
             }
             self.do_update_compute_buffers();
-            if let Some(ref cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state() {
                 if !cs.has_deleted_buffers {
                     break;
                 }
@@ -672,7 +742,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         mask: &[u32; NUM_STAGES as usize],
         sizes: &UniformBufferSizes,
     ) {
-        let Some(ref mut cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state_mut() else {
             return;
         };
         if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS && cs.enabled_uniform_buffer_masks != *mask {
@@ -695,7 +765,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         mask: u32,
         sizes: &ComputeUniformBufferSizes,
     ) {
-        let Some(ref mut cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state_mut() else {
             return;
         };
         cs.enabled_compute_uniform_buffer_mask = mask;
@@ -710,7 +780,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::UnbindGraphicsStorageBuffers`
     pub fn unbind_graphics_storage_buffers(&mut self, stage: usize) {
-        let Some(ref mut cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state_mut() else {
             return;
         };
         if stage < NUM_STAGES as usize {
@@ -723,9 +793,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::BindGraphicsStorageBuffer`
     ///
-    /// NOTE: Resolving the storage buffer address requires maxwell3d shader stage state
-    /// (`cbufs.const_buffers[cbuf_index].address + cbuf_offset`) which is not yet available.
-    /// We store the placeholder NULL_BINDING and set the enabled/written masks correctly.
     pub fn bind_graphics_storage_buffer(
         &mut self,
         stage: usize,
@@ -734,28 +801,30 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         cbuf_offset: u32,
         is_written: bool,
     ) {
-        let Some(ref mut cs) = self.channel_state else {
-            return;
-        };
         if stage >= NUM_STAGES as usize || ssbo_index >= NUM_STORAGE_BUFFERS as usize {
             return;
         }
-        cs.enabled_storage_buffers[stage] |= 1u32 << ssbo_index;
-        cs.written_storage_buffers[stage] |= if is_written { 1u32 } else { 0u32 } << ssbo_index;
-        drop(cs);
+        {
+            let Some(cs) = self.channel_caches.current_channel_state_mut() else {
+                return;
+            };
+            cs.enabled_storage_buffers[stage] |= 1u32 << ssbo_index;
+            cs.written_storage_buffers[stage] |=
+                (if is_written { 1u32 } else { 0u32 }) << ssbo_index;
+        }
 
         // Upstream: const auto& cbufs = maxwell3d->state.shader_stages[stage];
         //           const GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
         //           channel_state->storage_buffers[stage][ssbo_index] =
         //               StorageBufferBinding(ssbo_addr, cbuf_index, is_written);
-        let binding = if let Some(ref es) = self.engine_state {
-            let cbuf_info = es.get_const_buffer(stage, cbuf_index);
-            let ssbo_addr = cbuf_info.address.wrapping_add(cbuf_offset as u64);
+        let binding = if let Some(maxwell) = self.maxwell3d() {
+            let cbuf = maxwell.const_buffer_bindings(stage)[cbuf_index as usize];
+            let ssbo_addr = cbuf.address.wrapping_add(cbuf_offset as u64);
             self.storage_buffer_binding(ssbo_addr, cbuf_index, is_written)
         } else {
             NULL_BINDING
         };
-        if let Some(ref mut cs) = self.channel_state {
+        if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.storage_buffers[stage][ssbo_index] = binding;
         }
     }
@@ -778,19 +847,21 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         mut get_memory_layout_size: impl FnMut(u64) -> u64,
         mut read_block: impl FnMut(u64, &mut [u8]) -> bool,
     ) {
-        let Some(ref mut cs) = self.channel_state else {
-            return;
-        };
         if stage >= NUM_STAGES as usize || ssbo_index >= NUM_STORAGE_BUFFERS as usize {
             return;
         }
-        cs.enabled_storage_buffers[stage] |= 1u32 << ssbo_index;
-        cs.written_storage_buffers[stage] |= if is_written { 1u32 } else { 0u32 } << ssbo_index;
-        drop(cs);
+        {
+            let Some(cs) = self.channel_caches.current_channel_state_mut() else {
+                return;
+            };
+            cs.enabled_storage_buffers[stage] |= 1u32 << ssbo_index;
+            cs.written_storage_buffers[stage] |=
+                (if is_written { 1u32 } else { 0u32 }) << ssbo_index;
+        }
 
-        let binding = if let Some(ref es) = self.engine_state {
-            let cbuf_info = es.get_const_buffer(stage, cbuf_index);
-            let ssbo_addr = cbuf_info.address.wrapping_add(cbuf_offset as u64);
+        let binding = if let Some(maxwell) = self.maxwell3d() {
+            let cbuf = maxwell.const_buffer_bindings(stage)[cbuf_index as usize];
+            let ssbo_addr = cbuf.address.wrapping_add(cbuf_offset as u64);
             self.storage_buffer_binding_with_gpu_reader(
                 ssbo_addr,
                 cbuf_index,
@@ -802,7 +873,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         } else {
             NULL_BINDING
         };
-        if let Some(ref mut cs) = self.channel_state {
+        if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.storage_buffers[stage][ssbo_index] = binding;
         }
     }
@@ -811,7 +882,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::UnbindComputeStorageBuffers`
     pub fn unbind_compute_storage_buffers(&mut self) {
-        let Some(ref mut cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state_mut() else {
             return;
         };
         cs.enabled_compute_storage_buffers = 0;
@@ -832,7 +903,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         cbuf_offset: u32,
         is_written: bool,
     ) {
-        let Some(ref mut cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state_mut() else {
             return;
         };
         if ssbo_index >= cs.compute_storage_buffers.len() {
@@ -844,7 +915,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
         cs.enabled_compute_storage_buffers |= 1u32 << ssbo_index;
         cs.written_compute_storage_buffers |= if is_written { 1u32 } else { 0u32 } << ssbo_index;
-        drop(cs);
 
         // Upstream: const auto& launch_desc = kepler_compute->launch_description;
         //           ASSERT(((launch_desc.const_buffer_enable_mask >> cbuf_index) & 1) != 0);
@@ -852,7 +922,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         //           const GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
         //           channel_state->compute_storage_buffers[ssbo_index] =
         //               StorageBufferBinding(ssbo_addr, cbuf_index, is_written);
-        let binding = if let Some(ref es) = self.engine_state {
+        let binding = if let Some(ref es) = self.compute_engine_state {
             let launch_info = es.get_compute_launch_info();
             if (cbuf_index as usize) < launch_info.const_buffer_config.len() {
                 let cbuf = &launch_info.const_buffer_config[cbuf_index as usize];
@@ -864,7 +934,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         } else {
             NULL_BINDING
         };
-        if let Some(ref mut cs) = self.channel_state {
+        if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.compute_storage_buffers[ssbo_index] = binding;
         }
     }
@@ -877,7 +947,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::UnbindGraphicsTextureBuffers`
     pub fn unbind_graphics_texture_buffers(&mut self, stage: usize) {
-        let Some(ref mut cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state_mut() else {
             return;
         };
         if stage < NUM_STAGES as usize {
@@ -904,7 +974,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return;
         }
         let binding = self.get_texture_buffer_binding(gpu_addr, size, format);
-        let Some(ref mut cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state_mut() else {
             return;
         };
         cs.enabled_texture_buffers[stage] |= 1u32 << tbo_index;
@@ -919,7 +989,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::UnbindComputeTextureBuffers`
     pub fn unbind_compute_texture_buffers(&mut self) {
-        let Some(ref mut cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state_mut() else {
             return;
         };
         cs.enabled_compute_texture_buffers = 0;
@@ -947,7 +1017,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return;
         }
         let binding = self.get_texture_buffer_binding(gpu_addr, size, format);
-        let Some(ref mut cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state_mut() else {
             return;
         };
         cs.enabled_compute_texture_buffers |= 1u32 << tbo_index;
@@ -1299,12 +1369,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let mut buffer_a = NULL_BUFFER_ID;
         let mut buffer_b = NULL_BUFFER_ID;
         loop {
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.has_deleted_buffers = false;
             }
             buffer_a = self.find_buffer(cpu_src_address, amount as u32);
             buffer_b = self.find_buffer(cpu_dest_address, amount as u32);
-            if let Some(ref cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state() {
                 if !cs.has_deleted_buffers {
                     break;
                 }
@@ -1458,7 +1528,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::GetDrawIndirectCount`
     pub fn get_draw_indirect_count(&mut self) -> (BufferId, u32) {
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return (NULL_BUFFER_ID, 0);
         };
         let binding = cs.count_buffer_binding;
@@ -1470,7 +1540,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::GetDrawIndirectBuffer`
     pub fn get_draw_indirect_buffer(&mut self) -> (BufferId, u32) {
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return (NULL_BUFFER_ID, 0);
         };
         let binding = cs.indirect_buffer_binding;
@@ -1509,11 +1579,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         F: FnMut(&mut Self),
     {
         loop {
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.has_deleted_buffers = false;
             }
             func(self);
-            if let Some(ref cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state() {
                 if !cs.has_deleted_buffers {
                     break;
                 }
@@ -1612,19 +1682,22 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     }
 
     fn bind_host_index_buffer(&mut self) {
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let binding = cs.index_buffer;
         let buffer_id = binding.buffer_id;
         let device_addr = binding.device_addr;
         let size = binding.size;
-        drop(cs); // release borrow
 
         let inline_indexes = self
-            .engine_state
-            .as_ref()
-            .map(|state| state.get_inline_index_draw_indexes().to_vec())
+            .maxwell3d()
+            .map(|maxwell| {
+                maxwell
+                    .draw_manager_state()
+                    .inline_index_draw_indexes
+                    .clone()
+            })
             .unwrap_or_default();
 
         self.touch_buffer(buffer_id);
@@ -1657,16 +1730,16 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         let offset = self.slot_buffers[buffer_id].offset(device_addr);
         let (topology, index_format, first, count, format_size) = self
-            .engine_state
-            .as_ref()
-            .map(|state| {
-                let index = state.get_index_buffer();
+            .maxwell3d()
+            .map(|maxwell| {
+                let draw_state = maxwell.draw_manager_state();
+                let index = draw_state.index_buffer;
                 (
-                    state.get_primitive_topology(),
-                    state.get_index_format(),
+                    draw_state.topology,
+                    index.format,
                     index.first,
                     index.count,
-                    index.format_size_in_bytes,
+                    index.format.size_bytes() as u32,
                 )
             })
             .unwrap_or((
@@ -1697,16 +1770,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     }
 
     fn bind_host_vertex_buffers(&mut self) {
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let bindings: Vec<Binding> = cs.vertex_buffers.to_vec();
-        drop(cs);
         let strides: Vec<u64> = (0..bindings.len())
             .map(|index| {
-                self.engine_state
-                    .as_ref()
-                    .map(|state| state.get_vertex_stream(index as u32).stride as u64)
+                self.maxwell3d()
+                    .map(|maxwell| maxwell.vertex_stream_info(index as u32).stride as u64)
                     .unwrap_or_default()
             })
             .collect();
@@ -1719,16 +1790,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 self.touch_buffer(binding.buffer_id);
                 self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
             }
-            if !self
-                .engine_state
-                .as_ref()
-                .is_some_and(|state| state.is_dirty(DirtyFlag::VertexBuffer(index as u32)))
-            {
+            if !self.is_geometry_dirty(DirtyFlag::VertexBuffer(index as u32)) {
                 continue;
             }
-            if let Some(state) = self.engine_state.as_mut() {
-                state.clear_dirty(DirtyFlag::VertexBuffer(index as u32));
-            }
+            self.clear_geometry_dirty(DirtyFlag::VertexBuffer(index as u32));
             min_index = min_index.min(index as u32);
             max_index = max_index.max(index as u32);
             any_valid = true;
@@ -1744,9 +1809,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             ..HostBindings::default()
         };
         for index in min_index as usize..max_index as usize {
-            if let Some(state) = self.engine_state.as_mut() {
-                state.clear_dirty(DirtyFlag::VertexBuffer(index as u32));
-            }
+            self.clear_geometry_dirty(DirtyFlag::VertexBuffer(index as u32));
             let binding = &bindings[index];
             if !binding.buffer_id.is_valid() || binding.buffer_id == NULL_BUFFER_ID {
                 host_bindings.buffer_ids.push(NULL_BUFFER_ID);
@@ -1771,12 +1834,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let include_count = self
             .current_draw_indirect
             .is_some_and(|params| params.include_count);
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let count_binding = cs.count_buffer_binding;
         let indirect_binding = cs.indirect_buffer_binding;
-        drop(cs);
 
         if include_count {
             self.touch_buffer(count_binding.buffer_id);
@@ -1796,7 +1858,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
     /// Upstream: `BufferCache<P>::BindHostGraphicsUniformBuffers`
     fn bind_host_graphics_uniform_buffers(&mut self, stage: usize) {
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let dirty = if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
@@ -1805,10 +1867,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             !0u32
         };
         let mask = cs.enabled_uniform_buffer_masks[stage];
-        drop(cs);
 
         if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.dirty_uniform_buffers[stage] = 0;
             }
         }
@@ -1838,13 +1899,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         binding_index: u32,
         needs_bind: bool,
     ) {
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let binding = cs.uniform_buffers[stage][index as usize];
         let skip_cache_size = cs.uniform_buffer_skip_cache_size;
         let ub_sizes = cs.uniform_buffer_sizes.clone();
-        drop(cs);
 
         let device_addr = binding.device_addr;
         let size = if let Some(ref sizes) = ub_sizes {
@@ -1871,12 +1931,16 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                         // Upstream: runtime.PushFastUniformBuffer(stage, binding_index, span)
                         // Read device memory and push it.
                         if let Some(ref dm) = self.device_memory {
-                            let should_fast_bind = self.channel_state.as_ref().is_none_or(|cs| {
-                                ((cs.fast_bound_uniform_buffers[stage] >> binding_index) & 1) == 0
-                                    || cs.uniform_buffer_binding_sizes[stage]
-                                        [binding_index as usize]
-                                        != size
-                            });
+                            let should_fast_bind = self
+                                .channel_caches
+                                .current_channel_state()
+                                .is_none_or(|cs| {
+                                    ((cs.fast_bound_uniform_buffers[stage] >> binding_index) & 1)
+                                        == 0
+                                        || cs.uniform_buffer_binding_sizes[stage]
+                                            [binding_index as usize]
+                                            != size
+                                });
                             if should_fast_bind {
                                 rt.bind_fast_uniform_buffer(stage, binding_index, size);
                             }
@@ -1903,14 +1967,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 }
             }
             if fast_buffer_bound {
-                if let Some(ref mut cs) = self.channel_state {
+                if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                     cs.fast_bound_uniform_buffers[stage] |= 1u32 << binding_index;
                     cs.uniform_buffer_binding_sizes[stage][binding_index as usize] = size;
                 }
                 return;
             }
             if P::IS_OPENGL {
-                if let Some(ref mut cs) = self.channel_state {
+                if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                     cs.fast_bound_uniform_buffers[stage] |= 1u32 << binding_index;
                     cs.uniform_buffer_binding_sizes[stage][binding_index as usize] = size;
                 }
@@ -1928,7 +1992,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         // Classic cached path.
         let sync_cached = self.synchronize_buffer(binding.buffer_id, device_addr, size);
-        if let Some(ref mut cs) = self.channel_state {
+        if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             if sync_cached {
                 cs.uniform_cache_hits[0] = cs.uniform_cache_hits[0].wrapping_add(1);
             }
@@ -1938,9 +2002,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let needs_stream_fallback_upload = P::IS_OPENGL;
         let has_fast_bound = self.has_fast_uniform_buffer_bound(stage, binding_index);
         let binding_size_differs = if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
-            self.channel_state.as_ref().map_or(false, |cs| {
-                cs.uniform_buffer_binding_sizes[stage][binding_index as usize] != size
-            })
+            self.channel_caches
+                .current_channel_state()
+                .map_or(false, |cs| {
+                    cs.uniform_buffer_binding_sizes[stage][binding_index as usize] != size
+                })
         } else {
             false
         };
@@ -1970,7 +2036,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             } else {
                 false
             };
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.fast_bound_uniform_buffers[stage] &= !(1u32 << binding_index);
                 if is_copy_bind {
                     cs.dirty_uniform_buffers[stage] |= 1u32 << index;
@@ -1978,7 +2044,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             }
         }
         if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.uniform_buffer_binding_sizes[stage][binding_index as usize] = size;
             }
         }
@@ -2021,13 +2087,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     fn bind_host_graphics_storage_buffers(&mut self, stage: usize) {
         // Upstream: iterates enabled storage buffers, synchronizes, then calls
         // runtime.BindStorageBuffer.
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let mask = cs.enabled_storage_buffers[stage];
         let written_mask = cs.written_storage_buffers[stage];
         let bindings: Vec<Binding> = cs.storage_buffers[stage].to_vec();
-        drop(cs);
 
         let mut binding_index = 0u32;
         let mut bits = mask;
@@ -2076,14 +2141,13 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     }
 
     fn bind_host_graphics_texture_buffers(&mut self, stage: usize) {
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let mask = cs.enabled_texture_buffers[stage];
         let written_mask = cs.written_texture_buffers[stage];
         let image_mask = cs.image_texture_buffers[stage];
         let bindings: Vec<TextureBufferBinding> = cs.texture_buffers[stage].to_vec();
-        drop(cs);
 
         let mut bits = mask;
         let mut idx: u32 = 0;
@@ -2132,11 +2196,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         // Upstream: iterates transform feedback buffers if tfb is enabled.
         // Requires maxwell3d->regs.transform_feedback_enabled — not yet available.
         // We synchronize unconditionally for all non-null bindings.
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let bindings: Vec<Binding> = cs.transform_feedback_buffers.to_vec();
-        drop(cs);
 
         for binding in bindings {
             if !binding.buffer_id.is_valid() || binding.buffer_id == NULL_BUFFER_ID {
@@ -2148,7 +2211,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
 
         // Build HostBindings and bind them all at once (matching upstream pattern).
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let mut host_bindings = HostBindings::default();
@@ -2164,7 +2227,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             host_bindings.min_index = host_bindings.min_index.min(index as u32);
             host_bindings.max_index = host_bindings.max_index.max(index as u32);
         }
-        drop(cs);
         if let Some(ref mut rt) = self.runtime {
             rt.bind_transform_feedback_buffers(&host_bindings);
         }
@@ -2174,19 +2236,18 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         // Upstream: marks all uniform buffers dirty (persistent bindings), then
         // iterates and calls runtime.BindComputeUniformBuffer.
         if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.dirty_uniform_buffers.fill(!0u32);
                 cs.fast_bound_uniform_buffers.fill(0);
             }
         }
 
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let mask = cs.enabled_compute_uniform_buffer_mask;
         let ub_sizes = cs.compute_uniform_buffer_sizes.clone();
         let bindings: Vec<Binding> = cs.compute_uniform_buffers.to_vec();
-        drop(cs);
 
         let mut binding_index = 0u32;
         let mut bits = mask;
@@ -2237,13 +2298,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     }
 
     fn bind_host_compute_storage_buffers(&mut self) {
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let mask = cs.enabled_compute_storage_buffers;
         let written_mask = cs.written_compute_storage_buffers;
         let bindings: Vec<Binding> = cs.compute_storage_buffers.to_vec();
-        drop(cs);
 
         let mut binding_index = 0u32;
         let mut bits = mask;
@@ -2304,14 +2364,13 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     }
 
     fn bind_host_compute_texture_buffers(&mut self) {
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let mask = cs.enabled_compute_texture_buffers;
         let written_mask = cs.written_compute_texture_buffers;
         let image_mask = cs.image_compute_texture_buffers;
         let bindings: Vec<TextureBufferBinding> = cs.compute_texture_buffers.to_vec();
-        drop(cs);
 
         let mut bits = mask;
         let mut idx: u32 = 0;
@@ -2423,17 +2482,21 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
     /// Upstream: `BufferCache<P>::UpdateIndexBuffer`
     fn update_index_buffer(&mut self) {
-        let Some(ref mut es) = self.engine_state else {
-            return;
-        };
-        if !es.is_dirty(DirtyFlag::IndexBuffer) {
+        if self.maxwell3d().is_none() {
             return;
         }
-        es.clear_dirty(DirtyFlag::IndexBuffer);
+        if !self.is_geometry_dirty(DirtyFlag::IndexBuffer) {
+            return;
+        }
+        self.clear_geometry_dirty(DirtyFlag::IndexBuffer);
 
-        let inline_indexes = es.get_inline_index_draw_indexes().to_vec();
-        if !inline_indexes.is_empty() {
-            let inline_index_size = inline_indexes.len() as u32;
+        let inline_index_size = self
+            .maxwell3d()
+            .expect("checked above")
+            .draw_manager_state()
+            .inline_index_draw_indexes
+            .len() as u32;
+        if inline_index_size != 0 {
             let buffer_size =
                 (inline_index_size + CACHING_PAGESIZE as u32 - 1) & !(CACHING_PAGESIZE as u32 - 1);
             if self.inline_buffer_id == NULL_BUFFER_ID {
@@ -2441,10 +2504,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             }
             if (self.slot_buffers[self.inline_buffer_id].size_bytes() as u32) < buffer_size {
                 let old_id = self.inline_buffer_id;
+                self.slot_buffers.erase(old_id);
                 self.inline_buffer_id = self.create_buffer(0, buffer_size);
-                let _ = old_id; // old buffer gets cleaned up by page table overwrite
             }
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.index_buffer = Binding {
                     device_addr: 0,
                     size: inline_index_size,
@@ -2454,8 +2517,18 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return;
         }
 
-        let index_buffer_ref = es.get_index_buffer();
-        drop(es);
+        let index_buffer_ref = {
+            let maxwell = self.maxwell3d().expect("checked above");
+            let index = maxwell.draw_manager_state().index_buffer;
+            let format_size_in_bytes = index.format.size_bytes() as u32;
+            IndexBufferRef {
+                start_address: maxwell.index_buffer_addr(),
+                end_address: Maxwell3DAccess::index_buffer_addr_end(maxwell),
+                count: index.count,
+                first: index.first,
+                format_size_in_bytes,
+            }
+        };
 
         let gpu_addr_begin = index_buffer_ref.start_address;
         let gpu_addr_end = index_buffer_ref.end_address;
@@ -2468,14 +2541,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             * index_buffer_ref.format_size_in_bytes;
         let size = address_size.min(draw_size);
         if size == 0 || device_addr.is_none() {
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.index_buffer = NULL_BINDING;
             }
             return;
         }
         let device_addr = device_addr.unwrap();
         let buffer_id = self.find_buffer(device_addr, size);
-        if let Some(ref mut cs) = self.channel_state {
+        if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.index_buffer = Binding {
                 device_addr,
                 size,
@@ -2488,17 +2561,21 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         &mut self,
         gpu_to_cpu_address: &mut impl FnMut(u64) -> Option<u64>,
     ) {
-        let Some(ref mut es) = self.engine_state else {
-            return;
-        };
-        if !es.is_dirty(DirtyFlag::IndexBuffer) {
+        if self.maxwell3d().is_none() {
             return;
         }
-        es.clear_dirty(DirtyFlag::IndexBuffer);
+        if !self.is_geometry_dirty(DirtyFlag::IndexBuffer) {
+            return;
+        }
+        self.clear_geometry_dirty(DirtyFlag::IndexBuffer);
 
-        let inline_indexes = es.get_inline_index_draw_indexes().to_vec();
-        if !inline_indexes.is_empty() {
-            let inline_index_size = inline_indexes.len() as u32;
+        let inline_index_size = self
+            .maxwell3d()
+            .expect("checked above")
+            .draw_manager_state()
+            .inline_index_draw_indexes
+            .len() as u32;
+        if inline_index_size != 0 {
             let buffer_size =
                 (inline_index_size + CACHING_PAGESIZE as u32 - 1) & !(CACHING_PAGESIZE as u32 - 1);
             if self.inline_buffer_id == NULL_BUFFER_ID {
@@ -2506,10 +2583,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             }
             if (self.slot_buffers[self.inline_buffer_id].size_bytes() as u32) < buffer_size {
                 let old_id = self.inline_buffer_id;
+                self.slot_buffers.erase(old_id);
                 self.inline_buffer_id = self.create_buffer(0, buffer_size);
-                let _ = old_id;
             }
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.index_buffer = Binding {
                     device_addr: 0,
                     size: inline_index_size,
@@ -2519,8 +2596,18 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return;
         }
 
-        let index_buffer_ref = es.get_index_buffer();
-        drop(es);
+        let index_buffer_ref = {
+            let maxwell = self.maxwell3d().expect("checked above");
+            let index = maxwell.draw_manager_state().index_buffer;
+            let format_size_in_bytes = index.format.size_bytes() as u32;
+            IndexBufferRef {
+                start_address: maxwell.index_buffer_addr(),
+                end_address: Maxwell3DAccess::index_buffer_addr_end(maxwell),
+                count: index.count,
+                first: index.first,
+                format_size_in_bytes,
+            }
+        };
 
         let gpu_addr_begin = index_buffer_ref.start_address;
         let gpu_addr_end = index_buffer_ref.end_address;
@@ -2530,14 +2617,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             * index_buffer_ref.format_size_in_bytes;
         let size = address_size.min(draw_size);
         if size == 0 || device_addr.is_none() {
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.index_buffer = NULL_BINDING;
             }
             return;
         }
         let device_addr = device_addr.unwrap();
         let buffer_id = self.find_buffer(device_addr, size);
-        if let Some(ref mut cs) = self.channel_state {
+        if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.index_buffer = Binding {
                 device_addr,
                 size,
@@ -2551,14 +2638,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         // Upstream: auto& flags = maxwell3d->dirty.flags;
         //           if (!flags[Dirty::VertexBuffers]) { return; }
         //           flags[Dirty::VertexBuffers] = false;
-        if let Some(ref mut es) = self.engine_state {
-            if !es.is_dirty(DirtyFlag::VertexBuffers) {
-                return;
-            }
-            es.clear_dirty(DirtyFlag::VertexBuffers);
-        } else {
+        if !self.is_geometry_dirty(DirtyFlag::VertexBuffers) {
             return;
         }
+        self.clear_geometry_dirty(DirtyFlag::VertexBuffers);
         for index in 0..NUM_VERTEX_BUFFERS {
             self.update_vertex_buffer(index);
         }
@@ -2570,14 +2653,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         is_within_gpu_address_range: &mut impl FnMut(u64) -> bool,
         max_continuous_range: &mut impl FnMut(u64, u64) -> u64,
     ) {
-        if let Some(ref mut es) = self.engine_state {
-            if !es.is_dirty(DirtyFlag::VertexBuffers) {
-                return;
-            }
-            es.clear_dirty(DirtyFlag::VertexBuffers);
-        } else {
+        if !self.is_geometry_dirty(DirtyFlag::VertexBuffers) {
             return;
         }
+        self.clear_geometry_dirty(DirtyFlag::VertexBuffers);
         for index in 0..NUM_VERTEX_BUFFERS {
             self.update_vertex_buffer_with_gpu_resolver(
                 index,
@@ -2595,15 +2674,17 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         is_within_gpu_address_range: &mut impl FnMut(u64) -> bool,
         max_continuous_range: &mut impl FnMut(u64, u64) -> u64,
     ) {
-        let Some(ref mut es) = self.engine_state else {
-            return;
-        };
-        if !es.is_dirty(DirtyFlag::VertexBuffer(index)) {
+        if !self.is_geometry_dirty(DirtyFlag::VertexBuffer(index)) {
             return;
         }
-        let array = es.get_vertex_stream(index);
-        let limit = es.get_vertex_stream_limit(index);
-        drop(es);
+        let Some((array, limit)) = self.maxwell3d().map(|maxwell| {
+            (
+                maxwell.vertex_stream_info(index),
+                maxwell.vertex_stream_limit(index),
+            )
+        }) else {
+            return;
+        };
 
         let gpu_addr_begin = array.address;
         let gpu_addr_end = limit.address + 1;
@@ -2611,8 +2692,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let address_size = (gpu_addr_end - gpu_addr_begin) as u32;
         let mut size = address_size;
 
-        if array.enable == 0 || size == 0 || device_addr.is_none() {
-            if let Some(ref mut cs) = self.channel_state {
+        if !array.enabled || size == 0 || device_addr.is_none() {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.vertex_buffers[index as usize] = NULL_BINDING;
             }
             return;
@@ -2625,7 +2706,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         let device_addr = device_addr.unwrap();
         let buffer_id = self.find_buffer(device_addr, size);
-        if let Some(ref mut cs) = self.channel_state {
+        if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.vertex_buffers[index as usize] = Binding {
                 device_addr,
                 size,
@@ -2636,15 +2717,17 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
     /// Upstream: `BufferCache<P>::UpdateVertexBuffer`
     fn update_vertex_buffer(&mut self, index: u32) {
-        let Some(ref mut es) = self.engine_state else {
-            return;
-        };
-        if !es.is_dirty(DirtyFlag::VertexBuffer(index)) {
+        if !self.is_geometry_dirty(DirtyFlag::VertexBuffer(index)) {
             return;
         }
-        let array = es.get_vertex_stream(index);
-        let limit = es.get_vertex_stream_limit(index);
-        drop(es);
+        let Some((array, limit)) = self.maxwell3d().map(|maxwell| {
+            (
+                maxwell.vertex_stream_info(index),
+                maxwell.vertex_stream_limit(index),
+            )
+        }) else {
+            return;
+        };
 
         let gpu_addr_begin = array.address;
         let gpu_addr_end = limit.address + 1;
@@ -2655,8 +2738,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let address_size = (gpu_addr_end - gpu_addr_begin) as u32;
         let mut size = address_size;
 
-        if array.enable == 0 || size == 0 || device_addr.is_none() {
-            if let Some(ref mut cs) = self.channel_state {
+        if !array.enabled || size == 0 || device_addr.is_none() {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.vertex_buffers[index as usize] = NULL_BINDING;
             }
             return;
@@ -2673,7 +2756,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         let device_addr = device_addr.unwrap();
         let buffer_id = self.find_buffer(device_addr, size);
-        if let Some(ref mut cs) = self.channel_state {
+        if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.vertex_buffers[index as usize] = Binding {
                 device_addr,
                 size,
@@ -2710,13 +2793,13 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         // Upstream: if (current_draw_indirect->include_count) { update count binding }
         if params.include_count {
             let binding = resolve_binding(self, params.count_start_address, 4); // sizeof(u32)
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.count_buffer_binding = binding;
             }
         }
 
         let binding = resolve_binding(self, params.indirect_start_address, params.buffer_size);
-        if let Some(ref mut cs) = self.channel_state {
+        if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.indirect_buffer_binding = binding;
         }
     }
@@ -2745,24 +2828,23 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         if params.include_count {
             let binding = resolve_binding(self, params.count_start_address, 4);
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.count_buffer_binding = binding;
             }
         }
 
         let binding = resolve_binding(self, params.indirect_start_address, params.buffer_size);
-        if let Some(ref mut cs) = self.channel_state {
+        if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.indirect_buffer_binding = binding;
         }
     }
 
     /// Upstream: `BufferCache<P>::UpdateUniformBuffers`
     fn update_uniform_buffers(&mut self, stage: usize) {
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let mask = cs.enabled_uniform_buffer_masks[stage];
-        drop(cs);
 
         let mut bits = mask;
         let mut idx: u32 = 0;
@@ -2771,7 +2853,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             idx += skip;
             bits >>= skip;
 
-            if let Some(ref cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state() {
                 let binding = cs.uniform_buffers[stage][idx as usize];
                 // If already resolved, skip.
                 if binding.buffer_id.is_valid() && binding.buffer_id != NULL_BUFFER_ID {
@@ -2783,19 +2865,20 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
             // Mark as dirty and resolve buffer_id.
             if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
-                if let Some(ref mut cs) = self.channel_state {
+                if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                     cs.dirty_uniform_buffers[stage] |= 1u32 << idx;
                 }
             }
 
-            let (device_addr, size) = if let Some(ref cs) = self.channel_state {
+            let (device_addr, size) = if let Some(cs) = self.channel_caches.current_channel_state()
+            {
                 let b = cs.uniform_buffers[stage][idx as usize];
                 (b.device_addr, b.size)
             } else {
                 break;
             };
             let buffer_id = self.find_buffer(device_addr, size);
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.uniform_buffers[stage][idx as usize].buffer_id = buffer_id;
             }
 
@@ -2806,11 +2889,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
     /// Upstream: `BufferCache<P>::UpdateStorageBuffers`
     fn update_storage_buffers(&mut self, stage: usize) {
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let mask = cs.enabled_storage_buffers[stage];
-        drop(cs);
 
         let mut bits = mask;
         let mut idx: u32 = 0;
@@ -2819,14 +2901,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             idx += skip;
             bits >>= skip;
 
-            let (device_addr, size) = if let Some(ref cs) = self.channel_state {
+            let (device_addr, size) = if let Some(cs) = self.channel_caches.current_channel_state()
+            {
                 let b = cs.storage_buffers[stage][idx as usize];
                 (b.device_addr, b.size)
             } else {
                 break;
             };
             let buffer_id = self.find_buffer(device_addr, size);
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.storage_buffers[stage][idx as usize].buffer_id = buffer_id;
             }
 
@@ -2837,11 +2920,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
     /// Upstream: `BufferCache<P>::UpdateTextureBuffers`
     fn update_texture_buffers(&mut self, stage: usize) {
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let mask = cs.enabled_texture_buffers[stage];
-        drop(cs);
 
         let mut bits = mask;
         let mut idx: u32 = 0;
@@ -2850,14 +2932,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             idx += skip;
             bits >>= skip;
 
-            let (device_addr, size) = if let Some(ref cs) = self.channel_state {
+            let (device_addr, size) = if let Some(cs) = self.channel_caches.current_channel_state()
+            {
                 let b = cs.texture_buffers[stage][idx as usize];
                 (b.device_addr, b.size)
             } else {
                 break;
             };
             let buffer_id = self.find_buffer(device_addr, size);
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.texture_buffers[stage][idx as usize].buffer_id = buffer_id;
             }
 
@@ -2869,10 +2952,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Upstream: `BufferCache<P>::UpdateTransformFeedbackBuffers`
     fn update_transform_feedback_buffers(&mut self) {
         // Upstream: if (maxwell3d->regs.transform_feedback_enabled == 0) { return; }
-        if let Some(ref es) = self.engine_state {
-            if !es.is_transform_feedback_enabled() {
-                return;
-            }
+        if !self
+            .maxwell3d()
+            .is_some_and(Maxwell3D::transform_feedback_enabled)
+        {
+            return;
         }
         for index in 0..NUM_TRANSFORM_FEEDBACK_BUFFERS {
             self.update_transform_feedback_buffer(index);
@@ -2881,9 +2965,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
     /// Upstream: `BufferCache<P>::UpdateTransformFeedbackBuffer`
     fn update_transform_feedback_buffer(&mut self, index: u32) {
-        let tfb_info = if let Some(ref es) = self.engine_state {
-            es.get_transform_feedback_buffer(index)
-        } else {
+        let Some(tfb_info) = self
+            .maxwell3d()
+            .map(|maxwell| maxwell.transform_feedback_buffer_info(index))
+        else {
             return;
         };
 
@@ -2895,14 +2980,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             .and_then(|gm| gm.gpu_to_cpu_address(gpu_addr));
 
         if tfb_info.enable == 0 || size == 0 || device_addr.is_none() {
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.transform_feedback_buffers[index as usize] = NULL_BINDING;
             }
             return;
         }
         let device_addr = device_addr.unwrap();
         let buffer_id = self.find_buffer(device_addr, size);
-        if let Some(ref mut cs) = self.channel_state {
+        if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.transform_feedback_buffers[index as usize] = Binding {
                 device_addr,
                 size,
@@ -2913,15 +2998,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
     /// Upstream: `BufferCache<P>::UpdateComputeUniformBuffers`
     fn update_compute_uniform_buffers(&mut self) {
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let mask = cs.enabled_compute_uniform_buffer_mask;
-        drop(cs);
 
         // Get launch description from engine state.
         let launch_info = self
-            .engine_state
+            .compute_engine_state
             .as_ref()
             .map(|es| es.get_compute_launch_info());
 
@@ -2954,7 +3038,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 }
             }
             binding.buffer_id = self.find_buffer(binding.device_addr, binding.size);
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.compute_uniform_buffers[idx as usize] = binding;
             }
 
@@ -2965,11 +3049,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
     /// Upstream: `BufferCache<P>::UpdateComputeStorageBuffers`
     fn update_compute_storage_buffers(&mut self) {
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let mask = cs.enabled_compute_storage_buffers;
-        drop(cs);
 
         let mut bits = mask;
         let mut idx: u32 = 0;
@@ -2978,14 +3061,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             idx += skip;
             bits >>= skip;
 
-            let (device_addr, size) = if let Some(ref cs) = self.channel_state {
+            let (device_addr, size) = if let Some(cs) = self.channel_caches.current_channel_state()
+            {
                 let b = cs.compute_storage_buffers[idx as usize];
                 (b.device_addr, b.size)
             } else {
                 break;
             };
             let buffer_id = self.find_buffer(device_addr, size);
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.compute_storage_buffers[idx as usize].buffer_id = buffer_id;
             }
 
@@ -2996,11 +3080,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
     /// Upstream: `BufferCache<P>::UpdateComputeTextureBuffers`
     fn update_compute_texture_buffers(&mut self) {
-        let Some(ref cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state() else {
             return;
         };
         let mask = cs.enabled_compute_texture_buffers;
-        drop(cs);
 
         let mut bits = mask;
         let mut idx: u32 = 0;
@@ -3009,14 +3092,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             idx += skip;
             bits >>= skip;
 
-            let (device_addr, size) = if let Some(ref cs) = self.channel_state {
+            let (device_addr, size) = if let Some(cs) = self.channel_caches.current_channel_state()
+            {
                 let b = cs.compute_texture_buffers[idx as usize];
                 (b.device_addr, b.size)
             } else {
                 break;
             };
             let buffer_id = self.find_buffer(device_addr, size);
-            if let Some(ref mut cs) = self.channel_state {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.compute_texture_buffers[idx as usize].buffer_id = buffer_id;
             }
 
@@ -3583,7 +3667,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::DeleteBuffer`
     fn delete_buffer(&mut self, buffer_id: BufferId, do_not_mark: bool) {
-        let Some(ref mut cs) = self.channel_state else {
+        let Some(cs) = self.channel_caches.current_channel_state_mut() else {
             return;
         };
 
@@ -3630,27 +3714,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             }
         }
 
-        if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
-            cs.dirty_uniform_buffers.fill(!0u32);
-            cs.uniform_buffer_binding_sizes =
-                [[0; NUM_GRAPHICS_UNIFORM_BUFFERS as usize]; NUM_STAGES as usize];
-        }
-
-        cs.has_deleted_buffers = true;
-        drop(cs); // release borrow before calling methods that need &mut self
-
-        if let Some(state) = self.engine_state.as_mut() {
-            if dirty_index {
-                state.set_dirty(DirtyFlag::IndexBuffer);
-            }
-            if !dirty_vertex_buffers.is_empty() {
-                state.set_dirty(DirtyFlag::VertexBuffers);
-                for index in dirty_vertex_buffers {
-                    state.set_dirty(DirtyFlag::VertexBuffer(index));
-                }
-            }
-        }
-
         // Mark the whole buffer as CPU-modified to stop tracking.
         if !do_not_mark {
             let (cpu_addr, size_bytes) = {
@@ -3664,6 +3727,27 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         self.unregister(buffer_id);
         let buffer = self.slot_buffers.take(buffer_id);
         self.delayed_destruction_ring.push(buffer);
+
+        if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
+            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
+                cs.dirty_uniform_buffers.fill(!0u32);
+                cs.uniform_buffer_binding_sizes =
+                    [[0; NUM_GRAPHICS_UNIFORM_BUFFERS as usize]; NUM_STAGES as usize];
+            }
+        }
+
+        if dirty_index {
+            self.set_geometry_dirty(DirtyFlag::IndexBuffer);
+        }
+        if !dirty_vertex_buffers.is_empty() {
+            self.set_geometry_dirty(DirtyFlag::VertexBuffers);
+            for index in dirty_vertex_buffers {
+                self.set_geometry_dirty(DirtyFlag::VertexBuffer(index));
+            }
+        }
+        if let Some(cs) = self.channel_caches.current_channel_state_mut() {
+            cs.has_deleted_buffers = true;
+        }
     }
 
     /// Build a storage buffer binding from a GPU virtual SSBO address.
@@ -3865,9 +3949,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Upstream: `BufferCache<P>::HasFastUniformBufferBound`
     fn has_fast_uniform_buffer_bound(&self, stage: usize, binding_index: u32) -> bool {
         if P::IS_OPENGL {
-            self.channel_state.as_ref().map_or(false, |cs| {
-                ((cs.fast_bound_uniform_buffers[stage] >> binding_index) & 1) != 0
-            })
+            self.channel_caches
+                .current_channel_state()
+                .map_or(false, |cs| {
+                    ((cs.fast_bound_uniform_buffers[stage] >> binding_index) & 1) != 0
+                })
         } else {
             // Only OpenGL has fast uniform buffers.
             false
@@ -3961,7 +4047,6 @@ pub struct RasterizerDownloadArea {
 mod tests {
     use super::super::word_manager::DeviceTracker;
     use super::*;
-    use std::sync::{Arc, Mutex};
 
     struct DummyTracker;
     impl DeviceTracker for DummyTracker {
@@ -3980,60 +4065,10 @@ mod tests {
         const USE_MEMORY_MAPS_FOR_UPLOADS: bool = false;
     }
 
-    struct TrackingEngineState {
-        dirty: Arc<Mutex<Vec<DirtyFlag>>>,
-    }
-
-    impl EngineState for TrackingEngineState {
-        fn get_index_buffer(&self) -> IndexBufferRef {
-            IndexBufferRef::default()
-        }
-
-        fn get_inline_index_draw_indexes(&self) -> &[u8] {
-            &[]
-        }
-
-        fn is_dirty(&self, flag: DirtyFlag) -> bool {
-            self.dirty.lock().unwrap().contains(&flag)
-        }
-
-        fn clear_dirty(&mut self, flag: DirtyFlag) {
-            self.dirty.lock().unwrap().retain(|dirty| *dirty != flag);
-        }
-
-        fn set_dirty(&mut self, flag: DirtyFlag) {
-            let mut dirty = self.dirty.lock().unwrap();
-            if !dirty.contains(&flag) {
-                dirty.push(flag);
-            }
-        }
-
-        fn get_vertex_stream(&self, _index: u32) -> VertexStreamInfo {
-            VertexStreamInfo::default()
-        }
-
-        fn get_vertex_stream_limit(&self, _index: u32) -> VertexStreamLimit {
-            VertexStreamLimit::default()
-        }
-
-        fn is_transform_feedback_enabled(&self) -> bool {
-            false
-        }
-
-        fn get_transform_feedback_buffer(&self, _index: u32) -> TransformFeedbackBufferInfo {
-            TransformFeedbackBufferInfo::default()
-        }
-
-        fn get_const_buffer(&self, _stage: usize, _cbuf_index: u32) -> ConstBufferInfo {
-            ConstBufferInfo::default()
-        }
-
-        fn get_compute_launch_info(&self) -> ComputeLaunchInfo {
-            ComputeLaunchInfo {
-                const_buffer_enable_mask: 0,
-                const_buffer_config: Vec::new(),
-            }
-        }
+    fn bind_test_channel(cache: &mut BufferCache<TestParams, DummyTracker>, bind_id: i32) {
+        let channel = ChannelState::new(bind_id);
+        cache.create_channel(&channel);
+        cache.bind_to_channel(bind_id);
     }
 
     #[test]
@@ -4042,6 +4077,76 @@ mod tests {
         let cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
         assert!(!cache.has_uncommitted_flushes());
         assert!(!cache.should_wait_async_flushes());
+    }
+
+    #[test]
+    fn channel_binding_rebinds_live_engines_and_preserves_per_channel_payload() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        let mut channel_a = ChannelState::new(11);
+        channel_a.maxwell_3d = Some(Box::new(crate::engines::maxwell_3d::Maxwell3D::new()));
+        channel_a.kepler_compute = Some(Box::default());
+        let mut channel_b = ChannelState::new(12);
+        channel_b.maxwell_3d = Some(Box::new(crate::engines::maxwell_3d::Maxwell3D::new()));
+        channel_b.kepler_compute = Some(Box::default());
+        let maxwell_a = (&**channel_a.maxwell_3d.as_ref().unwrap() as *const _) as usize;
+        let maxwell_b = (&**channel_b.maxwell_3d.as_ref().unwrap() as *const _) as usize;
+
+        cache.create_channel(&channel_a);
+        cache.create_channel(&channel_b);
+        cache.bind_to_channel(channel_a.bind_id);
+        assert_eq!(cache.channel_caches.maxwell3d, Some(maxwell_a));
+        cache
+            .current_channel_state_mut()
+            .unwrap()
+            .enabled_uniform_buffer_masks[0] = 0x55;
+
+        cache.bind_to_channel(channel_b.bind_id);
+        assert_eq!(cache.channel_caches.maxwell3d, Some(maxwell_b));
+        assert_eq!(
+            cache
+                .current_channel_state()
+                .unwrap()
+                .enabled_uniform_buffer_masks[0],
+            0
+        );
+
+        cache.bind_to_channel(channel_a.bind_id);
+        assert_eq!(
+            cache
+                .current_channel_state()
+                .unwrap()
+                .enabled_uniform_buffer_masks[0],
+            0x55
+        );
+    }
+
+    #[test]
+    fn graphics_dirty_state_is_read_from_live_channel_maxwell() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        let mut owner = ChannelState::new(13);
+        owner.maxwell_3d = Some(Box::new(Maxwell3D::new()));
+        owner
+            .maxwell_3d
+            .as_mut()
+            .unwrap()
+            .dirty_flags_mut()
+            .fill(false);
+
+        cache.create_channel(&owner);
+        cache.bind_to_channel(owner.bind_id);
+        assert!(!cache.is_geometry_dirty(DirtyFlag::IndexBuffer));
+
+        owner.maxwell_3d.as_mut().unwrap().dirty_flags_mut()
+            [crate::dirty_flags::flags::INDEX_BUFFER as usize] = true;
+        assert!(cache.is_geometry_dirty(DirtyFlag::IndexBuffer));
+
+        cache.clear_geometry_dirty(DirtyFlag::IndexBuffer);
+        assert!(
+            !owner.maxwell_3d.as_ref().unwrap().dirty_flags()
+                [crate::dirty_flags::flags::INDEX_BUFFER as usize]
+        );
     }
 
     #[test]
@@ -4103,13 +4208,12 @@ mod tests {
     fn delete_buffer_replaces_channel_references_with_null_buffer() {
         let tracker = DummyTracker;
         let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
-        cache.channel_state = Some(Box::default());
-        let dirty = Arc::new(Mutex::new(Vec::new()));
-        cache.engine_state = Some(Box::new(TrackingEngineState {
-            dirty: dirty.clone(),
-        }));
+        let mut owner = ChannelState::new(1);
+        owner.maxwell_3d = Some(Box::new(Maxwell3D::new()));
+        cache.create_channel(&owner);
+        cache.bind_to_channel(owner.bind_id);
         let buffer_id = cache.create_buffer(0x10000, 0x1000);
-        let channel = cache.channel_state.as_mut().unwrap();
+        let channel = cache.current_channel_state_mut().unwrap();
         channel.index_buffer.buffer_id = buffer_id;
         channel.vertex_buffers[0].buffer_id = buffer_id;
         channel.vertex_buffers[7].buffer_id = buffer_id;
@@ -4118,17 +4222,17 @@ mod tests {
 
         cache.delete_buffer(buffer_id, true);
 
-        let channel = cache.channel_state.as_ref().unwrap();
+        let channel = cache.current_channel_state().unwrap();
         assert_eq!(channel.index_buffer.buffer_id, NULL_BUFFER_ID);
         assert_eq!(channel.vertex_buffers[0].buffer_id, NULL_BUFFER_ID);
         assert_eq!(channel.vertex_buffers[7].buffer_id, NULL_BUFFER_ID);
         assert_eq!(channel.uniform_buffers[0][0].buffer_id, NULL_BUFFER_ID);
         assert_eq!(channel.storage_buffers[0][0].buffer_id, NULL_BUFFER_ID);
-        let dirty = dirty.lock().unwrap();
-        assert!(dirty.contains(&DirtyFlag::IndexBuffer));
-        assert!(dirty.contains(&DirtyFlag::VertexBuffers));
-        assert!(dirty.contains(&DirtyFlag::VertexBuffer(0)));
-        assert!(dirty.contains(&DirtyFlag::VertexBuffer(7)));
+        let dirty = owner.maxwell_3d.as_ref().unwrap().dirty_flags();
+        assert!(dirty[crate::dirty_flags::flags::INDEX_BUFFER as usize]);
+        assert!(dirty[crate::dirty_flags::flags::VERTEX_BUFFERS as usize]);
+        assert!(dirty[crate::dirty_flags::flags::VERTEX_BUFFER0 as usize]);
+        assert!(dirty[crate::dirty_flags::flags::VERTEX_BUFFER0 as usize + 7]);
     }
 
     #[test]
@@ -4190,9 +4294,9 @@ mod tests {
     fn test_disable_graphics_uniform_buffer() {
         let tracker = DummyTracker;
         let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
-        cache.channel_state = Some(Box::new(BufferCacheChannelInfo::default()));
+        bind_test_channel(&mut cache, 1);
         cache.disable_graphics_uniform_buffer(0, 0);
-        let cs = cache.channel_state.as_ref().unwrap();
+        let cs = cache.current_channel_state().unwrap();
         assert_eq!(cs.uniform_buffers[0][0].device_addr, 0);
         assert_eq!(cs.uniform_buffers[0][0].buffer_id, NULL_BUFFER_ID);
     }
@@ -4201,13 +4305,13 @@ mod tests {
     fn test_unbind_graphics_storage_buffers() {
         let tracker = DummyTracker;
         let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
-        cache.channel_state = Some(Box::new(BufferCacheChannelInfo::default()));
-        if let Some(ref mut cs) = cache.channel_state {
+        bind_test_channel(&mut cache, 1);
+        if let Some(cs) = cache.current_channel_state_mut() {
             cs.enabled_storage_buffers[0] = 0xFF;
             cs.written_storage_buffers[0] = 0x0F;
         }
         cache.unbind_graphics_storage_buffers(0);
-        let cs = cache.channel_state.as_ref().unwrap();
+        let cs = cache.current_channel_state().unwrap();
         assert_eq!(cs.enabled_storage_buffers[0], 0);
         assert_eq!(cs.written_storage_buffers[0], 0);
     }
@@ -4216,13 +4320,13 @@ mod tests {
     fn test_unbind_compute_storage_buffers() {
         let tracker = DummyTracker;
         let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
-        cache.channel_state = Some(Box::new(BufferCacheChannelInfo::default()));
-        if let Some(ref mut cs) = cache.channel_state {
+        bind_test_channel(&mut cache, 1);
+        if let Some(cs) = cache.current_channel_state_mut() {
             cs.enabled_compute_storage_buffers = 0xFF;
             cs.written_compute_storage_buffers = 0x0F;
         }
         cache.unbind_compute_storage_buffers();
-        let cs = cache.channel_state.as_ref().unwrap();
+        let cs = cache.current_channel_state().unwrap();
         assert_eq!(cs.enabled_compute_storage_buffers, 0);
         assert_eq!(cs.written_compute_storage_buffers, 0);
     }

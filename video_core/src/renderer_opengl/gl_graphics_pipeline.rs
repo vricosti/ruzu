@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use crate::buffer_cache::buffer_cache::BufferCache;
-use crate::buffer_cache::buffer_cache_base::{BufferCacheParams, EngineState, UniformBufferSizes};
+use crate::buffer_cache::buffer_cache_base::{BufferCacheParams, UniformBufferSizes};
 use crate::buffer_cache::word_manager::DeviceTracker;
 use crate::engines::draw_manager::Maxwell3DRenderTargets;
 use crate::engines::maxwell_3d::SurfaceClipInfo;
@@ -538,24 +538,6 @@ impl GraphicsPipeline {
     {
         self.synchronize_graphics_descriptors(texture_cache, regs);
         self.configure_buffer_cache_state(buffer_cache);
-    }
-
-    /// Install the graphics engine-state bridge consumed by the buffer cache.
-    ///
-    /// Upstream stores live `maxwell3d` and `gpu_memory` pointers on
-    /// `GraphicsPipeline` through `SetEngine`; Rust still passes a boxed
-    /// draw-state adapter, but the graphics pipeline now owns the configure
-    /// step that makes the state visible to subsequent descriptor and buffer
-    /// binding work.
-    pub fn set_graphics_engine_state<P, DT>(
-        &self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        engine_state: Box<dyn EngineState>,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-    {
-        buffer_cache.set_engine_state(engine_state);
     }
 
     /// Bind enabled graphics uniform buffers from the draw-time cbuf snapshot.
@@ -1102,27 +1084,16 @@ impl GraphicsPipeline {
         )
     }
 
-    /// Install graphics engine state, then collect descriptors/fill image views/update targets.
+    /// Collect descriptors, fill image views, and update render targets.
     ///
     /// This is the Rust bridge for the upstream `ConfigureImpl` sequence after
     /// the base buffer-cache state is configured and before `config_stage(...)`
     /// walks descriptors using `maxwell3d->state.shader_stages[...]`.
     #[allow(clippy::too_many_arguments)]
-    pub fn set_engine_state_then_configure_graphics_descriptors_and_framebuffer<
-        P,
-        DT,
-        A,
-        L,
-        B,
-        R,
-        RD,
-        DA,
-        E,
-    >(
+    pub fn configure_graphics_descriptors_and_framebuffer<P, DT, A, L, B, R, RD, DA, E>(
         &self,
         buffer_cache: &mut BufferCache<P, DT>,
-        engine_state: Box<dyn EngineState>,
-        mut after_engine_state: E,
+        mut after_live_engine_bound: E,
         texture_cache: &mut OpenGLTextureCache,
         state_tracker: &mut StateTracker,
         num_shader_stages: usize,
@@ -1154,9 +1125,8 @@ impl GraphicsPipeline {
         E: FnMut(),
     {
         trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] set_engine_then_configure enter");
-        self.set_graphics_engine_state(buffer_cache, engine_state);
-        after_engine_state();
-        trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] after_set_graphics_engine_state");
+        after_live_engine_bound();
+        trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] after_bind_live_graphics_engine");
         self.configure_graphics_descriptors_then_fill_and_bind_framebuffer(
             buffer_cache,
             texture_cache,
@@ -1180,8 +1150,8 @@ impl GraphicsPipeline {
         )
     }
 
-    /// Synchronize descriptors/base buffer state, install engine state, then
-    /// collect descriptors/fill image views/update targets in upstream order.
+    /// Synchronize descriptors/base buffer state, then collect descriptors,
+    /// fill image views, and update targets in upstream order.
     ///
     /// This extends the Rust bridge for upstream `ConfigureImpl` from:
     /// `texture_cache.SynchronizeGraphicsDescriptors()` through
@@ -1189,25 +1159,13 @@ impl GraphicsPipeline {
     /// `SetEngine`, `config_stage(...)`, `FillGraphicsImageViews`,
     /// `UpdateRenderTargets(false)`, and framebuffer bind.
     #[allow(clippy::too_many_arguments)]
-    pub fn synchronize_then_set_engine_state_and_configure_graphics_framebuffer<
-        P,
-        DT,
-        A,
-        L,
-        B,
-        R,
-        RD,
-        DA,
-        S,
-        E,
-    >(
+    pub fn synchronize_then_configure_graphics_framebuffer<P, DT, A, L, B, R, RD, DA, S, E>(
         &self,
         texture_cache: &mut OpenGLTextureCache,
         descriptor_sync_regs: DescriptorSyncRegs,
         buffer_cache: &mut BufferCache<P, DT>,
         mut after_descriptor_base_state: S,
-        engine_state: Box<dyn EngineState>,
-        after_engine_state: E,
+        after_live_engine_bound: E,
         state_tracker: &mut StateTracker,
         num_shader_stages: usize,
         max_desc_count: u32,
@@ -1238,7 +1196,7 @@ impl GraphicsPipeline {
         S: FnMut(),
         E: FnMut(),
     {
-        trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] synchronize_then_set_engine enter");
+        trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] synchronize_then_configure enter");
         self.synchronize_graphics_descriptors_then_configure_buffer_cache_state(
             texture_cache,
             descriptor_sync_regs,
@@ -1246,10 +1204,9 @@ impl GraphicsPipeline {
         );
         after_descriptor_base_state();
         trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] after_synchronize_descriptor_base_state");
-        self.set_engine_state_then_configure_graphics_descriptors_and_framebuffer(
+        self.configure_graphics_descriptors_and_framebuffer(
             buffer_cache,
-            engine_state,
-            after_engine_state,
+            after_live_engine_bound,
             texture_cache,
             state_tracker,
             num_shader_stages,
@@ -3121,20 +3078,7 @@ mod tests",
     }
 
     #[test]
-    fn graphics_pipeline_owns_graphics_engine_state_install_bridge() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn set_graphics_engine_state")
-            .expect("set_graphics_engine_state");
-        let next = source[method..]
-            .find("/// Bind enabled graphics uniform buffers")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        assert!(body.contains("engine_state: Box<dyn EngineState>"));
-        assert!(body.contains("buffer_cache.set_engine_state(engine_state)"));
-
+    fn graphics_pipeline_uses_channel_bound_live_maxwell_state() {
         let rasterizer = include_str!("gl_rasterizer.rs");
         let rasterizer_runtime = rasterizer
             .split(
@@ -3144,39 +3088,30 @@ mod tests",
             )
             .next()
             .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime
-            .contains(".synchronize_then_set_engine_state_and_configure_graphics_framebuffer("));
-        assert!(rasterizer_runtime.contains("Box::new(DrawStateEngineAdapter"));
-        assert!(!rasterizer_runtime.contains("pipeline.set_graphics_engine_state("));
-        assert!(!rasterizer_runtime.contains(
-            "self.buffer_cache\n            .set_engine_state(Box::new(DrawStateEngineAdapter"
-        ));
+        assert!(rasterizer_runtime.contains(".synchronize_then_configure_graphics_framebuffer("));
+        assert!(!rasterizer_runtime.contains("DrawStateEngineAdapter"));
+        assert!(!rasterizer_runtime.contains("set_engine_state(Box::new"));
     }
 
     #[test]
-    fn graphics_pipeline_owns_engine_state_then_descriptor_framebuffer_sequence() {
+    fn graphics_pipeline_owns_descriptor_framebuffer_sequence() {
         let source = include_str!("gl_graphics_pipeline.rs");
         let method = source
-            .find("pub fn set_engine_state_then_configure_graphics_descriptors_and_framebuffer")
-            .expect("set_engine_state_then_configure_graphics_descriptors_and_framebuffer");
+            .find("pub fn configure_graphics_descriptors_and_framebuffer")
+            .expect("configure_graphics_descriptors_and_framebuffer");
         let next = source[method..]
             .find("/// Bind host buffer resources")
             .expect("next method boundary")
             + method;
         let body = &source[method..next];
 
-        let set_engine = body
-            .find("self.set_graphics_engine_state(buffer_cache, engine_state)")
-            .expect("engine-state installation");
-        let after_engine = body[set_engine..]
-            .find("after_engine_state();")
-            .expect("after engine-state callback")
-            + set_engine;
+        let after_engine = body
+            .find("after_live_engine_bound();")
+            .expect("live engine-bound callback");
         let configure = body[after_engine..]
             .find("self.configure_graphics_descriptors_then_fill_and_bind_framebuffer(")
             .expect("descriptor/fill/framebuffer helper")
             + after_engine;
-        assert!(set_engine < after_engine);
         assert!(after_engine < configure);
 
         let rasterizer = include_str!("gl_rasterizer.rs");
@@ -3188,8 +3123,7 @@ mod tests",
             )
             .next()
             .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime
-            .contains(".synchronize_then_set_engine_state_and_configure_graphics_framebuffer("));
+        assert!(rasterizer_runtime.contains(".synchronize_then_configure_graphics_framebuffer("));
         assert!(!rasterizer_runtime
             .contains(".configure_graphics_descriptors_then_fill_and_bind_framebuffer("));
     }
@@ -3198,7 +3132,7 @@ mod tests",
     fn graphics_pipeline_owns_sync_engine_descriptor_framebuffer_sequence() {
         let source = include_str!("gl_graphics_pipeline.rs");
         let method = source
-            .find("pub fn synchronize_then_set_engine_state_and_configure_graphics_framebuffer")
+            .find("pub fn synchronize_then_configure_graphics_framebuffer")
             .expect("synchronize/set-engine/configure helper");
         let next = source[method..]
             .find("/// Bind host buffer resources")
@@ -3214,7 +3148,7 @@ mod tests",
             .expect("after descriptor/base-state callback")
             + sync;
         let set_engine = body[after_sync..]
-            .find("self.set_engine_state_then_configure_graphics_descriptors_and_framebuffer(")
+            .find("self.configure_graphics_descriptors_and_framebuffer(")
             .expect("set engine then descriptor/framebuffer helper")
             + after_sync;
         assert!(sync < after_sync);
@@ -3229,10 +3163,8 @@ mod tests",
             )
             .next()
             .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime
-            .contains(".synchronize_then_set_engine_state_and_configure_graphics_framebuffer("));
-        assert!(!rasterizer_runtime
-            .contains(".set_engine_state_then_configure_graphics_descriptors_and_framebuffer("));
+        assert!(rasterizer_runtime.contains(".synchronize_then_configure_graphics_framebuffer("));
+        assert!(!rasterizer_runtime.contains(".configure_graphics_descriptors_and_framebuffer("));
     }
 
     #[test]
@@ -3308,8 +3240,7 @@ mod tests",
             )
             .next()
             .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime
-            .contains(".synchronize_then_set_engine_state_and_configure_graphics_framebuffer("));
+        assert!(rasterizer_runtime.contains(".synchronize_then_configure_graphics_framebuffer("));
         assert!(!rasterizer_runtime
             .contains("pipeline.configure_enabled_stage_texture_image_descriptors("));
         assert!(!rasterizer_runtime.contains("pipeline.bind_stage_storage_buffers("));
@@ -3369,8 +3300,7 @@ mod tests",
             )
             .next()
             .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime
-            .contains(".synchronize_then_set_engine_state_and_configure_graphics_framebuffer("));
+        assert!(rasterizer_runtime.contains(".synchronize_then_configure_graphics_framebuffer("));
         assert!(!rasterizer_runtime
             .contains("pipeline.configure_enabled_stage_texture_image_descriptors("));
         assert!(!rasterizer_runtime.contains("pipeline.collect_stage_texture_image_descriptors("));
@@ -3418,8 +3348,7 @@ mod tests",
             )
             .next()
             .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime
-            .contains(".synchronize_then_set_engine_state_and_configure_graphics_framebuffer("));
+        assert!(rasterizer_runtime.contains(".synchronize_then_configure_graphics_framebuffer("));
         assert!(!rasterizer_runtime
             .contains("pipeline.configure_enabled_stage_texture_image_descriptors("));
         assert!(!rasterizer_runtime.contains("for stage in 0..NUM_STAGES.min(num_shader_stages)"));
@@ -3455,8 +3384,7 @@ mod tests",
         assert!(!body.contains("read_gpu"));
 
         let rasterizer = include_str!("gl_rasterizer.rs");
-        assert!(rasterizer
-            .contains("synchronize_then_set_engine_state_and_configure_graphics_framebuffer("));
+        assert!(rasterizer.contains("synchronize_then_configure_graphics_framebuffer("));
         assert!(!rasterizer.contains("pipeline.fill_and_materialize_graphics_image_views("));
         assert!(!rasterizer.contains("let mut read_gpu = |gpu_addr, out: &mut [u8]|"));
         assert!(!rasterizer.contains("fill_and_materialize_graphics_image_views::<"));
@@ -3503,8 +3431,7 @@ mod tests",
             )
             .next()
             .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime
-            .contains(".synchronize_then_set_engine_state_and_configure_graphics_framebuffer("));
+        assert!(rasterizer_runtime.contains(".synchronize_then_configure_graphics_framebuffer("));
         assert!(!rasterizer_runtime.contains(
             "pipeline.fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer("
         ));
@@ -3549,8 +3476,7 @@ mod tests",
             )
             .next()
             .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime
-            .contains(".synchronize_then_set_engine_state_and_configure_graphics_framebuffer("));
+        assert!(rasterizer_runtime.contains(".synchronize_then_configure_graphics_framebuffer("));
         assert!(!rasterizer_runtime
             .contains("pipeline.configure_enabled_stage_texture_image_descriptors("));
         assert!(!rasterizer_runtime.contains(

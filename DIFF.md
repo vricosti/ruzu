@@ -233,11 +233,11 @@
 - Broader sparse texture-cache parity is still incomplete outside this slice: full backend runtime ownership, sparse image deletion interactions, and render-target/alias lifecycle remain covered by existing texture-cache DIFF entries.
 
 ### Intentional differences
-- Rust still passes `DescriptorSyncRegs`, a boxed `DrawStateEngineAdapter`, GPU-memory closures, and diagnostic callbacks into `GraphicsPipeline::synchronize_then_set_engine_state_and_configure_graphics_framebuffer(...)` because `GraphicsPipeline` still does not own upstream-equivalent live `Maxwell3D*` and `Tegra::MemoryManager*` members.
+- Rust still passes `DescriptorSyncRegs`, GPU-memory closures, and diagnostic callbacks into `GraphicsPipeline::synchronize_then_configure_graphics_framebuffer(...)` because `GraphicsPipeline` does not own upstream-equivalent live `Maxwell3D*` and `Tegra::MemoryManager*` members. `BufferCache` now obtains Maxwell3D directly from its bound channel.
 - Rust keeps a fallback `RasterizerOpenGL::draw(...)` path that calls `synchronize_graphics_descriptors_then_configure_buffer_cache_state(...)` when no channel `MemoryManager` is available. Upstream has `gpu_memory` after `SetEngine`; this fallback remains a documented owner-graph gap.
 
 ### Unintentional differences (to fix)
-- Fixed: the normal draw path no longer calls `synchronize_graphics_descriptors_then_configure_buffer_cache_state(...)` as a standalone rasterizer-owned step before the descriptor/framebuffer configure bridge. `GraphicsPipeline::synchronize_then_set_engine_state_and_configure_graphics_framebuffer(...)` now owns the adjacent upstream order from `texture_cache.SynchronizeGraphicsDescriptors()` through base buffer-cache state, engine-state installation, enabled-stage descriptor collection, `FillGraphicsImageViews`, `UpdateRenderTargets(false)`, and framebuffer bind.
+- Fixed: the normal draw path no longer calls `synchronize_graphics_descriptors_then_configure_buffer_cache_state(...)` as a standalone rasterizer-owned step before the descriptor/framebuffer configure bridge. `GraphicsPipeline::synchronize_then_configure_graphics_framebuffer(...)` now owns the adjacent upstream order from `texture_cache.SynchronizeGraphicsDescriptors()` through base buffer-cache state, enabled-stage descriptor collection, `FillGraphicsImageViews`, `UpdateRenderTargets(false)`, and framebuffer bind.
 - Fixed: source-level parity tests now assert that the normal rasterizer runtime delegates this larger initial `ConfigureImpl` slice through the graphics pipeline owner before the post-framebuffer configure/prepare/bind helper.
 
 ### Missing items
@@ -257,11 +257,11 @@
 - Full upstream `GraphicsPipeline::SetEngine(...)` parity remains incomplete: `GraphicsPipeline` still does not store live `Maxwell3D` and `gpu_memory` references, so Rust still has normal/GPU-resolver helper variants.
 
 ### Intentional differences
-- Upstream `GraphicsPipeline::SetEngine(...)` stores live `Maxwell3D*` and `Tegra::MemoryManager*` members, then `ConfigureImpl(...)` reads `maxwell3d->regs`, `maxwell3d->state.shader_stages[...]`, and `gpu_memory` directly. Rust still constructs a boxed `DrawStateEngineAdapter` plus draw-time GPU-memory closures from the rasterizer because the live owner graph has not yet been rebuilt.
-- Rust keeps an `after_engine_state` callback in `set_engine_state_then_configure_graphics_descriptors_and_framebuffer(...)` for existing draw-stage tracing. Upstream has no equivalent diagnostic callback between state installation and descriptor walking.
+- Upstream `GraphicsPipeline::SetEngine(...)` stores live `Maxwell3D*` and `Tegra::MemoryManager*` members. Rust BufferCache now reads Maxwell3D through its live channel binding, while GraphicsPipeline still receives draw-time GPU-memory closures.
+- Rust keeps an `after_live_engine_bound` callback in `configure_graphics_descriptors_and_framebuffer(...)` for existing draw-stage tracing. Upstream has no equivalent diagnostic callback.
 
 ### Unintentional differences (to fix)
-- Fixed: `RasterizerOpenGL::draw(...)` no longer calls `pipeline.set_graphics_engine_state(...)` as a standalone configure step before descriptor collection. The call is now inside `GraphicsPipeline::set_engine_state_then_configure_graphics_descriptors_and_framebuffer(...)`, immediately before the pipeline-owned descriptor/fill/render-target/framebuffer sequence.
+- Fixed by the live-channel port: graphics engine-state installation is gone. `BufferCache` reads the current channel's Maxwell3D throughout the pipeline-owned descriptor/fill/render-target/framebuffer sequence.
 - Fixed: the Rust configure bridge now owns the adjacent order `engine state visible to BufferCache` -> enabled-stage descriptor/config-stage work -> `FillGraphicsImageViews` -> `UpdateRenderTargets(false)` -> `BindFramebuffer`, reducing another split from upstream `GraphicsPipeline::ConfigureImpl(...)`.
 
 ### Missing items
@@ -269,11 +269,10 @@
 - Full `GraphicsPipeline::ConfigureImpl(...)` ownership remains incomplete: descriptor read handles, memory access, diagnostics, buffer/program configure, prepare-stage binding, and final draw-time state are still composed through `RasterizerOpenGL::draw(...)` plus pipeline helpers.
 
 ### Intentional differences
-- Upstream `GraphicsPipeline::SetEngine(...)` stores live `Maxwell3D*` and `Tegra::MemoryManager*` members on the pipeline. Rust still builds a boxed `DrawStateEngineAdapter` from the draw snapshot and installs it on `BufferCache`; this remains a bridge until the pipeline owns upstream-equivalent live engine/memory references.
-- The Rust helper is named `set_graphics_engine_state(...)` rather than `set_engine(...)` because it does not yet store `gpu_memory`/`maxwell3d` on `GraphicsPipeline` and only installs the buffer-cache engine-state adapter needed by the current configure path.
+- Upstream `GraphicsPipeline::SetEngine(...)` stores live `Maxwell3D*` and `Tegra::MemoryManager*` members on the pipeline. Rust BufferCache now has live Maxwell3D access through ChannelSetupCaches; only GraphicsPipeline's direct memory ownership remains split.
 
 ### Unintentional differences (to fix)
-- Fixed: `RasterizerOpenGL::draw(...)` no longer writes the graphics `DrawStateEngineAdapter` directly into `BufferCache`. The configure path now routes that installation through `GraphicsPipeline::set_graphics_engine_state(...)`, making `GraphicsPipeline` the owner-local bridge for the state that later descriptor and buffer binding helpers consume.
+- Fixed by the live-channel port: neither RasterizerOpenGL nor GraphicsPipeline installs a graphics adapter in BufferCache.
 
 ### Missing items
 - Full upstream `GraphicsPipeline::SetEngine(...)` parity remains incomplete: `GraphicsPipeline` still does not store live `Maxwell3D` and `gpu_memory` references, so `ConfigureImpl(...)` still receives draw-time register/memory access through snapshots and closures.
@@ -2062,13 +2061,13 @@
 - Port the remaining backend switch in `ShaderCache::CreateComputePipeline`: GLASM and SPIR-V emission, plus async/strict-context worker construction when that owner graph exists.
 
 ### Intentional differences
-- `RasterizerOpenGL::dispatch_compute_with_call(...)` now installs a compute-specific `EngineState` snapshot before the compute pipeline resource state can bind storage buffers. `ComputeEngineAdapter` exposes `DispatchCall.qmd.const_buffer_enable_mask` and all eight QMD const-buffer configs as `ComputeLaunchInfo`, matching upstream `kepler_compute->launch_description`.
+- `RasterizerOpenGL::dispatch_compute_with_call(...)` installs a compute-specific `ComputeEngineState` bridge before the compute pipeline resource state binds storage buffers. `ComputeEngineAdapter` exposes `DispatchCall.qmd.const_buffer_enable_mask` and all eight QMD const-buffer configs as `ComputeLaunchInfo`, matching upstream `kepler_compute->launch_description`.
 - With that adapter installed, existing `BufferCache::bind_compute_storage_buffer(...)` can resolve `cbuf.address + cbuf_offset` and then run the upstream-style `StorageBufferBinding` path instead of preserving masks with `NULL_BINDING`.
 - Rust uses a dispatch snapshot rather than a persistent `KeplerCompute*` because the current rasterizer entry point receives `DispatchCall` from `KeplerCompute::execute_pending`. This is the same temporary ownership adaptation already used for compute descriptor synchronization.
 
 ### Unintentional differences (to fix)
 - The real OpenGL dispatch path still does not obtain a shader-cache `ComputePipeline`, so the newly installed compute `EngineState` is only consumed once the pipeline configure path is actually called from dispatch.
-- `DrawStateEngineAdapter::get_compute_launch_info()` remains a default stub by design; draw and compute now have separate adapters, but code paths must continue installing the correct adapter before using the buffer cache.
+- Graphics no longer shares this bridge; only compute paths install `ComputeEngineState`.
 
 ### Missing items
 - Port/route compute shader-cache creation and dispatch pipeline selection, then call `ComputePipeline::configure_resource_state(...)` with this installed compute engine state.
@@ -3161,7 +3160,7 @@
 
 ### Unintentional differences (to fix)
 - Descriptor configuration still lives in `RasterizerOpenGL::draw` instead of a Rust counterpart to upstream `OpenGL::GraphicsPipeline::ConfigureImpl`. This remains a structural parity gap: upstream owns the descriptor walk in `gl_graphics_pipeline.cpp`, while ruzu currently bridges it in the rasterizer.
-- The Rust path still installs `DrawStateEngineAdapter` with a materialized `Maxwell3DDrawRegisters` fallback snapshot for buffer-cache reads. The descriptor and uniform-buffer paths read constant-buffer bindings through `Maxwell3DDrawView::cb_bindings()`, but this is still a per-call view bridge rather than upstream's direct `maxwell3d->state.shader_stages[stage].const_buffers` access from `GraphicsPipeline::ConfigureImpl`.
+- Fixed by the live-channel port: BufferCache reads constant-buffer bindings directly from the bound Maxwell3D. Draw-view snapshots remain only for renderer paths outside BufferCache and test fallbacks.
 
 ### Missing items
 - Move the descriptor-walk/configuration ownership into `gl_graphics_pipeline.rs` once the long-term live Maxwell3D/rasterizer access model is complete.
@@ -8544,15 +8543,13 @@
 - `GraphicsPipeline` construction/build remains synchronous/lazy in Rust, while upstream supports worker-thread shader building and fence-based readiness.
 
 ### Intentional differences
-- Rust exposes `vertex_streams`, `vertex_stream_limits`, and `vertex_attrib_format` through `Maxwell3DDrawView` / `DrawStateEngineAdapter`. The real Maxwell3D path reads them live through `Maxwell3DAccess`; snapshot storage remains only in `Maxwell3DDrawRegisters` for tests/fallbacks. Upstream `BufferCache<P>::UpdateVertexBuffer` and `RasterizerOpenGL::SyncVertexFormats()` read the same state directly through engine ownership.
-- `DrawStateEngineAdapter` converts the Rust `enabled: bool` stream field into upstream-compatible `enable: u32` for the common buffer cache trait.
+- BufferCache now reads `vertex_streams` and `vertex_stream_limits` directly from its channel-bound Maxwell3D. `Maxwell3DDrawRegisters` remains only for renderer test/fallback views.
 
 ### Unintentional differences (to fix)
-- The `DrawStateEngineAdapter` / per-call draw-view bridge is still not upstream's final ownership model. Long-term parity should let the OpenGL pipeline/buffer-cache path read live engine state through the same owner chain as C++ without materializing broad register snapshots for fallback paths.
+- Fixed: the OpenGL buffer-cache path reads live engine state through ChannelSetupCaches.
 
 ### Missing items
-- Transform-feedback buffer state is still returned as defaults by `DrawStateEngineAdapter`; upstream buffer cache reads this from Maxwell3D state.
-- Dirty tracking remains conservative: adapter dirty queries force updates instead of mirroring upstream dirty flag clearing precisely.
+- Fixed: transform-feedback bindings and geometry dirty flags are read and updated on live Maxwell3D state.
 
 ### Intentional differences
 - Upstream erases IR instructions from intrusive lists after use-def rewrites. Rust `InstRef` is an index pair `(block, inst)` into `Vec<Inst>`, so physically removing an instruction shifts later indices and corrupts live references. Rust now preserves indices by converting dead instructions to `Opcode::Void` tombstones, which the GLSL backend treats as no-op.
@@ -9767,16 +9764,14 @@ The following still panic because upstream either also throws NotImplementedExce
 - `FFMA32I` uses `FpRounding::RN` with `no_contraction=true`, matching upstream's immediate variant.
 
 ### Intentional differences
-- Ruzu's current OpenGL draw adapter reports every vertex-buffer dirty on every draw because the live Maxwell dirty flag ownership is still being ported. Under that current model, `bind_host_vertex_buffers` now builds the full vertex-buffer binding range and includes `NULL_BUFFER_ID` entries so OpenGL slots are explicitly rebound to zero, matching the upstream effect when all `Dirty::VertexBuffer0 + index` flags are set.
+- BufferCache now consumes the actual live Maxwell vertex-buffer dirty range and includes `NULL_BUFFER_ID` entries where an upstream null buffer would be bound.
 - `BufferCacheRuntime::bind_vertex_buffers` now clamps the GL bind count to `max_attributes - min_index`, matching upstream `BufferCacheRuntime::BindVertexBuffers`.
 
 ### Unintentional differences (to fix)
-- Upstream computes the host binding range from the actual Maxwell dirty flags and clears each `Dirty::VertexBuffer0 + index` as it consumes it. Ruzu still forces all vertex buffers dirty via `DrawStateEngineAdapter`, so this slice deliberately chooses the full-range equivalent rather than the final dirty-range implementation.
+- Fixed: the host binding range comes from actual Maxwell dirty flags and each consumed `Dirty::VertexBuffer0 + index` flag is cleared.
 - Upstream stores `Buffer*` in `HostBindings`; ruzu carries `BufferId` plus a parallel backend-handle slice because the backend buffer object is separated from the generic cache metadata.
 
 ### Missing items
-- Replace `DrawStateEngineAdapter`'s unconditional dirty flags with real live Maxwell dirty-flag reads and clears.
-- Once real dirty flags are wired, shrink `bind_host_vertex_buffers` from full-range binding to upstream's exact dirty min/max range.
 - Add backend-independent unit coverage for `HostBindings` range construction once the dirty flag source is not a temporary all-dirty adapter.
 
 ### Intentional differences
@@ -21704,7 +21699,7 @@ Upstream files:
 - Fixed: `invalidate_region`, `on_cache_invalidation`, `on_cpu_write`, and `unmap_memory` previously notified only `VulkanCommonBufferCache`. Vertex/index bindings still came from `DirectBufferCache`, whose address cache therefore returned stale `VkBuffer` contents after the guest rewrote a range. All four lifecycle edges now evict overlapping direct-cache entries before later draws.
 
 ### Missing items
-- Complete the upstream-owned geometry path: expose real draw dirty flags through `VulkanDrawStateEngineAdapter`, extend the runtime index-binding contract with topology/index format/base vertex/count, implement Vulkan `BindIndexBuffer` and `BindVertexBuffers`, call `UpdateGraphicsBuffers(is_indexed)` plus `BindHostGeometryBuffers`, then remove direct geometry binding/cache ownership.
+- Remove the remaining direct Vulkan geometry fallback used for unsupported converted topologies; the common path now reads live draw dirty flags and calls `UpdateGraphicsBuffers` plus `BindHostGeometryBuffers`.
 
 ### Binary layout verification
 - N/A: this changes host cache invalidation only.
@@ -24475,37 +24470,170 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ## 2026-07-27 — video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp and video_core/buffer_cache/buffer_cache.h
 
 ### Intentional differences
-- Upstream `BufferCache` owns a live `Maxwell3D*` and reads draw-manager state,
-  registers, constant buffers, and dirty flags directly. The current Rust
-  ownership split still supplies `BufferCache` through an `EngineState` trait
-  object. The Vulkan adapter therefore retains a compact copy of only the
-  state consumed through that trait, while its dirty flags continue to refer
-  to the live engine flags.
+- Vulkan still builds the broader `DrawCall` value for renderer state outside
+  `BufferCache`. Removing that separate renderer snapshot is outside this
+  ownership slice.
 
 ### Unintentional differences (fixed)
-- The Vulkan adapter previously cloned the complete `DrawCall`, duplicating
-  pipeline, render-target, viewport, shader, and dynamic-state data that
-  `BufferCache` never reads. It now copies only index-buffer, vertex-stream,
-  transform-feedback, constant-buffer, topology, and fallback dirty state.
-
-### Missing items
-- Replacing the `EngineState` snapshot with direct live Maxwell3D access still
-  requires the larger upstream ownership refactor. This change only removes
-  the redundant second full snapshot.
+- Vulkan installed a `VulkanDrawStateEngineAdapter` snapshot before every
+  draw. The adapter and installation are removed; the common buffer cache now
+  reads its channel-bound live Maxwell3D like upstream.
+- Geometry dirty flags no longer require a copied fallback array or adapter
+  writeback.
 
 ### Binary layout verification
-- PASS: the adapter is host-only state. Guest structures, Vulkan structures,
-  descriptors, and serialized data are unchanged.
+- PASS: only host-side ownership and access changed. Guest structures, Vulkan
+  structures, descriptors, and serialized data are unchanged.
 
 ### Verification
-- Re-read upstream `RasterizerVulkan::{PrepareDraw,Draw}`,
-  `BufferCache::{BindHostGeometryBuffers,BindHostIndexBuffer,
-  BindHostVertexBuffers,UpdateIndexBuffer,UpdateVertexBuffers}` after the
-  implementation.
-- The existing dirty-flag mapping test and the regression asserting that the
-  adapter is smaller than `DrawCall` pass in release mode.
+- Re-read upstream `RasterizerVulkan::{InitializeChannel,BindChannel,
+  ReleaseChannel,Draw}` and the graphics buffer update/bind methods.
+- `runtime_has_no_graphics_engine_snapshot_adapter` passes in release mode.
 - `cargo check -p video_core --release` passes.
-- In a matched 15-second VMRD race sample, process utilization changed from
-  211.00% to 208.07%, while the GPU thread remained effectively unchanged at
-  76.60% versus 76.27%. The redundant copy is gone, but the original full
-  `DrawCall` snapshot remains the relevant measured divergence.
+
+## 2026-07-27 — video_core/src/buffer_cache/buffer_cache_base.rs and buffer_cache.rs vs video_core/buffer_cache/buffer_cache_base.h and buffer_cache.h
+
+### Intentional differences
+- Rust embeds `ChannelInfo` in `BufferCacheChannelInfo` because it has no class
+  inheritance. State ownership and construction order match upstream.
+- The temporary compute-only `ComputeEngineState` bridge remains until the
+  KeplerCompute launch description is exposed through its live channel owner.
+
+### Unintentional differences (fixed)
+- `BufferCache` used one standalone payload and a replaceable graphics
+  `EngineState` snapshot. It now owns per-channel payloads through
+  `ChannelSetupCaches` and reads index, vertex, cbuf, transform-feedback, and
+  dirty state from the bound Maxwell3D.
+- `BufferCacheChannelInfo` had a production default constructor although
+  upstream deletes it. The Rust default is now test-only.
+- Index first/count/format now come from the live DrawManager state; start and
+  limit addresses come from the live Maxwell3D registers, matching upstream.
+- Growing the inline-index buffer leaked the previous slot. Rust now erases it
+  before creating the replacement in upstream order.
+- `DeleteBuffer` updated persistent bindings and Maxwell dirty flags before
+  unregistering and destroying the buffer. Those updates now follow upstream
+  after buffer destruction, with `has_deleted_buffers` set last.
+
+### Missing items
+- Replace the compute launch-description bridge with direct live
+  KeplerCompute access.
+
+### Binary layout verification
+- PASS: channel/cache payloads are host-only. No guest-visible or serialized
+  structure changed.
+
+### Verification
+- Re-read upstream channel payload, index/vertex update and bind,
+  transform-feedback update, and buffer deletion implementations.
+- Live rebinding, live dirty-state mutation, index register access,
+  buffer-deletion invalidation, and compute bridge regressions pass in release
+  mode.
+- `cargo test -p video_core --release --no-run` and
+  `cargo check -p video_core --release` pass.
+- The full release suite was also attempted with one test thread, but the
+  pre-existing
+  `shader_cache::tests::compute_shader_builds_from_bound_channel_compute_state`
+  consumed about 28 GiB RSS plus 10 GiB swap without completing after nearly
+  four minutes, so the run was terminated to protect the host.
+
+## 2026-07-27 — video_core/src/engines/maxwell_3d.rs vs video_core/engines/maxwell_3d.h
+
+### Intentional differences
+- Rust temporarily moves `DrawManager` out of `Maxwell3D` to satisfy the
+  mutable-borrow split used by method dispatch. During rasterizer callbacks a
+  scoped, non-owning address exposes the immutably borrowed active
+  `DrawState`; a drop guard restores the previous address even during
+  unwinding. Upstream keeps the `unique_ptr<DrawManager>` in place and returns
+  the same state by const reference.
+
+### Unintentional differences (fixed)
+- The Rust engine had no owner-local accessor for
+  `Regs::TransformFeedback::Buffer`, forcing graphics adapters to return an
+  empty binding. `transform_feedback_buffer_info` now decodes the live
+  enable/address/size/start-offset fields with the upstream register layout.
+- `with_draw_manager` replaced the owner field with `DrawManager::default`
+  during rasterizer callbacks. Channel-bound caches therefore observed
+  default point/non-indexed state while the active draw was
+  triangle/indexed. `draw_manager_state` now returns the scoped active state
+  by reference, matching upstream `GetDrawState()` without a per-draw clone.
+
+### Binary layout verification
+- PASS: the accessor returns decoded host values and does not alter register
+  storage.
+
+### Verification
+- Re-read upstream `Maxwell3D::Regs::TransformFeedback::Buffer` field order and
+  size, constructor ownership, and `DrawManager::GetDrawState`.
+- `transform_feedback_buffer_info_decodes_live_register_layout` passes in
+  release mode.
+- `test_active_draw_manager_state_is_visible_during_rasterizer_callback`
+  verifies active-state visibility and restoration and passes in release
+  mode.
+- A bounded runtime comparison found the pre-fix active state diverged on all
+  sampled draws while registers, vertex streams, cbufs, transform feedback,
+  and geometry dirty flags matched. After the fix all 16 sampled draws
+  matched for topology, indexed state, index count/first/format, and inline
+  data; the temporary diagnostic was removed.
+- Matched 15.2-second Vulkan startup runs used 21.91 CPU seconds for the
+  reference-based implementation and 22.89 for the pre-port baseline. Peak
+  RSS was effectively unchanged at 2,533,424 KiB versus 2,528,000 KiB.
+- Matched 20-second Vulkan in-race samples used 52.44 CPU seconds for the
+  reference-based implementation and 52.73 for the pre-port baseline. IPC
+  improved from 0.927 to 0.956, context switches fell by 1.2%, and CPU
+  migrations fell by 10.4%; both samples remained visually correct on the
+  same circuit and lap.
+
+## 2026-07-27 — video_core/src/control/channel_state_cache.rs vs video_core/control/channel_state_cache.h and channel_state_cache.inc
+
+### Intentional differences
+- Rust stores stable boxed engine addresses as `usize` and the memory manager
+  as `Arc<Mutex<_>>`; C++ stores references and raw pointers. ChannelState
+  remains the engine owner, and bind/erase updates the active addresses in the
+  same order.
+- Rust composition and exclusive `&mut self` replace template inheritance and
+  the C++ configuration mutex for cache mutations.
+
+### Unintentional differences (fixed)
+- BufferCache previously bypassed ChannelSetupCaches, so its channel payload
+  and engine owner were not changed by the shared create/bind/erase lifecycle.
+  Both renderer backends now forward those lifecycle operations to the common
+  cache.
+
+### Binary layout verification
+- PASS: ChannelInfo is host-only ownership metadata.
+
+### Verification
+- Re-read upstream ChannelInfo construction and all three
+  ChannelSetupCaches lifecycle methods.
+- The two-channel rebinding regression preserves per-channel payload and
+  switches to each channel's live engine address.
+
+## 2026-07-27 — video_core/src/renderer_opengl/gl_graphics_pipeline.rs and gl_rasterizer.rs vs video_core/renderer_opengl/gl_graphics_pipeline.cpp and gl_rasterizer.cpp
+
+### Intentional differences
+- GraphicsPipeline still receives GPU-memory closures because it does not yet
+  own the upstream `Tegra::MemoryManager*`. BufferCache's Maxwell3D access is
+  now live and channel-owned.
+- A diagnostic callback remains between base-state setup and descriptor work;
+  upstream has no draw-stage tracing callback.
+
+### Unintentional differences (fixed)
+- OpenGL created a `DrawStateEngineAdapter` for every draw and forced geometry
+  dirty queries true. The adapter and installation are removed; BufferCache
+  consumes and clears the actual Maxwell dirty flags.
+- Helper names and trace labels that described snapshot installation now
+  describe the live bound engine.
+
+### Missing items
+- Move the remaining GPU-memory closure ownership into the upstream-shaped
+  GraphicsPipeline engine binding.
+
+### Binary layout verification
+- PASS: renderer ownership changed without modifying guest or OpenGL payload
+  layouts.
+
+### Verification
+- Re-read upstream GraphicsPipeline engine ownership and RasterizerOpenGL
+  channel lifecycle.
+- The OpenGL live-owner source regression and compute bridge regressions pass
+  in release mode.

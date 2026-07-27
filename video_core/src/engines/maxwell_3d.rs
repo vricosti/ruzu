@@ -1682,6 +1682,16 @@ pub struct VertexStreamInfo {
     pub enabled: bool,
 }
 
+/// One `Maxwell3D::Regs::TransformFeedback::Buffer` decoded from the live
+/// register file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransformFeedbackBufferInfo {
+    pub enable: u32,
+    pub address: u64,
+    pub size: u32,
+    pub start_offset: u32,
+}
+
 /// Number of hardware viewports/scissors.
 pub const NUM_VIEWPORTS: usize = 16;
 
@@ -2160,6 +2170,15 @@ pub struct Maxwell3D {
     dirty: DirtyState,
     /// Upstream owner `std::unique_ptr<DrawManager> draw_manager`.
     draw_manager: dm::DrawManager,
+    /// Draw-manager state currently borrowed out by `with_draw_manager`.
+    ///
+    /// Upstream keeps `draw_manager` permanently owned by `Maxwell3D`, so
+    /// backend code can read `draw_manager->GetDrawState()` during a
+    /// rasterizer callback. Rust temporarily moves the manager out to split
+    /// the two mutable borrows; retain a scoped address to the active state
+    /// for that callback so channel-bound caches observe the same owner state
+    /// without cloning it.
+    active_draw_manager_state: Option<usize>,
     /// Constant buffer bindings: 5 shader stages x 18 slots.
     cb_bindings: [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
     /// Pending semaphore writes to be returned by execute_pending.
@@ -2248,6 +2267,34 @@ impl Maxwell3D {
         result
     }
 
+    fn with_active_draw_manager_state<R>(
+        &mut self,
+        draw_state: &dm::DrawState,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        struct RestoreActiveDrawState {
+            slot: *mut Option<usize>,
+            previous: Option<usize>,
+        }
+
+        impl Drop for RestoreActiveDrawState {
+            fn drop(&mut self) {
+                unsafe {
+                    *self.slot = self.previous;
+                }
+            }
+        }
+
+        let previous = self
+            .active_draw_manager_state
+            .replace((draw_state as *const dm::DrawState) as usize);
+        let _restore = RestoreActiveDrawState {
+            slot: &mut self.active_draw_manager_state,
+            previous,
+        };
+        f(self)
+    }
+
     fn new_impl(memory_manager: Arc<Mutex<MemoryManager>>) -> Self {
         Self::new_impl_common(
             engine_upload::State::new_with_memory_manager(Arc::clone(&memory_manager)),
@@ -2282,6 +2329,7 @@ impl Maxwell3D {
             execute_on: true,
             dirty: DirtyState::new(),
             draw_manager: dm::DrawManager::new(),
+            active_draw_manager_state: None,
             cb_bindings: [[ConstBufferBinding::default(); MAX_CB_SLOTS]; NUM_SHADER_STAGES],
             pending_semaphore_writes: Vec::new(),
             rasterizer: None,
@@ -2493,12 +2541,13 @@ impl Maxwell3D {
     }
 
     /// Upstream `maxwell3d->draw_manager->GetDrawState()`.
-    ///
-    /// The Rust runtime still lacks the literal live `DrawManager` owner
-    /// graph, so this returns the closest matching owner-local snapshot from
-    /// the current Maxwell register file.
-    pub fn draw_manager_state(&self) -> crate::engines::draw_manager::DrawState {
-        self.draw_manager.get_draw_state().clone()
+    pub fn draw_manager_state(&self) -> &crate::engines::draw_manager::DrawState {
+        if let Some(address) = self.active_draw_manager_state {
+            // `with_active_draw_manager_state` installs this address from an
+            // immutable borrow and restores it before that borrow expires.
+            return unsafe { &*(address as *const dm::DrawState) };
+        }
+        self.draw_manager.get_draw_state()
     }
 
     /// Upstream reads `regs.mandated_early_z != 0` directly.
@@ -2565,6 +2614,19 @@ impl Maxwell3D {
             })
         });
         TransformFeedbackState { layouts, varyings }
+    }
+
+    /// Read one transform-feedback buffer from
+    /// `regs.transform_feedback.buffers[index]`.
+    pub fn transform_feedback_buffer_info(&self, index: u32) -> TransformFeedbackBufferInfo {
+        let base =
+            (TRANSFORM_FEEDBACK_BUFFERS_BASE + index * TRANSFORM_FEEDBACK_BUFFER_STRIDE) as usize;
+        TransformFeedbackBufferInfo {
+            enable: self.regs[base],
+            address: ((self.regs[base + 1] as u64) << 32) | self.regs[base + 2] as u64,
+            size: self.regs[base + 3],
+            start_offset: self.regs[base + TRANSFORM_FEEDBACK_BUFFER_START_OFFSET as usize],
+        }
     }
 
     pub fn set_engine_state(&mut self, state: EngineHint) {
@@ -3592,14 +3654,14 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         let Some(handle) = self.rasterizer else {
             return false;
         };
-        unsafe {
+        self.with_active_draw_manager_state(draw_state, |this| unsafe {
             handle.with_mut(|rasterizer| {
                 rasterizer.draw(
-                    dm::Maxwell3DDrawView::live(draw_state, self),
+                    dm::Maxwell3DDrawView::live(draw_state, this),
                     instance_count,
                 );
-            });
-        }
+            })
+        });
         true
     }
 
@@ -3611,15 +3673,15 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         let Some(handle) = self.rasterizer else {
             return false;
         };
-        unsafe {
+        self.with_active_draw_manager_state(draw_state, |this| unsafe {
             handle.with_mut(|rasterizer| {
                 rasterizer.draw_indirect(dm::Maxwell3DIndirectView::live(
                     draw_state,
                     indirect_params,
-                    self,
+                    this,
                 ));
-            });
-        }
+            })
+        });
         true
     }
 
@@ -3631,15 +3693,15 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         let Some(handle) = self.rasterizer else {
             return false;
         };
-        unsafe {
+        self.with_active_draw_manager_state(draw_state, |this| unsafe {
             handle.with_mut(|rasterizer| {
                 rasterizer.draw_texture(dm::Maxwell3DDrawTextureView::live(
                     draw_state,
                     draw_texture_state,
-                    self,
+                    this,
                 ));
-            });
-        }
+            })
+        });
         true
     }
 
@@ -5624,11 +5686,17 @@ mod tests {
 
         engine.regs[base + IB_OFF_ADDR_HIGH as usize] = 0x0000_00AB;
         engine.regs[base + IB_OFF_ADDR_LOW as usize] = 0xCDEF_0000;
+        engine.regs[base + IB_OFF_LIMIT_HIGH as usize] = 0x0000_00AB;
+        engine.regs[base + IB_OFF_LIMIT_LOW as usize] = 0xCDEF_FFFF;
         engine.regs[base + IB_OFF_FORMAT as usize] = 1; // UnsignedShort
         engine.regs[base + IB_OFF_FIRST as usize] = 10;
         engine.regs[base + IB_OFF_COUNT as usize] = 500;
 
         assert_eq!(engine.index_buffer_addr(), 0xAB_CDEF_0000);
+        assert_eq!(
+            <Maxwell3D as dm::Maxwell3DAccess>::index_buffer_addr_end(&engine),
+            0xAB_CDEF_FFFF
+        );
         assert_eq!(engine.index_buffer_format(), IndexFormat::UnsignedShort);
         assert_eq!(engine.index_buffer_format().size_bytes(), 2);
         assert_eq!(engine.index_buffer_first(), 10);
@@ -7101,6 +7169,49 @@ mod tests {
     }
 
     #[test]
+    fn test_active_draw_manager_state_is_visible_during_rasterizer_callback() {
+        let mut engine = Maxwell3D::new();
+        let idle_state = engine.draw_manager_state().clone();
+        let mut active_state = idle_state.clone();
+        active_state.topology = PrimitiveTopology::Triangles;
+        active_state.draw_indexed = true;
+        active_state.index_buffer.count = 6;
+        active_state.index_buffer.format = IndexFormat::UnsignedShort;
+
+        engine.with_active_draw_manager_state(&active_state, |engine| {
+            let visible_state = engine.draw_manager_state();
+            assert_eq!(visible_state.topology, PrimitiveTopology::Triangles);
+            assert!(visible_state.draw_indexed);
+            assert_eq!(visible_state.index_buffer.count, 6);
+            assert_eq!(
+                visible_state.index_buffer.format,
+                IndexFormat::UnsignedShort
+            );
+        });
+
+        let restored_state = engine.draw_manager_state();
+        assert_eq!(restored_state.topology, idle_state.topology);
+        assert_eq!(restored_state.draw_indexed, idle_state.draw_indexed);
+        assert_eq!(
+            restored_state.index_buffer.count,
+            idle_state.index_buffer.count
+        );
+        assert_eq!(
+            restored_state.index_buffer.format,
+            idle_state.index_buffer.format
+        );
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.with_active_draw_manager_state(&active_state, |_| {
+                panic!("test callback unwind");
+            });
+        }));
+        assert!(unwind.is_err());
+        assert!(engine.active_draw_manager_state.is_none());
+        assert_eq!(engine.draw_manager_state().topology, idle_state.topology);
+    }
+
+    #[test]
     fn test_general_draw_has_instance_count_one() {
         let mut engine = Maxwell3D::new();
         // Plain draw: topology=Triangles(4), instance_id=First (bits[27:26]=0).
@@ -8279,6 +8390,28 @@ mod tests {
         assert_eq!(engine.regs[UPLOAD_REGS_BASE + 3], 0x5566);
         assert_eq!(engine.regs[LAUNCH_DMA as usize], 0x1011);
         assert_eq!(zero_memory.len(), 8);
+    }
+
+    #[test]
+    fn transform_feedback_buffer_info_decodes_live_register_layout() {
+        let mut engine = Maxwell3D::new();
+        let base = TRANSFORM_FEEDBACK_BUFFERS_BASE as usize
+            + 2 * TRANSFORM_FEEDBACK_BUFFER_STRIDE as usize;
+        engine.regs[base] = 1;
+        engine.regs[base + 1] = 0x12;
+        engine.regs[base + 2] = 0x3456_7800;
+        engine.regs[base + 3] = 0x400;
+        engine.regs[base + TRANSFORM_FEEDBACK_BUFFER_START_OFFSET as usize] = 0x20;
+
+        assert_eq!(
+            engine.transform_feedback_buffer_info(2),
+            TransformFeedbackBufferInfo {
+                enable: 1,
+                address: 0x12_3456_7800,
+                size: 0x400,
+                start_offset: 0x20,
+            }
+        );
     }
 
     #[test]

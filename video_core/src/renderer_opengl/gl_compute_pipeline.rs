@@ -1229,16 +1229,18 @@ mod tests {
         let pipeline = ComputePipeline::new_for_test(info, false, 0);
         let tracker = DummyTracker;
         let mut buffer_cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
-        buffer_cache.channel_state = Some(Box::new(BufferCacheChannelInfo::default()));
+        let channel = crate::control::channel_state::ChannelState::new(1);
+        buffer_cache.create_channel(&channel);
+        buffer_cache.bind_to_channel(channel.bind_id);
         {
-            let cs = buffer_cache.channel_state.as_mut().unwrap();
+            let cs = buffer_cache.current_channel_state_mut().unwrap();
             cs.enabled_compute_storage_buffers = 0xFFFF;
             cs.written_compute_storage_buffers = 0xFFFF;
         }
 
         pipeline.configure_buffer_state(&mut buffer_cache);
 
-        let cs = buffer_cache.channel_state.as_ref().unwrap();
+        let cs = buffer_cache.current_channel_state().unwrap();
         assert_eq!(cs.enabled_compute_uniform_buffer_mask, 0b101);
         assert_eq!(
             *cs.compute_uniform_buffer_sizes.as_ref().unwrap().as_ref(),

@@ -136,7 +136,7 @@ pub fn dump_gl_draw_stall_profile() {
         "after_pipeline_configure",
         "before_draw_call",
         "exit",
-        "after_set_engine_state",
+        "after_bind_live_engine",
         "before_descriptor_walk",
         "after_descriptor_walk",
         "after_fill_image_views",
@@ -319,20 +319,6 @@ impl crate::buffer_cache::buffer_cache_base::DeviceMemoryAccess for DeviceMemory
     }
 }
 
-/// Adapter that implements `EngineState` for the buffer cache by combining
-/// upstream `DrawState` fields with the current Maxwell3D draw-register view.
-/// Installed on the buffer cache at the start of each `RasterizerOpenGL::draw`
-/// call so `update_index_buffer` / `update_vertex_buffers` see the current
-/// draw's register state without adding non-upstream fields to `DrawState`.
-///
-/// Dirty flags always report `true` (forcing the cache to re-read every
-/// draw) because the Rust port doesn't yet track per-field dirty bits on
-/// the Maxwell3D register file the way upstream does.
-struct DrawStateEngineAdapter {
-    draw_state: DrawState,
-    registers: crate::engines::draw_manager::Maxwell3DDrawRegisters,
-}
-
 struct ComputeEngineAdapter {
     dispatch: DispatchCall,
 }
@@ -357,150 +343,9 @@ impl ComputeEngineAdapter {
     }
 }
 
-impl crate::buffer_cache::buffer_cache_base::EngineState for ComputeEngineAdapter {
-    fn get_index_buffer(&self) -> crate::buffer_cache::buffer_cache_base::IndexBufferRef {
-        crate::buffer_cache::buffer_cache_base::IndexBufferRef::default()
-    }
-
-    fn get_inline_index_draw_indexes(&self) -> &[u8] {
-        &[]
-    }
-
-    fn is_dirty(&self, _flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) -> bool {
-        false
-    }
-
-    fn clear_dirty(&mut self, _flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) {}
-
-    fn set_dirty(&mut self, _flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) {}
-
-    fn get_vertex_stream(
-        &self,
-        _index: u32,
-    ) -> crate::buffer_cache::buffer_cache_base::VertexStreamInfo {
-        crate::buffer_cache::buffer_cache_base::VertexStreamInfo::default()
-    }
-
-    fn get_vertex_stream_limit(
-        &self,
-        _index: u32,
-    ) -> crate::buffer_cache::buffer_cache_base::VertexStreamLimit {
-        crate::buffer_cache::buffer_cache_base::VertexStreamLimit::default()
-    }
-
-    fn is_transform_feedback_enabled(&self) -> bool {
-        false
-    }
-
-    fn get_transform_feedback_buffer(
-        &self,
-        _index: u32,
-    ) -> crate::buffer_cache::buffer_cache_base::TransformFeedbackBufferInfo {
-        crate::buffer_cache::buffer_cache_base::TransformFeedbackBufferInfo::default()
-    }
-
-    fn get_const_buffer(
-        &self,
-        _stage: usize,
-        _cbuf_index: u32,
-    ) -> crate::buffer_cache::buffer_cache_base::ConstBufferInfo {
-        crate::buffer_cache::buffer_cache_base::ConstBufferInfo::default()
-    }
-
+impl crate::buffer_cache::buffer_cache_base::ComputeEngineState for ComputeEngineAdapter {
     fn get_compute_launch_info(&self) -> crate::buffer_cache::buffer_cache_base::ComputeLaunchInfo {
         self.launch_info()
-    }
-}
-
-impl crate::buffer_cache::buffer_cache_base::EngineState for DrawStateEngineAdapter {
-    fn get_index_buffer(&self) -> crate::buffer_cache::buffer_cache_base::IndexBufferRef {
-        let ds = &self.draw_state;
-        let format_size = match ds.index_buffer.format {
-            crate::engines::maxwell_3d::IndexFormat::UnsignedByte => 1u32,
-            crate::engines::maxwell_3d::IndexFormat::UnsignedShort => 2,
-            crate::engines::maxwell_3d::IndexFormat::UnsignedInt => 4,
-        };
-        crate::buffer_cache::buffer_cache_base::IndexBufferRef {
-            start_address: self.registers.index_buffer_gpu_addr,
-            end_address: self.registers.index_buffer_gpu_addr_end,
-            count: ds.index_buffer.count,
-            first: ds.index_buffer.first,
-            format_size_in_bytes: format_size,
-        }
-    }
-
-    fn get_inline_index_draw_indexes(&self) -> &[u8] {
-        &self.draw_state.inline_index_draw_indexes
-    }
-
-    fn is_dirty(&self, _flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) -> bool {
-        true
-    }
-
-    fn clear_dirty(&mut self, _flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) {}
-
-    fn set_dirty(&mut self, _flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) {}
-
-    fn get_vertex_stream(
-        &self,
-        index: u32,
-    ) -> crate::buffer_cache::buffer_cache_base::VertexStreamInfo {
-        let Some(stream) = self.registers.vertex_streams.get(index as usize) else {
-            return crate::buffer_cache::buffer_cache_base::VertexStreamInfo::default();
-        };
-        crate::buffer_cache::buffer_cache_base::VertexStreamInfo {
-            address: stream.address,
-            stride: stream.stride,
-            enable: u32::from(stream.enabled),
-        }
-    }
-
-    fn get_vertex_stream_limit(
-        &self,
-        index: u32,
-    ) -> crate::buffer_cache::buffer_cache_base::VertexStreamLimit {
-        let Some(limit) = self.registers.vertex_stream_limits.get(index as usize) else {
-            return crate::buffer_cache::buffer_cache_base::VertexStreamLimit::default();
-        };
-        crate::buffer_cache::buffer_cache_base::VertexStreamLimit {
-            address: limit.address,
-        }
-    }
-
-    fn is_transform_feedback_enabled(&self) -> bool {
-        false
-    }
-
-    fn get_transform_feedback_buffer(
-        &self,
-        _index: u32,
-    ) -> crate::buffer_cache::buffer_cache_base::TransformFeedbackBufferInfo {
-        crate::buffer_cache::buffer_cache_base::TransformFeedbackBufferInfo::default()
-    }
-
-    fn get_const_buffer(
-        &self,
-        stage: usize,
-        cbuf_index: u32,
-    ) -> crate::buffer_cache::buffer_cache_base::ConstBufferInfo {
-        let Some(stage_bindings) = self.registers.cb_bindings.get(stage) else {
-            return crate::buffer_cache::buffer_cache_base::ConstBufferInfo::default();
-        };
-        let Some(binding) = stage_bindings.get(cbuf_index as usize) else {
-            return crate::buffer_cache::buffer_cache_base::ConstBufferInfo::default();
-        };
-        crate::buffer_cache::buffer_cache_base::ConstBufferInfo {
-            address: binding.address,
-            size: binding.size,
-            enabled: binding.enabled,
-        }
-    }
-
-    fn get_compute_launch_info(&self) -> crate::buffer_cache::buffer_cache_base::ComputeLaunchInfo {
-        crate::buffer_cache::buffer_cache_base::ComputeLaunchInfo {
-            const_buffer_enable_mask: 0,
-            const_buffer_config: Vec::new(),
-        }
     }
 }
 
@@ -4046,73 +3891,68 @@ impl RasterizerInterface for RasterizerOpenGL {
                 trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_rt_prepare", draw_seq);
                 let dirty_flags = draw_view.dirty_flags();
                 let surface_clip = draw_view.surface_clip();
-                bound_draw_framebuffer = pipeline
-                    .synchronize_then_set_engine_state_and_configure_graphics_framebuffer(
-                        &mut self.texture_cache,
-                        descriptor_sync_regs,
-                        &mut self.buffer_cache,
-                        || {
-                            record_gl_draw_stage(draw_seq, 10);
-                            trace_gl_draw_stall!(
-                                "[GL_DRAW_STALL] seq={} after_descriptor_sync",
-                                draw_seq
-                            );
-                            record_gl_draw_stage(draw_seq, 25);
-                            trace_gl_draw_stall!(
-                                "[GL_DRAW_STALL] seq={} after_base_bindings",
-                                draw_seq
-                            );
-                        },
-                        Box::new(DrawStateEngineAdapter {
-                            draw_state: draw_state.clone(),
-                            registers: draw_view.registers(),
-                        }),
-                        || {
-                            record_gl_draw_stage(draw_seq, 14);
-                            trace_gl_draw_stall!(
-                                "[GL_DRAW_STALL] seq={} after_set_engine_state",
-                                draw_seq
-                            );
-                        },
-                        &mut self.state_tracker,
-                        num_shader_stages,
-                        MAX_DESC_COUNT,
-                        via_header_index,
-                        &mut views,
-                        &mut sampler_ids,
-                        use_stage_gpu_reader,
-                        move |gpu_addr| {
-                            mm_for_ssbo_addr
-                                .as_ref()
-                                .and_then(|mm| mm.lock().gpu_to_cpu_address(gpu_addr))
-                        },
-                        move |gpu_addr| {
-                            mm_for_ssbo_layout
-                                .as_ref()
-                                .map(|mm| mm.lock().get_memory_layout_size(gpu_addr))
-                                .unwrap_or(0)
-                        },
-                        move |gpu_addr, out| {
-                            if let Some(mm) = mm_for_ssbo_read.as_ref() {
-                                mm.lock().read_block(gpu_addr, out);
-                                true
-                            } else {
-                                false
-                            }
-                        },
-                        &mut read_handle,
-                        |detail_stage, detail0, detail1| {
-                            record_gl_draw_stage_detail(draw_seq, detail_stage, detail0, detail1);
-                        },
-                        trace_texture_descriptors,
-                        &render_targets,
-                        &dirty_flags,
-                        &mut draw_view,
-                        crate::texture_cache::types::Extent2D {
-                            width: surface_clip.width,
-                            height: surface_clip.height,
-                        },
-                    );
+                bound_draw_framebuffer = pipeline.synchronize_then_configure_graphics_framebuffer(
+                    &mut self.texture_cache,
+                    descriptor_sync_regs,
+                    &mut self.buffer_cache,
+                    || {
+                        record_gl_draw_stage(draw_seq, 10);
+                        trace_gl_draw_stall!(
+                            "[GL_DRAW_STALL] seq={} after_descriptor_sync",
+                            draw_seq
+                        );
+                        record_gl_draw_stage(draw_seq, 25);
+                        trace_gl_draw_stall!(
+                            "[GL_DRAW_STALL] seq={} after_base_bindings",
+                            draw_seq
+                        );
+                    },
+                    || {
+                        record_gl_draw_stage(draw_seq, 14);
+                        trace_gl_draw_stall!(
+                            "[GL_DRAW_STALL] seq={} after_bind_live_engine",
+                            draw_seq
+                        );
+                    },
+                    &mut self.state_tracker,
+                    num_shader_stages,
+                    MAX_DESC_COUNT,
+                    via_header_index,
+                    &mut views,
+                    &mut sampler_ids,
+                    use_stage_gpu_reader,
+                    move |gpu_addr| {
+                        mm_for_ssbo_addr
+                            .as_ref()
+                            .and_then(|mm| mm.lock().gpu_to_cpu_address(gpu_addr))
+                    },
+                    move |gpu_addr| {
+                        mm_for_ssbo_layout
+                            .as_ref()
+                            .map(|mm| mm.lock().get_memory_layout_size(gpu_addr))
+                            .unwrap_or(0)
+                    },
+                    move |gpu_addr, out| {
+                        if let Some(mm) = mm_for_ssbo_read.as_ref() {
+                            mm.lock().read_block(gpu_addr, out);
+                            true
+                        } else {
+                            false
+                        }
+                    },
+                    &mut read_handle,
+                    |detail_stage, detail0, detail1| {
+                        record_gl_draw_stage_detail(draw_seq, detail_stage, detail0, detail1);
+                    },
+                    trace_texture_descriptors,
+                    &render_targets,
+                    &dirty_flags,
+                    &mut draw_view,
+                    crate::texture_cache::types::Extent2D {
+                        width: surface_clip.width,
+                        height: surface_clip.height,
+                    },
+                );
                 record_gl_draw_stage(draw_seq, 16);
                 trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_descriptor_walk", draw_seq);
                 record_gl_draw_stage(draw_seq, 2);
@@ -7877,7 +7717,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             mm.lock().flush_caching();
         }
         self.buffer_cache
-            .set_engine_state(Box::new(ComputeEngineAdapter {
+            .set_compute_engine_state(Box::new(ComputeEngineAdapter {
                 dispatch: dispatch.clone(),
             }));
         let Some(pipeline) = self
@@ -8600,14 +8440,11 @@ impl RasterizerInterface for RasterizerOpenGL {
         self.shader_cache.create_channel(channel);
         self.query_cache.create_channel(channel);
         self.texture_cache.base.create_channel(channel);
-        // Upstream `RasterizerOpenGL` also creates per-channel state for the
-        // buffer cache here. That owner is still partially reduced in Rust.
+        self.buffer_cache.create_channel(channel);
     }
 
     fn bind_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
-        if self.buffer_cache.channel_state.is_none() {
-            self.buffer_cache.channel_state = Some(Box::default());
-        }
+        self.buffer_cache.bind_to_channel(channel.bind_id);
         self.shader_cache.bind_to_channel(channel.bind_id);
         self.query_cache.bind_to_channel(channel.bind_id);
         self.texture_cache.base.bind_to_channel(channel.bind_id);
@@ -8637,6 +8474,7 @@ impl RasterizerInterface for RasterizerOpenGL {
     }
 
     fn release_channel(&mut self, channel_id: i32) {
+        self.buffer_cache.erase_channel(channel_id);
         self.shader_cache.erase_channel(channel_id);
         self.query_cache.erase_channel(channel_id);
         self.channel_memory_manager = None;
@@ -9096,15 +8934,16 @@ mod tests",
 
         let tracker = DummyTracker;
         let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
-        cache.channel_state = Some(Box::new(BufferCacheChannelInfo::default()));
+        let channel = crate::control::channel_state::ChannelState::new(1);
+        cache.create_channel(&channel);
+        cache.bind_to_channel(channel.bind_id);
         cache.set_gpu_memory(Box::new(TestGpuMemory));
-        cache.set_engine_state(Box::new(ComputeEngineAdapter { dispatch }));
+        cache.set_compute_engine_state(Box::new(ComputeEngineAdapter { dispatch }));
 
         cache.bind_compute_storage_buffer(0, 0, 0x20, true);
 
         let binding = cache
-            .channel_state
-            .as_ref()
+            .current_channel_state()
             .unwrap()
             .compute_storage_buffers[0];
         assert_eq!(binding.device_addr, 0x105000);

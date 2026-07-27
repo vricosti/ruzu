@@ -31,8 +31,7 @@ use log::{debug, info, trace, warn};
 use thiserror::Error;
 
 use crate::buffer_cache::buffer_cache_base::{
-    ConstBufferInfo, DeviceMemoryAccess, GpuMemoryAccess, IndexBufferRef, ObtainBufferOperation,
-    ObtainBufferSynchronize, VertexStreamInfo as BufferVertexStreamInfo, VertexStreamLimit,
+    DeviceMemoryAccess, GpuMemoryAccess, ObtainBufferOperation, ObtainBufferSynchronize,
 };
 use crate::control::channel_state_cache::{ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches};
 use crate::engines::kepler_compute::DispatchCall;
@@ -367,191 +366,12 @@ struct DeviceMemoryAccessAdapter {
     device_memory: Arc<MaxwellDeviceMemoryManager>,
 }
 
-/// Draw-local Maxwell state exposed to the common buffer cache.
-///
-/// Register values remain snapshotted for the split Rust renderer, but dirty
-/// flags point at the stable channel-owned `Maxwell3D` storage. Upstream keeps
-/// a permanent `Maxwell3D*` in `BufferCache`; using a copied flag array loses
-/// invalidations raised by `DeleteBuffer` between draws.
-struct VulkanDrawStateEngineAdapter {
-    index_buffer: IndexBufferRef,
-    inline_index_data: Vec<u8>,
-    topology: PrimitiveTopology,
-    index_format: crate::engines::maxwell_3d::IndexFormat,
-    vertex_streams: [BufferVertexStreamInfo; 32],
-    vertex_stream_limits: [VertexStreamLimit; 32],
-    transform_feedback_enabled: bool,
-    const_buffers: [[ConstBufferInfo; crate::engines::maxwell_3d::MAX_CB_SLOTS];
-        crate::engines::maxwell_3d::NUM_SHADER_STAGES],
-    fallback_dirty_flags: [bool; 256],
-    dirty_flags: Option<std::ptr::NonNull<[bool; 256]>>,
-}
-
-impl VulkanDrawStateEngineAdapter {
-    fn from_draw(draw: &DrawCall, dirty_flags: Option<std::ptr::NonNull<[bool; 256]>>) -> Self {
-        let format_size_in_bytes = match draw.index_format {
-            crate::engines::maxwell_3d::IndexFormat::UnsignedByte => 1,
-            crate::engines::maxwell_3d::IndexFormat::UnsignedShort => 2,
-            crate::engines::maxwell_3d::IndexFormat::UnsignedInt => 4,
-        };
-        Self {
-            index_buffer: IndexBufferRef {
-                start_address: draw.index_buffer_addr,
-                end_address: draw.index_buffer_addr_end,
-                count: draw.index_buffer_count,
-                first: draw.index_buffer_first,
-                format_size_in_bytes,
-            },
-            inline_index_data: draw.inline_index_data.clone(),
-            topology: draw.topology,
-            index_format: draw.index_format,
-            vertex_streams: std::array::from_fn(|index| {
-                let stream = draw.vertex_streams[index];
-                BufferVertexStreamInfo {
-                    address: stream.address,
-                    stride: stream.stride,
-                    enable: u32::from(stream.enabled),
-                }
-            }),
-            vertex_stream_limits: std::array::from_fn(|index| VertexStreamLimit {
-                address: draw.vertex_stream_limits[index].address,
-            }),
-            transform_feedback_enabled: draw.transform_feedback_enabled,
-            const_buffers: std::array::from_fn(|stage| {
-                std::array::from_fn(|index| {
-                    let binding = draw.cb_bindings[stage][index];
-                    ConstBufferInfo {
-                        address: binding.address,
-                        size: binding.size,
-                        enabled: binding.enabled,
-                    }
-                })
-            }),
-            fallback_dirty_flags: draw.dirty_flags,
-            dirty_flags,
-        }
-    }
-
-    fn dirty_flags(&self) -> &[bool; 256] {
-        match self.dirty_flags {
-            Some(flags) => unsafe { flags.as_ref() },
-            None => &self.fallback_dirty_flags,
-        }
-    }
-
-    fn dirty_flags_mut(&mut self) -> &mut [bool; 256] {
-        match self.dirty_flags.as_mut() {
-            Some(flags) => unsafe { flags.as_mut() },
-            None => &mut self.fallback_dirty_flags,
-        }
-    }
-}
-
-fn geometry_dirty_flag_index(flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) -> u8 {
-    match flag {
-        crate::buffer_cache::buffer_cache_base::DirtyFlag::IndexBuffer => {
-            crate::dirty_flags::flags::INDEX_BUFFER
-        }
-        crate::buffer_cache::buffer_cache_base::DirtyFlag::VertexBuffers => {
-            crate::dirty_flags::flags::VERTEX_BUFFERS
-        }
-        crate::buffer_cache::buffer_cache_base::DirtyFlag::VertexBuffer(index) => {
-            crate::dirty_flags::flags::VERTEX_BUFFER0.saturating_add(index as u8)
-        }
-    }
-}
-
 fn is_geometry_dirty_flag(index: usize) -> bool {
     index == crate::dirty_flags::flags::INDEX_BUFFER as usize
         || index == crate::dirty_flags::flags::VERTEX_BUFFERS as usize
         || (crate::dirty_flags::flags::VERTEX_BUFFER0 as usize
             ..=crate::dirty_flags::flags::VERTEX_BUFFER31 as usize)
             .contains(&index)
-}
-
-impl crate::buffer_cache::buffer_cache_base::EngineState for VulkanDrawStateEngineAdapter {
-    fn get_index_buffer(&self) -> crate::buffer_cache::buffer_cache_base::IndexBufferRef {
-        self.index_buffer
-    }
-
-    fn get_inline_index_draw_indexes(&self) -> &[u8] {
-        &self.inline_index_data
-    }
-
-    fn get_primitive_topology(&self) -> PrimitiveTopology {
-        self.topology
-    }
-
-    fn get_index_format(&self) -> crate::engines::maxwell_3d::IndexFormat {
-        self.index_format
-    }
-
-    fn is_dirty(&self, flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) -> bool {
-        let index = geometry_dirty_flag_index(flag);
-        self.dirty_flags()[index as usize]
-    }
-
-    fn clear_dirty(&mut self, flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) {
-        let index = geometry_dirty_flag_index(flag);
-        self.dirty_flags_mut()[index as usize] = false;
-    }
-
-    fn set_dirty(&mut self, flag: crate::buffer_cache::buffer_cache_base::DirtyFlag) {
-        let index = geometry_dirty_flag_index(flag);
-        self.dirty_flags_mut()[index as usize] = true;
-    }
-
-    fn get_vertex_stream(
-        &self,
-        index: u32,
-    ) -> crate::buffer_cache::buffer_cache_base::VertexStreamInfo {
-        let Some(stream) = self.vertex_streams.get(index as usize) else {
-            return crate::buffer_cache::buffer_cache_base::VertexStreamInfo::default();
-        };
-        *stream
-    }
-
-    fn get_vertex_stream_limit(
-        &self,
-        index: u32,
-    ) -> crate::buffer_cache::buffer_cache_base::VertexStreamLimit {
-        let Some(limit) = self.vertex_stream_limits.get(index as usize) else {
-            return crate::buffer_cache::buffer_cache_base::VertexStreamLimit::default();
-        };
-        *limit
-    }
-
-    fn is_transform_feedback_enabled(&self) -> bool {
-        self.transform_feedback_enabled
-    }
-
-    fn get_transform_feedback_buffer(
-        &self,
-        _index: u32,
-    ) -> crate::buffer_cache::buffer_cache_base::TransformFeedbackBufferInfo {
-        crate::buffer_cache::buffer_cache_base::TransformFeedbackBufferInfo::default()
-    }
-
-    fn get_const_buffer(
-        &self,
-        stage: usize,
-        cbuf_index: u32,
-    ) -> crate::buffer_cache::buffer_cache_base::ConstBufferInfo {
-        let Some(stage_bindings) = self.const_buffers.get(stage) else {
-            return crate::buffer_cache::buffer_cache_base::ConstBufferInfo::default();
-        };
-        let Some(binding) = stage_bindings.get(cbuf_index as usize) else {
-            return crate::buffer_cache::buffer_cache_base::ConstBufferInfo::default();
-        };
-        *binding
-    }
-
-    fn get_compute_launch_info(&self) -> crate::buffer_cache::buffer_cache_base::ComputeLaunchInfo {
-        crate::buffer_cache::buffer_cache_base::ComputeLaunchInfo {
-            const_buffer_enable_mask: 0,
-            const_buffer_config: Vec::new(),
-        }
-    }
 }
 
 impl DeviceMemoryAccess for DeviceMemoryAccessAdapter {
@@ -1201,9 +1021,6 @@ impl RasterizerVulkan {
             _bc_draw_buffer_guard,
             _bc_draw_texture_guard
         );
-        self.common_buffer_cache.set_engine_state(Box::new(
-            VulkanDrawStateEngineAdapter::from_draw(draw, engine_dirty_flags),
-        ));
         // Upstream `GraphicsPipeline::ConfigureImpl` updates all buffer
         // bindings once, then binds geometry before the per-stage buffers.
         // Keep the legacy path only for topologies whose Vulkan conversion
@@ -3326,9 +3143,8 @@ impl RasterizerInterface for RasterizerVulkan {
         // draw re-runs the full render-target resolution.
         for (index, dirty) in dirty_flags.iter().enumerate() {
             // The common buffer cache consumes geometry flags directly through
-            // `VulkanDrawStateEngineAdapter`, matching upstream's persistent
-            // `Maxwell3D*`. Replaying the pre-draw snapshot here would erase a
-            // command-buffer invalidation raised during the draw's FlushWork.
+            // the channel-bound Maxwell3D. Replaying the pre-draw snapshot here
+            // would erase an invalidation raised during the draw's FlushWork.
             if engine_dirty_flags.is_some() && is_geometry_dirty_flag(index) {
                 continue;
             }
@@ -4120,6 +3936,7 @@ impl RasterizerInterface for RasterizerVulkan {
         self.channel_caches.create_channel(channel);
         self.texture_cache.create_channel(channel);
         self.buffer_cache.create_channel(channel);
+        self.common_buffer_cache.create_channel(channel);
         self.shader_cache.create_channel(channel);
         self.pipeline_cache.create_channel(channel);
         self.query_cache.create_channel(channel);
@@ -4130,6 +3947,7 @@ impl RasterizerInterface for RasterizerVulkan {
         self.channel_caches.bind_to_channel(channel.bind_id);
         self.texture_cache.bind_to_channel(channel.bind_id);
         self.buffer_cache.bind_to_channel(channel.bind_id);
+        self.common_buffer_cache.bind_to_channel(channel.bind_id);
         self.shader_cache.bind_to_channel(channel.bind_id);
         self.pipeline_cache.bind_to_channel(channel.bind_id);
         self.query_cache.bind_to_channel(channel.bind_id);
@@ -4139,9 +3957,6 @@ impl RasterizerInterface for RasterizerVulkan {
             .channel_caches
             .current_channel_state()
             .and_then(ChannelCacheAccessor::gpu_memory_arc);
-        if self.common_buffer_cache.channel_state.is_none() {
-            self.common_buffer_cache.channel_state = Some(Box::default());
-        }
         if let Some(mm) = self.channel_memory_manager.as_ref() {
             self.common_buffer_cache
                 .set_gpu_memory(Box::new(GpuMemoryAccessAdapter { mm: Arc::clone(mm) }));
@@ -4153,6 +3968,7 @@ impl RasterizerInterface for RasterizerVulkan {
         self.channel_caches.erase_channel(channel_id);
         self.texture_cache.erase_channel(channel_id);
         self.buffer_cache.erase_channel(channel_id);
+        self.common_buffer_cache.erase_channel(channel_id);
         self.shader_cache.erase_channel(channel_id);
         self.pipeline_cache.erase_channel(channel_id);
         self.query_cache.erase_channel(channel_id);
@@ -4857,21 +4673,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_state_adapter_maps_upstream_geometry_dirty_flags() {
-        use crate::buffer_cache::buffer_cache_base::DirtyFlag;
-
-        assert_eq!(
-            geometry_dirty_flag_index(DirtyFlag::IndexBuffer),
-            crate::dirty_flags::flags::INDEX_BUFFER
-        );
-        assert_eq!(
-            geometry_dirty_flag_index(DirtyFlag::VertexBuffers),
-            crate::dirty_flags::flags::VERTEX_BUFFERS
-        );
-        assert_eq!(
-            geometry_dirty_flag_index(DirtyFlag::VertexBuffer(7)),
-            crate::dirty_flags::flags::VERTEX_BUFFER0 + 7
-        );
+    fn geometry_dirty_range_matches_upstream_common_flags() {
         assert!(is_geometry_dirty_flag(
             crate::dirty_flags::flags::INDEX_BUFFER as usize
         ));
@@ -4887,10 +4689,11 @@ mod tests {
     }
 
     #[test]
-    fn draw_state_adapter_does_not_duplicate_the_full_draw_snapshot() {
-        assert!(
-            std::mem::size_of::<VulkanDrawStateEngineAdapter>() < std::mem::size_of::<DrawCall>()
-        );
+    fn runtime_has_no_graphics_engine_snapshot_adapter() {
+        let source = include_str!("vk_rasterizer.rs");
+        let runtime = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(!runtime.contains("VulkanDrawStateEngineAdapter"));
+        assert!(!runtime.contains("set_engine_state(Box::new"));
     }
 
     #[test]

@@ -24,12 +24,11 @@ use crate::memory_manager::MemoryManager;
 // ChannelInfo — non-generic, corresponds to VideoCommon::ChannelInfo
 // ---------------------------------------------------------------------------
 
-/// Snapshot of a channel's key references, taken at channel creation time.
+/// Channel-owned engine and memory references captured at channel creation.
 ///
 /// Corresponds to `VideoCommon::ChannelInfo` (channel_state_cache.h).
-/// The C++ version holds live references; here we preserve the same owner
-/// boundary by storing channel-bound references in forms the Rust runtime can
-/// safely carry across backend owners.
+/// Engine addresses remain live for the lifetime of the owning `ChannelState`;
+/// GPU memory uses shared ownership.
 pub struct ChannelInfo {
     /// Channel-bound 3D engine reference.
     ///
