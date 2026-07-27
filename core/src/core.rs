@@ -1670,6 +1670,10 @@ impl System {
             self.current_process_arc = Some(process_arc);
         }
 
+        // Maps to upstream `System::Impl::Load`: performance counters become
+        // valid only after the title and its main process have been loaded.
+        self.init_perf_stats(self.runtime_program_id);
+
         self.status = SystemResultStatus::Success;
 
         log::info!("Successfully loaded ROM: {}", filepath);

@@ -17,6 +17,7 @@ use sdl2::sys as sdl;
 use std::ffi::CStr;
 
 use super::emu_window_sdl2::{DummyContext, EmuWindowSdl2};
+use ruzu_core::core::SystemRef;
 
 // Screen layout constants.
 // Maps to C++ `Layout::ScreenUndocked::Width` / `Layout::ScreenUndocked::Height`.
@@ -36,8 +37,8 @@ impl EmuWindowSdl2Null {
     /// Creates the SDL2 window for use with the null renderer.
     ///
     /// Maps to C++ `EmuWindow_SDL2_Null::EmuWindow_SDL2_Null`.
-    pub fn new(fullscreen: bool) -> Self {
-        let mut base = EmuWindowSdl2::new();
+    pub fn new(system: SystemRef, fullscreen: bool) -> Self {
+        let mut base = EmuWindowSdl2::new(system);
 
         let window_title = b"ruzu-cmd (Null)\0";
         // No OpenGL/Vulkan flags — plain resizable window.

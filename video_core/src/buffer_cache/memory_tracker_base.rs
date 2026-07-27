@@ -64,7 +64,7 @@ fn report_out_of_range(cpu_address: VAddr, size: u64, page_index: usize) {
             NUM_HIGH_PAGES,
             MAX_CPU_PAGE_BITS
         );
-        if std::env::var_os("RUZU_TRACE_MEMTRACK_OOR_BT").is_some() {
+        if common::env_flag!("RUZU_TRACE_MEMTRACK_OOR_BT") {
             eprintln!(
                 "[MEMTRACK_OOR_BT] addr=0x{cpu_address:X} size=0x{size:X} page_index={page_index}\n{}",
                 std::backtrace::Backtrace::force_capture()

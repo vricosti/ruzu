@@ -749,7 +749,7 @@ impl TextureCacheBase {
     /// images in the given CPU address range back to guest memory.
     pub fn download_memory(&mut self, cpu_addr: u64, size: usize) {
         let Some(downloader) = self.image_downloader.as_ref().cloned() else {
-            if std::env::var_os("RUZU_TRACE_TEXTURE_DOWNLOAD").is_some() {
+            if common::env_flag!("RUZU_TRACE_TEXTURE_DOWNLOAD") {
                 log::info!(
                     "[TEXTURE_DOWNLOAD] miss no_image_downloader cpu=0x{:X} size={}",
                     cpu_addr,
@@ -759,7 +759,7 @@ impl TextureCacheBase {
             return;
         };
         let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
-            if std::env::var_os("RUZU_TRACE_TEXTURE_DOWNLOAD").is_some() {
+            if common::env_flag!("RUZU_TRACE_TEXTURE_DOWNLOAD") {
                 log::info!(
                     "[TEXTURE_DOWNLOAD] miss no_guest_memory_writer cpu=0x{:X} size={}",
                     cpu_addr,
@@ -851,7 +851,7 @@ impl TextureCacheBase {
             self.slot_images[image_id].insert_view(info, view_id);
             view_id
         };
-        if std::env::var_os("RUZU_TRACE_PRESENT_IMG").is_some() {
+        if common::env_flag!("RUZU_TRACE_PRESENT_IMG") {
             let image = &self.slot_images[image_id];
             log::warn!(
                 "[PRESENT_IMG] cpu=0x{:X} gpu=0x{:X} candidates={} chosen_image={} view_id={} \

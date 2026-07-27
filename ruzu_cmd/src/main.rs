@@ -788,10 +788,14 @@ fn main() {
         Null(EmuWindowSdl2Null),
     }
 
+    let emu_window_system_ref = ruzu_core::core::SystemRef::from_ref(&system);
     let mut emu_window = match renderer_backend {
-        "opengl" => EmuWindow::Gl(EmuWindowSdl2Gl::new(args.fullscreen)),
-        "vulkan" => EmuWindow::Vk(EmuWindowSdl2Vk::new(args.fullscreen)),
-        _ => EmuWindow::Null(EmuWindowSdl2Null::new(args.fullscreen)),
+        "opengl" => EmuWindow::Gl(EmuWindowSdl2Gl::new(emu_window_system_ref, args.fullscreen)),
+        "vulkan" => EmuWindow::Vk(EmuWindowSdl2Vk::new(emu_window_system_ref, args.fullscreen)),
+        _ => EmuWindow::Null(EmuWindowSdl2Null::new(
+            emu_window_system_ref,
+            args.fullscreen,
+        )),
     };
 
     // -----------------------------------------------------------------------
@@ -1290,8 +1294,9 @@ fn main() {
         signal(15, 0);
     }
 
-    emu_window::emu_window_sdl2::schedule_auto_lr_if_requested();
-    emu_window::emu_window_sdl2::schedule_auto_a_if_requested();
+    // emu_window::emu_window_sdl2::schedule_auto_lr_if_requested();
+    // emu_window::emu_window_sdl2::schedule_auto_a_if_requested();
+    emu_window::emu_window_sdl2::schedule_perf_log_if_requested(emu_window_system_ref);
     log::info!("Entering main event loop");
     let poll_events_loop = std::env::var_os("RUZU_POLL_EVENTS_LOOP").is_some();
     match &mut emu_window {

@@ -13,15 +13,17 @@
 
 use sdl2::sys as sdl;
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use hid_core::frontend::emulated_controller::set_simple_npad_button;
 use hid_core::hid_types::{KeyboardKeyIndex, NpadButton};
+use ruzu_core::core::SystemRef;
 use ruzu_core::frontend::framebuffer_layout::{
     default_frame_layout, FramebufferLayout, ScreenUndocked,
 };
+use ruzu_core::perf_stats::PerfStatsResults;
 
 // SDL_TOUCH_MOUSEID is defined in SDL_touch.h as ((Uint32)-1).
 // It is not exported by sdl2-sys as a Rust constant, so we define it here.
@@ -118,6 +120,85 @@ pub fn schedule_auto_a_if_requested() {
         });
 }
 
+/// Whether the environment-gated benchmark sampler owns the destructive
+/// `PerfStats` read. The title bar reuses its last sample while this is set.
+static PERF_LOG_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PERF_LOG_LAST_FPS_MILLI: AtomicU64 = AtomicU64::new(0);
+static PERF_LOG_LAST_SPEED_MILLI: AtomicU64 = AtomicU64::new(0);
+
+fn perf_log_last_results() -> PerfStatsResults {
+    PerfStatsResults {
+        average_game_fps: PERF_LOG_LAST_FPS_MILLI.load(Ordering::Relaxed) as f64 / 1_000.0,
+        emulation_speed: PERF_LOG_LAST_SPEED_MILLI.load(Ordering::Relaxed) as f64 / 1_000.0,
+        ..Default::default()
+    }
+}
+
+/// Starts an optional fixed-interval performance sampler.
+///
+/// `update_title_bar` only runs when SDL delivers an event. The sampler makes
+/// benchmark output independent of event frequency and does nothing unless
+/// `RUZU_PERF_LOG` is configured.
+pub fn schedule_perf_log_if_requested(system: SystemRef) {
+    let Some(path) = std::env::var_os("RUZU_PERF_LOG") else {
+        return;
+    };
+    let interval_ms = std::env::var("RUZU_PERF_LOG_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1_000)
+        .max(100);
+
+    PERF_LOG_ACTIVE.store(true, Ordering::Relaxed);
+    let spawn_result = std::thread::Builder::new()
+        .name("PerfLog".to_string())
+        .spawn(move || {
+            use std::io::Write;
+
+            let mut file = match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    PERF_LOG_ACTIVE.store(false, Ordering::Relaxed);
+                    log::error!("[PERF_LOG] cannot open {:?}: {error}", path);
+                    return;
+                }
+            };
+            let start = std::time::Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_millis(interval_ms));
+                if system.is_null() {
+                    continue;
+                }
+                let results = system.get().get_and_reset_perf_stats();
+                PERF_LOG_LAST_FPS_MILLI.store(
+                    (results.average_game_fps * 1_000.0).max(0.0) as u64,
+                    Ordering::Relaxed,
+                );
+                PERF_LOG_LAST_SPEED_MILLI.store(
+                    (results.emulation_speed * 1_000.0).max(0.0) as u64,
+                    Ordering::Relaxed,
+                );
+                let _ = writeln!(
+                    file,
+                    "{:.3} fps={:.2} system_fps={:.2} speed={:.2} frametime_ms={:.3}",
+                    start.elapsed().as_secs_f64(),
+                    results.average_game_fps,
+                    results.system_fps,
+                    results.emulation_speed * 100.0,
+                    results.frametime * 1_000.0
+                );
+            }
+        });
+    if let Err(error) = spawn_result {
+        PERF_LOG_ACTIVE.store(false, Ordering::Relaxed);
+        log::error!("[PERF_LOG] cannot create sampler thread: {error}");
+    }
+}
+
 /// A no-op graphics context used as a placeholder.
 /// Maps to C++ `DummyContext` in `emu_window_sdl2.h`.
 pub struct DummyContext;
@@ -145,6 +226,9 @@ pub struct EmuWindowSdl2 {
     /// Maps to C++ `last_time`.
     pub last_time: u32,
 
+    /// Core instance used by the upstream title-bar performance update.
+    pub system: SystemRef,
+
     /// Raw SDL2 window pointer.
     /// Maps to C++ `render_window`.
     pub render_window: *mut sdl::SDL_Window,
@@ -160,7 +244,7 @@ impl EmuWindowSdl2 {
     /// Calls into SDL2 C API. The caller must ensure SDL2 is not already
     /// initialized in an incompatible way. Exits the process on failure,
     /// matching upstream behavior.
-    pub fn new() -> Self {
+    pub fn new(system: SystemRef) -> Self {
         // Maps to: input_subsystem->Initialize(); (stubbed — InputSubsystem not yet ported)
         // Rust binaries do not use SDL's SDL_main wrapper, so SDL must be
         // told that the application entry point is ready before SDL_Init().
@@ -187,6 +271,7 @@ impl EmuWindowSdl2 {
                 ScreenUndocked::HEIGHT,
             ))),
             last_time: 0,
+            system,
             render_window: std::ptr::null_mut(),
         }
     }
@@ -275,7 +360,20 @@ impl EmuWindowSdl2 {
         // Update window title every ~2 seconds.
         let current_time = unsafe { sdl::SDL_GetTicks() };
         if current_time > self.last_time + 2000 {
-            let title = b"ruzu-cmd\0";
+            // Maps to upstream `system.GetAndResetPerfStats()`. The optional
+            // sampler owns this destructive read while a benchmark is active.
+            let results = if self.system.is_null() {
+                PerfStatsResults::default()
+            } else if PERF_LOG_ACTIVE.load(Ordering::Relaxed) {
+                perf_log_last_results()
+            } else {
+                self.system.get().get_and_reset_perf_stats()
+            };
+            let title = format!(
+                "ruzu | FPS: {:.0} ({:.0}%)\0",
+                results.average_game_fps,
+                results.emulation_speed * 100.0
+            );
             unsafe {
                 sdl::SDL_SetWindowTitle(self.render_window, title.as_ptr() as *const _);
             }

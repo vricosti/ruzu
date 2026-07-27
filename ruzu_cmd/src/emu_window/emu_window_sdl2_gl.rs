@@ -19,6 +19,7 @@ use std::ffi::CStr;
 use std::sync::Mutex;
 
 use super::emu_window_sdl2::EmuWindowSdl2;
+use ruzu_core::core::SystemRef;
 
 // Screen layout constants.
 // Maps to C++ `Layout::ScreenUndocked::Width` / `Layout::ScreenUndocked::Height`.
@@ -197,8 +198,8 @@ impl EmuWindowSdl2Gl {
     /// Validates required extensions before returning.
     ///
     /// Maps to C++ `EmuWindow_SDL2_GL::EmuWindow_SDL2_GL`.
-    pub fn new(fullscreen: bool) -> Self {
-        let mut base = EmuWindowSdl2::new();
+    pub fn new(system: SystemRef, fullscreen: bool) -> Self {
+        let mut base = EmuWindowSdl2::new(system);
 
         // Maps to SDL_GL_SetAttribute calls in upstream constructor.
         // macOS only supports up to OpenGL 4.1 core profile (no compatibility profile).

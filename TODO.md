@@ -13,4 +13,4 @@
  Le draw bloquant est un glMultiDraw*Indirect logiciel. Le port Rust n’emprunte pas encore l’équivalent complet
   de PrepareDraw, mais corriger ce sous-système maintenant serait un autre chantier.
   --
-  DELETE RUZU_TRACE_FASTMEM_RECOMPILE, TRACE_PRESENT_RECREATE
+  DELETE trace_live_maxwell_draw

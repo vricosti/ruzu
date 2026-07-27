@@ -182,8 +182,8 @@ fn trace_unmapped_guest_access(kind: &str, vaddr: u64, bits: usize) {
         }
     }
 
-    let trace_all = std::env::var_os("RUZU_TRACE_UNMAPPED_GUEST_ALL").is_some();
-    let trace_suspicious = std::env::var_os("RUZU_TRACE_UNMAPPED_GUEST").is_some()
+    let trace_all = common::env_flag!("RUZU_TRACE_UNMAPPED_GUEST_ALL");
+    let trace_suspicious = common::env_flag!("RUZU_TRACE_UNMAPPED_GUEST")
         && (vaddr < 0x1000 || (vaddr >> 32) == 0xffff_ffff);
     if !trace_all && !trace_suspicious {
         return;
@@ -692,7 +692,7 @@ impl Memory {
                                     // RUZU_POLL_DIVERGE_LOG_CHANGES=1 — log every change in the
                                     // polled vaddr's value (even if arena==backing). Useful for
                                     // tracking when a specific slot gets the corrupt pattern.
-                                    if std::env::var_os("RUZU_POLL_DIVERGE_LOG_CHANGES").is_some()
+                                    if common::env_flag!("RUZU_POLL_DIVERGE_LOG_CHANGES")
                                         && (arena_changed || backing_changed)
                                     {
                                         let n = FIRES.fetch_add(1, Ordering::Relaxed);
@@ -1417,7 +1417,7 @@ impl Memory {
             // few unmapped reads so we can identify the calling subsystem
             // (HLE service code path, JIT trampoline, etc.). Throttled to
             // 5 entries to avoid log spam.
-            if std::env::var_os("RUZU_TRACE_UNMAPPED_BT").is_some() {
+            if common::env_flag!("RUZU_TRACE_UNMAPPED_BT") {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static SHOWN: AtomicU32 = AtomicU32::new(0);
                 let n = SHOWN.fetch_add(1, Ordering::Relaxed);
@@ -1432,7 +1432,7 @@ impl Memory {
                     );
                 }
             }
-            if std::env::var_os("RUZU_TRACE_UNMAPPED_GUEST").is_some()
+            if common::env_flag!("RUZU_TRACE_UNMAPPED_GUEST")
                 && (vaddr < 0x1000 || (vaddr >> 32) == 0xffff_ffff)
             {
                 use std::sync::atomic::{AtomicU32, Ordering};
@@ -2182,14 +2182,14 @@ impl Memory {
         // the source whenever a block write touches [START, START+LEN). Used
         // to find HLE-side writers of guest memory that the JIT
         // memory_write_NN watch doesn't see.
-        if std::env::var_os("RUZU_WATCH_BLOCK").is_some() {
+        if common::env_flag!("RUZU_WATCH_BLOCK") {
             check_block_watch("write_block", dest_addr, src);
         }
 
         // Upstream: AddressSpaceContains check before walking pages.
         if !self.address_space_contains(dest_addr, size) {
             log::error!("Unmapped WriteBlock @ {:#018x} size={:#x}", dest_addr, size);
-            if std::env::var_os("RUZU_TRACE_UNMAPPED_BT").is_some() {
+            if common::env_flag!("RUZU_TRACE_UNMAPPED_BT") {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static SHOWN: AtomicU32 = AtomicU32::new(0);
                 let n = SHOWN.fetch_add(1, Ordering::Relaxed);

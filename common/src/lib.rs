@@ -9,6 +9,7 @@ pub mod bit_util;
 pub mod container_hash;
 pub mod div_ceil;
 pub mod elf;
+pub mod env_flag;
 pub mod error;
 pub mod fixed_point;
 pub mod hash;

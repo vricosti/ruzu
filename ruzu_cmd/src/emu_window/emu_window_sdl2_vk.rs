@@ -22,6 +22,7 @@ use sdl2::sys as sdl;
 use std::ffi::CStr;
 
 use super::emu_window_sdl2::{DummyContext, EmuWindowSdl2};
+use ruzu_core::core::SystemRef;
 use ruzu_core::frontend::emu_window::{WindowSystemInfo, WindowSystemType};
 use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 use std::sync::atomic::AtomicBool;
@@ -182,8 +183,8 @@ impl EmuWindowSdl2Vk {
     /// window-system-info struct consumed by the Vulkan renderer.
     ///
     /// Maps to C++ `EmuWindow_SDL2_VK::EmuWindow_SDL2_VK`.
-    pub fn new(fullscreen: bool) -> Self {
-        let mut base = EmuWindowSdl2::new();
+    pub fn new(system: SystemRef, fullscreen: bool) -> Self {
+        let mut base = EmuWindowSdl2::new(system);
 
         let window_title = b"ruzu-cmd (Vulkan)\0";
         let mut window_flags = sdl::SDL_WindowFlags::SDL_WINDOW_RESIZABLE as u32

@@ -4,10 +4,24 @@
 //!
 //! KPriorityQueue — multi-core priority queue for thread scheduling.
 //!
-//! Upstream uses intrusive linked lists with raw Member* pointers in QueueEntry.
-//! We store QueueEntry nodes internally (in a HashMap keyed by thread_id),
-//! and cache thread properties so the PQ is self-contained — no external
-//! thread locking is needed for PQ operations.
+//! Upstream uses intrusive linked lists: `QueueEntry` nodes live inside
+//! `KThread` (`m_per_core_priority_queue_entry`) and the queue manipulates
+//! `member->GetPriorityQueueEntry(core)` directly. A thread and its scheduler
+//! linkage are therefore the same object and cannot disagree.
+//!
+//! The Rust port cannot put the links inside `KThread` without locking each
+//! `Arc<Mutex<KThread>>` during queue traversal, which would invert the
+//! scheduler/thread lock order. Instead it keeps the linkage outside the thread,
+//! in a map keyed by thread id, together with a cache of the thread properties
+//! the scheduler needs — so PQ operations still require no thread locking.
+//!
+//! The links and the properties live in **one** [`MemberSlot`], inserted and
+//! removed as a unit. That is the property upstream gets for free from
+//! intrusiveness: a member is either in the queue with both, or absent with
+//! neither. They were previously two independent maps, and the one holding the
+//! links was never pruned, so the two could disagree — a split-brain state the
+//! port had to detect and repair, and which could leave a core idle while a
+//! Runnable thread waited.
 
 use std::collections::HashMap;
 
@@ -127,18 +141,46 @@ impl QueueEntry {
 }
 
 // ---------------------------------------------------------------------------
-// EntryMap — internal storage for per-thread, per-core queue entries
+// MemberMap — internal storage for per-thread, per-core queue entries
 // ---------------------------------------------------------------------------
 
 /// Internal storage: thread_id → [QueueEntry; NUM_CORES].
 /// Shared between scheduled and suggested queues (a thread is in at most
 /// one list per core, so the entries don't conflict).
-type EntryMap = HashMap<u64, [QueueEntry; NUM_CORES]>;
+type MemberMap = HashMap<u64, MemberSlot>;
 
-fn ensure_entry(entries: &mut EntryMap, id: u64) {
-    entries
-        .entry(id)
-        .or_insert_with(|| std::array::from_fn(|_| QueueEntry::new()));
+/// Everything the queue owns for one member: its per-core list links and the
+/// cached properties that decide which lists it belongs to.
+///
+/// This is the port's stand-in for upstream storing `QueueEntry` inside
+/// `KThread`. Indexing a slot by core yields the link node, so link code reads
+/// the same as it did against a bare `[QueueEntry; NUM_CORES]`.
+#[derive(Debug, Clone)]
+pub struct MemberSlot {
+    entries: [QueueEntry; NUM_CORES],
+    props: ThreadProps,
+}
+
+impl MemberSlot {
+    fn new(props: ThreadProps) -> Self {
+        Self {
+            entries: std::array::from_fn(|_| QueueEntry::new()),
+            props,
+        }
+    }
+}
+
+impl std::ops::Index<usize> for MemberSlot {
+    type Output = QueueEntry;
+    fn index(&self, core: usize) -> &QueueEntry {
+        &self.entries[core]
+    }
+}
+
+impl std::ops::IndexMut<usize> for MemberSlot {
+    fn index_mut(&mut self, core: usize) -> &mut QueueEntry {
+        &mut self.entries[core]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -189,15 +231,18 @@ impl KPerCoreQueue {
 
     /// Push a thread to the back of the queue for a core.
     /// Returns true if the queue was previously empty (first element).
-    pub fn push_back(&mut self, core: i32, member_id: u64, entries: &mut EntryMap) -> bool {
+    pub fn push_back(&mut self, core: i32, member_id: u64, entries: &mut MemberMap) -> bool {
         let c = core as usize;
         let tail_id = self.roots[c].get_prev();
 
         // Link: member.prev = tail, member.next = None
         {
-            let e = entries
-                .entry(member_id)
-                .or_insert_with(|| std::array::from_fn(|_| QueueEntry::new()));
+            let Some(e) = entries.get_mut(&member_id) else {
+                // Upstream cannot reach this: the entry is part of the thread.
+                // Here it means a caller linked a member it never inserted.
+                debug_assert!(false, "push_back for member {member_id} with no slot");
+                return false;
+            };
             e[c].set_prev(tail_id);
             e[c].set_next(None);
         }
@@ -217,15 +262,16 @@ impl KPerCoreQueue {
 
     /// Push a thread to the front of the queue for a core.
     /// Returns true if the queue was previously empty.
-    pub fn push_front(&mut self, core: i32, member_id: u64, entries: &mut EntryMap) -> bool {
+    pub fn push_front(&mut self, core: i32, member_id: u64, entries: &mut MemberMap) -> bool {
         let c = core as usize;
         let head_id = self.roots[c].get_next();
 
         // Link: member.prev = None, member.next = head
         {
-            let e = entries
-                .entry(member_id)
-                .or_insert_with(|| std::array::from_fn(|_| QueueEntry::new()));
+            let Some(e) = entries.get_mut(&member_id) else {
+                debug_assert!(false, "push_front for member {member_id} with no slot");
+                return false;
+            };
             e[c].set_prev(None);
             e[c].set_next(head_id);
         }
@@ -245,7 +291,7 @@ impl KPerCoreQueue {
 
     /// Remove a thread from the queue for a core.
     /// Returns true if the queue is now empty.
-    pub fn remove(&mut self, core: i32, member_id: u64, entries: &mut EntryMap) -> bool {
+    pub fn remove(&mut self, core: i32, member_id: u64, entries: &mut MemberMap) -> bool {
         let c = core as usize;
         let root_next = self.roots[c].get_next();
         let root_prev = self.roots[c].get_prev();
@@ -318,8 +364,7 @@ impl KPerCoreQueue {
         priority: i32,
         scheduled: bool,
         member_id: u64,
-        entries: &mut EntryMap,
-        thread_props: &HashMap<u64, ThreadProps>,
+        entries: &mut MemberMap,
     ) -> bool {
         let c = core as usize;
         let mut kept = Vec::new();
@@ -339,26 +384,25 @@ impl KPerCoreQueue {
 
             current = entries.get(&id).and_then(|e| e[c].get_next());
             if id != member_id
-                && thread_props.get(&id).is_some_and(|props| {
-                    props.priority == priority
-                        && props.affinity & (1u64 << core) != 0
-                        && (props.active_core == core) == scheduled
+                && entries.get(&id).is_some_and(|slot| {
+                    slot.props.priority == priority
+                        && slot.props.affinity & (1u64 << core) != 0
+                        && (slot.props.active_core == core) == scheduled
                 })
             {
                 kept.push(id);
             }
         }
 
-        for (&id, per_core) in entries.iter() {
-            let belongs_to_queue = thread_props.get(&id).is_some_and(|props| {
-                props.priority == priority
-                    && props.affinity & (1u64 << core) != 0
-                    && (props.active_core == core) == scheduled
-            });
+        for (&id, slot) in entries.iter() {
+            let props = &slot.props;
+            let belongs_to_queue = props.priority == priority
+                && props.affinity & (1u64 << core) != 0
+                && (props.active_core == core) == scheduled;
             if id == member_id || kept.contains(&id) || !belongs_to_queue {
                 continue;
             }
-            let entry = &per_core[c];
+            let entry = &slot[c];
             if old_tail == Some(id)
                 || entry.get_prev() == Some(member_id)
                 || entry.get_next() == Some(member_id)
@@ -384,7 +428,6 @@ impl KPerCoreQueue {
 
         self.get_front(core).is_none()
     }
-
     pub fn get_front(&self, core: i32) -> Option<u64> {
         self.roots[core as usize].get_next()
     }
@@ -412,7 +455,7 @@ impl KPriorityQueueImpl {
         }
     }
 
-    pub fn push_back(&mut self, priority: i32, core: i32, member_id: u64, entries: &mut EntryMap) {
+    pub fn push_back(&mut self, priority: i32, core: i32, member_id: u64, entries: &mut MemberMap) {
         debug_assert!(is_valid_core(core));
         debug_assert!(is_valid_priority(priority));
         if priority > LOWEST_PRIORITY {
@@ -425,7 +468,13 @@ impl KPriorityQueueImpl {
         }
     }
 
-    pub fn push_front(&mut self, priority: i32, core: i32, member_id: u64, entries: &mut EntryMap) {
+    pub fn push_front(
+        &mut self,
+        priority: i32,
+        core: i32,
+        member_id: u64,
+        entries: &mut MemberMap,
+    ) {
         debug_assert!(is_valid_core(core));
         debug_assert!(is_valid_priority(priority));
         if priority > LOWEST_PRIORITY {
@@ -437,7 +486,7 @@ impl KPriorityQueueImpl {
         }
     }
 
-    pub fn remove(&mut self, priority: i32, core: i32, member_id: u64, entries: &mut EntryMap) {
+    pub fn remove(&mut self, priority: i32, core: i32, member_id: u64, entries: &mut MemberMap) {
         debug_assert!(is_valid_core(core));
         debug_assert!(is_valid_priority(priority));
         if priority > LOWEST_PRIORITY {
@@ -476,7 +525,7 @@ impl KPriorityQueueImpl {
         core: i32,
         member_id: u64,
         member_priority: i32,
-        entries: &EntryMap,
+        entries: &MemberMap,
     ) -> Option<u64> {
         debug_assert!(is_valid_core(core));
 
@@ -503,7 +552,7 @@ impl KPriorityQueueImpl {
         priority: i32,
         core: i32,
         member_id: u64,
-        entries: &mut EntryMap,
+        entries: &mut MemberMap,
     ) {
         debug_assert!(is_valid_core(core));
         debug_assert!(is_valid_priority(priority));
@@ -518,7 +567,7 @@ impl KPriorityQueueImpl {
         priority: i32,
         core: i32,
         member_id: u64,
-        entries: &mut EntryMap,
+        entries: &mut MemberMap,
     ) -> Option<u64> {
         debug_assert!(is_valid_core(core));
         debug_assert!(is_valid_priority(priority));
@@ -545,12 +594,13 @@ impl KPriorityQueueImpl {
 pub struct KPriorityQueue {
     scheduled_queue: KPriorityQueueImpl,
     suggested_queue: KPriorityQueueImpl,
-    /// Linked list entries, shared between scheduled and suggested.
-    /// A thread is in at most one list per core (either scheduled or suggested),
-    /// so the per-core entries don't conflict.
-    entries: EntryMap,
-    /// Cached thread properties for lock-free scheduler access.
-    thread_props: HashMap<u64, ThreadProps>,
+    /// Every member the queue knows about: its per-core list links and the
+    /// cached properties deciding which lists it belongs to, inserted and
+    /// removed as one unit so the two can never disagree.
+    ///
+    /// A thread is in at most one list per core (either scheduled or
+    /// suggested), so the per-core links don't conflict.
+    members: MemberMap,
 }
 
 fn clear_affinity_bit(affinity: &mut u64, core: i32) {
@@ -568,8 +618,7 @@ impl KPriorityQueue {
         Self {
             scheduled_queue: KPriorityQueueImpl::new(),
             suggested_queue: KPriorityQueueImpl::new(),
-            entries: HashMap::new(),
-            thread_props: HashMap::new(),
+            members: HashMap::new(),
         }
     }
 
@@ -577,13 +626,13 @@ impl KPriorityQueue {
 
     /// Get cached thread properties. Returns None if thread not in PQ.
     pub fn get_thread_props(&self, thread_id: u64) -> Option<&ThreadProps> {
-        self.thread_props.get(&thread_id)
+        self.members.get(&thread_id).map(|slot| &slot.props)
     }
 
     /// Upstream: IncrementScheduledCount(thread) — increments the owning process's
     /// schedule_count via the cached Arc<AtomicI64>. No locks needed.
     pub fn increment_scheduled_count(&self, thread_id: u64) {
-        if let Some(props) = self.thread_props.get(&thread_id) {
+        if let Some(props) = self.get_thread_props(thread_id) {
             if let Some(ref counter) = props.process_schedule_count {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -615,7 +664,7 @@ impl KPriorityQueue {
         member_priority: i32,
     ) -> Option<u64> {
         self.scheduled_queue
-            .get_next(core, member_id, member_priority, &self.entries)
+            .get_next(core, member_id, member_priority, &self.members)
     }
 
     pub fn get_suggested_next(
@@ -625,11 +674,11 @@ impl KPriorityQueue {
         member_priority: i32,
     ) -> Option<u64> {
         self.suggested_queue
-            .get_next(core, member_id, member_priority, &self.entries)
+            .get_next(core, member_id, member_priority, &self.members)
     }
 
     pub fn get_same_priority_next(&self, core: i32, member_id: u64) -> Option<u64> {
-        self.entries
+        self.members
             .get(&member_id)
             .and_then(|e| e[core as usize].get_next())
     }
@@ -648,8 +697,7 @@ impl KPriorityQueue {
         let Self {
             scheduled_queue,
             suggested_queue,
-            entries,
-            ..
+            members: entries,
         } = self;
         let mut affinity = affinity_mask;
         if active_core >= 0 {
@@ -674,8 +722,7 @@ impl KPriorityQueue {
         let Self {
             scheduled_queue,
             suggested_queue,
-            entries,
-            ..
+            members: entries,
         } = self;
         let mut affinity = affinity_mask;
         if active_core >= 0 {
@@ -695,8 +742,7 @@ impl KPriorityQueue {
         let Self {
             scheduled_queue,
             suggested_queue,
-            entries,
-            ..
+            members: entries,
         } = self;
         let mut affinity = affinity_mask;
         if active_core >= 0 {
@@ -721,9 +767,9 @@ impl KPriorityQueue {
         let Self {
             scheduled_queue,
             suggested_queue,
-            entries,
-            thread_props,
+            members,
         } = self;
+        let entries = members;
         let mut affinity = affinity_mask;
         if active_core >= 0 {
             if scheduled_queue.queues[priority as usize].remove_all_matching(
@@ -732,7 +778,6 @@ impl KPriorityQueue {
                 true,
                 member_id,
                 entries,
-                thread_props,
             ) {
                 scheduled_queue.available_priorities[active_core as usize].clear_bit(priority);
             }
@@ -741,14 +786,9 @@ impl KPriorityQueue {
 
         while affinity != 0 {
             let core = get_next_core(&mut affinity);
-            if suggested_queue.queues[priority as usize].remove_all_matching(
-                core,
-                priority,
-                false,
-                member_id,
-                entries,
-                thread_props,
-            ) {
+            if suggested_queue.queues[priority as usize]
+                .remove_all_matching(core, priority, false, member_id, entries)
+            {
                 suggested_queue.available_priorities[core as usize].clear_bit(priority);
             }
         }
@@ -770,7 +810,7 @@ impl KPriorityQueue {
         if is_dummy {
             return;
         }
-        if let Some(existing) = self.thread_props.get(&member_id).cloned() {
+        if let Some(existing) = self.get_thread_props(member_id).cloned() {
             self.remove_impl(
                 existing.priority,
                 member_id,
@@ -778,17 +818,20 @@ impl KPriorityQueue {
                 existing.affinity,
             );
         }
-        ensure_entry(&mut self.entries, member_id);
-        self.thread_props.insert(
-            member_id,
-            ThreadProps {
-                priority,
-                active_core,
-                affinity,
-                is_dummy,
-                process_schedule_count,
-            },
-        );
+        // Links and properties enter together, so a member is never half-known.
+        let props = ThreadProps {
+            priority,
+            active_core,
+            affinity,
+            is_dummy,
+            process_schedule_count,
+        };
+        match self.members.get_mut(&member_id) {
+            Some(slot) => slot.props = props,
+            None => {
+                self.members.insert(member_id, MemberSlot::new(props));
+            }
+        }
         self.push_back_impl(priority, member_id, active_core, affinity);
     }
 
@@ -806,7 +849,7 @@ impl KPriorityQueue {
         if is_dummy {
             return;
         }
-        if let Some(existing) = self.thread_props.get(&member_id).cloned() {
+        if let Some(existing) = self.get_thread_props(member_id).cloned() {
             self.remove_impl(
                 existing.priority,
                 member_id,
@@ -814,17 +857,20 @@ impl KPriorityQueue {
                 existing.affinity,
             );
         }
-        ensure_entry(&mut self.entries, member_id);
-        self.thread_props.insert(
-            member_id,
-            ThreadProps {
-                priority,
-                active_core,
-                affinity,
-                is_dummy,
-                process_schedule_count,
-            },
-        );
+        // Links and properties enter together, so a member is never half-known.
+        let props = ThreadProps {
+            priority,
+            active_core,
+            affinity,
+            is_dummy,
+            process_schedule_count,
+        };
+        match self.members.get_mut(&member_id) {
+            Some(slot) => slot.props = props,
+            None => {
+                self.members.insert(member_id, MemberSlot::new(props));
+            }
+        }
         self.push_front_impl(priority, member_id, active_core, affinity);
     }
 
@@ -842,18 +888,19 @@ impl KPriorityQueue {
             return;
         }
         let (priority, active_core, affinity) =
-            if let Some(existing) = self.thread_props.get(&member_id) {
+            if let Some(existing) = self.get_thread_props(member_id) {
                 (existing.priority, existing.active_core, existing.affinity)
             } else {
                 (priority, active_core, affinity)
             };
+        // Unlink from every list first — that fixes up the neighbours' links —
+        // then drop the slot. Dropping links and properties together is what
+        // makes the split-brain state unrepresentable, and it also stops the
+        // link storage growing without bound as threads come and go.
         self.remove_impl(priority, member_id, active_core, affinity);
         self.remove_all_expected_impl(priority, member_id, active_core, affinity);
-        // Keep entries around (they'll be reused on next push).
-        // Remove props since thread is no longer in PQ.
-        self.thread_props.remove(&member_id);
+        self.members.remove(&member_id);
     }
-
     pub fn move_to_scheduled_front(
         &mut self,
         member_id: u64,
@@ -865,12 +912,11 @@ impl KPriorityQueue {
             return;
         }
         let (priority, active_core) = self
-            .thread_props
-            .get(&member_id)
+            .get_thread_props(member_id)
             .map(|props| (props.priority, props.active_core))
             .unwrap_or((priority, active_core));
         self.scheduled_queue
-            .move_to_front(priority, active_core, member_id, &mut self.entries);
+            .move_to_front(priority, active_core, member_id, &mut self.members);
     }
 
     pub fn move_to_scheduled_back(
@@ -884,12 +930,11 @@ impl KPriorityQueue {
             return None;
         }
         let (priority, active_core) = self
-            .thread_props
-            .get(&member_id)
+            .get_thread_props(member_id)
             .map(|props| (props.priority, props.active_core))
             .unwrap_or((priority, active_core));
         self.scheduled_queue
-            .move_to_back(priority, active_core, member_id, &mut self.entries)
+            .move_to_back(priority, active_core, member_id, &mut self.members)
     }
 
     /// Change a thread's priority in the queue.
@@ -910,8 +955,7 @@ impl KPriorityQueue {
         debug_assert!(is_valid_priority(prev_priority));
 
         let (active_core, affinity) = self
-            .thread_props
-            .get(&member_id)
+            .get_thread_props(member_id)
             .map(|props| (props.active_core, props.affinity))
             .unwrap_or((active_core, affinity));
 
@@ -924,7 +968,7 @@ impl KPriorityQueue {
         }
 
         // Update cached priority
-        if let Some(props) = self.thread_props.get_mut(&member_id) {
+        if let Some(props) = self.members.get_mut(&member_id).map(|s| &mut s.props) {
             props.priority = new_priority;
         }
     }
@@ -948,9 +992,9 @@ impl KPriorityQueue {
         let Self {
             scheduled_queue,
             suggested_queue,
-            entries,
-            thread_props,
+            members,
         } = self;
+        let entries = members;
 
         // Remove from all old queues
         for core in 0..NUM_CORES as i32 {
@@ -975,9 +1019,9 @@ impl KPriorityQueue {
         }
 
         // Update cached properties
-        if let Some(props) = thread_props.get_mut(&member_id) {
-            props.active_core = new_core;
-            props.affinity = new_affinity;
+        if let Some(slot) = entries.get_mut(&member_id) {
+            slot.props.active_core = new_core;
+            slot.props.affinity = new_affinity;
         }
     }
 
@@ -1004,18 +1048,12 @@ impl KPriorityQueue {
             let Self {
                 scheduled_queue,
                 suggested_queue,
-                entries,
-                thread_props,
+                members: entries,
             } = self;
             if prev_core >= 0 {
-                if scheduled_queue.queues[priority as usize].remove_all_matching(
-                    prev_core,
-                    priority,
-                    true,
-                    member_id,
-                    entries,
-                    thread_props,
-                ) {
+                if scheduled_queue.queues[priority as usize]
+                    .remove_all_matching(prev_core, priority, true, member_id, entries)
+                {
                     scheduled_queue.available_priorities[prev_core as usize].clear_bit(priority);
                 }
             }
@@ -1032,7 +1070,8 @@ impl KPriorityQueue {
             }
 
             // Update cached active_core
-            if let Some(props) = thread_props.get_mut(&member_id) {
+            if let Some(slot) = entries.get_mut(&member_id) {
+                let props = &mut slot.props;
                 props.active_core = new_core;
             }
         }
@@ -1078,7 +1117,7 @@ mod tests {
                             seen.insert(thread_id),
                             "cycle in core {core} priority {priority}"
                         );
-                        let props = pq.thread_props.get(&thread_id).unwrap_or_else(|| {
+                        let props = pq.get_thread_props(thread_id).unwrap_or_else(|| {
                             panic!(
                                 "iteration {iteration}: queue member {thread_id} on core \
                                      {core} priority {priority} must have cached properties after \
@@ -1093,7 +1132,7 @@ mod tests {
                         assert_ne!(props.affinity & (1u64 << core), 0);
                         assert_eq!(scheduled, props.active_core == core);
 
-                        let entry = &pq.entries[&thread_id][core as usize];
+                        let entry = &pq.members[&thread_id][core as usize];
                         assert_eq!(entry.get_prev(), previous);
                         let memberships = if scheduled {
                             &mut scheduled_memberships
@@ -1114,7 +1153,8 @@ mod tests {
             }
         }
 
-        for (&thread_id, props) in &pq.thread_props {
+        for (&thread_id, slot) in &pq.members {
+            let props = &slot.props;
             for core in 0..NUM_CORES as i32 {
                 let in_affinity = props.affinity & (1u64 << core) != 0;
                 assert_eq!(
@@ -1230,7 +1270,7 @@ mod tests {
 
         // Thread 200 has an entry for core 0, but it is not linked in core 0's
         // scheduled queue. Removing it from that queue must be a no-op.
-        pq.scheduled_queue.remove(20, 0, 200, &mut pq.entries);
+        pq.scheduled_queue.remove(20, 0, 200, &mut pq.members);
 
         assert_eq!(pq.get_scheduled_front(0), Some(100));
         assert_eq!(pq.get_scheduled_front(1), Some(200));
@@ -1283,7 +1323,7 @@ mod tests {
         // root-visible more than once on the old scheduled core. Upstream's
         // intrusive QueueEntry cannot represent this, but the id-linked port
         // must purge it before scheduling the thread on the new core.
-        pq.scheduled_queue.push_back(44, 2, 82, &mut pq.entries);
+        pq.scheduled_queue.push_back(44, 2, 82, &mut pq.members);
 
         pq.change_core(2, 82, 1, 44, false, false);
 
@@ -1323,7 +1363,7 @@ mod tests {
 
         // Force the Rust-only corruption observed in ANIMUS: the same thread id
         // is visible twice in one queue, but only one QueueEntry stores links.
-        pq.scheduled_queue.push_back(16, 3, 100, &mut pq.entries);
+        pq.scheduled_queue.push_back(16, 3, 100, &mut pq.members);
 
         pq.remove(100, 16, 3, 0b1000, false);
 
@@ -1331,41 +1371,37 @@ mod tests {
         assert_eq!(pq.get_scheduled_next(3, 200, 16), None);
     }
 
+    /// Links and properties are one slot, so the split-brain state the port
+    /// used to repair — an id still linked in a list after its properties were
+    /// dropped — cannot be built any more. `remove` must take both away
+    /// together, which is what upstream gets for free by storing the
+    /// `QueueEntry` inside `KThread`.
+    ///
+    /// This replaces four tests that each constructed that state by hand and
+    /// asserted a repair path cleaned it up; the repair paths are gone with it.
     #[test]
-    fn test_remove_does_not_resurrect_member_without_props() {
-        let mut pq = KPriorityQueue::new();
-        pq.push_back(100, 44, 1, 0b0010, false, None);
-
-        // ANIMUS hit this Rust-only split-brain shape: an already-removed
-        // member no longer has ThreadProps, but its stale per-core links still
-        // point at a later member. Removing that later member must not rebuild
-        // the root-visible list by reintroducing the stale id.
-        ensure_entry(&mut pq.entries, 86);
-        pq.entries.get_mut(&86).unwrap()[1].set_next(Some(100));
-        pq.thread_props.remove(&86);
-
-        pq.remove(100, 44, 1, 0b0010, false);
-
-        assert!(pq.get_scheduled_front(1).is_none());
-        assert!(pq.get_thread_props(86).is_none());
-    }
-
-    #[test]
-    fn test_remove_purges_root_visible_members_without_props() {
+    fn remove_drops_links_and_properties_together() {
         let mut pq = KPriorityQueue::new();
         pq.push_back(86, 44, 1, 0b0010, false, None);
         pq.push_back(100, 44, 1, 0b0010, false, None);
         assert_eq!(pq.get_scheduled_front(1), Some(86));
+        assert!(pq.members.contains_key(&86));
 
-        // ANIMUS exposed this split-brain queue state: an older member remains
-        // root-visible after its ThreadProps are gone. A later full purge must
-        // not preserve that orphaned id while rebuilding the list.
-        pq.thread_props.remove(&86);
+        pq.remove(86, 44, 1, 0b0010, false);
+
+        // Neither half survives: no properties, and no link storage to go
+        // stale or to be resurrected by a later rebuild of the list.
+        assert!(pq.get_thread_props(86).is_none());
+        assert!(
+            !pq.members.contains_key(&86),
+            "removing a member must drop its link storage too, or it leaks and \
+             can be relinked later"
+        );
+        assert_eq!(pq.get_scheduled_front(1), Some(100));
 
         pq.remove(100, 44, 1, 0b0010, false);
-
         assert!(pq.get_scheduled_front(1).is_none());
-        assert!(pq.get_thread_props(86).is_none());
+        assert!(pq.members.is_empty(), "no member outlives its removal");
     }
 
     #[test]
@@ -1379,7 +1415,7 @@ mod tests {
         // Reproduce such a detached link into the member being removed from a
         // different bucket. The Rust repair path must not treat that link alone
         // as proof that thread 10 belongs to priority 49.
-        pq.entries.get_mut(&10).unwrap()[0].set_next(Some(22));
+        pq.members.get_mut(&10).unwrap()[0].set_next(Some(22));
 
         pq.remove(22, 49, 0, 0b0001, false);
 
@@ -1396,7 +1432,7 @@ mod tests {
         for iteration in 0..50_000 {
             let value = next_random(&mut random);
             let thread_id = 1 + ((value >> 8) % 64);
-            let existing = pq.thread_props.get(&thread_id).cloned();
+            let existing = pq.get_thread_props(thread_id).cloned();
 
             let operation = match (value % 6, existing) {
                 (0, None) => {

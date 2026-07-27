@@ -1073,7 +1073,7 @@ impl CpuManager {
                         jit_ref.get_context(&mut tc_pc);
                         static TRACE_A32_SVC_PC: OnceLock<bool> = OnceLock::new();
                         if *TRACE_A32_SVC_PC
-                            .get_or_init(|| std::env::var_os("RUZU_TRACE_A32_SVC_PC").is_some())
+                            .get_or_init(|| common::env_flag!("RUZU_TRACE_A32_SVC_PC"))
                         {
                             eprintln!(
                                 "[SVC_PC] core={} tid={} is_64bit={} svc=0x{:02X} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X}",
@@ -1455,8 +1455,7 @@ impl CpuManager {
                                     }
                                 }
                             }
-                            if zero_pc_break_loop
-                                && std::env::var_os("RUZU_DUMP_NULL_PC_CONTEXT").is_some()
+                            if zero_pc_break_loop && common::env_flag!("RUZU_DUMP_NULL_PC_CONTEXT")
                             {
                                 crate::hle::kernel::svc::svc_memory_history::dump(
                                     "null_pc_context",
@@ -1569,7 +1568,7 @@ impl CpuManager {
                                     }
                                 }
                             }
-                            if std::env::var_os("RUZU_DUMP_ABORT").is_some() {
+                            if common::env_flag!("RUZU_DUMP_ABORT") {
                                 use std::fmt::Write as _;
                                 let system_ref = kernel.system();
                                 if !system_ref.is_null() {
@@ -1643,9 +1642,7 @@ impl CpuManager {
                                 tc.r[0],
                                 tc.r[28],
                             );
-                            if zero_pc_break_loop
-                                && std::env::var_os("RUZU_EXIT_ON_NULL_PC").is_some()
-                            {
+                            if zero_pc_break_loop && common::env_flag!("RUZU_EXIT_ON_NULL_PC") {
                                 std::process::exit(101);
                             }
                         }

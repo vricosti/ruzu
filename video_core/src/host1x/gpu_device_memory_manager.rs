@@ -843,7 +843,7 @@ impl MaxwellDeviceMemoryManager {
         let num_pages = smmu_num_pages_for_size(size) as usize;
         // RUZU_SMMU_PHYS_OFF=1 reverts to pointer-only physical resolution
         // (A/B aid while the alias-page fallback is being validated).
-        let phys_fallback_enabled = std::env::var_os("RUZU_SMMU_PHYS_OFF").is_none();
+        let phys_fallback_enabled = !common::env_flag!("RUZU_SMMU_PHYS_OFF");
         for index in 0..num_pages {
             let page = start_page + index as u64;
             let current_vaddr = virtual_address.wrapping_add((index as u64) << SMMU_PAGE_BITS);

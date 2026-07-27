@@ -24637,3 +24637,83 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   channel lifecycle.
 - The OpenGL live-owner source regression and compute bridge regressions pass
   in release mode.
+
+## 2026-07-27 — core/src/hle/kernel/k_priority_queue.rs vs core/hle/kernel/k_priority_queue.h and k_thread.h
+
+### Intentional differences
+- Upstream stores intrusive `QueueEntry` nodes in `KThread`. Rust stores the
+  links and cached scheduler properties together in one `MemberSlot` keyed by
+  thread id, avoiding scheduler/thread lock-order inversion while preserving
+  the upstream one-owner invariant.
+
+### Unintentional differences (fixed)
+- Links and thread properties previously lived in independent maps, and
+  removal retained link entries indefinitely. Removal now unlinks the member
+  and drops its complete slot, preventing split state and unbounded growth.
+
+### Binary layout verification
+- PASS: `MemberSlot` is host-only scheduler storage and is never serialized.
+
+### Verification
+- Re-read upstream intrusive entry ownership and `PushBack`, `PushFront`, and
+  `Remove` ordering.
+- All 17 priority-queue tests pass in release mode, including the 50,000-step
+  invariant fuzz test.
+
+## 2026-07-27 — core/src/core.rs and ruzu_cmd/src/emu_window/emu_window_sdl2*.rs vs core/core.cpp and yuzu_cmd/emu_window/emu_window_sdl2.{h,cpp}
+
+### Intentional differences
+- The command-line frontend offers an environment-gated fixed-interval
+  performance log. While active it owns the destructive statistics read and
+  the title bar displays the latest published sample.
+- Rust passes `SystemRef` through the three renderer-specific constructors;
+  upstream stores `Core::System&`.
+
+### Unintentional differences (fixed)
+- `System::load` did not initialize performance statistics after creating the
+  main process.
+- The SDL window did not retain the system or report FPS and emulation speed
+  in its title.
+
+### Binary layout verification
+- PASS: these are host-only lifecycle and frontend fields.
+
+### Verification
+- Re-read upstream performance-stat initialization and SDL title update order.
+- Release checks pass for `core` and `ruzu_cmd`.
+
+## 2026-07-27 — common/src/env_flag.rs and cached diagnostic call sites vs no upstream counterpart
+
+### Intentional differences
+- Upstream has no `RUZU_*` diagnostic environment gates. Release builds cache
+  each selected hot-path gate once per call site; test builds retain live
+  reads so tests may change their environment.
+
+### Binary layout verification
+- PASS: no guest-visible or serialized data is involved.
+
+### Verification
+- All four matching common tests pass in release mode.
+
+## 2026-07-27 — externals/rdynarmic/src/backend/x64/a32_emit_x64.rs vs externals/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.{h,cpp}
+
+### Intentional differences
+- Rust defers fault-triggered fastmem container mutations until generated code
+  returns because mutating them in the signal handler is not signal-safe.
+- `RUZU_FASTMEM_RECOMPILE_LIMIT` remains an explicit diagnostic behavior
+  override; it is independent from trace output.
+
+### Unintentional differences (fixed)
+- Removed the Rust-only `RUZU_TRACE_FASTMEM_RECOMPILE` warning path. Upstream
+  performs fastmem patching and invalidation without this hot-path logging.
+
+### Missing items
+- Move deferred Rust fastmem recompilation ownership closer to upstream's
+  exception-callback flow if a signal-safe representation is introduced.
+
+### Binary layout verification
+- PASS: only host diagnostic output was removed.
+
+### Verification
+- Re-read upstream A32 x64 fastmem callback setup and patch ownership; no
+  equivalent recompilation trace exists.

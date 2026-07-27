@@ -3145,7 +3145,7 @@ fn dump_svc_full_regs(system: &System, imm: u32, tid: i64, label: &str) {
     // Optional: dump 16 words of stack at sp to surface saved-LR chain.
     // Gated by RUZU_SVC_TRACE_STACK to keep RUZU_SVC_TRACE_REGS output clean
     // when stack contents aren't needed.
-    if std::env::var_os("RUZU_SVC_TRACE_STACK").is_some() {
+    if common::env_flag!("RUZU_SVC_TRACE_STACK") {
         let sp = ctx.r[13] as u64;
         let mem = process.process_memory.read().unwrap();
         let mut hex = String::with_capacity(64 * 9);
