@@ -40,6 +40,40 @@ use crate::hardware_properties;
 // UINT8_MAX (255) means "not yet registered".
 std::thread_local! {
     static HOST_THREAD_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+    static IS_PHANTOM_MODE_FOR_SINGLECORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Upstream `KernelCore::Impl::SetHostThreadId()`.
+///
+/// The no-inline boundary is part of upstream's fiber contract: guest fibers
+/// can resume on a different host thread, so a TLS access must occur after the
+/// context switch instead of being folded into code that ran before it.
+#[inline(never)]
+fn set_host_thread_id(core_id: usize) -> u32 {
+    HOST_THREAD_ID.with(|id| {
+        assert_eq!(id.get(), u32::MAX, "host thread already registered");
+        let this_id = core_id as u32;
+        id.set(this_id);
+        this_id
+    })
+}
+
+/// Upstream `KernelCore::Impl::GetHostThreadId()`.
+#[inline(never)]
+fn get_host_thread_id() -> u32 {
+    HOST_THREAD_ID.with(std::cell::Cell::get)
+}
+
+/// Upstream `KernelCore::Impl::IsPhantomModeForSingleCore()`.
+#[inline(never)]
+fn is_phantom_mode_for_single_core() -> bool {
+    IS_PHANTOM_MODE_FOR_SINGLECORE.with(std::cell::Cell::get)
+}
+
+/// Upstream `KernelCore::Impl::SetIsPhantomModeForSingleCore()`.
+#[inline(never)]
+fn set_is_phantom_mode_for_single_core(value: bool) {
+    IS_PHANTOM_MODE_FOR_SINGLECORE.with(|mode| mode.set(value));
 }
 
 // Global kernel pointer for scheduler callbacks.
@@ -711,8 +745,21 @@ fn dump_thread_state(kernel: &KernelCore) {
         };
         match scheduler.try_lock() {
             Ok(scheduler) => {
+                let switch_thread_info = |thread: &Option<Weak<KThreadLock>>| {
+                    thread.as_ref().and_then(Weak::upgrade).map(|thread| {
+                        let guard = thread.lock().unwrap();
+                        (
+                            guard.get_thread_id(),
+                            Arc::as_ptr(&thread) as usize,
+                            guard.context_guard.is_locked(),
+                            guard.context_guard_owner.load(Ordering::SeqCst),
+                            guard.get_current_core(),
+                            guard.get_active_core(),
+                        )
+                    })
+                };
                 eprintln!(
-                    "[DUMP] scheduler core={} current={:?} highest={:?} prev={:?} needs={} interrupt_task={} idle={}",
+                    "[DUMP] scheduler core={} current={:?} highest={:?} prev={:?} needs={} interrupt_task={} idle={} switch_cur={:?} switch_target={:?} switch_from={}",
                     core_id,
                     scheduler.get_scheduler_current_thread_id(),
                     scheduler.state.highest_priority_thread_id,
@@ -720,6 +767,9 @@ fn dump_thread_state(kernel: &KernelCore) {
                     scheduler.needs_scheduling(),
                     scheduler.state.interrupt_task_runnable,
                     scheduler.is_idle(),
+                    switch_thread_info(&scheduler.switch_cur_thread),
+                    switch_thread_info(&scheduler.switch_highest_priority_thread),
+                    scheduler.switch_from_schedule,
                 );
             }
             Err(_) => {
@@ -1255,11 +1305,19 @@ fn dump_thread_state(kernel: &KernelCore) {
             // RUNNABLE thread wedges the switch fiber's try_lock spin.
             {
                 let ctx_locked = t.context_guard.is_locked();
+                let ctx_owner = t.context_guard_owner.load(Ordering::SeqCst);
                 let trace = t.context_guard_trace.lock();
-                if ctx_locked || trace.last_lock.is_some() {
+                if ctx_locked
+                    || ctx_owner != super::k_thread::CONTEXT_GUARD_UNOWNED
+                    || trace.last_lock.is_some()
+                {
                     eprintln!(
-                        "[DUMP]        tid={} ctx_guard locked={} last_lock={:?} last_unlock={:?}",
-                        tid, ctx_locked, trace.last_lock, trace.last_unlock,
+                        "[DUMP]        tid={} ctx_guard locked={} owner={} last_lock={:?} last_unlock={:?}",
+                        tid,
+                        ctx_locked,
+                        ctx_owner,
+                        trace.last_lock,
+                        trace.last_unlock,
                     );
                 }
             }
@@ -1381,9 +1439,7 @@ fn real_enable_scheduling(cores_needing_scheduling: u64) {
     KScheduler::enable_scheduling_with_scheduler(
         cores_needing_scheduling,
         current_scheduler,
-        kernel
-            .is_phantom_mode_for_singlecore
-            .load(Ordering::Relaxed),
+        kernel.is_phantom_mode_for_single_core(),
     );
 }
 
@@ -1508,6 +1564,7 @@ std::thread_local! {
     static HOST_DUMMY_THREAD: RefCell<Option<Arc<KThreadLock>>> = const { RefCell::new(None) };
 }
 
+#[inline(never)]
 fn get_or_create_host_dummy_thread(kernel: &KernelCore) -> Arc<KThreadLock> {
     HOST_DUMMY_THREAD.with(|cell| {
         if let Some(thread) = cell.borrow().as_ref() {
@@ -1531,6 +1588,7 @@ fn get_or_create_host_dummy_thread(kernel: &KernelCore) -> Arc<KThreadLock> {
 
 /// Get the current emulation thread for the calling host thread.
 /// Upstream: `KernelCore::Impl::GetCurrentEmuThread()`.
+#[inline(never)]
 pub fn get_current_emu_thread() -> Option<Arc<KThreadLock>> {
     let current = CURRENT_THREAD.with(|cell| cell.borrow().as_ref().and_then(Weak::upgrade));
     if current.is_some() {
@@ -1550,6 +1608,7 @@ pub fn get_current_emu_thread() -> Option<Arc<KThreadLock>> {
 
 /// Set the current emulation thread for the calling host thread.
 /// Upstream: `KernelCore::Impl::SetCurrentEmuThread(KThread*)`.
+#[inline(never)]
 pub fn set_current_emu_thread(thread: Option<&Arc<KThreadLock>>) {
     CURRENT_THREAD.with(|cell| {
         *cell.borrow_mut() = thread.map(Arc::downgrade);
@@ -1591,6 +1650,7 @@ fn ensure_current_thread_populated() -> bool {
     get_current_emu_thread().is_some()
 }
 
+#[inline(never)]
 pub fn get_current_thread_id_fast() -> Option<u64> {
     // Upstream totality: GetCurrentThreadPointer is always valid during
     // CPU execution. Populate lazily via the dummy-thread fallback if
@@ -1610,6 +1670,7 @@ pub fn get_current_thread_id_fast() -> Option<u64> {
     }
 }
 
+#[inline(never)]
 pub fn with_current_thread_fast_mut<R>(f: impl FnOnce(&mut KThread) -> R) -> Option<R> {
     // Same totality semantics as get_current_thread_id_fast.
     let ptr = CURRENT_THREAD_PTR.with(|cell| cell.get());
@@ -1676,7 +1737,6 @@ pub struct KernelCore {
     // -- Initialization state --
     is_multicore: bool,
     is_shutting_down: AtomicBool,
-    is_phantom_mode_for_singlecore: AtomicBool,
     exception_exited: bool,
 
     // -- ID counters --
@@ -1786,13 +1846,6 @@ pub struct KernelCore {
     /// Upstream: `std::shared_ptr<Core::Timing::EventType> preemption_event`.
     preemption_event: Option<Arc<parking_lot::Mutex<crate::core_timing::EventType>>>,
 
-    /// Dedicated preemption thread that fires every 10ms independently of
-    /// CoreTiming. Works around the CoreTiming event-starvation bug where
-    /// looping events stop being collected from the priority queue after
-    /// the initial burst.
-    preemption_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-    preemption_stop: Arc<std::sync::atomic::AtomicBool>,
-
     /// Active service server managers.
     /// Upstream: `Impl::server_managers`.
     server_managers: Mutex<Vec<TrackedServerManager>>,
@@ -1816,7 +1869,6 @@ impl KernelCore {
         Self {
             is_multicore: true,
             is_shutting_down: AtomicBool::new(false),
-            is_phantom_mode_for_singlecore: AtomicBool::new(false),
             exception_exited: false,
 
             next_object_id: AtomicU32::new(0),
@@ -1854,8 +1906,6 @@ impl KernelCore {
             core_timing: None,
             system_ref: crate::core::SystemRef::null(),
             preemption_event: None,
-            preemption_thread: Mutex::new(None),
-            preemption_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             server_managers: Mutex::new(Vec::new()),
             service_processes: Mutex::new(Vec::new()),
             host_service_processes: Mutex::new(Vec::new()),
@@ -1887,9 +1937,6 @@ impl KernelCore {
             SCHEDULER_LOCK_PTR.store(sl_ptr, Ordering::Release);
         }
 
-        self.is_phantom_mode_for_singlecore
-            .store(false, Ordering::Relaxed);
-
         // Initialize slab resource counts.
         super::init::init_slab_setup::initialize_slab_resource_counts(
             &mut self.slab_resource_counts,
@@ -1916,13 +1963,8 @@ impl KernelCore {
         }
 
         // Initialize preemption event.
-        // Upstream: InitializePreemption schedules a looping CoreTiming event every 10ms
-        // that calls PreemptThreads + Interrupt on each core, forcing the JIT out of
-        // tight loops so the scheduler can reschedule threads.
         // Upstream: InitializePreemption creates a looping CoreTiming event.
         // The callback takes KScopedSchedulerLock then calls PreemptThreads.
-        // Additionally, we interrupt all cores to force the JIT to exit
-        // linked block loops and check is_interrupted in the outer loop.
         self.preemption_event = Some(crate::core_timing::create_event(
             "PreemptionCallback".to_string(),
             Box::new(move |_time, _ns| {
@@ -1932,22 +1974,40 @@ impl KernelCore {
                 }
                 let kernel = unsafe { &*kernel_ptr };
 
-                // PreemptThreads (rotate priority queue).
-                if let Some(gsc_arc) = kernel.global_scheduler_context() {
-                    let mut gsc = gsc_arc.lock().unwrap();
-                    gsc.preempt_threads();
-                    drop(gsc);
+                if let Some(scheduler_lock) = scheduler_lock() {
+                    let _scheduler_guard =
+                        super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
+                    if let Some(gsc_arc) = kernel.global_scheduler_context() {
+                        gsc_arc.lock().unwrap().preempt_threads();
+                    }
                 }
 
-                // Local ruzu addition: interrupt cores to force JIT exits.
-                // Upstream only rotates scheduled queues here; keep this
-                // diagnostic gate to isolate preemption-vs-JIT-exit effects.
-                if std::env::var_os("RUZU_NO_PREEMPT_INTERRUPTS").is_none() {
-                    for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
-                        if let Some(core) = kernel.physical_core(core_id) {
-                            core.interrupt();
-                        }
+                // Rust's guest-core fibers only observe the scheduler update
+                // after ArmInterface::RunThread returns. Force that boundary
+                // from the upstream-owned 10 ms preemption event.
+                for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
+                    if let Some(core) = kernel.physical_core(core_id) {
+                        core.interrupt();
                     }
+                }
+
+                if DUMP_REQUESTED.load(Ordering::Relaxed) {
+                    // The per-core register snapshots are refreshed when the JIT
+                    // returns. Wait for the interrupt above before dumping so
+                    // SIGUSR1 reports the live guest loop rather than the
+                    // preceding SVC state.
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(100);
+                    while std::time::Instant::now() < deadline
+                        && (0..hardware_properties::NUM_CPU_CORES as usize).any(|core_id| {
+                            kernel
+                                .physical_core(core_id)
+                                .is_some_and(|core| core.is_interrupted())
+                        })
+                    {
+                        std::thread::yield_now();
+                    }
+                    dump_thread_state(kernel);
                 }
 
                 None
@@ -2255,47 +2315,9 @@ impl KernelCore {
             log::info!("KernelCore: preemption event scheduled (10ms interval)");
         }
 
-        // Also start a dedicated preemption thread that fires independently
-        // of CoreTiming. This works around the CoreTiming event-starvation
-        // bug where looping events stop being collected after the initial
-        // burst, causing the JIT to run unpreempted forever.
-        //
-        // The same thread also services SIGUSR1 dump requests — the signal
-        // handler sets DUMP_REQUESTED; this thread polls it every 10ms and
-        // runs `dump_thread_state` outside signal context.
+        // Keep the local SIGUSR1 diagnostic, but poll it from the upstream
+        // preemption event instead of adding a second scheduling thread.
         install_sigusr1_handler();
-
-        let stop = Arc::clone(&self.preemption_stop);
-        let kernel_ptr_val = KERNEL_PTR.load(Ordering::Acquire);
-        if std::env::var_os("RUZU_DISABLE_PREEMPTION_THREAD").is_some() {
-            log::warn!("RUZU_DISABLE_PREEMPTION_THREAD=1 -> skipping local preemption thread");
-        } else if !kernel_ptr_val.is_null() {
-            let thread = std::thread::Builder::new()
-                .name("PreemptionThread".to_string())
-                .spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        let kp = KERNEL_PTR.load(Ordering::Acquire);
-                        if kp.is_null() {
-                            break;
-                        }
-                        let kernel = unsafe { &*kp };
-                        if std::env::var_os("RUZU_NO_PREEMPT_INTERRUPTS").is_none() {
-                            for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
-                                if let Some(core) = kernel.physical_core(core_id) {
-                                    core.interrupt();
-                                }
-                            }
-                        }
-                        if DUMP_REQUESTED.load(Ordering::Relaxed) {
-                            dump_thread_state(kernel);
-                        }
-                    }
-                })
-                .expect("failed to spawn preemption thread");
-            *self.preemption_thread.lock().unwrap() = Some(thread);
-            log::info!("KernelCore: dedicated preemption thread started (10ms interval)");
-        }
     }
 
     /// Set the System reference.
@@ -2821,11 +2843,7 @@ impl KernelCore {
     /// Must be called from the host thread that will run this core.
     pub fn register_core_thread(&self, core_id: usize) {
         assert!(core_id < hardware_properties::NUM_CPU_CORES as usize);
-        let this_id = core_id as u32;
-        HOST_THREAD_ID.with(|id| {
-            assert_eq!(id.get(), u32::MAX, "host thread already registered");
-            id.set(this_id);
-        });
+        let this_id = set_host_thread_id(core_id);
         if !self.is_multicore {
             self.single_core_thread_id.store(this_id, Ordering::Relaxed);
         }
@@ -2860,17 +2878,15 @@ impl KernelCore {
     /// In single-core mode, if the calling thread is the single core thread,
     /// returns the current core index from CpuManager instead of the raw ID.
     fn get_current_host_thread_id(&self) -> u32 {
-        HOST_THREAD_ID.with(|id| {
-            let this_id = id.get();
-            if !self.is_multicore && this_id == self.single_core_thread_id.load(Ordering::Relaxed) {
-                // In single-core mode, the single core thread ID maps to the
-                // current core index. Upstream reads system.GetCpuManager().CurrentCore().
-                // We return 0 as default; CpuManager.current_core rotates this.
-                // Upstream: system.GetCpuManager().CurrentCore(). Defaults to 0 until wired.
-                return 0;
-            }
-            this_id
-        })
+        let this_id = get_host_thread_id();
+        if !self.is_multicore && this_id == self.single_core_thread_id.load(Ordering::Relaxed) {
+            // In single-core mode, the single core thread ID maps to the
+            // current core index. Upstream reads system.GetCpuManager().CurrentCore().
+            // We return 0 as default; CpuManager.current_core rotates this.
+            // Upstream: system.GetCpuManager().CurrentCore(). Defaults to 0 until wired.
+            return 0;
+        }
+        this_id
     }
 
     /// Get the hardware timer (Arc reference).
@@ -2949,13 +2965,13 @@ impl KernelCore {
 
     /// Workaround for single-core mode phantom mode.
     pub fn is_phantom_mode_for_single_core(&self) -> bool {
-        self.is_phantom_mode_for_singlecore.load(Ordering::Relaxed)
+        is_phantom_mode_for_single_core()
     }
 
     /// Set the phantom mode for single core.
     pub fn set_is_phantom_mode_for_single_core(&self, value: bool) {
-        self.is_phantom_mode_for_singlecore
-            .store(value, Ordering::Relaxed);
+        assert!(!self.is_multicore);
+        set_is_phantom_mode_for_single_core(value);
     }
 
     /// Get the slab resource counts.
@@ -3486,6 +3502,177 @@ mod tests {
             .get_current_emu_thread()
             .expect("existing thread should remain current");
         assert!(Arc::ptr_eq(&current, &thread));
+    }
+
+    #[test]
+    fn host_thread_id_is_reloaded_after_cross_thread_fiber_resume() {
+        use common::fiber::Fiber;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Barrier, Mutex as StdMutex};
+
+        struct FiberMigrationState {
+            kernel: Arc<KernelCore>,
+            barrier: Barrier,
+            phase: AtomicUsize,
+            observed_first: AtomicUsize,
+            observed_second: AtomicUsize,
+            observed_first_thread: AtomicUsize,
+            observed_second_thread: AtomicUsize,
+            observed_first_fast_thread: AtomicUsize,
+            observed_second_fast_thread: AtomicUsize,
+            host_threads: [Arc<KThreadLock>; 2],
+            thread_fibers: [StdMutex<Option<Arc<Fiber>>>; 2],
+            worker: StdMutex<Option<Arc<Fiber>>>,
+        }
+
+        let host_threads = [0x1001, 0x1002].map(|thread_id| {
+            let thread = Arc::new(KThreadLock::new(KThread::new()));
+            thread.lock().unwrap().thread_id = thread_id;
+            thread
+        });
+        let state = Arc::new(FiberMigrationState {
+            kernel: Arc::new(KernelCore::new()),
+            barrier: Barrier::new(2),
+            phase: AtomicUsize::new(0),
+            observed_first: AtomicUsize::new(usize::MAX),
+            observed_second: AtomicUsize::new(usize::MAX),
+            observed_first_thread: AtomicUsize::new(usize::MAX),
+            observed_second_thread: AtomicUsize::new(usize::MAX),
+            observed_first_fast_thread: AtomicUsize::new(usize::MAX),
+            observed_second_fast_thread: AtomicUsize::new(usize::MAX),
+            host_threads,
+            thread_fibers: [StdMutex::new(None), StdMutex::new(None)],
+            worker: StdMutex::new(None),
+        });
+
+        let weak_state = Arc::downgrade(&state);
+        let worker = Fiber::new(Box::new(move || {
+            let state = weak_state.upgrade().unwrap();
+            state
+                .observed_first
+                .store(state.kernel.current_physical_core_index(), Ordering::SeqCst);
+            state.observed_first_thread.store(
+                get_current_emu_thread()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .get_thread_id() as usize,
+                Ordering::SeqCst,
+            );
+            state.observed_first_fast_thread.store(
+                get_current_thread_id_fast().unwrap() as usize,
+                Ordering::SeqCst,
+            );
+            let worker = state.worker.lock().unwrap().as_ref().unwrap().clone();
+            let thread_fiber = state.thread_fibers[0]
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .clone();
+            Fiber::yield_to(Arc::downgrade(&worker), &thread_fiber);
+
+            state
+                .observed_second
+                .store(state.kernel.current_physical_core_index(), Ordering::SeqCst);
+            state.observed_second_thread.store(
+                get_current_emu_thread()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .get_thread_id() as usize,
+                Ordering::SeqCst,
+            );
+            state.observed_second_fast_thread.store(
+                get_current_thread_id_fast().unwrap() as usize,
+                Ordering::SeqCst,
+            );
+            let worker = state.worker.lock().unwrap().as_ref().unwrap().clone();
+            let thread_fiber = state.thread_fibers[1]
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .clone();
+            Fiber::yield_to(Arc::downgrade(&worker), &thread_fiber);
+        }));
+        *state.worker.lock().unwrap() = Some(worker);
+
+        let first_state = Arc::clone(&state);
+        let first = std::thread::spawn(move || {
+            first_state.kernel.register_core_thread(0);
+            set_current_emu_thread(Some(&first_state.host_threads[0]));
+            let thread_fiber = Fiber::thread_to_fiber();
+            *first_state.thread_fibers[0].lock().unwrap() = Some(Arc::clone(&thread_fiber));
+            first_state.barrier.wait();
+
+            let worker = first_state.worker.lock().unwrap().as_ref().unwrap().clone();
+            Fiber::yield_to(Arc::downgrade(&thread_fiber), &worker);
+            first_state.phase.store(1, Ordering::Release);
+            thread_fiber.exit();
+        });
+
+        let second_state = Arc::clone(&state);
+        let second = std::thread::spawn(move || {
+            second_state.kernel.register_core_thread(1);
+            set_current_emu_thread(Some(&second_state.host_threads[1]));
+            let thread_fiber = Fiber::thread_to_fiber();
+            *second_state.thread_fibers[1].lock().unwrap() = Some(Arc::clone(&thread_fiber));
+            second_state.barrier.wait();
+            while second_state.phase.load(Ordering::Acquire) == 0 {
+                std::hint::spin_loop();
+            }
+
+            let worker = second_state
+                .worker
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .clone();
+            Fiber::yield_to(Arc::downgrade(&thread_fiber), &worker);
+            thread_fiber.exit();
+        });
+
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(state.observed_first.load(Ordering::SeqCst), 0);
+        assert_eq!(state.observed_second.load(Ordering::SeqCst), 1);
+        assert_eq!(state.observed_first_thread.load(Ordering::SeqCst), 0x1001);
+        assert_eq!(state.observed_second_thread.load(Ordering::SeqCst), 0x1002);
+        assert_eq!(
+            state.observed_first_fast_thread.load(Ordering::SeqCst),
+            0x1001
+        );
+        assert_eq!(
+            state.observed_second_fast_thread.load(Ordering::SeqCst),
+            0x1002
+        );
+    }
+
+    #[test]
+    fn phantom_mode_is_local_to_the_calling_host_thread() {
+        let mut kernel = KernelCore::new();
+        kernel.is_multicore = false;
+        let kernel = Arc::new(kernel);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let first_kernel = Arc::clone(&kernel);
+        let first_barrier = Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            first_kernel.set_is_phantom_mode_for_single_core(true);
+            first_barrier.wait();
+            assert!(first_kernel.is_phantom_mode_for_single_core());
+        });
+
+        let second_kernel = Arc::clone(&kernel);
+        let second = std::thread::spawn(move || {
+            barrier.wait();
+            assert!(!second_kernel.is_phantom_mode_for_single_core());
+        });
+
+        first.join().unwrap();
+        second.join().unwrap();
     }
 
     #[test]

@@ -152,11 +152,6 @@ fn serialize_jit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_SERIALIZE_JIT").is_some())
 }
 
-fn post_svc_reschedule_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUZU_DISABLE_POST_SVC_RESCHEDULE").is_none())
-}
-
 fn spin_trace_target_tid() -> Option<u64> {
     static TARGET: OnceLock<Option<u64>> = OnceLock::new();
     *TARGET.get_or_init(|| {
@@ -239,12 +234,6 @@ fn trace_core_dispatch(
     {
         return;
     }
-    static CORE_DISPATCH_TRACE_COUNT: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
-    let n = CORE_DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n >= 512 && !n.is_multiple_of(10_000) {
-        return;
-    }
     let phase_id = match phase {
         "pre_inner stale_interrupt" => 1,
         "enter_inner_loop" => 2,
@@ -253,6 +242,16 @@ fn trace_core_dispatch(
         "after_reschedule" => 5,
         _ => 0,
     };
+    const PHASE_COUNT: usize = 6;
+    static CORE_DISPATCH_TRACE_COUNTS: [std::sync::atomic::AtomicU64;
+        hardware_properties::NUM_CPU_CORES as usize * PHASE_COUNT] =
+        [const { std::sync::atomic::AtomicU64::new(0) };
+            hardware_properties::NUM_CPU_CORES as usize * PHASE_COUNT];
+    let counter_index = core_index * PHASE_COUNT + phase_id as usize;
+    let n = CORE_DISPATCH_TRACE_COUNTS[counter_index].fetch_add(1, Ordering::Relaxed);
+    if n >= 512 && !n.is_multiple_of(1_000) {
+        return;
+    }
     let (tid, current_core, active_core, raw_state) = thread
         .lock()
         .ok()
@@ -492,12 +491,29 @@ impl CpuManager {
         if let Some(scheduler_arc) = kernel.current_scheduler() {
             let sched_ptr = {
                 let guard = scheduler_arc.lock().unwrap();
+                if common::trace::is_enabled(common::trace::cat::SCHED_STATE)
+                    && guard.core_id != kernel.current_physical_core_index() as i32
+                {
+                    common::trace::emit_raw(
+                        common::trace::cat::SCHED_STATE,
+                        &[
+                            22,
+                            7,
+                            1,
+                            guard.core_id as u32 as u64,
+                            kernel.current_physical_core_index() as u64,
+                            super::hle::kernel::kernel::get_current_thread_id_fast()
+                                .unwrap_or(u64::MAX),
+                            guard.state.needs_scheduling.load(Ordering::SeqCst) as u64,
+                        ],
+                    );
+                }
                 &*guard as *const super::hle::kernel::k_scheduler::KScheduler
                     as *mut super::hle::kernel::k_scheduler::KScheduler
             }; // Mutex guard dropped here
                // Safety: core OS thread; scheduler Arc keeps pointer valid; cooperative fibers.
             unsafe {
-                super::hle::kernel::k_scheduler::KScheduler::schedule_raw_if_needed(sched_ptr);
+                super::hle::kernel::k_scheduler::KScheduler::schedule_raw_if_needed(sched_ptr, 2);
             }
         }
     }
@@ -522,14 +538,20 @@ impl CpuManager {
         }
     }
 
-    fn scheduler_current_thread(kernel: &KernelCore) -> Option<Arc<KThreadLock>> {
-        let scheduler_arc = kernel.current_scheduler()?;
-        let thread = scheduler_arc
-            .lock()
-            .unwrap()
-            .get_scheduler_current_thread()?;
-        super::hle::kernel::kernel::set_current_emu_thread(Some(&thread));
-        Some(thread)
+    /// Restore the current-thread TLS to the guest fiber that is executing.
+    ///
+    /// Upstream maintains this TLS in exactly one place — `SetCurrentThread()`
+    /// at the end of `KScheduler::SwitchThread`. Returning from
+    /// `ScheduleImpl()` only happens after the calling guest fiber has been
+    /// scheduled again, so the SVC caller remains the thread whose context is
+    /// loaded in the JIT.
+    ///
+    /// Do not copy `KScheduler::m_current_thread` here. It may already name the
+    /// selected next thread while the current fiber still owns the live JIT
+    /// context. `ScheduleImplFiber` would then unload that context into the
+    /// wrong `KThread`.
+    fn restore_current_emu_thread(thread: &Arc<KThreadLock>) {
+        super::hle::kernel::kernel::set_current_emu_thread(Some(thread));
     }
 
     /// Guest thread activation function.
@@ -749,16 +771,6 @@ impl CpuManager {
         loop {
             Self::shutdown_if_requested(kernel);
             let mut physical_core = kernel.current_physical_core();
-            // Clear any stale interrupt before entering the JIT loop.
-            // The preemption timer may have fired while we were in the scheduler.
-            if physical_core.is_interrupted() {
-                trace_core_dispatch(
-                    physical_core.core_index(),
-                    "pre_inner stale_interrupt",
-                    &thread_arc,
-                );
-                Self::handle_interrupt(kernel);
-            }
             trace_core_dispatch(physical_core.core_index(), "enter_inner_loop", &thread_arc);
             while !physical_core.is_interrupted() {
                 Self::run_guest_thread_once(
@@ -889,7 +901,9 @@ impl CpuManager {
             }
             super::hle::kernel::kernel::set_current_emu_thread(Some(thread_arc));
             Self::force_reschedule_current_core_raw(kernel);
-            if common::trace::is_enabled(common::trace::cat::SCHED_STATE) {
+            if (n < 200 || n % 1000 == 0)
+                && common::trace::is_enabled(common::trace::cat::SCHED_STATE)
+            {
                 let scheduler_current_after_thread =
                     scheduler.lock().unwrap().get_scheduler_current_thread();
                 let scheduler_current_after = scheduler_current_after_thread
@@ -1112,70 +1126,14 @@ impl CpuManager {
                     if !system_ref.is_null() {
                         let system = system_ref.get();
                         let continue_thread = physical_core.dispatch_supervisor_call(
-                            jit_ref,
-                            &mut thread_context,
-                            &scheduler,
-                            process,
-                            thread_arc,
                             svc_num,
-                            0,
                             is_64bit,
                             &mut svc_args,
                             system,
                         );
                         if !continue_thread {
-                            super::hle::kernel::kernel::set_current_emu_thread(Some(thread_arc));
+                            Self::restore_current_emu_thread(thread_arc);
                             Self::force_reschedule_current_core_raw(kernel);
-                            return;
-                        }
-                        let (switched_scheduler_thread, needs_scheduling) = {
-                            let scheduler = scheduler.lock().unwrap();
-                            (
-                                scheduler.get_scheduler_current_thread_id()
-                                    != Some(current_thread_id),
-                                scheduler.needs_scheduling(),
-                            )
-                        };
-                        let current_thread_blocked = {
-                            let thread = thread_arc.lock().unwrap();
-                            thread.get_raw_state()
-                                != crate::hle::kernel::k_thread::ThreadState::RUNNABLE
-                        };
-                        if current_thread_blocked {
-                            log::trace!(
-                                "multi_core_run_guest_thread: tid={} core={} svc=0x{:x} reschedule after SVC switched={} blocked={} needs_sched={}",
-                                current_thread_id,
-                                core_index,
-                                svc_num,
-                                switched_scheduler_thread,
-                                current_thread_blocked,
-                                needs_scheduling,
-                            );
-                            super::hle::kernel::kernel::set_current_emu_thread(Some(thread_arc));
-                            Self::force_reschedule_current_core_raw(kernel);
-                            return;
-                        }
-                        if switched_scheduler_thread || needs_scheduling {
-                            log::trace!(
-                                "multi_core_run_guest_thread: tid={} core={} svc=0x{:x} reschedule after SVC switched={} blocked={} needs_sched={}",
-                                current_thread_id,
-                                core_index,
-                                svc_num,
-                                switched_scheduler_thread,
-                                current_thread_blocked,
-                                needs_scheduling,
-                            );
-                            if post_svc_reschedule_enabled() {
-                                super::hle::kernel::kernel::set_current_emu_thread(Some(
-                                    thread_arc,
-                                ));
-                                if switched_scheduler_thread {
-                                    Self::force_reschedule_current_core_raw(kernel);
-                                } else {
-                                    Self::reschedule_current_core_raw(kernel);
-                                }
-                                return;
-                            }
                         }
                         log::trace!(
                             "multi_core_run_guest_thread: tid={} core={} svc=0x{:x} returned from svc_dispatch r0=0x{:X} r1=0x{:X}",
@@ -1185,6 +1143,11 @@ impl CpuManager {
                             svc_args[0],
                             svc_args[1],
                         );
+                        // Upstream `PhysicalCore::RunThread` returns after every
+                        // SVC. The guest fiber may have migrated while the
+                        // handler slept, so the outer loop must reacquire both
+                        // `CurrentPhysicalCore()` and its JIT before executing
+                        // more guest code.
                         return;
                     }
                 }

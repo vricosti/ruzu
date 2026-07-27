@@ -14,6 +14,7 @@ use crate::arm::arm_interface::{
 use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::memory::memory::Memory;
 use common::page_table::PageInfo;
+use common::settings_enums::CpuAccuracy;
 
 use rdynarmic::backend::x64::jit_state::A64JitState;
 use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
@@ -56,6 +57,52 @@ fn optimization_flags_from_mask(mask: u32) -> OptimizationFlag {
     }
 
     flags
+}
+
+fn upstream_optimization_config(
+    accuracy: CpuAccuracy,
+    unsafe_unfuse_fma: bool,
+    unsafe_reduce_fp_error: bool,
+    unsafe_inaccurate_nan: bool,
+    unsafe_fastmem_check: bool,
+    unsafe_ignore_global_monitor: bool,
+) -> (OptimizationFlag, bool, usize) {
+    let mut flags = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+    let mut unsafe_optimizations = false;
+    let mut fastmem_address_space_bits = 39;
+
+    match accuracy {
+        CpuAccuracy::Unsafe => {
+            unsafe_optimizations = true;
+            if unsafe_unfuse_fma {
+                flags |= OptimizationFlag::UNSAFE_UNFUSE_FMA;
+            }
+            if unsafe_reduce_fp_error {
+                flags |= OptimizationFlag::UNSAFE_REDUCED_ERROR_FP;
+            }
+            if unsafe_inaccurate_nan {
+                flags |= OptimizationFlag::UNSAFE_INACCURATE_NAN;
+            }
+            if unsafe_fastmem_check {
+                fastmem_address_space_bits = 64;
+            }
+            if unsafe_ignore_global_monitor {
+                flags |= OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR;
+            }
+        }
+        CpuAccuracy::Auto => {
+            unsafe_optimizations = true;
+            flags |= OptimizationFlag::UNSAFE_UNFUSE_FMA;
+            fastmem_address_space_bits = 64;
+            flags |= OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR;
+        }
+        CpuAccuracy::Paranoid => {
+            flags = OptimizationFlag::NO_OPTIMIZATIONS;
+        }
+        CpuAccuracy::Accurate => {}
+    }
+
+    (flags, unsafe_optimizations, fastmem_address_space_bits)
 }
 
 fn parse_optimization_mask_env(name: &str) -> Option<u32> {
@@ -267,6 +314,11 @@ fn trace_w64_filter_oor_enabled() -> bool {
 fn trace_w64_value() -> Option<u64> {
     static VALUE: OnceLock<Option<u64>> = OnceLock::new();
     *VALUE.get_or_init(|| parse_u64_env("RUZU_TRACE_W64_VALUE"))
+}
+
+fn trace_w32_value() -> Option<u32> {
+    static VALUE: OnceLock<Option<u32>> = OnceLock::new();
+    *VALUE.get_or_init(|| parse_u64_env("RUZU_TRACE_W32_VALUE").map(|value| value as u32))
 }
 
 fn dump_v_index() -> usize {
@@ -1395,6 +1447,22 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
             return;
         }
         trace_unmapped_write_64(self, vaddr, 4, value as u128);
+        if trace_w32_value() == Some(value) {
+            static SHOWN: AtomicU32 = AtomicU32::new(0);
+            let n = SHOWN.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                if let Some(pc_ptr) = self.jit_pc_ptr {
+                    let state = unsafe {
+                        &*((pc_ptr as *const u8).sub(A64JitState::offset_of_pc())
+                            as *const A64JitState)
+                    };
+                    eprintln!(
+                        "[W32_VALUE #{n}] vaddr=0x{vaddr:016X} value=0x{value:08X} pc=0x{:016X} lr=0x{:016X}",
+                        state.pc, state.reg[30]
+                    );
+                }
+            }
+        }
         if trace_w_at_vaddr().is_some_and(|target| vaddr <= target && target < vaddr + 4) {
             if let Some(pc_ptr) = self.jit_pc_ptr {
                 let s = unsafe {
@@ -2200,7 +2268,7 @@ impl ArmDynarmic64 {
         // `RUZU_NO_FASTMEM=1` env-var disables fastmem entirely (forces
         // the slow callback path for all memory accesses) — useful for
         // debugging fastmem-related issues without rebuilding.
-        let page_table_pointer: Option<*const u8> = {
+        let mut page_table_pointer: Option<*const u8> = {
             let kernel_process = unsafe {
                 &*(process as *const _ as *const crate::hle::kernel::k_process::KProcess)
             };
@@ -2212,7 +2280,7 @@ impl ArmDynarmic64 {
                 .filter(|p| !p.is_null())
         };
 
-        let fastmem_pointer: Option<*mut u8> = if std::env::var("RUZU_NO_FASTMEM").is_ok() {
+        let mut fastmem_pointer: Option<*mut u8> = if std::env::var("RUZU_NO_FASTMEM").is_ok() {
             log::warn!("ArmDynarmic64: RUZU_NO_FASTMEM set — fastmem disabled");
             None
         } else {
@@ -2273,17 +2341,77 @@ impl ArmDynarmic64 {
             }
         }
 
-        let optimizations =
-            if let Some(mask) = parse_optimization_mask_env("RUZU_A64_OPTIMIZATION_MASK") {
-                optimization_flags_from_mask(mask)
-            } else if std::env::var("RUZU_A64_NO_OPTIMIZATIONS")
-                .ok()
-                .is_some_and(|value| value != "0")
-            {
-                OptimizationFlag::NO_OPTIMIZATIONS
+        let settings = common::settings::values();
+        let (mut optimizations, mut unsafe_optimizations, mut fastmem_address_space_bits) =
+            if *settings.cpu_debug_mode.get_value() {
+                (OptimizationFlag::ALL_SAFE_OPTIMIZATIONS, false, 39)
             } else {
-                OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
+                upstream_optimization_config(
+                    *settings.cpu_accuracy.get_value(),
+                    *settings.cpuopt_unsafe_unfuse_fma.get_value(),
+                    *settings.cpuopt_unsafe_reduce_fp_error.get_value(),
+                    *settings.cpuopt_unsafe_inaccurate_nan.get_value(),
+                    *settings.cpuopt_unsafe_fastmem_check.get_value(),
+                    *settings.cpuopt_unsafe_ignore_global_monitor.get_value(),
+                )
             };
+
+        let mut fastmem_exclusive_access =
+            fastmem_pointer.is_some() && !exclusive_monitor.is_null();
+        let mut recompile_on_exclusive_fastmem_failure = true;
+        let mut only_detect_misalignment_via_page_table_on_page_boundary = true;
+        let mut check_halt_on_memory_access = false;
+
+        if *settings.cpu_debug_mode.get_value() {
+            if !*settings.cpuopt_page_tables.get_value() {
+                page_table_pointer = None;
+            }
+            if !*settings.cpuopt_block_linking.get_value() {
+                optimizations &= !OptimizationFlag::BLOCK_LINKING;
+            }
+            if !*settings.cpuopt_return_stack_buffer.get_value() {
+                optimizations &= !OptimizationFlag::RETURN_STACK_BUFFER;
+            }
+            if !*settings.cpuopt_fast_dispatcher.get_value() {
+                optimizations &= !OptimizationFlag::FAST_DISPATCH;
+            }
+            if !*settings.cpuopt_context_elimination.get_value() {
+                optimizations &= !OptimizationFlag::GET_SET_ELIMINATION;
+            }
+            if !*settings.cpuopt_const_prop.get_value() {
+                optimizations &= !OptimizationFlag::CONST_PROP;
+            }
+            if !*settings.cpuopt_misc_ir.get_value() {
+                optimizations &= !OptimizationFlag::MISC_IR_OPT;
+            }
+            if !*settings.cpuopt_reduce_misalign_checks.get_value() {
+                only_detect_misalignment_via_page_table_on_page_boundary = false;
+            }
+            if !*settings.cpuopt_fastmem.get_value() {
+                fastmem_pointer = None;
+                fastmem_exclusive_access = false;
+            }
+            if !*settings.cpuopt_fastmem_exclusives.get_value() {
+                fastmem_exclusive_access = false;
+            }
+            if !*settings.cpuopt_recompile_exclusives.get_value() {
+                recompile_on_exclusive_fastmem_failure = false;
+            }
+            if !*settings.cpuopt_ignore_memory_aborts.get_value() {
+                check_halt_on_memory_access = true;
+            }
+        }
+
+        if let Some(mask) = parse_optimization_mask_env("RUZU_A64_OPTIMIZATION_MASK") {
+            optimizations = optimization_flags_from_mask(mask);
+            unsafe_optimizations = mask & !OptimizationFlag::ALL_SAFE_OPTIMIZATIONS.bits() != 0;
+        } else if std::env::var("RUZU_A64_NO_OPTIMIZATIONS")
+            .ok()
+            .is_some_and(|value| value != "0")
+        {
+            optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+            unsafe_optimizations = false;
+        }
 
         let tpidrro_el0 = Box::new(0u64);
         let mut tpidr_el0 = Box::new(0u64);
@@ -2301,7 +2429,7 @@ impl ArmDynarmic64 {
                 512 * 1024 * 1024
             },
             optimizations,
-            unsafe_optimizations: false,
+            unsafe_optimizations,
             global_monitor: if exclusive_monitor.is_null() {
                 None
             } else {
@@ -2324,10 +2452,10 @@ impl ArmDynarmic64 {
             // out-of-range accesses fall through to the callback path
             // rather than aliasing into the fastmem region.
             memory: rdynarmic::backend::x64::emit_context::MemoryEmitConfig {
-                fastmem_address_space_bits: 39,
+                fastmem_address_space_bits,
                 silently_mirror_fastmem: false,
-                fastmem_exclusive_access: fastmem_pointer.is_some() && !exclusive_monitor.is_null(),
-                recompile_on_exclusive_fastmem_failure: true,
+                fastmem_exclusive_access,
+                recompile_on_exclusive_fastmem_failure,
                 recompile_on_fastmem_failure: true,
                 page_table_present: page_table_pointer.is_some(),
                 page_table_address_space_bits: 39,
@@ -2335,8 +2463,8 @@ impl ArmDynarmic64 {
                 absolute_offset_page_table: true,
                 page_table_pointer_mask_bits: PageInfo::ATTRIBUTE_BITS as u32,
                 detect_misaligned_access_via_page_table: 16 | 32 | 64 | 128,
-                only_detect_misalignment_via_page_table_on_page_boundary: true,
-                check_halt_on_memory_access: false,
+                only_detect_misalignment_via_page_table_on_page_boundary,
+                check_halt_on_memory_access,
                 processor_id: core_index as usize,
             },
         };
@@ -2656,10 +2784,12 @@ fn thread_context_from_jit_state(jit_state: &A64JitState, pc: u64) -> ThreadCont
 mod tests {
     use super::{
         parse_optimization_mask_env, parse_watch_ranges, thread_context_from_jit_state,
-        translate_halt_reason,
+        translate_halt_reason, upstream_optimization_config,
     };
     use crate::arm::arm_interface::HaltReason;
+    use common::settings_enums::CpuAccuracy;
     use rdynarmic::backend::x64::jit_state::A64JitState;
+    use rdynarmic::jit_config::OptimizationFlag;
 
     #[test]
     fn parse_watch_ranges_accepts_hex_and_default_size() {
@@ -2709,6 +2839,24 @@ mod tests {
         unsafe {
             std::env::remove_var("RUZU_A64_TEST_OPT_MASK");
         }
+    }
+
+    #[test]
+    fn auto_and_paranoid_optimization_configs_match_upstream_a64() {
+        let (auto_flags, auto_unsafe, auto_fastmem_bits) =
+            upstream_optimization_config(CpuAccuracy::Auto, false, false, false, false, false);
+        assert!(auto_unsafe);
+        assert_eq!(auto_fastmem_bits, 64);
+        assert!(auto_flags.contains(OptimizationFlag::UNSAFE_UNFUSE_FMA));
+        assert!(auto_flags.contains(OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR));
+        assert!(!auto_flags.contains(OptimizationFlag::UNSAFE_REDUCED_ERROR_FP));
+        assert!(!auto_flags.contains(OptimizationFlag::UNSAFE_INACCURATE_NAN));
+
+        let (paranoid_flags, paranoid_unsafe, paranoid_fastmem_bits) =
+            upstream_optimization_config(CpuAccuracy::Paranoid, true, true, true, true, true);
+        assert_eq!(paranoid_flags, OptimizationFlag::NO_OPTIMIZATIONS);
+        assert!(!paranoid_unsafe);
+        assert_eq!(paranoid_fastmem_bits, 39);
     }
 
     #[test]

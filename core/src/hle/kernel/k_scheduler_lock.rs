@@ -424,6 +424,37 @@ impl Drop for KScopedSchedulerLock<'_> {
 mod tests {
     use super::*;
 
+    static CALLBACK_ORDER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_disable_scheduling() {
+        assert_eq!(
+            CALLBACK_ORDER.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst),
+            Ok(0)
+        );
+    }
+
+    fn test_update_highest_priority_threads() -> u64 {
+        assert_eq!(
+            CALLBACK_ORDER.compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst),
+            Ok(1)
+        );
+        0b1010
+    }
+
+    fn test_enable_scheduling(cores_needing_scheduling: u64) {
+        assert_eq!(cores_needing_scheduling, 0b1010);
+        assert_eq!(
+            CALLBACK_ORDER.compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst),
+            Ok(2)
+        );
+    }
+
+    static TEST_CALLBACKS: SchedulerCallbacks = SchedulerCallbacks {
+        disable_scheduling: test_disable_scheduling,
+        enable_scheduling: test_enable_scheduling,
+        update_highest_priority_threads: test_update_highest_priority_threads,
+    };
+
     #[test]
     fn test_scheduler_lock_basic() {
         let lock = KAbstractSchedulerLock::new();
@@ -456,5 +487,17 @@ mod tests {
             assert_eq!(lock.get_lock_count(), 1);
         }
         assert_eq!(lock.get_lock_count(), 0);
+    }
+
+    #[test]
+    fn outermost_unlock_updates_highest_before_enabling_scheduling() {
+        CALLBACK_ORDER.store(0, Ordering::SeqCst);
+        let mut lock = KAbstractSchedulerLock::new();
+        lock.set_callbacks(&TEST_CALLBACKS);
+
+        lock.lock();
+        lock.unlock();
+
+        assert_eq!(CALLBACK_ORDER.load(Ordering::SeqCst), 3);
     }
 }
