@@ -16,6 +16,7 @@ use gtk::{gio, glib};
 
 mod boot;
 mod config_import;
+mod configuration;
 mod emu_window;
 mod file_menu;
 mod game_list;
@@ -24,6 +25,7 @@ mod main_window;
 #[cfg(target_os = "macos")]
 mod render_window;
 mod status_bar;
+mod uisettings;
 
 use main_window::GMainWindow;
 
@@ -44,9 +46,16 @@ fn set_main_window(window: Rc<GMainWindow>) {
 fn main() -> glib::ExitCode {
     env_logger::init();
 
-    // Migrate an existing yuzu configuration on first run (guarded by a marker
-    // so it happens exactly once, not on every startup).
-    config_import::import_yuzu_config_once();
+    // A yuzu configuration is *offered* for import on first run, not copied
+    // silently — the prompt is raised from `GMainWindow` once the UI is up (see
+    // `main_window::maybe_offer_yuzu_import`).
+
+    // Load the configured game directories out of ruzu's own config, the way
+    // upstream's `Config::ReadUIValues` fills `UISettings::values.game_dirs`
+    // before the game list is built.
+    let game_dirs = configuration::qt_config::load_game_dirs();
+    log::info!("Loaded {} configured game directory(ies)", game_dirs.len());
+    uisettings::with_mut(|v| v.game_dirs = game_dirs);
 
     // Upstream constructs `QApplication app(argc, argv)`. We register handling
     // of file arguments ourselves later (open a game passed on the command
@@ -61,10 +70,11 @@ fn main() -> glib::ExitCode {
     // macOS (quartz) GDK backend, the menu model set here is bridged into the
     // native global menu bar at the top of the screen.
     app.connect_startup(|app| {
-        // Use a dark theme, matching yuzu.
-        if let Some(settings) = gtk::Settings::default() {
-            settings.set_gtk_application_prefer_dark_theme(true);
-        }
+        // Upstream calls `UpdateUITheme()` early in the `GMainWindow`
+        // constructor. It follows the desktop's dark-mode preference for the
+        // system themes rather than forcing one, which is why yuzu renders
+        // light on a light Linux desktop and dark on a dark macOS one.
+        main_window::update_ui_theme();
         main_window::init_app_menu(app);
     });
 

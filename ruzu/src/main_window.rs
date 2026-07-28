@@ -62,12 +62,18 @@ pub struct GMainWindow {
     /// `System` + emu thread on `GMainWindow`).
     session: RefCell<Option<EmulationSession>>,
     /// Bottom status bar (renderer / accuracy / dock / filter / AA / volume).
-    status_bar: StatusBar,
+    status_bar: Rc<StatusBar>,
     /// Native render-window handles for the running game, so it can be resized
     /// when the GTK window resizes.
     render: RefCell<Option<RenderHandles>>,
     /// Last observed central-stack size, to detect resizes.
     render_size: Cell<(i32, i32)>,
+    /// The open configuration dialog, kept alive while it is on screen
+    /// (upstream holds `ConfigureDialog` on the stack across `exec()`).
+    configure_dialog: RefCell<Option<Rc<crate::configuration::ConfigureDialog>>>,
+    /// Handle to the game list, so it can be rescanned when the configured
+    /// directories change.
+    game_list: RefCell<Option<crate::game_list::GameListHandle>>,
 }
 
 /// Handles needed to resize the embedded render surface on window resize.
@@ -94,8 +100,17 @@ impl GMainWindow {
         // Root vertical layout. On macOS the menu bar lives in the native
         // global menu bar (installed once via `init_app_menu` on the
         // application's `startup`), so the window itself only holds the central
-        // stack and the status bar — no in-window `PopoverMenuBar`.
+        // stack and the status bar. Every other platform has no global menu
+        // bar, so the same `GMenuModel` is rendered in-window as a
+        // `PopoverMenuBar` — the position upstream's `QMenuBar` occupies.
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let menubar = gtk::PopoverMenuBar::from_model(Some(&build_menu_model()));
+            menubar.set_halign(gtk::Align::Start);
+            root.append(&menubar);
+        }
 
         // --- Central stack (upstream `centralwidget`) ------------------------
         // Pages: game list, loading screen, (later) render view.
@@ -154,10 +169,12 @@ impl GMainWindow {
             status_bar,
             render: RefCell::new(None),
             render_size: Cell::new((0, 0)),
+            configure_dialog: RefCell::new(None),
+            game_list: RefCell::new(None),
         });
 
         // Game list page: activating a row boots that game in-process.
-        let game_list = crate::game_list::build(glib::clone!(
+        let (game_list, game_list_handle) = crate::game_list::build(glib::clone!(
             #[weak(rename_to = w)]
             this,
             #[upgrade_or_default]
@@ -165,6 +182,15 @@ impl GMainWindow {
         ));
         this.stack.add_named(&game_list, Some(PAGE_GAME_LIST));
         this.stack.set_visible_child_name(PAGE_GAME_LIST);
+        *this.game_list.borrow_mut() = Some(game_list_handle);
+
+        // First run with an importable yuzu configuration: ask before copying
+        // anything. Deferred to an idle callback so the window is on screen
+        // behind the dialog rather than appearing after it.
+        {
+            let this = Rc::clone(&this);
+            glib::idle_add_local_once(move || this.maybe_offer_yuzu_import());
+        }
 
         // Keep the embedded render surface sized to the central stack as the
         // window is resized. GTK4 has no widget `size-allocate` signal, so poll
@@ -234,6 +260,113 @@ impl GMainWindow {
             move |_, _| this.on_menu_load_folder()
         ));
         app.add_action(&load_folder);
+
+        // Upstream `connect_menu(action_Configure, OnConfigure)`. Overrides the
+        // startup stub, since the dialog is parented to this window.
+        let configure = gio::SimpleAction::new("configure", None);
+        configure.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.on_configure()
+        ));
+        app.add_action(&configure);
+
+        // The macOS App menu's "Preferences" opens the same dialog upstream.
+        let preferences = gio::SimpleAction::new("preferences", None);
+        preferences.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.on_configure()
+        ));
+        app.add_action(&preferences);
+
+        // The two blocks above replace the startup stubs by name, which resets
+        // their enabled state; re-apply it (upstream re-runs `UpdateMenuState`
+        // after `ConnectMenuEvents`).
+        update_menu_state(app, self.session.borrow().is_some(), true);
+    }
+
+    /// On a first run with an existing yuzu installation, offer to import its
+    /// configuration.
+    ///
+    /// ruzu has no upstream counterpart for this — yuzu has nothing to migrate
+    /// *from*. The rule is that nothing is copied without the user saying so,
+    /// and yuzu's directory is only ever read.
+    ///
+    /// The offer is made once: whichever way it is answered, a marker is
+    /// written into ruzu's config directory so the next launch starts silently.
+    fn maybe_offer_yuzu_import(self: &Rc<Self>) {
+        let Some(import) = crate::config_import::available_import() else {
+            return;
+        };
+
+        let dialog = gtk::AlertDialog::builder()
+            .modal(true)
+            .message("Import your yuzu configuration?")
+            .detail(format!(
+                "A yuzu configuration was found at:\n{}\n\n\
+                 ruzu can copy its settings — including your game directories — \
+                 so you can carry on where you left off. \
+                 Your yuzu configuration is only read, never modified.",
+                import.yuzu_dir.display()
+            ))
+            // Index order is button order; `cancel` is what Escape picks.
+            .buttons(["Start Fresh", "Import Settings"])
+            .default_button(1)
+            .cancel_button(0)
+            .build();
+
+        dialog.choose(
+            Some(&self.window),
+            gio::Cancellable::NONE,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |answer| {
+                    // `choose` reports Escape/close as an error rather than a
+                    // button index; treat that as declining, so the offer is
+                    // still marked answered and never nags again.
+                    let accepted = matches!(answer, Ok(1));
+                    if accepted {
+                        import.accept();
+                        this.on_yuzu_config_imported();
+                    } else {
+                        import.decline();
+                    }
+                }
+            ),
+        );
+    }
+
+    /// Re-read everything that came from the freshly imported configuration.
+    fn on_yuzu_config_imported(self: &Rc<Self>) {
+        let game_dirs = crate::configuration::qt_config::load_game_dirs();
+        log::info!(
+            "Imported configuration provides {} game directory(ies)",
+            game_dirs.len()
+        );
+        crate::uisettings::with_mut(|v| v.game_dirs = game_dirs);
+
+        // The imported file also carries the widget theme and the emulator
+        // settings the status bar reflects.
+        update_ui_theme();
+        self.status_bar.refresh();
+        if let Some(game_list) = self.game_list.borrow().as_ref() {
+            game_list.reload();
+        }
+    }
+
+    /// Upstream `GMainWindow::OnConfigure`: build and show the configuration
+    /// dialog, parented to the main window.
+    ///
+    /// Upstream keeps the dialog on the stack and inspects its exec() result to
+    /// decide whether to re-read settings. GTK dialogs are modeless objects
+    /// whose OK handler applies the settings itself, so the `Rc` is held alive
+    /// by the window until the next invocation replaces it.
+    fn on_configure(self: &Rc<Self>) {
+        let dialog = crate::configuration::ConfigureDialog::new(Some(&self.window));
+        dialog.present();
+        *self.configure_dialog.borrow_mut() = Some(dialog);
     }
 
     /// Upstream `OnMenuLoadFile`: choose a Switch executable, then boot it.
@@ -548,6 +681,112 @@ pub fn init_app_menu(app: &Application) {
     }
 
     app.set_menubar(Some(&build_menu_model()));
+
+    // Upstream calls `UpdateMenuState()` once the menu is built, which greys
+    // out the run-time entries because no game is running yet.
+    update_menu_state(app, false, true);
+}
+
+/// Whether the desktop is currently in dark mode — upstream
+/// `GMainWindow::CheckDarkMode` (`zuyu/src/yuzu/main.cpp`).
+///
+/// Upstream's Unix implementation compares the Qt palette's active Text and
+/// Window colours and calls it dark when the text is brighter than the
+/// background:
+///
+/// ```cpp
+/// const QColor text_color = test_palette.color(QPalette::Active, QPalette::Text);
+/// const QColor window_color = test_palette.color(QPalette::Active, QPalette::Window);
+/// return (text_color.value() > window_color.value());
+/// ```
+///
+/// GTK has no equivalent palette object to sample, but it does expose the
+/// desktop's stated preference directly, which is the thing the Qt heuristic is
+/// inferring. Two sources are consulted, most authoritative first:
+///
+///  1. the XDG desktop portal's `org.freedesktop.appearance` / `color-scheme`
+///     key (`0` = no preference, `1` = prefer dark, `2` = prefer light), which
+///     both GNOME and KDE publish;
+///  2. the GTK theme name, treated as dark when it ends in `-dark`.
+///
+/// Returning `false` (light) when neither source answers matches upstream,
+/// whose default theme on non-Windows is the light `DefaultColorful`.
+pub fn check_dark_mode() -> bool {
+    if let Some(prefers_dark) = portal_color_scheme() {
+        return prefers_dark;
+    }
+
+    gtk::Settings::default()
+        .and_then(|settings| settings.gtk_theme_name())
+        .map(|name| name.to_lowercase().ends_with("-dark"))
+        .unwrap_or(false)
+}
+
+/// Read `org.freedesktop.appearance` / `color-scheme` from the XDG desktop
+/// portal. `None` when no portal is reachable (no session bus, no portal
+/// service, or the key is absent).
+fn portal_color_scheme() -> Option<bool> {
+    let connection = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).ok()?;
+    let reply = connection
+        .call_sync(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Settings",
+            "ReadOne",
+            Some(&("org.freedesktop.appearance", "color-scheme").to_variant()),
+            None,
+            gio::DBusCallFlags::NONE,
+            // The portal is local; a short timeout keeps startup from stalling
+            // when the service is present but wedged.
+            500,
+            gio::Cancellable::NONE,
+        )
+        .ok()?;
+
+    // `ReadOne` returns `(v)` wrapping a `u` colour-scheme code.
+    let scheme: u32 = reply.child_value(0).as_variant()?.get()?;
+    match scheme {
+        1 => Some(true),  // prefer dark
+        2 => Some(false), // prefer light
+        _ => None,        // no preference — fall through to the theme name
+    }
+}
+
+/// Apply the configured widget theme — upstream `GMainWindow::UpdateUITheme`.
+///
+/// Upstream loads a `.qss` stylesheet per theme, and for the two
+/// system-following themes (`default` / `colorful`) additionally swaps to the
+/// dark variant when [`check_dark_mode`] reports dark. GTK has no stylesheet
+/// equivalent to load, so the ruzu port carries over the part that is
+/// observable: whether the window renders light or dark.
+///
+/// Themes whose name marks them as dark force dark; the system-following ones
+/// defer to the desktop, which is why ruzu (like yuzu) shows light on a light
+/// Linux desktop and dark on a dark macOS one instead of hard-coding either.
+pub fn update_ui_theme() {
+    let Some(settings) = gtk::Settings::default() else {
+        return;
+    };
+
+    let theme = crate::uisettings::with(|v| v.theme.get_value().clone());
+    let internal = crate::uisettings::THEMES
+        .iter()
+        .find(|(name, internal)| *name == theme || *internal == theme)
+        .map(|(_, internal)| *internal)
+        // Upstream falls back to `default_theme`, which is `DefaultColorful`
+        // on every non-Windows target.
+        .unwrap_or("colorful");
+
+    let dark = match internal {
+        // The system-following themes: ask the desktop, as upstream's
+        // `if (CheckDarkMode()) current_theme = "default_dark"` does.
+        "default" | "colorful" => check_dark_mode(),
+        // Every other theme upstream ships is a dark stylesheet.
+        _ => true,
+    };
+
+    settings.set_gtk_application_prefer_dark_theme(dark);
+    log::debug!("UI theme '{internal}' resolved to {} mode", if dark { "dark" } else { "light" });
 }
 
 /// Install the black backdrop CSS for the render page once.
@@ -652,6 +891,73 @@ fn register_menu_actions(app: &Application) {
         });
         app.add_action(&action);
     }
+}
+
+/// Menu actions that require a running game — upstream `UpdateMenuState`'s
+/// `running_actions` array.
+const RUNNING_ACTIONS: &[&str] = &[
+    "stop",
+    "restart",
+    "configure_current_game",
+    "report_compatibility",
+    "load_amiibo",
+    "pause",
+];
+
+/// Menu actions that open a system applet, which upstream enables only when
+/// firmware is installed *and* no game is running — `applet_actions`.
+const APPLET_ACTIONS: &[&str] = &[
+    "load_album",
+    "load_cabinet_nickname_owner",
+    "load_cabinet_eraser",
+    "load_cabinet_restorer",
+    "load_cabinet_formatter",
+    "load_mii_edit",
+    "open_controller_menu",
+];
+
+/// Enable/disable menu entries for the current emulation state — upstream
+/// `GMainWindow::UpdateMenuState`.
+///
+/// `is_paused` mirrors upstream's `emu_thread == nullptr || !emu_thread->IsRunning()`,
+/// which is why a *stopped* emulator counts as paused there too.
+pub fn update_menu_state(app: &Application, emulation_running: bool, is_paused: bool) {
+    let set_enabled = |name: &str, enabled: bool| {
+        if let Some(action) = app.lookup_action(name) {
+            if let Some(action) = action.downcast_ref::<gio::SimpleAction>() {
+                action.set_enabled(enabled);
+            }
+        }
+    };
+
+    for &name in RUNNING_ACTIONS {
+        set_enabled(name, emulation_running);
+    }
+
+    set_enabled("install_firmware", !emulation_running);
+    set_enabled("install_keys", !emulation_running);
+
+    let firmware_available = check_firmware_presence();
+    for &name in APPLET_ACTIONS {
+        set_enabled(name, firmware_available && !emulation_running);
+    }
+
+    set_enabled("capture_screenshot", emulation_running && !is_paused);
+}
+
+/// Whether system firmware is installed — upstream
+/// `GMainWindow::CheckFirmwarePresence`, which asks the content provider for
+/// the Mii Edit applet's program NCA.
+///
+/// The content provider is not reachable from the launcher yet, so this probes
+/// the registered-contents directory instead: it is the same NAND location
+/// upstream's provider indexes, and an empty one means no firmware either way.
+fn check_firmware_presence() -> bool {
+    let registered = common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::NANDDir)
+        .join("system/Contents/registered");
+    std::fs::read_dir(registered)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
 }
 
 /// GMenu UI definition mirroring upstream `main.ui`'s menu bar structure and

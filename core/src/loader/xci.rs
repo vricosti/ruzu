@@ -10,6 +10,7 @@ use crate::file_sys::card_image::XCI;
 use crate::file_sys::content_archive::{NCAContentType, NCA};
 use crate::file_sys::nca_metadata::{ContentRecordType, TitleType};
 use crate::file_sys::partition_filesystem::ResultStatus as FsResultStatus;
+use crate::file_sys::patch_manager::PatchManager;
 use crate::file_sys::registered_cache::get_update_title_id;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
 
@@ -81,20 +82,23 @@ impl AppLoaderXci {
         let program_nca_file = xci.get_program_nca_file().unwrap_or_else(|| file.clone());
         let nca_loader = AppLoaderNca::new(program_nca_file);
 
-        let icon_file: Option<VirtualFile> = None;
-        let nacp_file: Option<crate::file_sys::control_metadata::NACP> = None;
+        let mut icon_file: Option<VirtualFile> = None;
+        let mut nacp_file: Option<crate::file_sys::control_metadata::NACP> = None;
 
         if xci.get_status() == FsResultStatus::Success {
-            // Upstream: const auto control_nca = xci->GetNCAByType(FileSys::NCAContentType::Control);
+            // Upstream:
+            //   const auto control_nca = xci->GetNCAByType(FileSys::NCAContentType::Control);
+            //   if (control_nca != nullptr && control_nca->GetStatus() == ResultStatus::Success) {
+            //       const FileSys::PatchManager pm{xci->GetProgramTitleID(), fsc, content_provider};
+            //       std::tie(nacp_file, icon_file) = pm.ParseControlNCA(*control_nca);
+            //   }
             let control_nca = xci.get_nca_by_type(NCAContentType::Control);
-            if let Some(ref _control_nca) = control_nca {
-                if _control_nca.get_status() == FsResultStatus::Success {
-                    // Upstream: const FileSys::PatchManager pm{xci->GetProgramTitleID(), fsc, content_provider};
-                    // std::tie(nacp_file, icon_file) = pm.ParseControlNCA(*control_nca);
-                    //
-                    // PatchManager::ParseControlNCA requires FileSystemController and
-                    // ContentProvider references that are not yet wired into the loader path.
-                    // When those are available, this will produce valid nacp_file and icon_file.
+            if let Some(ref control) = control_nca {
+                if control.get_status() == FsResultStatus::Success {
+                    let pm = PatchManager::new_without_deps(xci.get_program_title_id());
+                    let (parsed_nacp, parsed_icon) = pm.parse_control_nca(control);
+                    nacp_file = parsed_nacp;
+                    icon_file = parsed_icon;
                 }
             }
         }

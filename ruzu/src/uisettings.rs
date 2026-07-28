@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Rust counterpart of the upstream frontend-only settings container in
+// `/home/vricosti/Dev/emulators/zuyu/src/yuzu/uisettings.h` +
+// `uisettings.cpp` (`UISettings::Values` / `UISettings::values`).
+//
+// These settings belong to the *frontend*, not to `Common::Settings`: upstream
+// keeps them in the `yuzu` GUI target because they describe window chrome, the
+// game list, screenshots, and multiplayer lobby state. The ruzu port therefore
+// owns them here rather than in the `common` crate, matching upstream's file
+// ownership.
+//
+// Upstream stores each field in a `Setting<T>` registered against a `linkage`
+// object so the config serializer can walk them. The ruzu port reuses
+// `common::settings_common::Setting<T>`, which provides the same
+// `get_value` / `set_value` / `get_default` contract.
+
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use common::settings_common::Setting;
+use common::settings_enums::{Category, ConfirmStop};
+
+/// One configured game directory — upstream `UISettings::GameDir`.
+///
+/// `path` may be one of the special provider tokens (`SDMC`, `UserNAND`,
+/// `SysNAND`) rather than a filesystem path; upstream stores them in the same
+/// array and distinguishes them when scanning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GameDir {
+    pub path: String,
+    pub deep_scan: bool,
+    pub expanded: bool,
+}
+
+impl GameDir {
+    /// Whether this entry is a real filesystem directory rather than one of the
+    /// `SDMC` / `UserNAND` / `SysNAND` provider tokens.
+    pub fn is_filesystem_path(&self) -> bool {
+        self.path.starts_with('/')
+    }
+}
+
+/// Frontend settings container — upstream `UISettings::Values`.
+#[derive(Clone)]
+pub struct Values {
+    /// Configured game directories — upstream `UISettings::values.game_dirs`.
+    /// Not a `Setting<T>`: upstream stores it as a plain `QVector<GameDir>`
+    /// serialized through `QSettings::beginWriteArray`, not through the
+    /// settings registry.
+    pub game_dirs: Vec<GameDir>,
+
+    // ── Ui ──────────────────────────────────────────────────────────────
+    pub single_window_mode: Setting<bool>,
+    pub fullscreen: Setting<bool>,
+    pub display_titlebar: Setting<bool>,
+    pub show_filter_bar: Setting<bool>,
+    pub show_status_bar: Setting<bool>,
+
+    pub confirm_before_stopping: Setting<ConfirmStop>,
+    pub pause_when_in_background: Setting<bool>,
+    pub mute_when_in_background: Setting<bool>,
+    pub hide_mouse: Setting<bool>,
+    pub controller_applet_disabled: Setting<bool>,
+    pub select_user_on_boot: Setting<bool>,
+
+    /// Interface language, as a locale string ("" = use the system language).
+    pub language: Setting<String>,
+    /// Widget theme name, matching one of [`THEMES`].
+    pub theme: Setting<String>,
+    /// Mirror the log to a console window — upstream `show_console`.
+    pub show_console: Setting<bool>,
+
+    // ── Screenshots ─────────────────────────────────────────────────────
+    pub enable_screenshot_save_as: Setting<bool>,
+    pub screenshot_path: Setting<String>,
+    pub screenshot_height: Setting<u32>,
+
+    // ── UiGameList ──────────────────────────────────────────────────────
+    pub show_add_ons: Setting<bool>,
+    pub show_compat: Setting<bool>,
+    pub show_size: Setting<bool>,
+    pub show_types: Setting<bool>,
+    pub show_play_time: Setting<bool>,
+    pub game_icon_size: Setting<u32>,
+    pub folder_icon_size: Setting<u32>,
+    pub row_1_text_id: Setting<u8>,
+    pub row_2_text_id: Setting<u8>,
+    pub cache_game_list: Setting<bool>,
+}
+
+impl Default for Values {
+    fn default() -> Self {
+        use Category::*;
+
+        Self {
+            game_dirs: Vec::new(),
+
+            single_window_mode: Setting::new(true, "singleWindowMode", Ui),
+            fullscreen: Setting::new(false, "fullscreen", Ui),
+            display_titlebar: Setting::new(true, "displayTitleBars", Ui),
+            show_filter_bar: Setting::new(true, "showFilterBar", Ui),
+            show_status_bar: Setting::new(true, "showStatusBar", Ui),
+
+            confirm_before_stopping: Setting::new(ConfirmStop::AskAlways, "confirmStop", Ui),
+            pause_when_in_background: Setting::new(false, "pauseWhenInBackground", Ui),
+            mute_when_in_background: Setting::new(false, "muteWhenInBackground", Ui),
+            hide_mouse: Setting::new(true, "hideInactiveMouse", Ui),
+            controller_applet_disabled: Setting::new(false, "disableControllerApplet", Ui),
+            select_user_on_boot: Setting::new(false, "select_user_on_boot", Ui),
+
+            language: Setting::new(String::new(), "language", Paths),
+            theme: Setting::new(String::from("Default Colorful"), "theme", Ui),
+            show_console: Setting::new(false, "showConsole", Ui),
+
+            enable_screenshot_save_as: Setting::new(true, "enable_screenshot_save_as", Screenshots),
+            screenshot_path: Setting::new(String::new(), "screenshot_path", Screenshots),
+            screenshot_height: Setting::new(0, "screenshot_height", Screenshots),
+
+            show_add_ons: Setting::new(true, "show_add_ons", UiGameList),
+            show_compat: Setting::new(false, "show_compat", UiGameList),
+            show_size: Setting::new(true, "show_size", UiGameList),
+            show_types: Setting::new(true, "show_types", UiGameList),
+            show_play_time: Setting::new(true, "show_play_time", UiGameList),
+            game_icon_size: Setting::new(64, "game_icon_size", UiGameList),
+            folder_icon_size: Setting::new(48, "folder_icon_size", UiGameList),
+            row_1_text_id: Setting::new(3, "row_1_text_id", UiGameList),
+            row_2_text_id: Setting::new(2, "row_2_text_id", UiGameList),
+            cache_game_list: Setting::new(true, "cache_game_list", UiGameList),
+        }
+    }
+}
+
+/// Selectable widget themes — upstream `UISettings::themes`.
+///
+/// Each entry is `(display name, internal name)`. GTK has no direct equivalent
+/// of Qt's `.qss` stylesheet themes, so only the two GTK provides natively
+/// (light / dark, via `gtk-application-prefer-dark-theme`) actually change the
+/// appearance; the rest are kept so the combo box matches upstream's contents.
+pub const THEMES: &[(&str, &str)] = &[
+    ("Default", "default"),
+    ("Default Colorful", "colorful"),
+    ("Dark", "qdarkstyle"),
+    ("Dark Colorful", "colorful_dark"),
+    ("Midnight Blue", "qdarkstyle_midnight_blue"),
+    ("Midnight Blue Colorful", "colorful_midnight_blue"),
+];
+
+/// Game-list row text sources — upstream `UISettings::game_list_row_text`,
+/// indexed by `row_1_text_id` / `row_2_text_id`.
+pub const GAME_LIST_ROW_TEXT: &[&str] = &[
+    "Filename",
+    "Filetype",
+    "Title ID",
+    "Title Name",
+    "None",
+];
+
+static VALUES: RwLock<Option<Values>> = RwLock::new(None);
+
+/// Shared read access to the frontend settings — upstream `UISettings::values`.
+pub fn values() -> RwLockReadGuard<'static, Option<Values>> {
+    ensure_initialized();
+    VALUES.read().unwrap()
+}
+
+/// Shared write access to the frontend settings.
+pub fn values_mut() -> RwLockWriteGuard<'static, Option<Values>> {
+    ensure_initialized();
+    VALUES.write().unwrap()
+}
+
+fn ensure_initialized() {
+    if VALUES.read().unwrap().is_some() {
+        return;
+    }
+    let mut guard = VALUES.write().unwrap();
+    if guard.is_none() {
+        *guard = Some(Values::default());
+    }
+}
+
+/// Convenience: run `f` with a shared reference to the values.
+pub fn with<R>(f: impl FnOnce(&Values) -> R) -> R {
+    let guard = values();
+    f(guard.as_ref().expect("UI settings initialized"))
+}
+
+/// Convenience: run `f` with a mutable reference to the values.
+pub fn with_mut<R>(f: impl FnOnce(&mut Values) -> R) -> R {
+    let mut guard = values_mut();
+    f(guard.as_mut().expect("UI settings initialized"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_upstream_uisettings() {
+        // Spot-check the defaults declared in upstream `uisettings.h`.
+        let v = Values::default();
+        assert!(*v.single_window_mode.get_value());
+        assert!(*v.show_status_bar.get_value());
+        assert!(*v.hide_mouse.get_value());
+        assert!(!*v.pause_when_in_background.get_value());
+        assert_eq!(*v.game_icon_size.get_value(), 64);
+        assert_eq!(*v.folder_icon_size.get_value(), 48);
+        assert_eq!(*v.row_1_text_id.get_value(), 3);
+        assert_eq!(*v.row_2_text_id.get_value(), 2);
+    }
+
+    #[test]
+    fn row_text_ids_index_game_list_row_text() {
+        let v = Values::default();
+        // Upstream's defaults render "Title Name" over "Title ID".
+        assert_eq!(GAME_LIST_ROW_TEXT[*v.row_1_text_id.get_value() as usize], "Title Name");
+        assert_eq!(GAME_LIST_ROW_TEXT[*v.row_2_text_id.get_value() as usize], "Title ID");
+    }
+
+    #[test]
+    fn global_values_are_lazily_initialized() {
+        let icon = with(|v| *v.game_icon_size.get_value());
+        assert_eq!(icon, 64);
+        with_mut(|v| v.game_icon_size.set_value(128));
+        assert_eq!(with(|v| *v.game_icon_size.get_value()), 128);
+        with_mut(|v| v.game_icon_size.set_value(64));
+    }
+}

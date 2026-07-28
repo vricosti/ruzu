@@ -1,32 +1,40 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Game list view — counterpart of upstream `GameList` / `GameListWorker`
-// (`/Users/vricosti/Dev/emulators/zuyu/src/yuzu/game_list*.cpp`). It reads the
-// configured game directories from the (yuzu-schema) config, scans them for
-// Switch executables, and shows them in a column view. Activating a row
-// (double-click / Enter) boots the game.
+// (`/home/vricosti/Dev/emulators/zuyu/src/yuzu/game_list*.cpp`). It reads the
+// configured game directories from ruzu's own config, scans them for Switch
+// executables, and shows them grouped under one expandable row per directory.
+// Activating a game row (double-click / Enter) boots it.
 //
-// This first version keys off the file itself (name from the filename, type
-// from the extension, size from the filesystem). Extracting the real title,
-// title id, and icon from the container (as upstream does via `Loader`) is a
-// follow-up.
+// Divergence from upstream, deliberate: yuzu exposes "add a game directory" as
+// a fake row appended *inside* the tree, which reads as an item belonging to
+// the scanned folder. Here that action lives in a toolbar above the list, so
+// the tree contains only real directories and real games. Per-directory actions
+// (remove, toggle deep scan) hang off a right-click menu on the directory row,
+// which is where upstream puts them too (`GameList::PopupContextMenu`).
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use common::fs::path_util::{get_ruzu_path, RuzuPath};
 use ruzu_core::file_sys::fs_filesystem::OpenMode;
 use ruzu_core::file_sys::registered_cache::ContentProviderUnion;
 use ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem;
 use ruzu_core::hle::service::filesystem::filesystem::FileSystemController;
-use ruzu_core::loader::loader::{get_loader, ResultStatus, System as LoaderSystem};
+use ruzu_core::loader::loader::{get_loader, FileType, ResultStatus, System as LoaderSystem};
+
+use crate::configuration::qt_config;
+use crate::uisettings::{self, GameDir};
 
 /// Pixel size of the game icon shown in the list.
 const ICON_SIZE: i32 = 48;
+
+/// Pixel size of the folder icon on a directory row.
+const FOLDER_ICON_SIZE: i32 = 24;
 
 /// Switch executable extensions listed in the game view. Mirrors
 /// `GameList::supported_file_extensions`.
@@ -39,7 +47,7 @@ const MAX_DEEP_SCAN_DEPTH: usize = 4;
 // GameEntry — a GObject row model for the ColumnView.
 // ---------------------------------------------------------------------------
 mod imp {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     use gtk::glib;
     use gtk::subclass::prelude::*;
@@ -51,6 +59,12 @@ mod imp {
         pub size: RefCell<String>,
         pub path: RefCell<String>,
         pub icon: RefCell<Option<gtk::gdk::Texture>>,
+        /// Directory rows group the games found beneath them.
+        pub is_folder: Cell<bool>,
+        /// Whether this directory is scanned recursively (directory rows only).
+        pub deep_scan: Cell<bool>,
+        /// Child rows, for directory rows.
+        pub children: RefCell<Option<gtk::gio::ListStore>>,
     }
 
     #[glib::object_subclass]
@@ -67,7 +81,14 @@ glib::wrapper! {
 }
 
 impl GameEntry {
-    fn new(name: &str, kind: &str, size: &str, path: &str, icon: Option<gdk::Texture>) -> Self {
+    /// A game row.
+    fn new_game(
+        name: &str,
+        kind: &str,
+        size: &str,
+        path: &str,
+        icon: Option<gdk::Texture>,
+    ) -> Self {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
         *imp.name.borrow_mut() = name.to_owned();
@@ -75,6 +96,19 @@ impl GameEntry {
         *imp.size.borrow_mut() = size.to_owned();
         *imp.path.borrow_mut() = path.to_owned();
         *imp.icon.borrow_mut() = icon;
+        imp.is_folder.set(false);
+        obj
+    }
+
+    /// A directory row, holding the games found under it.
+    fn new_folder(path: &str, deep_scan: bool, children: gio::ListStore) -> Self {
+        let obj: Self = glib::Object::new();
+        let imp = obj.imp();
+        *imp.name.borrow_mut() = path.to_owned();
+        *imp.path.borrow_mut() = path.to_owned();
+        imp.is_folder.set(true);
+        imp.deep_scan.set(deep_scan);
+        *imp.children.borrow_mut() = Some(children);
         obj
     }
 
@@ -93,63 +127,593 @@ impl GameEntry {
     fn icon(&self) -> Option<gdk::Texture> {
         self.imp().icon.borrow().clone()
     }
+    fn is_folder(&self) -> bool {
+        self.imp().is_folder.get()
+    }
+    fn deep_scan(&self) -> bool {
+        self.imp().deep_scan.get()
+    }
+    fn children(&self) -> Option<gio::ListStore> {
+        self.imp().children.borrow().clone()
+    }
+}
+
+/// The game list: a toolbar over either the tree or an empty-state placeholder.
+///
+/// Kept as a struct so the toolbar actions can rebuild the tree in place, the
+/// way upstream re-runs `GameListWorker` after the directory list changes.
+struct GameListView {
+    root: gtk::Box,
+    stack: gtk::Stack,
+    store: gio::ListStore,
+    /// Kept so a rescan can restore the selected directory: rebuilding the
+    /// store clears the selection, which would otherwise disable the
+    /// per-directory toolbar actions after every single use of them.
+    selection: gtk::SingleSelection,
+}
+
+/// Stack page names.
+const PAGE_LIST: &str = "list";
+const PAGE_EMPTY: &str = "empty";
+
+/// Handle to a built game list, letting the owner rescan it after the
+/// configured directories change (e.g. once a yuzu config has been imported).
+///
+/// Holding it also keeps the view alive for the widget's lifetime.
+#[derive(Clone)]
+pub struct GameListHandle(Rc<GameListView>);
+
+impl GameListHandle {
+    /// Re-read the configured directories and rebuild the list.
+    pub fn reload(&self) {
+        self.0.reload();
+    }
 }
 
 /// Build the game list widget. `on_activate` is invoked with the game's path
-/// when a row is activated (double-click / Enter).
-pub fn build<F: Fn(String) + 'static>(on_activate: F) -> gtk::Widget {
+/// when a game row is activated (double-click / Enter).
+pub fn build<F: Fn(String) + 'static>(on_activate: F) -> (gtk::Widget, GameListHandle) {
+    install_list_css();
+
     let store = gio::ListStore::new::<GameEntry>();
-    let games = scan_all_games();
-    log::info!("Game list: found {} game(s)", games.len());
-    for game in games {
-        // Decode the control-data icon (JPEG) into a texture on the main thread.
-        let icon = game
-            .icon
-            .as_ref()
-            .and_then(|bytes| gdk::Texture::from_bytes(&glib::Bytes::from(bytes.as_slice())).ok());
-        store.append(&GameEntry::new(
-            &game.name,
-            &game.kind,
-            &human_size(game.size),
-            &game.path.to_string_lossy(),
-            icon,
-        ));
-    }
 
-    let selection = gtk::SingleSelection::new(Some(store));
-    let column_view = gtk::ColumnView::new(Some(selection));
-    column_view.add_css_class("data-table");
-
-    column_view.append_column(&make_icon_column());
-    let name_col = make_column("Name", GameEntry::name, true);
-    column_view.append_column(&name_col);
-    column_view.append_column(&make_column("File type", GameEntry::kind, false));
-    column_view.append_column(&make_column("Size", GameEntry::size, false));
-
-    // Activate (double-click / Enter) → boot.
-    let on_activate = std::rc::Rc::new(on_activate);
-    column_view.connect_activate(move |view, position| {
-        if let Some(item) = view.model().and_then(|model| model.item(position)) {
-            if let Ok(entry) = item.downcast::<GameEntry>() {
-                on_activate(entry.path());
-            }
-        }
+    // --- Tree ------------------------------------------------------------
+    // One expandable row per configured directory; its games are the children.
+    let tree = gtk::TreeListModel::new(store.clone(), false, true, |item| {
+        item.downcast_ref::<GameEntry>()
+            .and_then(GameEntry::children)
+            .map(Cast::upcast)
     });
 
-    gtk::ScrolledWindow::builder()
+    let selection = gtk::SingleSelection::new(Some(tree));
+    // Upstream opens the game list with nothing selected; GTK's default is to
+    // auto-select the first row, which would highlight a game the user never
+    // picked.
+    selection.set_autoselect(false);
+    selection.set_can_unselect(true);
+    selection.set_selected(gtk::INVALID_LIST_POSITION);
+
+    let column_view = gtk::ColumnView::new(Some(selection.clone()));
+    column_view.add_css_class("data-table");
+    column_view.add_css_class("ruzu-game-list");
+    // The banding comes from the CSS below, not from GTK's separators.
+    column_view.set_show_row_separators(false);
+    column_view.set_show_column_separators(false);
+
+    column_view.append_column(&make_text_column("File type", GameEntry::kind));
+    column_view.append_column(&make_text_column("Size", GameEntry::size));
+
+    let on_activate: Rc<dyn Fn(String)> = Rc::new(on_activate);
+
+    // Activate (double-click / Enter) → boot a game; on a directory row, toggle
+    // it open instead, which is what a tree row activation should do.
+    {
+        let on_activate = Rc::clone(&on_activate);
+        column_view.connect_activate(move |view, position| {
+            let Some(row) = view
+                .model()
+                .and_then(|model| model.item(position))
+                .and_downcast::<gtk::TreeListRow>()
+            else {
+                return;
+            };
+            let Some(entry) = row.item().and_downcast::<GameEntry>() else {
+                return;
+            };
+            if entry.is_folder() {
+                row.set_expanded(!row.is_expanded());
+            } else {
+                on_activate(entry.path());
+            }
+        });
+    }
+
+    let scroller = gtk::ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
         .child(&column_view)
-        .build()
-        .upcast()
+        .build();
+
+    // --- Empty state ------------------------------------------------------
+    let empty = build_empty_state();
+
+    let stack = gtk::Stack::new();
+    stack.add_named(&scroller, Some(PAGE_LIST));
+    stack.add_named(&empty.root, Some(PAGE_EMPTY));
+
+    // --- Toolbar ----------------------------------------------------------
+    let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    // `ruzu-toolbar` draws the separating rule; without it the strip blends
+    // into the list and reintroduces exactly the ambiguity this layout is
+    // meant to remove.
+    toolbar.add_css_class("ruzu-toolbar");
+    toolbar.set_margin_top(4);
+    toolbar.set_margin_bottom(4);
+    toolbar.set_margin_start(6);
+    toolbar.set_margin_end(6);
+
+    // `Button::builder().label(..).icon_name(..)` is not additive — setting
+    // `icon_name` replaces the label child — so build the icon+label row
+    // explicitly.
+    let add_button = icon_label_button("list-add-symbolic", "Add Game Directory");
+    let refresh_button = gtk::Button::builder()
+        .icon_name("view-refresh-symbolic")
+        .tooltip_text("Rescan game directories")
+        .build();
+    // Per-directory actions act on the selected directory row. They live in the
+    // toolbar rather than a right-click menu because GTK4's ColumnView offers
+    // no reliable hit-test from a click back to the row under it, and a menu
+    // that silently fails to open is worse than a visible disabled button.
+    let deep_scan_toggle = gtk::ToggleButton::builder()
+        .label("Scan Subfolders")
+        .tooltip_text("Scan the selected directory recursively")
+        .sensitive(false)
+        .build();
+    let remove_button = icon_label_button("list-remove-symbolic", "Remove Directory");
+    remove_button.set_sensitive(false);
+
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+
+    toolbar.append(&add_button);
+    toolbar.append(&refresh_button);
+    toolbar.append(&spacer);
+    toolbar.append(&deep_scan_toggle);
+    toolbar.append(&remove_button);
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.append(&toolbar);
+    root.append(&stack);
+
+    let view = Rc::new(GameListView {
+        root: root.clone(),
+        stack,
+        store,
+        selection: selection.clone(),
+    });
+
+    // The Name column's cells carry the per-directory right-click menu, so the
+    // column is built once the view it acts on exists, and inserted first.
+    column_view.insert_column(0, &make_name_column(&view));
+
+    view.reload();
+
+    // Toolbar + empty-state actions.
+    for button in [&add_button, &empty.add_button] {
+        let view = Rc::clone(&view);
+        button.connect_clicked(move |_| view.prompt_add_directory());
+    }
+    {
+        let view = Rc::clone(&view);
+        refresh_button.connect_clicked(move |_| view.reload());
+    }
+
+    // Set while the toggle is being synced to the selection, so the resulting
+    // `toggled` signal is not mistaken for a user action and written back.
+    let syncing = Rc::new(std::cell::Cell::new(false));
+
+    // Enable the per-directory actions only while a directory row is selected,
+    // and reflect that directory's deep-scan state on the toggle.
+    {
+        let deep_scan_toggle = deep_scan_toggle.clone();
+        let remove_button = remove_button.clone();
+        let syncing = Rc::clone(&syncing);
+        selection.connect_selected_item_notify(move |selection| {
+            let entry = selection
+                .selected_item()
+                .and_downcast::<gtk::TreeListRow>()
+                .and_then(|row| row.item())
+                .and_downcast::<GameEntry>()
+                .filter(|entry| entry.is_folder());
+
+            let is_directory = entry.is_some();
+            deep_scan_toggle.set_sensitive(is_directory);
+            remove_button.set_sensitive(is_directory);
+            if let Some(entry) = entry {
+                syncing.set(true);
+                deep_scan_toggle.set_active(entry.deep_scan());
+                syncing.set(false);
+            }
+        });
+    }
+
+    {
+        let view = Rc::clone(&view);
+        let selection = selection.clone();
+        let syncing = Rc::clone(&syncing);
+        deep_scan_toggle.connect_toggled(move |toggle| {
+            if syncing.get() {
+                return;
+            }
+            let Some(path) = selected_directory_path(&selection) else {
+                return;
+            };
+            view.set_deep_scan(&path, toggle.is_active());
+        });
+    }
+
+    {
+        let view = Rc::clone(&view);
+        let selection = selection.clone();
+        remove_button.connect_clicked(move |_| {
+            let Some(path) = selected_directory_path(&selection) else {
+                return;
+            };
+            view.remove_directory(&path);
+        });
+    }
+
+    (root.upcast(), GameListHandle(view))
 }
 
-/// Build one column bound to a `GameEntry` string getter.
-fn make_column(
-    title: &str,
-    getter: fn(&GameEntry) -> String,
-    expand: bool,
-) -> gtk::ColumnViewColumn {
+/// A button showing an icon beside a text label.
+fn icon_label_button(icon_name: &str, label: &str) -> gtk::Button {
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    content.append(&gtk::Image::from_icon_name(icon_name));
+    content.append(&gtk::Label::new(Some(label)));
+
+    let button = gtk::Button::new();
+    button.set_child(Some(&content));
+    button
+}
+
+/// The centred call-to-action shown when no game directory is configured.
+struct EmptyState {
+    root: gtk::Box,
+    add_button: gtk::Button,
+}
+
+fn build_empty_state() -> EmptyState {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    root.set_valign(gtk::Align::Center);
+    root.set_halign(gtk::Align::Center);
+    root.set_hexpand(true);
+    root.set_vexpand(true);
+
+    let icon = gtk::Image::from_icon_name("folder-symbolic");
+    icon.set_pixel_size(64);
+    icon.add_css_class("dim-label");
+    root.append(&icon);
+
+    let title = gtk::Label::new(Some("No games found"));
+    title.add_css_class("title-2");
+    root.append(&title);
+
+    let subtitle = gtk::Label::new(Some(
+        "Add the folder that holds your Switch titles to get started.",
+    ));
+    subtitle.add_css_class("dim-label");
+    root.append(&subtitle);
+
+    let add_button = gtk::Button::with_label("Add Game Directory");
+    add_button.add_css_class("suggested-action");
+    add_button.set_halign(gtk::Align::Center);
+    root.append(&add_button);
+
+    EmptyState { root, add_button }
+}
+
+impl GameListView {
+    /// Rescan every configured directory and rebuild the tree — upstream
+    /// re-runs `GameListWorker` after the directory list changes.
+    fn reload(&self) {
+        // Rebuilding the store drops the selection; remember which directory
+        // was picked so it can be restored afterwards.
+        let previously_selected = selected_directory_path(&self.selection);
+
+        let dirs = uisettings::with(|v| v.game_dirs.clone());
+        let scannable: Vec<GameDir> = dirs
+            .into_iter()
+            .filter(GameDir::is_filesystem_path)
+            .collect();
+
+        self.store.remove_all();
+
+        let mut total = 0;
+        for dir in &scannable {
+            let games = scan_dir_games(Path::new(&dir.path), dir.deep_scan);
+            total += games.len();
+
+            let children = gio::ListStore::new::<GameEntry>();
+            for game in games {
+                // Decode the control-data icon (JPEG) into a texture on the
+                // main thread.
+                let icon = game.icon.as_ref().and_then(|bytes| {
+                    gdk::Texture::from_bytes(&glib::Bytes::from(bytes.as_slice())).ok()
+                });
+                children.append(&GameEntry::new_game(
+                    &game.name,
+                    &game.kind,
+                    &human_size(game.size),
+                    &game.path.to_string_lossy(),
+                    icon,
+                ));
+            }
+            self.store
+                .append(&GameEntry::new_folder(&dir.path, dir.deep_scan, children));
+        }
+
+        log::info!(
+            "Game list: found {total} game(s) across {} directory(ies)",
+            scannable.len()
+        );
+
+        self.stack.set_visible_child_name(if scannable.is_empty() {
+            PAGE_EMPTY
+        } else {
+            PAGE_LIST
+        });
+
+        if let Some(path) = previously_selected {
+            self.select_directory(&path);
+        }
+    }
+
+    /// Re-select the directory row for `path` after a rescan.
+    ///
+    /// The tree model is flat while every directory is collapsed, so the row
+    /// index equals the directory index — but expanded directories contribute
+    /// their games, so search the model rather than assuming.
+    fn select_directory(&self, path: &str) {
+        let model = self.selection.model();
+        let Some(model) = model else { return };
+        for position in 0..model.n_items() {
+            let matches = model
+                .item(position)
+                .and_downcast::<gtk::TreeListRow>()
+                .and_then(|row| row.item())
+                .and_downcast::<GameEntry>()
+                .is_some_and(|entry| entry.is_folder() && entry.path() == path);
+            if matches {
+                self.selection.set_selected(position);
+                return;
+            }
+        }
+    }
+
+    /// Ask for a directory and add it — upstream `GMainWindow::OnGameListAddDirectory`.
+    fn prompt_add_directory(self: &Rc<Self>) {
+        let dialog = gtk::FileDialog::builder()
+            .title("Select Game Directory")
+            .modal(true)
+            .build();
+        let parent = self.root.root().and_downcast::<gtk::Window>();
+        let view = Rc::clone(self);
+        dialog.select_folder(parent.as_ref(), gio::Cancellable::NONE, move |result| {
+            let Ok(folder) = result else { return };
+            let Some(path) = folder.path() else { return };
+            view.add_directory(&path.to_string_lossy());
+        });
+    }
+
+    /// Add `path` to the configured directories, unless it is already there.
+    fn add_directory(&self, path: &str) {
+        let already_present = uisettings::with(|v| v.game_dirs.iter().any(|d| d.path == path));
+        if already_present {
+            log::info!("Game list: {path} is already a game directory");
+            return;
+        }
+        uisettings::with_mut(|v| {
+            v.game_dirs.push(GameDir {
+                path: path.to_string(),
+                // Upstream's "Add New Game Directory" defaults deep scan off;
+                // it is offered per-directory afterwards.
+                deep_scan: false,
+                expanded: true,
+            })
+        });
+        self.persist();
+        self.reload();
+    }
+
+    /// Remove the directory at `path` — upstream's "Remove Game Directory".
+    fn remove_directory(&self, path: &str) {
+        uisettings::with_mut(|v| v.game_dirs.retain(|d| d.path != path));
+        self.persist();
+        self.reload();
+    }
+
+    /// Toggle recursive scanning for `path` — upstream's "Scan Subfolders".
+    fn set_deep_scan(&self, path: &str, deep_scan: bool) {
+        uisettings::with_mut(|v| {
+            if let Some(dir) = v.game_dirs.iter_mut().find(|d| d.path == path) {
+                dir.deep_scan = deep_scan;
+            }
+        });
+        self.persist();
+        self.reload();
+    }
+
+    /// Write the directory list back to ruzu's own config.
+    fn persist(&self) {
+        let dirs = uisettings::with(|v| v.game_dirs.clone());
+        if let Err(e) = qt_config::save_game_dirs(&dirs) {
+            log::error!("Failed to save game directories: {e}");
+        }
+    }
+}
+
+/// Key under which each Name cell stashes the entry it is currently bound to.
+const ENTRY_DATA_KEY: &str = "ruzu-game-entry";
+
+/// Path of the directory row currently selected, if any.
+fn selected_directory_path(selection: &gtk::SingleSelection) -> Option<String> {
+    selection
+        .selected_item()
+        .and_downcast::<gtk::TreeListRow>()
+        .and_then(|row| row.item())
+        .and_downcast::<GameEntry>()
+        .filter(|entry| entry.is_folder())
+        .map(|entry| entry.path())
+}
+
+/// Install the game-list CSS once.
+///
+/// Two effects upstream gets from Qt for free:
+///  * `QTreeView::alternatingRowColors`, set on the game list in `main.ui`,
+///    which produces the grey/white banding;
+///  * `QPalette::Highlight` for the selected row.
+///
+/// GTK4's `ColumnView` has no alternating-row property, so the banding is done
+/// with `:nth-child(even)` over the row widgets, derived from
+/// `@theme_base_color` so it stays legible in both light and dark themes (see
+/// `main_window::update_ui_theme`).
+fn install_list_css() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let Some(display) = gdk::Display::default() else {
+            return;
+        };
+        let provider = gtk::CssProvider::new();
+        provider.load_from_data(&format!(
+            ".ruzu-game-list > listview > row:nth-child(even) {{\
+                 background-color: shade(@theme_base_color, {ALTERNATE_ROW_SHADE});\
+             }}\
+             .ruzu-game-list > listview > row:nth-child(odd) {{\
+                 background-color: @theme_base_color;\
+             }}\
+             .ruzu-game-list > listview > row:selected {{\
+                 background-color: {SELECTION_BG};\
+                 color: #ffffff;\
+             }}\
+             .ruzu-game-list > listview > row:selected:focus {{\
+                 outline: none;\
+             }}\
+             .ruzu-toolbar {{\
+                 background-color: shade(@theme_bg_color, 1.02);\
+                 border-bottom: 1px solid @borders;\
+             }}"
+        ));
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    });
+}
+
+/// Selected-row background — Qt's `QPalette::Highlight` as the Fusion style
+/// defines it, sampled from yuzu's own game list.
+///
+/// This is deliberately *not* GTK's `@theme_selected_bg_color`. yuzu runs its
+/// default ("colorful") theme without a stylesheet, so its highlight comes from
+/// the Qt style palette, which is a fixed blue rather than the desktop accent
+/// colour. Inheriting the GTK accent instead makes the row orange on Ubuntu's
+/// Yaru theme, purple on some others — a different colour per desktop, where
+/// yuzu is blue everywhere.
+const SELECTION_BG: &str = "#308CC6";
+
+/// Alternating-row shade, likewise sampled from yuzu (`#F7F7F7` over white).
+/// Expressed as a shade factor so it also works on a dark theme.
+const ALTERNATE_ROW_SHADE: f32 = 0.97;
+
+/// The "Name" column: expander, icon, and label, so a directory row can be
+/// collapsed and its games are indented under it. Upstream likewise puts the
+/// icon inside the Name column rather than in a column of its own.
+fn make_name_column(view: &Rc<GameListView>) -> gtk::ColumnViewColumn {
+    let factory = gtk::SignalListItemFactory::new();
+    let view = Rc::clone(view);
+    factory.connect_setup(move |_, item| {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let picture = gtk::Picture::new();
+        picture.set_content_fit(gtk::ContentFit::Contain);
+        let label = gtk::Label::builder().xalign(0.0).build();
+        row.append(&picture);
+        row.append(&label);
+
+        let expander = gtk::TreeExpander::new();
+        expander.set_child(Some(&row));
+
+        item.downcast_ref::<gtk::ListItem>()
+            .unwrap()
+            .set_child(Some(&expander));
+    });
+    factory.connect_bind(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+        let Some(expander) = item.child().and_downcast::<gtk::TreeExpander>() else {
+            return;
+        };
+        let Some(tree_row) = item.item().and_downcast::<gtk::TreeListRow>() else {
+            return;
+        };
+        expander.set_list_row(Some(&tree_row));
+
+        let Some(entry) = tree_row.item().and_downcast::<GameEntry>() else {
+            return;
+        };
+        // Record which entry this cell now shows, for its right-click gesture.
+        unsafe {
+            expander.set_data(ENTRY_DATA_KEY, entry.clone());
+        }
+        let Some(row) = expander.child().and_downcast::<gtk::Box>() else {
+            return;
+        };
+        let Some(picture) = row.first_child().and_downcast::<gtk::Picture>() else {
+            return;
+        };
+        let Some(label) = row.last_child().and_downcast::<gtk::Label>() else {
+            return;
+        };
+
+        if entry.is_folder() {
+            picture.set_size_request(FOLDER_ICON_SIZE, FOLDER_ICON_SIZE);
+            picture.set_paintable(gtk::gdk::Paintable::NONE);
+            // A themed folder icon rather than control-data artwork.
+            picture.set_paintable(folder_paintable().as_ref());
+        } else {
+            picture.set_size_request(ICON_SIZE, ICON_SIZE);
+            picture.set_paintable(entry.icon().as_ref());
+        }
+        label.set_label(&entry.name());
+    });
+
+    let column = gtk::ColumnViewColumn::new(Some("Name"), Some(factory));
+    column.set_expand(true);
+    column.set_resizable(true);
+    column
+}
+
+/// The themed folder icon used on directory rows.
+fn folder_paintable() -> Option<gdk::Paintable> {
+    let display = gdk::Display::default()?;
+    let theme = gtk::IconTheme::for_display(&display);
+    Some(
+        theme
+            .lookup_icon(
+                "folder",
+                &[],
+                FOLDER_ICON_SIZE,
+                1,
+                gtk::TextDirection::None,
+                gtk::IconLookupFlags::empty(),
+            )
+            .upcast(),
+    )
+}
+
+/// Build one plain-text column bound to a `GameEntry` string getter.
+fn make_text_column(title: &str, getter: fn(&GameEntry) -> String) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
@@ -158,44 +722,21 @@ fn make_column(
     });
     factory.connect_bind(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let Some(entry) = item.item().and_downcast::<GameEntry>() else {
-            return;
-        };
         let Some(label) = item.child().and_downcast::<gtk::Label>() else {
             return;
         };
-        label.set_label(&getter(&entry));
+        let text = item
+            .item()
+            .and_downcast::<gtk::TreeListRow>()
+            .and_then(|row| row.item())
+            .and_downcast::<GameEntry>()
+            .map(|entry| getter(&entry))
+            .unwrap_or_default();
+        label.set_label(&text);
     });
 
     let column = gtk::ColumnViewColumn::new(Some(title), Some(factory));
-    column.set_expand(expand);
     column.set_resizable(true);
-    column
-}
-
-/// Build the leading icon column showing each game's control-data icon.
-fn make_icon_column() -> gtk::ColumnViewColumn {
-    let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
-        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let picture = gtk::Picture::new();
-        picture.set_size_request(ICON_SIZE, ICON_SIZE);
-        picture.set_content_fit(gtk::ContentFit::Contain);
-        item.set_child(Some(&picture));
-    });
-    factory.connect_bind(|_, item| {
-        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let Some(entry) = item.item().and_downcast::<GameEntry>() else {
-            return;
-        };
-        let Some(picture) = item.child().and_downcast::<gtk::Picture>() else {
-            return;
-        };
-        picture.set_paintable(entry.icon().as_ref());
-    });
-
-    let column = gtk::ColumnViewColumn::new(Some(""), Some(factory));
-    column.set_resizable(false);
     column
 }
 
@@ -215,31 +756,52 @@ struct GameFile {
     icon: Option<Vec<u8>>,
 }
 
-/// Scan every configured game directory for Switch executables and read each
-/// one's title and icon from its control data.
-fn scan_all_games() -> Vec<GameFile> {
-    let mut games = Vec::new();
-    for (dir, deep_scan) in read_game_dirs() {
-        let max_depth = if deep_scan { MAX_DEEP_SCAN_DEPTH } else { 0 };
-        scan_dir(&dir, max_depth, &mut games);
-    }
+/// Scan one directory and return the games it holds, sorted by title.
+///
+/// Mirrors upstream `GameListWorker::ScanFileSystem`: a candidate file is only
+/// listed once a `Loader` accepts it *and* reports a real file type. That check
+/// is what keeps update/DLC packages out of the list — an update-only NSP's
+/// program NCA carries `ErrorMissingBKTRBaseRomFS` (it is a patch with no base
+/// RomFS of its own), so `NSP::GetStatus()` is not `Success`, the loader
+/// identifies the file as `FileType::Error`, and upstream skips it:
+///
+/// ```cpp
+/// const auto file_type = loader->GetFileType();
+/// if (file_type == Loader::FileType::Unknown || file_type == Loader::FileType::Error) {
+///     return true;   // skip
+/// }
+/// ```
+fn scan_dir_games(dir: &Path, deep_scan: bool) -> Vec<GameFile> {
+    let mut candidates = Vec::new();
+    let max_depth = if deep_scan { MAX_DEEP_SCAN_DEPTH } else { 0 };
+    collect_candidates(dir, max_depth, &mut candidates);
 
-    // Enrich with title + icon from each container's control NCA.
+    // Load each candidate once, keeping only what the loader accepts, and take
+    // its title + icon from the same loader (upstream reuses the one loader for
+    // `GetFileType` / `ReadTitle` / `ReadIcon` too).
     let mut reader = MetadataReader::new();
-    for game in &mut games {
-        let (title, icon) = reader.read(&game.path.to_string_lossy());
-        if let Some(title) = title {
+    let mut games = Vec::with_capacity(candidates.len());
+    for mut game in candidates {
+        let Some(metadata) = reader.read(&game.path.to_string_lossy()) else {
+            log::debug!(
+                "Game list: skipping {} (no loader accepted it)",
+                game.path.display()
+            );
+            continue;
+        };
+        if let Some(title) = metadata.title {
             game.name = title;
         }
-        game.icon = icon;
+        game.icon = metadata.icon;
+        games.push(game);
     }
 
     games.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     games
 }
 
-/// Recursively (up to `max_depth`) collect game files under `dir`.
-fn scan_dir(dir: &Path, max_depth: usize, games: &mut Vec<GameFile>) {
+/// Recursively (up to `max_depth`) collect candidate game files under `dir`.
+fn collect_candidates(dir: &Path, max_depth: usize, games: &mut Vec<GameFile>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -250,7 +812,7 @@ fn scan_dir(dir: &Path, max_depth: usize, games: &mut Vec<GameFile>) {
         };
         if file_type.is_dir() {
             if max_depth > 0 {
-                scan_dir(&path, max_depth - 1, games);
+                collect_candidates(&path, max_depth - 1, games);
             }
             continue;
         }
@@ -301,14 +863,18 @@ impl MetadataReader {
         Self { vfs, loader_system }
     }
 
-    /// Return `(title, icon_jpeg)` for the game at `path`; either may be `None`.
-    fn read(&mut self, path: &str) -> (Option<String>, Option<Vec<u8>>) {
-        let Some(file) = self.vfs.arc_open_file(path, OpenMode::READ) else {
-            return (None, None);
-        };
-        let Some(loader) = get_loader(&mut self.loader_system, file, 0, 0) else {
-            return (None, None);
-        };
+    /// Metadata for a game the loader accepted; `None` when the file is not a
+    /// bootable title (no loader, or `FileType::Unknown` / `FileType::Error`).
+    fn read(&mut self, path: &str) -> Option<GameMetadata> {
+        let file = self.vfs.arc_open_file(path, OpenMode::READ)?;
+        let loader = get_loader(&mut self.loader_system, file, 0, 0)?;
+
+        // Upstream's skip condition, verbatim: an update-only NSP lands here as
+        // `Error` because its program NCA has no base RomFS to patch.
+        let file_type = loader.get_file_type();
+        if matches!(file_type, FileType::Unknown | FileType::Error) {
+            return None;
+        }
 
         let mut title = String::new();
         let title = if loader.read_title(&mut title) == ResultStatus::Success && !title.is_empty() {
@@ -324,62 +890,14 @@ impl MetadataReader {
             None
         };
 
-        (title, icon)
+        Some(GameMetadata { title, icon })
     }
 }
 
-/// Read the configured game directories (absolute paths only) and their
-/// deep-scan flags from the ruzu config (yuzu `Paths\gamedirs\N\...` schema).
-fn read_game_dirs() -> Vec<(PathBuf, bool)> {
-    let config = get_ruzu_path(RuzuPath::ConfigDir).join("qt-config.ini");
-    let Ok(contents) = std::fs::read_to_string(&config) else {
-        return Vec::new();
-    };
-
-    use std::collections::BTreeMap;
-    let mut paths: BTreeMap<u32, String> = BTreeMap::new();
-    let mut deep: BTreeMap<u32, bool> = BTreeMap::new();
-
-    for line in contents.lines() {
-        let line = line.trim();
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        // Keys look like `Paths\gamedirs\4\path` or `Paths\gamedirs\4\deep_scan`.
-        let Some(rest) = key.strip_prefix("Paths\\gamedirs\\") else {
-            continue;
-        };
-        let Some((index_str, field)) = rest.split_once('\\') else {
-            continue;
-        };
-        let Ok(index) = index_str.parse::<u32>() else {
-            continue;
-        };
-        match field {
-            "path" => {
-                paths.insert(index, value.to_owned());
-            }
-            "deep_scan" => {
-                deep.insert(index, matches!(value, "true" | "1"));
-            }
-            _ => {}
-        }
-    }
-
-    paths
-        .into_iter()
-        .filter_map(|(index, path)| {
-            // Skip the special tokens (SDMC / UserNAND / SysNAND) — only real
-            // filesystem directories are scanned for now.
-            if !path.starts_with('/') {
-                return None;
-            }
-            Some((
-                PathBuf::from(path),
-                deep.get(&index).copied().unwrap_or(false),
-            ))
-        })
-        .collect()
+/// What [`MetadataReader::read`] recovers from a container.
+struct GameMetadata {
+    title: Option<String>,
+    icon: Option<Vec<u8>>,
 }
 
 /// Human-readable byte size (KiB / MiB / GiB), matching yuzu's display style.
@@ -395,5 +913,27 @@ fn human_size(bytes: u64) -> String {
         format!("{bytes} {}", UNITS[unit])
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_size_matches_yuzu_formatting() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(21_599_437), "20.6 MiB");
+        assert_eq!(human_size(7_301_444_403), "6.8 GiB");
+    }
+
+    #[test]
+    fn supported_extensions_cover_every_switch_container() {
+        // Mirrors `GameList::supported_file_extensions`; dropping one silently
+        // hides a whole class of dumps.
+        for ext in ["nsp", "xci", "nca", "nro", "nso", "kip"] {
+            assert!(SUPPORTED_EXTENSIONS.contains(&ext), "{ext} missing");
+        }
     }
 }

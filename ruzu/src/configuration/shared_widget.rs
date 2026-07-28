@@ -1,0 +1,226 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Rust/GTK4 counterpart of the upstream row-building helpers in
+// `/home/vricosti/Dev/emulators/zuyu/src/yuzu/configuration/shared_widget.cpp`
+// (`ConfigurationShared::Widget` and its `CreateCheckBox` / `CreateCombobox` /
+// `CreateLineEdit` / `CreateSlider` / `CreateSpinBox` builders).
+//
+// Upstream builds one `ConfigurationShared::Widget` per `Settings::BasicSetting`
+// and lays it out as `[label] .......... [control]` inside a `QGroupBox`. This
+// module provides the same row shapes in GTK4 so every configuration page can
+// be written declaratively, keeping the visual result close to the Qt dialog.
+//
+// Divergence from upstream: upstream drives widget creation generically off the
+// `BasicSetting` type + `Specialization`, because Qt needs runtime type erasure
+// to walk the settings registry. The Rust port constructs rows explicitly at
+// each call site instead — the concrete `Setting<T>` types are known statically,
+// so the generic builder would add indirection without adding capability. The
+// row *shapes* below are the same ones upstream produces.
+
+use gtk::prelude::*;
+
+/// Left-column width for row labels, in characters. Qt sizes the label column
+/// to the widest label in the group; GTK's size groups are per-page, so a fixed
+/// request keeps the controls aligned across groups like the Qt dialog does.
+const LABEL_COLUMN_CHARS: i32 = 30;
+
+/// Build a titled group — upstream `QGroupBox`.
+///
+/// Returns `(outer, content)`: append the group's `outer` to the page, and each
+/// row to `content`. The title sits above a framed box, matching the flat
+/// group style the Qt dialog uses (see the "General" / "Linux" groups in
+/// `configure_general.ui`).
+pub fn group(title: &str) -> (gtk::Box, gtk::Box) {
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    outer.set_margin_bottom(8);
+
+    if !title.is_empty() {
+        let label = gtk::Label::new(Some(title));
+        label.set_xalign(0.0);
+        label.set_margin_bottom(2);
+        outer.append(&label);
+    }
+
+    let frame = gtk::Frame::new(None);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    content.set_margin_top(8);
+    content.set_margin_bottom(8);
+    content.set_margin_start(10);
+    content.set_margin_end(10);
+    frame.set_child(Some(&content));
+    outer.append(&frame);
+
+    (outer, content)
+}
+
+/// A page scaffold: a vertically scrolling column of groups.
+///
+/// Upstream pages are `QWidget`s with a vertical layout plus a trailing
+/// `QSpacerItem` that pushes the groups to the top; the `valign: Start` on the
+/// column here has the same effect.
+pub fn page() -> (gtk::ScrolledWindow, gtk::Box) {
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    column.set_margin_top(10);
+    column.set_margin_bottom(10);
+    column.set_margin_start(10);
+    column.set_margin_end(10);
+    column.set_valign(gtk::Align::Start);
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .hexpand(true)
+        .vexpand(true)
+        .child(&column)
+        .build();
+
+    (scroller, column)
+}
+
+/// `[label] .......... [control]` row — upstream's label + widget pairing.
+///
+/// The control is right-aligned and takes the remaining width, matching the Qt
+/// dialog where combo boxes and line edits fill the right half of the row.
+pub fn labeled_row(label: &str, control: &impl IsA<gtk::Widget>) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+
+    let name = gtk::Label::new(Some(label));
+    name.set_xalign(0.0);
+    name.set_width_chars(LABEL_COLUMN_CHARS);
+    name.set_max_width_chars(LABEL_COLUMN_CHARS);
+    row.append(&name);
+
+    let control = control.as_ref();
+    control.set_hexpand(true);
+    row.append(control);
+
+    row
+}
+
+/// Combo box row — upstream `ConfigurationShared::Widget::CreateCombobox`.
+///
+/// `active` is the index of the initially selected entry.
+pub fn combo_row(label: &str, items: &[&str], active: u32) -> (gtk::Box, gtk::DropDown) {
+    let dropdown = combo(items, active);
+    (labeled_row(label, &dropdown), dropdown)
+}
+
+/// Bare combo box, for rows that need custom placement.
+pub fn combo(items: &[&str], active: u32) -> gtk::DropDown {
+    let model = gtk::StringList::new(items);
+    let dropdown = gtk::DropDown::new(Some(model), gtk::Expression::NONE);
+    // Guard against an out-of-range stored setting selecting nothing at all;
+    // upstream's `setCurrentIndex` silently clamps the same way.
+    if (active as usize) < items.len() {
+        dropdown.set_selected(active);
+    }
+    dropdown
+}
+
+/// Check box row — upstream `ConfigurationShared::Widget::CreateCheckBox`.
+///
+/// Upstream check boxes span the full row width with the label to the right of
+/// the box, rather than using the `[label] [control]` split.
+pub fn check_row(label: &str, active: bool) -> gtk::CheckButton {
+    let check = gtk::CheckButton::with_label(label);
+    check.set_active(active);
+    check
+}
+
+/// Text entry row — upstream `ConfigurationShared::Widget::CreateLineEdit`.
+pub fn entry_row(label: &str, text: &str) -> (gtk::Box, gtk::Entry) {
+    let entry = gtk::Entry::new();
+    entry.set_text(text);
+    (labeled_row(label, &entry), entry)
+}
+
+/// Spin-button row — upstream `ConfigurationShared::Widget::CreateSpinBox`.
+///
+/// `suffix` mirrors the Qt spin box suffix (e.g. `"%"` for the speed limit).
+pub fn spin_row(
+    label: &str,
+    value: f64,
+    min: f64,
+    max: f64,
+    step: f64,
+) -> (gtk::Box, gtk::SpinButton) {
+    let spin = gtk::SpinButton::with_range(min, max, step);
+    spin.set_value(value);
+    (labeled_row(label, &spin), spin)
+}
+
+/// Slider row with a trailing percentage readout — upstream
+/// `ConfigurationShared::Widget::CreateSlider` with `Specialization::Percentage`.
+///
+/// Returns the row, the scale, and the readout label so callers can keep the
+/// two in sync (upstream connects `valueChanged` to update its label likewise).
+pub fn percent_slider_row(
+    label: &str,
+    value: f64,
+    min: f64,
+    max: f64,
+) -> (gtk::Box, gtk::Scale, gtk::Label) {
+    let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, min, max, 1.0);
+    scale.set_value(value);
+    scale.set_draw_value(false);
+    scale.set_hexpand(true);
+
+    let readout = gtk::Label::new(Some(&format!("{}%", value as i64)));
+    readout.set_width_chars(5);
+    readout.set_xalign(1.0);
+
+    // Keep the readout in sync, the same way upstream's slider updates its
+    // companion label on `valueChanged`.
+    let readout_clone = readout.clone();
+    scale.connect_value_changed(move |s| {
+        readout_clone.set_text(&format!("{}%", s.value() as i64));
+    });
+
+    let holder = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    holder.append(&scale);
+    holder.append(&readout);
+
+    (labeled_row(label, &holder), scale, readout)
+}
+
+/// Path row: an entry plus a `...` browse button — upstream's directory pickers
+/// in `configure_filesystem.ui` / `configure_ui.ui`.
+pub fn path_row(label: &str, text: &str) -> (gtk::Box, gtk::Entry, gtk::Button) {
+    let entry = gtk::Entry::new();
+    entry.set_text(text);
+    entry.set_hexpand(true);
+
+    let browse = gtk::Button::with_label("...");
+
+    let holder = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    holder.append(&entry);
+    holder.append(&browse);
+
+    (labeled_row(label, &holder), entry, browse)
+}
+
+/// Index of `needle` in `haystack`, or 0. Used to map a stored enum value onto
+/// its combo-box row without panicking on values the UI doesn't list.
+pub fn index_of<T: PartialEq>(haystack: &[T], needle: &T) -> u32 {
+    haystack
+        .iter()
+        .position(|item| item == needle)
+        .unwrap_or(0) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_of_finds_the_entry() {
+        let items = ["a", "b", "c"];
+        assert_eq!(index_of(&items, &"b"), 1);
+    }
+
+    #[test]
+    fn index_of_falls_back_to_zero_for_unknown_values() {
+        let items = ["a", "b"];
+        assert_eq!(index_of(&items, &"z"), 0);
+    }
+}
