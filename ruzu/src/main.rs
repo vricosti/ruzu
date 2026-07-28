@@ -24,6 +24,8 @@ mod loading_screen;
 mod main_window;
 #[cfg(target_os = "macos")]
 mod render_window;
+#[cfg(target_os = "linux")]
+mod render_window_x11;
 mod status_bar;
 mod uisettings;
 

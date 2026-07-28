@@ -22,14 +22,14 @@ pub struct GpuDirtyMemoryManager {
     /// Accessed atomically for lock-free collection.
     current: AtomicU64,
 
-    /// Mutex protecting the back buffer.
-    guard: Mutex<()>,
-
-    /// Back buffer for accumulated transforms (producer side).
+    /// Back buffer for accumulated transforms (producer side). This mutex is
+    /// the Rust counterpart of upstream's `guard`.
     back_buffer: Mutex<Vec<TransformAddress>>,
 
-    /// Front buffer for gathered transforms (consumer side).
-    front_buffer: Vec<TransformAddress>,
+    /// Front buffer for gathered transforms (consumer side). Its separate
+    /// mutex permits `gather` to take `&self` without blocking producers while
+    /// callbacks consume the gathered ranges.
+    front_buffer: Mutex<Vec<TransformAddress>>,
 }
 
 /// Packed address + dirty mask pair.
@@ -76,9 +76,8 @@ impl GpuDirtyMemoryManager {
     pub fn new() -> Self {
         Self {
             current: AtomicU64::new(DEFAULT_TRANSFORM.to_u64()),
-            guard: Mutex::new(()),
             back_buffer: Mutex::new(Vec::with_capacity(256)),
-            front_buffer: Vec::with_capacity(256),
+            front_buffer: Mutex::new(Vec::with_capacity(256)),
         }
     }
 
@@ -87,8 +86,17 @@ impl GpuDirtyMemoryManager {
     /// This is the hot path, called from GPU memory write handlers. Uses lock-free
     /// atomic operations for the common case where the same page is being dirtied
     /// repeatedly.
-    pub fn collect(&self, address: u64, size: usize) {
-        let t = self.build_transform(address, size);
+    pub fn collect(&self, mut address: u64, mut size: usize) {
+        while size != 0 {
+            let page_offset = (address as usize) & PAGE_MASK;
+            let page_size = (PAGE_SIZE - page_offset).min(size);
+            self.collect_transform(self.build_transform(address, page_size));
+            address = address.wrapping_add(page_size as u64);
+            size -= page_size;
+        }
+    }
+
+    fn collect_transform(&self, t: TransformAddress) {
         let mut tmp;
         let mut original;
 
@@ -98,9 +106,9 @@ impl GpuDirtyMemoryManager {
 
             if tmp.address != t.address {
                 if Self::is_valid(tmp.address as u64) {
-                    let _lk = self.guard.lock().unwrap();
-                    self.back_buffer.lock().unwrap().push(tmp);
-                    self.current.store(t.to_u64(), Ordering::Relaxed);
+                    let mut back_buffer = self.back_buffer.lock().unwrap();
+                    back_buffer.push(tmp);
+                    self.current.swap(t.to_u64(), Ordering::Relaxed);
                     return;
                 }
                 tmp.address = t.address;
@@ -128,21 +136,21 @@ impl GpuDirtyMemoryManager {
     /// contiguous dirty range.
     ///
     /// The callback receives (physical_address, size) pairs.
-    pub fn gather(&mut self, callback: &mut dyn FnMut(u64, usize)) {
+    pub fn gather(&self, callback: &mut dyn FnMut(u64, usize)) {
+        let mut front_buffer = self.front_buffer.lock().unwrap();
         {
-            let _lk = self.guard.lock().unwrap();
+            let mut back_buffer = self.back_buffer.lock().unwrap();
             let t = TransformAddress::from_u64(
                 self.current
                     .swap(DEFAULT_TRANSFORM.to_u64(), Ordering::Relaxed),
             );
-            let mut back = self.back_buffer.lock().unwrap();
-            core::mem::swap(&mut self.front_buffer, &mut *back);
+            core::mem::swap(&mut *front_buffer, &mut *back_buffer);
             if Self::is_valid(t.address as u64) {
-                self.front_buffer.push(t);
+                front_buffer.push(t);
             }
         }
 
-        for transform in &self.front_buffer {
+        for transform in front_buffer.iter() {
             let mut offset: usize = 0;
             let mut mask = transform.mask as u64;
 
@@ -164,7 +172,7 @@ impl GpuDirtyMemoryManager {
             }
         }
 
-        self.front_buffer.clear();
+        front_buffer.clear();
     }
 
     // --- Private helpers ---
@@ -174,12 +182,42 @@ impl GpuDirtyMemoryManager {
     }
 
     fn create_mask(top_bit: usize, minor_bit: usize) -> u32 {
-        if top_bit == 0 {
+        // Upstream `CreateMask<u32>`:
+        //
+        //     mask <<= (sizeof(T) * 8 - top_bit);
+        //     mask >>= (sizeof(T) * 8 - top_bit);
+        //     mask >>= minor_bit;
+        //     mask <<= minor_bit;
+        //
+        // `top_bit` is `(minor_address + size + align_mask) >> align_bits`.
+        // Production calls are split at each 2 KiB transform-page boundary,
+        // keeping top_bit within the 32-bit mask. The clamp remains defensive
+        // for direct helper use because reproducing upstream's oversized shift
+        // would be undefined behavior in C++ and a panic in Rust.
+        //
+        // DELIBERATE DIVERGENCE. Upstream cannot be reproduced bit-for-bit here
+        // without reproducing that UB, and its x86 behaviour is not what the
+        // code intends:
+        //
+        //   * top_bit = 64 -> shift count (32-64) & 31 == 0, so the mask stays
+        //     all-ones and only `minor_bit` is honoured. Same as the clamp below.
+        //   * top_bit = 33 -> shift count (32-33) & 31 == 31, so `!0 << 31 >> 31`
+        //     leaves a *single* bit set while 33 units are being written. That
+        //     under-reports dirty memory, which is a missed invalidation.
+        //
+        // Rust panics on the underflow instead ("attempt to subtract with
+        // overflow"). Clamping keeps this helper total, while `collect` ensures
+        // no bytes in following transform pages are discarded.
+        const WIDTH: usize = u32::BITS as usize;
+        if top_bit == 0 || minor_bit >= WIDTH {
             return 0;
         }
+        let top_bit = top_bit.min(WIDTH);
+        let shift = WIDTH - top_bit;
+
         let mut mask: u32 = !0u32;
-        mask <<= 32 - top_bit;
-        mask >>= 32 - top_bit;
+        mask <<= shift;
+        mask >>= shift;
         mask >>= minor_bit;
         mask <<= minor_bit;
         mask
@@ -215,6 +253,94 @@ mod tests {
     }
 
     #[test]
+    fn create_mask_clamps_a_top_bit_past_the_mask_width() {
+        // Direct helper use can produce top_bit above 32. Production `collect`
+        // splits first, but this must remain panic-free as a defensive boundary.
+        assert_eq!(GpuDirtyMemoryManager::create_mask(64, 0), !0u32);
+        assert_eq!(GpuDirtyMemoryManager::create_mask(33, 0), !0u32);
+        // Clamping keeps the low bits masked off, marking only minor_bit..end.
+        assert_eq!(GpuDirtyMemoryManager::create_mask(64, 4), !0u32 << 4);
+    }
+
+    #[test]
+    fn create_mask_handles_a_minor_bit_past_the_mask_width() {
+        // Would shift a u32 by >= 32, which also panics in Rust.
+        assert_eq!(GpuDirtyMemoryManager::create_mask(64, 32), 0);
+        assert_eq!(GpuDirtyMemoryManager::create_mask(64, 99), 0);
+    }
+
+    #[test]
+    fn collect_splits_a_write_at_the_transform_page_boundary() {
+        let mgr = GpuDirtyMemoryManager::new();
+        let start = (PAGE_SIZE - ALIGN_SIZE) as u64;
+        mgr.collect(start, ALIGN_SIZE * 2);
+
+        let mut results = Vec::new();
+        mgr.gather(&mut |address, size| results.push((address, size)));
+
+        assert_eq!(
+            results,
+            vec![(start, ALIGN_SIZE), (PAGE_SIZE as u64, ALIGN_SIZE),]
+        );
+    }
+
+    #[test]
+    fn collect_preserves_every_transform_page_in_a_large_write() {
+        let mgr = GpuDirtyMemoryManager::new();
+        let start = (PAGE_SIZE - ALIGN_SIZE) as u64;
+        mgr.collect(start, PAGE_SIZE + ALIGN_SIZE * 2);
+
+        let mut results = Vec::new();
+        mgr.gather(&mut |address, size| results.push((address, size)));
+
+        assert_eq!(
+            results,
+            vec![
+                (start, ALIGN_SIZE),
+                (PAGE_SIZE as u64, PAGE_SIZE),
+                ((PAGE_SIZE * 2) as u64, ALIGN_SIZE),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_does_not_wait_for_gather_callbacks() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let manager = Arc::new(GpuDirtyMemoryManager::new());
+        manager.collect(0, ALIGN_SIZE);
+
+        let gather_manager = Arc::clone(&manager);
+        let (callback_entered_tx, callback_entered_rx) = mpsc::channel();
+        let (release_callback_tx, release_callback_rx) = mpsc::channel();
+        let gather_thread = std::thread::spawn(move || {
+            gather_manager.gather(&mut |_, _| {
+                callback_entered_tx.send(()).unwrap();
+                release_callback_rx.recv().unwrap();
+            });
+        });
+
+        callback_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("gather callback did not start");
+
+        let collect_manager = Arc::clone(&manager);
+        let (collect_done_tx, collect_done_rx) = mpsc::channel();
+        let collect_thread = std::thread::spawn(move || {
+            collect_manager.collect(PAGE_SIZE as u64, ALIGN_SIZE);
+            collect_done_tx.send(()).unwrap();
+        });
+
+        collect_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("collect blocked while gather callback was running");
+        release_callback_tx.send(()).unwrap();
+        collect_thread.join().unwrap();
+        gather_thread.join().unwrap();
+    }
+
+    #[test]
     fn test_create_mask() {
         // Full mask
         let m = GpuDirtyMemoryManager::create_mask(32, 0);
@@ -242,8 +368,14 @@ mod tests {
     }
 
     #[test]
+    fn transform_address_matches_upstream_layout() {
+        assert_eq!(core::mem::size_of::<TransformAddress>(), 8);
+        assert_eq!(core::mem::align_of::<TransformAddress>(), 8);
+    }
+
+    #[test]
     fn test_collect_and_gather() {
-        let mut mgr = GpuDirtyMemoryManager::new();
+        let mgr = GpuDirtyMemoryManager::new();
 
         // Collect a single dirty region
         mgr.collect(0x1000, 64);
@@ -253,6 +385,6 @@ mod tests {
             results.push((addr, size));
         });
 
-        assert!(!results.is_empty());
+        assert_eq!(results, vec![(0x1000, 64)]);
     }
 }

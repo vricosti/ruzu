@@ -51,3 +51,12 @@ objc = "0.2"
 cocoa = "0.25"
 core-graphics = "0.23"
 core-foundation = "0.9"
+
+# Linux: the render surface is a native X11 child window embedded in the GTK
+# window, mirroring upstream's `RenderWidget` (a `WA_NativeWindow` child of
+# `GRenderWindow`) and the CAMetalLayer sub-view used on macOS.
+[target.'cfg(target_os = "linux")'.dependencies]
+# The `xlib` feature exposes `X11Display::xdisplay()`, the `Display*` that
+# `WindowSystemInfo::display_connection` needs for `VkXlibSurfaceCreateInfoKHR`.
+gdk4-x11 = { version = "0.9", features = ["xlib"] }
+x11 = { version = "2", features = ["xlib"] }

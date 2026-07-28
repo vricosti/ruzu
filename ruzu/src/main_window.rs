@@ -78,8 +78,14 @@ pub struct GMainWindow {
 
 /// Handles needed to resize the embedded render surface on window resize.
 struct RenderHandles {
+    /// macOS: the child `NSWindow*`. Linux: the child X11 `Window` XID.
     child_window: usize,
+    /// macOS: the `CAMetalLayer*`.
+    #[cfg(target_os = "macos")]
     metal_layer: usize,
+    /// Linux: the X11 `Display*`.
+    #[cfg(target_os = "linux")]
+    display: usize,
     /// Shared frame layout the renderer reads; updated so the frame is rendered
     /// at the new native resolution on resize (upstream `OnFramebufferSizeChanged`).
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
@@ -195,7 +201,7 @@ impl GMainWindow {
         // Keep the embedded render surface sized to the central stack as the
         // window is resized. GTK4 has no widget `size-allocate` signal, so poll
         // the stack size on the frame clock and act only on change.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         this.stack.add_tick_callback(glib::clone!(
             #[weak(rename_to = w)]
             this,
@@ -895,10 +901,133 @@ impl GMainWindow {
         *self.session.borrow_mut() = Some(session);
     }
 
-    /// In-process boot currently requires the macOS CAMetalLayer bridge.
-    #[cfg(not(target_os = "macos"))]
+    /// Boot `filepath` into an X11 child window embedded in the GTK window.
+    ///
+    /// Same shape as the macOS path above; only the native surface differs —
+    /// an X11 child `Window` instead of a `CAMetalLayer` sub-view, matching
+    /// upstream's per-platform `GetWindowSystemInfo`.
+    #[cfg(target_os = "linux")]
+    pub fn boot_game(self: &Rc<Self>, filepath: String) {
+        use crate::emu_window::GtkEmuWindow;
+        use crate::render_window_x11 as render;
+        use ruzu_core::frontend::emu_window::{WindowSystemInfo, WindowSystemType};
+
+        // The render surface only exists once the window is realized, and the
+        // central stack only has an allocation after the first layout pass.
+        let ready =
+            self.window.surface().is_some() && self.stack.width() > 0 && self.stack.height() > 0;
+        if !ready {
+            let this = Rc::clone(self);
+            glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+                if this.window.surface().is_some()
+                    && this.stack.width() > 0
+                    && this.stack.height() > 0
+                {
+                    this.boot_game(filepath.clone());
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            });
+            return;
+        }
+
+        // Stop any existing session first (upstream stops before re-booting).
+        if let Some(mut session) = self.session.borrow_mut().take() {
+            session.stop();
+        }
+        self.status_bar.refresh();
+
+        // Render area = the central stack's bounds, so the child window leaves
+        // the menu bar and status bar visible.
+        let render_rect = self.stack.compute_bounds(&self.window).map(|r| {
+            (
+                r.x() as f64,
+                r.y() as f64,
+                r.width() as f64,
+                r.height() as f64,
+            )
+        });
+
+        let Some(embedded) = render::attach_render_window(
+            self.window.upcast_ref::<gtk::Window>(),
+            render_rect,
+        ) else {
+            log::error!(
+                "Cannot boot: failed to embed an X11 render surface. \
+                 Native Wayland is not supported yet — relaunch with GDK_BACKEND=x11."
+            );
+            return;
+        };
+
+        // Keep it hidden so the loading screen shows during load.
+        render::set_render_window_hidden(embedded.display, embedded.window, true);
+
+        let window_info = WindowSystemInfo {
+            type_: WindowSystemType::X11,
+            display_connection: embedded.display as usize,
+            render_surface: embedded.window as usize,
+            render_surface_scale: embedded.scale,
+        };
+        let emu = GtkEmuWindow::from_window_info(window_info.clone(), embedded.drawable_size);
+        let drawable_size = emu.drawable_size();
+        let shown_state = emu.shown_state();
+        let framebuffer_layout = emu.framebuffer_layout();
+
+        *self.render.borrow_mut() = Some(RenderHandles {
+            display: embedded.display as usize,
+            child_window: embedded.window as usize,
+            framebuffer_layout: Arc::clone(&framebuffer_layout),
+        });
+        self.render_size
+            .set((self.stack.width(), self.stack.height()));
+
+        self.show_loading_screen();
+
+        // Progress is produced on the boot thread and consumed here via a
+        // shared slot polled on the GTK main loop — the same cross-thread
+        // marshaling shape as yuzu's queued LoadProgress signal.
+        let slot: Arc<Mutex<Option<(LoadStage, usize, usize)>>> = Arc::new(Mutex::new(None));
+        let slot_producer = Arc::clone(&slot);
+        let progress: crate::boot::ProgressFn = Box::new(move |stage, value, total| {
+            *slot_producer.lock().unwrap() = Some((stage, value, total));
+        });
+
+        let loading = Rc::clone(&self.loading_screen);
+        let stack = self.stack.clone();
+        let display = embedded.display as usize;
+        let child = embedded.window;
+        glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+            let update = slot.lock().unwrap().take();
+            if let Some((stage, value, total)) = update {
+                loading.on_load_progress(stage, value, total);
+                if stage == LoadStage::Complete {
+                    // Swap the backdrop to the black render page first, so a
+                    // resize exposes black rather than the loading screen.
+                    stack.set_visible_child_name(PAGE_RENDER);
+                    render::set_render_window_hidden(display as *mut _, child, false);
+                    return glib::ControlFlow::Break;
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+
+        let session = crate::boot::boot_game(
+            window_info,
+            drawable_size,
+            shown_state,
+            framebuffer_layout,
+            filepath,
+            progress,
+        );
+        *self.session.borrow_mut() = Some(session);
+    }
+
+    /// In-process boot needs a platform-specific render surface; only macOS
+    /// (CAMetalLayer) and Linux/X11 have one so far.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub fn boot_game(self: &Rc<Self>, _filepath: String) {
-        log::error!("In-process boot is only implemented on macOS for now");
+        log::error!("In-process boot is not implemented on this platform yet");
     }
 
     /// If a game is running and the central stack changed size, resize the
@@ -934,6 +1063,39 @@ impl GMainWindow {
             self.window.upcast_ref::<gtk::Window>(),
             handles.child_window as *mut _,
             handles.metal_layer as *mut _,
+            gr,
+        ) {
+            *handles.framebuffer_layout.write().unwrap() = default_frame_layout(dw, dh);
+        }
+    }
+
+    /// Linux counterpart of `maybe_resize_render`: move/resize the X11 child
+    /// window to the stack's new bounds and rebuild the frame layout.
+    #[cfg(target_os = "linux")]
+    fn maybe_resize_render(&self) {
+        let (w, h) = (self.stack.width(), self.stack.height());
+        if w <= 0 || h <= 0 || self.render_size.get() == (w, h) {
+            return;
+        }
+        let render = self.render.borrow();
+        let Some(handles) = render.as_ref() else {
+            self.render_size.set((w, h));
+            return;
+        };
+        let Some(rect) = self.stack.compute_bounds(&self.window) else {
+            return;
+        };
+        self.render_size.set((w, h));
+        let gr = (
+            rect.x() as f64,
+            rect.y() as f64,
+            rect.width() as f64,
+            rect.height() as f64,
+        );
+        if let Some((dw, dh)) = crate::render_window_x11::resize_render_window(
+            self.window.upcast_ref::<gtk::Window>(),
+            handles.display as *mut _,
+            handles.child_window as u64,
             gr,
         ) {
             *handles.framebuffer_layout.write().unwrap() = default_frame_layout(dw, dh);
