@@ -77,6 +77,7 @@ pub fn page(index: usize) -> Page {
     device_box.set_hexpand(true);
     let device_label = gtk::Label::new(Some("Input Device"));
     device_label.set_xalign(0.0);
+    device_label.set_valign(gtk::Align::Center);
     // Upstream fills this from `InputCommon::InputSubsystem::GetInputDevices()`,
     // always with "Any" first.
     let input_device = w::combo(&["Any"], 0);
@@ -87,6 +88,7 @@ pub fn page(index: usize) -> Page {
     let profile_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let profile_label = gtk::Label::new(Some("Profile"));
     profile_label.set_xalign(0.0);
+    profile_label.set_valign(gtk::Align::Center);
     let profile_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     let profile = w::combo(&[""], 0);
     profile.set_width_request(90);
@@ -100,6 +102,15 @@ pub fn page(index: usize) -> Page {
     profile_box.append(&profile_label);
     profile_box.append(&profile_row);
     header.append(&profile_box);
+
+    // The three header columns each stack a caption over a control. The
+    // "Connect Controller" check box is taller than a plain label, which pushed
+    // its combo below the other two; a vertical size group makes the caption
+    // row one height so the controls beneath line up.
+    let header_captions = gtk::SizeGroup::new(gtk::SizeGroupMode::Vertical);
+    header_captions.add_widget(&connected);
+    header_captions.add_widget(&device_label);
+    header_captions.add_widget(&profile_label);
 
     column.append(&header);
 
@@ -295,6 +306,10 @@ pub fn page(index: usize) -> Page {
         .build();
 
     Page::new(&format!("Player {}", index + 1), scroller, move || {
+        // Widgets hold only a weak reference to their size group, so it has to
+        // stay owned for the page's lifetime.
+        let _keep_alive = &header_captions;
+
         let is_connected = connected.is_active();
         let controller = CONTROLLER_TYPES
             .get(controller_type.selected() as usize)

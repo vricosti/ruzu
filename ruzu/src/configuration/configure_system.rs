@@ -121,7 +121,24 @@ pub fn page() -> Page {
     gate(&rng_seed_check, &rng_seed_entry);
     gate(&speed_check, &speed_spin);
 
+    // Line the control column up across both groups. The check-box rows would
+    // otherwise sit ~20px left of the combo rows above them.
+    let label_columns = w::align_label_columns(&[
+        &language_row,
+        &region_row,
+        &time_zone_row,
+        &rtc_row,
+        &seed_row,
+        &device_name_row,
+        &memory_row,
+        &speed_row,
+    ]);
+
     Page::new("System", scroller, move || {
+        // Widgets hold only a weak reference to their size group, so it has to
+        // stay owned for the page's lifetime or the columns drift apart again.
+        let _keep_alive = &label_columns;
+
         let language_value = tr::value_at(tr::LANGUAGE, language.selected());
         let region_value = tr::value_at(tr::REGION, region.selected());
         let time_zone_value = time_zone.selected();
@@ -157,9 +174,12 @@ pub fn page() -> Page {
 
 /// A row whose label column is a check box gating the control on its right —
 /// the shape upstream uses for Custom RTC, RNG Seed, and Limit Speed Percent.
+///
+/// The check box's width is left to `shared_widget::align_label_columns`, which
+/// matches it to the plain label rows; requesting a fixed width here would put
+/// the control column at a different x than the rows above it.
 fn gated_row(check: &gtk::CheckButton, control: &impl IsA<gtk::Widget>) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    check.set_width_request(220);
     row.append(check);
     let control = control.as_ref();
     control.set_hexpand(true);

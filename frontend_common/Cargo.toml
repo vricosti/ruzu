@@ -6,3 +6,8 @@ edition.workspace = true
 [dependencies]
 common.workspace = true
 log.workspace = true
+
+# Upstream's `frontend_common/content_manager.h` includes
+# `core/crypto/key_manager.h` and `core/file_sys/registered_cache.h`; the same
+# dependency direction holds here (core does not depend on frontend_common).
+ruzu_core = { package = "core", path = "../core" }

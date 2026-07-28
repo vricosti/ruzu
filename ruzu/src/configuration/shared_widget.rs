@@ -199,6 +199,27 @@ pub fn path_row(label: &str, text: &str) -> (gtk::Box, gtk::Entry, gtk::Button) 
     (labeled_row(label, &holder), entry, browse)
 }
 
+/// Give every row the same label-column width, so their controls line up.
+///
+/// Rows whose label column is a plain [`gtk::Label`] size themselves from
+/// [`LABEL_COLUMN_CHARS`], while rows that lead with a check box size to the
+/// check box's own text — so the two kinds drift apart and their controls start
+/// at different x positions. Qt avoids this because its pages use a
+/// `QFormLayout` / grid whose first column is shared; a `SizeGroup` is the GTK
+/// equivalent.
+///
+/// Pass every row of a page, including rows in different groups: upstream
+/// aligns the whole page, not each group separately.
+pub fn align_label_columns(rows: &[&gtk::Box]) -> gtk::SizeGroup {
+    let group = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+    for row in rows {
+        if let Some(label_column) = row.first_child() {
+            group.add_widget(&label_column);
+        }
+    }
+    group
+}
+
 /// Index of `needle` in `haystack`, or 0. Used to map a stored enum value onto
 /// its combo-box row without panicking on values the UI doesn't list.
 pub fn index_of<T: PartialEq>(haystack: &[T], needle: &T) -> u32 {

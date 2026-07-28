@@ -280,7 +280,23 @@ impl GMainWindow {
         ));
         app.add_action(&preferences);
 
-        // The two blocks above replace the startup stubs by name, which resets
+        // Tools menu — upstream `connect_menu(action_Install_Keys, …)` etc.
+        macro_rules! window_action {
+            ($name:literal, $handler:ident) => {{
+                let action = gio::SimpleAction::new($name, None);
+                action.connect_activate(glib::clone!(
+                    #[weak(rename_to = this)]
+                    self,
+                    move |_, _| this.$handler()
+                ));
+                app.add_action(&action);
+            }};
+        }
+        window_action!("install_keys", on_install_decryption_keys);
+        window_action!("install_firmware", on_install_firmware);
+        window_action!("verify_installed_contents", on_verify_installed_contents);
+
+        // The blocks above replace the startup stubs by name, which resets
         // their enabled state; re-apply it (upstream re-runs `UpdateMenuState`
         // after `ConnectMenuEvents`).
         update_menu_state(app, self.session.borrow().is_some(), true);
@@ -354,6 +370,323 @@ impl GMainWindow {
         if let Some(game_list) = self.game_list.borrow().as_ref() {
             game_list.reload();
         }
+    }
+
+    /// Upstream `GMainWindow::OnInstallDecryptionKeys`.
+    ///
+    /// Asks for a `prod.keys`, copies it (plus `title.keys` / `key_retail.bin`
+    /// when they sit beside it) into ruzu's keys directory, reloads the key
+    /// manager, and rescans the game list so titles that were undecryptable
+    /// appear.
+    fn on_install_decryption_keys(self: &Rc<Self>) {
+        // Upstream refuses while emulation is running.
+        if self.session.borrow().is_some() {
+            log::info!("Install Decryption Keys ignored: emulation is running");
+            return;
+        }
+
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("prod.keys"));
+        filter.add_pattern("prod.keys");
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+
+        let dialog = gtk::FileDialog::builder()
+            .title("Select Dumped Keys Location")
+            .filters(&filters)
+            .default_filter(&filter)
+            .modal(true)
+            .build();
+
+        log::info!("Install Decryption Keys: opening file chooser");
+        dialog.open(
+            Some(&self.window),
+            gio::Cancellable::NONE,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |result| {
+                    let file = match result {
+                        Ok(file) => file,
+                        Err(e) => {
+                            log::info!("Install Decryption Keys cancelled: {e}");
+                            return;
+                        }
+                    };
+                    let Some(prod_keys) = file.path() else { return };
+                    this.install_decryption_keys_from(&prod_keys);
+                }
+            ),
+        );
+    }
+
+    /// Copy the key files sitting beside `prod_keys` into the keys directory.
+    fn install_decryption_keys_from(self: &Rc<Self>, prod_keys: &std::path::Path) {
+        log::info!("Installing key files from {}", prod_keys.display());
+        let Some(source_dir) = prod_keys.parent() else {
+            return;
+        };
+
+        // There must be at least prod.keys; the other two are optional.
+        if !prod_keys.is_file() {
+            self.alert(
+                "Decryption Keys install failed",
+                "prod.keys is a required decryption key file.",
+            );
+            return;
+        }
+        let mut sources = vec![prod_keys.to_path_buf()];
+        for optional in ["title.keys", "key_retail.bin"] {
+            let candidate = source_dir.join(optional);
+            if candidate.is_file() {
+                sources.push(candidate);
+            }
+        }
+
+        let keys_dir = common::fs::path_util::get_ruzu_path(
+            common::fs::path_util::RuzuPath::KeysDir,
+        );
+        if let Err(e) = std::fs::create_dir_all(&keys_dir) {
+            log::error!("Could not create keys dir {}: {e}", keys_dir.display());
+            self.alert(
+                "Decryption Keys install failed",
+                "Could not create the keys directory.",
+            );
+            return;
+        }
+
+        for source in &sources {
+            let Some(name) = source.file_name() else {
+                continue;
+            };
+            let destination = keys_dir.join(name);
+            // Selecting the keys that are *already* installed would make source
+            // and destination the same file, and `fs::copy` onto itself
+            // truncates it — destroying the user's keys. Nothing to do anyway.
+            if same_file(source, &destination) {
+                log::info!("{} is already installed; skipping", source.display());
+                continue;
+            }
+            if let Err(e) = std::fs::copy(source, &destination) {
+                log::error!(
+                    "Failed to copy file {} to {}: {e}",
+                    source.display(),
+                    destination.display()
+                );
+                self.alert(
+                    "Decryption Keys install failed",
+                    "One or more keys failed to copy.",
+                );
+                return;
+            }
+        }
+
+        // Reinitialize the key manager and re-populate the game list, so titles
+        // that could not be decrypted before are picked up.
+        ruzu_core::crypto::key_manager::KeyManager::instance()
+            .lock()
+            .unwrap()
+            .reload_keys();
+        if let Some(game_list) = self.game_list.borrow().as_ref() {
+            game_list.reload();
+        }
+
+        if frontend_common::content_manager::are_keys_present() {
+            self.alert(
+                "Decryption Keys install succeeded",
+                "Decryption Keys were successfully installed",
+            );
+        } else {
+            self.alert(
+                "Decryption Keys install failed",
+                "Decryption Keys failed to initialize. Check that your dumping tools are \
+                 up to date and re-dump keys.",
+            );
+        }
+    }
+
+    /// Upstream `GMainWindow::OnInstallFirmware`.
+    ///
+    /// Clears `nand/system/Contents/registered` and copies the dumped firmware
+    /// NCAs into it.
+    fn on_install_firmware(self: &Rc<Self>) {
+        if self.session.borrow().is_some() {
+            log::info!("Install Firmware ignored: emulation is running");
+            return;
+        }
+
+        // Upstream checks for keys first: firmware NCAs cannot be read without
+        // them, so installing would produce an unusable NAND.
+        if !frontend_common::content_manager::are_keys_present() {
+            self.alert(
+                "Keys not installed",
+                "Install decryption keys and restart ruzu before attempting to install firmware.",
+            );
+            return;
+        }
+
+        let dialog = gtk::FileDialog::builder()
+            .title("Select Dumped Firmware Source Location")
+            .modal(true)
+            .build();
+
+        dialog.select_folder(
+            Some(&self.window),
+            gio::Cancellable::NONE,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |result| {
+                    let Ok(folder) = result else { return };
+                    let Some(path) = folder.path() else { return };
+                    this.install_firmware_from(&path);
+                }
+            ),
+        );
+    }
+
+    /// Replace the installed firmware with the NCAs found in `source`.
+    fn install_firmware_from(self: &Rc<Self>, source: &std::path::Path) {
+        log::info!("Installing firmware from {}", source.display());
+
+        // Check for a reasonable number of .nca files — upstream does not
+        // hardcode names, it just looks for some.
+        let mut ncas: Vec<std::path::PathBuf> = match std::fs::read_dir(source) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|ext| ext == "nca"))
+                .collect(),
+            Err(e) => {
+                log::error!("Could not read {}: {e}", source.display());
+                return;
+            }
+        };
+        ncas.sort();
+
+        if ncas.is_empty() {
+            self.alert(
+                "Firmware install failed",
+                "Unable to locate potential firmware NCA files",
+            );
+            return;
+        }
+
+        // Locate and erase the content of nand/system/Contents/registered.
+        let registered = common::fs::path_util::get_ruzu_path(
+            common::fs::path_util::RuzuPath::NANDDir,
+        )
+        .join("system/Contents/registered");
+
+        if registered.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&registered) {
+                log::error!("Failed to clean {}: {e}", registered.display());
+                self.alert(
+                    "Firmware install failed",
+                    "Failed to delete one or more firmware file.",
+                );
+                return;
+            }
+        }
+        if let Err(e) = std::fs::create_dir_all(&registered) {
+            log::error!("Failed to create {}: {e}", registered.display());
+            self.alert(
+                "Firmware install failed",
+                "Failed to create the firmware directory.",
+            );
+            return;
+        }
+        log::info!(
+            "Cleaned {} in preparation for new firmware",
+            registered.display()
+        );
+
+        let progress = ProgressWindow::new(&self.window, "Installing Firmware...");
+        for (index, nca) in ncas.iter().enumerate() {
+            let Some(name) = nca.file_name() else { continue };
+            if let Err(e) = std::fs::copy(nca, registered.join(name)) {
+                log::error!(
+                    "Failed to copy firmware file {} into the registered folder: {e}",
+                    nca.display()
+                );
+                progress.close();
+                self.alert(
+                    "Firmware install failed",
+                    "One or more firmware files failed to copy into NAND.",
+                );
+                return;
+            }
+            progress.set_fraction((index + 1) as f64 / ncas.len() as f64);
+        }
+        progress.close();
+
+        log::info!("Installed {} firmware NCA(s)", ncas.len());
+        // Upstream then verifies the freshly installed firmware; that runs here
+        // as the separate Tools ▸ Verify Installed Contents action rather than
+        // automatically, so a slow scan does not block the install dialog.
+        self.alert(
+            "Firmware install succeeded",
+            &format!(
+                "Installed {} firmware file(s).\n\n\
+                 Run Tools ▸ Verify Installed Contents to check their integrity.",
+                ncas.len()
+            ),
+        );
+    }
+
+    /// Upstream `GMainWindow::OnVerifyInstalledContents`.
+    fn on_verify_installed_contents(self: &Rc<Self>) {
+        log::info!("Verifying installed contents");
+        let progress = ProgressWindow::new(&self.window, "Verifying integrity...");
+
+        // Upstream verifies through `system.GetFileSystemController()`. The
+        // launcher has no booted `System`, so build the same controller over the
+        // real filesystem — the registries it opens are the on-disk NAND ones
+        // either way.
+        let vfs = ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem::new();
+        let mut filesystem =
+            ruzu_core::hle::service::filesystem::filesystem::FileSystemController::new();
+        filesystem.create_factories(vfs, false);
+
+        let failed = frontend_common::content_manager::verify_installed_contents(
+            &filesystem,
+            &|total, processed| {
+                if total > 0 {
+                    progress.set_fraction(processed as f64 / total as f64);
+                }
+                // Returning true cancels; nothing cancels this yet.
+                false
+            },
+            false,
+        );
+
+        progress.close();
+
+        if failed.is_empty() {
+            self.alert(
+                "Integrity verification succeeded!",
+                "The operation completed successfully.",
+            );
+        } else {
+            self.alert(
+                "Integrity verification failed!",
+                &format!(
+                    "Verification failed for the following files:\n\n{}",
+                    failed.join("\n")
+                ),
+            );
+        }
+    }
+
+    /// Show a modal message — the `QMessageBox` calls peppered through the
+    /// upstream handlers.
+    fn alert(&self, message: &str, detail: &str) {
+        gtk::AlertDialog::builder()
+            .modal(true)
+            .message(message)
+            .detail(detail)
+            .build()
+            .show(Some(&self.window));
     }
 
     /// Upstream `GMainWindow::OnConfigure`: build and show the configuration
@@ -685,6 +1018,83 @@ pub fn init_app_menu(app: &Application) {
     // Upstream calls `UpdateMenuState()` once the menu is built, which greys
     // out the run-time entries because no game is running yet.
     update_menu_state(app, false, true);
+}
+
+/// Whether two paths refer to the same file on disk, resolving symlinks.
+///
+/// Used to keep `fs::copy` from being handed identical source and destination,
+/// which truncates the file rather than being a no-op.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        // A destination that does not exist yet cannot be the source.
+        _ => false,
+    }
+}
+
+/// A modal progress window — upstream's `QProgressDialog`.
+///
+/// The operations it covers (firmware copy, integrity verification) run
+/// synchronously on the main thread, as upstream's do. Qt pumps its event loop
+/// from inside `QProgressDialog::setValue`; the GTK equivalent is to iterate the
+/// main context explicitly, which is what [`Self::set_fraction`] does — without
+/// it the window would never paint.
+struct ProgressWindow {
+    window: gtk::Window,
+    bar: gtk::ProgressBar,
+}
+
+impl ProgressWindow {
+    fn new(parent: &gtk::ApplicationWindow, message: &str) -> Self {
+        let bar = gtk::ProgressBar::new();
+        bar.set_show_text(true);
+        bar.set_hexpand(true);
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(18);
+        content.set_margin_bottom(18);
+        content.set_margin_start(18);
+        content.set_margin_end(18);
+        let label = gtk::Label::new(Some(message));
+        label.set_xalign(0.0);
+        content.append(&label);
+        content.append(&bar);
+
+        let window = gtk::Window::builder()
+            .title(message)
+            .modal(true)
+            .transient_for(parent)
+            .resizable(false)
+            .default_width(360)
+            .child(&content)
+            .build();
+        window.present();
+
+        let this = Self { window, bar };
+        this.pump();
+        this
+    }
+
+    fn set_fraction(&self, fraction: f64) {
+        self.bar.set_fraction(fraction.clamp(0.0, 1.0));
+        self.pump();
+    }
+
+    /// Let GTK lay out and paint while the caller keeps the main thread busy.
+    fn pump(&self) {
+        let context = glib::MainContext::default();
+        // Bounded so a storm of pending events cannot stall the operation.
+        for _ in 0..32 {
+            if !context.iteration(false) {
+                break;
+            }
+        }
+    }
+
+    fn close(&self) {
+        self.window.close();
+        self.pump();
+    }
 }
 
 /// Whether the desktop is currently in dark mode — upstream

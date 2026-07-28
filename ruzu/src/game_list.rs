@@ -200,6 +200,7 @@ pub fn build<F: Fn(String) + 'static>(on_activate: F) -> (gtk::Widget, GameListH
     column_view.set_show_row_separators(false);
     column_view.set_show_column_separators(false);
 
+    column_view.append_column(&make_name_column());
     column_view.append_column(&make_text_column("File type", GameEntry::kind));
     column_view.append_column(&make_text_column("Size", GameEntry::size));
 
@@ -291,10 +292,6 @@ pub fn build<F: Fn(String) + 'static>(on_activate: F) -> (gtk::Widget, GameListH
         store,
         selection: selection.clone(),
     });
-
-    // The Name column's cells carry the per-directory right-click menu, so the
-    // column is built once the view it acts on exists, and inserted first.
-    column_view.insert_column(0, &make_name_column(&view));
 
     view.reload();
 
@@ -553,9 +550,6 @@ impl GameListView {
     }
 }
 
-/// Key under which each Name cell stashes the entry it is currently bound to.
-const ENTRY_DATA_KEY: &str = "ruzu-game-entry";
-
 /// Path of the directory row currently selected, if any.
 fn selected_directory_path(selection: &gtk::SingleSelection) -> Option<String> {
     selection
@@ -631,10 +625,9 @@ const ALTERNATE_ROW_SHADE: f32 = 0.97;
 /// The "Name" column: expander, icon, and label, so a directory row can be
 /// collapsed and its games are indented under it. Upstream likewise puts the
 /// icon inside the Name column rather than in a column of its own.
-fn make_name_column(view: &Rc<GameListView>) -> gtk::ColumnViewColumn {
+fn make_name_column() -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
-    let view = Rc::clone(view);
-    factory.connect_setup(move |_, item| {
+    factory.connect_setup(|_, item| {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let picture = gtk::Picture::new();
         picture.set_content_fit(gtk::ContentFit::Contain);
@@ -662,10 +655,6 @@ fn make_name_column(view: &Rc<GameListView>) -> gtk::ColumnViewColumn {
         let Some(entry) = tree_row.item().and_downcast::<GameEntry>() else {
             return;
         };
-        // Record which entry this cell now shows, for its right-click gesture.
-        unsafe {
-            expander.set_data(ENTRY_DATA_KEY, entry.clone());
-        }
         let Some(row) = expander.child().and_downcast::<gtk::Box>() else {
             return;
         };

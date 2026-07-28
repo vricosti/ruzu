@@ -636,6 +636,7 @@ name = "frontend_common"
 version = "0.1.0"
 dependencies = [
  "common",
+ "core",
  "log",
 ]
 
@@ -1567,6 +1568,7 @@ dependencies = [
  "core-foundation",
  "core-graphics",
  "env_logger",
+ "frontend_common",
  "gtk4",
  "log",
  "objc",

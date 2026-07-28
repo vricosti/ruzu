@@ -32,6 +32,10 @@ common = { path = "../common" }
 # crate — the same rename `ruzu_cmd` uses.
 ruzu_core = { package = "core", path = "../core" }
 
+# Shared frontend helpers (content install / verification), the ruzu port of
+# upstream's `src/frontend_common`.
+frontend_common = { path = "../frontend_common" }
+
 # Video/audio subsystems, created in the boot subsystem factory (Phase 1b),
 # mirroring `ruzu_cmd`'s Vulkan boot path.
 video_core = { workspace = true }
