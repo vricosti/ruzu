@@ -344,36 +344,19 @@ pub fn pixel_format_from_texture_info(
     )
 }
 
-fn stop_unimplemented_texture_format(
+fn unimplemented_texture_format(
     format: u32,
     red: u32,
     green: u32,
     blue: u32,
     alpha: u32,
     is_srgb: bool,
-) -> ! {
-    #[cfg(not(test))]
-    {
-        let path = std::path::Path::new(".agents/format_lookup_table_unimplemented_state.md");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(
-            path,
-            format!(
-                "# Texture format lookup unimplemented\n\n\
-                 - format: {format}\n\
-                 - srgb: {is_srgb}\n\
-                 - components: {{{red} {green} {blue} {alpha}}}\n\
-                 - upstream: PixelFormatFromTextureInfo reaches UNIMPLEMENTED_MSG before returning the fallback format\n\
-                 - rust: stopped before treating the fallback A8B8G8R8Unorm as an implemented mapping\n"
-            ),
-        );
-    }
-    panic!(
+) -> PixelFormat {
+    log::error!(
         "PixelFormatFromTextureInfo unimplemented texture format={} srgb={} components=({} {} {} {})",
         format, is_srgb, red, green, blue, alpha
     );
+    PixelFormat::A8B8G8R8Unorm
 }
 
 pub fn pixel_format_from_texture_info_raw(
@@ -513,7 +496,7 @@ pub fn pixel_format_from_texture_info_raw(
         x if x == h_uni!(TF::Astc2d8x6, UNORM, srgb) => PixelFormat::Astc2d8x6Srgb,
         x if x == h_uni!(TF::Astc2d6x5, UNORM) => PixelFormat::Astc2d6x5Unorm,
         x if x == h_uni!(TF::Astc2d6x5, UNORM, srgb) => PixelFormat::Astc2d6x5Srgb,
-        _ => stop_unimplemented_texture_format(format, red, green, blue, alpha, is_srgb),
+        _ => unimplemented_texture_format(format, red, green, blue, alpha, is_srgb),
     }
 }
 
@@ -537,11 +520,25 @@ mod tests {
     }
 
     #[test]
-    fn unknown_texture_format_stops_like_upstream_unimplemented_msg() {
-        let result = std::panic::catch_unwind(|| {
-            pixel_format_from_texture_info_raw(0xFFFF_FFFF, 0, 0, 0, 0, false);
-        });
+    fn unknown_texture_component_tuple_uses_upstream_fallback() {
+        assert_eq!(
+            pixel_format_from_texture_info_raw(
+                TextureFormat::A8B8G8R8 as u32,
+                ComponentType::Float as u32,
+                ComponentType::Float as u32,
+                ComponentType::Float as u32,
+                ComponentType::Float as u32,
+                false,
+            ),
+            PixelFormat::A8B8G8R8Unorm
+        );
+    }
 
-        assert!(result.is_err());
+    #[test]
+    fn unknown_texture_format_uses_upstream_fallback() {
+        assert_eq!(
+            pixel_format_from_texture_info_raw(0xFFFF_FFFF, 0, 0, 0, 0, false),
+            PixelFormat::A8B8G8R8Unorm
+        );
     }
 }
