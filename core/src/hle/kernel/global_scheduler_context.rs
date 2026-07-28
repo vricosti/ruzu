@@ -456,11 +456,7 @@ impl GlobalSchedulerContext {
     pub fn preempt_threads(&mut self) {
         for core_id in 0..hardware_properties::NUM_CPU_CORES {
             let priority = PREEMPTION_PRIORITIES[core_id as usize] as i32;
-            super::k_scheduler::KScheduler::rotate_scheduled_queue(
-                self,
-                core_id as i32,
-                priority,
-            );
+            super::k_scheduler::KScheduler::rotate_scheduled_queue(self, core_id as i32, priority);
         }
     }
 

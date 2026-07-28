@@ -136,6 +136,9 @@ impl<'a> Emitter<'a> {
     }
 
     pub fn get_pred(&mut self, pred: Pred, is_negated: bool) -> Value {
+        if pred.is_true() {
+            return Value::ImmU1(!is_negated);
+        }
         let raw = self.emit(Inst::new(Opcode::GetPred, vec![Value::Pred(pred)]));
         if is_negated {
             self.logical_not(raw)
@@ -145,7 +148,9 @@ impl<'a> Emitter<'a> {
     }
 
     pub fn set_pred(&mut self, pred: Pred, value: Value) {
-        self.emit_void(Inst::new(Opcode::SetPred, vec![Value::Pred(pred), value]));
+        if !pred.is_true() {
+            self.emit_void(Inst::new(Opcode::SetPred, vec![Value::Pred(pred), value]));
+        }
     }
 
     pub fn get_z_flag(&mut self) -> Value {
@@ -2484,5 +2489,18 @@ mod tests {
                 .get_associated_pseudo(Opcode::GetSparseFromOp),
             Some(sparse_ref)
         );
+    }
+
+    #[test]
+    fn pt_reads_are_immediate_and_writes_are_discarded() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        let block = program.add_block();
+        let mut emitter = Emitter::new(&mut program, block);
+
+        assert_eq!(emitter.get_pred(Pred::PT, false), Value::ImmU1(true));
+        assert_eq!(emitter.get_pred(Pred::PT, true), Value::ImmU1(false));
+        emitter.set_pred(Pred::PT, Value::ImmU1(false));
+
+        assert!(emitter.program.block(block).is_empty());
     }
 }

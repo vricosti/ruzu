@@ -48,3 +48,9 @@ Avant de continuer a investiguer j'ai une question: comment on peut utiliser Mol
     -g "/home/vricosti/Games/Emulators/Switch/common/roms/SuperTuxKart-1.5-switch/switch/stk.nro"
 
   Les trois icônes apparaissent après quelques secondes, puis le blocage se reproduit.
+
+  ---
+  • Oui, le comportement est nécessaire pour la fidélité upstream: l’ancien InnerFence::wait() vide libérait syncpoints et ressources avant la fin GPU.
+
+  Mais ce commit ne doit pas être poussé tel quel: il fait chuter MK8D à ~38 FPS en imposant le backpressure GPU réel. Recommandation: le retirer de main, puis porter
+  complètement MasterSemaphore/Scheduler/FenceManager upstream avant de le réintroduire.

@@ -25800,3 +25800,115 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   and `EmitImageFetch` after implementation.
 - Added a regression test proving that a buffer AOFFI emits `OpIAdd`, feeds
   its result to `OpImageFetch`, and emits no LOD operand.
+
+## 2026-07-28 — shader_recompiler/src/backend/spirv/spirv_emit_context.rs vs shader_recompiler/backend/spirv/{spirv_emit_context.{h,cpp},emit_spirv.cpp}
+
+### Intentional differences
+- Rust currently performs capability setup while constructing
+  `SpirvEmitContext`; upstream owns the same setup in `SetupCapabilities`
+  during `EmitSPIRV`.
+
+### Unintentional differences (fixed)
+- Rust emitted sampled buffer image types and `OpImageFetch` without declaring
+  `SampledBuffer`, producing SPIR-V rejected by `spirv-val`. It now declares
+  `SampledBuffer` unconditionally, matching upstream's current
+  `SetupCapabilities` behavior.
+- Rust also omitted upstream's unconditional `ImageGatherExtended`
+  capability; it is now declared in the same capability block.
+- Rust declared `DrawParameters` and `Sampled1D` unconditionally and declared
+  the non-upstream `SampledCubeArray` capability. The declarations now follow
+  upstream's exact usage/profile gates.
+- Rust omitted upstream's conditional `SparseResidency`, `MultiViewport`,
+  `ShaderViewportMaskNV`, `ShaderViewportIndexLayerEXT`, `Int64Atomics`,
+  `StorageImageReadWithoutFormat`, `StorageImageWriteWithoutFormat`,
+  `ImageBuffer`, `SampleRateShading`, and `DerivativeControl` capabilities,
+  including the associated viewport/draw-parameter extensions. These now
+  follow `SetupCapabilities` literally.
+- Rust's subgroup capability condition used `uses_subgroup_mask`, ignored
+  `uses_subgroup_invocation_id` and `support_vote`, and always enabled vote.
+  It now matches upstream's flags and warp-size gate.
+
+### Missing items
+- Capability ownership still differs structurally: moving the complete setup
+  from `SpirvEmitContext::new` into Rust's `emit_spirv.rs` counterpart remains
+  a separate ownership-parity slice.
+- Entry-point setup is incomplete for compute, tessellation, and geometry:
+  local size, topology, invocation/output counts, geometry streams/point size,
+  and passthrough extension handling are not ported. Fragment lower-left
+  origin and early-fragment-tests handling are also missing.
+- `SetupTransformFeedbackCapabilities` and the `Xfb` execution mode are
+  missing.
+- Context-owned local/shared memory definitions and shared-memory helper
+  functions are missing.
+- Typed indirect CBUF accessors, the full typed SSBO definitions, indexed
+  attribute access helpers, storage CAS loops, and global-memory helper
+  functions are incomplete or missing.
+- Several upstream interfaces remain absent: subgroup masks/invocation ID,
+  clip distances, viewport index/mask, tessellation patch inputs/outputs,
+  sample mask, and the complete position/generic output model.
+- The non-unified rescaling uniform-constant path is missing.
+
+### Binary layout verification
+- PASS: SPIR-V capability declarations only; no guest or serialized host
+  structure changed.
+
+### Verification
+- Re-read upstream `emit_spirv.h`, `SetupCapabilities`, and `EmitSPIRV`.
+- Captured the skinned vertex module and reproduced the missing-capability
+  failure with Khronos `spirv-val`.
+- Added focused regression coverage requiring `SampledBuffer`.
+- Added focused coverage for the conditional capability gates and associated
+  draw-parameters extension.
+
+## 2026-07-28 — shader_recompiler/src/frontend/translate/integer_minimum_maximum.rs vs shader_recompiler/frontend/maxwell/translate/impl/integer_minimum_maximum.cpp
+
+### Intentional differences
+- Rust dispatches the three source encodings through one function and an
+  opcode argument; upstream has three thin visitor methods around the same
+  shared implementation.
+
+### Unintentional differences (fixed)
+- Rust decoded the predicate from bits 42-44 instead of bits 39-41. Those
+  bits are upstream's `neg_pred` and `mode` fields, so valid `PT` selections
+  became undefined user-predicate reads.
+- Rust ignored `neg_pred`; it now swaps minimum and maximum exactly as
+  upstream does.
+- Rust omitted the `cc` and nonzero `mode` rejection paths; both now match
+  upstream.
+- Source-B decoding now precedes validation and source-A access, preserving
+  upstream's IR emission order.
+
+### Missing items
+- None in the `IMNMX` translation slice.
+
+### Binary layout verification
+- PASS: instruction fields are decoded at upstream's exact bit positions;
+  no serialized structure changed.
+
+### Verification
+- Re-read upstream `integer_minimum_maximum.cpp` line by line after the fix.
+- Added focused tests for predicate bits 39-41, bit-42 inversion, `cc`, and
+  `mode`.
+
+## 2026-07-28 — shader_recompiler/src/ir/emitter.rs vs shader_recompiler/frontend/ir/ir_emitter.cpp
+
+### Intentional differences
+- Rust's emitter methods return the generic `Value` enum rather than
+  upstream's typed IR wrappers.
+
+### Unintentional differences (fixed)
+- `get_pred(PT, negated)` now returns an immediate boolean without emitting
+  `GetPred`, matching upstream.
+- `set_pred(PT, value)` now discards the write without emitting `SetPred`,
+  matching upstream's immutable always-true predicate.
+
+### Missing items
+- None in the predicate get/set slice.
+
+### Binary layout verification
+- PASS: IR construction only; no guest or serialized layout changed.
+
+### Verification
+- Re-read upstream `IREmitter::GetPred` and `IREmitter::SetPred`.
+- Added a focused regression test for positive/negated PT reads and ignored
+  PT writes.
