@@ -25607,6 +25607,80 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   successfully with the blacklist and did not reproduce that pipeline crash;
   the later application stall is scheduler-related and independent.
 
+## 2026-07-28 — video_core/src/renderer_vulkan/{master_semaphore,scheduler,command_pool,resource_pool,fence_manager,vk_rasterizer,query_cache,renderer_vulkan}.rs vs video_core/renderer_vulkan/vk_{master_semaphore,scheduler,command_pool,resource_pool,fence_manager,rasterizer,query_cache}.{h,cpp} and renderer_vulkan.{h,cpp}
+
+### Intentional differences
+- Rust shares `MasterSemaphore` through `Arc` between `Scheduler`,
+  `CommandPool`, and `InnerFence`. Upstream stores it as a `unique_ptr` in
+  `Scheduler` and gives `InnerFence` a `Scheduler&`; the Rust ownership keeps
+  the same single tick authority while allowing the generic fencing thread to
+  wait without dereferencing a movable rasterizer.
+- `StateTracker` and `QueryCache` are installed through stable `NonNull`
+  pointers after their `Box` allocations because Rust cannot construct the
+  mutually referring owners in one initializer. Their call ordering matches
+  upstream.
+- Rust declares the borrowing rasterizer before the boxed scheduler, state
+  tracker, and memory allocator so Rust's declaration-order field destruction
+  drops the borrower first. Upstream declares the owners first and relies on
+  C++ reverse-declaration destruction for the equivalent lifetime.
+- Vulkan creation failures are propagated as `Result` instead of C++ wrapper
+  exceptions. Queue submission failures are logged by the worker; the reduced
+  Rust `Device` owner does not yet expose upstream `Device::ReportLoss`.
+
+### Unintentional differences (fixed)
+- `Scheduler` independently owned a timeline semaphore, a single fallback
+  fence, and duplicate tick atomics while the ported `MasterSemaphore` was
+  unused. Scheduler submissions, command-pool reuse, delayed destruction, and
+  Vulkan fences now use one `MasterSemaphore`, matching upstream ownership and
+  tick semantics.
+- The fallback path waited before every submission and approximated completed
+  ticks from one fence. It now submits with a per-submission fence from the
+  upstream-sized reserve, and `VulkanFenceWait` advances `gpu_tick` in queue
+  order before recycling each fence.
+- `InnerFence::Wait` was empty. Consequently `GPUFencingThread` released
+  deferred operations and host syncpoints before GPU completion. `InnerFence`
+  now waits on its captured master-semaphore tick; `IsSignaled` uses the same
+  owner, and `Queue` records the tick returned by the scheduler flush.
+- Rust logical ticks started at zero and treated `current + 1` as the pending
+  tick. They now start at one; `NextTick` returns the submitted tick before
+  incrementing, and resource pools consume `CurrentTick`, matching upstream.
+- `Scheduler::Finish` resumed query segments before waiting for GPU
+  completion. `SubmitExecution` and `AllocateNewContext` are now separate, so
+  `Finish` waits for the pre-submit tick before resuming the segment.
+- The scheduler omitted the full signal/wait semaphore overload,
+  `UpdateRescaling`, `RegisterOnSubmit`, and query-cache segment lifecycle.
+  These methods and the upstream `NotifySegment(false/true)` ordering are now
+  present.
+- `QueryCache::notify_segment` discarded the notification instead of
+  forwarding it to `QueryCacheBase`.
+- `RendererVulkan` and `RasterizerVulkan` each created an independent
+  scheduler. Presentation and rasterization therefore used separate command
+  streams, timeline semaphores, and tick domains. The renderer now owns the
+  single boxed `StateTracker` and `Scheduler` and passes stable non-owning
+  references to the rasterizer, exactly matching upstream ownership.
+- `RendererVulkan::~RendererVulkan` documented clearing the submission
+  callback but did not do so. The Rust destructor now replaces it before
+  waiting for device idle, matching upstream teardown order.
+
+### Missing items
+- Device-loss reporting remains owned by the reduced Vulkan device wrapper;
+  scheduler submission errors are logged but cannot yet call upstream
+  `Device::ReportLoss`.
+
+### Binary layout verification
+- PASS: the changed scheduler, semaphore, fence, and pool state is host-only
+  and is never serialized or exposed to the guest ABI.
+
+### Verification
+- Re-read upstream `MasterSemaphore::{Refresh,Wait,SubmitQueueTimeline,
+  SubmitQueueFence,WaitThread}`, all `Scheduler` methods, `CommandPool::Commit`,
+  `ResourcePool::CommitResource`, and Vulkan
+  `InnerFence::{Queue,IsSignaled,Wait}` after implementation.
+- Scheduler command-arena/FIFO tests pass. Generic fence tests include a
+  regression proving asynchronous operations remain blocked until the backend
+  fence wait completes. Query-cache segment tests pass when run serially
+  because that suite mutates process-global GPU settings.
+
 ## 2026-07-28 — video_core/src/renderer_vulkan/{pipeline_cache,vk_rasterizer}.rs vs video_core/renderer_vulkan/vk_{pipeline_cache,graphics_pipeline,rasterizer}.{h,cpp}
 
 ### Intentional differences

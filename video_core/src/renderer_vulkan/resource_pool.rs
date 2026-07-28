@@ -56,9 +56,9 @@ impl ResourcePool {
 
     /// Construct a pool whose tick source is supplied by its owner.
     ///
-    /// The Rust scheduler currently owns the upstream `MasterSemaphore`
-    /// equivalent directly. This keeps the upstream resource-pool algorithm
-    /// while allowing that scheduler-owned timeline to drive reuse.
+    /// Used by reduced backends that have not yet moved their pool ownership
+    /// onto `MasterSemaphore`; the Vulkan scheduler and command pool use
+    /// `ResourcePool::new` like upstream.
     pub fn new_with_external_ticks(grow_step: usize) -> Self {
         ResourcePool {
             master_semaphore: None,

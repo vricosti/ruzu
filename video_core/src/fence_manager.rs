@@ -542,6 +542,27 @@ mod tests {
         fn wait_for_fence(&self) {}
     }
 
+    struct BlockingTestFence {
+        stubbed: bool,
+        entered_wait: Arc<AtomicBool>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl FenceBase for BlockingTestFence {
+        fn is_stubbed(&self) -> bool {
+            self.stubbed
+        }
+
+        fn wait_for_fence(&self) {
+            self.entered_wait.store(true, Ordering::Release);
+            let (lock, cv) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = cv.wait(released).unwrap();
+            }
+        }
+    }
+
     fn wait_until(flag: &AtomicBool) {
         let deadline = Instant::now() + Duration::from_secs(1);
         while !flag.load(Ordering::Relaxed) {
@@ -760,6 +781,55 @@ mod tests {
         );
 
         wait_until(&popped);
+        wait_until(&callback_hit);
+        settings::values_mut().current_gpu_accuracy = previous_gpu_accuracy;
+    }
+
+    #[test]
+    fn async_fence_does_not_release_operations_before_backend_wait_completes() {
+        let previous_gpu_accuracy = {
+            let mut values = settings::values_mut();
+            let previous = values.current_gpu_accuracy;
+            values.current_gpu_accuracy = GpuAccuracy::High;
+            previous
+        };
+
+        let mut manager = FenceManager::<BlockingTestFence>::new(true);
+        let entered_wait = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let callback_hit = Arc::new(AtomicBool::new(false));
+
+        manager.signal_fence(
+            Box::new({
+                let callback_hit = Arc::clone(&callback_hit);
+                move || callback_hit.store(true, Ordering::Release)
+            }),
+            {
+                let entered_wait = Arc::clone(&entered_wait);
+                let release = Arc::clone(&release);
+                move |is_stubbed| BlockingTestFence {
+                    stubbed: is_stubbed,
+                    entered_wait: Arc::clone(&entered_wait),
+                    release: Arc::clone(&release),
+                }
+            },
+            |_| {},
+            || false,
+            |_| false,
+            || {},
+            || true,
+            || {},
+            || {},
+            || {},
+        );
+
+        wait_until(&entered_wait);
+        assert!(!callback_hit.load(Ordering::Acquire));
+        {
+            let (lock, cv) = &*release;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
         wait_until(&callback_hit);
         settings::values_mut().current_gpu_accuracy = previous_gpu_accuracy;
     }

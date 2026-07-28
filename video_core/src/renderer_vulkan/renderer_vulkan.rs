@@ -32,6 +32,7 @@ use super::blit_screen::{BlitFrame, BlitScreen};
 use super::present::util::{create_wrapped_image, create_wrapped_image_view, download_color_image};
 use super::present_manager::{Frame, PresentManager};
 use super::scheduler::Scheduler;
+use super::state_tracker::StateTracker;
 use super::swapchain::Swapchain;
 
 // ---------------------------------------------------------------------------
@@ -208,8 +209,6 @@ pub struct RendererVulkan {
     swapchain: std::sync::Arc<std::sync::Mutex<Swapchain>>,
     /// Presentation frame manager.
     present_manager: PresentManager,
-    /// Presentation command scheduler.
-    scheduler: Scheduler,
     /// Swapchain blit/composition owner.
     blit_swapchain: BlitScreen,
     /// Screenshot/capture blit/composition owner.
@@ -217,7 +216,14 @@ pub struct RendererVulkan {
     /// Applet capture blit/composition owner.
     blit_applet: BlitScreen,
     /// Vulkan rasterizer owner.
+    ///
+    /// Rust drops fields in declaration order, so this borrowed owner must be
+    /// destroyed before `scheduler`, `state_tracker`, and `memory_allocator`.
     rasterizer: super::RasterizerVulkan,
+    /// Shared Vulkan command scheduler used by both rendering and presentation.
+    scheduler: Box<Scheduler>,
+    /// Shared Vulkan state tracker used by the scheduler and rasterizer.
+    state_tracker: Box<StateTracker>,
     /// Vulkan memory allocator owner.
     ///
     /// Declared after `rasterizer` so Rust drops the rasterizer first. This
@@ -297,13 +303,17 @@ impl RendererVulkan {
             physical_properties.limits.buffer_image_granularity,
             false,
         ));
-        let scheduler = Scheduler::new(
-            device.get_logical().clone(),
-            device.get_graphics_queue(),
-            device.get_graphics_family(),
-            device.is_timeline_semaphore_supported(),
-        )
-        .map_err(VulkanError::new)?;
+        let mut state_tracker = Box::new(StateTracker::new());
+        let mut scheduler = Box::new(
+            Scheduler::new(
+                device.get_logical().clone(),
+                device.get_graphics_queue(),
+                device.get_graphics_family(),
+                device.is_timeline_semaphore_supported(),
+            )
+            .map_err(VulkanError::new)?,
+        );
+        scheduler.set_state_tracker(std::ptr::NonNull::from(state_tracker.as_mut()));
         let submit_mutex = scheduler.submit_mutex();
         let swapchain = Swapchain::new(
             &instance.instance,
@@ -352,8 +362,6 @@ impl RendererVulkan {
             instance.instance.clone(),
             device.get_physical(),
             device.get_logical().clone(),
-            device.get_graphics_queue(),
-            device.get_graphics_family(),
             CAPTURE_IMAGE_WIDTH,
             CAPTURE_IMAGE_HEIGHT,
             device.supported_spirv_version(),
@@ -372,7 +380,6 @@ impl RendererVulkan {
             device.is_patch_list_primitive_restart_supported(),
             device.must_emulate_scaled_formats(),
             device.is_ext_shader_stencil_export_supported(),
-            device.is_timeline_semaphore_supported(),
             device.is_khr_image_format_list_supported(),
             device.is_optimal_astc_supported(),
             device.is_ext_custom_border_color_supported(),
@@ -384,6 +391,8 @@ impl RendererVulkan {
             syncpoints,
             Arc::clone(&device_memory),
             memory_allocator.as_mut(),
+            state_tracker.as_mut(),
+            scheduler.as_mut(),
         )
         .map_err(|err| {
             log::error!("Failed to initialize Vulkan rasterizer: {}", err);
@@ -403,11 +412,12 @@ impl RendererVulkan {
             device,
             swapchain,
             present_manager,
-            scheduler,
             blit_swapchain,
             blit_capture,
             blit_applet,
             rasterizer,
+            scheduler,
+            state_tracker,
             memory_allocator,
             base_data: RendererBaseData::new(),
             dummy_context: VulkanDummyContext,
@@ -767,6 +777,7 @@ impl Drop for RendererVulkan {
     /// Upstream: clears the scheduler on-submit callback, then waits for
     /// the device to become idle before destruction.
     fn drop(&mut self) {
+        self.scheduler.register_on_submit(|| {});
         unsafe {
             self.device.get_logical().device_wait_idle().ok();
             if self.applet_frame.framebuffer != vk::Framebuffer::null() {

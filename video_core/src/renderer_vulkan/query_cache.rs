@@ -273,8 +273,8 @@ impl QueryCache {
     /// Port of `QueryCache::NotifySegment`.
     ///
     /// Notifies the cache of a new command segment for query tracking.
-    pub fn notify_segment(&mut self, _is_draw: bool) {
-        // Base class handles segment tracking
+    pub fn notify_segment(&mut self, is_draw: bool) {
+        self.base.notify_segment(is_draw);
     }
 
     /// Port of `QueryCache::CounterEnable`.

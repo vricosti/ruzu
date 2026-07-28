@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use super::master_semaphore::MasterSemaphore;
+
 // ---------------------------------------------------------------------------
 // InnerFence
 // ---------------------------------------------------------------------------
@@ -18,43 +20,37 @@ use std::sync::Arc;
 pub struct InnerFence {
     is_stubbed: bool,
     wait_tick: u64,
-    // In the full implementation, this would hold an Arc to the Scheduler.
-    // For now we store the tick and expose query methods.
+    master_semaphore: Arc<MasterSemaphore>,
 }
 
 impl InnerFence {
     /// Port of `InnerFence::InnerFence`.
-    pub fn new(is_stubbed: bool) -> Self {
+    pub fn new(master_semaphore: Arc<MasterSemaphore>, is_stubbed: bool) -> Self {
         InnerFence {
             is_stubbed,
             wait_tick: 0,
+            master_semaphore,
         }
     }
 
     /// Port of `InnerFence::Queue`.
     ///
-    /// Records the current scheduler tick and triggers a flush.
-    /// When no scheduler is wired, behaves as if immediately signaled.
+    /// Records the scheduler tick selected immediately before `Flush`.
     pub fn queue(&mut self, current_tick: u64) {
         if self.is_stubbed {
             return;
         }
-        // Get the current tick so we can wait for it
         self.wait_tick = current_tick;
-        // In upstream: scheduler.Flush();
-        // Requires Scheduler integration (InnerFence holds &Scheduler in upstream;
-        // here we pass the tick externally until the Scheduler is wired).
     }
 
     /// Port of `InnerFence::IsSignaled`.
     ///
     /// Returns true if the GPU has completed the tick this fence is waiting on.
-    pub fn is_signaled(&self, known_gpu_tick: u64) -> bool {
+    pub fn is_signaled(&self) -> bool {
         if self.is_stubbed {
             return true;
         }
-        // In upstream: scheduler.IsFree(wait_tick)
-        known_gpu_tick >= self.wait_tick
+        self.master_semaphore.is_free(self.wait_tick)
     }
 
     /// Port of `InnerFence::Wait`.
@@ -64,9 +60,7 @@ impl InnerFence {
         if self.is_stubbed {
             return;
         }
-        // In upstream: scheduler.Wait(wait_tick);
-        // Requires Scheduler integration (InnerFence holds &Scheduler in upstream;
-        // here we pass the tick externally until the Scheduler is wired).
+        self.master_semaphore.wait(self.wait_tick);
     }
 
     /// Returns the tick this fence is waiting for.
@@ -102,20 +96,21 @@ impl crate::fence_manager::FenceBase for Fence {
 /// Extends `GenericFenceManager` (VideoCommon::FenceManager) with
 /// Vulkan-specific fence creation and synchronization.
 pub struct FenceManager {
-    /// Current scheduler tick for queuing fences.
-    /// In upstream this comes from `Scheduler& scheduler`.
-    _current_tick: u64,
+    master_semaphore: Arc<MasterSemaphore>,
 }
 
 impl FenceManager {
     /// Port of `FenceManager::FenceManager`.
-    pub fn new() -> Self {
-        FenceManager { _current_tick: 0 }
+    pub fn new(master_semaphore: Arc<MasterSemaphore>) -> Self {
+        FenceManager { master_semaphore }
     }
 
     /// Port of `FenceManager::CreateFence`.
     pub fn create_fence(&self, is_stubbed: bool) -> Fence {
-        Arc::new(std::sync::Mutex::new(InnerFence::new(is_stubbed)))
+        Arc::new(std::sync::Mutex::new(InnerFence::new(
+            Arc::clone(&self.master_semaphore),
+            is_stubbed,
+        )))
     }
 
     /// Port of `FenceManager::QueueFence`.
@@ -125,46 +120,14 @@ impl FenceManager {
     }
 
     /// Port of `FenceManager::IsFenceSignaled`.
-    pub fn is_fence_signaled(&self, fence: &Fence, known_gpu_tick: u64) -> bool {
+    pub fn is_fence_signaled(&self, fence: &Fence) -> bool {
         let inner = fence.lock().unwrap();
-        inner.is_signaled(known_gpu_tick)
+        inner.is_signaled()
     }
 
     /// Port of `FenceManager::WaitFence`.
     pub fn wait_fence(&self, fence: &Fence) {
         let inner = fence.lock().unwrap();
         inner.wait();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stubbed_fence_is_always_signaled() {
-        let fence = InnerFence::new(true);
-        assert!(fence.is_signaled(0));
-    }
-
-    #[test]
-    fn fence_not_signaled_before_tick() {
-        let mut fence = InnerFence::new(false);
-        fence.queue(10);
-        assert!(!fence.is_signaled(5));
-        assert!(fence.is_signaled(10));
-        assert!(fence.is_signaled(15));
-    }
-
-    #[test]
-    fn fence_manager_create_and_query() {
-        let manager = FenceManager::new();
-        let fence = manager.create_fence(false);
-        {
-            let mut inner = fence.lock().unwrap();
-            inner.queue(42);
-        }
-        assert!(!manager.is_fence_signaled(&fence, 41));
-        assert!(manager.is_fence_signaled(&fence, 42));
     }
 }

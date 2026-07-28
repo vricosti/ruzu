@@ -389,6 +389,57 @@ impl DeviceMemoryAccess for DeviceMemoryAccessAdapter {
     }
 }
 
+/// Non-owning reference to the renderer-owned scheduler.
+///
+/// Upstream stores `Scheduler&`; the pointee is boxed by `RendererVulkan`, so
+/// its address remains stable while the rasterizer exists.
+struct SchedulerReference(NonNull<Scheduler>);
+
+impl SchedulerReference {
+    fn new(scheduler: &mut Scheduler) -> Self {
+        Self(NonNull::from(scheduler))
+    }
+}
+
+impl std::ops::Deref for SchedulerReference {
+    type Target = Scheduler;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl std::ops::DerefMut for SchedulerReference {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self.0.as_mut() }
+    }
+}
+
+/// Non-owning reference to the renderer-owned state tracker.
+///
+/// Upstream stores `StateTracker&`; `RendererVulkan` owns the stable box.
+struct StateTrackerReference(NonNull<StateTracker>);
+
+impl StateTrackerReference {
+    fn new(state_tracker: &mut StateTracker) -> Self {
+        Self(NonNull::from(state_tracker))
+    }
+}
+
+impl std::ops::Deref for StateTrackerReference {
+    type Target = StateTracker;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl std::ops::DerefMut for StateTrackerReference {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self.0.as_mut() }
+    }
+}
+
 /// Central Vulkan rendering orchestrator.
 ///
 /// Ref: zuyu RasterizerVulkan — coordinates all rendering sub-components:
@@ -402,9 +453,9 @@ pub struct RasterizerVulkan {
     channel_caches: ChannelSetupCaches<ChannelInfo>,
 
     // Sub-components (matching zuyu's architecture)
-    scheduler: Box<Scheduler>,
+    scheduler: SchedulerReference,
     memory_allocator: NonNull<MemoryAllocator>,
-    state_tracker: Box<StateTracker>,
+    state_tracker: StateTrackerReference,
     staging_pool: Box<StagingBufferPool>,
     // Boxed like `scheduler`/`staging_pool`/`render_pass_cache`: sub-components
     // capture `NonNull` pointers to these during construction (BlitImageHelper
@@ -427,7 +478,7 @@ pub struct RasterizerVulkan {
     buffer_cache: DirectBufferCache,
     common_buffer_cache: VulkanCommonBufferCache,
     texture_cache: TextureCache,
-    query_cache: VulkanQueryCache,
+    query_cache: Box<VulkanQueryCache>,
     fence_manager: GenericFenceManager<VkFence>,
     fence_backend: VkFenceBackend,
     wfi_event: vk::Event,
@@ -501,8 +552,6 @@ impl RasterizerVulkan {
         instance: ash::Instance,
         physical_device: vk::PhysicalDevice,
         device: ash::Device,
-        graphics_queue: vk::Queue,
-        queue_family_index: u32,
         width: u32,
         height: u32,
         supported_spirv_version: u32,
@@ -521,7 +570,6 @@ impl RasterizerVulkan {
         patch_list_primitive_restart_supported: bool,
         must_emulate_scaled_formats: bool,
         shader_stencil_export_supported: bool,
-        timeline_semaphore_supported: bool,
         image_format_list_supported: bool,
         optimal_astc_supported: bool,
         custom_border_color_supported: bool,
@@ -533,33 +581,20 @@ impl RasterizerVulkan {
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<MaxwellDeviceMemoryManager>,
         memory_allocator: &mut MemoryAllocator,
+        state_tracker: &mut StateTracker,
+        scheduler: &mut Scheduler,
     ) -> Result<Self, RendererError> {
         info!(
             "RasterizerVulkan: initializing {}x{} renderer",
             width, height
         );
 
-        // Create state tracker
-        let mut state_tracker = Box::new(StateTracker::new());
-
-        // Create scheduler
-        let mut scheduler = Box::new(
-            Scheduler::new(
-                device.clone(),
-                graphics_queue,
-                queue_family_index,
-                timeline_semaphore_supported,
-            )
-            .map_err(|e| RendererError::InitFailed(format!("scheduler: {:?}", e)))?,
-        );
-        scheduler.set_state_tracker(NonNull::from(state_tracker.as_mut()));
-
         // Create staging buffer pool
         let mut staging_pool = Box::new(StagingBufferPool::new(
             device.clone(),
             instance.clone(),
             physical_device,
-            scheduler.as_mut(),
+            scheduler,
         ));
 
         // Create descriptor pool. Boxed (with the descriptor queues and the
@@ -572,7 +607,7 @@ impl RasterizerVulkan {
         let mut compute_pass_desc_queue = Box::new(UpdateDescriptorQueue::new());
         let mut blit_image = Box::new(BlitImageHelper::new(
             device.clone(),
-            &mut scheduler,
+            scheduler,
             descriptor_pool.as_mut(),
             shader_stencil_export_supported,
         ));
@@ -669,7 +704,7 @@ impl RasterizerVulkan {
             device.clone(),
             instance.clone(),
             physical_device,
-            scheduler.as_mut(),
+            scheduler,
             staging_pool.as_mut(),
             desc_queue.as_mut(),
             extended_dynamic_state_supported,
@@ -688,7 +723,7 @@ impl RasterizerVulkan {
             instance.clone(),
             physical_device,
             device_memory,
-            scheduler.as_mut(),
+            scheduler,
             &mut *memory_allocator,
             staging_pool.as_mut(),
             blit_image.as_mut(),
@@ -701,7 +736,8 @@ impl RasterizerVulkan {
         );
 
         // Create query cache
-        let query_cache = VulkanQueryCache::new();
+        let mut query_cache = Box::new(VulkanQueryCache::new());
+        scheduler.set_query_cache(NonNull::from(query_cache.as_mut()));
 
         let wfi_event_info = vk::EventCreateInfo::default();
         let wfi_event = unsafe {
@@ -749,6 +785,7 @@ impl RasterizerVulkan {
                 std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr()))
             })
         });
+        let fence_backend = VkFenceBackend::new(scheduler.master_semaphore());
 
         Ok(Self {
             device,
@@ -756,9 +793,9 @@ impl RasterizerVulkan {
             physical_device,
             syncpoints,
             channel_caches: ChannelSetupCaches::new(),
-            scheduler,
+            scheduler: SchedulerReference::new(scheduler),
             memory_allocator: NonNull::from(&mut *memory_allocator),
-            state_tracker,
+            state_tracker: StateTrackerReference::new(state_tracker),
             staging_pool,
             descriptor_pool,
             desc_queue,
@@ -776,7 +813,7 @@ impl RasterizerVulkan {
             texture_cache,
             query_cache,
             fence_manager: GenericFenceManager::new(true),
-            fence_backend: VkFenceBackend::new(),
+            fence_backend,
             wfi_event,
             default_render_pass,
             offscreen_image,
@@ -883,7 +920,6 @@ impl RasterizerVulkan {
             .as_ref()
             .map(|target| target.render_pass)
             .unwrap_or(self.default_render_pass);
-
         // 3. Compile or lookup cached pipeline
         let known_gpu_tick = self.scheduler.known_gpu_tick();
         let pending_tick = self.scheduler.pending_tick();
@@ -1381,13 +1417,11 @@ impl RasterizerVulkan {
     }
 
     fn is_fence_signaled(&self, fence: &VkFence) -> bool {
-        let wait_tick = fence.lock().unwrap().wait_tick();
-        self.scheduler.is_free(wait_tick)
+        self.fence_backend.is_fence_signaled(fence)
     }
 
-    fn wait_fence(&mut self, fence: &VkFence) {
-        let wait_tick = fence.lock().unwrap().wait_tick();
-        self.scheduler.wait(wait_tick);
+    fn wait_fence(&self, fence: &VkFence) {
+        self.fence_backend.wait_fence(fence);
     }
 
     /// Read back the offscreen framebuffer as RGBA8 pixels.

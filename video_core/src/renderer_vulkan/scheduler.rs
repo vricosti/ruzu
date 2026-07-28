@@ -11,10 +11,12 @@ use log::{debug, trace};
 use std::collections::VecDeque;
 use std::mem::{align_of, size_of, MaybeUninit};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 
 use super::command_pool::CommandPool;
+use super::master_semaphore::MasterSemaphore;
+use super::query_cache::QueryCache;
 use super::state_tracker::StateTracker;
 
 const COMMAND_CHUNK_CAPACITY: usize = 0x8000;
@@ -187,8 +189,10 @@ unsafe fn drop_command<T>(payload: *mut u8) {
 }
 
 struct SubmitRequest {
-    signal_semaphores: Vec<vk::Semaphore>,
+    signal_semaphore: vk::Semaphore,
+    wait_semaphore: vk::Semaphore,
     tick: u64,
+    on_submit: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Current render pass state tracked by the scheduler.
@@ -221,23 +225,14 @@ pub struct Scheduler {
     /// Current chunk being recorded to.
     current_chunk: CommandChunk,
 
-    /// Tick-based synchronization (simplified MasterSemaphore).
-    current_tick: Arc<AtomicU64>,
-    submitted_tick: Arc<AtomicU64>,
+    /// Upstream `Scheduler::master_semaphore`, shared with Vulkan fences and
+    /// resource pools so every completion query uses one authoritative tick.
+    master_semaphore: Arc<MasterSemaphore>,
 
     /// Render pass state.
     rp_state: RenderPassState,
     /// Upstream scheduler-local state invalidated by helper draws.
     state: SchedulerState,
-
-    /// Fence for GPU synchronization (legacy fallback when timeline
-    /// semaphores are unavailable: one submission in flight, wait-before-submit).
-    fence: vk::Fence,
-
-    /// Port of upstream `MasterSemaphore`: a timeline semaphore signalled with
-    /// the tick of each submission, so submissions pipeline without waiting
-    /// for the previous one and completion is queried per tick.
-    timeline_semaphore: Option<vk::Semaphore>,
 
     /// Port of upstream `Scheduler::submit_mutex`.
     submit_mutex: Arc<Mutex<()>>,
@@ -247,6 +242,8 @@ pub struct Scheduler {
     /// build a scheduler before a rasterizer state tracker exists, so this is
     /// installed by the rasterizer once both owners are allocated.
     state_tracker: Option<NonNull<StateTracker>>,
+    query_cache: Option<NonNull<QueryCache>>,
+    on_submit: Option<Arc<dyn Fn() + Send + Sync>>,
 
     /// Port of upstream `Scheduler::WorkerThread`: owns command-buffer
     /// recording, command-pool rotation, and queue submission.
@@ -281,15 +278,11 @@ impl SchedulerWorkerState {
 
 struct WorkerContext {
     device: ash::Device,
-    queue: vk::Queue,
     command_pool: CommandPool,
     current_cmdbuf: vk::CommandBuffer,
     upload_cmdbuf: vk::CommandBuffer,
-    timeline_semaphore: Option<vk::Semaphore>,
-    fence: vk::Fence,
+    master_semaphore: Arc<MasterSemaphore>,
     submit_mutex: Arc<Mutex<()>>,
-    current_tick: Arc<AtomicU64>,
-    submitted_tick: Arc<AtomicU64>,
 }
 
 impl SchedulerWorker {
@@ -373,33 +366,9 @@ impl SchedulerWorker {
 }
 
 impl WorkerContext {
-    fn known_gpu_tick(&self) -> u64 {
-        if let Some(timeline) = self.timeline_semaphore {
-            return unsafe {
-                self.device
-                    .get_semaphore_counter_value(timeline)
-                    .unwrap_or(0)
-            };
-        }
-        let submitted_tick = self.submitted_tick.load(Ordering::SeqCst);
-        if submitted_tick == 0
-            || unsafe { self.device.get_fence_status(self.fence).unwrap_or(false) }
-        {
-            submitted_tick
-        } else {
-            submitted_tick - 1
-        }
-    }
-
     fn allocate_worker_command_buffer(&mut self) -> Result<(), vk::Result> {
-        let known_gpu_tick = self.known_gpu_tick();
-        let pending_tick = self.current_tick.load(Ordering::SeqCst) + 1;
-        self.current_cmdbuf = self
-            .command_pool
-            .commit_with_ticks(known_gpu_tick, pending_tick);
-        self.upload_cmdbuf = self
-            .command_pool
-            .commit_with_ticks(known_gpu_tick, pending_tick);
+        self.current_cmdbuf = self.command_pool.commit();
+        self.upload_cmdbuf = self.command_pool.commit();
         let begin_info = vk::CommandBufferBeginInfo::builder()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
             .build();
@@ -435,68 +404,22 @@ impl WorkerContext {
             self.device.end_command_buffer(self.current_cmdbuf)?;
         }
 
-        let cmd_buffers = [self.upload_cmdbuf, self.current_cmdbuf];
-        if let Some(timeline) = self.timeline_semaphore {
-            let mut all_signals = Vec::with_capacity(1 + submit.signal_semaphores.len());
-            all_signals.push(timeline);
-            all_signals.extend_from_slice(&submit.signal_semaphores);
-            let mut signal_values = vec![0u64; all_signals.len()];
-            signal_values[0] = submit.tick;
-            let mut timeline_info =
-                vk::TimelineSemaphoreSubmitInfo::builder().signal_semaphore_values(&signal_values);
-            let submit_info = vk::SubmitInfo::builder()
-                .command_buffers(&cmd_buffers)
-                .signal_semaphores(&all_signals)
-                .push_next(&mut timeline_info)
-                .build();
-            let _submit_lock = self.submit_mutex.lock().unwrap();
-            let result = unsafe {
-                self.device
-                    .queue_submit(self.queue, &[submit_info], vk::Fence::null())
-            };
-            if result.is_ok() {
-                self.submitted_tick.store(submit.tick, Ordering::SeqCst);
-            }
-            result
-        } else {
-            let submit_info = vk::SubmitInfo::builder()
-                .command_buffers(&cmd_buffers)
-                .signal_semaphores(&submit.signal_semaphores)
-                .build();
-            let result = unsafe {
-                self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-                self.device.reset_fences(&[self.fence])?;
-                let _submit_lock = self.submit_mutex.lock().unwrap();
-                self.device
-                    .queue_submit(self.queue, &[submit_info], self.fence)
-            };
-            if result.is_ok() {
-                self.submitted_tick.store(submit.tick, Ordering::SeqCst);
-            }
-            result
+        if let Some(on_submit) = &submit.on_submit {
+            on_submit();
         }
+        let _submit_lock = self.submit_mutex.lock().unwrap();
+        self.master_semaphore.submit_queue(
+            self.current_cmdbuf,
+            self.upload_cmdbuf,
+            submit.signal_semaphore,
+            submit.wait_semaphore,
+            submit.tick,
+        )
     }
 
     fn wait_for_gpu(&self) {
-        let tick = self.current_tick.load(Ordering::SeqCst);
-        if tick == 0 {
-            return;
-        }
-        unsafe {
-            if let Some(timeline) = self.timeline_semaphore {
-                let semaphores = [timeline];
-                let values = [tick];
-                let wait_info = vk::SemaphoreWaitInfo::builder()
-                    .semaphores(&semaphores)
-                    .values(&values)
-                    .build();
-                self.device.wait_semaphores(&wait_info, u64::MAX).ok();
-            } else {
-                self.device
-                    .wait_for_fences(&[self.fence], true, u64::MAX)
-                    .ok();
-            }
-        }
+        let tick = self.master_semaphore.current_tick().saturating_sub(1);
+        self.master_semaphore.wait(tick);
     }
 }
 
@@ -508,42 +431,27 @@ impl Scheduler {
         graphics_family: u32,
         timeline_semaphore_supported: bool,
     ) -> Result<Self, vk::Result> {
-        let fence_info = vk::FenceCreateInfo::builder()
-            .flags(vk::FenceCreateFlags::SIGNALED)
-            .build();
-        let fence = unsafe { device.create_fence(&fence_info, None)? };
-
-        let timeline_semaphore = if timeline_semaphore_supported {
-            let mut type_info = vk::SemaphoreTypeCreateInfo::builder()
-                .semaphore_type(vk::SemaphoreType::TIMELINE)
-                .initial_value(0)
-                .build();
-            let semaphore_info = vk::SemaphoreCreateInfo::builder()
-                .push_next(&mut type_info)
-                .build();
-            Some(unsafe { device.create_semaphore(&semaphore_info, None)? })
-        } else {
+        if !timeline_semaphore_supported {
             log::warn!(
-                "Scheduler: timeline semaphores unavailable; falling back to                  single-submission fence synchronization"
+                "Scheduler: timeline semaphores unavailable; using upstream fence-queue fallback"
             );
-            None
-        };
+        }
 
+        let master_semaphore =
+            MasterSemaphore::new(device.clone(), queue, timeline_semaphore_supported)?;
         let submit_mutex = Arc::new(Mutex::new(()));
-        let current_tick = Arc::new(AtomicU64::new(0));
-        let submitted_tick = Arc::new(AtomicU64::new(0));
         let worker = Arc::new(SchedulerWorker::new());
         let mut worker_context = WorkerContext {
             device: device.clone(),
-            queue,
-            command_pool: CommandPool::new_with_external_ticks(device.clone(), graphics_family),
+            command_pool: CommandPool::new(
+                Arc::clone(&master_semaphore),
+                device.clone(),
+                graphics_family,
+            ),
             current_cmdbuf: vk::CommandBuffer::null(),
             upload_cmdbuf: vk::CommandBuffer::null(),
-            timeline_semaphore,
-            fence,
+            master_semaphore: Arc::clone(&master_semaphore),
             submit_mutex: Arc::clone(&submit_mutex),
-            current_tick: Arc::clone(&current_tick),
-            submitted_tick: Arc::clone(&submitted_tick),
         };
         worker_context.allocate_worker_command_buffer()?;
         let thread_worker = Arc::clone(&worker);
@@ -555,14 +463,13 @@ impl Scheduler {
         Ok(Self {
             device,
             current_chunk: CommandChunk::new(),
-            current_tick,
-            submitted_tick,
+            master_semaphore,
             rp_state: RenderPassState::default(),
             state: SchedulerState::default(),
-            fence,
-            timeline_semaphore,
             submit_mutex,
             state_tracker: None,
+            query_cache: None,
+            on_submit: None,
             worker: Some(worker),
             worker_thread: Some(worker_thread),
         })
@@ -572,8 +479,26 @@ impl Scheduler {
         Arc::clone(&self.submit_mutex)
     }
 
+    /// Returns the master timeline/fence owner used by scheduler submissions.
+    ///
+    /// Rust shares this owner with `InnerFence`; upstream reaches the same
+    /// object through `Scheduler&`.
+    pub fn master_semaphore(&self) -> Arc<MasterSemaphore> {
+        Arc::clone(&self.master_semaphore)
+    }
+
     pub fn set_state_tracker(&mut self, state_tracker: NonNull<StateTracker>) {
         self.state_tracker = Some(state_tracker);
+    }
+
+    /// Port of upstream `Scheduler::SetQueryCache`.
+    pub fn set_query_cache(&mut self, query_cache: NonNull<QueryCache>) {
+        self.query_cache = Some(query_cache);
+    }
+
+    /// Port of upstream `Scheduler::RegisterOnSubmit`.
+    pub fn register_on_submit(&mut self, callback: impl Fn() + Send + Sync + 'static) {
+        self.on_submit = Some(Arc::new(callback));
     }
 
     /// Record a command that only needs the render command buffer.
@@ -713,6 +638,16 @@ impl Scheduler {
         true
     }
 
+    /// Port of upstream `Scheduler::UpdateRescaling`.
+    pub fn update_rescaling(&mut self, is_rescaling: bool) -> bool {
+        if self.state.rescaling_defined && self.state.is_rescaling == is_rescaling {
+            return false;
+        }
+        self.state.rescaling_defined = true;
+        self.state.is_rescaling = is_rescaling;
+        true
+    }
+
     /// Port of upstream `Scheduler::InvalidateState`.
     pub fn invalidate_state(&mut self) {
         self.state.graphics_pipeline = vk::Pipeline::null();
@@ -747,47 +682,93 @@ impl Scheduler {
 
     /// Flush — end render pass, dispatch remaining work, submit to GPU, return tick.
     pub fn flush(&mut self) -> u64 {
-        self.flush_impl(&[])
+        self.flush_impl(vk::Semaphore::null(), vk::Semaphore::null())
     }
 
     /// Port of upstream `Scheduler::Flush(vk::Semaphore signal_semaphore)`.
     pub fn flush_with_signal(&mut self, signal_semaphore: vk::Semaphore) -> u64 {
-        if signal_semaphore == vk::Semaphore::null() {
-            self.flush()
-        } else {
-            self.flush_impl(&[signal_semaphore])
-        }
+        self.flush_impl(signal_semaphore, vk::Semaphore::null())
     }
 
-    fn flush_impl(&mut self, signal_semaphores: &[vk::Semaphore]) -> u64 {
-        self.request_outside_renderpass();
+    /// Full upstream `Scheduler::Flush(signal_semaphore, wait_semaphore)`.
+    pub fn flush_with_semaphores(
+        &mut self,
+        signal_semaphore: vk::Semaphore,
+        wait_semaphore: vk::Semaphore,
+    ) -> u64 {
+        self.flush_impl(signal_semaphore, wait_semaphore)
+    }
+
+    fn flush_impl(
+        &mut self,
+        signal_semaphore: vk::Semaphore,
+        wait_semaphore: vk::Semaphore,
+    ) -> u64 {
+        let tick = self.submit_execution(signal_semaphore, wait_semaphore);
+        self.allocate_new_context();
+        tick
+    }
+
+    /// Port of upstream `Scheduler::SubmitExecution`.
+    fn submit_execution(
+        &mut self,
+        signal_semaphore: vk::Semaphore,
+        wait_semaphore: vk::Semaphore,
+    ) -> u64 {
+        self.end_pending_operations();
         self.invalidate_state();
-        let tick = self.current_tick.fetch_add(1, Ordering::SeqCst) + 1;
+        let tick = self.master_semaphore.next_tick();
         self.current_chunk.submit = Some(SubmitRequest {
-            signal_semaphores: signal_semaphores.to_vec(),
+            signal_semaphore,
+            wait_semaphore,
             tick,
+            on_submit: self.on_submit.clone(),
         });
         self.dispatch_work();
-        if !signal_semaphores.is_empty() {
-            self.worker
-                .as_ref()
-                .expect("scheduler worker must exist")
-                .wait_drained();
-        }
         debug!("Scheduler: flushed at tick {}", tick);
         self.rp_state = RenderPassState::default();
         tick
     }
 
+    /// Port of upstream `Scheduler::EndPendingOperations`.
+    fn end_pending_operations(&mut self) {
+        if let Some(mut query_cache) = self.query_cache {
+            unsafe {
+                query_cache.as_mut().notify_segment(false);
+            }
+        }
+        self.request_outside_renderpass();
+    }
+
+    /// Port of upstream `Scheduler::AllocateNewContext`.
+    fn allocate_new_context(&mut self) {
+        if let Some(mut query_cache) = self.query_cache {
+            unsafe {
+                query_cache.as_mut().notify_segment(true);
+            }
+        }
+    }
+
     /// Flush + wait for GPU completion.
     pub fn finish(&mut self) {
-        let tick = self.flush();
-        self.wait(tick);
+        self.finish_with_semaphores(vk::Semaphore::null(), vk::Semaphore::null());
+    }
+
+    /// Full upstream `Scheduler::Finish(signal_semaphore, wait_semaphore)`.
+    pub fn finish_with_semaphores(
+        &mut self,
+        signal_semaphore: vk::Semaphore,
+        wait_semaphore: vk::Semaphore,
+    ) {
+        let presubmit_tick = self.current_tick();
+        self.submit_execution(signal_semaphore, wait_semaphore);
+        self.wait(presubmit_tick);
+        self.allocate_new_context();
     }
 
     /// Get the current tick value.
     pub fn current_tick(&self) -> u64 {
-        self.current_tick.load(Ordering::SeqCst)
+        self.master_semaphore.current_tick()
     }
 
     /// Last tick the GPU has fully completed.
@@ -796,88 +777,30 @@ impl Scheduler {
     /// rings must retire against this value, not against the submission tick:
     /// with pipelined submissions the CPU-side tick runs ahead of the GPU.
     pub fn known_gpu_tick(&self) -> u64 {
-        if let Some(timeline) = self.timeline_semaphore {
-            return unsafe {
-                self.device
-                    .get_semaphore_counter_value(timeline)
-                    .unwrap_or(0)
-            };
-        }
-        // Legacy single-submission fallback: the current tick remains in
-        // flight until the fence is signalled. Older ticks completed before
-        // that submission because this path waits on the same fence before
-        // each queue submit.
-        let submitted_tick = self.submitted_tick.load(Ordering::SeqCst);
-        if submitted_tick == 0
-            || unsafe { self.device.get_fence_status(self.fence).unwrap_or(false) }
-        {
-            submitted_tick
-        } else {
-            submitted_tick - 1
-        }
+        self.master_semaphore.refresh();
+        self.master_semaphore.known_gpu_tick()
     }
 
     /// Returns true when the GPU has completed `tick`.
     ///
-    /// Port-facing subset of upstream `Scheduler::IsFree`. This simplified
-    /// scheduler reuses a single fence, waiting on it before every new submit;
-    /// older ticks are therefore complete once a newer tick exists.
+    /// Port of upstream `Scheduler::IsFree`.
     pub fn is_free(&self, tick: u64) -> bool {
-        if tick == 0 {
-            return true;
-        }
-        if let Some(timeline) = self.timeline_semaphore {
-            // Upstream `MasterSemaphore::IsFree`: the GPU passed `tick` once
-            // the timeline counter reaches it.
-            return unsafe {
-                self.device
-                    .get_semaphore_counter_value(timeline)
-                    .map(|value| value >= tick)
-                    .unwrap_or(false)
-            };
-        }
-        let submitted_tick = self.submitted_tick.load(Ordering::SeqCst);
-        if tick > submitted_tick {
-            return false;
-        }
-        if tick < submitted_tick {
-            return true;
-        }
-        unsafe { self.device.get_fence_status(self.fence).unwrap_or(false) }
+        self.master_semaphore.is_free(tick)
     }
 
     /// Tick that will be signalled by the next `Flush`.
     pub fn pending_tick(&self) -> u64 {
-        self.current_tick() + 1
+        self.current_tick()
     }
 
     /// Port-facing subset of upstream `Scheduler::Wait`.
     pub fn wait(&mut self, tick: u64) {
-        if tick == 0 {
-            return;
-        }
-        if tick > self.current_tick() {
-            // The tick has not been submitted yet; flush so it will signal.
+        if tick >= self.current_tick() {
+            // Upstream: never wait for the current logical tick before a
+            // submission has been recorded to signal it.
             self.flush();
         }
-        if let Some(timeline) = self.timeline_semaphore {
-            let semaphores = [timeline];
-            let values = [tick];
-            let wait_info = vk::SemaphoreWaitInfo::builder()
-                .semaphores(&semaphores)
-                .values(&values)
-                .build();
-            unsafe {
-                self.device.wait_semaphores(&wait_info, u64::MAX).ok();
-            }
-            return;
-        }
-        self.wait_worker();
-        unsafe {
-            self.device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
-                .ok();
-        }
+        self.master_semaphore.wait(tick);
     }
 }
 
@@ -891,32 +814,13 @@ impl Drop for Scheduler {
                 let _ = handle.join();
             }
         }
-        unsafe {
-            if let Some(timeline) = self.timeline_semaphore {
-                let tick = self.current_tick();
-                if tick > 0 {
-                    let semaphores = [timeline];
-                    let values = [tick];
-                    let wait_info = vk::SemaphoreWaitInfo::builder()
-                        .semaphores(&semaphores)
-                        .values(&values)
-                        .build();
-                    self.device.wait_semaphores(&wait_info, u64::MAX).ok();
-                }
-                self.device.destroy_semaphore(timeline, None);
-            } else {
-                self.device
-                    .wait_for_fences(&[self.fence], true, u64::MAX)
-                    .ok();
-            }
-            self.device.destroy_fence(self.fence, None);
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
 
     #[test]
     fn test_command_chunk_new_is_empty() {
@@ -1027,13 +931,17 @@ mod tests {
     fn worker_queue_pops_chunks_fifo_and_tracks_in_flight() {
         let mut first = CommandChunk::new();
         first.submit = Some(SubmitRequest {
-            signal_semaphores: Vec::new(),
+            signal_semaphore: vk::Semaphore::null(),
+            wait_semaphore: vk::Semaphore::null(),
             tick: 7,
+            on_submit: None,
         });
         let mut second = CommandChunk::new();
         second.submit = Some(SubmitRequest {
-            signal_semaphores: Vec::new(),
+            signal_semaphore: vk::Semaphore::null(),
+            wait_semaphore: vk::Semaphore::null(),
             tick: 8,
+            on_submit: None,
         });
         let mut state = SchedulerWorkerState {
             chunks: VecDeque::from([first, second]),
