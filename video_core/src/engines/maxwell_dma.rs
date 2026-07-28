@@ -495,12 +495,7 @@ impl MaxwellDMA {
         let mut x_elements = self.line_length();
         let mut x_offset = src_params.origin.x();
         let bpp_shift = if !is_remapping {
-            self.fold_min_trailing_zeroes(&[
-                width,
-                x_elements,
-                x_offset,
-                self.src_addr() as u32,
-            ])
+            self.fold_min_trailing_zeroes(&[width, x_elements, x_offset, self.src_addr() as u32])
         } else {
             0
         };
@@ -1766,18 +1761,8 @@ mod tests {
         let line_count = height;
         let pitch = width * bytes_per_pixel;
         let linear: Vec<u8> = (0..pitch * line_count).map(|value| value as u8).collect();
-        let mut tiled = vec![
-            0u8;
-            calculate_size(
-                true,
-                bytes_per_pixel,
-                width,
-                height,
-                depth,
-                0,
-                0,
-            )
-        ];
+        let mut tiled =
+            vec![0u8; calculate_size(true, bytes_per_pixel, width, height, depth, 0, 0,)];
         swizzle_subrect(
             &mut tiled,
             &linear,

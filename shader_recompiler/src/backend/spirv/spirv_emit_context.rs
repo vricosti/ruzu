@@ -301,15 +301,11 @@ impl SpirvEmitContext {
         if program.info.uses_int64 && profile.support_int64 {
             builder.capability(spirv::Capability::Int64);
         }
-        // Upstream gates subgroup capabilities on individual usage flags.
-        if program.info.uses_subgroup_vote
-            || program.info.uses_subgroup_mask
-            || program.info.uses_subgroup_shuffles
-        {
-            builder.capability(spirv::Capability::GroupNonUniform);
-            builder.capability(spirv::Capability::GroupNonUniformBallot);
-            builder.capability(spirv::Capability::GroupNonUniformShuffle);
-            builder.capability(spirv::Capability::GroupNonUniformVote);
+        if program.info.uses_sampled_1d {
+            builder.capability(spirv::Capability::Sampled1D);
+        }
+        if program.info.uses_sparse_residency {
+            builder.capability(spirv::Capability::SparseResidency);
         }
         if program.info.uses_demote_to_helper_invocation
             && profile.support_demote_to_helper_invocation
@@ -319,10 +315,79 @@ impl SpirvEmitContext {
             }
             builder.capability(spirv::Capability::DemoteToHelperInvocation);
         }
-        builder.capability(spirv::Capability::DrawParameters);
+
+        use crate::ir::value::Attribute as IrAttribute;
+        if program
+            .info
+            .stores
+            .get(IrAttribute::VIEWPORT_INDEX.0 as usize)
+            && profile.support_multi_viewport
+        {
+            builder.capability(spirv::Capability::MultiViewport);
+        }
+        if program
+            .info
+            .stores
+            .get(IrAttribute::VIEWPORT_MASK.0 as usize)
+            && profile.support_viewport_mask
+        {
+            builder.extension("SPV_NV_viewport_array2");
+            builder.capability(spirv::Capability::ShaderViewportMaskNV);
+        }
+        if program.info.stores.get(IrAttribute::LAYER.0 as usize)
+            || program
+                .info
+                .stores
+                .get(IrAttribute::VIEWPORT_INDEX.0 as usize)
+        {
+            if profile.support_viewport_index_layer_non_geometry
+                && program.stage != ShaderStage::Geometry
+            {
+                builder.extension("SPV_EXT_shader_viewport_index_layer");
+                builder.capability(spirv::Capability::ShaderViewportIndexLayerEXT);
+            }
+        }
+        if !profile.support_vertex_instance_id
+            && (program.info.loads.get(IrAttribute::INSTANCE_ID.0 as usize)
+                || program.info.loads.get(IrAttribute::VERTEX_ID.0 as usize))
+        {
+            builder.extension("SPV_KHR_shader_draw_parameters");
+            builder.capability(spirv::Capability::DrawParameters);
+        }
+        if (program.info.uses_subgroup_vote
+            || program.info.uses_subgroup_invocation_id
+            || program.info.uses_subgroup_shuffles)
+            && profile.support_vote
+        {
+            builder.capability(spirv::Capability::GroupNonUniformBallot);
+            builder.capability(spirv::Capability::GroupNonUniformShuffle);
+            if !profile.warp_size_potentially_larger_than_guest {
+                builder.capability(spirv::Capability::GroupNonUniformVote);
+            }
+        }
+        if program.info.uses_int64_bit_atomics && profile.support_int64_atomics {
+            builder.capability(spirv::Capability::Int64Atomics);
+        }
+        if program.info.uses_typeless_image_reads && profile.support_typeless_image_loads {
+            builder.capability(spirv::Capability::StorageImageReadWithoutFormat);
+        }
+        if program.info.uses_typeless_image_writes {
+            builder.capability(spirv::Capability::StorageImageWriteWithoutFormat);
+        }
+        if program.info.uses_image_buffers {
+            builder.capability(spirv::Capability::ImageBuffer);
+        }
+        if program.info.uses_sample_id {
+            builder.capability(spirv::Capability::SampleRateShading);
+        }
+        if program.info.uses_derivatives {
+            builder.capability(spirv::Capability::DerivativeControl);
+        }
+
+        // Upstream SetupCapabilities does not track these usages yet.
+        builder.capability(spirv::Capability::ImageGatherExtended);
         builder.capability(spirv::Capability::ImageQuery);
-        builder.capability(spirv::Capability::Sampled1D);
-        builder.capability(spirv::Capability::SampledCubeArray);
+        builder.capability(spirv::Capability::SampledBuffer);
 
         builder.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
 
@@ -607,11 +672,7 @@ impl SpirvEmitContext {
     }
 
     /// Port of upstream `EmitContext::DefineImageBuffers`.
-    fn define_image_buffers(
-        &mut self,
-        descriptors: &[ImageBufferDescriptor],
-        binding: &mut u32,
-    ) {
+    fn define_image_buffers(&mut self, descriptors: &[ImageBufferDescriptor], binding: &mut u32) {
         self.image_buffers.reserve(descriptors.len());
         for desc in descriptors {
             assert_eq!(desc.count, 1, "SPIR-V: array of image buffers");
@@ -630,11 +691,9 @@ impl SpirvEmitContext {
                 image_format(desc.format),
                 None,
             );
-            let pointer_type = self.builder.type_pointer(
-                None,
-                spirv::StorageClass::UniformConstant,
-                image_type,
-            );
+            let pointer_type =
+                self.builder
+                    .type_pointer(None, spirv::StorageClass::UniformConstant, image_type);
             let id = self.builder.variable(
                 pointer_type,
                 None,
@@ -675,11 +734,9 @@ impl SpirvEmitContext {
                 self.f32_type
             };
             let image_type = storage_image_type(self, desc, sampled_type);
-            let pointer_type = self.builder.type_pointer(
-                None,
-                spirv::StorageClass::UniformConstant,
-                image_type,
-            );
+            let pointer_type =
+                self.builder
+                    .type_pointer(None, spirv::StorageClass::UniformConstant, image_type);
             let id = self.builder.variable(
                 pointer_type,
                 None,
@@ -2887,6 +2944,19 @@ mod tests {
     use crate::ir::types::{ShaderStage, TextureInstInfo, Type};
     use crate::ir::value::{Attribute, InstRef, Value};
 
+    fn has_capability(ctx: &SpirvEmitContext, capability: spirv::Capability) -> bool {
+        ctx.builder
+            .module_ref()
+            .capabilities
+            .iter()
+            .any(|instruction| {
+                matches!(
+                    instruction.operands.as_slice(),
+                    [Operand::Capability(found)] if *found == capability
+                )
+            })
+    }
+
     #[test]
     fn fragment_depth_declares_builtin_mode_and_store() {
         let mut program = ir::Program::new(ShaderStage::Fragment);
@@ -3244,10 +3314,7 @@ mod tests {
         let mut vertex_ctx = SpirvEmitContext::new(&vertex, &profile, &runtime_info);
         vertex_ctx.define_global_variables(&vertex, &mut bindings);
         assert_eq!(bindings.unified, 2);
-        assert_eq!(
-            binding_of(&vertex_ctx, vertex_ctx.texture_buffers[0].id),
-            1
-        );
+        assert_eq!(binding_of(&vertex_ctx, vertex_ctx.texture_buffers[0].id), 1);
 
         let texture = TextureDescriptor {
             texture_type: TextureType::Color2D,
@@ -3271,6 +3338,79 @@ mod tests {
         assert_eq!(bindings.unified, 4);
         assert_eq!(binding_of(&fragment_ctx, fragment_ctx.textures[0].id), 2);
         assert_eq!(binding_of(&fragment_ctx, fragment_ctx.textures[1].id), 3);
+    }
+
+    #[test]
+    fn texel_buffer_declares_sampled_buffer_capability() {
+        let mut program = ir::Program::new(ShaderStage::VertexB);
+        program
+            .info
+            .texture_buffer_descriptors
+            .push(TextureBufferDescriptor {
+                has_secondary: false,
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                shift_left: 0,
+                secondary_cbuf_index: 0,
+                secondary_cbuf_offset: 0,
+                secondary_shift_left: 0,
+                count: 1,
+                size_shift: 0,
+            });
+
+        let context = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+        assert!(has_capability(&context, spirv::Capability::SampledBuffer));
+    }
+
+    #[test]
+    fn setup_capabilities_matches_upstream_usage_gates() {
+        let unused = ir::Program::new(ShaderStage::VertexB);
+        let unused_ctx =
+            SpirvEmitContext::new(&unused, &Profile::default(), &RuntimeInfo::default());
+        assert!(!has_capability(&unused_ctx, spirv::Capability::Sampled1D));
+        assert!(!has_capability(
+            &unused_ctx,
+            spirv::Capability::DrawParameters
+        ));
+        assert!(!has_capability(
+            &unused_ctx,
+            spirv::Capability::DerivativeControl
+        ));
+
+        let mut used = ir::Program::new(ShaderStage::VertexB);
+        used.info.uses_sampled_1d = true;
+        used.info.uses_derivatives = true;
+        used.info.uses_typeless_image_reads = true;
+        used.info.uses_typeless_image_writes = true;
+        used.info.uses_image_buffers = true;
+        used.info.loads.set(Attribute::VERTEX_ID.0 as usize, true);
+        let profile = Profile {
+            support_typeless_image_loads: true,
+            support_vertex_instance_id: false,
+            ..Profile::default()
+        };
+        let used_ctx = SpirvEmitContext::new(&used, &profile, &RuntimeInfo::default());
+
+        for capability in [
+            spirv::Capability::Sampled1D,
+            spirv::Capability::DerivativeControl,
+            spirv::Capability::StorageImageReadWithoutFormat,
+            spirv::Capability::StorageImageWriteWithoutFormat,
+            spirv::Capability::ImageBuffer,
+            spirv::Capability::DrawParameters,
+        ] {
+            assert!(
+                has_capability(&used_ctx, capability),
+                "missing capability {capability:?}"
+            );
+        }
+        assert!(used_ctx.builder.module_ref().extensions.iter().any(|inst| {
+            matches!(
+                inst.operands.as_slice(),
+                [Operand::LiteralString(extension)]
+                    if extension == "SPV_KHR_shader_draw_parameters"
+            )
+        }));
     }
 
     #[test]
