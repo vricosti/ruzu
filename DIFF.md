@@ -25606,3 +25606,123 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   affected fragment shader. The official Khronos 1.4.2 build loaded
   successfully with the blacklist and did not reproduce that pipeline crash;
   the later application stall is scheduler-related and independent.
+
+## 2026-07-28 — video_core/src/renderer_vulkan/{pipeline_cache,vk_rasterizer}.rs vs video_core/renderer_vulkan/vk_{pipeline_cache,graphics_pipeline,rasterizer}.{h,cpp}
+
+### Intentional differences
+- None.
+
+### Unintentional differences (fixed)
+- Rust passed the render pass selected by the current texture-cache
+  framebuffer into graphics-pipeline creation. Upstream
+  `GraphicsPipeline` obtains its render pass from
+  `render_pass_cache.Get(MakeRenderPassKey(key.state))`; pipeline compatibility
+  is therefore defined exclusively by `FixedPipelineState`. Rust now performs
+  the same lookup inside `PipelineCache` for both direct and shared-shader-cache
+  creation paths.
+- The old path could combine a fixed state whose last non-zero render-target
+  slot was higher than the framebuffer subpass attachment count. MoltenVK then
+  indexed beyond its render-pass attachment-location table while creating the
+  pipeline. The pipeline and framebuffer render passes now retain their
+  distinct upstream ownership and compatible state derivation.
+
+### Missing items
+- None introduced by this correction.
+
+### Binary layout verification
+- PASS: pipeline/render-pass selection is host-only; serialized
+  `FixedPipelineState` and pipeline keys are unchanged.
+
+### Verification
+- Re-read upstream `PipelineCache::CurrentGraphicsPipeline`,
+  `GraphicsPipeline::GraphicsPipeline`, `MakeRenderPassKey`, and
+  `RasterizerVulkan::PrepareDraw`.
+- Added regression coverage requiring both graphics-pipeline creation paths to
+  derive the render pass from `fixed_state`.
+
+## 2026-07-28 — shader_recompiler/src/backend/spirv/{spirv_emit_context,emit_spirv_image}.rs vs shader_recompiler/backend/spirv/{spirv_emit_context.h,spirv_emit_context.cpp,emit_spirv_image.cpp}
+
+### Intentional differences
+- Rust represents upstream's invalid default texture index as `Value::Void`;
+  `TextureImage` accepts that value as the implicit zero index for a
+  non-array descriptor.
+
+### Unintentional differences (fixed)
+- Rust skipped `DefineTextureBuffers`, `DefineImageBuffers`, and
+  `DefineImages`. This failed to advance the shared Vulkan descriptor-binding
+  counter before later shader stages and made emitted SPIR-V bindings disagree
+  with the pipeline layout. The dedicated upstream resource definitions and
+  declaration order are now ported.
+- `TextureImage` always indexed the sampled-texture vector. It now loads the
+  dedicated `Dim::Buffer` image for `TextureType::Buffer`, matching upstream.
+- Buffer texture fetches incorrectly carried a LOD operand, and dimension
+  queries returned a scalar instead of upstream's four-component result.
+  Buffer fetch/query operand and result construction now follow upstream.
+
+### Missing items
+- The pre-existing SPIR-V dispatch still lacks storage
+  `ImageRead`/`ImageWrite`/image-atomic emission. Their declarations are now
+  represented correctly, but those operations remain a separate upstream
+  method-port slice.
+
+### Binary layout verification
+- PASS: this change affects SPIR-V resource declarations only; no guest or
+  serialized host structure changed.
+
+### Verification
+- Re-read upstream `TextureBufferDefinition`, `ImageBufferDefinition`,
+  `ImageDefinition`, `EmitContext::DefineTextureBuffers`,
+  `EmitContext::DefineImageBuffers`, `EmitContext::DefineTextures`,
+  `EmitContext::DefineImages`, `TextureImage`, `EmitImageFetch`, and
+  `EmitImageQueryDimensions`.
+- Added regression coverage for the cross-stage unified binding sequence
+  UBO 0, uniform texel buffer 1, and fragment samplers 2 and 3.
+
+## 2026-07-28 — video_core/src/renderer_vulkan/buffer_cache.rs vs video_core/renderer_vulkan/vk_buffer_cache.cpp
+
+### Intentional differences
+- Extension-dependent transform-feedback and conditional-rendering buffer
+  usage flags remain owned by their not-yet-complete extension paths.
+
+### Unintentional differences (fixed)
+- Common-cache Vulkan buffers omitted
+  `VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT` and
+  `VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT`, although
+  `BindTextureBuffer`/`BindImageBuffer` create views over those buffers.
+  The base usage mask now matches upstream's `CreateBuffer`.
+
+### Missing items
+- Extension-dependent transform-feedback and conditional-rendering usage
+  flags still need to be added when those runtime paths are enabled.
+
+### Binary layout verification
+- PASS: Vulkan creation flags only; no guest or serialized layout changed.
+
+### Verification
+- Re-read upstream `CreateBuffer` and the Vulkan
+  `BindTextureBuffer`/`BindImageBuffer` runtime methods.
+- Added a regression test requiring both texel-buffer usage flags.
+
+## 2026-07-28 — shader_recompiler/src/backend/spirv/emit_spirv_image.rs vs shader_recompiler/backend/spirv/emit_spirv_image.cpp
+
+### Intentional differences
+- None.
+
+### Unintentional differences (fixed)
+- `EmitImageFetch` discarded the frontend-preserved offset and multisample
+  operands. It now ports `AddOffsetToCoordinates` and upstream's exact
+  `Lod`/`Sample` operand selection, including suppressing LOD for buffer and
+  multisample fetches.
+
+### Missing items
+- None in the `EmitImageFetch` slice.
+
+### Binary layout verification
+- PASS: SPIR-V instruction emission only; no guest or serialized structure
+  changed.
+
+### Verification
+- Re-read upstream `AddOffsetToCoordinates`, `ImageOperands(Id lod, Id ms)`,
+  and `EmitImageFetch` after implementation.
+- Added a regression test proving that a buffer AOFFI emits `OpIAdd`, feeds
+  its result to `OpImageFetch`, and emits no LOD operand.

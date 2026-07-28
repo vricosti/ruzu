@@ -451,7 +451,6 @@ impl PipelineCache {
     pub fn current_graphics_pipeline(
         &mut self,
         draw: &DrawCall,
-        render_pass: vk::RenderPass,
         read_gpu: &dyn Fn(u64, &mut [u8]),
     ) -> Option<(&GraphicsPipeline, FixedPipelineState)> {
         let (key, fixed_state) = self.graphics_pipeline_cache.make_key(draw, read_gpu)?;
@@ -474,7 +473,7 @@ impl PipelineCache {
             }
         }
 
-        self.current_graphics_pipeline_slow_path(draw, render_pass, read_gpu, key, fixed_state)
+        self.current_graphics_pipeline_slow_path(draw, read_gpu, key, fixed_state)
     }
 
     /// Shared-cache runtime path matching upstream's pipeline-cache ownership:
@@ -483,7 +482,6 @@ impl PipelineCache {
     pub fn current_graphics_pipeline_with_shared_cache(
         &mut self,
         draw: &DrawCall,
-        render_pass: vk::RenderPass,
         shared_cache: &mut SharedShaderCache,
     ) -> Option<(&GraphicsPipeline, FixedPipelineState)> {
         let mut unique_hashes = self.graphics_key.unique_hashes;
@@ -515,7 +513,6 @@ impl PipelineCache {
 
         self.current_graphics_pipeline_slow_path_with_shared_cache(
             draw,
-            render_pass,
             shared_cache,
             key,
             fixed_state,
@@ -651,7 +648,6 @@ impl PipelineCache {
     fn current_graphics_pipeline_slow_path(
         &mut self,
         draw: &DrawCall,
-        render_pass: vk::RenderPass,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         key: GraphicsPipelineKey,
         fixed_state: FixedPipelineState,
@@ -663,7 +659,7 @@ impl PipelineCache {
         let is_new = !self.graphics_cache.contains_key(&key);
         if is_new {
             let Some(pipeline) =
-                self.create_graphics_pipeline(draw, render_pass, read_gpu, &key, &fixed_state)
+                self.create_graphics_pipeline(draw, read_gpu, &key, &fixed_state)
             else {
                 self.failed_graphics_cache.insert(key);
                 return None;
@@ -690,7 +686,6 @@ impl PipelineCache {
     fn current_graphics_pipeline_slow_path_with_shared_cache(
         &mut self,
         draw: &DrawCall,
-        render_pass: vk::RenderPass,
         shared_cache: &SharedShaderCache,
         key: GraphicsPipelineKey,
         fixed_state: FixedPipelineState,
@@ -703,7 +698,6 @@ impl PipelineCache {
         if is_new {
             let Some(pipeline) = self.create_graphics_pipeline_with_shared_cache(
                 draw,
-                render_pass,
                 shared_cache,
                 &key,
                 &fixed_state,
@@ -749,12 +743,12 @@ impl PipelineCache {
     fn create_graphics_pipeline(
         &mut self,
         draw: &DrawCall,
-        render_pass: vk::RenderPass,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         key: &GraphicsPipelineKey,
         fixed_state: &FixedPipelineState,
     ) -> Option<GraphicsPipeline> {
         self.main_pools.release_contents();
+        let render_pass = self.render_pass_for_state(fixed_state)?;
         let pipeline_cache = self.vulkan_pipeline_cache;
         let mut pipeline = self.graphics_pipeline_cache.build_pipeline_keyed(
             draw,
@@ -776,12 +770,12 @@ impl PipelineCache {
     fn create_graphics_pipeline_with_shared_cache(
         &mut self,
         draw: &DrawCall,
-        render_pass: vk::RenderPass,
         shared_cache: &SharedShaderCache,
         key: &GraphicsPipelineKey,
         fixed_state: &FixedPipelineState,
     ) -> Option<GraphicsPipeline> {
         self.main_pools.release_contents();
+        let render_pass = self.render_pass_for_state(fixed_state)?;
         let pipeline_cache = self.vulkan_pipeline_cache;
         let mut environments = GraphicsEnvironments::default();
         shared_cache.get_graphics_environments(&mut environments, &key.unique_hashes);
@@ -1313,6 +1307,27 @@ mod tests {
     #[test]
     fn cache_version_tracks_environment_constant_buffer_folding() {
         assert_eq!(CACHE_VERSION, 18);
+    }
+
+    #[test]
+    fn graphics_pipeline_creation_derives_render_pass_from_fixed_state() {
+        let source = include_str!("pipeline_cache.rs");
+        for function_name in [
+            "fn create_graphics_pipeline(",
+            "fn create_graphics_pipeline_with_shared_cache(",
+        ] {
+            let function = source
+                .split(function_name)
+                .nth(1)
+                .expect("graphics pipeline creation function must exist")
+                .split("\n    fn ")
+                .next()
+                .expect("graphics pipeline creation function must have a body");
+            assert!(
+                function.contains("self.render_pass_for_state(fixed_state)?"),
+                "{function_name} must select its render pass from the pipeline fixed state"
+            );
+        }
     }
 
     #[test]

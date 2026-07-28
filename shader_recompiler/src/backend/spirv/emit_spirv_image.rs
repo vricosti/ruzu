@@ -256,6 +256,63 @@ fn immediate_offset_components(program: &Program, offset: Value) -> Option<Vec<u
     }
 }
 
+/// Port of upstream `AddOffsetToCoordinates`.
+fn add_offset_to_coordinates(
+    ctx: &mut SpirvEmitContext,
+    info: TextureInstInfo,
+    coords: Word,
+    offset: &Value,
+) -> Word {
+    if offset.is_void() {
+        return coords;
+    }
+
+    let texture_type = crate::shader_info::TextureType::from_u8(info.texture_type);
+    let mut offset = ctx.resolve_value(offset);
+    let result_type = match texture_type {
+        crate::shader_info::TextureType::Buffer
+        | crate::shader_info::TextureType::Color1D => ctx.u32_type,
+        crate::shader_info::TextureType::ColorArray1D => {
+            offset = ctx
+                .builder
+                .composite_construct(
+                    ctx.u32_vec2_type,
+                    None,
+                    vec![offset, ctx.const_zero_u32],
+                )
+                .unwrap();
+            ctx.u32_vec2_type
+        }
+        crate::shader_info::TextureType::Color2D
+        | crate::shader_info::TextureType::Color2DRect => ctx.u32_vec2_type,
+        crate::shader_info::TextureType::ColorArray2D => {
+            let x = ctx
+                .builder
+                .composite_extract(ctx.u32_type, None, coords, vec![0])
+                .unwrap();
+            let y = ctx
+                .builder
+                .composite_extract(ctx.u32_type, None, coords, vec![1])
+                .unwrap();
+            offset = ctx
+                .builder
+                .composite_construct(
+                    ctx.u32_vec3_type,
+                    None,
+                    vec![x, y, ctx.const_zero_u32],
+                )
+                .unwrap();
+            ctx.u32_vec3_type
+        }
+        crate::shader_info::TextureType::Color3D => ctx.u32_vec3_type,
+        crate::shader_info::TextureType::ColorCube
+        | crate::shader_info::TextureType::ColorArrayCube => return coords,
+    };
+    ctx.builder
+        .i_add(result_type, None, coords, offset)
+        .unwrap()
+}
+
 fn decorate_sample(ctx: &mut SpirvEmitContext, info: TextureInstInfo, sample: Word) -> Word {
     if info.relaxed_precision {
         ctx.builder
@@ -283,9 +340,25 @@ fn texture(ctx: &mut SpirvEmitContext, descriptor_index: u32, index: Value) -> O
     )
 }
 
-/// Port of upstream `TextureImage`: extract the image from a combined sampler.
-fn texture_image(ctx: &mut SpirvEmitContext, descriptor_index: u32, index: Value) -> Option<Word> {
-    let def = *ctx.textures.get(descriptor_index as usize)?;
+/// Port of upstream `TextureImage`: load a texel buffer or extract the image
+/// from a combined sampler.
+fn texture_image(ctx: &mut SpirvEmitContext, info: TextureInstInfo, index: Value) -> Option<Word> {
+    if !matches!(index, Value::Void) && (!index.is_immediate() || index.imm_u32() != 0) {
+        panic!("SPIR-V: indirect image indexing is not implemented");
+    }
+    if crate::shader_info::TextureType::from_u8(info.texture_type)
+        == crate::shader_info::TextureType::Buffer
+    {
+        let def = *ctx.texture_buffers.get(info.descriptor_index as usize)?;
+        assert_eq!(def.count, 1, "SPIR-V: indirect texture sample");
+        return Some(
+            ctx.builder
+                .load(ctx.image_buffer_type, None, def.id, None, vec![])
+                .unwrap(),
+        );
+    }
+
+    let def = *ctx.textures.get(info.descriptor_index as usize)?;
     let sampled_image = if def.count > 1 {
         let index = ctx.resolve_value(&index);
         let pointer = ctx
@@ -295,14 +368,10 @@ fn texture_image(ctx: &mut SpirvEmitContext, descriptor_index: u32, index: Value
         ctx.builder
             .load(def.sampled_type, None, pointer, None, vec![])
             .unwrap()
-    // Upstream's default-constructed `IR::Value{}` is the implicit index zero
-    // used for non-array descriptors; Rust represents it as `Value::Void`.
-    } else if matches!(index, Value::Void) || (index.is_immediate() && index.imm_u32() == 0) {
+    } else {
         ctx.builder
             .load(def.sampled_type, None, def.id, None, vec![])
             .unwrap()
-    } else {
-        panic!("SPIR-V: indirect texture image indexing is not implemented");
     };
     Some(
         ctx.builder
@@ -486,25 +555,37 @@ pub fn emit_image_fetch_inst(
     inst_idx: u32,
 ) {
     let info = TextureInstInfo::from_u32(inst.flags);
-    let desc_idx = info.descriptor_index as u32;
-    let coord = ctx.resolve_value(inst.arg(1));
+    let coords = ctx.resolve_value(inst.arg(1));
+    let coords = add_offset_to_coordinates(ctx, info, coords, inst.arg(2));
 
-    if let Some(image) = texture_image(ctx, desc_idx, *inst.arg(0)) {
-        let lod = if inst.args.len() > 3 {
-            ctx.resolve_value(inst.arg(3))
-        } else {
-            ctx.const_zero_u32
-        };
-
+    if let Some(image) = texture_image(ctx, info, *inst.arg(0)) {
+        let is_buffer = crate::shader_info::TextureType::from_u8(info.texture_type)
+            == crate::shader_info::TextureType::Buffer;
+        let mut lod = (!is_buffer && !inst.arg(3).is_void())
+            .then(|| ctx.resolve_value(inst.arg(3)));
+        let sample = (!inst.arg(4).is_void()).then(|| ctx.resolve_value(inst.arg(4)));
+        if sample.is_some() {
+            lod = None;
+        }
+        let mut operand_mask = spirv::ImageOperands::NONE;
+        let mut operand_ids = Vec::with_capacity(2);
+        if let Some(lod) = lod {
+            operand_mask |= spirv::ImageOperands::LOD;
+            operand_ids.push(Operand::IdRef(lod));
+        }
+        if let Some(sample) = sample {
+            operand_mask |= spirv::ImageOperands::SAMPLE;
+            operand_ids.push(Operand::IdRef(sample));
+        }
         let id = ctx
             .builder
             .image_fetch(
                 ctx.f32_vec4_type,
                 None,
                 image,
-                coord,
-                Some(spirv::ImageOperands::LOD),
-                vec![Operand::IdRef(lod)],
+                coords,
+                (!operand_mask.is_empty()).then_some(operand_mask),
+                operand_ids,
             )
             .unwrap();
 
@@ -527,18 +608,60 @@ pub fn emit_image_query(
     inst_idx: u32,
 ) {
     let info = TextureInstInfo::from_u32(inst.flags);
-    let desc_idx = info.descriptor_index as u32;
-
-    if let Some(image) = texture_image(ctx, desc_idx, *inst.arg(0)) {
+    if let Some(image) = texture_image(ctx, info, *inst.arg(0)) {
+        let texture_type = crate::shader_info::TextureType::from_u8(info.texture_type);
+        let is_buffer = texture_type == crate::shader_info::TextureType::Buffer;
         let lod = if inst.args.len() > 1 {
             ctx.resolve_value(inst.arg(1))
         } else {
             ctx.const_zero_u32
         };
-
+        let skip_mips = inst.args.get(2).map(Value::imm_u1).unwrap_or(false);
+        let mips = if skip_mips {
+            ctx.const_zero_u32
+        } else {
+            ctx.builder
+                .image_query_levels(ctx.u32_type, None, image)
+                .unwrap()
+        };
+        let is_msaa = !is_buffer
+            && ctx
+                .textures
+                .get(info.descriptor_index as usize)
+                .is_some_and(|def| def.is_multisample);
+        let uses_lod = !is_msaa && !is_buffer;
+        let mut query = |result_type| {
+            if uses_lod {
+                ctx.builder
+                    .image_query_size_lod(result_type, None, image, lod)
+                    .unwrap()
+            } else {
+                ctx.builder
+                    .image_query_size(result_type, None, image)
+                    .unwrap()
+            }
+        };
+        let zero = ctx.const_zero_u32;
+        let constituents = match texture_type {
+            crate::shader_info::TextureType::Color1D
+            | crate::shader_info::TextureType::Buffer => {
+                vec![query(ctx.u32_type), zero, zero, mips]
+            }
+            crate::shader_info::TextureType::ColorArray1D
+            | crate::shader_info::TextureType::Color2D
+            | crate::shader_info::TextureType::ColorCube
+            | crate::shader_info::TextureType::Color2DRect => {
+                vec![query(ctx.u32_vec2_type), zero, mips]
+            }
+            crate::shader_info::TextureType::ColorArray2D
+            | crate::shader_info::TextureType::Color3D
+            | crate::shader_info::TextureType::ColorArrayCube => {
+                vec![query(ctx.u32_vec3_type), mips]
+            }
+        };
         let id = ctx
             .builder
-            .image_query_size_lod(ctx.u32_vec2_type, None, image, lod)
+            .composite_construct(ctx.u32_vec4_type, None, constituents)
             .unwrap();
 
         ctx.set_value(block_idx, inst_idx, id);
