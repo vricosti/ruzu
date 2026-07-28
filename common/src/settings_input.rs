@@ -499,7 +499,12 @@ pub struct TouchscreenInput {
 impl Default for TouchscreenInput {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // Upstream defaults this to `true`, in
+            // `Config::ReadTouchscreenValues` (zuyu frontend_common/config.cpp:189
+            // — `ReadBooleanSetting("touchscreen_enabled", std::make_optional(true))`).
+            // The C++ struct itself has no initializer, so the default lives in
+            // the config reader rather than beside the field.
+            enabled: true,
             device: String::new(),
             finger: 0,
             diameter_x: 0,
