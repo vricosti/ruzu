@@ -19,6 +19,8 @@ use std::time::Duration;
 
 use hid_core::frontend::emulated_controller::set_simple_npad_button;
 use hid_core::hid_types::{KeyboardKeyIndex, NpadButton};
+use input_common::drivers::mouse::MouseButton;
+use input_common::InputSubsystem;
 use ruzu_core::core::SystemRef;
 use ruzu_core::frontend::framebuffer_layout::{
     default_frame_layout, FramebufferLayout, ScreenUndocked,
@@ -208,6 +210,10 @@ pub struct DummyContext;
 /// Maps to C++ class `EmuWindow_SDL2` in
 /// `yuzu_cmd/emu_window/emu_window_sdl2.h`.
 pub struct EmuWindowSdl2 {
+    /// Host input drivers and their registered factories.
+    /// Maps to C++ `input_subsystem`.
+    pub input_subsystem: InputSubsystem,
+
     /// Whether the window is still open (close not yet requested).
     /// Maps to C++ `is_open`.
     pub is_open: bool,
@@ -245,7 +251,8 @@ impl EmuWindowSdl2 {
     /// initialized in an incompatible way. Exits the process on failure,
     /// matching upstream behavior.
     pub fn new(system: SystemRef) -> Self {
-        // Maps to: input_subsystem->Initialize(); (stubbed — InputSubsystem not yet ported)
+        let mut input_subsystem = InputSubsystem::new();
+        input_subsystem.initialize();
         // Rust binaries do not use SDL's SDL_main wrapper, so SDL must be
         // told that the application entry point is ready before SDL_Init().
         unsafe { sdl::SDL_SetMainReady() };
@@ -263,6 +270,7 @@ impl EmuWindowSdl2 {
         }
 
         EmuWindowSdl2 {
+            input_subsystem,
             is_open: true,
             is_shown: true,
             shown_state: Arc::new(AtomicBool::new(true)),
@@ -488,6 +496,13 @@ impl EmuWindowSdl2 {
         if !pressed && !released {
             return;
         }
+        if let Some(keyboard) = self.input_subsystem.get_keyboard_mut() {
+            if pressed {
+                keyboard.press_key(key);
+            } else {
+                keyboard.release_key(key);
+            }
+        }
 
         let Some(button) = keyboard_key_to_npad_button(key) else {
             log::trace!("on_key_event: unmapped key={} state={}", key, state);
@@ -541,67 +556,57 @@ impl EmuWindowSdl2 {
     /// Called when a mouse button is pressed or released.
     ///
     /// Maps to C++ `EmuWindow_SDL2::OnMouseButton`.
-    /// Note: InputSubsystem not yet ported — logs and returns.
     pub(crate) fn on_mouse_button(&mut self, button: u32, state: u8, x: i32, y: i32) {
-        // Upstream: SDLButtonToMouseButton + input_subsystem->GetMouse()->PressButton / ReleaseButton
-        let _mouse_button = self.sdl_button_to_mouse_button(button);
-        let _ = (state, x, y);
-        log::trace!(
-            "on_mouse_button: button={} state={} (InputSubsystem not yet ported)",
-            button,
-            state
-        );
+        let mouse_button = self.sdl_button_to_mouse_button(button);
+        let touch = self.mouse_to_touch_pos(x, y);
+        if let Some(mouse) = self.input_subsystem.get_mouse_mut() {
+            if state == sdl::SDL_PRESSED as u8 {
+                mouse.press_button(x, y, mouse_button);
+                mouse.press_mouse_button(mouse_button);
+                mouse.press_touch_button(touch.0, touch.1, mouse_button);
+            } else {
+                mouse.release_button(mouse_button);
+            }
+        }
     }
 
     /// Called when the mouse cursor moves.
     ///
     /// Maps to C++ `EmuWindow_SDL2::OnMouseMotion`.
-    /// Note: InputSubsystem not yet ported — logs and returns.
     pub(crate) fn on_mouse_motion(&mut self, x: i32, y: i32) {
-        // Upstream: MouseToTouchPos + input_subsystem->GetMouse()->Move / MouseMove / TouchMove
-        let _pos = self.mouse_to_touch_pos(x, y);
-        log::trace!(
-            "on_mouse_motion: x={} y={} (InputSubsystem not yet ported)",
-            x,
-            y
-        );
+        let touch = self.mouse_to_touch_pos(x, y);
+        if let Some(mouse) = self.input_subsystem.get_mouse_mut() {
+            mouse.move_cursor(x, y, 0, 0);
+            mouse.mouse_move(touch.0, touch.1);
+            mouse.touch_move(touch.0, touch.1);
+        }
     }
 
     /// Called when a finger starts touching the touchscreen.
     ///
     /// Maps to C++ `EmuWindow_SDL2::OnFingerDown`.
-    /// Note: InputSubsystem not yet ported — logs and returns.
     pub(crate) fn on_finger_down(&mut self, x: f32, y: f32, id: usize) {
-        // Upstream: input_subsystem->GetTouchScreen()->TouchPressed(x, y, id)
-        log::trace!(
-            "on_finger_down: x={} y={} id={} (InputSubsystem not yet ported)",
-            x,
-            y,
-            id
-        );
+        if let Some(touch_screen) = self.input_subsystem.get_touch_screen_mut() {
+            touch_screen.touch_pressed(x, y, id);
+        }
     }
 
     /// Called when a finger moves on the touchscreen.
     ///
     /// Maps to C++ `EmuWindow_SDL2::OnFingerMotion`.
-    /// Note: InputSubsystem not yet ported — logs and returns.
     pub(crate) fn on_finger_motion(&mut self, x: f32, y: f32, id: usize) {
-        // Upstream: input_subsystem->GetTouchScreen()->TouchMoved(x, y, id)
-        log::trace!(
-            "on_finger_motion: x={} y={} id={} (InputSubsystem not yet ported)",
-            x,
-            y,
-            id
-        );
+        if let Some(touch_screen) = self.input_subsystem.get_touch_screen_mut() {
+            touch_screen.touch_moved(x, y, id);
+        }
     }
 
     /// Called when a finger lifts from the touchscreen.
     ///
     /// Maps to C++ `EmuWindow_SDL2::OnFingerUp`.
-    /// Note: InputSubsystem not yet ported — logs and returns.
     pub(crate) fn on_finger_up(&mut self) {
-        // Upstream: input_subsystem->GetTouchScreen()->ReleaseAllTouch()
-        log::trace!("on_finger_up (InputSubsystem not yet ported)");
+        if let Some(touch_screen) = self.input_subsystem.get_touch_screen_mut() {
+            touch_screen.release_all_touch();
+        }
     }
 
     /// Called when the window is resized or restored.
@@ -706,24 +711,7 @@ impl Drop for EmuWindowSdl2 {
     ///
     /// Maps to C++ `EmuWindow_SDL2::~EmuWindow_SDL2`.
     fn drop(&mut self) {
-        // Upstream: system.HIDCore().UnloadInputDevices(); input_subsystem->Shutdown(); SDL_Quit();
-        // HIDCore/InputSubsystem not yet ported.
-        log::debug!(
-            "EmuWindowSdl2::drop — calling SDL_Quit (HIDCore/InputSubsystem not yet ported)"
-        );
+        self.input_subsystem.shutdown();
         unsafe { sdl::SDL_Quit() };
     }
-}
-
-/// Mouse button identifiers forwarded from InputCommon.
-///
-/// Mirrors `InputCommon::MouseButton` used in the C++ port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MouseButton {
-    Left,
-    Right,
-    Wheel,
-    Backward,
-    Forward,
-    Undefined,
 }

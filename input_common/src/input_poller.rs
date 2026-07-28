@@ -357,22 +357,61 @@ impl Drop for InputFromStick {
 // Port of InputFromTouch class from input_poller.cpp
 
 struct InputFromTouch {
-    identifier: PadIdentifier,
-    button: i32,
-    toggle: bool,
-    inverted: bool,
-    axis_x: i32,
-    axis_y: i32,
-    properties_x: AnalogProperties,
-    properties_y: AnalogProperties,
     callback_key_button: i32,
     callback_key_x: i32,
     callback_key_y: i32,
-    last_button_value: bool,
-    last_axis_x_value: f32,
-    last_axis_y_value: f32,
     input_engine: Arc<Mutex<InputEngine>>,
+    state: Arc<Mutex<TouchCallbackState>>,
+}
+
+struct TouchCallbackState {
+    button: i32,
+    axis_x: i32,
+    axis_y: i32,
+    touch_status: TouchStatus,
     callback: InputCallback,
+}
+
+impl TouchCallbackState {
+    fn update(&mut self, event: &crate::input_engine::MappingData) {
+        let changed = match event.r#type {
+            EngineInputType::Button if event.index == self.button => {
+                let changed = self.touch_status.pressed.value != event.button_value;
+                self.touch_status.pressed.value = event.button_value;
+                changed
+            }
+            EngineInputType::Analog if event.index == self.axis_x => {
+                let changed = self.touch_status.x.raw_value != event.axis_value;
+                self.touch_status.x.raw_value = event.axis_value;
+                changed
+            }
+            EngineInputType::Analog if event.index == self.axis_y => {
+                let changed = self.touch_status.y.raw_value != event.axis_value;
+                self.touch_status.y.raw_value = event.axis_value;
+                changed
+            }
+            _ => false,
+        };
+        if changed {
+            self.notify();
+        }
+    }
+
+    fn notify(&self) {
+        if let Some(ref on_change) = self.callback.on_change {
+            on_change(&CallbackStatus {
+                input_type: InputType::Touch,
+                touch_status: self.touch_status,
+                ..Default::default()
+            });
+        }
+    }
+}
+
+fn touch_update_callback(state: Arc<Mutex<TouchCallbackState>>) -> UpdateCallback {
+    UpdateCallback {
+        on_change: Some(Box::new(move |event| state.lock().update(event))),
+    }
 }
 
 impl InputFromTouch {
@@ -387,76 +426,65 @@ impl InputFromTouch {
         properties_y: AnalogProperties,
         input_engine: Arc<Mutex<InputEngine>>,
     ) -> Self {
+        let state = Arc::new(Mutex::new(TouchCallbackState {
+            button,
+            axis_x,
+            axis_y,
+            touch_status: TouchStatus {
+                pressed: ButtonStatus {
+                    inverted,
+                    toggle,
+                    ..Default::default()
+                },
+                x: make_analog(0.0, properties_x),
+                y: make_analog(0.0, properties_y),
+                ..Default::default()
+            },
+            callback: InputCallback { on_change: None },
+        }));
         let (kb, kx, ky) = {
             let mut engine = input_engine.lock();
             let kb = engine.set_callback(InputIdentifier {
                 identifier: identifier.clone(),
                 r#type: EngineInputType::Button,
                 index: button,
-                callback: UpdateCallback { on_change: None },
+                callback: touch_update_callback(Arc::clone(&state)),
             });
             let kx = engine.set_callback(InputIdentifier {
                 identifier: identifier.clone(),
                 r#type: EngineInputType::Analog,
                 index: axis_x,
-                callback: UpdateCallback { on_change: None },
+                callback: touch_update_callback(Arc::clone(&state)),
             });
             let ky = engine.set_callback(InputIdentifier {
-                identifier: identifier.clone(),
+                identifier,
                 r#type: EngineInputType::Analog,
                 index: axis_y,
-                callback: UpdateCallback { on_change: None },
+                callback: touch_update_callback(Arc::clone(&state)),
             });
             (kb, kx, ky)
         };
         Self {
-            identifier,
-            button,
-            toggle,
-            inverted,
-            axis_x,
-            axis_y,
-            properties_x,
-            properties_y,
             callback_key_button: kb,
             callback_key_x: kx,
             callback_key_y: ky,
-            last_button_value: false,
-            last_axis_x_value: 0.0,
-            last_axis_y_value: 0.0,
             input_engine,
-            callback: InputCallback { on_change: None },
-        }
-    }
-
-    fn get_status(&self) -> TouchStatus {
-        let engine = self.input_engine.lock();
-        TouchStatus {
-            pressed: ButtonStatus {
-                value: engine.get_button(&self.identifier, self.button),
-                inverted: self.inverted,
-                toggle: self.toggle,
-                ..Default::default()
-            },
-            x: make_analog(
-                engine.get_axis(&self.identifier, self.axis_x),
-                self.properties_x.clone(),
-            ),
-            y: make_analog(
-                engine.get_axis(&self.identifier, self.axis_y),
-                self.properties_y.clone(),
-            ),
-            ..Default::default()
+            state,
         }
     }
 }
 
 impl InputDevice for InputFromTouch {
-    fn set_callback(&mut self, callback: InputCallback) {
-        self.callback = callback;
+    fn force_update(&mut self) {
+        self.state.lock().notify();
     }
+
+    fn set_callback(&mut self, callback: InputCallback) {
+        self.state.lock().callback = callback;
+    }
+
     fn trigger_on_change(&self, status: &CallbackStatus) {
-        if let Some(ref on_change) = self.callback.on_change {
+        if let Some(ref on_change) = self.state.lock().callback.on_change {
             on_change(status);
         }
     }
@@ -1118,6 +1146,12 @@ impl OutputFactory {
     }
 }
 
+impl common::input::OutputDeviceFactory for OutputFactory {
+    fn create(&self, params: &ParamPackage) -> Box<dyn OutputDevice> {
+        OutputFactory::create(self, params)
+    }
+}
+
 // ---- InputFactory ----
 // Port of `InputFactory` class from input_poller.h
 
@@ -1453,5 +1487,11 @@ impl InputFactory {
         let id = identifier_from_params(params);
         self.input_engine.lock().pre_set_controller(&id);
         Box::new(InputFromNfc::new(id, Arc::clone(&self.input_engine)))
+    }
+}
+
+impl common::input::InputDeviceFactory for InputFactory {
+    fn create(&self, params: &ParamPackage) -> Box<dyn InputDevice> {
+        InputFactory::create(self, params)
     }
 }

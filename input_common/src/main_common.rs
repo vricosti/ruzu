@@ -8,9 +8,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
-
-use common::input::ButtonNames;
+use common::input::{
+    register_input_factory, register_output_factory, unregister_input_factory,
+    unregister_output_factory, ButtonNames,
+};
 use common::param_package::ParamPackage;
 use common::uuid::UUID;
 
@@ -21,8 +22,9 @@ use crate::drivers::tas_input;
 use crate::drivers::touch_screen::TouchScreen;
 use crate::drivers::virtual_amiibo::VirtualAmiibo;
 use crate::drivers::virtual_gamepad::VirtualGamepad;
-use crate::input_engine::{InputEngine, MappingCallback, MappingData, PadIdentifier};
+use crate::input_engine::{InputEngine, MappingData, PadIdentifier};
 use crate::input_mapping::MappingFactory;
+use crate::input_poller::{InputFactory, OutputFactory};
 
 /// Port of `Polling` namespace from main.h
 pub mod Polling {
@@ -118,6 +120,14 @@ impl InputSubsystemImpl {
         self.keyboard = Some(Keyboard::new("keyboard".to_string()));
         self.mouse = Some(Mouse::new("mouse".to_string()));
         self.touch_screen = Some(TouchScreen::new("touch".to_string()));
+        for engine in [
+            self.mouse.as_ref().unwrap().engine(),
+            self.touch_screen.as_ref().unwrap().engine(),
+        ] {
+            let name = engine.lock().get_engine_name().to_string();
+            register_input_factory(&name, Arc::new(InputFactory::new(Arc::clone(&engine))));
+            register_output_factory(&name, Arc::new(OutputFactory::new(engine)));
+        }
         self.tas_input = Some(tas_input::Tas::new("tas".to_string()));
         self.camera = Some(Camera::new("camera".to_string()));
         self.virtual_amiibo = Some(VirtualAmiibo::new("virtual_amiibo".to_string()));
@@ -126,6 +136,10 @@ impl InputSubsystemImpl {
 
     /// Port of Impl::Shutdown
     fn shutdown(&mut self) {
+        for name in ["mouse", "touch"] {
+            unregister_input_factory(name);
+            unregister_output_factory(name);
+        }
         self.update_engine = None;
         self.keyboard = None;
         self.mouse = None;
@@ -180,7 +194,7 @@ impl InputSubsystemImpl {
         if self
             .mouse
             .as_ref()
-            .map_or(false, |m| m.engine().get_engine_name() == engine)
+            .map_or(false, |m| m.engine().lock().get_engine_name() == engine)
         {
             return self
                 .mouse
@@ -226,7 +240,7 @@ impl InputSubsystemImpl {
         if self
             .mouse
             .as_ref()
-            .map_or(false, |m| m.engine().get_engine_name() == engine)
+            .map_or(false, |m| m.engine().lock().get_engine_name() == engine)
         {
             return self.mouse.as_ref().unwrap().get_ui_name(params);
         }

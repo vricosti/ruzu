@@ -110,7 +110,7 @@ pub struct MappingData {
 // Port of `UpdateCallback` struct from input_engine.h
 
 pub struct UpdateCallback {
-    pub on_change: Option<Box<dyn Fn() + Send + Sync>>,
+    pub on_change: Option<Box<dyn Fn(&MappingData) + Send + Sync>>,
 }
 
 impl std::fmt::Debug for UpdateCallback {
@@ -573,13 +573,21 @@ impl InputEngine {
     /// Port of InputEngine::TriggerOnButtonChange
     fn trigger_on_button_change(&self, identifier: &PadIdentifier, button: i32, value: bool) {
         let _lock = self.mutex_callback.lock();
+        let event = MappingData {
+            engine: self.get_engine_name().to_string(),
+            pad: identifier.clone(),
+            r#type: EngineInputType::Button,
+            index: button,
+            button_value: value,
+            ..Default::default()
+        };
         for poller in self.callback_list.values() {
             if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Button, button)
             {
                 continue;
             }
             if let Some(ref on_change) = poller.callback.on_change {
-                on_change();
+                on_change(&event);
             }
         }
         if !self.configuring || self.mapping_callback.on_data.is_none() {
@@ -589,20 +597,21 @@ impl InputEngine {
             return;
         }
         if let Some(ref on_data) = self.mapping_callback.on_data {
-            on_data(&MappingData {
-                engine: self.get_engine_name().to_string(),
-                pad: identifier.clone(),
-                r#type: EngineInputType::Button,
-                index: button,
-                button_value: value,
-                ..Default::default()
-            });
+            on_data(&event);
         }
     }
 
     /// Port of InputEngine::TriggerOnHatButtonChange
     fn trigger_on_hat_button_change(&self, identifier: &PadIdentifier, button: i32, value: u8) {
         let _lock = self.mutex_callback.lock();
+        let event = MappingData {
+            engine: self.get_engine_name().to_string(),
+            pad: identifier.clone(),
+            r#type: EngineInputType::HatButton,
+            index: button,
+            button_value: value != 0,
+            ..Default::default()
+        };
         for poller in self.callback_list.values() {
             if !Self::is_input_identifier_equal(
                 poller,
@@ -613,7 +622,7 @@ impl InputEngine {
                 continue;
             }
             if let Some(ref on_change) = poller.callback.on_change {
-                on_change();
+                on_change(&event);
             }
         }
         if !self.configuring || self.mapping_callback.on_data.is_none() {
@@ -643,12 +652,20 @@ impl InputEngine {
     /// Port of InputEngine::TriggerOnAxisChange
     fn trigger_on_axis_change(&self, identifier: &PadIdentifier, axis: i32, value: f32) {
         let _lock = self.mutex_callback.lock();
+        let event = MappingData {
+            engine: self.get_engine_name().to_string(),
+            pad: identifier.clone(),
+            r#type: EngineInputType::Analog,
+            index: axis,
+            axis_value: value,
+            ..Default::default()
+        };
         for poller in self.callback_list.values() {
             if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Analog, axis) {
                 continue;
             }
             if let Some(ref on_change) = poller.callback.on_change {
-                on_change();
+                on_change(&event);
             }
         }
         if !self.configuring || self.mapping_callback.on_data.is_none() {
@@ -658,26 +675,25 @@ impl InputEngine {
             return;
         }
         if let Some(ref on_data) = self.mapping_callback.on_data {
-            on_data(&MappingData {
-                engine: self.get_engine_name().to_string(),
-                pad: identifier.clone(),
-                r#type: EngineInputType::Analog,
-                index: axis,
-                axis_value: value,
-                ..Default::default()
-            });
+            on_data(&event);
         }
     }
 
     /// Port of InputEngine::TriggerOnBatteryChange
     fn trigger_on_battery_change(&self, identifier: &PadIdentifier, _value: BatteryLevel) {
         let _lock = self.mutex_callback.lock();
+        let event = MappingData {
+            engine: self.get_engine_name().to_string(),
+            pad: identifier.clone(),
+            r#type: EngineInputType::Battery,
+            ..Default::default()
+        };
         for poller in self.callback_list.values() {
             if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Battery, 0) {
                 continue;
             }
             if let Some(ref on_change) = poller.callback.on_change {
-                on_change();
+                on_change(&event);
             }
         }
     }
@@ -685,12 +701,18 @@ impl InputEngine {
     /// Port of InputEngine::TriggerOnColorChange
     fn trigger_on_color_change(&self, identifier: &PadIdentifier, _value: BodyColorStatus) {
         let _lock = self.mutex_callback.lock();
+        let event = MappingData {
+            engine: self.get_engine_name().to_string(),
+            pad: identifier.clone(),
+            r#type: EngineInputType::Color,
+            ..Default::default()
+        };
         for poller in self.callback_list.values() {
             if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Color, 0) {
                 continue;
             }
             if let Some(ref on_change) = poller.callback.on_change {
-                on_change();
+                on_change(&event);
             }
         }
     }
@@ -703,13 +725,21 @@ impl InputEngine {
         value: &BasicMotion,
     ) {
         let _lock = self.mutex_callback.lock();
+        let event = MappingData {
+            engine: self.get_engine_name().to_string(),
+            pad: identifier.clone(),
+            r#type: EngineInputType::Motion,
+            index: motion,
+            motion_value: value.clone(),
+            ..Default::default()
+        };
         for poller in self.callback_list.values() {
             if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Motion, motion)
             {
                 continue;
             }
             if let Some(ref on_change) = poller.callback.on_change {
-                on_change();
+                on_change(&event);
             }
         }
         if !self.configuring || self.mapping_callback.on_data.is_none() {
@@ -747,12 +777,18 @@ impl InputEngine {
     /// Port of InputEngine::TriggerOnCameraChange
     fn trigger_on_camera_change(&self, identifier: &PadIdentifier, _value: &CameraStatus) {
         let _lock = self.mutex_callback.lock();
+        let event = MappingData {
+            engine: self.get_engine_name().to_string(),
+            pad: identifier.clone(),
+            r#type: EngineInputType::Camera,
+            ..Default::default()
+        };
         for poller in self.callback_list.values() {
             if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Camera, 0) {
                 continue;
             }
             if let Some(ref on_change) = poller.callback.on_change {
-                on_change();
+                on_change(&event);
             }
         }
     }
@@ -760,12 +796,18 @@ impl InputEngine {
     /// Port of InputEngine::TriggerOnNfcChange
     fn trigger_on_nfc_change(&self, identifier: &PadIdentifier, _value: &NfcStatus) {
         let _lock = self.mutex_callback.lock();
+        let event = MappingData {
+            engine: self.get_engine_name().to_string(),
+            pad: identifier.clone(),
+            r#type: EngineInputType::Nfc,
+            ..Default::default()
+        };
         for poller in self.callback_list.values() {
             if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Nfc, 0) {
                 continue;
             }
             if let Some(ref on_change) = poller.callback.on_change {
-                on_change();
+                on_change(&event);
             }
         }
     }

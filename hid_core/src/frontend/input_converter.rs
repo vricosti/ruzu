@@ -7,6 +7,8 @@
 //! These functions depend on common::input types which define callback structures,
 //! analog properties, battery levels, etc.
 
+use common::input::{CallbackStatus, InputType, TouchStatus};
+
 /// Sanitizes an analog value by applying deadzone, range, offset and invert properties.
 ///
 /// Port of `SanitizeAnalog` from upstream.
@@ -166,4 +168,59 @@ pub fn analog_value_to_battery_level(value: f32) -> u32 {
     } else {
         0 // Empty
     }
+}
+
+/// Converts callback data to a normalized touch status.
+///
+/// Port of upstream `TransformToTouch`.
+pub fn transform_to_touch(callback: &CallbackStatus) -> TouchStatus {
+    let mut status = match callback.input_type {
+        InputType::Touch => callback.touch_status,
+        InputType::Stick => TouchStatus {
+            x: callback.stick_status.x,
+            y: callback.stick_status.y,
+            ..Default::default()
+        },
+        input_type => {
+            log::error!(
+                "Conversion from input type {:?} to touch not implemented",
+                input_type
+            );
+            TouchStatus::default()
+        }
+    };
+
+    let x_properties = status.x.properties;
+    sanitize_analog(
+        &mut status.x.raw_value,
+        &mut status.x.value,
+        x_properties.deadzone,
+        x_properties.range,
+        x_properties.offset,
+        x_properties.inverted,
+        true,
+    );
+    let y_properties = status.y.properties;
+    sanitize_analog(
+        &mut status.y.raw_value,
+        &mut status.y.value,
+        y_properties.deadzone,
+        y_properties.range,
+        y_properties.offset,
+        y_properties.inverted,
+        true,
+    );
+
+    if status.x.properties.inverted {
+        status.x.value = 1.0 + status.x.value;
+    }
+    if status.y.properties.inverted {
+        status.y.value = 1.0 + status.y.value;
+    }
+    status.x.value = status.x.value.clamp(0.0, 1.0);
+    status.y.value = status.y.value.clamp(0.0, 1.0);
+    if status.pressed.inverted {
+        status.pressed.value = !status.pressed.value;
+    }
+    status
 }

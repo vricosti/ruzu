@@ -6,9 +6,13 @@
 //! The touch screen driver handles reading raw touch input from the emulated
 //! console and converting it into TouchState entries.
 
+use std::sync::Arc;
+
 use common::ResultCode;
+use parking_lot::Mutex;
 
 use super::touch_types::*;
+use crate::hid_core::HIDCore;
 use crate::hid_types::{TouchAttribute, TouchScreenModeForNx};
 
 /// Maximum number of fingers tracked by the touch driver.
@@ -28,17 +32,17 @@ struct TouchFinger {
 /// This handles all requests to Ftm3bd56(TouchPanel) hardware.
 /// Port of upstream `TouchDriver`.
 pub struct TouchScreenDriver {
+    hid_core: Arc<Mutex<HIDCore>>,
     is_running: bool,
     touch_status: TouchScreenState,
     fingers: [TouchFinger; MAX_TOUCH_FINGERS],
     touch_mode: TouchScreenModeForNx,
-    // In upstream, this holds a pointer to EmulatedConsole.
-    // Touch input is injected via process_touch_input instead.
 }
 
 impl TouchScreenDriver {
-    pub fn new() -> Self {
+    pub fn new(hid_core: Arc<Mutex<HIDCore>>) -> Self {
         Self {
+            hid_core,
             is_running: false,
             touch_status: TouchScreenState::default(),
             fingers: [TouchFinger::default(); MAX_TOUCH_FINGERS],
@@ -75,14 +79,18 @@ impl TouchScreenDriver {
     }
 
     /// Port of TouchDriver::WaitForInput.
-    /// In upstream, this reads from EmulatedConsole::GetTouch().
-    /// Here, touch input must be provided via `process_touch_input` first.
     pub fn wait_for_input(&mut self) -> ResultCode {
-        // Upstream processes console touch input here.
-        // The actual touch reading from EmulatedConsole would go here,
-        // but since we don't hold a direct reference to EmulatedConsole
-        // in the Rust port, this is handled by the caller providing
-        // touch data through process_touch_input.
+        let touch = self.hid_core.lock().get_emulated_console().get_touch();
+        let touch_input = std::array::from_fn(|index| {
+            let finger = touch[index];
+            (
+                finger.id,
+                finger.pressed,
+                finger.position_x,
+                finger.position_y,
+            )
+        });
+        self.process_touch_input(&touch_input);
         ResultCode::SUCCESS
     }
 
@@ -172,11 +180,5 @@ impl TouchScreenDriver {
     /// Port of TouchDriver::GetTouchMode.
     pub fn get_touch_mode(&self) -> TouchScreenModeForNx {
         self.touch_mode
-    }
-}
-
-impl Default for TouchScreenDriver {
-    fn default() -> Self {
-        Self::new()
     }
 }

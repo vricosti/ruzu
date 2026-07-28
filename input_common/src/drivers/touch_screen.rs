@@ -6,6 +6,8 @@
 //! Touch screen input driver that receives touch events and forwards them to touch devices.
 
 use crate::input_engine::{InputEngine, PadIdentifier};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// Maximum number of simultaneous touch points.
 /// Port of TouchScreen::MAX_FINGER_COUNT
@@ -30,30 +32,26 @@ struct TouchStatus {
 
 /// Port of `TouchScreen` class from touch_screen.h / touch_screen.cpp
 pub struct TouchScreen {
-    engine: InputEngine,
+    engine: Arc<Mutex<InputEngine>>,
     fingers: [TouchStatus; MAX_FINGER_COUNT],
 }
 
 impl TouchScreen {
     /// Port of TouchScreen::TouchScreen
     pub fn new(input_engine: String) -> Self {
+        let engine = Arc::new(Mutex::new(InputEngine::new(input_engine)));
+        engine.lock().pre_set_controller(&default_identifier());
         let mut ts = Self {
-            engine: InputEngine::new(input_engine),
+            engine,
             fingers: Default::default(),
         };
-        // PreSetController(identifier) + ReleaseAllTouch()
         ts.release_all_touch();
         ts
     }
 
-    /// Returns a reference to the underlying input engine.
-    pub fn engine(&self) -> &InputEngine {
-        &self.engine
-    }
-
-    /// Returns a mutable reference to the underlying input engine.
-    pub fn engine_mut(&mut self) -> &mut InputEngine {
-        &mut self.engine
+    /// Returns the shared input engine used by the registered factories.
+    pub fn engine(&self) -> Arc<Mutex<InputEngine>> {
+        Arc::clone(&self.engine)
     }
 
     /// Signals that touch has moved and marks this touch point as active.
@@ -69,9 +67,10 @@ impl TouchScreen {
         };
         let identifier = default_identifier();
         self.fingers[index].is_active = true;
-        self.engine.set_button(&identifier, index as i32, true);
-        self.engine.set_axis(&identifier, (index * 2) as i32, x);
-        self.engine.set_axis(&identifier, (index * 2 + 1) as i32, y);
+        let mut engine = self.engine.lock();
+        engine.set_button(&identifier, index as i32, true);
+        engine.set_axis(&identifier, (index * 2) as i32, x);
+        engine.set_axis(&identifier, (index * 2 + 1) as i32, y);
     }
 
     /// Signals and creates a new touch point with this finger id.
@@ -103,10 +102,10 @@ impl TouchScreen {
         };
         let identifier = default_identifier();
         self.fingers[index].is_enabled = false;
-        self.engine.set_button(&identifier, index as i32, false);
-        self.engine.set_axis(&identifier, (index * 2) as i32, 0.0);
-        self.engine
-            .set_axis(&identifier, (index * 2 + 1) as i32, 0.0);
+        let mut engine = self.engine.lock();
+        engine.set_button(&identifier, index as i32, false);
+        engine.set_axis(&identifier, (index * 2) as i32, 0.0);
+        engine.set_axis(&identifier, (index * 2 + 1) as i32, 0.0);
     }
 
     /// Resets the active flag for each touch point.

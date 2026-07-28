@@ -7,6 +7,8 @@
 
 use common::input::ButtonNames;
 use common::param_package::ParamPackage;
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 use crate::input_engine::{InputEngine, PadIdentifier};
 use crate::main_common::AnalogMapping;
@@ -71,7 +73,7 @@ pub enum MouseButton {
 
 /// Port of `Mouse` class from mouse.h / mouse.cpp
 pub struct Mouse {
-    engine: InputEngine,
+    engine: Arc<Mutex<InputEngine>>,
     mouse_origin: (i32, i32),
     last_mouse_position: (i32, i32),
     last_mouse_change: (f32, f32),
@@ -83,52 +85,111 @@ pub struct Mouse {
 impl Mouse {
     /// Port of Mouse::Mouse
     pub fn new(input_engine: String) -> Self {
-        let mut m = Self {
-            engine: InputEngine::new(input_engine),
+        let engine = Arc::new(Mutex::new(InputEngine::new(input_engine)));
+        {
+            let mut engine = engine.lock();
+            engine.pre_set_controller(&identifier());
+            engine.pre_set_controller(&real_mouse_identifier());
+            engine.pre_set_controller(&touch_identifier());
+            engine.pre_set_controller(&motion_identifier());
+            engine.pre_set_axis(&identifier(), MOUSE_AXIS_X);
+            engine.pre_set_axis(&identifier(), MOUSE_AXIS_Y);
+            engine.pre_set_axis(&identifier(), WHEEL_AXIS_X);
+            engine.pre_set_axis(&identifier(), WHEEL_AXIS_Y);
+            engine.pre_set_axis(&real_mouse_identifier(), MOUSE_AXIS_X);
+            engine.pre_set_axis(&real_mouse_identifier(), MOUSE_AXIS_Y);
+            engine.pre_set_axis(&touch_identifier(), MOUSE_AXIS_X);
+            engine.pre_set_axis(&touch_identifier(), MOUSE_AXIS_Y);
+        }
+        Self {
+            engine,
             mouse_origin: (0, 0),
             last_mouse_position: (0, 0),
             last_mouse_change: (0.0, 0.0),
             last_motion_change: (0.0, 0.0, 0.0),
             wheel_position: (0, 0),
             button_pressed: false,
-        };
-        // PreSetController for all identifiers
-        // PreSetAxis for all mouse axes
-        // Note: update_thread would need a separate spawned thread for stick/motion decay
-        m
+        }
     }
 
-    /// Returns a reference to the underlying input engine.
-    pub fn engine(&self) -> &InputEngine {
-        &self.engine
+    /// Returns the shared input engine used by the registered factories.
+    pub fn engine(&self) -> Arc<Mutex<InputEngine>> {
+        Arc::clone(&self.engine)
     }
 
-    /// Returns a mutable reference to the underlying input engine.
-    pub fn engine_mut(&mut self) -> &mut InputEngine {
-        &mut self.engine
+    /// Port of Mouse::Move.
+    pub fn move_cursor(&mut self, x: i32, y: i32, center_x: i32, center_y: i32) {
+        let mouse_change = (x - center_x, y - center_y);
+        if self.is_mouse_panning_enabled() {
+            let settings = common::settings::values();
+            let x_sensitivity = *settings.mouse_panning_x_sensitivity.get_value() as f32
+                * DEFAULT_PANNING_SENSITIVITY;
+            let y_sensitivity = *settings.mouse_panning_y_sensitivity.get_value() as f32
+                * DEFAULT_PANNING_SENSITIVITY;
+            let deadzone_counterweight = *settings.mouse_panning_deadzone_counterweight.get_value()
+                as f32
+                * DEFAULT_DEADZONE_COUNTERWEIGHT;
+            self.last_motion_change.0 += -(mouse_change.1 as f32) * x_sensitivity;
+            self.last_motion_change.1 += -(mouse_change.0 as f32) * y_sensitivity;
+            self.last_mouse_change.0 += mouse_change.0 as f32 * x_sensitivity;
+            self.last_mouse_change.1 += mouse_change.1 as f32 * y_sensitivity;
+            let length =
+                (self.last_mouse_change.0.powi(2) + self.last_mouse_change.1.powi(2)).sqrt();
+            if length < deadzone_counterweight && length != 0.0 {
+                self.last_mouse_change.0 =
+                    self.last_mouse_change.0 / length * deadzone_counterweight;
+                self.last_mouse_change.1 =
+                    self.last_mouse_change.1 / length * deadzone_counterweight;
+            }
+            return;
+        }
+
+        if self.button_pressed {
+            let mouse_move = (x - self.mouse_origin.0, y - self.mouse_origin.1);
+            let settings = common::settings::values();
+            let x_sensitivity = *settings.mouse_panning_x_sensitivity.get_value() as f32
+                * DEFAULT_STICK_SENSITIVITY;
+            let y_sensitivity = *settings.mouse_panning_y_sensitivity.get_value() as f32
+                * DEFAULT_STICK_SENSITIVITY;
+            let mut engine = self.engine.lock();
+            engine.set_axis(
+                &identifier(),
+                MOUSE_AXIS_X,
+                mouse_move.0 as f32 * x_sensitivity,
+            );
+            engine.set_axis(
+                &identifier(),
+                MOUSE_AXIS_Y,
+                -(mouse_move.1 as f32) * y_sensitivity,
+            );
+            self.last_motion_change.0 = -(mouse_move.1 as f32) * x_sensitivity;
+            self.last_motion_change.1 = -(mouse_move.0 as f32) * y_sensitivity;
+        }
     }
 
     /// Signals that real mouse has moved.
     /// Port of Mouse::MouseMove
     pub fn mouse_move(&mut self, touch_x: f32, touch_y: f32) {
         let id = real_mouse_identifier();
-        self.engine.set_axis(&id, MOUSE_AXIS_X, touch_x);
-        self.engine.set_axis(&id, MOUSE_AXIS_Y, touch_y);
+        let mut engine = self.engine.lock();
+        engine.set_axis(&id, MOUSE_AXIS_X, touch_x);
+        engine.set_axis(&id, MOUSE_AXIS_Y, touch_y);
     }
 
     /// Signals that touch finger has moved.
     /// Port of Mouse::TouchMove
     pub fn touch_move(&mut self, touch_x: f32, touch_y: f32) {
         let id = touch_identifier();
-        self.engine.set_axis(&id, MOUSE_AXIS_X, touch_x);
-        self.engine.set_axis(&id, MOUSE_AXIS_Y, touch_y);
+        let mut engine = self.engine.lock();
+        engine.set_axis(&id, MOUSE_AXIS_X, touch_x);
+        engine.set_axis(&id, MOUSE_AXIS_Y, touch_y);
     }
 
     /// Sets the status of a button to pressed.
     /// Port of Mouse::PressButton
     pub fn press_button(&mut self, x: i32, y: i32, button: MouseButton) {
         let id = identifier();
-        self.engine.set_button(&id, button as i32, true);
+        self.engine.lock().set_button(&id, button as i32, true);
 
         // Set initial analog parameters
         self.mouse_origin = (x, y);
@@ -140,16 +201,17 @@ impl Mouse {
     /// Port of Mouse::PressMouseButton
     pub fn press_mouse_button(&mut self, button: MouseButton) {
         let id = real_mouse_identifier();
-        self.engine.set_button(&id, button as i32, true);
+        self.engine.lock().set_button(&id, button as i32, true);
     }
 
     /// Sets the status of touch finger to pressed.
     /// Port of Mouse::PressTouchButton
     pub fn press_touch_button(&mut self, touch_x: f32, touch_y: f32, button: MouseButton) {
         let id = touch_identifier();
-        self.engine.set_axis(&id, MOUSE_AXIS_X, touch_x);
-        self.engine.set_axis(&id, MOUSE_AXIS_Y, touch_y);
-        self.engine.set_button(&id, button as i32, true);
+        let mut engine = self.engine.lock();
+        engine.set_axis(&id, MOUSE_AXIS_X, touch_x);
+        engine.set_axis(&id, MOUSE_AXIS_Y, touch_y);
+        engine.set_button(&id, button as i32, true);
     }
 
     /// Sets the status of all buttons bound with the key to released.
@@ -159,13 +221,14 @@ impl Mouse {
         let real_id = real_mouse_identifier();
         let touch_id = touch_identifier();
 
-        self.engine.set_button(&id, button as i32, false);
-        self.engine.set_button(&real_id, button as i32, false);
-        self.engine.set_button(&touch_id, button as i32, false);
+        let mut engine = self.engine.lock();
+        engine.set_button(&id, button as i32, false);
+        engine.set_button(&real_id, button as i32, false);
+        engine.set_button(&touch_id, button as i32, false);
 
         if !self.is_mouse_panning_enabled() {
-            self.engine.set_axis(&id, MOUSE_AXIS_X, 0.0);
-            self.engine.set_axis(&id, MOUSE_AXIS_Y, 0.0);
+            engine.set_axis(&id, MOUSE_AXIS_X, 0.0);
+            engine.set_axis(&id, MOUSE_AXIS_Y, 0.0);
         }
 
         self.last_motion_change.0 = 0.0;
@@ -181,22 +244,21 @@ impl Mouse {
         self.wheel_position.1 += y;
         self.last_motion_change.2 += y as f32;
         let id = identifier();
-        self.engine
-            .set_axis(&id, WHEEL_AXIS_X, self.wheel_position.0 as f32);
-        self.engine
-            .set_axis(&id, WHEEL_AXIS_Y, self.wheel_position.1 as f32);
+        let mut engine = self.engine.lock();
+        engine.set_axis(&id, WHEEL_AXIS_X, self.wheel_position.0 as f32);
+        engine.set_axis(&id, WHEEL_AXIS_Y, self.wheel_position.1 as f32);
     }
 
     /// Port of Mouse::ReleaseAllButtons
     pub fn release_all_buttons(&mut self) {
-        self.engine.reset_button_state();
+        self.engine.lock().reset_button_state();
         self.button_pressed = false;
     }
 
     /// Port of Mouse::GetInputDevices (override)
     pub fn get_input_devices(&self) -> Vec<ParamPackage> {
         let mut param = ParamPackage::default();
-        param.set_str("engine", self.engine.get_engine_name().to_string());
+        param.set_str("engine", self.engine.lock().get_engine_name().to_string());
         param.set_str("display", "Keyboard/Mouse".to_string());
         vec![param]
     }
@@ -206,7 +268,7 @@ impl Mouse {
         // Only overwrite different buttons from default
         let mut mapping = AnalogMapping::new();
         let mut right_analog_params = ParamPackage::default();
-        right_analog_params.set_str("engine", self.engine.get_engine_name().to_string());
+        right_analog_params.set_str("engine", self.engine.lock().get_engine_name().to_string());
         right_analog_params.set_int("axis_x", 0);
         right_analog_params.set_int("axis_y", 1);
         right_analog_params.set_float("threshold", 0.5);
@@ -238,10 +300,8 @@ impl Mouse {
 
     /// Port of Mouse::IsMousePanningEnabled
     fn is_mouse_panning_enabled(&self) -> bool {
-        // Disable mouse panning when a real mouse is connected
-        // Upstream: Settings::values.mouse_panning && !Settings::values.mouse_enabled
-        // For now, default to false since settings wiring is not connected
-        false
+        let settings = common::settings::values();
+        *settings.mouse_panning.get_value() && !*settings.mouse_enabled.get_value()
     }
 
     /// Port of Mouse::GetUIButtonName

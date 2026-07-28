@@ -975,7 +975,10 @@ impl ResourceManager {
     fn initialize_touch_screen_sampler(&mut self) {
         // This is nn.hid.TouchScreenSampler
         self.touch_resource = Some(Arc::new(Mutex::new(TouchResource::new())));
-        self.touch_driver = Some(Arc::new(Mutex::new(TouchScreenDriver::new())));
+        self.touch_driver = self
+            .hid_core
+            .as_ref()
+            .map(|hid_core| Arc::new(Mutex::new(TouchScreenDriver::new(Arc::clone(hid_core)))));
         self.touch_screen = Some(Arc::new(Mutex::new(TouchScreen::new())));
         self.gesture = Some(Arc::new(Mutex::new(Gesture::new())));
 
