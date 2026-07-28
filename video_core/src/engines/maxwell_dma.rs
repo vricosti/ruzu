@@ -446,10 +446,6 @@ impl MaxwellDMA {
         &mut self,
         read_gpu: &dyn Fn(u64, &mut [u8]),
     ) -> Option<Vec<PendingWrite>> {
-        if self.launch_remap_enable() {
-            self.stop_unimplemented_dma_path("blocklinear->pitch remap-enabled DMA is not ported");
-        }
-
         let mut bytes_per_pixel = 1;
         let src_params = self.src_params();
         let dst_pitch = (self.pitch_out() as i32).unsigned_abs();
@@ -493,15 +489,27 @@ impl MaxwellDMA {
             );
         }
 
+        let is_remapping = self.launch_remap_enable();
+        let base_bpp = self.base_bytes_per_pixel();
         let mut width = src_params.width;
         let mut x_elements = self.line_length();
         let mut x_offset = src_params.origin.x();
-        let bpp_shift =
-            self.fold_min_trailing_zeroes(&[width, x_elements, x_offset, self.src_addr() as u32]);
-        width >>= bpp_shift;
-        x_elements >>= bpp_shift;
-        x_offset >>= bpp_shift;
-        bytes_per_pixel <<= bpp_shift;
+        let bpp_shift = if !is_remapping {
+            self.fold_min_trailing_zeroes(&[
+                width,
+                x_elements,
+                x_offset,
+                self.src_addr() as u32,
+            ])
+        } else {
+            0
+        };
+        if !is_remapping {
+            width >>= bpp_shift;
+            x_elements >>= bpp_shift;
+            x_offset >>= bpp_shift;
+        }
+        bytes_per_pixel = base_bpp << bpp_shift;
 
         let height = src_params.height;
         let depth = src_params.depth;
@@ -524,7 +532,9 @@ impl MaxwellDMA {
         self.invalidate_gpu_region(dst_addr, dst_size as u64);
 
         let src = Self::read_gpu_range(read_gpu, src_addr, src_size);
-        let mut dst = vec![0u8; dst_size];
+        // Upstream uses GpuGuestMemoryScoped<..., *ReadCachedWrite> for the
+        // destination. Preserve pixels outside the copied subrectangle.
+        let mut dst = Self::read_gpu_range(read_gpu, dst_addr, dst_size);
         unswizzle_subrect(
             &mut dst,
             &src,
@@ -620,7 +630,9 @@ impl MaxwellDMA {
         self.invalidate_gpu_region(dst_addr, dst_size as u64);
 
         let src = Self::read_gpu_range(read_gpu, src_addr, src_size);
-        let mut dst = vec![0u8; dst_size];
+        // Upstream uses GpuGuestMemoryScoped<..., *ReadCachedWrite> for the
+        // destination. Preserve pixels outside the copied subrectangle.
+        let mut dst = Self::read_gpu_range(read_gpu, dst_addr, dst_size);
         swizzle_subrect(
             &mut dst,
             &src,
@@ -709,7 +721,9 @@ impl MaxwellDMA {
 
         let src = Self::read_gpu_range(read_gpu, src_addr, src_size);
         let mut intermediate = vec![0u8; mid_size];
-        let mut dst = vec![0u8; dst_size];
+        // Upstream uses GpuGuestMemoryScoped<..., *ReadCachedWrite> for the
+        // destination. Preserve pixels outside the copied subrectangle.
+        let mut dst = Self::read_gpu_range(read_gpu, dst_addr, dst_size);
         unswizzle_subrect(
             &mut intermediate,
             &src,
@@ -995,7 +1009,9 @@ impl MaxwellDMA {
         }
 
         let dst_size = dst_span as usize;
-        let mut dst_buf = vec![0u8; dst_size];
+        // Upstream copies only line_length bytes per row. Reading the
+        // destination first preserves pitch padding between copied rows.
+        let mut dst_buf = Self::read_gpu_range(read_gpu, dst_addr, dst_size);
         let mut line_buf = vec![0u8; ll as usize];
 
         for line in 0..lines {
@@ -1402,6 +1418,10 @@ mod tests {
         let src: Vec<u8> = (0..16).collect();
 
         let writes = eng.execute_pending(&|addr, buf| {
+            if addr == 0x2000 {
+                buf.fill(0);
+                return;
+            }
             let offset = (addr - 0x1000) as usize;
             let len = buf.len();
             buf.copy_from_slice(&src[offset..offset + len]);
@@ -1436,6 +1456,10 @@ mod tests {
         ];
 
         let writes = eng.execute_pending(&|addr, buf| {
+            if addr == 0x2000 {
+                buf.fill(0x7E);
+                return;
+            }
             let offset = (addr - 0x1000) as usize;
             let len = buf.len();
             buf.copy_from_slice(&src[offset..offset + len]);
@@ -1447,7 +1471,7 @@ mod tests {
         assert_eq!(dst.len(), 20); // pitch_out * (line_count - 1) + line_length
                                    // Line 0: 4 bytes copied + 12 untouched bytes.
         assert_eq!(&dst[0..4], &[1, 2, 3, 4]);
-        assert_eq!(&dst[4..16], &[0; 12]);
+        assert_eq!(&dst[4..16], &[0x7E; 12]);
         // Line 1 starts at pitch_out and contributes only its copied bytes.
         assert_eq!(&dst[16..20], &[5, 6, 7, 8]);
     }
@@ -1468,6 +1492,10 @@ mod tests {
 
         let src: Vec<u8> = (0x10..0x20).collect();
         let writes = eng.execute_pending(&|addr, buf| {
+            if addr == 0x2000 {
+                buf.fill(0);
+                return;
+            }
             let offset = (addr - 0x1000) as usize;
             buf.copy_from_slice(&src[offset..offset + buf.len()]);
         });
@@ -1713,6 +1741,89 @@ mod tests {
         eng.write_reg(LAUNCH_DMA, MULTI_LINE_BLOCKLINEAR_TO_PITCH_LAUNCH);
 
         let writes = eng.execute_pending(&|addr, buf| {
+            if addr == dst_addr as u64 {
+                buf.fill(0);
+                return;
+            }
+            let offset = (addr - src_addr as u64) as usize;
+            buf.copy_from_slice(&tiled[offset..offset + buf.len()]);
+        });
+
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].gpu_va, dst_addr as u64);
+        assert_eq!(writes[0].data, linear);
+    }
+
+    #[test]
+    fn test_multi_line_blocklinear_to_pitch_remap_uses_component_size() {
+        let mut eng = new_test_engine();
+        let src_addr = 0x1000;
+        let dst_addr = 0x8000;
+        let width = 16;
+        let height = 4;
+        let depth = 1;
+        let bytes_per_pixel = 4;
+        let line_count = height;
+        let pitch = width * bytes_per_pixel;
+        let linear: Vec<u8> = (0..pitch * line_count).map(|value| value as u8).collect();
+        let mut tiled = vec![
+            0u8;
+            calculate_size(
+                true,
+                bytes_per_pixel,
+                width,
+                height,
+                depth,
+                0,
+                0,
+            )
+        ];
+        swizzle_subrect(
+            &mut tiled,
+            &linear,
+            bytes_per_pixel,
+            width,
+            height,
+            depth,
+            0,
+            0,
+            width,
+            line_count,
+            0,
+            0,
+            pitch,
+        );
+
+        eng.write_reg(SRC_ADDR_HIGH, 0);
+        eng.write_reg(SRC_ADDR_LOW, src_addr);
+        eng.write_reg(DST_ADDR_HIGH, 0);
+        eng.write_reg(DST_ADDR_LOW, dst_addr);
+        eng.write_reg(PITCH_OUT, pitch);
+        eng.write_reg(LINE_LENGTH, width);
+        eng.write_reg(LINE_COUNT, line_count);
+        eng.write_reg(REMAP_COMPONENTS, 3 << 16);
+        write_dma_params(
+            &mut eng,
+            SRC_PARAMS,
+            dma::Parameters {
+                block_size: dma::BlockSize { raw: 0 },
+                width,
+                height,
+                depth,
+                layer: 0,
+                origin: dma::Origin { raw: 0 },
+            },
+        );
+        eng.write_reg(
+            LAUNCH_DMA,
+            MULTI_LINE_BLOCKLINEAR_TO_PITCH_LAUNCH | LAUNCH_REMAP_ENABLE,
+        );
+
+        let writes = eng.execute_pending(&|addr, buf| {
+            if addr == dst_addr as u64 {
+                buf.fill(0);
+                return;
+            }
             let offset = (addr - src_addr as u64) as usize;
             buf.copy_from_slice(&tiled[offset..offset + buf.len()]);
         });
@@ -1777,6 +1888,10 @@ mod tests {
         eng.write_reg(LAUNCH_DMA, MULTI_LINE_PITCH_TO_BLOCKLINEAR_LAUNCH);
 
         let writes = eng.execute_pending(&|addr, buf| {
+            if addr == dst_addr as u64 {
+                buf.fill(0);
+                return;
+            }
             let offset = (addr - src_addr as u64) as usize;
             buf.copy_from_slice(&linear[offset..offset + buf.len()]);
         });
@@ -1838,6 +1953,10 @@ mod tests {
         eng.write_reg(LAUNCH_DMA, MULTI_LINE_BLOCKLINEAR_TO_BLOCKLINEAR_LAUNCH);
 
         let writes = eng.execute_pending(&|addr, buf| {
+            if addr == dst_addr as u64 {
+                buf.fill(0);
+                return;
+            }
             let offset = (addr - src_addr as u64) as usize;
             buf.copy_from_slice(&tiled[offset..offset + buf.len()]);
         });
@@ -2047,6 +2166,10 @@ mod tests {
 
         let src = vec![0x55; 0x100];
         let writes = eng.execute_pending(&|addr, buf| {
+            if addr == 0x8000 {
+                buf.fill(0);
+                return;
+            }
             let offset = (addr - 0x1000) as usize;
             buf.copy_from_slice(&src[offset..offset + buf.len()]);
         });
@@ -2079,6 +2202,10 @@ mod tests {
 
         let src = vec![0x55; 0x100];
         let writes = eng.execute_pending(&|addr, buf| {
+            if addr == 0x8000 {
+                buf.fill(0);
+                return;
+            }
             let offset = (addr - 0x1000) as usize;
             buf.copy_from_slice(&src[offset..offset + buf.len()]);
         });
@@ -2119,6 +2246,10 @@ mod tests {
 
         let src = vec![0x66; 0x100];
         let writes = eng.execute_pending(&|addr, buf| {
+            if addr == 0x8000 {
+                buf.fill(0);
+                return;
+            }
             let offset = (addr - 0x1000) as usize;
             buf.copy_from_slice(&src[offset..offset + buf.len()]);
         });
