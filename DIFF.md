@@ -4449,19 +4449,19 @@
 - Restore the upstream migration loop once `common/src/fiber.rs` can safely exchange runnable guest fibers across host core threads.
 
 ### Intentional differences
-- Rust keeps `initialize_guest_runtime(...)` and `handoff_after_svc(...)` owner-local helpers because the current callback-based `run_loop(...)` does not mirror the upstream `RunThread(...)` monolith one-for-one. This preserves `PhysicalCore` ownership while adapting to the Rust run-loop structure.
-
-### Missing items
-- Reconcile `handoff_after_svc(...)` with the upstream `Svc::Call(...)` return path once the scheduler/current-thread ownership is stable.
+- Rust keeps `initialize_guest_runtime(...)` and the existing context-capture
+  helper owner-local because the callback-based `run_loop(...)` does not mirror
+  upstream `RunThread(...)` one-for-one. Normal SVC return no longer calls that
+  helper; it is retained only for the separate pending-termination halt path.
 
 ### Intentional differences
 - Rust stores `SystemRef` by value in the factory instead of upstream's reference member because the port uses a lightweight copyable system handle type.
 
 ### Intentional differences
-- `capture_guest_context()` / `restore_guest_context()` are Rust-only helpers used by the temporary post-SVC runtime handoff path in `physical_core.rs`; upstream does not have these helpers because it keeps the context switch flow inside `PhysicalCore::RunThread`.
-
-### Missing items
-- remove the Rust-only helper path once `physical_core.rs` is brought closer to the upstream `RunThread()` lifecycle
+- `capture_guest_context()` / `restore_guest_context()` are Rust-only helpers
+  used by the split runtime initialization and termination-boundary paths in
+  `physical_core.rs`; upstream keeps the equivalent context transfer inside
+  `PhysicalCore::RunThread` and scheduler switching.
 
 ### Intentional differences
 - `KScheduler` still stores cloned `Arc<PhysicalCore>` handles because the Rust scheduler does not yet own the upstream `KernelCore& m_kernel` reference directly.
@@ -12018,29 +12018,6 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Binary layout verification
 - Scheduler/wait bookkeeping only; no guest raw-copied payload or serialized ABI layout changed.
-
-## core/src/hle/kernel/physical_core.rs vs core/cpu_manager.cpp + core/arm/arm_interface.h
-
-### Intentional differences
-- Rust has an explicit `write_svc_return_registers_if_runnable` guard before calling `ArmInterface::set_svc_arguments`. Upstream can set SVC return registers directly because the guest thread resumes through host fibers after the kernel wait completes; ruzu saves guest contexts cooperatively, so a blocking SVC must defer writing return registers while `KThread` is `Waiting`.
-
-### Unintentional differences (fixed)
-- Blocking SVCs no longer write the provisional `svc_args[0]` value into guest `r0/x0` when the handler has just put the current thread into `Waiting`. This prevents `WaitProcessWideKeyAtomic` / `ArbitrateLock` from publishing the default wait result (`0x7201`) before `EndWait`, timeout, cancellation, or termination writes the real result into the saved thread context.
-
-### Behavioral parity verified
-- `KThread::base_end_wait` / synchronization wake paths still own the final wait result and `KThread::apply_wait_result_to_context` copies it into guest `r0/x0` when the blocked thread is resumed.
-- ANIMUS run `/tmp/ruzu_animus_defer_svc_1781939647.log` no longer shows cores stuck inside SVC handlers (`in_svc={tid=0, imm=0x0}` in the SIGUSR1 dump) and reaches `SF_COMPOSE #8192 COMPOSING display_id=0 layers=1`.
-
-### Binary layout verification
-- CPU scheduling/register handoff only; no guest raw-copied payload or serialized ABI layout changed.
-
-### Verification
-- `cargo check -p core`
-- `cargo build --release --bin ruzu-cmd`
-- `cargo test -p core wait_for_address -- --nocapture`
-- `cargo test -p core wait_condition_variable -- --nocapture`
-- `cargo test -p core wait_locked_returns_only_after_signal -- --nocapture`
-- `cargo test -p core blocked_svc_defers_return_register_write_until_wake -- --nocapture`
 
 ## core/src/hle/service/cmif_serialization.rs vs core/hle/service/cmif_serialization.h
 
@@ -25097,3 +25074,535 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   `FRINTX V.2D`, including `FPSR.IXC`.
 - Re-read upstream `EmitIR<FPVectorSqrt32/64>` after implementation; the
   AArch64 execution regression validates all four `V.4S` lanes.
+
+## 2026-07-27 — externals/rdynarmic/src/{common/safe_ops.rs,common/fp/mantissa_util.rs,common/fp/op/fp_to_fixed.rs,backend/x64/emit_floating_point.rs} vs externals/dynarmic/src/dynarmic/{common/safe_ops.h,common/fp/mantissa_util.h,common/fp/op/FPToFixed.cpp,backend/x64/emit_x64_floating_point.cpp}
+
+### Intentional differences
+- Rust selects the signed 32-bit fallback at emission time and passes packed
+  `fbits`/rounding parameters to one helper. Upstream uses a compile-time
+  lookup table of specialized lambdas; both pass the raw FP operand, FPCR, and
+  mutable FPSR exception state to the same `FPToFixed` algorithm.
+- `safe_ops.rs` currently exposes only the `u64` operations required by
+  `FPToFixed`; their signed-shift and overflow behavior matches the
+  corresponding upstream templates.
+
+### Unintentional differences (fixed)
+- The x64 tie-away fallback obtained argument information twice, registering
+  its sole SSA source twice although the IR use count was one. It now reuses
+  the first argument descriptor, matching upstream `EmitFPToFixed`.
+- The signed 32-bit fallback previously used host arithmetic without ARM
+  saturation, FPCR unpacking, or FPSR exception accumulation. It now uses the
+  upstream `FPToFixed` behavior.
+
+### Missing items
+- Existing x64 fallbacks for other FP-to-fixed destination widths and
+  signedness variants have not yet been switched to the shared exact
+  `FPToFixed` implementation.
+
+### Binary layout verification
+- PASS: inputs remain raw IEEE-754 bit patterns, signed 32-bit results retain
+  their low-32-bit two's-complement representation, and FPSR exception flags
+  are updated in the existing JIT-state field.
+
+### Verification
+- Re-read upstream `Safe`, `ResidualErrorOnRightShift`, `FPToFixed`, and
+  `EmitFPToFixed` after implementation.
+- Focused tests cover tie-away rounding, signed saturation, NaN/Infinity
+  invalid-operation flags, and emission with a single-use SSA source.
+
+## 2026-07-27 — core/src/hle/kernel/physical_core.rs vs core/hle/kernel/physical_core.cpp and core/hle/kernel/svc.cpp
+
+### Intentional differences
+- Rust keeps the SVC wrapper dispatch in `svc_dispatch.rs` and a thin
+  `PhysicalCore::dispatch_supervisor_call` coordinator because the current
+  callback-based execution loop is split across modules. Register transfer
+  ownership still follows upstream `Svc::Call`: save and load through
+  `kernel.current_physical_core()` at the point each transfer occurs.
+- `dispatch_supervisor_call` returns a boolean for the Rust `ExitThread`
+  scheduler fallback. Upstream expresses this by never returning to guest
+  execution from `KThread::Exit`.
+
+### Unintentional differences (fixed)
+- Removed the second post-dispatch `set_svc_arguments` and
+  `handoff_after_svc` through the `PhysicalCore` and JIT captured on SVC
+  entry. A blocking SVC can resume its fiber on another core; the stale
+  handoff overwrote the live destination-core JIT context after
+  `svc_dispatch::call` had already restored the correct return registers.
+- `run_loop` now returns after every SVC, matching
+  `PhysicalCore::RunThread`, instead of continuing with an entry-core JIT
+  reference that may no longer own the resumed guest fiber.
+
+### Missing items
+- The unit-test kernel fixture does not yet model a complete cross-core
+  blocking-SVC fiber migration. The ownership regression is covered by the
+  reduced API, focused register tests, and repeated runtime traces.
+
+### Binary layout verification
+- PASS: no guest payload or thread-context layout changed; this correction
+  changes only which physical core owns SVC register restoration.
+
+### Verification
+- Re-read upstream `PhysicalCore::RunThread` and `Svc::Call` after the
+  implementation.
+- `dispatch_supervisor_call_exit_thread_returns_false_without_handoff`
+  passes with a kernel-less SVC fixture.
+- Three traced STK runs and one uninstrumented run completed without
+  `PrefetchAbort`, `BreakLoopNullPc`, panic, duplicated guest stack, or
+  cross-core context save.
+
+## 2026-07-27 — core/src/cpu_manager.rs vs core/cpu_manager.cpp
+
+### Intentional differences
+- Rust keeps one JIT dispatch quantum in `run_guest_thread_once`; upstream
+  owns the equivalent work directly in `MultiCoreRunGuestThread`.
+
+### Unintentional differences (fixed)
+- The post-SVC path previously inspected and rescheduled through scheduler,
+  physical-core, and JIT references captured before the handler. It now
+  returns immediately so the outer guest loop reacquires
+  `kernel.current_physical_core()`, matching upstream's assignment after
+  every `PhysicalCore::RunThread` return.
+
+### Binary layout verification
+- PASS: execution-loop ownership only; no guest ABI data changed.
+
+### Verification
+- Re-read upstream `CpuManager::MultiCoreRunGuestThread` and
+  `SingleCoreRunGuestThread` after the implementation.
+- Runtime scheduler traces show each resumed STK thread retaining a distinct
+  guest stack and being saved only by its owning core.
+
+## 2026-07-27 — core/src/hle/kernel/k_thread.rs vs core/hle/kernel/k_thread.cpp, k_thread_queue.cpp, and k_synchronization_object.cpp
+
+### Intentional differences
+- Rust represents the polymorphic wait queue and synchronization nodes with
+  owned Rust queue state, while preserving upstream ownership of
+  `wait_result`, `synced_index`, cancellability, and state transitions.
+
+### Unintentional differences (fixed)
+- Removed `apply_wait_result_to_context` calls from synchronization wake,
+  cancellation, and timer completion. Upstream `KThreadQueue::EndWait` and
+  `CancelWait` store the result and make the thread runnable but never write
+  guest r0/r1; the resumed generated SVC wrapper owns those output writes.
+
+### Binary layout verification
+- PASS: no `KThread` context field or guest-visible layout changed.
+
+### Verification
+- Re-read upstream `KThread::{NotifyAvailable,EndWait,CancelWait,OnTimer}`,
+  `KThreadQueue::{EndWait,CancelWait}`, and the synchronization-object wait
+  callback after the implementation.
+- `internal_end_wait_does_not_overwrite_guest_registers` passes.
+- `wait_synchronization_` passes 3 focused tests; 3 pre-existing
+  full-handoff scenarios remain explicitly ignored by their existing test
+  annotations.
+
+## 2026-07-27 — core/src/hle/kernel/kernel.rs vs core/hle/kernel/kernel.cpp
+
+### Intentional differences
+- Rust keeps `Weak<KThreadLock>`, thread ID, and raw-pointer TLS companions for
+  its owned thread representation. Their accessors now share the same
+  no-inline boundary as upstream's single `KThread*` TLS access.
+- Rust's host dummy thread is held by a TLS `Arc` rather than an in-place C++
+  `KThread`; allocation remains lazy and local to the host thread.
+- `register_host_thread_with_existing` retains the existing Rust host-ID
+  classification used by guest-core/service-thread adaptations.
+
+### Unintentional differences (fixed)
+- `SetHostThreadId`, `GetHostThreadId`, `GetHostDummyThread`,
+  `GetCurrentEmuThread`, and `SetCurrentEmuThread` were inlineable. They now
+  preserve upstream's `LTO_NOINLINE` contract so a fiber resumed on another
+  host thread reloads that host's TLS state.
+- The Rust-only fast current-thread ID and pointer accessors bypassed that
+  boundary. They are now non-inline as well.
+- Single-core phantom mode was a process-wide `AtomicBool`; it is now
+  thread-local and accessed through non-inline functions like upstream.
+
+### Binary layout verification
+- PASS: only host TLS ownership and access boundaries changed; no guest
+  structure or serialized payload changed.
+
+### Verification
+- Re-read the `KernelCore::Impl` TLS block and the public
+  `KernelCore::{Get,Set}CurrentEmuThread` forwarding methods after
+  implementation.
+- `host_thread_id_is_reloaded_after_cross_thread_fiber_resume` verifies one
+  fiber observes distinct core IDs, current threads, and fast thread IDs after
+  migration between two host threads.
+- `phantom_mode_is_local_to_the_calling_host_thread` verifies phantom mode
+  remains isolated per host thread.
+- Four consecutive Vulkan STK runs reached `Login` instead of stalling during
+  icon loading, without panic, `PrefetchAbort`, `BreakLoopNullPc`, or duplicated
+  guest context.
+- The full `core` test run was attempted with `shader_cache` excluded; unrelated
+  existing failures in hardware-timer, memory-block, and page-table tests were
+  followed by a test-process `SIGSEGV`.
+
+## 2026-07-27 — core/src/hle/kernel/k_scheduler.rs vs core/hle/kernel/k_scheduler.cpp
+
+### Intentional differences
+- Rust tracks the owning core beside `context_guard` so retry and startup paths
+  can make context release idempotent. Upstream relies on its scheduler
+  invariant before calling `SpinLock::unlock`.
+
+### Unintentional differences (fixed)
+- Releasing an already-unowned context returned safely but emitted a
+  misleading cross-core ownership error. The unowned state now returns before
+  the genuine wrong-owner diagnostic.
+
+### Binary layout verification
+- PASS: the guard and owner are host scheduler state; no guest-visible layout
+  changed.
+
+### Verification
+- Re-read upstream `KScheduler::Unload` and the retry unlock in
+  `ScheduleImpl`.
+- `thread_context_guard_stays_locked_until_explicit_unlock` now covers the
+  already-unowned, wrong-owner, and owning-core release cases.
+
+## 2026-07-28 — core/src/hle/kernel/k_thread.rs vs core/hle/kernel/svc_types.h and core/arm/dynarmic/arm_dynarmic_{32,64}.cpp
+
+### Intentional differences
+- Rust uses `capture_guest_context` and `restore_guest_context` to bridge the
+  scheduler-owned `KThread::thread_context` and `ArmInterface::ThreadContext`.
+  These helpers are now mechanical field-for-field copies.
+
+### Unintentional differences (fixed)
+- The helpers overwrote `r[11]`, `r[13]`, `r[14]`, and `r[15]` with
+  `fp`, `sp`, `lr`, and `pc`. Upstream keeps all fields independent: A32
+  populates both representations in `GetContext`, while A64 maps `r[0..28]`
+  to `x0..x28` and the separate fields to `x29`, `x30`, SP, and PC.
+
+### Missing items
+- The two identical Rust `ThreadContext` declarations remain separate in
+  `arm_interface.rs` and `k_thread.rs`; upstream has one owner in
+  `svc_types.h`.
+
+### Binary layout verification
+- PASS: no field, order, alignment, or size changed; the upstream layout
+  remains `0x320` bytes.
+
+### Verification
+- Re-read upstream `Svc::ThreadContext`, `ArmDynarmic32::{Get,Set}Context`,
+  and `ArmDynarmic64::{Get,Set}Context` after the implementation.
+- `capture_and_restore_guest_context_preserve_independent_registers` passes.
+
+## 2026-07-28 — core/src/hle/kernel/global_scheduler_context.rs vs core/hle/kernel/global_scheduler_context.cpp
+
+### Intentional differences
+- Rust passes `GlobalSchedulerContext` directly to the scheduler-owned queue
+  rotation because the port does not store upstream's `KernelCore& m_kernel`
+  member in this object.
+
+### Unintentional differences (fixed)
+- `preempt_threads` previously duplicated only
+  `KPriorityQueue::MoveToScheduledBack`. It now delegates each core and its
+  upstream preemption priority to `KScheduler::rotate_scheduled_queue`, so
+  rotation accounting and `m_scheduler_update_needed` remain owned by
+  `k_scheduler.rs` like upstream.
+
+### Missing items
+- `KScheduler::rotate_scheduled_queue` still omits upstream's two
+  suggested-thread migration loops. A prior literal port regressed guest
+  scheduling because the Rust fiber scheduler does not yet guarantee that
+  each running thread is the scheduled front of its core. The prerequisite
+  and rejected runtime result remain recorded in
+  `.agents/stk_scheduler_preemption_state.md`.
+
+### Binary layout verification
+- PASS: scheduler queue control flow only; no guest-visible or serialized
+  layout changed.
+
+### Verification
+- Re-read upstream `GlobalSchedulerContext::PreemptThreads` and
+  `KScheduler::RotateScheduledQueue`.
+- `preempt_threads_rotates_each_core_queue_and_requests_scheduler_update`
+  verifies rotation, scheduled-count accounting, and the global update flag.
+
+## 2026-07-28 — core/src/hle/kernel/kernel.rs vs core/hle/kernel/kernel.cpp
+
+### Intentional differences
+- After the upstream-owned 10 ms CoreTiming callback releases the scheduler
+  lock, Rust interrupts every physical core. Upstream's scheduler integration
+  reaches its execution boundary through native scheduler interrupts; the
+  Rust fiber/JIT loop otherwise may remain inside `ArmInterface::run_thread`
+  after the queue rotation. The extra interrupt only requests a JIT exit and
+  does not perform scheduling outside the scheduler lock.
+- The local SIGUSR1 diagnostic is polled by the CoreTiming callback and waits
+  briefly for those JIT exits before reading live contexts.
+
+### Unintentional differences (fixed)
+- The port previously added a second host preemption thread beside upstream's
+  looping CoreTiming event. Preemption now has one 10 ms owner again:
+  `InitializePreemption` schedules the CoreTiming event, acquires the
+  scheduler lock, and calls `GlobalSchedulerContext::preempt_threads`.
+
+### Missing items
+- The unconditional JIT interrupt can become unnecessary once scheduler-lock
+  release reliably interrupts every Rust core whose runnable front changed.
+
+### Binary layout verification
+- PASS: event and host execution control only; no guest-visible or serialized
+  layout changed.
+
+### Verification
+- Re-read upstream `KernelCore::Impl::InitializePreemption`.
+- Release build of `ruzu-cmd` succeeds.
+- A 20-second Vulkan runtime check progressed through `NotifyRunning`,
+  `IStorage`, and NVDEC initialization instead of remaining on the first
+  logo.
+
+## 2026-07-28 — input_common/src/input_engine.rs vs input_common/input_engine.{h,cpp}
+
+### Intentional differences
+- Rust passes the completed `MappingData` snapshot to `UpdateCallback`.
+  Upstream callbacks re-read the engine after notification; the Rust drivers
+  share the engine behind an outer `Arc<Mutex<_>>`, so re-locking it from the
+  callback would deadlock. The snapshot contains the value that upstream
+  would observe after `SetButton`/`SetAxis`.
+
+### Unintentional differences (fixed)
+- Engine callbacks were previously invoked without enough state for a shared
+  Rust poller to publish the updated touch value.
+
+### Missing items
+- None introduced by this touch-input slice.
+
+### Binary layout verification
+- PASS: callback ABI is internal Rust state; no guest-visible layout changed.
+
+## 2026-07-28 — input_common/src/input_poller.rs vs input_common/input_poller.{h,cpp}
+
+### Intentional differences
+- `InputFromTouch` keeps its callback-visible state in
+  `Arc<Mutex<TouchCallbackState>>` instead of capturing a movable C++ `this`.
+
+### Unintentional differences (fixed)
+- `InputFromTouch` registered three empty engine callbacks, so button and axis
+  changes never reached its `InputDevice` callback. It now preserves the
+  upstream change filtering and emits complete `TouchStatus` updates.
+- `InputFactory` and `OutputFactory` now implement the common factory traits
+  required by the global factory registry.
+
+### Missing items
+- Other `InputFrom*` pollers with empty callbacks remain outside this
+  touch-input slice.
+
+### Binary layout verification
+- PASS: host-only callback state.
+
+## 2026-07-28 — input_common/src/drivers/{mouse,touch_screen}.rs vs input_common/drivers/{mouse,touch_screen}.{h,cpp}
+
+### Intentional differences
+- The engine is shared through `Arc<Mutex<InputEngine>>` so registered
+  factories and SDL event producers refer to the same engine object.
+
+### Unintentional differences (fixed)
+- Constructors now pre-register upstream controller/axis state.
+- `Mouse::Move` and the upstream mouse-panning setting predicate are restored.
+
+### Missing items
+- The mouse periodic update thread remains a pre-existing incomplete port.
+
+### Binary layout verification
+- PASS: host input-driver state only.
+
+## 2026-07-28 — input_common/src/main_common.rs vs input_common/main.{h,cpp}
+
+### Intentional differences
+- None for the registered mouse and touch engines.
+
+### Unintentional differences (fixed)
+- `Initialize` now registers input/output factories for the mouse and touch
+  engines, and `Shutdown` unregisters them before dropping the drivers.
+
+### Missing items
+- Upstream also registers updater, keyboard, Cemuhook UDP, TAS, camera,
+  virtual amiibo/gamepad, optional SDL/Joy-Con engines, and the
+  touch/analog-from-button factories. Their Rust drivers do not yet share the
+  factory-owned engine representation used by this slice.
+
+### Binary layout verification
+- PASS: host registry ownership only.
+
+## 2026-07-28 — hid_core/src/frontend/input_converter.rs vs hid_core/frontend/input_converter.{h,cpp}
+
+### Intentional differences
+- None.
+
+### Unintentional differences (fixed)
+- `TransformToTouch` was missing. The Rust port now selects touch/stick input,
+  sanitizes both axes, applies inversion, clamps coordinates, and inverts the
+  pressed value in the same order as upstream.
+
+### Missing items
+- None in `TransformToTouch`.
+
+### Binary layout verification
+- PASS: conversion only; existing status layouts are unchanged.
+
+## 2026-07-28 — hid_core/src/frontend/emulated_console.rs vs hid_core/frontend/emulated_console.{h,cpp}
+
+### Intentional differences
+- Callback-visible console state uses `Arc<Mutex<_>>` and configuration state
+  uses `Arc<AtomicBool>` because Rust input callbacks outlive the mutable
+  borrow used to install them.
+
+### Unintentional differences (fixed)
+- Touch parameters, devices, callbacks, finger-slot allocation, touch-state
+  updates, unloading, and change notification were stubs. They now follow the
+  upstream touch lifecycle.
+
+### Missing items
+- Motion parameters/devices and `SetMotion` remain a pre-existing incomplete
+  portion of `EmulatedConsole`.
+
+### Binary layout verification
+- PASS: guest-visible `TouchFinger` layout was not changed.
+
+## 2026-07-28 — hid_core/src/resources/touch_screen/touch_screen_driver.rs vs hid_core/resources/touch_screen/touch_screen_driver.{h,cpp}
+
+### Intentional differences
+- Rust retains the shared `HIDCore` handle rather than the upstream shared
+  `EmulatedConsole` pointer; `WaitForInput` reads the same console state.
+
+### Unintentional differences (fixed)
+- `WaitForInput` previously returned without reading frontend input. It now
+  feeds the upstream finger transition state machine from
+  `EmulatedConsole::GetTouch`.
+
+### Missing items
+- Touch diameter and rotation still use the existing fixed defaults rather
+  than the upstream touchscreen settings.
+
+### Binary layout verification
+- PASS: `TouchScreenState` and `TouchState` layouts are unchanged.
+
+## 2026-07-28 — hid_core/src/resource_manager.rs vs hid_core/resources/resource_manager.cpp
+
+### Intentional differences
+- Rust passes the shared `HIDCore` owner when constructing `TouchDriver`.
+
+### Unintentional differences (fixed)
+- Touch-driver construction did not connect the driver to frontend console
+  state.
+
+### Missing items
+- None introduced by this constructor change.
+
+### Binary layout verification
+- PASS: ownership wiring only.
+
+## 2026-07-28 — ruzu_cmd/src/emu_window/emu_window_sdl2.rs vs yuzu_cmd/emu_window/emu_window_sdl2.{h,cpp}
+
+### Intentional differences
+- The existing command-line keyboard-to-NPad bridge remains alongside the
+  upstream keyboard driver until the full keyboard factory path is wired.
+- Destruction cannot call upstream `system.HIDCore().UnloadInputDevices()`
+  because the Rust HID service owns its `HIDCore` separately.
+
+### Unintentional differences (fixed)
+- The window now initializes/shuts down `InputSubsystem` and forwards SDL
+  keyboard, mouse, and finger events through the upstream-owned driver
+  methods instead of dropping mouse/touch events.
+
+### Missing items
+- The HID-core unload ownership mismatch remains.
+
+### Binary layout verification
+- PASS: frontend event forwarding only.
+
+### Verification
+- A mouse down/up event injected into the live SDL queue reached
+  `EmuWindowSdl2`, `InputFromTouch`, `EmulatedConsole`, and
+  `TouchScreenDriver`; the driver sampled the pressed state on its 4 ms HID
+  update.
+
+## 2026-07-28 — video_core/src/engines/maxwell_dma.rs vs video_core/engines/maxwell_dma.{h,cpp}
+
+### Intentional differences
+- Rust materializes the destination through the existing `read_gpu` callback
+  and returns a `PendingWrite`; upstream uses
+  `GpuGuestMemoryScoped<..., ReadCachedWrite>` to expose the same
+  read-modify-write destination directly.
+
+### Unintentional differences (fixed)
+- The block-linear-to-pitch fallback aborted when remapping was enabled.
+  Upstream reports the path as unimplemented but continues with
+  `base_bpp = num_components * component_size` and disables the trailing-zero
+  packing optimization. Rust now follows that control flow and byte width.
+- The CPU fallbacks for block-linear-to-pitch, pitch-to-block-linear, and
+  block-linear-to-block-linear copies initialized the complete destination to
+  zero before copying a subrectangle. They now preserve the existing
+  destination, matching upstream's `ReadCachedWrite` mappings.
+- Multi-line pitch-to-pitch copies also preserve bytes between copied rows,
+  matching upstream's per-line writes instead of clearing pitch padding.
+
+### Missing items
+- None introduced by this destination-preservation correction.
+
+### Binary layout verification
+- PASS: DMA register and operand layouts are unchanged.
+
+### Verification
+- Re-read upstream `MaxwellDMA::CopyBlockLinearToPitch`,
+  `CopyPitchToBlockLinear`, `CopyBlockLinearToBlockLinear`, and the
+  pitch-to-pitch path in `Launch`.
+- `test_multi_line_blocklinear_to_pitch_remap_uses_component_size` covers the
+  remapped component byte width and code-start copy extent.
+- `test_dma_different_pitches` verifies that destination pitch padding
+  survives a partial copy.
+
+## 2026-07-28 — video_core/src/texture_cache/format_lookup_table.rs vs video_core/texture_cache/format_lookup_table.cpp
+
+### Intentional differences
+- Rust uses a match expression over the same packed hash instead of a C++
+  switch.
+
+### Unintentional differences (fixed)
+- Unknown texture format/component tuples panicked after writing a local
+  state file. Upstream emits `UNIMPLEMENTED_MSG` and returns
+  `A8B8G8R8_UNORM`; Rust now logs the unsupported tuple and returns the same
+  fallback. This includes `A8B8G8R8` with FLOAT components used while loading
+  the kart selection screen.
+
+### Missing items
+- None introduced by this correction.
+
+### Binary layout verification
+- PASS: lookup behavior only; the packed texture hash is unchanged.
+
+### Verification
+- Re-read the complete upstream `PixelFormatFromTextureInfo` switch and its
+  post-switch fallback.
+- Added regression coverage for both the observed unsupported component tuple
+  and an unknown raw texture format.
+
+## 2026-07-28 — video_core/src/vulkan_common/vulkan_device.rs vs video_core/vulkan_common/vulkan_device.{h,cpp}
+
+### Intentional differences
+- MoltenVK is blacklisted from
+  `VK_EXT_shader_demote_to_helper_invocation`. Both tested MoltenVK 1.4.2
+  builds advertise the feature, but the yuzu-bundled build fails to lower
+  `OpDemoteToHelperInvocation` when SPIRV-Cross selects MSL below 2.3 and then
+  aborts pipeline creation. Disabling the feature selects the existing
+  upstream shader fallback that emits conditional `OpKill`.
+
+### Unintentional differences (fixed)
+- None.
+
+### Missing items
+- Re-evaluate the blacklist when MoltenVK reliably selects MSL 2.3 or newer
+  for demote shaders.
+
+### Binary layout verification
+- PASS: host feature selection only.
+
+### Verification
+- Re-read upstream `Device::GetSuitability` and
+  `RemoveExtensionFeatureIfUnsuitable`; upstream enables demote whenever the
+  driver reports it and has no equivalent MoltenVK blacklist.
+- MoltenVK 1.4.2 from the yuzu bundle failed SPIRV-Cross conversion for the
+  affected fragment shader. The official Khronos 1.4.2 build loaded
+  successfully with the blacklist and did not reproduce that pipeline crash;
+  the later application stall is scheduler-related and independent.
