@@ -392,7 +392,8 @@ impl Device {
             }
             device_properties = properties2.properties;
         }
-        if driver_properties.driver_id == vk::DriverId::MOLTENVK {
+        let is_mvk = driver_properties.driver_id == vk::DriverId::MOLTENVK;
+        if is_mvk {
             log::warn!(
                 "MoltenVK breaks with more than 16 vertex attributes/bindings; capping both limits"
             );
@@ -643,8 +644,15 @@ impl Device {
         let supports_provoking_vertex = has_provoking_vertex
             && provoking_vertex_features.provoking_vertex_last != 0
             && provoking_vertex_features.transform_feedback_preserves_provoking_vertex != 0;
-        let supports_shader_demote_to_helper_invocation = has_shader_demote_to_helper_invocation
+        let mut supports_shader_demote_to_helper_invocation = has_shader_demote_to_helper_invocation
             && shader_demote_features.shader_demote_to_helper_invocation != 0;
+        if is_mvk && supports_shader_demote_to_helper_invocation {
+            log::warn!(
+                "MoltenVK advertises shader demote but fails to lower it below MSL 2.3; disabling"
+            );
+            supports_shader_demote_to_helper_invocation = false;
+            shader_demote_features.shader_demote_to_helper_invocation = vk::FALSE;
+        }
         log::info!(
             "Vulkan primitive topology restart: extension={} list={} patch={}",
             has_primitive_topology_list_restart,
@@ -671,13 +679,16 @@ impl Device {
             "VK_EXT_depth_clip_control",
             "VK_EXT_index_type_uint8",
             "VK_EXT_vertex_attribute_divisor",
-            "VK_EXT_shader_demote_to_helper_invocation",
             "VK_EXT_shader_stencil_export",
             "VK_KHR_draw_indirect_count",
         ] {
             if supported_extensions.contains(name) {
                 enabled_extensions.push(CString::new(name).unwrap());
             }
+        }
+        if supports_shader_demote_to_helper_invocation {
+            enabled_extensions
+                .push(CString::new("VK_EXT_shader_demote_to_helper_invocation").unwrap());
         }
         if supports_provoking_vertex {
             enabled_extensions.push(CString::new("VK_EXT_provoking_vertex").unwrap());
