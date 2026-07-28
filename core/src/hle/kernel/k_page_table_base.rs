@@ -9359,21 +9359,24 @@ mod tests {
 
     #[test]
     fn can_contain_normal_excludes_alias_but_not_heap() {
-        let pt = aarch32_layout();
-        // `Normal` maps to heap region. Overlap with alias must reject.
+        let mut pt = aarch32_layout();
+        // Upstream asserts that Normal candidates are in the heap.
         assert!(pt.can_contain(0x6000_0000, 0x4000, SvcMemoryState::Normal));
-        // Wholly inside alias (not heap) — Normal's region IS heap, so this
-        // is outside the region anyway, but the check still needs to hold.
-        assert!(!pt.can_contain(0xC000_0000, 0x4000, SvcMemoryState::Normal));
+        // Exercise the alias exclusion without violating that precondition.
+        pt.m_alias_region_start = 0x6000_0000;
+        pt.m_alias_region_end = 0x6000_4000;
+        assert!(!pt.can_contain(0x6000_0000, 0x4000, SvcMemoryState::Normal));
     }
 
     #[test]
     fn can_contain_ipc_requires_alias_excludes_heap() {
-        let pt = aarch32_layout();
-        // Ipc maps to alias region. Inside alias is OK.
+        let mut pt = aarch32_layout();
+        // Upstream asserts that IPC candidates are in the alias region.
         assert!(pt.can_contain(0xC000_0000, 0x4000, SvcMemoryState::Ipc));
-        // Outside alias rejects.
-        assert!(!pt.can_contain(0x6000_0000, 0x4000, SvcMemoryState::Ipc));
+        // Exercise the heap exclusion without violating that precondition.
+        pt.m_heap_region_start = 0xC000_0000;
+        pt.m_heap_region_end = 0xC000_4000;
+        assert!(!pt.can_contain(0xC000_0000, 0x4000, SvcMemoryState::Ipc));
     }
 
     #[test]
