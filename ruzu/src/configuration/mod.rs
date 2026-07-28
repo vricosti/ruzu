@@ -42,6 +42,8 @@ pub mod configure_profile_manager;
 pub mod configure_system;
 pub mod configure_ui;
 pub mod configure_web;
+pub mod controller_outlines;
+pub mod controller_preview;
 pub mod qt_config;
 pub mod shared_translation;
 pub mod shared_widget;

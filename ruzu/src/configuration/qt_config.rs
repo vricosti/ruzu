@@ -20,6 +20,7 @@ use std::io;
 use std::path::PathBuf;
 
 use common::fs::path_util::{get_ruzu_path, RuzuPath};
+use common::settings_input::{native_analog, native_button, native_motion};
 
 use crate::uisettings::GameDir;
 
@@ -58,6 +59,187 @@ pub fn save_game_dirs(dirs: &[GameDir]) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, updated)
+}
+
+/// The INI section the per-player control bindings live in.
+const CONTROLS_SECTION: &str = "[Controls]";
+
+/// Read every player's bindings — upstream `QtConfig::ReadQtPlayerValues`,
+/// called once per player from `Config::ReadControlValues`.
+///
+/// Upstream falls back to a generated keyboard mapping when a key is missing;
+/// an absent key here leaves the slot at whatever `PlayerInput::default()` set,
+/// which is the same empty-string state the dialog renders as `[not set]`.
+pub fn load_control_values() {
+    let Ok(contents) = std::fs::read_to_string(config_path()) else {
+        return;
+    };
+    let values = parse_controls(&contents);
+    if values.is_empty() {
+        return;
+    }
+
+    let mut settings = common::settings::values_mut();
+    let players = settings.players.get_value_mut();
+    for (index, player) in players.iter_mut().enumerate() {
+        let prefix = format!("player_{index}_");
+        for (slot, name) in native_button::MAPPING.iter().enumerate() {
+            if let Some(param) = values.get(&format!("{prefix}{name}")) {
+                player.buttons[slot] = param.clone();
+            }
+        }
+        for (slot, name) in native_analog::MAPPING.iter().enumerate() {
+            if let Some(param) = values.get(&format!("{prefix}{name}")) {
+                player.analogs[slot] = param.clone();
+            }
+        }
+        for (slot, name) in native_motion::MAPPING.iter().enumerate() {
+            if let Some(param) = values.get(&format!("{prefix}{name}")) {
+                player.motions[slot] = param.clone();
+            }
+        }
+    }
+}
+
+/// Persist every player's bindings — upstream `QtConfig::SaveQtPlayerValues`.
+///
+/// Only the `[Controls]` keys this function owns are rewritten; every other
+/// line in the file is preserved, the same way `save_game_dirs` leaves the rest
+/// of the INI alone.
+pub fn save_control_values() -> io::Result<()> {
+    let path = config_path();
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+
+    let mut entries: Vec<(String, String)> = Vec::new();
+    {
+        let settings = common::settings::values();
+        for (index, player) in settings.players.get_value().iter().enumerate() {
+            let prefix = format!("player_{index}_");
+            for (slot, name) in native_button::MAPPING.iter().enumerate() {
+                entries.push((format!("{prefix}{name}"), player.buttons[slot].clone()));
+            }
+            for (slot, name) in native_analog::MAPPING.iter().enumerate() {
+                entries.push((format!("{prefix}{name}"), player.analogs[slot].clone()));
+            }
+            for (slot, name) in native_motion::MAPPING.iter().enumerate() {
+                entries.push((format!("{prefix}{name}"), player.motions[slot].clone()));
+            }
+        }
+    }
+
+    let updated = replace_controls(&contents, &entries);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, updated)
+}
+
+/// Parse the `player_N_…` keys out of the `[Controls]` section.
+///
+/// Upstream writes each binding as a `key\default=` line followed by the value,
+/// quoted because the parameter string contains commas. Both the quotes and the
+/// companion `\default` line are handled here; keys whose `\default` is `true`
+/// still carry their value, so they are read like any other.
+pub fn parse_controls(contents: &str) -> std::collections::BTreeMap<String, String> {
+    let mut values = std::collections::BTreeMap::new();
+    let mut in_section = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_section = trimmed == CONTROLS_SECTION;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        // `key\default=` is metadata about the neighbouring key, not a binding.
+        if key.ends_with("\\default") || !key.starts_with("player_") {
+            continue;
+        }
+        values.insert(key.to_string(), unquote(value.trim()).to_string());
+    }
+
+    values
+}
+
+/// Replace the `player_N_…` lines of `contents` with `entries`.
+///
+/// The rewritten block is dropped where the first existing binding sat, so a
+/// hand-edited file keeps its shape; a file with no `[Controls]` section at all
+/// gains one at the end.
+pub fn replace_controls(contents: &str, entries: &[(String, String)]) -> String {
+    let is_binding = |line: &str| {
+        let trimmed = line.trim();
+        let Some((key, _)) = trimmed.split_once('=') else {
+            return false;
+        };
+        key.trim().starts_with("player_")
+    };
+
+    let rendered: Vec<String> = entries
+        .iter()
+        .flat_map(|(key, value)| {
+            // Upstream's `WriteStringSetting` emits the `\default` marker first;
+            // a binding written from the dialog is never the built-in default.
+            [
+                format!("{key}\\default=false"),
+                format!("{key}=\"{value}\""),
+            ]
+        })
+        .collect();
+
+    let mut output: Vec<String> = Vec::new();
+    let mut in_section = false;
+    let mut written = false;
+    let mut saw_section = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            // Leaving `[Controls]` without having met a binding: append here so
+            // the keys land in their own section rather than the next one.
+            if in_section && !written {
+                output.extend(rendered.iter().cloned());
+                written = true;
+            }
+            in_section = trimmed == CONTROLS_SECTION;
+            saw_section |= in_section;
+            output.push(line.to_string());
+            continue;
+        }
+        if in_section && is_binding(line) {
+            if !written {
+                output.extend(rendered.iter().cloned());
+                written = true;
+            }
+            continue;
+        }
+        output.push(line.to_string());
+    }
+
+    if !written {
+        if !saw_section {
+            output.push(CONTROLS_SECTION.to_string());
+        }
+        output.extend(rendered);
+    }
+
+    let mut text = output.join("\n");
+    text.push('\n');
+    text
+}
+
+/// Strip the surrounding quotes yuzu writes around values containing commas.
+fn unquote(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(value)
 }
 
 /// Parse the `Paths\gamedirs\…` block of a yuzu-schema INI.
@@ -201,6 +383,89 @@ fn is_true(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The binding a real Xbox pad produces, as yuzu writes it.
+    const SDL_BINDING: &str =
+        "engine:sdl,port:0,guid:030000005e040000000b000015050000,button:1";
+
+    #[test]
+    fn control_bindings_survive_a_save_and_reload() {
+        // The whole point of the Controls page: what the dialog wrote must come
+        // back byte-for-byte on the next launch.
+        let entries = vec![
+            ("player_0_button_a".to_string(), SDL_BINDING.to_string()),
+            (
+                "player_0_lstick".to_string(),
+                "engine:sdl,axis_x:0,axis_y:1,offset_x:-0.03".to_string(),
+            ),
+        ];
+        let written = replace_controls("", &entries);
+        let parsed = parse_controls(&written);
+
+        assert_eq!(parsed.get("player_0_button_a").map(String::as_str), Some(SDL_BINDING));
+        assert_eq!(
+            parsed.get("player_0_lstick").map(String::as_str),
+            Some("engine:sdl,axis_x:0,axis_y:1,offset_x:-0.03")
+        );
+    }
+
+    #[test]
+    fn bindings_are_quoted_so_their_commas_survive() {
+        // A parameter string is a comma-separated list; written bare it would
+        // still round-trip through this parser but would break every other INI
+        // reader, yuzu's included.
+        let entries = vec![("player_0_button_a".to_string(), SDL_BINDING.to_string())];
+        let written = replace_controls("", &entries);
+        assert!(written.contains(&format!("player_0_button_a=\"{SDL_BINDING}\"")));
+        // Upstream pairs each key with its `\default` marker.
+        assert!(written.contains("player_0_button_a\\default=false"));
+    }
+
+    #[test]
+    fn saving_controls_leaves_the_rest_of_the_file_alone() {
+        // `save_control_values` shares the config file with every other
+        // setting; clobbering a neighbouring section would lose them.
+        let original = "[UI]\nPaths\\gamedirs\\size=1\n[Controls]\nplayer_0_button_a\\default=false\nplayer_0_button_a=\"old\"\ntouchscreen_enabled=true\n[Core]\nuse_multi_core=true\n";
+        let entries = vec![("player_0_button_a".to_string(), "new".to_string())];
+        let updated = replace_controls(original, &entries);
+
+        assert!(updated.contains("Paths\\gamedirs\\size=1"));
+        assert!(updated.contains("touchscreen_enabled=true"));
+        assert!(updated.contains("use_multi_core=true"));
+        assert!(updated.contains("player_0_button_a=\"new\""));
+        assert!(!updated.contains("\"old\""));
+    }
+
+    #[test]
+    fn a_config_without_a_controls_section_gains_one() {
+        let entries = vec![("player_0_button_a".to_string(), "x".to_string())];
+        let updated = replace_controls("[UI]\nsomething=1\n", &entries);
+        assert!(updated.contains("[Controls]"));
+        assert!(updated.contains("something=1"));
+
+        // And the new keys must land inside that section, not before it.
+        let section = updated.find("[Controls]").unwrap();
+        let key = updated.find("player_0_button_a").unwrap();
+        assert!(key > section);
+    }
+
+    #[test]
+    fn bindings_from_another_section_are_not_read_as_controls() {
+        // `player_` keys only mean a binding inside [Controls]; a same-named key
+        // elsewhere must not leak in.
+        let contents = "[UI]\nplayer_0_button_a=\"decoy\"\n[Controls]\nplayer_0_button_b=\"real\"\n";
+        let parsed = parse_controls(contents);
+        assert!(!parsed.contains_key("player_0_button_a"));
+        assert_eq!(parsed.get("player_0_button_b").map(String::as_str), Some("real"));
+    }
+
+    #[test]
+    fn the_default_marker_is_not_mistaken_for_a_binding() {
+        let contents = "[Controls]\nplayer_0_button_a\\default=false\nplayer_0_button_a=\"v\"\n";
+        let parsed = parse_controls(contents);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed.get("player_0_button_a").map(String::as_str), Some("v"));
+    }
 
     /// A config with a stale 5th entry nested inside the 4th — the shape a
     /// removed-then-re-added game directory leaves behind.

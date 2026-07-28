@@ -10,6 +10,9 @@
 // Controls screen shows nine tabs rather than a nested tab widget (unlike the
 // Debug screen, which does nest).
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use super::configure_dialog::Page;
 use super::configure_input_advanced;
 use super::configure_input_player;
@@ -19,9 +22,9 @@ use super::configure_input_player;
 pub const NUM_PLAYERS: usize = 8;
 
 /// Build the Controls tabs — upstream `ConfigureInput::GetSubTabs()`.
-pub fn pages() -> Vec<Page> {
+pub fn pages(input_subsystem: Rc<RefCell<input_common::InputSubsystem>>) -> Vec<Page> {
     let mut pages: Vec<Page> = (0..NUM_PLAYERS)
-        .map(configure_input_player::page)
+        .map(|index| configure_input_player::page(index, Rc::clone(&input_subsystem)))
         .collect();
     pages.push(configure_input_advanced::page());
     pages

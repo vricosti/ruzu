@@ -91,7 +91,10 @@ pub struct ConfigureDialog {
 impl ConfigureDialog {
     /// Build the dialog. Mirrors the upstream constructor: create every tab,
     /// populate the selector list, then select row 0.
-    pub fn new(parent: Option<&impl IsA<Window>>) -> Rc<Self> {
+    pub fn new(
+        parent: Option<&impl IsA<Window>>,
+        input_subsystem: Rc<RefCell<input_common::InputSubsystem>>,
+    ) -> Rc<Self> {
         let window = Window::builder()
             .title("ruzu Configuration")
             .modal(true)
@@ -141,7 +144,7 @@ impl ConfigureDialog {
             },
             Section {
                 name: "Controls",
-                pages: configure_input::pages(),
+                pages: configure_input::pages(input_subsystem),
             },
         ];
 
@@ -272,6 +275,12 @@ impl ConfigureDialog {
             for page in &section.pages {
                 (page.apply)();
             }
+        }
+        // Upstream `GMainWindow::OnConfigure` calls `config->Save()` once the
+        // dialog is accepted; without it the new bindings would live only in
+        // this process and be gone next launch.
+        if let Err(error) = super::qt_config::save_control_values() {
+            log::error!("Failed to save control settings: {error}");
         }
         common::settings::log_settings(&common::settings::values());
     }

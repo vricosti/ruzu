@@ -59,6 +59,11 @@ fn main() -> glib::ExitCode {
     log::info!("Loaded {} configured game directory(ies)", game_dirs.len());
     uisettings::with_mut(|v| v.game_dirs = game_dirs);
 
+    // Upstream's `Config` constructor reads every category, controls included,
+    // before the window is built. Without this the Controls page would open on
+    // an empty mapping even though one was saved last session.
+    configuration::qt_config::load_control_values();
+
     // Upstream constructs `QApplication app(argc, argv)`. We register handling
     // of file arguments ourselves later (open a game passed on the command
     // line), so declare HANDLES_OPEN even though the handler is not wired yet.
@@ -102,6 +107,5 @@ fn main() -> glib::ExitCode {
         set_main_window(window);
     });
 
-    // Upstream: `return app.exec();`
     app.run()
 }

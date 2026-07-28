@@ -20,6 +20,9 @@ path = "src/main.rs"
 # `v4_10` feature unlocks `FileDialog`, `AlertDialog`, and `FileLauncher`
 # (used by the File menu); the bundled Homebrew GTK is 4.22.
 gtk = { version = "0.9", package = "gtk4", features = ["v4_10"] }
+# Same cairo as gtk4 re-exports, with `png` so the controller drawings can be
+# rendered to a file in tests and compared against upstream by eye.
+cairo-rs = { version = "0.20", features = ["png"] }
 log = { workspace = true }
 env_logger = { workspace = true }
 
@@ -31,6 +34,10 @@ common = { path = "../common" }
 # `ruzu_core` because the crate's package name `core` shadows the std `core`
 # crate — the same rename `ruzu_cmd` uses.
 ruzu_core = { package = "core", path = "../core" }
+
+# Input drivers. Upstream's `GMainWindow` owns the `InputSubsystem` and hands
+# it to `GRenderWindow`, which forwards key events into it.
+input_common = { workspace = true }
 
 # Shared frontend helpers (content install / verification), the ruzu port of
 # upstream's `src/frontend_common`.

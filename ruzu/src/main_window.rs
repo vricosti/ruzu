@@ -74,6 +74,13 @@ pub struct GMainWindow {
     /// Handle to the game list, so it can be rescanned when the configured
     /// directories change.
     game_list: RefCell<Option<crate::game_list::GameListHandle>>,
+    /// Input drivers. Upstream `GMainWindow` owns the `InputSubsystem` and
+    /// passes it to `GRenderWindow`, which forwards events into it.
+    ///
+    /// It must stay alive for the whole session: `Initialize` registers each
+    /// engine in the process-wide factory registry that the emulated HID
+    /// resolves bindings through, and `Shutdown` unregisters them.
+    input_subsystem: Rc<RefCell<input_common::InputSubsystem>>,
 }
 
 /// Handles needed to resize the embedded render surface on window resize.
@@ -177,7 +184,14 @@ impl GMainWindow {
             render_size: Cell::new((0, 0)),
             configure_dialog: RefCell::new(None),
             game_list: RefCell::new(None),
+            input_subsystem: Rc::new(RefCell::new(input_common::InputSubsystem::new())),
         });
+
+        // Upstream calls `input_subsystem->Initialize()` from the
+        // `GRenderWindow` constructor. Do it once here, before any boot, so the
+        // engines are registered when the guest starts reading its controllers.
+        this.input_subsystem.borrow_mut().initialize();
+        this.install_input_handlers();
 
         // Game list page: activating a row boots that game in-process.
         let (game_list, game_list_handle) = crate::game_list::build(glib::clone!(
@@ -306,6 +320,81 @@ impl GMainWindow {
         // their enabled state; re-apply it (upstream re-runs `UpdateMenuState`
         // after `ConnectMenuEvents`).
         update_menu_state(app, self.session.borrow().is_some(), true);
+    }
+
+    /// Forward keyboard and mouse events into the input subsystem.
+    ///
+    /// Transposition of `GRenderWindow::keyPressEvent` / `keyReleaseEvent` /
+    /// `mousePressEvent` etc. (`zuyu/src/yuzu/bootmanager.cpp`). Upstream does
+    /// three things per key:
+    ///
+    /// ```cpp
+    /// input_subsystem->GetKeyboard()->SetKeyboardModifiers(modifier);
+    /// input_subsystem->GetKeyboard()->PressKeyboardKey(key);   // emulated USB keyboard
+    /// input_subsystem->GetKeyboard()->PressKey(event->key());  // controller bindings
+    /// ```
+    ///
+    /// The last call is the one that drives gamepad buttons, resolved through
+    /// the `engine:keyboard` bindings in `Settings::values.players`.
+    ///
+    /// Divergence: upstream passes Qt key codes, since that is the key space
+    /// its own configuration UI records. ruzu passes GDK keyvals for the same
+    /// reason — whatever the frontend records when binding is what it must send
+    /// back. Bindings imported from a yuzu config therefore carry Qt codes and
+    /// will not match; they have to be re-bound in Controls.
+    fn install_input_handlers(self: &Rc<Self>) {
+        let keys = gtk::EventControllerKey::new();
+        // Capture, so a key bound to a game control is not first swallowed by a
+        // focused widget in the launcher chrome.
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+
+        keys.connect_key_pressed(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, keyval, _keycode, state| {
+                this.on_key_event(keyval, state, true);
+                // Never claim the event: the menus and dialogs still need it.
+                glib::Propagation::Proceed
+            }
+        ));
+        keys.connect_key_released(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, keyval, _keycode, state| {
+                this.on_key_event(keyval, state, false);
+            }
+        ));
+        self.window.add_controller(keys);
+    }
+
+    /// One key press or release — upstream's `keyPressEvent` / `keyReleaseEvent`.
+    fn on_key_event(&self, keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType, pressed: bool) {
+        let subsystem = self.input_subsystem.borrow();
+        let Some(keyboard) = subsystem.get_keyboard() else {
+            return;
+        };
+
+        keyboard.set_keyboard_modifiers(switch_modifiers(state));
+
+        // The emulated USB keyboard, for games that read one directly.
+        let switch_key = gdk_key_to_switch_key(keyval);
+        if pressed {
+            keyboard.press_keyboard_key(switch_key);
+        } else {
+            keyboard.release_keyboard_key(switch_key);
+        }
+
+        // The controller-binding path.
+        // The raw GDK keyval — the key space ruzu records when binding, the
+        // way upstream records Qt key codes.
+        let code = gtk::glib::translate::IntoGlib::into_glib(keyval) as i32;
+        if pressed {
+            keyboard.press_key(code);
+        } else {
+            keyboard.release_key(code);
+        }
     }
 
     /// On a first run with an existing yuzu installation, offer to import its
@@ -703,7 +792,10 @@ impl GMainWindow {
     /// whose OK handler applies the settings itself, so the `Rc` is held alive
     /// by the window until the next invocation replaces it.
     fn on_configure(self: &Rc<Self>) {
-        let dialog = crate::configuration::ConfigureDialog::new(Some(&self.window));
+        let dialog = crate::configuration::ConfigureDialog::new(
+            Some(&self.window),
+            Rc::clone(&self.input_subsystem),
+        );
         dialog.present();
         *self.configure_dialog.borrow_mut() = Some(dialog);
     }
@@ -1180,6 +1272,96 @@ pub fn init_app_menu(app: &Application) {
     // Upstream calls `UpdateMenuState()` once the menu is built, which greys
     // out the run-time entries because no game is running yet.
     update_menu_state(app, false, true);
+}
+
+/// GDK modifier state to the Switch's HID modifier bitmask.
+///
+/// Port of `GRenderWindow::QtModifierToSwitchModifier`. Like Qt, GDK does not
+/// distinguish left from right for a held modifier, so upstream's commented-out
+/// right-hand cases stay unreachable here too.
+fn switch_modifiers(state: gtk::gdk::ModifierType) -> i32 {
+    use common::settings_input::native_keyboard::Modifiers;
+    use gtk::gdk::ModifierType;
+
+    let mut modifier = 0;
+    if state.contains(ModifierType::SHIFT_MASK) {
+        modifier |= 1 << Modifiers::LeftShift as i32;
+    }
+    if state.contains(ModifierType::CONTROL_MASK) {
+        modifier |= 1 << Modifiers::LeftControl as i32;
+    }
+    if state.contains(ModifierType::ALT_MASK) {
+        modifier |= 1 << Modifiers::LeftAlt as i32;
+    }
+    if state.contains(ModifierType::SUPER_MASK) {
+        modifier |= 1 << Modifiers::LeftMeta as i32;
+    }
+    // Unlike Qt, GDK does report these lock states, so they are worth mapping.
+    if state.contains(ModifierType::LOCK_MASK) {
+        modifier |= 1 << Modifiers::CapsLock as i32;
+    }
+    modifier
+}
+
+/// GDK keyval to the Switch's HID key code.
+///
+/// Port of `GRenderWindow::QtKeyToSwitchKey`, which maps the frontend toolkit's
+/// key constants onto `Settings::NativeKeyboard::Keys` (the USB HID usage IDs
+/// the console expects). Anything unmapped is `None`, which
+/// `PressKeyboardKey` ignores.
+fn gdk_key_to_switch_key(keyval: gtk::gdk::Key) -> i32 {
+    use common::settings_input::native_keyboard::Keys;
+    use gtk::gdk::Key;
+
+    let key = match keyval {
+        Key::a | Key::A => Keys::A,
+        Key::b | Key::B => Keys::B,
+        Key::c | Key::C => Keys::C,
+        Key::d | Key::D => Keys::D,
+        Key::e | Key::E => Keys::E,
+        Key::f | Key::F => Keys::F,
+        Key::g | Key::G => Keys::G,
+        Key::h | Key::H => Keys::H,
+        Key::i | Key::I => Keys::I,
+        Key::j | Key::J => Keys::J,
+        Key::k | Key::K => Keys::K,
+        Key::l | Key::L => Keys::L,
+        Key::m | Key::M => Keys::M,
+        Key::n | Key::N => Keys::N,
+        Key::o | Key::O => Keys::O,
+        Key::p | Key::P => Keys::P,
+        Key::q | Key::Q => Keys::Q,
+        Key::r | Key::R => Keys::R,
+        Key::s | Key::S => Keys::S,
+        Key::t | Key::T => Keys::T,
+        Key::u | Key::U => Keys::U,
+        Key::v | Key::V => Keys::V,
+        Key::w | Key::W => Keys::W,
+        Key::x | Key::X => Keys::X,
+        Key::y | Key::Y => Keys::Y,
+        Key::z | Key::Z => Keys::Z,
+        Key::_1 => Keys::N1,
+        Key::_2 => Keys::N2,
+        Key::_3 => Keys::N3,
+        Key::_4 => Keys::N4,
+        Key::_5 => Keys::N5,
+        Key::_6 => Keys::N6,
+        Key::_7 => Keys::N7,
+        Key::_8 => Keys::N8,
+        Key::_9 => Keys::N9,
+        Key::_0 => Keys::N0,
+        Key::Return => Keys::Return,
+        Key::Escape => Keys::Escape,
+        Key::BackSpace => Keys::Backspace,
+        Key::Tab => Keys::Tab,
+        Key::space => Keys::Space,
+        Key::Left => Keys::Left,
+        Key::Right => Keys::Right,
+        Key::Up => Keys::Up,
+        Key::Down => Keys::Down,
+        _ => Keys::None,
+    };
+    key as i32
 }
 
 /// Whether two paths refer to the same file on disk, resolving symlinks.

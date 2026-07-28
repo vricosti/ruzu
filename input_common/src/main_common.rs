@@ -18,6 +18,7 @@ use common::uuid::UUID;
 use crate::drivers::camera::Camera;
 use crate::drivers::keyboard::Keyboard;
 use crate::drivers::mouse::Mouse;
+use crate::drivers::sdl_driver::SDLDriver;
 use crate::drivers::tas_input;
 use crate::drivers::touch_screen::TouchScreen;
 use crate::drivers::virtual_amiibo::VirtualAmiibo;
@@ -94,7 +95,10 @@ struct InputSubsystemImpl {
     camera: Option<Camera>,
     virtual_amiibo: Option<VirtualAmiibo>,
     virtual_gamepad: Option<VirtualGamepad>,
-    // GCAdapter, SDLDriver, Joycons, Android omitted (feature-gated in C++)
+    /// Upstream registers this under `HAVE_SDL2`; it backs every `engine:sdl`
+    /// binding, i.e. all physical gamepads.
+    sdl: Option<SDLDriver>,
+    // GCAdapter, Joycons and Android remain unported.
 }
 
 impl InputSubsystemImpl {
@@ -109,6 +113,7 @@ impl InputSubsystemImpl {
             camera: None,
             virtual_amiibo: None,
             virtual_gamepad: None,
+            sdl: None,
         }
     }
 
@@ -120,7 +125,12 @@ impl InputSubsystemImpl {
         self.keyboard = Some(Keyboard::new("keyboard".to_string()));
         self.mouse = Some(Mouse::new("mouse".to_string()));
         self.touch_screen = Some(TouchScreen::new("touch".to_string()));
+        // Upstream `Impl::Initialize` calls `RegisterEngine` for every engine,
+        // which registers both an input and an output factory under the
+        // engine's name. Anything left out here can never resolve a binding:
+        // a `engine:keyboard` button would simply never be found.
         for engine in [
+            self.keyboard.as_ref().unwrap().engine(),
             self.mouse.as_ref().unwrap().engine(),
             self.touch_screen.as_ref().unwrap().engine(),
         ] {
@@ -132,11 +142,22 @@ impl InputSubsystemImpl {
         self.camera = Some(Camera::new("camera".to_string()));
         self.virtual_amiibo = Some(VirtualAmiibo::new("virtual_amiibo".to_string()));
         self.virtual_gamepad = Some(VirtualGamepad::new("virtual_gamepad".to_string()));
+
+        // Upstream: `RegisterEngine("sdl", sdl);` under HAVE_SDL2.
+        let sdl = SDLDriver::new("sdl".to_string());
+        let sdl_engine = sdl.engine();
+        let sdl_name = sdl_engine.lock().get_engine_name().to_string();
+        register_input_factory(
+            &sdl_name,
+            Arc::new(InputFactory::new(Arc::clone(&sdl_engine))),
+        );
+        register_output_factory(&sdl_name, Arc::new(OutputFactory::new(sdl_engine)));
+        self.sdl = Some(sdl);
     }
 
     /// Port of Impl::Shutdown
     fn shutdown(&mut self) {
-        for name in ["mouse", "touch"] {
+        for name in ["keyboard", "mouse", "touch", "sdl"] {
             unregister_input_factory(name);
             unregister_output_factory(name);
         }
@@ -148,6 +169,7 @@ impl InputSubsystemImpl {
         self.camera = None;
         self.virtual_amiibo = None;
         self.virtual_gamepad = None;
+        self.sdl = None;
         self.mapping_factory = None;
     }
 
@@ -165,6 +187,9 @@ impl InputSubsystemImpl {
         }
         if let Some(ref mouse) = self.mouse {
             devices.extend(mouse.get_input_devices());
+        }
+        if let Some(ref sdl) = self.sdl {
+            devices.extend(sdl.get_input_devices());
         }
 
         devices
@@ -202,6 +227,11 @@ impl InputSubsystemImpl {
                 .unwrap()
                 .get_analog_mapping_for_device(params);
         }
+        if let Some(ref sdl) = self.sdl {
+            if sdl.engine().lock().get_engine_name() == engine {
+                return sdl.get_analog_mapping_for_device(params);
+            }
+        }
         // Keyboard, touch_screen, tas_input, camera, virtual_amiibo, virtual_gamepad
         // don't have analog mappings — they use the default (empty).
         HashMap::new()
@@ -214,9 +244,13 @@ impl InputSubsystemImpl {
         if engine.is_empty() || engine == "any" {
             return HashMap::new();
         }
-        // None of the currently registered engines (keyboard, mouse, touch, tas, camera,
-        // virtual_amiibo, virtual_gamepad) provide custom button mappings.
-        // SDLDriver, GCAdapter, Joycon, UDPClient would when enabled.
+        if let Some(ref sdl) = self.sdl {
+            if sdl.engine().lock().get_engine_name() == engine {
+                return sdl.get_button_mapping_for_device(params);
+            }
+        }
+        // The remaining registered engines (keyboard, mouse, touch, tas, camera,
+        // virtual_amiibo, virtual_gamepad) provide no custom button mappings.
         HashMap::new()
     }
 
@@ -226,6 +260,11 @@ impl InputSubsystemImpl {
         let engine = params.get_str("engine", "");
         if engine.is_empty() || engine == "any" {
             return HashMap::new();
+        }
+        if let Some(ref sdl) = self.sdl {
+            if sdl.engine().lock().get_engine_name() == engine {
+                return sdl.get_motion_mapping_for_device(params);
+            }
         }
         HashMap::new()
     }

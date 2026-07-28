@@ -1115,6 +1115,7 @@ dependencies = [
  "common",
  "log",
  "parking_lot",
+ "sdl2",
 ]
 
 [[package]]
@@ -1588,6 +1589,7 @@ name = "ruzu"
 version = "0.1.0"
 dependencies = [
  "audio_core",
+ "cairo-rs",
  "cocoa",
  "common",
  "core",
@@ -1597,6 +1599,7 @@ dependencies = [
  "frontend_common",
  "gdk4-x11",
  "gtk4",
+ "input_common",
  "log",
  "objc",
  "parking_lot",
