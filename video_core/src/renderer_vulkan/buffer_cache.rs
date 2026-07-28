@@ -82,6 +82,18 @@ impl base::BufferCacheParams for BufferCacheParams {
     const USE_MEMORY_MAPS_FOR_UPLOADS: bool = Self::USE_MEMORY_MAPS_FOR_UPLOADS;
 }
 
+fn common_buffer_usage_flags() -> vk::BufferUsageFlags {
+    vk::BufferUsageFlags::TRANSFER_SRC
+        | vk::BufferUsageFlags::TRANSFER_DST
+        | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
+        | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER
+        | vk::BufferUsageFlags::UNIFORM_BUFFER
+        | vk::BufferUsageFlags::STORAGE_BUFFER
+        | vk::BufferUsageFlags::INDEX_BUFFER
+        | vk::BufferUsageFlags::VERTEX_BUFFER
+        | vk::BufferUsageFlags::INDIRECT_BUFFER
+}
+
 pub type VulkanCommonBufferCache = CommonBufferCache<BufferCacheParams, MaxwellDeviceMemoryManager>;
 
 impl DeviceTracker for MaxwellDeviceMemoryManager {
@@ -382,13 +394,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         }
         let Some(gpu_buffer) = self.create_gpu_buffer(
             buffer.size_bytes() as vk::DeviceSize,
-            vk::BufferUsageFlags::TRANSFER_SRC
-                | vk::BufferUsageFlags::TRANSFER_DST
-                | vk::BufferUsageFlags::UNIFORM_BUFFER
-                | vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::INDEX_BUFFER
-                | vk::BufferUsageFlags::VERTEX_BUFFER
-                | vk::BufferUsageFlags::INDIRECT_BUFFER,
+            common_buffer_usage_flags(),
         ) else {
             return;
         };
@@ -1594,6 +1600,13 @@ mod tests {
         assert!(BufferCacheParams::USE_MEMORY_MAPS);
         assert!(!BufferCacheParams::SEPARATE_IMAGE_BUFFER_BINDINGS);
         assert!(BufferCacheParams::USE_MEMORY_MAPS_FOR_UPLOADS);
+    }
+
+    #[test]
+    fn common_buffers_support_texel_buffer_views() {
+        let usage = common_buffer_usage_flags();
+        assert!(usage.contains(vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER));
+        assert!(usage.contains(vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER));
     }
 
     #[test]

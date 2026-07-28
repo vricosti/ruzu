@@ -17,7 +17,10 @@ use crate::ir::program::ShaderInfo;
 use crate::ir::types::{ShaderStage, Type};
 use crate::profile::Profile;
 use crate::runtime_info::{AttributeType, RuntimeInfo};
-use crate::shader_info::{ConstantBufferDescriptor, TextureDescriptor, TextureType};
+use crate::shader_info::{
+    ConstantBufferDescriptor, ImageBufferDescriptor, ImageDescriptor, ImageFormat,
+    TextureBufferDescriptor, TextureDescriptor, TextureType,
+};
 
 struct DeferredPhi {
     result_id: spirv::Word,
@@ -33,6 +36,31 @@ pub(crate) struct TextureDefinition {
     pub image_type: spirv::Word,
     pub count: u32,
     pub is_multisample: bool,
+}
+
+/// Port of upstream `TextureBufferDefinition` in `spirv_emit_context.h`.
+#[derive(Clone, Copy)]
+pub(crate) struct TextureBufferDefinition {
+    pub id: spirv::Word,
+    pub count: u32,
+}
+
+/// Port of upstream `ImageBufferDefinition` in `spirv_emit_context.h`.
+#[derive(Clone, Copy)]
+pub(crate) struct ImageBufferDefinition {
+    pub id: spirv::Word,
+    pub image_type: spirv::Word,
+    pub count: u32,
+    pub is_integer: bool,
+}
+
+/// Port of upstream `ImageDefinition` in `spirv_emit_context.h`.
+#[derive(Clone, Copy)]
+pub(crate) struct ImageDefinition {
+    pub id: spirv::Word,
+    pub image_type: spirv::Word,
+    pub count: u32,
+    pub is_integer: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -73,6 +101,52 @@ fn texture_image_type(ctx: &mut SpirvEmitContext, desc: &TextureDescriptor) -> s
         ms,
         1,
         spirv::ImageFormat::Unknown,
+        None,
+    )
+}
+
+/// Port of upstream `GetImageFormat`.
+fn image_format(format: ImageFormat) -> spirv::ImageFormat {
+    match format {
+        ImageFormat::Typeless => spirv::ImageFormat::Unknown,
+        ImageFormat::R8Uint => spirv::ImageFormat::R8ui,
+        ImageFormat::R8Sint => spirv::ImageFormat::R8i,
+        ImageFormat::R16Uint => spirv::ImageFormat::R16ui,
+        ImageFormat::R16Sint => spirv::ImageFormat::R16i,
+        ImageFormat::R32Uint => spirv::ImageFormat::R32ui,
+        ImageFormat::R32G32Uint => spirv::ImageFormat::Rg32ui,
+        ImageFormat::R32G32B32A32Uint => spirv::ImageFormat::Rgba32ui,
+    }
+}
+
+/// Port of upstream `ImageType(EmitContext&, const ImageDescriptor&, Id)`.
+fn storage_image_type(
+    ctx: &mut SpirvEmitContext,
+    desc: &ImageDescriptor,
+    sampled_type: spirv::Word,
+) -> spirv::Word {
+    let (dim, arrayed) = match desc.texture_type {
+        TextureType::Color1D => (spirv::Dim::Dim1D, 0),
+        TextureType::ColorArray1D => (spirv::Dim::Dim1D, 1),
+        TextureType::Color2D => (spirv::Dim::Dim2D, 0),
+        TextureType::ColorArray2D => (spirv::Dim::Dim2D, 1),
+        TextureType::Color3D => (spirv::Dim::Dim3D, 0),
+        TextureType::Buffer => panic!("SPIR-V: image buffer in image descriptors"),
+        TextureType::ColorCube | TextureType::ColorArrayCube | TextureType::Color2DRect => {
+            panic!(
+                "SPIR-V: invalid storage image texture type {:?}",
+                desc.texture_type
+            )
+        }
+    };
+    ctx.builder.type_image(
+        sampled_type,
+        dim,
+        0,
+        arrayed,
+        0,
+        2,
+        image_format(desc.format),
         None,
     )
 }
@@ -166,6 +240,14 @@ pub struct SpirvEmitContext {
     pub(crate) cbufs: HashMap<u32, UniformDefinitions>,
     /// Texture combined image sampler variables, indexed by descriptor index.
     pub(crate) textures: Vec<TextureDefinition>,
+    /// Uniform texel-buffer variables, indexed by descriptor index.
+    pub(crate) texture_buffers: Vec<TextureBufferDefinition>,
+    /// Storage texel-buffer variables, indexed by descriptor index.
+    pub(crate) image_buffers: Vec<ImageBufferDefinition>,
+    /// Storage image variables, indexed by descriptor index.
+    pub(crate) images: Vec<ImageDefinition>,
+    /// Shared sampled image type for uniform texel buffers.
+    pub(crate) image_buffer_type: spirv::Word,
     /// Storage buffer variables, indexed by compact SSBO descriptor index.
     pub ssbo_vars: HashMap<u32, spirv::Word>,
     /// Pointer to a u32 element inside an SSBO runtime array.
@@ -380,6 +462,10 @@ impl SpirvEmitContext {
             glsl_ext,
             cbufs: HashMap::new(),
             textures: Vec::new(),
+            texture_buffers: Vec::new(),
+            image_buffers: Vec::new(),
+            images: Vec::new(),
+            image_buffer_type: 0,
             ssbo_vars: HashMap::new(),
             storage_u32_ptr,
             input_vars: HashMap::new(),
@@ -463,6 +549,163 @@ impl SpirvEmitContext {
                 self.interfaces.push(var);
             }
             binding += desc.count;
+        }
+    }
+
+    /// Port of upstream `EmitContext::DefineTextureBuffers`.
+    fn define_texture_buffers(
+        &mut self,
+        descriptors: &[TextureBufferDescriptor],
+        binding: &mut u32,
+    ) {
+        if descriptors.is_empty() {
+            return;
+        }
+        self.image_buffer_type = self.builder.type_image(
+            self.f32_type,
+            spirv::Dim::DimBuffer,
+            0,
+            0,
+            0,
+            1,
+            spirv::ImageFormat::Unknown,
+            None,
+        );
+        let pointer_type = self.builder.type_pointer(
+            None,
+            spirv::StorageClass::UniformConstant,
+            self.image_buffer_type,
+        );
+        self.texture_buffers.reserve(descriptors.len());
+        for desc in descriptors {
+            assert_eq!(desc.count, 1, "SPIR-V: array of texture buffers");
+            let id = self.builder.variable(
+                pointer_type,
+                None,
+                spirv::StorageClass::UniformConstant,
+                None,
+            );
+            self.builder.decorate(
+                id,
+                spirv::Decoration::Binding,
+                vec![Operand::LiteralBit32(*binding)],
+            );
+            self.builder.decorate(
+                id,
+                spirv::Decoration::DescriptorSet,
+                vec![Operand::LiteralBit32(0)],
+            );
+            self.texture_buffers.push(TextureBufferDefinition {
+                id,
+                count: desc.count,
+            });
+            if self.profile.supported_spirv >= 0x0001_0400 {
+                self.interfaces.push(id);
+            }
+            *binding += 1;
+        }
+    }
+
+    /// Port of upstream `EmitContext::DefineImageBuffers`.
+    fn define_image_buffers(
+        &mut self,
+        descriptors: &[ImageBufferDescriptor],
+        binding: &mut u32,
+    ) {
+        self.image_buffers.reserve(descriptors.len());
+        for desc in descriptors {
+            assert_eq!(desc.count, 1, "SPIR-V: array of image buffers");
+            let sampled_type = if desc.is_integer {
+                self.u32_type
+            } else {
+                self.f32_type
+            };
+            let image_type = self.builder.type_image(
+                sampled_type,
+                spirv::Dim::DimBuffer,
+                0,
+                0,
+                0,
+                2,
+                image_format(desc.format),
+                None,
+            );
+            let pointer_type = self.builder.type_pointer(
+                None,
+                spirv::StorageClass::UniformConstant,
+                image_type,
+            );
+            let id = self.builder.variable(
+                pointer_type,
+                None,
+                spirv::StorageClass::UniformConstant,
+                None,
+            );
+            self.builder.decorate(
+                id,
+                spirv::Decoration::Binding,
+                vec![Operand::LiteralBit32(*binding)],
+            );
+            self.builder.decorate(
+                id,
+                spirv::Decoration::DescriptorSet,
+                vec![Operand::LiteralBit32(0)],
+            );
+            self.image_buffers.push(ImageBufferDefinition {
+                id,
+                image_type,
+                count: desc.count,
+                is_integer: desc.is_integer,
+            });
+            if self.profile.supported_spirv >= 0x0001_0400 {
+                self.interfaces.push(id);
+            }
+            *binding += 1;
+        }
+    }
+
+    /// Port of upstream `EmitContext::DefineImages`.
+    fn define_images(&mut self, descriptors: &[ImageDescriptor], binding: &mut u32) {
+        self.images.reserve(descriptors.len());
+        for desc in descriptors {
+            assert_eq!(desc.count, 1, "SPIR-V: array of images");
+            let sampled_type = if desc.is_integer {
+                self.u32_type
+            } else {
+                self.f32_type
+            };
+            let image_type = storage_image_type(self, desc, sampled_type);
+            let pointer_type = self.builder.type_pointer(
+                None,
+                spirv::StorageClass::UniformConstant,
+                image_type,
+            );
+            let id = self.builder.variable(
+                pointer_type,
+                None,
+                spirv::StorageClass::UniformConstant,
+                None,
+            );
+            self.builder.decorate(
+                id,
+                spirv::Decoration::Binding,
+                vec![Operand::LiteralBit32(*binding)],
+            );
+            self.builder.decorate(
+                id,
+                spirv::Decoration::DescriptorSet,
+                vec![Operand::LiteralBit32(0)],
+            );
+            self.images.push(ImageDefinition {
+                id,
+                image_type,
+                count: desc.count,
+                is_integer: desc.is_integer,
+            });
+            if self.profile.supported_spirv >= 0x0001_0400 {
+                self.interfaces.push(id);
+            }
+            *binding += 1;
         }
     }
 
@@ -757,6 +1000,30 @@ impl SpirvEmitContext {
             }
         }
 
+        let mut texture_binding = if self.profile.unified_descriptor_binding {
+            bindings.unified
+        } else {
+            bindings.texture
+        };
+        self.define_texture_buffers(&info.texture_buffer_descriptors, &mut texture_binding);
+        if self.profile.unified_descriptor_binding {
+            bindings.unified = texture_binding;
+        } else {
+            bindings.texture = texture_binding;
+        }
+
+        let mut image_binding = if self.profile.unified_descriptor_binding {
+            bindings.unified
+        } else {
+            bindings.image
+        };
+        self.define_image_buffers(&info.image_buffer_descriptors, &mut image_binding);
+        if self.profile.unified_descriptor_binding {
+            bindings.unified = image_binding;
+        } else {
+            bindings.image = image_binding;
+        }
+
         // Textures (combined image samplers)
         self.textures.reserve(info.texture_descriptors.len());
         for desc in &info.texture_descriptors {
@@ -812,6 +1079,18 @@ impl SpirvEmitContext {
                 self.interfaces.push(var);
             }
             *binding += 1;
+        }
+
+        let mut image_binding = if self.profile.unified_descriptor_binding {
+            bindings.unified
+        } else {
+            bindings.image
+        };
+        self.define_images(&info.image_descriptors, &mut image_binding);
+        if self.profile.unified_descriptor_binding {
+            bindings.unified = image_binding;
+        } else {
+            bindings.image = image_binding;
         }
 
         // System value input variables
@@ -2605,8 +2884,7 @@ mod tests {
     use crate::ir::emitter::Emitter;
     use crate::ir::instruction::Inst;
     use crate::ir::opcodes::Opcode;
-    use crate::ir::types::ShaderStage;
-    use crate::ir::types::Type;
+    use crate::ir::types::{ShaderStage, TextureInstInfo, Type};
     use crate::ir::value::{Attribute, InstRef, Value};
 
     #[test]
@@ -2917,6 +3195,144 @@ mod tests {
                 Operand::ImageFormat(spirv::ImageFormat::Unknown),
             ]
         ));
+    }
+
+    #[test]
+    fn texel_buffer_advances_unified_binding_before_later_stage_textures() {
+        fn binding_of(ctx: &SpirvEmitContext, id: spirv::Word) -> u32 {
+            ctx.builder
+                .module_ref()
+                .annotations
+                .iter()
+                .find_map(|inst| match inst.operands.as_slice() {
+                    [
+                        Operand::IdRef(target),
+                        Operand::Decoration(spirv::Decoration::Binding),
+                        Operand::LiteralBit32(binding),
+                    ] if *target == id => Some(*binding),
+                    _ => None,
+                })
+                .expect("resource must have a binding")
+        }
+
+        let profile = Profile {
+            unified_descriptor_binding: true,
+            ..Profile::default()
+        };
+        let runtime_info = RuntimeInfo::default();
+        let mut bindings = Bindings::default();
+
+        let mut vertex = ir::Program::new(ShaderStage::VertexB);
+        vertex
+            .info
+            .constant_buffer_descriptors
+            .push(ConstantBufferDescriptor { index: 1, count: 1 });
+        vertex
+            .info
+            .texture_buffer_descriptors
+            .push(TextureBufferDescriptor {
+                has_secondary: false,
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                shift_left: 0,
+                secondary_cbuf_index: 0,
+                secondary_cbuf_offset: 0,
+                secondary_shift_left: 0,
+                count: 1,
+                size_shift: 0,
+            });
+        let mut vertex_ctx = SpirvEmitContext::new(&vertex, &profile, &runtime_info);
+        vertex_ctx.define_global_variables(&vertex, &mut bindings);
+        assert_eq!(bindings.unified, 2);
+        assert_eq!(
+            binding_of(&vertex_ctx, vertex_ctx.texture_buffers[0].id),
+            1
+        );
+
+        let texture = TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth: false,
+            is_multisample: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        };
+        let mut fragment = ir::Program::new(ShaderStage::Fragment);
+        fragment.info.texture_descriptors = vec![texture.clone(), texture];
+        let mut fragment_ctx = SpirvEmitContext::new(&fragment, &profile, &runtime_info);
+        fragment_ctx.define_global_variables(&fragment, &mut bindings);
+
+        assert_eq!(bindings.unified, 4);
+        assert_eq!(binding_of(&fragment_ctx, fragment_ctx.textures[0].id), 2);
+        assert_eq!(binding_of(&fragment_ctx, fragment_ctx.textures[1].id), 3);
+    }
+
+    #[test]
+    fn texel_buffer_fetch_applies_offset_without_lod() {
+        let mut program = ir::Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        program
+            .info
+            .texture_buffer_descriptors
+            .push(TextureBufferDescriptor {
+                has_secondary: false,
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                shift_left: 0,
+                secondary_cbuf_index: 0,
+                secondary_cbuf_offset: 0,
+                secondary_shift_left: 0,
+                count: 1,
+                size_shift: 0,
+            });
+        let info = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Buffer as u8,
+            ..TextureInstInfo::default()
+        };
+        program.block_mut(0).append_inst(Inst::with_flags(
+            Opcode::ImageFetch,
+            vec![
+                Value::ImmU32(0),
+                Value::ImmU32(4),
+                Value::ImmU32(2),
+                Value::Void,
+                Value::Void,
+            ],
+            info.to_u32(),
+        ));
+        program.syntax_list = vec![ir::SyntaxNode::Block(0), ir::SyntaxNode::Return];
+
+        let profile = Profile::default();
+        let runtime_info = RuntimeInfo::default();
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &runtime_info);
+        ctx.emit_program(&program);
+
+        let instructions = ctx
+            .builder
+            .module_ref()
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+            .collect::<Vec<_>>();
+        let add = instructions
+            .iter()
+            .find(|inst| inst.class.opcode == spirv::Op::IAdd)
+            .expect("buffer AOFFI must be added to the texel coordinate");
+        let fetch = instructions
+            .iter()
+            .find(|inst| inst.class.opcode == spirv::Op::ImageFetch)
+            .expect("buffer fetch must emit OpImageFetch");
+
+        assert_eq!(fetch.operands.len(), 2, "buffer fetch must not carry LOD");
+        assert_eq!(fetch.operands[1], Operand::IdRef(add.result_id.unwrap()));
     }
 
     #[test]

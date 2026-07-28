@@ -889,7 +889,7 @@ impl RasterizerVulkan {
         let pending_tick = self.scheduler.pending_tick();
         let pipeline_result = self
             .pipeline_cache
-            .current_graphics_pipeline_with_shared_cache(draw, render_pass, &mut self.shader_cache);
+            .current_graphics_pipeline_with_shared_cache(draw, &mut self.shader_cache);
         let (
             pipeline_waiter,
             pipeline_layout,
