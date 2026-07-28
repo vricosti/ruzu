@@ -267,6 +267,44 @@ struct SchedulerWorkerState {
     in_flight: usize,
 }
 
+/// Stable synchronization subset of `Scheduler` used by Vulkan fences.
+///
+/// Upstream `InnerFence` stores a `Scheduler&`. The Rust rasterizer owns the
+/// scheduler by value, so fences retain clones of only the scheduler-owned
+/// synchronization objects instead of a pointer into a movable owner.
+#[derive(Clone)]
+pub(crate) struct SchedulerWaitHandle {
+    device: ash::Device,
+    timeline_semaphore: Option<vk::Semaphore>,
+    fence: vk::Fence,
+    worker: Arc<SchedulerWorker>,
+}
+
+impl SchedulerWaitHandle {
+    pub(crate) fn wait(&self, tick: u64) {
+        if tick == 0 {
+            return;
+        }
+        if let Some(timeline) = self.timeline_semaphore {
+            let semaphores = [timeline];
+            let values = [tick];
+            let wait_info = vk::SemaphoreWaitInfo::builder()
+                .semaphores(&semaphores)
+                .values(&values)
+                .build();
+            if let Err(error) = unsafe { self.device.wait_semaphores(&wait_info, u64::MAX) } {
+                log::error!("Vulkan fence failed waiting for scheduler tick {tick}: {error:?}");
+            }
+            return;
+        }
+
+        self.worker.wait_drained();
+        if let Err(error) = unsafe { self.device.wait_for_fences(&[self.fence], true, u64::MAX) } {
+            log::error!("Vulkan fence failed waiting for scheduler fence: {error:?}");
+        }
+    }
+}
+
 impl SchedulerWorkerState {
     fn is_drained(&self) -> bool {
         self.chunks.is_empty() && self.in_flight == 0
@@ -570,6 +608,19 @@ impl Scheduler {
 
     pub fn submit_mutex(&self) -> Arc<Mutex<()>> {
         Arc::clone(&self.submit_mutex)
+    }
+
+    pub(crate) fn wait_handle(&self) -> SchedulerWaitHandle {
+        SchedulerWaitHandle {
+            device: self.device.clone(),
+            timeline_semaphore: self.timeline_semaphore,
+            fence: self.fence,
+            worker: Arc::clone(
+                self.worker
+                    .as_ref()
+                    .expect("scheduler worker must exist while fences are active"),
+            ),
+        }
     }
 
     pub fn set_state_tracker(&mut self, state_tracker: NonNull<StateTracker>) {

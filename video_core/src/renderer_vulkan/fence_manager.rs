@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use super::scheduler::SchedulerWaitHandle;
+
 // ---------------------------------------------------------------------------
 // InnerFence
 // ---------------------------------------------------------------------------
@@ -18,16 +20,16 @@ use std::sync::Arc;
 pub struct InnerFence {
     is_stubbed: bool,
     wait_tick: u64,
-    // In the full implementation, this would hold an Arc to the Scheduler.
-    // For now we store the tick and expose query methods.
+    scheduler: Option<SchedulerWaitHandle>,
 }
 
 impl InnerFence {
-    /// Port of `InnerFence::InnerFence`.
-    pub fn new(is_stubbed: bool) -> Self {
+    /// Port of `InnerFence::InnerFence(Scheduler&, bool)`.
+    pub(crate) fn new(scheduler: SchedulerWaitHandle, is_stubbed: bool) -> Self {
         InnerFence {
             is_stubbed,
             wait_tick: 0,
+            scheduler: Some(scheduler),
         }
     }
 
@@ -39,11 +41,7 @@ impl InnerFence {
         if self.is_stubbed {
             return;
         }
-        // Get the current tick so we can wait for it
         self.wait_tick = current_tick;
-        // In upstream: scheduler.Flush();
-        // Requires Scheduler integration (InnerFence holds &Scheduler in upstream;
-        // here we pass the tick externally until the Scheduler is wired).
     }
 
     /// Port of `InnerFence::IsSignaled`.
@@ -64,9 +62,10 @@ impl InnerFence {
         if self.is_stubbed {
             return;
         }
-        // In upstream: scheduler.Wait(wait_tick);
-        // Requires Scheduler integration (InnerFence holds &Scheduler in upstream;
-        // here we pass the tick externally until the Scheduler is wired).
+        self.scheduler
+            .as_ref()
+            .expect("non-stubbed Vulkan fence must retain its scheduler")
+            .wait(self.wait_tick);
     }
 
     /// Returns the tick this fence is waiting for.
@@ -102,20 +101,21 @@ impl crate::fence_manager::FenceBase for Fence {
 /// Extends `GenericFenceManager` (VideoCommon::FenceManager) with
 /// Vulkan-specific fence creation and synchronization.
 pub struct FenceManager {
-    /// Current scheduler tick for queuing fences.
-    /// In upstream this comes from `Scheduler& scheduler`.
-    _current_tick: u64,
+    scheduler: SchedulerWaitHandle,
 }
 
 impl FenceManager {
     /// Port of `FenceManager::FenceManager`.
-    pub fn new() -> Self {
-        FenceManager { _current_tick: 0 }
+    pub(crate) fn new(scheduler: SchedulerWaitHandle) -> Self {
+        FenceManager { scheduler }
     }
 
     /// Port of `FenceManager::CreateFence`.
     pub fn create_fence(&self, is_stubbed: bool) -> Fence {
-        Arc::new(std::sync::Mutex::new(InnerFence::new(is_stubbed)))
+        Arc::new(std::sync::Mutex::new(InnerFence::new(
+            self.scheduler.clone(),
+            is_stubbed,
+        )))
     }
 
     /// Port of `FenceManager::QueueFence`.
@@ -141,30 +141,29 @@ impl FenceManager {
 mod tests {
     use super::*;
 
-    #[test]
-    fn stubbed_fence_is_always_signaled() {
-        let fence = InnerFence::new(true);
-        assert!(fence.is_signaled(0));
+    impl InnerFence {
+        fn new_for_test(is_stubbed: bool) -> Self {
+            Self {
+                is_stubbed,
+                wait_tick: 0,
+                scheduler: None,
+            }
+        }
     }
 
     #[test]
-    fn fence_not_signaled_before_tick() {
-        let mut fence = InnerFence::new(false);
+    fn stubbed_fence_is_always_signaled() {
+        let fence = InnerFence::new_for_test(true);
+        assert!(fence.is_signaled(0));
+        fence.wait();
+    }
+
+    #[test]
+    fn fence_tracks_queued_tick() {
+        let mut fence = InnerFence::new_for_test(false);
         fence.queue(10);
         assert!(!fence.is_signaled(5));
         assert!(fence.is_signaled(10));
         assert!(fence.is_signaled(15));
-    }
-
-    #[test]
-    fn fence_manager_create_and_query() {
-        let manager = FenceManager::new();
-        let fence = manager.create_fence(false);
-        {
-            let mut inner = fence.lock().unwrap();
-            inner.queue(42);
-        }
-        assert!(!manager.is_fence_signaled(&fence, 41));
-        assert!(manager.is_fence_signaled(&fence, 42));
     }
 }

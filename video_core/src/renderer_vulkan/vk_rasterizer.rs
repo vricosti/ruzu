@@ -750,6 +750,7 @@ impl RasterizerVulkan {
             })
         });
 
+        let fence_wait_handle = scheduler.wait_handle();
         Ok(Self {
             device,
             instance,
@@ -776,7 +777,7 @@ impl RasterizerVulkan {
             texture_cache,
             query_cache,
             fence_manager: GenericFenceManager::new(true),
-            fence_backend: VkFenceBackend::new(),
+            fence_backend: VkFenceBackend::new(fence_wait_handle),
             wfi_event,
             default_render_pass,
             offscreen_image,
