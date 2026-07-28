@@ -49,6 +49,7 @@ mod tests {
     use crate::ir::opcodes::Opcode;
     use crate::ir::program::Program;
     use crate::ir::types::ShaderStage;
+    use crate::ir::value::Value;
 
     #[test]
     fn fmnmx_regression_particle_word_keeps_ftz_separate_from_abs_b() {
@@ -67,8 +68,12 @@ mod tests {
                 .expect("FMNMX must emit both min and max like upstream");
             assert_eq!(FpControl::from_u32(inst.flags).fmz_mode, FmzMode::FTZ);
         }
-        assert!(block.iter().any(|inst| inst.opcode == Opcode::GetPred));
-        assert!(block.iter().any(|inst| inst.opcode == Opcode::SelectF32));
+        assert!(!block.iter().any(|inst| inst.opcode == Opcode::GetPred));
+        let select = block
+            .iter()
+            .find(|inst| inst.opcode == Opcode::SelectF32)
+            .expect("FMNMX must select between min and max like upstream");
+        assert_eq!(select.args[0], Value::ImmU1(true));
     }
 
     #[test]

@@ -157,6 +157,19 @@ impl<'a> TranslatorVisitor<'a> {
         }
     }
 
+    /// Get an unsigned 64-bit integer from an aligned register pair.
+    ///
+    /// Corresponds to upstream `TranslatorVisitor::L(IR::Reg reg)`.
+    pub fn l(&mut self, reg_idx: u32) -> Value {
+        if reg_idx & 1 != 0 {
+            panic!("Unaligned source register {}", reg_idx);
+        }
+        let lo = self.x(reg_idx);
+        let hi = self.x(reg_idx + 1);
+        let pair = self.ir.composite_construct_u32x2(lo, hi);
+        self.ir.pack_uint_2x32(pair)
+    }
+
     /// Get a register value interpreted as F32.
     pub fn f(&mut self, reg_idx: u32) -> Value {
         let u = self.x(reg_idx);
@@ -169,6 +182,20 @@ impl<'a> TranslatorVisitor<'a> {
         if !reg.is_zero() {
             self.ir.set_reg(reg, value);
         }
+    }
+
+    /// Store an unsigned 64-bit integer into an aligned register pair.
+    ///
+    /// Corresponds to upstream `TranslatorVisitor::L(IR::Reg, IR::U64)`.
+    pub fn set_l(&mut self, reg_idx: u32, value: Value) {
+        if reg_idx & 1 != 0 {
+            panic!("Unaligned destination register {}", reg_idx);
+        }
+        let pair = self.ir.unpack_uint_2x32(value);
+        let lo = self.ir.composite_extract_u32x2_idx(pair.clone(), 0);
+        let hi = self.ir.composite_extract_u32x2_idx(pair, 1);
+        self.set_x(reg_idx, lo);
+        self.set_x(reg_idx + 1, hi);
     }
 
     /// Set a register to an F32 value (via bitcast).
@@ -249,6 +276,9 @@ impl<'a> TranslatorVisitor<'a> {
     ///
     /// Corresponds to `TranslatorVisitor::D(IR::Reg reg)` upstream.
     pub fn d(&mut self, reg_idx: u32) -> Value {
+        if reg_idx & 1 != 0 {
+            panic!("Unaligned source register {}", reg_idx);
+        }
         let lo = self.x(reg_idx);
         let hi = self.x(reg_idx + 1);
         let vec = self.ir.composite_construct_u32x2(lo, hi);
@@ -259,6 +289,9 @@ impl<'a> TranslatorVisitor<'a> {
     ///
     /// Corresponds to `TranslatorVisitor::D(IR::Reg dest, const IR::F64& value)` upstream.
     pub fn set_d(&mut self, reg_idx: u32, value: Value) {
+        if reg_idx & 1 != 0 {
+            panic!("Unaligned destination register {}", reg_idx);
+        }
         let unpacked = self.ir.unpack_double_2x32(value);
         let lo = self.ir.composite_extract_u32x2_idx(unpacked.clone(), 0);
         let hi = self.ir.composite_extract_u32x2_idx(unpacked, 1);
@@ -644,6 +677,25 @@ impl<'a> TranslatorVisitor<'a> {
             }
             MaxwellOpcode::STG => {
                 self::load_store_memory::stg(self, insn);
+            }
+
+            // atomic_operations_global_memory.cpp
+            MaxwellOpcode::ATOM => {
+                self::atomic_operations_global_memory::atom(self, insn);
+            }
+            MaxwellOpcode::RED => {
+                self::atomic_operations_global_memory::red(self, insn);
+            }
+            MaxwellOpcode::ATOM_cas => {
+                panic!("Instruction ATOM_cas not implemented (upstream throws)");
+            }
+
+            // atomic_operations_shared_memory.cpp
+            MaxwellOpcode::ATOMS => {
+                self::atomic_operations_shared_memory::atoms(self, insn);
+            }
+            MaxwellOpcode::ATOMS_cas => {
+                self::atomic_operations_shared_memory::atoms_cas(self, insn);
             }
 
             // load_constant.cpp

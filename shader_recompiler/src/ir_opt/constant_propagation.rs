@@ -80,14 +80,6 @@ fn fold_environment_constant_buffers(env: &mut dyn Environment, program: &mut Pr
             if !matches!(inst.opcode, Opcode::GetCbufU32 | Opcode::GetCbufF32) {
                 continue;
             }
-            if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some()
-                && env.start_address() == 0x231630
-            {
-                eprintln!(
-                    "[CONST_CBUF_BEFORE] block={} inst={} opcode={:?} args={:?}",
-                    block_index, inst_index, inst.opcode, inst.args
-                );
-            }
             let (Some(&Value::ImmU32(bank)), Some(&Value::ImmU32(offset))) =
                 (inst.args.first(), inst.args.get(1))
             else {
@@ -563,6 +555,7 @@ fn fold_instruction_references(program: &mut Program) {
             Opcode::BitCastF32U32 => fold_bitcast(program, inst_ref, Opcode::BitCastU32F32),
             Opcode::FPMul32 => fold_fp_mul_interpolation(program, inst_ref),
             Opcode::LogicalNot => fold_double_logical_not(program, inst_ref),
+            Opcode::FSwizzleAdd => fold_fswizzle_add(program, inst_ref),
             _ => {}
         }
     }
@@ -610,10 +603,104 @@ fn resolve_value(mut value: Value, program: &Program) -> Value {
     value
 }
 
+fn get_through_cast(value: Value, expected_cast: Opcode, program: &Program) -> Value {
+    let value = resolve_value(value, program);
+    let Some(inst_ref) = inst_recursive(value, program) else {
+        return value;
+    };
+    let inst = program.block(inst_ref.block).inst(inst_ref.inst);
+    if inst.opcode != expected_cast {
+        return value;
+    }
+    inst.args
+        .first()
+        .copied()
+        .map(|arg| resolve_value(arg, program))
+        .unwrap_or(value)
+}
+
 fn replace_with_identity(program: &mut Program, inst_ref: InstRef, value: Value) {
     let inst = program.block_mut(inst_ref.block).inst_mut(inst_ref.inst);
     inst.opcode = Opcode::Identity;
     inst.args = vec![value];
+}
+
+fn fold_fswizzle_add(program: &mut Program, inst_ref: InstRef) {
+    let inst = program.block(inst_ref.block).inst(inst_ref.inst).clone();
+    let [op_a, op_b, swizzle, ..] = inst.args.as_slice() else {
+        return;
+    };
+    let Value::ImmU32(swizzle) = resolve_value(*swizzle, program) else {
+        return;
+    };
+    if !matches!(swizzle, 0x99 | 0xA5) {
+        return;
+    }
+    let value_1 = get_through_cast(*op_a, Opcode::BitCastF32U32, program);
+    let value_2 = get_through_cast(*op_b, Opcode::BitCastF32U32, program);
+    if value_1.is_immediate() {
+        return;
+    }
+    let Some(shuffle_ref) = inst_recursive(value_1, program) else {
+        return;
+    };
+    let shuffle = program
+        .block(shuffle_ref.block)
+        .inst(shuffle_ref.inst)
+        .clone();
+    if shuffle.opcode != Opcode::ShuffleButterfly {
+        return;
+    }
+    let Some(shuffle_value) = shuffle.args.first().copied() else {
+        return;
+    };
+    let value_3 = get_through_cast(shuffle_value, Opcode::BitCastU32F32, program);
+    if value_2 != value_3 {
+        match (value_2, value_3) {
+            (Value::ImmF32(lhs), Value::ImmU32(rhs)) if lhs.to_bits() == rhs => {}
+            _ => return,
+        }
+    }
+    let (
+        Some(Value::ImmU32(index)),
+        Some(Value::ImmU32(clamp)),
+        Some(Value::ImmU32(segmentation_mask)),
+    ) = (
+        shuffle
+            .args
+            .get(1)
+            .map(|value| resolve_value(*value, program)),
+        shuffle
+            .args
+            .get(2)
+            .map(|value| resolve_value(*value, program)),
+        shuffle
+            .args
+            .get(3)
+            .map(|value| resolve_value(*value, program)),
+    )
+    else {
+        return;
+    };
+    if clamp != 3 || segmentation_mask != 28 {
+        return;
+    }
+    let derivative = match (swizzle, index) {
+        (0x99, 1) => Opcode::DPdxFine,
+        (0xA5, 2) => Opcode::DPdyFine,
+        _ => return,
+    };
+    let derivative_index = program
+        .block_mut(inst_ref.block)
+        .insert_inst_before(inst_ref.inst, Inst::new(derivative, vec![*op_b]));
+    replace_with_identity(
+        program,
+        inst_ref,
+        Value::Inst(InstRef {
+            block: inst_ref.block,
+            inst: derivative_index,
+        }),
+    );
 }
 
 fn fold_bitcast(program: &mut Program, inst_ref: InstRef, reverse: Opcode) {
@@ -916,6 +1003,52 @@ mod tests {
         let folded = program.block(0).inst(4);
         assert_eq!(folded.opcode, Opcode::Identity);
         assert_eq!(folded.args, vec![inst(0, 0)]);
+    }
+
+    #[test]
+    fn fswizzle_add_derivative_patterns_match_upstream() {
+        for (swizzle, index, derivative) in
+            [(0x99, 1, Opcode::DPdxFine), (0xA5, 2, Opcode::DPdyFine)]
+        {
+            let mut program = Program::new(ShaderStage::Fragment);
+            program.blocks.push(Block::new());
+            let block = program.block_mut(0);
+            block.append_inst(Inst::new(
+                Opcode::GetAttribute,
+                vec![Value::Attribute(Attribute::generic(1, 0)), Value::ImmU32(0)],
+            ));
+            block.append_inst(Inst::new(Opcode::BitCastU32F32, vec![inst(0, 0)]));
+            block.append_inst(Inst::new(
+                Opcode::ShuffleButterfly,
+                vec![
+                    inst(0, 1),
+                    Value::ImmU32(index),
+                    Value::ImmU32(3),
+                    Value::ImmU32(28),
+                ],
+            ));
+            block.append_inst(Inst::new(Opcode::BitCastF32U32, vec![inst(0, 2)]));
+            block.append_inst(Inst::new(
+                Opcode::FSwizzleAdd,
+                vec![inst(0, 3), inst(0, 0), Value::ImmU32(swizzle)],
+            ));
+
+            constant_propagation_pass(&mut program);
+
+            let derivative_value = program
+                .block(0)
+                .indexed_iter()
+                .find_map(|(index, inst)| {
+                    (inst.opcode == derivative).then_some(Value::Inst(InstRef {
+                        block: 0,
+                        inst: index,
+                    }))
+                })
+                .expect("derivative instruction was not materialized");
+            let folded = program.block(0).inst(4);
+            assert_eq!(folded.opcode, Opcode::Identity);
+            assert_eq!(folded.args, vec![derivative_value]);
+        }
     }
 
     struct DriverEnvironment {

@@ -305,9 +305,8 @@ mod tests {
 
     /// Encode the F2F bitfields shared by all 3 entry points.
     fn encode(src_size: u32, dst_size: u32, rounding_op_field: u64) -> u64 {
-        // Place a dummy non-zero dest reg (bits 0..8) so set_x has somewhere
-        // to write; harmless because the test only inspects emitted opcodes.
-        1u64 | ((src_size as u64) << 10) | ((dst_size as u64) << 8) | (rounding_op_field << 39)
+        // R2 is valid for both scalar and register-pair destinations.
+        2u64 | ((src_size as u64) << 10) | ((dst_size as u64) << 8) | (rounding_op_field << 39)
     }
 
     #[test]

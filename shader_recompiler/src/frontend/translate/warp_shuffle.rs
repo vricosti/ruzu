@@ -70,16 +70,15 @@ pub fn shfl(v: &mut TranslatorVisitor<'_>, insn: u64) {
     // Upstream `TranslatorVisitor::SHFL` dispatches on the 2-bit mode:
     //   0 = IDX, 1 = UP, 2 = DOWN, 3 = BFLY (matching `IR::ShuffleMode`).
     // Each routes to a distinct IR opcode (`Shuffle{Index,Up,Down,Butterfly}`).
-    let _ = clamp; // upstream passes mask as a single value; clamp/seg_mask split done at IR-level.
     let result = match mode {
-        0 => v.ir.shuffle_index(value, src_a, seg_mask),
-        1 => v.ir.shuffle_up(value, src_a, seg_mask),
-        2 => v.ir.shuffle_down(value, src_a, seg_mask),
-        3 => v.ir.shuffle_butterfly(value, src_a, seg_mask),
+        0 => v.ir.shuffle_index(value, src_a, clamp, seg_mask),
+        1 => v.ir.shuffle_up(value, src_a, clamp, seg_mask),
+        2 => v.ir.shuffle_down(value, src_a, clamp, seg_mask),
+        3 => v.ir.shuffle_butterfly(value, src_a, clamp, seg_mask),
         _ => unreachable!("2-bit mode field"),
     };
 
-    // Set destination predicate (in-bounds flag) — emit true as placeholder
-    v.ir.set_pred(Pred(pred_idx as u8), Value::ImmU1(true));
+    let in_bounds = v.ir.get_in_bounds_from_op(result);
+    v.ir.set_pred(Pred(pred_idx as u8), in_bounds);
     v.set_x(dest_reg, result);
 }

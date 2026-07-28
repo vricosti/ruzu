@@ -454,6 +454,10 @@ impl<'a> Emitter<'a> {
         self.emit_pseudo_from_op(Opcode::GetSparseFromOp, op)
     }
 
+    pub fn get_in_bounds_from_op(&mut self, op: Value) -> Value {
+        self.emit_pseudo_from_op(Opcode::GetInBoundsFromOp, op)
+    }
+
     // ── System values ─────────────────────────────────────────────────
 
     pub fn workgroup_id(&mut self) -> Value {
@@ -941,6 +945,165 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::LaneId, vec![]))
     }
 
+    // ── Global-memory atomic helpers (port of `IREmitter::GlobalAtomic*`) ──
+
+    fn global_atomic_integer(
+        &mut self,
+        opcode_32: Opcode,
+        opcode_64: Opcode,
+        offset: Value,
+        value: Value,
+        is_64_bit: bool,
+    ) -> Value {
+        let opcode = if is_64_bit { opcode_64 } else { opcode_32 };
+        self.emit(Inst::new(opcode, vec![offset, value]))
+    }
+
+    pub fn global_atomic_iadd(&mut self, offset: Value, value: Value, is_64_bit: bool) -> Value {
+        self.global_atomic_integer(
+            Opcode::GlobalAtomicIAdd32,
+            Opcode::GlobalAtomicIAdd64,
+            offset,
+            value,
+            is_64_bit,
+        )
+    }
+
+    pub fn global_atomic_imin(
+        &mut self,
+        offset: Value,
+        value: Value,
+        is_signed: bool,
+        is_64_bit: bool,
+    ) -> Value {
+        let (opcode_32, opcode_64) = if is_signed {
+            (Opcode::GlobalAtomicSMin32, Opcode::GlobalAtomicSMin64)
+        } else {
+            (Opcode::GlobalAtomicUMin32, Opcode::GlobalAtomicUMin64)
+        };
+        self.global_atomic_integer(opcode_32, opcode_64, offset, value, is_64_bit)
+    }
+
+    pub fn global_atomic_imax(
+        &mut self,
+        offset: Value,
+        value: Value,
+        is_signed: bool,
+        is_64_bit: bool,
+    ) -> Value {
+        let (opcode_32, opcode_64) = if is_signed {
+            (Opcode::GlobalAtomicSMax32, Opcode::GlobalAtomicSMax64)
+        } else {
+            (Opcode::GlobalAtomicUMax32, Opcode::GlobalAtomicUMax64)
+        };
+        self.global_atomic_integer(opcode_32, opcode_64, offset, value, is_64_bit)
+    }
+
+    pub fn global_atomic_inc_32(&mut self, offset: Value, value: Value) -> Value {
+        self.emit(Inst::new(Opcode::GlobalAtomicInc32, vec![offset, value]))
+    }
+
+    pub fn global_atomic_dec_32(&mut self, offset: Value, value: Value) -> Value {
+        self.emit(Inst::new(Opcode::GlobalAtomicDec32, vec![offset, value]))
+    }
+
+    pub fn global_atomic_and(&mut self, offset: Value, value: Value, is_64_bit: bool) -> Value {
+        self.global_atomic_integer(
+            Opcode::GlobalAtomicAnd32,
+            Opcode::GlobalAtomicAnd64,
+            offset,
+            value,
+            is_64_bit,
+        )
+    }
+
+    pub fn global_atomic_or(&mut self, offset: Value, value: Value, is_64_bit: bool) -> Value {
+        self.global_atomic_integer(
+            Opcode::GlobalAtomicOr32,
+            Opcode::GlobalAtomicOr64,
+            offset,
+            value,
+            is_64_bit,
+        )
+    }
+
+    pub fn global_atomic_xor(&mut self, offset: Value, value: Value, is_64_bit: bool) -> Value {
+        self.global_atomic_integer(
+            Opcode::GlobalAtomicXor32,
+            Opcode::GlobalAtomicXor64,
+            offset,
+            value,
+            is_64_bit,
+        )
+    }
+
+    pub fn global_atomic_exchange(
+        &mut self,
+        offset: Value,
+        value: Value,
+        is_64_bit: bool,
+    ) -> Value {
+        self.global_atomic_integer(
+            Opcode::GlobalAtomicExchange32,
+            Opcode::GlobalAtomicExchange64,
+            offset,
+            value,
+            is_64_bit,
+        )
+    }
+
+    pub fn global_atomic_f32_add(
+        &mut self,
+        offset: Value,
+        value: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::GlobalAtomicAddF32,
+            vec![offset, value],
+            control.to_u32(),
+        ))
+    }
+
+    pub fn global_atomic_f16x2_add(
+        &mut self,
+        offset: Value,
+        value: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::GlobalAtomicAddF16x2,
+            vec![offset, value],
+            control.to_u32(),
+        ))
+    }
+
+    pub fn global_atomic_f16x2_min(
+        &mut self,
+        offset: Value,
+        value: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::GlobalAtomicMinF16x2,
+            vec![offset, value],
+            control.to_u32(),
+        ))
+    }
+
+    pub fn global_atomic_f16x2_max(
+        &mut self,
+        offset: Value,
+        value: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::GlobalAtomicMaxF16x2,
+            vec![offset, value],
+            control.to_u32(),
+        ))
+    }
+
     // ── Shared-memory atomic helpers (port of `IREmitter::SharedAtomic*`) ──
 
     pub fn shared_atomic_iadd_32(&mut self, offset: Value, value: Value) -> Value {
@@ -962,6 +1125,12 @@ impl<'a> Emitter<'a> {
         };
         self.emit(Inst::new(op, vec![offset, value]))
     }
+    pub fn shared_atomic_inc_32(&mut self, offset: Value, value: Value) -> Value {
+        self.emit(Inst::new(Opcode::SharedAtomicInc32, vec![offset, value]))
+    }
+    pub fn shared_atomic_dec_32(&mut self, offset: Value, value: Value) -> Value {
+        self.emit(Inst::new(Opcode::SharedAtomicDec32, vec![offset, value]))
+    }
     pub fn shared_atomic_and_32(&mut self, offset: Value, value: Value) -> Value {
         self.emit(Inst::new(Opcode::SharedAtomicAnd32, vec![offset, value]))
     }
@@ -974,6 +1143,12 @@ impl<'a> Emitter<'a> {
     pub fn shared_atomic_exchange_32(&mut self, offset: Value, value: Value) -> Value {
         self.emit(Inst::new(
             Opcode::SharedAtomicExchange32,
+            vec![offset, value],
+        ))
+    }
+    pub fn shared_atomic_exchange_64(&mut self, offset: Value, value: Value) -> Value {
+        self.emit(Inst::new(
+            Opcode::SharedAtomicExchange64,
             vec![offset, value],
         ))
     }
@@ -2081,25 +2256,55 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::SubgroupBallot, vec![pred]))
     }
 
-    pub fn shuffle_up(&mut self, value: Value, index: Value, seg_mask: Value) -> Value {
-        self.emit(Inst::new(Opcode::ShuffleUp, vec![value, index, seg_mask]))
-    }
-
-    pub fn shuffle_down(&mut self, value: Value, index: Value, seg_mask: Value) -> Value {
-        self.emit(Inst::new(Opcode::ShuffleDown, vec![value, index, seg_mask]))
-    }
-
-    pub fn shuffle_butterfly(&mut self, value: Value, index: Value, seg_mask: Value) -> Value {
+    pub fn shuffle_up(
+        &mut self,
+        value: Value,
+        index: Value,
+        clamp: Value,
+        seg_mask: Value,
+    ) -> Value {
         self.emit(Inst::new(
-            Opcode::ShuffleButterfly,
-            vec![value, index, seg_mask],
+            Opcode::ShuffleUp,
+            vec![value, index, clamp, seg_mask],
         ))
     }
 
-    pub fn shuffle_index(&mut self, value: Value, index: Value, seg_mask: Value) -> Value {
+    pub fn shuffle_down(
+        &mut self,
+        value: Value,
+        index: Value,
+        clamp: Value,
+        seg_mask: Value,
+    ) -> Value {
+        self.emit(Inst::new(
+            Opcode::ShuffleDown,
+            vec![value, index, clamp, seg_mask],
+        ))
+    }
+
+    pub fn shuffle_butterfly(
+        &mut self,
+        value: Value,
+        index: Value,
+        clamp: Value,
+        seg_mask: Value,
+    ) -> Value {
+        self.emit(Inst::new(
+            Opcode::ShuffleButterfly,
+            vec![value, index, clamp, seg_mask],
+        ))
+    }
+
+    pub fn shuffle_index(
+        &mut self,
+        value: Value,
+        index: Value,
+        clamp: Value,
+        seg_mask: Value,
+    ) -> Value {
         self.emit(Inst::new(
             Opcode::ShuffleIndex,
-            vec![value, index, seg_mask],
+            vec![value, index, clamp, seg_mask],
         ))
     }
 
@@ -2121,6 +2326,22 @@ impl<'a> Emitter<'a> {
 
     pub fn subgroup_ge_mask(&mut self) -> Value {
         self.emit(Inst::new(Opcode::SubgroupGeMask, vec![]))
+    }
+
+    pub fn dpdx_fine(&mut self, value: Value) -> Value {
+        self.emit(Inst::new(Opcode::DPdxFine, vec![value]))
+    }
+
+    pub fn dpdy_fine(&mut self, value: Value) -> Value {
+        self.emit(Inst::new(Opcode::DPdyFine, vec![value]))
+    }
+
+    pub fn dpdx_coarse(&mut self, value: Value) -> Value {
+        self.emit(Inst::new(Opcode::DPdxCoarse, vec![value]))
+    }
+
+    pub fn dpdy_coarse(&mut self, value: Value) -> Value {
+        self.emit(Inst::new(Opcode::DPdyCoarse, vec![value]))
     }
 
     pub fn y_direction(&mut self) -> Value {
@@ -2488,6 +2709,45 @@ mod tests {
                 .inst(sample_ref.inst)
                 .get_associated_pseudo(Opcode::GetSparseFromOp),
             Some(sparse_ref)
+        );
+    }
+
+    #[test]
+    fn shuffle_preserves_clamp_and_associates_in_bounds_pseudo() {
+        let mut program = Program::new(ShaderStage::Compute);
+        let block = program.add_block();
+        let mut emitter = Emitter::new(&mut program, block);
+
+        let shuffle = emitter.shuffle_index(
+            Value::ImmU32(1),
+            Value::ImmU32(2),
+            Value::ImmU32(3),
+            Value::ImmU32(4),
+        );
+        let in_bounds = emitter.get_in_bounds_from_op(shuffle);
+
+        let Value::Inst(shuffle_ref) = shuffle else {
+            panic!("shuffle should be an instruction value");
+        };
+        let Value::Inst(in_bounds_ref) = in_bounds else {
+            panic!("in-bounds result should be an instruction value");
+        };
+        let shuffle = emitter
+            .program
+            .block(shuffle_ref.block)
+            .inst(shuffle_ref.inst);
+        assert_eq!(
+            shuffle.args,
+            vec![
+                Value::ImmU32(1),
+                Value::ImmU32(2),
+                Value::ImmU32(3),
+                Value::ImmU32(4),
+            ]
+        );
+        assert_eq!(
+            shuffle.get_associated_pseudo(Opcode::GetInBoundsFromOp),
+            Some(in_bounds_ref)
         );
     }
 

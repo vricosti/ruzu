@@ -26776,3 +26776,521 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - A live STK launch without `--renderer` selected the configured Vulkan
   backend and presented frames without the OpenGL texture-view errors seen
   with the previous hard-coded Linux default.
+
+## 2026-07-28 — shader_recompiler/src/backend/spirv/{emit_spirv.rs,spirv_emit_context.rs} vs shader_recompiler/backend/spirv/{emit_spirv.cpp,spirv_emit_context.{h,cpp}}
+
+### Intentional differences
+- Rust passes `Bindings` to `emit_into_context` because descriptor counters
+  are not constructor arguments. The observable setup order remains identical
+  to upstream `EmitSPIRV`.
+
+### Unintentional differences (fixed)
+- Capability and float-control setup was owned by
+  `SpirvEmitContext::new`. It now lives in the `emit_spirv.rs` counterpart as
+  upstream's `SetupCapabilities`, `SetupDenormControl`,
+  `SetupSignedNanCapabilities`, and `EmitSPIRV` orchestration require.
+- Entry-point setup only covered vertex and a subset of fragment behavior.
+  `DefineEntryPoint` now ports compute local size, tessellation modes,
+  geometry input/output topology, output vertex and invocation counts,
+  geometry stream/point-size capabilities, passthrough handling, fragment
+  origin selection, depth replacement, and early fragment tests.
+- Transform-feedback shaders omitted the `TransformFeedback` capability and
+  `Xfb` execution mode. `SetupTransformFeedbackCapabilities` now emits both
+  when `runtime_info.xfb_count` is nonzero.
+- `SpirvEmitContext::define_main_function` previously also owned entry-point
+  and float-control setup. It now only defines and emits `main`, matching
+  upstream `DefineMain`.
+
+### Missing items
+- Context-owned local/shared memory definitions, shared-memory emitters, and
+  the shared CAS helper functions must be ported as one slice; the existing
+  Rust shared and atomic emitters still contain placeholder operations.
+- Typed indirect CBUF accessors, full typed SSBO definitions, indexed
+  attribute access helpers, storage CAS loops, and global-memory helpers
+  remain incomplete.
+- Several upstream interfaces remain absent: subgroup masks/invocation ID,
+  clip distances, viewport index/mask, tessellation patch inputs/outputs,
+  sample mask, and the complete position/generic output model.
+- The non-unified rescaling uniform-constant path remains missing.
+
+### Binary layout verification
+- PASS: this changes SPIR-V module ownership and instruction declaration
+  order only; no guest or serialized host structure changed.
+
+### Verification
+- Re-read upstream `DefineMain`, `DefineEntryPoint`,
+  `SetupDenormControl`, `SetupSignedNanCapabilities`,
+  `SetupCapabilities`, `SetupTransformFeedbackCapabilities`, and
+  `EmitSPIRV` after implementation.
+- `cargo test -p shader_recompiler --lib
+  backend::spirv::emit_spirv::tests` passes all four focused entry-point/Xfb
+  tests.
+- `cargo test -p shader_recompiler --lib
+  backend::spirv::spirv_emit_context::tests` passes all 13 context tests.
+
+## 2026-07-28 — shader_recompiler/src/ir_opt/lower_int64_to_int32.rs vs shader_recompiler/ir_opt/lower_int64_to_int32.cpp
+
+### Intentional differences
+- Rust instructions use stable numeric slots instead of intrusive-list
+  iterators. The pass snapshots each block's original instruction slots,
+  inserts the lowered instructions immediately before the original, and then
+  rewrites instruction, phi, and structured-syntax uses explicitly.
+- Upstream throws `NotImplementedException` when a lowered arithmetic
+  instruction owns pseudo operations; Rust panics with the same operation
+  name because the optimizer has no exception-return channel.
+
+### Unintentional differences (fixed)
+- The Rust file was a stub and the optimization pipelines did not invoke it.
+  Both host-aware pipelines now run the pass before SSA whenever the host
+  lacks native Int64 support, matching upstream ordering.
+- `PackUint2x32`, `UnpackUint2x32`, 64-bit add/subtract/negate, and all three
+  64-bit shifts now lower with upstream's exact low/high-word operation and
+  selection order.
+- Shared and global 64-bit atomic opcodes now become their upstream `32x2`
+  forms. The missing global 64-bit and `32x2` IR opcode vocabulary and
+  metadata were restored for this transformation.
+- Global atomic address operands were typed as opaque values. They now use
+  upstream's `U64` address type before lowering.
+
+### Missing items
+- None in `LowerInt64ToInt32`. Emission of the resulting global atomic
+  `32x2` operations belongs to the separate SPIR-V global-memory slice.
+
+### Binary layout verification
+- PASS: IR transformation only; no guest or serialized structure changed.
+
+### Verification
+- Re-read every helper, opcode replacement, traversal, and call-site ordering
+  in upstream `lower_int64_to_int32.cpp`.
+- Added focused tests for replacement opcodes, carry propagation, and all
+  three shift families.
+
+## 2026-07-28 — shader_recompiler shared-memory frontend/IR/SPIR-V files vs upstream shared-memory and atomic counterparts
+
+### Intentional differences
+- Rust uses generic `Value` and SPIR-V `Word` values instead of upstream's
+  typed IR/Id wrappers; opcode and result types remain identical.
+- Rust's stable IR representation requires explicit register-pair pack and
+  unpack helpers for upstream `TranslatorVisitor::L`.
+
+### Unintentional differences (fixed)
+- Context-owned local and shared memory were placeholders. The context now
+  defines local memory, explicit-layout typed shared aliases when supported,
+  the U32 fallback representation, and upstream's shared increment/decrement
+  CAS helper functions.
+- Shared U8/S8/U16/S16/U32/U64/U128 loads and subword/U32/U64/U128 stores
+  now perform the same indexing, extraction, sign extension, bitcasts, and
+  CAS updates as upstream.
+- Shared 32-bit arithmetic, min/max, increment/decrement, bitwise, and
+  exchange atomics now emit real SPIR-V operations. U64 exchange uses the
+  native explicit-layout atomic path when available and the upstream
+  two-word fallback otherwise.
+- ATOMS U64 exchange previously had no complete frontend path. It now reads
+  and writes aligned register pairs and emits `SharedAtomicExchange64`;
+  no-Int64 profiles lower that opcode to `SharedAtomicExchange32x2`.
+- The existing F64 register-pair helpers accepted odd registers, unlike
+  upstream. They now enforce the same pair alignment as U64.
+- Signed-min/max shader-info flags included global atomics. They now match
+  upstream's shared/storage-only cases.
+
+### Missing items
+- Storage-buffer CAS helpers and the complete storage/global atomic emitters
+  are not part of this shared-memory slice and remain to be ported with their
+  upstream-owned storage/global-memory helpers.
+
+### Binary layout verification
+- PASS: instruction decoding and SPIR-V emission only; no guest or serialized
+  host structure changed.
+
+### Verification
+- Re-read upstream `atomic_operations_shared_memory.cpp`,
+  `emit_spirv_shared_memory.cpp`, the shared portions of
+  `emit_spirv_atomic.cpp`, and the local/shared definitions and CAS helpers in
+  `spirv_emit_context.{h,cpp}`.
+- Focused tests cover U64 ATOMS register pairs, native/fallback U64 exchange,
+  no-Int64 `32x2` exchange, shared helper flags, and shared load/store paths.
+## 2026-07-28 — shader_recompiler/src/backend/spirv/emit_spirv_warp.rs vs shader_recompiler/backend/spirv/emit_spirv_warp.cpp
+
+### Intentional differences
+- SPIR-V IDs are stored in `SpirvEmitContext::values` instead of mutating the
+  associated pseudo instruction's backend definition; this preserves the same
+  `GetInBoundsFromOp` result ownership with Rust's indexed IR storage.
+
+### Unintentional differences (to fix)
+- None in the subgroup vote, ballot, mask, shuffle, lane-ID, or FSWZADD paths
+  after this pass.
+
+### Missing items
+- The four derivative operations remain disconnected because the Rust IR does
+  not yet define the upstream `DPdxFine`, `DPdyFine`, `DPdxCoarse`, and
+  `DPdyCoarse` opcodes. Their existing SPIR-V helper functions are not part of
+  the subgroup prerequisite completed here.
+
+### Binary layout verification
+- PASS: no shared binary layout is involved.
+
+## 2026-07-28 — shader_recompiler/src/frontend/translate/warp_shuffle.rs vs shader_recompiler/frontend/maxwell/translate/impl/warp_shuffle.cpp
+
+### Intentional differences
+- The Rust translator decodes fields directly instead of using C++
+  `BitField` union members; bit positions and signedness are unchanged.
+
+### Unintentional differences (to fix)
+- None after restoring the separate clamp and segmentation-mask IR operands
+  and the `GetInBoundsFromOp` destination predicate.
+
+### Missing items
+- None for `SHFL`.
+
+### Binary layout verification
+- PASS: instruction bit fields 0:8, 8:8, 20:5/8, 28:1, 29:1, 30:2,
+  34:13/39:8, and 48:3 match upstream.
+
+## 2026-07-28 — shader_recompiler/src/ir_opt/collect_info.rs vs shader_recompiler/ir_opt/collect_shader_info_pass.cpp
+
+### Intentional differences
+- The Rust pass stores descriptor sets in `BTreeSet` while scanning, without
+  changing the final descriptor ordering.
+
+### Unintentional differences (to fix)
+- None for subgroup invocation, shuffle, mask, vote, or FSWZADD usage
+  collection after this pass.
+
+### Missing items
+- Derivative usage collection awaits the missing derivative IR opcodes.
+
+### Binary layout verification
+- PASS: no shared binary layout is involved.
+
+## 2026-07-28 — shader_recompiler/src/backend/spirv/{spirv_emit_context.rs,emit_spirv_context_get_set.rs} vs shader_recompiler/backend/spirv/{spirv_emit_context.{h,cpp},emit_spirv_context_get_set.cpp}
+
+### Intentional differences
+- Rust stores resource definitions in keyed containers rather than fixed-size
+  C++ arrays. The hardware CBUF indices and the 14-entry indirect switch are
+  unchanged.
+- Rust uses one `UniformDefinitionKind` selector where upstream uses
+  pointer-to-member arguments. It selects the same typed definition and keeps
+  ownership in `spirv_emit_context.rs`.
+
+### Unintentional differences (fixed)
+- Input/output interfaces omitted subgroup built-ins, clip distances,
+  viewport index/mask, tessellation patch variables, fragment sample mask,
+  position, and the complete generic-output component model. They are now
+  declared and consumed by the same stage/profile gates as upstream.
+- Patch loads/stores and sample-mask stores were not dispatched. Their SPIR-V
+  access chains and tessellation outer-level ordering now match upstream.
+- Transform-feedback generic outputs ignored `runtime_info.xfb_count` and
+  lacked upstream names. Both are corrected.
+- Constant-buffer definitions only exposed U32/F32/U32x2/U32x4 views. The
+  U8/S8/U16/S16 aliasing views and signed scalar types now match upstream.
+- Indirect CBUF bindings were forced through `imm_u32()` and could not be
+  emitted. Context-owned typed accessor functions now switch over all
+  `Info::MAX_INDIRECT_CBUFS` bindings before instruction emission.
+- Placeholder low-level CBUF helpers returning `OpUndef` were removed.
+
+### Missing items
+- `DefineAttributeMemAccess` and the indexed load/store instruction calls
+  remain to be ported.
+- Full typed SSBO definitions, storage subword CAS writes, and global-memory
+  helper functions remain incomplete.
+- The non-unified rescaling uniform-constant definition remains missing.
+
+### Binary layout verification
+- PASS: SPIR-V declarations and instructions only; no guest or serialized
+  structure changed.
+
+### Verification
+- Re-read upstream `UniformDefinitions`, `DefineConstBuffers`,
+  `DefineConstantBufferIndirectFunctions`, `GetCbuf`, every typed
+  `EmitGetCbuf*`, `DefineInputs`, `DefineOutputs`, and patch/sample accessors.
+- `indirect_cbuf_accessors_switch_over_all_hardware_bindings` verifies the
+  three requested accessor types, all 14 switch cases, signed/unsigned typed
+  views, and upstream alias-binding advancement.
+
+## 2026-07-28 — shader_recompiler/src/backend/spirv/{spirv_emit_context.rs,emit_spirv_memory.rs} vs shader_recompiler/backend/spirv/{spirv_emit_context.{h,cpp},emit_spirv_memory.cpp}
+
+### Intentional differences
+- Rust selects storage definition members through `StorageDefinitionKind`
+  rather than C++ pointer-to-member parameters. Array/element pointer types,
+  descriptor indices, and access-chain operands are unchanged.
+
+### Unintentional differences (fixed)
+- SSBOs were represented only as U32 runtime arrays. The context now owns
+  upstream's U8/S8/U16/S16/U32/F32/U64/U32x2/U32x4 type definitions and
+  per-descriptor variables.
+- Storage U8/S8/U16/S16 and all storage stores were undispatched or stubbed.
+  Typed loads/stores, U32 extraction fallbacks, and split U64/U128 fallbacks
+  now match upstream.
+- Subword stores without native Int8/Int16 support were dropped. The
+  context-owned atomic compare-exchange loop now preserves neighboring bits
+  exactly as upstream.
+- Global 32/64/128 loads and stores were stubbed. Six context-owned functions
+  now locate the NVN SSBO whose CBUF address/size range contains the guest
+  address, apply `min_ssbo_alignment`, and load/store the typed element.
+- Legacy `ssbo_vars`/`storage_u32_ptr` state was removed after all storage
+  consumers moved to the typed definitions.
+
+### Missing items
+- Storage/global atomic operations still need to consume the typed SSBO
+  definitions throughout `emit_spirv_atomic.rs`.
+- Upstream intentionally leaves global subword operations unimplemented;
+  Rust now fails explicitly on those opcodes rather than returning fabricated
+  values.
+
+### Binary layout verification
+- PASS: SPIR-V resource definitions and instructions only.
+
+### Verification
+- Re-read upstream `DefineSsbos`, `DefineStorageBuffers`,
+  `DefineWriteStorageCasLoopFunction`, and every storage load/store emitter.
+- Focused tests verify all typed definitions, descriptor-count mapping,
+  native subword load emission, the atomic CAS fallback, and all six
+  address-range-based global helper functions.
+
+## 2026-07-28 — shader_recompiler/src/backend/spirv/{spirv_emit_context.rs,emit_spirv_context_get_set.rs} vs shader_recompiler/backend/spirv/{spirv_emit_context.{h,cpp},emit_spirv_context_get_set.cpp}
+
+### Intentional differences
+- Upstream's local `make_load` and `make_store` lambdas are private Rust
+  methods so their mutable `rspirv::Builder` access remains explicit. They
+  are still owned by `spirv_emit_context.rs` and are called only by
+  `define_attribute_mem_access`.
+
+### Unintentional differences (fixed)
+- `DefineAttributeMemAccess` was absent. Indexed position, generic, and clip
+  distance accesses now use the same offset decomposition and `OpSwitch`
+  cases as upstream, including typed generic-input conversion and the
+  physical-store/transform-feedback restriction.
+- `GetAttributeIndexed` and `SetAttributeIndexed` were not dispatched by the
+  SPIR-V backend. They now call the context-owned helper functions with the
+  same stage-dependent argument list as upstream.
+- Context setup now defines indexed attribute helpers after image resources
+  and before storage CAS/global-memory helpers, preserving upstream
+  constructor ordering.
+
+### Missing items
+- None for `DefineAttributeMemAccess`, `EmitGetAttributeIndexed`, or
+  `EmitSetAttributeIndexed`.
+
+### Binary layout verification
+- PASS: SPIR-V functions and instructions only; no guest or serialized
+  structure changed.
+
+### Verification
+- Re-read upstream `DefineAttributeMemAccess` and both indexed attribute
+  emitters after implementation and compared case ordering, access-chain
+  indices, conversion operations, default returns, and stage gates.
+- Five focused indexed-attribute tests pass, covering position/generic/clip
+  switch literals, Geometry's vertex parameter, and the emitted helper calls.
+
+## 2026-07-28 — shader_recompiler/src/backend/spirv/spirv_emit_context.rs vs shader_recompiler/backend/spirv/spirv_emit_context.cpp
+
+### Intentional differences
+- Rust computes the push-constant member offsets from the Rust-owned
+  `RescalingLayout` constants; their values and layout match upstream's
+  `offsetof` constants.
+
+### Unintentional differences (fixed)
+- Non-unified descriptor profiles did not define the upstream
+  `UniformConstant` F32x4 rescaling input at location zero. It is now
+  declared, included in SPIR-V 1.4+ entry-point interfaces, and consumed by
+  the existing component-two down-factor load.
+- Push-constant rescaling types, members, and variables lacked upstream's
+  debug names. The `ResolutionInfo`, member, and variable names now match.
+
+### Missing items
+- None for `DefineRescalingInput`, its push-constant path, or its
+  uniform-constant path.
+
+### Binary layout verification
+- PASS: `RescalingLayout` offsets remain 0 for texture words, 16 for image
+  words, and 24 for `down_factor`, matching upstream.
+
+### Verification
+- Re-read all three upstream rescaling-definition methods and
+  `EmitResolutionDownFactor`.
+- `non_unified_rescaling_uses_location_zero_uniform_constant` verifies the
+  location, SPIR-V interface, uniform load, and component-two extraction.
+
+## 2026-07-28 — shader_recompiler/src/backend/spirv/emit_spirv_atomic.rs vs shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
+
+### Intentional differences
+- Rust selects the atomic builder operation through a local enum instead of
+  a C++ member-function pointer. Pointer construction, scope, semantics, and
+  operation selection remain identical.
+- Unsupported dynamic SSBO indexing panics because the Rust emitter has no
+  exception-return channel; upstream throws `NotImplementedException`.
+
+### Unintentional differences (fixed)
+- Every 32-bit storage atomic returned `OpUndef`, and none was dispatched by
+  the SPIR-V context. IAdd, signed/unsigned min/max, bitwise AND/OR/XOR, and
+  exchange now use the typed U32 SSBO view and emit their corresponding
+  `OpAtomic*` instruction.
+- Immediate byte offsets now use upstream's element-size division, while
+  dynamic byte offsets use the same logical right shift.
+
+### Missing items
+- Storage 64-bit, U32x2, and floating-point atomic opcodes are not present in
+  the Rust IR and therefore remain a separate IR/frontend parity slice.
+- Global atomic emitters remain intentionally unimplemented, matching the
+  upstream functions that throw `NotImplementedException`.
+
+### Binary layout verification
+- PASS: SPIR-V instructions only; no guest or serialized structure changed.
+
+### Verification
+- Re-read upstream `StorageIndex`, `StoragePointer`, `StorageAtomicU32`, and
+  all 32-bit storage atomic emitters after implementation.
+- `storage_u32_atomics_use_typed_ssbo_pointer` verifies all nine atomic
+  opcodes and rejects the former `OpUndef` behavior.
+## 2026-07-28 — shader_recompiler/src/ir_opt/lower_fp16_to_fp32.rs vs shader_recompiler/ir_opt/lower_fp16_to_fp32.cpp
+
+### Intentional differences
+- Rust updates each instruction's `opcode` field directly; this is the direct equivalent of upstream `Inst::ReplaceOpcode`.
+
+### Unintentional differences (to fix)
+- None identified after line-by-line verification.
+
+### Missing items
+- None in this pass.
+
+### Binary layout verification
+- N/A: this pass rewrites IR opcodes and does not serialize data.
+
+## 2026-07-28 — shader_recompiler global-atomic frontend/IR/optimization files vs upstream global-atomic counterparts
+
+### Intentional differences
+- Rust represents upstream's `U32U64` overloads with an explicit
+  `is_64_bit` selector in the IR emitter. The selected opcode and operand
+  types are unchanged.
+- Upstream exceptions map to Rust panics because these translation and
+  optimization APIs have no error-return channel.
+
+### Unintentional differences (fixed)
+- `ATOM` and `RED` were not dispatched and their matching translation file
+  was a panic stub. Integer, floating-point, address, applicability fallback,
+  and destination handling now follow
+  `atomic_operations_global_memory.cpp`.
+- The global 64-bit, lowered U32x2, increment/decrement, and floating atomic
+  IR vocabulary was incomplete. All upstream opcodes and emitter methods are
+  now present with matching result and argument types.
+- `GlobalMemoryToStorageBufferPass` did not recognize or rewrite atomics.
+  Every global atomic now maps to its storage equivalent, marks the
+  descriptor written, and preserves the atomic's returned value uses.
+- A non-upstream environment-gated trace in the optimization pass was
+  removed.
+
+### Missing items
+- `ATOM_cas` remains unsupported because upstream also throws
+  `NotImplementedException` for that encoding.
+
+### Binary layout verification
+- PASS: instruction fields 0:8, 8:8, 20:8, 28:20, 48:1, 49:3, and 52:4
+  match upstream; no serialized structure changed.
+
+### Verification
+- Re-read `atomic_operations_global_memory.cpp`, the global atomic section of
+  `opcodes.inc`, the matching `IREmitter` methods, and
+  `global_memory_to_storage_buffer_pass.cpp` line by line.
+- Focused tests cover integer/floating opcode selection, unsupported-operation
+  loads, global-to-storage replacement, descriptor write tracking, and return
+  value preservation.
+
+## 2026-07-28 — shader_recompiler/src/backend/spirv/{spirv_emit_context.rs,emit_spirv_atomic.rs} vs shader_recompiler/backend/spirv/{spirv_emit_context.{h,cpp},emit_spirv_atomic.cpp}
+
+### Intentional differences
+- Rust selects native/fallback atomic operations with enums rather than C++
+  member-function pointers. The generated SPIR-V operations and order are
+  unchanged.
+- Dynamic SSBO indexing panics where upstream throws
+  `NotImplementedException`.
+
+### Unintentional differences (fixed)
+- Storage increment/decrement and floating-point atomics had no context-owned
+  CAS functions. The nine upstream CAS operation/loop functions are now
+  conditionally defined from `Info` and use the same scope, zero semantics,
+  compare-exchange loop, bitcasts, and half packing.
+- Storage U64 and lowered U32x2 atomics were absent. Native Int64 atomics and
+  upstream's non-atomic descriptor-aliasing fallbacks are now emitted.
+- Storage F32, F16x2, and F32x2 add/min/max operations now call their matching
+  CAS helpers and all storage atomic opcodes are dispatched.
+
+### Missing items
+- Global atomic SPIR-V emitters intentionally remain absent: upstream's
+  `EmitGlobalAtomic*` functions throw because
+  `GlobalMemoryToStorageBufferPass` must rewrite them first.
+
+### Binary layout verification
+- PASS: SPIR-V function and instruction construction only.
+
+### Verification
+- Re-read upstream `CasFunction`, `CasLoop`, `DefineStorageBuffers`, and every
+  storage atomic emitter after implementation.
+- Focused tests cover all nine 32-bit native atomics, all nine conditional CAS
+  helpers, compare-exchange emission, and native/fallback U64 IAdd.
+
+## 2026-07-28 — shader_recompiler derivative IR/SPIR-V files vs upstream derivative counterparts
+
+### Intentional differences
+- Stable instruction slots require inserting the derivative before
+  `FSwizzleAdd` and replacing the latter with `Identity`; this is the indexed
+  IR equivalent of upstream's `ReplaceUsesWith`.
+
+### Unintentional differences (fixed)
+- The four derivative helpers existed in `emit_spirv_warp.rs`, but their IR
+  opcodes, emitter methods, shader-info collection, and backend dispatch were
+  absent. `DPdxFine`, `DPdyFine`, `DPdxCoarse`, and `DPdyCoarse` are now
+  connected end to end.
+- Upstream's `FoldFSwizzleAdd` producer was absent. The exact shuffle,
+  clamp, segmentation-mask, swizzle, cast, and immediate-bit-pattern checks
+  now materialize fine X/Y derivatives.
+
+### Missing items
+- None for the derivative IR/backend interface or `FoldFSwizzleAdd`.
+
+### Binary layout verification
+- PASS: IR and SPIR-V instructions only.
+
+### Verification
+- Re-read upstream `FoldFSwizzleAdd`, the four `IREmitter` methods,
+  `collect_shader_info_pass.cpp`, and the four SPIR-V emitters.
+- Focused tests cover both fine-derivative shuffle patterns.
+## 2026-07-28 — `shader_recompiler/src/pipeline_cache.rs` vs `shader_recompiler/frontend/maxwell/control_flow.cpp`
+
+### Intentional differences
+- The Rust metadata regression test uses a local `DummyEnvironment`; upstream has no equivalent unit-test fixture.
+
+### Unintentional differences (to fix)
+- None. The fixture now returns a terminating `EXIT` at the first Maxwell instruction location instead of returning zero forever. This preserves upstream CFG behavior, which scans until a control-flow terminator.
+
+### Missing items
+- None for this test correction.
+
+### Binary layout verification
+- N/A: no serialized or raw-memory layout changed.
+## 2026-07-28 — `shader_recompiler/src/backend/glsl/emit_glsl.rs` vs `shader_recompiler/backend/glsl/emit_glsl.cpp`
+
+### Intentional differences
+- None.
+
+### Unintentional differences (to fix)
+- None in implementation. The regression test now counts both upstream uses of each phi source: the original `Phi` operand and the `PhiMove` inserted by `PrecolorInst`.
+
+### Missing items
+- None for this test correction.
+
+### Binary layout verification
+- N/A: no serialized or raw-memory layout changed.
+
+## 2026-07-28 — `shader_recompiler/src/frontend/translate/floating_point_min_max.rs` vs `shader_recompiler/frontend/maxwell/translate/impl/floating_point_min_max.cpp`
+
+### Intentional differences
+- None.
+
+### Unintentional differences (to fix)
+- None in implementation. The regression test now expects the encoded `PT` predicate to become immediate `true`, matching upstream `IREmitter::GetPred(Pred::PT)`, rather than expecting a `GetPred` instruction.
+
+### Missing items
+- None for this test correction.
+
+### Binary layout verification
+- N/A: no serialized or raw-memory layout changed.

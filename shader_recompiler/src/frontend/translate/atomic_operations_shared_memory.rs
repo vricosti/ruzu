@@ -89,14 +89,12 @@ fn apply_atoms_op(
         AtomOp::Add => tv.ir.shared_atomic_iadd_32(offset, op_b),
         AtomOp::Min => tv.ir.shared_atomic_imin_32(offset, op_b, is_signed),
         AtomOp::Max => tv.ir.shared_atomic_imax_32(offset, op_b, is_signed),
+        AtomOp::Inc => tv.ir.shared_atomic_inc_32(offset, op_b),
+        AtomOp::Dec => tv.ir.shared_atomic_dec_32(offset, op_b),
         AtomOp::And => tv.ir.shared_atomic_and_32(offset, op_b),
         AtomOp::Or => tv.ir.shared_atomic_or_32(offset, op_b),
         AtomOp::Xor => tv.ir.shared_atomic_xor_32(offset, op_b),
         AtomOp::Exch => tv.ir.shared_atomic_exchange_32(offset, op_b),
-        // Inc/Dec atomics need a CAS loop helper not present in ruzu IR;
-        // upstream uses `ir.SharedAtomicInc/Dec`. Panic to match upstream
-        // when those IR helpers throw.
-        AtomOp::Inc | AtomOp::Dec => panic!("Integer Atoms Inc/Dec not implemented"),
     }
 }
 
@@ -117,14 +115,14 @@ pub fn atoms(tv: &mut TranslatorVisitor<'_>, insn: u64) {
     let offset = atoms_offset(tv, insn);
 
     if size_64 {
-        // U64 path requires `L()` register-pair load and an `IR::U64`
-        // atomic — not wired in ruzu's IR. Panic to match upstream
-        // until it's ported.
-        panic!("ATOMS 64-bit not implemented");
+        let op_b = tv.l(src_reg_b);
+        let result = tv.ir.shared_atomic_exchange_64(offset, op_b);
+        tv.set_l(dest_reg, result);
+    } else {
+        let op_b = tv.x(src_reg_b);
+        let result = apply_atoms_op(tv, offset, op_b, op, is_signed);
+        tv.set_x(dest_reg, result);
     }
-    let op_b = tv.x(src_reg_b);
-    let result = apply_atoms_op(tv, offset, op_b, op, is_signed);
-    tv.set_x(dest_reg, result);
 }
 
 /// ATOMS_CAS — Atomic Compare-and-Swap on Shared Memory.
@@ -133,4 +131,46 @@ pub fn atoms(tv: &mut TranslatorVisitor<'_>, insn: u64) {
 /// it's covered by `not_implemented.cpp::ATOMS_cas` which throws.
 pub fn atoms_cas(_tv: &mut TranslatorVisitor<'_>, _insn: u64) {
     panic!("ATOMS_cas not implemented (upstream NotImplementedException)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::basic_block::Block;
+    use crate::ir::opcodes::Opcode;
+    use crate::ir::program::Program;
+    use crate::ir::types::ShaderStage;
+
+    fn translate_op(op: u32, size: AtomsSize) -> Vec<Opcode> {
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        let mut visitor = TranslatorVisitor::new(&mut program, 0);
+        let insn = u64::from(Reg::RZ.0) << 8 | u64::from(op) << 52 | (size as u64) << 28 | 2 << 20;
+
+        atoms(&mut visitor, insn);
+
+        program
+            .block(0)
+            .iter()
+            .map(|instruction| instruction.opcode)
+            .collect()
+    }
+
+    #[test]
+    fn atoms_inc_dec_match_upstream_ir_opcodes() {
+        assert!(
+            translate_op(AtomOp::Inc as u32, AtomsSize::U32).contains(&Opcode::SharedAtomicInc32)
+        );
+        assert!(
+            translate_op(AtomOp::Dec as u32, AtomsSize::U32).contains(&Opcode::SharedAtomicDec32)
+        );
+    }
+
+    #[test]
+    fn atoms_u64_exchange_uses_register_pairs() {
+        let opcodes = translate_op(AtomOp::Exch as u32, AtomsSize::U64);
+        assert!(opcodes.contains(&Opcode::PackUint2x32));
+        assert!(opcodes.contains(&Opcode::SharedAtomicExchange64));
+        assert!(opcodes.contains(&Opcode::UnpackUint2x32));
+    }
 }

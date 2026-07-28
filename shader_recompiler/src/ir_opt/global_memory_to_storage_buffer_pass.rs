@@ -67,6 +67,42 @@ fn is_global_memory(opcode: Opcode) -> bool {
             | Opcode::WriteGlobal32
             | Opcode::WriteGlobal64
             | Opcode::WriteGlobal128
+            | Opcode::GlobalAtomicIAdd32
+            | Opcode::GlobalAtomicSMin32
+            | Opcode::GlobalAtomicUMin32
+            | Opcode::GlobalAtomicSMax32
+            | Opcode::GlobalAtomicUMax32
+            | Opcode::GlobalAtomicInc32
+            | Opcode::GlobalAtomicDec32
+            | Opcode::GlobalAtomicAnd32
+            | Opcode::GlobalAtomicOr32
+            | Opcode::GlobalAtomicXor32
+            | Opcode::GlobalAtomicExchange32
+            | Opcode::GlobalAtomicIAdd64
+            | Opcode::GlobalAtomicSMin64
+            | Opcode::GlobalAtomicUMin64
+            | Opcode::GlobalAtomicSMax64
+            | Opcode::GlobalAtomicUMax64
+            | Opcode::GlobalAtomicAnd64
+            | Opcode::GlobalAtomicOr64
+            | Opcode::GlobalAtomicXor64
+            | Opcode::GlobalAtomicExchange64
+            | Opcode::GlobalAtomicIAdd32x2
+            | Opcode::GlobalAtomicSMin32x2
+            | Opcode::GlobalAtomicUMin32x2
+            | Opcode::GlobalAtomicSMax32x2
+            | Opcode::GlobalAtomicUMax32x2
+            | Opcode::GlobalAtomicAnd32x2
+            | Opcode::GlobalAtomicOr32x2
+            | Opcode::GlobalAtomicXor32x2
+            | Opcode::GlobalAtomicExchange32x2
+            | Opcode::GlobalAtomicAddF32
+            | Opcode::GlobalAtomicAddF16x2
+            | Opcode::GlobalAtomicAddF32x2
+            | Opcode::GlobalAtomicMinF16x2
+            | Opcode::GlobalAtomicMinF32x2
+            | Opcode::GlobalAtomicMaxF16x2
+            | Opcode::GlobalAtomicMaxF32x2
     )
 }
 
@@ -80,6 +116,42 @@ fn is_global_memory_write(opcode: Opcode) -> bool {
             | Opcode::WriteGlobal32
             | Opcode::WriteGlobal64
             | Opcode::WriteGlobal128
+            | Opcode::GlobalAtomicIAdd32
+            | Opcode::GlobalAtomicSMin32
+            | Opcode::GlobalAtomicUMin32
+            | Opcode::GlobalAtomicSMax32
+            | Opcode::GlobalAtomicUMax32
+            | Opcode::GlobalAtomicInc32
+            | Opcode::GlobalAtomicDec32
+            | Opcode::GlobalAtomicAnd32
+            | Opcode::GlobalAtomicOr32
+            | Opcode::GlobalAtomicXor32
+            | Opcode::GlobalAtomicExchange32
+            | Opcode::GlobalAtomicIAdd64
+            | Opcode::GlobalAtomicSMin64
+            | Opcode::GlobalAtomicUMin64
+            | Opcode::GlobalAtomicSMax64
+            | Opcode::GlobalAtomicUMax64
+            | Opcode::GlobalAtomicAnd64
+            | Opcode::GlobalAtomicOr64
+            | Opcode::GlobalAtomicXor64
+            | Opcode::GlobalAtomicExchange64
+            | Opcode::GlobalAtomicIAdd32x2
+            | Opcode::GlobalAtomicSMin32x2
+            | Opcode::GlobalAtomicUMin32x2
+            | Opcode::GlobalAtomicSMax32x2
+            | Opcode::GlobalAtomicUMax32x2
+            | Opcode::GlobalAtomicAnd32x2
+            | Opcode::GlobalAtomicOr32x2
+            | Opcode::GlobalAtomicXor32x2
+            | Opcode::GlobalAtomicExchange32x2
+            | Opcode::GlobalAtomicAddF32
+            | Opcode::GlobalAtomicAddF16x2
+            | Opcode::GlobalAtomicAddF32x2
+            | Opcode::GlobalAtomicMinF16x2
+            | Opcode::GlobalAtomicMinF32x2
+            | Opcode::GlobalAtomicMaxF16x2
+            | Opcode::GlobalAtomicMaxF32x2
     )
 }
 
@@ -99,6 +171,42 @@ fn global_to_storage(opcode: Opcode) -> Option<Opcode> {
         Opcode::WriteGlobal32 => Opcode::WriteStorage32,
         Opcode::WriteGlobal64 => Opcode::WriteStorage64,
         Opcode::WriteGlobal128 => Opcode::WriteStorage128,
+        Opcode::GlobalAtomicIAdd32 => Opcode::StorageAtomicIAdd32,
+        Opcode::GlobalAtomicSMin32 => Opcode::StorageAtomicSMin32,
+        Opcode::GlobalAtomicUMin32 => Opcode::StorageAtomicUMin32,
+        Opcode::GlobalAtomicSMax32 => Opcode::StorageAtomicSMax32,
+        Opcode::GlobalAtomicUMax32 => Opcode::StorageAtomicUMax32,
+        Opcode::GlobalAtomicInc32 => Opcode::StorageAtomicInc32,
+        Opcode::GlobalAtomicDec32 => Opcode::StorageAtomicDec32,
+        Opcode::GlobalAtomicAnd32 => Opcode::StorageAtomicAnd32,
+        Opcode::GlobalAtomicOr32 => Opcode::StorageAtomicOr32,
+        Opcode::GlobalAtomicXor32 => Opcode::StorageAtomicXor32,
+        Opcode::GlobalAtomicExchange32 => Opcode::StorageAtomicExchange32,
+        Opcode::GlobalAtomicIAdd64 => Opcode::StorageAtomicIAdd64,
+        Opcode::GlobalAtomicSMin64 => Opcode::StorageAtomicSMin64,
+        Opcode::GlobalAtomicUMin64 => Opcode::StorageAtomicUMin64,
+        Opcode::GlobalAtomicSMax64 => Opcode::StorageAtomicSMax64,
+        Opcode::GlobalAtomicUMax64 => Opcode::StorageAtomicUMax64,
+        Opcode::GlobalAtomicAnd64 => Opcode::StorageAtomicAnd64,
+        Opcode::GlobalAtomicOr64 => Opcode::StorageAtomicOr64,
+        Opcode::GlobalAtomicXor64 => Opcode::StorageAtomicXor64,
+        Opcode::GlobalAtomicExchange64 => Opcode::StorageAtomicExchange64,
+        Opcode::GlobalAtomicIAdd32x2 => Opcode::StorageAtomicIAdd32x2,
+        Opcode::GlobalAtomicSMin32x2 => Opcode::StorageAtomicSMin32x2,
+        Opcode::GlobalAtomicUMin32x2 => Opcode::StorageAtomicUMin32x2,
+        Opcode::GlobalAtomicSMax32x2 => Opcode::StorageAtomicSMax32x2,
+        Opcode::GlobalAtomicUMax32x2 => Opcode::StorageAtomicUMax32x2,
+        Opcode::GlobalAtomicAnd32x2 => Opcode::StorageAtomicAnd32x2,
+        Opcode::GlobalAtomicOr32x2 => Opcode::StorageAtomicOr32x2,
+        Opcode::GlobalAtomicXor32x2 => Opcode::StorageAtomicXor32x2,
+        Opcode::GlobalAtomicExchange32x2 => Opcode::StorageAtomicExchange32x2,
+        Opcode::GlobalAtomicAddF32 => Opcode::StorageAtomicAddF32,
+        Opcode::GlobalAtomicAddF16x2 => Opcode::StorageAtomicAddF16x2,
+        Opcode::GlobalAtomicAddF32x2 => Opcode::StorageAtomicAddF32x2,
+        Opcode::GlobalAtomicMinF16x2 => Opcode::StorageAtomicMinF16x2,
+        Opcode::GlobalAtomicMinF32x2 => Opcode::StorageAtomicMinF32x2,
+        Opcode::GlobalAtomicMaxF16x2 => Opcode::StorageAtomicMaxF16x2,
+        Opcode::GlobalAtomicMaxF32x2 => Opcode::StorageAtomicMaxF32x2,
         _ => return None,
     })
 }
@@ -115,10 +223,6 @@ fn track_low_address(program: &Program, global_inst: &Inst) -> Option<LowAddrInf
     if addr.is_immediate() {
         return None;
     }
-    trace_global_memory_pass(format_args!(
-        "track_low addr_chain={}",
-        describe_value_chain(program, addr, 6)
-    ));
 
     let (_, mut addr_inst) = inst_from_value(program, addr)?;
     let mut imm_offset = 0;
@@ -154,26 +258,6 @@ fn track_low_address(program: &Program, global_inst: &Inst) -> Option<LowAddrInf
         value: *addr_inst.args.first()?,
         imm_offset,
     })
-}
-
-fn describe_value_chain(program: &Program, mut value: Value, limit: usize) -> String {
-    let mut parts = Vec::new();
-    for _ in 0..limit {
-        let Value::Inst(inst_ref) = value else {
-            parts.push(format!("{:?}", value));
-            break;
-        };
-        let inst = program.block(inst_ref.block).inst(inst_ref.inst);
-        parts.push(format!(
-            "{}:{}:{:?} args={:?}",
-            inst_ref.block, inst_ref.inst, inst.opcode, inst.args
-        ));
-        let Some(next) = inst.args.first().copied() else {
-            break;
-        };
-        value = next;
-    }
-    parts.join(" -> ")
 }
 
 fn meets_bias(storage_buffer: StorageBufferAddr, bias: Bias) -> bool {
@@ -231,19 +315,11 @@ fn collect_storage_buffer(program: &Program, inst_ref: InstRef, info: &mut Stora
     };
     let inst = program.block(inst_ref.block).inst(inst_ref.inst);
     let Some(low_addr) = track_low_address(program, inst) else {
-        trace_global_memory_pass(format_args!(
-            "track_low_failed block={} inst={} opcode={:?}",
-            inst_ref.block, inst_ref.inst, inst.opcode
-        ));
         return;
     };
     let storage_buffer = track(program, low_addr.value, Some(NVN_BIAS))
         .or_else(|| track(program, low_addr.value, None));
     let Some(storage_buffer) = storage_buffer else {
-        trace_global_memory_pass(format_args!(
-            "storage_failed block={} inst={} opcode={:?} low_addr={:?}",
-            inst_ref.block, inst_ref.inst, inst.opcode, low_addr.value
-        ));
         return;
     };
     if is_global_memory_write(inst.opcode) {
@@ -254,12 +330,6 @@ fn collect_storage_buffer(program: &Program, inst_ref: InstRef, info: &mut Stora
         storage_buffer,
         inst: inst_ref,
     });
-}
-
-fn trace_global_memory_pass(args: std::fmt::Arguments<'_>) {
-    if std::env::var_os("RUZU_TRACE_GLOBAL_MEMORY_PASS").is_some() {
-        eprintln!("[GLOBAL_MEMORY_PASS] {}", args);
-    }
 }
 
 fn replace_uses_with(program: &mut Program, old: InstRef, replacement: Value) {
@@ -356,40 +426,53 @@ fn replace(program: &mut Program, storage_inst: StorageInst, storage_index: u32,
     let Some(new_opcode) = global_to_storage(opcode) else {
         return;
     };
-    let new_value = match opcode {
+    let is_load = matches!(
+        opcode,
         Opcode::LoadGlobalU8
-        | Opcode::LoadGlobalS8
-        | Opcode::LoadGlobalU16
-        | Opcode::LoadGlobalS16
-        | Opcode::LoadGlobal32
-        | Opcode::LoadGlobal64
-        | Opcode::LoadGlobal128 => insert_before(
+            | Opcode::LoadGlobalS8
+            | Opcode::LoadGlobalU16
+            | Opcode::LoadGlobalS16
+            | Opcode::LoadGlobal32
+            | Opcode::LoadGlobal64
+            | Opcode::LoadGlobal128
+    );
+    let is_write = matches!(
+        opcode,
+        Opcode::WriteGlobalU8
+            | Opcode::WriteGlobalS8
+            | Opcode::WriteGlobalU16
+            | Opcode::WriteGlobalS16
+            | Opcode::WriteGlobal32
+            | Opcode::WriteGlobal64
+            | Opcode::WriteGlobal128
+    );
+    if is_load {
+        let new_value = insert_before(
             program,
             storage_inst.inst,
             new_opcode,
             vec![Value::ImmU32(storage_index), offset],
-        ),
-        _ => {
-            let value = program
-                .block(storage_inst.inst.block)
-                .inst(storage_inst.inst.inst)
-                .args
-                .get(1)
-                .copied();
-            let Some(value) = value else {
-                return;
-            };
-            insert_before(
-                program,
-                storage_inst.inst,
-                new_opcode,
-                vec![Value::ImmU32(storage_index), offset, value],
-            );
-            Value::Void
-        }
-    };
-    if !new_value.is_void() {
+        );
         replace_uses_with(program, storage_inst.inst, new_value);
+    } else {
+        let value = program
+            .block(storage_inst.inst.block)
+            .inst(storage_inst.inst.inst)
+            .args
+            .get(1)
+            .copied();
+        let Some(value) = value else {
+            return;
+        };
+        let new_value = insert_before(
+            program,
+            storage_inst.inst,
+            new_opcode,
+            vec![Value::ImmU32(storage_index), offset, value],
+        );
+        if !is_write {
+            replace_uses_with(program, storage_inst.inst, new_value);
+        }
     }
     program
         .block_mut(storage_inst.inst.block)
@@ -404,14 +487,12 @@ pub fn global_memory_to_storage_buffer_pass(program: &mut Program, host_info: &H
         to_replace: Vec::new(),
         writes: BTreeSet::new(),
     };
-    let mut global_count = 0usize;
     for block_idx in program.post_order_blocks.clone() {
         let inst_indices: Vec<u32> = program
             .block(block_idx)
             .indexed_iter()
             .filter_map(|(inst_idx, inst)| is_global_memory(inst.opcode).then_some(inst_idx))
             .collect();
-        global_count += inst_indices.len();
         for inst_idx in inst_indices {
             collect_storage_buffer(
                 program,
@@ -423,14 +504,6 @@ pub fn global_memory_to_storage_buffer_pass(program: &mut Program, host_info: &H
             );
         }
     }
-
-    trace_global_memory_pass(format_args!(
-        "stage={:?} globals={} tracked={} descriptors={}",
-        program.stage,
-        global_count,
-        info.to_replace.len(),
-        info.set.len()
-    ));
 
     program.info.storage_buffers_descriptors = info
         .set
@@ -547,5 +620,74 @@ mod tests {
             .block(0)
             .iter()
             .any(|inst| inst.opcode == Opcode::LoadGlobal32));
+    }
+
+    #[test]
+    fn global_atomic_rewrite_preserves_the_return_value() {
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        program.post_order_blocks = vec![0];
+        let cbuf = program.block_mut(0).append_inst(Inst::new(
+            Opcode::GetCbufU32,
+            vec![Value::ImmU32(0), Value::ImmU32(0x110)],
+        ));
+        let address = program.block_mut(0).append_inst(Inst::new(
+            Opcode::IAdd32,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: cbuf,
+                }),
+                Value::ImmU32(0x20),
+            ],
+        ));
+        let atomic = program.block_mut(0).append_inst(Inst::new(
+            Opcode::GlobalAtomicIAdd32,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: address,
+                }),
+                Value::ImmU32(7),
+            ],
+        ));
+        program.block_mut(0).append_inst(Inst::new(
+            Opcode::IAdd32,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: atomic,
+                }),
+                Value::ImmU32(1),
+            ],
+        ));
+
+        global_memory_to_storage_buffer_pass(
+            &mut program,
+            &HostTranslateInfo {
+                min_ssbo_alignment: 0x100,
+                ..Default::default()
+            },
+        );
+
+        let (storage_index, _) = program
+            .block(0)
+            .indexed_iter()
+            .find(|(_, inst)| inst.opcode == Opcode::StorageAtomicIAdd32)
+            .expect("global atomic was not rewritten");
+        let storage_value = Value::Inst(InstRef {
+            block: 0,
+            inst: storage_index,
+        });
+        assert!(program.block(0).iter().any(|inst| {
+            inst.opcode == Opcode::IAdd32
+                && inst.args.first() == Some(&storage_value)
+                && inst.args.get(1) == Some(&Value::ImmU32(1))
+        }));
+        assert!(!program
+            .block(0)
+            .iter()
+            .any(|inst| inst.opcode == Opcode::GlobalAtomicIAdd32));
+        assert!(program.info.storage_buffers_descriptors[0].is_written);
     }
 }

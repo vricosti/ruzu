@@ -54,6 +54,80 @@ pub fn collect_shader_info_pass(program: &mut Program) {
 
     for block in &program.blocks {
         for inst in block.iter() {
+            if matches!(
+                inst.opcode,
+                Opcode::SharedAtomicSMin32 | Opcode::StorageAtomicSMin32
+            ) {
+                program.info.uses_atomic_s32_min = true;
+            }
+            if matches!(
+                inst.opcode,
+                Opcode::SharedAtomicSMax32 | Opcode::StorageAtomicSMax32
+            ) {
+                program.info.uses_atomic_s32_max = true;
+            }
+            match inst.opcode {
+                Opcode::GlobalAtomicInc32 | Opcode::StorageAtomicInc32 => {
+                    program.info.used_storage_buffer_types |= Type::U32 as u32;
+                    program.info.uses_global_increment = true;
+                }
+                Opcode::GlobalAtomicDec32 | Opcode::StorageAtomicDec32 => {
+                    program.info.used_storage_buffer_types |= Type::U32 as u32;
+                    program.info.uses_global_decrement = true;
+                }
+                Opcode::GlobalAtomicAddF32 | Opcode::StorageAtomicAddF32 => {
+                    program.info.used_storage_buffer_types |= Type::U32 as u32;
+                    program.info.uses_atomic_f32_add = true;
+                }
+                Opcode::GlobalAtomicAddF16x2 | Opcode::StorageAtomicAddF16x2 => {
+                    program.info.used_storage_buffer_types |= Type::U32 as u32;
+                    program.info.uses_atomic_f16x2_add = true;
+                }
+                Opcode::GlobalAtomicAddF32x2 | Opcode::StorageAtomicAddF32x2 => {
+                    program.info.used_storage_buffer_types |= Type::U32 as u32;
+                    program.info.uses_atomic_f32x2_add = true;
+                }
+                Opcode::GlobalAtomicMinF16x2 | Opcode::StorageAtomicMinF16x2 => {
+                    program.info.used_storage_buffer_types |= Type::U32 as u32;
+                    program.info.uses_atomic_f16x2_min = true;
+                }
+                Opcode::GlobalAtomicMinF32x2 | Opcode::StorageAtomicMinF32x2 => {
+                    program.info.used_storage_buffer_types |= Type::U32 as u32;
+                    program.info.uses_atomic_f32x2_min = true;
+                }
+                Opcode::GlobalAtomicMaxF16x2 | Opcode::StorageAtomicMaxF16x2 => {
+                    program.info.used_storage_buffer_types |= Type::U32 as u32;
+                    program.info.uses_atomic_f16x2_max = true;
+                }
+                Opcode::GlobalAtomicMaxF32x2 | Opcode::StorageAtomicMaxF32x2 => {
+                    program.info.used_storage_buffer_types |= Type::U32 as u32;
+                    program.info.uses_atomic_f32x2_max = true;
+                }
+                Opcode::GlobalAtomicIAdd64
+                | Opcode::GlobalAtomicSMin64
+                | Opcode::GlobalAtomicUMin64
+                | Opcode::GlobalAtomicSMax64
+                | Opcode::GlobalAtomicUMax64
+                | Opcode::GlobalAtomicAnd64
+                | Opcode::GlobalAtomicOr64
+                | Opcode::GlobalAtomicXor64
+                | Opcode::GlobalAtomicExchange64
+                | Opcode::StorageAtomicIAdd64
+                | Opcode::StorageAtomicSMin64
+                | Opcode::StorageAtomicUMin64
+                | Opcode::StorageAtomicSMax64
+                | Opcode::StorageAtomicUMax64
+                | Opcode::StorageAtomicAnd64
+                | Opcode::StorageAtomicOr64
+                | Opcode::StorageAtomicXor64
+                | Opcode::StorageAtomicExchange64 => {
+                    program.info.used_storage_buffer_types |=
+                        (Type::U64 as u32) | (Type::U32x2 as u32);
+                    program.info.uses_int64 = true;
+                    program.info.uses_int64_bit_atomics = true;
+                }
+                _ => {}
+            }
             match inst.opcode {
                 // Constant buffer access
                 Opcode::GetCbufU32
@@ -166,6 +240,31 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                 Opcode::DemoteToHelperInvocation => {
                     program.info.uses_demote_to_helper_invocation = true;
                 }
+                Opcode::LaneId => {
+                    program.info.uses_subgroup_invocation_id = true;
+                }
+                Opcode::ShuffleIndex
+                | Opcode::ShuffleUp
+                | Opcode::ShuffleDown
+                | Opcode::ShuffleButterfly => {
+                    program.info.uses_subgroup_shuffles = true;
+                }
+                Opcode::SubgroupEqMask
+                | Opcode::SubgroupLtMask
+                | Opcode::SubgroupLeMask
+                | Opcode::SubgroupGtMask
+                | Opcode::SubgroupGeMask => {
+                    program.info.uses_subgroup_mask = true;
+                }
+                Opcode::VoteAll | Opcode::VoteAny | Opcode::VoteEqual | Opcode::SubgroupBallot => {
+                    program.info.uses_subgroup_vote = true;
+                }
+                Opcode::FSwizzleAdd => {
+                    program.info.uses_fswzadd = true;
+                }
+                Opcode::DPdxFine | Opcode::DPdyFine | Opcode::DPdxCoarse | Opcode::DPdyCoarse => {
+                    program.info.uses_derivatives = true;
+                }
 
                 // Texture access
                 Opcode::BindlessImageSampleImplicitLod
@@ -227,6 +326,48 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                     uses_local_memory = true;
                 }
 
+                Opcode::LoadStorageU8
+                | Opcode::LoadStorageS8
+                | Opcode::WriteStorageU8
+                | Opcode::WriteStorageS8 => {
+                    program.info.used_storage_buffer_types |= Type::U8 as u32;
+                }
+                Opcode::LoadStorageU16
+                | Opcode::LoadStorageS16
+                | Opcode::WriteStorageU16
+                | Opcode::WriteStorageS16 => {
+                    program.info.used_storage_buffer_types |= Type::U16 as u32;
+                }
+                Opcode::LoadStorage32
+                | Opcode::WriteStorage32
+                | Opcode::StorageAtomicIAdd32
+                | Opcode::StorageAtomicSMin32
+                | Opcode::StorageAtomicUMin32
+                | Opcode::StorageAtomicSMax32
+                | Opcode::StorageAtomicUMax32
+                | Opcode::StorageAtomicAnd32
+                | Opcode::StorageAtomicOr32
+                | Opcode::StorageAtomicXor32
+                | Opcode::StorageAtomicExchange32 => {
+                    program.info.used_storage_buffer_types |= Type::U32 as u32;
+                }
+                Opcode::LoadStorage64
+                | Opcode::WriteStorage64
+                | Opcode::StorageAtomicIAdd32x2
+                | Opcode::StorageAtomicSMin32x2
+                | Opcode::StorageAtomicUMin32x2
+                | Opcode::StorageAtomicSMax32x2
+                | Opcode::StorageAtomicUMax32x2
+                | Opcode::StorageAtomicAnd32x2
+                | Opcode::StorageAtomicOr32x2
+                | Opcode::StorageAtomicXor32x2
+                | Opcode::StorageAtomicExchange32x2 => {
+                    program.info.used_storage_buffer_types |= Type::U32x2 as u32;
+                }
+                Opcode::LoadStorage128 | Opcode::WriteStorage128 => {
+                    program.info.used_storage_buffer_types |= Type::U32x4 as u32;
+                }
+
                 // Global memory
                 Opcode::LoadGlobalU8
                 | Opcode::LoadGlobalS8
@@ -248,7 +389,43 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                 | Opcode::WriteGlobalS16
                 | Opcode::WriteGlobal32
                 | Opcode::WriteGlobal64
-                | Opcode::WriteGlobal128 => {
+                | Opcode::WriteGlobal128
+                | Opcode::GlobalAtomicIAdd32
+                | Opcode::GlobalAtomicSMin32
+                | Opcode::GlobalAtomicUMin32
+                | Opcode::GlobalAtomicSMax32
+                | Opcode::GlobalAtomicUMax32
+                | Opcode::GlobalAtomicInc32
+                | Opcode::GlobalAtomicDec32
+                | Opcode::GlobalAtomicAnd32
+                | Opcode::GlobalAtomicOr32
+                | Opcode::GlobalAtomicXor32
+                | Opcode::GlobalAtomicExchange32
+                | Opcode::GlobalAtomicIAdd64
+                | Opcode::GlobalAtomicSMin64
+                | Opcode::GlobalAtomicUMin64
+                | Opcode::GlobalAtomicSMax64
+                | Opcode::GlobalAtomicUMax64
+                | Opcode::GlobalAtomicAnd64
+                | Opcode::GlobalAtomicOr64
+                | Opcode::GlobalAtomicXor64
+                | Opcode::GlobalAtomicExchange64
+                | Opcode::GlobalAtomicIAdd32x2
+                | Opcode::GlobalAtomicSMin32x2
+                | Opcode::GlobalAtomicUMin32x2
+                | Opcode::GlobalAtomicSMax32x2
+                | Opcode::GlobalAtomicUMax32x2
+                | Opcode::GlobalAtomicAnd32x2
+                | Opcode::GlobalAtomicOr32x2
+                | Opcode::GlobalAtomicXor32x2
+                | Opcode::GlobalAtomicExchange32x2
+                | Opcode::GlobalAtomicAddF32
+                | Opcode::GlobalAtomicAddF16x2
+                | Opcode::GlobalAtomicAddF32x2
+                | Opcode::GlobalAtomicMinF16x2
+                | Opcode::GlobalAtomicMinF32x2
+                | Opcode::GlobalAtomicMaxF16x2
+                | Opcode::GlobalAtomicMaxF32x2 => {
                     program.info.stores_global_memory = true;
                     program.info.uses_int64 = true;
                     program.info.uses_global_memory = true;
@@ -257,17 +434,16 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                     program.info.used_storage_buffer_types |=
                         (Type::U32 as u32) | (Type::U32x2 as u32) | (Type::U32x4 as u32);
                 }
-                Opcode::SharedAtomicSMin32
-                | Opcode::StorageAtomicSMin32
-                | Opcode::GlobalAtomicSMin32 => {
-                    program.info.uses_atomic_s32_min = true;
+                Opcode::SharedAtomicInc32 => {
+                    program.info.uses_shared_increment = true;
                 }
-                Opcode::SharedAtomicSMax32
-                | Opcode::StorageAtomicSMax32
-                | Opcode::GlobalAtomicSMax32 => {
-                    program.info.uses_atomic_s32_max = true;
+                Opcode::SharedAtomicDec32 => {
+                    program.info.uses_shared_decrement = true;
                 }
-
+                Opcode::SharedAtomicExchange64 => {
+                    program.info.uses_int64 = true;
+                    program.info.uses_int64_bit_atomics = true;
+                }
                 _ => {}
             }
         }
@@ -443,6 +619,31 @@ mod tests {
     }
 
     #[test]
+    fn collect_info_records_all_subgroup_interface_users() {
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        for opcode in [
+            Opcode::LaneId,
+            Opcode::ShuffleIndex,
+            Opcode::SubgroupEqMask,
+            Opcode::VoteAll,
+            Opcode::FSwizzleAdd,
+        ] {
+            program
+                .block_mut(0)
+                .append_inst(Inst::new(opcode, Vec::new()));
+        }
+
+        collect_shader_info_pass(&mut program);
+
+        assert!(program.info.uses_subgroup_invocation_id);
+        assert!(program.info.uses_subgroup_shuffles);
+        assert!(program.info.uses_subgroup_mask);
+        assert!(program.info.uses_subgroup_vote);
+        assert!(program.info.uses_fswzadd);
+    }
+
+    #[test]
     fn collect_info_header_sets_fragment_indexed_generic_loads() {
         let mut program = Program::new(ShaderStage::Fragment);
         program.blocks.push(Block::new());
@@ -479,6 +680,25 @@ mod tests {
 
         assert!(program.info.uses_atomic_s32_min);
         assert!(program.info.uses_atomic_s32_max);
+    }
+
+    #[test]
+    fn collect_info_sets_shared_inc_dec_helper_flags() {
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        program.block_mut(0).append_inst(Inst::new(
+            Opcode::SharedAtomicInc32,
+            vec![Value::ImmU32(0), Value::ImmU32(7)],
+        ));
+        program.block_mut(0).append_inst(Inst::new(
+            Opcode::SharedAtomicDec32,
+            vec![Value::ImmU32(4), Value::ImmU32(7)],
+        ));
+
+        super::collect_shader_info_pass(&mut program);
+
+        assert!(program.info.uses_shared_increment);
+        assert!(program.info.uses_shared_decrement);
     }
 
     #[test]

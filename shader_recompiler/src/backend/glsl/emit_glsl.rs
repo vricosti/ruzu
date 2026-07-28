@@ -2526,8 +2526,10 @@ mod tests {
                 Opcode::Reference,
             ]
         );
-        assert_eq!(program.block(0).inst(src0).use_count, 1);
-        assert_eq!(program.block(0).inst(src1).use_count, 1);
+        // Each source remains used by its Phi operand and is additionally
+        // consumed by the PhiMove inserted by upstream PrecolorInst.
+        assert_eq!(program.block(0).inst(src0).use_count, 2);
+        assert_eq!(program.block(0).inst(src1).use_count, 2);
         assert_eq!(program.block(1).inst(phi0).use_count, 2);
         assert_eq!(program.block(1).inst(phi1).use_count, 2);
     }

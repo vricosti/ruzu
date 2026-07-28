@@ -3,8 +3,8 @@
 
 //! IR opcode definitions for the shader recompiler.
 //!
-//! Matches zuyu's `opcodes.inc` — a prioritized subset of ~180 opcodes covering
-//! the operations needed for Mario Kart vertex/fragment shaders.
+//! Matches zuyu's `opcodes.inc`, covering the operations translated by the
+//! Maxwell shader frontend.
 
 use super::types::Type;
 use std::fmt;
@@ -386,17 +386,25 @@ pub enum Opcode {
 
     // ── Conversion ────────────────────────────────────────────────────
     ConvertS16F16,
+    ConvertS16F32,
+    ConvertS16F64,
     ConvertS32F16,
     ConvertS32F32,
     ConvertS32F64,
+    ConvertS64F16,
     ConvertS64F32,
     ConvertS64F64,
     ConvertU16F16,
+    ConvertU16F32,
+    ConvertU16F64,
     ConvertU32F16,
     ConvertU32F32,
     ConvertU32F64,
+    ConvertU64F16,
     ConvertU64F32,
     ConvertU64F64,
+    ConvertU64U32,
+    ConvertU32U64,
     ConvertF16F32,
     ConvertF32F16,
     ConvertF32F64,
@@ -517,28 +525,86 @@ pub enum Opcode {
     GlobalAtomicUMin32,
     GlobalAtomicSMax32,
     GlobalAtomicUMax32,
+    GlobalAtomicInc32,
+    GlobalAtomicDec32,
     GlobalAtomicAnd32,
     GlobalAtomicOr32,
     GlobalAtomicXor32,
     GlobalAtomicExchange32,
+    GlobalAtomicIAdd64,
+    GlobalAtomicSMin64,
+    GlobalAtomicUMin64,
+    GlobalAtomicSMax64,
+    GlobalAtomicUMax64,
+    GlobalAtomicAnd64,
+    GlobalAtomicOr64,
+    GlobalAtomicXor64,
+    GlobalAtomicExchange64,
+    GlobalAtomicIAdd32x2,
+    GlobalAtomicSMin32x2,
+    GlobalAtomicUMin32x2,
+    GlobalAtomicSMax32x2,
+    GlobalAtomicUMax32x2,
+    GlobalAtomicAnd32x2,
+    GlobalAtomicOr32x2,
+    GlobalAtomicXor32x2,
+    GlobalAtomicExchange32x2,
+    GlobalAtomicAddF32,
+    GlobalAtomicAddF16x2,
+    GlobalAtomicAddF32x2,
+    GlobalAtomicMinF16x2,
+    GlobalAtomicMinF32x2,
+    GlobalAtomicMaxF16x2,
+    GlobalAtomicMaxF32x2,
     StorageAtomicIAdd32,
     StorageAtomicSMin32,
     StorageAtomicUMin32,
     StorageAtomicSMax32,
     StorageAtomicUMax32,
+    StorageAtomicInc32,
+    StorageAtomicDec32,
     StorageAtomicAnd32,
     StorageAtomicOr32,
     StorageAtomicXor32,
     StorageAtomicExchange32,
+    StorageAtomicIAdd64,
+    StorageAtomicSMin64,
+    StorageAtomicUMin64,
+    StorageAtomicSMax64,
+    StorageAtomicUMax64,
+    StorageAtomicAnd64,
+    StorageAtomicOr64,
+    StorageAtomicXor64,
+    StorageAtomicExchange64,
+    StorageAtomicIAdd32x2,
+    StorageAtomicSMin32x2,
+    StorageAtomicUMin32x2,
+    StorageAtomicSMax32x2,
+    StorageAtomicUMax32x2,
+    StorageAtomicAnd32x2,
+    StorageAtomicOr32x2,
+    StorageAtomicXor32x2,
+    StorageAtomicExchange32x2,
+    StorageAtomicAddF32,
+    StorageAtomicAddF16x2,
+    StorageAtomicAddF32x2,
+    StorageAtomicMinF16x2,
+    StorageAtomicMinF32x2,
+    StorageAtomicMaxF16x2,
+    StorageAtomicMaxF32x2,
     SharedAtomicIAdd32,
     SharedAtomicSMin32,
     SharedAtomicUMin32,
     SharedAtomicSMax32,
     SharedAtomicUMax32,
+    SharedAtomicInc32,
+    SharedAtomicDec32,
     SharedAtomicAnd32,
     SharedAtomicOr32,
     SharedAtomicXor32,
     SharedAtomicExchange32,
+    SharedAtomicExchange64,
+    SharedAtomicExchange32x2,
 
     // ── Warp / Subgroup ───────────────────────────────────────────────
     VoteAll,
@@ -556,6 +622,10 @@ pub enum Opcode {
     ShuffleDown,
     ShuffleButterfly,
     FSwizzleAdd,
+    DPdxFine,
+    DPdyFine,
+    DPdxCoarse,
+    DPdyCoarse,
 
     // ── Branch / control flow (used internally by structured CF) ──────
     Branch,
@@ -717,28 +787,86 @@ impl Opcode {
                 | Opcode::GlobalAtomicUMin32
                 | Opcode::GlobalAtomicSMax32
                 | Opcode::GlobalAtomicUMax32
+                | Opcode::GlobalAtomicInc32
+                | Opcode::GlobalAtomicDec32
                 | Opcode::GlobalAtomicAnd32
                 | Opcode::GlobalAtomicOr32
                 | Opcode::GlobalAtomicXor32
                 | Opcode::GlobalAtomicExchange32
+                | Opcode::GlobalAtomicIAdd64
+                | Opcode::GlobalAtomicSMin64
+                | Opcode::GlobalAtomicUMin64
+                | Opcode::GlobalAtomicSMax64
+                | Opcode::GlobalAtomicUMax64
+                | Opcode::GlobalAtomicAnd64
+                | Opcode::GlobalAtomicOr64
+                | Opcode::GlobalAtomicXor64
+                | Opcode::GlobalAtomicExchange64
+                | Opcode::GlobalAtomicIAdd32x2
+                | Opcode::GlobalAtomicSMin32x2
+                | Opcode::GlobalAtomicUMin32x2
+                | Opcode::GlobalAtomicSMax32x2
+                | Opcode::GlobalAtomicUMax32x2
+                | Opcode::GlobalAtomicAnd32x2
+                | Opcode::GlobalAtomicOr32x2
+                | Opcode::GlobalAtomicXor32x2
+                | Opcode::GlobalAtomicExchange32x2
+                | Opcode::GlobalAtomicAddF32
+                | Opcode::GlobalAtomicAddF16x2
+                | Opcode::GlobalAtomicAddF32x2
+                | Opcode::GlobalAtomicMinF16x2
+                | Opcode::GlobalAtomicMinF32x2
+                | Opcode::GlobalAtomicMaxF16x2
+                | Opcode::GlobalAtomicMaxF32x2
                 | Opcode::StorageAtomicIAdd32
                 | Opcode::StorageAtomicSMin32
                 | Opcode::StorageAtomicUMin32
                 | Opcode::StorageAtomicSMax32
                 | Opcode::StorageAtomicUMax32
+                | Opcode::StorageAtomicInc32
+                | Opcode::StorageAtomicDec32
                 | Opcode::StorageAtomicAnd32
                 | Opcode::StorageAtomicOr32
                 | Opcode::StorageAtomicXor32
                 | Opcode::StorageAtomicExchange32
+                | Opcode::StorageAtomicIAdd64
+                | Opcode::StorageAtomicSMin64
+                | Opcode::StorageAtomicUMin64
+                | Opcode::StorageAtomicSMax64
+                | Opcode::StorageAtomicUMax64
+                | Opcode::StorageAtomicAnd64
+                | Opcode::StorageAtomicOr64
+                | Opcode::StorageAtomicXor64
+                | Opcode::StorageAtomicExchange64
+                | Opcode::StorageAtomicIAdd32x2
+                | Opcode::StorageAtomicSMin32x2
+                | Opcode::StorageAtomicUMin32x2
+                | Opcode::StorageAtomicSMax32x2
+                | Opcode::StorageAtomicUMax32x2
+                | Opcode::StorageAtomicAnd32x2
+                | Opcode::StorageAtomicOr32x2
+                | Opcode::StorageAtomicXor32x2
+                | Opcode::StorageAtomicExchange32x2
+                | Opcode::StorageAtomicAddF32
+                | Opcode::StorageAtomicAddF16x2
+                | Opcode::StorageAtomicAddF32x2
+                | Opcode::StorageAtomicMinF16x2
+                | Opcode::StorageAtomicMinF32x2
+                | Opcode::StorageAtomicMaxF16x2
+                | Opcode::StorageAtomicMaxF32x2
                 | Opcode::SharedAtomicIAdd32
                 | Opcode::SharedAtomicSMin32
                 | Opcode::SharedAtomicUMin32
                 | Opcode::SharedAtomicSMax32
                 | Opcode::SharedAtomicUMax32
+                | Opcode::SharedAtomicInc32
+                | Opcode::SharedAtomicDec32
                 | Opcode::SharedAtomicAnd32
                 | Opcode::SharedAtomicOr32
                 | Opcode::SharedAtomicXor32
                 | Opcode::SharedAtomicExchange32
+                | Opcode::SharedAtomicExchange64
+                | Opcode::SharedAtomicExchange32x2
                 | Opcode::ImageWrite
                 | Opcode::BoundImageWrite
                 | Opcode::BindlessImageWrite
@@ -2357,6 +2485,16 @@ impl Opcode {
                 return_type: U32,
                 arg_types: &[F16],
             },
+            Opcode::ConvertS16F32 => OpcodeMeta {
+                name: "ConvertS16F32",
+                return_type: U32,
+                arg_types: &[F32],
+            },
+            Opcode::ConvertS16F64 => OpcodeMeta {
+                name: "ConvertS16F64",
+                return_type: U32,
+                arg_types: &[F64],
+            },
             Opcode::ConvertS32F16 => OpcodeMeta {
                 name: "ConvertS32F16",
                 return_type: U32,
@@ -2371,6 +2509,11 @@ impl Opcode {
                 name: "ConvertS32F64",
                 return_type: U32,
                 arg_types: &[F64],
+            },
+            Opcode::ConvertS64F16 => OpcodeMeta {
+                name: "ConvertS64F16",
+                return_type: U64,
+                arg_types: &[F16],
             },
             Opcode::ConvertS64F32 => OpcodeMeta {
                 name: "ConvertS64F32",
@@ -2387,6 +2530,16 @@ impl Opcode {
                 return_type: U32,
                 arg_types: &[F16],
             },
+            Opcode::ConvertU16F32 => OpcodeMeta {
+                name: "ConvertU16F32",
+                return_type: U32,
+                arg_types: &[F32],
+            },
+            Opcode::ConvertU16F64 => OpcodeMeta {
+                name: "ConvertU16F64",
+                return_type: U32,
+                arg_types: &[F64],
+            },
             Opcode::ConvertU32F16 => OpcodeMeta {
                 name: "ConvertU32F16",
                 return_type: U32,
@@ -2402,6 +2555,11 @@ impl Opcode {
                 return_type: U32,
                 arg_types: &[F64],
             },
+            Opcode::ConvertU64F16 => OpcodeMeta {
+                name: "ConvertU64F16",
+                return_type: U64,
+                arg_types: &[F16],
+            },
             Opcode::ConvertU64F32 => OpcodeMeta {
                 name: "ConvertU64F32",
                 return_type: U64,
@@ -2411,6 +2569,16 @@ impl Opcode {
                 name: "ConvertU64F64",
                 return_type: U64,
                 arg_types: &[F64],
+            },
+            Opcode::ConvertU64U32 => OpcodeMeta {
+                name: "ConvertU64U32",
+                return_type: U64,
+                arg_types: &[U32],
+            },
+            Opcode::ConvertU32U64 => OpcodeMeta {
+                name: "ConvertU32U64",
+                return_type: U32,
+                arg_types: &[U64],
             },
             Opcode::ConvertF16F32 => OpcodeMeta {
                 name: "ConvertF16F32",
@@ -2726,47 +2894,182 @@ impl Opcode {
             Opcode::GlobalAtomicIAdd32 => OpcodeMeta {
                 name: "GlobalAtomicIAdd32",
                 return_type: U32,
-                arg_types: &[Opaque, U32],
+                arg_types: &[U64, U32],
             },
             Opcode::GlobalAtomicSMin32 => OpcodeMeta {
                 name: "GlobalAtomicSMin32",
                 return_type: U32,
-                arg_types: &[Opaque, U32],
+                arg_types: &[U64, U32],
             },
             Opcode::GlobalAtomicUMin32 => OpcodeMeta {
                 name: "GlobalAtomicUMin32",
                 return_type: U32,
-                arg_types: &[Opaque, U32],
+                arg_types: &[U64, U32],
             },
             Opcode::GlobalAtomicSMax32 => OpcodeMeta {
                 name: "GlobalAtomicSMax32",
                 return_type: U32,
-                arg_types: &[Opaque, U32],
+                arg_types: &[U64, U32],
             },
             Opcode::GlobalAtomicUMax32 => OpcodeMeta {
                 name: "GlobalAtomicUMax32",
                 return_type: U32,
-                arg_types: &[Opaque, U32],
+                arg_types: &[U64, U32],
+            },
+            Opcode::GlobalAtomicInc32 => OpcodeMeta {
+                name: "GlobalAtomicInc32",
+                return_type: U32,
+                arg_types: &[U64, U32],
+            },
+            Opcode::GlobalAtomicDec32 => OpcodeMeta {
+                name: "GlobalAtomicDec32",
+                return_type: U32,
+                arg_types: &[U64, U32],
             },
             Opcode::GlobalAtomicAnd32 => OpcodeMeta {
                 name: "GlobalAtomicAnd32",
                 return_type: U32,
-                arg_types: &[Opaque, U32],
+                arg_types: &[U64, U32],
             },
             Opcode::GlobalAtomicOr32 => OpcodeMeta {
                 name: "GlobalAtomicOr32",
                 return_type: U32,
-                arg_types: &[Opaque, U32],
+                arg_types: &[U64, U32],
             },
             Opcode::GlobalAtomicXor32 => OpcodeMeta {
                 name: "GlobalAtomicXor32",
                 return_type: U32,
-                arg_types: &[Opaque, U32],
+                arg_types: &[U64, U32],
             },
             Opcode::GlobalAtomicExchange32 => OpcodeMeta {
                 name: "GlobalAtomicExchange32",
                 return_type: U32,
-                arg_types: &[Opaque, U32],
+                arg_types: &[U64, U32],
+            },
+            Opcode::GlobalAtomicIAdd64 => OpcodeMeta {
+                name: "GlobalAtomicIAdd64",
+                return_type: U64,
+                arg_types: &[U64, U64],
+            },
+            Opcode::GlobalAtomicSMin64 => OpcodeMeta {
+                name: "GlobalAtomicSMin64",
+                return_type: U64,
+                arg_types: &[U64, U64],
+            },
+            Opcode::GlobalAtomicUMin64 => OpcodeMeta {
+                name: "GlobalAtomicUMin64",
+                return_type: U64,
+                arg_types: &[U64, U64],
+            },
+            Opcode::GlobalAtomicSMax64 => OpcodeMeta {
+                name: "GlobalAtomicSMax64",
+                return_type: U64,
+                arg_types: &[U64, U64],
+            },
+            Opcode::GlobalAtomicUMax64 => OpcodeMeta {
+                name: "GlobalAtomicUMax64",
+                return_type: U64,
+                arg_types: &[U64, U64],
+            },
+            Opcode::GlobalAtomicAnd64 => OpcodeMeta {
+                name: "GlobalAtomicAnd64",
+                return_type: U64,
+                arg_types: &[U64, U64],
+            },
+            Opcode::GlobalAtomicOr64 => OpcodeMeta {
+                name: "GlobalAtomicOr64",
+                return_type: U64,
+                arg_types: &[U64, U64],
+            },
+            Opcode::GlobalAtomicXor64 => OpcodeMeta {
+                name: "GlobalAtomicXor64",
+                return_type: U64,
+                arg_types: &[U64, U64],
+            },
+            Opcode::GlobalAtomicExchange64 => OpcodeMeta {
+                name: "GlobalAtomicExchange64",
+                return_type: U64,
+                arg_types: &[U64, U64],
+            },
+            Opcode::GlobalAtomicIAdd32x2 => OpcodeMeta {
+                name: "GlobalAtomicIAdd32x2",
+                return_type: U32x2,
+                arg_types: &[U32x2, U32x2],
+            },
+            Opcode::GlobalAtomicSMin32x2 => OpcodeMeta {
+                name: "GlobalAtomicSMin32x2",
+                return_type: U32x2,
+                arg_types: &[U32x2, U32x2],
+            },
+            Opcode::GlobalAtomicUMin32x2 => OpcodeMeta {
+                name: "GlobalAtomicUMin32x2",
+                return_type: U32x2,
+                arg_types: &[U32x2, U32x2],
+            },
+            Opcode::GlobalAtomicSMax32x2 => OpcodeMeta {
+                name: "GlobalAtomicSMax32x2",
+                return_type: U32x2,
+                arg_types: &[U32x2, U32x2],
+            },
+            Opcode::GlobalAtomicUMax32x2 => OpcodeMeta {
+                name: "GlobalAtomicUMax32x2",
+                return_type: U32x2,
+                arg_types: &[U32x2, U32x2],
+            },
+            Opcode::GlobalAtomicAnd32x2 => OpcodeMeta {
+                name: "GlobalAtomicAnd32x2",
+                return_type: U32x2,
+                arg_types: &[U32x2, U32x2],
+            },
+            Opcode::GlobalAtomicOr32x2 => OpcodeMeta {
+                name: "GlobalAtomicOr32x2",
+                return_type: U32x2,
+                arg_types: &[U32x2, U32x2],
+            },
+            Opcode::GlobalAtomicXor32x2 => OpcodeMeta {
+                name: "GlobalAtomicXor32x2",
+                return_type: U32x2,
+                arg_types: &[U32x2, U32x2],
+            },
+            Opcode::GlobalAtomicExchange32x2 => OpcodeMeta {
+                name: "GlobalAtomicExchange32x2",
+                return_type: U32x2,
+                arg_types: &[U32x2, U32x2],
+            },
+            Opcode::GlobalAtomicAddF32 => OpcodeMeta {
+                name: "GlobalAtomicAddF32",
+                return_type: F32,
+                arg_types: &[U64, F32],
+            },
+            Opcode::GlobalAtomicAddF16x2 => OpcodeMeta {
+                name: "GlobalAtomicAddF16x2",
+                return_type: U32,
+                arg_types: &[U64, F16x2],
+            },
+            Opcode::GlobalAtomicAddF32x2 => OpcodeMeta {
+                name: "GlobalAtomicAddF32x2",
+                return_type: U32,
+                arg_types: &[U64, F32x2],
+            },
+            Opcode::GlobalAtomicMinF16x2 => OpcodeMeta {
+                name: "GlobalAtomicMinF16x2",
+                return_type: U32,
+                arg_types: &[U64, F16x2],
+            },
+            Opcode::GlobalAtomicMinF32x2 => OpcodeMeta {
+                name: "GlobalAtomicMinF32x2",
+                return_type: U32,
+                arg_types: &[U64, F32x2],
+            },
+            Opcode::GlobalAtomicMaxF16x2 => OpcodeMeta {
+                name: "GlobalAtomicMaxF16x2",
+                return_type: U32,
+                arg_types: &[U64, F16x2],
+            },
+            Opcode::GlobalAtomicMaxF32x2 => OpcodeMeta {
+                name: "GlobalAtomicMaxF32x2",
+                return_type: U32,
+                arg_types: &[U64, F32x2],
             },
 
             // Atomic storage
@@ -2795,6 +3098,16 @@ impl Opcode {
                 return_type: U32,
                 arg_types: &[U32, U32, U32],
             },
+            Opcode::StorageAtomicInc32 => OpcodeMeta {
+                name: "StorageAtomicInc32",
+                return_type: U32,
+                arg_types: &[U32, U32, U32],
+            },
+            Opcode::StorageAtomicDec32 => OpcodeMeta {
+                name: "StorageAtomicDec32",
+                return_type: U32,
+                arg_types: &[U32, U32, U32],
+            },
             Opcode::StorageAtomicAnd32 => OpcodeMeta {
                 name: "StorageAtomicAnd32",
                 return_type: U32,
@@ -2814,6 +3127,131 @@ impl Opcode {
                 name: "StorageAtomicExchange32",
                 return_type: U32,
                 arg_types: &[U32, U32, U32],
+            },
+            Opcode::StorageAtomicIAdd64 => OpcodeMeta {
+                name: "StorageAtomicIAdd64",
+                return_type: U64,
+                arg_types: &[U32, U32, U64],
+            },
+            Opcode::StorageAtomicSMin64 => OpcodeMeta {
+                name: "StorageAtomicSMin64",
+                return_type: U64,
+                arg_types: &[U32, U32, U64],
+            },
+            Opcode::StorageAtomicUMin64 => OpcodeMeta {
+                name: "StorageAtomicUMin64",
+                return_type: U64,
+                arg_types: &[U32, U32, U64],
+            },
+            Opcode::StorageAtomicSMax64 => OpcodeMeta {
+                name: "StorageAtomicSMax64",
+                return_type: U64,
+                arg_types: &[U32, U32, U64],
+            },
+            Opcode::StorageAtomicUMax64 => OpcodeMeta {
+                name: "StorageAtomicUMax64",
+                return_type: U64,
+                arg_types: &[U32, U32, U64],
+            },
+            Opcode::StorageAtomicAnd64 => OpcodeMeta {
+                name: "StorageAtomicAnd64",
+                return_type: U64,
+                arg_types: &[U32, U32, U64],
+            },
+            Opcode::StorageAtomicOr64 => OpcodeMeta {
+                name: "StorageAtomicOr64",
+                return_type: U64,
+                arg_types: &[U32, U32, U64],
+            },
+            Opcode::StorageAtomicXor64 => OpcodeMeta {
+                name: "StorageAtomicXor64",
+                return_type: U64,
+                arg_types: &[U32, U32, U64],
+            },
+            Opcode::StorageAtomicExchange64 => OpcodeMeta {
+                name: "StorageAtomicExchange64",
+                return_type: U64,
+                arg_types: &[U32, U32, U64],
+            },
+            Opcode::StorageAtomicIAdd32x2 => OpcodeMeta {
+                name: "StorageAtomicIAdd32x2",
+                return_type: U32x2,
+                arg_types: &[U32, U32, U32x2],
+            },
+            Opcode::StorageAtomicSMin32x2 => OpcodeMeta {
+                name: "StorageAtomicSMin32x2",
+                return_type: U32x2,
+                arg_types: &[U32, U32, U32x2],
+            },
+            Opcode::StorageAtomicUMin32x2 => OpcodeMeta {
+                name: "StorageAtomicUMin32x2",
+                return_type: U32x2,
+                arg_types: &[U32, U32, U32x2],
+            },
+            Opcode::StorageAtomicSMax32x2 => OpcodeMeta {
+                name: "StorageAtomicSMax32x2",
+                return_type: U32x2,
+                arg_types: &[U32, U32, U32x2],
+            },
+            Opcode::StorageAtomicUMax32x2 => OpcodeMeta {
+                name: "StorageAtomicUMax32x2",
+                return_type: U32x2,
+                arg_types: &[U32, U32, U32x2],
+            },
+            Opcode::StorageAtomicAnd32x2 => OpcodeMeta {
+                name: "StorageAtomicAnd32x2",
+                return_type: U32x2,
+                arg_types: &[U32, U32, U32x2],
+            },
+            Opcode::StorageAtomicOr32x2 => OpcodeMeta {
+                name: "StorageAtomicOr32x2",
+                return_type: U32x2,
+                arg_types: &[U32, U32, U32x2],
+            },
+            Opcode::StorageAtomicXor32x2 => OpcodeMeta {
+                name: "StorageAtomicXor32x2",
+                return_type: U32x2,
+                arg_types: &[U32, U32, U32x2],
+            },
+            Opcode::StorageAtomicExchange32x2 => OpcodeMeta {
+                name: "StorageAtomicExchange32x2",
+                return_type: U32x2,
+                arg_types: &[U32, U32, U32x2],
+            },
+            Opcode::StorageAtomicAddF32 => OpcodeMeta {
+                name: "StorageAtomicAddF32",
+                return_type: F32,
+                arg_types: &[U32, U32, F32],
+            },
+            Opcode::StorageAtomicAddF16x2 => OpcodeMeta {
+                name: "StorageAtomicAddF16x2",
+                return_type: U32,
+                arg_types: &[U32, U32, F16x2],
+            },
+            Opcode::StorageAtomicAddF32x2 => OpcodeMeta {
+                name: "StorageAtomicAddF32x2",
+                return_type: U32,
+                arg_types: &[U32, U32, F32x2],
+            },
+            Opcode::StorageAtomicMinF16x2 => OpcodeMeta {
+                name: "StorageAtomicMinF16x2",
+                return_type: U32,
+                arg_types: &[U32, U32, F16x2],
+            },
+            Opcode::StorageAtomicMinF32x2 => OpcodeMeta {
+                name: "StorageAtomicMinF32x2",
+                return_type: U32,
+                arg_types: &[U32, U32, F32x2],
+            },
+            Opcode::StorageAtomicMaxF16x2 => OpcodeMeta {
+                name: "StorageAtomicMaxF16x2",
+                return_type: U32,
+                arg_types: &[U32, U32, F16x2],
+            },
+            Opcode::StorageAtomicMaxF32x2 => OpcodeMeta {
+                name: "StorageAtomicMaxF32x2",
+                return_type: U32,
+                arg_types: &[U32, U32, F32x2],
             },
 
             // Atomic shared
@@ -2842,6 +3280,16 @@ impl Opcode {
                 return_type: U32,
                 arg_types: &[U32, U32],
             },
+            Opcode::SharedAtomicInc32 => OpcodeMeta {
+                name: "SharedAtomicInc32",
+                return_type: U32,
+                arg_types: &[U32, U32],
+            },
+            Opcode::SharedAtomicDec32 => OpcodeMeta {
+                name: "SharedAtomicDec32",
+                return_type: U32,
+                arg_types: &[U32, U32],
+            },
             Opcode::SharedAtomicAnd32 => OpcodeMeta {
                 name: "SharedAtomicAnd32",
                 return_type: U32,
@@ -2862,6 +3310,16 @@ impl Opcode {
                 return_type: U32,
                 arg_types: &[U32, U32],
             },
+            Opcode::SharedAtomicExchange64 => OpcodeMeta {
+                name: "SharedAtomicExchange64",
+                return_type: U64,
+                arg_types: &[U32, U64],
+            },
+            Opcode::SharedAtomicExchange32x2 => OpcodeMeta {
+                name: "SharedAtomicExchange32x2",
+                return_type: U32x2,
+                arg_types: &[U32, U32x2],
+            },
 
             // Warp / Subgroup
             Opcode::VoteAll => OpcodeMeta {
@@ -2881,7 +3339,7 @@ impl Opcode {
             },
             Opcode::SubgroupBallot => OpcodeMeta {
                 name: "SubgroupBallot",
-                return_type: U32x4,
+                return_type: U32,
                 arg_types: &[U1],
             },
             Opcode::LaneId => OpcodeMeta {
@@ -2917,27 +3375,47 @@ impl Opcode {
             Opcode::ShuffleIndex => OpcodeMeta {
                 name: "ShuffleIndex",
                 return_type: U32,
-                arg_types: &[U32, U32, U32],
+                arg_types: &[U32, U32, U32, U32],
             },
             Opcode::ShuffleUp => OpcodeMeta {
                 name: "ShuffleUp",
                 return_type: U32,
-                arg_types: &[U32, U32, U32],
+                arg_types: &[U32, U32, U32, U32],
             },
             Opcode::ShuffleDown => OpcodeMeta {
                 name: "ShuffleDown",
                 return_type: U32,
-                arg_types: &[U32, U32, U32],
+                arg_types: &[U32, U32, U32, U32],
             },
             Opcode::ShuffleButterfly => OpcodeMeta {
                 name: "ShuffleButterfly",
                 return_type: U32,
-                arg_types: &[U32, U32, U32],
+                arg_types: &[U32, U32, U32, U32],
             },
             Opcode::FSwizzleAdd => OpcodeMeta {
                 name: "FSwizzleAdd",
                 return_type: F32,
                 arg_types: &[F32, F32, U32],
+            },
+            Opcode::DPdxFine => OpcodeMeta {
+                name: "DPdxFine",
+                return_type: F32,
+                arg_types: &[F32],
+            },
+            Opcode::DPdyFine => OpcodeMeta {
+                name: "DPdyFine",
+                return_type: F32,
+                arg_types: &[F32],
+            },
+            Opcode::DPdxCoarse => OpcodeMeta {
+                name: "DPdxCoarse",
+                return_type: F32,
+                arg_types: &[F32],
+            },
+            Opcode::DPdyCoarse => OpcodeMeta {
+                name: "DPdyCoarse",
+                return_type: F32,
+                arg_types: &[F32],
             },
 
             // Branch / control flow

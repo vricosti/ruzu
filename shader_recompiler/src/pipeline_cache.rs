@@ -1898,7 +1898,7 @@ mod tests {
     fn sched_control_skip_is_anchored_at_code_start() {
         // The sched grid is anchored at the start of the code slice
         // (`code[0]` is always a sched word), regardless of the code's
-        // `abs % 32 == 16` (verified by memory dump, 2026-07-09).
+        // absolute alignment.
         assert!(is_sched_control_word(0));
         assert!(!is_sched_control_word(1));
         assert!(!is_sched_control_word(2));
@@ -1906,6 +1906,8 @@ mod tests {
         assert!(is_sched_control_word(4));
         assert!(is_sched_control_word(8));
     }
+
+    const UNCONDITIONAL_EXIT: u64 = 0xE300_0000_0007_000F;
 
     struct DummyEnvironment {
         sph: ProgramHeader,
@@ -1920,8 +1922,12 @@ mod tests {
     }
 
     impl Environment for DummyEnvironment {
-        fn read_instruction(&mut self, _address: u32) -> u64 {
-            0
+        fn read_instruction(&mut self, address: u32) -> u64 {
+            match address {
+                // Location aligns past the sched word at byte offset zero.
+                8 => UNCONDITIONAL_EXIT,
+                _ => 0,
+            }
         }
 
         fn read_cbuf_value(&mut self, _cbuf_index: u32, _cbuf_offset: u32) -> u32 {
@@ -1999,8 +2005,9 @@ mod tests {
     #[test]
     fn translate_program_from_env_uses_environment_metadata() {
         let mut env = DummyEnvironment::compute();
+        let code = [0, UNCONDITIONAL_EXIT];
 
-        let program = translate_program_from_env(&[0, 0], 0, &mut env);
+        let program = translate_program_from_env(&code, 0, &mut env);
 
         assert_eq!(program.stage, ShaderStage::Compute);
         assert_eq!(program.local_memory_size, 0x240);

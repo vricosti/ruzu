@@ -39,6 +39,9 @@ pub fn optimize(program: &mut Program) {
 }
 
 pub fn optimize_with_host_info(program: &mut Program, host_info: &HostTranslateInfo) {
+    if !host_info.support_int64 {
+        lower_int64_to_int32::lower_int64_to_int32(program);
+    }
     ssa_rewrite_pass::ssa_rewrite_pass(program);
     verify_no_erased_refs_if_requested(program, "after_ssa_rewrite");
     identity_removal::identity_removal_pass(program);
@@ -75,6 +78,9 @@ pub fn optimize_with_bound_textures_and_host_info(
     texture_bound_buffer: u32,
     host_info: &HostTranslateInfo,
 ) {
+    if !host_info.support_int64 {
+        lower_int64_to_int32::lower_int64_to_int32(program);
+    }
     ssa_rewrite_pass::ssa_rewrite_pass(program);
     verify_no_erased_refs_if_requested(program, "after_ssa_rewrite");
     identity_removal::identity_removal_pass(program);
