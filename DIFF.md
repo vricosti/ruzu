@@ -26628,3 +26628,40 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   underflow regression.
 - A live Vulkan launch passed the formerly crashing macro and reached the
   animated title.
+
+## 2026-07-29 — ruzu_cmd/src/main.rs vs yuzu_cmd/yuzu.cpp
+
+### Intentional differences
+- Rust stores the disk-resource callback in an `Arc` because the rasterizer
+  interface requires a thread-safe owned callback; upstream passes the
+  equivalent `std::function` by const reference.
+- The Rust rasterizer interface does not yet expose upstream's
+  `std::stop_token` argument.
+- Rust retains the non-upstream `--renderer` option as an explicit per-run
+  override. Without that option, backend selection follows the configured
+  `RendererBackend` exactly like upstream.
+
+### Unintentional differences (fixed)
+- `ruzu-cmd` now passes the empty disk-resource progress callback used by
+  upstream after the rasterizer callback became mandatory. This restores the
+  command-line frontend build without moving GUI progress handling into SDL.
+- Removed the platform-specific hard-coded renderer default. It forced OpenGL
+  on Linux even when `Settings::values.renderer_backend` selected Vulkan,
+  unlike upstream's direct switch on the configured enum.
+
+### Missing items
+- Cancellation through the upstream disk-resource `std::stop_token` remains
+  absent from the Rust rasterizer interface.
+
+### Binary layout verification
+- N/A: frontend callback ownership only.
+
+### Verification
+- Re-read the disk-resource loading block in `yuzu_cmd/yuzu.cpp` and the
+  `RasterizerInterface::LoadDiskResources` declaration.
+- Re-read upstream's renderer window switch and `SdlConfig` initialization.
+- Both focused renderer-resolution tests pass, and
+  `cargo build --release --bin ruzu-cmd` succeeds.
+- A live STK launch without `--renderer` selected the configured Vulkan
+  backend and presented frames without the OpenGL texture-view errors seen
+  with the previous hard-coded Linux default.

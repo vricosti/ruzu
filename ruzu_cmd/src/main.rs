@@ -23,6 +23,7 @@
 //! | `-v` / `--version`   | handled by clap          |
 
 use clap::Parser;
+use common::settings_enums::RendererBackend;
 use sdl2::libc;
 use std::ffi::OsStr;
 
@@ -35,14 +36,66 @@ use emu_window::{
 };
 use sdl_config::SdlConfig;
 
-#[cfg(target_os = "macos")]
-fn default_renderer_backend() -> String {
-    "vulkan".to_string()
+fn resolve_renderer_backend(
+    renderer_override: Option<&str>,
+    configured_backend: RendererBackend,
+) -> &'static str {
+    let configured_name = match configured_backend {
+        RendererBackend::OpenGL => "opengl",
+        RendererBackend::Vulkan => "vulkan",
+        RendererBackend::Null => "null",
+    };
+
+    let Some(renderer_override) = renderer_override else {
+        return configured_name;
+    };
+
+    match renderer_override.to_lowercase().as_str() {
+        "opengl" | "gl" | "0" => "opengl",
+        "vulkan" | "vk" | "1" => "vulkan",
+        "null" | "2" => "null",
+        other => {
+            log::warn!(
+                "Unknown renderer '{}', using configured backend {}",
+                other,
+                configured_name
+            );
+            configured_name
+        }
+    }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn default_renderer_backend() -> String {
-    "opengl".to_string()
+#[cfg(test)]
+mod tests {
+    use super::{resolve_renderer_backend, RendererBackend};
+
+    #[test]
+    fn configured_renderer_is_used_without_cli_override() {
+        assert_eq!(
+            resolve_renderer_backend(None, RendererBackend::OpenGL),
+            "opengl"
+        );
+        assert_eq!(
+            resolve_renderer_backend(None, RendererBackend::Vulkan),
+            "vulkan"
+        );
+        assert_eq!(
+            resolve_renderer_backend(None, RendererBackend::Null),
+            "null"
+        );
+    }
+
+    #[test]
+    fn cli_renderer_overrides_configured_renderer() {
+        assert_eq!(
+            resolve_renderer_backend(Some("vulkan"), RendererBackend::OpenGL),
+            "vulkan"
+        );
+        assert_eq!(
+            resolve_renderer_backend(Some("GL"), RendererBackend::Vulkan),
+            "opengl"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -100,13 +153,8 @@ struct Args {
     /// Renderer backend: opengl, vulkan, or null.
     ///
     /// Not in upstream CLI — added for convenience while Settings is not fully ported.
-    #[arg(
-        short = 'r',
-        long = "renderer",
-        value_name = "BACKEND",
-        default_value_t = default_renderer_backend()
-    )]
-    renderer: String,
+    #[arg(short = 'r', long = "renderer", value_name = "BACKEND")]
+    renderer: Option<String>,
 
     /// Positional game path (alternative to --game).
     ///
@@ -757,20 +805,8 @@ fn main() {
 
     // Determine renderer backend.
     // Maps to C++ switch on `Settings::values.renderer_backend.GetValue()`.
-    // Once Settings is fully ported, this should read from config instead of CLI.
-    let renderer_backend = match args.renderer.to_lowercase().as_str() {
-        "opengl" | "gl" | "0" => "opengl",
-        "vulkan" | "vk" | "1" => "vulkan",
-        "null" | "2" => "null",
-        other => {
-            #[cfg(target_os = "macos")]
-            let fallback = "vulkan";
-            #[cfg(not(target_os = "macos"))]
-            let fallback = "opengl";
-            log::warn!("Unknown renderer '{}', defaulting to {}", other, fallback);
-            fallback
-        }
-    };
+    let configured_backend = *common::settings::values().renderer_backend.get_value();
+    let renderer_backend = resolve_renderer_backend(args.renderer.as_deref(), configured_backend);
     log::info!("Renderer backend: {}", renderer_backend);
 
     // -----------------------------------------------------------------------
@@ -1228,7 +1264,10 @@ fn main() {
                     let rasterizer = renderer.read_rasterizer();
                     unsafe {
                         if let Some(rasterizer) = rasterizer.as_mut() {
-                            rasterizer.load_disk_resources(system.runtime_program_id());
+                            rasterizer.load_disk_resources(
+                                system.runtime_program_id(),
+                                std::sync::Arc::new(|_, _, _| {}),
+                            );
                         }
                     }
                 }
