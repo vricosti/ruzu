@@ -46,10 +46,8 @@ pub fn page() -> Page {
 
     let time_zones = time_zone_labels();
     let time_zone_refs: Vec<&str> = time_zones.iter().map(String::as_str).collect();
-    let time_zone_index =
-        *common::settings::values().time_zone_index.get_value() as u32;
-    let (time_zone_row, time_zone) =
-        w::combo_row("Time Zone:", &time_zone_refs, time_zone_index);
+    let time_zone_index = *common::settings::values().time_zone_index.get_value() as u32;
+    let (time_zone_row, time_zone) = w::combo_row("Time Zone:", &time_zone_refs, time_zone_index);
     system.append(&time_zone_row);
 
     // Custom RTC: check box in the label column, entry in the control column,

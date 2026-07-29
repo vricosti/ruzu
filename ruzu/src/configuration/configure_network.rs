@@ -27,7 +27,10 @@ pub fn page() -> Page {
     entries.extend(available_network_interfaces());
     let entry_refs: Vec<&str> = entries.iter().map(String::as_str).collect();
 
-    let current = common::settings::values().network_interface.get_value().clone();
+    let current = common::settings::values()
+        .network_interface
+        .get_value()
+        .clone();
     let selected = entries
         .iter()
         .position(|name| *name == current)

@@ -151,7 +151,12 @@ impl SdlJoystick {
     /// timestamps and all-zero samples are dropped; after
     /// [`MOTION_ERROR_LIMIT`] consecutive zero samples the sensors are
     /// restarted, which is upstream's recovery for a pad that stops reporting.
-    pub fn update_motion(&mut self, sensor: sdl::SDL_SensorType, timestamp: u32, data: [f32; 3]) -> bool {
+    pub fn update_motion(
+        &mut self,
+        sensor: sdl::SDL_SensorType,
+        timestamp: u32,
+        data: [f32; 3],
+    ) -> bool {
         let time_difference = timestamp.wrapping_sub(self.last_motion_update);
         self.last_motion_update = timestamp;
 
@@ -403,20 +408,55 @@ mod tests {
                 1.0
             }
         };
-        assert_eq!(scale(100.0, LOW_START_SENSITIVITY_LIMIT, LOW_WIDTH_SENSITIVITY_LIMIT), 1.0);
-        assert!(scale(300.0, LOW_START_SENSITIVITY_LIMIT, LOW_WIDTH_SENSITIVITY_LIMIT) < 1.0);
+        assert_eq!(
+            scale(
+                100.0,
+                LOW_START_SENSITIVITY_LIMIT,
+                LOW_WIDTH_SENSITIVITY_LIMIT
+            ),
+            1.0
+        );
+        assert!(
+            scale(
+                300.0,
+                LOW_START_SENSITIVITY_LIMIT,
+                LOW_WIDTH_SENSITIVITY_LIMIT
+            ) < 1.0
+        );
         // Far past the limit it clamps rather than going negative.
-        assert_eq!(scale(9000.0, LOW_START_SENSITIVITY_LIMIT, LOW_WIDTH_SENSITIVITY_LIMIT), 0.3);
+        assert_eq!(
+            scale(
+                9000.0,
+                LOW_START_SENSITIVITY_LIMIT,
+                LOW_WIDTH_SENSITIVITY_LIMIT
+            ),
+            0.3
+        );
     }
 
     #[test]
     fn battery_level_maps_every_sdl_power_level() {
         use sdl::SDL_JoystickPowerLevel as P;
-        assert_eq!(SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_EMPTY), BatteryLevel::Empty);
-        assert_eq!(SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_LOW), BatteryLevel::Critical);
-        assert_eq!(SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_MEDIUM), BatteryLevel::Low);
-        assert_eq!(SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_FULL), BatteryLevel::Full);
+        assert_eq!(
+            SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_EMPTY),
+            BatteryLevel::Empty
+        );
+        assert_eq!(
+            SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_LOW),
+            BatteryLevel::Critical
+        );
+        assert_eq!(
+            SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_MEDIUM),
+            BatteryLevel::Low
+        );
+        assert_eq!(
+            SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_FULL),
+            BatteryLevel::Full
+        );
         // A wired pad reports UNKNOWN/WIRED; upstream treats both as charging.
-        assert_eq!(SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_WIRED), BatteryLevel::Charging);
+        assert_eq!(
+            SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_WIRED),
+            BatteryLevel::Charging
+        );
     }
 }

@@ -1599,6 +1599,7 @@ dependencies = [
  "frontend_common",
  "gdk4-x11",
  "gtk4",
+ "hid_core",
  "input_common",
  "log",
  "objc",

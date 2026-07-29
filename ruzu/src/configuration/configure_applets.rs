@@ -31,7 +31,9 @@ type Field = fn(&mut Values) -> &mut common::settings_common::Setting<AppletMode
 
 const APPLETS: &[(&str, Field)] = &[
     ("Amiibo editor", |v| &mut v.cabinet_applet_mode),
-    ("Controller configuration", |v| &mut v.controller_applet_mode),
+    ("Controller configuration", |v| {
+        &mut v.controller_applet_mode
+    }),
     ("Error", |v| &mut v.error_applet_mode),
     ("Player select", |v| &mut v.player_select_applet_mode),
     ("Software keyboard", |v| &mut v.swkbd_applet_mode),

@@ -45,6 +45,9 @@ const DEFAULT_HEIGHT: i32 = 720;
 /// Window title. Upstream uses "yuzu"; adapted to the ruzu app name.
 const WINDOW_TITLE: &str = "ruzu";
 
+/// Upstream `default_input_update_timeout`, the interval of `update_input_timer`.
+const INPUT_UPDATE_TIMEOUT_MS: u64 = 1;
+
 /// The main launcher window.
 ///
 /// Upstream `GMainWindow` derives from `QMainWindow`; here we wrap a
@@ -81,6 +84,10 @@ pub struct GMainWindow {
     /// engine in the process-wide factory registry that the emulated HID
     /// resolves bindings through, and `Shutdown` unregisters them.
     input_subsystem: Rc<RefCell<input_common::InputSubsystem>>,
+    /// The single HID core shared by configuration and the emulation System.
+    ///
+    /// Upstream owner: `Core::System::Impl::hid_core`.
+    hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
 }
 
 /// Handles needed to resize the embedded render surface on window resize.
@@ -185,13 +192,16 @@ impl GMainWindow {
             configure_dialog: RefCell::new(None),
             game_list: RefCell::new(None),
             input_subsystem: Rc::new(RefCell::new(input_common::InputSubsystem::new())),
+            hid_core: Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new())),
         });
 
         // Upstream calls `input_subsystem->Initialize()` from the
         // `GRenderWindow` constructor. Do it once here, before any boot, so the
         // engines are registered when the guest starts reading its controllers.
         this.input_subsystem.borrow_mut().initialize();
+        this.hid_core.lock().reload_input_devices();
         this.install_input_handlers();
+        this.start_input_driver_updates();
 
         // Game list page: activating a row boots that game in-process.
         let (game_list, game_list_handle) = crate::game_list::build(glib::clone!(
@@ -387,9 +397,9 @@ impl GMainWindow {
         }
 
         // The controller-binding path.
-        // The raw GDK keyval — the key space ruzu records when binding, the
-        // way upstream records Qt key codes.
-        let code = gtk::glib::translate::IntoGlib::into_glib(keyval) as i32;
+        // Normalize letters so a Shift modifier does not change the binding's
+        // key code while it is held, matching Qt's key-event space upstream.
+        let code = gtk::glib::translate::IntoGlib::into_glib(keyval.to_lower()) as i32;
         if pressed {
             keyboard.press_key(code);
         } else {
@@ -538,9 +548,8 @@ impl GMainWindow {
             }
         }
 
-        let keys_dir = common::fs::path_util::get_ruzu_path(
-            common::fs::path_util::RuzuPath::KeysDir,
-        );
+        let keys_dir =
+            common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::KeysDir);
         if let Err(e) = std::fs::create_dir_all(&keys_dir) {
             log::error!("Could not create keys dir {}: {e}", keys_dir.display());
             self.alert(
@@ -668,10 +677,9 @@ impl GMainWindow {
         }
 
         // Locate and erase the content of nand/system/Contents/registered.
-        let registered = common::fs::path_util::get_ruzu_path(
-            common::fs::path_util::RuzuPath::NANDDir,
-        )
-        .join("system/Contents/registered");
+        let registered =
+            common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::NANDDir)
+                .join("system/Contents/registered");
 
         if registered.exists() {
             if let Err(e) = std::fs::remove_dir_all(&registered) {
@@ -698,7 +706,9 @@ impl GMainWindow {
 
         let progress = ProgressWindow::new(&self.window, "Installing Firmware...");
         for (index, nca) in ncas.iter().enumerate() {
-            let Some(name) = nca.file_name() else { continue };
+            let Some(name) = nca.file_name() else {
+                continue;
+            };
             if let Err(e) = std::fs::copy(nca, registered.join(name)) {
                 log::error!(
                     "Failed to copy firmware file {} into the registered folder: {e}",
@@ -795,7 +805,15 @@ impl GMainWindow {
         let dialog = crate::configuration::ConfigureDialog::new(
             Some(&self.window),
             Rc::clone(&self.input_subsystem),
+            Arc::clone(&self.hid_core),
         );
+        dialog.connect_closed(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move || {
+                this.configure_dialog.borrow_mut().take();
+            }
+        ));
         dialog.present();
         *self.configure_dialog.borrow_mut() = Some(dialog);
     }
@@ -987,6 +1005,7 @@ impl GMainWindow {
             drawable_size,
             shown_state,
             framebuffer_layout,
+            Arc::clone(&self.hid_core),
             filepath,
             progress,
         );
@@ -1041,13 +1060,17 @@ impl GMainWindow {
             )
         });
 
-        let Some(embedded) = render::attach_render_window(
-            self.window.upcast_ref::<gtk::Window>(),
-            render_rect,
-        ) else {
+        let Some(embedded) =
+            render::attach_render_window(self.window.upcast_ref::<gtk::Window>(), render_rect)
+        else {
             log::error!(
                 "Cannot boot: failed to embed an X11 render surface. \
                  Native Wayland is not supported yet — relaunch with GDK_BACKEND=x11."
+            );
+            self.alert(
+                "Unable to start the game",
+                "ruzu could not create its embedded X11 render surface. \
+                 Ensure XWayland is available and restart the application.",
             );
             return;
         };
@@ -1109,6 +1132,7 @@ impl GMainWindow {
             drawable_size,
             shown_state,
             framebuffer_layout,
+            Arc::clone(&self.hid_core),
             filepath,
             progress,
         );
@@ -1223,6 +1247,23 @@ impl GMainWindow {
                 glib::ControlFlow::Continue
             }
         });
+    }
+
+    /// Upstream `GMainWindow::UpdateInputDrivers`, driven by `update_input_timer`.
+    ///
+    /// Nothing else pumps the input engines: the SDL driver installs an event
+    /// watch but SDL only dispatches to it while somebody pumps its queue, so
+    /// without this timer no button press or stick movement ever reaches the
+    /// engines. Upstream's interval is `default_input_update_timeout = 1` ms.
+    fn start_input_driver_updates(self: &Rc<Self>) {
+        let input_subsystem = Rc::clone(&self.input_subsystem);
+        glib::timeout_add_local(
+            std::time::Duration::from_millis(INPUT_UPDATE_TIMEOUT_MS),
+            move || {
+                input_subsystem.borrow_mut().pump_events();
+                glib::ControlFlow::Continue
+            },
+        );
     }
 
     /// Show the window. Mirrors upstream `main_window.show()`.
@@ -1540,7 +1581,10 @@ pub fn update_ui_theme() {
     };
 
     settings.set_gtk_application_prefer_dark_theme(dark);
-    log::debug!("UI theme '{internal}' resolved to {} mode", if dark { "dark" } else { "light" });
+    log::debug!(
+        "UI theme '{internal}' resolved to {} mode",
+        if dark { "dark" } else { "light" }
+    );
 }
 
 /// Install the black backdrop CSS for the render page once.

@@ -9,8 +9,8 @@
 use std::sync::{Arc, Mutex};
 
 use common::input::{
-    self, AnalogProperties, BasicInputDevice, ButtonStatus, CallbackStatus, InputCallback,
-    InputDevice, InputType, TouchStatus,
+    self, AnalogProperties, ButtonStatus, CallbackStatus, InputCallback, InputDevice, InputType,
+    TouchStatus,
 };
 use common::param_package::ParamPackage;
 
@@ -31,20 +31,26 @@ const TOUCH_PROPERTIES: AnalogProperties = AnalogProperties {
 /// Converts button presses into touch events at the specified (x, y) screen position.
 struct TouchFromButtonDevice {
     button: Box<dyn InputDevice>,
-    last_button_value: Mutex<bool>,
-    x: f32,
-    y: f32,
-    callback: Mutex<InputCallback>,
+    state: Arc<Mutex<TouchState>>,
 }
 
-impl TouchFromButtonDevice {
-    fn new(button: Box<dyn InputDevice>, x: f32, y: f32) -> Self {
+type ChangeCallback = Arc<dyn Fn(&CallbackStatus) + Send + Sync>;
+type PendingChange = Option<(ChangeCallback, CallbackStatus)>;
+
+struct TouchState {
+    last_button_value: bool,
+    x: f32,
+    y: f32,
+    callback: InputCallback,
+}
+
+impl TouchState {
+    fn new(x: f32, y: f32) -> Self {
         Self {
-            button,
-            last_button_value: Mutex::new(false),
+            last_button_value: false,
             x,
             y,
-            callback: Mutex::new(InputCallback { on_change: None }),
+            callback: InputCallback { on_change: None },
         }
     }
 
@@ -70,6 +76,42 @@ impl TouchFromButtonDevice {
         status.y.raw_value = self.y;
         status
     }
+
+    fn update_button_status(&mut self, callback: &CallbackStatus) -> PendingChange {
+        let pressed = callback.button_status.value;
+        let status = CallbackStatus {
+            input_type: InputType::Touch,
+            touch_status: self.get_status(pressed),
+            ..Default::default()
+        };
+        if self.last_button_value == pressed {
+            return None;
+        }
+        self.last_button_value = pressed;
+        self.callback
+            .on_change
+            .as_ref()
+            .map(|consumer| (Arc::clone(consumer), status))
+    }
+}
+
+impl TouchFromButtonDevice {
+    fn new(mut button: Box<dyn InputDevice>, x: f32, y: f32) -> Self {
+        let state = Arc::new(Mutex::new(TouchState::new(x, y)));
+        {
+            let state = Arc::clone(&state);
+            button.set_callback(InputCallback {
+                on_change: Some(Arc::new(move |callback| {
+                    let change = state.lock().unwrap().update_button_status(callback);
+                    if let Some((consumer, status)) = change {
+                        consumer(&status);
+                    }
+                })),
+            });
+        }
+        button.force_update();
+        Self { button, state }
+    }
 }
 
 impl InputDevice for TouchFromButtonDevice {
@@ -78,13 +120,13 @@ impl InputDevice for TouchFromButtonDevice {
     }
 
     fn set_callback(&mut self, callback: InputCallback) {
-        *self.callback.lock().unwrap() = callback;
+        self.state.lock().unwrap().callback = callback;
     }
 
     fn trigger_on_change(&self, status: &CallbackStatus) {
-        let cb = self.callback.lock().unwrap();
-        if let Some(ref on_change) = cb.on_change {
-            on_change(status);
+        let callback = self.state.lock().unwrap().callback.on_change.clone();
+        if let Some(callback) = callback {
+            callback(status);
         }
     }
 }
@@ -124,5 +166,11 @@ impl TouchFromButton {
 impl Default for TouchFromButton {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl common::input::InputDeviceFactory for TouchFromButton {
+    fn create(&self, params: &ParamPackage) -> Box<dyn InputDevice> {
+        TouchFromButton::create(self, params)
     }
 }

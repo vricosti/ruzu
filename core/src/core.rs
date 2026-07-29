@@ -29,6 +29,7 @@ use crate::hle::service::server_manager::ServerManager;
 use crate::hle::service::sm::sm::ServiceManager;
 use crate::memory::memory::Memory;
 use crate::perf_stats::{PerfStats, PerfStatsResults, SpeedLimiter};
+use hid_core::hid_core::HIDCore;
 
 use crate::hle::kernel::k_process::ProcessLock;
 use parking_lot::Mutex;
@@ -898,6 +899,12 @@ pub struct System {
     /// The CPU manager (thread dispatch).
     pub cpu_manager: CpuManager,
 
+    /// Shared HID core.
+    ///
+    /// Upstream owner: `System::Impl::hid_core`. The `Arc<Mutex<_>>` lets the
+    /// frontend hold the same object while the HID service thread updates it.
+    hid_core: Arc<Mutex<HIDCore>>,
+
     /// The kernel core (schedulers, physical cores, kernel objects).
     kernel: Option<KernelCore>,
 
@@ -1064,9 +1071,18 @@ pub struct System {
 impl System {
     /// Creates a new System instance.
     pub fn new() -> Self {
+        Self::new_with_hid_core(Arc::new(Mutex::new(HIDCore::new())))
+    }
+
+    /// Creates a System around a frontend-owned handle to the same HID core.
+    ///
+    /// This preserves upstream's single `System::Impl::hid_core` object while
+    /// adapting the frontend/service references to Rust shared ownership.
+    pub fn new_with_hid_core(hid_core: Arc<Mutex<HIDCore>>) -> Self {
         Self {
             core_timing: Arc::new(CoreTiming::new()),
             cpu_manager: CpuManager::new(),
+            hid_core,
             kernel: None,
             telemetry_session: None,
             host1x_core: None,
@@ -1114,6 +1130,13 @@ impl System {
             runtime_program_id: 0,
             runtime_is_64bit: false,
         }
+    }
+
+    /// Gets the HID interface.
+    ///
+    /// Upstream: `HID::HIDCore& System::HIDCore()`.
+    pub fn hid_core(&self) -> Arc<Mutex<HIDCore>> {
+        Arc::clone(&self.hid_core)
     }
 
     /// Initializes the system.

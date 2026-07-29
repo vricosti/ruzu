@@ -59,7 +59,10 @@ pub const ASTC_DECODE_MODE: &[(AstcDecodeMode, &str)] = &[
 ];
 
 pub const ASTC_RECOMPRESSION: &[(AstcRecompression, &str)] = &[
-    (AstcRecompression::Uncompressed, "Uncompressed (Best quality)"),
+    (
+        AstcRecompression::Uncompressed,
+        "Uncompressed (Best quality)",
+    ),
     (AstcRecompression::Bc1, "BC1 (Low quality)"),
     (AstcRecompression::Bc3, "BC3 (Medium quality)"),
 ];
@@ -77,7 +80,10 @@ pub const RENDERER_BACKEND: &[(RendererBackend, &str)] = &[
 
 pub const SHADER_BACKEND: &[(ShaderBackend, &str)] = &[
     (ShaderBackend::Glsl, "GLSL"),
-    (ShaderBackend::Glasm, "GLASM (Assembly Shaders, NVIDIA Only)"),
+    (
+        ShaderBackend::Glasm,
+        "GLASM (Assembly Shaders, NVIDIA Only)",
+    ),
     (ShaderBackend::SpirV, "SPIR-V (Experimental, AMD/Mesa Only)"),
 ];
 
@@ -91,17 +97,18 @@ pub const CPU_ACCURACY: &[(CpuAccuracy, &str)] = &[
     (CpuAccuracy::Auto, "Auto"),
     (CpuAccuracy::Accurate, "Accurate"),
     (CpuAccuracy::Unsafe, "Unsafe"),
-    (CpuAccuracy::Paranoid, "Paranoid (disables most optimizations)"),
+    (
+        CpuAccuracy::Paranoid,
+        "Paranoid (disables most optimizations)",
+    ),
 ];
 
 /// Upstream's `configure_cpu.ui` only shows the "Backend:" row on targets where
 /// NCE exists (ARM64 hosts), so the x86-64 dialog never renders it — but the
 /// table is part of `ComboboxEnumeration` upstream, so it is kept here too.
 #[allow(dead_code)]
-pub const CPU_BACKEND: &[(CpuBackend, &str)] = &[
-    (CpuBackend::Dynarmic, "Dynarmic"),
-    (CpuBackend::Nce, "NCE"),
-];
+pub const CPU_BACKEND: &[(CpuBackend, &str)] =
+    &[(CpuBackend::Dynarmic, "Dynarmic"), (CpuBackend::Nce, "NCE")];
 
 pub const FULLSCREEN_MODE: &[(FullscreenMode, &str)] = &[
     (FullscreenMode::Borderless, "Borderless Windowed"),
@@ -118,7 +125,10 @@ pub const RESOLUTION_SETUP: &[(ResolutionSetup, &str)] = &[
     (ResolutionSetup::Res1_2X, "0.5X (360p/540p) [EXPERIMENTAL]"),
     (ResolutionSetup::Res3_4X, "0.75X (540p/810p) [EXPERIMENTAL]"),
     (ResolutionSetup::Res1X, "1X (720p/1080p)"),
-    (ResolutionSetup::Res3_2X, "1.5X (1080p/1620p) [EXPERIMENTAL]"),
+    (
+        ResolutionSetup::Res3_2X,
+        "1.5X (1080p/1620p) [EXPERIMENTAL]",
+    ),
     (ResolutionSetup::Res2X, "2X (1440p/2160p)"),
     (ResolutionSetup::Res3X, "3X (2160p/3240p)"),
     (ResolutionSetup::Res4X, "4X (2880p/4320p)"),
@@ -177,7 +187,10 @@ pub const LANGUAGE: &[(Language, &str)] = &[
     (Language::FrenchCanadian, "Canadian French"),
     (Language::SpanishLatin, "Latin American Spanish"),
     (Language::ChineseSimplified, "Simplified Chinese"),
-    (Language::ChineseTraditional, "Traditional Chinese (正體中文)"),
+    (
+        Language::ChineseTraditional,
+        "Traditional Chinese (正體中文)",
+    ),
     (
         Language::PortugueseBrazilian,
         "Brazilian Portuguese (português do Brasil)",
@@ -213,7 +226,10 @@ pub const CONSOLE_MODE: &[(ConsoleMode, &str)] = &[
 
 pub const CONFIRM_STOP: &[(ConfirmStop, &str)] = &[
     (ConfirmStop::AskAlways, "Always ask (Default)"),
-    (ConfirmStop::AskBasedOnGame, "Only if game specifies not to stop"),
+    (
+        ConfirmStop::AskBasedOnGame,
+        "Only if game specifies not to stop",
+    ),
     (ConfirmStop::AskNever, "Never ask"),
 ];
 

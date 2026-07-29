@@ -8,7 +8,11 @@ fn main() {
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     for (index, device) in subsystem.get_input_devices().iter().enumerate() {
-        println!("[{index}] display={:?} engine={:?}", device.get_str("display", "?"), device.get_str("engine", "?"));
+        println!(
+            "[{index}] display={:?} engine={:?}",
+            device.get_str("display", "?"),
+            device.get_str("engine", "?")
+        );
         let buttons = subsystem.get_button_mapping_for_device(device);
         let analogs = subsystem.get_analog_mapping_for_device(device);
         let motions = subsystem.get_motion_mapping_for_device(device);

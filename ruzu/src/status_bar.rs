@@ -232,15 +232,16 @@ impl StatusBar {
         set_checked(&self.dock, console_mode == ConsoleMode::Docked);
 
         // `UpdateFilterText`: FSR gets a short label of its own.
-        self.filter.set_label(match *values.scaling_filter.get_value() {
-            ScalingFilter::NearestNeighbor => "NEAREST",
-            ScalingFilter::Bilinear => "BILINEAR",
-            ScalingFilter::Bicubic => "BICUBIC",
-            ScalingFilter::Gaussian => "GAUSSIAN",
-            ScalingFilter::ScaleForce => "SCALEFORCE",
-            ScalingFilter::Fsr => "FSR",
-            ScalingFilter::MaxEnum => "BILINEAR",
-        });
+        self.filter
+            .set_label(match *values.scaling_filter.get_value() {
+                ScalingFilter::NearestNeighbor => "NEAREST",
+                ScalingFilter::Bilinear => "BILINEAR",
+                ScalingFilter::Bicubic => "BICUBIC",
+                ScalingFilter::Gaussian => "GAUSSIAN",
+                ScalingFilter::ScaleForce => "SCALEFORCE",
+                ScalingFilter::Fsr => "FSR",
+                ScalingFilter::MaxEnum => "BILINEAR",
+            });
         // Upstream keeps the filter button permanently checked.
         set_checked(&self.filter, true);
 

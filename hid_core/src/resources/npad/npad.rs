@@ -10,7 +10,7 @@ use common::ResultCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::frontend::emulated_controller::get_simple_npad_button_state;
+use crate::frontend::emulated_controller::{get_simple_npad_button_state, AnalogSticks};
 use crate::hid_core::{HIDCore, AVAILABLE_CONTROLLERS};
 use crate::hid_result;
 use crate::hid_types::*;
@@ -296,12 +296,13 @@ impl NPad {
                             entry_index,
                             controller.get_npad_id_type(),
                             controller.get_npad_style_index(false),
-                            controller.is_connected(),
+                            controller.is_connected(false),
                             {
                                 let mut buttons = controller.get_npad_buttons();
                                 buttons.raw |= get_simple_npad_button_state().raw;
                                 buttons
                             },
+                            controller.get_sticks(),
                         )
                     })
                     .collect()
@@ -312,6 +313,7 @@ impl NPad {
                     NpadStyleIndex::Fullkey,
                     true,
                     get_simple_npad_button_state(),
+                    AnalogSticks::default(),
                 )]
             };
 
@@ -319,7 +321,7 @@ impl NPad {
             // lacks the per-aruid controller_data storage, but the runtime path
             // now consumes HIDCore's EmulatedController state instead of inventing
             // a local Player1 controller.
-            for (entry_index, npad_id, controller_type, is_connected, button_state) in
+            for (entry_index, npad_id, controller_type, is_connected, button_state, stick_state) in
                 controller_states
             {
                 let npad = &mut shared.npad.npad_entry[entry_index].internal_state;
@@ -360,6 +362,8 @@ impl NPad {
                 let mut pad_state = NPadGenericState::default();
                 pad_state.connection_status.raw = 0x3;
                 pad_state.npad_buttons = button_state;
+                pad_state.l_stick = stick_state.left;
+                pad_state.r_stick = stick_state.right;
                 pad_state.sampling_number = prev_sampling + 1;
                 if trace_npad_state_env_enabled() && !pad_state.npad_buttons.raw.is_empty() {
                     log::info!(
@@ -394,6 +398,8 @@ impl NPad {
                 let mut libnx_state = NPadGenericState::default();
                 libnx_state.connection_status.raw = 0x3;
                 libnx_state.npad_buttons = pad_state.npad_buttons;
+                libnx_state.l_stick = pad_state.l_stick;
+                libnx_state.r_stick = pad_state.r_stick;
                 libnx_state.sampling_number = prev_ext + 1;
                 npad.system_ext_lifo.write_next_entry(libnx_state);
 
@@ -842,9 +848,16 @@ mod tests {
     use std::any::Any;
     use std::sync::Arc;
 
+    use common::input::{
+        register_input_factory, unregister_input_factory, AnalogStatus, CallbackStatus,
+        InputCallback, InputDevice, InputDeviceFactory, InputType, StickStatus,
+    };
+    use common::param_package::ParamPackage;
+    use common::settings_input::native_analog;
     use parking_lot::Mutex;
 
     use super::NPad;
+    use crate::frontend::emulated_controller::HID_JOYSTICK_MAX;
     use crate::hid_core::HIDCore;
     use crate::hid_types::{NpadIdType, NpadStyleIndex, NpadStyleSet};
     use crate::resources::applet_resource::{AppletResource, AppletResourceHolder};
@@ -859,6 +872,54 @@ mod tests {
             let ptr = bytes.as_mut_ptr();
             let keepalive: Arc<dyn Any + Send + Sync> = Arc::new(bytes);
             Some((ptr, keepalive))
+        }
+    }
+
+    struct TestStickDevice {
+        callback: InputCallback,
+        x: f32,
+        y: f32,
+    }
+
+    impl InputDevice for TestStickDevice {
+        fn force_update(&mut self) {
+            self.trigger_on_change(&CallbackStatus {
+                input_type: InputType::Stick,
+                stick_status: StickStatus {
+                    x: AnalogStatus {
+                        raw_value: self.x,
+                        ..Default::default()
+                    },
+                    y: AnalogStatus {
+                        raw_value: self.y,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+
+        fn set_callback(&mut self, callback: InputCallback) {
+            self.callback = callback;
+        }
+
+        fn trigger_on_change(&self, status: &CallbackStatus) {
+            if let Some(on_change) = &self.callback.on_change {
+                on_change(status);
+            }
+        }
+    }
+
+    struct TestStickFactory;
+
+    impl InputDeviceFactory for TestStickFactory {
+        fn create(&self, params: &ParamPackage) -> Box<dyn InputDevice> {
+            Box::new(TestStickDevice {
+                callback: InputCallback { on_change: None },
+                x: params.get_float("test_x", 0.0),
+                y: params.get_float("test_y", 0.0),
+            })
         }
     }
 
@@ -967,6 +1028,79 @@ mod tests {
             .style_tag
             .raw
             .contains(NpadStyleSet::FULLKEY));
+    }
+
+    #[test]
+    fn on_update_writes_controller_sticks_to_fullkey_and_system_ext_lifos() {
+        const ARUID: u64 = 0x51;
+        const ENGINE: &str = "npad_test_stick";
+
+        register_input_factory(ENGINE, Arc::new(TestStickFactory));
+
+        let mut left_stick = ParamPackage::default();
+        left_stick.set_str("engine", ENGINE.to_string());
+        left_stick.set_float("test_x", 0.75);
+        left_stick.set_float("test_y", -0.25);
+
+        let mut right_stick = ParamPackage::default();
+        right_stick.set_str("engine", ENGINE.to_string());
+        right_stick.set_float("test_x", -0.5);
+        right_stick.set_float("test_y", 0.5);
+
+        let hid_core = Arc::new(Mutex::new(HIDCore::new()));
+        {
+            let mut hid_core = hid_core.lock();
+            let controller = hid_core.get_emulated_controller_mut(NpadIdType::Player1);
+            controller.set_stick_param(native_analog::Values::LStick as usize, left_stick);
+            controller.set_stick_param(native_analog::Values::RStick as usize, right_stick);
+            controller.set_npad_style_index(NpadStyleIndex::Fullkey);
+            controller.connect(false);
+        }
+
+        let mut applet_resource = AppletResource::new();
+        applet_resource.set_shared_memory_backing(Arc::new(TestSharedMemoryBacking));
+        assert!(applet_resource
+            .register_applet_resource_user_id(ARUID, true)
+            .is_success());
+        assert!(applet_resource.create_applet_resource(ARUID).is_success());
+        let applet_resource = Arc::new(Mutex::new(applet_resource));
+
+        let mut npad = NPad::new_with_hid_core(hid_core);
+        npad.set_npad_externals(AppletResourceHolder {
+            applet_resource: Some(Arc::clone(&applet_resource)),
+            handheld_config: None,
+        });
+        assert!(npad.register_applet_resource_user_id(ARUID).is_success());
+        assert!(npad.activate_npad_resource_with_aruid(ARUID).is_success());
+        assert!(npad
+            .set_supported_npad_style_set(ARUID, NpadStyleSet::FULLKEY)
+            .is_success());
+        assert!(npad.activate().is_success());
+        assert!(npad.activate_for_aruid(ARUID).is_success());
+
+        npad.on_update();
+
+        let resource = applet_resource.lock();
+        let npad_state = &resource
+            .get_shared_memory_format(ARUID)
+            .unwrap()
+            .npad
+            .npad_entry[0]
+            .internal_state;
+        let fullkey = npad_state.fullkey_lifo.read_current_entry().state;
+        let system_ext = npad_state.system_ext_lifo.read_current_entry().state;
+
+        assert_eq!(fullkey.l_stick.x, (0.75 * HID_JOYSTICK_MAX as f32) as i32);
+        assert_eq!(fullkey.l_stick.y, (-0.25 * HID_JOYSTICK_MAX as f32) as i32);
+        assert_eq!(fullkey.r_stick.x, (-0.5 * HID_JOYSTICK_MAX as f32) as i32);
+        assert_eq!(fullkey.r_stick.y, (0.5 * HID_JOYSTICK_MAX as f32) as i32);
+        assert_eq!(system_ext.l_stick.x, fullkey.l_stick.x);
+        assert_eq!(system_ext.l_stick.y, fullkey.l_stick.y);
+        assert_eq!(system_ext.r_stick.x, fullkey.r_stick.x);
+        assert_eq!(system_ext.r_stick.y, fullkey.r_stick.y);
+
+        drop(resource);
+        unregister_input_factory(ENGINE);
     }
 
     #[test]

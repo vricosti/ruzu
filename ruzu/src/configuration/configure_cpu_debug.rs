@@ -21,8 +21,7 @@ use super::shared_widget as w;
 /// Accessor for a plain `Setting<bool>` optimization flag.
 type BoolField = fn(&mut Values) -> &mut common::settings_common::Setting<bool>;
 /// Accessor for a per-game overridable optimization flag.
-type SwitchableField =
-    fn(&mut Values) -> &mut common::settings_common::SwitchableSetting<bool>;
+type SwitchableField = fn(&mut Values) -> &mut common::settings_common::SwitchableSetting<bool>;
 
 /// The optimization toggles, in `configure_cpu_debug.ui` order.
 const BOOL_OPTIONS: &[(&str, BoolField)] = &[
@@ -47,9 +46,10 @@ const BOOL_OPTIONS: &[(&str, BoolField)] = &[
 /// The two host-MMU toggles are `SwitchableSetting`s upstream, because they can
 /// be overridden per game.
 const SWITCHABLE_OPTIONS: &[(&str, SwitchableField)] = &[
-    ("Enable Host MMU Emulation (general memory instructions)", |v| {
-        &mut v.cpuopt_fastmem
-    }),
+    (
+        "Enable Host MMU Emulation (general memory instructions)",
+        |v| &mut v.cpuopt_fastmem,
+    ),
     (
         "Enable Host MMU Emulation (exclusive memory instructions)",
         |v| &mut v.cpuopt_fastmem_exclusives,
@@ -58,9 +58,10 @@ const SWITCHABLE_OPTIONS: &[(&str, SwitchableField)] = &[
 
 /// Trailing plain-`Setting<bool>` rows, after the switchable pair.
 const TRAILING_BOOL_OPTIONS: &[(&str, BoolField)] = &[
-    ("Enable recompilation of exclusive memory instructions", |v| {
-        &mut v.cpuopt_recompile_exclusives
-    }),
+    (
+        "Enable recompilation of exclusive memory instructions",
+        |v| &mut v.cpuopt_recompile_exclusives,
+    ),
     ("Enable fallbacks for invalid memory accesses", |v| {
         &mut v.cpuopt_ignore_memory_aborts
     }),

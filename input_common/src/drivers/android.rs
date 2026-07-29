@@ -74,14 +74,16 @@ impl Android {
     /// Port of Android::SetButtonState
     pub fn set_button_state(&mut self, guid: &str, port: usize, button_id: i32, value: bool) {
         let identifier = self.get_identifier(guid, port);
-        self.engine.set_button(&identifier, button_id, value);
+        self.engine
+            .set_button(&identifier, button_id, value)
+            .dispatch();
     }
 
     /// Sets the status of an axis on a specific controller.
     /// Port of Android::SetAxisPosition
     pub fn set_axis_position(&mut self, guid: &str, port: usize, axis_id: i32, value: f32) {
         let identifier = self.get_identifier(guid, port);
-        self.engine.set_axis(&identifier, axis_id, value);
+        self.engine.set_axis(&identifier, axis_id, value).dispatch();
     }
 
     /// Sets the status of the motion sensor on a specific controller.
@@ -108,7 +110,9 @@ impl Android {
             accel_z,
             delta_timestamp,
         };
-        self.engine.set_motion(&identifier, 0, &motion_data);
+        self.engine
+            .set_motion(&identifier, 0, &motion_data)
+            .dispatch();
     }
 
     /// Port of Android::SetVibration (override)

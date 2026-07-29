@@ -151,17 +151,24 @@ impl Mouse {
                 * DEFAULT_STICK_SENSITIVITY;
             let y_sensitivity = *settings.mouse_panning_y_sensitivity.get_value() as f32
                 * DEFAULT_STICK_SENSITIVITY;
-            let mut engine = self.engine.lock();
-            engine.set_axis(
-                &identifier(),
-                MOUSE_AXIS_X,
-                mouse_move.0 as f32 * x_sensitivity,
-            );
-            engine.set_axis(
-                &identifier(),
-                MOUSE_AXIS_Y,
-                -(mouse_move.1 as f32) * y_sensitivity,
-            );
+            let pending = {
+                let mut engine = self.engine.lock();
+                vec![
+                    engine.set_axis(
+                        &identifier(),
+                        MOUSE_AXIS_X,
+                        mouse_move.0 as f32 * x_sensitivity,
+                    ),
+                    engine.set_axis(
+                        &identifier(),
+                        MOUSE_AXIS_Y,
+                        -(mouse_move.1 as f32) * y_sensitivity,
+                    ),
+                ]
+            };
+            for callbacks in pending {
+                callbacks.dispatch();
+            }
             self.last_motion_change.0 = -(mouse_move.1 as f32) * x_sensitivity;
             self.last_motion_change.1 = -(mouse_move.0 as f32) * y_sensitivity;
         }
@@ -171,25 +178,40 @@ impl Mouse {
     /// Port of Mouse::MouseMove
     pub fn mouse_move(&mut self, touch_x: f32, touch_y: f32) {
         let id = real_mouse_identifier();
-        let mut engine = self.engine.lock();
-        engine.set_axis(&id, MOUSE_AXIS_X, touch_x);
-        engine.set_axis(&id, MOUSE_AXIS_Y, touch_y);
+        let pending = {
+            let mut engine = self.engine.lock();
+            vec![
+                engine.set_axis(&id, MOUSE_AXIS_X, touch_x),
+                engine.set_axis(&id, MOUSE_AXIS_Y, touch_y),
+            ]
+        };
+        for callbacks in pending {
+            callbacks.dispatch();
+        }
     }
 
     /// Signals that touch finger has moved.
     /// Port of Mouse::TouchMove
     pub fn touch_move(&mut self, touch_x: f32, touch_y: f32) {
         let id = touch_identifier();
-        let mut engine = self.engine.lock();
-        engine.set_axis(&id, MOUSE_AXIS_X, touch_x);
-        engine.set_axis(&id, MOUSE_AXIS_Y, touch_y);
+        let pending = {
+            let mut engine = self.engine.lock();
+            vec![
+                engine.set_axis(&id, MOUSE_AXIS_X, touch_x),
+                engine.set_axis(&id, MOUSE_AXIS_Y, touch_y),
+            ]
+        };
+        for callbacks in pending {
+            callbacks.dispatch();
+        }
     }
 
     /// Sets the status of a button to pressed.
     /// Port of Mouse::PressButton
     pub fn press_button(&mut self, x: i32, y: i32, button: MouseButton) {
         let id = identifier();
-        self.engine.lock().set_button(&id, button as i32, true);
+        let pending = self.engine.lock().set_button(&id, button as i32, true);
+        pending.dispatch();
 
         // Set initial analog parameters
         self.mouse_origin = (x, y);
@@ -201,17 +223,25 @@ impl Mouse {
     /// Port of Mouse::PressMouseButton
     pub fn press_mouse_button(&mut self, button: MouseButton) {
         let id = real_mouse_identifier();
-        self.engine.lock().set_button(&id, button as i32, true);
+        let pending = self.engine.lock().set_button(&id, button as i32, true);
+        pending.dispatch();
     }
 
     /// Sets the status of touch finger to pressed.
     /// Port of Mouse::PressTouchButton
     pub fn press_touch_button(&mut self, touch_x: f32, touch_y: f32, button: MouseButton) {
         let id = touch_identifier();
-        let mut engine = self.engine.lock();
-        engine.set_axis(&id, MOUSE_AXIS_X, touch_x);
-        engine.set_axis(&id, MOUSE_AXIS_Y, touch_y);
-        engine.set_button(&id, button as i32, true);
+        let pending = {
+            let mut engine = self.engine.lock();
+            vec![
+                engine.set_axis(&id, MOUSE_AXIS_X, touch_x),
+                engine.set_axis(&id, MOUSE_AXIS_Y, touch_y),
+                engine.set_button(&id, button as i32, true),
+            ]
+        };
+        for callbacks in pending {
+            callbacks.dispatch();
+        }
     }
 
     /// Sets the status of all buttons bound with the key to released.
@@ -221,14 +251,22 @@ impl Mouse {
         let real_id = real_mouse_identifier();
         let touch_id = touch_identifier();
 
-        let mut engine = self.engine.lock();
-        engine.set_button(&id, button as i32, false);
-        engine.set_button(&real_id, button as i32, false);
-        engine.set_button(&touch_id, button as i32, false);
-
-        if !self.is_mouse_panning_enabled() {
-            engine.set_axis(&id, MOUSE_AXIS_X, 0.0);
-            engine.set_axis(&id, MOUSE_AXIS_Y, 0.0);
+        let reset_stick = !self.is_mouse_panning_enabled();
+        let pending = {
+            let mut engine = self.engine.lock();
+            let mut pending = vec![
+                engine.set_button(&id, button as i32, false),
+                engine.set_button(&real_id, button as i32, false),
+                engine.set_button(&touch_id, button as i32, false),
+            ];
+            if reset_stick {
+                pending.push(engine.set_axis(&id, MOUSE_AXIS_X, 0.0));
+                pending.push(engine.set_axis(&id, MOUSE_AXIS_Y, 0.0));
+            }
+            pending
+        };
+        for callbacks in pending {
+            callbacks.dispatch();
         }
 
         self.last_motion_change.0 = 0.0;
@@ -244,14 +282,24 @@ impl Mouse {
         self.wheel_position.1 += y;
         self.last_motion_change.2 += y as f32;
         let id = identifier();
-        let mut engine = self.engine.lock();
-        engine.set_axis(&id, WHEEL_AXIS_X, self.wheel_position.0 as f32);
-        engine.set_axis(&id, WHEEL_AXIS_Y, self.wheel_position.1 as f32);
+        let pending = {
+            let mut engine = self.engine.lock();
+            vec![
+                engine.set_axis(&id, WHEEL_AXIS_X, self.wheel_position.0 as f32),
+                engine.set_axis(&id, WHEEL_AXIS_Y, self.wheel_position.1 as f32),
+            ]
+        };
+        for callbacks in pending {
+            callbacks.dispatch();
+        }
     }
 
     /// Port of Mouse::ReleaseAllButtons
     pub fn release_all_buttons(&mut self) {
-        self.engine.lock().reset_button_state();
+        let pending = self.engine.lock().reset_button_state();
+        for callbacks in pending {
+            callbacks.dispatch();
+        }
         self.button_pressed = false;
     }
 

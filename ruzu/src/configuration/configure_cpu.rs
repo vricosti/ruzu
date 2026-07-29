@@ -43,15 +43,15 @@ pub fn page() -> Page {
     // (`ConfigureCpu::UpdateGroup`).
     let (unsafe_group, unsafe_content) = w::group("Unsafe CPU Optimization Settings");
 
-    let unsafe_note = gtk::Label::new(Some(
-        "These settings reduce accuracy for speed.",
-    ));
+    let unsafe_note = gtk::Label::new(Some("These settings reduce accuracy for speed."));
     unsafe_note.set_xalign(0.0);
     unsafe_content.append(&unsafe_note);
 
     let unfuse_fma = w::check_row(
         "Unfuse FMA (improve performance on CPUs without FMA)",
-        *common::settings::values().cpuopt_unsafe_unfuse_fma.get_value(),
+        *common::settings::values()
+            .cpuopt_unsafe_unfuse_fma
+            .get_value(),
     );
     let reduce_fp_error = w::check_row(
         "Faster FRSQRTE and FRECPE",
@@ -123,6 +123,8 @@ pub fn page() -> Page {
         values.cpuopt_unsafe_ignore_standard_fpcr.set_value(fpcr);
         values.cpuopt_unsafe_inaccurate_nan.set_value(nan);
         values.cpuopt_unsafe_fastmem_check.set_value(fastmem);
-        values.cpuopt_unsafe_ignore_global_monitor.set_value(monitor);
+        values
+            .cpuopt_unsafe_ignore_global_monitor
+            .set_value(monitor);
     })
 }

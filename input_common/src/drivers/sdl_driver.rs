@@ -27,7 +27,9 @@ use common::settings_input::{native_analog, native_button, native_motion};
 use common::uuid::UUID;
 
 use crate::drivers::sdl_joystick::{get_guid, SdlJoystick};
-use crate::input_engine::{InputEngine, PadIdentifier, VibrationRequest};
+use crate::input_engine::{
+    InputEngine, InputEngineMetadata, InputEngineOutput, PadIdentifier, VibrationRequest,
+};
 use crate::main_common::{AnalogMapping, ButtonMapping, MotionMapping};
 
 /// SDL HAT direction constants (matching SDL_HAT_* values).
@@ -135,21 +137,23 @@ impl SdlState {
                     let pressed = event.type_ == sdl::SDL_EventType::SDL_JOYBUTTONDOWN as u32;
                     if let Some(joystick) = self.joystick_by_sdl_id(event.jbutton.which) {
                         let identifier = joystick.lock().pad_identifier();
-                        self.engine.lock().set_button(
+                        let pending = self.engine.lock().set_button(
                             &identifier,
                             event.jbutton.button as i32,
                             pressed,
                         );
+                        pending.dispatch();
                     }
                 }
                 sdl::SDL_EventType::SDL_JOYHATMOTION => {
                     if let Some(joystick) = self.joystick_by_sdl_id(event.jhat.which) {
                         let identifier = joystick.lock().pad_identifier();
-                        self.engine.lock().set_hat_button(
+                        let pending = self.engine.lock().set_hat_button(
                             &identifier,
                             event.jhat.hat as i32,
                             event.jhat.value,
                         );
+                        pending.dispatch();
                     }
                 }
                 sdl::SDL_EventType::SDL_JOYAXISMOTION => {
@@ -157,11 +161,12 @@ impl SdlState {
                         let identifier = joystick.lock().pad_identifier();
                         // Upstream divides by 32767 rather than 32768, so a
                         // full-scale axis reads exactly 1.0.
-                        self.engine.lock().set_axis(
+                        let pending = self.engine.lock().set_axis(
                             &identifier,
                             event.jaxis.axis as i32,
                             event.jaxis.value as f32 / 32767.0,
                         );
+                        pending.dispatch();
                     }
                 }
                 sdl::SDL_EventType::SDL_CONTROLLERSENSORUPDATE => {
@@ -169,20 +174,28 @@ impl SdlState {
                         let sensor =
                             std::mem::transmute::<i32, sdl::SDL_SensorType>(event.csensor.sensor);
                         let mut guard = joystick.lock();
-                        if guard.update_motion(sensor, event.csensor.timestamp, event.csensor.data) {
+                        if guard.update_motion(sensor, event.csensor.timestamp, event.csensor.data)
+                        {
                             let identifier = guard.pad_identifier();
                             let motion = guard.motion().clone();
                             drop(guard);
-                            self.engine.lock().set_motion(&identifier, 0, &motion);
+                            let pending = self.engine.lock().set_motion(&identifier, 0, &motion);
+                            pending.dispatch();
                         }
                     }
                 }
                 sdl::SDL_EventType::SDL_JOYDEVICEREMOVED => {
-                    log::debug!("Controller removed with instance id {}", event.jdevice.which);
+                    log::debug!(
+                        "Controller removed with instance id {}",
+                        event.jdevice.which
+                    );
                     self.close_joystick_by_instance_id(event.jdevice.which);
                 }
                 sdl::SDL_EventType::SDL_JOYDEVICEADDED => {
-                    log::debug!("Controller connected with device index {}", event.jdevice.which);
+                    log::debug!(
+                        "Controller connected with device index {}",
+                        event.jdevice.which
+                    );
                     self.init_joystick(event.jdevice.which);
                 }
                 _ => {}
@@ -255,7 +268,9 @@ impl SdlState {
                 if name.is_null() {
                     "Unknown".to_string()
                 } else {
-                    std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned()
+                    std::ffi::CStr::from_ptr(name)
+                        .to_string_lossy()
+                        .into_owned()
                 }
             },
             guid.raw_string()
@@ -300,6 +315,74 @@ impl SdlState {
             joystick.lock().rumble_play(&request.vibration);
         }
     }
+
+    fn set_vibration(
+        &self,
+        identifier: &PadIdentifier,
+        vibration: &VibrationStatus,
+    ) -> DriverResult {
+        self.vibration_queue.lock().push_back(VibrationRequest {
+            identifier: identifier.clone(),
+            vibration: vibration.clone(),
+        });
+        DriverResult::Success
+    }
+
+    fn is_vibration_enabled(&self, identifier: &PadIdentifier) -> bool {
+        let map = self.joystick_map.lock();
+        map.get(&identifier.guid)
+            .and_then(|group| group.get(identifier.port))
+            .map(|joystick| joystick.lock().has_vibration())
+            .unwrap_or(false)
+    }
+}
+
+struct SdlOutput {
+    state: std::sync::Weak<SdlState>,
+}
+
+struct SdlMetadata;
+
+impl InputEngineMetadata for SdlMetadata {
+    fn get_hat_button_name(&self, direction_value: u8) -> String {
+        match direction_value {
+            SDL_HAT_UP => "up".to_string(),
+            SDL_HAT_DOWN => "down".to_string(),
+            SDL_HAT_LEFT => "left".to_string(),
+            SDL_HAT_RIGHT => "right".to_string(),
+            _ => String::new(),
+        }
+    }
+
+    fn get_hat_button_id(&self, direction_name: &str) -> u8 {
+        match direction_name {
+            "up" => SDL_HAT_UP,
+            "down" => SDL_HAT_DOWN,
+            "left" => SDL_HAT_LEFT,
+            "right" => SDL_HAT_RIGHT,
+            _ => 0,
+        }
+    }
+}
+
+impl InputEngineOutput for SdlOutput {
+    fn set_vibration(
+        &self,
+        identifier: &PadIdentifier,
+        vibration: &VibrationStatus,
+    ) -> DriverResult {
+        self.state
+            .upgrade()
+            .map_or(DriverResult::NoDeviceDetected, |state| {
+                state.set_vibration(identifier, vibration)
+            })
+    }
+
+    fn is_vibration_enabled(&self, identifier: &PadIdentifier) -> bool {
+        self.state
+            .upgrade()
+            .is_some_and(|state| state.is_vibration_enabled(identifier))
+    }
 }
 
 /// Port of `SDLDriver` class from sdl_driver.h / sdl_driver.cpp
@@ -326,19 +409,24 @@ impl SDLDriver {
             vibration_queue: Mutex::new(VecDeque::new()),
             initialized: AtomicBool::new(false),
         });
+        state.engine.lock().set_output_handler(Arc::new(SdlOutput {
+            state: Arc::downgrade(&state),
+        }));
+        state
+            .engine
+            .lock()
+            .set_metadata_handler(Arc::new(SdlMetadata));
 
         Self::set_hints();
 
         // If the frontend already runs an SDL event loop we must not start a
         // second one — upstream makes the same check.
-        let already_initialized = unsafe {
-            sdl::SDL_WasInit(sdl::SDL_INIT_JOYSTICK | sdl::SDL_INIT_GAMECONTROLLER) != 0
-        };
+        let already_initialized =
+            unsafe { sdl::SDL_WasInit(sdl::SDL_INIT_JOYSTICK | sdl::SDL_INIT_GAMECONTROLLER) != 0 };
         let start_thread = !already_initialized;
         if start_thread {
-            let result = unsafe {
-                sdl::SDL_Init(sdl::SDL_INIT_JOYSTICK | sdl::SDL_INIT_GAMECONTROLLER)
-            };
+            let result =
+                unsafe { sdl::SDL_Init(sdl::SDL_INIT_JOYSTICK | sdl::SDL_INIT_GAMECONTROLLER) };
             if result < 0 {
                 let error = unsafe { std::ffi::CStr::from_ptr(sdl::SDL_GetError()) };
                 log::error!("SDL_Init failed with: {}", error.to_string_lossy());
@@ -481,10 +569,7 @@ impl SDLDriver {
                 };
                 let mut params = ParamPackage::default();
                 params.set_str("engine", self.engine_name());
-                params.set_str(
-                    "display",
-                    format!("Nintendo Dual Joy-Con {}", guard.port()),
-                );
+                params.set_str("display", format!("Nintendo Dual Joy-Con {}", guard.port()));
                 params.set_str("guid", guard.guid().raw_string());
                 params.set_str("guid2", left_guid.raw_string());
                 params.set_str("port", guard.port().to_string());
@@ -526,9 +611,7 @@ impl SDLDriver {
         // A dual Joy-Con device carries a second GUID; the left-hand buttons
         // then come from the second controller.
         if params.has("guid2") {
-            if let Some(joystick2) =
-                self.joystick_by_guid(&params.get_str("guid2", ""), port)
-            {
+            if let Some(joystick2) = self.joystick_by_guid(&params.get_str("guid2", ""), port) {
                 if !joystick2.lock().sdl_game_controller().is_null() {
                     return self.dual_controller_mapping(
                         &joystick,
@@ -718,11 +801,17 @@ impl SDLDriver {
 
         for &(switch_button, sdl_button) in switch_to_sdl_button {
             let binding = bind_button(controller, sdl_button);
-            mapping.insert(switch_button, self.build_param_for_binding(port, &guid, binding));
+            mapping.insert(
+                switch_button,
+                self.build_param_for_binding(port, &guid, binding),
+            );
         }
         for &(switch_button, sdl_axis) in switch_to_sdl_axis {
             let binding = bind_axis_raw(controller, sdl_axis);
-            mapping.insert(switch_button, self.build_param_for_binding(port, &guid, binding));
+            mapping.insert(
+                switch_button,
+                self.build_param_for_binding(port, &guid, binding),
+            );
         }
 
         mapping
@@ -779,14 +868,13 @@ impl SDLDriver {
                 sdl::SDL_GameControllerBindType::SDL_CONTROLLER_BINDTYPE_BUTTON => {
                     self.build_button_param_for_button(port, guid, binding.value.button)
                 }
-                sdl::SDL_GameControllerBindType::SDL_CONTROLLER_BINDTYPE_HAT => {
-                    self.build_hat_param_for_button(
+                sdl::SDL_GameControllerBindType::SDL_CONTROLLER_BINDTYPE_HAT => self
+                    .build_hat_param_for_button(
                         port,
                         guid,
                         binding.value.hat.hat,
                         binding.value.hat.hat_mask as u8,
-                    )
-                }
+                    ),
                 // SDL_CONTROLLER_BINDTYPE_NONE: upstream returns an empty
                 // package, which the UI renders as "[not set]".
                 _ => ParamPackage::default(),
@@ -897,24 +985,12 @@ impl SDLDriver {
 
     /// Port of SDLDriver::GetHatButtonName (override)
     pub fn get_hat_button_name(&self, direction_value: u8) -> String {
-        match direction_value {
-            SDL_HAT_UP => "up".to_string(),
-            SDL_HAT_DOWN => "down".to_string(),
-            SDL_HAT_LEFT => "left".to_string(),
-            SDL_HAT_RIGHT => "right".to_string(),
-            _ => String::new(),
-        }
+        SdlMetadata.get_hat_button_name(direction_value)
     }
 
     /// Port of SDLDriver::GetHatButtonId (override)
     pub fn get_hat_button_id(&self, direction_name: &str) -> u8 {
-        match direction_name {
-            "up" => SDL_HAT_UP,
-            "down" => SDL_HAT_DOWN,
-            "left" => SDL_HAT_LEFT,
-            "right" => SDL_HAT_RIGHT,
-            _ => 0,
-        }
+        SdlMetadata.get_hat_button_id(direction_name)
     }
 
     /// Port of SDLDriver::IsStickInverted (override)
@@ -934,22 +1010,12 @@ impl SDLDriver {
         identifier: &PadIdentifier,
         vibration: &VibrationStatus,
     ) -> DriverResult {
-        // Upstream queues the request and lets the vibration thread play it,
-        // so a slow SDL call never blocks the caller.
-        self.state.vibration_queue.lock().push_back(VibrationRequest {
-            identifier: identifier.clone(),
-            vibration: vibration.clone(),
-        });
-        DriverResult::Success
+        self.state.set_vibration(identifier, vibration)
     }
 
     /// Port of SDLDriver::IsVibrationEnabled (override)
     pub fn is_vibration_enabled(&self, identifier: &PadIdentifier) -> bool {
-        let map = self.state.joystick_map.lock();
-        map.get(&identifier.guid)
-            .and_then(|group| group.get(identifier.port))
-            .map(|joystick| joystick.lock().has_vibration())
-            .unwrap_or(false)
+        self.state.is_vibration_enabled(identifier)
     }
 
     // ---- Private methods ----
@@ -987,7 +1053,10 @@ impl SDLDriver {
         value: f32,
     ) -> ParamPackage {
         let mut params = ParamPackage::default();
-        params.set_str("engine", self.state.engine.lock().get_engine_name().to_string());
+        params.set_str(
+            "engine",
+            self.state.engine.lock().get_engine_name().to_string(),
+        );
         params.set_str("guid", guid.raw_string());
         params.set_int("port", port);
         params.set_int("axis", axis);
@@ -1009,7 +1078,10 @@ impl SDLDriver {
         button: i32,
     ) -> ParamPackage {
         let mut params = ParamPackage::default();
-        params.set_str("engine", self.state.engine.lock().get_engine_name().to_string());
+        params.set_str(
+            "engine",
+            self.state.engine.lock().get_engine_name().to_string(),
+        );
         params.set_str("guid", guid.raw_string());
         params.set_int("port", port);
         params.set_int("button", button);
@@ -1026,7 +1098,10 @@ impl SDLDriver {
         value: u8,
     ) -> ParamPackage {
         let mut params = ParamPackage::default();
-        params.set_str("engine", self.state.engine.lock().get_engine_name().to_string());
+        params.set_str(
+            "engine",
+            self.state.engine.lock().get_engine_name().to_string(),
+        );
         params.set_str("guid", guid.raw_string());
         params.set_int("port", port);
         params.set_int("hat", hat);
@@ -1038,7 +1113,10 @@ impl SDLDriver {
     /// Port of SDLDriver::BuildMotionParam
     fn build_motion_param(&self, port: i32, guid: &UUID) -> ParamPackage {
         let mut params = ParamPackage::default();
-        params.set_str("engine", self.state.engine.lock().get_engine_name().to_string());
+        params.set_str(
+            "engine",
+            self.state.engine.lock().get_engine_name().to_string(),
+        );
         params.set_str("guid", guid.raw_string());
         params.set_int("port", port);
         params.set_int("motion", 0);
@@ -1061,7 +1139,10 @@ impl Drop for SDLDriver {
         }
         if !self.watch_user_data.is_null() {
             unsafe {
-                sdl::SDL_DelEventWatch(Some(sdl_event_watcher), self.watch_user_data as *mut c_void);
+                sdl::SDL_DelEventWatch(
+                    Some(sdl_event_watcher),
+                    self.watch_user_data as *mut c_void,
+                );
                 // Reclaim the reference leaked for the watch.
                 drop(Arc::from_raw(self.watch_user_data));
             }
@@ -1069,7 +1150,9 @@ impl Drop for SDLDriver {
         }
         self.close_joysticks();
         if self.start_thread {
-            unsafe { sdl::SDL_QuitSubSystem(sdl::SDL_INIT_JOYSTICK | sdl::SDL_INIT_GAMECONTROLLER) };
+            unsafe {
+                sdl::SDL_QuitSubSystem(sdl::SDL_INIT_JOYSTICK | sdl::SDL_INIT_GAMECONTROLLER)
+            };
         }
     }
 }

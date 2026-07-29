@@ -170,10 +170,7 @@ fn connect_folder_picker(button: &gtk::Button, entry: &gtk::Entry, title: &str) 
     let entry = entry.clone();
     let title = title.to_string();
     button.connect_clicked(move |button| {
-        let dialog = gtk::FileDialog::builder()
-            .title(&title)
-            .modal(true)
-            .build();
+        let dialog = gtk::FileDialog::builder().title(&title).modal(true).build();
         let entry = entry.clone();
         let parent = button.root().and_downcast::<gtk::Window>();
         dialog.select_folder(

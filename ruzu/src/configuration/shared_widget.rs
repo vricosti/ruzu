@@ -223,10 +223,7 @@ pub fn align_label_columns(rows: &[&gtk::Box]) -> gtk::SizeGroup {
 /// Index of `needle` in `haystack`, or 0. Used to map a stored enum value onto
 /// its combo-box row without panicking on values the UI doesn't list.
 pub fn index_of<T: PartialEq>(haystack: &[T], needle: &T) -> u32 {
-    haystack
-        .iter()
-        .position(|item| item == needle)
-        .unwrap_or(0) as u32
+    haystack.iter().position(|item| item == needle).unwrap_or(0) as u32
 }
 
 #[cfg(test)]

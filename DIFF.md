@@ -25410,17 +25410,23 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ## 2026-07-28 — input_common/src/main_common.rs vs input_common/main.{h,cpp}
 
 ### Intentional differences
-- None for the registered mouse and touch engines.
+- Each registered engine is shared with its input/output factories through
+  `Arc<Mutex<InputEngine>>`. Upstream shares the concrete engine through
+  `std::shared_ptr`; the Rust representation preserves that ownership.
 
 ### Unintentional differences (fixed)
-- `Initialize` now registers input/output factories for the mouse and touch
-  engines, and `Shutdown` unregisters them before dropping the drivers.
+- `Initialize` now registers input/output factories for updater, keyboard,
+  mouse, touch, Cemuhook UDP and SDL, and registers the
+  `touch_from_button`/`analog_from_button` input factories. `Shutdown`
+  unregisters the same set before dropping the drivers.
+- `StopMapping` now calls `EndConfiguration` before
+  `MappingFactory::StopMapping`, in upstream order.
 
 ### Missing items
-- Upstream also registers updater, keyboard, Cemuhook UDP, TAS, camera,
-  virtual amiibo/gamepad, optional SDL/Joy-Con engines, and the
-  touch/analog-from-button factories. Their Rust drivers do not yet share the
-  factory-owned engine representation used by this slice.
+- TAS, camera and virtual amiibo/gamepad are instantiated but are not yet
+  registered because those driver ports still own an unshared `InputEngine`.
+- The platform-conditional GC adapter, Joy-Con and Android registrations remain
+  incomplete.
 
 ### Binary layout verification
 - PASS: host registry ownership only.
@@ -25726,3 +25732,578 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   and `EmitImageFetch` after implementation.
 - Added a regression test proving that a buffer AOFFI emits `OpIAdd`, feeds
   its result to `OpImageFetch`, and emits no LOD operand.
+
+## 2026-07-28 — core/src/gpu_dirty_memory_manager.rs vs core/gpu_dirty_memory_manager.h
+
+### Intentional differences
+- Rust packs upstream's aligned `TransformAddress` into `AtomicU64`, because
+  stable Rust has no generic atomic struct. Its address/mask word order and
+  8-byte size/alignment are verified by tests.
+- `collect` splits writes at each 2 KiB transform-page boundary. Upstream's
+  `CreateMask<u32>` has undefined oversized shifts when a caller crosses that
+  boundary; splitting preserves every dirty byte while retaining the exact
+  upstream transform and mask algorithm for each valid chunk.
+- A separate front-buffer mutex supplies Rust interior mutability for
+  `gather(&self)`. The producer guard is still released before callbacks, as
+  in upstream, so collection continues while the consumer processes ranges.
+
+### Unintentional differences (fixed)
+- Managers were wrapped in an owner-level `Mutex`, serializing the nominally
+  lock-free collection path and keeping producers blocked through gather
+  callbacks. The manager now owns only the same producer-side critical section
+  as upstream.
+- Page replacement used `store`; it now uses upstream's `exchange` while the
+  producer guard is held.
+- A write crossing a transform page was previously clamped to one mask and
+  silently lost the following dirty bytes. It is now split into exact chunks.
+
+### Binary layout verification
+- PASS: `TransformAddress` is 8 bytes with 8-byte alignment and packs
+  `address` in bits 0..31 and `mask` in bits 32..63 on supported little-endian
+  hosts.
+
+### Verification
+- Re-read the complete upstream `GPUDirtyMemoryManager` class after the
+  implementation.
+- Focused manager tests pass, including exact cross-page ranges and concurrent
+  collection during gather callbacks.
+
+## 2026-07-28 — core/src/memory/memory.rs vs core/memory.cpp
+
+### Intentional differences
+- Rust stores shared manager owners as `Arc<GPUDirtyMemoryManager>` rather than
+  a non-owning `std::span`.
+- `sys_core_guard` is an `Arc<Mutex<()>>` because Rust's two-phase cache
+  operation releases the outer `Memory` lock before applying rasterizer
+  notifications; the deferred batch must retain the same guard.
+- The SMMU bridge gathers aliases into an owned vector instead of upstream's
+  per-core scratch buffer.
+
+### Unintentional differences (fixed)
+- `HandleRasterizerWrite` omitted upstream's `sys_core_guard`, allowing
+  multiple non-core host threads to write concurrently to the shared final
+  manager slot after removal of the owner-level manager mutex.
+- Deferred `RasterizerWriteBatch` always selected manager 0. It now selects
+  `min(System::GetCurrentHostThreadID(), sys_core)` and retains the system guard
+  when that final slot is used.
+
+### Missing items
+- `InvalidateGPUMemory` remains absent from this owner and requires a separate
+  parity slice.
+
+### Binary layout verification
+- N/A: only host-side ownership and synchronization fields changed.
+
+### Verification
+- Re-read upstream `HandleRasterizerWrite`, `HandleRasterizerDownload`,
+  `InvalidateGPUMemory`, and the owner fields in `Memory::Impl`.
+- The system-slot batch regression proves that deferred collection waits for
+  and resumes after `sys_core_guard`.
+
+## 2026-07-28 — core/src/core.rs vs core/core.cpp
+
+### Intentional differences
+- Rust uses a `Vec<Arc<GPUDirtyMemoryManager>>` to share stable manager owners
+  with `Memory`; upstream owns a fixed array and lends a span.
+
+### Unintentional differences (fixed)
+- The shared managers carried an additional outer mutex. `System` now gathers
+  directly through each manager's upstream-owned synchronization.
+- `System::GetCurrentHostThreadID` was missing as an owner-level adapter; it is
+  now the path used by `Memory`.
+
+### Binary layout verification
+- N/A: these are host-only owners.
+
+### Verification
+- Re-read upstream `System::Impl` manager storage,
+  `GetGPUDirtyMemoryManager`, `GatherGPUDirtyMemory`, and
+  `GetCurrentHostThreadID`.
+
+## 2026-07-28 — core/src/hle/kernel/kernel.rs vs core/hle/kernel/kernel.cpp
+
+### Intentional differences
+- `ScopedKernelForTest` installs its minimal kernel through a test-only
+  thread-local override. Upstream owns one process-wide kernel and has no
+  equivalent native unit-test fixture; the override lets Rust's parallel test
+  threads exercise page-table allocation without replacing or freeing another
+  test's kernel singleton.
+
+### Unintentional differences (fixed)
+- `KernelCore::GetCurrentHostThreadID` was private to the Rust owner and its
+  single-core branch returned core 0 unconditionally. It is now exposed to
+  `System` and reads `CpuManager::current_core`, matching upstream.
+
+### Binary layout verification
+- N/A: method visibility and control flow only.
+
+### Verification
+- Re-read upstream `Impl::GetCurrentHostThreadID` and the public
+  `KernelCore::GetCurrentHostThreadID` forwarder.
+- The scoped-kernel isolation test verifies simultaneous fixtures on distinct
+  host threads and nested restoration on one host thread.
+- `cargo test -p core --lib scoped_test_kernels_are_isolated_per_host_thread`
+  passes.
+
+## 2026-07-28 — core/src/hle/kernel/k_page_table_base.rs vs core/hle/kernel/k_page_table_base.{h,cpp}
+
+### Unintentional differences (fixed)
+- The `Normal` containment test passed an address outside the heap despite
+  upstream's `ASSERT(is_in_heap)`.
+- The IPC containment test passed an address outside the alias region despite
+  upstream's `ASSERT(is_in_alias)`.
+- Both fixtures now preserve those preconditions and overlap the excluded
+  region to test the same rejection branches without changing production
+  `CanContain` behavior.
+
+### Binary layout verification
+- N/A: test fixtures only; no structure or serialized payload changed.
+
+### Verification
+- Re-read upstream `KPageTableBase::CanContain` and its declarations after the
+  test correction.
+- All 33 `k_page_table_base` tests pass both as a focused module and during the
+  parallel full-core run.
+- The full `core` suite proceeds past every `k_page_table_base` test, then
+  aborts in pre-existing concurrent `k_server_session` fixtures. Output:
+  `/tmp/ruzu-core-kpt-tls.log`.
+
+## 2026-07-29 — input_common/src/input_poller.rs vs input_common/input_poller.{h,cpp}
+
+### Intentional differences
+- Every `InputFrom*` is split into a `*Source` behind an `Arc` plus a thin
+  device wrapper. Upstream registers `UpdateCallback engine_callback{[this]() {
+  OnChange(); }}`, capturing the device itself; a device here is handed out as
+  `Box<dyn InputDevice>` and cannot be captured that way, so the part `OnChange`
+  reads — configuration, the consumer's callback, the last value reported —
+  lives behind an `Arc` the device and the engine closure both hold.
+- `UpdateCallback::on_change` is an `Arc<dyn Fn>` rather than a `Box`, so the
+  engine can clone the matching callbacks out of its table and run them after
+  releasing its lock. See the `input_engine` entry below.
+
+### Unintentional differences (fixed)
+- Fixed: all fifteen `InputEngine::SetCallback` registrations passed
+  `on_change: None`. The engine received the driver's events, matched the
+  registered poller, then had nothing to call. Every binding reported only what
+  `ForceUpdate` read at load time and never moved again — the whole input path
+  was dead past initialization, for the guest as well as the configuration
+  preview. `InputFromTouch` was the only one already wired.
+- Fixed: `InputFromTrigger`, `InputFromAnalog` and `InputFromMotion` had no
+  `ForceUpdate` at all, so their bindings started from the default status
+  instead of the device's current value. `InputFromAxisMotion` already had one.
+
+### Missing items
+- `InputFromButton::OnChange` does not implement upstream's turbo spam timer.
+
+### Binary layout verification
+- N/A: host callback plumbing only.
+
+### Verification
+- Re-read upstream `input_poller.cpp` for each `InputFrom*` constructor,
+  `GetStatus`, `OnChange` and `ForceUpdate`.
+- Measured end to end against a physical pad: SDL events reach the driver, the
+  device callbacks fire, and `EmulatedController` reports the press.
+
+## 2026-07-29 — input_common/src/input_engine.rs vs input_common/input_engine.{h,cpp}
+
+### Intentional differences
+- `set_button` / `set_hat_button` / `set_axis` / `set_motion` / `set_battery` /
+  `set_color` / `set_camera` / `set_nfc` return a `#[must_use] PendingCallbacks`
+  the caller dispatches, instead of invoking the callbacks in place.
+  Upstream guards `controller_list` and `callback_list` with two separate
+  mutexes, so a device's `OnChange` can read a value straight back while the
+  engine is dispatching. This port keeps the whole engine behind one
+  `Arc<Mutex<InputEngine>>` and drivers call it as `engine.lock().set_axis(..)`,
+  so dispatching inside that call deadlocks the instant a device reads a value
+  back — which is exactly what `InputFromStick::OnChange` does for the second
+  axis. Every call site now stores under the lock and dispatches after the guard
+  is gone.
+
+### Unintentional differences (fixed)
+- Fixed: the deadlock above froze the application on the first stick movement.
+
+### Binary layout verification
+- N/A: host callback plumbing only.
+
+### Verification
+- Re-read upstream `InputEngine::SetAxis`, `TriggerOnAxisChange` and the
+  surrounding mutex usage.
+- `#[must_use]` located all 61 call sites; `cargo build --workspace` is clean.
+- Verified on hardware that stick movement no longer hangs the process.
+
+## 2026-07-29 — hid_core/src/frontend/emulated_controller.rs vs hid_core/frontend/emulated_controller.{h,cpp}
+
+### Intentional differences
+- `ControllerStatus` lives behind an `Arc<Mutex<..>>` shared with the input
+  devices. Upstream's callbacks capture `this` and lock the controller's own
+  mutex; here they run on the driver's thread and cannot borrow the controller,
+  so `SetButton` / `SetStick` / `SetTrigger` are free functions over the shared
+  status. `npad_type`, `is_configuring` and `system_buttons_enabled` are
+  mirrored into it for the same reason.
+- `reload_from_player(&PlayerInput)` has no upstream counterpart. Upstream's
+  `ConfigureInputPlayer` edits the `EmulatedController` directly and calls
+  `SetButtonParam` per change, so `ReloadFromSettings` only ever reads the
+  globals; this port's dialog edits a working copy written back on OK.
+- `LoadDevices` builds only the button, stick and trigger devices. The colour,
+  battery, camera, NFC, ring and output devices have no consumer yet.
+
+### Unintentional differences (fixed)
+- Fixed: `ReloadInput`, `ReloadFromSettings` and `LoadDevices` were documented
+  stubs, so the controller never created an input device and had nothing to
+  report.
+- Fixed: `SetButton`, `SetStick` and `SetTrigger` only wrote the raw values the
+  configuration preview reads. Upstream also folds them into
+  `npad_button_state`, `debug_pad_button_state`, `analog_stick_state`,
+  `gc_trigger_state`, `home_button_state` and `capture_button_state`, which is
+  what the guest reads — the pad worked in the dialog and was dead in the game.
+  The `value_changed` guard, the GameCube ZL/ZR special case, the
+  `system_buttons_enabled` gate and the configuring-mode reset are all ported.
+- Fixed: `UnloadInput` only cleared `is_initialized`, leaving the devices and
+  their engine callbacks alive. It now drops the device vectors, whose `Drop`
+  calls `InputEngine::delete_callback`, matching upstream's `reset()` on each
+  `unique_ptr`.
+
+### Missing items
+- Motion, battery, colour, camera, NFC and ring devices; the TAS and virtual
+  device variants; `SetPollingMode`; the turbo timer.
+
+### Binary layout verification
+- PASS: `NpadButtonState`, `DebugPadButton`, `AnalogStickState` and
+  `NpadGcTriggerState` are unchanged; only their producers moved.
+
+### Verification
+- Re-read upstream `EmulatedController::LoadDevices`, `ReloadInput`,
+  `ReloadFromSettings`, `SetButton`, `SetStick`, `SetTrigger`,
+  `MapSettingsTypeToNPad` and `UnloadInput`.
+- `cargo test -p hid_core` — 21 tests, six of them new: press and release
+  reaching `npad_button_state`, the system-button gate, the GameCube ZL/ZR
+  case, sticks reaching `analog_stick_state` at HID scale, configuring mode not
+  leaking to the guest, and `unload_input` releasing every device.
+
+## 2026-07-29 — hid_core/src/frontend/input_converter.rs vs hid_core/frontend/input_converter.{h,cpp}
+
+### Unintentional differences (fixed)
+- Fixed: `TransformToButton`, `TransformToStick` and `TransformToTrigger` were
+  missing, so nothing could turn a device callback into a controller status.
+  Ported to their upstream file with the same clamping, threshold and inversion
+  order.
+
+### Missing items
+- `TransformToMotion`, `TransformToBattery`, `TransformToAnalog`,
+  `TransformToCamera`, `TransformToNfc` and `TransformToColor`.
+
+### Binary layout verification
+- N/A: pure conversion functions.
+
+### Verification
+- Re-read upstream `input_converter.cpp` for each ported function.
+
+## 2026-07-29 — ruzu/src/main_window.rs vs yuzu/main.cpp
+
+### Intentional differences
+- When Linux render-surface creation fails, the GTK frontend presents an
+  `AlertDialog` in addition to logging. Upstream can obtain both X11 and
+  Wayland native surfaces through Qt, so this failure is not normally exposed
+  there; a log-only failure in Rust made a successful game-row activation look
+  like an ignored double-click.
+
+### Unintentional differences (fixed)
+- Fixed: nothing pumped the input drivers. Upstream runs `update_input_timer` at
+  `default_input_update_timeout = 1` ms calling
+  `GMainWindow::UpdateInputDrivers` → `InputSubsystem::PumpEvents`. Without it
+  the SDL driver's event watch never fires, because SDL only dispatches to it
+  while its queue is being pumped.
+- Fixed: `InputSubsystem::PumpEvents` pumped only the update engine, never the
+  SDL driver, where upstream pumps both.
+- Fixed: launcher activation under native Wayland reached `boot_game`, failed
+  to create the X11-only embedded child, and returned with only an invisible
+  log message.
+
+### Binary layout verification
+- N/A: host event loop only.
+
+### Verification
+- Re-read upstream `GMainWindow::UpdateInputDrivers` and `Impl::PumpEvents`.
+- Re-read upstream `GameList::ValidateEntry` and the `GameChosen` connection to
+  `GMainWindow::OnGameListLoadFile`.
+- Measured 6000 pumps in 8 s in the running application.
+
+## 2026-07-29 — ruzu/src/main.rs and ruzu/src/render_window_x11.rs vs yuzu/main.cpp, yuzu/qt_common.cpp and yuzu/bootmanager.cpp
+
+### Intentional differences
+- Upstream Qt obtains a native `wl_surface` for Wayland and an XID for X11.
+  GTK4 does not expose the child `wl_subsurface` needed by the current embedded
+  renderer. On Linux, ruzu therefore selects the X11 GDK backend before GTK
+  initialization whenever `DISPLAY` is available, allowing XWayland to provide
+  the native child window.
+- A host without `DISPLAY` keeps its existing GDK backend so the launcher can
+  still open and report the unsupported render path visibly.
+
+### Missing items
+- Native Wayland child-surface creation equivalent to upstream
+  `QtCommon::GetWindowSystemInfo` remains unported.
+
+### Binary layout verification
+- N/A: frontend backend selection only.
+
+### Verification
+- Re-read upstream `GetWindowSystemType`, `GetWindowSystemInfo` and
+  `RenderWidget`'s Wayland setup.
+- Unit tests cover XWayland availability, an existing X11 selection, and a
+  Wayland-only host.
+
+## 2026-07-29 — ruzu/src/configuration/controller_preview.rs vs yuzu/configuration/configure_input_player_widget.cpp
+
+### Intentional differences
+- The drawing is a pure function of an `Input` snapshot rather than of widget
+  members, so it can be rendered to an image surface in tests.
+- The preview widget is rebuilt when the controller type changes; upstream tells
+  its single widget which type to draw.
+
+### Unintentional differences (fixed)
+- Fixed: `DrawDualController` was missing its triggers, both shoulder top views
+  and their letters, the rails between the shells and most of `DrawDualBody`.
+- Fixed: `DrawGCController` drew in the wrong order, missed the L/R letters, the
+  START/PAUSE caption, the stick gates and the handle colours, and placed the
+  d-pad at the wrong offset.
+- Fixed: `DrawArrowButton` drew neither the engraved glyph nor the cross
+  outline; `DrawArrow` filled without stroking; `Draw3dCube` was absent
+  everywhere; `pro_body_top` was never drawn.
+- Fixed: buttons were always drawn released and sticks always centred. Pressed
+  buttons now fill with `highlight`, sticks and their readout dots follow the
+  live value, and the drawing refreshes on upstream's 16 ms timer.
+
+### Missing items
+- `DrawBattery` (no battery device), the turbo blink, and the mapping-mode
+  blink driven by `BeginMappingButton`.
+
+### Binary layout verification
+- N/A: drawing only.
+
+### Verification
+- Re-read every `Draw*` in upstream `configure_input_player_widget.cpp` that the
+  six supported controller types reach.
+- Compared each rendering against the yuzu captures in
+  `screenshots/yuzu/23-28-config-controls-*.png`.
+- `cargo test -p ruzu` — 98 tests, including the shoulder top views, the rails,
+  the motion cube's presence per type and its projection at rest, a pressed
+  button filling with `highlight`, and a pushed stick changing the drawing.
+
+## 2026-07-29 — ruzu/src/configuration/configure_input_player.rs vs yuzu/configuration/configure_input_player.{cpp,ui}
+
+### Intentional differences
+- The page edits a working copy of `PlayerInput` and writes it back on OK;
+  upstream edits the `EmulatedController` itself. The copy is pushed into the
+  controller on every change so the preview reflects what is bound.
+- With nothing mapped yet the page adopts the pad that is plugged in and
+  installs its default mapping. Upstream leaves an unmapped player on "Any".
+
+### Unintentional differences (fixed)
+- Fixed: the shoulder row re-packed its groups when some were hidden. Upstream's
+  `shoulderButtons` row carries four expanding spacer widgets that
+  `UpdateControllerAvailableButtons` hides alongside the groups they separate,
+  which is what keeps one group per column. The row is now assembled from a
+  single `SHOULDER_ROW` constant so its order and the show/hide lists cannot
+  drift apart.
+- Fixed: the Input Device combo always opened on "Any". `UpdateInputDeviceCombobox`
+  and `EmulatedController::GetMappedDevices` are ported, including the
+  keyboard/mouse row and the paired-Joy-Con case.
+- Fixed: every GTK signal captured only `Weak<PlayerPage>`, but no strong owner
+  survived `page()`. Consequently controller-type changes and all other page
+  callbacks returned immediately. The `Page` apply closure now owns the
+  `PlayerPage` for the widget's lifetime, matching upstream's QObject
+  ownership; selecting a controller rebuilds the preview and updates the
+  per-layout controls.
+
+### Missing items
+- The Configure Vibration and Configure Motion buttons do not open their
+  upstream dialogs yet.
+
+### Binary layout verification
+- N/A: host UI only.
+
+### Verification
+- Re-read upstream `UpdateControllerAvailableButtons`,
+  `UpdateControllerEnabledButtons`, `UpdateMotionButtons`,
+  `UpdateControllerButtonNames`, `UpdateInputDeviceCombobox`, the
+  controller-type signal handler, `HandleClick`, and the `shoulderButtons`
+  layout in `configure_input_player.ui`.
+- Compared each controller type against the yuzu captures.
+
+## 2026-07-29 — ruzu/src/configuration/qt_config.rs vs frontend_common/config.cpp
+
+### Unintentional differences (fixed)
+- Fixed: `player_N_connected` was neither read nor written, and the loader
+  returned early when the file did not exist, so upstream's
+  `ReadBooleanSetting(.., player_index == 0)` default never ran and player 1
+  started disconnected on a first launch.
+
+### Binary layout verification
+- N/A: INI text only.
+
+### Verification
+- Re-read upstream `Config::ReadPlayerValues`.
+- `cargo test -p ruzu` covers the first launch with no file and a stored flag
+  overriding the default in both directions.
+
+## 2026-07-29 — ruzu/src/configuration/configure_dialog.rs vs yuzu/configuration/configure_dialog.cpp
+
+### Intentional differences
+- The dialog is not `transient_for` its parent. GTK advertises a transient
+  surface as `_NET_WM_WINDOW_TYPE_DIALOG`, and window managers drop
+  `_NET_WM_ACTION_MAXIMIZE_*` for dialogs, so the maximize button was drawn but
+  inert. The window stays modal, which is what `QDialog::exec` gives upstream.
+
+### Binary layout verification
+- N/A: host UI only.
+
+### Verification
+- Probed both variants under GTK4 and confirmed the window type and allowed
+  actions each produces.
+
+## 2026-07-29 — common/src/input.rs vs common/input.h
+
+### Intentional differences
+- Rust protects each global factory map with a mutex. `CreateInputDevice` and
+  `CreateOutputDevice` clone the selected `Arc<Factory>` while holding that
+  mutex, then release it before `Factory::Create`; upstream's registry has no
+  mutex and therefore permits composite factories to create child devices
+  recursively.
+
+### Unintentional differences (fixed)
+- Fixed: `BodyColorStatus` derived neither `PartialEq` nor `Eq`, so
+  `InputFromColor::OnChange` could not compare against the last value it
+  reported.
+- Fixed: the Rust registry held its non-recursive mutex across
+  `Factory::Create`. `analog_from_button` recursively creates its directional
+  button devices and deadlocked on the same factory map.
+
+### Binary layout verification
+- PASS: derives only; no field or layout change.
+
+### Verification
+- Re-read upstream `RegisterFactory`, `CreateDeviceFromString` and
+  `CreateDevice` in `common/input.h`.
+- `input_factory_can_create_a_child_device` covers recursive factory creation.
+
+## 2026-07-29 — input_common/src/helpers/stick_from_buttons.rs vs input_common/helpers/stick_from_buttons.{h,cpp}
+
+### Intentional differences
+- The child callbacks share `StickState` through `Arc<Mutex<_>>` instead of
+  capturing the enclosing C++ object. A pending consumer callback is cloned
+  under the state lock and dispatched after releasing it.
+- `last_update: Option<Instant>` represents upstream's default-constructed
+  `steady_clock::time_point`; the first elapsed duration is capped to the same
+  500 ms used upstream.
+
+### Unintentional differences (fixed)
+- `StickFromButton` did not implement `InputDeviceFactory`, so it could not be
+  registered under `analog_from_button`.
+- The directional, modifier and updater child devices had no callbacks.
+  Button state, modifier toggling, angle interpolation, soft updates and
+  duplicate suppression now follow `Stick` upstream.
+- The former angle helper reset the goal to zero for unsupported or
+  contradictory direction combinations. Upstream leaves the prior goal
+  unchanged in that case.
+
+### Binary layout verification
+- N/A: host input state only.
+
+### Verification
+- Re-read `Stick`, `StickFromButton::Create` and all update helpers in
+  `stick_from_buttons.cpp`.
+- `initialize_registers_updater_composite_and_udp_factories` verifies a
+  keyboard child event reaches the composite stick callback.
+
+## 2026-07-29 — input_common/src/helpers/touch_from_buttons.rs vs input_common/helpers/touch_from_buttons.{h,cpp}
+
+### Intentional differences
+- The child callback shares `TouchState` through `Arc<Mutex<_>>` and dispatches
+  the cloned consumer callback after releasing the state lock.
+
+### Unintentional differences (fixed)
+- `TouchFromButton` did not implement `InputDeviceFactory`.
+- The child button had no callback, so presses never produced touch updates.
+  Callback installation, initial `ForceUpdate`, coordinate normalization and
+  duplicate-state filtering now follow upstream.
+
+### Binary layout verification
+- N/A: host input state only.
+
+### Verification
+- Re-read `TouchFromButtonDevice` and `TouchFromButton::Create` in
+  `touch_from_buttons.cpp`.
+- `initialize_registers_updater_composite_and_udp_factories` verifies a
+  keyboard child event produces the normalized touch status.
+
+## 2026-07-29 — input_common/src/drivers/udp_client.rs vs input_common/drivers/udp_client.{h,cpp}
+
+### Intentional differences
+- `UdpClient` shares its base `InputEngine` with the registered factories
+  through `Arc<Mutex<InputEngine>>`; upstream shares the concrete subclass
+  through `std::shared_ptr`.
+
+### Unintentional differences (fixed)
+- The Cemuhook engine could not be registered because its `InputEngine` was
+  owned by value. Bindings using `engine:cemuhookudp` now resolve through the
+  same engine used by `UdpClient`.
+
+### Missing items
+- Socket creation, protocol receive/send loops and settings-driven server
+  parsing remain absent from the existing Rust UDP port. Registration fixes
+  saved binding resolution but does not claim network parity.
+
+### Binary layout verification
+- N/A: host driver ownership only.
+
+### Verification
+- Re-read `UDPClient` ownership and `ReloadSockets` in `udp_client.{h,cpp}`.
+- `initialize_registers_updater_composite_and_udp_factories` verifies a
+  Cemuhook motion binding resolves to an input device.
+
+## 2026-07-29 — input_common/src/input_engine.rs, input_poller.rs and drivers/sdl_driver.rs vs input_common/input_engine.{h,cpp}, input_poller.cpp and drivers/sdl_driver.{h,cpp}
+
+### Intentional differences
+- Rust represents the two concrete-driver hat query overrides with an
+  `InputEngineMetadata` adapter owned by `InputEngine`. This preserves the
+  upstream base-class defaults and keeps SDL's mappings in `sdl_driver.rs`
+  without requiring C++ inheritance.
+
+### Unintentional differences (fixed)
+- `InputFactory::create_hat_button_device` discarded the saved direction and
+  always passed `0` to `InputFromHatButton`. It now calls the concrete engine's
+  `get_hat_button_id`, matching upstream.
+- SDL now maps `up`, `right`, `down` and `left` to the corresponding
+  `SDL_HAT_*` bit values in its metadata override.
+
+### Binary layout verification
+- N/A: host input metadata only.
+
+### Verification
+- Re-read `InputEngine::GetHatButtonId`,
+  `InputFactory::CreateHatButtonDevice` and
+  `SDLDriver::{GetHatButtonName,GetHatButtonId}`.
+- `hat_device_uses_the_concrete_engine_direction_id` covers a saved left-hat
+  binding from parameter parsing through callback delivery.
+
+## 2026-07-29 — hid_core/src/resources/npad/npad.rs vs hid_core/resources/npad/npad.{h,cpp}
+
+### Unintentional differences (fixed)
+- `NPad::on_update` read only controller buttons and left both analog sticks
+  zeroed. It now reads `EmulatedController::get_sticks`, writes both sticks to
+  the Fullkey state, and copies them into `system_ext_lifo` exactly as
+  `RequestPadStateUpdate` and `OnUpdate` do upstream.
+
+### Missing items
+- The existing Rust update path still handles only Fullkey-compatible styles
+  and does not yet own upstream's per-ARUID `controller_data`. Handheld,
+  Joy-Con, GameCube and Palma LIFO updates remain a separate parity slice.
+
+### Binary layout verification
+- PASS: no HID structure layout changed; existing `NPadGenericState` stick
+  fields are populated in place.
+
+### Verification
+- Re-read `NPad::RequestPadStateUpdate` and `NPad::OnUpdate`.
+- `on_update_writes_controller_sticks_to_fullkey_and_system_ext_lifos`
+  verifies both axes of both sticks in the two guest-visible LIFOs.

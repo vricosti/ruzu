@@ -79,12 +79,8 @@ pub fn attach_render_window(
     }
 
     let scale = surface.scale_factor().max(1) as f32;
-    let (x, y, width, height) = gtk_render_rect.unwrap_or((
-        0.0,
-        0.0,
-        window.width() as f64,
-        window.height() as f64,
-    ));
+    let (x, y, width, height) =
+        gtk_render_rect.unwrap_or((0.0, 0.0, window.width() as f64, window.height() as f64));
     // Zero-sized windows are invalid in X and would fail the swapchain later.
     let width = (width.max(1.0) * scale as f64) as u32;
     let height = (height.max(1.0) * scale as f64) as u32;
@@ -159,7 +155,11 @@ pub fn resize_render_window(
     if display.is_null() || child == 0 {
         return None;
     }
-    let scale = window.surface().map(|s| s.scale_factor()).unwrap_or(1).max(1) as f64;
+    let scale = window
+        .surface()
+        .map(|s| s.scale_factor())
+        .unwrap_or(1)
+        .max(1) as f64;
     let (x, y, width, height) = gtk_render_rect;
     let width = (width.max(1.0) * scale) as u32;
     let height = (height.max(1.0) * scale) as u32;

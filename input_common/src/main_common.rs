@@ -21,11 +21,35 @@ use crate::drivers::mouse::Mouse;
 use crate::drivers::sdl_driver::SDLDriver;
 use crate::drivers::tas_input;
 use crate::drivers::touch_screen::TouchScreen;
+use crate::drivers::udp_client::UdpClient;
 use crate::drivers::virtual_amiibo::VirtualAmiibo;
 use crate::drivers::virtual_gamepad::VirtualGamepad;
+use crate::helpers::stick_from_buttons::StickFromButton;
+use crate::helpers::touch_from_buttons::TouchFromButton;
 use crate::input_engine::{InputEngine, MappingData, PadIdentifier};
 use crate::input_mapping::MappingFactory;
 use crate::input_poller::{InputFactory, OutputFactory};
+use parking_lot::Mutex;
+
+/// The callback upstream builds in `RegisterEngine`:
+/// `MappingCallback{[this](const MappingData& data) { RegisterInput(data); }}`.
+fn mapping_callback(factory: &Arc<Mutex<MappingFactory>>) -> crate::input_engine::MappingCallback {
+    let factory = Arc::clone(factory);
+    crate::input_engine::MappingCallback {
+        on_data: Some(Box::new(move |data| factory.lock().register_input(data))),
+    }
+}
+
+/// Upstream `InputSubsystem::Impl::RegisterEngine`.
+fn register_engine(engine: Arc<Mutex<InputEngine>>, mapping_factory: &Arc<Mutex<MappingFactory>>) {
+    let name = {
+        let mut engine = engine.lock();
+        engine.set_mapping_callback(mapping_callback(mapping_factory));
+        engine.get_engine_name().to_string()
+    };
+    register_input_factory(&name, Arc::new(InputFactory::new(Arc::clone(&engine))));
+    register_output_factory(&name, Arc::new(OutputFactory::new(engine)));
+}
 
 /// Port of `Polling` namespace from main.h
 pub mod Polling {
@@ -56,7 +80,7 @@ pub type MotionMapping = HashMap<i32, ParamPackage>;
 /// Dummy engine to get periodic updates.
 /// Port of UpdateEngine from main.cpp
 struct UpdateEngine {
-    engine: InputEngine,
+    engine: Arc<Mutex<InputEngine>>,
     last_state: bool,
 }
 
@@ -71,26 +95,37 @@ impl UpdateEngine {
         let mut engine = InputEngine::new(input_engine);
         engine.pre_set_controller(&Self::IDENTIFIER);
         Self {
-            engine,
+            engine: Arc::new(Mutex::new(engine)),
             last_state: false,
         }
     }
 
+    fn engine(&self) -> Arc<Mutex<InputEngine>> {
+        Arc::clone(&self.engine)
+    }
+
     fn pump_events(&mut self) {
-        self.engine
+        let callbacks = self
+            .engine
+            .lock()
             .set_button(&Self::IDENTIFIER, 0, self.last_state);
+        callbacks.dispatch();
         self.last_state = !self.last_state;
     }
 }
 
 /// Port of InputSubsystem::Impl from main.cpp
 struct InputSubsystemImpl {
-    mapping_factory: Option<MappingFactory>,
+    /// Shared, because every engine's mapping callback writes into it from the
+    /// driver's thread. Upstream hands each engine a lambda capturing the
+    /// `Impl`, which owns the factory outright.
+    mapping_factory: Option<Arc<Mutex<MappingFactory>>>,
 
     update_engine: Option<UpdateEngine>,
     keyboard: Option<Keyboard>,
     mouse: Option<Mouse>,
     touch_screen: Option<TouchScreen>,
+    udp_client: Option<UdpClient>,
     tas_input: Option<tas_input::Tas>,
     camera: Option<Camera>,
     virtual_amiibo: Option<VirtualAmiibo>,
@@ -109,6 +144,7 @@ impl InputSubsystemImpl {
             keyboard: None,
             mouse: None,
             touch_screen: None,
+            udp_client: None,
             tas_input: None,
             camera: None,
             virtual_amiibo: None,
@@ -119,24 +155,31 @@ impl InputSubsystemImpl {
 
     /// Port of Impl::Initialize
     fn initialize(&mut self) {
-        self.mapping_factory = Some(MappingFactory::new());
+        self.mapping_factory = Some(Arc::new(Mutex::new(MappingFactory::new())));
 
         self.update_engine = Some(UpdateEngine::new("updater".to_string()));
         self.keyboard = Some(Keyboard::new("keyboard".to_string()));
         self.mouse = Some(Mouse::new("mouse".to_string()));
         self.touch_screen = Some(TouchScreen::new("touch".to_string()));
+        self.udp_client = Some(UdpClient::new("cemuhookudp".to_string()));
         // Upstream `Impl::Initialize` calls `RegisterEngine` for every engine,
         // which registers both an input and an output factory under the
         // engine's name. Anything left out here can never resolve a binding:
         // a `engine:keyboard` button would simply never be found.
+        //
+        // Upstream's `RegisterEngine` also hands each engine a `MappingCallback`
+        // that funnels into `RegisterInput`. Without it the mapping factory
+        // never sees an event, and the Controls page can never capture a
+        // binding.
+        let mapping_factory = Arc::clone(self.mapping_factory.as_ref().unwrap());
         for engine in [
+            self.update_engine.as_ref().unwrap().engine(),
             self.keyboard.as_ref().unwrap().engine(),
             self.mouse.as_ref().unwrap().engine(),
             self.touch_screen.as_ref().unwrap().engine(),
+            self.udp_client.as_ref().unwrap().engine(),
         ] {
-            let name = engine.lock().get_engine_name().to_string();
-            register_input_factory(&name, Arc::new(InputFactory::new(Arc::clone(&engine))));
-            register_output_factory(&name, Arc::new(OutputFactory::new(engine)));
+            register_engine(engine, &mapping_factory);
         }
         self.tas_input = Some(tas_input::Tas::new("tas".to_string()));
         self.camera = Some(Camera::new("camera".to_string()));
@@ -146,25 +189,33 @@ impl InputSubsystemImpl {
         // Upstream: `RegisterEngine("sdl", sdl);` under HAVE_SDL2.
         let sdl = SDLDriver::new("sdl".to_string());
         let sdl_engine = sdl.engine();
-        let sdl_name = sdl_engine.lock().get_engine_name().to_string();
-        register_input_factory(
-            &sdl_name,
-            Arc::new(InputFactory::new(Arc::clone(&sdl_engine))),
-        );
-        register_output_factory(&sdl_name, Arc::new(OutputFactory::new(sdl_engine)));
+        register_engine(sdl_engine, &mapping_factory);
         self.sdl = Some(sdl);
+
+        register_input_factory("touch_from_button", Arc::new(TouchFromButton::new()));
+        register_input_factory("analog_from_button", Arc::new(StickFromButton::new()));
     }
 
     /// Port of Impl::Shutdown
     fn shutdown(&mut self) {
-        for name in ["keyboard", "mouse", "touch", "sdl"] {
+        for name in [
+            "updater",
+            "keyboard",
+            "mouse",
+            "touch",
+            "cemuhookudp",
+            "sdl",
+        ] {
             unregister_input_factory(name);
             unregister_output_factory(name);
         }
+        unregister_input_factory("touch_from_button");
+        unregister_input_factory("analog_from_button");
         self.update_engine = None;
         self.keyboard = None;
         self.mouse = None;
         self.touch_screen = None;
+        self.udp_client = None;
         self.tas_input = None;
         self.camera = None;
         self.virtual_amiibo = None;
@@ -188,6 +239,9 @@ impl InputSubsystemImpl {
         if let Some(ref mouse) = self.mouse {
             devices.extend(mouse.get_input_devices());
         }
+        if let Some(ref udp_client) = self.udp_client {
+            devices.extend(udp_client.get_input_devices());
+        }
         if let Some(ref sdl) = self.sdl {
             devices.extend(sdl.get_input_devices());
         }
@@ -195,17 +249,58 @@ impl InputSubsystemImpl {
         devices
     }
 
+    /// Port of Impl::BeginConfiguration.
+    fn begin_configuration(&mut self) {
+        for engine in self.engines() {
+            engine.lock().begin_configuration();
+        }
+    }
+
+    /// Port of Impl::EndConfiguration.
+    fn end_configuration(&mut self) {
+        for engine in self.engines() {
+            engine.lock().end_configuration();
+        }
+    }
+
+    /// Every engine that can produce a mapping event.
+    fn engines(&self) -> Vec<Arc<Mutex<InputEngine>>> {
+        let mut engines = Vec::new();
+        if let Some(ref update_engine) = self.update_engine {
+            engines.push(update_engine.engine());
+        }
+        if let Some(ref keyboard) = self.keyboard {
+            engines.push(keyboard.engine());
+        }
+        if let Some(ref mouse) = self.mouse {
+            engines.push(mouse.engine());
+        }
+        if let Some(ref touch_screen) = self.touch_screen {
+            engines.push(touch_screen.engine());
+        }
+        if let Some(ref udp_client) = self.udp_client {
+            engines.push(udp_client.engine());
+        }
+        if let Some(ref sdl) = self.sdl {
+            engines.push(sdl.engine());
+        }
+        engines
+    }
+
     /// Port of Impl::PumpEvents
     fn pump_events(&mut self) {
         if let Some(ref mut update_engine) = self.update_engine {
             update_engine.pump_events();
         }
+        if let Some(ref sdl) = self.sdl {
+            sdl.pump_events();
+        }
     }
 
     /// Port of Impl::RegisterInput
     fn register_input(&mut self, data: &MappingData) {
-        if let Some(ref mut mapping_factory) = self.mapping_factory {
-            mapping_factory.register_input(data);
+        if let Some(ref mapping_factory) = self.mapping_factory {
+            mapping_factory.lock().register_input(data);
         }
     }
 
@@ -232,6 +327,11 @@ impl InputSubsystemImpl {
                 return sdl.get_analog_mapping_for_device(params);
             }
         }
+        if let Some(ref udp_client) = self.udp_client {
+            if udp_client.engine().lock().get_engine_name() == engine {
+                return udp_client.get_analog_mapping_for_device(params);
+            }
+        }
         // Keyboard, touch_screen, tas_input, camera, virtual_amiibo, virtual_gamepad
         // don't have analog mappings — they use the default (empty).
         HashMap::new()
@@ -249,8 +349,12 @@ impl InputSubsystemImpl {
                 return sdl.get_button_mapping_for_device(params);
             }
         }
-        // The remaining registered engines (keyboard, mouse, touch, tas, camera,
-        // virtual_amiibo, virtual_gamepad) provide no custom button mappings.
+        if let Some(ref udp_client) = self.udp_client {
+            if udp_client.engine().lock().get_engine_name() == engine {
+                return udp_client.get_button_mapping_for_device(params);
+            }
+        }
+        // The remaining engines provide no custom button mappings.
         HashMap::new()
     }
 
@@ -264,6 +368,11 @@ impl InputSubsystemImpl {
         if let Some(ref sdl) = self.sdl {
             if sdl.engine().lock().get_engine_name() == engine {
                 return sdl.get_motion_mapping_for_device(params);
+            }
+        }
+        if let Some(ref udp_client) = self.udp_client {
+            if udp_client.engine().lock().get_engine_name() == engine {
+                return udp_client.get_motion_mapping_for_device(params);
             }
         }
         HashMap::new()
@@ -283,6 +392,16 @@ impl InputSubsystemImpl {
         {
             return self.mouse.as_ref().unwrap().get_ui_name(params);
         }
+        if let Some(ref udp_client) = self.udp_client {
+            if udp_client.engine().lock().get_engine_name() == engine {
+                return udp_client.get_ui_name(params);
+            }
+        }
+        if let Some(ref sdl) = self.sdl {
+            if sdl.engine().lock().get_engine_name() == engine {
+                return sdl.get_ui_name(params);
+            }
+        }
         ButtonNames::Invalid
     }
 
@@ -293,8 +412,16 @@ impl InputSubsystemImpl {
         if engine.is_empty() || engine == "any" {
             return false;
         }
-        // None of the currently registered engines implement stick inversion.
-        // GCAdapter and SDLDriver do when enabled.
+        if let Some(ref udp_client) = self.udp_client {
+            if udp_client.engine().lock().get_engine_name() == engine {
+                return udp_client.is_stick_inverted(params);
+            }
+        }
+        if let Some(ref sdl) = self.sdl {
+            if sdl.engine().lock().get_engine_name() == engine {
+                return sdl.is_stick_inverted(params);
+            }
+        }
         false
     }
 }
@@ -460,25 +587,26 @@ impl InputSubsystem {
     /// Reloads the input devices.
     /// Port of InputSubsystem::ReloadInputDevices
     /// Upstream: calls `udp_client->ReloadSockets()`.
-    /// UDPClient is not yet a registered engine in ruzu.
     pub fn reload_input_devices(&mut self) {
-        log::debug!("InputSubsystem::reload_input_devices called");
+        if let Some(ref mut udp_client) = self.imp.udp_client {
+            udp_client.reload_sockets();
+        }
     }
 
     /// Start polling from all backends for a desired input type.
     /// Port of InputSubsystem::BeginMapping
     pub fn begin_mapping(&mut self, input_type: Polling::InputType) {
-        // Begin configuration on all engines, then start mapping
-        if let Some(ref mut mapping_factory) = self.imp.mapping_factory {
-            mapping_factory.begin_mapping(input_type);
+        self.imp.begin_configuration();
+        if let Some(ref mapping_factory) = self.imp.mapping_factory {
+            mapping_factory.lock().begin_mapping(input_type);
         }
     }
 
     /// Returns an input event with mapping information.
     /// Port of InputSubsystem::GetNextInput
     pub fn get_next_input(&mut self) -> ParamPackage {
-        if let Some(ref mut mapping_factory) = self.imp.mapping_factory {
-            mapping_factory.get_next_input()
+        if let Some(ref mapping_factory) = self.imp.mapping_factory {
+            mapping_factory.lock().get_next_input()
         } else {
             ParamPackage::default()
         }
@@ -487,8 +615,9 @@ impl InputSubsystem {
     /// Stop polling from all backends.
     /// Port of InputSubsystem::StopMapping
     pub fn stop_mapping(&mut self) {
-        if let Some(ref mut mapping_factory) = self.imp.mapping_factory {
-            mapping_factory.stop_mapping();
+        self.imp.end_configuration();
+        if let Some(ref mapping_factory) = self.imp.mapping_factory {
+            mapping_factory.lock().stop_mapping();
         }
     }
 
@@ -534,4 +663,69 @@ pub fn generate_analog_param_from_keys(
     circle_pad_param.set_str("modifier", generate_keyboard_param(key_modifier));
     circle_pad_param.set_str("modifier_scale", modifier_scale.to_string());
     circle_pad_param.serialize()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    use common::input::{CallbackStatus, InputCallback, InputType};
+
+    fn capture_status(
+        device: &mut dyn common::input::InputDevice,
+    ) -> StdArc<StdMutex<CallbackStatus>> {
+        let status = StdArc::new(StdMutex::new(CallbackStatus::default()));
+        let output = StdArc::clone(&status);
+        device.set_callback(InputCallback {
+            on_change: Some(StdArc::new(move |value| {
+                *output.lock().unwrap() = value.clone();
+            })),
+        });
+        status
+    }
+
+    #[test]
+    fn initialize_registers_updater_composite_and_udp_factories() {
+        let mut subsystem = InputSubsystem::new();
+        subsystem.initialize();
+
+        let analog = generate_analog_param_from_keys(11, 12, 13, 14, 15, 0.5);
+        let mut analog = common::input::create_input_device_from_string(&analog);
+        let analog_status = capture_status(analog.as_mut());
+        subsystem.get_keyboard().unwrap().press_key(11);
+        let analog_status = analog_status.lock().unwrap().clone();
+        assert_eq!(analog_status.input_type, InputType::Stick);
+        assert!(analog_status.stick_status.y.raw_value > 0.99);
+
+        let mut touch_params = ParamPackage::default();
+        touch_params.set_str("engine", "touch_from_button".to_string());
+        touch_params.set_str("button", generate_keyboard_param(21));
+        touch_params.set_float("x", 640.0);
+        touch_params.set_float("y", 360.0);
+        let mut touch = common::input::create_input_device(&touch_params);
+        let touch_status = capture_status(touch.as_mut());
+        subsystem.get_keyboard().unwrap().press_key(21);
+        let touch_status = touch_status.lock().unwrap().clone();
+        assert_eq!(touch_status.input_type, InputType::Touch);
+        assert!(touch_status.touch_status.pressed.value);
+        assert_eq!(touch_status.touch_status.x.raw_value, 0.5);
+        assert_eq!(touch_status.touch_status.y.raw_value, 0.5);
+
+        let mut udp_params = ParamPackage::default();
+        udp_params.set_str("engine", "cemuhookudp".to_string());
+        udp_params.set_str("guid", UUID::default().raw_string());
+        udp_params.set_int("port", 26760);
+        udp_params.set_int("pad", 0);
+        udp_params.set_int("motion", 0);
+        let mut udp = common::input::create_input_device(&udp_params);
+        let udp_status = capture_status(udp.as_mut());
+        udp.force_update();
+        assert_eq!(udp_status.lock().unwrap().input_type, InputType::Motion);
+
+        drop(udp);
+        drop(touch);
+        drop(analog);
+        subsystem.shutdown();
+    }
 }

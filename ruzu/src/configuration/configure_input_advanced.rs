@@ -68,7 +68,9 @@ pub fn page() -> Page {
     );
     let ring_controller = device_row(
         "Ring Controller",
-        *common::settings::values().enable_ring_controller.get_value(),
+        *common::settings::values()
+            .enable_ring_controller
+            .get_value(),
         Some("Configure"),
     );
     let infrared = device_row(
@@ -96,7 +98,9 @@ pub fn page() -> Page {
 
     let emulate_analog = w::check_row(
         "Emulate Analog with Keyboard Input",
-        *common::settings::values().emulate_analog_keyboard.get_value(),
+        *common::settings::values()
+            .emulate_analog_keyboard
+            .get_value(),
     );
     let udp_controllers = w::check_row(
         "Enable UDP controllers (not needed for motion)",
@@ -164,7 +168,9 @@ pub fn page() -> Page {
 
     Page::new("Advanced", scroller, move || {
         let mut values = common::settings::values_mut();
-        values.keyboard_enabled.set_value(keyboard.check.is_active());
+        values
+            .keyboard_enabled
+            .set_value(keyboard.check.is_active());
         values.mouse_enabled.set_value(mouse.check.is_active());
         values.touchscreen.enabled = touchscreen.check.is_active();
         values
@@ -173,7 +179,9 @@ pub fn page() -> Page {
         values
             .enable_ring_controller
             .set_value(ring_controller.check.is_active());
-        values.enable_ir_sensor.set_value(infrared.check.is_active());
+        values
+            .enable_ir_sensor
+            .set_value(infrared.check.is_active());
 
         values
             .emulate_analog_keyboard

@@ -146,7 +146,7 @@ impl HIDCore {
         let mut active_players: i8 = 0;
         for player_index in 0..(AVAILABLE_CONTROLLERS - 2) {
             let controller = self.get_emulated_controller_by_index(player_index);
-            if controller.is_connected() {
+            if controller.is_connected(false) {
                 active_players += 1;
             }
         }
@@ -157,7 +157,7 @@ impl HIDCore {
     pub fn get_first_npad_id(&self) -> NpadIdType {
         for player_index in 0..AVAILABLE_CONTROLLERS {
             let controller = self.get_emulated_controller_by_index(player_index);
-            if controller.is_connected() {
+            if controller.is_connected(false) {
                 return controller.get_npad_id_type();
             }
         }
@@ -168,7 +168,7 @@ impl HIDCore {
     pub fn get_first_disconnected_npad_id(&self) -> NpadIdType {
         for player_index in 0..AVAILABLE_CONTROLLERS {
             let controller = self.get_emulated_controller_by_index(player_index);
-            if !controller.is_connected() {
+            if !controller.is_connected(false) {
                 return controller.get_npad_id_type();
             }
         }

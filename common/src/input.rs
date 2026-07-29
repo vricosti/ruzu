@@ -327,7 +327,7 @@ pub struct TouchStatus {
 /// Physical controller color in RGB format.
 ///
 /// Maps to upstream `BodyColorStatus`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BodyColorStatus {
     pub body: u32,
     pub buttons: u32,
@@ -531,7 +531,7 @@ pub struct CallbackStatus {
 ///
 /// Maps to upstream `InputCallback`.
 pub struct InputCallback {
-    pub on_change: Option<Box<dyn Fn(&CallbackStatus) + Send + Sync>>,
+    pub on_change: Option<Arc<dyn Fn(&CallbackStatus) + Send + Sync>>,
 }
 
 // =====================
@@ -742,8 +742,8 @@ pub fn create_output_device_from_string(params: &str) -> Box<dyn OutputDevice> {
 /// Maps to upstream `CreateDevice<InputDevice>` / `CreateInputDevice`.
 pub fn create_input_device(package: &ParamPackage) -> Box<dyn InputDevice> {
     let engine = package.get_str("engine", "null");
-    let list = input_factory_list().lock().unwrap();
-    match list.get(&engine) {
+    let factory = input_factory_list().lock().unwrap().get(&engine).cloned();
+    match factory {
         Some(factory) => factory.create(package),
         None => {
             if engine != "null" {
@@ -759,8 +759,8 @@ pub fn create_input_device(package: &ParamPackage) -> Box<dyn InputDevice> {
 /// Maps to upstream `CreateDevice<OutputDevice>` / `CreateOutputDevice`.
 pub fn create_output_device(package: &ParamPackage) -> Box<dyn OutputDevice> {
     let engine = package.get_str("engine", "null");
-    let list = output_factory_list().lock().unwrap();
-    match list.get(&engine) {
+    let factory = output_factory_list().lock().unwrap().get(&engine).cloned();
+    match factory {
         Some(factory) => factory.create(package),
         None => {
             if engine != "null" {
@@ -774,6 +774,14 @@ pub fn create_output_device(package: &ParamPackage) -> Box<dyn OutputDevice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RecursiveInputFactory;
+
+    impl InputDeviceFactory for RecursiveInputFactory {
+        fn create(&self, _params: &ParamPackage) -> Box<dyn InputDevice> {
+            create_input_device(&ParamPackage::default())
+        }
+    }
 
     #[test]
     fn test_default_values() {
@@ -796,7 +804,7 @@ mod tests {
         let called_clone = called.clone();
 
         device.set_callback(InputCallback {
-            on_change: Some(Box::new(move |_status| {
+            on_change: Some(Arc::new(move |_status| {
                 *called_clone.lock().unwrap() = true;
             })),
         });
@@ -828,6 +836,17 @@ mod tests {
         // They should not panic and return default devices
         let _ = input;
         let _ = output;
+    }
+
+    #[test]
+    fn input_factory_can_create_a_child_device() {
+        const ENGINE: &str = "common_test_recursive_input";
+        register_input_factory(ENGINE, Arc::new(RecursiveInputFactory));
+
+        let params = ParamPackage::from_pairs([("engine", ENGINE)]);
+        let _device = create_input_device(&params);
+
+        unregister_input_factory(ENGINE);
     }
 
     #[test]

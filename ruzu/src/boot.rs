@@ -69,6 +69,7 @@ pub fn boot_game(
     drawable_size: (u32, u32),
     shown_state: Arc<AtomicBool>,
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
+    hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     filepath: String,
     progress: ProgressFn,
 ) -> EmulationSession {
@@ -82,6 +83,7 @@ pub fn boot_game(
                 drawable_size,
                 shown_state,
                 framebuffer_layout,
+                hid_core,
                 filepath,
                 progress,
                 stop_rx,
@@ -101,6 +103,7 @@ fn run_boot(
     drawable_size: (u32, u32),
     shown_state: Arc<AtomicBool>,
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
+    hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     filepath: String,
     progress: ProgressFn,
     stop_rx: Receiver<()>,
@@ -113,7 +116,7 @@ fn run_boot(
     common::settings::log_settings(&common::settings::values());
 
     // System init — upstream `Core::System system{}; system.Initialize();`.
-    let mut system = System::new();
+    let mut system = System::new_with_hid_core(hid_core);
     system.initialize();
 
     // Content provider / filesystem / factories (upstream core.cpp:367-370).

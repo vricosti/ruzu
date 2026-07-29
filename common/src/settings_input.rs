@@ -422,6 +422,7 @@ pub const JOYCON_BUTTONS_NEON_BLUE: u32 = 0x001E1E;
 // ── Controller type ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum ControllerType {
     ProController,
     DualJoyconDetached,
@@ -439,6 +440,27 @@ pub enum ControllerType {
 impl Default for ControllerType {
     fn default() -> Self {
         Self::ProController
+    }
+}
+
+impl TryFrom<u8> for ControllerType {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::ProController),
+            1 => Ok(Self::DualJoyconDetached),
+            2 => Ok(Self::LeftJoycon),
+            3 => Ok(Self::RightJoycon),
+            4 => Ok(Self::Handheld),
+            5 => Ok(Self::GameCube),
+            6 => Ok(Self::Pokeball),
+            7 => Ok(Self::NES),
+            8 => Ok(Self::SNES),
+            9 => Ok(Self::N64),
+            10 => Ok(Self::SegaGenesis),
+            _ => Err(()),
+        }
     }
 }
 

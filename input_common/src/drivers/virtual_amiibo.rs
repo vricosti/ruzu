@@ -293,14 +293,18 @@ impl VirtualAmiibo {
 
         let uuid_len = self.status.uuid_length as usize;
         self.status.uuid[..uuid_len].copy_from_slice(&self.nfc_data[..uuid_len]);
-        self.engine.set_nfc(&amiibo_identifier(), &self.status);
+        self.engine
+            .set_nfc(&amiibo_identifier(), &self.status)
+            .dispatch();
         Info::Success
     }
 
     /// Port of VirtualAmiibo::ReloadAmiibo
     pub fn reload_amiibo(&mut self) -> Info {
         if self.state == State::TagNearby {
-            self.engine.set_nfc(&amiibo_identifier(), &self.status);
+            self.engine
+                .set_nfc(&amiibo_identifier(), &self.status)
+                .dispatch();
             return Info::Success;
         }
 
@@ -315,7 +319,9 @@ impl VirtualAmiibo {
 
         self.state = State::WaitingForAmiibo;
         self.status.state = NfcState::AmiiboRemoved;
-        self.engine.set_nfc(&amiibo_identifier(), &self.status);
+        self.engine
+            .set_nfc(&amiibo_identifier(), &self.status)
+            .dispatch();
         self.status.tag_type = 0;
         Info::Success
     }

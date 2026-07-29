@@ -45,8 +45,44 @@ fn set_main_window(window: Rc<GMainWindow>) {
     MAIN_WINDOW.with(|slot| *slot.borrow_mut() = Some(window));
 }
 
+#[cfg(target_os = "linux")]
+fn linux_gdk_backend_override(
+    current_backend: Option<&str>,
+    x11_display_available: bool,
+) -> Option<&'static str> {
+    if x11_display_available && current_backend != Some("x11") {
+        Some("x11")
+    } else {
+        None
+    }
+}
+
+/// GTK4 cannot expose a native Wayland child surface for the embedded renderer.
+/// Until that path is ported, use XWayland whenever an X11 display is
+/// available so every launcher boot path can create the same child window.
+#[cfg(target_os = "linux")]
+fn configure_linux_gdk_backend() -> bool {
+    let current_backend = std::env::var("GDK_BACKEND").ok();
+    let x11_display_available = std::env::var_os("DISPLAY").is_some();
+    let Some(backend) =
+        linux_gdk_backend_override(current_backend.as_deref(), x11_display_available)
+    else {
+        return false;
+    };
+    std::env::set_var("GDK_BACKEND", backend);
+    true
+}
+
 fn main() -> glib::ExitCode {
+    #[cfg(target_os = "linux")]
+    let forced_x11 = configure_linux_gdk_backend();
+
     env_logger::init();
+
+    #[cfg(target_os = "linux")]
+    if forced_x11 {
+        log::info!("Using the X11 GDK backend for the embedded Linux render surface");
+    }
 
     // A yuzu configuration is *offered* for import on first run, not copied
     // silently — the prompt is raised from `GMainWindow` once the UI is up (see
@@ -108,4 +144,24 @@ fn main() -> glib::ExitCode {
     });
 
     app.run()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_launcher_uses_x11_when_xwayland_is_available() {
+        assert_eq!(
+            linux_gdk_backend_override(Some("wayland"), true),
+            Some("x11")
+        );
+        assert_eq!(linux_gdk_backend_override(None, true), Some("x11"));
+        assert_eq!(linux_gdk_backend_override(Some("x11"), true), None);
+    }
+
+    #[test]
+    fn linux_launcher_keeps_wayland_without_an_x11_display() {
+        assert_eq!(linux_gdk_backend_override(Some("wayland"), false), None);
+    }
 }

@@ -39,6 +39,10 @@ ruzu_core = { package = "core", path = "../core" }
 # it to `GRenderWindow`, which forwards key events into it.
 input_common = { workspace = true }
 
+# The emulated controller the Controls preview reads its live values from,
+# upstream's `Core::HID::EmulatedController`.
+hid_core = { path = "../hid_core" }
+
 # Shared frontend helpers (content install / verification), the ruzu port of
 # upstream's `src/frontend_common`.
 frontend_common = { path = "../frontend_common" }

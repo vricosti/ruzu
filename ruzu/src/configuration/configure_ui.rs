@@ -113,17 +113,15 @@ pub fn page() -> Page {
     }
 
     let game_icon_labels: Vec<&str> = GAME_ICON_SIZES.iter().map(|(_, l)| *l).collect();
-    let game_icon_index = uisettings::with(|v| {
-        index_by_value(GAME_ICON_SIZES, *v.game_icon_size.get_value())
-    });
+    let game_icon_index =
+        uisettings::with(|v| index_by_value(GAME_ICON_SIZES, *v.game_icon_size.get_value()));
     let (game_icon_row, game_icon) =
         w::combo_row("Game Icon Size:", &game_icon_labels, game_icon_index);
     game_list.append(&game_icon_row);
 
     let folder_icon_labels: Vec<&str> = FOLDER_ICON_SIZES.iter().map(|(_, l)| *l).collect();
-    let folder_icon_index = uisettings::with(|v| {
-        index_by_value(FOLDER_ICON_SIZES, *v.folder_icon_size.get_value())
-    });
+    let folder_icon_index =
+        uisettings::with(|v| index_by_value(FOLDER_ICON_SIZES, *v.folder_icon_size.get_value()));
     let (folder_icon_row, folder_icon) =
         w::combo_row("Folder Icon Size:", &folder_icon_labels, folder_icon_index);
     game_list.append(&folder_icon_row);
@@ -266,7 +264,10 @@ mod tests {
     fn icon_size_defaults_select_the_standard_rows() {
         // Upstream defaults are 64 (game) and 48 (folder), both labelled
         // "Standard" — a mismatch here would silently show "None".
-        assert_eq!(GAME_ICON_SIZES[index_by_value(GAME_ICON_SIZES, 64) as usize].1, "Standard (64x64)");
+        assert_eq!(
+            GAME_ICON_SIZES[index_by_value(GAME_ICON_SIZES, 64) as usize].1,
+            "Standard (64x64)"
+        );
         assert_eq!(
             FOLDER_ICON_SIZES[index_by_value(FOLDER_ICON_SIZES, 48) as usize].1,
             "Standard (48x48)"

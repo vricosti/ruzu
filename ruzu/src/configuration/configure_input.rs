@@ -12,19 +12,36 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use super::configure_dialog::Page;
 use super::configure_input_advanced;
 use super::configure_input_player;
+use super::input_profiles::InputProfiles;
 
 /// Number of player tabs — upstream builds `Settings::values.players` slots
 /// 0..8 as "Player 1".."Player 8".
 pub const NUM_PLAYERS: usize = 8;
 
 /// Build the Controls tabs — upstream `ConfigureInput::GetSubTabs()`.
-pub fn pages(input_subsystem: Rc<RefCell<input_common::InputSubsystem>>) -> Vec<Page> {
+pub fn pages(
+    input_subsystem: Rc<RefCell<input_common::InputSubsystem>>,
+    hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+) -> Vec<Page> {
+    // Upstream `ConfigureInput` owns one `InputProfiles` instance shared by
+    // every per-player page.
+    let profiles = Rc::new(configure_input_player::InputProfileContext::new(
+        InputProfiles::new(),
+    ));
     let mut pages: Vec<Page> = (0..NUM_PLAYERS)
-        .map(|index| configure_input_player::page(index, Rc::clone(&input_subsystem)))
+        .map(|index| {
+            configure_input_player::page(
+                index,
+                Rc::clone(&input_subsystem),
+                Arc::clone(&hid_core),
+                Rc::clone(&profiles),
+            )
+        })
         .collect();
     pages.push(configure_input_advanced::page());
     pages

@@ -77,13 +77,21 @@ impl Keyboard {
     /// Sets the status of all buttons bound with the key to pressed.
     /// Port of Keyboard::PressKey
     pub fn press_key(&self, key_code: i32) {
-        self.engine.lock().set_button(&key_identifier(), key_code, true);
+        let pending = self
+            .engine
+            .lock()
+            .set_button(&key_identifier(), key_code, true);
+        pending.dispatch();
     }
 
     /// Sets the status of all buttons bound with the key to released.
     /// Port of Keyboard::ReleaseKey
     pub fn release_key(&self, key_code: i32) {
-        self.engine.lock().set_button(&key_identifier(), key_code, false);
+        let pending = self
+            .engine
+            .lock()
+            .set_button(&key_identifier(), key_code, false);
+        pending.dispatch();
     }
 
     /// Sets the status of the keyboard key to pressed.
@@ -92,7 +100,11 @@ impl Keyboard {
         if key_index == native_keyboard::Keys::None as i32 {
             return;
         }
-        self.engine.lock().set_button(&keyboard_key_identifier(), key_index, true);
+        let pending = self
+            .engine
+            .lock()
+            .set_button(&keyboard_key_identifier(), key_index, true);
+        pending.dispatch();
     }
 
     /// Sets the status of the keyboard key to released.
@@ -101,7 +113,11 @@ impl Keyboard {
         if key_index == native_keyboard::Keys::None as i32 {
             return;
         }
-        self.engine.lock().set_button(&keyboard_key_identifier(), key_index, false);
+        let pending = self
+            .engine
+            .lock()
+            .set_button(&keyboard_key_identifier(), key_index, false);
+        pending.dispatch();
     }
 
     /// Sets the status of all keyboard modifier keys.
@@ -112,65 +128,74 @@ impl Keyboard {
 
         for i in 0..32 {
             let key_value = ((key_modifiers >> i) & 0x1) != 0;
-            self.engine.lock().set_button(&kbd_mod_id, i, key_value);
+            let pending = self.engine.lock().set_button(&kbd_mod_id, i, key_value);
+            pending.dispatch();
 
             // Use the modifier to press the key button equivalent
             match i {
                 i if i == native_keyboard::Modifiers::LeftControl as i32 => {
-                    self.engine.lock().set_button(
+                    let pending = self.engine.lock().set_button(
                         &kbd_key_id,
                         native_keyboard::Keys::LeftControlKey as i32,
                         key_value,
                     );
+                    pending.dispatch();
                 }
                 i if i == native_keyboard::Modifiers::LeftShift as i32 => {
-                    self.engine.lock().set_button(
+                    let pending = self.engine.lock().set_button(
                         &kbd_key_id,
                         native_keyboard::Keys::LeftShiftKey as i32,
                         key_value,
                     );
+                    pending.dispatch();
                 }
                 i if i == native_keyboard::Modifiers::LeftAlt as i32 => {
-                    self.engine.lock().set_button(
+                    let pending = self.engine.lock().set_button(
                         &kbd_key_id,
                         native_keyboard::Keys::LeftAltKey as i32,
                         key_value,
                     );
+                    pending.dispatch();
                 }
                 i if i == native_keyboard::Modifiers::LeftMeta as i32 => {
-                    self.engine.lock().set_button(
+                    let pending = self.engine.lock().set_button(
                         &kbd_key_id,
                         native_keyboard::Keys::LeftMetaKey as i32,
                         key_value,
                     );
+                    pending.dispatch();
                 }
                 i if i == native_keyboard::Modifiers::RightControl as i32 => {
-                    self.engine.lock().set_button(
+                    let pending = self.engine.lock().set_button(
                         &kbd_key_id,
                         native_keyboard::Keys::RightControlKey as i32,
                         key_value,
                     );
+                    pending.dispatch();
                 }
                 i if i == native_keyboard::Modifiers::RightShift as i32 => {
-                    self.engine.lock().set_button(
+                    let pending = self.engine.lock().set_button(
                         &kbd_key_id,
                         native_keyboard::Keys::RightShiftKey as i32,
                         key_value,
                     );
+                    pending.dispatch();
                 }
                 i if i == native_keyboard::Modifiers::RightAlt as i32 => {
-                    self.engine.lock().set_button(
+                    let pending = self.engine.lock().set_button(
                         &kbd_key_id,
                         native_keyboard::Keys::RightAltKey as i32,
                         key_value,
                     );
+                    pending.dispatch();
                 }
                 i if i == native_keyboard::Modifiers::RightMeta as i32 => {
-                    self.engine.lock().set_button(
+                    let pending = self.engine.lock().set_button(
                         &kbd_key_id,
                         native_keyboard::Keys::RightMetaKey as i32,
                         key_value,
                     );
+                    pending.dispatch();
                 }
                 _ => {
                     // Other modifier keys should be pressed with PressKey since they stay enabled
@@ -183,7 +208,10 @@ impl Keyboard {
     /// Sets all keys to the non pressed state.
     /// Port of Keyboard::ReleaseAllKeys
     pub fn release_all_keys(&mut self) {
-        self.engine.lock().reset_button_state();
+        let pending = self.engine.lock().reset_button_state();
+        for callbacks in pending {
+            callbacks.dispatch();
+        }
     }
 
     /// Used for automapping features.
