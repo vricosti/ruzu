@@ -525,6 +525,95 @@ mod tests {
     }
 
     #[test]
+    fn rotate_scheduled_queue_migrates_same_priority_suggestion_to_front() {
+        let mut gsc = GlobalSchedulerContext::new();
+        let priority = 59;
+
+        gsc.m_priority_queue
+            .push_back(100, priority, 0, 0b0001, false, None);
+        gsc.m_priority_queue
+            .push_back(101, priority, 0, 0b0001, false, None);
+        gsc.m_priority_queue
+            .push_back(200, 10, 1, 0b0010, false, None);
+        gsc.m_priority_queue
+            .push_back(201, priority, 1, 0b0011, false, None);
+
+        KScheduler::rotate_scheduled_queue(&mut gsc, 0, priority, None);
+
+        assert_eq!(
+            gsc.m_priority_queue
+                .get_scheduled_front_at_priority(0, priority),
+            Some(201)
+        );
+        assert_eq!(
+            gsc.m_priority_queue
+                .get_thread_props(201)
+                .map(|props| props.active_core),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn rotate_scheduled_queue_prefers_next_thread_that_waited_longer() {
+        let mut gsc = GlobalSchedulerContext::new();
+        let priority = 59;
+
+        gsc.m_priority_queue
+            .push_back(100, priority, 0, 0b0001, false, None);
+        gsc.m_priority_queue
+            .push_back(101, priority, 0, 0b0001, false, None);
+        gsc.m_priority_queue
+            .push_back(200, 10, 1, 0b0010, false, None);
+        gsc.m_priority_queue
+            .push_back(201, priority, 1, 0b0011, false, None);
+        gsc.m_priority_queue.set_last_scheduled_tick(101, 1);
+        gsc.m_priority_queue.set_last_scheduled_tick(201, 10);
+
+        KScheduler::rotate_scheduled_queue(&mut gsc, 0, priority, None);
+
+        assert_eq!(
+            gsc.m_priority_queue
+                .get_scheduled_front_at_priority(0, priority),
+            Some(101)
+        );
+        assert_eq!(
+            gsc.m_priority_queue
+                .get_thread_props(201)
+                .map(|props| props.active_core),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn rotate_scheduled_queue_excludes_current_before_higher_priority_migration() {
+        let mut gsc = GlobalSchedulerContext::new();
+        let priority = 59;
+
+        gsc.m_priority_queue
+            .push_back(100, 10, 0, 0b0001, false, None);
+        gsc.m_priority_queue
+            .push_back(101, priority, 0, 0b0001, false, None);
+        gsc.m_priority_queue
+            .push_back(200, 10, 1, 0b0010, false, None);
+        gsc.m_priority_queue
+            .push_back(201, 20, 1, 0b0011, false, None);
+
+        KScheduler::rotate_scheduled_queue(&mut gsc, 0, priority, Some(100));
+
+        assert_eq!(
+            gsc.m_priority_queue
+                .get_scheduled_front_at_priority(0, 20),
+            Some(201)
+        );
+        assert_eq!(
+            gsc.m_priority_queue
+                .get_thread_props(201)
+                .map(|props| props.active_core),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn yield_with_core_migration_moves_suggestion_to_front_like_upstream() {
         let mut gsc = GlobalSchedulerContext::new();
         let suggested = Arc::new(KThreadLock::new(KThread::new()));
@@ -1882,13 +1971,8 @@ impl KScheduler {
             }
             top_threads[core_id] = top_thread_id;
             if core_id < schedulers.len() {
-                let (mask, prev_id) =
-                    schedulers[core_id].update_highest_priority_thread(top_thread_id);
-                cores_needing_scheduling |= mask;
-                // Upstream: IncrementScheduledCount(prev_thread)
-                if let Some(pid) = prev_id {
-                    gsc.m_priority_queue.increment_scheduled_count(pid);
-                }
+                cores_needing_scheduling |= schedulers[core_id]
+                    .update_highest_priority_thread(top_thread_id, gsc);
             }
         }
 
@@ -1953,9 +2037,8 @@ impl KScheduler {
                         );
                         top_threads[core_id] = Some(suggested_id);
                         if core_id < schedulers.len() {
-                            let (mask, _prev_id) = schedulers[core_id]
-                                .update_highest_priority_thread(top_threads[core_id]);
-                            cores_needing_scheduling |= mask;
+                            cores_needing_scheduling |= schedulers[core_id]
+                                .update_highest_priority_thread(top_threads[core_id], gsc);
                         }
                         break;
                     }
@@ -2003,11 +2086,11 @@ impl KScheduler {
 
                         top_threads[candidate_core as usize] = Some(next_on_candidate_core);
                         if (candidate_core as usize) < schedulers.len() {
-                            let (mask, _prev_id) = schedulers[candidate_core as usize]
+                            cores_needing_scheduling |= schedulers[candidate_core as usize]
                                 .update_highest_priority_thread(
                                     top_threads[candidate_core as usize],
+                                    gsc,
                                 );
-                            cores_needing_scheduling |= mask;
                         }
 
                         let Some(candidate_thread) =
@@ -2030,9 +2113,8 @@ impl KScheduler {
                         );
                         top_threads[core_id] = Some(candidate_thread_id);
                         if core_id < schedulers.len() {
-                            let (mask, _prev_id) = schedulers[core_id]
-                                .update_highest_priority_thread(top_threads[core_id]);
-                            cores_needing_scheduling |= mask;
+                            cores_needing_scheduling |= schedulers[core_id]
+                                .update_highest_priority_thread(top_threads[core_id], gsc);
                         }
                         break;
                     }
@@ -2059,13 +2141,26 @@ impl KScheduler {
 
     /// Update the highest priority thread for this core.
     /// Matches upstream `KScheduler::UpdateHighestPriorityThread(KThread*)`.
-    /// Returns (cores_needing_scheduling bitmask, previous_highest_thread_id).
     pub fn update_highest_priority_thread(
         &mut self,
         highest_thread_id: Option<u64>,
-    ) -> (u64, Option<u64>) {
+        gsc: &mut super::global_scheduler_context::GlobalSchedulerContext,
+    ) -> u64 {
         let prev = self.state.highest_priority_thread_id;
         if prev != highest_thread_id {
+            if let Some(prev_id) = prev {
+                gsc.m_priority_queue.increment_scheduled_count(prev_id);
+                let tick = self
+                    .core_timing
+                    .as_ref()
+                    .map(|core_timing| core_timing.get_clock_ticks() as i64)
+                    .unwrap_or(0);
+                gsc.m_priority_queue
+                    .set_last_scheduled_tick(prev_id, tick);
+                if let Some(prev_thread) = gsc.get_thread_by_thread_id(prev_id) {
+                    prev_thread.lock().unwrap().set_last_scheduled_tick(tick);
+                }
+            }
             if self.core_id == 0 || self.core_id == 1 {
                 log::trace!(
                     "update_highest_priority_thread: core={} prev={:?} next={:?}",
@@ -2076,9 +2171,9 @@ impl KScheduler {
             }
             self.state.highest_priority_thread_id = highest_thread_id;
             self.state.needs_scheduling.store(true, Ordering::Relaxed);
-            (1u64 << self.core_id, prev)
+            1u64 << self.core_id
         } else {
-            (0, None)
+            0
         }
     }
 
@@ -2523,29 +2618,156 @@ impl KScheduler {
     ///
     /// Moves the front thread at `priority` to the back, then tries to
     /// migrate a suggested thread to fill the gap.
-    /// Rotate the scheduled queue at a given priority for a core.
-    /// Operates on the GlobalSchedulerContext's PQ.
     pub fn rotate_scheduled_queue(
         gsc: &mut super::global_scheduler_context::GlobalSchedulerContext,
         core_id: i32,
         priority: i32,
+        current_thread_id: Option<u64>,
     ) {
         let top_thread_id = gsc
             .m_priority_queue
             .get_scheduled_front_at_priority(core_id, priority);
+        let mut next_thread_id = None;
         if let Some(top_id) = top_thread_id {
             let (t_priority, t_core, t_dummy) = gsc
                 .m_priority_queue
                 .get_thread_props(top_id)
                 .map(|p| (p.priority, p.active_core, p.is_dummy))
                 .unwrap_or((priority, core_id, false));
-            let next = gsc
+            next_thread_id = gsc
                 .m_priority_queue
                 .move_to_scheduled_back(top_id, t_priority, t_core, t_dummy);
-            if next != Some(top_id) {
+            if next_thread_id != Some(top_id) {
                 gsc.m_priority_queue.increment_scheduled_count(top_id);
-                if let Some(next_id) = next {
+                if let Some(next_id) = next_thread_id {
                     gsc.m_priority_queue.increment_scheduled_count(next_id);
+                }
+            }
+        }
+
+        let mut suggested_id = gsc
+            .m_priority_queue
+            .get_suggested_front_at_priority(core_id, priority);
+        while let Some(candidate_id) = suggested_id {
+            let Some(candidate_props) =
+                gsc.m_priority_queue.get_thread_props(candidate_id).cloned()
+            else {
+                break;
+            };
+            let suggested_core = candidate_props.active_core;
+            let top_on_suggested_core = if suggested_core >= 0 {
+                gsc.m_priority_queue.get_scheduled_front(suggested_core)
+            } else {
+                None
+            };
+
+            if top_on_suggested_core != Some(candidate_id) {
+                let next_waited_longer = top_thread_id != next_thread_id
+                    && next_thread_id
+                        .and_then(|next_id| gsc.m_priority_queue.get_thread_props(next_id))
+                        .is_some_and(|next_props| {
+                            next_props.last_scheduled_tick
+                                < candidate_props.last_scheduled_tick
+                        });
+                if next_waited_longer {
+                    break;
+                }
+
+                let top_priority = top_on_suggested_core
+                    .and_then(|thread_id| gsc.m_priority_queue.get_thread_props(thread_id))
+                    .map(|props| props.priority);
+                if top_priority.is_none_or(|top_priority| {
+                    top_priority
+                        >= super::global_scheduler_context::HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY
+                }) {
+                    if let Some(candidate) = gsc.get_thread_by_thread_id(candidate_id) {
+                        candidate.lock().unwrap().set_active_core(core_id);
+                    }
+                    gsc.m_priority_queue.change_core(
+                        suggested_core,
+                        candidate_id,
+                        core_id,
+                        candidate_props.priority,
+                        candidate_props.is_dummy,
+                        true,
+                    );
+                    gsc.m_priority_queue.increment_scheduled_count(candidate_id);
+                    break;
+                }
+            }
+
+            suggested_id = gsc
+                .m_priority_queue
+                .get_same_priority_next(core_id, candidate_id);
+        }
+
+        let mut best_thread_id = gsc.m_priority_queue.get_scheduled_front(core_id);
+        if best_thread_id == current_thread_id {
+            best_thread_id = best_thread_id.and_then(|thread_id| {
+                let priority = gsc
+                    .m_priority_queue
+                    .get_thread_props(thread_id)
+                    .map(|props| props.priority)?;
+                gsc.m_priority_queue
+                    .get_scheduled_next(core_id, thread_id, priority)
+            });
+        }
+
+        if let Some(best_id) = best_thread_id {
+            if let Some(best_priority) = gsc
+                .m_priority_queue
+                .get_thread_props(best_id)
+                .map(|props| props.priority)
+                .filter(|best_priority| *best_priority >= priority)
+            {
+                let mut suggested_id = gsc.m_priority_queue.get_suggested_front(core_id);
+                while let Some(candidate_id) = suggested_id {
+                    let Some(candidate_props) =
+                        gsc.m_priority_queue.get_thread_props(candidate_id).cloned()
+                    else {
+                        break;
+                    };
+                    if candidate_props.priority >= best_priority {
+                        break;
+                    }
+
+                    let suggested_core = candidate_props.active_core;
+                    let top_on_suggested_core = if suggested_core >= 0 {
+                        gsc.m_priority_queue.get_scheduled_front(suggested_core)
+                    } else {
+                        None
+                    };
+                    if top_on_suggested_core != Some(candidate_id) {
+                        let top_priority = top_on_suggested_core
+                            .and_then(|thread_id| {
+                                gsc.m_priority_queue.get_thread_props(thread_id)
+                            })
+                            .map(|props| props.priority);
+                        if top_priority.is_none_or(|top_priority| {
+                            top_priority
+                                >= super::global_scheduler_context::HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY
+                        }) {
+                            if let Some(candidate) = gsc.get_thread_by_thread_id(candidate_id) {
+                                candidate.lock().unwrap().set_active_core(core_id);
+                            }
+                            gsc.m_priority_queue.change_core(
+                                suggested_core,
+                                candidate_id,
+                                core_id,
+                                candidate_props.priority,
+                                candidate_props.is_dummy,
+                                true,
+                            );
+                            gsc.m_priority_queue.increment_scheduled_count(candidate_id);
+                            break;
+                        }
+                    }
+
+                    suggested_id = gsc.m_priority_queue.get_suggested_next(
+                        core_id,
+                        candidate_id,
+                        candidate_props.priority,
+                    );
                 }
             }
         }

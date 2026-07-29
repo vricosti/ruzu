@@ -197,6 +197,12 @@ pub struct ThreadProps {
     pub active_core: i32,
     pub affinity: u64,
     pub is_dummy: bool,
+    /// Cached `KThread::m_last_scheduled_tick`.
+    ///
+    /// Upstream reads this while holding only the scheduler lock. Keeping it
+    /// beside the other queue-owned thread properties preserves that access
+    /// ordering without introducing a per-thread lock into migration scans.
+    pub last_scheduled_tick: i64,
     /// Shared reference to the owning process's schedule_count.
     /// Allows IncrementScheduledCount without any lock acquisition.
     pub process_schedule_count: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
@@ -639,6 +645,12 @@ impl KPriorityQueue {
         }
     }
 
+    pub fn set_last_scheduled_tick(&mut self, thread_id: u64, tick: i64) {
+        if let Some(slot) = self.members.get_mut(&thread_id) {
+            slot.props.last_scheduled_tick = tick;
+        }
+    }
+
     // -- Getters --
 
     pub fn get_scheduled_front(&self, core: i32) -> Option<u64> {
@@ -824,6 +836,7 @@ impl KPriorityQueue {
             active_core,
             affinity,
             is_dummy,
+            last_scheduled_tick: 0,
             process_schedule_count,
         };
         match self.members.get_mut(&member_id) {
@@ -863,6 +876,7 @@ impl KPriorityQueue {
             active_core,
             affinity,
             is_dummy,
+            last_scheduled_tick: 0,
             process_schedule_count,
         };
         match self.members.get_mut(&member_id) {

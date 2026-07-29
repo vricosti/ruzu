@@ -3016,6 +3016,7 @@ impl KThread {
                 is_dummy,
                 self_reference,
                 self.process_schedule_count.clone(),
+                self.last_scheduled_tick,
             );
             if should_trace_ct_fire() {
                 log::info!(

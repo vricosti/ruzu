@@ -1345,6 +1345,7 @@ impl KProcess {
         active_core: i32,
         affinity: u64,
         is_dummy: bool,
+        last_scheduled_tick: i64,
     ) {
         if let Some(ref gsc) = self.global_scheduler_context {
             gsc.lock().unwrap().push_back_to_priority_queue(
@@ -1354,6 +1355,7 @@ impl KProcess {
                 affinity,
                 is_dummy,
                 Some(std::sync::Arc::clone(&self.schedule_count)),
+                last_scheduled_tick,
             );
         }
         // Upstream: IncrementScheduledCount(thread) in OnThreadStateChanged
@@ -1391,8 +1393,16 @@ impl KProcess {
                 super::global_scheduler_context::GlobalSchedulerContext::extract_thread_props(
                     &guard,
                 );
+            let last_scheduled_tick = guard.get_last_scheduled_tick();
             drop(guard);
-            self.push_back_to_priority_queue_with_props(id, pri, core, aff, dummy);
+            self.push_back_to_priority_queue_with_props(
+                id,
+                pri,
+                core,
+                aff,
+                dummy,
+                last_scheduled_tick,
+            );
         }
     }
 
@@ -1413,7 +1423,14 @@ impl KProcess {
     pub fn push_back_to_priority_queue_from_thread(&self, thread: &super::k_thread::KThread) {
         let (id, pri, core, aff, dummy) =
             super::global_scheduler_context::GlobalSchedulerContext::extract_thread_props(thread);
-        self.push_back_to_priority_queue_with_props(id, pri, core, aff, dummy);
+        self.push_back_to_priority_queue_with_props(
+            id,
+            pri,
+            core,
+            aff,
+            dummy,
+            thread.get_last_scheduled_tick(),
+        );
     }
 
     /// Remove a thread from PQ, extracting props from a thread reference.

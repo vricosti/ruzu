@@ -27367,3 +27367,32 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 
 ### Binary layout verification
 - N/A: no serialized or raw-memory layout changed.
+
+## 2026-07-29 — `core/src/hle/kernel/{global_scheduler_context,k_priority_queue,k_process,k_scheduler,k_thread,kernel}.rs` vs `core/hle/kernel/{global_scheduler_context,k_scheduler}.cpp`
+
+### Intentional differences
+- Rust caches `last_scheduled_tick` in `KPriorityQueue::ThreadProps` because
+  queue migration scans cannot borrow each mutex-backed `KThread` while the
+  global scheduler context is locked. The cache is updated at the same
+  lifecycle points where upstream reads or writes `KThread::m_last_scheduled_tick`.
+- The preemption callback forwards the current guest thread ID rather than an
+  upstream `KThread*`; it is read once from host TLS before rotating all cores,
+  preserving upstream `GetCurrentThreadPointer(kernel)` semantics.
+
+### Unintentional differences (to fix)
+- None in the preemption rotation and migration paths covered by this slice.
+
+### Missing items
+- `KScheduler::UpdateHighestPriorityThread` still lacks upstream's
+  `m_state.should_count_idle` process-running-thread and idle-count accounting.
+
+### Binary layout verification
+- N/A: scheduler queues and thread properties are internal Rust structures and
+  are not serialized or shared as raw guest ABI data.
+
+### Verification
+- Re-read upstream `GlobalSchedulerContext::PreemptThreads`,
+  `KScheduler::RotateScheduledQueue`, and
+  `KScheduler::UpdateHighestPriorityThread` after implementation.
+- Focused tests cover same-priority migration, last-scheduled-tick preference,
+  current-thread exclusion, and per-core preemption update requests.

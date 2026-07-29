@@ -2011,8 +2011,9 @@ impl KernelCore {
                 if let Some(scheduler_lock) = scheduler_lock() {
                     let _scheduler_guard =
                         super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
+                    let current_thread_id = get_current_thread_id_fast();
                     if let Some(gsc_arc) = kernel.global_scheduler_context() {
-                        gsc_arc.lock().unwrap().preempt_threads();
+                        gsc_arc.lock().unwrap().preempt_threads(current_thread_id);
                     }
                 }
 
