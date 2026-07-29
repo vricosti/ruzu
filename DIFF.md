@@ -27645,3 +27645,202 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Live activation of the keys, firmware, and game-file actions opens the
   corresponding GTK 4.6 native chooser; cancelling each chooser returns
   cleanly to the caller.
+
+## 2026-07-29 — Unix build portability vs upstream platform abstractions
+
+### Intentional differences
+- Linux SDL2 dependencies use the distribution library through pkg-config
+  instead of compiling SDL2 2.28 from the crate. This matches the setup
+  script's explicit SDL2 development-package requirement and avoids the
+  vendored SDL2 CMake project being rejected by CMake 4.
+- Native socket addresses are zero-initialized before assigning common fields;
+  `sin_len` is assigned only on Apple and BSD-derived layouts that expose it.
+- Socket errno is read through Rust's portable `last_os_error` abstraction
+  instead of calling platform-specific libc errno accessors.
+- On FreeBSD only, cubeb's portable C audio backends are selected instead of
+  its optional Rust PulseAudio backend. `cubeb-sys` otherwise requests a
+  static `cubeb_pulse` archive that its nested CMake build did not place in
+  the target-specific directory expected by the outer build script. Linux,
+  macOS, and the other BSD targets retain cubeb's normal production features.
+- `sched_param` is zero-initialized before assigning `sched_priority`, matching
+  upstream C initialization and accommodating musl's additional
+  sporadic-server fields.
+- musl builds disable Rust's default static C runtime so Alpine can link the
+  shared GTK, Vulkan, SDL2, FFmpeg, and audio libraries supplied by `apk`.
+- Diagnostic stack dumps retain their marker but omit glibc's `backtrace`
+  calls on musl, whose libc does not export those non-standard symbols.
+- Diagnostic stack dumps use libc's target-specific declarations: Linux and
+  macOS pass `c_int` frame counts, while FreeBSD, NetBSD, and OpenBSD use
+  libexecinfo's `size_t` ABI and link metadata.
+- OpenBSD builds vendor OpenSSL because the base system's LibreSSL 4.3 is newer
+  than the version range currently accepted by `openssl-sys`.
+
+### Unintentional differences (fixed)
+- The CLI still enabled SDL2's `bundled` and `static-link` features on Linux,
+  defeating the package-based configuration used by the input crate.
+- Socket conversion and errno handling only declared implementations for Linux
+  and macOS, so FreeBSD, NetBSD, and OpenBSD builds referenced undefined local
+  variables.
+- The SDL dependency was still absent on DragonFly, FreeBSD, NetBSD and
+  OpenBSD, so the input and CLI crates could not compile there.
+- `SockAddrIn` conversion byte-swapped the IPv4 address after constructing its
+  native-endian representation, reversing the four network-order bytes on
+  little-endian hosts. The conversion now matches upstream's byte shifts.
+- DragonFly and non-macOS Apple socket layouts were omitted from the `sin_len`
+  assignment.
+- Native errno `0` and `EMFILE` now map to upstream `SUCCESS` and `MFILE`
+  instead of falling through to `OTHER`.
+- The glibc-shaped `sched_param` struct literal did not compile against Alpine
+  Linux's musl libc definition.
+- Alpine reached the final link but requested static variants of every native
+  dependency because Rust's musl target enables `crt-static` by default.
+- After dynamic linking was enabled, Alpine exposed two diagnostic callsites
+  that unconditionally referenced glibc-only `backtrace` symbols.
+- The non-musl diagnostic path declared every native backtrace function with
+  Linux's `c_int` ABI. The BSD libexecinfo implementations instead use
+  `size_t`; using libc's declarations fixes both the ABI and `-lexecinfo`.
+
+### Missing items
+- None for these build-portability changes.
+
+### Binary layout verification
+- N/A: no guest-facing or serialized type layout changed.
+
+### Verification
+- Re-read upstream Unix `TranslateFromSockAddrIn`, `TranslateNativeError`,
+  `GetAndLogLastError`, and `SetCurrentThreadPriority`; the port continues to
+  populate the same fields and translate the current thread's errno.
+- `sockaddr_in_preserves_network_order_bytes` verifies the native address bytes,
+  port bytes, and round trip.
+- Cross-distribution clean-build results are recorded in the accompanying
+  compatibility report.
+
+## 2026-07-29 — ruzu/src/main_window.rs vs zuyu/src/yuzu/bootmanager.{h,cpp}
+
+### Intentional differences
+- GTK event controllers are attached to the toplevel and translate their
+  coordinates into the render stack because GTK4 cannot represent the native
+  X11 render child as a `GtkWidget`; upstream receives events directly on its
+  native `GRenderWindow` QWidget.
+- A discrete GTK scroll step is converted to Qt's conventional 120 angle units,
+  with the vertical sign reversed to preserve `QWheelEvent::angleDelta`.
+
+### Unintentional differences (fixed)
+- The GTK frontend forwarded keyboard input only. Mouse press, release and
+  motion never reached `InputCommon::Mouse`, while the SDL frontend and
+  upstream both forwarded all three.
+- Pointer-to-touch conversion ignored the live framebuffer screen rectangle.
+  It now applies the drawable scale and clips letterbox coordinates in the same
+  order as upstream `ScaleTouch` and `MapToTouchScreen`.
+- Mouse-wheel input was not forwarded.
+
+### Missing items
+- Native GTK touchscreen begin/update/end events are not yet forwarded through
+  `InputCommon::TouchScreen`; this change fixes physical mouse input only.
+- The optional mouse-panning cursor recentering/confinement and its leave-event
+  timer are not yet implemented by the GTK render host.
+- GTK has no counterpart yet for upstream's `MouseActivity` signal, which the
+  Qt frontend uses for cursor-visibility policy.
+
+### Binary layout verification
+- N/A: no guest-visible structure layout changed.
+
+### Verification
+- Re-read `GRenderWindow::QtButtonToMouseButton`, `mousePressEvent`,
+  `mouseMoveEvent`, `mouseReleaseEvent`, and `wheelEvent` after implementation.
+- Three pointer-conversion tests cover center mapping, letterbox clipping and
+  logical-to-physical scaling.
+- A release GTK run of SuperTuxKart confirms that clicking its `OK` control now
+  reaches the guest; the same click previously worked only through `ruzu-cmd`.
+
+## 2026-07-29 — core/src/hle/service/{service,hle_ipc}.rs vs zuyu/src/core/hle/service/{service,hle_ipc}.{h,cpp}
+
+### Intentional differences
+- Upstream stores `Core::System&` directly in `ServiceFrameworkBase`; the
+  trait-based Rust framework carries the same non-owning `SystemRef` through
+  `HLERequestContext`, which already represents the request's upstream
+  `KernelCore&` owner.
+
+### Unintentional differences (fixed)
+- `ReportUnimplementedFunction` recovered `SystemRef` by locking the request's
+  `SessionRequestManager` and `ServerManager`. Upstream reads its direct system
+  member and takes neither lock. The extra lock could remain owned by a
+  cooperative service fiber after another CPU core stopped, deadlocking the
+  final CPU thread during shutdown.
+- The unimplemented-function warning was emitted before saving the report;
+  upstream saves the report first. The Rust ordering now matches upstream.
+
+### Binary layout verification
+- PASS: `SystemRef` is host-only request metadata; no guest-facing or serialized
+  payload layout changed.
+
+### Verification
+- Re-read `ServiceFrameworkBase::ReportUnimplementedFunction`,
+  `ServiceFrameworkBase` ownership, and the `HLERequestContext` constructor
+  after implementation.
+- `unimplemented_report_does_not_lock_server_manager` holds the owning manager
+  mutex while executing the report path and completes without waiting for it.
+
+## 2026-07-29 — externals/rdynarmic/src/frontend/a64/translate/simd_shift_by_immediate.rs vs zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_shift_by_immediate.cpp
+
+### Intentional differences
+- Decoder fields are extracted from `DecodedInst` inside the Rust methods
+  instead of arriving as typed C++ visitor parameters. The decoded bit
+  positions, validation and derived values are unchanged.
+
+### Unintentional differences (fixed)
+- The shared vector `ShiftRight` operation and its `Rounding`,
+  `Accumulating`, and `Signedness` dimensions were reduced to separate
+  `SSHR_2` and `USHR_2` implementations.
+- `SSRA_2`, `SRSHR_2`, `SRSRA_2`, `USRA_2`, `URSHR_2`, and `URSRA_2` fell
+  through the visitor to interpreter fallback. In particular, guest
+  instruction `0x4F3417BC` suspended its thread as unimplemented.
+- The `SHL_2`, `SSHR_2`, and `USHR_2` invalid-encoding paths returned `true`
+  after setting an error terminal instead of returning the result of
+  `DecodeError` or `ReservedValue`.
+
+### Missing items
+- `SQSHL_imm_2`, `SQSHLU_2`, `UQSHL_imm_2`, `SRI_2`, `SLI_2`,
+  `SCVTF_fix_2`, `UCVTF_fix_2`, `FCVTZS_fix_2`, and `FCVTZU_fix_2` remain
+  unported from this upstream file.
+
+### Binary layout verification
+- N/A: this change only adds instruction translation and IR emission.
+
+### Verification
+- Re-read upstream `ShiftRight`, `SSHR_2`, `SRSHR_2`, `SRSRA_2`, `SSRA_2`,
+  `URSHR_2`, `URSRA_2`, `USHR_2`, `USRA_2`, and `SHL_2` after implementation.
+- `vector_shift_right_family_matches_upstream_variant_semantics` verifies all
+  eight signed/unsigned, rounded/unrounded, accumulating/non-accumulating
+  encodings emit the corresponding IR operations without interpreter fallback.
+- `test_a64_ssra_v28_4s_v29_4s_accumulates_signed_shift` executes the exact
+  failing encoding through the host JIT and verifies all four result lanes.
+
+## 2026-07-29 — externals/rdynarmic/src/backend/x64/emit_floating_point.rs vs zuyu/externals/dynarmic/src/dynarmic/backend/x64/emit_x64_floating_point.cpp
+
+### Intentional differences
+- Rust fallback calls use a shared `emit_host_call_3_with_args` adapter around
+  `RegAlloc::host_call`; upstream performs the equivalent work inside the
+  templated `EmitFPToFixed` implementation.
+
+### Unintentional differences (fixed)
+- `EmitFPSingleToFixedU64` and `EmitFPDoubleToFixedU32` called
+  `get_argument_info` to inspect `fbits` and rounding, then called a fallback
+  helper that invoked `get_argument_info` again. Upstream obtains the argument
+  set exactly once before selecting its native or fallback path. The duplicate
+  Rust registration exceeded the SSA value's use count and panicked in the x64
+  register allocator.
+
+### Missing items
+- None for the argument-ownership correction. Numeric parity of the broader
+  FP-to-fixed implementation is outside this focused register-allocation fix.
+
+### Binary layout verification
+- N/A: no guest-facing or serialized structure changed.
+
+### Verification
+- Re-read upstream `EmitFPToFixed`, `EmitFPSingleToFixedU64`, and
+  `EmitFPDoubleToFixedU32` after implementation.
+- `test_a64_unsigned_fp_to_fixed_fallbacks_count_input_once` executes
+  `fcvtzu w0,d0,#1` and `fcvtzu x1,s1,#1`, covering both corrected fallback
+  paths and their results.
