@@ -12,6 +12,7 @@
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use crate::core::SystemRef;
 use crate::hle::ipc;
 
 // Temporary investigation: per-thread slot holding the service name + cmd of the
@@ -717,8 +718,9 @@ pub fn complete_sync_request(
 /// Corresponds to upstream `HLERequestContext`.
 ///
 /// Upstream stores `KThread* thread`, `Core::Memory::Memory& memory`, `KernelCore& kernel`,
-/// and `KServerSession* server_session`. We store the thread, memory, and TLS address
-/// to match the upstream access pattern (thread→process→handle_table, memory write-back).
+/// and `KServerSession* server_session`. We store the thread, memory, the kernel's
+/// non-owning system reference, and the TLS address to match the upstream access
+/// pattern (thread→process→handle_table, memory write-back).
 pub struct HLERequestContext {
     /// IPC command buffer.
     pub cmd_buf: [u32; ipc::COMMAND_BUFFER_LENGTH],
@@ -727,6 +729,8 @@ pub struct HLERequestContext {
     thread: Option<Arc<KThreadLock>>,
     /// Guest memory bridge. Matches upstream `Core::Memory::Memory& memory`.
     memory: Option<Arc<std::sync::Mutex<crate::memory::memory::Memory>>>,
+    /// Non-owning system owner obtained from upstream's `KernelCore& kernel`.
+    system: SystemRef,
     /// TLS address for command buffer read/write.
     /// Upstream derives this from `thread->GetTlsAddress()`.
     tls_address: u64,
@@ -784,10 +788,14 @@ impl HLERequestContext {
     /// Upstream: `HLERequestContext(KernelCore&, Memory&, KServerSession*, KThread*)`
     pub fn new_with_thread(thread: Arc<KThreadLock>, tls_address: u64) -> Self {
         let memory = Self::owner_process_memory(&thread);
+        let system = crate::hle::kernel::kernel::get_kernel_ref()
+            .map(|kernel| kernel.system())
+            .unwrap_or_else(SystemRef::null);
         Self {
             cmd_buf: [0u32; ipc::COMMAND_BUFFER_LENGTH],
             thread: Some(thread),
             memory,
+            system,
             tls_address,
             command_header: None,
             handle_descriptor_header: None,
@@ -823,6 +831,7 @@ impl HLERequestContext {
             cmd_buf: [0u32; ipc::COMMAND_BUFFER_LENGTH],
             thread: None,
             memory: None,
+            system: SystemRef::null(),
             tls_address: 0,
             command_header: None,
             handle_descriptor_header: None,
@@ -861,6 +870,11 @@ impl HLERequestContext {
     /// Matches upstream ownership where `HLERequestContext` carries `KThread* thread`.
     pub fn get_thread(&self) -> Option<Arc<KThreadLock>> {
         self.thread.clone()
+    }
+
+    /// Return the system associated with upstream's request `KernelCore&`.
+    pub fn get_system(&self) -> Option<SystemRef> {
+        (!self.system.is_null()).then_some(self.system)
     }
 
     pub fn tls_address(&self) -> u64 {

@@ -180,13 +180,11 @@ pub trait ServiceFramework: SessionRequestHandler {
         }
         buf.push('}');
 
-        log::warn!("Unknown / unimplemented {}", buf);
-
-        if let Some(system) = ctx.get_manager().and_then(|manager| {
-            let server_manager = manager.lock().unwrap().get_server_manager()?.clone();
-            let system = server_manager.lock().unwrap().system();
-            (!system.is_null()).then_some(system)
-        }) {
+        // Upstream reads the System reference stored directly by
+        // ServiceFrameworkBase. The Rust framework carries the same non-owning
+        // owner through the request's KernelCore; do not recover it by locking
+        // ServerManager, whose cooperative service fiber may be suspended.
+        if let Some(system) = ctx.get_system() {
             system.get_reporter().save_unimplemented_function_report(
                 system.get().runtime_program_id(),
                 ctx.get_command(),
@@ -194,6 +192,8 @@ pub trait ServiceFramework: SessionRequestHandler {
                 self.get_service_name(),
             );
         }
+
+        log::warn!("Unknown / unimplemented {}", buf);
 
         if *common::settings::values().use_auto_stub.get_value() {
             log::warn!("Using auto stub fallback!");
@@ -300,6 +300,43 @@ pub fn build_handler_map_from_infos(functions: &[FunctionInfo]) -> BTreeMap<u32,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::SystemRef;
+    use crate::hle::service::hle_ipc::SessionRequestManager;
+    use crate::hle::service::server_manager::ServerManager;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    struct TestService {
+        handlers: BTreeMap<u32, FunctionInfo>,
+    }
+
+    impl TestService {
+        fn new() -> Self {
+            Self {
+                handlers: BTreeMap::new(),
+            }
+        }
+    }
+
+    impl SessionRequestHandler for TestService {
+        fn handle_sync_request(&self, _ctx: &mut HLERequestContext) -> ResultCode {
+            RESULT_SUCCESS
+        }
+    }
+
+    impl ServiceFramework for TestService {
+        fn get_service_name(&self) -> &str {
+            "TestService"
+        }
+
+        fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+            &self.handlers
+        }
+
+        fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+            &self.handlers
+        }
+    }
 
     #[test]
     fn test_server_session_count_max() {
@@ -326,5 +363,41 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert_eq!(map[&3].expected_header, 3);
         assert_eq!(map[&4].name, "Get1");
+    }
+
+    #[test]
+    fn unimplemented_report_does_not_lock_server_manager() {
+        let server_manager = ServerManager::new_shared(SystemRef::null());
+        let request_manager = Arc::new(Mutex::new(SessionRequestManager::new_with_server_manager(
+            Arc::clone(&server_manager),
+        )));
+        let mut ctx = HLERequestContext::new();
+        ctx.set_session_request_manager(request_manager);
+
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let held_manager = Arc::clone(&server_manager);
+        let holder = std::thread::spawn(move || {
+            let _guard = held_manager.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let reporter = std::thread::spawn(move || {
+            TestService::new().report_unimplemented_function(&mut ctx, None);
+            done_tx.send(()).unwrap();
+        });
+
+        let completed_without_manager = done_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        reporter.join().unwrap();
+
+        assert!(
+            completed_without_manager,
+            "unimplemented report waited for the owning ServerManager"
+        );
     }
 }
