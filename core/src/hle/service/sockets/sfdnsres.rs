@@ -8,11 +8,8 @@
 
 use std::collections::BTreeMap;
 
-use super::sockets::{Domain, Errno};
-use super::sockets_translate::{
-    get_addr_info_error_string, get_addr_info_error_to_errno, get_addr_info_error_to_netdb_error,
-    GetAddrInfoError, NetDbError, SockAddrIn,
-};
+use super::sockets::{Domain, Errno, GetAddrInfoError, SockAddrIn};
+use super::sockets_translate::get_addr_info_error_string;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
@@ -38,6 +35,42 @@ pub mod commands {
     pub const GET_NAME_INFO_REQUEST_WITH_OPTIONS: u32 = 13;
     pub const RESOLVER_SET_OPTION_REQUEST: u32 = 14;
     pub const RESOLVER_GET_OPTION_REQUEST: u32 = 15;
+}
+
+/// NetDbError codes.
+///
+/// Corresponds to `NetDbError` in upstream sfdnsres.cpp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+enum NetDbError {
+    Internal = -1,
+    Success = 0,
+    HostNotFound = 1,
+    TryAgain = 2,
+    NoRecovery = 3,
+    NoData = 4,
+}
+
+/// Corresponds to `GetAddrInfoErrorToNetDbError` in upstream sfdnsres.cpp.
+fn get_addr_info_error_to_netdb_error(result: GetAddrInfoError) -> NetDbError {
+    match result {
+        GetAddrInfoError::SUCCESS => NetDbError::Success,
+        GetAddrInfoError::AGAIN => NetDbError::TryAgain,
+        GetAddrInfoError::NODATA => NetDbError::HostNotFound,
+        GetAddrInfoError::SERVICE => NetDbError::Success,
+        _ => NetDbError::HostNotFound,
+    }
+}
+
+/// Corresponds to `GetAddrInfoErrorToErrno` in upstream sfdnsres.cpp.
+fn get_addr_info_error_to_errno(result: GetAddrInfoError) -> Errno {
+    match result {
+        GetAddrInfoError::SUCCESS | GetAddrInfoError::AGAIN | GetAddrInfoError::NODATA => {
+            Errno::SUCCESS
+        }
+        GetAddrInfoError::SERVICE => Errno::INVAL,
+        _ => Errno::SUCCESS,
+    }
 }
 
 /// Input parameters for GetHostByNameRequest / GetAddrInfoRequest.
@@ -182,7 +215,7 @@ impl Sfdnsres {
         Self::append_raw(&mut data, 0u32.to_be()); // count of aliases = 0
 
         // h_addrtype
-        Self::append_raw(&mut data, (Domain::INET as u16).to_be());
+        Self::append_raw(&mut data, (Domain::INET.0 as u16).to_be());
         // h_length
         Self::append_raw(&mut data, 4u16.to_be()); // sizeof(IPv4Address)
 
@@ -350,7 +383,7 @@ impl Sfdnsres {
             // ai_flags = 0.
             Self::append_raw(&mut data, 0u32.to_be());
             // ai_family = INET.
-            Self::append_raw(&mut data, (Domain::INET as u32).to_be());
+            Self::append_raw(&mut data, (Domain::INET.0 as u32).to_be());
             // ai_socktype = STREAM (default).
             Self::append_raw(&mut data, 1u32.to_be());
             // ai_protocol = TCP (default).
@@ -363,7 +396,7 @@ impl Sfdnsres {
 
             // ai_addr: SockAddrIn fields.
             // sin_family.
-            Self::append_raw(&mut data, (Domain::INET as u16).to_be());
+            Self::append_raw(&mut data, (Domain::INET.0 as u16).to_be());
             // sin_port (LE due to Switch double-swap).
             Self::append_raw(&mut data, port.to_le());
             // sin_addr (LE due to Switch double-swap).

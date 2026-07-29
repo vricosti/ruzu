@@ -12,13 +12,17 @@ use super::sockets::{
     Domain, Errno, FcntlCmd, Linger, OptName, PollEvents, PollFD, Protocol, ShutdownHow,
     SockAddrIn, SocketLevel, Type,
 };
+use super::sockets_translate::{
+    translate_domain, translate_errno, translate_poll_events, translate_poll_events_from_network,
+    translate_protocol, translate_result, translate_shutdown_how, translate_sockaddr_from_network,
+    translate_sockaddr_to_network, translate_type,
+};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use crate::internal_network::network::{
-    Domain as NetDomain, Errno as NetErrno, Protocol as NetProtocol, ShutdownHow as NetShutdownHow,
-    SockAddrIn as NetSockAddrIn, Type as NetType,
+    Errno as NetErrno, PollEvents as NetPollEvents, SockAddrIn as NetSockAddrIn,
 };
 use crate::internal_network::sockets::{self as net_sockets, Socket, SocketBase};
 
@@ -110,123 +114,6 @@ fn is_connection_based(ty: Type) -> bool {
             log::warn!("Unimplemented socket type={:?}", ty);
             false
         }
-    }
-}
-
-// --- Translation helpers between guest (service) and internal (network) types ---
-
-/// Translate guest Domain to internal Domain.
-///
-/// Corresponds to `Translate(Domain)` in upstream sockets_translate.cpp.
-fn translate_domain(domain: Domain) -> NetDomain {
-    match domain {
-        Domain::Unspecified => NetDomain::Unspecified,
-        Domain::INET => NetDomain::INET,
-    }
-}
-
-/// Translate internal Domain to guest Domain.
-fn translate_domain_back(domain: Option<NetDomain>) -> u8 {
-    match domain {
-        Some(NetDomain::INET) => Domain::INET as u8,
-        _ => Domain::Unspecified as u8,
-    }
-}
-
-/// Translate guest Type to internal Type.
-fn translate_type(ty: Type) -> NetType {
-    match ty {
-        Type::Unspecified => NetType::Unspecified,
-        Type::STREAM => NetType::STREAM,
-        Type::DGRAM => NetType::DGRAM,
-        Type::RAW => NetType::RAW,
-        Type::SEQPACKET => NetType::SEQPACKET,
-    }
-}
-
-/// Translate guest Protocol to internal Protocol.
-fn translate_protocol(protocol: Protocol) -> NetProtocol {
-    match protocol {
-        Protocol::Unspecified => NetProtocol::Unspecified,
-        Protocol::ICMP => NetProtocol::ICMP,
-        Protocol::TCP => NetProtocol::TCP,
-        Protocol::UDP => NetProtocol::UDP,
-    }
-}
-
-/// Translate guest SockAddrIn to internal SockAddrIn.
-///
-/// Corresponds to `Translate(SockAddrIn)` in upstream sockets_translate.cpp.
-/// Note: portno byte-swap matches upstream (big-endian to host).
-fn translate_sockaddr_to_network(value: &SockAddrIn) -> NetSockAddrIn {
-    // Note: 6 is incorrect, but can be passed by homebrew (because libnx sets
-    // sin_len to 6 when deserializing getaddrinfo results).
-    assert!(
-        value.len == 0 || value.len == std::mem::size_of::<SockAddrIn>() as u8 || value.len == 6
-    );
-
-    let domain = match value.family {
-        2 => NetDomain::INET,
-        _ => NetDomain::Unspecified,
-    };
-
-    NetSockAddrIn {
-        family: Some(domain),
-        ip: value.ip,
-        portno: (value.portno >> 8) | (value.portno << 8),
-    }
-}
-
-/// Translate internal SockAddrIn to guest SockAddrIn.
-///
-/// Corresponds to `Translate(Network::SockAddrIn)` in upstream sockets_translate.cpp.
-fn translate_sockaddr_from_network(value: &NetSockAddrIn) -> SockAddrIn {
-    SockAddrIn {
-        len: std::mem::size_of::<SockAddrIn>() as u8,
-        family: translate_domain_back(value.family),
-        portno: (value.portno >> 8) | (value.portno << 8),
-        ip: value.ip,
-        zeroes: [0u8; 8],
-    }
-}
-
-/// Translate internal Errno to guest Errno.
-///
-/// Corresponds to `Translate(Network::Errno)` in upstream sockets_translate.cpp.
-fn translate_errno(value: NetErrno) -> Errno {
-    match value {
-        NetErrno::Success => Errno::SUCCESS,
-        NetErrno::Badf => Errno::BADF,
-        NetErrno::Again => Errno::AGAIN,
-        NetErrno::Inval => Errno::INVAL,
-        NetErrno::Mfile => Errno::MFILE,
-        NetErrno::Pipe => Errno::PIPE,
-        NetErrno::Connrefused => Errno::CONNREFUSED,
-        NetErrno::Notconn => Errno::NOTCONN,
-        NetErrno::Timedout => Errno::TIMEDOUT,
-        NetErrno::Connaborted => Errno::CONNABORTED,
-        NetErrno::Connreset => Errno::CONNRESET,
-        NetErrno::Inprogress => Errno::INPROGRESS,
-        _ => {
-            log::warn!("Unimplemented errno={:?}", value);
-            Errno::SUCCESS
-        }
-    }
-}
-
-/// Translate an (i32, NetErrno) pair to (i32, Errno).
-///
-/// Corresponds to `Translate(std::pair<s32, Network::Errno>)` in upstream.
-fn translate_result(value: (i32, NetErrno)) -> (i32, Errno) {
-    (value.0, translate_errno(value.1))
-}
-
-/// Translate guest ShutdownHow to internal ShutdownHow.
-fn translate_shutdown_how(how: ShutdownHow) -> NetShutdownHow {
-    match how {
-        ShutdownHow::RD => NetShutdownHow::RD,
-        ShutdownHow::WR => NetShutdownHow::WR,
-        ShutdownHow::RDWR => NetShutdownHow::RDWR,
     }
 }
 
@@ -362,12 +249,12 @@ impl Bsd {
         }
 
         // Check and strip unknown flag (bit 29)
-        let raw_type = ty as u32;
+        let raw_type = ty.0;
         let unk_flag = (raw_type & 0x20000000) != 0;
         if unk_flag {
             log::warn!("Unknown flag in type");
-            ty = unsafe { std::mem::transmute(raw_type & !0x20000000) };
         }
+        ty = Type(raw_type & !0x20000000);
 
         let fd = self.find_free_file_descriptor_handle();
         if fd < 0 {
@@ -465,7 +352,8 @@ impl Bsd {
                 let descriptor = self.file_descriptors[pollfd.fd as usize].as_ref().unwrap();
                 net_sockets::PollFD {
                     fd: descriptor.socket.get_fd(),
-                    events: pollfd.events,
+                    events: translate_poll_events(PollEvents::from_bits_retain(pollfd.events))
+                        .bits(),
                     revents: 0,
                 }
             })
@@ -475,7 +363,10 @@ impl Bsd {
 
         // Copy revents back
         for (i, host_pollfd) in host_pollfds.iter().enumerate() {
-            fds[i].revents = host_pollfd.revents;
+            fds[i].revents = translate_poll_events_from_network(NetPollEvents::from_bits_retain(
+                host_pollfd.revents,
+            ))
+            .bits();
         }
 
         unsafe {
@@ -678,6 +569,10 @@ impl Bsd {
                 descriptor.flags = arg;
                 (0, Errno::SUCCESS)
             }
+            _ => {
+                log::warn!("Unimplemented cmd={cmd:?}");
+                (-1, Errno::SUCCESS)
+            }
         }
     }
 
@@ -800,14 +695,9 @@ impl Bsd {
         if !self.is_file_descriptor_valid(fd) {
             return Errno::BADF;
         }
-        let host_how = match how {
-            0 => ShutdownHow::RD,
-            1 => ShutdownHow::WR,
-            2 => ShutdownHow::RDWR,
-            _ => return Errno::INVAL,
-        };
+        let host_how = translate_shutdown_how(ShutdownHow(how));
         let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
-        translate_errno(descriptor.socket.shutdown(translate_shutdown_how(host_how)))
+        translate_errno(descriptor.socket.shutdown(host_how))
     }
 
     /// RecvImpl
@@ -1090,11 +980,7 @@ impl Bsd {
         let ty = rp.pop_u32();
         let protocol = rp.pop_u32();
 
-        let (fd, bsd_errno) = bsd.socket_impl(
-            unsafe { std::mem::transmute(domain) },
-            unsafe { std::mem::transmute(ty) },
-            unsafe { std::mem::transmute(protocol) },
-        );
+        let (fd, bsd_errno) = bsd.socket_impl(Domain(domain), Type(ty), Protocol(protocol));
 
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -1201,7 +1087,7 @@ impl Bsd {
         let fd = rp.pop_i32();
         let level = rp.pop_u32();
         let optname_raw = rp.pop_u32();
-        let optname: OptName = unsafe { std::mem::transmute(optname_raw) };
+        let optname = OptName(optname_raw);
 
         let mut optval = vec![0u8; ctx.get_write_buffer_size(0)];
         let err = bsd.get_sock_opt_impl(fd, level, optname, &mut optval);
@@ -1230,7 +1116,7 @@ impl Bsd {
         let cmd = rp.pop_i32();
         let arg = rp.pop_i32();
 
-        let (ret, bsd_errno) = bsd.fcntl_impl(fd, unsafe { std::mem::transmute(cmd) }, arg);
+        let (ret, bsd_errno) = bsd.fcntl_impl(fd, FcntlCmd(cmd), arg);
 
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -1244,7 +1130,7 @@ impl Bsd {
         let fd = rp.pop_i32();
         let level = rp.pop_u32();
         let optname_raw = rp.pop_u32();
-        let optname: OptName = unsafe { std::mem::transmute(optname_raw) };
+        let optname = OptName(optname_raw);
         let optval = ctx.read_buffer(0);
         let bsd_errno = bsd.set_sock_opt_impl(fd, level, optname, &optval);
         Bsd::build_errno_response_ipc(ctx, bsd_errno);
@@ -1474,5 +1360,25 @@ impl ServiceFramework for BsdCfg {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_set_sock_opt_name_reaches_upstream_default_case() {
+        let mut bsd = Bsd::new(false);
+        let (fd, errno) = bsd.socket_impl(Domain::INET, Type::DGRAM, Protocol::UDP);
+        assert_eq!(errno, Errno::SUCCESS);
+        assert!(fd >= 0);
+
+        let optval = 0u32.to_ne_bytes();
+        assert_eq!(
+            bsd.set_sock_opt_impl(fd, SocketLevel::SOCKET as u32, OptName(0x1), &optval),
+            Errno::SUCCESS
+        );
+        assert_eq!(bsd.close_impl(fd), Errno::SUCCESS);
     }
 }

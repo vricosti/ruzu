@@ -6,141 +6,65 @@
 //!
 //! Translation utilities between BSD/guest socket types and internal network types.
 
-use super::sockets::{Domain, Errno, Protocol, Type};
+use super::sockets::{
+    Domain, Errno, GetAddrInfoError, PollEvents, Protocol, ShutdownHow, SockAddrIn, Type,
+};
+use crate::internal_network::network::{
+    Domain as NetDomain, Errno as NetErrno, GetAddrInfoError as NetGetAddrInfoError,
+    PollEvents as NetPollEvents, Protocol as NetProtocol, ShutdownHow as NetShutdownHow,
+    SockAddrIn as NetSockAddrIn, Type as NetType,
+};
 
-/// GetAddrInfoError codes matching upstream.
-///
-/// Corresponds to `GetAddrInfoError` in upstream sockets.h.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub enum GetAddrInfoError {
-    SUCCESS = 0,
-    ADDRFAMILY = 1,
-    AGAIN = 2,
-    BADFLAGS = 3,
-    FAIL = 4,
-    FAMILY = 5,
-    MEMORY = 6,
-    NODATA = 7,
-    NONAME = 8,
-    SERVICE = 9,
-    SOCKTYPE = 10,
-    SYSTEM = 11,
-    BADHINTS = 12,
-    PROTOCOL = 13,
-    OVERFLOW = 14,
-    OTHER = 15,
-}
-
-/// NetDbError codes.
-///
-/// Corresponds to `NetDbError` in upstream sfdnsres.cpp.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub enum NetDbError {
-    Internal = -1,
-    Success = 0,
-    HostNotFound = 1,
-    TryAgain = 2,
-    NoRecovery = 3,
-    NoData = 4,
-}
-
-/// PollEvents flags.
-///
-/// Corresponds to `PollEvents` in upstream sockets.h.
-bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct PollEvents: u16 {
-        const IN = 0x001;
-        const PRI = 0x002;
-        const OUT = 0x004;
-        const ERR = 0x008;
-        const HUP = 0x010;
-        const NVAL = 0x020;
-        const RD_NORM = 0x040;
-        const RD_BAND = 0x080;
-        const WR_BAND = 0x100;
-    }
-}
-
-/// ShutdownHow modes.
-///
-/// Corresponds to `ShutdownHow` in upstream sockets.h.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum ShutdownHow {
-    RD = 0,
-    WR = 1,
-    RDWR = 2,
-}
-
-/// Guest socket address structure.
-///
-/// Corresponds to `SockAddrIn` in upstream sockets.h.
-#[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
-pub struct SockAddrIn {
-    pub len: u8,
-    pub family: u8,
-    pub portno: u16,
-    pub ip: [u8; 4],
-    pub zeroes: [u8; 8],
-}
-
-/// Translate Errno values from an internal representation.
-///
 /// Corresponds to `Translate(Network::Errno)` in upstream sockets_translate.cpp.
-pub fn translate_errno_from_network(value: i32) -> Errno {
+pub fn translate_errno(value: NetErrno) -> Errno {
     match value {
-        0 => Errno::SUCCESS,
-        9 => Errno::BADF,
-        11 => Errno::AGAIN,
-        22 => Errno::INVAL,
-        24 => Errno::MFILE,
-        32 => Errno::PIPE,
-        103 => Errno::CONNABORTED,
-        104 => Errno::CONNRESET,
-        107 => Errno::NOTCONN,
-        110 => Errno::TIMEDOUT,
-        111 => Errno::CONNREFUSED,
-        115 => Errno::INPROGRESS,
+        NetErrno::Success => Errno::SUCCESS,
+        NetErrno::Badf => Errno::BADF,
+        NetErrno::Again => Errno::AGAIN,
+        NetErrno::Inval => Errno::INVAL,
+        NetErrno::Mfile => Errno::MFILE,
+        NetErrno::Pipe => Errno::PIPE,
+        NetErrno::Connrefused => Errno::CONNREFUSED,
+        NetErrno::Notconn => Errno::NOTCONN,
+        NetErrno::Timedout => Errno::TIMEDOUT,
+        NetErrno::Connaborted => Errno::CONNABORTED,
+        NetErrno::Connreset => Errno::CONNRESET,
+        NetErrno::Inprogress => Errno::INPROGRESS,
         _ => {
-            log::warn!("Unimplemented errno translation for value={}", value);
+            log::warn!("Unimplemented errno={value:?}");
             Errno::SUCCESS
         }
     }
 }
 
-/// Translate GetAddrInfoError to NetDbError.
-///
-/// Corresponds to `GetAddrInfoErrorToNetDbError` in upstream sfdnsres.cpp.
-pub fn get_addr_info_error_to_netdb_error(result: GetAddrInfoError) -> NetDbError {
-    match result {
-        GetAddrInfoError::SUCCESS => NetDbError::Success,
-        GetAddrInfoError::AGAIN => NetDbError::TryAgain,
-        GetAddrInfoError::NODATA => NetDbError::HostNotFound,
-        GetAddrInfoError::SERVICE => NetDbError::Success,
-        _ => NetDbError::HostNotFound,
+/// Corresponds to `Translate(std::pair<s32, Network::Errno>)` in upstream.
+pub fn translate_result(value: (i32, NetErrno)) -> (i32, Errno) {
+    (value.0, translate_errno(value.1))
+}
+
+/// Corresponds to `Translate(Network::GetAddrInfoError)` in upstream.
+pub fn translate_get_addr_info_error(error: NetGetAddrInfoError) -> GetAddrInfoError {
+    match error {
+        NetGetAddrInfoError::Success => GetAddrInfoError::SUCCESS,
+        NetGetAddrInfoError::Addrfamily => GetAddrInfoError::ADDRFAMILY,
+        NetGetAddrInfoError::Again => GetAddrInfoError::AGAIN,
+        NetGetAddrInfoError::Badflags => GetAddrInfoError::BADFLAGS,
+        NetGetAddrInfoError::Fail => GetAddrInfoError::FAIL,
+        NetGetAddrInfoError::Family => GetAddrInfoError::FAMILY,
+        NetGetAddrInfoError::Memory => GetAddrInfoError::MEMORY,
+        NetGetAddrInfoError::Nodata => GetAddrInfoError::NODATA,
+        NetGetAddrInfoError::Noname => GetAddrInfoError::NONAME,
+        NetGetAddrInfoError::Service => GetAddrInfoError::SERVICE,
+        NetGetAddrInfoError::Socktype => GetAddrInfoError::SOCKTYPE,
+        NetGetAddrInfoError::System => GetAddrInfoError::SYSTEM,
+        NetGetAddrInfoError::Badhints => GetAddrInfoError::BADHINTS,
+        NetGetAddrInfoError::Protocol => GetAddrInfoError::PROTOCOL,
+        NetGetAddrInfoError::Overflow => GetAddrInfoError::OVERFLOW,
+        NetGetAddrInfoError::Other => GetAddrInfoError::OTHER,
     }
 }
 
-/// Translate GetAddrInfoError to Errno.
-///
-/// Corresponds to `GetAddrInfoErrorToErrno` in upstream sfdnsres.cpp.
-pub fn get_addr_info_error_to_errno(result: GetAddrInfoError) -> Errno {
-    match result {
-        GetAddrInfoError::SUCCESS => Errno::SUCCESS,
-        GetAddrInfoError::AGAIN => Errno::SUCCESS,
-        GetAddrInfoError::NODATA => Errno::SUCCESS,
-        GetAddrInfoError::SERVICE => Errno::INVAL,
-        _ => Errno::SUCCESS,
-    }
-}
-
-/// Translate GetAddrInfoError to human-readable string.
-///
-/// Corresponds to `Translate(GetAddrInfoError)` returning `const char*` in upstream.
+/// Corresponds to `Translate(GetAddrInfoError)` in upstream.
 pub fn get_addr_info_error_string(error: GetAddrInfoError) -> &'static str {
     match error {
         GetAddrInfoError::SUCCESS => "Success",
@@ -158,104 +82,204 @@ pub fn get_addr_info_error_string(error: GetAddrInfoError) -> &'static str {
         GetAddrInfoError::BADHINTS => "Invalid value for hints",
         GetAddrInfoError::PROTOCOL => "Resolved protocol is unknown",
         GetAddrInfoError::OVERFLOW => "Argument buffer overflow",
-        _ => "Unknown error",
+        GetAddrInfoError::OTHER => "Unknown error",
     }
 }
 
-/// Translate guest Domain to internal domain.
-pub fn translate_domain_to_network(domain: Domain) -> u32 {
+/// Corresponds to `Translate(Domain)` in upstream.
+pub fn translate_domain(domain: Domain) -> NetDomain {
     match domain {
-        Domain::Unspecified => 0,
-        Domain::INET => 2,
-    }
-}
-
-/// Translate internal domain to guest Domain.
-pub fn translate_domain_from_network(domain: u32) -> Domain {
-    match domain {
-        0 => Domain::Unspecified,
-        2 => Domain::INET,
+        Domain::Unspecified => NetDomain::Unspecified,
+        Domain::INET => NetDomain::INET,
         _ => {
-            log::warn!("Unimplemented domain={}", domain);
-            Domain::Unspecified
+            log::warn!("Unimplemented domain={domain:?}");
+            NetDomain::Unspecified
         }
     }
 }
 
-/// Translate guest Type to internal type.
-pub fn translate_type_to_network(ty: Type) -> u32 {
-    match ty {
-        Type::Unspecified => 0,
-        Type::STREAM => 1,
-        Type::DGRAM => 2,
-        Type::RAW => 3,
-        Type::SEQPACKET => 5,
+/// Corresponds to `Translate(Network::Domain)` in upstream.
+pub fn translate_domain_from_network(domain: NetDomain) -> Domain {
+    match domain {
+        NetDomain::Unspecified => Domain::Unspecified,
+        NetDomain::INET => Domain::INET,
     }
 }
 
-/// Translate internal type to guest Type.
-pub fn translate_type_from_network(ty: u32) -> Type {
+/// Corresponds to `Translate(Type)` in upstream.
+pub fn translate_type(ty: Type) -> NetType {
     match ty {
-        1 => Type::STREAM,
-        2 => Type::DGRAM,
-        3 => Type::RAW,
-        5 => Type::SEQPACKET,
+        Type::Unspecified => NetType::Unspecified,
+        Type::STREAM => NetType::STREAM,
+        Type::DGRAM => NetType::DGRAM,
+        Type::RAW => NetType::RAW,
+        Type::SEQPACKET => NetType::SEQPACKET,
         _ => {
-            log::warn!("Unimplemented type={}", ty);
-            Type::STREAM
+            log::warn!("Unimplemented type={ty:?}");
+            NetType::Unspecified
         }
     }
 }
 
-/// Translate guest Protocol to internal protocol.
-pub fn translate_protocol_to_network(protocol: Protocol) -> u32 {
-    match protocol {
-        Protocol::Unspecified => 0,
-        Protocol::ICMP => 1,
-        Protocol::TCP => 6,
-        Protocol::UDP => 17,
+/// Corresponds to `Translate(Network::Type)` in upstream.
+pub fn translate_type_from_network(ty: NetType) -> Type {
+    match ty {
+        NetType::Unspecified => Type::Unspecified,
+        NetType::STREAM => Type::STREAM,
+        NetType::DGRAM => Type::DGRAM,
+        NetType::RAW => Type::RAW,
+        NetType::SEQPACKET => Type::SEQPACKET,
     }
 }
 
-/// Translate internal protocol to guest Protocol.
-pub fn translate_protocol_from_network(protocol: u32) -> Protocol {
+/// Corresponds to `Translate(Protocol)` in upstream.
+pub fn translate_protocol(protocol: Protocol) -> NetProtocol {
     match protocol {
-        0 => Protocol::Unspecified,
-        1 => Protocol::ICMP,
-        6 => Protocol::TCP,
-        17 => Protocol::UDP,
+        Protocol::Unspecified => NetProtocol::Unspecified,
+        Protocol::TCP => NetProtocol::TCP,
+        Protocol::UDP => NetProtocol::UDP,
         _ => {
-            log::warn!("Unimplemented protocol={}", protocol);
+            log::warn!("Unimplemented protocol={protocol:?}");
+            NetProtocol::Unspecified
+        }
+    }
+}
+
+/// Corresponds to `Translate(Network::Protocol)` in upstream.
+pub fn translate_protocol_from_network(protocol: NetProtocol) -> Protocol {
+    match protocol {
+        NetProtocol::Unspecified => Protocol::Unspecified,
+        NetProtocol::TCP => Protocol::TCP,
+        NetProtocol::UDP => Protocol::UDP,
+        _ => {
+            log::warn!("Unimplemented protocol={protocol:?}");
             Protocol::Unspecified
         }
     }
 }
 
-/// Translate guest SockAddrIn to internal representation.
-///
-/// Corresponds to `Translate(SockAddrIn)` in upstream sockets_translate.cpp.
-/// Note: portno byte-swap matches upstream (big-endian to host).
-pub fn translate_sockaddr_to_network(value: &SockAddrIn) -> (u32, [u8; 4], u16) {
-    // Upstream: assert len == 0 || len == sizeof(SockAddrIn) || len == 6
-    let family = translate_domain_to_network(match value.family {
-        0 => Domain::Unspecified,
-        2 => Domain::INET,
-        _ => Domain::Unspecified,
-    });
-    let port = (value.portno >> 8) | (value.portno << 8);
-    (family, value.ip, port)
+/// Corresponds to `Translate(PollEvents)` in upstream.
+pub fn translate_poll_events(mut flags: PollEvents) -> NetPollEvents {
+    let mut result = NetPollEvents::empty();
+    macro_rules! translate {
+        ($from:ident, $to:ident) => {
+            if flags.contains(PollEvents::$from) {
+                flags.remove(PollEvents::$from);
+                result.insert(NetPollEvents::$to);
+            }
+        };
+    }
+    translate!(IN, IN);
+    translate!(PRI, PRI);
+    translate!(OUT, OUT);
+    translate!(ERR, ERR);
+    translate!(HUP, HUP);
+    translate!(NVAL, NVAL);
+    translate!(RD_NORM, RD_NORM);
+    translate!(RD_BAND, RD_BAND);
+    translate!(WR_BAND, WR_BAND);
+    if !flags.is_empty() {
+        log::warn!("Unimplemented poll flags={:#x}", flags.bits());
+    }
+    result
 }
 
-/// Translate internal representation to guest SockAddrIn.
-///
+/// Corresponds to `Translate(Network::PollEvents)` in upstream.
+pub fn translate_poll_events_from_network(mut flags: NetPollEvents) -> PollEvents {
+    let mut result = PollEvents::empty();
+    macro_rules! translate {
+        ($from:ident, $to:ident) => {
+            if flags.contains(NetPollEvents::$from) {
+                flags.remove(NetPollEvents::$from);
+                result.insert(PollEvents::$to);
+            }
+        };
+    }
+    translate!(IN, IN);
+    translate!(PRI, PRI);
+    translate!(OUT, OUT);
+    translate!(ERR, ERR);
+    translate!(HUP, HUP);
+    translate!(NVAL, NVAL);
+    translate!(RD_NORM, RD_NORM);
+    translate!(RD_BAND, RD_BAND);
+    translate!(WR_BAND, WR_BAND);
+    if !flags.is_empty() {
+        log::warn!("Unimplemented network poll flags={:#x}", flags.bits());
+    }
+    result
+}
+
+/// Corresponds to `Translate(SockAddrIn)` in upstream.
+pub fn translate_sockaddr_to_network(value: &SockAddrIn) -> NetSockAddrIn {
+    // Homebrew can pass 6 because libnx uses it when deserializing
+    // getaddrinfo results.
+    assert!(
+        value.len == 0 || value.len == std::mem::size_of::<SockAddrIn>() as u8 || value.len == 6
+    );
+
+    NetSockAddrIn {
+        family: Some(translate_domain(Domain(value.family as u32))),
+        ip: value.ip,
+        portno: value.portno.swap_bytes(),
+    }
+}
+
 /// Corresponds to `Translate(Network::SockAddrIn)` in upstream.
-pub fn translate_sockaddr_from_network(family: u32, ip: [u8; 4], portno: u16) -> SockAddrIn {
-    let domain = translate_domain_from_network(family);
+pub fn translate_sockaddr_from_network(value: &NetSockAddrIn) -> SockAddrIn {
     SockAddrIn {
         len: std::mem::size_of::<SockAddrIn>() as u8,
-        family: domain as u8,
-        portno: (portno >> 8) | (portno << 8),
-        ip,
-        zeroes: [0u8; 8],
+        family: value
+            .family
+            .map(translate_domain_from_network)
+            .unwrap_or(Domain::Unspecified)
+            .0 as u8,
+        portno: value.portno.swap_bytes(),
+        ip: value.ip,
+        zeroes: [0; 8],
+    }
+}
+
+/// Corresponds to `Translate(ShutdownHow)` in upstream.
+pub fn translate_shutdown_how(how: ShutdownHow) -> NetShutdownHow {
+    match how {
+        ShutdownHow::RD => NetShutdownHow::RD,
+        ShutdownHow::WR => NetShutdownHow::WR,
+        ShutdownHow::RDWR => NetShutdownHow::RDWR,
+        _ => {
+            log::warn!("Unimplemented how={how:?}");
+            NetShutdownHow::RD
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_guest_values_use_upstream_defaults() {
+        assert_eq!(translate_domain(Domain(u32::MAX)), NetDomain::Unspecified);
+        assert_eq!(translate_type(Type(u32::MAX)), NetType::Unspecified);
+        assert_eq!(translate_protocol(Protocol::ICMP), NetProtocol::Unspecified);
+        assert_eq!(
+            translate_shutdown_how(ShutdownHow(i32::MAX)),
+            NetShutdownHow::RD
+        );
+    }
+
+    #[test]
+    fn sockaddr_translation_preserves_upstream_layout_and_byte_order() {
+        let guest = SockAddrIn {
+            len: 16,
+            family: Domain::INET.0 as u8,
+            portno: 0x3412,
+            ip: [127, 0, 0, 1],
+            zeroes: [0; 8],
+        };
+        let network = translate_sockaddr_to_network(&guest);
+        assert_eq!(network.family, Some(NetDomain::INET));
+        assert_eq!(network.portno, 0x1234);
+        assert_eq!(translate_sockaddr_from_network(&network).portno, 0x3412);
     }
 }

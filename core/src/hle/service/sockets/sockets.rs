@@ -31,39 +31,104 @@ pub enum Errno {
     INPROGRESS = 115,
 }
 
-/// Domain (address family).
+/// GetAddrInfoError codes matching upstream.
 ///
-/// Corresponds to `Domain` in upstream sockets.h.
-#[repr(u32)]
+/// Corresponds to `GetAddrInfoError` in upstream sockets.h.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Domain {
-    Unspecified = 0,
-    INET = 2,
+#[repr(i32)]
+pub enum GetAddrInfoError {
+    SUCCESS = 0,
+    ADDRFAMILY = 1,
+    AGAIN = 2,
+    BADFLAGS = 3,
+    FAIL = 4,
+    FAMILY = 5,
+    MEMORY = 6,
+    NODATA = 7,
+    NONAME = 8,
+    SERVICE = 9,
+    SOCKTYPE = 10,
+    SYSTEM = 11,
+    BADHINTS = 12,
+    PROTOCOL = 13,
+    OVERFLOW = 14,
+    OTHER = 15,
 }
 
-/// Type (socket type).
+/// Declares the Rust counterpart of a C++ scoped enumeration that the guest
+/// supplies raw values for.
 ///
-/// Corresponds to `Type` in upstream sockets.h.
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Type {
-    Unspecified = 0,
-    STREAM = 1,
-    DGRAM = 2,
-    RAW = 3,
-    SEQPACKET = 5,
+/// Upstream writes these as `enum class X : u32 { ... }` and builds them from
+/// an IPC word with `static_cast<X>(word)`. In C++ that cast is value
+/// preserving for *every* value of the underlying type — an enumeration with a
+/// fixed underlying type has the same range as that type — and each `switch`
+/// that consumes one carries a `default:` arm for the unnamed values. A Rust
+/// `enum` cannot hold an unnamed discriminant, so these types are newtypes over
+/// the underlying integer with the upstream enumerators as associated
+/// constants. Deriving `PartialEq`/`Eq` keeps them usable in `match` patterns,
+/// so the ported `switch` statements read the same as upstream, and the manual
+/// `Debug` prints the enumerator name exactly like upstream's fmt formatter.
+macro_rules! guest_enum {
+    (
+        $(#[$meta:meta])*
+        pub struct $name:ident : $repr:ty {
+            $($variant:ident = $value:expr),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[repr(transparent)]
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        pub struct $name(pub $repr);
+
+        #[allow(non_upper_case_globals)]
+        impl $name {
+            $(pub const $variant: Self = Self($value);)*
+        }
+
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match *self {
+                    $(Self::$variant => f.write_str(stringify!($variant)),)*
+                    Self(value) => write!(f, concat!(stringify!($name), "({:#x})"), value),
+                }
+            }
+        }
+    };
 }
 
-/// Protocol.
-///
-/// Corresponds to `Protocol` in upstream sockets.h.
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Protocol {
-    Unspecified = 0,
-    ICMP = 1,
-    TCP = 6,
-    UDP = 17,
+guest_enum! {
+    /// Domain (address family).
+    ///
+    /// Corresponds to `Domain` in upstream sockets.h.
+    pub struct Domain: u32 {
+        Unspecified = 0,
+        INET = 2,
+    }
+}
+
+guest_enum! {
+    /// Type (socket type).
+    ///
+    /// Corresponds to `Type` in upstream sockets.h.
+    pub struct Type: u32 {
+        Unspecified = 0,
+        STREAM = 1,
+        DGRAM = 2,
+        RAW = 3,
+        SEQPACKET = 5,
+    }
+}
+
+guest_enum! {
+    /// Protocol.
+    ///
+    /// Corresponds to `Protocol` in upstream sockets.h.
+    pub struct Protocol: u32 {
+        Unspecified = 0,
+        ICMP = 1,
+        TCP = 6,
+        UDP = 17,
+    }
 }
 
 /// Socket level for setsockopt/getsockopt.
@@ -75,43 +140,43 @@ pub enum SocketLevel {
     SOCKET = 0xffff, // SOL_SOCKET
 }
 
-/// Socket option names.
-///
-/// Corresponds to `OptName` in upstream sockets.h.
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OptName {
-    REUSEADDR = 0x4,
-    KEEPALIVE = 0x8,
-    BROADCAST = 0x20,
-    LINGER = 0x80,
-    SNDBUF = 0x1001,
-    RCVBUF = 0x1002,
-    SNDTIMEO = 0x1005,
-    RCVTIMEO = 0x1006,
-    ERROR = 0x1007,
-    NOSIGPIPE = 0x800, // at least according to libnx
+guest_enum! {
+    /// Socket option names.
+    ///
+    /// Corresponds to `OptName` in upstream sockets.h.
+    pub struct OptName: u32 {
+        REUSEADDR = 0x4,
+        KEEPALIVE = 0x8,
+        BROADCAST = 0x20,
+        LINGER = 0x80,
+        SNDBUF = 0x1001,
+        RCVBUF = 0x1002,
+        SNDTIMEO = 0x1005,
+        RCVTIMEO = 0x1006,
+        ERROR = 0x1007,
+        NOSIGPIPE = 0x800, // at least according to libnx
+    }
 }
 
-/// ShutdownHow modes.
-///
-/// Corresponds to `ShutdownHow` in upstream sockets.h.
-#[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShutdownHow {
-    RD = 0,
-    WR = 1,
-    RDWR = 2,
+guest_enum! {
+    /// ShutdownHow modes.
+    ///
+    /// Corresponds to `ShutdownHow` in upstream sockets.h.
+    pub struct ShutdownHow: i32 {
+        RD = 0,
+        WR = 1,
+        RDWR = 2,
+    }
 }
 
-/// Fcntl command codes.
-///
-/// Corresponds to `FcntlCmd` in upstream sockets.h.
-#[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FcntlCmd {
-    GETFL = 3,
-    SETFL = 4,
+guest_enum! {
+    /// Fcntl command codes.
+    ///
+    /// Corresponds to `FcntlCmd` in upstream sockets.h.
+    pub struct FcntlCmd: i32 {
+        GETFL = 3,
+        SETFL = 4,
+    }
 }
 
 /// Guest socket address structure.
@@ -226,4 +291,63 @@ pub fn loop_process(system: crate::core::SystemRef) {
     }
 
     ServerManager::run_server_shared(server_manager);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Upstream builds these from an IPC word with `static_cast<X>(word)`,
+    /// which is value preserving for every value of the underlying type. A
+    /// value the guest sends that names no enumerator must survive the
+    /// conversion so the consuming `switch` can reach its `default:` arm —
+    /// Super Tux Kart calls `setsockopt` with `optname=0x1`, which used to
+    /// abort the emulator when the port modelled `OptName` as a Rust `enum`.
+    #[test]
+    fn a_guest_word_that_names_no_enumerator_survives_the_conversion() {
+        assert_eq!(OptName(0x1).0, 0x1);
+        assert_ne!(OptName(0x1), OptName::REUSEADDR);
+        assert_eq!(Domain(0xdead).0, 0xdead);
+        assert_eq!(Type(0x2000_0001).0, 0x2000_0001);
+        assert_eq!(Protocol(99).0, 99);
+        assert_eq!(FcntlCmd(-1).0, -1);
+        assert_eq!(ShutdownHow(7).0, 7);
+    }
+
+    /// The enumerator values are the ones in upstream `sockets.h`.
+    #[test]
+    fn the_enumerators_keep_their_upstream_values() {
+        assert_eq!(std::mem::size_of::<Domain>(), std::mem::size_of::<u32>());
+        assert_eq!(std::mem::size_of::<Type>(), std::mem::size_of::<u32>());
+        assert_eq!(std::mem::size_of::<Protocol>(), std::mem::size_of::<u32>());
+        assert_eq!(std::mem::size_of::<OptName>(), std::mem::size_of::<u32>());
+        assert_eq!(
+            std::mem::size_of::<ShutdownHow>(),
+            std::mem::size_of::<i32>()
+        );
+        assert_eq!(std::mem::size_of::<FcntlCmd>(), std::mem::size_of::<i32>());
+        assert_eq!(Domain::Unspecified.0, 0);
+        assert_eq!(Domain::INET.0, 2);
+        assert_eq!(Type::STREAM.0, 1);
+        assert_eq!(Type::SEQPACKET.0, 5);
+        assert_eq!(Protocol::TCP.0, 6);
+        assert_eq!(Protocol::UDP.0, 17);
+        assert_eq!(OptName::REUSEADDR.0, 0x4);
+        assert_eq!(OptName::LINGER.0, 0x80);
+        assert_eq!(OptName::NOSIGPIPE.0, 0x800);
+        assert_eq!(OptName::ERROR.0, 0x1007);
+        assert_eq!(FcntlCmd::GETFL.0, 3);
+        assert_eq!(FcntlCmd::SETFL.0, 4);
+        assert_eq!(ShutdownHow::RDWR.0, 2);
+    }
+
+    /// Upstream's fmt formatter prints the enumerator name; the log messages in
+    /// the `default:` arms rely on unnamed values still being readable.
+    #[test]
+    fn debug_names_the_enumerator_and_falls_back_to_the_raw_value() {
+        assert_eq!(format!("{:?}", OptName::RCVTIMEO), "RCVTIMEO");
+        assert_eq!(format!("{:?}", OptName(0x1)), "OptName(0x1)");
+        assert_eq!(format!("{:?}", Domain::INET), "INET");
+        assert_eq!(format!("{:?}", FcntlCmd(9)), "FcntlCmd(0x9)");
+    }
 }
