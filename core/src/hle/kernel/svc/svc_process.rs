@@ -4,9 +4,7 @@
 //!
 //! SVC handlers for process operations (ExitProcess, GetProcessId, GetProcessList, etc.).
 
-use super::super::k_process::ProcessLock;
 use crate::core::System;
-use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::{Handle, PseudoHandle};
@@ -21,8 +19,7 @@ pub fn exit_process(system: &System) {
         .get_process_id();
     log::info!("svc::ExitProcess called for process {}", process_id);
 
-    KProcess::exit_with_current_thread(system.current_process_arc());
-    system.scheduler_arc().lock().unwrap().request_schedule();
+    system.exit();
 }
 
 /// Gets the ID of the specified process or a specified thread's owning process.
@@ -200,7 +197,6 @@ mod tests {
     use crate::hle::kernel::k_process::{KProcess, ProcessLock, ProcessState};
     use crate::hle::kernel::k_scheduler::KScheduler;
     use crate::hle::kernel::k_thread::{KThread, KThreadLock, ThreadState};
-    use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
     use std::sync::{Arc, Mutex};
 
     fn test_system() -> System {
@@ -239,19 +235,23 @@ mod tests {
     }
 
     #[test]
-    fn exit_process_exits_current_process_and_thread() {
-        let system = test_system();
+    fn exit_process_notifies_the_frontend() {
+        let mut system = test_system();
+        let exit_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_exit_called = Arc::clone(&exit_called);
+        system.register_exit_callback(Box::new(move || {
+            callback_exit_called.store(true, std::sync::atomic::Ordering::Release);
+        }));
 
         exit_process(&system);
-        KWorkerTaskManager::wait_for_global_idle();
 
         let process = system.current_process_arc().lock().unwrap();
         let current_thread = process.get_thread_by_thread_id(1).unwrap();
-        assert_ne!(process.state, ProcessState::Running);
+        assert_eq!(process.state, ProcessState::Running);
         drop(process);
 
         let thread = current_thread.lock().unwrap();
-        assert!(thread.is_termination_requested());
-        assert!(thread.is_signaled());
+        assert!(!thread.is_termination_requested());
+        assert!(exit_called.load(std::sync::atomic::Ordering::Acquire));
     }
 }

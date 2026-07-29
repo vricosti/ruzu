@@ -49,6 +49,13 @@ pub enum LoadingEvent {
         total: usize,
     },
     FirstFrame,
+    Failed {
+        message: String,
+        detail: String,
+    },
+    Stopped {
+        before_first_frame: bool,
+    },
 }
 
 /// Loading event callback marshaled to the GTK main thread.
@@ -160,6 +167,9 @@ fn run_boot(
 ) {
     use ruzu_core::core::{System, SystemRef, SystemResultStatus};
 
+    let first_frame_displayed = Arc::new(AtomicBool::new(false));
+    let guest_exit_requested = Arc::new(AtomicBool::new(false));
+
     loading_event(LoadingEvent::Progress {
         stage: LoadStage::Prepare,
         value: 0,
@@ -191,6 +201,7 @@ fn run_boot(
     // Subsystem factory (upstream SetupForApplicationProcess): Host1x + GPU +
     // Vulkan renderer + AudioCore. Called during `system.load()`.
     let frame_loading_event = Arc::clone(&loading_event);
+    let frame_displayed = Arc::clone(&first_frame_displayed);
     system.set_subsystem_factory(Box::new(move |system| {
         use std::sync::Arc;
 
@@ -243,9 +254,8 @@ fn run_boot(
             return;
         };
         let renderer_device_memory = Arc::clone(host1x.memory_manager());
-        let first_frame_sent = Arc::new(AtomicBool::new(false));
         let frame_displayed_notify = Arc::new(move || {
-            if !first_frame_sent.swap(true, Ordering::AcqRel) {
+            if !frame_displayed.swap(true, Ordering::AcqRel) {
                 frame_loading_event(LoadingEvent::FirstFrame);
             }
         });
@@ -369,10 +379,9 @@ fn run_boot(
     let load_result = system.load(&filepath);
     if load_result != SystemResultStatus::Success {
         log::error!("Failed to load ROM '{filepath}': {load_result:?}");
-        loading_event(LoadingEvent::Progress {
-            stage: LoadStage::Complete,
-            value: 1,
-            total: 1,
+        loading_event(LoadingEvent::Failed {
+            message: "Unable to start the game".to_owned(),
+            detail: load_error_detail(load_result).to_owned(),
         });
         return;
     }
@@ -441,8 +450,15 @@ fn run_boot(
     }
 
     system.get_cpu_manager().on_gpu_ready();
-    system.register_exit_callback(Box::new(|| {
-        std::process::exit(0);
+    let exit_loading_event = Arc::clone(&loading_event);
+    let exit_first_frame_displayed = Arc::clone(&first_frame_displayed);
+    let exit_requested = Arc::clone(&guest_exit_requested);
+    system.register_exit_callback(Box::new(move || {
+        if !exit_requested.swap(true, Ordering::AcqRel) {
+            exit_loading_event(LoadingEvent::Stopped {
+                before_first_frame: !exit_first_frame_displayed.load(Ordering::Acquire),
+            });
+        }
     }));
 
     // Run the guest (upstream `system.Run()`): starts CPU threads in background.
@@ -452,6 +468,9 @@ fn run_boot(
     // `System`, samples the same counters as upstream's 500 ms GUI timer, and
     // waits for a stop request between samples.
     loop {
+        if guest_exit_requested.load(Ordering::Acquire) {
+            break;
+        }
         match stop_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {
@@ -468,11 +487,35 @@ fn run_boot(
     log::info!("Emulation stopping: pause + shutdown");
     system.pause();
     system.shutdown_main_process();
+}
 
-    // Force-exit like `ruzu_cmd`: some background threads (CPU idle loops, audio
-    // ADSP, CoreTiming timer) block on condvars that aren't cleanly woken during
-    // shutdown, so Rust's implicit static-drop / thread-join at process teardown
-    // would hang or crash (the "send report to Apple" dialog). Upstream C++ exits
-    // via `main()` return → `exit()` without joining detached threads.
-    std::process::exit(0);
+fn load_error_detail(status: ruzu_core::core::SystemResultStatus) -> &'static str {
+    use ruzu_core::core::SystemResultStatus;
+
+    match status {
+        SystemResultStatus::ErrorGetLoader => "The ROM format is not supported.",
+        SystemResultStatus::ErrorVideoCore => {
+            "The video renderer could not be initialized. Check the log for details."
+        }
+        SystemResultStatus::ErrorLoader => {
+            "The game data could not be loaded. Check the log for details."
+        }
+        _ => "An unknown error occurred while loading the game. Check the log for details.",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ruzu_core::core::SystemResultStatus;
+
+    #[test]
+    fn load_errors_have_frontend_facing_details() {
+        assert_eq!(
+            load_error_detail(SystemResultStatus::ErrorGetLoader),
+            "The ROM format is not supported."
+        );
+        assert!(load_error_detail(SystemResultStatus::ErrorVideoCore).contains("renderer"));
+        assert!(load_error_detail(SystemResultStatus::ErrorUnknown).contains("unknown"));
+    }
 }

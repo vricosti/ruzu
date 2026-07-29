@@ -70,6 +70,14 @@ pub struct GMainWindow {
     /// The active emulation session, if a game is running (upstream keeps the
     /// `System` + emu thread on `GMainWindow`).
     session: RefCell<Option<EmulationSession>>,
+    /// GTK close requests are asynchronous when confirmation is required.
+    /// These flags prevent duplicate dialogs and let the accepted request pass
+    /// through the close handler exactly once.
+    close_confirmation_pending: Cell<bool>,
+    close_confirmed: Cell<bool>,
+    /// Invalidates the previous session's GTK event poller when another title
+    /// is booted before that poller receives a terminal event.
+    session_generation: Cell<u64>,
     /// Bottom status bar (renderer / accuracy / dock / filter / AA / volume).
     status_bar: Rc<StatusBar>,
     /// Native render-window handles for the running game, so it can be resized
@@ -217,6 +225,23 @@ mod loading_event_mailbox_tests {
         assert!(matches!(mailbox.pop(), Some(LoadingEvent::FirstFrame)));
         assert!(mailbox.pop().is_none());
     }
+
+    #[test]
+    fn guest_exit_is_preserved_after_the_first_frame() {
+        let mut mailbox = LoadingEventMailbox::default();
+        mailbox.push(LoadingEvent::FirstFrame);
+        mailbox.push(LoadingEvent::Stopped {
+            before_first_frame: false,
+        });
+
+        assert!(matches!(mailbox.pop(), Some(LoadingEvent::FirstFrame)));
+        assert!(matches!(
+            mailbox.pop(),
+            Some(LoadingEvent::Stopped {
+                before_first_frame: false
+            })
+        ));
+    }
 }
 
 impl GMainWindow {
@@ -304,6 +329,9 @@ impl GMainWindow {
             stack,
             loading_screen,
             session: RefCell::new(None),
+            close_confirmation_pending: Cell::new(false),
+            close_confirmed: Cell::new(false),
+            session_generation: Cell::new(0),
             status_bar,
             render: RefCell::new(None),
             render_size: Cell::new((0, 0)),
@@ -378,21 +406,62 @@ impl GMainWindow {
             }
         ));
 
-        // Stop the emulation session when the window is closing, *before* GTK
-        // tears down the native surface — otherwise the GPU thread keeps
-        // presenting into a destroyed Metal layer and crashes. If a game is
-        // running, `stop()` lets the boot thread shut down and `process::exit`,
-        // so the close handler doesn't return (the process is already gone).
+        // Confirm while a title is active, then stop emulation before GTK tears
+        // down the native surface. This mirrors upstream `ConfirmClose()` and
+        // `closeEvent()`.
         this.window.connect_close_request(glib::clone!(
             #[weak(rename_to = w)]
             this,
             #[upgrade_or]
             glib::Propagation::Proceed,
             move |_| {
-                if let Some(mut session) = w.session.borrow_mut().take() {
-                    session.stop();
+                log::debug!(
+                    "GTK close request: session_active={} confirmed={} pending={}",
+                    w.session.borrow().is_some(),
+                    w.close_confirmed.get(),
+                    w.close_confirmation_pending.get()
+                );
+                if w.session.borrow().is_none() {
+                    return glib::Propagation::Proceed;
                 }
-                glib::Propagation::Proceed
+
+                if w.close_confirmed.replace(false) {
+                    if let Some(mut session) = w.session.borrow_mut().take() {
+                        session.stop();
+                    }
+                    return glib::Propagation::Proceed;
+                }
+
+                if w.close_confirmation_pending.replace(true) {
+                    return glib::Propagation::Stop;
+                }
+
+                let dialog = gtk::AlertDialog::builder()
+                    .modal(true)
+                    .message("ruzu")
+                    .detail("Are you sure you want to close ruzu?")
+                    .buttons(["Cancel", "Close ruzu"])
+                    .default_button(1)
+                    .cancel_button(0)
+                    .build();
+                dialog.choose(
+                    Some(&w.window),
+                    gio::Cancellable::NONE,
+                    glib::clone!(
+                        #[weak(rename_to = w)]
+                        w,
+                        move |answer| {
+                            log::debug!("GTK close confirmation answered: {answer:?}");
+                            w.close_confirmation_pending.set(false);
+                            if matches!(answer, Ok(1)) {
+                                w.close_confirmed.set(true);
+                                w.window.close();
+                            }
+                        }
+                    ),
+                );
+
+                glib::Propagation::Stop
             }
         ));
 
@@ -1134,6 +1203,8 @@ impl GMainWindow {
         if let Some(mut session) = self.session.borrow_mut().take() {
             session.stop();
         }
+        let session_generation = self.session_generation.get().wrapping_add(1);
+        self.session_generation.set(session_generation);
 
         // Reflect current settings in the status bar (upstream refreshes the
         // status buttons around boot).
@@ -1192,7 +1263,11 @@ impl GMainWindow {
 
         let loading = Rc::clone(&self.loading_screen);
         let stack = self.stack.clone();
+        let this = Rc::clone(self);
         glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+            if this.session_generation.get() != session_generation {
+                return glib::ControlFlow::Break;
+            }
             match mailbox.lock().unwrap().pop() {
                 Some(LoadingEvent::Assets(assets)) => {
                     loading.set_assets(assets.logo.as_deref(), assets.banner.as_deref());
@@ -1211,6 +1286,22 @@ impl GMainWindow {
                         stack.set_visible_child_name(PAGE_RENDER);
                         crate::render_window::set_render_view_hidden(child_window as *mut _, false);
                     });
+                }
+                Some(LoadingEvent::Failed { message, detail }) => {
+                    this.on_emulation_stopped(Some((message, detail)));
+                    return glib::ControlFlow::Break;
+                }
+                Some(LoadingEvent::Stopped { before_first_frame }) => {
+                    let failure = before_first_frame.then(|| {
+                        (
+                            "The game stopped unexpectedly".to_owned(),
+                            "The application stopped before displaying a frame. \
+                             Verify that its required files are available on the emulated SD card \
+                             and check the log for details."
+                                .to_owned(),
+                        )
+                    });
+                    this.on_emulation_stopped(failure);
                     return glib::ControlFlow::Break;
                 }
                 None => {}
@@ -1271,6 +1362,8 @@ impl GMainWindow {
         if let Some(mut session) = self.session.borrow_mut().take() {
             session.stop();
         }
+        let session_generation = self.session_generation.get().wrapping_add(1);
+        self.session_generation.set(session_generation);
         self.status_bar.refresh();
 
         // Render area = the central stack's bounds, so the child window leaves
@@ -1333,7 +1426,11 @@ impl GMainWindow {
         let stack = self.stack.clone();
         let display = embedded.display as usize;
         let child = embedded.window;
+        let this = Rc::clone(self);
         glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+            if this.session_generation.get() != session_generation {
+                return glib::ControlFlow::Break;
+            }
             match mailbox.lock().unwrap().pop() {
                 Some(LoadingEvent::Assets(assets)) => {
                     loading.set_assets(assets.logo.as_deref(), assets.banner.as_deref());
@@ -1349,6 +1446,22 @@ impl GMainWindow {
                         stack.set_visible_child_name(PAGE_RENDER);
                         render::set_render_window_hidden(display as *mut _, child, false);
                     });
+                }
+                Some(LoadingEvent::Failed { message, detail }) => {
+                    this.on_emulation_stopped(Some((message, detail)));
+                    return glib::ControlFlow::Break;
+                }
+                Some(LoadingEvent::Stopped { before_first_frame }) => {
+                    let failure = before_first_frame.then(|| {
+                        (
+                            "The game stopped unexpectedly".to_owned(),
+                            "The application stopped before displaying a frame. \
+                             Verify that its required files are available on the emulated SD card \
+                             and check the log for details."
+                                .to_owned(),
+                        )
+                    });
+                    this.on_emulation_stopped(failure);
                     return glib::ControlFlow::Break;
                 }
                 None => {}
@@ -1463,6 +1576,38 @@ impl GMainWindow {
     /// Switch the central stack back to the game list.
     pub fn show_game_list(&self) {
         self.stack.set_visible_child_name(PAGE_GAME_LIST);
+    }
+
+    /// Finish a session after a load failure or guest-requested exit.
+    ///
+    /// This follows upstream `OnEmulationStopped`: stop and join emulation
+    /// before releasing the native render target, clear the loading assets,
+    /// restore the game list, and then report an error when applicable.
+    fn on_emulation_stopped(self: &Rc<Self>, failure: Option<(String, String)>) {
+        if let Some(mut session) = self.session.borrow_mut().take() {
+            session.stop();
+        }
+
+        if let Some(handles) = self.render.borrow_mut().take() {
+            #[cfg(target_os = "linux")]
+            crate::render_window_x11::destroy_render_window(
+                handles.display as *mut _,
+                handles.child_window as u64,
+            );
+            #[cfg(target_os = "macos")]
+            crate::render_window::set_render_view_hidden(handles.child_window as *mut _, true);
+        }
+
+        self.loading_screen.clear();
+        self.show_game_list();
+        self.status_bar.update_performance(None);
+        if let Some(app) = self.window.application() {
+            update_menu_state(&app, false, true);
+        }
+
+        if let Some((message, detail)) = failure {
+            self.alert(&message, &detail);
+        }
     }
 
     /// Animate fake shader-build progress to exercise the loading-screen UI.
