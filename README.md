@@ -1,2 +1,210 @@
 # ruzu
-Porting yuzu in rust (to avoid compilation hell)
+
+**ruzu is not a new emulator. It is a port.**
+
+Every design decision, file layout, class boundary, constant and control flow in
+this repository comes from yuzu a Nintendo Switch emulator written in C++ with a 
+Qt frontend. ruzu translates that codebase into Rust, with a GTK4 frontend replacing Qt.
+
+## What this project actually is
+
+ruzu is **an experiment in whether large language models can port genuinely
+complex software from one high-level language to another.**
+
+The interesting question is not "can an LLM write Rust?" — it plainly can. The
+question is whether an LLM can carry out a *faithful* port of a codebase that is:
+
+- large — hundreds of thousands of lines across a dozen subsystems;
+- deeply stateful — an HLE kernel with schedulers, fibers, IPC and services;
+- unforgiving — a GPU command processor, a shader recompiler, and a JIT where a
+  single wrong bit produces a black screen rather than a stack trace;
+- built on C++ idioms with no direct Rust equivalent — inheritance hierarchies,
+  raw pointer graphs, `shared_ptr` cycles, destructor ordering, `std::variant`.
+
+"Faithful" is the whole point, and it is a much harder target than "works". The
+port is held to **structural parity** with the C++ source: the Rust file tree
+mirrors the upstream directory tree, methods live in the file their C++
+counterpart lives in, constants stay next to the code that owns them, and
+lifecycle order is preserved literally. A maintainer looking at any Rust file
+should be able to answer *which C++ file is this, and what is still missing?*
+The contract the work is held to is written down in
+[`CLAUDE.md`](CLAUDE.md) — it is the interesting artefact of this project as
+much as the code is.
+
+Rust adaptations are allowed where they preserve behaviour (`Result` for
+exceptions, `Arc<Mutex<T>>` for `shared_ptr` + mutex, `enum` for
+`std::variant`, `Drop` for destructors). Architectural redesigns are not — a
+prettier Rust design that drifts from upstream makes the port unreviewable, and
+review is the only thing that keeps a port of this size honest.
+
+## Ports produced along the way
+
+Getting the emulator to run meant porting its dependencies too. Each of these is
+a standalone Rust crate in its own right:
+
+| Crate | Ports | Upstream |
+|---|---|---|
+| [**rxbyak**](https://github.com/vricosti/rxbyak) | Xbyak, a C++ JIT assembler — x86-64 machine-code encoding, bit-identical to upstream | [herumi/xbyak](https://github.com/herumi/xbyak) |
+| [**rdynarmic**](https://github.com/vricosti/rdynarmic) | dynarmic, an ARM dynamic recompiler — AArch32 and AArch64 frontends, x86-64 and ARM64 backends, ~650 IR opcodes | [lioncash/dynarmic](https://github.com/lioncash/dynarmic) |
+
+rdynarmic's ARM32 and ARM64 translation is validated by **differential fuzzing
+against the C++ dynarmic oracle**: the same instruction encodings are fed to
+both implementations and the resulting register and flag state is compared.
+That, rather than "the game boots", is what makes a JIT port credible.
+
+## Platforms
+
+The emulator runs on both **x86-64** and **aarch64** hosts. rdynarmic carries a
+backend for each, so guest ARM code is JIT-compiled natively on either
+architecture rather than interpreted.
+
+A **RISC-V** host is one of the next objectives — the plan is to get the
+workspace compiling on riscv64 first, then add a RISC-V backend to rdynarmic.
+
+### Compilation tested on
+
+Results from [the compatibility
+report](https://github.com/vricosti/ruzu) of 29 July 2026. Each platform started
+from a clean image with neither build dependencies nor a Rust toolchain
+installed; `setup.sh` installed them, and the validation command was
+`cargo build --locked --bin ruzu`.
+
+| Platform | Package manager | GTK | Rust | Result |
+|---|---|---:|---:|---|
+| Ubuntu 22.04.5 LTS | apt | 4.6.9 | 1.97.1 (rustup) | OK |
+| Ubuntu 24.04.4 LTS | apt | 4.14.5 | 1.97.1 (rustup) | OK |
+| Ubuntu 26.04 LTS | apt | 4.22.4 | 1.97.1 (rustup) | OK |
+| Fedora 44 | dnf | 4.22.4 | 1.97.1 (rustup) | OK |
+| Arch Linux | pacman | 4.22.4 | 1.97.1 (rustup) | OK |
+| openSUSE Tumbleweed | zypper | 4.22.4 | 1.97.1 (rustup) | OK |
+| Alpine 3.24.1 | apk | 4.22.4 | 1.97.1 (rustup, musl) | OK |
+| FreeBSD 15.1-RELEASE | pkg | 4.20.4 | 1.97.1 (rustup) | OK |
+| NetBSD 10.1 | pkgin | 4.22.4 | 1.97.1 (rustup) | OK |
+| OpenBSD 7.9 | pkg_add | 4.22.3 | 1.94.1 (native package) | OK |
+| macOS Tahoe 26 | Homebrew | — | rustup | Not yet run — Homebrew support is implemented in `setup.sh`, pending validation on real Apple hardware |
+
+## Building
+
+### Requirements
+
+- Rust **1.75** or newer (the workspace `rust-version`; the platforms above were
+  validated with 1.97.1).
+- **GTK 4.6** or newer, plus SDL2, Vulkan headers, OpenSSL, FFmpeg, glslang and
+  a C/C++ toolchain. `setup.sh` installs the right package names per platform.
+
+### Clone
+
+The JIT crates are git submodules, so clone recursively:
+
+```sh
+git clone --recurse-submodules <repository-url> ruzu
+cd ruzu
+```
+
+Already cloned without them?
+
+```sh
+git submodule update --init --recursive
+```
+
+### Install dependencies
+
+From the root of the clone:
+
+```sh
+./setup.sh
+```
+
+`setup.sh` dispatches to `scripts/setup-linux.sh`, `scripts/setup-bsd.sh` or
+`scripts/setup-macos.sh` based on `uname -s`. It is idempotent, and it asks
+separately before installing system packages and before installing Rust — it
+will not install either without confirmation.
+
+### Build and run
+
+```sh
+cargo build --locked --bin ruzu
+./target/debug/ruzu
+```
+
+Optimized:
+
+```sh
+cargo build --locked --release --bin ruzu
+./target/release/ruzu
+```
+
+There is also a headless command-line frontend:
+
+```sh
+cargo run --bin ruzu-cmd -- -g "/path/to/game.nsp"
+```
+
+With logging, and with cache/config kept out of your real profile:
+
+```sh
+env XDG_CACHE_HOME=/tmp/ruzu-cache \
+    XDG_CONFIG_HOME=/tmp/ruzu-config \
+    RUST_LOG=info cargo run --bin ruzu-cmd -- -g "/path/to/game.nsp"
+```
+
+> Do **not** override `XDG_DATA_HOME`. ruzu falls back to an existing yuzu NAND
+> directory under `$XDG_DATA_HOME` when its own is empty; pointing it at a fresh
+> temporary directory makes ruzu synthesize placeholder system archives instead.
+
+### Tests
+
+```sh
+cargo test -p common
+cargo test -p core
+cargo test -p rdynarmic
+```
+
+Tests here are focused parity regressions — a test exists for a specific
+upstream contract, edge case or previously-fixed bug. Green tests are treated as
+necessary but *not* sufficient: they prove exercised behaviour works, not that
+the structure, ownership or lifecycle match upstream.
+
+### OpenBSD note
+
+The default login class caps a process's data memory at 1.5 GiB, which is not
+enough to compile the `core` crate. Raise it and build single-threaded:
+
+```sh
+ulimit -d 6291456
+cargo build --locked --bin ruzu -j 1
+```
+
+rustup publishes no OpenBSD host toolchain, so install the native `rust`
+package there; `setup.sh` refuses to substitute something else silently.
+
+## Legal
+
+ruzu is a clean-room-in-spirit port of GPL-licensed software and inherits its
+licensing: **GPL-3.0-or-later**. It ships no Nintendo code, keys or system
+files, and you need to provide your own dumps of anything it loads.
+
+## Acknowledgements
+
+*Nanos gigantum humeris insidentes* — dwarfs standing on the shoulders of
+giants.
+
+This project writes no new ideas. Every algorithm, every hard-won workaround for
+undocumented hardware, every subtle ordering constraint in this repository was
+discovered by someone else, and this port only translates their work into
+another language. It exists solely because of:
+
+- **the yuzu team and its contributors**, for years of reverse-engineering the
+  Switch and for a codebase clear enough that a faithful port is even
+  conceivable;
+- **Merry (MerryMage)**, author of **dynarmic**, and **Lioncash**, whose fork is
+  the reference for this port — a recompiler whose correctness is the reason
+  guest code runs at all;
+- **Mitsunari Shigeo (herumi)**, author of **Xbyak**, an x86-64 assembler so
+  well-shaped that its structure survived translation to Rust almost intact;
+- the maintainers of **Rust**, **GTK**, **SDL**, **Vulkan** and the crate
+  ecosystem this port stands on.
+
+Any bug you find here is a translation error introduced by this port, not a flaw
+in the work it was translated from. The credit runs entirely in the other
+direction.
