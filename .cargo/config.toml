@@ -1,0 +1,10 @@
+[target.'cfg(target_env = "musl")']
+# musl targets default to a static C runtime, but Alpine's GTK, Vulkan, SDL2,
+# FFmpeg, and audio development packages provide shared libraries.
+rustflags = ["-C", "target-feature=-crt-static"]
+
+[target.'cfg(target_os = "openbsd")']
+# cubeb-sys 0.34 emits -lstdc++ on every non-FreeBSD Unix target, while
+# OpenBSD's system compiler and the bundled libcubeb use libc++. setup.sh
+# creates this project-local compatibility library name.
+rustflags = ["-L", "native=.cargo/openbsd-lib"]
