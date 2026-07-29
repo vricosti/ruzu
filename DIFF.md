@@ -27397,6 +27397,64 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Focused tests cover same-priority migration, last-scheduled-tick preference,
   current-thread exclusion, and per-core preemption update requests.
 
+## 2026-07-29 — `ruzu/src/game_list.rs` vs `yuzu/game_list_worker.cpp`
+
+### Intentional differences
+- Rust uses `std::fs::read_dir` recursively instead of
+  `Common::FS::IterateDirEntriesRecursively`; `DirEntry::metadata` preserves
+  upstream's `directory_entry::status()` behavior of following symbolic links.
+
+### Unintentional differences (fixed)
+- Recursive scans were capped at four directory levels. The cap is removed to
+  match upstream's unbounded recursive traversal.
+
+### Missing items
+- The GTK frontend still scans synchronously and does not yet own upstream's
+  worker cancellation and filesystem watcher lifecycle.
+
+### Binary layout verification
+- N/A: directory traversal does not serialize or expose binary structures.
+
+### Verification
+- Re-read upstream `GameListWorker::ScanFileSystem` and
+  `GMainWindow::OnGameListAddDirectory`, plus
+  `Common::FS::IterateDirEntriesRecursively`.
+- A focused test verifies direct-only scanning and discovery beyond the former
+  four-level recursion limit.
+
+### `core/src/hle/kernel/svc/svc_process.rs`
+
+### Unintentional differences (fixed)
+- `ExitProcess` now calls `System::exit()`, matching upstream
+  `svc_process.cpp`. The Rust handler previously terminated `KProcess`
+  directly and bypassed the frontend exit callback, leaving the launcher on
+  `Launching...` after an application exited.
+
+### Verification
+- Re-read upstream `Svc::ExitProcess` and `System::Exit`.
+- `cargo test -p core exit_process_notifies_the_frontend -- --nocapture`
+  passes.
+
+### `ruzu/src/boot.rs` and `ruzu/src/main_window.rs`
+
+### Intentional differences
+- GTK `AlertDialog::choose` is asynchronous, so the close handler retains
+  pending and accepted flags while upstream Qt uses a synchronous message box.
+
+### Unintentional differences (fixed)
+- Guest exit and load failure events now stop the emulation session, clear the
+  loading screen, restore the game list, and report a pre-frame failure.
+- Closing ruzu while a title is launching or running now asks
+  `Are you sure you want to close ruzu?` before stopping the session and
+  destroying the native render surface.
+- A guest-requested exit no longer terminates the entire launcher process.
+
+### Verification
+- Re-read upstream `GMainWindow::ConfirmClose`, `GMainWindow::closeEvent`,
+  `GMainWindow::OnEmulationStopped`, `EmuThread`, and `System::Exit`.
+- `cargo test -p ruzu -- --nocapture` passes (117 tests).
+- `cargo check -p ruzu` and `cargo build --release --bin ruzu` pass.
+
 ## 2026-07-29 — `video_core/build.rs`, `externals/{stb,bc_decoder}` and `video_core/src/host_shaders` vs upstream build inputs
 
 ### Intentional differences
@@ -27430,3 +27488,121 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - The three `textures::bcn::tests` and
   `generated_vulkan_shaders_are_spirv_modules` pass with the same invalid
   `ZUYU_DIR`.
+
+## 2026-07-29 — `core/src/hle/service/sockets/{sockets,sockets_translate,sfdnsres,bsd}.rs` vs `core/hle/service/sockets/{sockets,sockets_translate,sfdnsres,bsd}.{h,cpp}`
+
+### Intentional differences
+- Guest-provided C++ enums are represented by transparent integer newtypes.
+  This preserves every unnamed value accepted by upstream `static_cast`
+  without invoking Rust enum-discriminant undefined behavior.
+- The two DNS error conversion helpers and `NetDbError` remain private to
+  `sfdnsres.rs`, matching their static ownership in upstream `sfdnsres.cpp`.
+
+### Unintentional differences (fixed)
+- IPC words for `Domain`, `Type`, `Protocol`, `OptName`, `FcntlCmd`, and
+  `ShutdownHow` were converted with `transmute`; unnamed guest values could
+  panic or cause undefined behavior before reaching upstream's `default`
+  cases.
+- BSD-local copies of the socket translation functions bypassed
+  `sockets_translate.rs`; poll flags and all socket argument translations now
+  use the upstream-owned counterpart.
+
+### Binary layout verification
+- PASS: transparent guest enum wrappers retain their upstream 32-bit layouts.
+- PASS: `SockAddrIn`, `PollFD`, and `Linger` retain sizes 16, 8, and 8 bytes,
+  and sockaddr port byte order matches upstream.
+
+### Verification
+- Re-read all four upstream headers and implementations after the correction.
+- The six focused socket tests pass, including a real UDP `setsockopt` call
+  with unnamed guest option `0x1`.
+- STK creates and closes its sockets without the former enum-conversion panic.
+
+## 2026-07-29 — `core/src/hle/kernel/k_hardware_timer.rs` vs `core/hle/kernel/k_hardware_timer.{h,cpp}` and `k_hardware_timer_base.h`
+
+### Intentional differences
+- Rust stores timer state behind a mutex and resolves intrusive
+  `KTimerTask*` ownership through the scheduler context or a retained raw
+  thread pointer. The callback still holds the scheduler lock before mutating
+  waiter state, as upstream does.
+- `Finalize` accepts shared ownership because Rust wait queues retain `Arc`
+  clones where upstream queues retain non-owning `KHardwareTimer*` pointers.
+- Rust marks the interrupt disabled before waiting for CoreTiming to
+  unschedule it, so an already-running callback observes the disabled state;
+  the state mutex is released before the wait to preserve callback progress.
+
+### Unintentional differences (fixed)
+- `Finalize` used CoreTiming's `NoWait` mode although upstream uses the
+  default waiting unschedule, and it required `Arc::get_mut`, aborting when a
+  wait queue still referenced the timer.
+- Dispatch disabling used a manual disable/call/enable sequence that was not
+  panic-safe; it now uses the existing `KScopedDisableDispatch` guard.
+- The callback could mutate waiter state without the scheduler lock when its
+  weak scheduler-context reference was unavailable.
+
+### Verification
+- Re-read `Initialize`, `Finalize`, `DoTask`, `EnableInterrupt`,
+  `DisableInterrupt`, and the base task-tree operations after implementation.
+- All four hardware-timer tests pass, including shared-owner finalization,
+  waiter wakeup, and next-deadline rearming.
+
+## 2026-07-29 — `core/src/{core.rs,hle/kernel/kernel.rs,hle/service/{server_manager,services}.rs}` vs `core/{core.cpp,hle/kernel/kernel.{h,cpp},hle/service/{server_manager,services}.{h,cpp}}`
+
+### Intentional differences
+- Upstream can destroy `ServerManager` synchronously before CPU shutdown.
+  Ruzu's cooperative guest fibers may still retain their Rust owner, so stop
+  and wakeup happen at `CloseServices`, while owner release is deferred until
+  `CpuManager::shutdown` has stopped those fibers.
+- Main and additional host-service `JoinHandle`s are retained instead of
+  detached because their Rust closures capture a raw `KernelCore` pointer.
+  Their handle storage has an independent mutex matching upstream's
+  host-state ownership rather than the guest event-loop mutex.
+
+### Unintentional differences (fixed)
+- Shutdown waited for guest service managers before stopping cooperative CPU
+  fibers, which could deadlock the frontend indefinitely.
+- Post-CPU finalization locked a `ServerManager` that a stopped guest fiber
+  could retain forever.
+- Additional host threads were joined while holding the manager mutex they
+  need to reacquire in order to observe the stop request and exit.
+- The timer was finalized only through exclusive `Arc` ownership and after
+  scheduler owners had already been released.
+
+### Verification
+- Re-read upstream `System::ShutdownMainProcess`, `KernelCore::CloseServices`,
+  `KernelCore::Impl::Shutdown`, `ServerManager::~ServerManager`,
+  `LoopProcess`, and `StartAdditionalHostThreads`.
+- Five close/finalize/server-thread regression tests pass.
+- Manual STK close on the SDL Wayland frontend reached
+  `CpuManager: shutdown complete` and `System: shutdown complete` within
+  278 ms of the close event; the process exited normally.
+
+## 2026-07-29 — `video_core/src/renderer_vulkan/renderer_vulkan.rs` vs `video_core/renderer_vulkan/renderer_vulkan.{h,cpp}`
+
+### Intentional differences
+- Rust represents upstream's RAII `vk::SurfaceKHR` wrapper with a local
+  `OwnedSurface` containing the `ash` surface loader and raw handle.
+- Rust fields are declared in effective destruction order because Rust drops
+  fields in declaration order, whereas C++ destroys members in reverse
+  declaration order.
+
+### Unintentional differences (fixed)
+- The logical device could be destroyed after its instance or surface owner,
+  producing an invalid `vkDestroyDevice` call during frontend shutdown.
+- The surface previously became owned only after every fallible renderer
+  initialization step. `OwnedSurface` is now created immediately after
+  `CreateSurface`, so constructor failure destroys it before the instance just
+  like upstream RAII.
+
+### Missing items
+- The debug messenger remains a null raw handle until renderer-debug callback
+  creation is ported; no live debug messenger currently requires destruction.
+
+### Binary layout verification
+- N/A: the change affects host-side Vulkan ownership and destruction only.
+
+### Verification
+- Re-read the upstream renderer member declaration order, constructor
+  initializer list, and destructor.
+- A live Vulkan STK launch and confirmed GUI close completed with exit code
+  zero and no `vkDestroyDevice`, validation, panic, or SIGSEGV error.
