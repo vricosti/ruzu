@@ -2293,6 +2293,15 @@ impl System {
         self.load_parameters.as_ref()
     }
 
+    /// Get the loader for the current application.
+    ///
+    /// Upstream: `System::GetAppLoader()`.
+    pub fn get_app_loader(&self) -> &dyn crate::loader::loader::AppLoader {
+        self.app_loader
+            .as_deref()
+            .expect("application loader is only available after a successful load")
+    }
+
     // ── Runtime SVC state setters ──
 
     /// Set the Arc-wrapped current process for SVC dispatch.

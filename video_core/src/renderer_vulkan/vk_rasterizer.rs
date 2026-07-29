@@ -3089,11 +3089,15 @@ impl RasterizerVulkan {
 }
 
 impl RasterizerInterface for RasterizerVulkan {
-    fn load_disk_resources(&mut self, title_id: u64) {
+    fn load_disk_resources(
+        &mut self,
+        title_id: u64,
+        callback: crate::rasterizer_interface::DiskResourceLoadCallback,
+    ) {
         let shader_dir =
             common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::ShaderDir);
         self.pipeline_cache
-            .load_disk_resources(title_id, &shader_dir);
+            .load_disk_resources(title_id, &shader_dir, callback);
     }
 
     fn draw(

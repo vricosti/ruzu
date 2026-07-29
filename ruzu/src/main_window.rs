@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Rust/GTK4 counterpart of the upstream `GMainWindow` class defined in
-// `/Users/vricosti/Dev/emulators/zuyu/src/yuzu/main.cpp` + `main.h`, whose
+// `/home/vricosti/Dev/emulators/zuyu/src/yuzu/main.cpp` + `main.h`, whose
 // widget tree is described declaratively in `main.ui`.
 //
 // The upstream window layout is:
@@ -16,6 +16,7 @@
 // milestone: "build the main window with un-wired menus".
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -24,7 +25,7 @@ use gtk::{gio, glib, Application, ApplicationWindow};
 
 use ruzu_core::frontend::framebuffer_layout::{default_frame_layout, FramebufferLayout};
 
-use crate::boot::EmulationSession;
+use crate::boot::{EmulationSession, LoadingEvent};
 use crate::loading_screen::{LoadStage, LoadingScreen};
 use crate::status_bar::StatusBar;
 
@@ -47,6 +48,8 @@ const WINDOW_TITLE: &str = "ruzu";
 
 /// Upstream `default_input_update_timeout`, the interval of `update_input_timer`.
 const INPUT_UPDATE_TIMEOUT_MS: u64 = 1;
+/// Upstream `status_bar_update_timer` interval.
+const STATUS_BAR_UPDATE_TIMEOUT_MS: u64 = 500;
 
 /// The main launcher window.
 ///
@@ -56,6 +59,9 @@ const INPUT_UPDATE_TIMEOUT_MS: u64 = 1;
 /// upstream class members do.
 pub struct GMainWindow {
     window: ApplicationWindow,
+    /// In-window menu bar on non-macOS platforms. Upstream hides the menu bar
+    /// while the single-window render surface is fullscreen.
+    menu_bar: Option<gtk::PopoverMenuBar>,
     /// Central stack swapping between the game list, loading screen, and render
     /// view (upstream swaps `centralwidget`).
     stack: gtk::Stack,
@@ -105,6 +111,114 @@ struct RenderHandles {
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
 }
 
+#[derive(Default)]
+struct LoadingEventMailbox {
+    events: VecDeque<LoadingEvent>,
+}
+
+impl LoadingEventMailbox {
+    fn push(&mut self, event: LoadingEvent) {
+        match event {
+            LoadingEvent::Progress {
+                stage: LoadStage::Build,
+                value,
+                total,
+            } => {
+                if let Some(LoadingEvent::Progress {
+                    stage: LoadStage::Build,
+                    value: queued_value,
+                    total: queued_total,
+                }) = self.events.back_mut()
+                {
+                    *queued_value = value;
+                    *queued_total = total;
+                } else {
+                    self.events.push_back(LoadingEvent::Progress {
+                        stage: LoadStage::Build,
+                        value,
+                        total,
+                    });
+                }
+            }
+            LoadingEvent::Assets(assets) => {
+                if let Some(LoadingEvent::Assets(queued_assets)) = self.events.back_mut() {
+                    *queued_assets = assets;
+                } else {
+                    self.events.push_back(LoadingEvent::Assets(assets));
+                }
+            }
+            LoadingEvent::FirstFrame => {
+                if !self
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, LoadingEvent::FirstFrame))
+                {
+                    self.events.push_back(LoadingEvent::FirstFrame);
+                }
+            }
+            event => self.events.push_back(event),
+        }
+    }
+
+    fn pop(&mut self) -> Option<LoadingEvent> {
+        self.events.pop_front()
+    }
+}
+
+#[cfg(test)]
+mod loading_event_mailbox_tests {
+    use super::*;
+
+    #[test]
+    fn build_updates_are_coalesced_without_losing_stage_transitions() {
+        let mut mailbox = LoadingEventMailbox::default();
+        mailbox.push(LoadingEvent::Progress {
+            stage: LoadStage::Prepare,
+            value: 0,
+            total: 0,
+        });
+        for value in 0..=929 {
+            mailbox.push(LoadingEvent::Progress {
+                stage: LoadStage::Build,
+                value,
+                total: 929,
+            });
+        }
+        mailbox.push(LoadingEvent::Progress {
+            stage: LoadStage::Complete,
+            value: 0,
+            total: 0,
+        });
+        mailbox.push(LoadingEvent::FirstFrame);
+        mailbox.push(LoadingEvent::FirstFrame);
+
+        assert!(matches!(
+            mailbox.pop(),
+            Some(LoadingEvent::Progress {
+                stage: LoadStage::Prepare,
+                ..
+            })
+        ));
+        assert!(matches!(
+            mailbox.pop(),
+            Some(LoadingEvent::Progress {
+                stage: LoadStage::Build,
+                value: 929,
+                total: 929,
+            })
+        ));
+        assert!(matches!(
+            mailbox.pop(),
+            Some(LoadingEvent::Progress {
+                stage: LoadStage::Complete,
+                ..
+            })
+        ));
+        assert!(matches!(mailbox.pop(), Some(LoadingEvent::FirstFrame)));
+        assert!(mailbox.pop().is_none());
+    }
+}
+
 impl GMainWindow {
     /// Construct and lay out the main window. Mirrors the body of the upstream
     /// `GMainWindow::GMainWindow` constructor (widget creation + `Initialize*`
@@ -126,11 +240,14 @@ impl GMainWindow {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
         #[cfg(not(target_os = "macos"))]
-        {
+        let menu_bar = {
             let menubar = gtk::PopoverMenuBar::from_model(Some(&build_menu_model()));
             menubar.set_halign(gtk::Align::Start);
             root.append(&menubar);
-        }
+            Some(menubar)
+        };
+        #[cfg(target_os = "macos")]
+        let menu_bar = None;
 
         // --- Central stack (upstream `centralwidget`) ------------------------
         // Pages: game list, loading screen, (later) render view.
@@ -183,6 +300,7 @@ impl GMainWindow {
 
         let this = Rc::new(Self {
             window,
+            menu_bar,
             stack,
             loading_screen,
             session: RefCell::new(None),
@@ -202,6 +320,7 @@ impl GMainWindow {
         this.hid_core.lock().reload_input_devices();
         this.install_input_handlers();
         this.start_input_driver_updates();
+        this.start_status_bar_updates();
 
         // Game list page: activating a row boots that game in-process.
         let (game_list, game_list_handle) = crate::game_list::build(glib::clone!(
@@ -242,6 +361,22 @@ impl GMainWindow {
         // need the window (render surface, loading screen, stack) so they live
         // here rather than in the app-startup registration.
         this.register_boot_actions(app);
+        this.register_fullscreen_actions(app);
+
+        // Keep the checkable menu action and the window chrome synchronized
+        // when the compositor exits fullscreen independently.
+        this.window.connect_fullscreened_notify(glib::clone!(
+            #[weak(rename_to = this)]
+            this,
+            #[weak]
+            app,
+            move |window| {
+                let fullscreen = window.is_fullscreen();
+                this.set_fullscreen_action_state(&app, fullscreen);
+                crate::uisettings::with_mut(|values| values.fullscreen.set_value(fullscreen));
+                this.update_fullscreen_chrome(fullscreen);
+            }
+        ));
 
         // Stop the emulation session when the window is closing, *before* GTK
         // tears down the native surface — otherwise the GPU thread keeps
@@ -330,6 +465,78 @@ impl GMainWindow {
         // their enabled state; re-apply it (upstream re-runs `UpdateMenuState`
         // after `ConnectMenuEvents`).
         update_menu_state(app, self.session.borrow().is_some(), true);
+    }
+
+    /// Register upstream's checkable `View > Fullscreen` action and its two
+    /// hotkeys: `F11` toggles it, while `Esc` only exits fullscreen.
+    fn register_fullscreen_actions(self: &Rc<Self>, app: &Application) {
+        let initially_checked = crate::uisettings::with(|values| *values.fullscreen.get_value());
+        let fullscreen =
+            gio::SimpleAction::new_stateful("fullscreen", None, &initially_checked.to_variant());
+        fullscreen.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |action, _| {
+                let checked = !action
+                    .state()
+                    .and_then(|state| state.get::<bool>())
+                    .unwrap_or(false);
+                action.set_state(&checked.to_variant());
+                crate::uisettings::with_mut(|values| values.fullscreen.set_value(checked));
+
+                // Upstream leaves the action checked when no game is running,
+                // but ToggleFullscreen itself returns without changing the
+                // launcher window. BootGame consumes the saved checked state.
+                if this.session.borrow().is_some() {
+                    this.set_fullscreen(checked);
+                }
+            }
+        ));
+        app.add_action(&fullscreen);
+        app.set_accels_for_action("app.fullscreen", &["F11"]);
+
+        let exit_fullscreen = gio::SimpleAction::new("exit_fullscreen", None);
+        exit_fullscreen.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            app,
+            move |_, _| {
+                if this.session.borrow().is_some() && this.window.is_fullscreen() {
+                    this.set_fullscreen_action_state(&app, false);
+                    crate::uisettings::with_mut(|values| values.fullscreen.set_value(false));
+                    this.set_fullscreen(false);
+                }
+            }
+        ));
+        app.add_action(&exit_fullscreen);
+        app.set_accels_for_action("app.exit_fullscreen", &["Escape"]);
+    }
+
+    /// Upstream `GMainWindow::ToggleFullscreen` / `ShowFullscreen` /
+    /// `HideFullscreen`, adapted to ruzu's always-single-window GTK frontend.
+    fn set_fullscreen(&self, fullscreen: bool) {
+        self.update_fullscreen_chrome(fullscreen);
+        self.window.set_fullscreened(fullscreen);
+    }
+
+    fn update_fullscreen_chrome(&self, fullscreen: bool) {
+        if let Some(menu_bar) = self.menu_bar.as_ref() {
+            menu_bar.set_visible(!fullscreen);
+        }
+        let show_status_bar = crate::uisettings::with(|values| *values.show_status_bar.get_value());
+        self.status_bar
+            .widget()
+            .set_visible(!fullscreen && show_status_bar);
+    }
+
+    fn set_fullscreen_action_state(&self, app: &Application, fullscreen: bool) {
+        if let Some(action) = app
+            .lookup_action("fullscreen")
+            .and_downcast::<gio::SimpleAction>()
+        {
+            action.set_state(&fullscreen.to_variant());
+        }
     }
 
     /// Forward keyboard and mouse events into the input subsystem.
@@ -973,29 +1180,40 @@ impl GMainWindow {
 
         self.show_loading_screen();
 
-        // Progress is produced on the boot thread and consumed on the GTK main
-        // thread via a shared slot polled by a timeout (cross-thread marshaling,
-        // the same shape as yuzu's queued LoadProgress signal).
-        let slot: Arc<Mutex<Option<(LoadStage, usize, usize)>>> = Arc::new(Mutex::new(None));
-        let slot_producer = Arc::clone(&slot);
-        let progress: crate::boot::ProgressFn = Box::new(move |stage, value, total| {
-            *slot_producer.lock().unwrap() = Some((stage, value, total));
+        // Loading events are produced on the boot and Vulkan worker threads,
+        // then consumed on GTK's main thread. Adjacent Build events are
+        // coalesced while stage transitions remain queued, so a hot cache still
+        // visibly passes through `Loading Shaders` before `Launching`.
+        let mailbox = Arc::new(Mutex::new(LoadingEventMailbox::default()));
+        let producer = Arc::clone(&mailbox);
+        let loading_event: crate::boot::LoadingEventFn = Arc::new(move |event| {
+            producer.lock().unwrap().push(event);
         });
 
         let loading = Rc::clone(&self.loading_screen);
         let stack = self.stack.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
-            let update = slot.lock().unwrap().take();
-            if let Some((stage, value, total)) = update {
-                loading.on_load_progress(stage, value, total);
-                if stage == LoadStage::Complete {
-                    // Switch the backdrop to the black render page so a resize
-                    // exposes black (not the light loading screen), then reveal
-                    // the native render window over it.
-                    stack.set_visible_child_name(PAGE_RENDER);
-                    crate::render_window::set_render_view_hidden(child_window as *mut _, false);
+            match mailbox.lock().unwrap().pop() {
+                Some(LoadingEvent::Assets(assets)) => {
+                    loading.set_assets(assets.logo.as_deref(), assets.banner.as_deref());
+                }
+                Some(LoadingEvent::Progress {
+                    stage,
+                    value,
+                    total,
+                }) => loading.on_load_progress(stage, value, total),
+                Some(LoadingEvent::FirstFrame) => {
+                    let stack = stack.clone();
+                    loading.on_load_complete(move || {
+                        // Upstream reveals the render window only after the
+                        // loading screen has faded out following its first
+                        // framebuffer.
+                        stack.set_visible_child_name(PAGE_RENDER);
+                        crate::render_window::set_render_view_hidden(child_window as *mut _, false);
+                    });
                     return glib::ControlFlow::Break;
                 }
+                None => {}
             }
             glib::ControlFlow::Continue
         });
@@ -1007,9 +1225,15 @@ impl GMainWindow {
             framebuffer_layout,
             Arc::clone(&self.hid_core),
             filepath,
-            progress,
+            loading_event,
         );
         *self.session.borrow_mut() = Some(session);
+        if let Some(app) = self.window.application() {
+            update_menu_state(&app, true, false);
+        }
+        if crate::uisettings::with(|values| *values.fullscreen.get_value()) {
+            self.set_fullscreen(true);
+        }
     }
 
     /// Boot `filepath` into an X11 child window embedded in the GTK window.
@@ -1099,13 +1323,10 @@ impl GMainWindow {
 
         self.show_loading_screen();
 
-        // Progress is produced on the boot thread and consumed here via a
-        // shared slot polled on the GTK main loop — the same cross-thread
-        // marshaling shape as yuzu's queued LoadProgress signal.
-        let slot: Arc<Mutex<Option<(LoadStage, usize, usize)>>> = Arc::new(Mutex::new(None));
-        let slot_producer = Arc::clone(&slot);
-        let progress: crate::boot::ProgressFn = Box::new(move |stage, value, total| {
-            *slot_producer.lock().unwrap() = Some((stage, value, total));
+        let mailbox = Arc::new(Mutex::new(LoadingEventMailbox::default()));
+        let producer = Arc::clone(&mailbox);
+        let loading_event: crate::boot::LoadingEventFn = Arc::new(move |event| {
+            producer.lock().unwrap().push(event);
         });
 
         let loading = Rc::clone(&self.loading_screen);
@@ -1113,16 +1334,24 @@ impl GMainWindow {
         let display = embedded.display as usize;
         let child = embedded.window;
         glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
-            let update = slot.lock().unwrap().take();
-            if let Some((stage, value, total)) = update {
-                loading.on_load_progress(stage, value, total);
-                if stage == LoadStage::Complete {
-                    // Swap the backdrop to the black render page first, so a
-                    // resize exposes black rather than the loading screen.
-                    stack.set_visible_child_name(PAGE_RENDER);
-                    render::set_render_window_hidden(display as *mut _, child, false);
+            match mailbox.lock().unwrap().pop() {
+                Some(LoadingEvent::Assets(assets)) => {
+                    loading.set_assets(assets.logo.as_deref(), assets.banner.as_deref());
+                }
+                Some(LoadingEvent::Progress {
+                    stage,
+                    value,
+                    total,
+                }) => loading.on_load_progress(stage, value, total),
+                Some(LoadingEvent::FirstFrame) => {
+                    let stack = stack.clone();
+                    loading.on_load_complete(move || {
+                        stack.set_visible_child_name(PAGE_RENDER);
+                        render::set_render_window_hidden(display as *mut _, child, false);
+                    });
                     return glib::ControlFlow::Break;
                 }
+                None => {}
             }
             glib::ControlFlow::Continue
         });
@@ -1134,9 +1363,15 @@ impl GMainWindow {
             framebuffer_layout,
             Arc::clone(&self.hid_core),
             filepath,
-            progress,
+            loading_event,
         );
         *self.session.borrow_mut() = Some(session);
+        if let Some(app) = self.window.application() {
+            update_menu_state(&app, true, false);
+        }
+        if crate::uisettings::with(|values| *values.fullscreen.get_value()) {
+            self.set_fullscreen(true);
+        }
     }
 
     /// In-process boot needs a platform-specific render surface; only macOS
@@ -1263,6 +1498,30 @@ impl GMainWindow {
                 input_subsystem.borrow_mut().pump_events();
                 glib::ControlFlow::Continue
             },
+        );
+    }
+
+    /// Refresh the performance section of the status bar at upstream's 500 ms
+    /// cadence. The boot thread owns `System` and publishes each reset sample
+    /// through [`EmulationSession`], so GTK only reads a small copied snapshot.
+    fn start_status_bar_updates(self: &Rc<Self>) {
+        glib::timeout_add_local(
+            std::time::Duration::from_millis(STATUS_BAR_UPDATE_TIMEOUT_MS),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    let results = this
+                        .session
+                        .borrow()
+                        .as_ref()
+                        .and_then(EmulationSession::perf_stats);
+                    this.status_bar.update_performance(results);
+                    glib::ControlFlow::Continue
+                }
+            ),
         );
     }
 

@@ -20,6 +20,7 @@ use common::thread_worker::ThreadWorker;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
 use crate::engines::maxwell_3d::DrawCall;
+use crate::rasterizer_interface::{DiskResourceLoadCallback, LoadCallbackStage};
 use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
 use crate::shader_environment::{
     load_pipelines, serialize_pipeline, ComputeEnvironment, FileEnvironment,
@@ -57,6 +58,22 @@ pub struct CurrentComputePipeline {
 enum DiskPipelineBuildResult {
     Compute(ComputePipelineCacheKey, ComputePipeline),
     Graphics(GraphicsPipelineKey, GraphicsPipeline),
+}
+
+#[derive(Default)]
+struct DiskResourceLoadState {
+    total: usize,
+    built: usize,
+    has_loaded: bool,
+}
+
+impl DiskResourceLoadState {
+    fn complete_one(&mut self, callback: &DiskResourceLoadCallback) {
+        self.built += 1;
+        if self.has_loaded {
+            callback(LoadCallbackStage::Build, self.built, self.total);
+        }
+    }
 }
 
 impl ComputePipelineCacheKey {
@@ -658,8 +675,7 @@ impl PipelineCache {
 
         let is_new = !self.graphics_cache.contains_key(&key);
         if is_new {
-            let Some(pipeline) =
-                self.create_graphics_pipeline(draw, read_gpu, &key, &fixed_state)
+            let Some(pipeline) = self.create_graphics_pipeline(draw, read_gpu, &key, &fixed_state)
             else {
                 self.failed_graphics_cache.insert(key);
                 return None;
@@ -834,7 +850,12 @@ impl PipelineCache {
     /// Port of `PipelineCache::LoadDiskResources`.
     ///
     /// Loads previously compiled pipelines from disk for the given title.
-    pub fn load_disk_resources(&mut self, title_id: u64, pipeline_cache_dir: &std::path::Path) {
+    pub fn load_disk_resources(
+        &mut self,
+        title_id: u64,
+        pipeline_cache_dir: &std::path::Path,
+        callback: DiskResourceLoadCallback,
+    ) {
         let Some((pipeline_cache_filename, vulkan_pipeline_cache_filename)) =
             pipeline_cache_paths(pipeline_cache_dir, title_id)
         else {
@@ -866,7 +887,6 @@ impl PipelineCache {
 
         use std::cell::{Cell, RefCell};
 
-        let total = Cell::new(0usize);
         let mut built = 0usize;
         let skipped = Cell::new(0usize);
         let has_extended_dynamic_state = self
@@ -890,7 +910,6 @@ impl PipelineCache {
         let loaded_compute: RefCell<Vec<(ComputePipelineCacheKey, FileEnvironment)>> =
             RefCell::new(Vec::new());
         let load_compute = |file: &mut std::fs::File, env: FileEnvironment| {
-            total.set(total.get() + 1);
             match ComputePipelineCacheKey::read_from_file(file) {
                 Ok(key) => {
                     loaded_compute.borrow_mut().push((key, env));
@@ -904,7 +923,6 @@ impl PipelineCache {
         let loaded_graphics: RefCell<Vec<(GraphicsPipelineKey, Vec<FileEnvironment>)>> =
             RefCell::new(Vec::new());
         let load_graphics = |file: &mut std::fs::File, envs: Vec<FileEnvironment>| {
-            total.set(total.get() + 1);
             match GraphicsPipelineKey::read_from_file(file) {
                 Ok(key) => {
                     if !graphics_key_dynamic_features_match(
@@ -937,6 +955,8 @@ impl PipelineCache {
 
         let build_results = Arc::new(Mutex::new(Vec::<DiskPipelineBuildResult>::new()));
         let job_skipped = Arc::new(AtomicUsize::new(0));
+        let load_state = Arc::new(Mutex::new(DiskResourceLoadState::default()));
+        let mut queued_total = 0usize;
 
         let loaded_compute = loaded_compute.into_inner();
         for (key, env) in loaded_compute {
@@ -950,6 +970,8 @@ impl PipelineCache {
             let vulkan_pipeline_cache = self.vulkan_pipeline_cache;
             let results = build_results.clone();
             let skipped_jobs = job_skipped.clone();
+            let state = Arc::clone(&load_state);
+            let callback = Arc::clone(&callback);
             self.workers.queue_stateless_work(move || {
                 let mut env = env;
                 match build_compute_pipeline_from_file_environment(
@@ -968,7 +990,9 @@ impl PipelineCache {
                         skipped_jobs.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                state.lock().unwrap().complete_one(&callback);
             });
+            queued_total += 1;
         }
 
         let loaded_graphics = loaded_graphics.into_inner();
@@ -998,6 +1022,8 @@ impl PipelineCache {
             let vulkan_pipeline_cache = self.vulkan_pipeline_cache;
             let results = build_results.clone();
             let skipped_jobs = job_skipped.clone();
+            let state = Arc::clone(&load_state);
+            let callback = Arc::clone(&callback);
             self.workers.queue_stateless_work(move || {
                 let mut envs = envs;
                 match builder.build_pipeline_keyed_from_file_environments(
@@ -1014,9 +1040,17 @@ impl PipelineCache {
                         skipped_jobs.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                state.lock().unwrap().complete_one(&callback);
             });
+            queued_total += 1;
         }
 
+        {
+            let mut state = load_state.lock().unwrap();
+            state.total = queued_total;
+            callback(LoadCallbackStage::Build, 0, state.total);
+            state.has_loaded = true;
+        }
         self.workers.wait_for_requests();
 
         let mut skipped_count = skipped.get() + job_skipped.load(Ordering::Relaxed);
@@ -1056,7 +1090,7 @@ impl PipelineCache {
         }
         log::info!(
             "Total Pipeline Count: {} (built={}, skipped={})",
-            total.get(),
+            queued_total,
             built,
             skipped_count
         );
@@ -1468,5 +1502,33 @@ mod tests {
     fn compute_pipeline_cache_key_layout_matches_upstream_shape() {
         assert_eq!(std::mem::size_of::<ComputePipelineCacheKey>(), 24);
         assert_eq!(std::mem::align_of::<ComputePipelineCacheKey>(), 8);
+    }
+
+    #[test]
+    fn disk_resource_progress_starts_after_total_is_known() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let callback_calls = Arc::clone(&calls);
+        let callback: DiskResourceLoadCallback = Arc::new(move |stage, value, total| {
+            callback_calls.lock().unwrap().push((stage, value, total));
+        });
+        let mut state = DiskResourceLoadState::default();
+
+        state.complete_one(&callback);
+        assert!(calls.lock().unwrap().is_empty());
+
+        state.total = 3;
+        callback(LoadCallbackStage::Build, 0, state.total);
+        state.has_loaded = true;
+        state.complete_one(&callback);
+        state.complete_one(&callback);
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                (LoadCallbackStage::Build, 0, 3),
+                (LoadCallbackStage::Build, 2, 3),
+                (LoadCallbackStage::Build, 3, 3),
+            ]
+        );
     }
 }
