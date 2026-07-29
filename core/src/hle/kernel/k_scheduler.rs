@@ -56,9 +56,7 @@ fn should_trace_raw_pq_repair() -> bool {
 }
 
 const DISABLE_RAW_PQ_REFRESH: u8 = 1 << 0;
-const DISABLE_FORCE_UPDATE: u8 = 1 << 1;
-const DISABLE_SWITCH_FIBER_UPDATE: u8 = 1 << 2;
-const DISABLE_RAW_PQ_WRITE: u8 = 1 << 3;
+const DISABLE_RAW_PQ_WRITE: u8 = 1 << 1;
 
 fn scheduler_workaround_disabled(flag: u8) -> bool {
     static MASK: OnceLock<u8> = OnceLock::new();
@@ -71,8 +69,6 @@ fn scheduler_workaround_disabled(flag: u8) -> bool {
                     .map(str::trim)
                     .fold(0, |mask, name| match name {
                         "raw-refresh" => mask | DISABLE_RAW_PQ_REFRESH,
-                        "force-update" => mask | DISABLE_FORCE_UPDATE,
-                        "switch-update" => mask | DISABLE_SWITCH_FIBER_UPDATE,
                         "raw-write" => mask | DISABLE_RAW_PQ_WRITE,
                         _ => mask,
                     })
@@ -514,6 +510,18 @@ mod tests {
         assert_eq!(schedulers[0].state.highest_priority_thread_id, Some(2));
         assert_eq!(schedulers[1].state.highest_priority_thread_id, Some(1));
         assert_ne!(cores_needing_scheduling & (1 << 1), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed: gsc.is_locked()")]
+    fn update_highest_priority_threads_impl_requires_scheduler_lock() {
+        let mut gsc = GlobalSchedulerContext::new();
+        let scheduler_arcs: Vec<_> = (0..crate::hardware_properties::NUM_CPU_CORES)
+            .map(|core_id| Mutex::new(KScheduler::new(core_id as i32)))
+            .collect();
+        let mut schedulers: Vec<_> = scheduler_arcs.iter().map(|s| s.lock().unwrap()).collect();
+
+        let _ = KScheduler::update_highest_priority_threads_impl(&mut schedulers, &mut gsc);
     }
 
     #[test]
@@ -1395,17 +1403,7 @@ impl KScheduler {
             }
         }
 
-        if let Some(gsc_arc) = &(*sched).global_scheduler_context {
-            let update_fn = {
-                let gsc = gsc_arc.lock().unwrap();
-                gsc.scheduler_lock().get_update_callback()
-            };
-            if !scheduler_workaround_disabled(DISABLE_FORCE_UPDATE) {
-                if let Some(f) = update_fn {
-                    f();
-                }
-            }
-
+        if (*sched).global_scheduler_context.is_some() {
             (*sched)
                 .state
                 .needs_scheduling
@@ -1857,6 +1855,8 @@ impl KScheduler {
         gsc: &mut super::global_scheduler_context::GlobalSchedulerContext,
     ) -> (u64, Vec<(u64, i32)>) {
         use crate::hardware_properties::NUM_CPU_CORES;
+
+        debug_assert!(gsc.is_locked());
 
         // Clear scheduler update needed.
         gsc.m_scheduler_update_needed
@@ -2897,22 +2897,6 @@ impl KScheduler {
     /// unloads old thread, spins to acquire new thread's context_guard,
     /// calls SwitchThread, reloads new thread, then yields back.
     fn schedule_impl_fiber_loop(&mut self) {
-        // Trigger UpdateHighestPriorityThreads to sync PQ → highest_priority_thread_id.
-        // This is needed when re-entering after a service thread fiber returned,
-        // because the thread's TERMINATED transition removed it from PQ but
-        // highest_priority_thread_id still points to the old thread.
-        if let Some(gsc_arc) = &self.global_scheduler_context {
-            let update_fn = {
-                let gsc = gsc_arc.lock().unwrap();
-                gsc.scheduler_lock().get_update_callback()
-            };
-            if !scheduler_workaround_disabled(DISABLE_SWITCH_FIBER_UPDATE) {
-                if let Some(f) = update_fn {
-                    f();
-                }
-            }
-        }
-
         let cur_thread = self.switch_cur_thread.as_ref().and_then(Weak::upgrade);
         // Upstream starts with m_switch_highest_priority_thread captured by
         // ScheduleImpl(), and only refreshes m_state.highest_priority_thread

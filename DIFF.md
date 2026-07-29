@@ -54,12 +54,6 @@
 - `cargo build --release --bin ruzu-cmd`
 
 ### Intentional differences
-- Rust runs a late `UpdateHighestPriorityThreads` inside `KScheduler::schedule_impl_fiber_loop` to compensate for the split scheduler-lock/fiber ownership. After that late update, the fiber loop resolves the target from refreshed `highest_priority_thread_id` instead of using the pre-update captured `switch_highest_priority_thread`; upstream captures after scheduler-lock unlock has already updated the state.
-
-### Unintentional differences (fixed)
-- Fixed: a thread that left `Runnable` could remain as the captured fiber target even after the late Rust scheduler update removed it from the per-core highest-priority slot. ANIMUS exposed this as the scheduler switching back to a just-blocked graphics/service thread while the PQ front was already empty.
-
-### Intentional differences
 - Added env-gated diagnostic logging for the OpenGL backend present view materialization under `RUZU_TRACE_PRESENT_PATH_ADDR` / `RUZU_TRACE_PRESENT_PATH_EVERY`: logs the selected `image_id`, `view_id`, GPU/CPU address, format, flags, modification tick, and GL texture handles for the framebuffer image chosen by `TryFindFramebufferImageView`. This is inactive unless requested and does not change image selection.
 
 ### Intentional differences
@@ -26307,3 +26301,330 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Re-read `NPad::RequestPadStateUpdate` and `NPad::OnUpdate`.
 - `on_update_writes_controller_sticks_to_fullkey_and_system_ext_lifos`
   verifies both axes of both sticks in the two guest-visible LIFOs.
+
+## 2026-07-29 — hid_core/src/frontend/emulated_controller.rs vs hid_core/frontend/emulated_controller.{h,cpp}
+
+### Intentional differences
+- Parameter getters clone `ParamPackage` values instead of exposing references
+  across the controller mutex boundary.
+
+### Unintentional differences (fixed)
+- Added the reverse NPad-to-settings controller-type mapping, controller-owned
+  button/stick/motion/ring parameter access, and the complete
+  `SaveCurrentConfig` / `RestoreConfig` lifecycle used by the configuration UI.
+- `SaveCurrentConfig` now serializes all binding arrays and Player 1's ring
+  binding after storing the real connection and controller type, in upstream
+  order.
+
+### Missing items
+- Existing color reload and physical LED/polling implementations remain less
+  complete than upstream; they are not prerequisites for controller ownership
+  or guest-visible NPad state updates.
+
+### Binary layout verification
+- PASS: controller ownership and host parameter storage changed without
+  modifying a guest-visible HID structure.
+
+### Verification
+- Re-read `SaveCurrentConfig`, `RestoreConfig`, `ReloadFromSettings`, and the
+  parameter accessors in `emulated_controller.{h,cpp}`.
+- `save_and_restore_config_use_the_controller_owned_parameters` passes.
+
+## 2026-07-29 — hid_core/src/hid_core.rs and resource_manager.rs vs hid_core/hid_core.{h,cpp} and resources/resource_manager.cpp
+
+### Intentional differences
+- `Arc<parking_lot::Mutex<EmulatedController>>` provides the stable shared
+  object identity of upstream's HIDCore-owned `unique_ptr` while permitting
+  GTK, NPad, and resource updates to access it across Rust ownership
+  boundaries.
+- Resource-manager callers clone a controller handle while holding the HIDCore
+  mutex, then release HIDCore before locking that controller.
+
+### Unintentional differences (fixed)
+- Controller getters previously returned temporary borrows that prevented NPad
+  and the GTK frontend from retaining the HIDCore-owned controller. Both
+  by-id and by-index getters now return the same stable object.
+
+### Missing items
+- Console and generic-device ownership remains boxed because no current
+  cross-owner consumer requires a stable shared handle for those upstream
+  objects.
+
+### Binary layout verification
+- N/A: host object ownership only.
+
+### Verification
+- Re-read the HIDCore constructor, both controller getter overloads, indexed
+  getter, style propagation, and resource-manager controller reads.
+- `controller_getters_return_the_hid_core_owned_instance` verifies object
+  identity with `Arc::ptr_eq`.
+
+## 2026-07-29 — hid_core/src/resources/npad/npad.rs vs hid_core/resources/npad/npad.{h,cpp}
+
+### Intentional differences
+- Each `NpadControllerData` stores whether its per-ARUID shared-memory entry is
+  assigned, then resolves that entry by index while the applet-resource lock is
+  held. This replaces upstream's long-lived raw `NpadInternalState*` without
+  changing which ARUID/controller entry is updated.
+- Controller callbacks record trigger bits in a shared matrix; `on_update`
+  consumes them while it owns the applet-resource and NPad state. Upstream can
+  invoke `ControllerUpdate` directly because C++ permits the callback to retain
+  `this`.
+
+### Unintentional differences (fixed)
+- Ported per-ARUID `controller_data`, stable HIDCore devices, callback keys,
+  activation state, connection state, dual-Joy-Con side state, pad/libnx/GC
+  state, press-state accumulation, and callback cleanup.
+- `on_update` now routes Fullkey, Handheld, Joy-Con Dual/Left/Right, GameCube,
+  Palma, and retro styles to their corresponding LIFOs with upstream
+  connection bits and sampling-number progression.
+- `SetNpadMode` now performs upstream's single/dual Joy-Con conversion and
+  two-controller split instead of only writing `assignment_mode`.
+
+### Missing items
+- The pre-existing `AbstractPad` array and its update handlers remain a
+  separate structural parity slice.
+- Style-update event signalling and physical LED/polling setup still await
+  their upstream service/device prerequisites.
+
+### Binary layout verification
+- PASS: `NPadGenericState`, `NpadGcTriggerState`, and shared-memory layouts are
+  unchanged; the new controller data is host-only state.
+
+### Verification
+- Re-read the NPad constructor/destructor, `Activate`, `ControllerUpdate`,
+  `InitNewlyAddedController`, `RequestPadStateUpdate`, `OnUpdate`,
+  `SetNpadMode`, `UpdateControllerAt`, and `DisconnectNpad`.
+- All 34 `hid_core` library tests pass. The style-routing and Joy-Con split
+  regressions cover every newly guest-visible path.
+
+## 2026-07-29 — ruzu/src/configuration/configure_input_player.rs and controller_preview.rs vs yuzu/configuration/configure_input_player.{h,cpp,ui} and controller_preview.{h,cpp}
+
+### Intentional differences
+- GTK callbacks retain stable HIDCore controller handles and acquire the
+  controller mutex only for each update; upstream retains raw pointers whose
+  lifetime is guaranteed by HIDCore.
+
+### Unintentional differences (fixed)
+- Removed the frontend-local `EmulatedController`. Configuration and preview
+  now use the same controller object consumed by NPad and the running game.
+- Player 1 configures both Player1 and Handheld. Construction, temporary
+  connected/type changes, apply, and destruction follow upstream's
+  `SaveCurrentConfig`, `EnableConfiguration`, `DisableConfiguration` ordering.
+
+### Missing items
+- The Configure Vibration and Configure Motion subdialogs remain separate
+  frontend parity slices.
+
+### Binary layout verification
+- N/A: host UI only.
+
+### Verification
+- Re-read the `ConfigureInputPlayer` constructor, destructor,
+  `ApplyConfiguration`, controller-type handler, and preview controller access.
+- `cargo check -p ruzu` passes.
+
+## 2026-07-29 — ruzu/src/boot.rs, main_window.rs and status_bar.rs vs yuzu/main.{h,cpp}
+
+### Intentional differences
+- The Rust boot thread owns `System`, so it performs
+  `GetAndResetPerfStats` every 500 ms and publishes a copied
+  `PerfStatsResults` through `RwLock`. GTK's timer only reads that snapshot;
+  upstream's Qt timer can call the shared System object directly.
+- GTK labels and margins replace Qt `QLabel` frame/margin configuration.
+
+### Unintentional differences (fixed)
+- Added the permanent `Scale`, `Game`, and `Frame` labels, hidden outside an
+  active session and updated at upstream's 500 ms cadence from real engine
+  counters.
+- Formatting now matches upstream: rounded game FPS, two-decimal frame time in
+  milliseconds, resolution multiplier, and the `(Unlocked)` suffix.
+
+### Missing items
+- Shader-building, single-core speed, and firmware labels from the full
+  upstream status bar are not part of this requested slice.
+
+### Binary layout verification
+- N/A: frontend widgets and copied telemetry only.
+
+### Verification
+- Re-read status-label construction, boot/stop visibility, timer setup, and
+  `GMainWindow::UpdateStatusBar`.
+- All five status-bar tests pass, including exact text formatting.
+
+## 2026-07-29 — core/src/core.rs vs core/core.{h,cpp}
+
+### Intentional differences
+- Rust exposes only the immutable `get_app_loader` accessor needed by the
+  frontend; mutable loader access has no current owner.
+
+### Unintentional differences (fixed)
+- Added `System::get_app_loader`, preserving upstream's post-load ownership and
+  failure contract so the loading screen reads assets from the active loader.
+
+### Missing items
+- The mutable overload is deferred until a caller requiring loader mutation is
+  ported.
+
+### Binary layout verification
+- N/A: accessor-only change.
+
+### Verification
+- Re-read both `System::GetAppLoader` overloads in `core.h` and `core.cpp`.
+- `cargo check -p ruzu` passes through the frontend consumer.
+
+## 2026-07-29 — video_core/src/rasterizer_interface.rs and renderer_vulkan/{vk_rasterizer.rs,pipeline_cache.rs} vs video_core/rasterizer_interface.h and renderer_vulkan/vk_{rasterizer,pipeline_cache}.{h,cpp}
+
+### Intentional differences
+- The progress callback is an `Arc<dyn Fn + Send + Sync>` because Vulkan
+  workers and the boot thread share it; this is the Rust ownership equivalent
+  of upstream's shared `std::function` reference.
+- The current Rust worker pool has no `std::stop_token` counterpart. Existing
+  session shutdown still takes effect after disk-resource loading returns.
+
+### Unintentional differences (fixed)
+- Vulkan disk-cache loading now reports `Build, 0, total` after all jobs are
+  queued and reports each subsequent completed count under the shared state
+  lock, matching upstream's `total`, `built`, and `has_loaded` ordering.
+- `RasterizerVulkan` now forwards the callback instead of discarding shader
+  build progress at the interface boundary.
+
+### Missing items
+- Cooperative cancellation during disk-cache loading requires a cancellation
+  primitive in the existing Rust worker-pool API.
+
+### Binary layout verification
+- PASS: pipeline cache keys and serialized cache data are unchanged.
+
+### Verification
+- Re-read `RasterizerInterface::LoadDiskResources`,
+  `RasterizerVulkan::LoadDiskResources`, and the full Vulkan
+  `PipelineCache::LoadDiskResources`.
+- `disk_resource_progress_starts_after_total_is_known` covers workers that
+  finish before and after total publication.
+
+## 2026-07-29 — video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp
+
+### Intentional differences
+- Rust invokes a stored notification closure instead of calling
+  `GRenderWindow::OnFrameDisplayed` directly across the crate boundary.
+
+### Unintentional differences (fixed)
+- The frame-displayed guard is now installed only after the empty-framebuffer
+  early return, so an empty composite cannot dismiss the loading screen.
+
+### Missing items
+- The existing OpenGL renderer has not yet acquired the same frontend
+  first-frame notification path.
+
+### Binary layout verification
+- N/A: presentation control flow only.
+
+### Verification
+- Re-read `RendererVulkan::Composite` and `GRenderWindow::OnFrameDisplayed`.
+- A live Vulkan launch kept the loading screen visible until a non-empty
+  framebuffer was submitted.
+
+## 2026-07-29 — ruzu/src/loading_screen.rs, boot.rs and main_window.rs vs yuzu/loading_screen.{h,cpp,ui}, bootmanager.cpp and main.{h,cpp,ui}
+
+### Intentional differences
+- GTK receives boot and worker events through a main-thread mailbox instead of
+  Qt queued signals. Adjacent Build updates are coalesced, while Prepare,
+  Build, Complete, assets, and first-frame transitions retain FIFO order.
+- Ruzu begins loading on a dedicated thread, so the empty black screen is shown
+  before `System::load` finishes and loader assets are installed when available.
+
+### Unintentional differences (fixed)
+- Replaced the white placeholder with upstream's black loading screen, title
+  logo/banner placement, exact stage labels, progress colors, ETA heuristic,
+  animated banner playback, and 500 ms OutBack fade.
+- Banner and logo bytes now come from `AppLoader::ReadBanner` and `ReadLogo`.
+- `Loading Shaders value / total` is driven by real Vulkan pipeline jobs,
+  followed by `Launching...` before GPU startup.
+- The render surface remains hidden until the first non-empty framebuffer and
+  is revealed only after the loading screen's fade completes.
+- `View > Fullscreen` is now a checkable action with `F11`; `Esc` exits,
+  menu/status chrome is restored, and a pre-checked action is applied at boot.
+- Session creation now refreshes running menu actions as upstream
+  `OnStartGame` does.
+
+### Missing items
+- Ruzu currently has only the integrated single-window render mode; upstream's
+  detached render-window fullscreen branch has no GTK window counterpart.
+
+### Binary layout verification
+- N/A: frontend widgets, events, and host image data only.
+
+### Verification
+- Re-read `LoadingScreen::{Prepare,OnLoadProgress,OnLoadComplete,Clear}`,
+  `EmuThread::run`, `GRenderWindow::OnFrameDisplayed`, and
+  `GMainWindow::{ToggleFullscreen,ShowFullscreen,HideFullscreen}`.
+- Live captures verified title assets and `Launching...` in windowed and F11
+  fullscreen modes; F11 hid both menu and status bars.
+- Loading labels, ETA format, fade curve, and event coalescing have focused
+  tests.
+
+## 2026-07-29 — core/src/hle/kernel/{k_scheduler.rs,k_scheduler_lock.rs} vs core/hle/kernel/k_scheduler.{h,cpp} and k_scheduler_lock.h
+
+### Intentional differences
+- Rust keeps the scheduler template callbacks as function pointers in
+  `KAbstractSchedulerLock`; upstream resolves them through the
+  `SchedulerType` template parameter.
+
+### Unintentional differences (fixed)
+- Removed direct calls to the lock's update callback from
+  `reschedule_current_core_raw` and `schedule_impl_fiber_loop`. They ran
+  `UpdateHighestPriorityThreadsImpl` without owning the scheduler lock, while
+  upstream invokes it only from the outermost
+  `KAbstractSchedulerLock::Unlock`.
+- Added the upstream `IsSchedulerLockedByCurrentThread` assertion at the start
+  of `update_highest_priority_threads_impl` and removed the callback accessor
+  that allowed callers to bypass lock ownership.
+
+### Missing items
+- The Rust raw scheduling helpers still refresh a per-core highest-priority
+  value directly from the priority queue. Replacing that adaptation requires
+  restoring the full upstream atomic scheduler-lock/fiber handoff.
+
+### Binary layout verification
+- PASS: scheduler host control flow only; no guest-visible or serialized
+  structure changed.
+
+### Verification
+- Re-read `KAbstractSchedulerLock::Unlock`,
+  `KScheduler::{UpdateHighestPriorityThreads,UpdateHighestPriorityThreadsImpl,
+  RescheduleCurrentCore,ScheduleImplFiber}`.
+- The three focused update tests and four scheduler-lock tests pass.
+- A live Vulkan launch produced more than 500 frames and reached the animated
+  title without a scheduler-lock panic.
+- The full 1108-test `core` run was attempted. It remains red on nine
+  unrelated existing tests and aborts in
+  `cleanup_map_succeeds_without_resolved_processes` on an invalid raw slice;
+  all scheduler and scheduler-lock tests completed successfully before that
+  abort.
+
+## 2026-07-29 — video_core/src/macro_engine/macro_interpreter.rs vs video_core/macro/macro_interpreter.{h,cpp}
+
+### Intentional differences
+- Rust routes Maxwell3D reads and writes through stored callbacks; upstream's
+  interpreter owns a direct `Engines::Maxwell3D&`.
+
+### Unintentional differences (fixed)
+- `AluOperation::Subtract` now performs wrapping `u64` subtraction. This
+  preserves the unsigned C++ underflow bit pattern and carry computation
+  instead of panicking in debug builds when `src_a < src_b`.
+
+### Missing items
+- Direct live Maxwell3D ownership remains a structural parity slice for the
+  macro interpreter.
+
+### Binary layout verification
+- N/A: interpreter host state and arithmetic only.
+
+### Verification
+- Re-read the complete `MacroInterpreterImpl` declaration and
+  `GetALUResult`.
+- All 39 focused macro-interpreter tests pass, including the new subtract
+  underflow regression.
+- A live Vulkan launch passed the formerly crashing macro and reached the
+  animated title.
