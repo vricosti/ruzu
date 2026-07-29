@@ -118,6 +118,8 @@ struct TrackedServerManager {
     manager: Arc<Mutex<ServerManager>>,
     stop_requested: Arc<AtomicBool>,
     wakeup_event: Arc<Event>,
+    host_threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    name: String,
 }
 
 /// Public accessor for KERNEL_PTR — used by GSC to interrupt cores on thread state changes.
@@ -1884,6 +1886,20 @@ pub struct KernelCore {
     /// Upstream: `Impl::server_managers`.
     server_managers: Mutex<Vec<TrackedServerManager>>,
 
+    /// Guest-core managers whose Rust owners must survive until the CPU fibers
+    /// have stopped. Upstream service threads can complete during
+    /// `CloseServices`; ruzu's cooperative guest fibers are only guaranteed
+    /// not to touch their captured managers after `CpuManager::shutdown`.
+    deferred_server_managers: Mutex<Vec<TrackedServerManager>>,
+
+    /// Main host service threads returned by `RunOnHostCoreProcess`.
+    ///
+    /// Upstream detaches these `std::jthread`s, while `ServerManager` shutdown
+    /// synchronizes their event-loop exit. Rust retains the join handles so a
+    /// detached thread cannot outlive the raw `KernelCore` pointer captured by
+    /// its closure.
+    host_service_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+
     /// Guest service processes created by `RunOnGuestCoreProcess`.
     /// Upstream keeps them alive after `KProcess::Register(*this, process)`.
     service_processes: Mutex<Vec<Arc<ProcessLock>>>,
@@ -1941,6 +1957,8 @@ impl KernelCore {
             system_ref: crate::core::SystemRef::null(),
             preemption_event: None,
             server_managers: Mutex::new(Vec::new()),
+            deferred_server_managers: Mutex::new(Vec::new()),
+            host_service_threads: Mutex::new(Vec::new()),
             service_processes: Mutex::new(Vec::new()),
             host_service_processes: Mutex::new(Vec::new()),
         }
@@ -2302,6 +2320,14 @@ impl KernelCore {
         self.run_host_thread_func(&process, format!("HLE:{}", name), func)
     }
 
+    /// Retain an upstream-detached host service thread until `CloseServices`.
+    ///
+    /// The closure captures a raw `KernelCore` pointer, so Rust must join the
+    /// thread before the kernel owner can be destroyed.
+    pub fn track_host_service_thread(&self, thread: std::thread::JoinHandle<()>) {
+        self.host_service_threads.lock().unwrap().push(thread);
+    }
+
     /// Port of upstream `KernelCore::RunOnHostCoreThread` (kernel.cpp:1096-1103).
     ///
     /// Reuses the current emulation thread's process, then delegates to
@@ -2381,7 +2407,8 @@ impl KernelCore {
     pub fn shutdown(&mut self) {
         self.is_shutting_down.store(true, Ordering::Relaxed);
 
-        let _ = self.close_services();
+        self.close_services();
+        self.finalize_services_after_cpu_shutdown();
 
         self.next_object_id.store(0, Ordering::Relaxed);
         self.next_kernel_process_id
@@ -2389,6 +2416,7 @@ impl KernelCore {
         self.next_user_process_id
             .store(PROCESS_ID_MIN, Ordering::Relaxed);
         self.next_thread_id.store(1, Ordering::Relaxed);
+        self.preemption_event = None;
 
         // Clean up registered objects.
         {
@@ -2408,9 +2436,23 @@ impl KernelCore {
 
         self.object_name_global_data = None;
 
-        // Upstream: schedulers[core_id].reset() per core.
-        self.schedulers.clear();
+        // Stop the timing callback while the scheduler lock and per-core
+        // schedulers are still alive. `Finalize()` waits for an in-flight
+        // callback, matching upstream's default UnscheduleEvent mode.
+        if let Some(ref timer) = self.hardware_timer {
+            timer.finalize();
+        }
+        self.hardware_timer = None;
+
+        // Upstream closes each shutdown thread before resetting that core's
+        // scheduler. CPU and service host threads have already been joined by
+        // `System::shutdown_main_process`, so callback globals can no longer
+        // safely expose this kernel while the scheduler owners are released.
         self.shutdown_threads.clear();
+        KERNEL_PTR.store(std::ptr::null_mut(), Ordering::Release);
+        SCHEDULER_LOCK_PTR.store(std::ptr::null_mut(), Ordering::Release);
+        PENDING_ACTIVE_CORE_UPDATES.lock().unwrap().clear();
+        self.schedulers.clear();
         self.main_threads.clear();
         self.idle_threads.clear();
         self.service_processes.lock().unwrap().clear();
@@ -2420,13 +2462,6 @@ impl KernelCore {
             container.finalize();
         }
         self.global_object_list_container = None;
-
-        if let Some(timer) = self.hardware_timer.as_mut() {
-            Arc::get_mut(timer)
-                .expect("hardware timer still shared at shutdown")
-                .finalize();
-        }
-        self.hardware_timer = None;
 
         self.is_shutting_down.store(false, Ordering::Relaxed);
     }
@@ -2439,7 +2474,11 @@ impl KernelCore {
     /// the service loop may hold that mutex while blocked in `WaitSignaled`.
     /// Keep stop/wakeup handles outside the mutex so the destructor ordering
     /// can be reproduced without ABBA-deadlocking the close path.
-    pub fn close_services(&self) -> bool {
+    pub fn close_services(&self) {
+        // Host service processes are created asynchronously. Prevent a late
+        // RunServer from registering after the manager list has been taken.
+        self.is_shutting_down.store(true, Ordering::Release);
+
         let server_managers = {
             let mut managers = self.server_managers.lock().unwrap();
             std::mem::take(&mut *managers)
@@ -2450,48 +2489,46 @@ impl KernelCore {
             tracked.wakeup_event.signal();
         }
 
-        let mut closed_all = true;
-        for tracked in server_managers {
-            let manager = tracked.manager;
-            let should_wait = {
-                match manager.try_lock() {
-                    Ok(guard) => guard.loop_started(),
-                    Err(_) => {
-                        log::warn!(
-                            "KernelCore::close_services: skipping locked ServerManager during shutdown"
-                        );
-                        closed_all = false;
-                        continue;
-                    }
-                }
-            };
+        // Upstream destroys each ServerManager here. Its guest threads can
+        // complete synchronously during destruction; ruzu's cooperative
+        // fibers cannot, because CpuManager is still running and may retain a
+        // captured Arc. Keep every owner alive until CPU shutdown instead of
+        // waiting for `stopped` here and deadlocking shutdown on a suspended
+        // guest fiber.
+        self.deferred_server_managers
+            .lock()
+            .unwrap()
+            .extend(server_managers);
+    }
 
-            if should_wait {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-                while !manager
-                    .try_lock()
-                    .map(|guard| guard.is_stopped())
-                    .unwrap_or(false)
-                {
-                    if std::time::Instant::now() >= deadline {
-                        log::warn!(
-                            "KernelCore::close_services: timed out waiting for ServerManager stop"
-                        );
-                        closed_all = false;
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            }
-
-            {
-                let join_guard = manager.try_lock();
-                if let Ok(mut guard) = join_guard {
-                    guard.join_host_threads();
-                }
+    /// Release guest service-manager owners after all CPU fibers have stopped.
+    ///
+    /// This is the Rust ownership counterpart of the synchronous guest-thread
+    /// completion performed by upstream `ServerManager::~ServerManager`.
+    /// It must run after `CpuManager::shutdown` and before scheduler/process
+    /// owners are cleared.
+    pub fn finalize_services_after_cpu_shutdown(&self) {
+        let host_threads = {
+            let mut threads = self.host_service_threads.lock().unwrap();
+            std::mem::take(&mut *threads)
+        };
+        for thread in host_threads {
+            if let Err(err) = thread.join() {
+                log::warn!(
+                    "KernelCore::finalize_services_after_cpu_shutdown: \
+                     host service thread failed: {err:?}"
+                );
             }
         }
-        closed_all
+
+        let deferred = {
+            let mut managers = self.deferred_server_managers.lock().unwrap();
+            std::mem::take(&mut *managers)
+        };
+
+        for tracked in deferred {
+            ServerManager::join_host_threads(&tracked.host_threads, &tracked.name);
+        }
     }
 
     /// Run a service manager that already lives in its final shared Rust owner.
@@ -2501,14 +2538,21 @@ impl KernelCore {
             if self.is_shutting_down.load(Ordering::Relaxed) {
                 return;
             }
-            let (stop_requested, wakeup_event) = {
+            let (stop_requested, wakeup_event, host_threads, name) = {
                 let guard = manager.lock().unwrap();
-                (guard.stop_requested_arc(), guard.wakeup_event_arc())
+                (
+                    guard.stop_requested_arc(),
+                    guard.wakeup_event_arc(),
+                    guard.host_threads_arc(),
+                    guard.name().to_owned(),
+                )
             };
             managers.push(TrackedServerManager {
                 manager: Arc::clone(&manager),
                 stop_requested,
                 wakeup_event,
+                host_threads,
+                name,
             });
         }
 
@@ -2516,9 +2560,14 @@ impl KernelCore {
     }
 
     pub(crate) fn track_server_manager_for_test(&self, server_manager: Arc<Mutex<ServerManager>>) {
-        let (stop_requested, wakeup_event) = {
+        let (stop_requested, wakeup_event, host_threads, name) = {
             let guard = server_manager.lock().unwrap();
-            (guard.stop_requested_arc(), guard.wakeup_event_arc())
+            (
+                guard.stop_requested_arc(),
+                guard.wakeup_event_arc(),
+                guard.host_threads_arc(),
+                guard.name().to_owned(),
+            )
         };
         self.server_managers
             .lock()
@@ -2527,6 +2576,8 @@ impl KernelCore {
                 manager: server_manager,
                 stop_requested,
                 wakeup_event,
+                host_threads,
+                name,
             });
     }
 
@@ -3416,6 +3467,57 @@ mod tests {
         kernel.close_services();
 
         assert!(manager.lock().unwrap().stop_requested_for_test());
+    }
+
+    #[test]
+    fn close_services_defers_manager_ownership_until_cpu_shutdown() {
+        let kernel = KernelCore::new();
+        let manager = ServerManager::new_shared(SystemRef::null());
+        kernel.track_server_manager_for_test(Arc::clone(&manager));
+
+        kernel.close_services();
+
+        assert!(manager.lock().unwrap().stop_requested_for_test());
+        assert!(!manager.lock().unwrap().is_stopped());
+        assert!(kernel.server_managers.lock().unwrap().is_empty());
+        assert_eq!(kernel.deferred_server_managers.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn finalize_services_releases_deferred_manager_ownership() {
+        let kernel = KernelCore::new();
+        let manager = ServerManager::new_shared(SystemRef::null());
+        kernel.track_server_manager_for_test(manager);
+        kernel.close_services();
+        assert_eq!(kernel.deferred_server_managers.lock().unwrap().len(), 1);
+
+        kernel.finalize_services_after_cpu_shutdown();
+        assert!(kernel.deferred_server_managers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn finalize_services_does_not_lock_a_stopped_guest_manager() {
+        let kernel = KernelCore::new();
+        let manager = ServerManager::new_shared(SystemRef::null());
+        kernel.track_server_manager_for_test(Arc::clone(&manager));
+        kernel.close_services();
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _manager = manager.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        // A stopped cooperative guest fiber may retain this mutex forever.
+        // Post-CPU finalization must only touch the independently synchronized
+        // host-thread handles.
+        kernel.finalize_services_after_cpu_shutdown();
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
     }
 
     #[test]

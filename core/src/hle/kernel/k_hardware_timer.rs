@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use super::k_hardware_timer_base::KHardwareTimerBase;
 use super::k_scheduler_lock::KScopedSchedulerLock;
-use super::k_thread::{KThread, KThreadLock};
+use super::k_thread::{KScopedDisableDispatch, KThread, KThreadLock};
 use crate::core_timing::{self, CoreTiming, EventType, UnscheduleEventType};
 
 /// The kernel hardware timer.
@@ -48,17 +48,8 @@ enum TimerTaskTarget {
 
 fn with_current_emu_thread_dispatch_disabled<R>(f: impl FnOnce() -> R) -> R {
     let current_thread = super::kernel::get_current_emu_thread();
-    if let Some(thread) = current_thread.as_ref() {
-        thread.lock().unwrap().disable_dispatch();
-    }
-
-    let result = f();
-
-    if let Some(thread) = current_thread {
-        thread.lock().unwrap().enable_dispatch();
-    }
-
-    result
+    let _dispatch_guard = current_thread.as_ref().map(KScopedDisableDispatch::new);
+    f()
 }
 
 impl KHardwareTimer {
@@ -115,13 +106,33 @@ impl KHardwareTimer {
 
     /// Unschedule the event and clean up.
     /// Matches upstream: `KHardwareTimer::Finalize()`
-    pub fn finalize(&mut self) {
-        let state = self.state.get_mut().unwrap();
-        if let (Some(ref core_timing), Some(ref event_type)) =
-            (&state.core_timing, &state.m_event_type)
-        {
-            core_timing.unschedule_event(event_type, UnscheduleEventType::NoWait);
+    ///
+    /// Takes `&self` like every other method on this type. Upstream owns the
+    /// timer through a `std::unique_ptr` and calls `Finalize()` through it
+    /// without caring how many `KHardwareTimer*` raw pointers are still around
+    /// — `KThreadQueue` holds exactly such a pointer. Rust models those raw
+    /// pointers as `Arc` clones, so requiring `&mut self` here would demand
+    /// sole ownership that upstream never has: a thread queue outliving the
+    /// kernel by one drop is normal, not an error.
+    pub fn finalize(&self) {
+        let event = {
+            let mut state = self.state.lock().unwrap();
+            state.m_wakeup_time = i64::MAX;
+            state
+                .core_timing
+                .as_ref()
+                .zip(state.m_event_type.as_ref())
+                .map(|(core_timing, event_type)| (Arc::clone(core_timing), Arc::clone(event_type)))
+        };
+
+        if let Some((core_timing, event_type)) = event {
+            // Upstream uses the default `Wait` mode in `Finalize()`. Do not
+            // hold `state` while waiting: an in-flight callback may already be
+            // waiting for that mutex.
+            core_timing.unschedule_event(&event_type, UnscheduleEventType::Wait);
         }
+
+        let mut state = self.state.lock().unwrap();
         state.m_wakeup_time = i64::MAX;
         state.m_event_type = None;
         state.core_timing = None;
@@ -376,13 +387,28 @@ impl KHardwareTimer {
         // host-thread-IPC boot stall (committed baseline stalls at the same
         // rate). The bounds-checked accessors in k_thread.rs remain as a safety
         // net for the rare `scheduler_lock unavailable` startup window.
-        let _scheduler_guard = super::kernel::scheduler_lock().map(KScopedSchedulerLock::new);
-        if _scheduler_guard.is_none() {
-            log::error!(
-                "KHardwareTimer::do_task: kernel scheduler_lock unavailable — \
-                 kernel waiter state will be mutated unserialized"
-            );
-        }
+        let local_scheduler_lock = if super::kernel::scheduler_lock().is_none() {
+            gsc.as_ref().map(|gsc| {
+                let gsc = gsc.lock().unwrap();
+                &gsc.m_scheduler_lock as *const super::k_scheduler_lock::KAbstractSchedulerLock
+            })
+        } else {
+            None
+        };
+        let scheduler_lock = super::kernel::scheduler_lock().or_else(|| {
+            local_scheduler_lock.map(|lock| {
+                // SAFETY: `gsc` above owns the scheduler lock and remains
+                // alive for the duration of this callback.
+                unsafe { &*lock }
+            })
+        });
+        let Some(scheduler_lock) = scheduler_lock else {
+            // There is no kernel waiter state to update once both the kernel
+            // singleton and the timer's GSC owner have gone away.
+            log::debug!("KHardwareTimer::do_task: scheduler lock unavailable during shutdown");
+            return;
+        };
+        let _scheduler_guard = KScopedSchedulerLock::new(scheduler_lock);
         if trace {
             log::info!("KHardwareTimer::do_task after_scheduler_lock");
         }
@@ -506,6 +532,35 @@ mod tests {
     use crate::hle::kernel::global_scheduler_context::GlobalSchedulerContext;
     use crate::hle::kernel::k_thread::ThreadState;
 
+    /// Upstream owns the timer through a `std::unique_ptr` and calls
+    /// `Finalize()` through it no matter how many `KHardwareTimer*` raw
+    /// pointers `KThreadQueue`s are still holding. Those raw pointers are
+    /// `Arc` clones here, so finalizing must not require sole ownership —
+    /// asserting it aborted `KernelCore::shutdown` when a thread queue
+    /// outlived the kernel by one drop.
+    #[test]
+    fn the_timer_finalizes_while_a_thread_queue_still_holds_it() {
+        let timer = Arc::new(KHardwareTimer::new());
+        let core_timing = Arc::new(CoreTiming::new());
+        KHardwareTimer::wire_callback(&timer, Arc::clone(&core_timing));
+        {
+            let mut state = timer.state.lock().unwrap();
+            state.m_wakeup_time = 42;
+            state.thread_ptrs.insert(17, 0xdead_beef);
+        }
+
+        // The clone a sleeping `KThreadQueue` would be holding.
+        let queue_side = Arc::clone(&timer);
+
+        timer.finalize();
+
+        let state = queue_side.state.lock().unwrap();
+        assert_eq!(state.m_wakeup_time, i64::MAX);
+        assert!(state.m_event_type.is_none());
+        assert!(state.core_timing.is_none());
+        assert!(state.thread_ptrs.is_empty());
+    }
+
     #[test]
     fn resolve_task_target_falls_back_to_gsc_thread_lookup() {
         let mut timer = KHardwareTimer::new();
@@ -561,15 +616,17 @@ mod tests {
     fn do_task_rearms_next_deadline_without_unscheduling_callback_event() {
         let timer = Arc::new(KHardwareTimer::new());
         let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
-        let core_timing = CoreTiming::new();
+        let core_timing = Arc::new(CoreTiming::new());
         core_timing.set_multicore(true);
-        KHardwareTimer::wire_callback(&timer, Arc::new(core_timing));
+        KHardwareTimer::wire_callback(&timer, Arc::clone(&core_timing));
+        let first_deadline = (core_timing.get_global_time_ns().as_nanos() as i64).max(1);
+        let second_deadline = first_deadline + 1_000_000_000;
         {
             let mut state = timer.state.lock().unwrap();
             state.gsc = Some(Arc::downgrade(&gsc));
-            state.m_wakeup_time = 10;
-            state.base.register_absolute_task_impl(1, 10);
-            state.base.register_absolute_task_impl(2, 20);
+            state.m_wakeup_time = first_deadline;
+            state.base.register_absolute_task_impl(1, first_deadline);
+            state.base.register_absolute_task_impl(2, second_deadline);
         }
 
         let waiter1 = Arc::new(KThreadLock::new(KThread::new()));
@@ -577,14 +634,14 @@ mod tests {
             let mut guard = waiter1.lock().unwrap();
             guard.thread_id = 1;
             guard.begin_wait();
-            guard.set_timer_task_time(10);
+            guard.set_timer_task_time(first_deadline);
         }
         let waiter2 = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = waiter2.lock().unwrap();
             guard.thread_id = 2;
             guard.begin_wait();
-            guard.set_timer_task_time(20);
+            guard.set_timer_task_time(second_deadline);
         }
         {
             let mut gsc_guard = gsc.lock().unwrap();
@@ -595,7 +652,7 @@ mod tests {
         timer.do_task();
 
         let state = timer.state.lock().unwrap();
-        assert_eq!(state.m_wakeup_time, 20);
+        assert_eq!(state.m_wakeup_time, second_deadline);
         drop(state);
         assert_eq!(waiter1.lock().unwrap().get_state(), ThreadState::RUNNABLE);
         assert_eq!(waiter2.lock().unwrap().get_state(), ThreadState::WAITING);

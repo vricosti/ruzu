@@ -164,7 +164,8 @@ impl Services {
                 if let Some(kptr) = kernel_ref {
                     let kernel =
                         unsafe { &*(kptr as *const crate::hle::kernel::kernel::KernelCore) };
-                    let _ = kernel.run_on_host_core_process($name, Box::new($body));
+                    let thread = kernel.run_on_host_core_process($name, Box::new($body));
+                    kernel.track_host_service_thread(thread);
                 } else {
                     ($body)();
                 }

@@ -1763,10 +1763,7 @@ impl System {
         self.core_timing.sync_pause(false);
         if let Some(ref kernel) = self.kernel {
             kernel.suspend_emulation(true);
-            if !kernel.close_services() {
-                log::warn!("System: service shutdown incomplete; skipping deeper kernel teardown");
-                return;
-            }
+            kernel.close_services();
             kernel.shutdown_cores();
         }
         self.service_manager = None;
@@ -1787,6 +1784,9 @@ impl System {
 
         self.perf_stats = None;
         self.cpu_manager.shutdown();
+        if let Some(ref kernel) = self.kernel {
+            kernel.finalize_services_after_cpu_shutdown();
+        }
         self.current_process_arc = None;
         self.current_process = None;
         if let Some(ref mut kernel) = self.kernel {

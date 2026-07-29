@@ -256,7 +256,11 @@ pub struct ServerManager {
 
     /// Owned handles for additional host threads.
     /// Upstream: `m_threads`.
-    host_threads: Vec<JoinHandle<()>>,
+    ///
+    /// This has its own mutex because shutdown may need to join the host
+    /// threads after guest CPU fibers have stopped while holding the enclosing
+    /// `ServerManager` mutex.
+    host_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
 
     /// Shared self-owner used where upstream passes `*this` into
     /// `SessionRequestManager(server_manager)`.
@@ -457,7 +461,7 @@ impl ServerManager {
             loop_started: AtomicBool::new(false),
             pending_registrations: Arc::new(Mutex::new(Vec::new())),
             pending_additional_host_threads: Vec::new(),
-            host_threads: Vec::new(),
+            host_threads: Arc::new(Mutex::new(Vec::new())),
             self_reference: None,
             loop_stats: LoopStats::default(),
         }
@@ -502,6 +506,14 @@ impl ServerManager {
 
     pub fn stop_requested_arc(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.stop_requested)
+    }
+
+    pub fn host_threads_arc(&self) -> Arc<Mutex<Vec<JoinHandle<()>>>> {
+        Arc::clone(&self.host_threads)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     fn service_owner_weak(&self) -> Weak<Mutex<ServerManager>> {
@@ -1809,10 +1821,10 @@ impl ServerManager {
     /// Port of upstream `StartAdditionalHostThreads`: each requested thread
     /// runs the same manager's `LoopProcessImpl`.
     pub fn activate_additional_host_threads(manager: &Arc<Mutex<ServerManager>>) {
-        let (system, pending) = {
+        let (system, pending, host_threads) = {
             let mut guard = manager.lock().unwrap();
             let pending = std::mem::take(&mut guard.pending_additional_host_threads);
-            (guard.system, pending)
+            (guard.system, pending, Arc::clone(&guard.host_threads))
         };
 
         if system.is_null() {
@@ -1833,7 +1845,7 @@ impl ServerManager {
                         let _ = ServerManager::loop_process_impl_shared(&manager_for_thread);
                     }),
                 );
-                manager.lock().unwrap().host_threads.push(handle);
+                host_threads.lock().unwrap().push(handle);
             }
         }
     }
@@ -1841,7 +1853,7 @@ impl ServerManager {
     /// Request the server to stop.
     pub fn request_stop(&self) {
         self.stop_requested.store(true, Ordering::Release);
-        for handle in &self.host_threads {
+        for handle in self.host_threads.lock().unwrap().iter() {
             handle.thread().unpark();
         }
         self.signal_wakeup_event();
@@ -1855,12 +1867,20 @@ impl ServerManager {
         self.stopped.load(Ordering::Acquire)
     }
 
-    pub fn join_host_threads(&mut self) {
-        for handle in self.host_threads.drain(..) {
+    /// Join the additional host threads without retaining the manager lock.
+    ///
+    /// Upstream clears `m_threads` from the destructor without an enclosing
+    /// manager mutex. In Rust, an additional thread must reacquire the manager
+    /// mutex to observe `stop_requested` and leave `LoopProcessImpl`, so joining
+    /// while holding that mutex would deadlock shutdown.
+    pub fn join_host_threads(host_threads: &Arc<Mutex<Vec<JoinHandle<()>>>>, name: &str) {
+        let host_threads = std::mem::take(&mut *host_threads.lock().unwrap());
+
+        for handle in host_threads {
             if let Err(err) = handle.join() {
                 log::warn!(
                     "ServerManager({}): additional host thread join failed: {:?}",
-                    self.name,
+                    name,
                     err
                 );
             }
@@ -1931,6 +1951,36 @@ mod tests {
 
         assert!(manager.stop_requested_for_test());
         assert!(manager.wakeup_event.is_signaled());
+    }
+
+    #[test]
+    fn joining_additional_threads_does_not_hold_the_manager_lock() {
+        let manager = ServerManager::new_shared(SystemRef::null());
+        let host_threads = manager.lock().unwrap().host_threads_arc();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (worker_done_tx, worker_done_rx) = std::sync::mpsc::channel();
+        let worker_manager = Arc::clone(&manager);
+        let worker = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            let _manager = worker_manager.lock().unwrap();
+            worker_done_tx.send(()).unwrap();
+        });
+        host_threads.lock().unwrap().push(worker);
+
+        let (join_done_tx, join_done_rx) = std::sync::mpsc::channel();
+        let join_host_threads = Arc::clone(&host_threads);
+        std::thread::spawn(move || {
+            ServerManager::join_host_threads(&join_host_threads, "test");
+            join_done_tx.send(()).unwrap();
+        });
+
+        start_tx.send(()).unwrap();
+        worker_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker could not reacquire the manager during join");
+        join_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("additional host thread join did not complete");
     }
 
     #[test]
