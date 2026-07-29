@@ -302,22 +302,45 @@ pub fn guard(name: &'static str) -> LockOrderGuard {
 }
 
 fn print_backtrace() {
-    // glibc backtrace -> stderr (async-signal-safe, matches the SIGURG dumper
-    // so addr2line resolves the same `ruzu-cmd(+0xOFF)` offsets).
-    const MAX: usize = 48;
-    let mut frames = [std::ptr::null_mut::<libc::c_void>(); MAX];
-    unsafe {
-        extern "C" {
-            fn backtrace(buffer: *mut *mut libc::c_void, size: libc::c_int) -> libc::c_int;
-            fn backtrace_symbols_fd(
-                buffer: *const *mut libc::c_void,
-                size: libc::c_int,
-                fd: libc::c_int,
-            );
+    #[cfg(not(any(
+        all(target_os = "linux", target_env = "gnu"),
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    {
+        eprintln!("[LOCKORDER] native backtrace unavailable on this platform");
+    }
+
+    #[cfg(any(
+        all(target_os = "linux", target_env = "gnu"),
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    {
+        // Native backtrace -> stderr, matching the SIGURG dumper so addr2line
+        // resolves the same `ruzu-cmd(+0xOFF)` offsets. libc supplies the
+        // platform-correct declarations and links libexecinfo on the BSDs.
+        const MAX: usize = 48;
+        let mut frames = [std::ptr::null_mut::<libc::c_void>(); MAX];
+        unsafe {
+            let marker = b"[LOCKORDER] --- backtrace ---\n";
+            libc::write(2, marker.as_ptr() as *const libc::c_void, marker.len());
+
+            #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
+            {
+                let n = libc::backtrace(frames.as_mut_ptr(), MAX as libc::c_int);
+                libc::backtrace_symbols_fd(frames.as_ptr(), n, 2);
+            }
+
+            #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+            {
+                let n = libc::backtrace(frames.as_mut_ptr(), MAX);
+                let _ = libc::backtrace_symbols_fd(frames.as_ptr(), n, 2);
+            }
         }
-        let n = backtrace(frames.as_mut_ptr(), MAX as libc::c_int);
-        let marker = b"[LOCKORDER] --- backtrace ---\n";
-        libc::write(2, marker.as_ptr() as *const libc::c_void, marker.len());
-        backtrace_symbols_fd(frames.as_ptr(), n, 2);
     }
 }

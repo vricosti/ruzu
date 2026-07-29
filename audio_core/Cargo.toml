@@ -11,3 +11,10 @@ cubeb.workspace = true
 sdl2.workspace = true
 log.workspace = true
 parking_lot.workspace = true
+
+# cubeb-sys 0.34 asks Cargo to link the optional Rust PulseAudio archive on
+# FreeBSD, although its nested CMake build does not place that archive in the
+# target-specific directory expected by build.rs. Keep the portable C backends
+# workaround limited to the affected target.
+[target.'cfg(target_os = "freebsd")'.dependencies]
+cubeb-sys = { workspace = true, features = ["unittest-build"] }

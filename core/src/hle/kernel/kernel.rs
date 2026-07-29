@@ -455,26 +455,48 @@ extern "C" fn sigusr1_handler(_signum: libc::c_int) {
 }
 
 extern "C" fn sigurg_handler(_signum: libc::c_int) {
-    // Async-signal-safe: use libc::backtrace + libc::backtrace_symbols_fd.
-    // glibc documents these as thread-safe and signal-safe.
-    const MAX_FRAMES: usize = 32;
-    let mut frames: [*mut libc::c_void; MAX_FRAMES] = [std::ptr::null_mut(); MAX_FRAMES];
-    // Use raw libc symbols via direct FFI — neither is in the libc crate by default on all
-    // platforms, so declare them here.
-    extern "C" {
-        fn backtrace(buffer: *mut *mut libc::c_void, size: libc::c_int) -> libc::c_int;
-        fn backtrace_symbols_fd(
-            buffer: *const *mut libc::c_void,
-            size: libc::c_int,
-            fd: libc::c_int,
-        );
-    }
+    #[cfg(not(any(
+        all(target_os = "linux", target_env = "gnu"),
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
     unsafe {
-        let n = backtrace(frames.as_mut_ptr(), MAX_FRAMES as libc::c_int);
-        // Write marker + backtrace to stderr.
-        let marker = b"[SIGURG] --- backtrace ---\n";
+        // Keep the signal handler valid on targets without a supported native
+        // backtrace API, but emit only the diagnostic marker.
+        let marker = b"[SIGURG] native backtrace unavailable on this platform\n";
         let _ = libc::write(2, marker.as_ptr() as *const _, marker.len());
-        backtrace_symbols_fd(frames.as_ptr(), n, 2);
+    }
+
+    #[cfg(any(
+        all(target_os = "linux", target_env = "gnu"),
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    {
+        // Use libc's declarations so Linux/macOS get the c_int ABI while the
+        // BSDs get libexecinfo's size_t ABI and link requirement.
+        const MAX_FRAMES: usize = 32;
+        let mut frames: [*mut libc::c_void; MAX_FRAMES] = [std::ptr::null_mut(); MAX_FRAMES];
+        unsafe {
+            let marker = b"[SIGURG] --- backtrace ---\n";
+            let _ = libc::write(2, marker.as_ptr() as *const _, marker.len());
+
+            #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
+            {
+                let n = libc::backtrace(frames.as_mut_ptr(), MAX_FRAMES as libc::c_int);
+                libc::backtrace_symbols_fd(frames.as_ptr(), n, 2);
+            }
+
+            #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+            {
+                let n = libc::backtrace(frames.as_mut_ptr(), MAX_FRAMES);
+                let _ = libc::backtrace_symbols_fd(frames.as_ptr(), n, 2);
+            }
+        }
     }
 }
 

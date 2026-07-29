@@ -29,9 +29,8 @@ log = { workspace = true }
 env_logger = { workspace = true }
 rdynarmic = { workspace = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-sdl2 = { version = "0.37", features = ["raw-window-handle", "bundled", "static-link"] }
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
+sdl2 = { version = "0.37", features = ["raw-window-handle", "use-pkgconfig"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
-sdl2 = { version = "0.37", features = ["raw-window-handle", "use-pkgconfig"] }

@@ -12,8 +12,5 @@ parking_lot.workspace = true
 # SDL2 backs the `sdl` input engine (upstream `input_common/drivers/sdl_driver.cpp`,
 # guarded by HAVE_SDL2). Feature flags mirror `ruzu_cmd`, which already links SDL2
 # the same way on each platform.
-[target.'cfg(target_os = "linux")'.dependencies]
-sdl2 = { version = "0.37", features = ["bundled", "static-link"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
 sdl2 = { version = "0.37", features = ["use-pkgconfig"] }

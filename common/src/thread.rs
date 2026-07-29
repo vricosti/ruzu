@@ -35,9 +35,11 @@ pub fn set_current_thread_priority(new_priority: ThreadPriority) {
                 min_prio - ((min_prio - max_prio) * level as i32) / 4
             };
 
-            let params = libc::sched_param {
-                sched_priority: priority,
-            };
+            // libc exposes additional sporadic-server fields on musl. Match
+            // upstream's C initialization while remaining ABI-compatible with
+            // both glibc and musl layouts.
+            let mut params: libc::sched_param = std::mem::zeroed();
+            params.sched_priority = priority;
             libc::pthread_setschedparam(this_thread, scheduling_type, &params);
         }
     }

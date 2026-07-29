@@ -27,4 +27,10 @@ thiserror.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 md-5.workspace = true
+
+[target.'cfg(not(target_os = "openbsd"))'.dependencies]
 openssl.workspace = true
+
+[target.'cfg(target_os = "openbsd")'.dependencies]
+# OpenBSD 7.9 ships LibreSSL 4.3, newer than openssl-sys currently accepts.
+openssl = { workspace = true, features = ["vendored"] }

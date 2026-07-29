@@ -83,24 +83,26 @@ const INVALID_SOCKET: i32 = -1;
 #[cfg(unix)]
 fn to_sockaddr_in(addr: &SockAddrIn) -> libc::sockaddr_in {
     let ip = addr.ip;
-    #[cfg(target_os = "linux")]
-    let sa = libc::sockaddr_in {
-        sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: addr.portno.to_be(),
-        sin_addr: libc::in_addr {
-            s_addr: u32::from_ne_bytes(ip).to_be(),
-        },
-        sin_zero: [0; 8],
-    };
-    #[cfg(target_os = "macos")]
-    let sa = libc::sockaddr_in {
-        sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
-        sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: addr.portno.to_be(),
-        sin_addr: libc::in_addr {
-            s_addr: u32::from_ne_bytes(ip).to_be(),
-        },
-        sin_zero: [0; 8],
+    // Initialize through libc's platform-specific definition: BSD sockaddr_in
+    // has sin_len while Linux sockaddr_in does not.
+    let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    {
+        sa.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+    }
+    sa.sin_family = libc::AF_INET as libc::sa_family_t;
+    sa.sin_port = addr.portno.to_be();
+    sa.sin_addr = libc::in_addr {
+        // `s_addr` is stored in network byte order. Building the native-endian
+        // integer from the four bytes gives it that exact in-memory layout on
+        // both little- and big-endian hosts, matching upstream's byte shifts.
+        s_addr: u32::from_ne_bytes(ip),
     };
     sa
 }
@@ -108,10 +110,9 @@ fn to_sockaddr_in(addr: &SockAddrIn) -> libc::sockaddr_in {
 /// Convert libc::sockaddr_in to our SockAddrIn.
 #[cfg(unix)]
 fn from_sockaddr_in(addr: &libc::sockaddr_in) -> SockAddrIn {
-    let ip_bytes = u32::from_be(addr.sin_addr.s_addr).to_ne_bytes();
     SockAddrIn {
         family: Some(Domain::INET),
-        ip: ip_bytes,
+        ip: addr.sin_addr.s_addr.to_ne_bytes(),
         portno: u16::from_be(addr.sin_port),
     }
 }
@@ -119,12 +120,11 @@ fn from_sockaddr_in(addr: &libc::sockaddr_in) -> SockAddrIn {
 /// Get the last socket error as an Errno.
 #[cfg(unix)]
 fn get_last_error() -> Errno {
-    #[cfg(target_os = "linux")]
-    let err = unsafe { *libc::__errno_location() };
-    #[cfg(target_os = "macos")]
-    let err = unsafe { *libc::__error() };
+    let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
     match err {
+        0 => Errno::Success,
         libc::EWOULDBLOCK | libc::EAGAIN => Errno::Again,
+        libc::EMFILE => Errno::Mfile,
         libc::ECONNREFUSED => Errno::Connrefused,
         libc::ECONNRESET => Errno::Connreset,
         libc::ECONNABORTED => Errno::Connaborted,
@@ -142,6 +142,29 @@ fn get_last_error() -> Errno {
             log::warn!("Unmapped socket errno: {}", err);
             Errno::Other
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sockaddr_in_preserves_network_order_bytes() {
+        let guest = SockAddrIn {
+            family: Some(Domain::INET),
+            ip: [192, 0, 2, 7],
+            portno: 0x1234,
+        };
+
+        let native = to_sockaddr_in(&guest);
+        assert_eq!(native.sin_addr.s_addr.to_ne_bytes(), guest.ip);
+        assert_eq!(native.sin_port.to_ne_bytes(), guest.portno.to_be_bytes());
+
+        let round_trip = from_sockaddr_in(&native);
+        assert_eq!(round_trip.family, guest.family);
+        assert_eq!(round_trip.ip, guest.ip);
+        assert_eq!(round_trip.portno, guest.portno);
     }
 }
 
