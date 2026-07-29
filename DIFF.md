@@ -26777,6 +26777,79 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   backend and presented frames without the OpenGL texture-view errors seen
   with the previous hard-coded Linux default.
 
+## 2026-07-29 — externals/rdynarmic/src/backend/x64/{emit_vector_arrangement.rs,emit.rs} vs externals/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp
+
+### Intentional differences
+- The Rust emitter uses `rxbyak` and `RegAlloc` APIs in place of Xbyak and
+  `EmitContext::reg_alloc`; register ownership and instruction ordering remain
+  identical.
+- Environment-gated A64 diagnostics are specific to rdynarmic. PC-targeted
+  hooks are selected while compiling each block so an enabled narrow trace no
+  longer injects a host callback into every guest block.
+
+### Unintentional differences (fixed)
+- `emit_vector_extract_lower` previously ignored its second vector and
+  extraction position, reducing every operation to `movq` of the first
+  operand. It now matches upstream: combine both low 64-bit operands with
+  `punpcklqdq`, shift by the bit position converted to bytes, then use `movq`
+  to clear the upper 64 bits.
+
+### Missing items
+- This audit covered `EmitVectorExtractLower` and the block-entry diagnostic
+  dispatch only; the remaining vector-arrangement emitters were not re-audited
+  as part of this correction.
+
+### Binary layout verification
+- Not applicable: the corrected path operates on JIT vector registers and
+  emits no serialized host structure.
+
+### Verification
+- Re-read upstream `EmitX64::EmitVectorExtractLower` line by line after the
+  implementation.
+- `test_a64_ext_8b_extracts_across_64_bit_operands` passes in release mode and
+  verifies extraction across the two 64-bit inputs.
+- During diagnosis, the corrected JIT reproduced libpng's expected RGB24 row
+  exactly; the regenerated texture-cache file matched yuzu's SHA-256, and the
+  rendered kart was manually validated.
+- The complete rdynarmic suite was attempted both in parallel and with
+  `--test-threads=1`, but the existing ARM64-backend interface test
+  `run_performs_deferred_clear_cache_before_execution` terminates the x64 test
+  process with `SIGSEGV` before the suite reaches this regression.
+
+## 2026-07-29 — video_core/src/shader_environment.rs vs video_core/shader_environment.{h,cpp}
+
+### Intentional differences
+- Rust receives GPU reads through `MemoryManager` or the test callback stored
+  by `GenericEnvironment`; upstream owns a direct `Tegra::MemoryManager*`.
+- Rust uses `read_unaligned` to materialize the 32-byte `TicEntry` because the
+  byte buffer has no guaranteed `u64` alignment. This preserves the exact raw
+  layout read by upstream.
+
+### Unintentional differences (fixed)
+- `GenericEnvironment::read_texture_info` now returns the canonical
+  `textures::texture::TicEntry`, matching upstream. The removed local parsed
+  `maxwell_3d::TextureDescriptor` used a different, incorrect texture-format
+  number space.
+- `convert_texture_type` and `convert_texture_pixel_format` now consume the
+  canonical TIC fields directly. In particular, upstream TIC format `0x0f`
+  remains `R32` instead of being reinterpreted as `A8B8G8R8`.
+
+### Missing items
+- `video_core/src/engines/maxwell_3d.rs` still contains a separate parsed
+  texture descriptor for the non-upstream software rasterizer. It is no
+  longer used by the shader environment and requires its own ownership-parity
+  slice.
+
+### Binary layout verification
+- PASS: `TicEntry` is `repr(C)`, exactly 0x20 bytes, and accepts every raw
+  32-byte TIC bit pattern.
+
+### Verification
+- Re-read upstream `GenericEnvironment::ReadTextureInfo`,
+  `ConvertTextureType`, `ConvertTexturePixelFormat`, and the graphics/compute
+  texture metadata callers.
+- The focused `R32_FLOAT` regression and the existing detached TIC test pass.
+
 ## 2026-07-28 — shader_recompiler/src/backend/spirv/{emit_spirv.rs,spirv_emit_context.rs} vs shader_recompiler/backend/spirv/{emit_spirv.cpp,spirv_emit_context.{h,cpp}}
 
 ### Intentional differences

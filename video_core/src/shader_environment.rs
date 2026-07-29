@@ -14,16 +14,11 @@ use std::sync::Arc;
 
 use crate::engines::kepler_compute::{KeplerCompute, QmdConstBuffer};
 use crate::engines::maxwell_3d::{
-    ComponentType as MaxwellComponentType, ConstBufferBinding, EngineHint, Maxwell3D,
-    SamplerBinding, ShaderStageType, TextureDescriptor, TextureFormat as MaxwellTextureFormat,
-    TextureType as MaxwellTextureType,
+    ConstBufferBinding, EngineHint, Maxwell3D, SamplerBinding, ShaderStageType,
 };
 use crate::memory_manager::MemoryManager;
-use crate::texture_cache::format_lookup_table::{
-    pixel_format_from_texture_info, ComponentType as LookupComponentType,
-    TextureFormat as LookupTextureFormat,
-};
-use crate::textures::texture::texture_pair;
+use crate::texture_cache::format_lookup_table::pixel_format_from_texture_info_raw;
+use crate::textures::texture::{texture_pair, TextureType as TegraTextureType, TicEntry};
 use common::fs::fs_util::path_to_utf8_string;
 use common::fs::path_util::{get_ruzu_path, RuzuPath};
 use parking_lot::Mutex as ParkingLotMutex;
@@ -542,7 +537,7 @@ impl GenericEnvironment {
         tic_limit: u32,
         via_header_index: bool,
         raw: u32,
-    ) -> TextureDescriptor {
+    ) -> TicEntry {
         let (tic_index, _) = texture_pair(raw, via_header_index);
         assert!(tic_index <= tic_limit);
         let mut raw_bytes = [0u8; 32];
@@ -555,16 +550,15 @@ impl GenericEnvironment {
             if let Some(reader) = self.gpu_read.as_ref() {
                 reader(tic_addr + tic_index as u64 * 32, &mut raw_bytes);
             } else {
-                return TextureDescriptor::from_words(&[0; 8]);
+                return TicEntry::default();
             }
             #[cfg(not(test))]
-            return TextureDescriptor::from_words(&[0; 8]);
+            return TicEntry::default();
         }
-        let mut words = [0u32; 8];
-        for (index, chunk) in raw_bytes.chunks_exact(4).enumerate() {
-            words[index] = u32::from_le_bytes(chunk.try_into().expect("4-byte TIC word"));
-        }
-        TextureDescriptor::from_words(&words)
+        // SAFETY: TicEntry is a repr(C) wrapper around [u64; 4], so every
+        // 32-byte bit pattern is valid. read_unaligned matches upstream's
+        // ReadBlock directly into a TICEntry without imposing host alignment.
+        unsafe { std::ptr::read_unaligned(raw_bytes.as_ptr().cast::<TicEntry>()) }
     }
 
     pub fn dump(&mut self, pipeline_hash: u64, shader_hash: u64) {
@@ -1807,106 +1801,42 @@ pub fn load_pipelines<'a, FStop>(
     }
 }
 
-fn convert_texture_type(entry: &TextureDescriptor) -> TextureType {
-    match entry.texture_type {
-        MaxwellTextureType::Texture1D => TextureType::Color1D,
-        MaxwellTextureType::Texture2D => {
-            if entry.normalized_coords {
+fn convert_texture_type(entry: &TicEntry) -> TextureType {
+    match TegraTextureType::from_raw(entry.texture_type()) {
+        Some(TegraTextureType::Texture1D) => TextureType::Color1D,
+        Some(TegraTextureType::Texture2D) | Some(TegraTextureType::Texture2DNoMipmap) => {
+            if entry.normalized_coords() != 0 {
                 TextureType::Color2D
             } else {
                 TextureType::Color2DRect
             }
         }
-        MaxwellTextureType::Texture2DNoMip => {
-            if entry.normalized_coords {
-                TextureType::Color2D
-            } else {
-                TextureType::Color2DRect
-            }
+        Some(TegraTextureType::Texture3D) => TextureType::Color3D,
+        Some(TegraTextureType::TextureCubemap) => TextureType::ColorCube,
+        Some(TegraTextureType::Texture1DArray) => TextureType::ColorArray1D,
+        Some(TegraTextureType::Texture2DArray) => TextureType::ColorArray2D,
+        Some(TegraTextureType::Texture1DBuffer) => TextureType::Buffer,
+        Some(TegraTextureType::TextureCubeArray) => TextureType::ColorArrayCube,
+        None => {
+            log::error!(
+                "ConvertTextureType unimplemented texture_type={}",
+                entry.texture_type()
+            );
+            TextureType::Color2D
         }
-        MaxwellTextureType::Texture3D => TextureType::Color3D,
-        MaxwellTextureType::Cubemap => TextureType::ColorCube,
-        MaxwellTextureType::Array1D => TextureType::ColorArray1D,
-        MaxwellTextureType::Array2D => TextureType::ColorArray2D,
-        MaxwellTextureType::Buffer1D => TextureType::Buffer,
-        MaxwellTextureType::CubemapArray => TextureType::ColorArrayCube,
-        MaxwellTextureType::Invalid => TextureType::Color2D,
     }
 }
 
-fn convert_component_type(component: MaxwellComponentType) -> LookupComponentType {
-    match component {
-        MaxwellComponentType::SNorm => LookupComponentType::Snorm,
-        MaxwellComponentType::UNorm => LookupComponentType::Unorm,
-        MaxwellComponentType::SInt => LookupComponentType::Sint,
-        MaxwellComponentType::UInt => LookupComponentType::Uint,
-        MaxwellComponentType::Float => LookupComponentType::Float,
-        MaxwellComponentType::SNormForceFp16 => LookupComponentType::Snorm,
-        MaxwellComponentType::UNormForceFp16 => LookupComponentType::Unorm,
-        MaxwellComponentType::Invalid => LookupComponentType::Unorm,
-    }
-}
-
-fn convert_texture_pixel_format(entry: &TextureDescriptor) -> TexturePixelFormat {
-    let pixel_format = pixel_format_from_texture_info(
-        convert_texture_format(entry.format),
-        convert_component_type(entry.r_type),
-        convert_component_type(entry.g_type),
-        convert_component_type(entry.b_type),
-        convert_component_type(entry.a_type),
-        entry.srgb_conversion,
+fn convert_texture_pixel_format(entry: &TicEntry) -> TexturePixelFormat {
+    let pixel_format = pixel_format_from_texture_info_raw(
+        entry.format(),
+        entry.r_type(),
+        entry.g_type(),
+        entry.b_type(),
+        entry.a_type(),
+        entry.srgb_conversion() != 0,
     );
     unsafe { std::mem::transmute::<u32, TexturePixelFormat>(pixel_format as u32) }
-}
-
-fn convert_texture_format(format: MaxwellTextureFormat) -> LookupTextureFormat {
-    match format as u32 {
-        0x01 => LookupTextureFormat::R32G32B32A32,
-        0x02 => LookupTextureFormat::R32G32B32,
-        0x03 => LookupTextureFormat::R16G16B16A16,
-        0x04 => LookupTextureFormat::R32G32,
-        0x05 => LookupTextureFormat::R32B24G8,
-        0x06 => LookupTextureFormat::E5B9G9R9,
-        0x07 => LookupTextureFormat::B10G11R11,
-        0x08 => LookupTextureFormat::A8B8G8R8,
-        0x09 => LookupTextureFormat::A2B10G10R10,
-        0x0A => LookupTextureFormat::A2R10G10B10,
-        0x0B => LookupTextureFormat::R32,
-        0x0C => LookupTextureFormat::G8R8,
-        0x0D => LookupTextureFormat::R16G16,
-        0x0E => LookupTextureFormat::R16,
-        0x0F => LookupTextureFormat::R8,
-        0x10 => LookupTextureFormat::X8Z24,
-        0x11 => LookupTextureFormat::Z24S8,
-        0x12 => LookupTextureFormat::A4B4G4R4,
-        0x13 => LookupTextureFormat::Z16,
-        0x14 => LookupTextureFormat::A1B5G5R5,
-        0x15 => LookupTextureFormat::B5G6R5,
-        0x16 => LookupTextureFormat::A5B5G5R1,
-        0x17 => LookupTextureFormat::BC7U,
-        0x19 => LookupTextureFormat::Z32X24S8,
-        0x1D => LookupTextureFormat::G4R4,
-        0x24 => LookupTextureFormat::DXT1,
-        0x25 => LookupTextureFormat::DXT23,
-        0x26 => LookupTextureFormat::DXT45,
-        0x27 => LookupTextureFormat::DXN1,
-        0x28 => LookupTextureFormat::DXN2,
-        0x40 => LookupTextureFormat::Astc2d4x4,
-        0x41 => LookupTextureFormat::Astc2d5x5,
-        0x42 => LookupTextureFormat::Astc2d6x6,
-        0x43 => LookupTextureFormat::Astc2d8x6,
-        0x44 => LookupTextureFormat::Astc2d8x8,
-        0x45 => LookupTextureFormat::Astc2d10x10,
-        0x46 => LookupTextureFormat::Astc2d12x12,
-        0x50 => LookupTextureFormat::Astc2d5x4,
-        0x51 => LookupTextureFormat::Astc2d8x5,
-        0x52 => LookupTextureFormat::Astc2d10x8,
-        0x53 => LookupTextureFormat::Astc2d10x6,
-        0x54 => LookupTextureFormat::Astc2d10x5,
-        0x55 => LookupTextureFormat::Astc2d12x10,
-        0x56 => LookupTextureFormat::Astc2d6x5,
-        _ => LookupTextureFormat::A8B8G8R8,
-    }
 }
 
 fn is_integer_pixel_format(format: TexturePixelFormat) -> bool {
@@ -2363,9 +2293,35 @@ mod tests {
         env.set_detached_texture_header_pool_state(gpu_base, 3, SamplerBinding::Independently);
 
         let format = env.read_texture_pixel_format(3);
+        assert_eq!(format, TexturePixelFormat::R8Unorm);
         assert_eq!(
             env.base.texture_pixel_formats.get(&3).copied(),
             Some(format)
+        );
+    }
+
+    #[test]
+    fn graphics_environment_preserves_r32_float_tic_format() {
+        let gpu_base = 0x4_1000_0000;
+        let mut raw = [0u8; 32];
+        let word0: u32 = 0x0F | (7 << 7) | (7 << 10) | (7 << 13) | (7 << 16);
+        raw[0..4].copy_from_slice(&word0.to_le_bytes());
+        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
+            dst.fill(0);
+            if gpu_addr == gpu_base {
+                dst.copy_from_slice(&raw);
+            }
+        });
+
+        let mut env = GraphicsEnvironment::new();
+        env.base = GenericEnvironment::new()
+            .with_gpu_read(reader)
+            .with_program(gpu_base, 0);
+        env.set_detached_texture_header_pool_state(gpu_base, 0, SamplerBinding::Independently);
+
+        assert_eq!(
+            env.read_texture_pixel_format(0),
+            TexturePixelFormat::R32Float
         );
     }
 
