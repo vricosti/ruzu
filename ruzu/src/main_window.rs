@@ -345,6 +345,19 @@ mod render_pointer_tests {
         assert_eq!(position.touch_x, 0.25);
         assert_eq!(position.touch_y, 0.25);
     }
+
+    #[test]
+    fn controller_bindings_use_upstream_qt_key_codes() {
+        use gtk::gdk::Key;
+
+        assert_eq!(gdk_key_to_qt_key(Key::Left), 16_777_234);
+        assert_eq!(gdk_key_to_qt_key(Key::Up), 16_777_235);
+        assert_eq!(gdk_key_to_qt_key(Key::Right), 16_777_236);
+        assert_eq!(gdk_key_to_qt_key(Key::Down), 16_777_237);
+        assert_eq!(gdk_key_to_qt_key(Key::space), 32);
+        assert_eq!(gdk_key_to_qt_key(Key::w), i32::from(b'W'));
+        assert_eq!(gdk_key_to_qt_key(Key::C), i32::from(b'C'));
+    }
 }
 
 impl GMainWindow {
@@ -721,11 +734,10 @@ impl GMainWindow {
     /// The last call is the one that drives gamepad buttons, resolved through
     /// the `engine:keyboard` bindings in `Settings::values.players`.
     ///
-    /// Divergence: upstream passes Qt key codes, since that is the key space
-    /// its own configuration UI records. ruzu passes GDK keyvals for the same
-    /// reason — whatever the frontend records when binding is what it must send
-    /// back. Bindings imported from a yuzu config therefore carry Qt codes and
-    /// will not match; they have to be re-bound in Controls.
+    /// GTK keyvals are converted to Qt's key space before reaching the
+    /// controller-binding path. Settings store those Qt values upstream, so
+    /// preserving them keeps imported bindings and newly captured bindings in
+    /// the same key space.
     fn install_input_handlers(self: &Rc<Self>) {
         let keys = gtk::EventControllerKey::new();
         // Capture, so a key bound to a game control is not first swallowed by a
@@ -739,8 +751,16 @@ impl GMainWindow {
             glib::Propagation::Proceed,
             move |_, keyval, _keycode, state| {
                 this.on_key_event(keyval, state, true);
-                // Never claim the event: the menus and dialogs still need it.
-                glib::Propagation::Proceed
+                // Upstream delivers gameplay keys to the focused
+                // GRenderWindow, whose keyPressEvent does not forward them to
+                // the launcher chrome. Capture at the GTK toplevel because the
+                // native render child is not a GTK widget, then preserve that
+                // ownership by stopping propagation while emulation is active.
+                if this.session.borrow().is_some() {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
             }
         ));
         keys.connect_key_released(glib::clone!(
@@ -819,10 +839,8 @@ impl GMainWindow {
             keyboard.release_keyboard_key(switch_key);
         }
 
-        // The controller-binding path.
-        // Normalize letters so a Shift modifier does not change the binding's
-        // key code while it is held, matching Qt's key-event space upstream.
-        let code = gtk::glib::translate::IntoGlib::into_glib(keyval.to_lower()) as i32;
+        // The controller-binding path uses Qt key codes in upstream settings.
+        let code = gdk_key_to_qt_key(keyval);
         if pressed {
             keyboard.press_key(code);
         } else {
@@ -1951,6 +1969,78 @@ fn switch_modifiers(state: gtk::gdk::ModifierType) -> i32 {
         modifier |= 1 << Modifiers::CapsLock as i32;
     }
     modifier
+}
+
+/// Convert a GDK keyval to the `Qt::Key` value upstream stores in controller
+/// bindings and passes to `Keyboard::PressKey`.
+///
+/// Printable Qt keys use their uppercase Unicode value. Non-printable keys
+/// occupy Qt's `0x01000000` range.
+fn gdk_key_to_qt_key(keyval: gtk::gdk::Key) -> i32 {
+    use gtk::gdk::Key;
+
+    const QT_KEY_ESCAPE: i32 = 0x0100_0000;
+    const QT_KEY_TAB: i32 = 0x0100_0001;
+    const QT_KEY_BACKTAB: i32 = 0x0100_0002;
+    const QT_KEY_BACKSPACE: i32 = 0x0100_0003;
+    const QT_KEY_RETURN: i32 = 0x0100_0004;
+    const QT_KEY_ENTER: i32 = 0x0100_0005;
+    const QT_KEY_INSERT: i32 = 0x0100_0006;
+    const QT_KEY_DELETE: i32 = 0x0100_0007;
+    const QT_KEY_PAUSE: i32 = 0x0100_0008;
+    const QT_KEY_PRINT: i32 = 0x0100_0009;
+    const QT_KEY_HOME: i32 = 0x0100_0010;
+    const QT_KEY_END: i32 = 0x0100_0011;
+    const QT_KEY_LEFT: i32 = 0x0100_0012;
+    const QT_KEY_UP: i32 = 0x0100_0013;
+    const QT_KEY_RIGHT: i32 = 0x0100_0014;
+    const QT_KEY_DOWN: i32 = 0x0100_0015;
+    const QT_KEY_PAGE_UP: i32 = 0x0100_0016;
+    const QT_KEY_PAGE_DOWN: i32 = 0x0100_0017;
+    const QT_KEY_F1: i32 = 0x0100_0030;
+
+    match keyval {
+        Key::Escape => QT_KEY_ESCAPE,
+        Key::Tab => QT_KEY_TAB,
+        Key::ISO_Left_Tab => QT_KEY_BACKTAB,
+        Key::BackSpace => QT_KEY_BACKSPACE,
+        Key::Return => QT_KEY_RETURN,
+        Key::KP_Enter => QT_KEY_ENTER,
+        Key::Insert => QT_KEY_INSERT,
+        Key::Delete => QT_KEY_DELETE,
+        Key::Pause => QT_KEY_PAUSE,
+        Key::Print => QT_KEY_PRINT,
+        Key::Home | Key::KP_Home => QT_KEY_HOME,
+        Key::End | Key::KP_End => QT_KEY_END,
+        Key::Left | Key::KP_Left => QT_KEY_LEFT,
+        Key::Up | Key::KP_Up => QT_KEY_UP,
+        Key::Right | Key::KP_Right => QT_KEY_RIGHT,
+        Key::Down | Key::KP_Down => QT_KEY_DOWN,
+        Key::Page_Up | Key::KP_Page_Up => QT_KEY_PAGE_UP,
+        Key::Page_Down | Key::KP_Page_Down => QT_KEY_PAGE_DOWN,
+        Key::F1 => QT_KEY_F1,
+        Key::F2 => QT_KEY_F1 + 1,
+        Key::F3 => QT_KEY_F1 + 2,
+        Key::F4 => QT_KEY_F1 + 3,
+        Key::F5 => QT_KEY_F1 + 4,
+        Key::F6 => QT_KEY_F1 + 5,
+        Key::F7 => QT_KEY_F1 + 6,
+        Key::F8 => QT_KEY_F1 + 7,
+        Key::F9 => QT_KEY_F1 + 8,
+        Key::F10 => QT_KEY_F1 + 9,
+        Key::F11 => QT_KEY_F1 + 10,
+        Key::F12 => QT_KEY_F1 + 11,
+        _ => keyval
+            .to_unicode()
+            .map(|character| {
+                if character.is_ascii_lowercase() {
+                    character.to_ascii_uppercase() as i32
+                } else {
+                    character as i32
+                }
+            })
+            .unwrap_or(0),
+    }
 }
 
 /// GDK keyval to the Switch's HID key code.

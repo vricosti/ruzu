@@ -24,7 +24,6 @@ use common::settings_input::{
     native_analog, native_button, native_motion, ControllerType, PlayerInput,
     JOYCON_BODY_NEON_BLUE, JOYCON_BODY_NEON_RED, JOYCON_BUTTONS_NEON_BLUE, JOYCON_BUTTONS_NEON_RED,
 };
-use gtk::glib::translate::IntoGlib;
 use input_common::main_common::{generate_analog_param_from_keys, generate_keyboard_param};
 
 use crate::uisettings::GameDir;
@@ -69,65 +68,66 @@ pub fn save_game_dirs(dirs: &[GameDir]) -> io::Result<()> {
 /// The INI section the per-player control bindings live in.
 const CONTROLS_SECTION: &str = "[Controls]";
 
-fn key_code(key: gtk::gdk::Key) -> i32 {
-    key.into_glib() as i32
-}
+const QT_KEY_LEFT: i32 = 0x0100_0012;
+const QT_KEY_UP: i32 = 0x0100_0013;
+const QT_KEY_RIGHT: i32 = 0x0100_0014;
+const QT_KEY_DOWN: i32 = 0x0100_0015;
+const QT_KEY_SHIFT: i32 = 0x0100_0020;
 
-/// GTK-key-space counterpart of `QtConfig::default_buttons`.
+/// Upstream `QtConfig::default_buttons`.
 fn default_buttons() -> [i32; native_button::NUM_BUTTONS] {
-    use gtk::gdk::Key;
-
     [
-        Key::c,
-        Key::x,
-        Key::v,
-        Key::z,
-        Key::f,
-        Key::g,
-        Key::q,
-        Key::e,
-        Key::r,
-        Key::t,
-        Key::m,
-        Key::n,
-        Key::Left,
-        Key::Up,
-        Key::Right,
-        Key::Down,
-        Key::q,
-        Key::e,
-        Key::VoidSymbol,
-        Key::VoidSymbol,
-        Key::q,
-        Key::e,
+        i32::from(b'C'),
+        i32::from(b'X'),
+        i32::from(b'V'),
+        i32::from(b'Z'),
+        i32::from(b'F'),
+        i32::from(b'G'),
+        i32::from(b'Q'),
+        i32::from(b'E'),
+        i32::from(b'R'),
+        i32::from(b'T'),
+        i32::from(b'M'),
+        i32::from(b'N'),
+        QT_KEY_LEFT,
+        QT_KEY_UP,
+        QT_KEY_RIGHT,
+        QT_KEY_DOWN,
+        i32::from(b'Q'),
+        i32::from(b'E'),
+        0,
+        0,
+        i32::from(b'Q'),
+        i32::from(b'E'),
     ]
-    .map(|key| {
-        if key == Key::VoidSymbol {
-            0
-        } else {
-            key_code(key)
-        }
-    })
 }
 
-/// GTK-key-space counterpart of `QtConfig::default_motions`.
+/// Upstream `QtConfig::default_motions`.
 fn default_motions() -> [i32; native_motion::NUM_MOTIONS] {
-    [key_code(gtk::gdk::Key::_7), key_code(gtk::gdk::Key::_8)]
+    [i32::from(b'7'), i32::from(b'8')]
 }
 
-/// GTK-key-space counterpart of `QtConfig::default_analogs`.
+/// Upstream `QtConfig::default_analogs`.
 fn default_analogs() -> [[i32; 4]; native_analog::NUM_ANALOGS] {
-    use gtk::gdk::Key;
-
     [
-        [Key::w, Key::s, Key::a, Key::d].map(key_code),
-        [Key::i, Key::k, Key::j, Key::l].map(key_code),
+        [
+            i32::from(b'W'),
+            i32::from(b'S'),
+            i32::from(b'A'),
+            i32::from(b'D'),
+        ],
+        [
+            i32::from(b'I'),
+            i32::from(b'K'),
+            i32::from(b'J'),
+            i32::from(b'L'),
+        ],
     ]
 }
 
-/// GTK-key-space counterpart of `QtConfig::default_stick_mod`.
+/// Upstream `QtConfig::default_stick_mod`.
 fn default_stick_mod() -> [i32; native_analog::NUM_ANALOGS] {
-    [key_code(gtk::gdk::Key::Shift_L), 0]
+    [QT_KEY_SHIFT, 0]
 }
 
 /// Read every player's bindings — upstream `QtConfig::ReadQtPlayerValues`,
@@ -654,7 +654,7 @@ mod tests {
 
         let button_a = common::param_package::ParamPackage::from_serialized(&player_one.buttons[0]);
         assert_eq!(button_a.get_str("engine", ""), "keyboard");
-        assert_eq!(button_a.get_int("code", -1), key_code(gtk::gdk::Key::c));
+        assert_eq!(button_a.get_int("code", -1), i32::from(b'C'));
     }
 
     /// A stored `connected` beats the default, in both directions.

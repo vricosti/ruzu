@@ -370,6 +370,9 @@ fn status_button(class: &str) -> gtk::Button {
     button.add_css_class("flat");
     button.add_css_class(class);
     button.set_has_frame(false);
+    // Upstream assigns Qt::NoFocus to every status-bar button. The render
+    // surface owns keyboard input while emulation is active.
+    button.set_can_focus(false);
     button.set_focus_on_click(false);
     button
 }

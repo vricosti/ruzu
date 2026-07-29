@@ -27844,3 +27844,56 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - `test_a64_unsigned_fp_to_fixed_fallbacks_count_input_once` executes
   `fcvtzu w0,d0,#1` and `fcvtzu x1,s1,#1`, covering both corrected fallback
   paths and their results.
+## 2026-07-30 — ruzu/src/render_window.rs vs yuzu/bootmanager.cpp
+
+### Intentional differences
+- macOS hosts the `CAMetalLayer` in a borderless child `NSWindow` because GTK's macOS content view composites over ordinary subviews. The child ignores mouse events so the parent GTK handlers receive and forward pointer input through upstream's `Mouse::PressMouseButton`, `PressButton`, and `PressTouchButton` path.
+
+### Unintentional differences (to fix)
+- None identified in this slice.
+
+### Missing items
+- Native macOS touch-event forwarding remains separate from mouse-to-touch emulation.
+
+### Binary layout verification
+- PASS: no shared binary layout is involved.
+## 2026-07-30 — ruzu/src/main_window.rs vs yuzu/bootmanager.cpp
+
+### Intentional differences
+- GTK supplies GDK keyvals, so the frontend converts them to upstream's `Qt::Key` values before calling `Keyboard::PressKey`/`ReleaseKey`.
+- The native macOS render child is not a GTK widget, so a capture-phase controller on the GTK toplevel owns keyboard events while a session is active. It stops propagation to reproduce the focused upstream `GRenderWindow::keyPressEvent`.
+
+### Unintentional differences (to fix)
+- None identified in this slice.
+
+### Missing items
+- None identified for keyboard-to-controller key-code forwarding.
+
+### Binary layout verification
+- PASS: no shared binary layout is involved.
+## 2026-07-30 — ruzu/src/status_bar.rs vs yuzu/main.cpp
+
+### Intentional differences
+- None identified in this slice.
+
+### Unintentional differences (to fix)
+- None identified: GTK status buttons now disable keyboard focus, matching upstream's `Qt::NoFocus`.
+
+### Missing items
+- None identified for status-button focus ownership.
+
+### Binary layout verification
+- PASS: no shared binary layout is involved.
+## 2026-07-30 — ruzu/src/configuration/qt_config.rs vs yuzu/configuration/qt_config.cpp
+
+### Intentional differences
+- Rust spells the upstream `Qt::Key` constants as their stable integer values because the GTK frontend does not link Qt.
+
+### Unintentional differences (to fix)
+- None identified: default buttons, motions, analog directions, and stick modifiers now use upstream's Qt key space rather than GDK keyvals.
+
+### Missing items
+- None identified for the default keyboard binding arrays.
+
+### Binary layout verification
+- PASS: serialized `code` fields retain the same integer values as upstream.

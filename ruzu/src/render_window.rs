@@ -222,6 +222,11 @@ pub fn attach_metal_layer(
         let _: () = msg_send![child_window, setContentView: render_view];
         let _: () = msg_send![child_window, setOpaque: YES];
         let _: () = msg_send![child_window, setHasShadow: NO];
+        // Unlike upstream's in-widget render surface, this native child window
+        // sits above the GTK event target. Let pointer events pass through to
+        // the parent so `GMainWindow` can forward them through the same
+        // Mouse::PressButton/PressTouchButton path as GRenderWindow.
+        let _: () = msg_send![child_window, setIgnoresMouseEvents: YES];
         // Start hidden; revealed once presentation begins.
         let _: () = msg_send![child_window, setAlphaValue: 0.0f64];
         // Attach above the parent so it tracks the parent's movement and the
