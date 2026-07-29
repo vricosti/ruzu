@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use gtk::prelude::*;
 use gtk::{gio, glib, Application, ApplicationWindow};
 
+use input_common::drivers::mouse::MouseButton;
 use ruzu_core::frontend::framebuffer_layout::{default_frame_layout, FramebufferLayout};
 
 use crate::boot::{EmulationSession, LoadingEvent};
@@ -117,6 +118,65 @@ struct RenderHandles {
     /// Shared frame layout the renderer reads; updated so the frame is rendered
     /// at the new native resolution on resize (upstream `OnFramebufferSizeChanged`).
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RenderPointerPosition {
+    mouse_x: i32,
+    mouse_y: i32,
+    center_x: i32,
+    center_y: i32,
+    touch_x: f32,
+    touch_y: f32,
+}
+
+/// Convert render-widget coordinates to the mouse and touchscreen coordinate
+/// spaces used by upstream `GRenderWindow`.
+fn map_render_pointer(
+    local_x: f64,
+    local_y: f64,
+    logical_width: f64,
+    logical_height: f64,
+    layout: &FramebufferLayout,
+) -> Option<RenderPointerPosition> {
+    if logical_width <= 0.0
+        || logical_height <= 0.0
+        || layout.width == 0
+        || layout.height == 0
+        || layout.screen.right <= layout.screen.left
+        || layout.screen.bottom <= layout.screen.top
+    {
+        return None;
+    }
+
+    // Upstream keeps mouse coordinates in widget pixels, but ScaleTouch first
+    // applies the device-pixel ratio before MapToTouchScreen. Deriving the
+    // scale from the live framebuffer layout also handles fractional GTK
+    // allocations without drifting from the drawable size.
+    let mouse_x = local_x.round().max(0.0) as i32;
+    let mouse_y = local_y.round().max(0.0) as i32;
+    let framebuffer_x = (local_x * f64::from(layout.width) / logical_width)
+        .round()
+        .max(0.0) as u32;
+    let framebuffer_y = (local_y * f64::from(layout.height) / logical_height)
+        .round()
+        .max(0.0) as u32;
+
+    let clipped_x = framebuffer_x.clamp(layout.screen.left, layout.screen.right - 1);
+    let clipped_y = framebuffer_y.clamp(layout.screen.top, layout.screen.bottom - 1);
+    let touch_x =
+        (clipped_x - layout.screen.left) as f32 / (layout.screen.right - layout.screen.left) as f32;
+    let touch_y =
+        (clipped_y - layout.screen.top) as f32 / (layout.screen.bottom - layout.screen.top) as f32;
+
+    Some(RenderPointerPosition {
+        mouse_x,
+        mouse_y,
+        center_x: (logical_width / 2.0) as i32,
+        center_y: (logical_height / 2.0) as i32,
+        touch_x,
+        touch_y,
+    })
 }
 
 #[derive(Default)]
@@ -241,6 +301,49 @@ mod loading_event_mailbox_tests {
                 before_first_frame: false
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod render_pointer_tests {
+    use super::*;
+    use ruzu_core::frontend::framebuffer_layout::Rectangle;
+
+    #[test]
+    fn maps_center_of_render_area_to_center_of_touchscreen() {
+        let layout = default_frame_layout(1280, 720);
+        let position = map_render_pointer(640.0, 360.0, 1280.0, 720.0, &layout).unwrap();
+
+        assert_eq!((position.mouse_x, position.mouse_y), (640, 360));
+        assert_eq!((position.center_x, position.center_y), (640, 360));
+        assert!((position.touch_x - 0.5).abs() < f32::EPSILON);
+        assert!((position.touch_y - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn clips_letterbox_coordinates_like_upstream_map_to_touch_screen() {
+        let layout = FramebufferLayout {
+            width: 1024,
+            height: 768,
+            screen: Rectangle::new(0, 96, 1024, 672),
+            is_srgb: false,
+        };
+
+        let top = map_render_pointer(512.0, 0.0, 1024.0, 768.0, &layout).unwrap();
+        let bottom = map_render_pointer(512.0, 767.0, 1024.0, 768.0, &layout).unwrap();
+
+        assert_eq!(top.touch_y, 0.0);
+        assert_eq!(bottom.touch_y, 575.0 / 576.0);
+    }
+
+    #[test]
+    fn scales_touch_coordinates_to_physical_framebuffer() {
+        let layout = default_frame_layout(2560, 1440);
+        let position = map_render_pointer(320.0, 180.0, 1280.0, 720.0, &layout).unwrap();
+
+        assert_eq!((position.mouse_x, position.mouse_y), (320, 180));
+        assert_eq!(position.touch_x, 0.25);
+        assert_eq!(position.touch_y, 0.25);
     }
 }
 
@@ -648,6 +751,55 @@ impl GMainWindow {
             }
         ));
         self.window.add_controller(keys);
+
+        let clicks = gtk::GestureClick::new();
+        // Zero asks GTK to report every mouse button. This mirrors upstream's
+        // QtButtonToMouseButton dispatch instead of recognizing only primary
+        // clicks.
+        clicks.set_button(0);
+        clicks.set_propagation_phase(gtk::PropagationPhase::Capture);
+        clicks.connect_pressed(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |gesture, _press_count, x, y| {
+                this.on_mouse_button_pressed(gesture.current_button(), x, y);
+            }
+        ));
+        clicks.connect_released(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |gesture, _press_count, _x, _y| {
+                this.on_mouse_button_released(gesture.current_button());
+            }
+        ));
+        self.window.add_controller(clicks);
+
+        let motion = gtk::EventControllerMotion::new();
+        motion.set_propagation_phase(gtk::PropagationPhase::Capture);
+        motion.connect_motion(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, x, y| {
+                this.on_mouse_motion(x, y);
+            }
+        ));
+        self.window.add_controller(motion);
+
+        let scroll = gtk::EventControllerScroll::new(
+            gtk::EventControllerScrollFlags::BOTH_AXES | gtk::EventControllerScrollFlags::DISCRETE,
+        );
+        scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+        scroll.connect_scroll(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, dx, dy| {
+                this.on_mouse_wheel(dx, dy);
+                glib::Propagation::Proceed
+            }
+        ));
+        self.window.add_controller(scroll);
     }
 
     /// One key press or release — upstream's `keyPressEvent` / `keyReleaseEvent`.
@@ -675,6 +827,96 @@ impl GMainWindow {
             keyboard.press_key(code);
         } else {
             keyboard.release_key(code);
+        }
+    }
+
+    /// Resolve a toplevel GTK pointer position into the embedded render
+    /// surface. Upstream receives these coordinates directly because
+    /// `GRenderWindow` is a QWidget; GTK's native X11 child is not a widget, so
+    /// the toplevel handler performs the equivalent bounds translation.
+    fn render_pointer_position(
+        &self,
+        window_x: f64,
+        window_y: f64,
+    ) -> Option<RenderPointerPosition> {
+        if self.stack.visible_child_name().as_deref() != Some(PAGE_RENDER) {
+            return None;
+        }
+        let rect = self.stack.compute_bounds(&self.window)?;
+        let local_x = window_x - f64::from(rect.x());
+        let local_y = window_y - f64::from(rect.y());
+        let width = f64::from(rect.width());
+        let height = f64::from(rect.height());
+        if local_x < 0.0 || local_y < 0.0 || local_x >= width || local_y >= height {
+            return None;
+        }
+
+        let render = self.render.borrow();
+        let layout = render.as_ref()?.framebuffer_layout.read().ok()?;
+        map_render_pointer(local_x, local_y, width, height, &layout)
+    }
+
+    /// Upstream `GRenderWindow::mousePressEvent`.
+    fn on_mouse_button_pressed(&self, button: u32, x: f64, y: f64) {
+        let Some(position) = self.render_pointer_position(x, y) else {
+            return;
+        };
+        let button = gdk_button_to_mouse_button(button);
+        let mut subsystem = self.input_subsystem.borrow_mut();
+        let Some(mouse) = subsystem.get_mouse_mut() else {
+            return;
+        };
+
+        mouse.press_mouse_button(button);
+        mouse.press_button(position.mouse_x, position.mouse_y, button);
+        mouse.press_touch_button(position.touch_x, position.touch_y, button);
+    }
+
+    /// Upstream `GRenderWindow::mouseMoveEvent`.
+    fn on_mouse_motion(&self, x: f64, y: f64) {
+        let Some(position) = self.render_pointer_position(x, y) else {
+            return;
+        };
+        let mut subsystem = self.input_subsystem.borrow_mut();
+        let Some(mouse) = subsystem.get_mouse_mut() else {
+            return;
+        };
+
+        mouse.mouse_move(position.touch_x, position.touch_y);
+        mouse.touch_move(position.touch_x, position.touch_y);
+        mouse.move_cursor(
+            position.mouse_x,
+            position.mouse_y,
+            position.center_x,
+            position.center_y,
+        );
+    }
+
+    /// Upstream `GRenderWindow::mouseReleaseEvent`.
+    fn on_mouse_button_released(&self, button: u32) {
+        if self.render.borrow().is_none() {
+            return;
+        }
+        let mut subsystem = self.input_subsystem.borrow_mut();
+        if let Some(mouse) = subsystem.get_mouse_mut() {
+            mouse.release_button(gdk_button_to_mouse_button(button));
+        }
+    }
+
+    /// Upstream `GRenderWindow::wheelEvent`.
+    fn on_mouse_wheel(&self, delta_x: f64, delta_y: f64) {
+        if self.render.borrow().is_none() {
+            return;
+        }
+        let mut subsystem = self.input_subsystem.borrow_mut();
+        if let Some(mouse) = subsystem.get_mouse_mut() {
+            // GTK scrolls down with positive Y; Qt's angleDelta is positive
+            // upward. One discrete GTK step corresponds to Qt's conventional
+            // 120 angle units.
+            mouse.mouse_wheel_change(
+                (delta_x * 120.0).round() as i32,
+                (-delta_y * 120.0).round() as i32,
+            );
         }
     }
 
@@ -1667,6 +1909,19 @@ pub fn init_app_menu(app: &Application) {
     // Upstream calls `UpdateMenuState()` once the menu is built, which greys
     // out the run-time entries because no game is running yet.
     update_menu_state(app, false, true);
+}
+
+/// GTK counterpart of upstream `GRenderWindow::QtButtonToMouseButton`.
+fn gdk_button_to_mouse_button(button: u32) -> MouseButton {
+    match button {
+        1 => MouseButton::Left,
+        2 => MouseButton::Wheel,
+        3 => MouseButton::Right,
+        8 => MouseButton::Backward,
+        9 => MouseButton::Forward,
+        10 => MouseButton::Task,
+        _ => MouseButton::Extra,
+    }
 }
 
 /// GDK modifier state to the Switch's HID modifier bitmask.
