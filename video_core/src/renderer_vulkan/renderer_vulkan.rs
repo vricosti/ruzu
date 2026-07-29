@@ -184,12 +184,39 @@ fn add_report_telemetry_fields(
 /// StateTracker, Scheduler, Swapchain, PresentManager, BlitScreen,
 /// RasterizerVulkan, TurboMode) which are all declared in sibling modules.
 pub struct RendererVulkan {
+    // Rust drops fields in declaration order, unlike C++'s reverse declaration
+    // order. Keep Vulkan owners here in upstream destruction order: dependent
+    // resources, device, surface, then instance.
+    /// Applet capture frame. Its raw Vulkan handles are released in `Drop`.
+    applet_frame: Frame,
+    /// Whether turbo mode is enabled.
+    turbo_mode_enabled: bool,
+    /// Vulkan rasterizer owner.
+    rasterizer: super::RasterizerVulkan,
+    /// Applet capture blit/composition owner.
+    blit_applet: BlitScreen,
+    /// Screenshot/capture blit/composition owner.
+    blit_capture: BlitScreen,
+    /// Swapchain blit/composition owner.
+    blit_swapchain: BlitScreen,
+    /// Presentation frame manager.
+    present_manager: PresentManager,
+    /// Presentation swapchain owner.
+    /// Shared with the present thread (upstream `Swapchain& swapchain` used
+    /// from `PresentThread` under `swapchain_mutex`).
+    swapchain: std::sync::Arc<std::sync::Mutex<Swapchain>>,
+    /// Presentation command scheduler.
+    scheduler: Scheduler,
+    /// Vulkan memory allocator owner.
+    memory_allocator: Box<MemoryAllocator>,
+    /// Physical/logical Vulkan device owner.
+    device: Device,
+    /// Presentation surface owner.
+    surface: OwnedSurface,
+    debug_messenger: vk::DebugUtilsMessengerEXT,
     /// Vulkan instance owner.
     instance: Instance,
-    debug_messenger: vk::DebugUtilsMessengerEXT,
-    surface_loader: ash::extensions::khr::Surface,
-    /// Surface for presentation.
-    surface: vk::SurfaceKHR,
+
     /// Shared Tegra device memory manager used by presentation uploads.
     device_memory: Arc<MaxwellDeviceMemoryManager>,
     /// Frontend visibility state used for upstream `render_window.IsShown()`.
@@ -200,41 +227,39 @@ pub struct RendererVulkan {
     frame_displayed_notify: Arc<dyn Fn() + Send + Sync>,
     /// Callback for upstream `gpu.RendererFrameEndNotify()`.
     frame_end_notify: Arc<dyn Fn() + Send + Sync>,
-    /// Physical/logical Vulkan device owner.
-    device: Device,
-    /// Presentation swapchain owner.
-    /// Shared with the present thread (upstream `Swapchain& swapchain` used
-    /// from `PresentThread` under `swapchain_mutex`).
-    swapchain: std::sync::Arc<std::sync::Mutex<Swapchain>>,
-    /// Presentation frame manager.
-    present_manager: PresentManager,
-    /// Presentation command scheduler.
-    scheduler: Scheduler,
-    /// Swapchain blit/composition owner.
-    blit_swapchain: BlitScreen,
-    /// Screenshot/capture blit/composition owner.
-    blit_capture: BlitScreen,
-    /// Applet capture blit/composition owner.
-    blit_applet: BlitScreen,
-    /// Vulkan rasterizer owner.
-    rasterizer: super::RasterizerVulkan,
-    /// Vulkan memory allocator owner.
-    ///
-    /// Declared after `rasterizer` so Rust drops the rasterizer first. This
-    /// mirrors upstream C++ field destruction, where `RasterizerVulkan`
-    /// references `RendererVulkan::memory_allocator`.
-    memory_allocator: Box<MemoryAllocator>,
     /// RendererBase shared state.
     base_data: RendererBaseData,
     /// Vulkan does not require a shared GL-style context.
     dummy_context: VulkanDummyContext,
-    /// Applet capture frame.
-    applet_frame: Frame,
-    /// Whether turbo mode is enabled.
-    turbo_mode_enabled: bool,
 }
 
 unsafe impl Send for RendererVulkan {}
+
+/// RAII counterpart of upstream `vk::SurfaceKHR`.
+///
+/// It is a separate owner so Rust can destroy the surface after the logical
+/// device and before the instance, matching the effective C++ member order.
+struct OwnedSurface {
+    loader: ash::extensions::khr::Surface,
+    handle: vk::SurfaceKHR,
+}
+
+impl OwnedSurface {
+    fn new(loader: ash::extensions::khr::Surface, handle: vk::SurfaceKHR) -> Self {
+        Self { loader, handle }
+    }
+}
+
+impl Drop for OwnedSurface {
+    fn drop(&mut self) {
+        if self.handle != vk::SurfaceKHR::null() {
+            unsafe {
+                self.loader.destroy_surface(self.handle, None);
+            }
+            self.handle = vk::SurfaceKHR::null();
+        }
+    }
+}
 
 struct VulkanDummyContext;
 
@@ -272,11 +297,12 @@ impl RendererVulkan {
             display_connection: window_info.display_connection as *mut std::ffi::c_void,
             render_surface: window_info.render_surface as *mut std::ffi::c_void,
         };
-        let surface = unsafe {
+        let surface_handle = unsafe {
             vulkan_surface::create_surface(&instance.entry, &instance.instance, &surface_info)?
         };
         let surface_loader =
             ash::extensions::khr::Surface::new(&instance.entry, &instance.instance);
+        let surface = OwnedSurface::new(surface_loader, surface_handle);
 
         let physical_device = select_physical_device(&instance.instance)?;
         let memory_properties = unsafe {
@@ -290,7 +316,7 @@ impl RendererVulkan {
                 .get_physical_device_properties(physical_device)
         };
 
-        let device = create_device(&instance.instance, physical_device, surface)?;
+        let device = create_device(&instance.instance, physical_device, surface.handle)?;
         let mut memory_allocator = Box::new(MemoryAllocator::new(
             device.get_logical().clone(),
             memory_properties,
@@ -307,8 +333,8 @@ impl RendererVulkan {
         let submit_mutex = scheduler.submit_mutex();
         let swapchain = Swapchain::new(
             &instance.instance,
-            surface_loader.clone(),
-            surface,
+            surface.loader.clone(),
+            surface.handle,
             &device,
             submit_mutex.clone(),
             drawable_size.0.max(1),
@@ -391,28 +417,27 @@ impl RendererVulkan {
         })?;
 
         let renderer = RendererVulkan {
-            instance,
-            debug_messenger: vk::DebugUtilsMessengerEXT::null(),
-            surface_loader,
+            applet_frame: Frame::default(),
+            turbo_mode_enabled: false,
+            rasterizer,
+            blit_applet,
+            blit_capture,
+            blit_swapchain,
+            present_manager,
+            swapchain,
+            scheduler,
+            memory_allocator,
+            device,
             surface,
+            debug_messenger: vk::DebugUtilsMessengerEXT::null(),
+            instance,
             device_memory,
             window_shown,
             framebuffer_layout,
             frame_displayed_notify,
             frame_end_notify,
-            device,
-            swapchain,
-            present_manager,
-            scheduler,
-            blit_swapchain,
-            blit_capture,
-            blit_applet,
-            rasterizer,
-            memory_allocator,
             base_data: RendererBaseData::new(),
             dummy_context: VulkanDummyContext,
-            applet_frame: Frame::default(),
-            turbo_mode_enabled: false,
         };
         renderer.report(telemetry_session);
         Ok(renderer)
@@ -780,10 +805,6 @@ impl Drop for RendererVulkan {
                     .get_logical()
                     .destroy_image_view(self.applet_frame.image_view, None);
                 self.applet_frame.image_view = vk::ImageView::null();
-            }
-            if self.surface != vk::SurfaceKHR::null() {
-                self.surface_loader.destroy_surface(self.surface, None);
-                self.surface = vk::SurfaceKHR::null();
             }
         }
     }
