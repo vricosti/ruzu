@@ -96,6 +96,14 @@ static SCHEDULER_LOCK_PTR: std::sync::atomic::AtomicPtr<
     super::k_scheduler_lock::KAbstractSchedulerLock,
 > = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
+#[cfg(test)]
+std::thread_local! {
+    static SCOPED_TEST_KERNEL_PTR: std::cell::Cell<*mut KernelCore> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+    static SCOPED_TEST_KERNEL_ACTIVE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// Deferred `KThread::SetActiveCore()` updates that could not be applied
 /// immediately because the target thread mutex was still held.
 ///
@@ -114,6 +122,15 @@ struct TrackedServerManager {
 
 /// Public accessor for KERNEL_PTR — used by GSC to interrupt cores on thread state changes.
 pub fn get_kernel_ref() -> Option<&'static KernelCore> {
+    #[cfg(test)]
+    if let Some(ptr) = SCOPED_TEST_KERNEL_ACTIVE.with(|active| {
+        active
+            .get()
+            .then(|| SCOPED_TEST_KERNEL_PTR.with(std::cell::Cell::get))
+    }) {
+        return (!ptr.is_null()).then(|| unsafe { &*ptr });
+    }
+
     let ptr = KERNEL_PTR.load(Ordering::Acquire);
     if ptr.is_null() {
         None
@@ -124,10 +141,20 @@ pub fn get_kernel_ref() -> Option<&'static KernelCore> {
 
 /// Mutable accessor for KERNEL_PTR — used by code paths (e.g. KPageTableBase
 /// allocation paths) that need `&mut KernelCore` to call `memory_manager_mut()`.
-/// The kernel pointer is set once at startup and never reassigned, so the
-/// returned reference is valid for the duration of the program.
+/// In production, the kernel pointer is set once at startup and never
+/// reassigned, so the returned reference is valid for the duration of the
+/// program.
 #[allow(clippy::mut_from_ref)]
 pub fn get_kernel_mut() -> Option<&'static mut KernelCore> {
+    #[cfg(test)]
+    if let Some(ptr) = SCOPED_TEST_KERNEL_ACTIVE.with(|active| {
+        active
+            .get()
+            .then(|| SCOPED_TEST_KERNEL_PTR.with(std::cell::Cell::get))
+    }) {
+        return (!ptr.is_null()).then(|| unsafe { &mut *ptr });
+    }
+
     let ptr = KERNEL_PTR.load(Ordering::Acquire);
     if ptr.is_null() {
         None
@@ -136,17 +163,19 @@ pub fn get_kernel_mut() -> Option<&'static mut KernelCore> {
     }
 }
 
-/// Test-only owner that installs a minimal `KernelCore` in the global kernel
-/// pointer without running full kernel initialization.
+/// Test-only owner that installs a minimal `KernelCore` in a thread-local
+/// override without running full kernel initialization.
 ///
 /// Unit tests for page-table allocation paths need upstream-shaped access to
 /// `KernelCore::MemoryManager()`, but `KernelCore::initialize()` starts broad
-/// scheduler/core state that is inappropriate for small native tests.
+/// scheduler/core state that is inappropriate for small native tests. The
+/// thread-local override prevents parallel native tests from replacing each
+/// other's process-global kernel pointer.
 #[cfg(test)]
 pub struct ScopedKernelForTest {
     kernel: Box<KernelCore>,
     previous: *mut KernelCore,
-    previous_scheduler_lock: *mut super::k_scheduler_lock::KAbstractSchedulerLock,
+    previous_active: bool,
 }
 
 #[cfg(test)]
@@ -154,13 +183,12 @@ impl ScopedKernelForTest {
     pub fn new() -> Self {
         let mut kernel = Box::new(KernelCore::new());
         let ptr = &mut *kernel as *mut KernelCore;
-        let previous = KERNEL_PTR.swap(ptr, Ordering::AcqRel);
-        let previous_scheduler_lock =
-            SCHEDULER_LOCK_PTR.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        let previous = SCOPED_TEST_KERNEL_PTR.with(|current| current.replace(ptr));
+        let previous_active = SCOPED_TEST_KERNEL_ACTIVE.with(|active| active.replace(true));
         Self {
             kernel,
             previous,
-            previous_scheduler_lock,
+            previous_active,
         }
     }
 
@@ -176,8 +204,8 @@ impl ScopedKernelForTest {
 #[cfg(test)]
 impl Drop for ScopedKernelForTest {
     fn drop(&mut self) {
-        SCHEDULER_LOCK_PTR.store(self.previous_scheduler_lock, Ordering::Release);
-        KERNEL_PTR.store(self.previous, Ordering::Release);
+        SCOPED_TEST_KERNEL_PTR.with(|current| current.set(self.previous));
+        SCOPED_TEST_KERNEL_ACTIVE.with(|active| active.set(self.previous_active));
     }
 }
 
@@ -185,9 +213,15 @@ impl Drop for ScopedKernelForTest {
 /// been initialized. Matches upstream `KScheduler::GetSchedulerLock(kernel)`.
 ///
 /// Safe to call from any site (SVC handlers, HLE threads, hardware timer
-/// callbacks). Returns `None` only before `KernelCore::initialize()` has
-/// run — i.e., unit-test harness entry paths before a kernel exists.
+/// callbacks). In production, returns `None` only before
+/// `KernelCore::initialize()` has run. Minimal scoped test kernels also return
+/// `None` because they do not initialize scheduler state.
 pub fn scheduler_lock() -> Option<&'static super::k_scheduler_lock::KAbstractSchedulerLock> {
+    #[cfg(test)]
+    if SCOPED_TEST_KERNEL_ACTIVE.with(std::cell::Cell::get) {
+        return None;
+    }
+
     let ptr = SCHEDULER_LOCK_PTR.load(Ordering::Acquire);
     if ptr.is_null() {
         None
@@ -2877,14 +2911,15 @@ impl KernelCore {
     /// Upstream: `Impl::GetCurrentHostThreadID()` (kernel.cpp:403-409).
     /// In single-core mode, if the calling thread is the single core thread,
     /// returns the current core index from CpuManager instead of the raw ID.
-    fn get_current_host_thread_id(&self) -> u32 {
+    pub fn get_current_host_thread_id(&self) -> u32 {
         let this_id = get_host_thread_id();
         if !self.is_multicore && this_id == self.single_core_thread_id.load(Ordering::Relaxed) {
-            // In single-core mode, the single core thread ID maps to the
-            // current core index. Upstream reads system.GetCpuManager().CurrentCore().
-            // We return 0 as default; CpuManager.current_core rotates this.
-            // Upstream: system.GetCpuManager().CurrentCore(). Defaults to 0 until wired.
-            return 0;
+            // Upstream: `system.GetCpuManager().CurrentCore()`.
+            return if self.system_ref.is_null() {
+                0
+            } else {
+                self.system_ref.get().get_cpu_manager().current_core() as u32
+            };
         }
         this_id
     }
@@ -3332,6 +3367,44 @@ impl KernelCore {
 mod tests {
     use super::*;
     use crate::core::SystemRef;
+
+    #[test]
+    fn scoped_test_kernels_are_isolated_per_host_thread() {
+        use std::sync::mpsc;
+
+        let first = ScopedKernelForTest::new();
+        let first_ptr = get_kernel_ref().unwrap() as *const KernelCore as usize;
+        let (second_ptr_tx, second_ptr_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _second = ScopedKernelForTest::new();
+            second_ptr_tx
+                .send(get_kernel_ref().unwrap() as *const KernelCore as usize)
+                .unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let second_ptr = second_ptr_rx.recv().unwrap();
+        assert_ne!(first_ptr, second_ptr);
+        assert_eq!(
+            get_kernel_ref().unwrap() as *const KernelCore as usize,
+            first_ptr
+        );
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+
+        let nested = ScopedKernelForTest::new();
+        assert_ne!(
+            get_kernel_ref().unwrap() as *const KernelCore as usize,
+            first_ptr
+        );
+        drop(nested);
+        assert_eq!(
+            get_kernel_ref().unwrap() as *const KernelCore as usize,
+            first_ptr
+        );
+        drop(first);
+    }
 
     #[test]
     fn close_services_requests_stop_on_tracked_server_managers() {

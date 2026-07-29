@@ -6,11 +6,11 @@
 //! An analog device factory that takes direction button devices and combines
 //! them into an analog device.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use common::input::{
-    self, AnalogProperties, AnalogStatus, CallbackStatus, InputCallback, InputDevice, InputType,
+    self, AnalogProperties, ButtonStatus, CallbackStatus, InputCallback, InputDevice, InputType,
     StickStatus,
 };
 use common::param_package::ParamPackage;
@@ -50,48 +50,6 @@ pub fn is_angle_smaller(old_angle: f32, new_angle: f32) -> bool {
         || (old_angle - TAU >= bottom_limit && old_angle - TAU < new_angle)
 }
 
-/// Sets goal_angle based on button directions.
-/// Port of Stick::SetGoalAngle
-pub fn compute_goal_angle(r: bool, l: bool, u: bool, d: bool) -> f32 {
-    let pi = common::math_util::PI;
-
-    // Move to the right
-    if r && !u && !d {
-        return 0.0;
-    }
-    // Move to the upper right
-    if r && u && !d {
-        return pi * 0.25;
-    }
-    // Move up
-    if u && !l && !r {
-        return pi * 0.5;
-    }
-    // Move to the upper left
-    if l && u && !d {
-        return pi * 0.75;
-    }
-    // Move to the left
-    if l && !u && !d {
-        return pi;
-    }
-    // Move to the bottom left
-    if l && !u && d {
-        return pi * 1.25;
-    }
-    // Move down
-    if d && !l && !r {
-        return pi * 1.5;
-    }
-    // Move to the bottom right
-    if r && !u && d {
-        return pi * 1.75;
-    }
-
-    // Default: no change
-    0.0
-}
-
 /// Port of the inner `Stick` class from stick_from_buttons.cpp.
 ///
 /// Handles angle interpolation for smooth diagonal transitions.
@@ -102,6 +60,13 @@ struct Stick {
     right: Box<dyn InputDevice>,
     modifier: Box<dyn InputDevice>,
     updater: Box<dyn InputDevice>,
+    state: Arc<Mutex<StickState>>,
+}
+
+type ChangeCallback = Arc<dyn Fn(&CallbackStatus) + Send + Sync>;
+type PendingChange = Option<(ChangeCallback, CallbackStatus)>;
+
+struct StickState {
     modifier_scale: f32,
     modifier_angle: f32,
     angle: f32,
@@ -113,31 +78,14 @@ struct Stick {
     right_status: bool,
     last_x_axis_value: f32,
     last_y_axis_value: f32,
-    modifier_value: bool,
-    modifier_toggle: bool,
-    modifier_locked: bool,
-    last_update: Instant,
-    callback: Mutex<InputCallback>,
+    modifier_status: ButtonStatus,
+    last_update: Option<Instant>,
+    callback: InputCallback,
 }
 
-impl Stick {
-    fn new(
-        up: Box<dyn InputDevice>,
-        down: Box<dyn InputDevice>,
-        left: Box<dyn InputDevice>,
-        right: Box<dyn InputDevice>,
-        modifier: Box<dyn InputDevice>,
-        updater: Box<dyn InputDevice>,
-        modifier_scale: f32,
-        modifier_angle: f32,
-    ) -> Self {
+impl StickState {
+    fn new(modifier_scale: f32, modifier_angle: f32) -> Self {
         Self {
-            up,
-            down,
-            left,
-            right,
-            modifier,
-            updater,
             modifier_scale,
             modifier_angle,
             angle: 0.0,
@@ -149,18 +97,18 @@ impl Stick {
             right_status: false,
             last_x_axis_value: 0.0,
             last_y_axis_value: 0.0,
-            modifier_value: false,
-            modifier_toggle: false,
-            modifier_locked: false,
-            last_update: Instant::now(),
-            callback: Mutex::new(InputCallback { on_change: None }),
+            modifier_status: ButtonStatus::default(),
+            last_update: None,
+            callback: InputCallback { on_change: None },
         }
     }
 
     fn get_angle(&self, now: Instant) -> f32 {
         let mut new_angle = self.angle;
 
-        let mut time_difference = now.duration_since(self.last_update).as_secs_f32();
+        let mut time_difference = self.last_update.map_or(0.5, |last_update| {
+            now.duration_since(last_update).as_secs_f32()
+        });
         if time_difference > 0.5 {
             time_difference = 0.5;
         }
@@ -188,10 +136,77 @@ impl Stick {
     }
 
     fn set_goal_angle(&mut self, r: bool, l: bool, u: bool, d: bool) {
-        self.goal_angle = compute_goal_angle(r, l, u, d);
+        let pi = common::math_util::PI;
+        if r && !u && !d {
+            self.goal_angle = 0.0;
+        }
+        if r && u && !d {
+            self.goal_angle = pi * 0.25;
+        }
+        if u && !l && !r {
+            self.goal_angle = pi * 0.5;
+        }
+        if l && u && !d {
+            self.goal_angle = pi * 0.75;
+        }
+        if l && !u && !d {
+            self.goal_angle = pi;
+        }
+        if l && !u && d {
+            self.goal_angle = pi * 1.25;
+        }
+        if d && !l && !r {
+            self.goal_angle = pi * 1.5;
+        }
+        if r && !u && d {
+            self.goal_angle = pi * 1.75;
+        }
     }
 
-    /// Upstream: `StickFromButtonDevice::GetStatus()` (stick_from_buttons.cpp:267-283).
+    fn update_up_button_status(&mut self, callback: &CallbackStatus) -> PendingChange {
+        self.up_status = callback.button_status.value;
+        self.update_status()
+    }
+
+    fn update_down_button_status(&mut self, callback: &CallbackStatus) -> PendingChange {
+        self.down_status = callback.button_status.value;
+        self.update_status()
+    }
+
+    fn update_left_button_status(&mut self, callback: &CallbackStatus) -> PendingChange {
+        self.left_status = callback.button_status.value;
+        self.update_status()
+    }
+
+    fn update_right_button_status(&mut self, callback: &CallbackStatus) -> PendingChange {
+        self.right_status = callback.button_status.value;
+        self.update_status()
+    }
+
+    fn update_mod_button_status(&mut self, callback: &CallbackStatus) -> PendingChange {
+        let new_status = callback.button_status;
+        let new_button_value = if new_status.inverted {
+            !new_status.value
+        } else {
+            new_status.value
+        };
+        self.modifier_status.toggle = new_status.toggle;
+
+        if !self.modifier_status.toggle {
+            self.modifier_status.locked = false;
+            self.modifier_status.value = new_button_value;
+        } else {
+            if new_button_value && !self.modifier_status.locked {
+                self.modifier_status.locked = true;
+                self.modifier_status.value = !self.modifier_status.value;
+            }
+            if !new_button_value && self.modifier_status.locked {
+                self.modifier_status.locked = false;
+            }
+        }
+        self.update_status()
+    }
+
     fn get_status(&self) -> StickStatus {
         let mut status = StickStatus::default();
         status.x.properties = STICK_PROPERTIES;
@@ -213,7 +228,7 @@ impl Stick {
         status
     }
 
-    fn update_status(&mut self) {
+    fn update_status(&mut self) -> PendingChange {
         let mut r = self.right_status;
         let mut l = self.left_status;
         let mut u = self.up_status;
@@ -231,7 +246,7 @@ impl Stick {
 
         // Move if a key is pressed
         if r || l || u || d {
-            self.amplitude = if self.modifier_value {
+            self.amplitude = if self.modifier_status.value {
                 self.modifier_scale
             } else {
                 MAX_RANGE
@@ -241,7 +256,9 @@ impl Stick {
         }
 
         let now = Instant::now();
-        let time_difference = now.duration_since(self.last_update).as_millis() as u64;
+        let time_difference = self.last_update.map_or(u128::MAX, |last_update| {
+            now.duration_since(last_update).as_millis()
+        });
 
         if time_difference < 10 {
             // Disable analog mode if inputs are too fast
@@ -252,7 +269,7 @@ impl Stick {
             self.set_goal_angle(r, l, u, d);
         }
 
-        self.last_update = now;
+        self.last_update = Some(now);
         let stick_status = self.get_status();
         self.last_x_axis_value = stick_status.x.raw_value;
         self.last_y_axis_value = stick_status.y.raw_value;
@@ -261,7 +278,87 @@ impl Stick {
             stick_status,
             ..Default::default()
         };
-        self.trigger_on_change(&status);
+        self.pending_change(status)
+    }
+
+    fn soft_update(&mut self) -> PendingChange {
+        let status = CallbackStatus {
+            input_type: InputType::Stick,
+            stick_status: self.get_status(),
+            ..Default::default()
+        };
+        if self.last_x_axis_value == status.stick_status.x.raw_value
+            && self.last_y_axis_value == status.stick_status.y.raw_value
+        {
+            return None;
+        }
+        self.last_x_axis_value = status.stick_status.x.raw_value;
+        self.last_y_axis_value = status.stick_status.y.raw_value;
+        self.pending_change(status)
+    }
+
+    fn pending_change(&self, status: CallbackStatus) -> PendingChange {
+        self.callback
+            .on_change
+            .as_ref()
+            .map(|callback| (Arc::clone(callback), status))
+    }
+}
+
+fn dispatch_pending(change: PendingChange) {
+    if let Some((callback, status)) = change {
+        callback(&status);
+    }
+}
+
+impl Stick {
+    fn new(
+        mut up: Box<dyn InputDevice>,
+        mut down: Box<dyn InputDevice>,
+        mut left: Box<dyn InputDevice>,
+        mut right: Box<dyn InputDevice>,
+        mut modifier: Box<dyn InputDevice>,
+        mut updater: Box<dyn InputDevice>,
+        modifier_scale: f32,
+        modifier_angle: f32,
+    ) -> Self {
+        let state = Arc::new(Mutex::new(StickState::new(modifier_scale, modifier_angle)));
+
+        macro_rules! set_button_callback {
+            ($device:ident, $method:ident) => {{
+                let state = Arc::clone(&state);
+                $device.set_callback(InputCallback {
+                    on_change: Some(Arc::new(move |callback| {
+                        let change = state.lock().unwrap().$method(callback);
+                        dispatch_pending(change);
+                    })),
+                });
+            }};
+        }
+        set_button_callback!(up, update_up_button_status);
+        set_button_callback!(down, update_down_button_status);
+        set_button_callback!(left, update_left_button_status);
+        set_button_callback!(right, update_right_button_status);
+        set_button_callback!(modifier, update_mod_button_status);
+        {
+            let state = Arc::clone(&state);
+            updater.set_callback(InputCallback {
+                on_change: Some(Arc::new(move |_| {
+                    let change = state.lock().unwrap().soft_update();
+                    dispatch_pending(change);
+                })),
+            });
+        }
+
+        Self {
+            up,
+            down,
+            left,
+            right,
+            modifier,
+            updater,
+            state,
+        }
     }
 }
 
@@ -275,13 +372,13 @@ impl InputDevice for Stick {
     }
 
     fn set_callback(&mut self, callback: InputCallback) {
-        *self.callback.lock().unwrap() = callback;
+        self.state.lock().unwrap().callback = callback;
     }
 
     fn trigger_on_change(&self, status: &CallbackStatus) {
-        let cb = self.callback.lock().unwrap();
-        if let Some(ref on_change) = cb.on_change {
-            on_change(status);
+        let callback = self.state.lock().unwrap().callback.on_change.clone();
+        if let Some(callback) = callback {
+            callback(status);
         }
     }
 }
@@ -340,5 +437,11 @@ impl StickFromButton {
 impl Default for StickFromButton {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl common::input::InputDeviceFactory for StickFromButton {
+    fn create(&self, params: &ParamPackage) -> Box<dyn InputDevice> {
+        StickFromButton::create(self, params)
     }
 }

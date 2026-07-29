@@ -34,7 +34,12 @@ pub fn page() -> Page {
     let engine_refs: Vec<&str> = engines.iter().map(String::as_str).collect();
     let engine_index = engines
         .iter()
-        .position(|name| name == common::settings::values().sink_id.get_value().canonicalize())
+        .position(|name| {
+            name == common::settings::values()
+                .sink_id
+                .get_value()
+                .canonicalize()
+        })
         .unwrap_or(0) as u32;
     let (engine_row, engine) = w::combo_row("Output Engine:", &engine_refs, engine_index);
     content.append(&engine_row);
@@ -46,7 +51,11 @@ pub fn page() -> Page {
     let (output_row, output_device) = w::combo_row(
         "Output Device:",
         &[AUTO_DEVICE],
-        if output_device_value == AUTO_DEVICE { 0 } else { 0 },
+        if output_device_value == AUTO_DEVICE {
+            0
+        } else {
+            0
+        },
     );
     content.append(&output_row);
 
@@ -62,8 +71,7 @@ pub fn page() -> Page {
     content.append(&mode_row);
 
     let volume_value = *common::settings::values().volume.get_value();
-    let (volume_row, volume, _) =
-        w::percent_slider_row("Volume:", volume_value as f64, 0.0, 200.0);
+    let (volume_row, volume, _) = w::percent_slider_row("Volume:", volume_value as f64, 0.0, 200.0);
     content.append(&volume_row);
 
     let mute = w::check_row(

@@ -62,7 +62,10 @@ pub fn available_import() -> Option<AvailableImport> {
         return None;
     }
 
-    log::info!("Found an importable yuzu configuration at {}", yuzu_dir.display());
+    log::info!(
+        "Found an importable yuzu configuration at {}",
+        yuzu_dir.display()
+    );
     Some(AvailableImport { yuzu_dir, ruzu_dir })
 }
 
@@ -150,7 +153,11 @@ fn import_from(yuzu_dir: &Path, ruzu_dir: &Path) {
         match fs::copy(&src, &dst) {
             Ok(_) => {
                 imported += 1;
-                log::info!("Imported yuzu config {} -> {}", src.display(), dst.display());
+                log::info!(
+                    "Imported yuzu config {} -> {}",
+                    src.display(),
+                    dst.display()
+                );
             }
             Err(e) => log::warn!("Failed to import {}: {e}", src.display()),
         }

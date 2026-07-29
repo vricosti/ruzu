@@ -115,7 +115,10 @@ pub struct Memory {
     /// Upstream owner: `rasterizer_write_areas[Core::Hardware::NUM_CPU_CORES]`.
     rasterizer_write_areas: [Mutex<GpuDirtyState>; hardware_properties::NUM_CPU_CORES as usize],
     /// Upstream owner: `std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers`.
-    gpu_dirty_managers: Vec<Arc<Mutex<GpuDirtyMemoryManager>>>,
+    gpu_dirty_managers: Vec<Arc<GpuDirtyMemoryManager>>,
+    /// Serializes non-core host threads sharing the last per-core GPU cache
+    /// slot. Upstream owner: `std::mutex sys_core_guard`.
+    sys_core_guard: Arc<Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -429,11 +432,12 @@ impl Memory {
             rasterizer_read_areas: new_rasterizer_read_areas(),
             rasterizer_write_areas: std::array::from_fn(|_| Mutex::new(GpuDirtyState::default())),
             gpu_dirty_managers: Vec::new(),
+            sys_core_guard: Arc::new(Mutex::new(())),
         }
     }
 
     /// Upstream: `Memory::SetGPUDirtyManagers(std::span<Core::GPUDirtyMemoryManager>)`.
-    pub fn set_gpu_dirty_managers(&mut self, managers: Vec<Arc<Mutex<GpuDirtyMemoryManager>>>) {
+    pub fn set_gpu_dirty_managers(&mut self, managers: Vec<Arc<GpuDirtyMemoryManager>>) {
         self.gpu_dirty_managers = managers;
     }
 
@@ -1135,6 +1139,8 @@ impl Memory {
             return;
         };
         let core = self.current_host_thread_cache_index();
+        let sys_core = hardware_properties::NUM_CPU_CORES as usize - 1;
+        let _sys_core_guard = (core == sys_core).then(|| self.sys_core_guard.lock().unwrap());
 
         let mut write = |device_addr: u64| {
             let subaddress = device_addr >> PAGE_BITS;
@@ -1151,7 +1157,7 @@ impl Memory {
             drop(write_area);
 
             if let Some(manager) = self.gpu_dirty_managers.get(core) {
-                manager.lock().unwrap().collect(device_addr, size);
+                manager.collect(device_addr, size);
             }
         };
 
@@ -1174,9 +1180,7 @@ impl Memory {
 
         self.system
             .get()
-            .kernel()
-            .map(|kernel| kernel.current_physical_core_index())
-            .unwrap_or(0)
+            .current_host_thread_id()
             .min(hardware_properties::NUM_CPU_CORES as usize - 1)
     }
 
@@ -1379,9 +1383,12 @@ impl Memory {
             remaining -= block_size;
         }
 
+        let core = self.current_host_thread_cache_index();
+        let sys_core = hardware_properties::NUM_CPU_CORES as usize - 1;
         RasterizerWriteBatch {
             system: self.system,
-            dirty_manager: self.gpu_dirty_managers.first().cloned(),
+            dirty_manager: self.gpu_dirty_managers.get(core).cloned(),
+            sys_core_guard: (core == sys_core).then(|| Arc::clone(&self.sys_core_guard)),
             ranges,
         }
     }
@@ -2795,7 +2802,9 @@ unsafe fn cmpxchg16b(
 /// been released, mirroring upstream's lock-free `PerformCacheOperation`.
 pub struct RasterizerWriteBatch {
     system: SystemRef,
-    dirty_manager: Option<Arc<Mutex<GpuDirtyMemoryManager>>>,
+    dirty_manager: Option<Arc<GpuDirtyMemoryManager>>,
+    /// Upstream's `sys_core_guard`, retained by deferred system-slot writes.
+    sys_core_guard: Option<Arc<Mutex<()>>>,
     /// Merged `(device_addr, size)` ranges of rasterizer-cached pages.
     ranges: Vec<(u64, usize)>,
 }
@@ -2804,6 +2813,10 @@ impl RasterizerWriteBatch {
     /// Notify the rasterizer for every collected range. Same per-range logic
     /// as `Memory::handle_rasterizer_write`, without touching `Memory` state.
     pub fn apply(self) {
+        let _sys_core_guard = self
+            .sys_core_guard
+            .as_ref()
+            .map(|guard| guard.lock().unwrap());
         for (device_addr, size) in self.ranges {
             let do_collection = self.system.is_null()
                 || self
@@ -2816,9 +2829,49 @@ impl RasterizerWriteBatch {
                 continue;
             }
             if let Some(manager) = &self.dirty_manager {
-                manager.lock().unwrap().collect(device_addr, size);
+                manager.collect(device_addr, size);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod rasterizer_write_batch_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn system_slot_batch_waits_for_sys_core_guard() {
+        let manager = Arc::new(GpuDirtyMemoryManager::new());
+        let sys_core_guard = Arc::new(Mutex::new(()));
+        let held_guard = sys_core_guard.lock().unwrap();
+        let batch = RasterizerWriteBatch {
+            system: SystemRef::null(),
+            dirty_manager: Some(Arc::clone(&manager)),
+            sys_core_guard: Some(Arc::clone(&sys_core_guard)),
+            ranges: vec![(0x4000, 64)],
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            batch.apply();
+            done_tx.send(()).unwrap();
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "system-slot batch bypassed sys_core_guard"
+        );
+        drop(held_guard);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("system-slot batch did not resume after guard release");
+        worker.join().unwrap();
+
+        let mut ranges = Vec::new();
+        manager.gather(&mut |address, size| ranges.push((address, size)));
+        assert_eq!(ranges, vec![(0x4000, 64)]);
     }
 }
 

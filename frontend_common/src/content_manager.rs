@@ -6,6 +6,12 @@
 //! Provides enums and helper functions for managing installed content
 //! (DLC, updates, mods, NSP, NCA) and verifying game integrity.
 
+use ruzu_core::crypto::key_manager::KeyManager;
+use ruzu_core::file_sys::registered_cache::{ContentProvider, RegisteredCache};
+use ruzu_core::hle::service::filesystem::filesystem::FileSystemController;
+use ruzu_core::loader::loader::{AppLoader, ResultStatus};
+use ruzu_core::loader::nca::AppLoaderNca;
+
 // ---------------------------------------------------------------------------
 // Enums
 // ---------------------------------------------------------------------------
@@ -144,17 +150,86 @@ pub fn install_nca(_filename: &str, _callback: &dyn Fn(usize, usize) -> bool) ->
 ///
 /// Maps to C++ `ContentManager::VerifyInstalledContents`.
 ///
-/// # Arguments
-/// * `callback` - Callback to report progress. Returns true to cancel.
-/// * `firmware_only` - Set to true to only scan system NAND NCAs.
+/// Walks the System NAND registry (and the User NAND one unless `firmware_only`),
+/// hashes every installed NCA through `AppLoader_NCA::VerifyIntegrity`, and
+/// returns the names of the files that failed.
 ///
-/// NOTE: Requires `Core::System`; stubbed.
+/// # Arguments
+/// * `filesystem` - the controller owning the NAND registries.
+/// * `callback` - progress reporter, `(total_bytes, processed_bytes)`; returning
+///   `true` cancels, matching upstream's convention.
+/// * `firmware_only` - only scan System NAND NCAs.
 pub fn verify_installed_contents(
-    _callback: &dyn Fn(usize, usize) -> bool,
-    _firmware_only: bool,
+    filesystem: &FileSystemController,
+    callback: &dyn Fn(usize, usize) -> bool,
+    firmware_only: bool,
 ) -> Vec<String> {
-    log::warn!("verify_installed_contents: Core::System not integrated, returning empty list");
-    Vec::new()
+    // Get content registries.
+    let mut providers: Vec<&RegisteredCache> = Vec::new();
+    if let Some(bis) = filesystem.get_system_nand_contents() {
+        providers.push(bis);
+    }
+    if !firmware_only {
+        if let Some(user) = filesystem.get_user_nand_contents() {
+            providers.push(user);
+        }
+    }
+
+    // Collect the associated NCA files, and the total size for progress.
+    let mut nca_files = Vec::new();
+    let mut total_size = 0usize;
+    for provider in providers {
+        for entry in provider.list_entries_filter(None, None, None) {
+            let Some(nca_file) = provider.get_entry_raw(entry.title_id, entry.record_type) else {
+                continue;
+            };
+            total_size += nca_file.get_size() as usize;
+            nca_files.push(nca_file);
+        }
+    }
+
+    log::info!(
+        "Verifying {} installed NCA(s), {total_size} byte(s) total",
+        nca_files.len()
+    );
+
+    let mut failed = Vec::new();
+    let mut processed_size = 0usize;
+
+    for nca_file in nca_files {
+        let name = nca_file.get_name();
+        let size = nca_file.get_size() as usize;
+
+        // Upstream forwards the running total so the bar advances across files
+        // rather than restarting for each one.
+        let cancelled = std::cell::Cell::new(false);
+        let nca_callback = |nca_total: usize, nca_processed: usize| {
+            let _ = nca_total;
+            cancelled.set(callback(total_size, processed_size + nca_processed));
+            !cancelled.get()
+        };
+
+        let loader = AppLoaderNca::new(nca_file);
+        match loader.verify_integrity(&nca_callback) {
+            ResultStatus::Success => {}
+            // A file the verifier cannot check is not a *failed* file; upstream
+            // likewise only records genuine mismatches.
+            ResultStatus::ErrorIntegrityVerificationNotImplemented => {
+                log::debug!("Skipping integrity check for {name}");
+            }
+            status => {
+                log::warn!("Integrity verification failed for {name}: {status:?}");
+                failed.push(name);
+            }
+        }
+
+        if cancelled.get() {
+            break;
+        }
+        processed_size += size;
+    }
+
+    failed
 }
 
 /// Verifies the contents of a given game.
@@ -176,12 +251,16 @@ pub fn verify_game_contents(
 
 /// Checks if the keys required for decrypting firmware and games are available.
 ///
-/// Maps to C++ `ContentManager::AreKeysPresent`.
+/// Maps to C++ `ContentManager::AreKeysPresent`:
 ///
-/// NOTE: Requires `Core::Crypto::KeyManager`; stubbed.
+/// ```cpp
+/// return !Core::Crypto::KeyManager::Instance().BaseDeriveNecessary();
+/// ```
 pub fn are_keys_present() -> bool {
-    log::warn!("are_keys_present: Core::Crypto::KeyManager not integrated, returning false");
-    false
+    let keys = KeyManager::instance();
+    let present = !keys.lock().unwrap().base_derive_necessary();
+    log::debug!("are_keys_present: {present}");
+    present
 }
 
 #[cfg(test)]

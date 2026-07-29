@@ -91,7 +91,9 @@ pub fn page() -> Page {
     );
     let barrier_feedback_loops = w::check_row(
         "Barrier feedback loops",
-        *common::settings::values().barrier_feedback_loops.get_value(),
+        *common::settings::values()
+            .barrier_feedback_loops
+            .get_value(),
     );
     for check in [
         &async_presentation,
@@ -145,7 +147,9 @@ pub fn page() -> Page {
         values.use_reactive_flushing.set_value(reactive);
         values.use_asynchronous_shaders.set_value(shaders);
         values.use_fast_gpu_time.set_value(fast_gpu);
-        values.use_vulkan_driver_pipeline_cache.set_value(pipeline_cache);
+        values
+            .use_vulkan_driver_pipeline_cache
+            .set_value(pipeline_cache);
         values.use_video_framerate.set_value(framerate);
         values.barrier_feedback_loops.set_value(barriers);
         values.enable_compute_pipelines.set_value(compute);

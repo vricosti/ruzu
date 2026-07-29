@@ -12,6 +12,7 @@ pub mod joycon;
 pub mod keyboard;
 pub mod mouse;
 pub mod sdl_driver;
+pub mod sdl_joystick;
 pub mod tas_input;
 pub mod touch_screen;
 pub mod udp_client;

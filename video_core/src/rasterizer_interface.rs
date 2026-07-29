@@ -7,6 +7,8 @@
 //! Abstract interface for GPU rasterizer backends. Each renderer
 //! (Null, OpenGL, Vulkan) provides its own implementation.
 
+use std::sync::Arc;
+
 use crate::control::channel_state::ChannelState;
 use crate::engines::draw_manager::{Maxwell3DClearView, Maxwell3DDrawView, Maxwell3DIndirectView};
 use crate::engines::fermi_2d::{Config as Fermi2DConfig, Surface as Fermi2DSurface};
@@ -23,7 +25,8 @@ pub enum LoadCallbackStage {
 }
 
 /// Callback for disk resource loading progress.
-pub type DiskResourceLoadCallback = Box<dyn Fn(LoadCallbackStage, usize, usize)>;
+pub type DiskResourceLoadCallback =
+    Arc<dyn Fn(LoadCallbackStage, usize, usize) + Send + Sync + 'static>;
 
 /// Non-owning rasterizer pointer matching upstream `VideoCore::RasterizerInterface*`.
 ///
@@ -294,7 +297,7 @@ pub trait RasterizerInterface {
     // ── Disk resources ──────────────────────────────────────────────────
 
     /// Initialize disk cached resources for the game being emulated.
-    fn load_disk_resources(&mut self, _title_id: u64) {}
+    fn load_disk_resources(&mut self, _title_id: u64, _callback: DiskResourceLoadCallback) {}
 
     // ── Channel management ──────────────────────────────────────────────
 

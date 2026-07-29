@@ -290,7 +290,6 @@ impl KAbstractSchedulerLock {
     /// Lock the scheduler lock.
     /// Matches upstream `KAbstractSchedulerLock::Lock()`.
     pub fn lock(&self) {
-        let current_tid = super::kernel::get_current_thread_id_fast();
         let current_sched_id = current_sched_thread_id();
         if self.m_owner_thread.load(Ordering::Relaxed) == current_sched_id {
             debug_assert!(self.m_lock_count.get() > 0);
@@ -381,15 +380,6 @@ impl KAbstractSchedulerLock {
 
     pub fn get_lock_count(&self) -> i32 {
         self.m_lock_count.get()
-    }
-
-    /// Get the update_highest_priority_threads callback, if wired.
-    /// Returns None if callbacks use the default (noop).
-    pub fn get_update_callback(&self) -> Option<fn() -> u64> {
-        let f = self.callbacks.update_highest_priority_threads;
-        // Check if it's the default noop (returns 0 always).
-        // We can't distinguish at runtime, so always return it.
-        Some(f)
     }
 }
 

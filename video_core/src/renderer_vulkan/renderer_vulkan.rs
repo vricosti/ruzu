@@ -434,10 +434,10 @@ impl RendererVulkan {
     /// 8. Notify GPU of frame end
     /// 9. Tick rasterizer frame
     pub fn composite_impl(&mut self, framebuffers: &[FramebufferConfig]) {
-        let _frame_displayed = FrameDisplayedNotifyGuard::new(&self.frame_displayed_notify);
         if framebuffers.is_empty() {
             return;
         }
+        let _frame_displayed = FrameDisplayedNotifyGuard::new(&self.frame_displayed_notify);
         self.render_applet_capture_layer(framebuffers);
         if !should_present_window(&self.window_shown) {
             return;

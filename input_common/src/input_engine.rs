@@ -110,7 +110,7 @@ pub struct MappingData {
 // Port of `UpdateCallback` struct from input_engine.h
 
 pub struct UpdateCallback {
-    pub on_change: Option<Box<dyn Fn(&MappingData) + Send + Sync>>,
+    pub on_change: Option<Arc<dyn Fn(&MappingData) + Send + Sync>>,
 }
 
 impl std::fmt::Debug for UpdateCallback {
@@ -145,6 +145,31 @@ impl std::fmt::Debug for MappingCallback {
 // ---- InputIdentifier ----
 // Port of `InputIdentifier` struct from input_engine.h
 
+/// Callbacks that must run once the engine's lock has been released.
+///
+/// Upstream guards `controller_list` and `callback_list` with two separate
+/// mutexes, so a device's `OnChange` can read a value straight back while the
+/// engine is dispatching. This port keeps the whole engine behind one
+/// `Arc<Mutex<InputEngine>>`, and a driver calls it as
+/// `engine.lock().set_axis(..)` — dispatching from inside that call deadlocks
+/// the instant a device reads a value back, which is exactly what
+/// `InputFromStick::OnChange` does. The matching callbacks are handed to the
+/// caller instead, which runs them after its guard is gone.
+#[must_use = "the callbacks only run once dispatched, outside the engine lock"]
+pub struct PendingCallbacks {
+    event: MappingData,
+    callbacks: Vec<Arc<dyn Fn(&MappingData) + Send + Sync>>,
+}
+
+impl PendingCallbacks {
+    /// Run the callbacks. Call this with no engine lock held.
+    pub fn dispatch(self) {
+        for callback in self.callbacks {
+            callback(&self.event);
+        }
+    }
+}
+
 pub struct InputIdentifier {
     pub identifier: PadIdentifier,
     pub r#type: EngineInputType,
@@ -167,6 +192,86 @@ struct ControllerData {
     nfc: NfcStatus,
 }
 
+/// Rust counterpart of the virtual output methods on upstream `InputEngine`.
+///
+/// Drivers still own their output behavior; the concrete driver installs one
+/// implementation in the composed `InputEngine`, preserving the C++ virtual
+/// dispatch without making the input-state container itself driver-specific.
+pub trait InputEngineOutput: Send + Sync {
+    fn set_leds(&self, _identifier: &PadIdentifier, _status: &LedStatus) -> DriverResult {
+        DriverResult::NotSupported
+    }
+
+    fn set_vibration(
+        &self,
+        _identifier: &PadIdentifier,
+        _status: &VibrationStatus,
+    ) -> DriverResult {
+        DriverResult::NotSupported
+    }
+
+    fn is_vibration_enabled(&self, _identifier: &PadIdentifier) -> bool {
+        false
+    }
+
+    fn set_polling_mode(&self, _identifier: &PadIdentifier, _mode: PollingMode) -> DriverResult {
+        DriverResult::NotSupported
+    }
+
+    fn set_camera_format(
+        &self,
+        _identifier: &PadIdentifier,
+        _format: CameraFormat,
+    ) -> DriverResult {
+        DriverResult::NotSupported
+    }
+
+    fn supports_nfc(&self, _identifier: &PadIdentifier) -> NfcState {
+        NfcState::NotSupported
+    }
+
+    fn start_nfc_polling(&self, _identifier: &PadIdentifier) -> NfcState {
+        NfcState::NotSupported
+    }
+
+    fn stop_nfc_polling(&self, _identifier: &PadIdentifier) -> NfcState {
+        NfcState::NotSupported
+    }
+
+    fn read_amiibo_data(&self, _identifier: &PadIdentifier, _out_data: &mut Vec<u8>) -> NfcState {
+        NfcState::NotSupported
+    }
+
+    fn write_nfc_data(&self, _identifier: &PadIdentifier, _data: &[u8]) -> NfcState {
+        NfcState::NotSupported
+    }
+
+    fn read_mifare_data(
+        &self,
+        _identifier: &PadIdentifier,
+        _request: &MifareRequest,
+        _out_data: &mut MifareRequest,
+    ) -> NfcState {
+        NfcState::NotSupported
+    }
+
+    fn write_mifare_data(&self, _identifier: &PadIdentifier, _request: &MifareRequest) -> NfcState {
+        NfcState::NotSupported
+    }
+}
+
+/// Rust counterpart of the input-query virtuals overridden by concrete
+/// upstream `InputEngine` subclasses.
+pub trait InputEngineMetadata: Send + Sync {
+    fn get_hat_button_name(&self, _direction_value: u8) -> String {
+        "Unknown".to_string()
+    }
+
+    fn get_hat_button_id(&self, _direction_name: &str) -> u8 {
+        0
+    }
+}
+
 // ---- InputEngine ----
 // Port of `InputEngine` class from input_engine.h / input_engine.cpp
 
@@ -179,6 +284,8 @@ pub struct InputEngine {
     controller_list: HashMap<PadIdentifier, ControllerData>,
     callback_list: HashMap<i32, InputIdentifier>,
     mapping_callback: MappingCallback,
+    metadata: Option<Arc<dyn InputEngineMetadata>>,
+    output: Option<Arc<dyn InputEngineOutput>>,
 }
 
 impl InputEngine {
@@ -192,6 +299,8 @@ impl InputEngine {
             controller_list: HashMap::new(),
             callback_list: HashMap::new(),
             mapping_callback: MappingCallback::default(),
+            metadata: None,
+            output: None,
         }
     }
 
@@ -215,6 +324,125 @@ impl InputEngine {
     /// Port of InputEngine::GetEngineName
     pub fn get_engine_name(&self) -> &str {
         &self.input_engine
+    }
+
+    pub fn set_output_handler(&mut self, output: Arc<dyn InputEngineOutput>) {
+        self.output = Some(output);
+    }
+
+    pub fn set_metadata_handler(&mut self, metadata: Arc<dyn InputEngineMetadata>) {
+        self.metadata = Some(metadata);
+    }
+
+    pub fn set_leds(&self, identifier: &PadIdentifier, status: &LedStatus) -> DriverResult {
+        self.output
+            .as_ref()
+            .map_or(DriverResult::NotSupported, |output| {
+                output.set_leds(identifier, status)
+            })
+    }
+
+    pub fn set_vibration(
+        &self,
+        identifier: &PadIdentifier,
+        status: &VibrationStatus,
+    ) -> DriverResult {
+        self.output
+            .as_ref()
+            .map_or(DriverResult::NotSupported, |output| {
+                output.set_vibration(identifier, status)
+            })
+    }
+
+    pub fn is_vibration_enabled(&self, identifier: &PadIdentifier) -> bool {
+        self.output
+            .as_ref()
+            .is_some_and(|output| output.is_vibration_enabled(identifier))
+    }
+
+    pub fn set_polling_mode(&self, identifier: &PadIdentifier, mode: PollingMode) -> DriverResult {
+        self.output
+            .as_ref()
+            .map_or(DriverResult::NotSupported, |output| {
+                output.set_polling_mode(identifier, mode)
+            })
+    }
+
+    pub fn set_camera_format(
+        &self,
+        identifier: &PadIdentifier,
+        format: CameraFormat,
+    ) -> DriverResult {
+        self.output
+            .as_ref()
+            .map_or(DriverResult::NotSupported, |output| {
+                output.set_camera_format(identifier, format)
+            })
+    }
+
+    pub fn supports_nfc(&self, identifier: &PadIdentifier) -> NfcState {
+        self.output
+            .as_ref()
+            .map_or(NfcState::NotSupported, |output| {
+                output.supports_nfc(identifier)
+            })
+    }
+
+    pub fn start_nfc_polling(&self, identifier: &PadIdentifier) -> NfcState {
+        self.output
+            .as_ref()
+            .map_or(NfcState::NotSupported, |output| {
+                output.start_nfc_polling(identifier)
+            })
+    }
+
+    pub fn stop_nfc_polling(&self, identifier: &PadIdentifier) -> NfcState {
+        self.output
+            .as_ref()
+            .map_or(NfcState::NotSupported, |output| {
+                output.stop_nfc_polling(identifier)
+            })
+    }
+
+    pub fn read_amiibo_data(&self, identifier: &PadIdentifier, out_data: &mut Vec<u8>) -> NfcState {
+        self.output
+            .as_ref()
+            .map_or(NfcState::NotSupported, |output| {
+                output.read_amiibo_data(identifier, out_data)
+            })
+    }
+
+    pub fn write_nfc_data(&self, identifier: &PadIdentifier, data: &[u8]) -> NfcState {
+        self.output
+            .as_ref()
+            .map_or(NfcState::NotSupported, |output| {
+                output.write_nfc_data(identifier, data)
+            })
+    }
+
+    pub fn read_mifare_data(
+        &self,
+        identifier: &PadIdentifier,
+        request: &MifareRequest,
+        out_data: &mut MifareRequest,
+    ) -> NfcState {
+        self.output
+            .as_ref()
+            .map_or(NfcState::NotSupported, |output| {
+                output.read_mifare_data(identifier, request, out_data)
+            })
+    }
+
+    pub fn write_mifare_data(
+        &self,
+        identifier: &PadIdentifier,
+        request: &MifareRequest,
+    ) -> NfcState {
+        self.output
+            .as_ref()
+            .map_or(NfcState::NotSupported, |output| {
+                output.write_mifare_data(identifier, request)
+            })
     }
 
     // ---- Pre-set methods ----
@@ -260,7 +488,12 @@ impl InputEngine {
     // ---- Set methods (protected in C++) ----
 
     /// Port of InputEngine::SetButton
-    pub fn set_button(&mut self, identifier: &PadIdentifier, button: i32, value: bool) {
+    pub fn set_button(
+        &mut self,
+        identifier: &PadIdentifier,
+        button: i32,
+        value: bool,
+    ) -> PendingCallbacks {
         {
             let _lock = self.mutex.lock();
             if let Some(controller) = self.controller_list.get_mut(identifier) {
@@ -269,11 +502,16 @@ impl InputEngine {
                 }
             }
         }
-        self.trigger_on_button_change(identifier, button, value);
+        self.trigger_on_button_change(identifier, button, value)
     }
 
     /// Port of InputEngine::SetHatButton
-    pub fn set_hat_button(&mut self, identifier: &PadIdentifier, button: i32, value: u8) {
+    pub fn set_hat_button(
+        &mut self,
+        identifier: &PadIdentifier,
+        button: i32,
+        value: u8,
+    ) -> PendingCallbacks {
         {
             let _lock = self.mutex.lock();
             if let Some(controller) = self.controller_list.get_mut(identifier) {
@@ -282,11 +520,16 @@ impl InputEngine {
                 }
             }
         }
-        self.trigger_on_hat_button_change(identifier, button, value);
+        self.trigger_on_hat_button_change(identifier, button, value)
     }
 
     /// Port of InputEngine::SetAxis
-    pub fn set_axis(&mut self, identifier: &PadIdentifier, axis: i32, value: f32) {
+    pub fn set_axis(
+        &mut self,
+        identifier: &PadIdentifier,
+        axis: i32,
+        value: f32,
+    ) -> PendingCallbacks {
         {
             let _lock = self.mutex.lock();
             if let Some(controller) = self.controller_list.get_mut(identifier) {
@@ -295,11 +538,15 @@ impl InputEngine {
                 }
             }
         }
-        self.trigger_on_axis_change(identifier, axis, value);
+        self.trigger_on_axis_change(identifier, axis, value)
     }
 
     /// Port of InputEngine::SetBattery
-    pub fn set_battery(&mut self, identifier: &PadIdentifier, value: BatteryLevel) {
+    pub fn set_battery(
+        &mut self,
+        identifier: &PadIdentifier,
+        value: BatteryLevel,
+    ) -> PendingCallbacks {
         {
             let _lock = self.mutex.lock();
             if let Some(controller) = self.controller_list.get_mut(identifier) {
@@ -308,11 +555,15 @@ impl InputEngine {
                 }
             }
         }
-        self.trigger_on_battery_change(identifier, value);
+        self.trigger_on_battery_change(identifier, value)
     }
 
     /// Port of InputEngine::SetColor
-    pub fn set_color(&mut self, identifier: &PadIdentifier, value: BodyColorStatus) {
+    pub fn set_color(
+        &mut self,
+        identifier: &PadIdentifier,
+        value: BodyColorStatus,
+    ) -> PendingCallbacks {
         {
             let _lock = self.mutex.lock();
             if let Some(controller) = self.controller_list.get_mut(identifier) {
@@ -321,11 +572,16 @@ impl InputEngine {
                 }
             }
         }
-        self.trigger_on_color_change(identifier, value);
+        self.trigger_on_color_change(identifier, value)
     }
 
     /// Port of InputEngine::SetMotion
-    pub fn set_motion(&mut self, identifier: &PadIdentifier, motion: i32, value: &BasicMotion) {
+    pub fn set_motion(
+        &mut self,
+        identifier: &PadIdentifier,
+        motion: i32,
+        value: &BasicMotion,
+    ) -> PendingCallbacks {
         {
             let _lock = self.mutex.lock();
             if let Some(controller) = self.controller_list.get_mut(identifier) {
@@ -334,11 +590,15 @@ impl InputEngine {
                 }
             }
         }
-        self.trigger_on_motion_change(identifier, motion, value);
+        self.trigger_on_motion_change(identifier, motion, value)
     }
 
     /// Port of InputEngine::SetCamera
-    pub fn set_camera(&mut self, identifier: &PadIdentifier, value: &CameraStatus) {
+    pub fn set_camera(
+        &mut self,
+        identifier: &PadIdentifier,
+        value: &CameraStatus,
+    ) -> PendingCallbacks {
         {
             let _lock = self.mutex.lock();
             if let Some(controller) = self.controller_list.get_mut(identifier) {
@@ -347,11 +607,11 @@ impl InputEngine {
                 }
             }
         }
-        self.trigger_on_camera_change(identifier, value);
+        self.trigger_on_camera_change(identifier, value)
     }
 
     /// Port of InputEngine::SetNfc
-    pub fn set_nfc(&mut self, identifier: &PadIdentifier, value: &NfcStatus) {
+    pub fn set_nfc(&mut self, identifier: &PadIdentifier, value: &NfcStatus) -> PendingCallbacks {
         {
             let _lock = self.mutex.lock();
             if let Some(controller) = self.controller_list.get_mut(identifier) {
@@ -360,7 +620,7 @@ impl InputEngine {
                 }
             }
         }
-        self.trigger_on_nfc_change(identifier, value);
+        self.trigger_on_nfc_change(identifier, value)
     }
 
     // ---- Get methods ----
@@ -500,14 +760,15 @@ impl InputEngine {
     // ---- Reset methods ----
 
     /// Port of InputEngine::ResetButtonState
-    pub fn reset_button_state(&mut self) {
+    pub fn reset_button_state(&mut self) -> Vec<PendingCallbacks> {
         let pairs: Vec<_> = self
             .controller_list
             .iter()
             .flat_map(|(id, data)| data.buttons.keys().map(move |&button| (id.clone(), button)))
             .collect();
+        let mut pending = Vec::with_capacity(pairs.len());
         for (id, button) in pairs {
-            self.set_button(&id, button, false);
+            pending.push(self.set_button(&id, button, false));
         }
         let hat_pairs: Vec<_> = self
             .controller_list
@@ -518,21 +779,24 @@ impl InputEngine {
                     .map(move |&button| (id.clone(), button))
             })
             .collect();
+        pending.reserve(hat_pairs.len());
         for (id, button) in hat_pairs {
-            self.set_hat_button(&id, button, 0);
+            pending.push(self.set_hat_button(&id, button, 0));
         }
+        pending
     }
 
     /// Port of InputEngine::ResetAnalogState
-    pub fn reset_analog_state(&mut self) {
+    pub fn reset_analog_state(&mut self) -> Vec<PendingCallbacks> {
         let pairs: Vec<_> = self
             .controller_list
             .iter()
             .flat_map(|(id, data)| data.axes.keys().map(move |&axis| (id.clone(), axis)))
             .collect();
-        for (id, axis) in pairs {
-            self.set_axis(&id, axis, 0.0);
-        }
+        pairs
+            .into_iter()
+            .map(|(id, axis)| self.set_axis(&id, axis, 0.0))
+            .collect()
     }
 
     // ---- Callback management ----
@@ -563,15 +827,30 @@ impl InputEngine {
     // ---- Virtual methods with default implementations ----
     // These would be overridden by concrete driver types via trait or manual dispatch.
 
-    /// Port of InputEngine::GetHatButtonName (virtual, default "Unknown")
-    pub fn get_hat_button_name(&self, _direction_value: u8) -> String {
-        "Unknown".to_string()
+    /// Port of InputEngine::GetHatButtonName (virtual, default "Unknown").
+    pub fn get_hat_button_name(&self, direction_value: u8) -> String {
+        self.metadata.as_ref().map_or_else(
+            || "Unknown".to_string(),
+            |metadata| metadata.get_hat_button_name(direction_value),
+        )
+    }
+
+    /// Port of InputEngine::GetHatButtonId (virtual, default zero).
+    pub fn get_hat_button_id(&self, direction_name: &str) -> u8 {
+        self.metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.get_hat_button_id(direction_name))
     }
 
     // ---- Trigger methods (private in C++) ----
 
     /// Port of InputEngine::TriggerOnButtonChange
-    fn trigger_on_button_change(&self, identifier: &PadIdentifier, button: i32, value: bool) {
+    fn trigger_on_button_change(
+        &self,
+        identifier: &PadIdentifier,
+        button: i32,
+        value: bool,
+    ) -> PendingCallbacks {
         let _lock = self.mutex_callback.lock();
         let event = MappingData {
             engine: self.get_engine_name().to_string(),
@@ -581,28 +860,37 @@ impl InputEngine {
             button_value: value,
             ..Default::default()
         };
-        for poller in self.callback_list.values() {
-            if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Button, button)
-            {
-                continue;
-            }
-            if let Some(ref on_change) = poller.callback.on_change {
-                on_change(&event);
-            }
-        }
+        let callbacks: Vec<_> = self
+            .callback_list
+            .values()
+            .filter(|poller| {
+                Self::is_input_identifier_equal(poller, identifier, EngineInputType::Button, button)
+            })
+            .filter_map(|poller| poller.callback.on_change.clone())
+            .collect();
+        let pending = PendingCallbacks {
+            event: event.clone(),
+            callbacks,
+        };
         if !self.configuring || self.mapping_callback.on_data.is_none() {
-            return;
+            return pending;
         }
         if value == self.get_button(identifier, button) {
-            return;
+            return pending;
         }
         if let Some(ref on_data) = self.mapping_callback.on_data {
             on_data(&event);
         }
+        pending
     }
 
     /// Port of InputEngine::TriggerOnHatButtonChange
-    fn trigger_on_hat_button_change(&self, identifier: &PadIdentifier, button: i32, value: u8) {
+    fn trigger_on_hat_button_change(
+        &self,
+        identifier: &PadIdentifier,
+        button: i32,
+        value: u8,
+    ) -> PendingCallbacks {
         let _lock = self.mutex_callback.lock();
         let event = MappingData {
             engine: self.get_engine_name().to_string(),
@@ -612,21 +900,22 @@ impl InputEngine {
             button_value: value != 0,
             ..Default::default()
         };
-        for poller in self.callback_list.values() {
-            if !Self::is_input_identifier_equal(
-                poller,
-                identifier,
-                EngineInputType::HatButton,
-                button,
-            ) {
-                continue;
-            }
-            if let Some(ref on_change) = poller.callback.on_change {
-                on_change(&event);
-            }
-        }
+        let callbacks: Vec<_> = self
+            .callback_list
+            .values()
+            .filter(|poller| {
+                Self::is_input_identifier_equal(
+                    poller,
+                    identifier,
+                    EngineInputType::HatButton,
+                    button,
+                )
+            })
+            .filter_map(|poller| poller.callback.on_change.clone())
+            .collect();
+        let pending = PendingCallbacks { event, callbacks };
         if !self.configuring || self.mapping_callback.on_data.is_none() {
-            return;
+            return pending;
         }
         let mut index: usize = 1;
         while index < 0xff {
@@ -647,10 +936,16 @@ impl InputEngine {
             }
             index <<= 1;
         }
+        pending
     }
 
     /// Port of InputEngine::TriggerOnAxisChange
-    fn trigger_on_axis_change(&self, identifier: &PadIdentifier, axis: i32, value: f32) {
+    fn trigger_on_axis_change(
+        &self,
+        identifier: &PadIdentifier,
+        axis: i32,
+        value: f32,
+    ) -> PendingCallbacks {
         let _lock = self.mutex_callback.lock();
         let event = MappingData {
             engine: self.get_engine_name().to_string(),
@@ -660,27 +955,36 @@ impl InputEngine {
             axis_value: value,
             ..Default::default()
         };
-        for poller in self.callback_list.values() {
-            if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Analog, axis) {
-                continue;
-            }
-            if let Some(ref on_change) = poller.callback.on_change {
-                on_change(&event);
-            }
-        }
+        let callbacks: Vec<_> = self
+            .callback_list
+            .values()
+            .filter(|poller| {
+                Self::is_input_identifier_equal(poller, identifier, EngineInputType::Analog, axis)
+            })
+            .filter_map(|poller| poller.callback.on_change.clone())
+            .collect();
+        let pending = PendingCallbacks {
+            event: event.clone(),
+            callbacks,
+        };
         if !self.configuring || self.mapping_callback.on_data.is_none() {
-            return;
+            return pending;
         }
         if (value - self.get_axis(identifier, axis)).abs() < 0.5 {
-            return;
+            return pending;
         }
         if let Some(ref on_data) = self.mapping_callback.on_data {
             on_data(&event);
         }
+        pending
     }
 
     /// Port of InputEngine::TriggerOnBatteryChange
-    fn trigger_on_battery_change(&self, identifier: &PadIdentifier, _value: BatteryLevel) {
+    fn trigger_on_battery_change(
+        &self,
+        identifier: &PadIdentifier,
+        _value: BatteryLevel,
+    ) -> PendingCallbacks {
         let _lock = self.mutex_callback.lock();
         let event = MappingData {
             engine: self.get_engine_name().to_string(),
@@ -688,18 +992,23 @@ impl InputEngine {
             r#type: EngineInputType::Battery,
             ..Default::default()
         };
-        for poller in self.callback_list.values() {
-            if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Battery, 0) {
-                continue;
-            }
-            if let Some(ref on_change) = poller.callback.on_change {
-                on_change(&event);
-            }
-        }
+        let callbacks: Vec<_> = self
+            .callback_list
+            .values()
+            .filter(|poller| {
+                Self::is_input_identifier_equal(poller, identifier, EngineInputType::Battery, 0)
+            })
+            .filter_map(|poller| poller.callback.on_change.clone())
+            .collect();
+        PendingCallbacks { event, callbacks }
     }
 
     /// Port of InputEngine::TriggerOnColorChange
-    fn trigger_on_color_change(&self, identifier: &PadIdentifier, _value: BodyColorStatus) {
+    fn trigger_on_color_change(
+        &self,
+        identifier: &PadIdentifier,
+        _value: BodyColorStatus,
+    ) -> PendingCallbacks {
         let _lock = self.mutex_callback.lock();
         let event = MappingData {
             engine: self.get_engine_name().to_string(),
@@ -707,14 +1016,15 @@ impl InputEngine {
             r#type: EngineInputType::Color,
             ..Default::default()
         };
-        for poller in self.callback_list.values() {
-            if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Color, 0) {
-                continue;
-            }
-            if let Some(ref on_change) = poller.callback.on_change {
-                on_change(&event);
-            }
-        }
+        let callbacks: Vec<_> = self
+            .callback_list
+            .values()
+            .filter(|poller| {
+                Self::is_input_identifier_equal(poller, identifier, EngineInputType::Color, 0)
+            })
+            .filter_map(|poller| poller.callback.on_change.clone())
+            .collect();
+        PendingCallbacks { event, callbacks }
     }
 
     /// Port of InputEngine::TriggerOnMotionChange
@@ -723,7 +1033,7 @@ impl InputEngine {
         identifier: &PadIdentifier,
         motion: i32,
         value: &BasicMotion,
-    ) {
+    ) -> PendingCallbacks {
         let _lock = self.mutex_callback.lock();
         let event = MappingData {
             engine: self.get_engine_name().to_string(),
@@ -733,17 +1043,17 @@ impl InputEngine {
             motion_value: value.clone(),
             ..Default::default()
         };
-        for poller in self.callback_list.values() {
-            if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Motion, motion)
-            {
-                continue;
-            }
-            if let Some(ref on_change) = poller.callback.on_change {
-                on_change(&event);
-            }
-        }
+        let callbacks: Vec<_> = self
+            .callback_list
+            .values()
+            .filter(|poller| {
+                Self::is_input_identifier_equal(poller, identifier, EngineInputType::Motion, motion)
+            })
+            .filter_map(|poller| poller.callback.on_change.clone())
+            .collect();
+        let pending = PendingCallbacks { event, callbacks };
         if !self.configuring || self.mapping_callback.on_data.is_none() {
-            return;
+            return pending;
         }
         let old_value = self.get_motion(identifier, motion);
         let mut is_active = false;
@@ -760,7 +1070,7 @@ impl InputEngine {
             is_active = true;
         }
         if !is_active {
-            return;
+            return pending;
         }
         if let Some(ref on_data) = self.mapping_callback.on_data {
             on_data(&MappingData {
@@ -772,10 +1082,15 @@ impl InputEngine {
                 ..Default::default()
             });
         }
+        pending
     }
 
     /// Port of InputEngine::TriggerOnCameraChange
-    fn trigger_on_camera_change(&self, identifier: &PadIdentifier, _value: &CameraStatus) {
+    fn trigger_on_camera_change(
+        &self,
+        identifier: &PadIdentifier,
+        _value: &CameraStatus,
+    ) -> PendingCallbacks {
         let _lock = self.mutex_callback.lock();
         let event = MappingData {
             engine: self.get_engine_name().to_string(),
@@ -783,18 +1098,23 @@ impl InputEngine {
             r#type: EngineInputType::Camera,
             ..Default::default()
         };
-        for poller in self.callback_list.values() {
-            if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Camera, 0) {
-                continue;
-            }
-            if let Some(ref on_change) = poller.callback.on_change {
-                on_change(&event);
-            }
-        }
+        let callbacks: Vec<_> = self
+            .callback_list
+            .values()
+            .filter(|poller| {
+                Self::is_input_identifier_equal(poller, identifier, EngineInputType::Camera, 0)
+            })
+            .filter_map(|poller| poller.callback.on_change.clone())
+            .collect();
+        PendingCallbacks { event, callbacks }
     }
 
     /// Port of InputEngine::TriggerOnNfcChange
-    fn trigger_on_nfc_change(&self, identifier: &PadIdentifier, _value: &NfcStatus) {
+    fn trigger_on_nfc_change(
+        &self,
+        identifier: &PadIdentifier,
+        _value: &NfcStatus,
+    ) -> PendingCallbacks {
         let _lock = self.mutex_callback.lock();
         let event = MappingData {
             engine: self.get_engine_name().to_string(),
@@ -802,14 +1122,15 @@ impl InputEngine {
             r#type: EngineInputType::Nfc,
             ..Default::default()
         };
-        for poller in self.callback_list.values() {
-            if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Nfc, 0) {
-                continue;
-            }
-            if let Some(ref on_change) = poller.callback.on_change {
-                on_change(&event);
-            }
-        }
+        let callbacks: Vec<_> = self
+            .callback_list
+            .values()
+            .filter(|poller| {
+                Self::is_input_identifier_equal(poller, identifier, EngineInputType::Nfc, 0)
+            })
+            .filter_map(|poller| poller.callback.on_change.clone())
+            .collect();
+        PendingCallbacks { event, callbacks }
     }
 
     /// Port of InputEngine::IsInputIdentifierEqual
@@ -830,50 +1151,6 @@ impl InputEngine {
         }
         true
     }
-}
-
-// ---- Virtual method defaults (would be trait methods in a full port) ----
-// These correspond to the virtual methods in the C++ InputEngine class.
-// Concrete drivers override these. For now they are provided as default
-// free-standing helpers since InputEngine is used via composition.
-
-/// Default implementation for SetLeds virtual method
-pub fn default_set_leds(_identifier: &PadIdentifier, _led_status: &LedStatus) -> DriverResult {
-    DriverResult::NotSupported
-}
-
-/// Default implementation for SetVibration virtual method
-pub fn default_set_vibration(
-    _identifier: &PadIdentifier,
-    _vibration: &VibrationStatus,
-) -> DriverResult {
-    DriverResult::NotSupported
-}
-
-/// Default implementation for IsVibrationEnabled virtual method
-pub fn default_is_vibration_enabled(_identifier: &PadIdentifier) -> bool {
-    false
-}
-
-/// Default implementation for SetPollingMode virtual method
-pub fn default_set_polling_mode(
-    _identifier: &PadIdentifier,
-    _polling_mode: PollingMode,
-) -> DriverResult {
-    DriverResult::NotSupported
-}
-
-/// Default implementation for SetCameraFormat virtual method
-pub fn default_set_camera_format(
-    _identifier: &PadIdentifier,
-    _camera_format: CameraFormat,
-) -> DriverResult {
-    DriverResult::NotSupported
-}
-
-/// Default implementation for SupportsNfc virtual method
-pub fn default_supports_nfc(_identifier: &PadIdentifier) -> NfcState {
-    NfcState::NotSupported
 }
 
 /// Default implementation for GetInputDevices virtual method
@@ -909,4 +1186,111 @@ pub fn default_get_hat_button_id(_direction_name: &str) -> u8 {
 /// Default implementation for IsStickInverted virtual method
 pub fn default_is_stick_inverted(_params: &ParamPackage) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TestOutput {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl InputEngineOutput for TestOutput {
+        fn set_vibration(
+            &self,
+            _identifier: &PadIdentifier,
+            _status: &VibrationStatus,
+        ) -> DriverResult {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            DriverResult::Success
+        }
+
+        fn is_vibration_enabled(&self, _identifier: &PadIdentifier) -> bool {
+            true
+        }
+    }
+
+    fn callback_that_relocks_engine(
+        engine: &Arc<Mutex<InputEngine>>,
+        calls: Arc<AtomicUsize>,
+    ) -> UpdateCallback {
+        let engine = Arc::downgrade(engine);
+        UpdateCallback {
+            on_change: Some(Arc::new(move |_| {
+                let engine = engine.upgrade().expect("engine must still exist");
+                assert!(
+                    engine.try_lock().is_some(),
+                    "input callbacks must run after the shared engine lock is released"
+                );
+                calls.fetch_add(1, Ordering::Relaxed);
+            })),
+        }
+    }
+
+    #[test]
+    fn pending_callback_can_relock_shared_engine() {
+        let engine = Arc::new(Mutex::new(InputEngine::new("test".to_string())));
+        let identifier = PadIdentifier::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let mut guard = engine.lock();
+            guard.pre_set_controller(&identifier);
+            guard.pre_set_button(&identifier, 0);
+            guard.set_callback(InputIdentifier {
+                identifier: identifier.clone(),
+                r#type: EngineInputType::Button,
+                index: 0,
+                callback: callback_that_relocks_engine(&engine, Arc::clone(&calls)),
+            });
+        }
+
+        let pending = engine.lock().set_button(&identifier, 0, true);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        pending.dispatch();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reset_callbacks_can_relock_shared_engine() {
+        let engine = Arc::new(Mutex::new(InputEngine::new("test".to_string())));
+        let identifier = PadIdentifier::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let mut guard = engine.lock();
+            guard.pre_set_controller(&identifier);
+            guard.pre_set_button(&identifier, 0);
+            guard.set_callback(InputIdentifier {
+                identifier: identifier.clone(),
+                r#type: EngineInputType::Button,
+                index: 0,
+                callback: callback_that_relocks_engine(&engine, Arc::clone(&calls)),
+            });
+        }
+
+        let pending = engine.lock().reset_button_state();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        for callback in pending {
+            callback.dispatch();
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn output_calls_use_the_concrete_engine_handler() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut engine = InputEngine::new("test".to_string());
+        engine.set_output_handler(Arc::new(TestOutput {
+            calls: Arc::clone(&calls),
+        }));
+        let identifier = PadIdentifier::default();
+
+        assert_eq!(
+            engine.set_vibration(&identifier, &VibrationStatus::default()),
+            DriverResult::Success
+        );
+        assert!(engine.is_vibration_enabled(&identifier));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
 }

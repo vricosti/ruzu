@@ -10,8 +10,11 @@ use common::ResultCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::frontend::emulated_controller::get_simple_npad_button_state;
-use crate::hid_core::{HIDCore, AVAILABLE_CONTROLLERS};
+use crate::frontend::emulated_controller::{
+    get_simple_npad_button_state, AnalogSticks, BatteryLevelState, ControllerColors,
+    ControllerTriggerType, ControllerUpdateCallback,
+};
+use crate::hid_core::{EmulatedControllerHandle, HIDCore, AVAILABLE_CONTROLLERS};
 use crate::hid_result;
 use crate::hid_types::*;
 use crate::hid_util;
@@ -23,6 +26,59 @@ use crate::resources::shared_memory_format::NpadInternalState;
 use crate::resources::vibration::vibration_device::NpadVibrationDevice;
 
 static NPAD_UPDATE_TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone)]
+struct NpadControllerData {
+    device: Option<EmulatedControllerHandle>,
+    shared_memory_assigned: bool,
+    is_active: bool,
+    is_connected: bool,
+    is_dual_left_connected: bool,
+    is_dual_right_connected: bool,
+    npad_pad_state: NPadGenericState,
+    npad_libnx_state: NPadGenericState,
+    npad_trigger_state: NpadGcTriggerState,
+    callback_key: Option<i32>,
+}
+
+impl Default for NpadControllerData {
+    fn default() -> Self {
+        Self {
+            device: None,
+            shared_memory_assigned: false,
+            is_active: false,
+            is_connected: false,
+            is_dual_left_connected: true,
+            is_dual_right_connected: true,
+            npad_pad_state: NPadGenericState::default(),
+            npad_libnx_state: NPadGenericState::default(),
+            npad_trigger_state: NpadGcTriggerState::default(),
+            callback_key: None,
+        }
+    }
+}
+
+type ControllerData = [[NpadControllerData; MAX_SUPPORTED_NPAD_ID_TYPES]; ARUID_INDEX_MAX];
+type ControllerCallbackEvents = [[u32; MAX_SUPPORTED_NPAD_ID_TYPES]; ARUID_INDEX_MAX];
+
+fn controller_trigger_bit(trigger: ControllerTriggerType) -> u32 {
+    1 << (trigger as u32)
+}
+
+fn two_mut<T, const N: usize>(
+    values: &mut [T; N],
+    first: usize,
+    second: usize,
+) -> (&mut T, &mut T) {
+    debug_assert_ne!(first, second);
+    if first < second {
+        let (left, right) = values.split_at_mut(second);
+        (&mut left[first], &mut right[0])
+    } else {
+        let (left, right) = values.split_at_mut(first);
+        (&mut right[0], &mut left[second])
+    }
+}
 
 fn trace_npad_update_env_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -63,6 +119,9 @@ fn trace_npad_update(
 /// Main NPad controller resource
 pub struct NPad {
     hid_core: Option<Arc<parking_lot::Mutex<HIDCore>>>,
+    controller_data: Box<ControllerData>,
+    callback_events: Arc<parking_lot::Mutex<ControllerCallbackEvents>>,
+    press_state: AtomicU64,
     npad_resource: NPadResource,
     vibration: NpadVibration,
     vibration_devices: [NpadVibrationDevice; 2],
@@ -74,6 +133,13 @@ impl Default for NPad {
     fn default() -> Self {
         Self {
             hid_core: None,
+            controller_data: Box::new(std::array::from_fn(|_| {
+                std::array::from_fn(|_| NpadControllerData::default())
+            })),
+            callback_events: Arc::new(parking_lot::Mutex::new(
+                [[0; MAX_SUPPORTED_NPAD_ID_TYPES]; ARUID_INDEX_MAX],
+            )),
+            press_state: AtomicU64::new(0),
             npad_resource: NPadResource::new(),
             vibration: NpadVibration::new(),
             vibration_devices: {
@@ -95,10 +161,31 @@ impl NPad {
     }
 
     pub fn new_with_hid_core(hid_core: Arc<parking_lot::Mutex<HIDCore>>) -> Self {
-        Self {
-            hid_core: Some(hid_core),
-            ..Self::default()
+        let mut npad = Self::default();
+        npad.hid_core = Some(Arc::clone(&hid_core));
+        let controllers: Vec<_> = {
+            let hid_core = hid_core.lock();
+            (0..AVAILABLE_CONTROLLERS)
+                .map(|index| hid_core.get_emulated_controller_by_index(index))
+                .collect()
+        };
+        for aruid_index in 0..ARUID_INDEX_MAX {
+            for (controller_index, device) in controllers.iter().enumerate() {
+                let callback_events = Arc::clone(&npad.callback_events);
+                let callback = ControllerUpdateCallback {
+                    on_change: Arc::new(move |trigger| {
+                        callback_events.lock()[aruid_index][controller_index] |=
+                            controller_trigger_bit(trigger);
+                    }),
+                    is_npad_service: true,
+                };
+                let callback_key = device.lock().set_callback(callback);
+                let controller = &mut npad.controller_data[aruid_index][controller_index];
+                controller.device = Some(Arc::clone(device));
+                controller.callback_key = Some(callback_key);
+            }
         }
+        npad
     }
 
     /// Port of NPad::Activate().
@@ -143,7 +230,7 @@ impl NPad {
             return ResultCode::SUCCESS;
         };
 
-        for entry in &mut shared.npad.npad_entry {
+        for (controller_index, entry) in shared.npad.npad_entry.iter_mut().enumerate() {
             let npad = &mut entry.internal_state;
             npad.fullkey_color.attribute = ColorAttribute::NoController;
             npad.joycon_color.attribute = ColorAttribute::NoController;
@@ -152,6 +239,10 @@ impl NPad {
             for _ in 0..19 {
                 Self::write_empty_entry(npad);
             }
+
+            let controller = &mut self.controller_data[aruid_index][controller_index];
+            controller.shared_memory_assigned = true;
+            controller.is_active = true;
         }
 
         ResultCode::SUCCESS
@@ -168,7 +259,7 @@ impl NPad {
     }
 
     pub fn free_applet_resource_id(&mut self, _aruid: u64) {
-        // Upstream cleans up applet resource data for the given aruid
+        self.npad_resource.free_applet_resource_id(_aruid);
     }
 
     /// Port of NPad::RegisterAppletResourceUserId.
@@ -187,25 +278,6 @@ impl NPad {
     }
 
     /// Port of NPad::OnUpdate.
-    ///
-    /// Upstream iterates `controller_data[aruid_index][i]` (a 2D array of 10
-    /// EmulatedController-backed entries per aruid), reads input from the
-    /// device, and writes `NPadGenericState` entries into the shared-memory
-    /// LIFOs (fullkey_lifo, handheld_lifo, joy_*_lifo, etc.) based on each
-    /// controller's `NpadStyleIndex`.
-    ///
-    /// ruzu's port currently lacks the full controller_data array (see TODO
-    /// note below) and the `EmulatedController` integration is largely
-    /// stubbed (no real input devices wired up yet). To still let the guest
-    /// game see "a controller is attached", this implementation writes a
-    /// fixed Pro Controller (Fullkey) `NPadGenericState` with
-    /// `connection_status = is_connected | is_wired` to `npad_entry[0]`'s
-    /// `fullkey_lifo` for every assigned aruid.
-    ///
-    /// Once `EmulatedController::reload_from_settings` honors the
-    /// `Settings::values.players[i]` config and `controller_data` is fully
-    /// ported, this should be replaced by the full upstream loop (see
-    /// `zuyu/src/hid_core/resources/npad/npad.cpp:461`).
     pub fn on_update(&mut self) {
         let trace_update = trace_npad_update_env_enabled();
         let trace_index = if trace_update {
@@ -226,10 +298,17 @@ impl NPad {
             }
             return;
         };
+        let pending_events = {
+            let mut events = self.callback_events.lock();
+            std::mem::replace(
+                &mut *events,
+                [[0; MAX_SUPPORTED_NPAD_ID_TYPES]; ARUID_INDEX_MAX],
+            )
+        };
         let mut applet_resource = applet_resource.lock();
+        let mut last_active_controller = None;
 
         for aruid_index in 0..ARUID_INDEX_MAX {
-            // Mirror upstream's "skip if data is null or not assigned" gate.
             let (assigned, aruid, enable_input) = {
                 let data = applet_resource.get_aruid_data_by_index(aruid_index);
                 (
@@ -249,7 +328,6 @@ impl NPad {
                 continue;
             }
 
-            // Mirror upstream's IsSupportedNpadStyleSet gate.
             let is_set = self
                 .npad_resource
                 .is_supported_npad_style_set(aruid)
@@ -265,13 +343,6 @@ impl NPad {
                 continue;
             }
 
-            // Mirror upstream's enable_pad_input gate.
-            if !enable_input {
-                if trace_update && trace_index % 1000 == 0 {
-                    log::info!("[NPAD_UPDATE] skip aruid=0x{:X} enable_input=false", aruid);
-                }
-                continue;
-            }
             if trace_update && trace_index % 1000 == 0 {
                 log::info!(
                     "[NPAD_UPDATE] active aruid=0x{:X} enable_input={} buttons=0x{:X}",
@@ -281,86 +352,189 @@ impl NPad {
                 );
             }
 
-            // Get the npad shared-memory area for this aruid.
             let Some(shared) = applet_resource.get_shared_memory_format_by_index_mut(aruid_index)
             else {
                 continue;
             };
 
-            let controller_states: Vec<_> = if let Some(hid_core) = self.hid_core.as_ref() {
-                let hid_core = hid_core.lock();
-                (0..AVAILABLE_CONTROLLERS)
-                    .map(|entry_index| {
-                        let controller = hid_core.get_emulated_controller_by_index(entry_index);
-                        (
-                            entry_index,
-                            controller.get_npad_id_type(),
-                            controller.get_npad_style_index(false),
-                            controller.is_connected(),
-                            {
-                                let mut buttons = controller.get_npad_buttons();
-                                buttons.raw |= get_simple_npad_button_state().raw;
-                                buttons
-                            },
-                        )
-                    })
-                    .collect()
-            } else {
-                vec![(
-                    0,
-                    NpadIdType::Player1,
-                    NpadStyleIndex::Fullkey,
-                    true,
-                    get_simple_npad_button_state(),
-                )]
-            };
-
-            // Mirror upstream's controller_data[aruid_index][i] loop. ruzu still
-            // lacks the per-aruid controller_data storage, but the runtime path
-            // now consumes HIDCore's EmulatedController state instead of inventing
-            // a local Player1 controller.
-            for (entry_index, npad_id, controller_type, is_connected, button_state) in
-                controller_states
-            {
+            for entry_index in 0..MAX_SUPPORTED_NPAD_ID_TYPES {
                 let npad = &mut shared.npad.npad_entry[entry_index].internal_state;
+                let controller = &mut self.controller_data[aruid_index][entry_index];
+                controller.shared_memory_assigned = true;
+                let Some(device) = controller.device.as_ref().cloned() else {
+                    continue;
+                };
 
-                if controller_type == NpadStyleIndex::None || !is_connected {
+                let mut device = device.lock();
+                let controller_type = device.get_npad_style_index(false);
+                let npad_id = device.get_npad_id_type();
+                let is_connected = device.is_connected(false);
+
+                if !is_connected {
+                    if controller.is_connected {
+                        Self::disconnect_controller(npad, controller);
+                    }
+                    continue;
+                }
+                if controller_type == NpadStyleIndex::None {
                     continue;
                 }
 
-                // Mirror upstream `NPad::InitNewlyAddedController` for the
-                // Pro Controller (Fullkey) case (npad.cpp:202-215). These
-                // fields are connect-time state upstream, not per-poll state.
-                if !matches!(
+                let colors = device.get_colors();
+                let battery = device.get_battery();
+                if !controller.is_connected
+                    && self
+                        .npad_resource
+                        .is_controller_supported(aruid, controller_type)
+                {
+                    Self::init_newly_added_controller(
+                        npad,
+                        controller,
+                        controller_type,
+                        colors,
+                        battery,
+                    );
+                    last_active_controller = Some(npad_id);
+                } else {
+                    let events = pending_events[aruid_index][entry_index];
+                    if events
+                        & (controller_trigger_bit(ControllerTriggerType::Battery)
+                            | controller_trigger_bit(ControllerTriggerType::All))
+                        != 0
+                    {
+                        npad.battery_level_dual = battery.dual.battery_level;
+                        npad.battery_level_left = battery.left.battery_level;
+                        npad.battery_level_right = battery.right.battery_level;
+                    }
+                }
+
+                if !enable_input || !controller.shared_memory_assigned || !controller.is_active {
+                    continue;
+                }
+
+                device.status_update();
+                let mut button_state = device.get_npad_buttons();
+                button_state.raw |= get_simple_npad_button_state().raw;
+                let stick_state = device.get_sticks();
+                let trigger_state = device.get_triggers();
+                drop(device);
+
+                Self::request_pad_state_update(
+                    controller,
                     controller_type,
+                    button_state,
+                    stick_state,
+                    trigger_state,
+                );
+
+                let pad_state = &mut controller.npad_pad_state;
+                let libnx_state = &mut controller.npad_libnx_state;
+                let trigger_state = &mut controller.npad_trigger_state;
+                libnx_state.connection_status.raw = 1;
+
+                match controller_type {
+                    NpadStyleIndex::None => unreachable!(),
                     NpadStyleIndex::Fullkey
-                        | NpadStyleIndex::NES
-                        | NpadStyleIndex::SNES
-                        | NpadStyleIndex::N64
-                        | NpadStyleIndex::SegaGenesis
-                ) {
-                    continue;
-                }
-                if !npad.style_tag.raw.contains(NpadStyleSet::FULLKEY) {
-                    npad.style_tag.raw |= NpadStyleSet::FULLKEY;
-                    // device_type.fullkey = bit 0 (upstream `BitField<0,1,s32> fullkey`).
-                    npad.device_type.raw |= 1 << 0;
-                    // system_properties bits 11 (is_vertical), 13 (use_plus), 14 (use_minus).
-                    npad.system_properties.raw |= (1 << 11) | (1 << 13) | (1 << 14);
-                    npad.fullkey_color.attribute = ColorAttribute::Ok;
-                    npad.applet_footer_type = AppletFooterUiType::SwitchProController;
-                    npad.sixaxis_fullkey_properties.set_is_newly_assigned(true);
+                    | NpadStyleIndex::NES
+                    | NpadStyleIndex::SNES
+                    | NpadStyleIndex::N64
+                    | NpadStyleIndex::SegaGenesis => {
+                        pad_state.connection_status.raw = 0x3;
+                        libnx_state.connection_status.raw |= 1 << 1;
+                        pad_state.sampling_number =
+                            npad.fullkey_lifo.read_current_entry().state.sampling_number + 1;
+                        npad.fullkey_lifo.write_next_entry(*pad_state);
+                    }
+                    NpadStyleIndex::Handheld => {
+                        pad_state.connection_status.raw = 0x3f;
+                        libnx_state.connection_status.raw |= 0x3e;
+                        pad_state.sampling_number = npad
+                            .handheld_lifo
+                            .read_current_entry()
+                            .state
+                            .sampling_number
+                            + 1;
+                        npad.handheld_lifo.write_next_entry(*pad_state);
+                    }
+                    NpadStyleIndex::JoyconDual => {
+                        pad_state.connection_status.raw = 1;
+                        if controller.is_dual_left_connected {
+                            pad_state.connection_status.raw |= 1 << 2;
+                            libnx_state.connection_status.raw |= 1 << 2;
+                        }
+                        if controller.is_dual_right_connected {
+                            pad_state.connection_status.raw |= 1 << 4;
+                            libnx_state.connection_status.raw |= 1 << 4;
+                        }
+                        pad_state.sampling_number = npad
+                            .joy_dual_lifo
+                            .read_current_entry()
+                            .state
+                            .sampling_number
+                            + 1;
+                        npad.joy_dual_lifo.write_next_entry(*pad_state);
+                    }
+                    NpadStyleIndex::JoyconLeft => {
+                        pad_state.connection_status.raw = 1 | (1 << 2);
+                        libnx_state.connection_status.raw |= 1 << 2;
+                        pad_state.sampling_number = npad
+                            .joy_left_lifo
+                            .read_current_entry()
+                            .state
+                            .sampling_number
+                            + 1;
+                        npad.joy_left_lifo.write_next_entry(*pad_state);
+                    }
+                    NpadStyleIndex::JoyconRight => {
+                        pad_state.connection_status.raw = 1 | (1 << 4);
+                        libnx_state.connection_status.raw |= 1 << 4;
+                        pad_state.sampling_number = npad
+                            .joy_right_lifo
+                            .read_current_entry()
+                            .state
+                            .sampling_number
+                            + 1;
+                        npad.joy_right_lifo.write_next_entry(*pad_state);
+                    }
+                    NpadStyleIndex::GameCube => {
+                        pad_state.connection_status.raw = 0x3;
+                        libnx_state.connection_status.raw |= 1 << 1;
+                        pad_state.sampling_number =
+                            npad.fullkey_lifo.read_current_entry().state.sampling_number + 1;
+                        trigger_state.sampling_number = npad
+                            .gc_trigger_lifo
+                            .read_current_entry()
+                            .state
+                            .sampling_number
+                            + 1;
+                        npad.fullkey_lifo.write_next_entry(*pad_state);
+                        npad.gc_trigger_lifo.write_next_entry(*trigger_state);
+                    }
+                    NpadStyleIndex::Pokeball => {
+                        pad_state.connection_status.raw = 1;
+                        pad_state.sampling_number =
+                            npad.palma_lifo.read_current_entry().state.sampling_number + 1;
+                        npad.palma_lifo.write_next_entry(*pad_state);
+                    }
+                    _ => continue,
                 }
 
-                // Build a Pro Controller / Fullkey `NPadGenericState`:
-                //   connection_status.raw bits: is_connected (0) | is_wired (1) = 0x3.
-                // Sampling number monotonically increases (upstream:
-                //   `npad->fullkey_lifo.ReadCurrentEntry().state.sampling_number + 1`).
-                let prev_sampling = npad.fullkey_lifo.read_current_entry().state.sampling_number;
-                let mut pad_state = NPadGenericState::default();
-                pad_state.connection_status.raw = 0x3;
-                pad_state.npad_buttons = button_state;
-                pad_state.sampling_number = prev_sampling + 1;
+                libnx_state.npad_buttons = pad_state.npad_buttons;
+                libnx_state.l_stick = pad_state.l_stick;
+                libnx_state.r_stick = pad_state.r_stick;
+                libnx_state.sampling_number = npad
+                    .system_ext_lifo
+                    .read_current_entry()
+                    .state
+                    .sampling_number
+                    + 1;
+                npad.system_ext_lifo.write_next_entry(*libnx_state);
+
+                self.press_state
+                    .fetch_or(pad_state.npad_buttons.raw.bits(), Ordering::Relaxed);
+                if !pad_state.npad_buttons.raw.is_empty() {
+                    last_active_controller = Some(npad_id);
+                }
                 if trace_npad_state_env_enabled() && !pad_state.npad_buttons.raw.is_empty() {
                     log::info!(
                         "[NPAD_STATE] aruid=0x{:X} entry={} buttons=0x{:X} sampling={}",
@@ -380,29 +554,305 @@ impl NPad {
                         npad.sixaxis_fullkey_properties.raw as u32,
                     );
                 }
-                npad.fullkey_lifo.write_next_entry(pad_state);
+            }
+        }
 
-                // Mirror the libnx-state write: upstream also updates
-                // `system_ext_lifo` with the `NpadCommonState` so libnx clients
-                // (which don't activate any specific style) still see a connected
-                // controller via that LIFO.
-                let prev_ext = npad
-                    .system_ext_lifo
-                    .read_current_entry()
-                    .state
-                    .sampling_number;
-                let mut libnx_state = NPadGenericState::default();
-                libnx_state.connection_status.raw = 0x3;
-                libnx_state.npad_buttons = pad_state.npad_buttons;
-                libnx_state.sampling_number = prev_ext + 1;
-                npad.system_ext_lifo.write_next_entry(libnx_state);
+        drop(applet_resource);
+        if let (Some(hid_core), Some(npad_id)) = (self.hid_core.as_ref(), last_active_controller) {
+            hid_core.lock().set_last_active_controller(npad_id);
+        }
+    }
 
-                if !pad_state.npad_buttons.raw.is_empty() {
-                    if let Some(hid_core) = self.hid_core.as_ref() {
-                        hid_core.lock().set_last_active_controller(npad_id);
-                    }
+    fn init_newly_added_controller(
+        npad: &mut NpadInternalState,
+        controller: &mut NpadControllerData,
+        controller_type: NpadStyleIndex,
+        body_colors: ControllerColors,
+        battery_level: BatteryLevelState,
+    ) {
+        npad.style_tag.raw = NpadStyleSet::NONE;
+        npad.device_type.raw = 0;
+        npad.system_properties.raw = 0;
+        npad.fullkey_color = NpadFullKeyColorState::default();
+        npad.joycon_color = NpadJoyColorState::default();
+        npad.battery_level_dual = NpadBatteryLevel::default();
+        npad.battery_level_left = NpadBatteryLevel::default();
+        npad.battery_level_right = NpadBatteryLevel::default();
+
+        match controller_type {
+            NpadStyleIndex::None => return,
+            NpadStyleIndex::Fullkey => {
+                npad.fullkey_color.attribute = ColorAttribute::Ok;
+                npad.fullkey_color.fullkey = body_colors.fullkey;
+                npad.battery_level_dual = battery_level.dual.battery_level;
+                npad.style_tag.raw.insert(NpadStyleSet::FULLKEY);
+                npad.device_type.raw |= 1 << 0;
+                npad.system_properties.raw |= (1 << 11) | (1 << 13) | (1 << 14);
+                npad.system_properties
+                    .set_is_charging_joy_dual(battery_level.dual.is_charging);
+                npad.applet_footer_type = AppletFooterUiType::SwitchProController;
+                npad.sixaxis_fullkey_properties.set_is_newly_assigned(true);
+            }
+            NpadStyleIndex::Handheld => {
+                npad.fullkey_color.attribute = ColorAttribute::Ok;
+                npad.joycon_color.attribute = ColorAttribute::Ok;
+                npad.fullkey_color.fullkey = body_colors.fullkey;
+                npad.joycon_color.left = body_colors.left;
+                npad.joycon_color.right = body_colors.right;
+                npad.style_tag.raw.insert(NpadStyleSet::HANDHELD);
+                npad.device_type.raw |= (1 << 2) | (1 << 3);
+                npad.system_properties.raw |= (1 << 11) | (1 << 13) | (1 << 14) | (1 << 15);
+                npad.system_properties
+                    .set_is_charging_joy_dual(battery_level.left.is_charging);
+                npad.system_properties
+                    .set_is_charging_joy_left(battery_level.left.is_charging);
+                npad.system_properties
+                    .set_is_charging_joy_right(battery_level.right.is_charging);
+                npad.assignment_mode = NpadJoyAssignmentMode::Dual;
+                npad.applet_footer_type = AppletFooterUiType::HandheldJoyConLeftJoyConRight;
+                npad.sixaxis_handheld_properties.set_is_newly_assigned(true);
+            }
+            NpadStyleIndex::JoyconDual => {
+                npad.fullkey_color.attribute = ColorAttribute::Ok;
+                npad.joycon_color.attribute = ColorAttribute::Ok;
+                npad.style_tag.raw.insert(NpadStyleSet::JOY_DUAL);
+                if controller.is_dual_left_connected {
+                    npad.joycon_color.left = body_colors.left;
+                    npad.battery_level_left = battery_level.left.battery_level;
+                    npad.device_type.raw |= 1 << 4;
+                    npad.system_properties.raw |= 1 << 14;
+                    npad.system_properties
+                        .set_is_charging_joy_left(battery_level.left.is_charging);
+                    npad.sixaxis_dual_left_properties
+                        .set_is_newly_assigned(true);
+                }
+                if controller.is_dual_right_connected {
+                    npad.joycon_color.right = body_colors.right;
+                    npad.battery_level_right = battery_level.right.battery_level;
+                    npad.device_type.raw |= 1 << 5;
+                    npad.system_properties.raw |= 1 << 13;
+                    npad.system_properties
+                        .set_is_charging_joy_right(battery_level.right.is_charging);
+                    npad.sixaxis_dual_right_properties
+                        .set_is_newly_assigned(true);
+                }
+                npad.system_properties.raw |= (1 << 11) | (1 << 15);
+                npad.assignment_mode = NpadJoyAssignmentMode::Dual;
+                if controller.is_dual_left_connected && controller.is_dual_right_connected {
+                    npad.applet_footer_type = AppletFooterUiType::JoyDual;
+                    npad.fullkey_color.fullkey = body_colors.left;
+                    npad.battery_level_dual = battery_level.left.battery_level;
+                    npad.system_properties
+                        .set_is_charging_joy_dual(battery_level.left.is_charging);
+                } else if controller.is_dual_left_connected {
+                    npad.applet_footer_type = AppletFooterUiType::JoyDualLeftOnly;
+                    npad.fullkey_color.fullkey = body_colors.left;
+                    npad.battery_level_dual = battery_level.left.battery_level;
+                    npad.system_properties
+                        .set_is_charging_joy_dual(battery_level.left.is_charging);
+                } else {
+                    npad.applet_footer_type = AppletFooterUiType::JoyDualRightOnly;
+                    npad.fullkey_color.fullkey = body_colors.right;
+                    npad.battery_level_dual = battery_level.right.battery_level;
+                    npad.system_properties
+                        .set_is_charging_joy_dual(battery_level.right.is_charging);
                 }
             }
+            NpadStyleIndex::JoyconLeft => {
+                npad.fullkey_color.attribute = ColorAttribute::Ok;
+                npad.fullkey_color.fullkey = body_colors.left;
+                npad.joycon_color.attribute = ColorAttribute::Ok;
+                npad.joycon_color.left = body_colors.left;
+                npad.battery_level_dual = battery_level.left.battery_level;
+                npad.style_tag.raw.insert(NpadStyleSet::JOY_LEFT);
+                npad.device_type.raw |= 1 << 4;
+                npad.system_properties.raw |= (1 << 12) | (1 << 14);
+                npad.system_properties
+                    .set_is_charging_joy_left(battery_level.left.is_charging);
+                npad.applet_footer_type = AppletFooterUiType::JoyLeftHorizontal;
+                npad.sixaxis_left_properties.set_is_newly_assigned(true);
+            }
+            NpadStyleIndex::JoyconRight => {
+                npad.fullkey_color.attribute = ColorAttribute::Ok;
+                npad.fullkey_color.fullkey = body_colors.right;
+                npad.joycon_color.attribute = ColorAttribute::Ok;
+                npad.joycon_color.right = body_colors.right;
+                npad.battery_level_right = battery_level.right.battery_level;
+                npad.style_tag.raw.insert(NpadStyleSet::JOY_RIGHT);
+                npad.device_type.raw |= 1 << 5;
+                npad.system_properties.raw |= (1 << 12) | (1 << 13);
+                npad.system_properties
+                    .set_is_charging_joy_right(battery_level.right.is_charging);
+                npad.applet_footer_type = AppletFooterUiType::JoyRightHorizontal;
+                npad.sixaxis_right_properties.set_is_newly_assigned(true);
+            }
+            NpadStyleIndex::GameCube => {
+                npad.style_tag.raw.insert(NpadStyleSet::GC);
+                npad.device_type.raw |= 1 << 0;
+                npad.system_properties.raw |= (1 << 11) | (1 << 13);
+            }
+            NpadStyleIndex::Pokeball => {
+                npad.style_tag.raw.insert(NpadStyleSet::PALMA);
+                npad.device_type.raw |= 1 << 6;
+                npad.sixaxis_fullkey_properties.set_is_newly_assigned(true);
+            }
+            NpadStyleIndex::NES => {
+                npad.style_tag.raw.insert(NpadStyleSet::LARK);
+                npad.device_type.raw |= 1 << 0;
+            }
+            NpadStyleIndex::SNES => {
+                npad.style_tag.raw.insert(NpadStyleSet::LUCIA);
+                npad.device_type.raw |= 1 << 0;
+                npad.applet_footer_type = AppletFooterUiType::Lucia;
+            }
+            NpadStyleIndex::N64 => {
+                npad.style_tag.raw.insert(NpadStyleSet::LAGOON);
+                npad.device_type.raw |= 1 << 0;
+                npad.applet_footer_type = AppletFooterUiType::Lagon;
+            }
+            NpadStyleIndex::SegaGenesis => {
+                npad.style_tag.raw.insert(NpadStyleSet::LAGER);
+                npad.device_type.raw |= 1 << 0;
+            }
+            _ => {}
+        }
+
+        controller.is_connected = true;
+        Self::write_empty_entry(npad);
+    }
+
+    fn disconnect_controller(npad: &mut NpadInternalState, controller: &mut NpadControllerData) {
+        npad.style_tag.raw = NpadStyleSet::NONE;
+        npad.device_type.raw = 0;
+        npad.system_properties.raw = 0;
+        npad.button_properties.raw = 0;
+        npad.sixaxis_fullkey_properties.raw = 0;
+        npad.sixaxis_handheld_properties.raw = 0;
+        npad.sixaxis_dual_left_properties.raw = 0;
+        npad.sixaxis_dual_right_properties.raw = 0;
+        npad.sixaxis_left_properties.raw = 0;
+        npad.sixaxis_right_properties.raw = 0;
+        npad.battery_level_dual = NpadBatteryLevel::Empty;
+        npad.battery_level_left = NpadBatteryLevel::Empty;
+        npad.battery_level_right = NpadBatteryLevel::Empty;
+        npad.fullkey_color = NpadFullKeyColorState::default();
+        npad.joycon_color = NpadJoyColorState::default();
+        npad.applet_footer_type = AppletFooterUiType::None;
+        controller.is_dual_left_connected = true;
+        controller.is_dual_right_connected = true;
+        controller.is_connected = false;
+        Self::write_empty_entry(npad);
+    }
+
+    fn disconnect_npad(npad: &mut NpadInternalState, controller: &mut NpadControllerData) {
+        if let Some(device) = &controller.device {
+            device.lock().disconnect();
+        }
+        Self::disconnect_controller(npad, controller);
+    }
+
+    fn update_controller_at(
+        npad: &mut NpadInternalState,
+        controller: &mut NpadControllerData,
+        controller_type: NpadStyleIndex,
+    ) {
+        let Some(device) = controller.device.as_ref().cloned() else {
+            return;
+        };
+        let (is_connected, body_colors, battery_level) = {
+            let mut device = device.lock();
+            device.set_npad_style_index(controller_type);
+            device.connect(false);
+            (
+                device.is_connected(false),
+                device.get_colors(),
+                device.get_battery(),
+            )
+        };
+        if !is_connected {
+            return;
+        }
+        Self::init_newly_added_controller(
+            npad,
+            controller,
+            controller_type,
+            body_colors,
+            battery_level,
+        );
+    }
+
+    fn request_pad_state_update(
+        controller: &mut NpadControllerData,
+        controller_type: NpadStyleIndex,
+        button_state: NpadButtonState,
+        stick_state: AnalogSticks,
+        trigger_state: NpadGcTriggerState,
+    ) {
+        let pad_entry = &mut controller.npad_pad_state;
+        let right_button_mask = NpadButton::A
+            | NpadButton::B
+            | NpadButton::X
+            | NpadButton::Y
+            | NpadButton::STICK_R
+            | NpadButton::R
+            | NpadButton::ZR
+            | NpadButton::PLUS
+            | NpadButton::STICK_R_LEFT
+            | NpadButton::STICK_R_UP
+            | NpadButton::STICK_R_RIGHT
+            | NpadButton::STICK_R_DOWN;
+        let left_button_mask = NpadButton::LEFT
+            | NpadButton::UP
+            | NpadButton::RIGHT
+            | NpadButton::DOWN
+            | NpadButton::STICK_L
+            | NpadButton::L
+            | NpadButton::ZL
+            | NpadButton::MINUS
+            | NpadButton::STICK_L_LEFT
+            | NpadButton::STICK_L_UP
+            | NpadButton::STICK_L_RIGHT
+            | NpadButton::STICK_L_DOWN;
+
+        pad_entry.npad_buttons.raw = NpadButton::NONE;
+        if controller_type != NpadStyleIndex::JoyconLeft {
+            pad_entry.npad_buttons.raw = button_state.raw & right_button_mask;
+            pad_entry.r_stick = stick_state.right;
+        }
+        if controller_type != NpadStyleIndex::JoyconRight {
+            pad_entry.npad_buttons.raw |= button_state.raw & left_button_mask;
+            pad_entry.l_stick = stick_state.left;
+        }
+        if matches!(
+            controller_type,
+            NpadStyleIndex::JoyconLeft | NpadStyleIndex::JoyconDual
+        ) {
+            pad_entry.npad_buttons.raw |=
+                button_state.raw & (NpadButton::LEFT_SL | NpadButton::LEFT_SR);
+        }
+        if matches!(
+            controller_type,
+            NpadStyleIndex::JoyconRight | NpadStyleIndex::JoyconDual
+        ) {
+            pad_entry.npad_buttons.raw |=
+                button_state.raw & (NpadButton::RIGHT_SL | NpadButton::RIGHT_SR);
+        }
+        if controller_type == NpadStyleIndex::GameCube {
+            controller.npad_trigger_state.left = trigger_state.left;
+            controller.npad_trigger_state.right = trigger_state.right;
+            pad_entry.npad_buttons.raw.remove(NpadButton::ZL);
+            pad_entry
+                .npad_buttons
+                .raw
+                .set(NpadButton::ZR, button_state.raw.contains(NpadButton::R));
+            pad_entry
+                .npad_buttons
+                .raw
+                .set(NpadButton::L, button_state.raw.contains(NpadButton::ZL));
+            pad_entry
+                .npad_buttons
+                .raw
+                .set(NpadButton::R, button_state.raw.contains(NpadButton::ZR));
         }
     }
 
@@ -411,11 +861,21 @@ impl NPad {
         self.vibration.get_session_aruid()
     }
 
+    /// Port of NPad::GetAndResetPressState.
+    pub fn get_and_reset_press_state(&self) -> NpadButton {
+        NpadButton::from_bits_truncate(self.press_state.swap(0, Ordering::Relaxed))
+    }
+
     pub fn set_supported_npad_style_set(
         &mut self,
         aruid: u64,
         supported_style_set: NpadStyleSet,
     ) -> ResultCode {
+        if let Some(hid_core) = self.hid_core.as_ref() {
+            hid_core.lock().set_supported_style_tag(NpadStyleTag {
+                raw: supported_style_set,
+            });
+        }
         let result = self
             .npad_resource
             .set_supported_npad_style_set(aruid, supported_style_set);
@@ -550,20 +1010,12 @@ impl NPad {
         ResultCode::SUCCESS
     }
 
-    /// Partial port of upstream `NPad::SetNpadMode`.
-    ///
-    /// Upstream first validates the npad id and writes
-    /// `shared_memory->assignment_mode` before any JoyCon split/merge logic.
-    /// ruzu does not yet have upstream's `controller_data[aruid][npad]`
-    /// device model, so it cannot faithfully decide connected JoyConDual
-    /// split/reassignment state here. Keep the guest-visible assignment-mode
-    /// write, then return "not reassigned" just like upstream does for
-    /// non-JoyConDual controllers.
+    /// Port of upstream `NPad::SetNpadMode`.
     pub fn set_npad_mode(
         &mut self,
         aruid: u64,
         npad_id: NpadIdType,
-        _npad_device_type: NpadJoyDeviceType,
+        npad_device_type: NpadJoyDeviceType,
         assignment_mode: NpadJoyAssignmentMode,
     ) -> (bool, NpadIdType) {
         if !hid_util::is_npad_id_valid(npad_id) {
@@ -585,12 +1037,100 @@ impl NPad {
             return (false, NpadIdType::default());
         };
         let npad_index = hid_util::npad_id_type_to_index(npad_id);
-        let controller = &mut shared.npad.npad_entry[npad_index].internal_state;
-        if controller.assignment_mode != assignment_mode {
-            controller.assignment_mode = assignment_mode;
+        let shared_memory = &mut shared.npad.npad_entry[npad_index].internal_state;
+        if shared_memory.assignment_mode != assignment_mode {
+            shared_memory.assignment_mode = assignment_mode;
         }
 
-        (false, NpadIdType::default())
+        let controller = &mut self.controller_data[aruid_index][npad_index];
+        let Some(device) = controller.device.as_ref().cloned() else {
+            return (false, NpadIdType::default());
+        };
+        let (is_connected, controller_type) = {
+            let device = device.lock();
+            (
+                device.is_connected(false),
+                device.get_npad_style_index(false),
+            )
+        };
+        if !is_connected {
+            return (false, NpadIdType::default());
+        }
+
+        if assignment_mode == NpadJoyAssignmentMode::Dual {
+            match controller_type {
+                NpadStyleIndex::JoyconLeft => {
+                    Self::disconnect_npad(shared_memory, controller);
+                    controller.is_dual_left_connected = true;
+                    controller.is_dual_right_connected = false;
+                    Self::update_controller_at(
+                        shared_memory,
+                        controller,
+                        NpadStyleIndex::JoyconDual,
+                    );
+                }
+                NpadStyleIndex::JoyconRight => {
+                    Self::disconnect_npad(shared_memory, controller);
+                    controller.is_dual_left_connected = false;
+                    controller.is_dual_right_connected = true;
+                    Self::update_controller_at(
+                        shared_memory,
+                        controller,
+                        NpadStyleIndex::JoyconDual,
+                    );
+                }
+                _ => {}
+            }
+            return (false, NpadIdType::default());
+        }
+
+        if controller_type != NpadStyleIndex::JoyconDual {
+            return (false, NpadIdType::default());
+        }
+
+        if controller.is_dual_left_connected && !controller.is_dual_right_connected {
+            Self::disconnect_npad(shared_memory, controller);
+            Self::update_controller_at(shared_memory, controller, NpadStyleIndex::JoyconLeft);
+            return (false, NpadIdType::default());
+        }
+        if !controller.is_dual_left_connected && controller.is_dual_right_connected {
+            Self::disconnect_npad(shared_memory, controller);
+            Self::update_controller_at(shared_memory, controller, NpadStyleIndex::JoyconRight);
+            return (false, NpadIdType::default());
+        }
+
+        let new_npad_id = self
+            .hid_core
+            .as_ref()
+            .map(|hid_core| hid_core.lock().get_first_disconnected_npad_id())
+            .unwrap_or_default();
+        let new_npad_index = hid_util::npad_id_type_to_index(new_npad_id);
+        if new_npad_index == npad_index {
+            return (false, NpadIdType::default());
+        }
+
+        let (shared_memory, shared_memory_2) =
+            two_mut(&mut shared.npad.npad_entry, npad_index, new_npad_index);
+        let (controller, controller_2) = two_mut(
+            &mut self.controller_data[aruid_index],
+            npad_index,
+            new_npad_index,
+        );
+        let shared_memory = &mut shared_memory.internal_state;
+        let shared_memory_2 = &mut shared_memory_2.internal_state;
+
+        Self::disconnect_npad(shared_memory, controller);
+        if npad_device_type == NpadJoyDeviceType::Left {
+            Self::update_controller_at(shared_memory, controller, NpadStyleIndex::JoyconLeft);
+            controller_2.is_dual_left_connected = false;
+            controller_2.is_dual_right_connected = true;
+        } else {
+            Self::update_controller_at(shared_memory, controller, NpadStyleIndex::JoyconRight);
+            controller_2.is_dual_left_connected = true;
+            controller_2.is_dual_right_connected = false;
+        }
+        Self::update_controller_at(shared_memory_2, controller_2, NpadStyleIndex::JoyconDual);
+        (true, new_npad_id)
     }
 
     pub fn apply_npad_system_common_policy(&mut self, aruid: u64) -> ResultCode {
@@ -837,14 +1377,36 @@ impl NPad {
     }
 }
 
+impl Drop for NPad {
+    fn drop(&mut self) {
+        for controllers in self.controller_data.iter_mut() {
+            for controller in controllers {
+                let (Some(device), Some(callback_key)) =
+                    (controller.device.as_ref(), controller.callback_key.take())
+                else {
+                    continue;
+                };
+                device.lock().delete_callback(callback_key);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::any::Any;
     use std::sync::Arc;
 
+    use common::input::{
+        register_input_factory, unregister_input_factory, AnalogStatus, CallbackStatus,
+        InputCallback, InputDevice, InputDeviceFactory, InputType, StickStatus,
+    };
+    use common::param_package::ParamPackage;
+    use common::settings_input::native_analog;
     use parking_lot::Mutex;
 
     use super::NPad;
+    use crate::frontend::emulated_controller::HID_JOYSTICK_MAX;
     use crate::hid_core::HIDCore;
     use crate::hid_types::{NpadIdType, NpadStyleIndex, NpadStyleSet};
     use crate::resources::applet_resource::{AppletResource, AppletResourceHolder};
@@ -859,6 +1421,54 @@ mod tests {
             let ptr = bytes.as_mut_ptr();
             let keepalive: Arc<dyn Any + Send + Sync> = Arc::new(bytes);
             Some((ptr, keepalive))
+        }
+    }
+
+    struct TestStickDevice {
+        callback: InputCallback,
+        x: f32,
+        y: f32,
+    }
+
+    impl InputDevice for TestStickDevice {
+        fn force_update(&mut self) {
+            self.trigger_on_change(&CallbackStatus {
+                input_type: InputType::Stick,
+                stick_status: StickStatus {
+                    x: AnalogStatus {
+                        raw_value: self.x,
+                        ..Default::default()
+                    },
+                    y: AnalogStatus {
+                        raw_value: self.y,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+
+        fn set_callback(&mut self, callback: InputCallback) {
+            self.callback = callback;
+        }
+
+        fn trigger_on_change(&self, status: &CallbackStatus) {
+            if let Some(on_change) = &self.callback.on_change {
+                on_change(status);
+            }
+        }
+    }
+
+    struct TestStickFactory;
+
+    impl InputDeviceFactory for TestStickFactory {
+        fn create(&self, params: &ParamPackage) -> Box<dyn InputDevice> {
+            Box::new(TestStickDevice {
+                callback: InputCallback { on_change: None },
+                x: params.get_float("test_x", 0.0),
+                y: params.get_float("test_y", 0.0),
+            })
         }
     }
 
@@ -898,6 +1508,78 @@ mod tests {
     }
 
     #[test]
+    fn set_npad_mode_splits_dual_joycon_like_upstream() {
+        const ARUID: u64 = 0x51;
+
+        let mut applet_resource = AppletResource::new();
+        applet_resource.set_shared_memory_backing(Arc::new(TestSharedMemoryBacking));
+        assert!(applet_resource
+            .register_applet_resource_user_id(ARUID, true)
+            .is_success());
+        assert!(applet_resource.create_applet_resource(ARUID).is_success());
+        let applet_resource = Arc::new(Mutex::new(applet_resource));
+
+        let hid_core = Arc::new(Mutex::new(HIDCore::new()));
+        let mut npad = NPad::new_with_hid_core(Arc::clone(&hid_core));
+        npad.set_npad_externals(AppletResourceHolder {
+            applet_resource: Some(Arc::clone(&applet_resource)),
+            handheld_config: None,
+        });
+        assert!(npad.register_applet_resource_user_id(ARUID).is_success());
+        assert!(npad.activate_npad_resource_with_aruid(ARUID).is_success());
+        assert!(npad
+            .set_supported_npad_style_set(
+                ARUID,
+                NpadStyleSet::JOY_DUAL | NpadStyleSet::JOY_LEFT | NpadStyleSet::JOY_RIGHT,
+            )
+            .is_success());
+        assert!(npad.activate().is_success());
+        assert!(npad.activate_for_aruid(ARUID).is_success());
+
+        let player_1 = hid_core.lock().get_emulated_controller(NpadIdType::Player1);
+        {
+            let mut player_1 = player_1.lock();
+            player_1.set_npad_style_index(NpadStyleIndex::JoyconDual);
+            player_1.connect(false);
+        }
+        npad.on_update();
+
+        let (is_reassigned, new_npad_id) = npad.set_npad_mode(
+            ARUID,
+            NpadIdType::Player1,
+            NpadJoyDeviceType::Left,
+            NpadJoyAssignmentMode::Single,
+        );
+
+        assert!(is_reassigned);
+        assert_eq!(new_npad_id, NpadIdType::Player2);
+        let player_2 = hid_core.lock().get_emulated_controller(NpadIdType::Player2);
+        assert_eq!(
+            player_1.lock().get_npad_style_index(false),
+            NpadStyleIndex::JoyconLeft
+        );
+        let player_2 = player_2.lock();
+        assert_eq!(
+            player_2.get_npad_style_index(false),
+            NpadStyleIndex::JoyconDual
+        );
+        assert!(player_2.is_connected(false));
+
+        let resource = applet_resource.lock();
+        let shared = resource.get_shared_memory_format(ARUID).unwrap();
+        assert!(shared.npad.npad_entry[0]
+            .internal_state
+            .style_tag
+            .raw
+            .contains(NpadStyleSet::JOY_LEFT));
+        assert!(shared.npad.npad_entry[1]
+            .internal_state
+            .style_tag
+            .raw
+            .contains(NpadStyleSet::JOY_DUAL));
+    }
+
+    #[test]
     fn lr_assignment_mode_start_stop_matches_upstream() {
         const ARUID: u64 = 0x51;
 
@@ -929,12 +1611,17 @@ mod tests {
 
         let hid_core = Arc::new(Mutex::new(HIDCore::new()));
         {
-            let mut hid_core = hid_core.lock();
-            let p1 = hid_core.get_emulated_controller_mut(NpadIdType::Player1);
+            let hid_core = hid_core.lock();
+            let p1 = hid_core.get_emulated_controller(NpadIdType::Player1);
+            let p2 = hid_core.get_emulated_controller(NpadIdType::Player2);
+            drop(hid_core);
+
+            let mut p1 = p1.lock();
             p1.set_npad_style_index(NpadStyleIndex::Fullkey);
             p1.connect(false);
+            drop(p1);
 
-            let p2 = hid_core.get_emulated_controller_mut(NpadIdType::Player2);
+            let mut p2 = p2.lock();
             p2.set_npad_style_index(NpadStyleIndex::Fullkey);
             p2.disconnect();
         }
@@ -967,6 +1654,81 @@ mod tests {
             .style_tag
             .raw
             .contains(NpadStyleSet::FULLKEY));
+    }
+
+    #[test]
+    fn on_update_writes_controller_sticks_to_fullkey_and_system_ext_lifos() {
+        const ARUID: u64 = 0x51;
+        const ENGINE: &str = "npad_test_stick";
+
+        register_input_factory(ENGINE, Arc::new(TestStickFactory));
+
+        let mut left_stick = ParamPackage::default();
+        left_stick.set_str("engine", ENGINE.to_string());
+        left_stick.set_float("test_x", 0.75);
+        left_stick.set_float("test_y", -0.25);
+
+        let mut right_stick = ParamPackage::default();
+        right_stick.set_str("engine", ENGINE.to_string());
+        right_stick.set_float("test_x", -0.5);
+        right_stick.set_float("test_y", 0.5);
+
+        let hid_core = Arc::new(Mutex::new(HIDCore::new()));
+        {
+            let hid_core = hid_core.lock();
+            let controller = hid_core.get_emulated_controller(NpadIdType::Player1);
+            drop(hid_core);
+            let mut controller = controller.lock();
+            controller.set_stick_param(native_analog::Values::LStick as usize, left_stick);
+            controller.set_stick_param(native_analog::Values::RStick as usize, right_stick);
+            controller.set_npad_style_index(NpadStyleIndex::Fullkey);
+            controller.connect(false);
+        }
+
+        let mut applet_resource = AppletResource::new();
+        applet_resource.set_shared_memory_backing(Arc::new(TestSharedMemoryBacking));
+        assert!(applet_resource
+            .register_applet_resource_user_id(ARUID, true)
+            .is_success());
+        assert!(applet_resource.create_applet_resource(ARUID).is_success());
+        let applet_resource = Arc::new(Mutex::new(applet_resource));
+
+        let mut npad = NPad::new_with_hid_core(hid_core);
+        npad.set_npad_externals(AppletResourceHolder {
+            applet_resource: Some(Arc::clone(&applet_resource)),
+            handheld_config: None,
+        });
+        assert!(npad.register_applet_resource_user_id(ARUID).is_success());
+        assert!(npad.activate_npad_resource_with_aruid(ARUID).is_success());
+        assert!(npad
+            .set_supported_npad_style_set(ARUID, NpadStyleSet::FULLKEY)
+            .is_success());
+        assert!(npad.activate().is_success());
+        assert!(npad.activate_for_aruid(ARUID).is_success());
+
+        npad.on_update();
+
+        let resource = applet_resource.lock();
+        let npad_state = &resource
+            .get_shared_memory_format(ARUID)
+            .unwrap()
+            .npad
+            .npad_entry[0]
+            .internal_state;
+        let fullkey = npad_state.fullkey_lifo.read_current_entry().state;
+        let system_ext = npad_state.system_ext_lifo.read_current_entry().state;
+
+        assert_eq!(fullkey.l_stick.x, (0.75 * HID_JOYSTICK_MAX as f32) as i32);
+        assert_eq!(fullkey.l_stick.y, (-0.25 * HID_JOYSTICK_MAX as f32) as i32);
+        assert_eq!(fullkey.r_stick.x, (-0.5 * HID_JOYSTICK_MAX as f32) as i32);
+        assert_eq!(fullkey.r_stick.y, (0.5 * HID_JOYSTICK_MAX as f32) as i32);
+        assert_eq!(system_ext.l_stick.x, fullkey.l_stick.x);
+        assert_eq!(system_ext.l_stick.y, fullkey.l_stick.y);
+        assert_eq!(system_ext.r_stick.x, fullkey.r_stick.x);
+        assert_eq!(system_ext.r_stick.y, fullkey.r_stick.y);
+
+        drop(resource);
+        unregister_input_factory(ENGINE);
     }
 
     #[test]
@@ -1018,5 +1780,126 @@ mod tests {
                 .sampling_number,
             19
         );
+    }
+
+    #[test]
+    fn on_update_routes_each_controller_style_to_its_upstream_lifo() {
+        const ARUID: u64 = 0x52;
+        let cases = [
+            (NpadStyleIndex::Handheld, NpadStyleSet::HANDHELD, 0x3f),
+            (NpadStyleIndex::JoyconDual, NpadStyleSet::JOY_DUAL, 0x15),
+            (NpadStyleIndex::JoyconLeft, NpadStyleSet::JOY_LEFT, 0x05),
+            (NpadStyleIndex::JoyconRight, NpadStyleSet::JOY_RIGHT, 0x11),
+            (NpadStyleIndex::GameCube, NpadStyleSet::GC, 0x03),
+            (NpadStyleIndex::Pokeball, NpadStyleSet::PALMA, 0x01),
+        ];
+
+        for (style, style_set, expected_connection) in cases {
+            let hid_core = Arc::new(Mutex::new(HIDCore::new()));
+            let controller = hid_core.lock().get_emulated_controller(NpadIdType::Player1);
+            {
+                let mut controller = controller.lock();
+                controller.set_npad_style_index(style);
+                controller.connect(false);
+            }
+
+            let mut applet_resource = AppletResource::new();
+            applet_resource.set_shared_memory_backing(Arc::new(TestSharedMemoryBacking));
+            assert!(applet_resource
+                .register_applet_resource_user_id(ARUID, true)
+                .is_success());
+            assert!(applet_resource.create_applet_resource(ARUID).is_success());
+            let applet_resource = Arc::new(Mutex::new(applet_resource));
+
+            let mut npad = NPad::new_with_hid_core(hid_core);
+            npad.set_npad_externals(AppletResourceHolder {
+                applet_resource: Some(Arc::clone(&applet_resource)),
+                handheld_config: None,
+            });
+            assert!(npad.register_applet_resource_user_id(ARUID).is_success());
+            assert!(npad.activate_npad_resource_with_aruid(ARUID).is_success());
+            assert!(npad
+                .set_supported_npad_style_set(ARUID, NpadStyleSet::ALL)
+                .is_success());
+            assert!(npad.activate().is_success());
+            assert!(npad.activate_for_aruid(ARUID).is_success());
+            npad.on_update();
+
+            let resource = applet_resource.lock();
+            let state = &resource
+                .get_shared_memory_format(ARUID)
+                .unwrap()
+                .npad
+                .npad_entry[0]
+                .internal_state;
+            assert!(
+                state.style_tag.raw.contains(style_set),
+                "{style:?} did not expose {style_set:?}"
+            );
+
+            let connection_status = match style {
+                NpadStyleIndex::Handheld => {
+                    state
+                        .handheld_lifo
+                        .read_current_entry()
+                        .state
+                        .connection_status
+                        .raw
+                }
+                NpadStyleIndex::JoyconDual => {
+                    state
+                        .joy_dual_lifo
+                        .read_current_entry()
+                        .state
+                        .connection_status
+                        .raw
+                }
+                NpadStyleIndex::JoyconLeft => {
+                    state
+                        .joy_left_lifo
+                        .read_current_entry()
+                        .state
+                        .connection_status
+                        .raw
+                }
+                NpadStyleIndex::JoyconRight => {
+                    state
+                        .joy_right_lifo
+                        .read_current_entry()
+                        .state
+                        .connection_status
+                        .raw
+                }
+                NpadStyleIndex::GameCube => {
+                    assert!(
+                        state
+                            .gc_trigger_lifo
+                            .read_current_entry()
+                            .state
+                            .sampling_number
+                            > 19
+                    );
+                    state
+                        .fullkey_lifo
+                        .read_current_entry()
+                        .state
+                        .connection_status
+                        .raw
+                }
+                NpadStyleIndex::Pokeball => {
+                    state
+                        .palma_lifo
+                        .read_current_entry()
+                        .state
+                        .connection_status
+                        .raw
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                connection_status, expected_connection,
+                "{style:?} used the wrong connection bits"
+            );
+        }
     }
 }

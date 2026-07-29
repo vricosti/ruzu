@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Rust/GTK4 counterpart of the upstream `GMainWindow` class defined in
-// `/Users/vricosti/Dev/emulators/zuyu/src/yuzu/main.cpp` + `main.h`, whose
+// `/home/vricosti/Dev/emulators/zuyu/src/yuzu/main.cpp` + `main.h`, whose
 // widget tree is described declaratively in `main.ui`.
 //
 // The upstream window layout is:
@@ -16,6 +16,7 @@
 // milestone: "build the main window with un-wired menus".
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -24,7 +25,7 @@ use gtk::{gio, glib, Application, ApplicationWindow};
 
 use ruzu_core::frontend::framebuffer_layout::{default_frame_layout, FramebufferLayout};
 
-use crate::boot::EmulationSession;
+use crate::boot::{EmulationSession, LoadingEvent};
 use crate::loading_screen::{LoadStage, LoadingScreen};
 use crate::status_bar::StatusBar;
 
@@ -45,6 +46,11 @@ const DEFAULT_HEIGHT: i32 = 720;
 /// Window title. Upstream uses "yuzu"; adapted to the ruzu app name.
 const WINDOW_TITLE: &str = "ruzu";
 
+/// Upstream `default_input_update_timeout`, the interval of `update_input_timer`.
+const INPUT_UPDATE_TIMEOUT_MS: u64 = 1;
+/// Upstream `status_bar_update_timer` interval.
+const STATUS_BAR_UPDATE_TIMEOUT_MS: u64 = 500;
+
 /// The main launcher window.
 ///
 /// Upstream `GMainWindow` derives from `QMainWindow`; here we wrap a
@@ -53,6 +59,9 @@ const WINDOW_TITLE: &str = "ruzu";
 /// upstream class members do.
 pub struct GMainWindow {
     window: ApplicationWindow,
+    /// In-window menu bar on non-macOS platforms. Upstream hides the menu bar
+    /// while the single-window render surface is fullscreen.
+    menu_bar: Option<gtk::PopoverMenuBar>,
     /// Central stack swapping between the game list, loading screen, and render
     /// view (upstream swaps `centralwidget`).
     stack: gtk::Stack,
@@ -74,15 +83,140 @@ pub struct GMainWindow {
     /// Handle to the game list, so it can be rescanned when the configured
     /// directories change.
     game_list: RefCell<Option<crate::game_list::GameListHandle>>,
+    /// Input drivers. Upstream `GMainWindow` owns the `InputSubsystem` and
+    /// passes it to `GRenderWindow`, which forwards events into it.
+    ///
+    /// It must stay alive for the whole session: `Initialize` registers each
+    /// engine in the process-wide factory registry that the emulated HID
+    /// resolves bindings through, and `Shutdown` unregisters them.
+    input_subsystem: Rc<RefCell<input_common::InputSubsystem>>,
+    /// The single HID core shared by configuration and the emulation System.
+    ///
+    /// Upstream owner: `Core::System::Impl::hid_core`.
+    hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
 }
 
 /// Handles needed to resize the embedded render surface on window resize.
 struct RenderHandles {
+    /// macOS: the child `NSWindow*`. Linux: the child X11 `Window` XID.
     child_window: usize,
+    /// macOS: the `CAMetalLayer*`.
+    #[cfg(target_os = "macos")]
     metal_layer: usize,
+    /// Linux: the X11 `Display*`.
+    #[cfg(target_os = "linux")]
+    display: usize,
     /// Shared frame layout the renderer reads; updated so the frame is rendered
     /// at the new native resolution on resize (upstream `OnFramebufferSizeChanged`).
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
+}
+
+#[derive(Default)]
+struct LoadingEventMailbox {
+    events: VecDeque<LoadingEvent>,
+}
+
+impl LoadingEventMailbox {
+    fn push(&mut self, event: LoadingEvent) {
+        match event {
+            LoadingEvent::Progress {
+                stage: LoadStage::Build,
+                value,
+                total,
+            } => {
+                if let Some(LoadingEvent::Progress {
+                    stage: LoadStage::Build,
+                    value: queued_value,
+                    total: queued_total,
+                }) = self.events.back_mut()
+                {
+                    *queued_value = value;
+                    *queued_total = total;
+                } else {
+                    self.events.push_back(LoadingEvent::Progress {
+                        stage: LoadStage::Build,
+                        value,
+                        total,
+                    });
+                }
+            }
+            LoadingEvent::Assets(assets) => {
+                if let Some(LoadingEvent::Assets(queued_assets)) = self.events.back_mut() {
+                    *queued_assets = assets;
+                } else {
+                    self.events.push_back(LoadingEvent::Assets(assets));
+                }
+            }
+            LoadingEvent::FirstFrame => {
+                if !self
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, LoadingEvent::FirstFrame))
+                {
+                    self.events.push_back(LoadingEvent::FirstFrame);
+                }
+            }
+            event => self.events.push_back(event),
+        }
+    }
+
+    fn pop(&mut self) -> Option<LoadingEvent> {
+        self.events.pop_front()
+    }
+}
+
+#[cfg(test)]
+mod loading_event_mailbox_tests {
+    use super::*;
+
+    #[test]
+    fn build_updates_are_coalesced_without_losing_stage_transitions() {
+        let mut mailbox = LoadingEventMailbox::default();
+        mailbox.push(LoadingEvent::Progress {
+            stage: LoadStage::Prepare,
+            value: 0,
+            total: 0,
+        });
+        for value in 0..=929 {
+            mailbox.push(LoadingEvent::Progress {
+                stage: LoadStage::Build,
+                value,
+                total: 929,
+            });
+        }
+        mailbox.push(LoadingEvent::Progress {
+            stage: LoadStage::Complete,
+            value: 0,
+            total: 0,
+        });
+        mailbox.push(LoadingEvent::FirstFrame);
+        mailbox.push(LoadingEvent::FirstFrame);
+
+        assert!(matches!(
+            mailbox.pop(),
+            Some(LoadingEvent::Progress {
+                stage: LoadStage::Prepare,
+                ..
+            })
+        ));
+        assert!(matches!(
+            mailbox.pop(),
+            Some(LoadingEvent::Progress {
+                stage: LoadStage::Build,
+                value: 929,
+                total: 929,
+            })
+        ));
+        assert!(matches!(
+            mailbox.pop(),
+            Some(LoadingEvent::Progress {
+                stage: LoadStage::Complete,
+                ..
+            })
+        ));
+        assert!(matches!(mailbox.pop(), Some(LoadingEvent::FirstFrame)));
+        assert!(mailbox.pop().is_none());
+    }
 }
 
 impl GMainWindow {
@@ -106,11 +240,14 @@ impl GMainWindow {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
         #[cfg(not(target_os = "macos"))]
-        {
+        let menu_bar = {
             let menubar = gtk::PopoverMenuBar::from_model(Some(&build_menu_model()));
             menubar.set_halign(gtk::Align::Start);
             root.append(&menubar);
-        }
+            Some(menubar)
+        };
+        #[cfg(target_os = "macos")]
+        let menu_bar = None;
 
         // --- Central stack (upstream `centralwidget`) ------------------------
         // Pages: game list, loading screen, (later) render view.
@@ -163,6 +300,7 @@ impl GMainWindow {
 
         let this = Rc::new(Self {
             window,
+            menu_bar,
             stack,
             loading_screen,
             session: RefCell::new(None),
@@ -171,7 +309,18 @@ impl GMainWindow {
             render_size: Cell::new((0, 0)),
             configure_dialog: RefCell::new(None),
             game_list: RefCell::new(None),
+            input_subsystem: Rc::new(RefCell::new(input_common::InputSubsystem::new())),
+            hid_core: Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new())),
         });
+
+        // Upstream calls `input_subsystem->Initialize()` from the
+        // `GRenderWindow` constructor. Do it once here, before any boot, so the
+        // engines are registered when the guest starts reading its controllers.
+        this.input_subsystem.borrow_mut().initialize();
+        this.hid_core.lock().reload_input_devices();
+        this.install_input_handlers();
+        this.start_input_driver_updates();
+        this.start_status_bar_updates();
 
         // Game list page: activating a row boots that game in-process.
         let (game_list, game_list_handle) = crate::game_list::build(glib::clone!(
@@ -195,7 +344,7 @@ impl GMainWindow {
         // Keep the embedded render surface sized to the central stack as the
         // window is resized. GTK4 has no widget `size-allocate` signal, so poll
         // the stack size on the frame clock and act only on change.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         this.stack.add_tick_callback(glib::clone!(
             #[weak(rename_to = w)]
             this,
@@ -212,6 +361,22 @@ impl GMainWindow {
         // need the window (render surface, loading screen, stack) so they live
         // here rather than in the app-startup registration.
         this.register_boot_actions(app);
+        this.register_fullscreen_actions(app);
+
+        // Keep the checkable menu action and the window chrome synchronized
+        // when the compositor exits fullscreen independently.
+        this.window.connect_fullscreened_notify(glib::clone!(
+            #[weak(rename_to = this)]
+            this,
+            #[weak]
+            app,
+            move |window| {
+                let fullscreen = window.is_fullscreen();
+                this.set_fullscreen_action_state(&app, fullscreen);
+                crate::uisettings::with_mut(|values| values.fullscreen.set_value(fullscreen));
+                this.update_fullscreen_chrome(fullscreen);
+            }
+        ));
 
         // Stop the emulation session when the window is closing, *before* GTK
         // tears down the native surface — otherwise the GPU thread keeps
@@ -280,10 +445,173 @@ impl GMainWindow {
         ));
         app.add_action(&preferences);
 
-        // The two blocks above replace the startup stubs by name, which resets
+        // Tools menu — upstream `connect_menu(action_Install_Keys, …)` etc.
+        macro_rules! window_action {
+            ($name:literal, $handler:ident) => {{
+                let action = gio::SimpleAction::new($name, None);
+                action.connect_activate(glib::clone!(
+                    #[weak(rename_to = this)]
+                    self,
+                    move |_, _| this.$handler()
+                ));
+                app.add_action(&action);
+            }};
+        }
+        window_action!("install_keys", on_install_decryption_keys);
+        window_action!("install_firmware", on_install_firmware);
+        window_action!("verify_installed_contents", on_verify_installed_contents);
+
+        // The blocks above replace the startup stubs by name, which resets
         // their enabled state; re-apply it (upstream re-runs `UpdateMenuState`
         // after `ConnectMenuEvents`).
         update_menu_state(app, self.session.borrow().is_some(), true);
+    }
+
+    /// Register upstream's checkable `View > Fullscreen` action and its two
+    /// hotkeys: `F11` toggles it, while `Esc` only exits fullscreen.
+    fn register_fullscreen_actions(self: &Rc<Self>, app: &Application) {
+        let initially_checked = crate::uisettings::with(|values| *values.fullscreen.get_value());
+        let fullscreen =
+            gio::SimpleAction::new_stateful("fullscreen", None, &initially_checked.to_variant());
+        fullscreen.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |action, _| {
+                let checked = !action
+                    .state()
+                    .and_then(|state| state.get::<bool>())
+                    .unwrap_or(false);
+                action.set_state(&checked.to_variant());
+                crate::uisettings::with_mut(|values| values.fullscreen.set_value(checked));
+
+                // Upstream leaves the action checked when no game is running,
+                // but ToggleFullscreen itself returns without changing the
+                // launcher window. BootGame consumes the saved checked state.
+                if this.session.borrow().is_some() {
+                    this.set_fullscreen(checked);
+                }
+            }
+        ));
+        app.add_action(&fullscreen);
+        app.set_accels_for_action("app.fullscreen", &["F11"]);
+
+        let exit_fullscreen = gio::SimpleAction::new("exit_fullscreen", None);
+        exit_fullscreen.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            app,
+            move |_, _| {
+                if this.session.borrow().is_some() && this.window.is_fullscreen() {
+                    this.set_fullscreen_action_state(&app, false);
+                    crate::uisettings::with_mut(|values| values.fullscreen.set_value(false));
+                    this.set_fullscreen(false);
+                }
+            }
+        ));
+        app.add_action(&exit_fullscreen);
+        app.set_accels_for_action("app.exit_fullscreen", &["Escape"]);
+    }
+
+    /// Upstream `GMainWindow::ToggleFullscreen` / `ShowFullscreen` /
+    /// `HideFullscreen`, adapted to ruzu's always-single-window GTK frontend.
+    fn set_fullscreen(&self, fullscreen: bool) {
+        self.update_fullscreen_chrome(fullscreen);
+        self.window.set_fullscreened(fullscreen);
+    }
+
+    fn update_fullscreen_chrome(&self, fullscreen: bool) {
+        if let Some(menu_bar) = self.menu_bar.as_ref() {
+            menu_bar.set_visible(!fullscreen);
+        }
+        let show_status_bar = crate::uisettings::with(|values| *values.show_status_bar.get_value());
+        self.status_bar
+            .widget()
+            .set_visible(!fullscreen && show_status_bar);
+    }
+
+    fn set_fullscreen_action_state(&self, app: &Application, fullscreen: bool) {
+        if let Some(action) = app
+            .lookup_action("fullscreen")
+            .and_downcast::<gio::SimpleAction>()
+        {
+            action.set_state(&fullscreen.to_variant());
+        }
+    }
+
+    /// Forward keyboard and mouse events into the input subsystem.
+    ///
+    /// Transposition of `GRenderWindow::keyPressEvent` / `keyReleaseEvent` /
+    /// `mousePressEvent` etc. (`zuyu/src/yuzu/bootmanager.cpp`). Upstream does
+    /// three things per key:
+    ///
+    /// ```cpp
+    /// input_subsystem->GetKeyboard()->SetKeyboardModifiers(modifier);
+    /// input_subsystem->GetKeyboard()->PressKeyboardKey(key);   // emulated USB keyboard
+    /// input_subsystem->GetKeyboard()->PressKey(event->key());  // controller bindings
+    /// ```
+    ///
+    /// The last call is the one that drives gamepad buttons, resolved through
+    /// the `engine:keyboard` bindings in `Settings::values.players`.
+    ///
+    /// Divergence: upstream passes Qt key codes, since that is the key space
+    /// its own configuration UI records. ruzu passes GDK keyvals for the same
+    /// reason — whatever the frontend records when binding is what it must send
+    /// back. Bindings imported from a yuzu config therefore carry Qt codes and
+    /// will not match; they have to be re-bound in Controls.
+    fn install_input_handlers(self: &Rc<Self>) {
+        let keys = gtk::EventControllerKey::new();
+        // Capture, so a key bound to a game control is not first swallowed by a
+        // focused widget in the launcher chrome.
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+
+        keys.connect_key_pressed(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, keyval, _keycode, state| {
+                this.on_key_event(keyval, state, true);
+                // Never claim the event: the menus and dialogs still need it.
+                glib::Propagation::Proceed
+            }
+        ));
+        keys.connect_key_released(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, keyval, _keycode, state| {
+                this.on_key_event(keyval, state, false);
+            }
+        ));
+        self.window.add_controller(keys);
+    }
+
+    /// One key press or release — upstream's `keyPressEvent` / `keyReleaseEvent`.
+    fn on_key_event(&self, keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType, pressed: bool) {
+        let subsystem = self.input_subsystem.borrow();
+        let Some(keyboard) = subsystem.get_keyboard() else {
+            return;
+        };
+
+        keyboard.set_keyboard_modifiers(switch_modifiers(state));
+
+        // The emulated USB keyboard, for games that read one directly.
+        let switch_key = gdk_key_to_switch_key(keyval);
+        if pressed {
+            keyboard.press_keyboard_key(switch_key);
+        } else {
+            keyboard.release_keyboard_key(switch_key);
+        }
+
+        // The controller-binding path.
+        // Normalize letters so a Shift modifier does not change the binding's
+        // key code while it is held, matching Qt's key-event space upstream.
+        let code = gtk::glib::translate::IntoGlib::into_glib(keyval.to_lower()) as i32;
+        if pressed {
+            keyboard.press_key(code);
+        } else {
+            keyboard.release_key(code);
+        }
     }
 
     /// On a first run with an existing yuzu installation, offer to import its
@@ -356,6 +684,323 @@ impl GMainWindow {
         }
     }
 
+    /// Upstream `GMainWindow::OnInstallDecryptionKeys`.
+    ///
+    /// Asks for a `prod.keys`, copies it (plus `title.keys` / `key_retail.bin`
+    /// when they sit beside it) into ruzu's keys directory, reloads the key
+    /// manager, and rescans the game list so titles that were undecryptable
+    /// appear.
+    fn on_install_decryption_keys(self: &Rc<Self>) {
+        // Upstream refuses while emulation is running.
+        if self.session.borrow().is_some() {
+            log::info!("Install Decryption Keys ignored: emulation is running");
+            return;
+        }
+
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("prod.keys"));
+        filter.add_pattern("prod.keys");
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+
+        let dialog = gtk::FileDialog::builder()
+            .title("Select Dumped Keys Location")
+            .filters(&filters)
+            .default_filter(&filter)
+            .modal(true)
+            .build();
+
+        log::info!("Install Decryption Keys: opening file chooser");
+        dialog.open(
+            Some(&self.window),
+            gio::Cancellable::NONE,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |result| {
+                    let file = match result {
+                        Ok(file) => file,
+                        Err(e) => {
+                            log::info!("Install Decryption Keys cancelled: {e}");
+                            return;
+                        }
+                    };
+                    let Some(prod_keys) = file.path() else { return };
+                    this.install_decryption_keys_from(&prod_keys);
+                }
+            ),
+        );
+    }
+
+    /// Copy the key files sitting beside `prod_keys` into the keys directory.
+    fn install_decryption_keys_from(self: &Rc<Self>, prod_keys: &std::path::Path) {
+        log::info!("Installing key files from {}", prod_keys.display());
+        let Some(source_dir) = prod_keys.parent() else {
+            return;
+        };
+
+        // There must be at least prod.keys; the other two are optional.
+        if !prod_keys.is_file() {
+            self.alert(
+                "Decryption Keys install failed",
+                "prod.keys is a required decryption key file.",
+            );
+            return;
+        }
+        let mut sources = vec![prod_keys.to_path_buf()];
+        for optional in ["title.keys", "key_retail.bin"] {
+            let candidate = source_dir.join(optional);
+            if candidate.is_file() {
+                sources.push(candidate);
+            }
+        }
+
+        let keys_dir =
+            common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::KeysDir);
+        if let Err(e) = std::fs::create_dir_all(&keys_dir) {
+            log::error!("Could not create keys dir {}: {e}", keys_dir.display());
+            self.alert(
+                "Decryption Keys install failed",
+                "Could not create the keys directory.",
+            );
+            return;
+        }
+
+        for source in &sources {
+            let Some(name) = source.file_name() else {
+                continue;
+            };
+            let destination = keys_dir.join(name);
+            // Selecting the keys that are *already* installed would make source
+            // and destination the same file, and `fs::copy` onto itself
+            // truncates it — destroying the user's keys. Nothing to do anyway.
+            if same_file(source, &destination) {
+                log::info!("{} is already installed; skipping", source.display());
+                continue;
+            }
+            if let Err(e) = std::fs::copy(source, &destination) {
+                log::error!(
+                    "Failed to copy file {} to {}: {e}",
+                    source.display(),
+                    destination.display()
+                );
+                self.alert(
+                    "Decryption Keys install failed",
+                    "One or more keys failed to copy.",
+                );
+                return;
+            }
+        }
+
+        // Reinitialize the key manager and re-populate the game list, so titles
+        // that could not be decrypted before are picked up.
+        ruzu_core::crypto::key_manager::KeyManager::instance()
+            .lock()
+            .unwrap()
+            .reload_keys();
+        if let Some(game_list) = self.game_list.borrow().as_ref() {
+            game_list.reload();
+        }
+
+        if frontend_common::content_manager::are_keys_present() {
+            self.alert(
+                "Decryption Keys install succeeded",
+                "Decryption Keys were successfully installed",
+            );
+        } else {
+            self.alert(
+                "Decryption Keys install failed",
+                "Decryption Keys failed to initialize. Check that your dumping tools are \
+                 up to date and re-dump keys.",
+            );
+        }
+    }
+
+    /// Upstream `GMainWindow::OnInstallFirmware`.
+    ///
+    /// Clears `nand/system/Contents/registered` and copies the dumped firmware
+    /// NCAs into it.
+    fn on_install_firmware(self: &Rc<Self>) {
+        if self.session.borrow().is_some() {
+            log::info!("Install Firmware ignored: emulation is running");
+            return;
+        }
+
+        // Upstream checks for keys first: firmware NCAs cannot be read without
+        // them, so installing would produce an unusable NAND.
+        if !frontend_common::content_manager::are_keys_present() {
+            self.alert(
+                "Keys not installed",
+                "Install decryption keys and restart ruzu before attempting to install firmware.",
+            );
+            return;
+        }
+
+        let dialog = gtk::FileDialog::builder()
+            .title("Select Dumped Firmware Source Location")
+            .modal(true)
+            .build();
+
+        dialog.select_folder(
+            Some(&self.window),
+            gio::Cancellable::NONE,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |result| {
+                    let Ok(folder) = result else { return };
+                    let Some(path) = folder.path() else { return };
+                    this.install_firmware_from(&path);
+                }
+            ),
+        );
+    }
+
+    /// Replace the installed firmware with the NCAs found in `source`.
+    fn install_firmware_from(self: &Rc<Self>, source: &std::path::Path) {
+        log::info!("Installing firmware from {}", source.display());
+
+        // Check for a reasonable number of .nca files — upstream does not
+        // hardcode names, it just looks for some.
+        let mut ncas: Vec<std::path::PathBuf> = match std::fs::read_dir(source) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|ext| ext == "nca"))
+                .collect(),
+            Err(e) => {
+                log::error!("Could not read {}: {e}", source.display());
+                return;
+            }
+        };
+        ncas.sort();
+
+        if ncas.is_empty() {
+            self.alert(
+                "Firmware install failed",
+                "Unable to locate potential firmware NCA files",
+            );
+            return;
+        }
+
+        // Locate and erase the content of nand/system/Contents/registered.
+        let registered =
+            common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::NANDDir)
+                .join("system/Contents/registered");
+
+        if registered.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&registered) {
+                log::error!("Failed to clean {}: {e}", registered.display());
+                self.alert(
+                    "Firmware install failed",
+                    "Failed to delete one or more firmware file.",
+                );
+                return;
+            }
+        }
+        if let Err(e) = std::fs::create_dir_all(&registered) {
+            log::error!("Failed to create {}: {e}", registered.display());
+            self.alert(
+                "Firmware install failed",
+                "Failed to create the firmware directory.",
+            );
+            return;
+        }
+        log::info!(
+            "Cleaned {} in preparation for new firmware",
+            registered.display()
+        );
+
+        let progress = ProgressWindow::new(&self.window, "Installing Firmware...");
+        for (index, nca) in ncas.iter().enumerate() {
+            let Some(name) = nca.file_name() else {
+                continue;
+            };
+            if let Err(e) = std::fs::copy(nca, registered.join(name)) {
+                log::error!(
+                    "Failed to copy firmware file {} into the registered folder: {e}",
+                    nca.display()
+                );
+                progress.close();
+                self.alert(
+                    "Firmware install failed",
+                    "One or more firmware files failed to copy into NAND.",
+                );
+                return;
+            }
+            progress.set_fraction((index + 1) as f64 / ncas.len() as f64);
+        }
+        progress.close();
+
+        log::info!("Installed {} firmware NCA(s)", ncas.len());
+        // Upstream then verifies the freshly installed firmware; that runs here
+        // as the separate Tools ▸ Verify Installed Contents action rather than
+        // automatically, so a slow scan does not block the install dialog.
+        self.alert(
+            "Firmware install succeeded",
+            &format!(
+                "Installed {} firmware file(s).\n\n\
+                 Run Tools ▸ Verify Installed Contents to check their integrity.",
+                ncas.len()
+            ),
+        );
+    }
+
+    /// Upstream `GMainWindow::OnVerifyInstalledContents`.
+    fn on_verify_installed_contents(self: &Rc<Self>) {
+        log::info!("Verifying installed contents");
+        let progress = ProgressWindow::new(&self.window, "Verifying integrity...");
+
+        // Upstream verifies through `system.GetFileSystemController()`. The
+        // launcher has no booted `System`, so build the same controller over the
+        // real filesystem — the registries it opens are the on-disk NAND ones
+        // either way.
+        let vfs = ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem::new();
+        let mut filesystem =
+            ruzu_core::hle::service::filesystem::filesystem::FileSystemController::new();
+        filesystem.create_factories(vfs, false);
+
+        let failed = frontend_common::content_manager::verify_installed_contents(
+            &filesystem,
+            &|total, processed| {
+                if total > 0 {
+                    progress.set_fraction(processed as f64 / total as f64);
+                }
+                // Returning true cancels; nothing cancels this yet.
+                false
+            },
+            false,
+        );
+
+        progress.close();
+
+        if failed.is_empty() {
+            self.alert(
+                "Integrity verification succeeded!",
+                "The operation completed successfully.",
+            );
+        } else {
+            self.alert(
+                "Integrity verification failed!",
+                &format!(
+                    "Verification failed for the following files:\n\n{}",
+                    failed.join("\n")
+                ),
+            );
+        }
+    }
+
+    /// Show a modal message — the `QMessageBox` calls peppered through the
+    /// upstream handlers.
+    fn alert(&self, message: &str, detail: &str) {
+        gtk::AlertDialog::builder()
+            .modal(true)
+            .message(message)
+            .detail(detail)
+            .build()
+            .show(Some(&self.window));
+    }
+
     /// Upstream `GMainWindow::OnConfigure`: build and show the configuration
     /// dialog, parented to the main window.
     ///
@@ -364,7 +1009,18 @@ impl GMainWindow {
     /// whose OK handler applies the settings itself, so the `Rc` is held alive
     /// by the window until the next invocation replaces it.
     fn on_configure(self: &Rc<Self>) {
-        let dialog = crate::configuration::ConfigureDialog::new(Some(&self.window));
+        let dialog = crate::configuration::ConfigureDialog::new(
+            Some(&self.window),
+            Rc::clone(&self.input_subsystem),
+            Arc::clone(&self.hid_core),
+        );
+        dialog.connect_closed(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move || {
+                this.configure_dialog.borrow_mut().take();
+            }
+        ));
         dialog.present();
         *self.configure_dialog.borrow_mut() = Some(dialog);
     }
@@ -524,29 +1180,40 @@ impl GMainWindow {
 
         self.show_loading_screen();
 
-        // Progress is produced on the boot thread and consumed on the GTK main
-        // thread via a shared slot polled by a timeout (cross-thread marshaling,
-        // the same shape as yuzu's queued LoadProgress signal).
-        let slot: Arc<Mutex<Option<(LoadStage, usize, usize)>>> = Arc::new(Mutex::new(None));
-        let slot_producer = Arc::clone(&slot);
-        let progress: crate::boot::ProgressFn = Box::new(move |stage, value, total| {
-            *slot_producer.lock().unwrap() = Some((stage, value, total));
+        // Loading events are produced on the boot and Vulkan worker threads,
+        // then consumed on GTK's main thread. Adjacent Build events are
+        // coalesced while stage transitions remain queued, so a hot cache still
+        // visibly passes through `Loading Shaders` before `Launching`.
+        let mailbox = Arc::new(Mutex::new(LoadingEventMailbox::default()));
+        let producer = Arc::clone(&mailbox);
+        let loading_event: crate::boot::LoadingEventFn = Arc::new(move |event| {
+            producer.lock().unwrap().push(event);
         });
 
         let loading = Rc::clone(&self.loading_screen);
         let stack = self.stack.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
-            let update = slot.lock().unwrap().take();
-            if let Some((stage, value, total)) = update {
-                loading.on_load_progress(stage, value, total);
-                if stage == LoadStage::Complete {
-                    // Switch the backdrop to the black render page so a resize
-                    // exposes black (not the light loading screen), then reveal
-                    // the native render window over it.
-                    stack.set_visible_child_name(PAGE_RENDER);
-                    crate::render_window::set_render_view_hidden(child_window as *mut _, false);
+            match mailbox.lock().unwrap().pop() {
+                Some(LoadingEvent::Assets(assets)) => {
+                    loading.set_assets(assets.logo.as_deref(), assets.banner.as_deref());
+                }
+                Some(LoadingEvent::Progress {
+                    stage,
+                    value,
+                    total,
+                }) => loading.on_load_progress(stage, value, total),
+                Some(LoadingEvent::FirstFrame) => {
+                    let stack = stack.clone();
+                    loading.on_load_complete(move || {
+                        // Upstream reveals the render window only after the
+                        // loading screen has faded out following its first
+                        // framebuffer.
+                        stack.set_visible_child_name(PAGE_RENDER);
+                        crate::render_window::set_render_view_hidden(child_window as *mut _, false);
+                    });
                     return glib::ControlFlow::Break;
                 }
+                None => {}
             }
             glib::ControlFlow::Continue
         });
@@ -556,16 +1223,162 @@ impl GMainWindow {
             drawable_size,
             shown_state,
             framebuffer_layout,
+            Arc::clone(&self.hid_core),
             filepath,
-            progress,
+            loading_event,
         );
         *self.session.borrow_mut() = Some(session);
+        if let Some(app) = self.window.application() {
+            update_menu_state(&app, true, false);
+        }
+        if crate::uisettings::with(|values| *values.fullscreen.get_value()) {
+            self.set_fullscreen(true);
+        }
     }
 
-    /// In-process boot currently requires the macOS CAMetalLayer bridge.
-    #[cfg(not(target_os = "macos"))]
+    /// Boot `filepath` into an X11 child window embedded in the GTK window.
+    ///
+    /// Same shape as the macOS path above; only the native surface differs —
+    /// an X11 child `Window` instead of a `CAMetalLayer` sub-view, matching
+    /// upstream's per-platform `GetWindowSystemInfo`.
+    #[cfg(target_os = "linux")]
+    pub fn boot_game(self: &Rc<Self>, filepath: String) {
+        use crate::emu_window::GtkEmuWindow;
+        use crate::render_window_x11 as render;
+        use ruzu_core::frontend::emu_window::{WindowSystemInfo, WindowSystemType};
+
+        // The render surface only exists once the window is realized, and the
+        // central stack only has an allocation after the first layout pass.
+        let ready =
+            self.window.surface().is_some() && self.stack.width() > 0 && self.stack.height() > 0;
+        if !ready {
+            let this = Rc::clone(self);
+            glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+                if this.window.surface().is_some()
+                    && this.stack.width() > 0
+                    && this.stack.height() > 0
+                {
+                    this.boot_game(filepath.clone());
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            });
+            return;
+        }
+
+        // Stop any existing session first (upstream stops before re-booting).
+        if let Some(mut session) = self.session.borrow_mut().take() {
+            session.stop();
+        }
+        self.status_bar.refresh();
+
+        // Render area = the central stack's bounds, so the child window leaves
+        // the menu bar and status bar visible.
+        let render_rect = self.stack.compute_bounds(&self.window).map(|r| {
+            (
+                r.x() as f64,
+                r.y() as f64,
+                r.width() as f64,
+                r.height() as f64,
+            )
+        });
+
+        let Some(embedded) =
+            render::attach_render_window(self.window.upcast_ref::<gtk::Window>(), render_rect)
+        else {
+            log::error!(
+                "Cannot boot: failed to embed an X11 render surface. \
+                 Native Wayland is not supported yet — relaunch with GDK_BACKEND=x11."
+            );
+            self.alert(
+                "Unable to start the game",
+                "ruzu could not create its embedded X11 render surface. \
+                 Ensure XWayland is available and restart the application.",
+            );
+            return;
+        };
+
+        // Keep it hidden so the loading screen shows during load.
+        render::set_render_window_hidden(embedded.display, embedded.window, true);
+
+        let window_info = WindowSystemInfo {
+            type_: WindowSystemType::X11,
+            display_connection: embedded.display as usize,
+            render_surface: embedded.window as usize,
+            render_surface_scale: embedded.scale,
+        };
+        let emu = GtkEmuWindow::from_window_info(window_info.clone(), embedded.drawable_size);
+        let drawable_size = emu.drawable_size();
+        let shown_state = emu.shown_state();
+        let framebuffer_layout = emu.framebuffer_layout();
+
+        *self.render.borrow_mut() = Some(RenderHandles {
+            display: embedded.display as usize,
+            child_window: embedded.window as usize,
+            framebuffer_layout: Arc::clone(&framebuffer_layout),
+        });
+        self.render_size
+            .set((self.stack.width(), self.stack.height()));
+
+        self.show_loading_screen();
+
+        let mailbox = Arc::new(Mutex::new(LoadingEventMailbox::default()));
+        let producer = Arc::clone(&mailbox);
+        let loading_event: crate::boot::LoadingEventFn = Arc::new(move |event| {
+            producer.lock().unwrap().push(event);
+        });
+
+        let loading = Rc::clone(&self.loading_screen);
+        let stack = self.stack.clone();
+        let display = embedded.display as usize;
+        let child = embedded.window;
+        glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+            match mailbox.lock().unwrap().pop() {
+                Some(LoadingEvent::Assets(assets)) => {
+                    loading.set_assets(assets.logo.as_deref(), assets.banner.as_deref());
+                }
+                Some(LoadingEvent::Progress {
+                    stage,
+                    value,
+                    total,
+                }) => loading.on_load_progress(stage, value, total),
+                Some(LoadingEvent::FirstFrame) => {
+                    let stack = stack.clone();
+                    loading.on_load_complete(move || {
+                        stack.set_visible_child_name(PAGE_RENDER);
+                        render::set_render_window_hidden(display as *mut _, child, false);
+                    });
+                    return glib::ControlFlow::Break;
+                }
+                None => {}
+            }
+            glib::ControlFlow::Continue
+        });
+
+        let session = crate::boot::boot_game(
+            window_info,
+            drawable_size,
+            shown_state,
+            framebuffer_layout,
+            Arc::clone(&self.hid_core),
+            filepath,
+            loading_event,
+        );
+        *self.session.borrow_mut() = Some(session);
+        if let Some(app) = self.window.application() {
+            update_menu_state(&app, true, false);
+        }
+        if crate::uisettings::with(|values| *values.fullscreen.get_value()) {
+            self.set_fullscreen(true);
+        }
+    }
+
+    /// In-process boot needs a platform-specific render surface; only macOS
+    /// (CAMetalLayer) and Linux/X11 have one so far.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub fn boot_game(self: &Rc<Self>, _filepath: String) {
-        log::error!("In-process boot is only implemented on macOS for now");
+        log::error!("In-process boot is not implemented on this platform yet");
     }
 
     /// If a game is running and the central stack changed size, resize the
@@ -607,6 +1420,39 @@ impl GMainWindow {
         }
     }
 
+    /// Linux counterpart of `maybe_resize_render`: move/resize the X11 child
+    /// window to the stack's new bounds and rebuild the frame layout.
+    #[cfg(target_os = "linux")]
+    fn maybe_resize_render(&self) {
+        let (w, h) = (self.stack.width(), self.stack.height());
+        if w <= 0 || h <= 0 || self.render_size.get() == (w, h) {
+            return;
+        }
+        let render = self.render.borrow();
+        let Some(handles) = render.as_ref() else {
+            self.render_size.set((w, h));
+            return;
+        };
+        let Some(rect) = self.stack.compute_bounds(&self.window) else {
+            return;
+        };
+        self.render_size.set((w, h));
+        let gr = (
+            rect.x() as f64,
+            rect.y() as f64,
+            rect.width() as f64,
+            rect.height() as f64,
+        );
+        if let Some((dw, dh)) = crate::render_window_x11::resize_render_window(
+            self.window.upcast_ref::<gtk::Window>(),
+            handles.display as *mut _,
+            handles.child_window as u64,
+            gr,
+        ) {
+            *handles.framebuffer_layout.write().unwrap() = default_frame_layout(dw, dh);
+        }
+    }
+
     /// Switch the central stack to the loading screen and reset its state.
     /// Mirrors the point where upstream shows `LoadingScreen` before booting.
     pub fn show_loading_screen(&self) {
@@ -636,6 +1482,47 @@ impl GMainWindow {
                 glib::ControlFlow::Continue
             }
         });
+    }
+
+    /// Upstream `GMainWindow::UpdateInputDrivers`, driven by `update_input_timer`.
+    ///
+    /// Nothing else pumps the input engines: the SDL driver installs an event
+    /// watch but SDL only dispatches to it while somebody pumps its queue, so
+    /// without this timer no button press or stick movement ever reaches the
+    /// engines. Upstream's interval is `default_input_update_timeout = 1` ms.
+    fn start_input_driver_updates(self: &Rc<Self>) {
+        let input_subsystem = Rc::clone(&self.input_subsystem);
+        glib::timeout_add_local(
+            std::time::Duration::from_millis(INPUT_UPDATE_TIMEOUT_MS),
+            move || {
+                input_subsystem.borrow_mut().pump_events();
+                glib::ControlFlow::Continue
+            },
+        );
+    }
+
+    /// Refresh the performance section of the status bar at upstream's 500 ms
+    /// cadence. The boot thread owns `System` and publishes each reset sample
+    /// through [`EmulationSession`], so GTK only reads a small copied snapshot.
+    fn start_status_bar_updates(self: &Rc<Self>) {
+        glib::timeout_add_local(
+            std::time::Duration::from_millis(STATUS_BAR_UPDATE_TIMEOUT_MS),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    let results = this
+                        .session
+                        .borrow()
+                        .as_ref()
+                        .and_then(EmulationSession::perf_stats);
+                    this.status_bar.update_performance(results);
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
     }
 
     /// Show the window. Mirrors upstream `main_window.show()`.
@@ -685,6 +1572,173 @@ pub fn init_app_menu(app: &Application) {
     // Upstream calls `UpdateMenuState()` once the menu is built, which greys
     // out the run-time entries because no game is running yet.
     update_menu_state(app, false, true);
+}
+
+/// GDK modifier state to the Switch's HID modifier bitmask.
+///
+/// Port of `GRenderWindow::QtModifierToSwitchModifier`. Like Qt, GDK does not
+/// distinguish left from right for a held modifier, so upstream's commented-out
+/// right-hand cases stay unreachable here too.
+fn switch_modifiers(state: gtk::gdk::ModifierType) -> i32 {
+    use common::settings_input::native_keyboard::Modifiers;
+    use gtk::gdk::ModifierType;
+
+    let mut modifier = 0;
+    if state.contains(ModifierType::SHIFT_MASK) {
+        modifier |= 1 << Modifiers::LeftShift as i32;
+    }
+    if state.contains(ModifierType::CONTROL_MASK) {
+        modifier |= 1 << Modifiers::LeftControl as i32;
+    }
+    if state.contains(ModifierType::ALT_MASK) {
+        modifier |= 1 << Modifiers::LeftAlt as i32;
+    }
+    if state.contains(ModifierType::SUPER_MASK) {
+        modifier |= 1 << Modifiers::LeftMeta as i32;
+    }
+    // Unlike Qt, GDK does report these lock states, so they are worth mapping.
+    if state.contains(ModifierType::LOCK_MASK) {
+        modifier |= 1 << Modifiers::CapsLock as i32;
+    }
+    modifier
+}
+
+/// GDK keyval to the Switch's HID key code.
+///
+/// Port of `GRenderWindow::QtKeyToSwitchKey`, which maps the frontend toolkit's
+/// key constants onto `Settings::NativeKeyboard::Keys` (the USB HID usage IDs
+/// the console expects). Anything unmapped is `None`, which
+/// `PressKeyboardKey` ignores.
+fn gdk_key_to_switch_key(keyval: gtk::gdk::Key) -> i32 {
+    use common::settings_input::native_keyboard::Keys;
+    use gtk::gdk::Key;
+
+    let key = match keyval {
+        Key::a | Key::A => Keys::A,
+        Key::b | Key::B => Keys::B,
+        Key::c | Key::C => Keys::C,
+        Key::d | Key::D => Keys::D,
+        Key::e | Key::E => Keys::E,
+        Key::f | Key::F => Keys::F,
+        Key::g | Key::G => Keys::G,
+        Key::h | Key::H => Keys::H,
+        Key::i | Key::I => Keys::I,
+        Key::j | Key::J => Keys::J,
+        Key::k | Key::K => Keys::K,
+        Key::l | Key::L => Keys::L,
+        Key::m | Key::M => Keys::M,
+        Key::n | Key::N => Keys::N,
+        Key::o | Key::O => Keys::O,
+        Key::p | Key::P => Keys::P,
+        Key::q | Key::Q => Keys::Q,
+        Key::r | Key::R => Keys::R,
+        Key::s | Key::S => Keys::S,
+        Key::t | Key::T => Keys::T,
+        Key::u | Key::U => Keys::U,
+        Key::v | Key::V => Keys::V,
+        Key::w | Key::W => Keys::W,
+        Key::x | Key::X => Keys::X,
+        Key::y | Key::Y => Keys::Y,
+        Key::z | Key::Z => Keys::Z,
+        Key::_1 => Keys::N1,
+        Key::_2 => Keys::N2,
+        Key::_3 => Keys::N3,
+        Key::_4 => Keys::N4,
+        Key::_5 => Keys::N5,
+        Key::_6 => Keys::N6,
+        Key::_7 => Keys::N7,
+        Key::_8 => Keys::N8,
+        Key::_9 => Keys::N9,
+        Key::_0 => Keys::N0,
+        Key::Return => Keys::Return,
+        Key::Escape => Keys::Escape,
+        Key::BackSpace => Keys::Backspace,
+        Key::Tab => Keys::Tab,
+        Key::space => Keys::Space,
+        Key::Left => Keys::Left,
+        Key::Right => Keys::Right,
+        Key::Up => Keys::Up,
+        Key::Down => Keys::Down,
+        _ => Keys::None,
+    };
+    key as i32
+}
+
+/// Whether two paths refer to the same file on disk, resolving symlinks.
+///
+/// Used to keep `fs::copy` from being handed identical source and destination,
+/// which truncates the file rather than being a no-op.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        // A destination that does not exist yet cannot be the source.
+        _ => false,
+    }
+}
+
+/// A modal progress window — upstream's `QProgressDialog`.
+///
+/// The operations it covers (firmware copy, integrity verification) run
+/// synchronously on the main thread, as upstream's do. Qt pumps its event loop
+/// from inside `QProgressDialog::setValue`; the GTK equivalent is to iterate the
+/// main context explicitly, which is what [`Self::set_fraction`] does — without
+/// it the window would never paint.
+struct ProgressWindow {
+    window: gtk::Window,
+    bar: gtk::ProgressBar,
+}
+
+impl ProgressWindow {
+    fn new(parent: &gtk::ApplicationWindow, message: &str) -> Self {
+        let bar = gtk::ProgressBar::new();
+        bar.set_show_text(true);
+        bar.set_hexpand(true);
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(18);
+        content.set_margin_bottom(18);
+        content.set_margin_start(18);
+        content.set_margin_end(18);
+        let label = gtk::Label::new(Some(message));
+        label.set_xalign(0.0);
+        content.append(&label);
+        content.append(&bar);
+
+        let window = gtk::Window::builder()
+            .title(message)
+            .modal(true)
+            .transient_for(parent)
+            .resizable(false)
+            .default_width(360)
+            .child(&content)
+            .build();
+        window.present();
+
+        let this = Self { window, bar };
+        this.pump();
+        this
+    }
+
+    fn set_fraction(&self, fraction: f64) {
+        self.bar.set_fraction(fraction.clamp(0.0, 1.0));
+        self.pump();
+    }
+
+    /// Let GTK lay out and paint while the caller keeps the main thread busy.
+    fn pump(&self) {
+        let context = glib::MainContext::default();
+        // Bounded so a storm of pending events cannot stall the operation.
+        for _ in 0..32 {
+            if !context.iteration(false) {
+                break;
+            }
+        }
+    }
+
+    fn close(&self) {
+        self.window.close();
+        self.pump();
+    }
 }
 
 /// Whether the desktop is currently in dark mode — upstream
@@ -786,7 +1840,10 @@ pub fn update_ui_theme() {
     };
 
     settings.set_gtk_application_prefer_dark_theme(dark);
-    log::debug!("UI theme '{internal}' resolved to {} mode", if dark { "dark" } else { "light" });
+    log::debug!(
+        "UI theme '{internal}' resolved to {} mode",
+        if dark { "dark" } else { "light" }
+    );
 }
 
 /// Install the black backdrop CSS for the render page once.

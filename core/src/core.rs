@@ -29,6 +29,7 @@ use crate::hle::service::server_manager::ServerManager;
 use crate::hle::service::sm::sm::ServiceManager;
 use crate::memory::memory::Memory;
 use crate::perf_stats::{PerfStats, PerfStatsResults, SpeedLimiter};
+use hid_core::hid_core::HIDCore;
 
 use crate::hle::kernel::k_process::ProcessLock;
 use parking_lot::Mutex;
@@ -898,6 +899,12 @@ pub struct System {
     /// The CPU manager (thread dispatch).
     pub cpu_manager: CpuManager,
 
+    /// Shared HID core.
+    ///
+    /// Upstream owner: `System::Impl::hid_core`. The `Arc<Mutex<_>>` lets the
+    /// frontend hold the same object while the HID service thread updates it.
+    hid_core: Arc<Mutex<HIDCore>>,
+
     /// The kernel core (schedulers, physical cores, kernel objects).
     kernel: Option<KernelCore>,
 
@@ -952,7 +959,7 @@ pub struct System {
     /// Upstream: `std::unique_ptr<Core::Memory::Memory> m_memory`.
     memory: Option<Arc<StdMutex<Memory>>>,
     /// Upstream owner: `std::array<GPUDirtyMemoryManager, NUM_CPU_CORES>`.
-    gpu_dirty_memory_managers: Vec<Arc<StdMutex<GpuDirtyMemoryManager>>>,
+    gpu_dirty_memory_managers: Vec<Arc<GpuDirtyMemoryManager>>,
 
     // ── State flags ──
     /// Guard for suspend/resume operations.
@@ -1064,9 +1071,18 @@ pub struct System {
 impl System {
     /// Creates a new System instance.
     pub fn new() -> Self {
+        Self::new_with_hid_core(Arc::new(Mutex::new(HIDCore::new())))
+    }
+
+    /// Creates a System around a frontend-owned handle to the same HID core.
+    ///
+    /// This preserves upstream's single `System::Impl::hid_core` object while
+    /// adapting the frontend/service references to Rust shared ownership.
+    pub fn new_with_hid_core(hid_core: Arc<Mutex<HIDCore>>) -> Self {
         Self {
             core_timing: Arc::new(CoreTiming::new()),
             cpu_manager: CpuManager::new(),
+            hid_core,
             kernel: None,
             telemetry_session: None,
             host1x_core: None,
@@ -1116,6 +1132,13 @@ impl System {
         }
     }
 
+    /// Gets the HID interface.
+    ///
+    /// Upstream: `HID::HIDCore& System::HIDCore()`.
+    pub fn hid_core(&self) -> Arc<Mutex<HIDCore>> {
+        Arc::clone(&self.hid_core)
+    }
+
     /// Initializes the system.
     /// This function will initialize core functionality used for system emulation.
     ///
@@ -1133,7 +1156,7 @@ impl System {
         let buffer_ptr = unsafe { &(*dm_ptr).buffer as *const common::host_memory::HostMemory };
         let mut memory = unsafe { Memory::new(SystemRef::from_ref(self), dm_ptr, buffer_ptr) };
         self.gpu_dirty_memory_managers = (0..hardware_properties::NUM_CPU_CORES as usize)
-            .map(|_| Arc::new(StdMutex::new(GpuDirtyMemoryManager::new())))
+            .map(|_| Arc::new(GpuDirtyMemoryManager::new()))
             .collect();
         memory.set_gpu_dirty_managers(self.gpu_dirty_memory_managers.clone());
         self.memory = Some(Arc::new(StdMutex::new(memory)));
@@ -1966,14 +1989,22 @@ impl System {
     }
 
     /// Upstream: `System::GetGPUDirtyMemoryManager()`.
-    pub fn gpu_dirty_memory_managers(&self) -> Vec<Arc<StdMutex<GpuDirtyMemoryManager>>> {
+    pub fn gpu_dirty_memory_managers(&self) -> Vec<Arc<GpuDirtyMemoryManager>> {
         self.gpu_dirty_memory_managers.clone()
+    }
+
+    /// Upstream: `System::GetCurrentHostThreadID()`.
+    pub fn current_host_thread_id(&self) -> usize {
+        self.kernel
+            .as_ref()
+            .map(|kernel| kernel.get_current_host_thread_id() as usize)
+            .unwrap_or(u32::MAX as usize)
     }
 
     /// Upstream: `System::GatherGPUDirtyMemory(std::function<void(PAddr, size_t)>&)`.
     pub fn gather_gpu_dirty_memory(&self, callback: &mut dyn FnMut(u64, usize)) {
         for manager in &self.gpu_dirty_memory_managers {
-            manager.lock().unwrap().gather(callback);
+            manager.gather(callback);
         }
     }
 
@@ -2260,6 +2291,15 @@ impl System {
     /// Get the load parameters from the last successful load.
     pub fn load_parameters(&self) -> Option<&crate::loader::loader::LoadParameters> {
         self.load_parameters.as_ref()
+    }
+
+    /// Get the loader for the current application.
+    ///
+    /// Upstream: `System::GetAppLoader()`.
+    pub fn get_app_loader(&self) -> &dyn crate::loader::loader::AppLoader {
+        self.app_loader
+            .as_deref()
+            .expect("application loader is only available after a successful load")
     }
 
     // ── Runtime SVC state setters ──

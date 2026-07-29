@@ -232,7 +232,7 @@ impl MacroInterpreterImpl {
                 result as u32
             }
             AluOperation::Subtract => {
-                let result = src_a as u64 - src_b as u64;
+                let result = (src_a as u64).wrapping_sub(src_b as u64);
                 self.carry_flag = result < 0x100000000;
                 result as u32
             }
@@ -516,6 +516,14 @@ mod tests {
         let result = interp.get_alu_result(AluOperation::Subtract, 10, 3);
         assert_eq!(result, 7);
         assert!(interp.carry_flag); // No borrow
+    }
+
+    #[test]
+    fn alu_subtract_underflow_wraps_and_clears_carry() {
+        let mut interp = MacroInterpreterImpl::new(vec![]);
+        let result = interp.get_alu_result(AluOperation::Subtract, 3, 5);
+        assert_eq!(result, u32::MAX - 1);
+        assert!(!interp.carry_flag);
     }
 
     #[test]

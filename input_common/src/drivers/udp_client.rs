@@ -5,13 +5,14 @@
 //!
 //! UDP client driver for Cemuhook protocol (e.g., DS4Windows, BetterJoy).
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use common::input::{BatteryLevel, ButtonNames, DriverResult};
 use common::param_package::ParamPackage;
 use common::settings_input::{native_analog, native_button, native_motion};
 use common::uuid::UUID;
+use parking_lot::Mutex as EngineMutex;
 
 use crate::input_engine::{InputEngine, PadIdentifier};
 use crate::main_common::{AnalogMapping, ButtonMapping, MotionMapping};
@@ -170,7 +171,7 @@ impl Default for ClientConnection {
 
 /// Port of `UDPClient` class from udp_client.h / udp_client.cpp
 pub struct UdpClient {
-    engine: InputEngine,
+    engine: Arc<EngineMutex<InputEngine>>,
     pads: Vec<PadData>,
     clients: Vec<ClientConnection>,
 }
@@ -180,7 +181,7 @@ impl UdpClient {
     pub fn new(input_engine: String) -> Self {
         log::info!("Udp Initialization started");
         let mut client = Self {
-            engine: InputEngine::new(input_engine),
+            engine: Arc::new(EngineMutex::new(InputEngine::new(input_engine))),
             pads: (0..MAX_UDP_CLIENTS * PADS_PER_CLIENT)
                 .map(|_| PadData::default())
                 .collect(),
@@ -190,6 +191,14 @@ impl UdpClient {
         };
         client.reload_sockets();
         client
+    }
+
+    pub fn engine(&self) -> Arc<EngineMutex<InputEngine>> {
+        Arc::clone(&self.engine)
+    }
+
+    fn engine_name(&self) -> String {
+        self.engine.lock().get_engine_name().to_string()
     }
 
     /// Port of UDPClient::ReloadSockets
@@ -217,7 +226,7 @@ impl UdpClient {
                 }
                 let pad_identifier = self.get_pad_identifier(pad_index);
                 let mut identifier = ParamPackage::default();
-                identifier.set_str("engine", self.engine.get_engine_name().to_string());
+                identifier.set_str("engine", self.engine_name());
                 identifier.set_str("display", format!("UDP Controller {}", pad_identifier.pad));
                 identifier.set_str("guid", pad_identifier.guid.raw_string());
                 identifier.set_int("port", pad_identifier.port as i32);
@@ -263,7 +272,7 @@ impl UdpClient {
         let mut mapping = ButtonMapping::new();
         for &(switch_button, dsu_button) in &SWITCH_TO_DSU_BUTTON {
             let mut button_params = ParamPackage::default();
-            button_params.set_str("engine", self.engine.get_engine_name().to_string());
+            button_params.set_str("engine", self.engine_name());
             button_params.set_str("guid", params.get_str("guid", ""));
             button_params.set_int("port", params.get_int("port", 0));
             button_params.set_int("pad", params.get_int("pad", 0));
@@ -282,7 +291,7 @@ impl UdpClient {
 
         let mut mapping = AnalogMapping::new();
         let mut left_analog_params = ParamPackage::default();
-        left_analog_params.set_str("engine", self.engine.get_engine_name().to_string());
+        left_analog_params.set_str("engine", self.engine_name());
         left_analog_params.set_str("guid", params.get_str("guid", ""));
         left_analog_params.set_int("port", params.get_int("port", 0));
         left_analog_params.set_int("pad", params.get_int("pad", 0));
@@ -291,7 +300,7 @@ impl UdpClient {
         mapping.insert(native_analog::Values::LStick as i32, left_analog_params);
 
         let mut right_analog_params = ParamPackage::default();
-        right_analog_params.set_str("engine", self.engine.get_engine_name().to_string());
+        right_analog_params.set_str("engine", self.engine_name());
         right_analog_params.set_str("guid", params.get_str("guid", ""));
         right_analog_params.set_int("port", params.get_int("port", 0));
         right_analog_params.set_int("pad", params.get_int("pad", 0));
@@ -309,14 +318,14 @@ impl UdpClient {
 
         let mut mapping = MotionMapping::new();
         let mut left_motion_params = ParamPackage::default();
-        left_motion_params.set_str("engine", self.engine.get_engine_name().to_string());
+        left_motion_params.set_str("engine", self.engine_name());
         left_motion_params.set_str("guid", params.get_str("guid", ""));
         left_motion_params.set_int("port", params.get_int("port", 0));
         left_motion_params.set_int("pad", params.get_int("pad", 0));
         left_motion_params.set_int("motion", 0);
 
         let mut right_motion_params = ParamPackage::default();
-        right_motion_params.set_str("engine", self.engine.get_engine_name().to_string());
+        right_motion_params.set_str("engine", self.engine_name());
         right_motion_params.set_str("guid", params.get_str("guid", ""));
         right_motion_params.set_int("port", params.get_int("port", 0));
         right_motion_params.set_int("pad", params.get_int("pad", 0));

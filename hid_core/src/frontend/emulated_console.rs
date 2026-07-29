@@ -109,7 +109,7 @@ impl EmulatedConsole {
             let callback_list = Arc::clone(&self.callback_list);
             let is_configuring = Arc::clone(&self.is_configuring);
             device.set_callback(InputCallback {
-                on_change: Some(Box::new(move |callback| {
+                on_change: Some(Arc::new(move |callback| {
                     Self::set_touch(&console, &callback_list, &is_configuring, callback, index);
                 })),
             });
@@ -310,7 +310,7 @@ mod tests {
         let callback_list = Arc::new(Mutex::new(HashMap::new()));
         let is_configuring = Arc::new(AtomicBool::new(false));
         device.set_callback(InputCallback {
-            on_change: Some(Box::new({
+            on_change: Some(Arc::new({
                 let console = Arc::clone(&console);
                 let callback_list = Arc::clone(&callback_list);
                 let is_configuring = Arc::clone(&is_configuring);

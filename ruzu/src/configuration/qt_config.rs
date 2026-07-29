@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Rust counterpart of the game-directory half of
+// Rust counterpart of
 // `/home/vricosti/Dev/emulators/zuyu/src/yuzu/configuration/qt_config.cpp`
-// (`Config::ReadUIValues` / `Config::SaveUIValues`, the `Paths\gamedirs\…`
-// array).
+// (`Config::ReadUIValues` / `Config::SaveUIValues` and the Qt-owned control
+// values).
 //
 // Upstream persists `UISettings::values.game_dirs` with
 // `QSettings::beginWriteArray("gamedirs")`, which writes a `size` key plus one
@@ -20,6 +20,12 @@ use std::io;
 use std::path::PathBuf;
 
 use common::fs::path_util::{get_ruzu_path, RuzuPath};
+use common::settings_input::{
+    native_analog, native_button, native_motion, ControllerType, PlayerInput,
+    JOYCON_BODY_NEON_BLUE, JOYCON_BODY_NEON_RED, JOYCON_BUTTONS_NEON_BLUE, JOYCON_BUTTONS_NEON_RED,
+};
+use gtk::glib::translate::IntoGlib;
+use input_common::main_common::{generate_analog_param_from_keys, generate_keyboard_param};
 
 use crate::uisettings::GameDir;
 
@@ -58,6 +64,430 @@ pub fn save_game_dirs(dirs: &[GameDir]) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, updated)
+}
+
+/// The INI section the per-player control bindings live in.
+const CONTROLS_SECTION: &str = "[Controls]";
+
+fn key_code(key: gtk::gdk::Key) -> i32 {
+    key.into_glib() as i32
+}
+
+/// GTK-key-space counterpart of `QtConfig::default_buttons`.
+fn default_buttons() -> [i32; native_button::NUM_BUTTONS] {
+    use gtk::gdk::Key;
+
+    [
+        Key::c,
+        Key::x,
+        Key::v,
+        Key::z,
+        Key::f,
+        Key::g,
+        Key::q,
+        Key::e,
+        Key::r,
+        Key::t,
+        Key::m,
+        Key::n,
+        Key::Left,
+        Key::Up,
+        Key::Right,
+        Key::Down,
+        Key::q,
+        Key::e,
+        Key::VoidSymbol,
+        Key::VoidSymbol,
+        Key::q,
+        Key::e,
+    ]
+    .map(|key| {
+        if key == Key::VoidSymbol {
+            0
+        } else {
+            key_code(key)
+        }
+    })
+}
+
+/// GTK-key-space counterpart of `QtConfig::default_motions`.
+fn default_motions() -> [i32; native_motion::NUM_MOTIONS] {
+    [key_code(gtk::gdk::Key::_7), key_code(gtk::gdk::Key::_8)]
+}
+
+/// GTK-key-space counterpart of `QtConfig::default_analogs`.
+fn default_analogs() -> [[i32; 4]; native_analog::NUM_ANALOGS] {
+    use gtk::gdk::Key;
+
+    [
+        [Key::w, Key::s, Key::a, Key::d].map(key_code),
+        [Key::i, Key::k, Key::j, Key::l].map(key_code),
+    ]
+}
+
+/// GTK-key-space counterpart of `QtConfig::default_stick_mod`.
+fn default_stick_mod() -> [i32; native_analog::NUM_ANALOGS] {
+    [key_code(gtk::gdk::Key::Shift_L), 0]
+}
+
+/// Read every player's bindings — upstream `QtConfig::ReadQtPlayerValues`,
+/// called once per player from `Config::ReadControlValues`.
+pub fn load_control_values() {
+    // A missing file is the first launch, and it still has to go through the
+    // loop below: upstream's `ReadBooleanSetting` applies its `player_index == 0`
+    // default whether or not the file exists, and `PlayerInput::default()`
+    // starts every player disconnected. Returning early here left player 1
+    // unusable until the user ticked the box by hand.
+    let contents = std::fs::read_to_string(config_path()).unwrap_or_default();
+    let values = parse_controls(&contents);
+
+    let mut settings = common::settings::values_mut();
+    let players = settings.players.get_value_mut();
+    for (index, player) in players.iter_mut().enumerate() {
+        load_player_values(player, index, &values);
+    }
+}
+
+fn load_player_values(
+    player: &mut PlayerInput,
+    index: usize,
+    values: &std::collections::BTreeMap<String, String>,
+) {
+    let prefix = format!("player_{index}_");
+    load_player_bindings(player, &prefix, values);
+
+    player.connected = read_bool(values, &format!("{prefix}connected"), index == 0);
+    player.controller_type = values
+        .get(&format!("{prefix}type"))
+        .and_then(|value| value.parse::<u8>().ok())
+        .and_then(|value| ControllerType::try_from(value).ok())
+        .unwrap_or(ControllerType::ProController);
+    player.vibration_enabled = read_bool(values, &format!("{prefix}vibration_enabled"), true);
+    player.vibration_strength = read_number(values, &format!("{prefix}vibration_strength"), 100);
+    player.body_color_left = read_number(
+        values,
+        &format!("{prefix}body_color_left"),
+        JOYCON_BODY_NEON_BLUE,
+    );
+    player.body_color_right = read_number(
+        values,
+        &format!("{prefix}body_color_right"),
+        JOYCON_BODY_NEON_RED,
+    );
+    player.button_color_left = read_number(
+        values,
+        &format!("{prefix}button_color_left"),
+        JOYCON_BUTTONS_NEON_BLUE,
+    );
+    player.button_color_right = read_number(
+        values,
+        &format!("{prefix}button_color_right"),
+        JOYCON_BUTTONS_NEON_RED,
+    );
+    player.profile_name = values
+        .get(&format!("{prefix}profile_name"))
+        .cloned()
+        .unwrap_or_default();
+}
+
+/// Upstream `QtConfig::ReadQtPlayerValues`: bindings use a `player_N_`
+/// prefix in the global config and no prefix in an input-profile config.
+fn load_player_bindings(
+    player: &mut PlayerInput,
+    prefix: &str,
+    values: &std::collections::BTreeMap<String, String>,
+) {
+    let button_defaults = default_buttons();
+    for (slot, name) in native_button::MAPPING.iter().enumerate() {
+        let default = generate_keyboard_param(button_defaults[slot]);
+        player.buttons[slot] = values
+            .get(&format!("{prefix}{name}"))
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .unwrap_or(default);
+    }
+
+    let analog_defaults = default_analogs();
+    let stick_modifiers = default_stick_mod();
+    for (slot, name) in native_analog::MAPPING.iter().enumerate() {
+        let keys = analog_defaults[slot];
+        let default = generate_analog_param_from_keys(
+            keys[0],
+            keys[1],
+            keys[2],
+            keys[3],
+            stick_modifiers[slot],
+            0.5,
+        );
+        player.analogs[slot] = values
+            .get(&format!("{prefix}{name}"))
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .unwrap_or(default);
+    }
+
+    let motion_defaults = default_motions();
+    for (slot, name) in native_motion::MAPPING.iter().enumerate() {
+        let default = generate_keyboard_param(motion_defaults[slot]);
+        player.motions[slot] = values
+            .get(&format!("{prefix}{name}"))
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .unwrap_or(default);
+    }
+}
+
+fn read_bool(
+    values: &std::collections::BTreeMap<String, String>,
+    key: &str,
+    default: bool,
+) -> bool {
+    values
+        .get(key)
+        .map(|value| value == "true" || value == "1")
+        .unwrap_or(default)
+}
+
+fn read_number<T>(values: &std::collections::BTreeMap<String, String>, key: &str, default: T) -> T
+where
+    T: std::str::FromStr,
+{
+    values
+        .get(key)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Persist every player's bindings — upstream `QtConfig::SaveQtPlayerValues`.
+///
+/// Only the `[Controls]` keys this function owns are rewritten; every other
+/// line in the file is preserved, the same way `save_game_dirs` leaves the rest
+/// of the INI alone.
+pub fn save_control_values() -> io::Result<()> {
+    let path = config_path();
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+
+    let mut entries: Vec<(String, String)> = Vec::new();
+    {
+        let settings = common::settings::values();
+        for (index, player) in settings.players.get_value().iter().enumerate() {
+            append_player_entries(&mut entries, index, player);
+        }
+    }
+
+    let updated = replace_controls(&contents, &entries);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, updated)
+}
+
+/// Upstream `QtConfig::ReadQtControlPlayerValues` for
+/// `ConfigType::InputProfile`.
+pub(crate) fn load_input_profile(contents: &str, player: &mut PlayerInput) {
+    let values = parse_profile_controls(contents);
+    load_player_bindings(player, "", &values);
+    player.controller_type = values
+        .get("type")
+        .and_then(|value| value.parse::<u8>().ok())
+        .and_then(|value| ControllerType::try_from(value).ok())
+        .unwrap_or(ControllerType::ProController);
+}
+
+/// Upstream `QtConfig::SaveQtControlPlayerValues` for
+/// `ConfigType::InputProfile`.
+pub(crate) fn serialize_input_profile(player: &PlayerInput) -> String {
+    let mut entries = Vec::new();
+    entries.push((
+        "type".to_string(),
+        (player.controller_type as u8).to_string(),
+    ));
+    for (slot, name) in native_button::MAPPING.iter().enumerate() {
+        entries.push((name.to_string(), player.buttons[slot].clone()));
+    }
+    for (slot, name) in native_analog::MAPPING.iter().enumerate() {
+        entries.push((name.to_string(), player.analogs[slot].clone()));
+    }
+    for (slot, name) in native_motion::MAPPING.iter().enumerate() {
+        entries.push((name.to_string(), player.motions[slot].clone()));
+    }
+    replace_controls("", &entries)
+}
+
+fn append_player_entries(entries: &mut Vec<(String, String)>, index: usize, player: &PlayerInput) {
+    let prefix = format!("player_{index}_");
+    for (slot, name) in native_button::MAPPING.iter().enumerate() {
+        entries.push((format!("{prefix}{name}"), player.buttons[slot].clone()));
+    }
+    for (slot, name) in native_analog::MAPPING.iter().enumerate() {
+        entries.push((format!("{prefix}{name}"), player.analogs[slot].clone()));
+    }
+    for (slot, name) in native_motion::MAPPING.iter().enumerate() {
+        entries.push((format!("{prefix}{name}"), player.motions[slot].clone()));
+    }
+    entries.push((format!("{prefix}connected"), player.connected.to_string()));
+    entries.push((
+        format!("{prefix}type"),
+        (player.controller_type as u8).to_string(),
+    ));
+    entries.push((
+        format!("{prefix}vibration_enabled"),
+        player.vibration_enabled.to_string(),
+    ));
+    entries.push((
+        format!("{prefix}vibration_strength"),
+        player.vibration_strength.to_string(),
+    ));
+    entries.push((
+        format!("{prefix}body_color_left"),
+        player.body_color_left.to_string(),
+    ));
+    entries.push((
+        format!("{prefix}body_color_right"),
+        player.body_color_right.to_string(),
+    ));
+    entries.push((
+        format!("{prefix}button_color_left"),
+        player.button_color_left.to_string(),
+    ));
+    entries.push((
+        format!("{prefix}button_color_right"),
+        player.button_color_right.to_string(),
+    ));
+    entries.push((format!("{prefix}profile_name"), player.profile_name.clone()));
+}
+
+/// Parse the `player_N_…` keys out of the `[Controls]` section.
+///
+/// Upstream writes each binding as a `key\default=` line followed by the value,
+/// quoted because the parameter string contains commas. Both the quotes and the
+/// companion `\default` line are handled here; keys whose `\default` is `true`
+/// still carry their value, so they are read like any other.
+pub fn parse_controls(contents: &str) -> std::collections::BTreeMap<String, String> {
+    let mut values = std::collections::BTreeMap::new();
+    let mut in_section = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_section = trimmed == CONTROLS_SECTION;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        // `key\default=` is metadata about the neighbouring key, not a binding.
+        if key.ends_with("\\default") || !key.starts_with("player_") {
+            continue;
+        }
+        values.insert(key.to_string(), unquote(value.trim()).to_string());
+    }
+
+    values
+}
+
+fn parse_profile_controls(contents: &str) -> std::collections::BTreeMap<String, String> {
+    let mut values = std::collections::BTreeMap::new();
+    let mut in_section = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_section = trimmed == CONTROLS_SECTION;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.ends_with("\\default") {
+            continue;
+        }
+        values.insert(key.to_string(), unquote(value.trim()).to_string());
+    }
+    values
+}
+
+/// Replace the `player_N_…` lines of `contents` with `entries`.
+///
+/// The rewritten block is dropped where the first existing binding sat, so a
+/// hand-edited file keeps its shape; a file with no `[Controls]` section at all
+/// gains one at the end.
+pub fn replace_controls(contents: &str, entries: &[(String, String)]) -> String {
+    let is_binding = |line: &str| {
+        let trimmed = line.trim();
+        let Some((key, _)) = trimmed.split_once('=') else {
+            return false;
+        };
+        key.trim().starts_with("player_")
+    };
+
+    let rendered: Vec<String> = entries
+        .iter()
+        .flat_map(|(key, value)| {
+            // Upstream's `WriteStringSetting` emits the `\default` marker first;
+            // a binding written from the dialog is never the built-in default.
+            [
+                format!("{key}\\default=false"),
+                format!("{key}=\"{value}\""),
+            ]
+        })
+        .collect();
+
+    let mut output: Vec<String> = Vec::new();
+    let mut in_section = false;
+    let mut written = false;
+    let mut saw_section = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            // Leaving `[Controls]` without having met a binding: append here so
+            // the keys land in their own section rather than the next one.
+            if in_section && !written {
+                output.extend(rendered.iter().cloned());
+                written = true;
+            }
+            in_section = trimmed == CONTROLS_SECTION;
+            saw_section |= in_section;
+            output.push(line.to_string());
+            continue;
+        }
+        if in_section && is_binding(line) {
+            if !written {
+                output.extend(rendered.iter().cloned());
+                written = true;
+            }
+            continue;
+        }
+        output.push(line.to_string());
+    }
+
+    if !written {
+        if !saw_section {
+            output.push(CONTROLS_SECTION.to_string());
+        }
+        output.extend(rendered);
+    }
+
+    let mut text = output.join("\n");
+    text.push('\n');
+    text
+}
+
+/// Strip the surrounding quotes yuzu writes around values containing commas.
+fn unquote(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(value)
 }
 
 /// Parse the `Paths\gamedirs\…` block of a yuzu-schema INI.
@@ -201,6 +631,183 @@ fn is_true(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The binding a real Xbox pad produces, as yuzu writes it.
+    const SDL_BINDING: &str = "engine:sdl,port:0,guid:030000005e040000000b000015050000,button:1";
+
+    /// Upstream defaults `player.connected` to `player_index == 0`, and applies
+    /// that default whether or not a config file exists. Bailing out on a
+    /// missing file left player 1 disconnected on a fresh install.
+    #[test]
+    fn player_one_is_connected_on_a_first_launch() {
+        let values = parse_controls("");
+        let mut player_one = PlayerInput::default();
+        let mut player_two = PlayerInput::default();
+        load_player_values(&mut player_one, 0, &values);
+        load_player_values(&mut player_two, 1, &values);
+
+        assert!(player_one.connected);
+        assert!(!player_two.connected);
+        assert!(player_one.buttons.iter().all(|binding| !binding.is_empty()));
+        assert!(player_one.analogs.iter().all(|binding| !binding.is_empty()));
+        assert!(player_one.motions.iter().all(|binding| !binding.is_empty()));
+
+        let button_a = common::param_package::ParamPackage::from_serialized(&player_one.buttons[0]);
+        assert_eq!(button_a.get_str("engine", ""), "keyboard");
+        assert_eq!(button_a.get_int("code", -1), key_code(gtk::gdk::Key::c));
+    }
+
+    /// A stored `connected` beats the default, in both directions.
+    #[test]
+    fn a_stored_connected_flag_wins_over_the_default() {
+        let values =
+            parse_controls("[Controls]\nplayer_0_connected=false\nplayer_1_connected=true\n");
+        let mut players = std::array::from_fn::<_, 3, _>(|_| PlayerInput::default());
+        for (index, player) in players.iter_mut().enumerate() {
+            load_player_values(player, index, &values);
+        }
+        assert!(!players[0].connected);
+        assert!(players[1].connected);
+        assert!(!players[2].connected);
+    }
+
+    #[test]
+    fn player_metadata_survives_a_save_and_reload() {
+        let mut source = PlayerInput::default();
+        source.connected = true;
+        source.controller_type = ControllerType::GameCube;
+        source.vibration_enabled = false;
+        source.vibration_strength = 63;
+        source.body_color_left = 1;
+        source.body_color_right = 2;
+        source.button_color_left = 3;
+        source.button_color_right = 4;
+        source.profile_name = "arcade".to_string();
+        source.buttons[0] = SDL_BINDING.to_string();
+
+        let mut entries = Vec::new();
+        append_player_entries(&mut entries, 0, &source);
+        let values = parse_controls(&replace_controls("", &entries));
+        let mut loaded = PlayerInput::default();
+        load_player_values(&mut loaded, 0, &values);
+
+        assert!(loaded.connected);
+        assert_eq!(loaded.controller_type, ControllerType::GameCube);
+        assert!(!loaded.vibration_enabled);
+        assert_eq!(loaded.vibration_strength, 63);
+        assert_eq!(loaded.body_color_left, 1);
+        assert_eq!(loaded.body_color_right, 2);
+        assert_eq!(loaded.button_color_left, 3);
+        assert_eq!(loaded.button_color_right, 4);
+        assert_eq!(loaded.profile_name, "arcade");
+        assert_eq!(loaded.buttons[0], SDL_BINDING);
+    }
+
+    #[test]
+    fn input_profile_uses_unprefixed_control_keys() {
+        let mut source = PlayerInput::default();
+        source.controller_type = ControllerType::GameCube;
+        source.buttons[0] = SDL_BINDING.to_string();
+
+        let written = serialize_input_profile(&source);
+        assert!(written.contains("type=\"5\""));
+        assert!(written.contains(&format!("button_a=\"{SDL_BINDING}\"")));
+        assert!(!written.contains("player_0_"));
+
+        let mut loaded = PlayerInput::default();
+        load_input_profile(&written, &mut loaded);
+        assert_eq!(loaded.controller_type, ControllerType::GameCube);
+        assert_eq!(loaded.buttons[0], SDL_BINDING);
+    }
+
+    #[test]
+    fn control_bindings_survive_a_save_and_reload() {
+        // The whole point of the Controls page: what the dialog wrote must come
+        // back byte-for-byte on the next launch.
+        let entries = vec![
+            ("player_0_button_a".to_string(), SDL_BINDING.to_string()),
+            (
+                "player_0_lstick".to_string(),
+                "engine:sdl,axis_x:0,axis_y:1,offset_x:-0.03".to_string(),
+            ),
+        ];
+        let written = replace_controls("", &entries);
+        let parsed = parse_controls(&written);
+
+        assert_eq!(
+            parsed.get("player_0_button_a").map(String::as_str),
+            Some(SDL_BINDING)
+        );
+        assert_eq!(
+            parsed.get("player_0_lstick").map(String::as_str),
+            Some("engine:sdl,axis_x:0,axis_y:1,offset_x:-0.03")
+        );
+    }
+
+    #[test]
+    fn bindings_are_quoted_so_their_commas_survive() {
+        // A parameter string is a comma-separated list; written bare it would
+        // still round-trip through this parser but would break every other INI
+        // reader, yuzu's included.
+        let entries = vec![("player_0_button_a".to_string(), SDL_BINDING.to_string())];
+        let written = replace_controls("", &entries);
+        assert!(written.contains(&format!("player_0_button_a=\"{SDL_BINDING}\"")));
+        // Upstream pairs each key with its `\default` marker.
+        assert!(written.contains("player_0_button_a\\default=false"));
+    }
+
+    #[test]
+    fn saving_controls_leaves_the_rest_of_the_file_alone() {
+        // `save_control_values` shares the config file with every other
+        // setting; clobbering a neighbouring section would lose them.
+        let original = "[UI]\nPaths\\gamedirs\\size=1\n[Controls]\nplayer_0_button_a\\default=false\nplayer_0_button_a=\"old\"\ntouchscreen_enabled=true\n[Core]\nuse_multi_core=true\n";
+        let entries = vec![("player_0_button_a".to_string(), "new".to_string())];
+        let updated = replace_controls(original, &entries);
+
+        assert!(updated.contains("Paths\\gamedirs\\size=1"));
+        assert!(updated.contains("touchscreen_enabled=true"));
+        assert!(updated.contains("use_multi_core=true"));
+        assert!(updated.contains("player_0_button_a=\"new\""));
+        assert!(!updated.contains("\"old\""));
+    }
+
+    #[test]
+    fn a_config_without_a_controls_section_gains_one() {
+        let entries = vec![("player_0_button_a".to_string(), "x".to_string())];
+        let updated = replace_controls("[UI]\nsomething=1\n", &entries);
+        assert!(updated.contains("[Controls]"));
+        assert!(updated.contains("something=1"));
+
+        // And the new keys must land inside that section, not before it.
+        let section = updated.find("[Controls]").unwrap();
+        let key = updated.find("player_0_button_a").unwrap();
+        assert!(key > section);
+    }
+
+    #[test]
+    fn bindings_from_another_section_are_not_read_as_controls() {
+        // `player_` keys only mean a binding inside [Controls]; a same-named key
+        // elsewhere must not leak in.
+        let contents =
+            "[UI]\nplayer_0_button_a=\"decoy\"\n[Controls]\nplayer_0_button_b=\"real\"\n";
+        let parsed = parse_controls(contents);
+        assert!(!parsed.contains_key("player_0_button_a"));
+        assert_eq!(
+            parsed.get("player_0_button_b").map(String::as_str),
+            Some("real")
+        );
+    }
+
+    #[test]
+    fn the_default_marker_is_not_mistaken_for_a_binding() {
+        let contents = "[Controls]\nplayer_0_button_a\\default=false\nplayer_0_button_a=\"v\"\n";
+        let parsed = parse_controls(contents);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed.get("player_0_button_a").map(String::as_str),
+            Some("v")
+        );
+    }
 
     /// A config with a stale 5th entry nested inside the 4th — the shape a
     /// removed-then-re-added game directory leaves behind.

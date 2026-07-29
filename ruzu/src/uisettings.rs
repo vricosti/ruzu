@@ -147,13 +147,7 @@ pub const THEMES: &[(&str, &str)] = &[
 
 /// Game-list row text sources — upstream `UISettings::game_list_row_text`,
 /// indexed by `row_1_text_id` / `row_2_text_id`.
-pub const GAME_LIST_ROW_TEXT: &[&str] = &[
-    "Filename",
-    "Filetype",
-    "Title ID",
-    "Title Name",
-    "None",
-];
+pub const GAME_LIST_ROW_TEXT: &[&str] = &["Filename", "Filetype", "Title ID", "Title Name", "None"];
 
 static VALUES: RwLock<Option<Values>> = RwLock::new(None);
 
@@ -213,8 +207,14 @@ mod tests {
     fn row_text_ids_index_game_list_row_text() {
         let v = Values::default();
         // Upstream's defaults render "Title Name" over "Title ID".
-        assert_eq!(GAME_LIST_ROW_TEXT[*v.row_1_text_id.get_value() as usize], "Title Name");
-        assert_eq!(GAME_LIST_ROW_TEXT[*v.row_2_text_id.get_value() as usize], "Title ID");
+        assert_eq!(
+            GAME_LIST_ROW_TEXT[*v.row_1_text_id.get_value() as usize],
+            "Title Name"
+        );
+        assert_eq!(
+            GAME_LIST_ROW_TEXT[*v.row_2_text_id.get_value() as usize],
+            "Title ID"
+        );
     }
 
     #[test]

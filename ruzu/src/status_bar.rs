@@ -21,6 +21,7 @@ use common::settings;
 use common::settings_enums::{
     AntiAliasing, ConsoleMode, GpuAccuracy, RendererBackend, ScalingFilter, ShaderBackend,
 };
+use ruzu_core::perf_stats::PerfStatsResults;
 
 /// The status bar and handles to the value buttons so they can be refreshed.
 pub struct StatusBar {
@@ -31,6 +32,9 @@ pub struct StatusBar {
     filter: gtk::Button,
     aa: gtk::Button,
     volume: gtk::Button,
+    res_scale: gtk::Label,
+    game_fps: gtk::Label,
+    frame_time: gtk::Label,
     /// Invoked after any button changes a setting, so the owner can react
     /// (upstream calls `system->ApplySettings()` from the same handlers).
     on_changed: RefCell<Option<Box<dyn Fn()>>>,
@@ -58,11 +62,21 @@ impl StatusBar {
             root.append(b);
         }
 
-        // Right side: message label (upstream `message_label`, stretch) then the
-        // firmware/room widgets (placeholder for now).
+        // Right side: message label (upstream `message_label`, stretch), then
+        // the performance labels updated by `GMainWindow::UpdateStatusBar`.
         let message = gtk::Label::new(None);
         message.set_hexpand(true);
         root.append(&message);
+
+        let res_scale = performance_label("The current selected resolution scaling multiplier.");
+        let game_fps =
+            performance_label("How many frames per second the game is currently displaying.");
+        let frame_time = performance_label(
+            "Time taken to emulate a Switch frame, excluding frame limiting and v-sync.",
+        );
+        for label in [&res_scale, &game_fps, &frame_time] {
+            root.append(label);
+        }
 
         let bar = Rc::new(Self {
             root,
@@ -72,6 +86,9 @@ impl StatusBar {
             filter,
             aa,
             volume,
+            res_scale,
+            game_fps,
+            frame_time,
             on_changed: RefCell::new(None),
         });
 
@@ -232,15 +249,16 @@ impl StatusBar {
         set_checked(&self.dock, console_mode == ConsoleMode::Docked);
 
         // `UpdateFilterText`: FSR gets a short label of its own.
-        self.filter.set_label(match *values.scaling_filter.get_value() {
-            ScalingFilter::NearestNeighbor => "NEAREST",
-            ScalingFilter::Bilinear => "BILINEAR",
-            ScalingFilter::Bicubic => "BICUBIC",
-            ScalingFilter::Gaussian => "GAUSSIAN",
-            ScalingFilter::ScaleForce => "SCALEFORCE",
-            ScalingFilter::Fsr => "FSR",
-            ScalingFilter::MaxEnum => "BILINEAR",
-        });
+        self.filter
+            .set_label(match *values.scaling_filter.get_value() {
+                ScalingFilter::NearestNeighbor => "NEAREST",
+                ScalingFilter::Bilinear => "BILINEAR",
+                ScalingFilter::Bicubic => "BICUBIC",
+                ScalingFilter::Gaussian => "GAUSSIAN",
+                ScalingFilter::ScaleForce => "SCALEFORCE",
+                ScalingFilter::Fsr => "FSR",
+                ScalingFilter::MaxEnum => "BILINEAR",
+            });
         // Upstream keeps the filter button permanently checked.
         set_checked(&self.filter, true);
 
@@ -263,6 +281,53 @@ impl StatusBar {
         }
         set_checked(&self.volume, !muted);
     }
+
+    /// Update the permanent performance labels from the latest engine sample.
+    ///
+    /// This is the GTK counterpart of `GMainWindow::UpdateStatusBar`.
+    pub fn update_performance(&self, results: Option<PerfStatsResults>) {
+        let Some(results) = results else {
+            for label in [&self.res_scale, &self.game_fps, &self.frame_time] {
+                label.set_visible(false);
+            }
+            return;
+        };
+
+        let values = settings::values();
+        self.res_scale
+            .set_label(&format_resolution_scale(values.resolution_info.up_factor));
+        self.game_fps.set_label(&format_game_fps(
+            results.average_game_fps,
+            !*values.use_speed_limit.get_value(),
+        ));
+        self.frame_time
+            .set_label(&format_frame_time(results.frametime));
+
+        for label in [&self.res_scale, &self.game_fps, &self.frame_time] {
+            label.set_visible(true);
+        }
+    }
+}
+
+fn format_resolution_scale(up_factor: f32) -> String {
+    let scale = if up_factor.fract().abs() < f32::EPSILON {
+        format!("{up_factor:.0}")
+    } else {
+        format!("{up_factor:.2}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    };
+    format!("Scale: {scale}x")
+}
+
+fn format_game_fps(average_game_fps: f64, unlocked: bool) -> String {
+    let suffix = if unlocked { " (Unlocked)" } else { "" };
+    format!("Game: {:.0} FPS{suffix}", average_game_fps.round())
+}
+
+fn format_frame_time(frametime_seconds: f64) -> String {
+    format!("Frame: {:.2} ms", frametime_seconds * 1000.0)
 }
 
 /// Next enum discriminant, wrapping back to 0 once `max` is reached.
@@ -307,6 +372,15 @@ fn status_button(class: &str) -> gtk::Button {
     button.set_has_frame(false);
     button.set_focus_on_click(false);
     button
+}
+
+fn performance_label(tooltip: &str) -> gtk::Label {
+    let label = gtk::Label::new(None);
+    label.set_tooltip_text(Some(tooltip));
+    label.set_margin_start(4);
+    label.set_margin_end(4);
+    label.set_visible(false);
+    label
 }
 
 /// Install the status-bar styling once.
@@ -410,5 +484,14 @@ mod tests {
         for start in 0..max {
             assert_ne!(next_wrapping(start, max), max);
         }
+    }
+
+    #[test]
+    fn performance_text_matches_upstream_status_bar() {
+        assert_eq!(format_resolution_scale(1.0), "Scale: 1x");
+        assert_eq!(format_resolution_scale(1.5), "Scale: 1.5x");
+        assert_eq!(format_game_fps(59.4, false), "Game: 59 FPS");
+        assert_eq!(format_game_fps(59.5, true), "Game: 60 FPS (Unlocked)");
+        assert_eq!(format_frame_time(1.0 / 60.0), "Frame: 16.67 ms");
     }
 }

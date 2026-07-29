@@ -204,7 +204,9 @@ impl Tas {
 
                 for i in 0..(std::mem::size_of::<u64>() * 8) {
                     let button_status = (command.buttons & (1u64 << i)) != 0;
-                    self.engine.set_button(&identifier, i as i32, button_status);
+                    self.engine
+                        .set_button(&identifier, i as i32, button_status)
+                        .dispatch();
                 }
                 self.set_tas_axis(&identifier, TasAxis::StickX as u8, command.l_axis.x);
                 self.set_tas_axis(&identifier, TasAxis::StickY as u8, command.l_axis.y);
@@ -379,8 +381,12 @@ impl Tas {
 
     /// Port of Tas::ClearInput
     fn clear_input(&mut self) {
-        self.engine.reset_button_state();
-        self.engine.reset_analog_state();
+        for callbacks in self.engine.reset_button_state() {
+            callbacks.dispatch();
+        }
+        for callbacks in self.engine.reset_analog_state() {
+            callbacks.dispatch();
+        }
     }
 
     /// Port of Tas::WriteCommandButtons
@@ -406,7 +412,9 @@ impl Tas {
 
     /// Port of Tas::SetTasAxis
     fn set_tas_axis(&mut self, identifier: &PadIdentifier, axis: u8, value: f32) {
-        self.engine.set_axis(identifier, axis as i32, value);
+        self.engine
+            .set_axis(identifier, axis as i32, value)
+            .dispatch();
     }
 }
 

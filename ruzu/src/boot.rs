@@ -20,18 +20,39 @@
 // concurrently-modified `ruzu_cmd`/`frontend_common` trees; unifying the two is
 // deferred tech debt.
 
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use ruzu_core::frontend::emu_window::WindowSystemInfo;
 use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
+use ruzu_core::perf_stats::PerfStatsResults;
 
 use crate::loading_screen::LoadStage;
 
-/// Progress callback marshaled to the loading screen on the GTK main thread.
-pub type ProgressFn = Box<dyn Fn(LoadStage, usize, usize) + Send + 'static>;
+/// Assets read from the current application loader for the loading screen.
+#[derive(Debug, Default)]
+pub struct LoadingScreenAssets {
+    pub logo: Option<Vec<u8>>,
+    pub banner: Option<Vec<u8>>,
+}
+
+/// Cross-thread events consumed by the GTK loading screen.
+#[derive(Debug)]
+pub enum LoadingEvent {
+    Assets(LoadingScreenAssets),
+    Progress {
+        stage: LoadStage,
+        value: usize,
+        total: usize,
+    },
+    FirstFrame,
+}
+
+/// Loading event callback marshaled to the GTK main thread.
+pub type LoadingEventFn = Arc<dyn Fn(LoadingEvent) + Send + Sync + 'static>;
 
 /// A running emulation session. Dropping (or calling [`Self::stop`]) shuts the
 /// system down: `System::pause` + `System::shutdown_main_process`, mirroring the
@@ -39,9 +60,28 @@ pub type ProgressFn = Box<dyn Fn(LoadStage, usize, usize) + Send + 'static>;
 pub struct EmulationSession {
     stop_tx: Option<Sender<()>>,
     join: Option<JoinHandle<()>>,
+    perf_results: Arc<RwLock<PerfStatsResults>>,
+    running: Arc<AtomicBool>,
 }
 
 impl EmulationSession {
+    /// Return the most recent 500 ms performance sample while the guest runs.
+    ///
+    /// Upstream's GUI calls `System::GetAndResetPerfStats()` from its status
+    /// timer. The Rust `System` remains owned by the boot thread, so that thread
+    /// performs the same reset and publishes this copy for GTK.
+    pub fn perf_stats(&self) -> Option<PerfStatsResults> {
+        if !self.running.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(
+            *self
+                .perf_results
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
     /// Signal the boot thread to shut the system down and join it.
     pub fn stop(&mut self) {
         if let Some(tx) = self.stop_tx.take() {
@@ -69,10 +109,15 @@ pub fn boot_game(
     drawable_size: (u32, u32),
     shown_state: Arc<AtomicBool>,
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
+    hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     filepath: String,
-    progress: ProgressFn,
+    loading_event: LoadingEventFn,
 ) -> EmulationSession {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let perf_results = Arc::new(RwLock::new(PerfStatsResults::default()));
+    let running = Arc::new(AtomicBool::new(false));
+    let boot_perf_results = Arc::clone(&perf_results);
+    let boot_running = Arc::clone(&running);
 
     let join = std::thread::Builder::new()
         .name("ruzu-boot".into())
@@ -82,9 +127,12 @@ pub fn boot_game(
                 drawable_size,
                 shown_state,
                 framebuffer_layout,
+                hid_core,
                 filepath,
-                progress,
+                loading_event,
                 stop_rx,
+                boot_perf_results,
+                boot_running,
             );
         })
         .expect("spawn boot thread");
@@ -92,6 +140,8 @@ pub fn boot_game(
     EmulationSession {
         stop_tx: Some(stop_tx),
         join: Some(join),
+        perf_results,
+        running,
     }
 }
 
@@ -101,19 +151,26 @@ fn run_boot(
     drawable_size: (u32, u32),
     shown_state: Arc<AtomicBool>,
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
+    hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     filepath: String,
-    progress: ProgressFn,
+    loading_event: LoadingEventFn,
     stop_rx: Receiver<()>,
+    perf_results: Arc<RwLock<PerfStatsResults>>,
+    running: Arc<AtomicBool>,
 ) {
     use ruzu_core::core::{System, SystemRef, SystemResultStatus};
 
-    progress(LoadStage::Prepare, 0, 0);
+    loading_event(LoadingEvent::Progress {
+        stage: LoadStage::Prepare,
+        value: 0,
+        total: 0,
+    });
 
     // Log configuration (upstream logs settings during EmuWindow construction).
     common::settings::log_settings(&common::settings::values());
 
     // System init — upstream `Core::System system{}; system.Initialize();`.
-    let mut system = System::new();
+    let mut system = System::new_with_hid_core(hid_core);
     system.initialize();
 
     // Content provider / filesystem / factories (upstream core.cpp:367-370).
@@ -133,6 +190,7 @@ fn run_boot(
 
     // Subsystem factory (upstream SetupForApplicationProcess): Host1x + GPU +
     // Vulkan renderer + AudioCore. Called during `system.load()`.
+    let frame_loading_event = Arc::clone(&loading_event);
     system.set_subsystem_factory(Box::new(move |system| {
         use std::sync::Arc;
 
@@ -185,7 +243,12 @@ fn run_boot(
             return;
         };
         let renderer_device_memory = Arc::clone(host1x.memory_manager());
-        let frame_displayed_notify = Arc::new(|| {});
+        let first_frame_sent = Arc::new(AtomicBool::new(false));
+        let frame_displayed_notify = Arc::new(move || {
+            if !first_frame_sent.swap(true, Ordering::AcqRel) {
+                frame_loading_event(LoadingEvent::FirstFrame);
+            }
+        });
         let frame_end_notify = Arc::new(move || unsafe {
             let gpu_ref = &*(gpu_ptr as *const video_core::gpu::Gpu);
             gpu_ref.renderer_frame_end_notify();
@@ -306,9 +369,24 @@ fn run_boot(
     let load_result = system.load(&filepath);
     if load_result != SystemResultStatus::Success {
         log::error!("Failed to load ROM '{filepath}': {load_result:?}");
-        progress(LoadStage::Complete, 1, 1);
+        loading_event(LoadingEvent::Progress {
+            stage: LoadStage::Complete,
+            value: 1,
+            total: 1,
+        });
         return;
     }
+
+    let loader = system.get_app_loader();
+    let mut assets = LoadingScreenAssets::default();
+    let mut buffer = Vec::new();
+    if loader.read_banner(&mut buffer) == ruzu_core::loader::loader::ResultStatus::Success {
+        assets.banner = Some(std::mem::take(&mut buffer));
+    }
+    if loader.read_logo(&mut buffer) == ruzu_core::loader::loader::ResultStatus::Success {
+        assets.logo = Some(buffer);
+    }
+    loading_event(LoadingEvent::Assets(assets));
 
     // Build the disk pipeline cache before starting execution (upstream order).
     if *common::settings::values().use_disk_shader_cache.get_value() {
@@ -319,13 +397,41 @@ fn run_boot(
                     let rasterizer = renderer.read_rasterizer();
                     unsafe {
                         if let Some(rasterizer) = rasterizer.as_mut() {
-                            rasterizer.load_disk_resources(system.runtime_program_id());
+                            let loading_event = Arc::clone(&loading_event);
+                            let callback: video_core::rasterizer_interface::DiskResourceLoadCallback =
+                                Arc::new(move |stage, value, total| {
+                                    let stage = match stage {
+                                        video_core::rasterizer_interface::LoadCallbackStage::Prepare => {
+                                            LoadStage::Prepare
+                                        }
+                                        video_core::rasterizer_interface::LoadCallbackStage::Build => {
+                                            LoadStage::Build
+                                        }
+                                        video_core::rasterizer_interface::LoadCallbackStage::Complete => {
+                                            LoadStage::Complete
+                                        }
+                                    };
+                                    loading_event(LoadingEvent::Progress {
+                                        stage,
+                                        value,
+                                        total,
+                                    });
+                                });
+                            rasterizer.load_disk_resources(system.runtime_program_id(), callback);
                         }
                     }
                 }
             }
         }
     }
+
+    // Upstream emits Complete immediately after disk resources are loaded and
+    // before releasing the graphics context / starting the GPU.
+    loading_event(LoadingEvent::Progress {
+        stage: LoadStage::Complete,
+        value: 0,
+        total: 0,
+    });
 
     // GPU start (upstream `system.GPU().Start()`).
     if let Some(gpu_any) = system.gpu_core() {
@@ -339,15 +445,25 @@ fn run_boot(
         std::process::exit(0);
     }));
 
-    // Loading done; the render page can take over.
-    progress(LoadStage::Complete, 1, 1);
-
     // Run the guest (upstream `system.Run()`): starts CPU threads in background.
     system.run();
 
-    // GTK owns the main event loop; here we simply wait for a stop signal
-    // instead of `ruzu_cmd`'s `while (emu_window->IsOpen()) WaitEvent()`.
-    let _ = stop_rx.recv();
+    // GTK owns the main event loop. The boot thread retains ownership of
+    // `System`, samples the same counters as upstream's 500 ms GUI timer, and
+    // waits for a stop request between samples.
+    loop {
+        match stop_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                let sample = system.get_and_reset_perf_stats();
+                *perf_results
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = sample;
+                running.store(true, Ordering::Release);
+            }
+        }
+    }
+    running.store(false, Ordering::Release);
 
     log::info!("Emulation stopping: pause + shutdown");
     system.pause();

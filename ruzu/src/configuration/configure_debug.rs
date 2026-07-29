@@ -79,15 +79,21 @@ pub fn page() -> Page {
     );
     let renderdoc_hotkey = w::check_row(
         "Enable Renderdoc Hotkey",
-        *common::settings::values().enable_renderdoc_hotkey.get_value(),
+        *common::settings::values()
+            .enable_renderdoc_hotkey
+            .get_value(),
     );
     let shader_feedback = w::check_row(
         "Enable Shader Feedback",
-        *common::settings::values().renderer_shader_feedback.get_value(),
+        *common::settings::values()
+            .renderer_shader_feedback
+            .get_value(),
     );
     let nsight_aftermath = w::check_row(
         "Enable Nsight Aftermath",
-        *common::settings::values().enable_nsight_aftermath.get_value(),
+        *common::settings::values()
+            .enable_nsight_aftermath
+            .get_value(),
     );
     let disable_loop_safety = w::check_row(
         "Disable Loop safety checks",
@@ -97,7 +103,9 @@ pub fn page() -> Page {
     );
     let disable_buffer_reorder = w::check_row(
         "Disable Buffer Reorder",
-        *common::settings::values().disable_buffer_reorder.get_value(),
+        *common::settings::values()
+            .disable_buffer_reorder
+            .get_value(),
     );
     let dump_shaders = w::check_row(
         "Dump Game Shaders",
@@ -155,7 +163,9 @@ pub fn page() -> Page {
     web_applet.set_sensitive(false);
     let all_controllers = w::check_row(
         "Enable All Controller Types",
-        *common::settings::values().enable_all_controllers.get_value(),
+        *common::settings::values()
+            .enable_all_controllers
+            .get_value(),
     );
     let auto_stub = w::check_row(
         "Enable Auto-Stub**",
@@ -255,8 +265,12 @@ pub fn page() -> Page {
 
         values.quest_flag.set_value(quest_flag.is_active());
         values.cpu_debug_mode.set_value(cpu_debug_mode.is_active());
-        values.use_debug_asserts.set_value(debug_asserts.is_active());
-        values.perform_vulkan_check.set_value(vulkan_check.is_active());
+        values
+            .use_debug_asserts
+            .set_value(debug_asserts.is_active());
+        values
+            .perform_vulkan_check
+            .set_value(vulkan_check.is_active());
         values
             .enable_all_controllers
             .set_value(all_controllers.is_active());

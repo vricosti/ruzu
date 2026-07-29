@@ -84,7 +84,9 @@ impl VirtualGamepad {
             return;
         }
         let identifier = self.get_identifier(player_index);
-        self.engine.set_button(&identifier, button_id, value);
+        self.engine
+            .set_button(&identifier, button_id, value)
+            .dispatch();
     }
 
     /// Sets the status of all buttons bound with the key to pressed (by enum).
@@ -106,9 +108,12 @@ impl VirtualGamepad {
             return;
         }
         let identifier = self.get_identifier(player_index);
-        self.engine.set_axis(&identifier, axis_id * 2, x_value);
         self.engine
-            .set_axis(&identifier, (axis_id * 2) + 1, y_value);
+            .set_axis(&identifier, axis_id * 2, x_value)
+            .dispatch();
+        self.engine
+            .set_axis(&identifier, (axis_id * 2) + 1, y_value)
+            .dispatch();
     }
 
     /// Sets the status of a stick to a specific player index (by enum).
@@ -146,7 +151,9 @@ impl VirtualGamepad {
             accel_z,
             delta_timestamp,
         };
-        self.engine.set_motion(&identifier, 0, &motion_data);
+        self.engine
+            .set_motion(&identifier, 0, &motion_data)
+            .dispatch();
     }
 
     /// Restores all inputs into the neutral position.

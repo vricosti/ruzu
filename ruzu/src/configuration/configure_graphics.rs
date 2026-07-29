@@ -85,7 +85,11 @@ pub fn page() -> Page {
     let vsync_index = tr::VSYNC_MODE_LABELS
         .iter()
         .position(|(name, _)| {
-            *name == common::settings::values().vsync_mode.get_value().canonicalize()
+            *name
+                == common::settings::values()
+                    .vsync_mode
+                    .get_value()
+                    .canonicalize()
         })
         .unwrap_or(0) as u32;
     let (vsync_row, vsync) = w::combo_row("VSync Mode:", &vsync_labels, vsync_index);
@@ -199,8 +203,12 @@ pub fn page() -> Page {
         values.anti_aliasing.set_value(aa_value);
         values.fsr_sharpening_slider.set_value(sharpness_value);
         values.bg_red.set_value((rgba.red() * 255.0).round() as u8);
-        values.bg_green.set_value((rgba.green() * 255.0).round() as u8);
-        values.bg_blue.set_value((rgba.blue() * 255.0).round() as u8);
+        values
+            .bg_green
+            .set_value((rgba.green() * 255.0).round() as u8);
+        values
+            .bg_blue
+            .set_value((rgba.blue() * 255.0).round() as u8);
     })
 }
 

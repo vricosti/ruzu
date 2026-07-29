@@ -26,6 +26,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gtk::prelude::*;
 use gtk::{glib, Window};
@@ -91,16 +92,26 @@ pub struct ConfigureDialog {
 impl ConfigureDialog {
     /// Build the dialog. Mirrors the upstream constructor: create every tab,
     /// populate the selector list, then select row 0.
-    pub fn new(parent: Option<&impl IsA<Window>>) -> Rc<Self> {
+    pub fn new(
+        parent: Option<&impl IsA<Window>>,
+        input_subsystem: Rc<RefCell<input_common::InputSubsystem>>,
+        hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+    ) -> Rc<Self> {
         let window = Window::builder()
             .title("ruzu Configuration")
             .modal(true)
             .default_width(DEFAULT_WIDTH)
             .default_height(DEFAULT_HEIGHT)
             .build();
-        if let Some(parent) = parent {
-            window.set_transient_for(Some(parent.as_ref()));
-        }
+        // Divergence from upstream, forced by the platform: upstream passes the
+        // main window as the `QDialog` parent. Setting `transient_for` here makes
+        // GTK advertise the surface as `_NET_WM_WINDOW_TYPE_DIALOG`, and window
+        // managers drop `_NET_WM_ACTION_MAXIMIZE_*` for dialogs — the maximize
+        // button in the titlebar is drawn but does nothing. The window stays
+        // modal, which is the behaviour `QDialog::exec` gives upstream; only the
+        // transient hint is dropped, so the dialog can be maximized like the
+        // main window.
+        let _ = &parent;
 
         // Upstream `PopulateSelectionList`'s six rows, in order.
         let sections = vec![
@@ -141,7 +152,7 @@ impl ConfigureDialog {
             },
             Section {
                 name: "Controls",
-                pages: configure_input::pages(),
+                pages: configure_input::pages(input_subsystem, hid_core),
             },
         ];
 
@@ -273,11 +284,26 @@ impl ConfigureDialog {
                 (page.apply)();
             }
         }
+        // Upstream `GMainWindow::OnConfigure` calls `config->Save()` once the
+        // dialog is accepted; without it the new bindings would live only in
+        // this process and be gone next launch.
+        if let Err(error) = super::qt_config::save_control_values() {
+            log::error!("Failed to save control settings: {error}");
+        }
         common::settings::log_settings(&common::settings::values());
     }
 
     /// Show the dialog — upstream `ConfigureDialog::exec()`.
     pub fn present(&self) {
         self.window.present();
+    }
+
+    /// Notify the owner once the GTK window closes so its `Rc` can be dropped,
+    /// matching upstream's stack-owned dialog lifetime.
+    pub fn connect_closed(&self, callback: impl Fn() + 'static) {
+        self.window.connect_close_request(move |_| {
+            callback();
+            glib::Propagation::Proceed
+        });
     }
 }

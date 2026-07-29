@@ -31,9 +31,8 @@ pub fn page() -> Page {
     // --- "General" group -------------------------------------------------
     let (general_group, general) = w::group("General");
 
-    let confirm_index = uisettings::with(|v| {
-        tr::index_of(tr::CONFIRM_STOP, v.confirm_before_stopping.get_value())
-    });
+    let confirm_index =
+        uisettings::with(|v| tr::index_of(tr::CONFIRM_STOP, v.confirm_before_stopping.get_value()));
     let (confirm_row, confirm) = w::combo_row(
         "Confirm before stopping emulation",
         &tr::labels(tr::CONFIRM_STOP),

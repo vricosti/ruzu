@@ -23,6 +23,41 @@ use crate::input_engine::{
     EngineInputType, InputEngine, InputIdentifier, PadIdentifier, UpdateCallback,
 };
 
+/// The half of an input device the engine's update callback has to reach.
+///
+/// Upstream registers `UpdateCallback engine_callback{[this]() { OnChange(); }}`
+/// with `InputEngine::SetCallback`, so the engine calls straight back into the
+/// device. A device here is handed out as a `Box<dyn InputDevice>` and cannot be
+/// captured that way, so everything `OnChange` touches — the consumer's callback
+/// and the value last reported to it — lives behind an `Arc` that the device and
+/// the engine's closure both hold.
+///
+/// Registering with no callback at all, which this port did before, leaves the
+/// engine with nothing to call: every binding then reports only what
+/// `ForceUpdate` read at load time and never moves again.
+struct DeviceState<T> {
+    consumer: Mutex<InputCallback>,
+    last_value: Mutex<T>,
+}
+
+impl<T> DeviceState<T> {
+    fn new(last_value: T) -> Arc<Self> {
+        Arc::new(Self {
+            consumer: Mutex::new(InputCallback { on_change: None }),
+            last_value: Mutex::new(last_value),
+        })
+    }
+
+    /// Upstream `InputDevice::TriggerOnChange`.
+    fn trigger(&self, status: &CallbackStatus) {
+        // The consumer can reload devices and replace this callback.
+        let callback = self.consumer.lock().on_change.clone();
+        if let Some(on_change) = callback {
+            on_change(status);
+        }
+    }
+}
+
 // ---- Helper: extract identifier from params ----
 
 fn identifier_from_params(params: &ParamPackage) -> PadIdentifier {
@@ -71,16 +106,51 @@ impl InputDevice for DummyInput {
 // ---- InputFromButton ----
 // Port of InputFromButton class from input_poller.cpp
 
-struct InputFromButton {
+/// Everything `InputFromButton::OnChange` reads, shared with the engine.
+struct ButtonSource {
     identifier: PadIdentifier,
     button: i32,
     turbo: bool,
     toggle: bool,
     inverted: bool,
-    callback_key: i32,
-    last_button_value: bool,
     input_engine: Arc<Mutex<InputEngine>>,
-    callback: InputCallback,
+    state: Arc<DeviceState<bool>>,
+}
+
+impl ButtonSource {
+    /// Upstream `InputFromButton::GetStatus`.
+    fn get_status(&self) -> ButtonStatus {
+        let engine = self.input_engine.lock();
+        ButtonStatus {
+            value: engine.get_button(&self.identifier, self.button),
+            inverted: self.inverted,
+            toggle: self.toggle,
+            turbo: self.turbo,
+            ..Default::default()
+        }
+    }
+
+    /// Upstream `InputFromButton::OnChange`: report only real transitions.
+    fn on_change(&self) {
+        let status = CallbackStatus {
+            input_type: InputType::Button,
+            button_status: self.get_status(),
+            ..Default::default()
+        };
+        {
+            let mut last = self.state.last_value.lock();
+            if status.button_status.value == *last {
+                return;
+            }
+            *last = status.button_status.value;
+        }
+        self.state.trigger(&status);
+    }
+}
+
+struct InputFromButton {
+    source: Arc<ButtonSource>,
+    callback_key: i32,
 }
 
 impl InputFromButton {
@@ -92,36 +162,31 @@ impl InputFromButton {
         inverted: bool,
         input_engine: Arc<Mutex<InputEngine>>,
     ) -> Self {
-        let callback_key = {
-            let mut engine = input_engine.lock();
-            engine.set_callback(InputIdentifier {
-                identifier: identifier.clone(),
-                r#type: EngineInputType::Button,
-                index: button,
-                callback: UpdateCallback { on_change: None },
-            })
-        };
-        Self {
-            identifier,
+        let source = Arc::new(ButtonSource {
+            identifier: identifier.clone(),
             button,
             turbo,
             toggle,
             inverted,
-            callback_key,
-            last_button_value: false,
-            input_engine,
-            callback: InputCallback { on_change: None },
-        }
-    }
+            input_engine: Arc::clone(&input_engine),
+            state: DeviceState::new(false),
+        });
 
-    fn get_status(&self) -> ButtonStatus {
-        let engine = self.input_engine.lock();
-        ButtonStatus {
-            value: engine.get_button(&self.identifier, self.button),
-            inverted: self.inverted,
-            toggle: self.toggle,
-            turbo: self.turbo,
-            ..Default::default()
+        let callback_source = Arc::clone(&source);
+        let callback_key = {
+            let mut engine = input_engine.lock();
+            engine.set_callback(InputIdentifier {
+                identifier,
+                r#type: EngineInputType::Button,
+                index: button,
+                callback: UpdateCallback {
+                    on_change: Some(Arc::new(move |_| callback_source.on_change())),
+                },
+            })
+        };
+        Self {
+            source,
+            callback_key,
         }
     }
 }
@@ -130,27 +195,25 @@ impl InputDevice for InputFromButton {
     fn force_update(&mut self) {
         let status = CallbackStatus {
             input_type: InputType::Button,
-            button_status: self.get_status(),
+            button_status: self.source.get_status(),
             ..Default::default()
         };
-        self.last_button_value = status.button_status.value;
+        *self.source.state.last_value.lock() = status.button_status.value;
         self.trigger_on_change(&status);
     }
 
     fn set_callback(&mut self, callback: InputCallback) {
-        self.callback = callback;
+        *self.source.state.consumer.lock() = callback;
     }
 
     fn trigger_on_change(&self, status: &CallbackStatus) {
-        if let Some(ref on_change) = self.callback.on_change {
-            on_change(status);
-        }
+        self.source.state.trigger(status);
     }
 }
 
 impl Drop for InputFromButton {
     fn drop(&mut self) {
-        let mut engine = self.input_engine.lock();
+        let mut engine = self.source.input_engine.lock();
         engine.delete_callback(self.callback_key);
     }
 }
@@ -158,17 +221,52 @@ impl Drop for InputFromButton {
 // ---- InputFromHatButton ----
 // Port of InputFromHatButton class from input_poller.cpp
 
-struct InputFromHatButton {
+/// Everything `InputFromHatButton::OnChange` reads, shared with the engine.
+struct HatButtonSource {
     identifier: PadIdentifier,
     button: i32,
     direction: u8,
     turbo: bool,
     toggle: bool,
     inverted: bool,
-    callback_key: i32,
-    last_button_value: bool,
     input_engine: Arc<Mutex<InputEngine>>,
-    callback: InputCallback,
+    state: Arc<DeviceState<bool>>,
+}
+
+impl HatButtonSource {
+    /// Upstream `InputFromHatButton::GetStatus`.
+    fn get_status(&self) -> ButtonStatus {
+        let engine = self.input_engine.lock();
+        ButtonStatus {
+            value: engine.get_hat_button(&self.identifier, self.button, self.direction),
+            inverted: self.inverted,
+            toggle: self.toggle,
+            turbo: self.turbo,
+            ..Default::default()
+        }
+    }
+
+    /// Upstream `InputFromHatButton::OnChange`.
+    fn on_change(&self) {
+        let status = CallbackStatus {
+            input_type: InputType::Button,
+            button_status: self.get_status(),
+            ..Default::default()
+        };
+        {
+            let mut last = self.state.last_value.lock();
+            if status.button_status.value == *last {
+                return;
+            }
+            *last = status.button_status.value;
+        }
+        self.state.trigger(&status);
+    }
+}
+
+struct InputFromHatButton {
+    source: Arc<HatButtonSource>,
+    callback_key: i32,
 }
 
 impl InputFromHatButton {
@@ -181,37 +279,32 @@ impl InputFromHatButton {
         inverted: bool,
         input_engine: Arc<Mutex<InputEngine>>,
     ) -> Self {
-        let callback_key = {
-            let mut engine = input_engine.lock();
-            engine.set_callback(InputIdentifier {
-                identifier: identifier.clone(),
-                r#type: EngineInputType::HatButton,
-                index: button,
-                callback: UpdateCallback { on_change: None },
-            })
-        };
-        Self {
-            identifier,
+        let source = Arc::new(HatButtonSource {
+            identifier: identifier.clone(),
             button,
             direction,
             turbo,
             toggle,
             inverted,
-            callback_key,
-            last_button_value: false,
-            input_engine,
-            callback: InputCallback { on_change: None },
-        }
-    }
+            input_engine: Arc::clone(&input_engine),
+            state: DeviceState::new(false),
+        });
 
-    fn get_status(&self) -> ButtonStatus {
-        let engine = self.input_engine.lock();
-        ButtonStatus {
-            value: engine.get_hat_button(&self.identifier, self.button, self.direction),
-            inverted: self.inverted,
-            toggle: self.toggle,
-            turbo: self.turbo,
-            ..Default::default()
+        let callback_source = Arc::clone(&source);
+        let callback_key = {
+            let mut engine = input_engine.lock();
+            engine.set_callback(InputIdentifier {
+                identifier,
+                r#type: EngineInputType::HatButton,
+                index: button,
+                callback: UpdateCallback {
+                    on_change: Some(Arc::new(move |_| callback_source.on_change())),
+                },
+            })
+        };
+        Self {
+            source,
+            callback_key,
         }
     }
 }
@@ -220,27 +313,25 @@ impl InputDevice for InputFromHatButton {
     fn force_update(&mut self) {
         let status = CallbackStatus {
             input_type: InputType::Button,
-            button_status: self.get_status(),
+            button_status: self.source.get_status(),
             ..Default::default()
         };
-        self.last_button_value = status.button_status.value;
+        *self.source.state.last_value.lock() = status.button_status.value;
         self.trigger_on_change(&status);
     }
 
     fn set_callback(&mut self, callback: InputCallback) {
-        self.callback = callback;
+        *self.source.state.consumer.lock() = callback;
     }
 
     fn trigger_on_change(&self, status: &CallbackStatus) {
-        if let Some(ref on_change) = self.callback.on_change {
-            on_change(status);
-        }
+        self.source.state.trigger(status);
     }
 }
 
 impl Drop for InputFromHatButton {
     fn drop(&mut self) {
-        let mut engine = self.input_engine.lock();
+        let mut engine = self.source.input_engine.lock();
         engine.delete_callback(self.callback_key);
     }
 }
@@ -248,19 +339,63 @@ impl Drop for InputFromHatButton {
 // ---- InputFromStick ----
 // Port of InputFromStick class from input_poller.cpp
 
-struct InputFromStick {
+/// Everything `InputFromStick::OnChange` reads, shared with the engine.
+struct StickSource {
     identifier: PadIdentifier,
     axis_x: i32,
     axis_y: i32,
     properties_x: AnalogProperties,
     properties_y: AnalogProperties,
-    callback_key_x: i32,
-    callback_key_y: i32,
-    last_axis_x_value: f32,
-    last_axis_y_value: f32,
     input_engine: Arc<Mutex<InputEngine>>,
     invert_axis_y: bool,
-    callback: InputCallback,
+    state: Arc<DeviceState<(f32, f32)>>,
+}
+
+impl StickSource {
+    /// Upstream `InputFromStick::GetStatus`.
+    fn get_status(&self) -> StickStatus {
+        let engine = self.input_engine.lock();
+        let mut status = StickStatus::default();
+        status.x = make_analog(
+            engine.get_axis(&self.identifier, self.axis_x),
+            self.properties_x.clone(),
+        );
+        let mut raw_y = engine.get_axis(&self.identifier, self.axis_y);
+        // Kept for compatibility with old yuzu versions: SDL's vertical axis
+        // runs the other way round from Nintendo's.
+        if self.invert_axis_y {
+            raw_y = -raw_y;
+        }
+        status.y = make_analog(raw_y, self.properties_y.clone());
+        status
+    }
+
+    /// Upstream `InputFromStick::OnChange`.
+    fn on_change(&self) {
+        let status = CallbackStatus {
+            input_type: InputType::Stick,
+            stick_status: self.get_status(),
+            ..Default::default()
+        };
+        {
+            let mut last = self.state.last_value.lock();
+            let fresh = (
+                status.stick_status.x.raw_value,
+                status.stick_status.y.raw_value,
+            );
+            if fresh == *last {
+                return;
+            }
+            *last = fresh;
+        }
+        self.state.trigger(&status);
+    }
+}
+
+struct InputFromStick {
+    source: Arc<StickSource>,
+    callback_key_x: i32,
+    callback_key_y: i32,
 }
 
 impl InputFromStick {
@@ -276,51 +411,45 @@ impl InputFromStick {
             let engine = input_engine.lock();
             engine.get_engine_name() == "sdl"
         };
-        let (callback_key_x, callback_key_y) = {
-            let mut engine = input_engine.lock();
-            let kx = engine.set_callback(InputIdentifier {
-                identifier: identifier.clone(),
-                r#type: EngineInputType::Analog,
-                index: axis_x,
-                callback: UpdateCallback { on_change: None },
-            });
-            let ky = engine.set_callback(InputIdentifier {
-                identifier: identifier.clone(),
-                r#type: EngineInputType::Analog,
-                index: axis_y,
-                callback: UpdateCallback { on_change: None },
-            });
-            (kx, ky)
-        };
-        Self {
-            identifier,
+        let source = Arc::new(StickSource {
+            identifier: identifier.clone(),
             axis_x,
             axis_y,
             properties_x,
             properties_y,
+            input_engine: Arc::clone(&input_engine),
+            invert_axis_y,
+            state: DeviceState::new((0.0, 0.0)),
+        });
+
+        // Upstream hands the *same* `engine_callback` to both axes.
+        let (callback_key_x, callback_key_y) = {
+            let mut engine = input_engine.lock();
+            let source_x = Arc::clone(&source);
+            let kx = engine.set_callback(InputIdentifier {
+                identifier: identifier.clone(),
+                r#type: EngineInputType::Analog,
+                index: axis_x,
+                callback: UpdateCallback {
+                    on_change: Some(Arc::new(move |_| source_x.on_change())),
+                },
+            });
+            let source_y = Arc::clone(&source);
+            let ky = engine.set_callback(InputIdentifier {
+                identifier,
+                r#type: EngineInputType::Analog,
+                index: axis_y,
+                callback: UpdateCallback {
+                    on_change: Some(Arc::new(move |_| source_y.on_change())),
+                },
+            });
+            (kx, ky)
+        };
+        Self {
+            source,
             callback_key_x,
             callback_key_y,
-            last_axis_x_value: 0.0,
-            last_axis_y_value: 0.0,
-            input_engine,
-            invert_axis_y,
-            callback: InputCallback { on_change: None },
         }
-    }
-
-    fn get_status(&self) -> StickStatus {
-        let engine = self.input_engine.lock();
-        let mut status = StickStatus::default();
-        status.x = make_analog(
-            engine.get_axis(&self.identifier, self.axis_x),
-            self.properties_x.clone(),
-        );
-        let mut raw_y = engine.get_axis(&self.identifier, self.axis_y);
-        if self.invert_axis_y {
-            raw_y = -raw_y;
-        }
-        status.y = make_analog(raw_y, self.properties_y.clone());
-        status
     }
 }
 
@@ -328,26 +457,28 @@ impl InputDevice for InputFromStick {
     fn force_update(&mut self) {
         let status = CallbackStatus {
             input_type: InputType::Stick,
-            stick_status: self.get_status(),
+            stick_status: self.source.get_status(),
             ..Default::default()
         };
-        self.last_axis_x_value = status.stick_status.x.raw_value;
-        self.last_axis_y_value = status.stick_status.y.raw_value;
+        *self.source.state.last_value.lock() = (
+            status.stick_status.x.raw_value,
+            status.stick_status.y.raw_value,
+        );
         self.trigger_on_change(&status);
     }
+
     fn set_callback(&mut self, callback: InputCallback) {
-        self.callback = callback;
+        *self.source.state.consumer.lock() = callback;
     }
+
     fn trigger_on_change(&self, status: &CallbackStatus) {
-        if let Some(ref on_change) = self.callback.on_change {
-            on_change(status);
-        }
+        self.source.state.trigger(status);
     }
 }
 
 impl Drop for InputFromStick {
     fn drop(&mut self) {
-        let mut engine = self.input_engine.lock();
+        let mut engine = self.source.input_engine.lock();
         engine.delete_callback(self.callback_key_x);
         engine.delete_callback(self.callback_key_y);
     }
@@ -410,7 +541,7 @@ impl TouchCallbackState {
 
 fn touch_update_callback(state: Arc<Mutex<TouchCallbackState>>) -> UpdateCallback {
     UpdateCallback {
-        on_change: Some(Box::new(move |event| state.lock().update(event))),
+        on_change: Some(Arc::new(move |event| state.lock().update(event))),
     }
 }
 
@@ -502,63 +633,20 @@ impl Drop for InputFromTouch {
 // ---- InputFromTrigger ----
 // Port of InputFromTrigger class from input_poller.cpp
 
-struct InputFromTrigger {
+/// Everything `InputFromTrigger::OnChange` reads, shared with the engine.
+struct TriggerSource {
     identifier: PadIdentifier,
     button: i32,
     toggle: bool,
     inverted: bool,
     axis: i32,
     properties: AnalogProperties,
-    callback_key_button: i32,
-    axis_callback_key: i32,
-    last_button_value: bool,
-    last_axis_value: f32,
     input_engine: Arc<Mutex<InputEngine>>,
-    callback: InputCallback,
+    state: Arc<DeviceState<(bool, f32)>>,
 }
 
-impl InputFromTrigger {
-    fn new(
-        identifier: PadIdentifier,
-        button: i32,
-        toggle: bool,
-        inverted: bool,
-        axis: i32,
-        properties: AnalogProperties,
-        input_engine: Arc<Mutex<InputEngine>>,
-    ) -> Self {
-        let (kb, ka) = {
-            let mut engine = input_engine.lock();
-            let kb = engine.set_callback(InputIdentifier {
-                identifier: identifier.clone(),
-                r#type: EngineInputType::Button,
-                index: button,
-                callback: UpdateCallback { on_change: None },
-            });
-            let ka = engine.set_callback(InputIdentifier {
-                identifier: identifier.clone(),
-                r#type: EngineInputType::Analog,
-                index: axis,
-                callback: UpdateCallback { on_change: None },
-            });
-            (kb, ka)
-        };
-        Self {
-            identifier,
-            button,
-            toggle,
-            inverted,
-            axis,
-            properties,
-            callback_key_button: kb,
-            axis_callback_key: ka,
-            last_button_value: false,
-            last_axis_value: 0.0,
-            input_engine,
-            callback: InputCallback { on_change: None },
-        }
-    }
-
+impl TriggerSource {
+    /// Upstream `InputFromTrigger::GetStatus`.
     fn get_status(&self) -> TriggerStatus {
         let engine = self.input_engine.lock();
         TriggerStatus {
@@ -575,22 +663,112 @@ impl InputFromTrigger {
             ..Default::default()
         }
     }
+
+    /// Upstream `InputFromTrigger::OnChange`.
+    fn on_change(&self) {
+        let status = CallbackStatus {
+            input_type: InputType::Trigger,
+            trigger_status: self.get_status(),
+            ..Default::default()
+        };
+        {
+            let mut last = self.state.last_value.lock();
+            let fresh = (
+                status.trigger_status.pressed.value,
+                status.trigger_status.analog.raw_value,
+            );
+            if fresh == *last {
+                return;
+            }
+            *last = fresh;
+        }
+        self.state.trigger(&status);
+    }
+}
+
+struct InputFromTrigger {
+    source: Arc<TriggerSource>,
+    callback_key_button: i32,
+    axis_callback_key: i32,
+}
+
+impl InputFromTrigger {
+    fn new(
+        identifier: PadIdentifier,
+        button: i32,
+        toggle: bool,
+        inverted: bool,
+        axis: i32,
+        properties: AnalogProperties,
+        input_engine: Arc<Mutex<InputEngine>>,
+    ) -> Self {
+        let source = Arc::new(TriggerSource {
+            identifier: identifier.clone(),
+            button,
+            toggle,
+            inverted,
+            axis,
+            properties,
+            input_engine: Arc::clone(&input_engine),
+            state: DeviceState::new((false, 0.0)),
+        });
+
+        let (callback_key_button, axis_callback_key) = {
+            let mut engine = input_engine.lock();
+            let button_source = Arc::clone(&source);
+            let kb = engine.set_callback(InputIdentifier {
+                identifier: identifier.clone(),
+                r#type: EngineInputType::Button,
+                index: button,
+                callback: UpdateCallback {
+                    on_change: Some(Arc::new(move |_| button_source.on_change())),
+                },
+            });
+            let axis_source = Arc::clone(&source);
+            let ka = engine.set_callback(InputIdentifier {
+                identifier,
+                r#type: EngineInputType::Analog,
+                index: axis,
+                callback: UpdateCallback {
+                    on_change: Some(Arc::new(move |_| axis_source.on_change())),
+                },
+            });
+            (kb, ka)
+        };
+        Self {
+            source,
+            callback_key_button,
+            axis_callback_key,
+        }
+    }
 }
 
 impl InputDevice for InputFromTrigger {
-    fn set_callback(&mut self, callback: InputCallback) {
-        self.callback = callback;
+    fn force_update(&mut self) {
+        let status = CallbackStatus {
+            input_type: InputType::Trigger,
+            trigger_status: self.source.get_status(),
+            ..Default::default()
+        };
+        *self.source.state.last_value.lock() = (
+            status.trigger_status.pressed.value,
+            status.trigger_status.analog.raw_value,
+        );
+        self.trigger_on_change(&status);
     }
+
+    fn set_callback(&mut self, callback: InputCallback) {
+        *self.source.state.consumer.lock() = callback;
+    }
+
     fn trigger_on_change(&self, status: &CallbackStatus) {
-        if let Some(ref on_change) = self.callback.on_change {
-            on_change(status);
-        }
+        self.source.state.trigger(status);
     }
 }
 
 impl Drop for InputFromTrigger {
     fn drop(&mut self) {
-        let mut engine = self.input_engine.lock();
+        let mut engine = self.source.input_engine.lock();
         engine.delete_callback(self.callback_key_button);
         engine.delete_callback(self.axis_callback_key);
     }
@@ -599,14 +777,46 @@ impl Drop for InputFromTrigger {
 // ---- InputFromAnalog ----
 // Port of InputFromAnalog class from input_poller.cpp
 
-struct InputFromAnalog {
+/// Everything `InputFromAnalog::OnChange` reads, shared with the engine.
+struct AnalogSource {
     identifier: PadIdentifier,
     axis: i32,
     properties: AnalogProperties,
-    callback_key: i32,
-    last_axis_value: f32,
     input_engine: Arc<Mutex<InputEngine>>,
-    callback: InputCallback,
+    state: Arc<DeviceState<f32>>,
+}
+
+impl AnalogSource {
+    /// Upstream `InputFromAnalog::GetStatus`.
+    fn get_status(&self) -> AnalogStatus {
+        let engine = self.input_engine.lock();
+        make_analog(
+            engine.get_axis(&self.identifier, self.axis),
+            self.properties.clone(),
+        )
+    }
+
+    /// Upstream `InputFromAnalog::OnChange`.
+    fn on_change(&self) {
+        let status = CallbackStatus {
+            input_type: InputType::Analog,
+            analog_status: self.get_status(),
+            ..Default::default()
+        };
+        {
+            let mut last = self.state.last_value.lock();
+            if status.analog_status.raw_value == *last {
+                return;
+            }
+            *last = status.analog_status.raw_value;
+        }
+        self.state.trigger(&status);
+    }
+}
+
+struct InputFromAnalog {
+    source: Arc<AnalogSource>,
+    callback_key: i32,
 }
 
 impl InputFromAnalog {
@@ -616,49 +826,56 @@ impl InputFromAnalog {
         properties: AnalogProperties,
         input_engine: Arc<Mutex<InputEngine>>,
     ) -> Self {
+        let source = Arc::new(AnalogSource {
+            identifier: identifier.clone(),
+            axis,
+            properties,
+            input_engine: Arc::clone(&input_engine),
+            state: DeviceState::new(0.0),
+        });
+
+        let callback_source = Arc::clone(&source);
         let callback_key = {
             let mut engine = input_engine.lock();
             engine.set_callback(InputIdentifier {
-                identifier: identifier.clone(),
+                identifier,
                 r#type: EngineInputType::Analog,
                 index: axis,
-                callback: UpdateCallback { on_change: None },
+                callback: UpdateCallback {
+                    on_change: Some(Arc::new(move |_| callback_source.on_change())),
+                },
             })
         };
         Self {
-            identifier,
-            axis,
-            properties,
+            source,
             callback_key,
-            last_axis_value: 0.0,
-            input_engine,
-            callback: InputCallback { on_change: None },
         }
-    }
-
-    fn get_status(&self) -> AnalogStatus {
-        let engine = self.input_engine.lock();
-        make_analog(
-            engine.get_axis(&self.identifier, self.axis),
-            self.properties.clone(),
-        )
     }
 }
 
 impl InputDevice for InputFromAnalog {
-    fn set_callback(&mut self, callback: InputCallback) {
-        self.callback = callback;
+    fn force_update(&mut self) {
+        let status = CallbackStatus {
+            input_type: InputType::Analog,
+            analog_status: self.source.get_status(),
+            ..Default::default()
+        };
+        *self.source.state.last_value.lock() = status.analog_status.raw_value;
+        self.trigger_on_change(&status);
     }
+
+    fn set_callback(&mut self, callback: InputCallback) {
+        *self.source.state.consumer.lock() = callback;
+    }
+
     fn trigger_on_change(&self, status: &CallbackStatus) {
-        if let Some(ref on_change) = self.callback.on_change {
-            on_change(status);
-        }
+        self.source.state.trigger(status);
     }
 }
 
 impl Drop for InputFromAnalog {
     fn drop(&mut self) {
-        let mut engine = self.input_engine.lock();
+        let mut engine = self.source.input_engine.lock();
         engine.delete_callback(self.callback_key);
     }
 }
@@ -666,36 +883,66 @@ impl Drop for InputFromAnalog {
 // ---- InputFromBattery ----
 // Port of InputFromBattery class from input_poller.cpp
 
-struct InputFromBattery {
+/// Everything `InputFromBattery::OnChange` reads, shared with the engine.
+struct BatterySource {
     identifier: PadIdentifier,
-    callback_key: i32,
-    last_battery_value: BatteryStatus,
     input_engine: Arc<Mutex<InputEngine>>,
-    callback: InputCallback,
+    state: Arc<DeviceState<BatteryStatus>>,
+}
+
+impl BatterySource {
+    /// Upstream `InputFromBattery::GetStatus`.
+    fn get_status(&self) -> BatteryStatus {
+        let engine = self.input_engine.lock();
+        engine.get_battery(&self.identifier)
+    }
+
+    /// Upstream `InputFromBattery::OnChange`.
+    fn on_change(&self) {
+        let status = CallbackStatus {
+            input_type: InputType::Battery,
+            battery_status: self.get_status(),
+            ..Default::default()
+        };
+        {
+            let mut last = self.state.last_value.lock();
+            if status.battery_status == *last {
+                return;
+            }
+            *last = status.battery_status;
+        }
+        self.state.trigger(&status);
+    }
+}
+
+struct InputFromBattery {
+    source: Arc<BatterySource>,
+    callback_key: i32,
 }
 
 impl InputFromBattery {
     fn new(identifier: PadIdentifier, input_engine: Arc<Mutex<InputEngine>>) -> Self {
+        let source = Arc::new(BatterySource {
+            identifier: identifier.clone(),
+            input_engine: Arc::clone(&input_engine),
+            state: DeviceState::new(BatteryLevel::Charging),
+        });
+        let callback_source = Arc::clone(&source);
         let callback_key = {
             let mut engine = input_engine.lock();
             engine.set_callback(InputIdentifier {
-                identifier: identifier.clone(),
+                identifier,
                 r#type: EngineInputType::Battery,
                 index: 0,
-                callback: UpdateCallback { on_change: None },
+                callback: UpdateCallback {
+                    on_change: Some(Arc::new(move |_| callback_source.on_change())),
+                },
             })
         };
         Self {
-            identifier,
+            source,
             callback_key,
-            last_battery_value: BatteryLevel::Charging,
-            input_engine,
-            callback: InputCallback { on_change: None },
         }
-    }
-    fn get_status(&self) -> BatteryStatus {
-        let engine = self.input_engine.lock();
-        engine.get_battery(&self.identifier)
     }
 }
 
@@ -703,60 +950,93 @@ impl InputDevice for InputFromBattery {
     fn force_update(&mut self) {
         let status = CallbackStatus {
             input_type: InputType::Battery,
-            battery_status: self.get_status(),
+            battery_status: self.source.get_status(),
             ..Default::default()
         };
-        self.last_battery_value = status.battery_status;
+        *self.source.state.last_value.lock() = status.battery_status;
         self.trigger_on_change(&status);
     }
+
     fn set_callback(&mut self, callback: InputCallback) {
-        self.callback = callback;
+        *self.source.state.consumer.lock() = callback;
     }
+
     fn trigger_on_change(&self, status: &CallbackStatus) {
-        if let Some(ref on_change) = self.callback.on_change {
-            on_change(status);
-        }
+        self.source.state.trigger(status);
     }
 }
 
 impl Drop for InputFromBattery {
     fn drop(&mut self) {
-        self.input_engine.lock().delete_callback(self.callback_key);
+        self.source
+            .input_engine
+            .lock()
+            .delete_callback(self.callback_key);
     }
 }
 
 // ---- InputFromColor ----
 // Port of InputFromColor class from input_poller.cpp
 
-struct InputFromColor {
+/// Everything `InputFromColor::OnChange` reads, shared with the engine.
+struct ColorSource {
     identifier: PadIdentifier,
-    callback_key: i32,
-    last_color_value: BodyColorStatus,
     input_engine: Arc<Mutex<InputEngine>>,
-    callback: InputCallback,
+    state: Arc<DeviceState<BodyColorStatus>>,
+}
+
+impl ColorSource {
+    /// Upstream `InputFromColor::GetStatus`.
+    fn get_status(&self) -> BodyColorStatus {
+        self.input_engine.lock().get_color(&self.identifier)
+    }
+
+    /// Upstream `InputFromColor::OnChange`.
+    fn on_change(&self) {
+        let status = CallbackStatus {
+            input_type: InputType::Color,
+            color_status: self.get_status(),
+            ..Default::default()
+        };
+        {
+            let mut last = self.state.last_value.lock();
+            if status.color_status == *last {
+                return;
+            }
+            *last = status.color_status;
+        }
+        self.state.trigger(&status);
+    }
+}
+
+struct InputFromColor {
+    source: Arc<ColorSource>,
+    callback_key: i32,
 }
 
 impl InputFromColor {
     fn new(identifier: PadIdentifier, input_engine: Arc<Mutex<InputEngine>>) -> Self {
+        let source = Arc::new(ColorSource {
+            identifier: identifier.clone(),
+            input_engine: Arc::clone(&input_engine),
+            state: DeviceState::new(BodyColorStatus::default()),
+        });
+        let callback_source = Arc::clone(&source);
         let callback_key = {
             let mut engine = input_engine.lock();
             engine.set_callback(InputIdentifier {
-                identifier: identifier.clone(),
+                identifier,
                 r#type: EngineInputType::Color,
                 index: 0,
-                callback: UpdateCallback { on_change: None },
+                callback: UpdateCallback {
+                    on_change: Some(Arc::new(move |_| callback_source.on_change())),
+                },
             })
         };
         Self {
-            identifier,
+            source,
             callback_key,
-            last_color_value: BodyColorStatus::default(),
-            input_engine,
-            callback: InputCallback { on_change: None },
         }
-    }
-    fn get_status(&self) -> BodyColorStatus {
-        self.input_engine.lock().get_color(&self.identifier)
     }
 }
 
@@ -764,66 +1044,45 @@ impl InputDevice for InputFromColor {
     fn force_update(&mut self) {
         let status = CallbackStatus {
             input_type: InputType::Color,
-            color_status: self.get_status(),
+            color_status: self.source.get_status(),
             ..Default::default()
         };
-        self.last_color_value = status.color_status;
+        *self.source.state.last_value.lock() = status.color_status;
         self.trigger_on_change(&status);
     }
+
     fn set_callback(&mut self, callback: InputCallback) {
-        self.callback = callback;
+        *self.source.state.consumer.lock() = callback;
     }
+
     fn trigger_on_change(&self, status: &CallbackStatus) {
-        if let Some(ref on_change) = self.callback.on_change {
-            on_change(status);
-        }
+        self.source.state.trigger(status);
     }
 }
 
 impl Drop for InputFromColor {
     fn drop(&mut self) {
-        self.input_engine.lock().delete_callback(self.callback_key);
+        self.source
+            .input_engine
+            .lock()
+            .delete_callback(self.callback_key);
     }
 }
 
 // ---- InputFromMotion ----
 // Port of InputFromMotion class from input_poller.cpp
 
-struct InputFromMotion {
+/// Everything `InputFromMotion::OnChange` reads, shared with the engine.
+struct MotionSource {
     identifier: PadIdentifier,
     motion_sensor: i32,
     gyro_threshold: f32,
-    callback_key: i32,
     input_engine: Arc<Mutex<InputEngine>>,
-    callback: InputCallback,
+    state: Arc<DeviceState<()>>,
 }
 
-impl InputFromMotion {
-    fn new(
-        identifier: PadIdentifier,
-        motion_sensor: i32,
-        gyro_threshold: f32,
-        input_engine: Arc<Mutex<InputEngine>>,
-    ) -> Self {
-        let callback_key = {
-            let mut engine = input_engine.lock();
-            engine.set_callback(InputIdentifier {
-                identifier: identifier.clone(),
-                r#type: EngineInputType::Motion,
-                index: motion_sensor,
-                callback: UpdateCallback { on_change: None },
-            })
-        };
-        Self {
-            identifier,
-            motion_sensor,
-            gyro_threshold,
-            callback_key,
-            input_engine,
-            callback: InputCallback { on_change: None },
-        }
-    }
-
+impl MotionSource {
+    /// Upstream `InputFromMotion::GetStatus`.
     fn get_status(&self) -> MotionStatus {
         let engine = self.input_engine.lock();
         let bm = engine.get_motion(&self.identifier, self.motion_sensor);
@@ -844,29 +1103,90 @@ impl InputFromMotion {
         s.delta_timestamp = bm.delta_timestamp;
         s
     }
+
+    /// Upstream `InputFromMotion::OnChange`, which reports every sample
+    /// unconditionally — motion data is continuous.
+    fn on_change(&self) {
+        let status = CallbackStatus {
+            input_type: InputType::Motion,
+            motion_status: self.get_status(),
+            ..Default::default()
+        };
+        self.state.trigger(&status);
+    }
+}
+
+struct InputFromMotion {
+    source: Arc<MotionSource>,
+    callback_key: i32,
+}
+
+impl InputFromMotion {
+    fn new(
+        identifier: PadIdentifier,
+        motion_sensor: i32,
+        gyro_threshold: f32,
+        input_engine: Arc<Mutex<InputEngine>>,
+    ) -> Self {
+        let source = Arc::new(MotionSource {
+            identifier: identifier.clone(),
+            motion_sensor,
+            gyro_threshold,
+            input_engine: Arc::clone(&input_engine),
+            state: DeviceState::new(()),
+        });
+        let callback_source = Arc::clone(&source);
+        let callback_key = {
+            let mut engine = input_engine.lock();
+            engine.set_callback(InputIdentifier {
+                identifier,
+                r#type: EngineInputType::Motion,
+                index: motion_sensor,
+                callback: UpdateCallback {
+                    on_change: Some(Arc::new(move |_| callback_source.on_change())),
+                },
+            })
+        };
+        Self {
+            source,
+            callback_key,
+        }
+    }
 }
 
 impl InputDevice for InputFromMotion {
-    fn set_callback(&mut self, callback: InputCallback) {
-        self.callback = callback;
+    fn force_update(&mut self) {
+        let status = CallbackStatus {
+            input_type: InputType::Motion,
+            motion_status: self.source.get_status(),
+            ..Default::default()
+        };
+        self.trigger_on_change(&status);
     }
+
+    fn set_callback(&mut self, callback: InputCallback) {
+        *self.source.state.consumer.lock() = callback;
+    }
+
     fn trigger_on_change(&self, status: &CallbackStatus) {
-        if let Some(ref on_change) = self.callback.on_change {
-            on_change(status);
-        }
+        self.source.state.trigger(status);
     }
 }
 
 impl Drop for InputFromMotion {
     fn drop(&mut self) {
-        self.input_engine.lock().delete_callback(self.callback_key);
+        self.source
+            .input_engine
+            .lock()
+            .delete_callback(self.callback_key);
     }
 }
 
 // ---- InputFromAxisMotion ----
 // Port of InputFromAxisMotion class from input_poller.cpp
 
-struct InputFromAxisMotion {
+/// Everything `InputFromAxisMotion::OnChange` reads, shared with the engine.
+struct AxisMotionSource {
     identifier: PadIdentifier,
     axis_x: i32,
     axis_y: i32,
@@ -874,68 +1194,12 @@ struct InputFromAxisMotion {
     properties_x: AnalogProperties,
     properties_y: AnalogProperties,
     properties_z: AnalogProperties,
-    callback_key_x: i32,
-    callback_key_y: i32,
-    callback_key_z: i32,
-    last_axis_x_value: f32,
-    last_axis_y_value: f32,
-    last_axis_z_value: f32,
     input_engine: Arc<Mutex<InputEngine>>,
-    callback: InputCallback,
+    state: Arc<DeviceState<(f32, f32, f32)>>,
 }
 
-impl InputFromAxisMotion {
-    fn new(
-        identifier: PadIdentifier,
-        axis_x: i32,
-        axis_y: i32,
-        axis_z: i32,
-        properties_x: AnalogProperties,
-        properties_y: AnalogProperties,
-        properties_z: AnalogProperties,
-        input_engine: Arc<Mutex<InputEngine>>,
-    ) -> Self {
-        let (kx, ky, kz) = {
-            let mut engine = input_engine.lock();
-            let kx = engine.set_callback(InputIdentifier {
-                identifier: identifier.clone(),
-                r#type: EngineInputType::Analog,
-                index: axis_x,
-                callback: UpdateCallback { on_change: None },
-            });
-            let ky = engine.set_callback(InputIdentifier {
-                identifier: identifier.clone(),
-                r#type: EngineInputType::Analog,
-                index: axis_y,
-                callback: UpdateCallback { on_change: None },
-            });
-            let kz = engine.set_callback(InputIdentifier {
-                identifier: identifier.clone(),
-                r#type: EngineInputType::Analog,
-                index: axis_z,
-                callback: UpdateCallback { on_change: None },
-            });
-            (kx, ky, kz)
-        };
-        Self {
-            identifier,
-            axis_x,
-            axis_y,
-            axis_z,
-            properties_x,
-            properties_y,
-            properties_z,
-            callback_key_x: kx,
-            callback_key_y: ky,
-            callback_key_z: kz,
-            last_axis_x_value: 0.0,
-            last_axis_y_value: 0.0,
-            last_axis_z_value: 0.0,
-            input_engine,
-            callback: InputCallback { on_change: None },
-        }
-    }
-
+impl AxisMotionSource {
+    /// Upstream `InputFromAxisMotion::GetStatus`.
     fn get_status(&self) -> MotionStatus {
         let engine = self.input_engine.lock();
         let mut s = MotionStatus::default();
@@ -955,33 +1219,114 @@ impl InputFromAxisMotion {
         s.force_update = true;
         s
     }
+
+    /// Upstream `InputFromAxisMotion::OnChange`.
+    fn on_change(&self) {
+        let status = CallbackStatus {
+            input_type: InputType::Motion,
+            motion_status: self.get_status(),
+            ..Default::default()
+        };
+        {
+            let mut last = self.state.last_value.lock();
+            let fresh = (
+                status.motion_status.gyro.x.raw_value,
+                status.motion_status.gyro.y.raw_value,
+                status.motion_status.gyro.z.raw_value,
+            );
+            if fresh == *last {
+                return;
+            }
+            *last = fresh;
+        }
+        self.state.trigger(&status);
+    }
+}
+
+struct InputFromAxisMotion {
+    source: Arc<AxisMotionSource>,
+    callback_key_x: i32,
+    callback_key_y: i32,
+    callback_key_z: i32,
+}
+
+impl InputFromAxisMotion {
+    fn new(
+        identifier: PadIdentifier,
+        axis_x: i32,
+        axis_y: i32,
+        axis_z: i32,
+        properties_x: AnalogProperties,
+        properties_y: AnalogProperties,
+        properties_z: AnalogProperties,
+        input_engine: Arc<Mutex<InputEngine>>,
+    ) -> Self {
+        let source = Arc::new(AxisMotionSource {
+            identifier: identifier.clone(),
+            axis_x,
+            axis_y,
+            axis_z,
+            properties_x,
+            properties_y,
+            properties_z,
+            input_engine: Arc::clone(&input_engine),
+            state: DeviceState::new((0.0, 0.0, 0.0)),
+        });
+
+        let (callback_key_x, callback_key_y, callback_key_z) = {
+            let mut engine = input_engine.lock();
+            let mut register = |index: i32, identifier: PadIdentifier| {
+                let source = Arc::clone(&source);
+                engine.set_callback(InputIdentifier {
+                    identifier,
+                    r#type: EngineInputType::Analog,
+                    index,
+                    callback: UpdateCallback {
+                        on_change: Some(Arc::new(move |_| source.on_change())),
+                    },
+                })
+            };
+            let kx = register(axis_x, identifier.clone());
+            let ky = register(axis_y, identifier.clone());
+            let kz = register(axis_z, identifier);
+            (kx, ky, kz)
+        };
+        Self {
+            source,
+            callback_key_x,
+            callback_key_y,
+            callback_key_z,
+        }
+    }
 }
 
 impl InputDevice for InputFromAxisMotion {
     fn force_update(&mut self) {
         let status = CallbackStatus {
             input_type: InputType::Motion,
-            motion_status: self.get_status(),
+            motion_status: self.source.get_status(),
             ..Default::default()
         };
-        self.last_axis_x_value = status.motion_status.gyro.x.raw_value;
-        self.last_axis_y_value = status.motion_status.gyro.y.raw_value;
-        self.last_axis_z_value = status.motion_status.gyro.z.raw_value;
+        *self.source.state.last_value.lock() = (
+            status.motion_status.gyro.x.raw_value,
+            status.motion_status.gyro.y.raw_value,
+            status.motion_status.gyro.z.raw_value,
+        );
         self.trigger_on_change(&status);
     }
+
     fn set_callback(&mut self, callback: InputCallback) {
-        self.callback = callback;
+        *self.source.state.consumer.lock() = callback;
     }
+
     fn trigger_on_change(&self, status: &CallbackStatus) {
-        if let Some(ref on_change) = self.callback.on_change {
-            on_change(status);
-        }
+        self.source.state.trigger(status);
     }
 }
 
 impl Drop for InputFromAxisMotion {
     fn drop(&mut self) {
-        let mut engine = self.input_engine.lock();
+        let mut engine = self.source.input_engine.lock();
         engine.delete_callback(self.callback_key_x);
         engine.delete_callback(self.callback_key_y);
         engine.delete_callback(self.callback_key_z);
@@ -991,125 +1336,164 @@ impl Drop for InputFromAxisMotion {
 // ---- InputFromCamera ----
 // Port of InputFromCamera class from input_poller.cpp
 
-struct InputFromCamera {
+/// Everything `InputFromCamera::OnChange` reads, shared with the engine.
+struct CameraSource {
     identifier: PadIdentifier,
-    callback_key: i32,
     input_engine: Arc<Mutex<InputEngine>>,
-    callback: InputCallback,
+    state: Arc<DeviceState<()>>,
+}
+
+impl CameraSource {
+    /// Upstream `InputFromCamera::GetStatus`.
+    fn get_status(&self) -> CameraStatus {
+        self.input_engine.lock().get_camera(&self.identifier)
+    }
+
+    /// Upstream `InputFromCamera::OnChange`.
+    fn on_change(&self) {
+        let camera = self.get_status();
+        let status = CallbackStatus {
+            input_type: InputType::IrSensor,
+            camera_status: camera.format,
+            raw_data: camera.data,
+            ..Default::default()
+        };
+        self.state.trigger(&status);
+    }
+}
+
+struct InputFromCamera {
+    source: Arc<CameraSource>,
+    callback_key: i32,
 }
 
 impl InputFromCamera {
     fn new(identifier: PadIdentifier, input_engine: Arc<Mutex<InputEngine>>) -> Self {
+        let source = Arc::new(CameraSource {
+            identifier: identifier.clone(),
+            input_engine: Arc::clone(&input_engine),
+            state: DeviceState::new(()),
+        });
+        let callback_source = Arc::clone(&source);
         let callback_key = {
             let mut engine = input_engine.lock();
             engine.set_callback(InputIdentifier {
-                identifier: identifier.clone(),
+                identifier,
                 r#type: EngineInputType::Camera,
                 index: 0,
-                callback: UpdateCallback { on_change: None },
+                callback: UpdateCallback {
+                    on_change: Some(Arc::new(move |_| callback_source.on_change())),
+                },
             })
         };
         Self {
-            identifier,
+            source,
             callback_key,
-            input_engine,
-            callback: InputCallback { on_change: None },
         }
-    }
-    fn get_status(&self) -> CameraStatus {
-        self.input_engine.lock().get_camera(&self.identifier)
-    }
-    fn on_change(&self) {
-        let cs = self.get_status();
-        let status = CallbackStatus {
-            input_type: InputType::IrSensor,
-            camera_status: cs.format,
-            raw_data: cs.data,
-            ..Default::default()
-        };
-        self.trigger_on_change(&status);
     }
 }
 
 impl InputDevice for InputFromCamera {
     fn force_update(&mut self) {
-        self.on_change();
+        self.source.on_change();
     }
+
     fn set_callback(&mut self, callback: InputCallback) {
-        self.callback = callback;
+        *self.source.state.consumer.lock() = callback;
     }
+
     fn trigger_on_change(&self, status: &CallbackStatus) {
-        if let Some(ref on_change) = self.callback.on_change {
-            on_change(status);
-        }
+        self.source.state.trigger(status);
     }
 }
 
 impl Drop for InputFromCamera {
     fn drop(&mut self) {
-        self.input_engine.lock().delete_callback(self.callback_key);
+        self.source
+            .input_engine
+            .lock()
+            .delete_callback(self.callback_key);
     }
 }
 
 // ---- InputFromNfc ----
 // Port of InputFromNfc class from input_poller.cpp
 
-struct InputFromNfc {
+/// Everything `InputFromNfc::OnChange` reads, shared with the engine.
+struct NfcSource {
     identifier: PadIdentifier,
-    callback_key: i32,
     input_engine: Arc<Mutex<InputEngine>>,
-    callback: InputCallback,
+    state: Arc<DeviceState<()>>,
+}
+
+impl NfcSource {
+    /// Upstream `InputFromNfc::GetStatus`.
+    fn get_status(&self) -> NfcStatus {
+        self.input_engine.lock().get_nfc(&self.identifier)
+    }
+
+    /// Upstream `InputFromNfc::OnChange`.
+    fn on_change(&self) {
+        let status = CallbackStatus {
+            input_type: InputType::Nfc,
+            nfc_status: self.get_status(),
+            ..Default::default()
+        };
+        self.state.trigger(&status);
+    }
+}
+
+struct InputFromNfc {
+    source: Arc<NfcSource>,
+    callback_key: i32,
 }
 
 impl InputFromNfc {
     fn new(identifier: PadIdentifier, input_engine: Arc<Mutex<InputEngine>>) -> Self {
+        let source = Arc::new(NfcSource {
+            identifier: identifier.clone(),
+            input_engine: Arc::clone(&input_engine),
+            state: DeviceState::new(()),
+        });
+        let callback_source = Arc::clone(&source);
         let callback_key = {
             let mut engine = input_engine.lock();
             engine.set_callback(InputIdentifier {
-                identifier: identifier.clone(),
+                identifier,
                 r#type: EngineInputType::Nfc,
                 index: 0,
-                callback: UpdateCallback { on_change: None },
+                callback: UpdateCallback {
+                    on_change: Some(Arc::new(move |_| callback_source.on_change())),
+                },
             })
         };
         Self {
-            identifier,
+            source,
             callback_key,
-            input_engine,
-            callback: InputCallback { on_change: None },
         }
-    }
-    fn get_status(&self) -> NfcStatus {
-        self.input_engine.lock().get_nfc(&self.identifier)
-    }
-    fn on_change(&self) {
-        let nfc_status = self.get_status();
-        let status = CallbackStatus {
-            input_type: InputType::Nfc,
-            nfc_status,
-            ..Default::default()
-        };
-        self.trigger_on_change(&status);
     }
 }
 
 impl InputDevice for InputFromNfc {
     fn force_update(&mut self) {
-        self.on_change();
+        self.source.on_change();
     }
+
     fn set_callback(&mut self, callback: InputCallback) {
-        self.callback = callback;
+        *self.source.state.consumer.lock() = callback;
     }
+
     fn trigger_on_change(&self, status: &CallbackStatus) {
-        if let Some(ref on_change) = self.callback.on_change {
-            on_change(status);
-        }
+        self.source.state.trigger(status);
     }
 }
 
 impl Drop for InputFromNfc {
     fn drop(&mut self) {
-        self.input_engine.lock().delete_callback(self.callback_key);
+        self.source
+            .input_engine
+            .lock()
+            .delete_callback(self.callback_key);
     }
 }
 
@@ -1117,11 +1501,79 @@ impl Drop for InputFromNfc {
 // Port of OutputFromIdentifier class from input_poller.cpp
 
 struct OutputFromIdentifier {
-    _identifier: PadIdentifier,
-    _input_engine: Arc<Mutex<InputEngine>>,
+    identifier: PadIdentifier,
+    input_engine: Arc<Mutex<InputEngine>>,
 }
 
-impl OutputDevice for OutputFromIdentifier {}
+impl OutputDevice for OutputFromIdentifier {
+    fn set_led(&mut self, status: &LedStatus) -> DriverResult {
+        self.input_engine.lock().set_leds(&self.identifier, status)
+    }
+
+    fn set_vibration(&mut self, status: &VibrationStatus) -> DriverResult {
+        self.input_engine
+            .lock()
+            .set_vibration(&self.identifier, status)
+    }
+
+    fn is_vibration_enabled(&self) -> bool {
+        self.input_engine
+            .lock()
+            .is_vibration_enabled(&self.identifier)
+    }
+
+    fn set_polling_mode(&mut self, mode: PollingMode) -> DriverResult {
+        self.input_engine
+            .lock()
+            .set_polling_mode(&self.identifier, mode)
+    }
+
+    fn set_camera_format(&mut self, format: CameraFormat) -> DriverResult {
+        self.input_engine
+            .lock()
+            .set_camera_format(&self.identifier, format)
+    }
+
+    fn supports_nfc(&self) -> NfcState {
+        self.input_engine.lock().supports_nfc(&self.identifier)
+    }
+
+    fn start_nfc_polling(&mut self) -> NfcState {
+        self.input_engine.lock().start_nfc_polling(&self.identifier)
+    }
+
+    fn stop_nfc_polling(&mut self) -> NfcState {
+        self.input_engine.lock().stop_nfc_polling(&self.identifier)
+    }
+
+    fn read_amiibo_data(&mut self, out_data: &mut Vec<u8>) -> NfcState {
+        self.input_engine
+            .lock()
+            .read_amiibo_data(&self.identifier, out_data)
+    }
+
+    fn write_nfc_data(&mut self, data: &[u8]) -> NfcState {
+        self.input_engine
+            .lock()
+            .write_nfc_data(&self.identifier, data)
+    }
+
+    fn read_mifare_data(
+        &mut self,
+        request: &MifareRequest,
+        out_data: &mut MifareRequest,
+    ) -> NfcState {
+        self.input_engine
+            .lock()
+            .read_mifare_data(&self.identifier, request, out_data)
+    }
+
+    fn write_mifare_data(&mut self, request: &MifareRequest) -> NfcState {
+        self.input_engine
+            .lock()
+            .write_mifare_data(&self.identifier, request)
+    }
+}
 
 // ---- OutputFactory ----
 // Port of `OutputFactory` class from input_poller.h
@@ -1140,8 +1592,8 @@ impl OutputFactory {
         let identifier = identifier_from_params(params);
         self.input_engine.lock().pre_set_controller(&identifier);
         Box::new(OutputFromIdentifier {
-            _identifier: identifier,
-            _input_engine: Arc::clone(&self.input_engine),
+            identifier,
+            input_engine: Arc::clone(&self.input_engine),
         })
     }
 }
@@ -1237,8 +1689,10 @@ impl InputFactory {
     fn create_hat_button_device(&self, params: &ParamPackage) -> Box<dyn InputDevice> {
         let id = identifier_from_params(params);
         let button_id = params.get_int("hat", 0);
-        let _direction_str = params.get_str("direction", "");
-        let direction: u8 = 0; // Would call engine.get_hat_button_id in full port
+        let direction = self
+            .input_engine
+            .lock()
+            .get_hat_button_id(&params.get_str("direction", ""));
         let toggle = params.get_int("toggle", 0) != 0;
         let inverted = params.get_int("inverted", 0) != 0;
         let turbo = params.get_int("turbo", 0) != 0;
@@ -1493,5 +1947,51 @@ impl InputFactory {
 impl common::input::InputDeviceFactory for InputFactory {
     fn create(&self, params: &ParamPackage) -> Box<dyn InputDevice> {
         InputFactory::create(self, params)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use crate::input_engine::InputEngineMetadata;
+
+    struct TestHatMetadata;
+
+    impl InputEngineMetadata for TestHatMetadata {
+        fn get_hat_button_id(&self, direction_name: &str) -> u8 {
+            match direction_name {
+                "left" => 0x08,
+                _ => 0,
+            }
+        }
+    }
+
+    #[test]
+    fn hat_device_uses_the_concrete_engine_direction_id() {
+        let engine = Arc::new(Mutex::new(InputEngine::new("test".to_string())));
+        engine
+            .lock()
+            .set_metadata_handler(Arc::new(TestHatMetadata));
+        let factory = InputFactory::new(Arc::clone(&engine));
+
+        let mut params = ParamPackage::default();
+        params.set_int("hat", 0);
+        params.set_str("direction", "left".to_string());
+        let identifier = identifier_from_params(&params);
+        let mut device = factory.create(&params);
+
+        let pressed = Arc::new(AtomicBool::new(false));
+        let callback_pressed = Arc::clone(&pressed);
+        device.set_callback(InputCallback {
+            on_change: Some(Arc::new(move |status| {
+                callback_pressed.store(status.button_status.value, Ordering::Relaxed);
+            })),
+        });
+
+        let pending = engine.lock().set_hat_button(&identifier, 0, 0x08);
+        pending.dispatch();
+        assert!(pressed.load(Ordering::Relaxed));
     }
 }

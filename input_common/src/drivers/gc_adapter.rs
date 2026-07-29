@@ -334,13 +334,15 @@ impl GCAdapter {
         for (i, &button) in B1_BUTTONS.iter().enumerate() {
             let button_status = (b1 & (1u8 << i)) != 0;
             self.engine
-                .set_button(&self.pads[port].identifier, button as i32, button_status);
+                .set_button(&self.pads[port].identifier, button as i32, button_status)
+                .dispatch();
         }
 
         for (j, &button) in B2_BUTTONS.iter().enumerate() {
             let button_status = (b2 & (1u8 << j)) != 0;
             self.engine
-                .set_button(&self.pads[port].identifier, button as i32, button_status);
+                .set_button(&self.pads[port].identifier, button as i32, button_status)
+                .dispatch();
         }
     }
 
@@ -373,7 +375,8 @@ impl GCAdapter {
             let axis_status =
                 (axis_value as f32 - self.pads[port].axis_origin[index] as f32) / 100.0;
             self.engine
-                .set_axis(&self.pads[port].identifier, index as i32, axis_status);
+                .set_axis(&self.pads[port].identifier, index as i32, axis_status)
+                .dispatch();
         }
     }
 

@@ -67,10 +67,17 @@ impl TouchScreen {
         };
         let identifier = default_identifier();
         self.fingers[index].is_active = true;
-        let mut engine = self.engine.lock();
-        engine.set_button(&identifier, index as i32, true);
-        engine.set_axis(&identifier, (index * 2) as i32, x);
-        engine.set_axis(&identifier, (index * 2 + 1) as i32, y);
+        let pending = {
+            let mut engine = self.engine.lock();
+            vec![
+                engine.set_button(&identifier, index as i32, true),
+                engine.set_axis(&identifier, (index * 2) as i32, x),
+                engine.set_axis(&identifier, (index * 2 + 1) as i32, y),
+            ]
+        };
+        for callbacks in pending {
+            callbacks.dispatch();
+        }
     }
 
     /// Signals and creates a new touch point with this finger id.
@@ -102,10 +109,17 @@ impl TouchScreen {
         };
         let identifier = default_identifier();
         self.fingers[index].is_enabled = false;
-        let mut engine = self.engine.lock();
-        engine.set_button(&identifier, index as i32, false);
-        engine.set_axis(&identifier, (index * 2) as i32, 0.0);
-        engine.set_axis(&identifier, (index * 2 + 1) as i32, 0.0);
+        let pending = {
+            let mut engine = self.engine.lock();
+            vec![
+                engine.set_button(&identifier, index as i32, false),
+                engine.set_axis(&identifier, (index * 2) as i32, 0.0),
+                engine.set_axis(&identifier, (index * 2 + 1) as i32, 0.0),
+            ]
+        };
+        for callbacks in pending {
+            callbacks.dispatch();
+        }
     }
 
     /// Resets the active flag for each touch point.

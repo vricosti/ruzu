@@ -7,7 +7,9 @@
 //! These functions depend on common::input types which define callback structures,
 //! analog properties, battery levels, etc.
 
-use common::input::{CallbackStatus, InputType, TouchStatus};
+use common::input::{
+    ButtonStatus, CallbackStatus, InputType, StickStatus, TouchStatus, TriggerStatus,
+};
 
 /// Sanitizes an analog value by applying deadzone, range, offset and invert properties.
 ///
@@ -168,6 +170,139 @@ pub fn analog_value_to_battery_level(value: f32) -> u32 {
     } else {
         0 // Empty
     }
+}
+
+/// Converts callback data to a normalized trigger status.
+///
+/// Port of upstream `TransformToTrigger`.
+pub fn transform_to_trigger(callback: &CallbackStatus) -> TriggerStatus {
+    let mut status = TriggerStatus::default();
+    let mut calculate_button_value = true;
+
+    match callback.input_type {
+        InputType::Analog => {
+            status.analog.properties = callback.analog_status.properties;
+            status.analog.raw_value = callback.analog_status.raw_value;
+        }
+        InputType::Button => {
+            status.analog.properties.range = 1.0;
+            status.analog.properties.inverted = callback.button_status.inverted;
+            status.analog.raw_value = if callback.button_status.value {
+                1.0
+            } else {
+                0.0
+            };
+        }
+        InputType::Trigger => {
+            status = callback.trigger_status;
+            calculate_button_value = false;
+        }
+        InputType::Motion => {
+            status.analog.properties.range = 1.0;
+            status.analog.raw_value = callback.motion_status.accel.x.raw_value;
+        }
+        input_type => {
+            log::error!(
+                "Conversion from input type {:?} to trigger not implemented",
+                input_type
+            );
+        }
+    }
+
+    let properties = status.analog.properties;
+    sanitize_analog(
+        &mut status.analog.raw_value,
+        &mut status.analog.value,
+        properties.deadzone,
+        properties.range,
+        properties.offset,
+        properties.inverted,
+        true,
+    );
+
+    if calculate_button_value {
+        status.pressed.value = status.analog.value > properties.threshold;
+    }
+
+    if properties.inverted {
+        status.analog.value = 1.0 + status.analog.value;
+    }
+    status.analog.value = status.analog.value.clamp(0.0, 1.0);
+    status
+}
+
+/// Converts callback data to a button status.
+///
+/// Port of upstream `TransformToButton`.
+pub fn transform_to_button(callback: &CallbackStatus) -> ButtonStatus {
+    let mut status = ButtonStatus::default();
+
+    match callback.input_type {
+        InputType::Analog => {
+            status.value = transform_to_trigger(callback).pressed.value;
+            status.toggle = callback.analog_status.properties.toggle;
+            status.inverted = callback.analog_status.properties.inverted_button;
+        }
+        InputType::Trigger => {
+            status.value = transform_to_trigger(callback).pressed.value;
+        }
+        InputType::Button => {
+            status = callback.button_status;
+        }
+        InputType::Motion => {
+            status.value = callback.motion_status.gyro.x.raw_value.abs() > 1.0;
+        }
+        input_type => {
+            log::error!(
+                "Conversion from input type {:?} to button not implemented",
+                input_type
+            );
+        }
+    }
+
+    if status.inverted {
+        status.value = !status.value;
+    }
+    status
+}
+
+/// Converts callback data to a normalized stick status.
+///
+/// Port of upstream `TransformToStick`.
+pub fn transform_to_stick(callback: &CallbackStatus) -> StickStatus {
+    let mut status = match callback.input_type {
+        InputType::Stick => callback.stick_status,
+        input_type => {
+            log::error!(
+                "Conversion from input type {:?} to stick not implemented",
+                input_type
+            );
+            StickStatus::default()
+        }
+    };
+
+    let properties_x = status.x.properties;
+    let properties_y = status.y.properties;
+    sanitize_stick(
+        &mut status.x.raw_value,
+        &mut status.y.raw_value,
+        &mut status.x.value,
+        &mut status.y.value,
+        properties_x.deadzone,
+        properties_x.range,
+        properties_x.offset,
+        properties_x.inverted,
+        properties_y.offset,
+        properties_y.inverted,
+        true,
+    );
+
+    // Set directional buttons
+    status.right = status.x.value > properties_x.threshold;
+    status.left = status.x.value < -properties_x.threshold;
+    status.up = status.y.value > properties_y.threshold;
+    status.down = status.y.value < -properties_y.threshold;
+    status
 }
 
 /// Converts callback data to a normalized touch status.
