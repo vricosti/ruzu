@@ -619,11 +619,13 @@ pub struct EmulatedController {
     last_callback_key: i32,
 
     // The parameters each input device is built from — upstream's
-    // `button_params`, `stick_params`, `motion_params`, `trigger_params`.
+    // `button_params`, `stick_params`, `motion_params`, `trigger_params`,
+    // `ring_params`.
     button_params: Vec<ParamPackage>,
     stick_params: Vec<ParamPackage>,
     motion_params: Vec<ParamPackage>,
     trigger_params: Vec<ParamPackage>,
+    ring_params: [ParamPackage; 1],
     output_params: Vec<ParamPackage>,
 
     // The live devices, kept alive so their callbacks keep firing. Upstream's
@@ -676,6 +678,24 @@ impl EmulatedController {
         }
     }
 
+    /// Port of EmulatedController::MapNPadToSettingsType.
+    pub fn map_npad_to_settings_type(npad_type: NpadStyleIndex) -> ControllerType {
+        match npad_type {
+            NpadStyleIndex::Fullkey => ControllerType::ProController,
+            NpadStyleIndex::JoyconDual => ControllerType::DualJoyconDetached,
+            NpadStyleIndex::JoyconLeft => ControllerType::LeftJoycon,
+            NpadStyleIndex::JoyconRight => ControllerType::RightJoycon,
+            NpadStyleIndex::Handheld => ControllerType::Handheld,
+            NpadStyleIndex::GameCube => ControllerType::GameCube,
+            NpadStyleIndex::Pokeball => ControllerType::Pokeball,
+            NpadStyleIndex::NES => ControllerType::NES,
+            NpadStyleIndex::SNES => ControllerType::SNES,
+            NpadStyleIndex::N64 => ControllerType::N64,
+            NpadStyleIndex::SegaGenesis => ControllerType::SegaGenesis,
+            _ => ControllerType::ProController,
+        }
+    }
+
     pub fn new(npad_id_type: NpadIdType) -> Self {
         let event_context = Arc::new(ControllerEventContext {
             npad_id_type,
@@ -715,6 +735,7 @@ impl EmulatedController {
                 ParamPackage::default();
                 settings_input::native_trigger::NUM_TRIGGERS
             ],
+            ring_params: [ParamPackage::default()],
             output_params: vec![ParamPackage::default(); OUTPUT_DEVICES_SIZE],
             button_devices: Vec::new(),
             stick_devices: Vec::new(),
@@ -1058,13 +1079,14 @@ impl EmulatedController {
     /// Port of EmulatedController::ReloadFromSettings.
     pub fn reload_from_settings(&mut self) {
         let player_index = crate::hid_util::npad_id_type_to_index(self.npad_id_type);
-        let (buttons, analogs, motions, controller_type, connected) = {
+        let (buttons, analogs, motions, ringcon_analog, controller_type, connected) = {
             let settings = common::settings::values();
             let player = &settings.players.get_value()[player_index];
             (
                 player.buttons.clone(),
                 player.analogs.clone(),
                 player.motions.clone(),
+                settings.ringcon_analogs.clone(),
                 player.controller_type,
                 player.connected,
             )
@@ -1079,6 +1101,7 @@ impl EmulatedController {
         for (index, param) in motions.iter().enumerate() {
             self.motion_params[index] = ParamPackage::from_serialized(param);
         }
+        self.ring_params[0] = ParamPackage::from_serialized(&ringcon_analog);
 
         // Other or debug controllers are always a Pro Controller upstream.
         let npad_type = if self.npad_id_type == NpadIdType::Other {
@@ -1124,6 +1147,21 @@ impl EmulatedController {
         self.reload_input();
     }
 
+    /// Port of EmulatedController::GetButtonParam.
+    pub fn get_button_param(&self, index: usize) -> ParamPackage {
+        self.button_params.get(index).cloned().unwrap_or_default()
+    }
+
+    /// Port of EmulatedController::GetStickParam.
+    pub fn get_stick_param(&self, index: usize) -> ParamPackage {
+        self.stick_params.get(index).cloned().unwrap_or_default()
+    }
+
+    /// Port of EmulatedController::GetMotionParam.
+    pub fn get_motion_param(&self, index: usize) -> ParamPackage {
+        self.motion_params.get(index).cloned().unwrap_or_default()
+    }
+
     /// Load every parameter from one `PlayerInput` and reload the devices once.
     ///
     /// Divergence from upstream, and the reason is the configuration dialog:
@@ -1164,21 +1202,31 @@ impl EmulatedController {
 
     /// Port of EmulatedController::SaveCurrentConfig.
     pub fn save_current_config(&self) {
-        // Upstream saves current parameters to Settings::values.players[player_index].
-        // Requires Settings integration.
-        log::debug!(
-            "EmulatedController::save_current_config called for {:?}",
-            self.npad_id_type
-        );
+        let player_index = crate::hid_util::npad_id_type_to_index(self.npad_id_type);
+        let mut settings = common::settings::values_mut();
+        let player = &mut settings.players.get_value_mut()[player_index];
+        player.connected = self.is_connected(false);
+        player.controller_type = Self::map_npad_to_settings_type(self.npad_type);
+        for (destination, source) in player.buttons.iter_mut().zip(&self.button_params) {
+            *destination = source.serialize();
+        }
+        for (destination, source) in player.analogs.iter_mut().zip(&self.stick_params) {
+            *destination = source.serialize();
+        }
+        for (destination, source) in player.motions.iter_mut().zip(&self.motion_params) {
+            *destination = source.serialize();
+        }
+        if self.npad_id_type == NpadIdType::Player1 {
+            settings.ringcon_analogs = self.ring_params[0].serialize();
+        }
     }
 
     /// Port of EmulatedController::RestoreConfig.
     pub fn restore_config(&mut self) {
-        // Upstream reloads from settings and reconnects if needed.
-        log::debug!(
-            "EmulatedController::restore_config called for {:?}",
-            self.npad_id_type
-        );
+        if !self.is_configuring {
+            return;
+        }
+        self.reload_from_settings();
     }
 
     /// Port of EmulatedController::ReloadColorsFromSettings.
@@ -1899,6 +1947,63 @@ mod tests {
             .output_params
             .iter()
             .all(|param| param.get_int("output", 0) == 1));
+    }
+
+    #[test]
+    fn save_and_restore_config_use_the_controller_owned_parameters() {
+        let player_index = crate::hid_util::npad_id_type_to_index(NpadIdType::Player8);
+        let original_player = common::settings::values().players.get_value()[player_index].clone();
+
+        let mut controller = EmulatedController::new(NpadIdType::Player8);
+        controller.npad_type = NpadStyleIndex::GameCube;
+        controller
+            .event_context
+            .is_connected
+            .store(true, Ordering::Relaxed);
+        controller.button_params[0] = ParamPackage::from_serialized("engine:save_test,button:4");
+        controller.stick_params[0] = ParamPackage::from_serialized("engine:save_test,axis_x:2");
+        controller.motion_params[0] = ParamPackage::from_serialized("engine:save_test,motion:1");
+
+        controller.save_current_config();
+
+        {
+            let settings = common::settings::values();
+            let saved = &settings.players.get_value()[player_index];
+            assert!(saved.connected);
+            assert_eq!(saved.controller_type, ControllerType::GameCube);
+            assert_eq!(
+                ParamPackage::from_serialized(&saved.buttons[0]).get_str("engine", ""),
+                "save_test"
+            );
+            assert_eq!(
+                ParamPackage::from_serialized(&saved.analogs[0]).get_int("axis_x", -1),
+                2
+            );
+            assert_eq!(
+                ParamPackage::from_serialized(&saved.motions[0]).get_int("motion", -1),
+                1
+            );
+        }
+
+        controller.enable_configuration();
+        controller.set_npad_style_index(NpadStyleIndex::JoyconDual);
+        controller.disconnect();
+        controller.button_params[0] = ParamPackage::from_serialized("engine:discarded");
+        controller.restore_config();
+
+        assert_eq!(
+            controller.get_npad_style_index(true),
+            NpadStyleIndex::GameCube
+        );
+        assert!(controller.is_connected(true));
+        assert_eq!(
+            controller.get_button_param(0).get_str("engine", ""),
+            "save_test"
+        );
+        controller.disable_configuration();
+        controller.unload_input();
+
+        common::settings::values_mut().players.get_value_mut()[player_index] = original_player;
     }
 
     #[test]

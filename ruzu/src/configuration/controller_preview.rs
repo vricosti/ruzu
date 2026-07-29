@@ -27,6 +27,7 @@ use common::settings_input::native_button::Values as NB;
 use common::settings_input::{native_analog, native_button, ControllerType};
 
 use hid_core::frontend::emulated_controller::EmulatedController;
+use hid_core::hid_core::EmulatedControllerHandle;
 
 use super::controller_outlines as art;
 
@@ -303,7 +304,7 @@ pub fn draw(
 /// the drawing area, which has the same effect and keeps the state in one place.
 pub fn build(
     controller_type: ControllerType,
-    controller: Option<Rc<RefCell<EmulatedController>>>,
+    controller: Option<EmulatedControllerHandle>,
 ) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::new();
     area.set_content_width(PREVIEW_WIDTH);
@@ -342,7 +343,7 @@ pub fn build(
                 let Some(area) = area_weak.upgrade() else {
                     return glib::ControlFlow::Break;
                 };
-                let fresh = Input::from_controller(&controller.borrow());
+                let fresh = Input::from_controller(&controller.lock());
                 let mut current = input.borrow_mut();
                 if !fresh.same_as(&current) {
                     *current = fresh;

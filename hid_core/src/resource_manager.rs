@@ -602,13 +602,19 @@ impl ResourceManager {
         // so no other thread can modify the shared memory concurrently.
         let shared_memory = unsafe { &mut *shared_memory };
 
-        let hc_guard = hid_core.lock();
+        let (other_controller, player_one_controller) = {
+            let hid_core = hid_core.lock();
+            (
+                hid_core.get_emulated_controller(NpadIdType::Other),
+                hid_core.get_emulated_controller(NpadIdType::Player1),
+            )
+        };
         let timestamp_ns = 0i64; // Upstream passes core_timing.GetGlobalTimeNs().count()
 
         // debug_pad->OnUpdate(core_timing)
         if let Some(ref debug_pad) = self.debug_pad {
             let mut dp = debug_pad.lock();
-            let controller = hc_guard.get_emulated_controller(NpadIdType::Other);
+            let controller = other_controller.lock();
             let button_state = controller.get_debug_pad_buttons();
             let sticks = controller.get_sticks();
             let stick_state = crate::resources::debug_pad::debug_pad::StickState {
@@ -644,7 +650,7 @@ impl ResourceManager {
         // home_button->OnUpdate(core_timing)
         if let Some(ref home_button) = self.home_button {
             let mut hb = home_button.lock();
-            let controller = hc_guard.get_emulated_controller(NpadIdType::Player1);
+            let controller = player_one_controller.lock();
             let home_buttons = controller.get_home_buttons();
             hb.on_update(&mut shared_memory.home_button, home_buttons);
         }
@@ -658,7 +664,7 @@ impl ResourceManager {
         // capture_button->OnUpdate(core_timing)
         if let Some(ref capture_button) = self.capture_button {
             let mut cb = capture_button.lock();
-            let controller = hc_guard.get_emulated_controller(NpadIdType::Player1);
+            let controller = player_one_controller.lock();
             // Upstream quirk: uses GetHomeButtons() for capture button too
             let home_buttons = controller.get_home_buttons();
             cb.on_update(

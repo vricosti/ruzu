@@ -26,7 +26,7 @@ use std::sync::Arc;
 use gtk::glib;
 use gtk::prelude::*;
 
-use hid_core::frontend::emulated_controller::EmulatedController;
+use hid_core::hid_core::EmulatedControllerHandle;
 
 use common::settings_input::{native_analog, native_button, ControllerType, PlayerInput};
 
@@ -244,7 +244,11 @@ struct PlayerPage {
     titles: RefCell<HashMap<&'static str, gtk::Label>>,
 
     /// The player's emulated controller, the preview's source of live values.
-    controller: RefCell<Option<Rc<RefCell<EmulatedController>>>>,
+    controller: RefCell<Option<EmulatedControllerHandle>>,
+
+    /// Controllers put into configuration mode for this page. Player 1 owns
+    /// both the Player1 and Handheld controllers upstream.
+    configuration_controllers: RefCell<Vec<EmulatedControllerHandle>>,
 
     /// The input subsystem, for the mapping session a click starts.
     input_subsystem: RefCell<Option<Rc<RefCell<input_common::InputSubsystem>>>>,
@@ -312,6 +316,7 @@ impl PlayerPage {
             groups: RefCell::new(HashMap::new()),
             titles: RefCell::new(HashMap::new()),
             controller: RefCell::new(None),
+            configuration_controllers: RefCell::new(Vec::new()),
             input_subsystem: RefCell::new(None),
             capture: RefCell::new(None),
             stick_controls: RefCell::new(Vec::new()),
@@ -336,10 +341,64 @@ impl PlayerPage {
     /// itself; see `EmulatedController::reload_from_player`.
     fn refresh_devices(&self) {
         if let Some(controller) = self.controller.borrow().as_ref() {
-            controller
-                .borrow_mut()
-                .reload_from_player(&self.state.borrow());
+            controller.lock().reload_from_player(&self.state.borrow());
         }
+    }
+
+    /// Port of the Player 1 branch in upstream's controller-type handler.
+    ///
+    /// Player 1 owns two HIDCore controllers. Selecting Handheld transfers the
+    /// temporary connection to Handheld; selecting any other style transfers it
+    /// back to Player1. Both objects retain the selected temporary style.
+    fn set_controller_type(&self, controller_type: ControllerType) {
+        let npad_type =
+            hid_core::frontend::emulated_controller::EmulatedController::map_settings_type_to_npad(
+                controller_type,
+            );
+        let controllers = self.configuration_controllers.borrow();
+        if controllers.len() != 2 {
+            if let Some(controller) = self.controller.borrow().as_ref() {
+                controller.lock().set_npad_style_index(npad_type);
+            }
+            return;
+        }
+
+        let controller_for = |npad_id| {
+            controllers
+                .iter()
+                .find(|controller| controller.lock().get_npad_id_type() == npad_id)
+                .cloned()
+        };
+        let Some(player_one) = controller_for(hid_core::hid_types::NpadIdType::Player1) else {
+            return;
+        };
+        let Some(handheld) = controller_for(hid_core::hid_types::NpadIdType::Handheld) else {
+            return;
+        };
+
+        let current = self.controller.borrow().as_ref().cloned();
+        let is_connected = current
+            .as_ref()
+            .is_some_and(|controller| controller.lock().is_connected(true));
+
+        player_one.lock().set_npad_style_index(npad_type);
+        handheld.lock().set_npad_style_index(npad_type);
+
+        let selected = if is_connected {
+            if npad_type == hid_core::hid_types::NpadStyleIndex::Handheld {
+                player_one.lock().disconnect();
+                handheld.lock().connect(true);
+                handheld
+            } else {
+                handheld.lock().disconnect();
+                player_one.lock().connect(true);
+                player_one
+            }
+        } else {
+            current.unwrap_or(player_one)
+        };
+        selected.lock().set_npad_style_index(npad_type);
+        *self.controller.borrow_mut() = Some(selected);
     }
 
     fn update_ui(&self) {
@@ -663,8 +722,8 @@ impl Drop for PlayerPage {
                 subsystem.borrow_mut().stop_mapping();
             }
         }
-        if let Some(controller) = self.controller.get_mut().as_ref() {
-            controller.borrow_mut().unload_input();
+        for controller in self.configuration_controllers.get_mut() {
+            controller.lock().disable_configuration();
         }
     }
 }
@@ -676,20 +735,55 @@ pub fn page(
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     profile_context: Rc<InputProfileContext>,
 ) -> Page {
-    let state = Rc::new(RefCell::new(player_input(index)));
+    let (controller, mut configuration_controllers) = {
+        let hid_core = hid_core.lock();
+        if index == 0 {
+            let player_one =
+                hid_core.get_emulated_controller(hid_core::hid_types::NpadIdType::Player1);
+            let handheld =
+                hid_core.get_emulated_controller(hid_core::hid_types::NpadIdType::Handheld);
+            (player_one, vec![handheld])
+        } else {
+            (hid_core.get_emulated_controller_by_index(index), Vec::new())
+        }
+    };
+
+    let (controller, mut configuration_controllers) = if index == 0 {
+        let player_one = controller;
+        let handheld = configuration_controllers
+            .pop()
+            .expect("Player 1 configuration must own the Handheld controller");
+
+        player_one.lock().save_current_config();
+        player_one.lock().enable_configuration();
+        handheld.lock().save_current_config();
+        handheld.lock().enable_configuration();
+
+        let selected = if handheld.lock().is_connected(true) {
+            player_one.lock().disconnect();
+            Arc::clone(&handheld)
+        } else {
+            Arc::clone(&player_one)
+        };
+        (selected, vec![player_one, handheld])
+    } else {
+        controller.lock().save_current_config();
+        controller.lock().enable_configuration();
+        (Arc::clone(&controller), vec![controller])
+    };
+
+    let controller_settings_index =
+        hid_core::hid_util::npad_id_type_to_index(controller.lock().get_npad_id_type());
+    let state = Rc::new(RefCell::new(player_input(controller_settings_index)));
     let page = PlayerPage::new(Rc::clone(&state));
 
     // Upstream's `ConfigureInputPlayer` holds the player's
     // `Core::HID::EmulatedController` and hands it to the preview with
-    // `ui->controllerFrame->SetController(emulated_controller)`; the preview
-    // then reads its live button and stick values. The same controller is
-    // built here, kept in step with the page's working copy by
-    // `PlayerPage::refresh_devices`.
-    let controller = Rc::new(RefCell::new(EmulatedController::new(
-        hid_core::hid_util::index_to_npad_id_type(index),
-    )));
-    controller.borrow_mut().reload_from_player(&state.borrow());
-    *page.controller.borrow_mut() = Some(Rc::clone(&controller));
+    // `ui->controllerFrame->SetController(emulated_controller)`. Keep the
+    // stable controller owned by HIDCore; no frontend-local adapter exists.
+    controller.lock().reload_from_player(&state.borrow());
+    *page.controller.borrow_mut() = Some(Arc::clone(&controller));
+    *page.configuration_controllers.borrow_mut() = std::mem::take(&mut configuration_controllers);
     *page.input_subsystem.borrow_mut() = Some(Rc::clone(&input_subsystem));
     let initial_type = state.borrow().controller_type;
 
@@ -910,7 +1004,7 @@ pub fn page(
     preview_holder.set_hexpand(true);
     preview_holder.append(&super::controller_preview::build(
         initial_type,
-        Some(Rc::clone(&controller)),
+        Some(Arc::clone(&controller)),
     ));
     centre.append(&preview_holder);
 
@@ -1015,6 +1109,25 @@ pub fn page(
 
     // --- Behaviour --------------------------------------------------------
 
+    {
+        let page = Rc::downgrade(&page);
+        connected.connect_toggled(move |check| {
+            let Some(page) = page.upgrade() else {
+                return;
+            };
+            let is_connected = check.is_active();
+            page.state.borrow_mut().connected = is_connected;
+            let controller = page.controller.borrow().as_ref().cloned();
+            if let Some(controller) = controller {
+                if is_connected {
+                    controller.lock().connect(true);
+                } else {
+                    controller.lock().disconnect();
+                }
+            }
+        });
+    }
+
     // Upstream `UpdateMappingWithDefaults`: selecting a real device wipes the
     // current mapping and refills it from that device's defaults. Row 0 ("Any")
     // is left alone, exactly as upstream's early return does.
@@ -1085,6 +1198,7 @@ pub fn page(
                 .map(|(kind, _)| *kind)
                 .unwrap_or(ControllerType::ProController);
             page.state.borrow_mut().controller_type = selected;
+            page.set_controller_type(selected);
             while let Some(child) = preview_holder.first_child() {
                 preview_holder.remove(&child);
             }
@@ -1288,7 +1402,7 @@ pub fn page(
         let _keep_alive = &header_captions;
 
         let is_connected = connected.is_active();
-        let controller = CONTROLLER_TYPES
+        let selected_controller_type = CONTROLLER_TYPES
             .get(controller_type.selected() as usize)
             .map(|(t, _)| *t)
             .unwrap_or(ControllerType::ProController);
@@ -1296,21 +1410,33 @@ pub fn page(
         let uses_motion = motion.is_active();
         let is_docked = docked.is_active();
 
+        page_owner.refresh_devices();
+        if let Some(controller) = page_owner.controller.borrow().as_ref() {
+            let mut controller = controller.lock();
+            controller.set_npad_style_index(
+                hid_core::frontend::emulated_controller::EmulatedController::map_settings_type_to_npad(
+                    selected_controller_type,
+                ),
+            );
+            if is_connected {
+                controller.connect(true);
+            } else {
+                controller.disconnect();
+            }
+        }
+        for controller in page_owner.configuration_controllers.borrow().iter() {
+            let mut controller = controller.lock();
+            controller.disable_configuration();
+            controller.save_current_config();
+            controller.enable_configuration();
+        }
+
         {
             let mut values = common::settings::values_mut();
             let players = values.players.get_value_mut();
-            if let Some(slot) = players.get_mut(index) {
-                // Upstream `ApplyConfiguration` copies the whole working
-                // controller back, bindings included — without this the
-                // mappings picked in the dialog would be lost on OK.
+            if let Some(slot) = players.get_mut(controller_settings_index) {
                 let edited = page_owner.state.borrow();
-                slot.buttons = edited.buttons.clone();
-                slot.analogs = edited.analogs.clone();
-                slot.motions = edited.motions.clone();
                 slot.profile_name = edited.profile_name.clone();
-
-                slot.connected = is_connected;
-                slot.controller_type = controller;
                 slot.vibration_enabled = vibrates;
             }
             values.motion_enabled.set_value(uses_motion);
