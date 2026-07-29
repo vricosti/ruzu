@@ -40,9 +40,6 @@ const FOLDER_ICON_SIZE: i32 = 24;
 /// `GameList::supported_file_extensions`.
 const SUPPORTED_EXTENSIONS: &[&str] = &["nsp", "xci", "nca", "nro", "nso", "kip"];
 
-/// Max recursion depth when a game directory has deep-scan enabled.
-const MAX_DEEP_SCAN_DEPTH: usize = 4;
-
 // ---------------------------------------------------------------------------
 // GameEntry — a GObject row model for the ColumnView.
 // ---------------------------------------------------------------------------
@@ -762,8 +759,7 @@ struct GameFile {
 /// ```
 fn scan_dir_games(dir: &Path, deep_scan: bool) -> Vec<GameFile> {
     let mut candidates = Vec::new();
-    let max_depth = if deep_scan { MAX_DEEP_SCAN_DEPTH } else { 0 };
-    collect_candidates(dir, max_depth, &mut candidates);
+    collect_candidates(dir, deep_scan, &mut candidates);
 
     // Load each candidate once, keeping only what the loader accepts, and take
     // its title + icon from the same loader (upstream reuses the one loader for
@@ -789,19 +785,20 @@ fn scan_dir_games(dir: &Path, deep_scan: bool) -> Vec<GameFile> {
     games
 }
 
-/// Recursively (up to `max_depth`) collect candidate game files under `dir`.
-fn collect_candidates(dir: &Path, max_depth: usize, games: &mut Vec<GameFile>) {
+/// Collect candidate game files under `dir`, recursively when `deep_scan` is set.
+fn collect_candidates(dir: &Path, deep_scan: bool, games: &mut Vec<GameFile>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
+        // `directory_entry::status()` in upstream follows symbolic links.
+        let Ok(metadata) = entry.metadata() else {
             continue;
         };
-        if file_type.is_dir() {
-            if max_depth > 0 {
-                collect_candidates(&path, max_depth - 1, games);
+        if metadata.is_dir() {
+            if deep_scan {
+                collect_candidates(&path, true, games);
             }
             continue;
         }
@@ -817,11 +814,10 @@ fn collect_candidates(dir: &Path, max_depth: usize, games: &mut Vec<GameFile>) {
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_owned();
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
         games.push(GameFile {
             name,
             kind: ext_lower.to_uppercase(),
-            size,
+            size: metadata.len(),
             path,
             icon: None,
         });
@@ -908,6 +904,17 @@ fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn make_temp_dir() -> PathBuf {
+        let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("ruzu-game-list-{}-{counter}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     #[test]
     fn human_size_matches_yuzu_formatting() {
@@ -924,5 +931,31 @@ mod tests {
         for ext in ["nsp", "xci", "nca", "nro", "nso", "kip"] {
             assert!(SUPPORTED_EXTENSIONS.contains(&ext), "{ext} missing");
         }
+    }
+
+    #[test]
+    fn deep_scan_matches_upstream_unbounded_recursion() {
+        let root = make_temp_dir();
+        let nested = root.join("one/two/three/four/five/six");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("direct.nsp"), []).unwrap();
+        std::fs::write(nested.join("nested.nro"), []).unwrap();
+
+        let mut shallow = Vec::new();
+        collect_candidates(&root, false, &mut shallow);
+        assert_eq!(shallow.len(), 1);
+        assert_eq!(shallow[0].path, root.join("direct.nsp"));
+
+        let mut recursive = Vec::new();
+        collect_candidates(&root, true, &mut recursive);
+        assert_eq!(recursive.len(), 2);
+        assert!(recursive
+            .iter()
+            .any(|game| game.path == root.join("direct.nsp")));
+        assert!(recursive
+            .iter()
+            .any(|game| game.path == nested.join("nested.nro")));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
