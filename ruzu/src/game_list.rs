@@ -487,14 +487,10 @@ impl GameListView {
 
     /// Ask for a directory and add it — upstream `GMainWindow::OnGameListAddDirectory`.
     fn prompt_add_directory(self: &Rc<Self>) {
-        let dialog = gtk::FileDialog::builder()
-            .title("Select Game Directory")
-            .modal(true)
-            .build();
         let parent = self.root.root().and_downcast::<gtk::Window>();
         let view = Rc::clone(self);
-        dialog.select_folder(parent.as_ref(), gio::Cancellable::NONE, move |result| {
-            let Ok(folder) = result else { return };
+        crate::gtk_compat::select_folder(parent.as_ref(), "Select Game Directory", move |result| {
+            let Some(folder) = result else { return };
             let Some(path) = folder.path() else { return };
             view.add_directory(&path.to_string_lossy());
         });
@@ -627,7 +623,9 @@ fn make_name_column() -> gtk::ColumnViewColumn {
     factory.connect_setup(|_, item| {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let picture = gtk::Picture::new();
-        picture.set_content_fit(gtk::ContentFit::Contain);
+        // GTK 4.8 renamed this pair to ContentFit::Contain.
+        picture.set_keep_aspect_ratio(true);
+        picture.set_can_shrink(true);
         let label = gtk::Label::builder().xalign(0.0).build();
         row.append(&picture);
         row.append(&label);

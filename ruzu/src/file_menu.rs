@@ -42,10 +42,8 @@ pub fn register(app: &Application) {
 fn on_open_ruzu_folder() {
     let dir = get_ruzu_path(RuzuPath::RuzuDir);
     let file = gio::File::for_path(&dir);
-    let launcher = gtk::FileLauncher::new(Some(&file));
-    launcher.launch(gtk::Window::NONE, gio::Cancellable::NONE, move |result| {
-        if let Err(err) = result {
-            log::error!("Failed to open ruzu folder: {err}");
-        }
-    });
+    if let Err(err) = gio::AppInfo::launch_default_for_uri(&file.uri(), gio::AppLaunchContext::NONE)
+    {
+        log::error!("Failed to open ruzu folder: {err}");
+    }
 }

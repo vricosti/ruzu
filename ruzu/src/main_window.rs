@@ -436,24 +436,19 @@ impl GMainWindow {
                     return glib::Propagation::Stop;
                 }
 
-                let dialog = gtk::AlertDialog::builder()
-                    .modal(true)
-                    .message("ruzu")
-                    .detail("Are you sure you want to close ruzu?")
-                    .buttons(["Cancel", "Close ruzu"])
-                    .default_button(1)
-                    .cancel_button(0)
-                    .build();
-                dialog.choose(
+                crate::gtk_compat::ask_question(
                     Some(&w.window),
-                    gio::Cancellable::NONE,
+                    "ruzu",
+                    "Are you sure you want to close ruzu?",
+                    "Cancel",
+                    "Close ruzu",
                     glib::clone!(
                         #[weak(rename_to = w)]
                         w,
-                        move |answer| {
-                            log::debug!("GTK close confirmation answered: {answer:?}");
+                        move |accepted| {
+                            log::debug!("GTK close confirmation answered: {accepted}");
                             w.close_confirmation_pending.set(false);
-                            if matches!(answer, Ok(1)) {
+                            if accepted {
                                 w.close_confirmed.set(true);
                                 w.window.close();
                             }
@@ -697,33 +692,22 @@ impl GMainWindow {
             return;
         };
 
-        let dialog = gtk::AlertDialog::builder()
-            .modal(true)
-            .message("Import your yuzu configuration?")
-            .detail(format!(
+        crate::gtk_compat::ask_question(
+            Some(&self.window),
+            "Import your yuzu configuration?",
+            &format!(
                 "A yuzu configuration was found at:\n{}\n\n\
                  ruzu can copy its settings — including your game directories — \
                  so you can carry on where you left off. \
                  Your yuzu configuration is only read, never modified.",
                 import.yuzu_dir.display()
-            ))
-            // Index order is button order; `cancel` is what Escape picks.
-            .buttons(["Start Fresh", "Import Settings"])
-            .default_button(1)
-            .cancel_button(0)
-            .build();
-
-        dialog.choose(
-            Some(&self.window),
-            gio::Cancellable::NONE,
+            ),
+            "Start Fresh",
+            "Import Settings",
             glib::clone!(
                 #[weak(rename_to = this)]
                 self,
-                move |answer| {
-                    // `choose` reports Escape/close as an error rather than a
-                    // button index; treat that as declining, so the offer is
-                    // still marked answered and never nags again.
-                    let accepted = matches!(answer, Ok(1));
+                move |accepted| {
                     if accepted {
                         import.accept();
                         this.on_yuzu_config_imported();
@@ -769,28 +753,21 @@ impl GMainWindow {
         let filter = gtk::FileFilter::new();
         filter.set_name(Some("prod.keys"));
         filter.add_pattern("prod.keys");
-        let filters = gio::ListStore::new::<gtk::FileFilter>();
-        filters.append(&filter);
-
-        let dialog = gtk::FileDialog::builder()
-            .title("Select Dumped Keys Location")
-            .filters(&filters)
-            .default_filter(&filter)
-            .modal(true)
-            .build();
 
         log::info!("Install Decryption Keys: opening file chooser");
-        dialog.open(
+        crate::gtk_compat::open_file(
             Some(&self.window),
-            gio::Cancellable::NONE,
+            "Select Dumped Keys Location",
+            std::slice::from_ref(&filter),
+            Some(&filter),
             glib::clone!(
                 #[weak(rename_to = this)]
                 self,
                 move |result| {
                     let file = match result {
-                        Ok(file) => file,
-                        Err(e) => {
-                            log::info!("Install Decryption Keys cancelled: {e}");
+                        Some(file) => file,
+                        None => {
+                            log::info!("Install Decryption Keys cancelled");
                             return;
                         }
                     };
@@ -905,19 +882,14 @@ impl GMainWindow {
             return;
         }
 
-        let dialog = gtk::FileDialog::builder()
-            .title("Select Dumped Firmware Source Location")
-            .modal(true)
-            .build();
-
-        dialog.select_folder(
+        crate::gtk_compat::select_folder(
             Some(&self.window),
-            gio::Cancellable::NONE,
+            "Select Dumped Firmware Source Location",
             glib::clone!(
                 #[weak(rename_to = this)]
                 self,
                 move |result| {
-                    let Ok(folder) = result else { return };
+                    let Some(folder) = result else { return };
                     let Some(path) = folder.path() else { return };
                     this.install_firmware_from(&path);
                 }
@@ -1062,12 +1034,7 @@ impl GMainWindow {
     /// Show a modal message — the `QMessageBox` calls peppered through the
     /// upstream handlers.
     fn alert(&self, message: &str, detail: &str) {
-        gtk::AlertDialog::builder()
-            .modal(true)
-            .message(message)
-            .detail(detail)
-            .build()
-            .show(Some(&self.window));
+        crate::gtk_compat::show_message(Some(&self.window), message, detail);
     }
 
     /// Upstream `GMainWindow::OnConfigure`: build and show the configuration
@@ -1105,30 +1072,21 @@ impl GMainWindow {
         let all_files = gtk::FileFilter::new();
         all_files.set_name(Some("All Files (*.*)"));
         all_files.add_pattern("*");
-        let filters = gio::ListStore::new::<gtk::FileFilter>();
-        filters.append(&filter);
-        filters.append(&all_files);
-
-        let dialog = gtk::FileDialog::builder()
-            .title("Load File")
-            .filters(&filters)
-            .default_filter(&filter)
-            .modal(true)
-            .build();
-
-        dialog.open(
+        crate::gtk_compat::open_file(
             Some(&self.window),
-            gio::Cancellable::NONE,
+            "Load File",
+            &[filter.clone(), all_files],
+            Some(&filter),
             glib::clone!(
                 #[weak(rename_to = this)]
                 self,
                 move |result| match result {
-                    Ok(file) => {
+                    Some(file) => {
                         if let Some(path) = file.path() {
                             this.boot_game(path.to_string_lossy().into_owned());
                         }
                     }
-                    Err(err) => log::debug!("Load File cancelled: {err}"),
+                    None => log::debug!("Load File cancelled"),
                 }
             ),
         );
@@ -1137,32 +1095,24 @@ impl GMainWindow {
     /// Upstream `OnMenuLoadFolder`: choose an extracted-ROM directory and boot
     /// its `main` file.
     fn on_menu_load_folder(self: &Rc<Self>) {
-        let dialog = gtk::FileDialog::builder()
-            .title("Open Extracted ROM Directory")
-            .modal(true)
-            .build();
-
-        dialog.select_folder(
+        crate::gtk_compat::select_folder(
             Some(&self.window),
-            gio::Cancellable::NONE,
+            "Open Extracted ROM Directory",
             glib::clone!(
                 #[weak(rename_to = this)]
                 self,
                 move |result| {
-                    let Ok(dir) = result else { return };
+                    let Some(dir) = result else { return };
                     let Some(dir_path) = dir.path() else { return };
                     let main = dir_path.join("main");
                     if main.is_file() {
                         this.boot_game(main.to_string_lossy().into_owned());
                     } else {
-                        let alert = gtk::AlertDialog::builder()
-                            .modal(true)
-                            .message("Invalid Directory Selected")
-                            .detail(
-                                "The directory you have selected does not contain a 'main' file.",
-                            )
-                            .build();
-                        alert.show(Some(&this.window));
+                        crate::gtk_compat::show_message(
+                            Some(&this.window),
+                            "Invalid Directory Selected",
+                            "The directory you have selected does not contain a 'main' file.",
+                        );
                     }
                 }
             ),

@@ -128,7 +128,7 @@ pub fn page() -> Page {
     // Directory pickers for every path row.
     connect_folder_picker(&nand_browse, &nand, "Select NAND Directory...");
     connect_folder_picker(&sdmc_browse, &sdmc, "Select SD Card Directory...");
-    connect_folder_picker(&gamecard_browse, &gamecard_path, "Select Gamecard Path...");
+    connect_gamecard_picker(&gamecard_browse, &gamecard_path);
     connect_folder_picker(&dump_browse, &dump_root, "Select Dump Directory...");
     connect_folder_picker(&load_browse, &load_root, "Select Mod Load Directory...");
 
@@ -165,24 +165,43 @@ pub fn page() -> Page {
     })
 }
 
+/// Wire the gamecard path button to the file chooser used by upstream
+/// `ConfigureFilesystem::SetDirectory(DirectoryTarget::Gamecard)`.
+fn connect_gamecard_picker(button: &gtk::Button, entry: &gtk::Entry) {
+    let entry = entry.clone();
+    button.connect_clicked(move |button| {
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("NX Gamecard"));
+        filter.add_pattern("*.xci");
+        let entry = entry.clone();
+        let parent = button.root().and_downcast::<gtk::Window>();
+        crate::gtk_compat::open_file(
+            parent.as_ref(),
+            "Select Gamecard Path...",
+            std::slice::from_ref(&filter),
+            Some(&filter),
+            move |result| {
+                if let Some(path) = result.and_then(|file| file.path()) {
+                    entry.set_text(&path.to_string_lossy());
+                }
+            },
+        );
+    });
+}
+
 /// Wire a `...` button to a folder chooser that writes into `entry`.
 fn connect_folder_picker(button: &gtk::Button, entry: &gtk::Entry, title: &str) {
     let entry = entry.clone();
     let title = title.to_string();
     button.connect_clicked(move |button| {
-        let dialog = gtk::FileDialog::builder().title(&title).modal(true).build();
         let entry = entry.clone();
         let parent = button.root().and_downcast::<gtk::Window>();
-        dialog.select_folder(
-            parent.as_ref(),
-            gtk::gio::Cancellable::NONE,
-            move |result| {
-                if let Ok(folder) = result {
-                    if let Some(path) = folder.path() {
-                        entry.set_text(&path.to_string_lossy());
-                    }
+        crate::gtk_compat::select_folder(parent.as_ref(), &title, move |result| {
+            if let Some(folder) = result {
+                if let Some(path) = folder.path() {
+                    entry.set_text(&path.to_string_lossy());
                 }
-            },
-        );
+            }
+        });
     });
 }

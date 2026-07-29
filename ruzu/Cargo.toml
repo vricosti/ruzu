@@ -17,9 +17,10 @@ path = "src/main.rs"
 [dependencies]
 # gtk4-rs bindings. The `gtk4` crate is imported under the `gtk` alias, which
 # is the convention used throughout the gtk4-rs ecosystem/examples. The
-# `v4_10` feature unlocks `FileDialog`, `AlertDialog`, and `FileLauncher`
-# (used by the File menu); the bundled Homebrew GTK is 4.22.
-gtk = { version = "0.9", package = "gtk4", features = ["v4_10"] }
+# Ubuntu 22.04 ships GTK 4.6. Keep the frontend on that API baseline; newer
+# FileDialog, AlertDialog, ColorDialogButton, and FileLauncher calls go through
+# local compatibility adapters.
+gtk = { version = "0.9", package = "gtk4", features = ["v4_6"] }
 # Same cairo as gtk4 re-exports, with `png` so the controller drawings can be
 # rendered to a file in tests and compared against upstream by eye.
 cairo-rs = { version = "0.20", features = ["png"] }

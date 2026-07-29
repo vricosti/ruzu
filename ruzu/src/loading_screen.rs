@@ -77,7 +77,8 @@ impl LoadingScreen {
         root.set_child(Some(&fade_parent));
 
         let logo = gtk::Picture::new();
-        logo.set_content_fit(gtk::ContentFit::Contain);
+        // GTK 4.8 renamed this pair to ContentFit::Contain.
+        logo.set_keep_aspect_ratio(true);
         logo.set_can_shrink(true);
         logo.set_halign(gtk::Align::Start);
         logo.set_valign(gtk::Align::Start);

@@ -20,6 +20,7 @@ mod configuration;
 mod emu_window;
 mod file_menu;
 mod game_list;
+mod gtk_compat;
 mod loading_screen;
 mod main_window;
 #[cfg(target_os = "macos")]

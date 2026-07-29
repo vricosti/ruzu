@@ -27606,3 +27606,42 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   initializer list, and destructor.
 - A live Vulkan STK launch and confirmed GUI close completed with exit code
   zero and no `vkDestroyDevice`, validation, panic, or SIGSEGV error.
+
+## 2026-07-29 — `ruzu/src/gtk_compat.rs` and GTK dialog callsites vs `yuzu/main.cpp` and `yuzu/configuration/*.cpp`
+
+### Intentional differences
+- Qt's synchronous `QMessageBox` and `QFileDialog` calls are represented by
+  asynchronous GTK callbacks. `gtk_compat.rs` owns only this toolkit
+  adaptation; each action and response remains in its upstream-owned frontend
+  module.
+- GTK 4.6 uses `MessageDialog`, `FileChooserNative`, and `ColorButton` where
+  GTK 4.10 deprecated those widgets in favor of `AlertDialog`, `FileDialog`,
+  and `ColorDialogButton`.
+- GTK 4.6 expresses image containment with `keep-aspect-ratio` and
+  `can-shrink`; this is the predecessor of GTK 4.8 `ContentFit::Contain`.
+
+### Unintentional differences (fixed)
+- The `v4_10` crate feature made the launcher require GTK 4.10 even though
+  Ubuntu 22.04 provides GTK 4.6.
+- The Gamecard path button opened a directory chooser. It now opens the
+  upstream file chooser with an `*.xci` filter.
+
+### Missing items
+- The GTK file choosers do not yet preload every initial directory retained by
+  upstream UI settings.
+
+### Binary layout verification
+- N/A: these changes affect host GUI APIs only.
+
+### Verification
+- Re-read upstream file/folder selection, close confirmation, message-box,
+  background-color, and Gamecard selection callsites after implementation.
+- `cargo tree -p ruzu -e features -i gtk4` reports `v4_6` as the highest GTK
+  API feature.
+- All 117 `ruzu` tests pass and `cargo build --release --bin ruzu` succeeds.
+- The rebuilt binary has no dynamic references to GTK 4.8/4.10
+  `AlertDialog`, `FileDialog`, `FileLauncher`, `ColorDialogButton`, or
+  `gtk_picture_set_content_fit` symbols.
+- Live activation of the keys, firmware, and game-file actions opens the
+  corresponding GTK 4.6 native chooser; cancelling each chooser returns
+  cleanly to the caller.

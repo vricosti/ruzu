@@ -148,8 +148,7 @@ pub fn page() -> Page {
         w::percent_slider_row("FSR Sharpness:", sharpness_value as f64, 0.0, 200.0);
     settings.append(&sharpness_row);
 
-    let bg_color = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
-    bg_color.set_rgba(&background_rgba());
+    let bg_color = gtk::ColorButton::with_rgba(&background_rgba());
     bg_color.set_halign(gtk::Align::Start);
     settings.append(&w::labeled_row("Background Color:", &bg_color));
 

@@ -276,8 +276,7 @@ fn swatch_pair(left_label: &str, left: u32, right_label: &str, right: u32) -> gt
     for (label, color) in [(left_label, left), (right_label, right)] {
         let block = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let caption = gtk::Label::new(Some(label));
-        let button = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
-        button.set_rgba(&rgba_from_u32(color));
+        let button = gtk::ColorButton::with_rgba(&rgba_from_u32(color));
         button.set_size_request(SWATCH_WIDTH, SWATCH_HEIGHT);
         block.append(&caption);
         block.append(&button);

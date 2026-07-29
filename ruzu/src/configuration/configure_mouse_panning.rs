@@ -159,15 +159,12 @@ pub fn present(
             };
 
             if apply_configuration(configuration).is_err() {
-                gtk::AlertDialog::builder()
-                    .modal(true)
-                    .message("Emulated mouse is enabled")
-                    .detail(
-                        "Real mouse input and mouse panning are incompatible. Please disable the \
-                         emulated mouse in input advanced settings to allow mouse panning.",
-                    )
-                    .build()
-                    .show(window.upgrade().as_ref());
+                crate::gtk_compat::show_message(
+                    window.upgrade().as_ref(),
+                    "Emulated mouse is enabled",
+                    "Real mouse input and mouse panning are incompatible. Please disable the \
+                     emulated mouse in input advanced settings to allow mouse panning.",
+                );
                 return;
             }
 

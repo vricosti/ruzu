@@ -1674,12 +1674,7 @@ fn select_profile(dropdown: &gtk::DropDown, profile_name: &str) {
 
 fn show_error(source: &impl IsA<gtk::Widget>, message: &str, detail: &str) {
     let parent = source.root().and_downcast::<gtk::Window>();
-    gtk::AlertDialog::builder()
-        .modal(true)
-        .message(message)
-        .detail(detail)
-        .build()
-        .show(parent.as_ref());
+    crate::gtk_compat::show_message(parent.as_ref(), message, detail);
 }
 
 fn request_profile_name(source: &impl IsA<gtk::Widget>, on_accept: impl FnOnce(String) + 'static) {

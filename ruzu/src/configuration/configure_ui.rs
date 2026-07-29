@@ -173,17 +173,13 @@ pub fn page() -> Page {
     // Upstream opens a `QFileDialog::getExistingDirectory` here.
     let entry_for_browse = path_entry.clone();
     path_browse.connect_clicked(move |button| {
-        let dialog = gtk::FileDialog::builder()
-            .title("Select Screenshots Path...")
-            .modal(true)
-            .build();
         let entry = entry_for_browse.clone();
         let parent = button.root().and_downcast::<gtk::Window>();
-        dialog.select_folder(
+        crate::gtk_compat::select_folder(
             parent.as_ref(),
-            gtk::gio::Cancellable::NONE,
+            "Select Screenshots Path...",
             move |result| {
-                if let Ok(folder) = result {
+                if let Some(folder) = result {
                     if let Some(path) = folder.path() {
                         entry.set_text(&path.to_string_lossy());
                     }
