@@ -27396,3 +27396,37 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   `KScheduler::UpdateHighestPriorityThread` after implementation.
 - Focused tests cover same-priority migration, last-scheduled-tick preference,
   current-thread exclusion, and per-core preemption update requests.
+
+## 2026-07-29 — `video_core/build.rs`, `externals/{stb,bc_decoder}` and `video_core/src/host_shaders` vs upstream build inputs
+
+### Intentional differences
+- Rust compiles only the 35 SPIR-V shaders currently consumed by its Vulkan
+  renderer. Upstream CMake also processes OpenGL-only shaders and Vulkan
+  compute shaders whose corresponding Rust consumers are not yet implemented.
+- The two FidelityFX headers live beside the Rust host shaders instead of in a
+  separate `FidelityFX-FSR` external, so the build needs only one include path.
+- Cargo receives explicit change notifications for all five transitive shader
+  inputs so edits cannot leave generated SPIR-V stale.
+
+### Unintentional differences (fixed)
+- `video_core/build.rs` loaded 42 build inputs from a sibling zuyu checkout.
+  The four BC/DXT files, 35 direct shader inputs and three transitive shader
+  includes are now owned by the ruzu tree at their upstream-equivalent paths.
+
+### Missing items
+- Host shaders present in upstream CMake but absent from the Rust build remain
+  tied to renderer paths that have not yet been ported.
+
+### Binary layout verification
+- PASS: all 42 newly vendored files compare byte-for-byte with their upstream
+  source; the two pre-existing FidelityFX headers also compare byte-for-byte.
+
+### Verification
+- Re-read upstream `externals/CMakeLists.txt`,
+  `src/video_core/CMakeLists.txt`, and
+  `src/video_core/host_shaders/CMakeLists.txt`.
+- `cargo check -p video_core` passes from a fresh target directory with
+  `ZUYU_DIR` pointing to a nonexistent path.
+- The three `textures::bcn::tests` and
+  `generated_vulkan_shaders_are_spirv_modules` pass with the same invalid
+  `ZUYU_DIR`.

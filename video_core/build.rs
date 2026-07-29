@@ -2,17 +2,31 @@ fn main() {
     println!("cargo:rerun-if-changed=src/host1x/ffmpeg/ffmpeg_shim.c");
     println!("cargo:rerun-if-changed=src/textures/bcn_shim.cpp");
 
-    let zuyu_base = std::env::var("ZUYU_DIR").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/vricosti".to_string());
-        format!("{}/Dev/emulators/zuyu", home)
-    });
-    let zuyu_stb_dir = format!("{}/externals/stb", zuyu_base);
-    let zuyu_bc_decoder_dir = format!("{}/externals/bc_decoder", zuyu_base);
+    let manifest_dir = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"),
+    );
+    let workspace_dir = manifest_dir
+        .parent()
+        .expect("video_core must be inside the ruzu workspace");
+    let stb_dir = workspace_dir.join("externals/stb");
+    let bc_decoder_dir = workspace_dir.join("externals/bc_decoder");
 
-    println!("cargo:rerun-if-changed={zuyu_stb_dir}/stb_dxt.cpp");
-    println!("cargo:rerun-if-changed={zuyu_stb_dir}/stb_dxt.h");
-    println!("cargo:rerun-if-changed={zuyu_bc_decoder_dir}/bc_decoder.cpp");
-    println!("cargo:rerun-if-changed={zuyu_bc_decoder_dir}/bc_decoder.h");
+    println!(
+        "cargo:rerun-if-changed={}",
+        stb_dir.join("stb_dxt.cpp").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        stb_dir.join("stb_dxt.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        bc_decoder_dir.join("bc_decoder.cpp").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        bc_decoder_dir.join("bc_decoder.h").display()
+    );
 
     let avcodec = pkg_config::Config::new()
         .probe("libavcodec")
@@ -36,32 +50,35 @@ fn main() {
     let mut bcn_build = cc::Build::new();
     bcn_build.cpp(true);
     bcn_build.file("src/textures/bcn_shim.cpp");
-    bcn_build.file(format!("{zuyu_stb_dir}/stb_dxt.cpp"));
-    bcn_build.file(format!("{zuyu_bc_decoder_dir}/bc_decoder.cpp"));
-    bcn_build.include(&zuyu_stb_dir);
-    bcn_build.include(&zuyu_bc_decoder_dir);
+    bcn_build.file(stb_dir.join("stb_dxt.cpp"));
+    bcn_build.file(bc_decoder_dir.join("bc_decoder.cpp"));
+    bcn_build.include(&stb_dir);
+    bcn_build.include(&bc_decoder_dir);
     bcn_build.warnings(false);
     bcn_build.compile("ruzu_video_core_bcn_shim");
 
-    compile_vulkan_present_shaders(&zuyu_base);
+    compile_vulkan_present_shaders(&manifest_dir);
 }
 
-fn compile_vulkan_present_shaders(zuyu_base: &str) {
+fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::process::Command;
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR must be set"));
-    let shader_dir = Path::new(zuyu_base).join("src/video_core/host_shaders");
-    let local_shader_dir = Path::new("src/host_shaders");
-    println!(
-        "cargo:rerun-if-changed={}",
-        local_shader_dir.join("ffx_a.h").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        local_shader_dir.join("ffx_fsr1.h").display()
-    );
+    let shader_dir = manifest_dir.join("src/host_shaders");
+    for include in [
+        "ffx_a.h",
+        "ffx_fsr1.h",
+        "fidelityfx_fsr.frag",
+        "opengl_smaa.glsl",
+        "opengl_present_scaleforce.frag",
+    ] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            shader_dir.join(include).display()
+        );
+    }
     let shaders = [
         ("VULKAN_PRESENT_VERT_SPV", "vulkan_present.vert"),
         ("VULKAN_PRESENT_FRAG_SPV", "vulkan_present.frag"),
@@ -177,7 +194,6 @@ fn compile_vulkan_present_shaders(zuyu_base: &str) {
             .args(["-V", "--quiet", "--target-env", "spirv1.3", "-o"])
             .arg(&spv_path)
             .arg(format!("-I{}", shader_dir.display()))
-            .arg(format!("-I{}", local_shader_dir.display()))
             .arg(&source)
             .output()
             .unwrap_or_else(|err| panic!("failed to run {glslang}: {err}"));
