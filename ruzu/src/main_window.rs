@@ -52,6 +52,20 @@ const INPUT_UPDATE_TIMEOUT_MS: u64 = 1;
 /// Upstream `status_bar_update_timer` interval.
 const STATUS_BAR_UPDATE_TIMEOUT_MS: u64 = 500;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullscreenHotkey {
+    Toggle,
+    Exit,
+}
+
+fn fullscreen_hotkey(keyval: gtk::gdk::Key) -> Option<FullscreenHotkey> {
+    match keyval {
+        gtk::gdk::Key::F11 => Some(FullscreenHotkey::Toggle),
+        gtk::gdk::Key::Escape => Some(FullscreenHotkey::Exit),
+        _ => None,
+    }
+}
+
 /// The main launcher window.
 ///
 /// Upstream `GMainWindow` derives from `QMainWindow`; here we wrap a
@@ -301,6 +315,24 @@ mod loading_event_mailbox_tests {
                 before_first_frame: false
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod fullscreen_hotkey_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_upstream_fullscreen_shortcuts() {
+        assert_eq!(
+            fullscreen_hotkey(gtk::gdk::Key::F11),
+            Some(FullscreenHotkey::Toggle)
+        );
+        assert_eq!(
+            fullscreen_hotkey(gtk::gdk::Key::Escape),
+            Some(FullscreenHotkey::Exit)
+        );
+        assert_eq!(fullscreen_hotkey(gtk::gdk::Key::F10), None);
     }
 }
 
@@ -656,21 +688,9 @@ impl GMainWindow {
         fullscreen.connect_activate(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move |action, _| {
-                let checked = !action
-                    .state()
-                    .and_then(|state| state.get::<bool>())
-                    .unwrap_or(false);
-                action.set_state(&checked.to_variant());
-                crate::uisettings::with_mut(|values| values.fullscreen.set_value(checked));
-
-                // Upstream leaves the action checked when no game is running,
-                // but ToggleFullscreen itself returns without changing the
-                // launcher window. BootGame consumes the saved checked state.
-                if this.session.borrow().is_some() {
-                    this.set_fullscreen(checked);
-                }
-            }
+            #[weak]
+            app,
+            move |_, _| this.toggle_fullscreen(&app)
         ));
         app.add_action(&fullscreen);
         app.set_accels_for_action("app.fullscreen", &["F11"]);
@@ -682,15 +702,35 @@ impl GMainWindow {
             #[weak]
             app,
             move |_, _| {
-                if this.session.borrow().is_some() && this.window.is_fullscreen() {
-                    this.set_fullscreen_action_state(&app, false);
-                    crate::uisettings::with_mut(|values| values.fullscreen.set_value(false));
-                    this.set_fullscreen(false);
-                }
+                this.exit_fullscreen(&app);
             }
         ));
         app.add_action(&exit_fullscreen);
         app.set_accels_for_action("app.exit_fullscreen", &["Escape"]);
+    }
+
+    fn toggle_fullscreen(&self, app: &Application) {
+        let checked = !app
+            .lookup_action("fullscreen")
+            .and_then(|action| action.state())
+            .and_then(|state| state.get::<bool>())
+            .unwrap_or(false);
+        self.set_fullscreen_action_state(app, checked);
+        crate::uisettings::with_mut(|values| values.fullscreen.set_value(checked));
+
+        // Upstream leaves the action checked when no game is running, but
+        // ToggleFullscreen returns without changing the launcher window.
+        if self.session.borrow().is_some() {
+            self.set_fullscreen(checked);
+        }
+    }
+
+    fn exit_fullscreen(&self, app: &Application) {
+        if self.session.borrow().is_some() && self.window.is_fullscreen() {
+            self.set_fullscreen_action_state(app, false);
+            crate::uisettings::with_mut(|values| values.fullscreen.set_value(false));
+            self.set_fullscreen(false);
+        }
     }
 
     /// Upstream `GMainWindow::ToggleFullscreen` / `ShowFullscreen` /
@@ -750,6 +790,18 @@ impl GMainWindow {
             #[upgrade_or]
             glib::Propagation::Proceed,
             move |_, keyval, _keycode, state| {
+                if this.session.borrow().is_some() {
+                    if let Some(hotkey) = fullscreen_hotkey(keyval) {
+                        if let Some(app) = this.window.application() {
+                            match hotkey {
+                                FullscreenHotkey::Toggle => this.toggle_fullscreen(&app),
+                                FullscreenHotkey::Exit => this.exit_fullscreen(&app),
+                            }
+                        }
+                        return glib::Propagation::Stop;
+                    }
+                }
+
                 this.on_key_event(keyval, state, true);
                 // Upstream delivers gameplay keys to the focused
                 // GRenderWindow, whose keyPressEvent does not forward them to
@@ -767,6 +819,9 @@ impl GMainWindow {
             #[weak(rename_to = this)]
             self,
             move |_, keyval, _keycode, state| {
+                if this.session.borrow().is_some() && fullscreen_hotkey(keyval).is_some() {
+                    return;
+                }
                 this.on_key_event(keyval, state, false);
             }
         ));

@@ -28020,3 +28020,22 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 
 ### Binary layout verification
 - PASS: no guest-facing or serialized structure changed.
+
+## 2026-07-30 — ruzu/src/main_window.rs vs zuyu/src/yuzu/main.{h,cpp} and bootmanager.cpp
+
+### Intentional differences
+- GTK's native render child is not a GTK event target, so the toplevel capture
+  controller recognizes frontend hotkeys before forwarding ordinary keys to
+  the guest. Upstream obtains the same ownership through `QShortcut`.
+
+### Unintentional differences (to fix)
+- Fixed: the capture controller no longer consumes `F11` and `Escape` as guest
+  input before the fullscreen actions run. Both keyboard paths now call the
+  same toggle/exit methods as the menu actions.
+
+### Missing items
+- Controller hotkeys for fullscreen remain part of the broader hotkey-registry
+  parity slice.
+
+### Binary layout verification
+- PASS: this frontend event-routing change has no shared binary payload.
