@@ -380,8 +380,31 @@ function Get-MissingVcpkgPackages {
     })
 }
 
+function Find-VcpkgRoot {
+    $candidates = @()
+    if ($env:VCPKG_ROOT) {
+        $candidates += $env:VCPKG_ROOT
+    }
+
+    $command = Get-Command vcpkg.exe -ErrorAction SilentlyContinue
+    if ($command) {
+        $candidates += Split-Path -Parent $command.Source
+    }
+
+    $candidates += Join-Path $env:LOCALAPPDATA "Ruzu\vcpkg"
+    foreach ($candidate in $candidates | Select-Object -Unique) {
+        $executable = Join-Path $candidate "vcpkg.exe"
+        $toolchain = Join-Path $candidate "scripts\buildsystems\vcpkg.cmake"
+        if ((Test-Path $executable) -and (Test-Path $toolchain)) {
+            return $candidate
+        }
+    }
+
+    return $null
+}
+
 function Ensure-VcpkgDependencies {
-    $vcpkgRoot = $env:VCPKG_ROOT
+    $vcpkgRoot = Find-VcpkgRoot
     if (-not $vcpkgRoot) {
         $vcpkgRoot = Join-Path $env:LOCALAPPDATA "Ruzu\vcpkg"
     }
@@ -390,6 +413,7 @@ function Ensure-VcpkgDependencies {
     $missingVcpkg = -not (Test-Path $vcpkgExecutable)
     $missingPackages = @()
     if (-not $missingVcpkg) {
+        Write-Host "[OK] Found an existing vcpkg installation in $vcpkgRoot."
         $missingPackages = Get-MissingVcpkgPackages -VcpkgExecutable $vcpkgExecutable
     }
 
