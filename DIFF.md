@@ -28403,3 +28403,49 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ### Binary layout verification
 - PASS: module selection changes host compilation only. The existing
   Windows SEH structure definitions and emitted unwind data are unchanged.
+
+## 2026-07-31 — core/src/crypto/key_manager.rs vs core/crypto/key_manager.{h,cpp}
+
+### Intentional differences
+- Upstream loads keys only from `GetYuzuPath(KeysDir)`. Ruzu keeps its own keys
+  directory as the primary owner and has an existing read-only fallback to
+  legacy yuzu/suyu directories so users do not have to duplicate sensitive key
+  files. The fallback now maps Windows yuzu/suyu data to `%APPDATA%`, while
+  retaining the existing Unix XDG-style candidates.
+
+### Unintentional differences (to fix)
+- Fixed: the legacy fallback claimed to support yuzu/suyu but constructed only
+  Unix-style paths from `HOME`. On Windows it missed
+  `%APPDATA%\yuzu\keys`, causing available `prod.keys` and `title.keys` files
+  not to be loaded and every encrypted XCI/NSP to fail game-list validation.
+
+### Missing items
+- None in this platform key-directory resolution prerequisite.
+
+### Binary layout verification
+- PASS: key types, maps, key loading order, and cryptographic payloads are
+  unchanged; only the host directory selected for existing key files changed.
+
+## 2026-07-31 — ruzu/src/game_list.rs vs yuzu/game_list.cpp and yuzu/main.cpp
+
+### Intentional differences
+- Upstream exposes `Scan Subfolders` from a context menu opened on a specific
+  directory row. The GTK frontend keeps the already documented toolbar
+  adaptation, whose actions target the selected directory.
+- The GTK list selects a newly added directory and automatically selects the
+  sole configured filesystem directory. This supplies the row context that
+  upstream gets inherently from opening that row's context menu.
+
+### Unintentional differences (to fix)
+- Fixed: initial population ran before the GTK selection handlers were
+  connected and no directory was selected after adding one. Consequently the
+  toolbar's `Scan Subfolders` action remained disabled and clicking it did not
+  update `deep_scan` or rescan nested titles.
+
+### Missing items
+- The three virtual content-provider rows remain pre-existing game-list parity
+  debt, as recorded in the `uisettings.rs` entry.
+
+### Binary layout verification
+- PASS: game-directory fields and config serialization are unchanged; this
+  affects frontend selection and action routing only.
