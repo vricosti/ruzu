@@ -74,7 +74,7 @@ pub unsafe fn create_surface(
             let win32_surface_fn = ash::extensions::khr::Win32Surface::new(entry, instance);
             let create_info = vk::Win32SurfaceCreateInfoKHR::builder()
                 .hinstance(std::ptr::null_mut())
-                .hwnd(window_info.render_surface as isize)
+                .hwnd(window_info.render_surface as *const _)
                 .build();
             win32_surface_fn
                 .create_win32_surface(&create_info, None)

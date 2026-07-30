@@ -9,6 +9,35 @@ use std::sync::Arc;
 
 static CUBEB_CALLBACK_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
+#[cfg(windows)]
+fn initialize_com_multithreaded() -> i32 {
+    unsafe {
+        winapi::um::combaseapi::CoInitializeEx(
+            std::ptr::null_mut(),
+            winapi::um::objbase::COINIT_MULTITHREADED,
+        )
+    }
+}
+
+#[cfg(windows)]
+fn uninitialize_com() {
+    unsafe {
+        winapi::um::combaseapi::CoUninitialize();
+    }
+}
+
+#[cfg(windows)]
+struct StreamComApartment;
+
+#[cfg(windows)]
+impl Drop for StreamComApartment {
+    fn drop(&mut self) {
+        // Upstream CubebSinkStream balances its constructor's CoInitializeEx
+        // unconditionally when the stream object is destroyed.
+        uninitialize_com();
+    }
+}
+
 fn should_trace_cubeb_callback() -> bool {
     std::env::var_os("RUZU_TRACE_CUBEB_CALLBACK").is_some()
 }
@@ -18,6 +47,8 @@ struct CubebStream {
     stream_type: StreamType,
     handle: SinkStreamHandle,
     _backend: cubeb::Stream<i16>,
+    #[cfg(windows)]
+    _com_apartment: StreamComApartment,
 }
 
 pub struct CubebSink {
@@ -27,6 +58,8 @@ pub struct CubebSink {
     device_channels: u32,
     system_channels: u32,
     streams: Vec<CubebStream>,
+    #[cfg(windows)]
+    com_init_result: i32,
 }
 
 // Safety: cubeb::Context and cubeb::DeviceId contain raw pointers internally,
@@ -104,6 +137,9 @@ fn process_stream_callback(
 
 impl CubebSink {
     pub fn new(target_device_name: &str) -> Self {
+        #[cfg(windows)]
+        let com_init_result = initialize_com_multithreaded();
+
         // RUZU_CUBEB_BACKEND env override is useful to bypass pulse-rust on
         // pipewire-pulse systems where it oscillates Drained↔Started.
         let backend_cstring = std::env::var("RUZU_CUBEB_BACKEND")
@@ -154,6 +190,24 @@ impl CubebSink {
             device_channels,
             system_channels: 2,
             streams: Vec::new(),
+            #[cfg(windows)]
+            com_init_result,
+        }
+    }
+}
+
+impl Drop for CubebSink {
+    fn drop(&mut self) {
+        if self.ctx.is_none() {
+            return;
+        }
+
+        self.streams.clear();
+        self.ctx.take();
+
+        #[cfg(windows)]
+        if self.com_init_result >= 0 {
+            uninitialize_com();
         }
     }
 }
@@ -175,6 +229,12 @@ impl Sink for CubebSink {
             stream.device_channels = self.device_channels;
             stream.name = name.to_string();
             return new_stream_handle(stream);
+        };
+
+        #[cfg(windows)]
+        let com_apartment = {
+            let _ = initialize_com_multithreaded();
+            StreamComApartment
         };
 
         let mut sink_stream = SinkStream::new(system, stream_type);
@@ -320,6 +380,8 @@ impl Sink for CubebSink {
                     stream_type,
                     handle: handle.clone(),
                     _backend: backend,
+                    #[cfg(windows)]
+                    _com_apartment: com_apartment,
                 });
             }
             Err(e) => {
@@ -405,6 +467,9 @@ mod tests {
 
 /// Get a list of connected devices from cubeb.
 pub fn list_cubeb_sink_devices(capture: bool) -> Vec<String> {
+    #[cfg(windows)]
+    let com_init_result = initialize_com_multithreaded();
+
     let ctx = match Context::init(Some(c"ruzu Device Enumerator"), None) {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -412,6 +477,11 @@ pub fn list_cubeb_sink_devices(capture: bool) -> Vec<String> {
             return Vec::new();
         }
     };
+
+    #[cfg(windows)]
+    if com_init_result >= 0 {
+        uninitialize_com();
+    }
 
     let device_type = if capture {
         DeviceType::INPUT
@@ -440,6 +510,9 @@ pub fn list_cubeb_sink_devices(capture: bool) -> Vec<String> {
 
 /// Check if the cubeb backend is suitable for use.
 pub fn is_cubeb_suitable() -> bool {
+    #[cfg(windows)]
+    let com_init_result = initialize_com_multithreaded();
+
     let ctx = match Context::init(Some(c"ruzu Latency Getter"), None) {
         Ok(ctx) => ctx,
         Err(_) => {
@@ -447,6 +520,11 @@ pub fn is_cubeb_suitable() -> bool {
             return false;
         }
     };
+
+    #[cfg(windows)]
+    if com_init_result >= 0 {
+        uninitialize_com();
+    }
 
     let params = StreamParamsBuilder::new()
         .rate(TARGET_SAMPLE_RATE)

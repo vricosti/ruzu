@@ -449,11 +449,13 @@ pub fn mark_svc_exit(core_id: usize) {
     SVC_IN_PROGRESS[core_id].store(0, Ordering::Release);
 }
 
+#[cfg(unix)]
 extern "C" fn sigusr1_handler(_signum: libc::c_int) {
     // Only async-signal-safe code here.
     DUMP_REQUESTED.store(true, Ordering::Relaxed);
 }
 
+#[cfg(unix)]
 extern "C" fn sigurg_handler(_signum: libc::c_int) {
     #[cfg(not(any(
         all(target_os = "linux", target_env = "gnu"),
@@ -500,6 +502,7 @@ extern "C" fn sigurg_handler(_signum: libc::c_int) {
     }
 }
 
+#[cfg(unix)]
 fn install_sigusr1_handler() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
@@ -522,6 +525,11 @@ fn install_sigusr1_handler() {
         "[SIGUSR1] handler installed for pid={}: send `kill -USR1 <pid>` to dump thread state",
         std::process::id(),
     );
+    maybe_spawn_pc_sampler();
+}
+
+#[cfg(not(unix))]
+fn install_sigusr1_handler() {
     maybe_spawn_pc_sampler();
 }
 

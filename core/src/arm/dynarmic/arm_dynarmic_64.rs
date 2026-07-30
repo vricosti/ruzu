@@ -2320,6 +2320,7 @@ impl ArmDynarmic64 {
         // capture every write to a tracked location (e.g. a free-list
         // head pointer) when direct-fastmem stores are otherwise
         // invisible to the slow-path callback.
+        #[cfg(any(unix, windows))]
         if let (Some(arena), Ok(spec)) = (fastmem_pointer, std::env::var("RUZU_PROTECT_PAGE")) {
             if core_index == 0 {
                 let target =
@@ -2328,11 +2329,27 @@ impl ArmDynarmic64 {
                     let page_size = 4096usize;
                     let page_aligned_va = (target as usize) & !(page_size - 1);
                     let host_addr = unsafe { arena.add(page_aligned_va) };
+                    #[cfg(unix)]
                     let rc = unsafe {
                         libc::mprotect(host_addr as *mut libc::c_void, page_size, libc::PROT_READ)
                     };
+                    #[cfg(windows)]
+                    let rc = unsafe {
+                        let mut old_protect = 0;
+                        if winapi::um::memoryapi::VirtualProtect(
+                            host_addr.cast(),
+                            page_size,
+                            winapi::um::winnt::PAGE_READONLY,
+                            &mut old_protect,
+                        ) != 0
+                        {
+                            0
+                        } else {
+                            -1
+                        }
+                    };
                     log::warn!(
-                        "RUZU_PROTECT_PAGE: mprotect(host=0x{:X}, 4KB, PROT_READ) for guest=0x{:X} → rc={}",
+                        "RUZU_PROTECT_PAGE: protect(host=0x{:X}, 4KB, read-only) for guest=0x{:X} → rc={}",
                         host_addr as usize,
                         page_aligned_va,
                         rc

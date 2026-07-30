@@ -354,11 +354,11 @@ mod tests {
         payload.process(&stream, 2);
 
         let stream = stream.lock();
-        assert_eq!(stream.queue.len(), 1);
+        assert_eq!(stream.get_queue_size(), 1);
         assert_eq!(
-            stream.queue.front().unwrap().frames,
+            stream.queued_buffer_front().unwrap().frames,
             TARGET_SAMPLE_COUNT as u64
         );
-        assert_ne!(stream.queue.front().unwrap().tag, 0);
+        assert_ne!(stream.queued_buffer_front().unwrap().tag, 0);
     }
 }

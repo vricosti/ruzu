@@ -7,18 +7,22 @@
 
 /// Signal used to return to run code by exception level change.
 /// Corresponds to `ReturnToRunCodeByExceptionLevelChangeSignal` (SIGUSR2).
+#[cfg(target_os = "linux")]
 pub const RETURN_TO_RUN_CODE_BY_EXCEPTION_LEVEL_CHANGE_SIGNAL: i32 = libc::SIGUSR2;
 
 /// Signal used to break from run code.
 /// Corresponds to `BreakFromRunCodeSignal` (SIGURG).
+#[cfg(target_os = "linux")]
 pub const BREAK_FROM_RUN_CODE_SIGNAL: i32 = libc::SIGURG;
 
 /// Signal used for guest access faults.
 /// Corresponds to `GuestAccessFaultSignal` (SIGSEGV).
+#[cfg(target_os = "linux")]
 pub const GUEST_ACCESS_FAULT_SIGNAL: i32 = libc::SIGSEGV;
 
 /// Signal used for guest alignment faults.
 /// Corresponds to `GuestAlignmentFaultSignal` (SIGBUS).
+#[cfg(target_os = "linux")]
 pub const GUEST_ALIGNMENT_FAULT_SIGNAL: i32 = libc::SIGBUS;
 
 /// Offset of `sp` field in `GuestContext`.

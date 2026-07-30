@@ -28165,3 +28165,241 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ### Binary layout verification
 - PASS: generated keyboard and analog parameter packages use the shared
   upstream-equivalent generators and existing settings arrays.
+
+## 2026-07-30 — core/src/arm/dynarmic/arm_dynarmic_64.rs vs core/arm/dynarmic/arm_dynarmic_64.{h,cpp}
+
+### Intentional differences
+- `RUZU_PROTECT_PAGE` is an opt-in ruzu diagnostic with no upstream C++
+  counterpart. Its code remains in the A64 Dynarmic owner and is inert unless
+  the environment variable is set.
+- Windows uses `VirtualProtect(..., PAGE_READONLY, ...)` where Unix uses
+  `mprotect(..., PROT_READ)`, preserving the diagnostic's host-page protection
+  behavior through the native platform API.
+
+### Unintentional differences (to fix)
+- Fixed: the diagnostic was enabled for Windows but still invoked Unix-only
+  `libc::mprotect`, preventing the Windows target from compiling.
+
+### Missing items
+- The broader pre-existing A64 callback and diagnostic differences recorded in
+  earlier entries are unchanged by this Windows portability slice.
+
+### Binary layout verification
+- PASS: this is an opt-in host virtual-memory diagnostic and changes no
+  guest-visible structure or serialized payload.
+
+## 2026-07-30 — ruzu_cmd/{Cargo.toml,src/main.rs} vs yuzu_cmd/{CMakeLists.txt,yuzu.cpp}
+
+### Intentional differences
+- Rust expresses upstream's unconditional `SDL2::SDL2` link as target-specific
+  Cargo dependencies so Unix can retain its pkg-config feature selection while
+  Windows uses the workspace/vcpkg configuration.
+- The `RUZU_*` profiling signal handlers are ruzu-only diagnostics absent from
+  `yuzu.cpp`; their definitions and registrations are restricted to Unix,
+  where `SIGUSR2` and `sigaction` exist.
+
+### Unintentional differences (to fix)
+- Fixed: the Windows command frontend had no SDL2 dependency even though
+  upstream links SDL2 on every supported command-frontend platform.
+- Fixed: Unix signal-handler definitions and registration code were compiled
+  on Windows.
+
+### Missing items
+- None in this Windows command-frontend build slice.
+
+### Binary layout verification
+- PASS: dependency selection and host signal registration do not alter guest
+  binary layouts.
+
+## 2026-07-30 — scripts/cmake-clean-env.cmd and video_core/build.rs vs upstream Windows build configuration
+
+### Intentional differences
+- Cargo build scripts need a wrapper around nested CMake invocations to
+  preserve the Visual Studio/vcpkg environment. Upstream's CMake build owns
+  that environment directly and has no corresponding wrapper file.
+- Rust's MSVC debug targets link the release-form dynamic CRT (`/MD`) rather
+  than CMake's default `/MDd`; the cubeb wrapper therefore keeps the CMake
+  configuration named Debug while selecting `MultiThreadedDLL` and
+  `_ITERATOR_DEBUG_LEVEL=0` to match the Rust and `cc`-crate objects.
+
+### Unintentional differences (to fix)
+- Fixed: the wrapper concatenated `%PATH%` and `%Path%`; Windows treats those
+  names case-insensitively, so the duplicated value could exceed `cmd.exe`'s
+  input-line limit before `cubeb-sys` launched CMake.
+- Fixed: cubeb's nested configure forced the static MSVC runtime while upstream
+  and `x64-windows-ruzu` select the dynamic runtime. The wrapper now passes
+  `USE_STATIC_MSVC_RUNTIME=OFF`, explicitly selects the dynamic release CRT
+  used by Rust's MSVC targets, and sets iterator-debug level zero for cubeb's
+  Debug configuration. The earlier `/MTd` compensation in
+  `video_core/build.rs` was removed.
+
+### Missing items
+- None in this nested-CMake/MSVC-runtime prerequisite.
+
+### Binary layout verification
+- PASS: all linked Rust and vcpkg artifacts now use the same dynamic MSVC CRT;
+  no guest payload layout is involved.
+
+## 2026-07-30 — audio_core/src/sink/cubeb_sink.rs vs audio_core/sink/cubeb_sink.{h,cpp}
+
+### Intentional differences
+- Rust stores successful stream COM initialization in a file-local RAII guard;
+  field ordering drops the cubeb stream backend before balancing
+  `CoUninitialize`, matching `CubebSinkStream::~CubebSinkStream`.
+- Failed Rust stream construction drops the temporary COM guard immediately
+  because there is no failed `CubebSinkStream` object to retain. Successful
+  stream, sink, enumeration and suitability lifetimes preserve upstream call
+  placement and ordering.
+- `cubeb` crate ownership replaces explicit `cubeb_destroy` and
+  `cubeb_stream_destroy`; `Drop` explicitly clears streams before dropping the
+  context so the upstream destruction order remains visible.
+
+### Unintentional differences (to fix)
+- Fixed: Windows never initialized COM before cubeb context or stream creation,
+  causing the real renderer-session backend to fail with
+  `CO_E_NOTINITIALIZED`.
+- Fixed: device enumeration and suitability probing now initialize and balance
+  COM in the same positions as `ListCubebSinkDevices` and `IsCubebSuitable`.
+
+### Missing items
+- Broader previously existing cubeb-rs callback and backend-selection
+  adaptations are outside this Windows COM lifecycle slice.
+
+### Binary layout verification
+- PASS: COM apartment management is host-only and introduces no guest-facing
+  data structure.
+
+## 2026-07-30 — audio_core/src/renderer/system.rs vs audio_core/renderer/system.{h,cpp}
+
+### Intentional differences
+- A test-only file-local helper owns boxed `KTransferMemory` and `KProcess`
+  prerequisites for the duration of each initialization assertion. Production
+  method ownership and the six-argument initialization interface are unchanged.
+
+### Unintentional differences (to fix)
+- Fixed: renderer-system tests called the obsolete five-argument initializer
+  instead of upstream's parameter, transfer-memory pointer, transfer-memory
+  size, process pointer, applet-resource ID and session-ID order.
+- Fixed: the rendered-event regression now installs the readable event owned
+  by the initialized system before exercising clear/signal ordering.
+
+### Missing items
+- None in this test-fixture synchronization slice.
+
+### Binary layout verification
+- PASS: the helper constructs the existing kernel objects and does not change
+  renderer work-buffer or IPC layouts.
+
+## 2026-07-30 — audio_core/src/{audio_core.rs,adsp/apps/audio_renderer/command_list_processor.rs,renderer/command/sink/device.rs,sink/sink_stream.rs} vs audio_core upstream owners
+
+### Intentional differences
+- A `cfg(test)` read-only queue-front accessor remains owned by
+  `sink_stream.rs`; it lets the device-command regression inspect the existing
+  private queue without moving queue ownership into the command module.
+- Rust tests retain their native fixtures while supplying real upstream-owned
+  `KProcess` and `KTransferMemory` objects instead of fabricated non-null
+  pointers.
+
+### Unintentional differences (to fix)
+- Fixed: the audio-core bridge test now supplies the transfer-memory argument
+  required by the renderer open contract.
+- Fixed: command-processor tests use the current direct `CoreTiming` accessor
+  and the upstream-owned per-delay-line state fields.
+- Fixed: the device-sink test uses public queue size behavior plus the
+  test-only owner accessor instead of reaching into `SinkStream`'s private
+  queue.
+
+### Missing items
+- The command-processor module still has pre-existing runtime test debt: its
+  full 29-test batch currently reports 13 failures. Several fixtures serialize
+  four-sample buffers even though upstream `DeviceSinkCommand::Process`
+  unconditionally consumes `TargetSampleCount` frames; auxiliary/capture,
+  circular-sink and delay fixtures also require separate upstream parity
+  investigation. This larger behavioral slice was not altered to make the
+  Windows build pass.
+
+### Binary layout verification
+- PASS for this fixture update: production command payload definitions and
+  serialized field ordering are unchanged.
+
+## 2026-07-30 — run-ruzu.cmd vs upstream Windows frontend launch environment
+
+### Intentional differences
+- Ruzu's Rust/GTK Windows build loads GTK, SDL2, FFmpeg and related native
+  libraries from the selected vcpkg triplet at runtime. The double-clickable
+  launcher prepends that triplet's `bin` directory to the child process
+  `PATH`; upstream's packaged frontend resolves its deployed dependencies
+  through its own distribution layout.
+- The setup and launcher compile GTK's installed GSettings schema XML files
+  when necessary and export `GSETTINGS_SCHEMA_DIR`. vcpkg installs the schema
+  sources and compiler but does not create `gschemas.compiled` for this custom
+  triplet.
+- The launcher selects `target/release/ruzu.exe`. `cubeb-sys` 0.34 explicitly
+  links `msvcrtd` in Cargo's debug profile, producing an unsupported mixed-CRT
+  GUI process with the release GTK/vcpkg libraries.
+
+### Unintentional differences (to fix)
+- Fixed for release launches: double-clicking the bare executable inherited no
+  vcpkg DLL search path and failed before GTK application startup.
+- Fixed: opening the GTK file chooser aborted with
+  `GLib-GIO-ERROR: No GSettings schemas are installed on the system`. The
+  launcher now guarantees the compiled schema prerequisite before startup.
+
+### Missing items
+- A self-contained distributable directory with copied runtime DLLs is not yet
+  produced; the launcher requires the vcpkg installation prepared by
+  `scripts/setup.ps1`.
+- A runnable Windows debug GUI still requires a local fix or upstream release
+  of `cubeb-sys` that does not inject `msvcrtd` into Rust debug targets.
+
+### Binary layout verification
+- PASS: the launcher only controls host executable, DLL discovery and GTK
+  settings metadata.
+
+## 2026-07-30 — ruzu/src/uisettings.rs vs yuzu/uisettings.h, yuzu/game_list_worker.cpp, and yuzu/main.cpp
+
+### Intentional differences
+- `GameDir::is_filesystem_path` is a Rust-owned predicate used by the GTK game
+  list coordinator. Upstream spells the same distinction as the ordered
+  `SDMC` / `UserNAND` / `SysNAND` comparisons in `GameListWorker::run`.
+
+### Unintentional differences (to fix)
+- Fixed: the predicate previously treated only paths beginning with `/` as
+  filesystem directories. That silently filtered a directory selected on
+  Windows (for example, `D:\Games\Switch`) out of the next game-list reload,
+  even though it had been persisted successfully. It now rejects only the
+  three upstream virtual-provider tokens and scans every other entry, matching
+  upstream's final `else` branch.
+
+### Missing items
+- The GTK game list still does not render the three virtual-provider rows or
+  enumerate their installed titles; this is pre-existing game-list parity debt
+  and is unchanged by the filesystem-directory fix.
+
+### Binary layout verification
+- PASS: `GameDir` fields and serialization are unchanged; only the
+  frontend-owned scan classification predicate changed.
+
+## 2026-07-30 — externals/rdynarmic/src/backend/{mod.rs,x64/exception_handler.rs} vs Dynarmic backend build selection and exception_handler_{windows,posix}.cpp
+
+### Intentional differences
+- Rust expresses upstream's architecture-specific CMake source selection with
+  `cfg(target_arch = "aarch64")` on the ARM64 backend module.
+- The Rust x64 exception-handler owner contains its Windows SEH, Linux signal,
+  and other-platform fallback implementations in one file; upstream separates
+  those implementations into platform-specific translation units.
+
+### Unintentional differences (to fix)
+- Fixed: the ARM64 backend was compiled on Windows x64 even though upstream
+  selects it only for an ARM64 host architecture.
+- Fixed: the generic non-Linux exception-handler fallbacks were also compiled
+  beside the Windows SEH implementations, creating duplicate function
+  definitions. Windows is now excluded from those fallback definitions just
+  as upstream selects only `exception_handler_windows.cpp`.
+
+### Missing items
+- None in this Windows host-selection slice.
+
+### Binary layout verification
+- PASS: module selection changes host compilation only. The existing
+  Windows SEH structure definitions and emitted unwind data are unchanged.

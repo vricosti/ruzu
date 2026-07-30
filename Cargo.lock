@@ -111,6 +111,7 @@ dependencies = [
  "log",
  "parking_lot",
  "sdl2",
+ "winapi",
 ]
 
 [[package]]
@@ -331,6 +332,7 @@ dependencies = [
  "parking_lot",
  "thiserror",
  "toml 0.8.23",
+ "winapi",
  "zstd",
 ]
 
@@ -369,6 +371,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "winapi",
 ]
 
 [[package]]

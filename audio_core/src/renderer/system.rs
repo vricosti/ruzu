@@ -1264,6 +1264,26 @@ mod tests {
         }
     }
 
+    fn initialize_system_for_test(
+        system: &mut System,
+        params: &AudioRendererParameterInternal,
+        transfer_memory_size: u64,
+        applet_resource_user_id: u64,
+        session_id: i32,
+    ) -> (ResultCode, Box<KTransferMemory>, Box<KProcess>) {
+        let mut transfer_memory = Box::new(KTransferMemory::new());
+        let mut process = Box::new(KProcess::new());
+        let result = system.initialize(
+            params,
+            &mut *transfer_memory,
+            transfer_memory_size,
+            &mut *process,
+            applet_resource_user_id,
+            session_id,
+        );
+        (result, transfer_memory, process)
+    }
+
     fn push_pod_bytes<T: Copy>(out: &mut Vec<u8>, value: &T) {
         let bytes =
             unsafe { std::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) };
@@ -1399,10 +1419,9 @@ mod tests {
         let params = make_params();
         let transfer_size = System::get_work_buffer_size(&params);
 
-        assert_eq!(
-            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
-            ResultCode::SUCCESS
-        );
+        let (result, _transfer_memory, _process) =
+            initialize_system_for_test(&mut system, &params, transfer_size, 1, 0);
+        assert_eq!(result, ResultCode::SUCCESS);
 
         system.frames_elapsed = 7;
         system.start();
@@ -1420,10 +1439,9 @@ mod tests {
         params.revision = 1;
         let transfer_size = System::get_work_buffer_size(&params);
 
-        assert_eq!(
-            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
-            ResultCode::SUCCESS
-        );
+        let (result, _transfer_memory, _process) =
+            initialize_system_for_test(&mut system, &params, transfer_size, 1, 0);
+        assert_eq!(result, ResultCode::SUCCESS);
 
         assert_eq!(system.get_rendering_time_limit(), 100);
     }
@@ -1436,10 +1454,9 @@ mod tests {
         let params = make_params();
         let transfer_size = System::get_work_buffer_size(&params);
 
-        assert_eq!(
-            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
-            ResultCode::SUCCESS
-        );
+        let (result, _transfer_memory, _process) =
+            initialize_system_for_test(&mut system, &params, transfer_size, 1, 0);
+        assert_eq!(result, ResultCode::SUCCESS);
         system.start();
         system.memory_pool_workbuffer.push({
             let mut pool = MemoryPoolInfo::new(PoolLocation::Dsp);
@@ -1465,10 +1482,9 @@ mod tests {
         params.revision = make_magic('R', 'E', 'V', '1');
         let transfer_size = System::get_work_buffer_size(&params);
 
-        assert_eq!(
-            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
-            ResultCode::SUCCESS
-        );
+        let (result, _transfer_memory, _process) =
+            initialize_system_for_test(&mut system, &params, transfer_size, 1, 0);
+        assert_eq!(result, ResultCode::SUCCESS);
 
         let mut input = Vec::new();
         let header = UpdateDataHeader {
@@ -1521,10 +1537,9 @@ mod tests {
         params.effects = 1;
         let transfer_size = System::get_work_buffer_size(&params);
 
-        assert_eq!(
-            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 77, 9),
-            ResultCode::SUCCESS
-        );
+        let (result, _transfer_memory, _process) =
+            initialize_system_for_test(&mut system, &params, transfer_size, 77, 9);
+        assert_eq!(result, ResultCode::SUCCESS);
 
         system.start();
         system.memory_pool_workbuffer[0].set_cpu_address(0x1000, 0x1000);
@@ -1560,10 +1575,9 @@ mod tests {
         params.execution_mode = ExecutionMode::Auto;
         let transfer_size = System::get_work_buffer_size(&params);
 
-        assert_eq!(
-            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 77, 9),
-            ResultCode::SUCCESS
-        );
+        let (result, _transfer_memory, _process) =
+            initialize_system_for_test(&mut system, &params, transfer_size, 77, 9);
+        assert_eq!(result, ResultCode::SUCCESS);
 
         system.finalize();
 
@@ -1579,10 +1593,9 @@ mod tests {
         params.mixes = 3;
         let transfer_size = System::get_work_buffer_size(&params);
 
-        assert_eq!(
-            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
-            ResultCode::SUCCESS
-        );
+        let (result, _transfer_memory, _process) =
+            initialize_system_for_test(&mut system, &params, transfer_size, 1, 0);
+        assert_eq!(result, ResultCode::SUCCESS);
 
         assert_eq!(system.voice_channels, MAX_CHANNELS as i32);
         assert_eq!(system.upsampler_count, params.sinks + params.sub_mixes);
@@ -1646,10 +1659,9 @@ mod tests {
         let extra_transfer_size = 0x2000;
         let transfer_size = minimum_transfer_size + extra_transfer_size;
 
-        assert_eq!(
-            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
-            ResultCode::SUCCESS
-        );
+        let (result, _transfer_memory, _process) =
+            initialize_system_for_test(&mut system, &params, transfer_size, 1, 0);
+        assert_eq!(result, ResultCode::SUCCESS);
 
         let expected_command_workbuffer_size =
             transfer_size - expected_pre_command_workbuffer_size(&params);
@@ -1670,22 +1682,28 @@ mod tests {
         let (rendered_event, mut process, _scheduler, readable_event_object_id) =
             make_kernel_rendered_event();
         let mut system = System::new(core, audio_renderer, rendered_event);
-        let mut params = make_params();
-        params.revision = make_magic('R', 'E', 'V', '1');
-        let transfer_size = System::get_work_buffer_size(&params);
-
-        assert_eq!(
-            system.initialize(&params, transfer_size, &mut *process, 1, 0),
-            ResultCode::SUCCESS
-        );
-
         let readable_event = process
             .get_readable_event_by_object_id(readable_event_object_id)
             .unwrap();
-        readable_event
-            .lock()
-            .unwrap()
-            .signal(&mut process, &_scheduler);
+        system.set_rendered_readable_event(readable_event.clone());
+        let mut params = make_params();
+        params.revision = make_magic('R', 'E', 'V', '1');
+        let transfer_size = System::get_work_buffer_size(&params);
+        let mut transfer_memory = Box::new(KTransferMemory::new());
+
+        assert_eq!(
+            system.initialize(
+                &params,
+                &mut *transfer_memory,
+                transfer_size,
+                &mut *process,
+                1,
+                0,
+            ),
+            ResultCode::SUCCESS
+        );
+
+        readable_event.lock().unwrap().signal();
 
         let mut input = Vec::new();
         let header = UpdateDataHeader {
@@ -1738,10 +1756,9 @@ mod tests {
         let params = make_params();
         let transfer_size = System::get_work_buffer_size(&params);
 
-        assert_eq!(
-            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
-            ResultCode::SUCCESS
-        );
+        let (result, _transfer_memory, _process) =
+            initialize_system_for_test(&mut system, &params, transfer_size, 1, 0);
+        assert_eq!(result, ResultCode::SUCCESS);
         system.start();
 
         let mut command_buffer = vec![0u8; 0x4000];
@@ -1765,10 +1782,9 @@ mod tests {
         params.execution_mode = ExecutionMode::Auto;
         let transfer_size = System::get_work_buffer_size(&params);
 
-        assert_eq!(
-            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
-            ResultCode::SUCCESS
-        );
+        let (result, _transfer_memory, _process) =
+            initialize_system_for_test(&mut system, &params, transfer_size, 1, 0);
+        assert_eq!(result, ResultCode::SUCCESS);
 
         system.start();
         let terminate_event = system.get_terminate_event();
@@ -1789,10 +1805,9 @@ mod tests {
         let params = make_params();
         let transfer_size = System::get_work_buffer_size(&params);
 
-        assert_eq!(
-            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
-            ResultCode::SUCCESS
-        );
+        let (result, _transfer_memory, _initial_process) =
+            initialize_system_for_test(&mut system, &params, transfer_size, 1, 0);
+        assert_eq!(result, ResultCode::SUCCESS);
 
         let process = Box::into_raw(Box::new(ruzu_core::hle::kernel::k_process::KProcess::new()));
         system.set_process(process);
@@ -1820,10 +1835,9 @@ mod tests {
         params.execution_mode = ExecutionMode::Auto;
         let transfer_size = System::get_work_buffer_size(&params);
 
-        assert_eq!(
-            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
-            ResultCode::SUCCESS
-        );
+        let (result, _transfer_memory, _process) =
+            initialize_system_for_test(&mut system, &params, transfer_size, 1, 0);
+        assert_eq!(result, ResultCode::SUCCESS);
 
         system.start();
 

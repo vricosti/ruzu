@@ -491,6 +491,7 @@ mod tests {
     use crate::sink::StreamType;
     use common::fixed_point::FixedPoint;
     use parking_lot::Mutex;
+    use ruzu_core::hle::kernel::k_process::KProcess;
     use std::sync::Arc;
 
     fn make_system() -> SharedSystem {
@@ -584,18 +585,18 @@ mod tests {
             4,
         );
 
-        // Stub: KProcess removed. Use an opaque non-null pointer for testing.
-        let fake_process = 0xDEAD_BEEF as *mut ();
+        let mut process = Box::new(KProcess::new());
+        let process_ptr = (&mut *process as *mut KProcess).cast();
         let mut processor = CommandListProcessor::default();
         assert!(processor.initialize(
             system,
-            fake_process,
+            process_ptr,
             bytes.as_ptr() as CpuAddr,
             bytes.len() as u64,
             stream,
         ));
 
-        assert_eq!(processor.get_process(), fake_process);
+        assert_eq!(processor.get_process(), process_ptr);
         // Memory handle is null since we can't extract MemoryManager without KProcess.
         assert_eq!(processor.get_memory(), std::ptr::null_mut());
         assert_eq!(processor.get_mix_buffer_count(), 2);
@@ -1486,12 +1487,7 @@ mod tests {
         let system = make_system();
         let mut mix_buffers = vec![0i32; 4];
         let mut performance_frame = vec![0u8; 64];
-        system
-            .lock()
-            .core_timing()
-            .lock()
-            .unwrap()
-            .add_ticks(10_000);
+        system.lock().core_timing().add_ticks(10_000);
 
         let (bytes, stream) = serialize_commands(
             system.clone(),
@@ -1791,8 +1787,8 @@ mod tests {
         let _ = processor.process(0);
 
         assert_eq!(&mix_buffers[4..8], &[0, 100, 200, 300]);
-        assert_eq!(state.sample_count[0], 1);
-        assert_eq!(state.buffer_pos[0], 0);
+        assert_eq!(state.delay_lines[0].sample_count, 1);
+        assert_eq!(state.delay_lines[0].buffer_pos, 0);
     }
 
     #[test]
