@@ -1,0 +1,61 @@
+name: macOS 26 compatibility
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - test/macos-26
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Ruzu on macOS 26
+    runs-on: macos-26
+    timeout-minutes: 360
+
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+
+    steps:
+      - name: Check out Ruzu and its submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Record runner information
+        run: |
+          sw_vers
+          uname -a
+          uname -m
+          sysctl -n machdep.cpu.brand_string || true
+          df -h .
+
+      - name: Install and verify build dependencies
+        run: |
+          printf 'y\ny\n' | ./setup.sh
+          brew cleanup --prune=all
+          rustc --version
+          cargo --version
+          pkg-config --modversion gtk4
+          pkg-config --modversion sdl2
+          df -h .
+
+      - name: Build Ruzu
+        run: |
+          time cargo build --locked --bin ruzu -j 2 2>&1 | tee macos-26-build.log
+          test -x target/debug/ruzu
+          file target/debug/ruzu
+          otool -L target/debug/ruzu
+          df -h .
+
+      - name: Upload the build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-26-build-log
+          path: macos-26-build.log
+          if-no-files-found: ignore
