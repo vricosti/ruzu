@@ -28039,3 +28039,17 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 
 ### Binary layout verification
 - PASS: this frontend event-routing change has no shared binary payload.
+
+## 2026-07-30 — video_core/src/renderer_vulkan/swapchain.rs vs zuyu/src/video_core/renderer_vulkan/vk_swapchain.{h,cpp}
+
+### Intentional differences
+- macOS retains a `vkDeviceWaitIdle` before destroying a recreated swapchain because MoltenVK may still execute a presentation completion callback on an IOGPU thread. This platform guard preserves the existing Apple Silicon crash workaround.
+
+### Unintentional differences (to fix)
+- Fixed: Linux and other non-macOS platforms no longer perform a device-wide idle wait before every `Swapchain::Create`. Their destroy/create/semaphore/resource-tick ordering now matches upstream.
+
+### Missing items
+- Replacing the macOS device-wide wait requires presentation-completion ownership that proves the MoltenVK callback has retired before `Destroy`; the current present fence covers the graphics submission but not that callback.
+
+### Binary layout verification
+- PASS: swapchain recreation synchronization is host-only and changes no shared payload.
