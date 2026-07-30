@@ -1680,6 +1680,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "pkg-config",
+ "vcpkg",
  "version-compare 0.1.1",
 ]
 
