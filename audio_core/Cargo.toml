@@ -8,9 +8,15 @@ license.workspace = true
 common = { path = "../common" }
 ruzu_core = { package = "core", path = "../core" }
 cubeb.workspace = true
-sdl2.workspace = true
 log.workspace = true
 parking_lot.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+sdl2.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Native Windows builds use the x64-windows libraries installed by vcpkg.
+sdl2 = { workspace = true, features = ["use-vcpkg"] }
 
 # cubeb-sys 0.34 asks Cargo to link the optional Rust PulseAudio archive on
 # FreeBSD, although its nested CMake build does not place that archive in the
