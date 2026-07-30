@@ -29,9 +29,11 @@ use gtk::prelude::*;
 use hid_core::hid_core::EmulatedControllerHandle;
 
 use common::settings_input::{native_analog, native_button, ControllerType, PlayerInput};
+use input_common::main_common::generate_keyboard_param;
 
 use super::configure_dialog::Page;
 use super::input_profiles::InputProfiles;
+use super::qt_config::{DEFAULT_ANALOGS, DEFAULT_BUTTONS, DEFAULT_MOTIONS, DEFAULT_STICK_MOD};
 use super::shared_widget as w;
 
 pub(crate) struct InputProfileContext {
@@ -1578,14 +1580,24 @@ fn apply_device_defaults(
     subsystem: &input_common::InputSubsystem,
     device: &common::param_package::ParamPackage,
 ) {
-    let buttons = subsystem.get_button_mapping_for_device(device);
-    let analogs = subsystem.get_analog_mapping_for_device(device);
-    let motions = subsystem.get_motion_mapping_for_device(device);
-
     let mut state = page.state.borrow_mut();
     state.buttons.iter_mut().for_each(|b| b.clear());
     state.analogs.iter_mut().for_each(|a| a.clear());
     state.motions.iter_mut().for_each(|m| m.clear());
+
+    let engine = device.get_str("engine", "");
+    if engine == "keyboard" || engine == "mouse" {
+        apply_keyboard_defaults(&mut state);
+        // Upstream's "Keyboard Only" row returns here. "Keyboard/Mouse"
+        // continues so Mouse::GetAnalogMappingForDevice can replace RStick.
+        if engine == "keyboard" {
+            return;
+        }
+    }
+
+    let buttons = subsystem.get_button_mapping_for_device(device);
+    let analogs = subsystem.get_analog_mapping_for_device(device);
+    let motions = subsystem.get_motion_mapping_for_device(device);
 
     for (index, param) in buttons {
         if let Some(slot) = state.buttons.get_mut(index as usize) {
@@ -1601,6 +1613,32 @@ fn apply_device_defaults(
         if let Some(slot) = state.motions.get_mut(index as usize) {
             *slot = param.serialize();
         }
+    }
+}
+
+/// The keyboard half of upstream
+/// `ConfigureInputPlayer::UpdateMappingWithDefaults`.
+fn apply_keyboard_defaults(player: &mut PlayerInput) {
+    for (slot, key) in DEFAULT_BUTTONS.iter().copied().enumerate() {
+        player.buttons[slot] = generate_keyboard_param(key);
+    }
+    for (slot, keys) in DEFAULT_ANALOGS.iter().copied().enumerate() {
+        let mut analog = common::param_package::ParamPackage::default();
+        for (key, direction) in keys.into_iter().zip([
+            Direction::Up,
+            Direction::Down,
+            Direction::Left,
+            Direction::Right,
+        ]) {
+            let input =
+                common::param_package::ParamPackage::from_serialized(&generate_keyboard_param(key));
+            set_analog_param(&input, &mut analog, direction);
+        }
+        analog.set_str("modifier", generate_keyboard_param(DEFAULT_STICK_MOD[slot]));
+        player.analogs[slot] = analog.serialize();
+    }
+    for (slot, key) in DEFAULT_MOTIONS.iter().copied().enumerate() {
+        player.motions[slot] = generate_keyboard_param(key);
     }
 }
 
@@ -1766,6 +1804,22 @@ pub fn button_to_text(param: &str) -> String {
     if !fields.contains_key("engine") {
         return NOT_SET.to_string();
     }
+
+    // Upstream handles keyboard bindings before asking the input driver for a
+    // common button name. Qt's QKeySequence renders the stored Qt::Key value;
+    // the GTK frontend keeps those same values for config compatibility.
+    if fields.get("engine") == Some(&"keyboard") {
+        let enabled = |name: &str| fields.get(name).is_some_and(|value| *value == "true");
+        let turbo = if enabled("turbo") { "$" } else { "" };
+        let toggle = if enabled("toggle") { "~" } else { "" };
+        let inverted = if enabled("inverted") { "!" } else { "" };
+        let code = fields
+            .get("code")
+            .and_then(|code| code.parse::<i32>().ok())
+            .unwrap_or(0);
+        return format!("{turbo}{toggle}{inverted}{}", qt_key_name(code));
+    }
+
     if let Some(button) = fields.get("button") {
         return format!("Button {button}");
     }
@@ -1779,6 +1833,75 @@ pub fn button_to_text(param: &str) -> String {
         return format!("Hat {hat} {direction}");
     }
     NOT_SET.to_string()
+}
+
+/// GTK counterpart of upstream's file-local `GetKeyName`.
+fn qt_key_name(key_code: i32) -> String {
+    const QT_KEY_ESCAPE: i32 = 0x0100_0000;
+    const QT_KEY_TAB: i32 = 0x0100_0001;
+    const QT_KEY_BACKTAB: i32 = 0x0100_0002;
+    const QT_KEY_BACKSPACE: i32 = 0x0100_0003;
+    const QT_KEY_RETURN: i32 = 0x0100_0004;
+    const QT_KEY_ENTER: i32 = 0x0100_0005;
+    const QT_KEY_INSERT: i32 = 0x0100_0006;
+    const QT_KEY_DELETE: i32 = 0x0100_0007;
+    const QT_KEY_PAUSE: i32 = 0x0100_0008;
+    const QT_KEY_PRINT: i32 = 0x0100_0009;
+    const QT_KEY_HOME: i32 = 0x0100_0010;
+    const QT_KEY_END: i32 = 0x0100_0011;
+    const QT_KEY_LEFT: i32 = 0x0100_0012;
+    const QT_KEY_UP: i32 = 0x0100_0013;
+    const QT_KEY_RIGHT: i32 = 0x0100_0014;
+    const QT_KEY_DOWN: i32 = 0x0100_0015;
+    const QT_KEY_PAGE_UP: i32 = 0x0100_0016;
+    const QT_KEY_PAGE_DOWN: i32 = 0x0100_0017;
+    const QT_KEY_SHIFT: i32 = 0x0100_0020;
+    const QT_KEY_CONTROL: i32 = 0x0100_0021;
+    const QT_KEY_META: i32 = 0x0100_0022;
+    const QT_KEY_ALT: i32 = 0x0100_0023;
+    const QT_KEY_CAPS_LOCK: i32 = 0x0100_0024;
+    const QT_KEY_NUM_LOCK: i32 = 0x0100_0025;
+    const QT_KEY_SCROLL_LOCK: i32 = 0x0100_0026;
+    const QT_KEY_F1: i32 = 0x0100_0030;
+    const QT_KEY_F35: i32 = 0x0100_0052;
+
+    let name = match key_code {
+        QT_KEY_ESCAPE => "Esc",
+        QT_KEY_TAB => "Tab",
+        QT_KEY_BACKTAB => "Backtab",
+        QT_KEY_BACKSPACE => "Backspace",
+        QT_KEY_RETURN => "Return",
+        QT_KEY_ENTER => "Enter",
+        QT_KEY_INSERT => "Ins",
+        QT_KEY_DELETE => "Del",
+        QT_KEY_PAUSE => "Pause",
+        QT_KEY_PRINT => "Print",
+        QT_KEY_HOME => "Home",
+        QT_KEY_END => "End",
+        QT_KEY_LEFT => "Left",
+        QT_KEY_UP => "Up",
+        QT_KEY_RIGHT => "Right",
+        QT_KEY_DOWN => "Down",
+        QT_KEY_PAGE_UP => "PgUp",
+        QT_KEY_PAGE_DOWN => "PgDown",
+        QT_KEY_SHIFT => "Shift",
+        QT_KEY_CONTROL => "Ctrl",
+        QT_KEY_META => "",
+        QT_KEY_ALT => "Alt",
+        QT_KEY_CAPS_LOCK => "CapsLock",
+        QT_KEY_NUM_LOCK => "NumLock",
+        QT_KEY_SCROLL_LOCK => "ScrollLock",
+        _ => {
+            if (QT_KEY_F1..=QT_KEY_F35).contains(&key_code) {
+                return format!("F{}", key_code - QT_KEY_F1 + 1);
+            }
+            return char::from_u32(key_code as u32)
+                .filter(|key| !key.is_control())
+                .map(|key| key.to_string())
+                .unwrap_or_default();
+        }
+    };
+    name.to_string()
 }
 
 /// A [`shared_widget::group`] with its padding trimmed.
@@ -2288,6 +2411,17 @@ mod tests {
     }
 
     #[test]
+    fn button_to_text_renders_upstream_qt_keyboard_names() {
+        assert_eq!(button_to_text("engine:keyboard,code:67"), "C");
+        assert_eq!(button_to_text("engine:keyboard,code:16777235"), "Up");
+        assert_eq!(button_to_text("engine:keyboard,code:16777248"), "Shift");
+        assert_eq!(
+            button_to_text("engine:keyboard,code:88,turbo:true,toggle:true,inverted:true"),
+            "$~!X"
+        );
+    }
+
+    #[test]
     fn button_to_text_renders_axes_with_direction() {
         assert_eq!(
             button_to_text("engine:sdl,axis:1,direction:+,guid:0,port:0"),
@@ -2632,6 +2766,45 @@ mod tests {
         player.buttons[0] = "engine:keyboard,code:65".to_string();
         player.analogs[0] = "engine:mouse,axis_x:0,axis_y:1".to_string();
         assert_eq!(device_index_for(&player, &devices), 2);
+    }
+
+    /// Upstream installs `QtConfig::default_*` when either keyboard row is
+    /// selected; the keyboard driver itself does not provide these mappings.
+    #[test]
+    fn keyboard_device_installs_qt_default_bindings() {
+        let mut player = PlayerInput::default();
+        apply_keyboard_defaults(&mut player);
+
+        let button = |button: native_button::Values| {
+            common::param_package::ParamPackage::from_serialized(&player.buttons[button as usize])
+        };
+        assert_eq!(
+            button(native_button::Values::A).get_int("code", 0),
+            b'C' as i32
+        );
+        assert_eq!(
+            button(native_button::Values::Plus).get_int("code", 0),
+            b'M' as i32
+        );
+        assert_eq!(
+            button(native_button::Values::Minus).get_int("code", 0),
+            b'N' as i32
+        );
+        assert_eq!(
+            button(native_button::Values::DUp).get_int("code", 0),
+            0x0100_0013
+        );
+
+        let left_stick = common::param_package::ParamPackage::from_serialized(
+            &player.analogs[native_analog::Values::LStick as usize],
+        );
+        assert_eq!(left_stick.get_str("engine", ""), "analog_from_button");
+        let up =
+            common::param_package::ParamPackage::from_serialized(&left_stick.get_str("up", ""));
+        assert_eq!(up.get_int("code", 0), b'W' as i32);
+
+        let motion = common::param_package::ParamPackage::from_serialized(&player.motions[0]);
+        assert_eq!(motion.get_int("code", 0), b'7' as i32);
     }
 
     /// With nothing mapped yet the page adopts the pad that is plugged in; with

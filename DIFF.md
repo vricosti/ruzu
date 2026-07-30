@@ -28053,3 +28053,115 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 
 ### Binary layout verification
 - PASS: swapchain recreation synchronization is host-only and changes no shared payload.
+
+## 2026-07-30 — ruzu/src/configuration/qt_config.rs vs zuyu/src/yuzu/configuration/qt_config.{h,cpp}
+
+### Intentional differences
+- Rust exposes the four upstream public static arrays as module-visible
+  `const` values. Their owner, order, lengths and Qt key-code values remain
+  those of `QtConfig`.
+
+### Unintentional differences (to fix)
+- Fixed: the default arrays were private factory functions, so
+  `ConfigureInputPlayer::UpdateMappingWithDefaults` could not use the same
+  values as `QtConfig::ReadQtPlayerValues`.
+
+### Missing items
+- `default_ringcon_analogs` is outside this controller-selection slice and
+  remains owned by the existing Ring-Con configuration path.
+
+### Binary layout verification
+- PASS: the serialized keyboard `code` values and array order match upstream.
+
+## 2026-07-30 — ruzu/src/configuration/configure_input_player.rs vs zuyu/src/yuzu/configuration/configure_input_player.{h,cpp}
+
+### Intentional differences
+- The GTK port recognizes the fixed keyboard and mouse rows by their upstream
+  engine names instead of Qt combo indices; the resulting row behavior is the
+  same and remains stable if a frontend model is rebuilt.
+
+### Unintentional differences (to fix)
+- Fixed: selecting `Keyboard Only` or `Keyboard/Mouse` cleared every binding
+  and queried the driver, but upstream explicitly installs
+  `QtConfig::default_buttons`, `default_analogs`, `default_stick_mod` and
+  `default_motions` first.
+- Fixed: `Keyboard Only` now stops after installing keyboard defaults, while
+  `Keyboard/Mouse` continues through `Mouse::GetAnalogMappingForDevice` so
+  only the right stick is replaced by mouse axes.
+
+### Missing items
+- The existing Configure Vibration and Configure Motion dialog debt is
+  unchanged by this input-device mapping slice.
+
+### Binary layout verification
+- PASS: generated button, analog direction, modifier and motion parameter
+  packages use the same generators and field ordering semantics as upstream.
+
+## 2026-07-30 — ruzu/src/configuration/configure_input_player.rs vs zuyu/src/yuzu/configuration/configure_input_player.cpp
+
+### Intentional differences
+- GTK has no `QKeySequence`; the file-local `qt_key_name` translates the same
+  stored `Qt::Key` integers into the labels used by upstream `GetKeyName`.
+
+### Unintentional differences (to fix)
+- Fixed: `ButtonToText` ignored `engine:keyboard` parameter packages, so valid
+  keyboard mappings were rendered as `[not set]` even though the controller
+  configuration contained the correct `code` values.
+- Fixed: keyboard labels now include upstream's turbo, toggle and inverted
+  prefixes before the translated key name.
+
+### Missing items
+- The remaining non-keyboard `ButtonToText` name variants continue to use the
+  existing driver-value rendering path.
+
+### Binary layout verification
+- PASS: this change only renders existing parameter packages and does not
+  alter their serialized contents.
+
+## 2026-07-30 — frontend_common/src/config.rs vs zuyu/src/frontend_common/config.{h,cpp}
+
+### Intentional differences
+- Rust stores the loaded INI sections in nested `BTreeMap`s instead of
+  upstream `CSimpleIniA`; key grouping, `\default` markers, quote removal and
+  boolean parsing preserve the behavior used by this control-config slice.
+- An invalid persisted controller-type integer falls back to `ProController`
+  because Rust cannot store an invalid enum discriminant. Upstream's unchecked
+  enum cast can retain such an invalid value.
+
+### Unintentional differences (to fix)
+- Fixed: `BaseConfig` had no loaded INI state, so its boolean, integer, string
+  and player-value reads could not implement upstream `Config`.
+- Fixed: player connection, controller type, vibration, colors and per-game
+  profile inheritance now follow `Config::ReadPlayerValues`, including the
+  player-one connected default.
+
+### Missing items
+- The broader `Reload`, category read/write, `SaveValues` and `WriteToIni`
+  lifecycle remains outside this read-only control-config slice.
+
+### Binary layout verification
+- PASS: the change reads textual INI values into existing settings structures;
+  it introduces no guest-facing binary payload.
+
+## 2026-07-30 — ruzu_cmd/src/sdl_config.rs vs zuyu/src/yuzu_cmd/sdl_config.{h,cpp}
+
+### Intentional differences
+- The Rust frontend currently constructs only global `SdlConfig`; profile and
+  per-game prefixes remain represented by `BaseConfig` but are not exposed by
+  the command-line constructor.
+
+### Unintentional differences (to fix)
+- Fixed: `SdlConfig` ignored controller mappings and only read RNG settings.
+  It now loads base player metadata followed by SDL buttons, sticks, motions,
+  debug-pad bindings and Ring-Con bindings in upstream order.
+- Fixed: `NUM_BUTTONS` was hard-coded to 15. It now follows
+  `NativeButton::NumButtons` (22), including C++ zero-initialization of the
+  seven omitted upstream array elements.
+
+### Missing items
+- `ReloadAllValues` and all SDL save/write methods still depend on the missing
+  generic `BaseConfig` write lifecycle and remain stubs.
+
+### Binary layout verification
+- PASS: generated keyboard and analog parameter packages use the shared
+  upstream-equivalent generators and existing settings arrays.

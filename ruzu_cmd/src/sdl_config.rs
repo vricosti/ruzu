@@ -23,6 +23,10 @@
 //! | `SdlConfig::default_stick_mod`   | `DEFAULT_STICK_MOD`                |
 //! | `SdlConfig::default_ringcon_analogs` | `DEFAULT_RINGCON_ANALOGS`      |
 
+use common::settings_input::{native_analog, native_button, native_motion};
+use frontend_common::config::{BaseConfig, ConfigType};
+use input_common::main_common::{generate_analog_param_from_keys, generate_keyboard_param};
+
 // ---------------------------------------------------------------------------
 // Upstream numeric scancode constants
 //
@@ -93,13 +97,13 @@ const SDL_SCANCODE_D: i32 = 7;
 // ---------------------------------------------------------------------------
 
 /// Number of native buttons. Maps to `Settings::NativeButton::NumButtons`.
-pub const NUM_BUTTONS: usize = 15;
+pub const NUM_BUTTONS: usize = native_button::NUM_BUTTONS;
 
 /// Number of native analogs. Maps to `Settings::NativeAnalog::NumAnalogs`.
-pub const NUM_ANALOGS: usize = 2;
+pub const NUM_ANALOGS: usize = native_analog::NUM_ANALOGS;
 
 /// Number of native motions. Maps to `Settings::NativeMotion::NumMotions`.
-pub const NUM_MOTIONS: usize = 2;
+pub const NUM_MOTIONS: usize = native_motion::NUM_MOTIONS;
 
 // ---------------------------------------------------------------------------
 // Default key binding constants
@@ -126,6 +130,15 @@ pub const DEFAULT_BUTTONS: [i32; NUM_BUTTONS] = [
     SDL_SCANCODE_1,
     SDL_SCANCODE_2,
     SDL_SCANCODE_B,
+    // The upstream std::array has 22 entries but only 15 explicit
+    // initializers. C++ zero-initializes the remaining slots.
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
 ];
 
 /// Default SDL scancode bindings for each NativeMotion.
@@ -172,15 +185,12 @@ pub const DEFAULT_RINGCON_ANALOGS: [i32; 2] = [0, 0];
 ///
 /// Inherits from `Config` (via trait in `frontend_common::config`).
 ///
-/// Note: The base `Config` infrastructure (INI read/write, BeginGroup/EndGroup,
-/// ReadStringSetting/WriteStringSetting, Initialize/Reload/SaveValues/WriteToIni)
-/// is not yet ported from `frontend_common`. All config I/O operations are
-/// stubbed with log::warn until `frontend_common::config` is available.
 pub struct SdlConfig {
     /// Whether this is a global (non-custom) config instance.
     /// Maps to C++ `Config::global`.
     is_global: bool,
     config_path: std::path::PathBuf,
+    base: BaseConfig,
 }
 
 impl SdlConfig {
@@ -189,12 +199,15 @@ impl SdlConfig {
     ///
     /// Maps to C++ `SdlConfig::SdlConfig`.
     pub fn new(config_path: Option<String>) -> Self {
-        // Upstream: Initialize(config_path); ReadSdlValues(); SaveSdlValues();
-        // frontend_common::Config::Initialize / ReadSdlValues / SaveSdlValues not yet ported.
+        let config_path = resolve_config_path(config_path);
+        let mut base = BaseConfig::new(ConfigType::GlobalConfig);
+        base.initialize(&config_path);
         let mut instance = SdlConfig {
             is_global: true,
-            config_path: resolve_config_path(config_path),
+            config_path,
+            base,
         };
+        instance.read_base_control_values();
         instance.read_system_values();
         instance.read_sdl_values();
         instance.save_sdl_values();
@@ -224,6 +237,23 @@ impl SdlConfig {
     // Read helpers
     // -----------------------------------------------------------------------
 
+    /// Runs the `Config::ReadPlayerValues` part of base `ReadControlValues`.
+    ///
+    /// Upstream executes this from `Config::Initialize` before the derived
+    /// `ReadSdlValues` pass fills the SDL bindings.
+    fn read_base_control_values(&mut self) {
+        self.base.begin_group("Controls");
+        {
+            let mut values = common::settings::values_mut();
+            values.players.set_global(true);
+        }
+        let player_count = common::settings::values().players.get_value().len();
+        for player_index in 0..player_count {
+            self.base.read_player_values(player_index);
+        }
+        self.base.end_group();
+    }
+
     /// Reads all SDL-specific config values.
     ///
     /// Maps to C++ `SdlConfig::ReadSdlValues`.
@@ -252,55 +282,89 @@ impl SdlConfig {
     ///
     /// Maps to C++ `SdlConfig::ReadSdlControlValues`.
     fn read_sdl_control_values(&mut self) {
-        // Upstream:
-        //   BeginGroup(Settings::TranslateCategory(Settings::Category::Controls))
-        //   Settings::values.players.SetGlobal(!IsCustomConfig())
-        //   for p in 0..players.size(): ReadSdlPlayerValues(p)
-        //   if !IsCustomConfig(): ReadDebugControlValues(); ReadHidbusValues()
-        //   EndGroup()
-        //
-        // Settings::values and Config::BeginGroup not yet ported.
-        log::debug!("SdlConfig::read_sdl_control_values: Settings not yet ported, using defaults");
-
-        for p in 0..8 {
+        self.base.begin_group("Controls");
+        {
+            common::settings::values_mut().players.set_global(true);
+        }
+        let player_count = common::settings::values().players.get_value().len();
+        for p in 0..player_count {
             self.read_sdl_player_values(p);
         }
         self.read_debug_control_values();
         self.read_hidbus_values();
+        self.base.end_group();
     }
 
     /// Reads key bindings for a single player slot.
     ///
     /// Maps to C++ `SdlConfig::ReadSdlPlayerValues`.
     fn read_sdl_player_values(&mut self, player_index: usize) {
-        // Upstream reads buttons/analogs/motions from INI for player_index,
-        // falling back to DEFAULT_BUTTONS / DEFAULT_ANALOGS / DEFAULT_MOTIONS.
-        // INI read infrastructure (Config::ReadStringSetting) not yet ported.
-        let _ = player_index;
-        log::trace!(
-            "SdlConfig::read_sdl_player_values({}): Config::ReadStringSetting not yet ported",
-            player_index
-        );
+        let mut values = common::settings::values_mut();
+        let player = &mut values.players.get_value_mut()[player_index];
+        read_sdl_player_values_into(&self.base, player_index, player);
     }
 
     /// Reads debug-pad control values.
     ///
     /// Maps to C++ `SdlConfig::ReadDebugControlValues`.
     fn read_debug_control_values(&mut self) {
-        // Upstream reads debug_pad_buttons and debug_pad_analogs from INI.
-        // INI read infrastructure not yet ported.
-        log::trace!(
-            "SdlConfig::read_debug_control_values: Config::ReadStringSetting not yet ported"
-        );
+        let mut buttons = std::array::from_fn(|_| String::new());
+        for (index, mapping) in native_button::MAPPING.iter().enumerate() {
+            let default_param = generate_keyboard_param(DEFAULT_BUTTONS[index]);
+            let key = format!("debug_pad_{mapping}");
+            let value = self.base.read_string_setting(&key, Some(&default_param));
+            buttons[index] = if value.is_empty() {
+                default_param
+            } else {
+                value
+            };
+        }
+
+        let mut analogs = std::array::from_fn(|_| String::new());
+        for (index, mapping) in native_analog::MAPPING.iter().enumerate() {
+            let keys = DEFAULT_ANALOGS[index];
+            let default_param = generate_analog_param_from_keys(
+                keys[0],
+                keys[1],
+                keys[2],
+                keys[3],
+                DEFAULT_STICK_MOD[index],
+                0.5,
+            );
+            let key = format!("debug_pad_{mapping}");
+            let value = self.base.read_string_setting(&key, Some(&default_param));
+            analogs[index] = if value.is_empty() {
+                default_param
+            } else {
+                value
+            };
+        }
+
+        let mut values = common::settings::values_mut();
+        values.debug_pad_buttons = buttons;
+        values.debug_pad_analogs = analogs;
     }
 
     /// Reads Hidbus (ring controller) values.
     ///
     /// Maps to C++ `SdlConfig::ReadHidbusValues`.
     fn read_hidbus_values(&mut self) {
-        // Upstream: reads "ring_controller" key using DEFAULT_RINGCON_ANALOGS as default.
-        // INI read infrastructure not yet ported.
-        log::trace!("SdlConfig::read_hidbus_values: Config::ReadStringSetting not yet ported");
+        let default_param = generate_analog_param_from_keys(
+            0,
+            0,
+            DEFAULT_RINGCON_ANALOGS[0],
+            DEFAULT_RINGCON_ANALOGS[1],
+            0,
+            0.05,
+        );
+        let value = self
+            .base
+            .read_string_setting("ring_controller", Some(&default_param));
+        common::settings::values_mut().ringcon_analogs = if value.is_empty() {
+            default_param
+        } else {
+            value
+        };
     }
 
     // -----------------------------------------------------------------------
@@ -367,6 +431,55 @@ impl SdlConfig {
         // Upstream: writes "ring_controller" key.
         // INI write infrastructure not yet ported.
         log::trace!("SdlConfig::save_hidbus_values: Config::WriteStringSetting not yet ported");
+    }
+}
+
+fn read_sdl_player_values_into(
+    base: &BaseConfig,
+    player_index: usize,
+    player: &mut common::settings_input::PlayerInput,
+) {
+    let player_prefix = format!("player_{player_index}_");
+
+    for (index, mapping) in native_button::MAPPING.iter().enumerate() {
+        let default_param = generate_keyboard_param(DEFAULT_BUTTONS[index]);
+        let key = format!("{player_prefix}{mapping}");
+        let value = base.read_string_setting(&key, Some(&default_param));
+        player.buttons[index] = if value.is_empty() {
+            default_param
+        } else {
+            value
+        };
+    }
+
+    for (index, mapping) in native_analog::MAPPING.iter().enumerate() {
+        let keys = DEFAULT_ANALOGS[index];
+        let default_param = generate_analog_param_from_keys(
+            keys[0],
+            keys[1],
+            keys[2],
+            keys[3],
+            DEFAULT_STICK_MOD[index],
+            0.5,
+        );
+        let key = format!("{player_prefix}{mapping}");
+        let value = base.read_string_setting(&key, Some(&default_param));
+        player.analogs[index] = if value.is_empty() {
+            default_param
+        } else {
+            value
+        };
+    }
+
+    for (index, mapping) in native_motion::MAPPING.iter().enumerate() {
+        let default_param = generate_keyboard_param(DEFAULT_MOTIONS[index]);
+        let key = format!("{player_prefix}{mapping}");
+        let value = base.read_string_setting(&key, Some(&default_param));
+        player.motions[index] = if value.is_empty() {
+            default_param
+        } else {
+            value
+        };
     }
 }
 
@@ -463,7 +576,43 @@ impl Drop for SdlConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_rng_seed_settings_from_ini, resolve_config_path};
+    use super::{
+        read_rng_seed_settings_from_ini, read_sdl_player_values_into, resolve_config_path,
+        DEFAULT_BUTTONS, NUM_BUTTONS,
+    };
+    use common::param_package::ParamPackage;
+    use common::settings_input::{native_button, PlayerInput};
+    use frontend_common::config::{BaseConfig, ConfigType};
+
+    #[test]
+    fn default_button_array_matches_upstream_zero_initialization() {
+        assert_eq!(NUM_BUTTONS, native_button::NUM_BUTTONS);
+        assert_eq!(DEFAULT_BUTTONS[0], 4);
+        assert!(DEFAULT_BUTTONS[15..].iter().all(|value| *value == 0));
+    }
+
+    #[test]
+    fn reads_sdl_player_bindings_and_defaults() {
+        let mut base = BaseConfig::new(ConfigType::GlobalConfig);
+        base.load_ini(
+            r#"
+            [Controls]
+            player_0_button_a\default=false
+            player_0_button_a="engine:sdl,port:0,button:1"
+            "#,
+        );
+        base.begin_group("Controls");
+        let mut player = PlayerInput::default();
+
+        read_sdl_player_values_into(&base, 0, &mut player);
+
+        let button_a = ParamPackage::from_serialized(&player.buttons[0]);
+        assert_eq!(button_a.get_str("engine", ""), "sdl");
+        assert_eq!(button_a.get_int("button", -1), 1);
+        let button_b = ParamPackage::from_serialized(&player.buttons[1]);
+        assert_eq!(button_b.get_str("engine", ""), "keyboard");
+        assert_eq!(button_b.get_int("code", -1), DEFAULT_BUTTONS[1]);
+    }
 
     #[test]
     fn reads_rng_seed_from_system_group_when_not_default() {

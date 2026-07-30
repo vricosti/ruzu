@@ -75,60 +75,42 @@ const QT_KEY_DOWN: i32 = 0x0100_0015;
 const QT_KEY_SHIFT: i32 = 0x0100_0020;
 
 /// Upstream `QtConfig::default_buttons`.
-fn default_buttons() -> [i32; native_button::NUM_BUTTONS] {
-    [
-        i32::from(b'C'),
-        i32::from(b'X'),
-        i32::from(b'V'),
-        i32::from(b'Z'),
-        i32::from(b'F'),
-        i32::from(b'G'),
-        i32::from(b'Q'),
-        i32::from(b'E'),
-        i32::from(b'R'),
-        i32::from(b'T'),
-        i32::from(b'M'),
-        i32::from(b'N'),
-        QT_KEY_LEFT,
-        QT_KEY_UP,
-        QT_KEY_RIGHT,
-        QT_KEY_DOWN,
-        i32::from(b'Q'),
-        i32::from(b'E'),
-        0,
-        0,
-        i32::from(b'Q'),
-        i32::from(b'E'),
-    ]
-}
+pub(super) const DEFAULT_BUTTONS: [i32; native_button::NUM_BUTTONS] = [
+    b'C' as i32,
+    b'X' as i32,
+    b'V' as i32,
+    b'Z' as i32,
+    b'F' as i32,
+    b'G' as i32,
+    b'Q' as i32,
+    b'E' as i32,
+    b'R' as i32,
+    b'T' as i32,
+    b'M' as i32,
+    b'N' as i32,
+    QT_KEY_LEFT,
+    QT_KEY_UP,
+    QT_KEY_RIGHT,
+    QT_KEY_DOWN,
+    b'Q' as i32,
+    b'E' as i32,
+    0,
+    0,
+    b'Q' as i32,
+    b'E' as i32,
+];
 
 /// Upstream `QtConfig::default_motions`.
-fn default_motions() -> [i32; native_motion::NUM_MOTIONS] {
-    [i32::from(b'7'), i32::from(b'8')]
-}
+pub(super) const DEFAULT_MOTIONS: [i32; native_motion::NUM_MOTIONS] = [b'7' as i32, b'8' as i32];
 
 /// Upstream `QtConfig::default_analogs`.
-fn default_analogs() -> [[i32; 4]; native_analog::NUM_ANALOGS] {
-    [
-        [
-            i32::from(b'W'),
-            i32::from(b'S'),
-            i32::from(b'A'),
-            i32::from(b'D'),
-        ],
-        [
-            i32::from(b'I'),
-            i32::from(b'K'),
-            i32::from(b'J'),
-            i32::from(b'L'),
-        ],
-    ]
-}
+pub(super) const DEFAULT_ANALOGS: [[i32; 4]; native_analog::NUM_ANALOGS] = [
+    [b'W' as i32, b'S' as i32, b'A' as i32, b'D' as i32],
+    [b'I' as i32, b'K' as i32, b'J' as i32, b'L' as i32],
+];
 
 /// Upstream `QtConfig::default_stick_mod`.
-fn default_stick_mod() -> [i32; native_analog::NUM_ANALOGS] {
-    [QT_KEY_SHIFT, 0]
-}
+pub(super) const DEFAULT_STICK_MOD: [i32; native_analog::NUM_ANALOGS] = [QT_KEY_SHIFT, 0];
 
 /// Read every player's bindings — upstream `QtConfig::ReadQtPlayerValues`,
 /// called once per player from `Config::ReadControlValues`.
@@ -197,9 +179,8 @@ fn load_player_bindings(
     prefix: &str,
     values: &std::collections::BTreeMap<String, String>,
 ) {
-    let button_defaults = default_buttons();
     for (slot, name) in native_button::MAPPING.iter().enumerate() {
-        let default = generate_keyboard_param(button_defaults[slot]);
+        let default = generate_keyboard_param(DEFAULT_BUTTONS[slot]);
         player.buttons[slot] = values
             .get(&format!("{prefix}{name}"))
             .filter(|value| !value.is_empty())
@@ -207,16 +188,14 @@ fn load_player_bindings(
             .unwrap_or(default);
     }
 
-    let analog_defaults = default_analogs();
-    let stick_modifiers = default_stick_mod();
     for (slot, name) in native_analog::MAPPING.iter().enumerate() {
-        let keys = analog_defaults[slot];
+        let keys = DEFAULT_ANALOGS[slot];
         let default = generate_analog_param_from_keys(
             keys[0],
             keys[1],
             keys[2],
             keys[3],
-            stick_modifiers[slot],
+            DEFAULT_STICK_MOD[slot],
             0.5,
         );
         player.analogs[slot] = values
@@ -226,9 +205,8 @@ fn load_player_bindings(
             .unwrap_or(default);
     }
 
-    let motion_defaults = default_motions();
     for (slot, name) in native_motion::MAPPING.iter().enumerate() {
-        let default = generate_keyboard_param(motion_defaults[slot]);
+        let default = generate_keyboard_param(DEFAULT_MOTIONS[slot]);
         player.motions[slot] = values
             .get(&format!("{prefix}{name}"))
             .filter(|value| !value.is_empty())

@@ -6,6 +6,15 @@
 //! Provides the base `Config` trait and configuration management infrastructure
 //! for reading/writing settings from INI files.
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use common::settings_common::InputSetting;
+use common::settings_input::{
+    ControllerType, PlayerInput, JOYCON_BODY_NEON_BLUE, JOYCON_BODY_NEON_RED,
+    JOYCON_BUTTONS_NEON_BLUE, JOYCON_BUTTONS_NEON_RED,
+};
+
 // ---------------------------------------------------------------------------
 // ConfigType
 // ---------------------------------------------------------------------------
@@ -169,6 +178,7 @@ pub struct BaseConfig {
     pub global: bool,
     pub key_stack: Vec<String>,
     pub array_stack: Vec<ConfigArrayEntry>,
+    ini: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// Public version of ConfigArray for use in BaseConfig.
@@ -187,6 +197,43 @@ impl BaseConfig {
             config_loc: String::new(),
             key_stack: Vec::new(),
             array_stack: Vec::new(),
+            ini: BTreeMap::new(),
+        }
+    }
+
+    /// Loads the INI document owned by the config instance.
+    ///
+    /// Maps to `Config::Initialize` followed by `Config::SetUpIni`.
+    pub fn initialize(&mut self, config_path: &Path) {
+        self.config_loc = config_path.to_string_lossy().into_owned();
+        let contents = std::fs::read_to_string(config_path).unwrap_or_default();
+        self.load_ini(&contents);
+    }
+
+    /// Replaces the loaded INI document. Kept public for focused config tests.
+    pub fn load_ini(&mut self, contents: &str) {
+        self.ini.clear();
+        let mut section = String::new();
+
+        for raw_line in contents.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+                continue;
+            }
+            if let Some(name) = line
+                .strip_prefix('[')
+                .and_then(|line| line.strip_suffix(']'))
+            {
+                section = name.to_string();
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            self.ini
+                .entry(section.clone())
+                .or_default()
+                .insert(key.trim().to_string(), value.trim().to_string());
         }
     }
 
@@ -256,6 +303,178 @@ impl BaseConfig {
         format!("{}{}{}", self.get_group(), array_key, adjust_key(key))
     }
 
+    fn read_raw(&self, key: &str) -> Option<&str> {
+        let section = self.get_section();
+        let full_key = self.get_full_key(key, false);
+        self.ini
+            .get(&section)
+            .and_then(|values| values.get(&full_key))
+            .map(String::as_str)
+    }
+
+    fn parse_bool(value: &str) -> Option<bool> {
+        let value = value.trim_matches('"').as_bytes();
+        match value.first().map(u8::to_ascii_lowercase) {
+            Some(b't' | b'y' | b'1') => Some(true),
+            Some(b'f' | b'n' | b'0') => Some(false),
+            Some(b'o') => match value.get(1).map(u8::to_ascii_lowercase) {
+                Some(b'n') => Some(true),
+                Some(b'f') => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Maps to `Config::ReadBooleanSetting`.
+    pub fn read_boolean_setting(&self, key: &str, default_value: Option<bool>) -> bool {
+        let Some(default_value) = default_value else {
+            return self
+                .read_raw(key)
+                .and_then(Self::parse_bool)
+                .unwrap_or(false);
+        };
+
+        let use_default = self
+            .read_raw(&format!("{key}\\default"))
+            .and_then(Self::parse_bool)
+            .unwrap_or(false);
+        if use_default {
+            default_value
+        } else {
+            self.read_raw(key)
+                .and_then(Self::parse_bool)
+                .unwrap_or(default_value)
+        }
+    }
+
+    /// Maps to `Config::ReadIntegerSetting`.
+    pub fn read_integer_setting(&self, key: &str, default_value: Option<i64>) -> i64 {
+        let Some(default_value) = default_value else {
+            return self
+                .read_raw(key)
+                .and_then(|value| value.trim_matches('"').parse().ok())
+                .unwrap_or(0);
+        };
+
+        let use_default = self
+            .read_raw(&format!("{key}\\default"))
+            .and_then(Self::parse_bool)
+            .unwrap_or(true);
+        if use_default {
+            default_value
+        } else {
+            self.read_raw(key)
+                .and_then(|value| value.trim_matches('"').parse().ok())
+                .unwrap_or(default_value)
+        }
+    }
+
+    /// Maps to `Config::ReadStringSetting`.
+    pub fn read_string_setting(&self, key: &str, default_value: Option<&str>) -> String {
+        let mut result = match default_value {
+            None => self.read_raw(key).unwrap_or_default().to_string(),
+            Some(default_value) => {
+                let use_default = self
+                    .read_raw(&format!("{key}\\default"))
+                    .and_then(Self::parse_bool)
+                    .unwrap_or(true);
+                if use_default {
+                    default_value.to_string()
+                } else {
+                    self.read_raw(key).unwrap_or(default_value).to_string()
+                }
+            }
+        };
+
+        // Upstream removes quotes after SimpleIni returns the value.
+        result.retain(|character| character != '"');
+        if default_value.is_some() {
+            result = result.replace("//", "/");
+        }
+        result
+    }
+
+    /// Maps to `Config::ReadPlayerValues`.
+    pub fn read_player_values(&self, player_index: usize) {
+        let configuring_global = common::settings::is_configuring_global();
+        let mut values = common::settings::values_mut();
+        self.read_player_values_into(player_index, &mut values.players, configuring_global);
+    }
+
+    fn read_player_values_into(
+        &self,
+        player_index: usize,
+        players: &mut InputSetting<[PlayerInput; 10]>,
+        configuring_global: bool,
+    ) {
+        let player_prefix = if self.config_type == ConfigType::InputProfile {
+            String::new()
+        } else {
+            format!("player_{player_index}_")
+        };
+        let profile_name = self.read_string_setting(&format!("{player_prefix}profile_name"), None);
+
+        if self.config_type == ConfigType::PerGameConfig {
+            if profile_name.is_empty() {
+                let mut global_player = players.get_value_explicit(true)[player_index].clone();
+                global_player.profile_name.clear();
+                players.get_value_mut()[player_index] = global_player;
+                return;
+            }
+            players.get_value_mut()[player_index].profile_name = profile_name.clone();
+        }
+
+        if player_prefix.is_empty() && configuring_global {
+            let controller = controller_type_from_config(self.read_integer_setting(
+                &format!("{player_prefix}type"),
+                Some(ControllerType::ProController as i64),
+            ));
+            if matches!(
+                controller,
+                ControllerType::LeftJoycon | ControllerType::RightJoycon
+            ) {
+                players.get_value_mut()[player_index].controller_type = controller;
+            }
+            return;
+        }
+
+        if self.global {
+            players.get_value_explicit_mut(true)[player_index].profile_name = profile_name.clone();
+        }
+
+        let player = &mut players.get_value_mut()[player_index];
+        player.connected = self.read_boolean_setting(
+            &format!("{player_prefix}connected"),
+            Some(player_index == 0),
+        );
+        player.controller_type = controller_type_from_config(self.read_integer_setting(
+            &format!("{player_prefix}type"),
+            Some(ControllerType::ProController as i64),
+        ));
+        player.vibration_enabled =
+            self.read_boolean_setting(&format!("{player_prefix}vibration_enabled"), Some(true));
+        player.vibration_strength = self
+            .read_integer_setting(&format!("{player_prefix}vibration_strength"), Some(100))
+            as i32;
+        player.body_color_left = self.read_integer_setting(
+            &format!("{player_prefix}body_color_left"),
+            Some(JOYCON_BODY_NEON_BLUE as i64),
+        ) as u32;
+        player.body_color_right = self.read_integer_setting(
+            &format!("{player_prefix}body_color_right"),
+            Some(JOYCON_BODY_NEON_RED as i64),
+        ) as u32;
+        player.button_color_left = self.read_integer_setting(
+            &format!("{player_prefix}button_color_left"),
+            Some(JOYCON_BUTTONS_NEON_BLUE as i64),
+        ) as u32;
+        player.button_color_right = self.read_integer_setting(
+            &format!("{player_prefix}button_color_right"),
+            Some(JOYCON_BUTTONS_NEON_RED as i64),
+        ) as u32;
+    }
+
     /// Begins a config array.
     pub fn begin_array(&mut self, array: &str) -> i32 {
         self.array_stack.push(ConfigArrayEntry {
@@ -300,6 +519,10 @@ impl BaseConfig {
     }
 }
 
+fn controller_type_from_config(value: i64) -> ControllerType {
+    ControllerType::try_from(value as u8).unwrap_or(ControllerType::ProController)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +562,95 @@ mod tests {
         let key = cfg.get_full_key("mykey", false);
         assert_eq!(key, "mykey");
         cfg.end_group();
+    }
+
+    #[test]
+    fn read_settings_honor_upstream_default_markers() {
+        let mut cfg = BaseConfig::new(ConfigType::GlobalConfig);
+        cfg.load_ini(
+            r#"
+            [Controls]
+            enabled\default=true
+            enabled=false
+            count\default=false
+            count=42
+            binding\default=false
+            binding="engine:sdl,button:1"
+            "#,
+        );
+        cfg.begin_group("Controls");
+
+        assert!(cfg.read_boolean_setting("enabled", Some(true)));
+        assert_eq!(cfg.read_integer_setting("count", Some(7)), 42);
+        assert_eq!(
+            cfg.read_string_setting("binding", Some("fallback")),
+            "engine:sdl,button:1"
+        );
+    }
+
+    #[test]
+    fn read_player_values_matches_global_player_defaults() {
+        let mut cfg = BaseConfig::new(ConfigType::GlobalConfig);
+        cfg.load_ini(
+            r#"
+            [Controls]
+            player_0_connected\default=false
+            player_0_connected=false
+            player_0_type\default=false
+            player_0_type=5
+            player_0_vibration_strength\default=false
+            player_0_vibration_strength=63
+            "#,
+        );
+        cfg.begin_group("Controls");
+
+        let mut players = InputSetting::<[PlayerInput; 10]>::new();
+        cfg.read_player_values_into(0, &mut players, true);
+        cfg.read_player_values_into(1, &mut players, true);
+        let first = &players.get_value()[0];
+        let second = &players.get_value()[1];
+
+        assert!(!first.connected);
+        assert_eq!(first.controller_type, ControllerType::GameCube);
+        assert_eq!(first.vibration_strength, 63);
+        assert!(!second.connected);
+        assert_eq!(second.controller_type, ControllerType::ProController);
+    }
+
+    #[test]
+    fn missing_global_config_connects_only_player_one() {
+        let mut cfg = BaseConfig::new(ConfigType::GlobalConfig);
+        cfg.load_ini("");
+        cfg.begin_group("Controls");
+
+        let mut players = InputSetting::<[PlayerInput; 10]>::new();
+        cfg.read_player_values_into(0, &mut players, true);
+        cfg.read_player_values_into(1, &mut players, true);
+
+        assert!(players.get_value()[0].connected);
+        assert!(!players.get_value()[1].connected);
+    }
+
+    #[test]
+    fn per_game_empty_profile_copies_global_player() {
+        let mut cfg = BaseConfig::new(ConfigType::PerGameConfig);
+        cfg.load_ini(
+            r#"
+            [Controls]
+            player_0_profile_name=
+            "#,
+        );
+        cfg.begin_group("Controls");
+
+        let mut players = InputSetting::<[PlayerInput; 10]>::new();
+        players.get_value_explicit_mut(true)[0].connected = true;
+        players.get_value_explicit_mut(true)[0].profile_name = "global".to_string();
+        players.set_global(false);
+
+        cfg.read_player_values_into(0, &mut players, false);
+
+        assert!(players.get_value()[0].connected);
+        assert!(players.get_value()[0].profile_name.is_empty());
     }
 
     #[test]
