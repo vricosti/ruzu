@@ -925,6 +925,24 @@ impl Bsd {
         )
     }
 
+    /// Mutable Rust counterpart to upstream `BSD::GetSocket`.
+    ///
+    /// Upstream returns a shared socket object whose mutating methods are used
+    /// by SSL. Rust keeps the descriptor table behind the shared BSD service
+    /// mutex and exposes the equivalent mutable borrow while that lock is held.
+    pub fn get_socket_mut(&mut self, fd: i32) -> Option<&mut dyn SocketBase> {
+        if !self.is_file_descriptor_valid(fd) {
+            return None;
+        }
+        Some(
+            self.file_descriptors[fd as usize]
+                .as_mut()
+                .unwrap()
+                .socket
+                .as_mut(),
+        )
+    }
+
     /// EventFd -- create event fd (stubbed).
     ///
     /// Corresponds to `BSD::EventFd` in upstream bsd.cpp.
@@ -1282,6 +1300,29 @@ impl SessionRequestHandler for Bsd {
             "bsd:u"
         }
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl SessionRequestHandler for std::sync::Mutex<Bsd> {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        let service = self.lock().unwrap();
+        ServiceFramework::handle_sync_request_impl(&*service, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        if self.lock().unwrap().is_privileged() {
+            "bsd:s"
+        } else {
+            "bsd:u"
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl ServiceFramework for Bsd {
@@ -1366,6 +1407,8 @@ impl ServiceFramework for BsdCfg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn unknown_set_sock_opt_name_reaches_upstream_default_case() {
@@ -1380,5 +1423,27 @@ mod tests {
             Errno::SUCCESS
         );
         assert_eq!(bsd.close_impl(fd), Errno::SUCCESS);
+    }
+
+    #[test]
+    fn shared_bsd_handler_exposes_one_descriptor_table() {
+        let handler: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new(false)));
+        let first = handler
+            .as_any()
+            .downcast_ref::<Mutex<Bsd>>()
+            .expect("shared BSD handler");
+        let (fd, errno) =
+            first
+                .lock()
+                .unwrap()
+                .socket_impl(Domain::INET, Type::DGRAM, Protocol::UDP);
+        assert_eq!(errno, Errno::SUCCESS);
+
+        let cloned_handler = Arc::clone(&handler);
+        let second = cloned_handler
+            .as_any()
+            .downcast_ref::<Mutex<Bsd>>()
+            .expect("same shared BSD handler");
+        assert!(second.lock().unwrap().get_socket(fd).is_some());
     }
 }

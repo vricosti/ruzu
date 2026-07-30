@@ -16,9 +16,11 @@
 
 use std::io::{self, Read as IoRead, Write as IoWrite};
 use std::net::TcpStream;
-use std::sync::Once;
+use std::sync::OnceLock;
 
-use openssl::ssl::{SslConnector, SslMethod, SslStream, SslVerifyMode};
+use openssl::ssl::{
+    HandshakeError, MidHandshakeSslStream, SslConnector, SslMethod, SslStream, SslVerifyMode,
+};
 
 use crate::hle::result::ResultCode;
 
@@ -28,25 +30,51 @@ use super::ssl_backend::{SslConnectionBackend, RESULT_INTERNAL_ERROR, RESULT_WOU
 // One-time initialization
 // =========================================================================
 
-static ONE_TIME_INIT: Once = Once::new();
-static mut ONE_TIME_INIT_SUCCESS: bool = false;
+static SSL_CONNECTOR: OnceLock<Result<SslConnector, String>> = OnceLock::new();
 
-/// One-time OpenSSL initialization.
+/// Build the process-wide OpenSSL context.
 ///
-/// Corresponds to `OneTimeInit()` in upstream ssl_backend_openssl.cpp.
-/// The `openssl` crate handles library initialization automatically.
-fn one_time_init() {
-    unsafe {
-        ONE_TIME_INIT_SUCCESS = true;
+/// Corresponds to upstream `OneTimeInit()`, which creates one shared
+/// `SSL_CTX` and configures the host trust store once.
+fn create_connector() -> Result<SslConnector, String> {
+    let mut builder = SslConnector::builder(SslMethod::tls_client()).map_err(|e| e.to_string())?;
+    builder.set_verify(SslVerifyMode::PEER);
+    builder
+        .set_default_verify_paths()
+        .map_err(|e| e.to_string())?;
+
+    if let Ok(logfile) = std::env::var("SSLKEYLOGFILE") {
+        builder.set_keylog_callback(move |_ssl, line| {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&logfile)
+            {
+                if writeln!(file, "{}", line).is_err() || file.flush().is_err() {
+                    log::error!("Failed to write to SSLKEYLOGFILE");
+                }
+            } else {
+                log::error!("Failed to write to SSLKEYLOGFILE");
+            }
+            log::debug!("Wrote to SSLKEYLOGFILE: {}", line);
+        });
     }
-    log::info!("OpenSSL one-time initialization succeeded");
+
+    Ok(builder.build())
 }
 
-fn is_initialized() -> bool {
-    ONE_TIME_INIT.call_once(one_time_init);
-    // SAFETY: ONE_TIME_INIT_SUCCESS is only written inside call_once, which
-    // guarantees happens-before with all subsequent reads.
-    unsafe { ONE_TIME_INIT_SUCCESS }
+fn shared_connector() -> Result<SslConnector, ResultCode> {
+    match SSL_CONNECTOR.get_or_init(create_connector) {
+        Ok(connector) => Ok(connector.clone()),
+        Err(error) => {
+            log::error!(
+                "Can't create SSL connection because OpenSSL one-time initialization failed: {}",
+                error
+            );
+            Err(RESULT_INTERNAL_ERROR)
+        }
+    }
 }
 
 // =========================================================================
@@ -108,15 +136,25 @@ impl IoWrite for TcpStreamAdapter {
 // SSLConnectionBackendOpenSSL
 // =========================================================================
 
+enum TlsStreamState {
+    Socket(TcpStreamAdapter),
+    Handshaking(MidHandshakeSslStream<TcpStreamAdapter>),
+    Connected(SslStream<TcpStreamAdapter>),
+}
+
 /// OpenSSL-backed SSL connection.
 ///
 /// Corresponds to `SSLConnectionBackendOpenSSL` in upstream
 /// ssl_backend_openssl.cpp.
 struct SslConnectionBackendOpenSsl {
-    /// The SSL stream, created during handshake.
-    ssl_stream: Option<SslStream<TcpStreamAdapter>>,
-    /// The raw TCP adapter, held before handshake connects it.
-    tcp_adapter: Option<TcpStreamAdapter>,
+    /// Clone of the process-wide connector/`SSL_CTX`.
+    connector: SslConnector,
+    /// Persistent socket and SSL handshake state.
+    ///
+    /// Upstream keeps one `SSL*` and calls `SSL_do_handshake` repeatedly after
+    /// `SSL_ERROR_WANT_READ`/`SSL_ERROR_WANT_WRITE`. Keeping the
+    /// `MidHandshakeSslStream` is the equivalent openssl-crate contract.
+    stream_state: Option<TlsStreamState>,
     /// Hostname for SNI and verification.
     hostname: Option<String>,
     /// Whether we got a read EOF from the peer.
@@ -126,12 +164,41 @@ struct SslConnectionBackendOpenSsl {
 }
 
 impl SslConnectionBackendOpenSsl {
-    fn new() -> Self {
-        Self {
-            ssl_stream: None,
-            tcp_adapter: None,
+    fn new() -> Result<Self, ResultCode> {
+        Ok(Self {
+            connector: shared_connector()?,
+            stream_state: None,
             hostname: None,
             got_read_eof: false,
+        })
+    }
+
+    fn finish_handshake(
+        &mut self,
+        result: Result<SslStream<TcpStreamAdapter>, HandshakeError<TcpStreamAdapter>>,
+    ) -> ResultCode {
+        match result {
+            Ok(stream) => {
+                log::info!(
+                    "SSL handshake succeeded for {}",
+                    self.hostname.as_deref().unwrap_or("localhost")
+                );
+                self.stream_state = Some(TlsStreamState::Connected(stream));
+                ResultCode(0)
+            }
+            Err(HandshakeError::WouldBlock(mid)) => {
+                self.stream_state = Some(TlsStreamState::Handshaking(mid));
+                log::debug!("SSL handshake would block");
+                RESULT_WOULD_BLOCK
+            }
+            Err(HandshakeError::Failure(mid)) => {
+                log::error!("SSL handshake failed: {}", mid.error());
+                RESULT_INTERNAL_ERROR
+            }
+            Err(HandshakeError::SetupFailure(error)) => {
+                log::error!("SSL handshake setup failure: {}", error);
+                RESULT_INTERNAL_ERROR
+            }
         }
     }
 }
@@ -144,10 +211,11 @@ impl SslConnectionBackend for SslConnectionBackendOpenSsl {
         log::debug!("SSLConnectionBackendOpenSSL::SetSocket: fd={}", socket_fd);
         match TcpStreamAdapter::from_fd(socket_fd) {
             Ok(adapter) => {
-                self.tcp_adapter = Some(adapter);
+                self.stream_state = Some(TlsStreamState::Socket(adapter));
             }
             Err(e) => {
                 log::error!("Failed to dup socket fd {}: {}", socket_fd, e);
+                self.stream_state = None;
             }
         }
     }
@@ -174,97 +242,27 @@ impl SslConnectionBackend for SslConnectionBackendOpenSsl {
     fn do_handshake(&mut self) -> ResultCode {
         log::debug!("SSLConnectionBackendOpenSSL::DoHandshake called");
 
-        if !is_initialized() {
-            log::error!(
-                "Can't create SSL connection because OpenSSL one-time initialization failed"
-            );
-            return RESULT_INTERNAL_ERROR;
-        }
-
-        let tcp_adapter = match self.tcp_adapter.take() {
-            Some(a) => a,
+        let stream_state = match self.stream_state.take() {
+            Some(state) => state,
             None => {
                 log::error!("DoHandshake called without a socket");
                 return RESULT_INTERNAL_ERROR;
             }
         };
 
-        let hostname = self.hostname.as_deref().unwrap_or("localhost");
-
-        // Build the SSL connector.
-        //
-        // Upstream: SSL_CTX_new(TLS_client_method()), SSL_CTX_set_verify(SSL_VERIFY_PEER),
-        // SSL_CTX_set_default_verify_paths()
-        let connector = match SslConnector::builder(SslMethod::tls_client()) {
-            Ok(mut builder) => {
-                builder.set_verify(SslVerifyMode::PEER);
-
-                // Corresponds to upstream SSL_CTX_set_default_verify_paths
-                if let Err(e) = builder.set_default_verify_paths() {
-                    log::error!("set_default_verify_paths failed: {}", e);
-                    self.tcp_adapter = Some(tcp_adapter);
-                    return RESULT_INTERNAL_ERROR;
-                }
-
-                // SSLKEYLOGFILE support.
-                // Corresponds to upstream OneTimeInitLogFile + KeyLogCallback.
-                if let Ok(logfile) = std::env::var("SSLKEYLOGFILE") {
-                    builder.set_keylog_callback(move |_ssl, line| {
-                        use std::io::Write;
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .append(true)
-                            .create(true)
-                            .open(&logfile)
-                        {
-                            let _ = writeln!(f, "{}", line);
-                            let _ = f.flush();
-                        } else {
-                            log::error!("Failed to write to SSLKEYLOGFILE");
-                        }
-                        log::debug!("Wrote to SSLKEYLOGFILE: {}", line);
-                    });
-                }
-
-                builder.build()
+        let result = match stream_state {
+            TlsStreamState::Socket(tcp_adapter) => {
+                let hostname = self.hostname.as_deref().unwrap_or("localhost");
+                self.connector.connect(hostname, tcp_adapter)
             }
-            Err(e) => {
-                log::error!("SslConnector::builder failed: {}", e);
-                self.tcp_adapter = Some(tcp_adapter);
-                return RESULT_INTERNAL_ERROR;
+            TlsStreamState::Handshaking(mid) => mid.handshake(),
+            TlsStreamState::Connected(stream) => {
+                self.stream_state = Some(TlsStreamState::Connected(stream));
+                return ResultCode(0);
             }
         };
 
-        // Perform the handshake.
-        //
-        // SslConnector::connect handles:
-        //   SSL_set1_host (hostname verification)
-        //   SSL_set_tlsext_host_name (SNI)
-        //   SSL_do_handshake
-        //   SSL_get_verify_result
-        match connector.connect(hostname, tcp_adapter) {
-            Ok(stream) => {
-                log::info!("SSL handshake succeeded for {}", hostname);
-                self.ssl_stream = Some(stream);
-                ResultCode(0) // RESULT_SUCCESS
-            }
-            Err(openssl::ssl::HandshakeError::WouldBlock(_mid)) => {
-                // Corresponds to upstream HandleReturn returning ResultWouldBlock
-                // for SSL_ERROR_WANT_READ / SSL_ERROR_WANT_WRITE.
-                log::debug!("SSL handshake would block");
-                RESULT_WOULD_BLOCK
-            }
-            Err(openssl::ssl::HandshakeError::Failure(mid)) => {
-                let ssl_error = mid.into_error();
-                // Corresponds to upstream checking SSL_get_verify_result and
-                // X509_verify_cert_error_string.
-                log::error!("SSL handshake failed: {}", ssl_error);
-                RESULT_INTERNAL_ERROR
-            }
-            Err(openssl::ssl::HandshakeError::SetupFailure(e)) => {
-                log::error!("SSL handshake setup failure: {}", e);
-                RESULT_INTERNAL_ERROR
-            }
-        }
+        self.finish_handshake(result)
     }
 
     /// Read.
@@ -272,7 +270,9 @@ impl SslConnectionBackend for SslConnectionBackendOpenSsl {
     /// Corresponds to `SSLConnectionBackendOpenSSL::Read` in upstream.
     /// Upstream: SSL_read_ex(ssl, data, size, &actual) then HandleReturn.
     fn read(&mut self, data: &mut [u8]) -> Result<usize, ResultCode> {
-        let stream = self.ssl_stream.as_mut().ok_or(RESULT_INTERNAL_ERROR)?;
+        let Some(TlsStreamState::Connected(stream)) = self.stream_state.as_mut() else {
+            return Err(RESULT_INTERNAL_ERROR);
+        };
 
         match stream.ssl_read(data) {
             Ok(0) => {
@@ -314,7 +314,9 @@ impl SslConnectionBackend for SslConnectionBackendOpenSsl {
     /// Corresponds to `SSLConnectionBackendOpenSSL::Write` in upstream.
     /// Upstream: SSL_write_ex(ssl, data, size, &actual) then HandleReturn.
     fn write(&mut self, data: &[u8]) -> Result<usize, ResultCode> {
-        let stream = self.ssl_stream.as_mut().ok_or(RESULT_INTERNAL_ERROR)?;
+        let Some(TlsStreamState::Connected(stream)) = self.stream_state.as_mut() else {
+            return Err(RESULT_INTERNAL_ERROR);
+        };
 
         match stream.ssl_write(data) {
             Ok(n) => Ok(n),
@@ -338,7 +340,9 @@ impl SslConnectionBackend for SslConnectionBackendOpenSsl {
     /// Upstream: SSL_get_peer_cert_chain, then i2d_X509 for each cert to get
     /// DER-encoded bytes.
     fn get_server_certs(&self) -> Result<Vec<Vec<u8>>, ResultCode> {
-        let stream = self.ssl_stream.as_ref().ok_or(RESULT_INTERNAL_ERROR)?;
+        let Some(TlsStreamState::Connected(stream)) = self.stream_state.as_ref() else {
+            return Err(RESULT_INTERNAL_ERROR);
+        };
 
         let ssl = stream.ssl();
         let chain = ssl.peer_cert_chain().ok_or_else(|| {
@@ -366,12 +370,7 @@ impl SslConnectionBackend for SslConnectionBackendOpenSsl {
 ///
 /// Corresponds to `CreateSSLConnectionBackend` in upstream ssl_backend_openssl.cpp.
 pub fn create_ssl_connection_backend() -> Result<Box<dyn SslConnectionBackend>, ResultCode> {
-    if !is_initialized() {
-        log::error!("Can't create SSL connection because OpenSSL one-time initialization failed");
-        return Err(RESULT_INTERNAL_ERROR);
-    }
-
-    let backend = SslConnectionBackendOpenSsl::new();
+    let backend = SslConnectionBackendOpenSsl::new()?;
     Ok(Box::new(backend))
 }
 
@@ -413,5 +412,44 @@ mod tests {
         let backend = create_ssl_connection_backend().unwrap();
         let result = backend.get_server_certs();
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonblocking_handshake_retains_mid_handshake_state() {
+        let mut sockets = [-1; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sockets.as_mut_ptr(),) },
+            0
+        );
+
+        let flags = unsafe { libc::fcntl(sockets[0], libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_eq!(
+            unsafe { libc::fcntl(sockets[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+
+        let mut backend = SslConnectionBackendOpenSsl::new().unwrap();
+        backend.set_socket(sockets[0]);
+        backend.set_host_name("localhost");
+        unsafe {
+            libc::close(sockets[0]);
+        }
+
+        assert_eq!(backend.do_handshake(), RESULT_WOULD_BLOCK);
+        assert!(matches!(
+            backend.stream_state,
+            Some(TlsStreamState::Handshaking(_))
+        ));
+        assert_eq!(backend.do_handshake(), RESULT_WOULD_BLOCK);
+        assert!(matches!(
+            backend.stream_state,
+            Some(TlsStreamState::Handshaking(_))
+        ));
+
+        unsafe {
+            libc::close(sockets[1]);
+        }
     }
 }

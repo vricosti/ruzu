@@ -4,8 +4,11 @@
 //! Port of zuyu/src/core/internal_network/sockets.h and sockets.cpp (partial)
 //! Socket abstraction layer.
 
+#[cfg(unix)]
+use crate::internal_network::network::get_interrupt_socket;
 use crate::internal_network::network::{
-    Domain, Errno, Protocol, ProxyPacket, ShutdownHow, SockAddrIn, Type,
+    Domain, Errno, PollEvents as NetworkPollEvents, Protocol, ProxyPacket, ShutdownHow, SockAddrIn,
+    Type,
 };
 
 /// Socket base trait.
@@ -145,9 +148,72 @@ fn get_last_error() -> Errno {
     }
 }
 
+#[cfg(unix)]
+fn translate_poll_events(mut events: NetworkPollEvents) -> i16 {
+    let mut result = 0;
+    macro_rules! translate {
+        ($event:ident, $native:ident) => {
+            if events.contains(NetworkPollEvents::$event) {
+                events.remove(NetworkPollEvents::$event);
+                result |= libc::$native;
+            }
+        };
+    }
+
+    translate!(IN, POLLIN);
+    translate!(PRI, POLLPRI);
+    translate!(OUT, POLLOUT);
+    translate!(ERR, POLLERR);
+    translate!(HUP, POLLHUP);
+    translate!(NVAL, POLLNVAL);
+    translate!(RD_NORM, POLLRDNORM);
+    translate!(RD_BAND, POLLRDBAND);
+    translate!(WR_BAND, POLLWRBAND);
+
+    if !events.is_empty() {
+        log::warn!("Unhandled poll events={:#x}", events.bits());
+    }
+    result
+}
+
+#[cfg(unix)]
+fn translate_poll_revents(mut revents: i16) -> NetworkPollEvents {
+    let mut result = NetworkPollEvents::empty();
+    macro_rules! translate {
+        ($native:ident, $event:ident) => {
+            if revents & libc::$native != 0 {
+                revents &= !libc::$native;
+                result.insert(NetworkPollEvents::$event);
+            }
+        };
+    }
+
+    translate!(POLLIN, IN);
+    translate!(POLLPRI, PRI);
+    translate!(POLLOUT, OUT);
+    translate!(POLLERR, ERR);
+    translate!(POLLHUP, HUP);
+    translate!(POLLNVAL, NVAL);
+    translate!(POLLRDNORM, RD_NORM);
+    translate!(POLLRDBAND, RD_BAND);
+    translate!(POLLWRBAND, WR_BAND);
+
+    if revents != 0 {
+        log::warn!("Unhandled host poll revents={revents:#x}");
+    }
+    result
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::internal_network::network::{
+        cancel_pending_socket_operations, restart_socket_operations, NetworkInstance,
+    };
+    use std::sync::{mpsc, Mutex};
+    use std::time::Duration;
+
+    static INTERRUPT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn sockaddr_in_preserves_network_order_bytes() {
@@ -165,6 +231,82 @@ mod tests {
         assert_eq!(round_trip.family, guest.family);
         assert_eq!(round_trip.ip, guest.ip);
         assert_eq!(round_trip.portno, guest.portno);
+    }
+
+    #[test]
+    fn poll_event_translation_uses_native_values() {
+        assert_eq!(
+            translate_poll_events(NetworkPollEvents::WR_BAND),
+            libc::POLLWRBAND
+        );
+        assert_eq!(
+            translate_poll_revents(libc::POLLWRBAND),
+            NetworkPollEvents::WR_BAND
+        );
+    }
+
+    #[test]
+    fn pending_poll_is_cancelled_by_network_interrupt() {
+        let _test_guard = INTERRUPT_TEST_LOCK.lock().unwrap();
+        let first_instance = NetworkInstance::new();
+        let _second_instance = NetworkInstance::new();
+        restart_socket_operations();
+
+        // Dropping one Rust System must not close the process-global pipe while
+        // another System still owns its NetworkInstance.
+        drop(first_instance);
+
+        let (sender, receiver) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut pollfds = [];
+            sender.send(poll(&mut pollfds, -1)).unwrap();
+        });
+
+        cancel_pending_socket_operations();
+        let result = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("network interrupt did not release poll");
+        thread.join().unwrap();
+        restart_socket_operations();
+
+        assert_eq!(result, (1, Errno::Success));
+    }
+
+    #[test]
+    fn blocking_accept_is_cancelled_by_network_interrupt() {
+        let _test_guard = INTERRUPT_TEST_LOCK.lock().unwrap();
+        let _network_instance = NetworkInstance::new();
+        restart_socket_operations();
+
+        let mut listener = Socket::new();
+        assert_eq!(
+            listener.initialize(Domain::INET, Type::STREAM, Protocol::TCP),
+            Errno::Success
+        );
+        assert_eq!(
+            listener.bind(SockAddrIn {
+                family: Some(Domain::INET),
+                ip: [127, 0, 0, 1],
+                portno: 0,
+            }),
+            Errno::Success
+        );
+        assert_eq!(listener.listen(1), Errno::Success);
+
+        let (sender, receiver) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let (accepted, error) = listener.accept();
+            sender.send((accepted.socket.is_none(), error)).unwrap();
+        });
+
+        cancel_pending_socket_operations();
+        let result = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("network interrupt did not release accept");
+        thread.join().unwrap();
+        restart_socket_operations();
+
+        assert_eq!(result, (true, Errno::Again));
     }
 }
 
@@ -247,6 +389,38 @@ impl SocketBase for Socket {
         {
             let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
             let mut addrlen: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in>() as u32;
+
+            if !self.is_non_blocking {
+                let mut host_pollfds = [
+                    libc::pollfd {
+                        fd: self.fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: get_interrupt_socket(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+
+                loop {
+                    let poll_result = unsafe {
+                        libc::poll(
+                            host_pollfds.as_mut_ptr(),
+                            host_pollfds.len() as libc::nfds_t,
+                            -1,
+                        )
+                    };
+                    if host_pollfds[1].revents != 0 {
+                        return (AcceptResult::default(), Errno::Again);
+                    }
+                    if poll_result > 0 {
+                        break;
+                    }
+                }
+            }
+
             let new_fd = unsafe {
                 libc::accept(
                     self.fd,
@@ -614,20 +788,26 @@ impl SocketBase for Socket {
 pub fn poll(pollfds: &mut [PollFD], timeout: i32) -> (i32, Errno) {
     #[cfg(unix)]
     {
+        let num = pollfds.len();
         let mut fds: Vec<libc::pollfd> = pollfds
             .iter()
             .map(|pfd| libc::pollfd {
                 fd: pfd.fd,
-                events: pfd.events as i16,
+                events: translate_poll_events(NetworkPollEvents::from_bits_retain(pfd.events)),
                 revents: 0,
             })
             .collect();
+        fds.push(libc::pollfd {
+            fd: get_interrupt_socket(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
 
         let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
 
         if result >= 0 {
-            for (i, fd) in fds.iter().enumerate() {
-                pollfds[i].revents = fd.revents as u16;
+            for (i, fd) in fds.iter().take(num).enumerate() {
+                pollfds[i].revents = translate_poll_revents(fd.revents).bits();
             }
             (result, Errno::Success)
         } else {

@@ -186,20 +186,44 @@ impl Drop for NetworkInstance {
 
 /// Interrupt pipe for cancelling blocking socket operations.
 /// Upstream uses a pipe fd pair (Unix) or event object (Windows).
-static INTERRUPT_PIPE: std::sync::Mutex<[i32; 2]> = std::sync::Mutex::new([-1, -1]);
+#[cfg(unix)]
+struct InterruptPipeState {
+    fds: [i32; 2],
+    // Rust tests can own multiple Systems concurrently; keep upstream's
+    // process-global pipe alive until the final NetworkInstance is dropped.
+    owners: usize,
+}
+
+#[cfg(unix)]
+static INTERRUPT_PIPE: std::sync::Mutex<InterruptPipeState> =
+    std::sync::Mutex::new(InterruptPipeState {
+        fds: [-1, -1],
+        owners: 0,
+    });
 
 /// Platform-specific network initialization.
 /// Port of upstream `Network::Initialize`.
 fn initialize() {
     #[cfg(unix)]
     {
-        let mut pipe_fds = INTERRUPT_PIPE.lock().unwrap();
-        if pipe_fds[0] == -1 {
+        let mut state = INTERRUPT_PIPE.lock().unwrap();
+        if state.owners == 0 {
             let mut fds = [0i32; 2];
-            if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
-                *pipe_fds = fds;
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                log::error!("Failed to create interrupt pipe");
+                return;
             }
+
+            let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFL) };
+            assert!(flags >= 0, "Failed to get interrupt pipe flags");
+            assert_eq!(
+                unsafe { libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                0,
+                "Failed to set nonblocking state for interrupt pipe"
+            );
+            state.fds = fds;
         }
+        state.owners += 1;
     }
 }
 
@@ -208,15 +232,30 @@ fn initialize() {
 fn finalize() {
     #[cfg(unix)]
     {
-        let mut pipe_fds = INTERRUPT_PIPE.lock().unwrap();
-        if pipe_fds[0] != -1 {
-            unsafe {
-                libc::close(pipe_fds[0]);
-                libc::close(pipe_fds[1]);
-            }
-            *pipe_fds = [-1, -1];
+        let mut state = INTERRUPT_PIPE.lock().unwrap();
+        if state.owners == 0 {
+            return;
         }
+
+        state.owners -= 1;
+        if state.owners != 0 {
+            return;
+        }
+
+        if state.fds[0] >= 0 {
+            unsafe { libc::close(state.fds[0]) };
+        }
+        if state.fds[1] >= 0 {
+            unsafe { libc::close(state.fds[1]) };
+        }
+        state.fds = [-1, -1];
     }
+}
+
+/// Return the read side of the socket-operation interrupt pipe.
+#[cfg(unix)]
+pub(crate) fn get_interrupt_socket() -> i32 {
+    INTERRUPT_PIPE.lock().unwrap().fds[0]
 }
 
 /// Cancel pending socket operations by writing to the interrupt pipe.
@@ -224,12 +263,21 @@ fn finalize() {
 pub fn cancel_pending_socket_operations() {
     #[cfg(unix)]
     {
-        let pipe_fds = INTERRUPT_PIPE.lock().unwrap();
-        if pipe_fds[1] != -1 {
-            let buf = [0u8; 1];
-            unsafe {
-                libc::write(pipe_fds[1], buf.as_ptr() as *const libc::c_void, 1);
-            }
+        let state = INTERRUPT_PIPE.lock().unwrap();
+        if state.fds[1] < 0 {
+            return;
+        }
+
+        let value = 0u8;
+        let written = unsafe {
+            libc::write(
+                state.fds[1],
+                &value as *const u8 as *const libc::c_void,
+                std::mem::size_of_val(&value),
+            )
+        };
+        if written != 1 {
+            log::error!("Failed to interrupt pending socket operations");
         }
     }
 }
@@ -239,11 +287,24 @@ pub fn cancel_pending_socket_operations() {
 pub fn restart_socket_operations() {
     #[cfg(unix)]
     {
-        let pipe_fds = INTERRUPT_PIPE.lock().unwrap();
-        if pipe_fds[0] != -1 {
-            let mut buf = [0u8; 1];
-            unsafe {
-                libc::read(pipe_fds[0], buf.as_mut_ptr() as *mut libc::c_void, 1);
+        let state = INTERRUPT_PIPE.lock().unwrap();
+        if state.fds[0] < 0 {
+            return;
+        }
+
+        let mut value = 0u8;
+        let read = unsafe {
+            libc::read(
+                state.fds[0],
+                &mut value as *mut u8 as *mut libc::c_void,
+                std::mem::size_of_val(&value),
+            )
+        };
+        if read != 1 {
+            let error = std::io::Error::last_os_error();
+            let raw_error = error.raw_os_error();
+            if raw_error != Some(libc::EAGAIN) && raw_error != Some(libc::EWOULDBLOCK) {
+                log::error!("Failed to acknowledge interrupt on shutdown: {error}");
             }
         }
     }

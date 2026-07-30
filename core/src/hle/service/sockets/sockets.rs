@@ -238,41 +238,25 @@ pub struct Linger {
 pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
+    use std::sync::{Arc, Mutex};
 
     let server_manager = ServerManager::new_shared(system);
 
     {
         let mut server_manager = server_manager.lock().unwrap();
-        server_manager.register_named_service(
-            "bsd:s",
-            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Bsd::new(true)) }),
-            16,
-        );
-        server_manager.register_named_service(
-            "bsd:u",
-            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Bsd::new(false)) }),
-            16,
-        );
-        server_manager.register_named_service(
-            "bsdcfg",
-            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BsdCfg::new()) }),
-            16,
-        );
-        server_manager.register_named_service(
-            "nsd:a",
-            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Nsd::new("nsd:a")) }),
-            16,
-        );
-        server_manager.register_named_service(
-            "nsd:u",
-            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Nsd::new("nsd:u")) }),
-            16,
-        );
-        server_manager.register_named_service(
-            "sfdnsres",
-            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Sfdnsres::new()) }),
-            16,
-        );
+        let bsd_s: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new(true)));
+        let bsd_u: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new(false)));
+        let bsdcfg: SessionRequestHandlerPtr = Arc::new(BsdCfg::new());
+        let nsd_a: SessionRequestHandlerPtr = Arc::new(Nsd::new("nsd:a"));
+        let nsd_u: SessionRequestHandlerPtr = Arc::new(Nsd::new("nsd:u"));
+        let sfdnsres: SessionRequestHandlerPtr = Arc::new(Sfdnsres::new());
+
+        server_manager.register_named_service_handler("bsd:s", bsd_s, 64);
+        server_manager.register_named_service_handler("bsd:u", bsd_u, 64);
+        server_manager.register_named_service_handler("bsdcfg", bsdcfg, 64);
+        server_manager.register_named_service_handler("nsd:a", nsd_a, 64);
+        server_manager.register_named_service_handler("nsd:u", nsd_u, 64);
+        server_manager.register_named_service_handler("sfdnsres", sfdnsres, 64);
     }
 
     // Wait for the main thread to finish spawning all initial services before

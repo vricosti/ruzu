@@ -936,6 +936,10 @@ pub struct System {
     /// Upstream: `std::unique_ptr<Core::TelemetrySession> telemetry_session`.
     telemetry_session: Option<crate::telemetry_session::TelemetrySession>,
 
+    /// Platform network initialization and interrupt-pipe lifetime.
+    /// Upstream: `Network::NetworkInstance network_instance`.
+    _network_instance: crate::internal_network::network::NetworkInstance,
+
     /// Host1x subsystem (syncpoint manager, device memory, GMMU, CDMA devices).
     /// Upstream: `std::unique_ptr<Tegra::Host1x::Host1x> host1x_core`.
     /// Stored behind an opaque bridge so `core` keeps upstream ownership
@@ -1085,6 +1089,7 @@ impl System {
             hid_core,
             kernel: None,
             telemetry_session: None,
+            _network_instance: crate::internal_network::network::NetworkInstance::new(),
             host1x_core: None,
             gpu_core: None,
             audio_core: None,
@@ -1761,6 +1766,7 @@ impl System {
         }
 
         self.core_timing.sync_pause(false);
+        crate::internal_network::network::cancel_pending_socket_operations();
         if let Some(ref kernel) = self.kernel {
             kernel.suspend_emulation(true);
             kernel.close_services();
@@ -1792,6 +1798,7 @@ impl System {
         if let Some(ref mut kernel) = self.kernel {
             kernel.shutdown();
         }
+        crate::internal_network::network::restart_socket_operations();
 
         log::info!("System: shutdown complete");
     }

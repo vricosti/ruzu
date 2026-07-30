@@ -27897,3 +27897,126 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 
 ### Binary layout verification
 - PASS: serialized `code` fields retain the same integer values as upstream.
+
+## 2026-07-30 — core/src/hle/service/sockets/sockets.rs vs zuyu/src/core/hle/service/sockets/sockets.cpp
+
+### Intentional differences
+- `BSD` is wrapped in `Mutex` because Rust service callbacks receive `&self`; the mutex supplies upstream `BSD::LockService` serialization while retaining one shared service object.
+
+### Unintentional differences (to fix)
+- Fixed: every socket service is now registered as one shared handler instance, matching upstream `std::make_shared`; the previous factories created a new descriptor table for each lookup/session.
+- Fixed: socket services now use the upstream default 64-session limit instead of 16.
+
+### Missing items
+- No additional registration-parity item was identified in this slice.
+
+### Binary layout verification
+- PASS: service registration has no shared binary payload.
+
+## 2026-07-30 — core/src/hle/service/sockets/bsd.rs vs zuyu/src/core/hle/service/sockets/bsd.{h,cpp}
+
+### Intentional differences
+- `get_socket_mut` is the Rust mutable-borrow counterpart to upstream `GetSocket`, whose returned `shared_ptr<SocketBase>` permits SSL to call `SetNonBlock`.
+- `SessionRequestHandler for Mutex<Bsd>` keeps the shared descriptor table serialized while dispatching the existing upstream-owned `Bsd` handlers.
+
+### Unintentional differences (to fix)
+- Existing debt: `DuplicateSocketImpl` duplicates the host descriptor, while upstream copies the `shared_ptr<SocketBase>` entry. Converting the descriptor table to shared socket ownership is a separate structural slice.
+
+### Missing items
+- Shared `SocketBase` ownership for duplicated BSD descriptors remains to be ported.
+
+### Binary layout verification
+- PASS: this slice changes service ownership only and introduces no IPC payload.
+
+## 2026-07-30 — core/src/hle/service/ssl/ssl.rs vs zuyu/src/core/hle/service/ssl/ssl.cpp
+
+### Intentional differences
+- Connection-mutating fields live in a local `Mutex<SslConnectionState>` because Rust callbacks receive `&self`; method ownership and upstream operation ordering remain in `ssl.rs`.
+- Rust retains the guest BSD descriptor and resolves it under the shared BSD mutex for `SetIoMode`; upstream retains a `shared_ptr<SocketBase>`.
+
+### Unintentional differences (to fix)
+- Fixed: ported the complete 0–35 `ISslConnection` command table and upstream implementations for socket setup, hostname, I/O mode, handshake, certificate-chain handshake, read, write, pending, session-cache mode, options, and lifecycle cleanup.
+- Fixed: `ISslContext::CreateConnection` now constructs the SSL backend and returns the connection interface; it was previously unimplemented.
+- Fixed: SSL service/context/connection objects now retain upstream's `System` owner and shared connection count.
+
+### Missing items
+- Existing service-level `GetCertificates` and `GetCertificateBufSize` commands remain disconnected from the already-ported certificate store.
+
+### Binary layout verification
+- PASS: context creation, connection options, and handshake certificate output are asserted as 0x10, 0x8, and 0x8 bytes respectively.
+
+## 2026-07-30 — core/src/hle/service/ssl/ssl_backend_openssl.rs vs zuyu/src/core/hle/service/ssl/ssl_backend_openssl.cpp
+
+### Intentional differences
+- Rust uses the `openssl` crate's `SslConnector` and `TcpStream` integration over a duplicated native descriptor instead of raw OpenSSL BIO callbacks over `SocketBase`.
+
+### Unintentional differences (to fix)
+- Fixed: one process-wide connector now owns the trust-store and key-log configuration, matching upstream's one-time `SSL_CTX` initialization.
+- Fixed: `MidHandshakeSslStream` is retained after `WANT_READ`/`WANT_WRITE` and resumed on the next `DoHandshake`, matching repeated `SSL_do_handshake` calls on one upstream `SSL*`.
+
+### Missing items
+- Proxy/non-native `SocketBase` transports still require a Rust BIO adapter; the current native-descriptor adapter covers host sockets.
+
+### Binary layout verification
+- PASS: the backend exchanges typed buffers and has no raw shared structure.
+
+## 2026-07-30 — core/src/internal_network/network.rs vs zuyu/src/core/internal_network/network.{h,cpp}
+
+### Intentional differences
+- The process-global Unix interrupt-pipe state is protected by a Rust `Mutex`
+  and reference-counts `NetworkInstance` owners. Upstream has one `System` and
+  raw global descriptors; Rust tests may construct multiple `System` values in
+  parallel, so the final owner alone closes the same process-global resource.
+
+### Unintentional differences (to fix)
+- Fixed: `NetworkInstance` now creates the Unix pipe and makes its read side
+  nonblocking, matching upstream `Initialize`.
+- Fixed: cancellation writes one byte and restart acknowledges one byte with
+  upstream's `EAGAIN`/`EWOULDBLOCK` handling.
+
+### Missing items
+- The Windows `WSAStartup` and interrupt-socket implementation remains part of
+  the existing non-Unix networking gap.
+
+### Binary layout verification
+- PASS: the interrupt pipe is host-only and introduces no guest payload.
+
+## 2026-07-30 — core/src/internal_network/sockets.rs vs zuyu/src/core/internal_network/network.{h,cpp}
+
+### Intentional differences
+- Rust `PollFD` carries a native descriptor instead of upstream's
+  `SocketBase*`; the translation and interruption behavior is otherwise kept
+  in the corresponding socket implementation.
+
+### Unintentional differences (to fix)
+- Fixed: `poll` now appends the upstream interrupt descriptor and returns its
+  readiness count while copying revents only to guest-requested descriptors.
+- Fixed: blocking `accept` now waits on both the listener and interrupt
+  descriptor and returns `Again` when shutdown wins the wait.
+- Fixed: poll events now use explicit host translation; the previous raw
+  bit-cast mapped `WR_BAND` incorrectly on Linux.
+
+### Missing items
+- Native Windows socket operations remain unimplemented in this Rust module.
+
+### Binary layout verification
+- PASS: the existing guest `PollFD` payload is unchanged.
+
+## 2026-07-30 — core/src/core.rs vs zuyu/src/core/core.cpp
+
+### Intentional differences
+- Rust stores upstream `System::Impl` members directly in `System`; the
+  `NetworkInstance` remains owned at that same system lifetime.
+
+### Unintentional differences (to fix)
+- Fixed: `System` now owns `NetworkInstance`.
+- Fixed: shutdown signals pending network operations after unpausing core
+  timing and acknowledges the signal after kernel shutdown, matching upstream
+  ordering.
+
+### Missing items
+- Upstream's `stop_event` request/reset lifecycle has no direct counterpart in
+  this focused network-shutdown slice.
+
+### Binary layout verification
+- PASS: no guest-facing or serialized structure changed.
