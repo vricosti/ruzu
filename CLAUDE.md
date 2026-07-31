@@ -616,4 +616,8 @@ env XDG_CACHE_HOME=/tmp/ruzu-cache \
     RUST_LOG=info cargo run --bin ruzu-cmd -- -g "/path/to/game.nsp"
 ```
 
-**Do NOT override `XDG_DATA_HOME`.** Ruzu's `PathManager` falls back to `$XDG_DATA_HOME/yuzu/nand` when its own `$XDG_DATA_HOME/ruzu/nand/system/Contents/registered` is empty (see `common/src/fs/path_util.rs::should_use_legacy_yuzu_root`). Pointing `XDG_DATA_HOME` at a fresh `/tmp` dir breaks that fallback: both the primary (`/tmp/.../ruzu/nand`) and the legacy (`/tmp/.../yuzu/nand`) are empty, so ruzu synthesizes placeholder system archives. Letting `XDG_DATA_HOME` default to `~/.local/share` preserves access to the real 229-NCA yuzu NAND while still isolating cache/config.
+Ruzu owns its complete application-data tree. On Unix, overriding `XDG_DATA_HOME`
+selects a separate Ruzu NAND beneath that location; on Windows the default root
+is `%APPDATA%/ruzu`. Ruzu never borrows yuzu's NAND, keys, SDMC, or caches. The
+only yuzu data read by the GTK frontend is a compatible INI selected for the
+one-time configuration import, which is copied into Ruzu's own config directory.

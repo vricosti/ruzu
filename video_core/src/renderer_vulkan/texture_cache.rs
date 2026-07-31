@@ -9,7 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ash::vk;
 use ash::vk::Handle;
@@ -23,7 +23,9 @@ use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::surface::{PixelFormat, SurfaceType};
 use crate::texture_cache::image_base::{AliasedImage, ImageBase, ImageFlagBits};
 use crate::texture_cache::image_info::ImageInfo;
-use crate::texture_cache::image_view_base::{ImageViewBase, ImageViewFlagBits};
+use crate::texture_cache::image_view_base::{
+    ImageViewBase, ImageViewFlagBits, NullImageViewParams,
+};
 use crate::texture_cache::image_view_info::ImageViewInfo;
 use crate::texture_cache::render_targets::RenderTargets;
 use crate::texture_cache::texture_cache_base::TICKS_TO_DESTROY;
@@ -60,6 +62,36 @@ use crate::vulkan_common::vulkan_device::{
     query_device_memory_info, query_device_memory_usage, DeviceMemoryInfo,
 };
 use crate::vulkan_common::vulkan_memory_allocator::{AllocatedImage, MemoryAllocator, MemoryUsage};
+
+fn vulkan_texture_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_VK_TRACE_DRAWS").is_some())
+}
+
+fn format_buffer_image_copy_trace(copies: &[BufferImageCopy]) -> String {
+    copies
+        .iter()
+        .map(|copy| {
+            format!(
+                "buffer=0x{:X}+0x{:X}/row={}/height={} subresource={}:{}+{} offset={},{},{} extent={}x{}x{}",
+                copy.buffer_offset,
+                copy.buffer_size,
+                copy.buffer_row_length,
+                copy.buffer_image_height,
+                copy.image_subresource.base_level,
+                copy.image_subresource.base_layer,
+                copy.image_subresource.num_layers,
+                copy.image_offset.x,
+                copy.image_offset.y,
+                copy.image_offset.z,
+                copy.image_extent.width,
+                copy.image_extent.height,
+                copy.image_extent.depth,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
 
 fn convert_border_color(color: [f32; 4]) -> vk::BorderColor {
     if color == [0.0, 0.0, 0.0, 0.0] {
@@ -561,6 +593,28 @@ impl Image {
         let aspect = self.aspect_mask();
         let vk_copies = transform_buffer_image_copies(copies, staging_offset, aspect);
 
+        if vulkan_texture_trace_enabled() {
+            log::info!(
+                "[VK_IMAGE_UPLOAD_TRACE] tick={} image_id={} image=0x{:X} format={:?}/{:?} type={:?} size={}x{}x{} levels={} layers={} aspect={:?} initialized_before={} staging=0x{:X}@0x{:X} copies=[{}]",
+                runtime.scheduler().pending_tick(),
+                self.image_id.index,
+                image.as_raw(),
+                self.base.info.format,
+                self.format,
+                self.base.info.image_type,
+                self.base.info.size.width,
+                self.base.info.size.height,
+                self.base.info.size.depth,
+                self.base.info.resources.levels,
+                self.base.info.resources.layers,
+                aspect,
+                is_initialized,
+                staging_buffer.as_raw(),
+                staging_offset,
+                format_buffer_image_copy_trace(copies),
+            );
+        }
+
         let device = runtime.device().clone();
         let scheduler = runtime.scheduler();
         scheduler.request_outside_renderpass();
@@ -711,6 +765,9 @@ pub struct ImageView {
         [vk::ImageView; shader_recompiler::shader_info::NUM_TEXTURE_TYPES as usize],
     pub storage_unsigneds:
         [vk::ImageView; shader_recompiler::shader_info::NUM_TEXTURE_TYPES as usize],
+    /// Dedicated fallback image owned by upstream's null `ImageView` on
+    /// devices without `nullDescriptor` support.
+    pub null_image: Option<AllocatedImage>,
     pub samples: vk::SampleCountFlags,
     pub buffer_size: u32,
 }
@@ -1031,6 +1088,7 @@ pub struct TextureCacheRuntime {
     optimal_astc_supported: bool,
     image_format_list_supported: bool,
     custom_border_color_supported: bool,
+    has_null_descriptor: bool,
 }
 
 impl TextureCacheRuntime {
@@ -1050,6 +1108,7 @@ impl TextureCacheRuntime {
         image_format_list_supported: bool,
         optimal_astc_supported: bool,
         custom_border_color_supported: bool,
+        has_null_descriptor: bool,
     ) -> Self {
         let device_memory_info = query_device_memory_info(&instance, physical_device);
         let storage_image_multisample_supported = unsafe {
@@ -1114,6 +1173,7 @@ impl TextureCacheRuntime {
             optimal_astc_supported,
             image_format_list_supported,
             custom_border_color_supported,
+            has_null_descriptor,
         };
         runtime.initialize_view_formats();
         runtime
@@ -1143,7 +1203,7 @@ impl TextureCacheRuntime {
                 let view_format =
                     unsafe { std::mem::transmute::<u32, PixelFormat>(view_index as u32) };
                 if crate::surface::is_view_compatible(image_format, view_format, false, true) {
-                    let format = self.surface_format_info(view_format).format;
+                    let format = self.surface_format_info(view_format, true).format;
                     if format != vk::Format::UNDEFINED && !formats.contains(&format) {
                         formats.push(format);
                     }
@@ -1897,11 +1957,18 @@ impl TextureCacheRuntime {
     /// actual image/view format must be selected through the device's supported
     /// alternatives. This matters on MoltenVK where D24S8 is not natively
     /// supported and must resolve to D32S8 before image/view creation.
-    fn surface_format_info(&self, format: PixelFormat) -> maxwell_to_vk::FormatInfo {
-        let mut format_info = maxwell_to_vk::surface_format(format);
-        if crate::surface::is_pixel_format_bcn(format) && !self.optimal_bcn_supported {
-            format_info.format = bcn_transcoded_format(format);
-        }
+    fn surface_format_info(
+        &self,
+        format: PixelFormat,
+        with_srgb: bool,
+    ) -> maxwell_to_vk::FormatInfo {
+        let mut format_info = maxwell_to_vk::surface_format_with_recompression(
+            format,
+            with_srgb,
+            self.optimal_astc_supported,
+            self.optimal_bcn_supported,
+            *common::settings::values().astc_recompression.get_value(),
+        );
         let mut usage = vk::FormatFeatureFlags::SAMPLED_IMAGE
             | vk::FormatFeatureFlags::TRANSFER_DST
             | vk::FormatFeatureFlags::TRANSFER_SRC;
@@ -1921,8 +1988,8 @@ impl TextureCacheRuntime {
         format_info
     }
 
-    fn surface_format(&self, format: PixelFormat) -> vk::Format {
-        self.surface_format_info(format).format
+    fn surface_format(&self, format: PixelFormat, with_srgb: bool) -> vk::Format {
+        self.surface_format_info(format, with_srgb).format
     }
 
     fn supported_surface_format(
@@ -1961,7 +2028,8 @@ impl TextureCacheRuntime {
         image: &mut Image,
         level: u32,
     ) -> Result<vk::ImageView, vk::Result> {
-        self.storage_image_view_with_format(image, level, image.format)
+        let format = self.surface_format(image.base.info.format, true);
+        self.storage_image_view_with_format(image, level, format)
     }
 
     fn storage_image_view_with_format(
@@ -2332,7 +2400,7 @@ impl TextureCacheRuntime {
     }
 
     fn create_image_from_info(&mut self, info: &ImageInfo) -> Result<AllocatedImage, vk::Result> {
-        let format_info = self.surface_format_info(info.format);
+        let format_info = self.surface_format_info(info.format, false);
         let mut image_info = make_image_create_info(info, format_info);
         let view_formats = self.view_formats[info.format as usize].clone();
         let mut format_list = vk::ImageFormatListCreateInfo::builder()
@@ -2349,18 +2417,99 @@ impl TextureCacheRuntime {
             .map_err(|err| err.result)
     }
 
+    /// Port of `Vulkan::ImageView(TextureCacheRuntime&, NullImageViewParams)`.
+    fn make_null_image_view(&mut self) -> Result<ImageView, vk::Result> {
+        let base = ImageViewBase::null(NullImageViewParams);
+        if self.has_null_descriptor {
+            return Ok(ImageView {
+                view_id: NULL_IMAGE_VIEW_ID,
+                base,
+                image_handle: vk::Image::null(),
+                image_views: [vk::ImageView::null();
+                    shader_recompiler::shader_info::NUM_TEXTURE_TYPES as usize],
+                render_target: vk::ImageView::null(),
+                depth_view: vk::ImageView::null(),
+                stencil_view: vk::ImageView::null(),
+                color_view: vk::ImageView::null(),
+                storage_signeds: [vk::ImageView::null();
+                    shader_recompiler::shader_info::NUM_TEXTURE_TYPES as usize],
+                storage_unsigneds: [vk::ImageView::null();
+                    shader_recompiler::shader_info::NUM_TEXTURE_TYPES as usize],
+                null_image: None,
+                samples: vk::SampleCountFlags::TYPE_1,
+                buffer_size: 0,
+            });
+        }
+
+        let info = null_image_info();
+        let format_info = self.surface_format_info(info.format, false);
+        let image_info = make_image_create_info(&info, format_info);
+        // Upstream passes an empty view-format span for the fallback image.
+        let null_image = self
+            .memory_allocator()
+            .create_owned_image(&image_info)
+            .map_err(|err| err.result)?;
+        let image_handle = null_image.handle();
+        let mut image_views =
+            [vk::ImageView::null(); shader_recompiler::shader_info::NUM_TEXTURE_TYPES as usize];
+        for index in 0..image_views.len() {
+            match self.make_aux_image_view(
+                image_handle,
+                &base,
+                vk::Format::A8B8G8R8_UNORM_PACK32,
+                vk::ImageAspectFlags::COLOR,
+            ) {
+                Ok(view) => image_views[index] = view,
+                Err(err) => {
+                    unsafe {
+                        for &view in &image_views {
+                            if view != vk::ImageView::null() {
+                                self.device.destroy_image_view(view, None);
+                            }
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        Ok(ImageView {
+            view_id: NULL_IMAGE_VIEW_ID,
+            base,
+            image_handle,
+            image_views,
+            render_target: vk::ImageView::null(),
+            depth_view: vk::ImageView::null(),
+            stencil_view: vk::ImageView::null(),
+            color_view: vk::ImageView::null(),
+            storage_signeds: [vk::ImageView::null();
+                shader_recompiler::shader_info::NUM_TEXTURE_TYPES as usize],
+            storage_unsigneds: [vk::ImageView::null();
+                shader_recompiler::shader_info::NUM_TEXTURE_TYPES as usize],
+            null_image: Some(null_image),
+            samples: vk::SampleCountFlags::TYPE_1,
+            buffer_size: 0,
+        })
+    }
+
     fn make_image_view(
         &self,
         view_id: ImageViewId,
         view_base: &ImageViewBase,
         image: &Image,
     ) -> Result<ImageView, vk::Result> {
-        let format_info = self.surface_format_info(view_base.format);
+        let format_info = self.surface_format_info(view_base.format, true);
         let format = format_info.format;
         let aspect_mask = image_view_aspect_mask(view_base);
         let components = image_view_components(view_base);
         let base_range = make_subresource_range(aspect_mask, view_base.range, view_base.flags);
-        let usage = image_usage_flags(format_info, view_base.format);
+        let image_format_info = self.surface_format_info(image.base.info.format, false);
+        let usage = image_view_usage_flags(
+            format_info,
+            view_base.format,
+            image_format_info,
+            image.base.info.format,
+        );
         let mut image_views =
             [vk::ImageView::null(); shader_recompiler::shader_info::NUM_TEXTURE_TYPES as usize];
 
@@ -2429,6 +2578,7 @@ impl TextureCacheRuntime {
                 shader_recompiler::shader_info::NUM_TEXTURE_TYPES as usize],
             storage_unsigneds: [vk::ImageView::null();
                 shader_recompiler::shader_info::NUM_TEXTURE_TYPES as usize],
+            null_image: None,
             samples: convert_sample_count(image.base.info.num_samples),
             buffer_size: image.base.guest_size_bytes,
         })
@@ -2617,13 +2767,13 @@ impl TextureCacheRuntime {
                 self.device.destroy_image_view(handle, None);
             }
         };
-        for handle in view.image_views {
+        for &handle in &view.image_views {
             destroy_once(handle);
         }
-        for handle in view.storage_signeds {
+        for &handle in &view.storage_signeds {
             destroy_once(handle);
         }
-        for handle in view.storage_unsigneds {
+        for &handle in &view.storage_unsigneds {
             destroy_once(handle);
         }
         for handle in [view.depth_view, view.stencil_view, view.color_view] {
@@ -2766,10 +2916,11 @@ impl TextureCache {
         image_format_list_supported: bool,
         optimal_astc_supported: bool,
         custom_border_color_supported: bool,
-    ) -> Self {
+        has_null_descriptor: bool,
+    ) -> Result<Self, vk::Result> {
         let mut base = CommonTextureCache::new(device_memory);
         base.set_backend_completes_join_images(true);
-        let runtime = TextureCacheRuntime::new(
+        let mut runtime = TextureCacheRuntime::new(
             device,
             instance,
             physical_device,
@@ -2783,22 +2934,26 @@ impl TextureCache {
             image_format_list_supported,
             optimal_astc_supported,
             custom_border_color_supported,
+            has_null_descriptor,
         );
         base.configure_device_memory_budget(runtime.get_device_local_memory());
-        Self {
+        let null_image_view = runtime.make_null_image_view()?;
+        let mut image_views = HashMap::new();
+        image_views.insert(NULL_IMAGE_VIEW_ID, null_image_view);
+        Ok(Self {
             base,
             runtime,
             channel_caches: ChannelSetupCaches::new(),
             framebuffers: HashMap::new(),
             images: HashMap::new(),
             framebuffers_by_render_targets: HashMap::new(),
-            image_views: HashMap::new(),
+            image_views,
             samplers: HashMap::new(),
             uncommitted_async_buffers: Vec::new(),
             async_buffers: VecDeque::new(),
             async_buffers_death_ring: Vec::new(),
             texture_decode_worker: ThreadWorker::new_named(1, "TextureDecoder"),
-        }
+        })
     }
 
     pub fn set_guest_memory_writer(&mut self, writer: crate::renderer_base::GuestMemoryWriter) {
@@ -2896,7 +3051,7 @@ impl TextureCache {
                 }
                 let image_id = download_info.object_id;
                 let image_base = self.base.slot_images[image_id].clone();
-                let format = self.runtime.surface_format(image_base.info.format);
+                let format = self.runtime.surface_format(image_base.info.format, false);
                 let aspect = image_aspect_mask(image_base.info.format);
                 if aspect.is_empty()
                     || self
@@ -3030,7 +3185,7 @@ impl TextureCache {
         let copies = [copy];
         if is_upload {
             let image_base = self.base.slot_images[image_id].clone();
-            let format = self.runtime.surface_format(image_base.info.format);
+            let format = self.runtime.surface_format(image_base.info.format, false);
             let aspect = image_aspect_mask(image_base.info.format);
             if aspect.is_empty()
                 || self
@@ -3078,7 +3233,7 @@ impl TextureCache {
 
         let mut image_base = self.base.slot_images[image_id].clone();
         self.apply_backend_image_flags(&mut image_base);
-        let format = self.runtime.surface_format(image_base.info.format);
+        let format = self.runtime.surface_format(image_base.info.format, false);
         let aspect = image_aspect_mask(image_base.info.format);
         if aspect.is_empty()
             || self
@@ -3155,7 +3310,7 @@ impl TextureCache {
         if staging_size == 0 {
             return None;
         }
-        let format = self.runtime.surface_format(image_base.info.format);
+        let format = self.runtime.surface_format(image_base.info.format, false);
         let aspect = image_aspect_mask(image_base.info.format);
         if aspect.is_empty()
             || self
@@ -3264,7 +3419,7 @@ impl TextureCache {
             let height = view.size.height.max(1);
             let image_format = self
                 .runtime
-                .surface_format(self.base.slot_images[view.image_id].info.format);
+                .surface_format(self.base.slot_images[view.image_id].info.format, false);
             let image_aspect = image_aspect_mask(self.base.slot_images[view.image_id].info.format);
             // Per-draw fast path: only clone the ImageBase (six Vecs) and run
             // the full `ensure_image` when the backend image actually needs
@@ -3303,7 +3458,7 @@ impl TextureCache {
             }
             let image_id = self.base.slot_image_views[image_id].image_id;
             let image_base = self.base.slot_images[image_id].clone();
-            let image_format = self.runtime.surface_format(image_base.info.format);
+            let image_format = self.runtime.surface_format(image_base.info.format, false);
             let image_aspect = image_aspect_mask(image_base.info.format);
             recreated |= self
                 .ensure_image(image_id, &image_base, image_format, image_aspect)
@@ -3331,7 +3486,7 @@ impl TextureCache {
             if view.image_id.is_valid() && view.image_id != NULL_IMAGE_ID {
                 let image_format = self
                     .runtime
-                    .surface_format(self.base.slot_images[view.image_id].info.format);
+                    .surface_format(self.base.slot_images[view.image_id].info.format, false);
                 let image_aspect =
                     image_aspect_mask(self.base.slot_images[view.image_id].info.format);
                 let width = view.size.width.max(1);
@@ -3747,7 +3902,7 @@ impl TextureCache {
         if base.flags.contains(ImageFlagBits::CPU_MODIFIED) {
             return false;
         }
-        let format = self.runtime.surface_format(base.info.format);
+        let format = self.runtime.surface_format(base.info.format, false);
         let aspect = image_aspect_mask(base.info.format);
         self.backend_image_matches(image_id, format, aspect)
     }
@@ -3939,7 +4094,7 @@ impl TextureCache {
             return false;
         }
         let image_base = self.base.slot_images[image_id].clone();
-        let format = self.runtime.surface_format(image_base.info.format);
+        let format = self.runtime.surface_format(image_base.info.format, false);
         let aspect = image_aspect_mask(image_base.info.format);
         !aspect.is_empty()
             && self
@@ -4115,7 +4270,7 @@ impl TextureCache {
             return false;
         }
         let image_base = self.base.slot_images[image_id].clone();
-        let format = self.runtime.surface_format(image_base.info.format);
+        let format = self.runtime.surface_format(image_base.info.format, false);
         let aspect = image_aspect_mask(image_base.info.format);
         if aspect.is_empty()
             || self
@@ -4375,7 +4530,7 @@ impl TextureCache {
         }
         let image_base = self.base.slot_images[image_id].clone();
         let aspect = image_aspect_mask(image_base.info.format);
-        let format = self.runtime.surface_format(image_base.info.format);
+        let format = self.runtime.surface_format(image_base.info.format, false);
         if aspect.is_empty()
             || self
                 .ensure_image(image_id, &image_base, format, aspect)
@@ -4896,7 +5051,7 @@ impl TextureCache {
             return true;
         }
         let image_base = self.base.slot_images[image_id].clone();
-        let format = self.runtime.surface_format(image_base.info.format);
+        let format = self.runtime.surface_format(image_base.info.format, false);
         let aspect = image_aspect_mask(image_base.info.format);
         if aspect.is_empty() {
             return false;
@@ -5099,7 +5254,7 @@ impl TextureCache {
 
             if self.base_image_exists(image_id) {
                 let base_image = self.base.slot_images[image_id].clone();
-                let format = self.runtime.surface_format(base_image.info.format);
+                let format = self.runtime.surface_format(base_image.info.format, false);
                 let aspect = image_aspect_mask(base_image.info.format);
                 let upload_ok = !aspect.is_empty()
                     && self
@@ -5299,7 +5454,7 @@ impl TextureCache {
             .ensure_image(
                 dst_id,
                 &dst_base,
-                self.runtime.surface_format(dst_base.info.format),
+                self.runtime.surface_format(dst_base.info.format, false),
                 dst_aspect,
             )
             .is_err()
@@ -5307,7 +5462,7 @@ impl TextureCache {
                 .ensure_image(
                     src_id,
                     &src_base,
-                    self.runtime.surface_format(src_base.info.format),
+                    self.runtime.surface_format(src_base.info.format, false),
                     src_aspect,
                 )
                 .is_err()
@@ -5650,6 +5805,82 @@ impl TextureCache {
         None
     }
 
+    pub(crate) fn sampled_image_view_trace(
+        &self,
+        view_id: ImageViewId,
+        view_handle: vk::ImageView,
+    ) -> String {
+        if !view_id.is_valid()
+            || view_id == NULL_IMAGE_VIEW_ID
+            || !self.base.slot_image_views.contains(view_id)
+        {
+            return format!(
+                "view_id={} view=0x{:X} null",
+                view_id.index,
+                view_handle.as_raw()
+            );
+        }
+        let view = &self.base.slot_image_views[view_id];
+        let image_id = view.image_id;
+        if !image_id.is_valid()
+            || image_id == NULL_IMAGE_ID
+            || !self.base.slot_images.contains(image_id)
+        {
+            return format!(
+                "view_id={} image_id={} view=0x{:X} missing_image",
+                view_id.index,
+                image_id.index,
+                view_handle.as_raw(),
+            );
+        }
+        let base = &self.base.slot_images[image_id];
+        let (image_handle, vk_format, aspect, initialized) = self
+            .images
+            .get(&image_id)
+            .map(|image| {
+                (
+                    image.handle(),
+                    image.format,
+                    image.aspect_mask(),
+                    image.initialized,
+                )
+            })
+            .unwrap_or((
+                vk::Image::null(),
+                vk::Format::UNDEFINED,
+                vk::ImageAspectFlags::empty(),
+                false,
+            ));
+        format!(
+            "view_id={} image_id={} view=0x{:X} image=0x{:X} format={:?}/{:?} type={:?} size={}x{}x{} levels={} layers={} aspect={:?} initialized={} gpu=0x{:X} cpu=0x{:X}",
+            view_id.index,
+            image_id.index,
+            view_handle.as_raw(),
+            image_handle.as_raw(),
+            base.info.format,
+            vk_format,
+            base.info.image_type,
+            base.info.size.width,
+            base.info.size.height,
+            base.info.size.depth,
+            base.info.resources.levels,
+            base.info.resources.layers,
+            aspect,
+            initialized,
+            base.gpu_addr,
+            base.cpu_addr,
+        )
+    }
+
+    /// `slot_image_views[NULL_IMAGE_VIEW_ID].Handle(texture_type)` from
+    /// upstream's texture cache.
+    pub fn null_image_view_handle(&self, texture_type: TextureType) -> vk::ImageView {
+        self.image_views
+            .get(&NULL_IMAGE_VIEW_ID)
+            .map(|view| view.handle(texture_type))
+            .unwrap_or(vk::ImageView::null())
+    }
+
     pub fn image_view_depth_view(&mut self, view_id: ImageViewId) -> Option<vk::ImageView> {
         self.finish_pending_backend_deletions();
         self.ensure_image_view(view_id).ok()?;
@@ -5659,7 +5890,7 @@ impl TextureCache {
         let image_handle = self.image_views.get(&view_id)?.image_handle();
         let format = self
             .runtime
-            .surface_format(self.image_views.get(&view_id)?.base.format);
+            .surface_format(self.image_views.get(&view_id)?.base.format, true);
         let view = self
             .runtime
             .make_aux_image_view(
@@ -5682,7 +5913,7 @@ impl TextureCache {
         let image_handle = self.image_views.get(&view_id)?.image_handle();
         let format = self
             .runtime
-            .surface_format(self.image_views.get(&view_id)?.base.format);
+            .surface_format(self.image_views.get(&view_id)?.base.format, true);
         let view = self
             .runtime
             .make_aux_image_view(
@@ -5724,8 +5955,29 @@ impl TextureCache {
     ) -> Option<vk::ImageView> {
         self.finish_pending_backend_deletions();
         self.ensure_image_view(view_id).ok()?;
+        self.storage_view(view_id, texture_type, image_format)
+    }
+
+    /// `slot_image_views[NULL_IMAGE_VIEW_ID].StorageView(...)` from upstream.
+    pub fn null_storage_image_view(
+        &mut self,
+        texture_type: TextureType,
+        image_format: ImageFormat,
+    ) -> Option<vk::ImageView> {
+        self.storage_view(NULL_IMAGE_VIEW_ID, texture_type, image_format)
+    }
+
+    fn storage_view(
+        &mut self,
+        view_id: ImageViewId,
+        texture_type: TextureType,
+        image_format: ImageFormat,
+    ) -> Option<vk::ImageView> {
+        if self.image_views.get(&view_id)?.image_handle() == vk::Image::null() {
+            return Some(vk::ImageView::null());
+        }
         if image_format == ImageFormat::Typeless {
-            return self.image_view_handle(view_id, texture_type);
+            return Some(self.image_views.get(&view_id)?.handle(texture_type));
         }
         let is_signed = matches!(image_format, ImageFormat::R8Sint | ImageFormat::R16Sint);
         let index = texture_type as usize;
@@ -5920,7 +6172,7 @@ impl TextureCache {
             );
             return None;
         }
-        let format = self.runtime.surface_format(image_base.info.format);
+        let format = self.runtime.surface_format(image_base.info.format, false);
         let aspect = image_aspect_mask(image_base.info.format);
         if aspect.is_empty() {
             return None;
@@ -6197,52 +6449,6 @@ unsafe fn cmd_transition_layout(
     );
 }
 
-fn pixel_format_to_vk(format: PixelFormat) -> vk::Format {
-    match format {
-        PixelFormat::A8B8G8R8Unorm => vk::Format::A8B8G8R8_UNORM_PACK32,
-        PixelFormat::A8B8G8R8Srgb => vk::Format::A8B8G8R8_SRGB_PACK32,
-        PixelFormat::B8G8R8A8Unorm => vk::Format::B8G8R8A8_UNORM,
-        PixelFormat::B8G8R8A8Srgb => vk::Format::B8G8R8A8_SRGB,
-        PixelFormat::R5G6B5Unorm => vk::Format::R5G6B5_UNORM_PACK16,
-        PixelFormat::R8Unorm => vk::Format::R8_UNORM,
-        PixelFormat::R8G8Unorm => vk::Format::R8G8_UNORM,
-        PixelFormat::R16Unorm => vk::Format::R16_UNORM,
-        PixelFormat::R16G16Unorm => vk::Format::R16G16_UNORM,
-        PixelFormat::R16G16B16A16Unorm => vk::Format::R16G16B16A16_UNORM,
-        PixelFormat::R16G16B16A16Float => vk::Format::R16G16B16A16_SFLOAT,
-        PixelFormat::R32Float => vk::Format::R32_SFLOAT,
-        PixelFormat::R32G32Float => vk::Format::R32G32_SFLOAT,
-        PixelFormat::R32G32B32A32Float => vk::Format::R32G32B32A32_SFLOAT,
-        PixelFormat::D16Unorm => vk::Format::D16_UNORM,
-        PixelFormat::D32Float => vk::Format::D32_SFLOAT,
-        PixelFormat::X8D24Unorm => vk::Format::X8_D24_UNORM_PACK32,
-        PixelFormat::S8Uint => vk::Format::S8_UINT,
-        PixelFormat::D24UnormS8Uint => vk::Format::D24_UNORM_S8_UINT,
-        PixelFormat::S8UintD24Unorm => vk::Format::D24_UNORM_S8_UINT,
-        PixelFormat::D32FloatS8Uint => vk::Format::D32_SFLOAT_S8_UINT,
-        _ => vk::Format::R8G8B8A8_UNORM,
-    }
-}
-
-fn bcn_transcoded_format(format: PixelFormat) -> vk::Format {
-    match format {
-        PixelFormat::Bc4Snorm => vk::Format::R8_SNORM,
-        PixelFormat::Bc4Unorm => vk::Format::R8_UNORM,
-        PixelFormat::Bc5Snorm => vk::Format::R8G8_SNORM,
-        PixelFormat::Bc5Unorm => vk::Format::R8G8_UNORM,
-        PixelFormat::Bc6hSfloat | PixelFormat::Bc6hUfloat => vk::Format::R16G16B16A16_SFLOAT,
-        PixelFormat::Bc1RgbaSrgb
-        | PixelFormat::Bc2Srgb
-        | PixelFormat::Bc3Srgb
-        | PixelFormat::Bc7Srgb => vk::Format::A8B8G8R8_SRGB_PACK32,
-        PixelFormat::Bc1RgbaUnorm
-        | PixelFormat::Bc2Unorm
-        | PixelFormat::Bc3Unorm
-        | PixelFormat::Bc7Unorm => vk::Format::A8B8G8R8_UNORM_PACK32,
-        _ => pixel_format_to_vk(format),
-    }
-}
-
 struct RangedBarrierRange {
     min_mip: u32,
     max_mip: u32,
@@ -6401,6 +6607,34 @@ mod tests {
     use ash::vk::Handle;
 
     #[test]
+    fn null_image_matches_upstream_fallback_create_info() {
+        let info = null_image_info();
+        assert_eq!(info.format, PixelFormat::A8B8G8R8Unorm);
+        assert_eq!(info.image_type, ImageType::E1D);
+        assert_eq!(
+            info.size,
+            Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            }
+        );
+        assert_eq!(info.resources, SubresourceExtent::default());
+        assert_eq!(info.num_samples, 1);
+
+        let format_info = maxwell_to_vk::surface_format(info.format);
+        let image_info = make_image_create_info(&info, format_info);
+        assert_eq!(image_info.format, vk::Format::A8B8G8R8_UNORM_PACK32);
+        assert!(image_info.usage.contains(
+            vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::COLOR_ATTACHMENT
+        ));
+    }
+
+    #[test]
     fn compatible_reinterpretation_uses_mutable_image_format_list() {
         assert!(crate::surface::is_view_compatible(
             PixelFormat::A2B10G10R10Unorm,
@@ -6423,6 +6657,38 @@ mod tests {
             .flags
             .contains(vk::ImageCreateFlags::MUTABLE_FORMAT));
         assert!(!image_info.p_next.is_null());
+    }
+
+    #[test]
+    fn image_creation_and_views_select_srgb_like_upstream() {
+        let source = include_str!("texture_cache.rs");
+        let create_image = source
+            .split("fn create_image_from_info")
+            .nth(1)
+            .expect("image creation owner must exist")
+            .split("fn ensure_null_resources")
+            .next()
+            .expect("image creation boundary must exist");
+        assert!(create_image.contains("surface_format_info(info.format, false)"));
+
+        let create_view = source
+            .split("fn make_image_view")
+            .nth(1)
+            .expect("image-view creation owner must exist")
+            .split("fn make_aux_image_view")
+            .next()
+            .expect("image-view creation boundary must exist");
+        assert!(create_view.contains("surface_format_info(view_base.format, true)"));
+        assert!(create_view.contains("surface_format_info(image.base.info.format, false)"));
+
+        let storage_view = source
+            .split("fn storage_image_view(")
+            .nth(1)
+            .expect("storage image-view owner must exist")
+            .split("fn storage_image_view_with_format")
+            .next()
+            .expect("storage image-view boundary must exist");
+        assert!(storage_view.contains("surface_format(image.base.info.format, true)"));
     }
 
     #[test]
@@ -6560,6 +6826,28 @@ mod tests {
             !image_usage_flags(format_info, PixelFormat::A2B10G10R10Unorm)
                 .contains(vk::ImageUsageFlags::STORAGE)
         );
+    }
+
+    #[test]
+    fn mutable_image_view_usage_stays_within_base_image_usage() {
+        let image_format = PixelFormat::A8B8G8R8Srgb;
+        let view_format = PixelFormat::A8B8G8R8Unorm;
+        let image_format_info = maxwell_to_vk::surface_format(image_format);
+        let view_format_info = maxwell_to_vk::surface_format(view_format);
+
+        let image_usage = image_usage_flags(image_format_info, image_format);
+        let requested_view_usage = image_usage_flags(view_format_info, view_format);
+        let view_usage = image_view_usage_flags(
+            view_format_info,
+            view_format,
+            image_format_info,
+            image_format,
+        );
+
+        assert!(!image_usage.contains(vk::ImageUsageFlags::STORAGE));
+        assert!(requested_view_usage.contains(vk::ImageUsageFlags::STORAGE));
+        assert!(!view_usage.contains(vk::ImageUsageFlags::STORAGE));
+        assert!(image_usage.contains(view_usage));
     }
 
     #[test]
@@ -6915,6 +7203,99 @@ mod tests {
             .flags
             .contains(ImageFlagBits::GPU_MODIFIED));
     }
+
+    #[test]
+    fn transform_buffer_image_copies_splits_depth_stencil_like_upstream() {
+        let copies = [
+            BufferImageCopy {
+                buffer_offset: 0x20,
+                buffer_size: 0x100,
+                buffer_row_length: 64,
+                buffer_image_height: 32,
+                image_subresource: SubresourceLayers {
+                    base_level: 1,
+                    base_layer: 2,
+                    num_layers: 3,
+                },
+                image_offset: Offset3D { x: 4, y: 5, z: 6 },
+                image_extent: Extent3D {
+                    width: 16,
+                    height: 8,
+                    depth: 2,
+                },
+            },
+            BufferImageCopy {
+                buffer_offset: 0x220,
+                buffer_size: 0x80,
+                ..BufferImageCopy::default()
+            },
+        ];
+
+        let transformed = transform_buffer_image_copies(
+            &copies,
+            0x1000,
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+        );
+
+        assert_eq!(transformed.len(), copies.len() * 2);
+        assert_eq!(
+            transformed
+                .iter()
+                .map(|copy| copy.image_subresource.aspect_mask)
+                .collect::<Vec<_>>(),
+            vec![
+                vk::ImageAspectFlags::DEPTH,
+                vk::ImageAspectFlags::DEPTH,
+                vk::ImageAspectFlags::STENCIL,
+                vk::ImageAspectFlags::STENCIL,
+            ]
+        );
+        assert_eq!(transformed[0].buffer_offset, 0x1020);
+        assert_eq!(transformed[2].buffer_offset, transformed[0].buffer_offset);
+        assert_eq!(transformed[0].buffer_row_length, 64);
+        assert_eq!(transformed[0].buffer_image_height, 32);
+        assert_eq!(transformed[0].image_subresource.mip_level, 1);
+        assert_eq!(transformed[0].image_subresource.base_array_layer, 2);
+        assert_eq!(transformed[0].image_subresource.layer_count, 3);
+        assert_eq!(
+            transformed[0].image_offset,
+            vk::Offset3D { x: 4, y: 5, z: 6 }
+        );
+        assert_eq!(
+            transformed[0].image_extent,
+            vk::Extent3D {
+                width: 16,
+                height: 8,
+                depth: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn upload_trace_preserves_copy_identity_and_geometry() {
+        let copy = BufferImageCopy {
+            buffer_offset: 0x40,
+            buffer_size: 0x800,
+            buffer_row_length: 128,
+            buffer_image_height: 64,
+            image_subresource: SubresourceLayers {
+                base_level: 2,
+                base_layer: 3,
+                num_layers: 4,
+            },
+            image_offset: Offset3D { x: 5, y: 6, z: 7 },
+            image_extent: Extent3D {
+                width: 32,
+                height: 16,
+                depth: 8,
+            },
+        };
+
+        assert_eq!(
+            format_buffer_image_copy_trace(&[copy]),
+            "buffer=0x40+0x800/row=128/height=64 subresource=2:3+4 offset=5,6,7 extent=32x16x8"
+        );
+    }
 }
 
 fn transform_buffer_image_copies(
@@ -6922,32 +7303,45 @@ fn transform_buffer_image_copies(
     base_offset: vk::DeviceSize,
     aspect: vk::ImageAspectFlags,
 ) -> Vec<vk::BufferImageCopy> {
-    copies
-        .iter()
-        .map(|copy| {
-            vk::BufferImageCopy::builder()
-                .buffer_offset(base_offset + copy.buffer_offset as vk::DeviceSize)
-                .buffer_row_length(copy.buffer_row_length)
-                .buffer_image_height(copy.buffer_image_height)
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: aspect,
-                    mip_level: copy.image_subresource.base_level as u32,
-                    base_array_layer: copy.image_subresource.base_layer as u32,
-                    layer_count: copy.image_subresource.num_layers as u32,
-                })
-                .image_offset(vk::Offset3D {
-                    x: copy.image_offset.x,
-                    y: copy.image_offset.y,
-                    z: copy.image_offset.z,
-                })
-                .image_extent(vk::Extent3D {
-                    width: copy.image_extent.width,
-                    height: copy.image_extent.height,
-                    depth: copy.image_extent.depth,
-                })
-                .build()
-        })
-        .collect()
+    let make = |copy: &BufferImageCopy, aspect_mask: vk::ImageAspectFlags| {
+        vk::BufferImageCopy::builder()
+            .buffer_offset(base_offset + copy.buffer_offset as vk::DeviceSize)
+            .buffer_row_length(copy.buffer_row_length)
+            .buffer_image_height(copy.buffer_image_height)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask,
+                mip_level: copy.image_subresource.base_level as u32,
+                base_array_layer: copy.image_subresource.base_layer as u32,
+                layer_count: copy.image_subresource.num_layers as u32,
+            })
+            .image_offset(vk::Offset3D {
+                x: copy.image_offset.x,
+                y: copy.image_offset.y,
+                z: copy.image_offset.z,
+            })
+            .image_extent(vk::Extent3D {
+                width: copy.image_extent.width,
+                height: copy.image_extent.height,
+                depth: copy.image_extent.depth,
+            })
+            .build()
+    };
+    if aspect == (vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL) {
+        let mut result = Vec::with_capacity(copies.len() * 2);
+        result.extend(
+            copies
+                .iter()
+                .map(|copy| make(copy, vk::ImageAspectFlags::DEPTH)),
+        );
+        result.extend(
+            copies
+                .iter()
+                .map(|copy| make(copy, vk::ImageAspectFlags::STENCIL)),
+        );
+        result
+    } else {
+        copies.iter().map(|copy| make(copy, aspect)).collect()
+    }
 }
 
 fn copy_buffer_to_image(
@@ -7155,6 +7549,15 @@ fn convert_sample_count(num_samples: u32) -> vk::SampleCountFlags {
     }
 }
 
+/// Exact `ImageInfo` used by upstream's non-`nullDescriptor` image-view
+/// fallback.
+fn null_image_info() -> ImageInfo {
+    ImageInfo {
+        format: PixelFormat::A8B8G8R8Unorm,
+        ..ImageInfo::default()
+    }
+}
+
 fn image_usage_flags(
     format_info: maxwell_to_vk::FormatInfo,
     format: PixelFormat,
@@ -7175,6 +7578,20 @@ fn image_usage_flags(
         usage |= vk::ImageUsageFlags::STORAGE;
     }
     usage
+}
+
+/// Keeps `VkImageViewUsageCreateInfo::usage` within the usage bits supplied
+/// when the underlying image was created. Compatible mutable views can have a
+/// broader format-table usage than the base format (notably UNORM views of
+/// sRGB images), but Vulkan requires the view usage to remain a subset.
+fn image_view_usage_flags(
+    view_format_info: maxwell_to_vk::FormatInfo,
+    view_format: PixelFormat,
+    image_format_info: maxwell_to_vk::FormatInfo,
+    image_format: PixelFormat,
+) -> vk::ImageUsageFlags {
+    image_usage_flags(view_format_info, view_format)
+        & image_usage_flags(image_format_info, image_format)
 }
 
 fn make_image_create_info(

@@ -333,6 +333,7 @@ dependencies = [
  "thiserror",
  "toml 0.8.23",
  "winapi",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 

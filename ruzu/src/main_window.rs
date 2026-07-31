@@ -397,6 +397,19 @@ impl GMainWindow {
     /// `GMainWindow::GMainWindow` constructor (widget creation + `Initialize*`
     /// calls), minus the not-yet-ported subsystems.
     pub fn new(app: &Application) -> Rc<Self> {
+        Self::new_with_config_import_offer(app, true)
+    }
+
+    /// Construct a window for a game supplied directly on the command line.
+    ///
+    /// The first-run configuration-import question must not cover a game that
+    /// is already booting in the background. A later launcher-only start can
+    /// still offer that one-time import.
+    pub fn new_for_direct_game(app: &Application) -> Rc<Self> {
+        Self::new_with_config_import_offer(app, false)
+    }
+
+    fn new_with_config_import_offer(app: &Application, offer_config_import: bool) -> Rc<Self> {
         let window = ApplicationWindow::builder()
             .application(app)
             .title(WINDOW_TITLE)
@@ -512,7 +525,7 @@ impl GMainWindow {
         // First run with an importable yuzu configuration: ask before copying
         // anything. Deferred to an idle callback so the window is on screen
         // behind the dialog rather than appearing after it.
-        {
+        if offer_config_import {
             let this = Rc::clone(&this);
             glib::idle_add_local_once(move || this.maybe_offer_yuzu_import());
         }

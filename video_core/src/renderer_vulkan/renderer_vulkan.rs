@@ -334,12 +334,23 @@ impl RendererVulkan {
             false,
         ));
         let mut state_tracker = Box::new(StateTracker::new());
+        let device_fault = device.is_device_fault_supported().then(|| {
+            vk::ExtDeviceFaultFn::load(|name| unsafe {
+                instance
+                    .instance
+                    .get_device_proc_addr(device.get_logical().handle(), name.as_ptr())
+                    .map_or(std::ptr::null(), |function| {
+                        function as *const std::ffi::c_void
+                    })
+            })
+        });
         let mut scheduler = Box::new(
             Scheduler::new(
                 device.get_logical().clone(),
                 device.get_graphics_queue(),
                 device.get_graphics_family(),
                 device.is_timeline_semaphore_supported(),
+                device_fault,
             )
             .map_err(VulkanError::new)?,
         );
@@ -400,6 +411,7 @@ impl RendererVulkan {
             device.float_controls_properties,
             device.is_ext_shader_demote_to_helper_invocation_supported(),
             device.is_ext_depth_clip_control_supported(),
+            device.has_null_descriptor(),
             device.is_ext_extended_dynamic_state_supported(),
             device.is_ext_extended_dynamic_state2_supported(),
             device.is_ext_extended_dynamic_state2_extras_supported(),

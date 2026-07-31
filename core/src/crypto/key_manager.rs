@@ -693,65 +693,8 @@ fn find_256_name_by_index(id: S256KeyType, field1: u64, field2: u64) -> Option<&
     None
 }
 
-/// Resolve the keys directory. Uses the common path manager (RuzuPath::KeysDir).
-/// Also searches fallback locations used by yuzu/suyu for user convenience.
-fn fallback_keys_dirs(home: Option<&Path>, roaming_app_data: Option<&Path>) -> Vec<PathBuf> {
-    let mut fallbacks = Vec::new();
-
-    if let Some(roaming_app_data) = roaming_app_data {
-        fallbacks.push(roaming_app_data.join("yuzu/keys"));
-        fallbacks.push(roaming_app_data.join("suyu/keys"));
-    }
-
-    if let Some(home) = home {
-        fallbacks.push(home.join(".local/share/yuzu/keys"));
-        fallbacks.push(home.join(".config/yuzu/keys"));
-        fallbacks.push(home.join(".local/share/suyu/keys"));
-    }
-
-    fallbacks
-}
-
 fn resolve_keys_dir() -> PathBuf {
-    // Primary: use the common path manager
-    let primary = get_ruzu_path(RuzuPath::KeysDir);
-
-    // Fallback locations (matching yuzu/suyu key file paths)
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from);
-    #[cfg(windows)]
-    let roaming_app_data = std::env::var_os("APPDATA").map(PathBuf::from);
-    #[cfg(not(windows))]
-    let roaming_app_data: Option<PathBuf> = None;
-    let fallbacks = fallback_keys_dirs(home.as_deref(), roaming_app_data.as_deref());
-
-    // Prefer any directory that actually contains prod.keys or dev.keys.
-    // Check primary first, then fallbacks.
-    let has_crypto_keys = |p: &PathBuf| p.join("prod.keys").exists() || p.join("dev.keys").exists();
-
-    if has_crypto_keys(&primary) {
-        return primary;
-    }
-
-    for fallback in &fallbacks {
-        if has_crypto_keys(fallback) {
-            return fallback.clone();
-        }
-    }
-
-    // No directory with crypto keys found. Fall back to the first existing dir.
-    if primary.exists() {
-        return primary;
-    }
-    for fallback in fallbacks {
-        if fallback.exists() {
-            return fallback;
-        }
-    }
-
-    // Return primary even if it does not exist; caller will handle missing files.
-    primary
+    get_ruzu_path(RuzuPath::KeysDir)
 }
 
 /// Key manager singleton. Manages all cryptographic keys.
@@ -2644,19 +2587,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fallback_key_directories_cover_windows_and_unix_yuzu_locations() {
-        let home = Path::new("home-root");
-        let roaming = Path::new("roaming-root");
-
-        assert_eq!(
-            fallback_keys_dirs(Some(home), Some(roaming)),
-            vec![
-                roaming.join("yuzu/keys"),
-                roaming.join("suyu/keys"),
-                home.join(".local/share/yuzu/keys"),
-                home.join(".config/yuzu/keys"),
-                home.join(".local/share/suyu/keys"),
-            ]
-        );
+    fn keys_directory_is_owned_by_ruzu_path_manager() {
+        assert_eq!(resolve_keys_dir(), get_ruzu_path(RuzuPath::KeysDir));
     }
 }

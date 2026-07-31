@@ -11,3 +11,4 @@ pub mod font_extended_chinese_simplified;
 pub mod font_korean;
 pub mod font_nintendo_extended;
 pub mod font_standard;
+pub mod time_zone_binary;

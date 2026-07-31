@@ -196,6 +196,9 @@ pub struct DeviceExtensions {
     pub vertex_input_dynamic_state: bool,
     pub pipeline_executable_properties: bool,
     pub workgroup_memory_explicit_layout: bool,
+    /// Diagnostic-only `VK_EXT_device_fault`, enabled through
+    /// `RUZU_VK_DEVICE_FAULT` when the host exposes the feature.
+    pub device_fault: bool,
 
     // Misc extensions
     pub conditional_rendering: bool,
@@ -281,6 +284,8 @@ pub struct Device {
     pub primitive_topology_list_restart_supported: bool,
     /// Feature bit from `VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT`.
     pub primitive_topology_patch_list_restart_supported: bool,
+    /// Feature bit from `VkPhysicalDeviceRobustness2FeaturesEXT`.
+    pub null_descriptor_supported: bool,
 
     // Misc capability flags
     pub is_optimal_astc_supported: bool,
@@ -436,6 +441,9 @@ impl Device {
         let has_vertex_attribute_divisor =
             supported_extensions.contains("VK_EXT_vertex_attribute_divisor");
         let has_provoking_vertex = supported_extensions.contains("VK_EXT_provoking_vertex");
+        let has_robustness2 = supported_extensions.contains("VK_EXT_robustness2");
+        let has_device_fault = supported_extensions.contains("VK_EXT_device_fault")
+            && std::env::var_os("RUZU_VK_DEVICE_FAULT").is_some();
         let has_shader_demote_to_helper_invocation = supported_extensions
             .contains("VK_EXT_shader_demote_to_helper_invocation")
             || device_properties.api_version >= vk::API_VERSION_1_3;
@@ -474,6 +482,8 @@ impl Device {
         let mut vertex_attribute_divisor_features =
             vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT::default();
         let mut provoking_vertex_features = vk::PhysicalDeviceProvokingVertexFeaturesEXT::default();
+        let mut robustness2_features = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
+        let mut device_fault_features = vk::PhysicalDeviceFaultFeaturesEXT::default();
         let mut shader_demote_features =
             vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures::default();
         let mut features2 = {
@@ -523,6 +533,12 @@ impl Device {
             }
             if has_provoking_vertex {
                 features2_builder = features2_builder.push_next(&mut provoking_vertex_features);
+            }
+            if has_robustness2 {
+                features2_builder = features2_builder.push_next(&mut robustness2_features);
+            }
+            if has_device_fault {
+                features2_builder = features2_builder.push_next(&mut device_fault_features);
             }
             if has_shader_demote_to_helper_invocation {
                 features2_builder = features2_builder.push_next(&mut shader_demote_features);
@@ -644,6 +660,8 @@ impl Device {
         let supports_provoking_vertex = has_provoking_vertex
             && provoking_vertex_features.provoking_vertex_last != 0
             && provoking_vertex_features.transform_feedback_preserves_provoking_vertex != 0;
+        let supports_null_descriptor = has_robustness2 && robustness2_features.null_descriptor != 0;
+        let supports_device_fault = has_device_fault && device_fault_features.device_fault != 0;
         let mut supports_shader_demote_to_helper_invocation = has_shader_demote_to_helper_invocation
             && shader_demote_features.shader_demote_to_helper_invocation != 0;
         if is_mvk && supports_shader_demote_to_helper_invocation {
@@ -679,6 +697,7 @@ impl Device {
             "VK_EXT_depth_clip_control",
             "VK_EXT_index_type_uint8",
             "VK_EXT_vertex_attribute_divisor",
+            "VK_EXT_robustness2",
             "VK_EXT_shader_stencil_export",
             "VK_KHR_draw_indirect_count",
         ] {
@@ -704,6 +723,10 @@ impl Device {
         }
         if supports_vertex_input_dynamic_state {
             enabled_extensions.push(CString::new("VK_EXT_vertex_input_dynamic_state").unwrap());
+        }
+        if supports_device_fault {
+            enabled_extensions.push(CString::new("VK_EXT_device_fault").unwrap());
+            log::info!("Vulkan device-fault diagnostics enabled");
         }
         let enabled_extension_ptrs: Vec<*const std::os::raw::c_char> = enabled_extensions
             .iter()
@@ -788,6 +811,8 @@ impl Device {
                 index_type_uint8: supports_index_type_uint8,
                 vertex_attribute_divisor: supports_vertex_attribute_divisor,
                 provoking_vertex: supports_provoking_vertex,
+                robustness2: has_robustness2,
+                device_fault: supports_device_fault,
                 shader_demote_to_helper_invocation: supports_shader_demote_to_helper_invocation,
                 draw_indirect_count: has_draw_indirect_count,
                 shader_float_controls: has_shader_float_controls,
@@ -810,6 +835,7 @@ impl Device {
             primitive_topology_list_restart_supported: supports_primitive_topology_list_restart,
             primitive_topology_patch_list_restart_supported:
                 supports_primitive_topology_patch_list_restart,
+            null_descriptor_supported: supports_null_descriptor,
             is_optimal_astc_supported: false,
             is_blit_depth24_stencil8_supported: false,
             is_blit_depth32_stencil8_supported: false,
@@ -943,6 +969,11 @@ impl Device {
         &self.logical.device
     }
 
+    /// Returns whether the opt-in `VK_EXT_device_fault` diagnostic is enabled.
+    pub fn is_device_fault_supported(&self) -> bool {
+        self.extensions.device_fault
+    }
+
     /// Returns the physical device.
     pub fn get_physical(&self) -> vk::PhysicalDevice {
         self.physical
@@ -1070,6 +1101,11 @@ impl Device {
     /// Port of `Device::IsPatchListPrimitiveRestartSupported`.
     pub fn is_patch_list_primitive_restart_supported(&self) -> bool {
         self.primitive_topology_patch_list_restart_supported
+    }
+
+    /// Port of upstream `Device::HasNullDescriptor`.
+    pub fn has_null_descriptor(&self) -> bool {
+        self.null_descriptor_supported
     }
 
     /// Returns true if the device supports int64 natively.

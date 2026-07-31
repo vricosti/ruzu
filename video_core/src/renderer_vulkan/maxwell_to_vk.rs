@@ -549,14 +549,7 @@ pub mod sampler {
 // Top-level conversion functions
 // ---------------------------------------------------------------------------
 
-/// Port of `MaxwellToVK::SurfaceFormat`.
-///
-/// Returns format properties supported by the host. The `pixel_format` index is
-/// used to look up the default Vulkan format and usage flags from the table.
-///
-/// Note: ASTC/BCn transcoding and device format querying are simplified here;
-/// the full implementation requires a Device reference for `GetSupportedFormat`
-/// and Settings for ASTC recompression mode.
+/// Returns the static format-table entry used by `MaxwellToVK::SurfaceFormat`.
 pub fn surface_format(pixel_format: PixelFormat) -> FormatInfo {
     let idx = pixel_format as usize;
     if idx >= TEX_FORMAT_TUPLES.len() {
@@ -572,6 +565,63 @@ pub fn surface_format(pixel_format: PixelFormat) -> FormatInfo {
         attachable: (tuple.usage & ATTACHABLE) != 0,
         storage: (tuple.usage & STORAGE) != 0,
     }
+}
+
+/// Port of the ASTC/BCn conversion portion of `MaxwellToVK::SurfaceFormat`.
+///
+/// Device format-feature resolution remains with the Vulkan runtime, which
+/// owns the physical-device handle. Format selection itself stays in this
+/// matching upstream module.
+pub fn surface_format_with_recompression(
+    pixel_format: PixelFormat,
+    with_srgb: bool,
+    optimal_astc_supported: bool,
+    optimal_bcn_supported: bool,
+    astc_recompression: common::settings_enums::AstcRecompression,
+) -> FormatInfo {
+    let mut info = surface_format(pixel_format);
+    let is_srgb = with_srgb && crate::surface::is_pixel_format_srgb(pixel_format);
+
+    if !optimal_astc_supported && crate::surface::is_pixel_format_astc(pixel_format) {
+        match astc_recompression {
+            common::settings_enums::AstcRecompression::Uncompressed => {
+                if is_srgb {
+                    info.format = vk::Format::A8B8G8R8_SRGB_PACK32;
+                } else {
+                    info.format = vk::Format::A8B8G8R8_UNORM_PACK32;
+                    info.storage = true;
+                }
+            }
+            common::settings_enums::AstcRecompression::Bc1 => {
+                info.format = if is_srgb {
+                    vk::Format::BC1_RGBA_SRGB_BLOCK
+                } else {
+                    vk::Format::BC1_RGBA_UNORM_BLOCK
+                };
+            }
+            common::settings_enums::AstcRecompression::Bc3 => {
+                info.format = if is_srgb {
+                    vk::Format::BC3_SRGB_BLOCK
+                } else {
+                    vk::Format::BC3_UNORM_BLOCK
+                };
+            }
+        }
+    }
+
+    if !optimal_bcn_supported && crate::surface::is_pixel_format_bcn(pixel_format) {
+        info.format = match pixel_format {
+            PixelFormat::Bc4Snorm => vk::Format::R8_SNORM,
+            PixelFormat::Bc4Unorm => vk::Format::R8_UNORM,
+            PixelFormat::Bc5Snorm => vk::Format::R8G8_SNORM,
+            PixelFormat::Bc5Unorm => vk::Format::R8G8_UNORM,
+            PixelFormat::Bc6hSfloat | PixelFormat::Bc6hUfloat => vk::Format::R16G16B16A16_SFLOAT,
+            _ if is_srgb => vk::Format::A8B8G8R8_SRGB_PACK32,
+            _ => vk::Format::A8B8G8R8_UNORM_PACK32,
+        };
+    }
+
+    info
 }
 
 /// Port of `MaxwellToVK::ShaderStage`.
@@ -1066,6 +1116,89 @@ mod tests {
         assert_eq!(info.format, vk::Format::BC1_RGBA_UNORM_BLOCK);
         assert!(!info.attachable);
         assert!(!info.storage);
+    }
+
+    #[test]
+    fn surface_format_recompresses_astc_like_upstream() {
+        use common::settings_enums::AstcRecompression;
+
+        let base = surface_format_with_recompression(
+            PixelFormat::Astc2d4x4Srgb,
+            false,
+            false,
+            true,
+            AstcRecompression::Uncompressed,
+        );
+        assert_eq!(base.format, vk::Format::A8B8G8R8_UNORM_PACK32);
+        assert!(base.storage);
+
+        let view = surface_format_with_recompression(
+            PixelFormat::Astc2d4x4Srgb,
+            true,
+            false,
+            true,
+            AstcRecompression::Uncompressed,
+        );
+        assert_eq!(view.format, vk::Format::A8B8G8R8_SRGB_PACK32);
+        assert!(!view.storage);
+
+        for (recompression, unorm, srgb) in [
+            (
+                AstcRecompression::Bc1,
+                vk::Format::BC1_RGBA_UNORM_BLOCK,
+                vk::Format::BC1_RGBA_SRGB_BLOCK,
+            ),
+            (
+                AstcRecompression::Bc3,
+                vk::Format::BC3_UNORM_BLOCK,
+                vk::Format::BC3_SRGB_BLOCK,
+            ),
+        ] {
+            assert_eq!(
+                surface_format_with_recompression(
+                    PixelFormat::Astc2d4x4Srgb,
+                    false,
+                    false,
+                    true,
+                    recompression,
+                )
+                .format,
+                unorm,
+            );
+            assert_eq!(
+                surface_format_with_recompression(
+                    PixelFormat::Astc2d4x4Srgb,
+                    true,
+                    false,
+                    true,
+                    recompression,
+                )
+                .format,
+                srgb,
+            );
+        }
+    }
+
+    #[test]
+    fn surface_format_bcn_transcode_honors_with_srgb() {
+        use common::settings_enums::AstcRecompression;
+
+        let base = surface_format_with_recompression(
+            PixelFormat::Bc3Srgb,
+            false,
+            true,
+            false,
+            AstcRecompression::Uncompressed,
+        );
+        let view = surface_format_with_recompression(
+            PixelFormat::Bc3Srgb,
+            true,
+            true,
+            false,
+            AstcRecompression::Uncompressed,
+        );
+        assert_eq!(base.format, vk::Format::A8B8G8R8_UNORM_PACK32);
+        assert_eq!(view.format, vk::Format::A8B8G8R8_SRGB_PACK32);
     }
 
     #[test]

@@ -2,237 +2,100 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Ported from: core/file_sys/system_archive/time_zone_binary.h / .cpp
-// Status: PARTIAL
-//
-// Synthesizes the TimeZoneBinary system archive. Upstream uses nx_tzdb to
-// embed timezone data directly. Rust does not have that exact dependency, so
-// this owner synthesizes the same archive shape from the host tzdb under
-// /usr/share/zoneinfo when available.
+// Status: COMPLETE
 
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::data::time_zone_binary as nx_tzdb;
 use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 use crate::file_sys::vfs::vfs_vector::{make_array_file, VectorVfsDirectory};
 
-/// Known timezone region directories, matching upstream tzdb_zoneinfo_dirs.
-const ZONEINFO_DIRS: &[&str] = &[
-    "Africa",
-    "America",
-    "Antarctica",
-    "Arctic",
-    "Asia",
-    "Atlantic",
-    "Australia",
-    "Brazil",
-    "Canada",
-    "Chile",
-    "Etc",
-    "Europe",
-    "Indian",
-    "Mexico",
-    "Pacific",
-    "US",
+use nx_tzdb::EmbeddedFile;
+
+/// Corresponds to upstream `tzdb_zoneinfo_dirs`.
+const TZDB_ZONEINFO_DIRS: &[(&str, &[EmbeddedFile])] = &[
+    ("Africa", nx_tzdb::AFRICA),
+    ("America", nx_tzdb::AMERICA),
+    ("Antarctica", nx_tzdb::ANTARCTICA),
+    ("Arctic", nx_tzdb::ARCTIC),
+    ("Asia", nx_tzdb::ASIA),
+    ("Atlantic", nx_tzdb::ATLANTIC),
+    ("Australia", nx_tzdb::AUSTRALIA),
+    ("Brazil", nx_tzdb::BRAZIL),
+    ("Canada", nx_tzdb::CANADA),
+    ("Chile", nx_tzdb::CHILE),
+    ("Etc", nx_tzdb::ETC),
+    ("Europe", nx_tzdb::EUROPE),
+    ("Indian", nx_tzdb::INDIAN),
+    ("Mexico", nx_tzdb::MEXICO),
+    ("Pacific", nx_tzdb::PACIFIC),
+    ("US", nx_tzdb::US),
 ];
 
-/// Known America subdirectories, matching upstream tzdb_america_dirs.
-const AMERICA_SUB_DIRS: &[&str] = &["Argentina", "Indiana", "Kentucky", "North_Dakota"];
-
-const HOST_ZONEINFO_ROOT: &str = "/usr/share/zoneinfo";
-const EXCLUDED_ROOT_FILES: &[&str] = &[
-    "iso3166.tab",
-    "leap-seconds.list",
-    "leapseconds",
-    "localtime",
-    "posixrules",
-    "tzdata.zi",
-    "zone.tab",
-    "zone1970.tab",
-    "zonenow.tab",
+/// Corresponds to upstream `tzdb_america_dirs`.
+const TZDB_AMERICA_DIRS: &[(&str, &[EmbeddedFile])] = &[
+    ("Argentina", nx_tzdb::AMERICA_ARGENTINA),
+    ("Indiana", nx_tzdb::AMERICA_INDIANA),
+    ("Kentucky", nx_tzdb::AMERICA_KENTUCKY),
+    ("North_Dakota", nx_tzdb::AMERICA_NORTH_DAKOTA),
 ];
 
-fn make_host_file(path: &Path, name: &str) -> Option<VirtualFile> {
-    let data = fs::read(path).ok()?;
-    Some(make_array_file(data, name.to_string(), None))
+/// Corresponds to upstream `GenerateFiles`.
+fn generate_files(files: &[EmbeddedFile]) -> Vec<VirtualFile> {
+    files
+        .iter()
+        .map(|file| make_array_file(file.data.to_vec(), file.name.to_string(), None))
+        .collect()
 }
 
-fn should_include_root_file(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    if EXCLUDED_ROOT_FILES.contains(&name) {
-        return false;
-    }
-    if name.contains('.') {
-        return false;
-    }
-    path.is_file()
+/// Corresponds to upstream `GenerateZoneinfoFiles`.
+fn generate_zoneinfo_files() -> Vec<VirtualFile> {
+    generate_files(nx_tzdb::ZONEINFO)
 }
 
-fn collect_time_zone_names(dir: &Path, prefix: &str, out_names: &mut Vec<String>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-
-    let mut children: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .collect();
-    children.sort();
-
-    for child in children {
-        let Some(name) = child.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let child_name = if prefix.is_empty() {
-            name.to_string()
-        } else {
-            format!("{prefix}/{name}")
-        };
-
-        if child.is_dir() {
-            collect_time_zone_names(&child, &child_name, out_names);
-        } else if child.is_file() {
-            out_names.push(child_name);
-        }
-    }
-}
-
-fn build_directory_from_host(path: &Path, name: &str, allow_nested: bool) -> Option<VirtualDir> {
-    let mut files: Vec<VirtualFile> = Vec::new();
-    let mut dirs: Vec<VirtualDir> = Vec::new();
-
-    let Ok(entries) = fs::read_dir(path) else {
-        return None;
-    };
-    let mut children: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .collect();
-    children.sort();
-
-    for child in children {
-        let Some(child_name) = child.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if child.is_file() {
-            if let Some(file) = make_host_file(&child, child_name) {
-                files.push(file);
-            }
-            continue;
-        }
-        if allow_nested && child.is_dir() {
-            if let Some(dir) = build_directory_from_host(&child, child_name, true) {
-                dirs.push(dir);
-            }
-        }
-    }
-
-    Some(Arc::new(VectorVfsDirectory::new(
-        files,
-        dirs,
-        name.to_string(),
-        None,
-    )))
-}
-
-fn read_tzdb_version() -> Vec<u8> {
-    let tzdata = Path::new(HOST_ZONEINFO_ROOT).join("tzdata.zi");
-    let Ok(data) = fs::read_to_string(tzdata) else {
-        return b"unknown\0".to_vec();
-    };
-
-    for line in data.lines() {
-        if let Some(version) = line.strip_prefix("# version ") {
-            let mut bytes = version.as_bytes().to_vec();
-            bytes.push(0);
-            return bytes;
-        }
-    }
-
-    b"unknown\0".to_vec()
-}
-
-/// Synthesize the TimeZoneBinary archive.
+/// Synthesize the `TimeZoneBinary` system archive.
 ///
-/// Creates a directory structure matching the upstream layout:
-/// ```text
-/// data/
-///   zoneinfo/
-///     Africa/
-///     America/
-///       Argentina/
-///       Indiana/
-///       Kentucky/
-///       North_Dakota/
-///     Antarctica/
-///     ...etc
-/// ```
-///
+/// Corresponds to upstream `FileSys::SystemArchive::TimeZoneBinary`.
 pub fn time_zone_binary() -> Option<VirtualDir> {
-    let host_root = Path::new(HOST_ZONEINFO_ROOT);
-    if !host_root.is_dir() {
-        return None;
-    }
+    let america_sub_dirs = TZDB_AMERICA_DIRS
+        .iter()
+        .map(|(dir_name, files)| {
+            Arc::new(VectorVfsDirectory::new(
+                generate_files(files),
+                Vec::new(),
+                (*dir_name).to_string(),
+                None,
+            )) as VirtualDir
+        })
+        .collect::<Vec<_>>();
 
-    let mut zoneinfo_files: Vec<VirtualFile> = Vec::new();
-    let mut zoneinfo_sub_dirs: Vec<VirtualDir> = Vec::new();
-    let mut binary_list_names: Vec<String> = Vec::new();
-
-    let Ok(entries) = fs::read_dir(host_root) else {
-        return None;
-    };
-    let mut children: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .collect();
-    children.sort();
-
-    for child in children {
-        let Some(name) = child.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-
-        if child.is_dir() && ZONEINFO_DIRS.contains(&name) {
-            if let Some(dir) = build_directory_from_host(&child, name, true) {
-                zoneinfo_sub_dirs.push(dir);
-            }
-            collect_time_zone_names(&child, name, &mut binary_list_names);
-            continue;
-        }
-
-        if should_include_root_file(&child) {
-            if let Some(file) = make_host_file(&child, name) {
-                zoneinfo_files.push(file);
-                binary_list_names.push(name.to_string());
-            }
-        }
-    }
-
-    binary_list_names.sort();
-    binary_list_names.dedup();
-
-    let binary_list = if binary_list_names.is_empty() {
-        b"Etc/GMT\n".to_vec()
-    } else {
-        let mut data = binary_list_names.join("\n").into_bytes();
-        data.push(b'\n');
-        data
-    };
-    let version = read_tzdb_version();
-
-    let root_files = vec![
-        make_array_file(binary_list, "binaryList.txt".to_string(), None),
-        make_array_file(version, "version.txt".to_string(), None),
-    ];
+    let mut america_sub_dirs = Some(america_sub_dirs);
+    let zoneinfo_sub_dirs = TZDB_ZONEINFO_DIRS
+        .iter()
+        .map(|(dir_name, files)| {
+            let sub_dirs = if *dir_name == "America" {
+                america_sub_dirs.take().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            Arc::new(VectorVfsDirectory::new(
+                generate_files(files),
+                sub_dirs,
+                (*dir_name).to_string(),
+                None,
+            )) as VirtualDir
+        })
+        .collect::<Vec<_>>();
 
     let zoneinfo_dir: VirtualDir = Arc::new(VectorVfsDirectory::new(
-        zoneinfo_files,
+        generate_zoneinfo_files(),
         zoneinfo_sub_dirs,
         "zoneinfo".to_string(),
         None,
     ));
 
     Some(Arc::new(VectorVfsDirectory::new(
-        root_files,
+        generate_files(nx_tzdb::BASE),
         vec![zoneinfo_dir],
         "data".to_string(),
         None,
@@ -244,60 +107,102 @@ mod tests {
     use super::*;
     use crate::file_sys::vfs::vfs::VfsDirectory;
 
+    const ALL_EMBEDDED_GROUPS: &[&[EmbeddedFile]] = &[
+        nx_tzdb::BASE,
+        nx_tzdb::ZONEINFO,
+        nx_tzdb::AFRICA,
+        nx_tzdb::AMERICA,
+        nx_tzdb::AMERICA_ARGENTINA,
+        nx_tzdb::AMERICA_INDIANA,
+        nx_tzdb::AMERICA_KENTUCKY,
+        nx_tzdb::AMERICA_NORTH_DAKOTA,
+        nx_tzdb::ANTARCTICA,
+        nx_tzdb::ARCTIC,
+        nx_tzdb::ASIA,
+        nx_tzdb::ATLANTIC,
+        nx_tzdb::AUSTRALIA,
+        nx_tzdb::BRAZIL,
+        nx_tzdb::CANADA,
+        nx_tzdb::CHILE,
+        nx_tzdb::ETC,
+        nx_tzdb::EUROPE,
+        nx_tzdb::INDIAN,
+        nx_tzdb::MEXICO,
+        nx_tzdb::PACIFIC,
+        nx_tzdb::US,
+    ];
+
     #[test]
-    fn test_time_zone_binary_structure() {
-        let dir = time_zone_binary().expect("time_zone_binary should return Some");
-        assert_eq!(dir.get_name(), "data");
-
-        let files = dir.get_files();
-        let file_names: Vec<String> = files.iter().map(|f| f.get_name()).collect();
-        assert!(file_names.contains(&"binaryList.txt".to_string()));
-        assert!(file_names.contains(&"version.txt".to_string()));
-
-        let subdirs = dir.get_subdirectories();
-        assert_eq!(subdirs.len(), 1);
-        assert_eq!(subdirs[0].get_name(), "zoneinfo");
+    fn embedded_data_matches_upstream_nx_tzdb_221202_archive() {
+        assert_eq!(
+            ALL_EMBEDDED_GROUPS
+                .iter()
+                .map(|group| group.len())
+                .sum::<usize>(),
+            599
+        );
+        assert_eq!(
+            ALL_EMBEDDED_GROUPS
+                .iter()
+                .flat_map(|group| group.iter())
+                .map(|file| file.data.len())
+                .sum::<usize>(),
+            314_337
+        );
     }
 
     #[test]
-    fn test_zoneinfo_has_regions() {
-        let dir = time_zone_binary().unwrap();
-        let zoneinfo = &dir.get_subdirectories()[0];
-        let regions = zoneinfo.get_subdirectories();
-        assert_eq!(regions.len(), ZONEINFO_DIRS.len());
+    fn time_zone_binary_matches_upstream_archive_shape() {
+        let root = time_zone_binary().expect("embedded archive is always available");
+        assert_eq!(root.get_name(), "data");
 
-        let names: Vec<String> = regions.iter().map(|d| d.get_name()).collect();
-        assert!(names.contains(&"Africa".to_string()));
-        assert!(names.contains(&"America".to_string()));
-        assert!(names.contains(&"Europe".to_string()));
-        assert!(names.contains(&"US".to_string()));
-    }
+        let root_files = root.get_files();
+        assert_eq!(
+            root_files
+                .iter()
+                .map(|file| file.get_name())
+                .collect::<Vec<_>>(),
+            vec!["binaryList.txt", "version.txt"]
+        );
 
-    #[test]
-    fn test_america_has_subdirs() {
-        let dir = time_zone_binary().unwrap();
-        let zoneinfo = &dir.get_subdirectories()[0];
+        let zoneinfo = root
+            .get_subdirectory("zoneinfo")
+            .expect("zoneinfo directory");
+        assert_eq!(zoneinfo.get_subdirectories().len(), 16);
+
         let america = zoneinfo
-            .get_subdirectories()
-            .into_iter()
-            .find(|d| d.get_name() == "America")
-            .expect("America should exist");
-        let sub = america.get_subdirectories();
-        assert_eq!(sub.len(), AMERICA_SUB_DIRS.len());
-
-        let names: Vec<String> = sub.iter().map(|d| d.get_name()).collect();
-        assert!(names.contains(&"Argentina".to_string()));
-        assert!(names.contains(&"Indiana".to_string()));
+            .get_subdirectory("America")
+            .expect("America directory");
+        assert_eq!(
+            america
+                .get_subdirectories()
+                .iter()
+                .map(|directory| directory.get_name())
+                .collect::<Vec<_>>(),
+            vec!["Argentina", "Indiana", "Kentucky", "North_Dakota"]
+        );
     }
 
     #[test]
-    fn test_binary_list_contains_etc_gmt() {
-        let dir = time_zone_binary().unwrap();
-        let binary_list = dir
+    fn time_zone_binary_contains_switch_format_paris_rule() {
+        let root = time_zone_binary().expect("embedded archive is always available");
+        let paris = root
+            .get_file_relative("/zoneinfo/Europe/Paris")
+            .expect("Europe/Paris rule");
+        let bytes = paris.read_all_bytes();
+
+        assert_eq!(&bytes[..4], b"TZif");
+        assert!(root
             .get_file_relative("/binaryList.txt")
-            .expect("binaryList.txt should exist");
-        let data = binary_list.read_all_bytes();
-        let text = String::from_utf8(data).expect("binaryList.txt should be utf8");
-        assert!(text.lines().any(|line| line == "Etc/GMT"));
+            .expect("binary list")
+            .read_all_bytes()
+            .windows(b"Europe/Paris".len())
+            .any(|window| window == b"Europe/Paris"));
+        assert_eq!(
+            root.get_file_relative("/version.txt")
+                .expect("version")
+                .read_all_bytes(),
+            b"221202\n"
+        );
     }
 }

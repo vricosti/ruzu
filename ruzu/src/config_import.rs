@@ -16,7 +16,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::fs::path_util::{get_data_directory, get_ruzu_path, RuzuPath};
+#[cfg(windows)]
+use common::fs::path_util::get_app_data_roaming_directory;
+#[cfg(unix)]
+use common::fs::path_util::get_data_directory;
+use common::fs::path_util::{get_ruzu_path, RuzuPath};
 
 /// Marker written after the offer is made, so it is never repeated.
 const IMPORT_MARKER: &str = ".yuzu-import-done";
@@ -104,10 +108,18 @@ fn has_config(dir: &Path) -> bool {
     CONFIG_FILES.iter().any(|name| dir.join(name).is_file())
 }
 
-/// Locate yuzu's config directory. yuzu (like ruzu) puts config under
+/// Locate yuzu's config directory. On Windows this is
+/// `%APPDATA%/yuzu/config`. On Unix, yuzu puts config under
 /// `$XDG_DATA_HOME/yuzu/config` when `$XDG_DATA_HOME/yuzu` exists, otherwise
 /// under `$XDG_CONFIG_HOME/yuzu`. Returns the first candidate that actually
 /// holds a config file we can import.
+#[cfg(windows)]
+fn yuzu_config_dir() -> Option<PathBuf> {
+    let candidate = get_app_data_roaming_directory().join("yuzu/config");
+    has_config(&candidate).then_some(candidate)
+}
+
+#[cfg(unix)]
 fn yuzu_config_dir() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     let data_yuzu = get_data_directory("XDG_DATA_HOME").join("yuzu");

@@ -601,8 +601,7 @@ mod tests {
         KScheduler::rotate_scheduled_queue(&mut gsc, 0, priority, Some(100));
 
         assert_eq!(
-            gsc.m_priority_queue
-                .get_scheduled_front_at_priority(0, 20),
+            gsc.m_priority_queue.get_scheduled_front_at_priority(0, 20),
             Some(201)
         );
         assert_eq!(
@@ -1971,8 +1970,8 @@ impl KScheduler {
             }
             top_threads[core_id] = top_thread_id;
             if core_id < schedulers.len() {
-                cores_needing_scheduling |= schedulers[core_id]
-                    .update_highest_priority_thread(top_thread_id, gsc);
+                cores_needing_scheduling |=
+                    schedulers[core_id].update_highest_priority_thread(top_thread_id, gsc);
             }
         }
 
@@ -2155,8 +2154,7 @@ impl KScheduler {
                     .as_ref()
                     .map(|core_timing| core_timing.get_clock_ticks() as i64)
                     .unwrap_or(0);
-                gsc.m_priority_queue
-                    .set_last_scheduled_tick(prev_id, tick);
+                gsc.m_priority_queue.set_last_scheduled_tick(prev_id, tick);
                 if let Some(prev_thread) = gsc.get_thread_by_thread_id(prev_id) {
                     prev_thread.lock().unwrap().set_last_scheduled_tick(tick);
                 }
@@ -2666,8 +2664,7 @@ impl KScheduler {
                     && next_thread_id
                         .and_then(|next_id| gsc.m_priority_queue.get_thread_props(next_id))
                         .is_some_and(|next_props| {
-                            next_props.last_scheduled_tick
-                                < candidate_props.last_scheduled_tick
+                            next_props.last_scheduled_tick < candidate_props.last_scheduled_tick
                         });
                 if next_waited_longer {
                     break;
@@ -2739,9 +2736,7 @@ impl KScheduler {
                     };
                     if top_on_suggested_core != Some(candidate_id) {
                         let top_priority = top_on_suggested_core
-                            .and_then(|thread_id| {
-                                gsc.m_priority_queue.get_thread_props(thread_id)
-                            })
+                            .and_then(|thread_id| gsc.m_priority_queue.get_thread_props(thread_id))
                             .map(|props| props.priority);
                         if top_priority.is_none_or(|top_priority| {
                             top_priority

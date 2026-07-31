@@ -122,6 +122,7 @@ pub struct BufferCacheRuntime {
     null_buffer: vk::Buffer,
     null_memory: vk::DeviceMemory,
     null_buffer_size: vk::DeviceSize,
+    has_null_descriptor: bool,
     extended_dynamic_state_supported: bool,
     max_vertex_input_bindings: u32,
 }
@@ -134,11 +135,10 @@ impl BufferCacheRuntime {
         scheduler: &mut Scheduler,
         staging_pool: &mut StagingBufferPool,
         guest_descriptor_queue: &mut UpdateDescriptorQueue,
+        has_null_descriptor: bool,
         extended_dynamic_state_supported: bool,
         max_vertex_input_bindings: u32,
     ) -> Self {
-        let (null_buffer, null_memory, null_buffer_size) =
-            create_runtime_null_buffer(&device, &instance, physical_device);
         Self {
             device,
             instance,
@@ -149,9 +149,10 @@ impl BufferCacheRuntime {
             buffers: HashMap::new(),
             staging_refs: HashMap::new(),
             next_handle: 1,
-            null_buffer,
-            null_memory,
-            null_buffer_size,
+            null_buffer: vk::Buffer::null(),
+            null_memory: vk::DeviceMemory::null(),
+            null_buffer_size: 4,
+            has_null_descriptor,
             extended_dynamic_state_supported,
             max_vertex_input_bindings,
         }
@@ -171,6 +172,27 @@ impl BufferCacheRuntime {
     fn guest_descriptor_queue(&mut self) -> &mut UpdateDescriptorQueue {
         // SAFETY: see `scheduler`.
         unsafe { self.guest_descriptor_queue.as_mut() }
+    }
+
+    /// Port of upstream `BufferCacheRuntime::ReserveNullBuffer`.
+    fn reserve_null_buffer(&mut self) {
+        if self.null_buffer != vk::Buffer::null() {
+            return;
+        }
+        let (buffer, memory, size) =
+            create_runtime_null_buffer(&self.device, &self.instance, self.physical_device);
+        if buffer == vk::Buffer::null() {
+            return;
+        }
+        self.null_buffer = buffer;
+        self.null_memory = memory;
+        self.null_buffer_size = size;
+
+        let device = self.device.clone();
+        self.scheduler().request_outside_renderpass();
+        self.scheduler().record(move |cmdbuf| unsafe {
+            device.cmd_fill_buffer(cmdbuf, buffer, 0, vk::WHOLE_SIZE, 0);
+        });
     }
 
     fn allocate_handle(&mut self) -> u32 {
@@ -374,7 +396,9 @@ impl BufferCacheRuntime {
         // copy/clear paths still skip missing handles; the substitution is done
         // here, locally to descriptor binding.
         let resolved = self.resolve_buffer(gpu_handle);
-        let (buffer, offset, size) = if resolved == vk::Buffer::null() {
+        let (buffer, offset, size) = if resolved == vk::Buffer::null() && !self.has_null_descriptor
+        {
+            self.reserve_null_buffer();
             (self.null_buffer, 0, self.null_buffer_size as u32)
         } else {
             (resolved, offset, size)
@@ -633,6 +657,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         ));
         let mut buffer = self.resolve_buffer(gpu_handle);
         if buffer == vk::Buffer::null() {
+            self.reserve_null_buffer();
             buffer = self.null_buffer;
         }
         let index_type = match index_format {
@@ -665,22 +690,25 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         let mut strides = SmallVec::<[u64; 32]>::new();
         for index in 0..binding_count {
             let buffer_id = bindings.buffer_ids[index];
-            let mut buffer = if buffer_id.is_valid() {
+            let buffer = if buffer_id.is_valid() {
                 self.resolve_buffer(buffers[buffer_id].gpu_handle)
             } else {
                 vk::Buffer::null()
             };
-            let is_null = buffer == vk::Buffer::null();
-            if is_null {
-                buffer = self.null_buffer;
+            if buffer == vk::Buffer::null() && !self.has_null_descriptor {
+                self.reserve_null_buffer();
             }
+            let (buffer, offset, size) = prepare_vertex_binding(
+                buffer,
+                bindings.offsets[index],
+                bindings.sizes[index],
+                self.has_null_descriptor,
+                self.null_buffer,
+                self.null_buffer_size,
+            );
             vk_buffers.push(buffer);
-            offsets.push(if is_null { 0 } else { bindings.offsets[index] });
-            sizes.push(if is_null {
-                vk::WHOLE_SIZE
-            } else {
-                bindings.sizes[index]
-            });
+            offsets.push(offset);
+            sizes.push(size);
             strides.push(bindings.strides[index]);
         }
         let first_binding = bindings.min_index;
@@ -840,19 +868,10 @@ fn create_runtime_null_buffer(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
 ) -> (vk::Buffer, vk::DeviceMemory, vk::DeviceSize) {
-    let size = 256;
+    let size = 4;
     let info = vk::BufferCreateInfo::builder()
         .size(size)
-        .usage(
-            vk::BufferUsageFlags::VERTEX_BUFFER
-                | vk::BufferUsageFlags::INDEX_BUFFER
-                | vk::BufferUsageFlags::UNIFORM_BUFFER
-                | vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
-                | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER
-                | vk::BufferUsageFlags::TRANSFER_DST
-                | vk::BufferUsageFlags::INDIRECT_BUFFER,
-        )
+        .usage(runtime_null_buffer_usage_flags())
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .build();
     let Ok(buffer) = (unsafe { device.create_buffer(&info, None) }) else {
@@ -885,6 +904,13 @@ fn create_runtime_null_buffer(
         return (vk::Buffer::null(), vk::DeviceMemory::null(), size);
     }
     (buffer, memory, size)
+}
+
+fn runtime_null_buffer_usage_flags() -> vk::BufferUsageFlags {
+    vk::BufferUsageFlags::VERTEX_BUFFER
+        | vk::BufferUsageFlags::INDEX_BUFFER
+        | vk::BufferUsageFlags::TRANSFER_DST
+        | vk::BufferUsageFlags::INDIRECT_BUFFER
 }
 
 /// Manages GPU buffers for vertex, index, uniform, and storage data.
@@ -1561,6 +1587,25 @@ fn vertex_binding_count(min_index: u32, max_index: u32, device_max: u32) -> u32 
     max_binding.saturating_sub(min_binding)
 }
 
+/// Port of the null-handle branch in upstream
+/// `BufferCacheRuntime::BindVertexBuffers`.
+fn prepare_vertex_binding(
+    buffer: vk::Buffer,
+    offset: vk::DeviceSize,
+    size: vk::DeviceSize,
+    has_null_descriptor: bool,
+    null_buffer: vk::Buffer,
+    null_buffer_size: vk::DeviceSize,
+) -> (vk::Buffer, vk::DeviceSize, vk::DeviceSize) {
+    if buffer != vk::Buffer::null() {
+        return (buffer, offset, size);
+    }
+    if has_null_descriptor {
+        return (vk::Buffer::null(), 0, vk::WHOLE_SIZE);
+    }
+    (null_buffer, 0, null_buffer_size)
+}
+
 fn find_device_local_memory(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -1588,6 +1633,35 @@ mod tests {
         assert_eq!(vertex_binding_count(0, 32, 16), 16);
         assert_eq!(vertex_binding_count(12, 20, 16), 4);
         assert_eq!(vertex_binding_count(16, 32, 16), 0);
+    }
+
+    #[test]
+    fn runtime_null_buffer_base_usage_matches_upstream() {
+        assert_eq!(
+            runtime_null_buffer_usage_flags(),
+            vk::BufferUsageFlags::VERTEX_BUFFER
+                | vk::BufferUsageFlags::INDEX_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::INDIRECT_BUFFER
+        );
+    }
+
+    #[test]
+    fn null_vertex_binding_preserves_upstream_null_descriptor_path() {
+        let fallback = vk::Buffer::from_raw(0x1234);
+        assert_eq!(
+            prepare_vertex_binding(vk::Buffer::null(), 91, 73, true, fallback, 4),
+            (vk::Buffer::null(), 0, vk::WHOLE_SIZE)
+        );
+    }
+
+    #[test]
+    fn null_vertex_binding_fallback_is_zero_buffer_bounded() {
+        let fallback = vk::Buffer::from_raw(0x1234);
+        assert_eq!(
+            prepare_vertex_binding(vk::Buffer::null(), 91, 73, false, fallback, 4),
+            (fallback, 0, 4)
+        );
     }
 
     #[test]
