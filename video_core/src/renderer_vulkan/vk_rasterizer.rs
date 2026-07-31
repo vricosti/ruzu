@@ -402,9 +402,15 @@ pub struct RasterizerVulkan {
     channel_caches: ChannelSetupCaches<ChannelInfo>,
 
     // Sub-components (matching zuyu's architecture)
-    scheduler: Box<Scheduler>,
+    /// Non-owning counterpart of upstream `Scheduler& scheduler`.
+    ///
+    /// `RendererVulkan` owns the single boxed scheduler and outlives this
+    /// rasterizer. The stable pointer preserves upstream ownership without a
+    /// self-referential Rust struct.
+    scheduler: OwnerReference<Scheduler>,
     memory_allocator: NonNull<MemoryAllocator>,
-    state_tracker: Box<StateTracker>,
+    /// Non-owning counterpart of upstream `StateTracker& state_tracker`.
+    state_tracker: OwnerReference<StateTracker>,
     staging_pool: Box<StagingBufferPool>,
     // Boxed like `scheduler`/`staging_pool`/`render_pass_cache`: sub-components
     // capture `NonNull` pointers to these during construction (BlitImageHelper
@@ -487,6 +493,52 @@ pub struct RasterizerVulkan {
 // Raw pointers are only used for mapped memory
 unsafe impl Send for RasterizerVulkan {}
 
+/// Stable, non-owning Rust representation of an upstream C++ reference member.
+///
+/// The owner boxes the referenced value and is declared after the borrower so
+/// Rust drops the borrower first.
+struct OwnerReference<T> {
+    pointer: NonNull<T>,
+}
+
+impl<T> OwnerReference<T> {
+    fn new(value: &mut T) -> Self {
+        Self {
+            pointer: NonNull::from(value),
+        }
+    }
+}
+
+impl<T> std::ops::Deref for OwnerReference<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.pointer.as_ref() }
+    }
+}
+
+impl<T> std::ops::DerefMut for OwnerReference<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self.pointer.as_mut() }
+    }
+}
+
+#[cfg(test)]
+mod owner_reference_tests {
+    use super::OwnerReference;
+
+    #[test]
+    fn references_renderer_owned_stable_storage() {
+        let mut owner = Box::new(0x1234_u64);
+        let owner_address = std::ptr::from_ref(owner.as_ref());
+        let mut reference = OwnerReference::new(owner.as_mut());
+
+        assert_eq!(reference.pointer.as_ptr(), owner_address.cast_mut());
+        *reference = 0x5678;
+        assert_eq!(*owner, 0x5678);
+    }
+}
+
 impl RasterizerVulkan {
     /// Low-bit mask used by upstream to check every eighth operation.
     const DISPATCH_THRESHOLD: u32 = 7;
@@ -501,8 +553,6 @@ impl RasterizerVulkan {
         instance: ash::Instance,
         physical_device: vk::PhysicalDevice,
         device: ash::Device,
-        graphics_queue: vk::Queue,
-        queue_family_index: u32,
         width: u32,
         height: u32,
         supported_spirv_version: u32,
@@ -521,7 +571,6 @@ impl RasterizerVulkan {
         patch_list_primitive_restart_supported: bool,
         must_emulate_scaled_formats: bool,
         shader_stencil_export_supported: bool,
-        timeline_semaphore_supported: bool,
         image_format_list_supported: bool,
         optimal_astc_supported: bool,
         custom_border_color_supported: bool,
@@ -533,33 +582,20 @@ impl RasterizerVulkan {
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<MaxwellDeviceMemoryManager>,
         memory_allocator: &mut MemoryAllocator,
+        state_tracker: &mut StateTracker,
+        scheduler: &mut Scheduler,
     ) -> Result<Self, RendererError> {
         info!(
             "RasterizerVulkan: initializing {}x{} renderer",
             width, height
         );
 
-        // Create state tracker
-        let mut state_tracker = Box::new(StateTracker::new());
-
-        // Create scheduler
-        let mut scheduler = Box::new(
-            Scheduler::new(
-                device.clone(),
-                graphics_queue,
-                queue_family_index,
-                timeline_semaphore_supported,
-            )
-            .map_err(|e| RendererError::InitFailed(format!("scheduler: {:?}", e)))?,
-        );
-        scheduler.set_state_tracker(NonNull::from(state_tracker.as_mut()));
-
         // Create staging buffer pool
         let mut staging_pool = Box::new(StagingBufferPool::new(
             device.clone(),
             instance.clone(),
             physical_device,
-            scheduler.as_mut(),
+            scheduler,
         ));
 
         // Create descriptor pool. Boxed (with the descriptor queues and the
@@ -572,7 +608,7 @@ impl RasterizerVulkan {
         let mut compute_pass_desc_queue = Box::new(UpdateDescriptorQueue::new());
         let mut blit_image = Box::new(BlitImageHelper::new(
             device.clone(),
-            &mut scheduler,
+            scheduler,
             descriptor_pool.as_mut(),
             shader_stencil_export_supported,
         ));
@@ -669,7 +705,7 @@ impl RasterizerVulkan {
             device.clone(),
             instance.clone(),
             physical_device,
-            scheduler.as_mut(),
+            scheduler,
             staging_pool.as_mut(),
             desc_queue.as_mut(),
             extended_dynamic_state_supported,
@@ -688,7 +724,7 @@ impl RasterizerVulkan {
             instance.clone(),
             physical_device,
             device_memory,
-            scheduler.as_mut(),
+            scheduler,
             &mut *memory_allocator,
             staging_pool.as_mut(),
             blit_image.as_mut(),
@@ -757,9 +793,9 @@ impl RasterizerVulkan {
             physical_device,
             syncpoints,
             channel_caches: ChannelSetupCaches::new(),
-            scheduler,
+            scheduler: OwnerReference::new(scheduler),
             memory_allocator: NonNull::from(&mut *memory_allocator),
-            state_tracker,
+            state_tracker: OwnerReference::new(state_tracker),
             staging_pool,
             descriptor_pool,
             desc_queue,

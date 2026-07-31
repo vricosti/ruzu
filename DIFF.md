@@ -28971,3 +28971,86 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ### Binary layout verification
 - PASS: `Pair128` remains `repr(C)` with ordered low/high `u64` lanes; the
   `LDR Q`, `LDXP`, and all-size transpose execution regressions pass.
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_vector_basic.rs vs externals/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp
+
+### Intentional differences
+- Rust releases scratch registers explicitly through `RegAlloc`; upstream C++
+  relies on its register-allocation scope. This is a mechanical ownership
+  adaptation and does not change the emitted instruction order.
+
+### Unintentional differences (to fix)
+- None in the audited `VectorReverseElementsIn{Half,Word,Long}Groups*` slice.
+  The previous shared `PSHUFB` helper and duplicated masks were removed.
+
+### Missing items
+- None in this six-method slice.
+
+### Binary layout verification
+- PASS: the methods operate entirely on a 128-bit XMM value and introduce no
+  serialized or stack payload.
+
+### Behavioral and platform verification
+- Re-read upstream `EmitVectorReverseElementsInHalfGroups8`,
+  `EmitVectorReverseElementsInWordGroups8/16`, and
+  `EmitVectorReverseElementsInLongGroups8/16/32` after implementation.
+- Rust now emits the same ordered `MOVDQA`, `PSLLW`, `PSRLW`, `POR`,
+  `PSHUFLW`, and `PSHUFHW` sequences with upstream immediates `0xB1`, `0x1B`,
+  and `0x4E`.
+- `jit::tests::test_a64_rev32_8h_reverses_halfwords_within_words` passes.
+- `jit::tests::test_a64_vector_reverse_group_family_matches_upstream_sequences`
+  passes for all six A64 vector `REV16`/`REV32`/`REV64` element arrangements.
+- The replacement uses only SSE2 instructions, which are baseline on x86_64.
+  Linux and macOS x86_64 retain the System V ABI path; Windows-only aggregate
+  return handling remains guarded by `cfg(all(target_os = "windows",
+  target_env = "msvc"))`. Cross-target compilation was not executed because
+  this host has only `x86_64-pc-windows-msvc` installed.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/renderer_vulkan.{h,cpp}
+
+### Intentional differences
+- Rust stores the renderer-owned `StateTracker` and `Scheduler` in `Box` values
+  so their addresses remain stable when `RendererVulkan` moves. Upstream owns
+  the same two values directly as class members.
+- Rust declares dependent fields in C++ destruction order because Rust drops
+  fields in declaration order while C++ destroys members in reverse
+  declaration order.
+
+### Unintentional differences (to fix)
+- None in the audited scheduler/state-tracker ownership slice. The previous
+  renderer scheduler plus independently rasterizer-owned scheduler has been
+  replaced by the single renderer-owned scheduler used by upstream.
+
+### Missing items
+- None in this ownership slice.
+
+### Binary layout verification
+- N/A: these are host-side owners and non-serialized Vulkan state objects.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.{h,cpp}
+
+### Intentional differences
+- Rust represents upstream `StateTracker&` and `Scheduler&` members with
+  private stable `NonNull` references behind `OwnerReference`; the boxed
+  owners live in `RendererVulkan` and are dropped after the rasterizer.
+
+### Unintentional differences (to fix)
+- None in the audited ownership and constructor slice.
+  `RasterizerVulkan::new` now receives both owners from `RendererVulkan`,
+  forwards that same scheduler to its sub-components, and no longer creates a
+  second queue-submission worker or submit mutex.
+
+### Missing items
+- None in this ownership slice.
+
+### Binary layout verification
+- N/A: the owner bridge is host-only and is not copied into guest-visible or
+  serialized memory.
+
+### Behavioral verification
+- Re-read both upstream headers and implementations after the Rust change and
+  compared the member ownership, constructor ordering, and sub-component
+  scheduler forwarding.
+- `cargo check -p video_core` passes.
+- `cargo test -p video_core
+  owner_reference_tests::references_renderer_owned_stable_storage --lib`
+  passes.

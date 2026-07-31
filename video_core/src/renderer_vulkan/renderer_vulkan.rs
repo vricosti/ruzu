@@ -32,6 +32,7 @@ use super::blit_screen::{BlitFrame, BlitScreen};
 use super::present::util::{create_wrapped_image, create_wrapped_image_view, download_color_image};
 use super::present_manager::{Frame, PresentManager};
 use super::scheduler::Scheduler;
+use super::state_tracker::StateTracker;
 use super::swapchain::Swapchain;
 
 // ---------------------------------------------------------------------------
@@ -206,7 +207,16 @@ pub struct RendererVulkan {
     /// from `PresentThread` under `swapchain_mutex`).
     swapchain: std::sync::Arc<std::sync::Mutex<Swapchain>>,
     /// Presentation command scheduler.
-    scheduler: Scheduler,
+    ///
+    /// Boxed so the non-owning references held by `RasterizerVulkan` remain
+    /// stable when this renderer moves. Upstream owns this single scheduler
+    /// here and passes it by reference to the rasterizer.
+    scheduler: Box<Scheduler>,
+    /// Vulkan command-buffer state tracker.
+    ///
+    /// Like `scheduler`, this is a renderer-owned upstream member boxed only
+    /// to provide a stable address for Rust's non-owning owner bridge.
+    state_tracker: Box<StateTracker>,
     /// Vulkan memory allocator owner.
     memory_allocator: Box<MemoryAllocator>,
     /// Physical/logical Vulkan device owner.
@@ -323,13 +333,17 @@ impl RendererVulkan {
             physical_properties.limits.buffer_image_granularity,
             false,
         ));
-        let scheduler = Scheduler::new(
-            device.get_logical().clone(),
-            device.get_graphics_queue(),
-            device.get_graphics_family(),
-            device.is_timeline_semaphore_supported(),
-        )
-        .map_err(VulkanError::new)?;
+        let mut state_tracker = Box::new(StateTracker::new());
+        let mut scheduler = Box::new(
+            Scheduler::new(
+                device.get_logical().clone(),
+                device.get_graphics_queue(),
+                device.get_graphics_family(),
+                device.is_timeline_semaphore_supported(),
+            )
+            .map_err(VulkanError::new)?,
+        );
+        scheduler.set_state_tracker(std::ptr::NonNull::from(state_tracker.as_mut()));
         let submit_mutex = scheduler.submit_mutex();
         let swapchain = Swapchain::new(
             &instance.instance,
@@ -378,8 +392,6 @@ impl RendererVulkan {
             instance.instance.clone(),
             device.get_physical(),
             device.get_logical().clone(),
-            device.get_graphics_queue(),
-            device.get_graphics_family(),
             CAPTURE_IMAGE_WIDTH,
             CAPTURE_IMAGE_HEIGHT,
             device.supported_spirv_version(),
@@ -398,7 +410,6 @@ impl RendererVulkan {
             device.is_patch_list_primitive_restart_supported(),
             device.must_emulate_scaled_formats(),
             device.is_ext_shader_stencil_export_supported(),
-            device.is_timeline_semaphore_supported(),
             device.is_khr_image_format_list_supported(),
             device.is_optimal_astc_supported(),
             device.is_ext_custom_border_color_supported(),
@@ -410,6 +421,8 @@ impl RendererVulkan {
             syncpoints,
             Arc::clone(&device_memory),
             memory_allocator.as_mut(),
+            state_tracker.as_mut(),
+            scheduler.as_mut(),
         )
         .map_err(|err| {
             log::error!("Failed to initialize Vulkan rasterizer: {}", err);
@@ -426,6 +439,7 @@ impl RendererVulkan {
             present_manager,
             swapchain,
             scheduler,
+            state_tracker,
             memory_allocator,
             device,
             surface,
