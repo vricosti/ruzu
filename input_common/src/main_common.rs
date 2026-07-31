@@ -640,7 +640,7 @@ pub fn generate_keyboard_param(key_code: i32) -> String {
     let mut param = ParamPackage::default();
     param.set_str("engine", "keyboard".to_string());
     param.set_int("code", key_code);
-    param.set_str("toggle", "false".to_string());
+    param.set_int("toggle", 0);
     param.serialize()
 }
 
@@ -671,6 +671,15 @@ mod tests {
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
     use common::input::{CallbackStatus, InputCallback, InputType};
+
+    #[test]
+    fn keyboard_param_serializes_false_through_integer_overload() {
+        let param = ParamPackage::from_serialized(&generate_keyboard_param(42));
+
+        assert_eq!(param.get_str("engine", ""), "keyboard");
+        assert_eq!(param.get_int("code", -1), 42);
+        assert_eq!(param.get_str("toggle", ""), "0");
+    }
 
     fn capture_status(
         device: &mut dyn common::input::InputDevice,

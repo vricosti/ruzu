@@ -1619,6 +1619,7 @@ dependencies = [
  "objc",
  "parking_lot",
  "video_core",
+ "windows-sys 0.59.0",
  "x11",
 ]
 

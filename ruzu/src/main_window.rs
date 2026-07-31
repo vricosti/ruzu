@@ -121,7 +121,7 @@ pub struct GMainWindow {
 
 /// Handles needed to resize the embedded render surface on window resize.
 struct RenderHandles {
-    /// macOS: the child `NSWindow*`. Linux: the child X11 `Window` XID.
+    /// macOS: child `NSWindow*`; Linux: X11 `Window`; Windows: child `HWND`.
     child_window: usize,
     /// macOS: the `CAMetalLayer*`.
     #[cfg(target_os = "macos")]
@@ -520,7 +520,7 @@ impl GMainWindow {
         // Keep the embedded render surface sized to the central stack as the
         // window is resized. GTK4 has no widget `size-allocate` signal, so poll
         // the stack size on the frame clock and act only on change.
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         this.stack.add_tick_callback(glib::clone!(
             #[weak(rename_to = w)]
             this,
@@ -1752,9 +1752,158 @@ impl GMainWindow {
         }
     }
 
-    /// In-process boot needs a platform-specific render surface; only macOS
-    /// (CAMetalLayer) and Linux/X11 have one so far.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    /// Boot `filepath` into a Win32 child window embedded in the GTK window.
+    ///
+    /// Upstream's Windows `RenderWidget` owns a native child `HWND` and passes
+    /// `windowHandle()->winId()` to Vulkan. GTK has no native surface per
+    /// widget, so `render_window_windows` creates the equivalent child directly.
+    #[cfg(target_os = "windows")]
+    pub fn boot_game(self: &Rc<Self>, filepath: String) {
+        use crate::emu_window::GtkEmuWindow;
+        use crate::render_window_windows as render;
+        use ruzu_core::frontend::emu_window::{WindowSystemInfo, WindowSystemType};
+
+        let ready =
+            self.window.surface().is_some() && self.stack.width() > 0 && self.stack.height() > 0;
+        if !ready {
+            let this = Rc::clone(self);
+            glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+                if this.window.surface().is_some()
+                    && this.stack.width() > 0
+                    && this.stack.height() > 0
+                {
+                    this.boot_game(filepath.clone());
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            });
+            return;
+        }
+
+        // Upstream releases the previous render target before initializing the
+        // next one. Stop the session first so Vulkan no longer owns its HWND.
+        if let Some(mut session) = self.session.borrow_mut().take() {
+            session.stop();
+        }
+        if let Some(handles) = self.render.borrow_mut().take() {
+            render::destroy_render_window(handles.child_window as _);
+        }
+        let session_generation = self.session_generation.get().wrapping_add(1);
+        self.session_generation.set(session_generation);
+        self.status_bar.refresh();
+
+        let render_rect = self.stack.compute_bounds(&self.window).map(|rect| {
+            (
+                rect.x() as f64,
+                rect.y() as f64,
+                rect.width() as f64,
+                rect.height() as f64,
+            )
+        });
+        let Some(embedded) =
+            render::attach_render_window(self.window.upcast_ref::<gtk::Window>(), render_rect)
+        else {
+            log::error!("Cannot boot: failed to embed a Win32 render surface");
+            self.alert(
+                "Unable to start the game",
+                "ruzu could not create its embedded Windows render surface.",
+            );
+            return;
+        };
+        render::set_render_window_hidden(embedded.window, true);
+
+        let window_info = WindowSystemInfo {
+            type_: WindowSystemType::Windows,
+            display_connection: 0,
+            render_surface: embedded.window as usize,
+            render_surface_scale: embedded.scale,
+        };
+        let emu = GtkEmuWindow::from_window_info(window_info.clone(), embedded.drawable_size);
+        let drawable_size = emu.drawable_size();
+        let shown_state = emu.shown_state();
+        let framebuffer_layout = emu.framebuffer_layout();
+
+        *self.render.borrow_mut() = Some(RenderHandles {
+            child_window: embedded.window as usize,
+            framebuffer_layout: Arc::clone(&framebuffer_layout),
+        });
+        self.render_size
+            .set((self.stack.width(), self.stack.height()));
+        self.show_loading_screen();
+
+        let mailbox = Arc::new(Mutex::new(LoadingEventMailbox::default()));
+        let producer = Arc::clone(&mailbox);
+        let loading_event: crate::boot::LoadingEventFn = Arc::new(move |event| {
+            producer.lock().unwrap().push(event);
+        });
+
+        let loading = Rc::clone(&self.loading_screen);
+        let stack = self.stack.clone();
+        let child = embedded.window as usize;
+        let this = Rc::clone(self);
+        glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+            if this.session_generation.get() != session_generation {
+                return glib::ControlFlow::Break;
+            }
+            match mailbox.lock().unwrap().pop() {
+                Some(LoadingEvent::Assets(assets)) => {
+                    loading.set_assets(assets.logo.as_deref(), assets.banner.as_deref());
+                }
+                Some(LoadingEvent::Progress {
+                    stage,
+                    value,
+                    total,
+                }) => loading.on_load_progress(stage, value, total),
+                Some(LoadingEvent::FirstFrame) => {
+                    let stack = stack.clone();
+                    loading.on_load_complete(move || {
+                        stack.set_visible_child_name(PAGE_RENDER);
+                        render::set_render_window_hidden(child as _, false);
+                    });
+                }
+                Some(LoadingEvent::Failed { message, detail }) => {
+                    this.on_emulation_stopped(Some((message, detail)));
+                    return glib::ControlFlow::Break;
+                }
+                Some(LoadingEvent::Stopped { before_first_frame }) => {
+                    let failure = before_first_frame.then(|| {
+                        (
+                            "The game stopped unexpectedly".to_owned(),
+                            "The application stopped before displaying a frame. \
+                             Verify that its required files are available on the emulated SD card \
+                             and check the log for details."
+                                .to_owned(),
+                        )
+                    });
+                    this.on_emulation_stopped(failure);
+                    return glib::ControlFlow::Break;
+                }
+                None => {}
+            }
+            glib::ControlFlow::Continue
+        });
+
+        let session = crate::boot::boot_game(
+            window_info,
+            drawable_size,
+            shown_state,
+            framebuffer_layout,
+            Arc::clone(&self.hid_core),
+            filepath,
+            loading_event,
+        );
+        *self.session.borrow_mut() = Some(session);
+        if let Some(app) = self.window.application() {
+            update_menu_state(&app, true, false);
+        }
+        if crate::uisettings::with(|values| *values.fullscreen.get_value()) {
+            self.set_fullscreen(true);
+        }
+    }
+
+    /// In-process boot needs a platform-specific native render surface.
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     pub fn boot_game(self: &Rc<Self>, _filepath: String) {
         log::error!("In-process boot is not implemented on this platform yet");
     }
@@ -1831,6 +1980,41 @@ impl GMainWindow {
         }
     }
 
+    /// Windows counterpart of `maybe_resize_render`: resize the child `HWND`
+    /// and publish the new framebuffer layout after the native resize.
+    #[cfg(target_os = "windows")]
+    fn maybe_resize_render(&self) {
+        let (width, height) = (self.stack.width(), self.stack.height());
+        if width <= 0 || height <= 0 || self.render_size.get() == (width, height) {
+            return;
+        }
+        let render = self.render.borrow();
+        let Some(handles) = render.as_ref() else {
+            self.render_size.set((width, height));
+            return;
+        };
+        let Some(rect) = self.stack.compute_bounds(&self.window) else {
+            return;
+        };
+        self.render_size.set((width, height));
+        let gtk_rect = (
+            rect.x() as f64,
+            rect.y() as f64,
+            rect.width() as f64,
+            rect.height() as f64,
+        );
+        if let Some((drawable_width, drawable_height)) =
+            crate::render_window_windows::resize_render_window(
+                self.window.upcast_ref::<gtk::Window>(),
+                handles.child_window as _,
+                gtk_rect,
+            )
+        {
+            *handles.framebuffer_layout.write().unwrap() =
+                default_frame_layout(drawable_width, drawable_height);
+        }
+    }
+
     /// Switch the central stack to the loading screen and reset its state.
     /// Mirrors the point where upstream shows `LoadingScreen` before booting.
     pub fn show_loading_screen(&self) {
@@ -1861,6 +2045,8 @@ impl GMainWindow {
             );
             #[cfg(target_os = "macos")]
             crate::render_window::set_render_view_hidden(handles.child_window as *mut _, true);
+            #[cfg(target_os = "windows")]
+            crate::render_window_windows::destroy_render_window(handles.child_window as _);
         }
 
         self.loading_screen.clear();

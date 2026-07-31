@@ -28449,3 +28449,525 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ### Binary layout verification
 - PASS: game-directory fields and config serialization are unchanged; this
   affects frontend selection and action routing only.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/callback.rs vs dynarmic/backend/x64/callback.{h,cpp}
+
+### Intentional differences
+- Rust callback setup closures also receive `&mut CodeAssembler` and return
+  `rxbyak::Result<()>`; this is a mechanical adaptation of upstream's closure
+  over `BlockOfCode` and preserves parameter ownership and emission order.
+- `emit_call_to` always uses `mov rax, imm64; call rax`; upstream
+  `BlockOfCode::CallFunction` selects a relative call when the target is in
+  range. Both forms call the same function without changing the dispatcher
+  stack frame.
+
+### Unintentional differences (to fix)
+- Fixed: callbacks created a second, dynamically realigned stack frame around
+  every host call. Upstream calls directly because the dispatcher prologue
+  already aligns `RSP` and reserves Windows shadow space.
+- Fixed: `ArgCallback::emit_call_with_return_pointer` always used the SysV
+  hidden-return order. The MSVC path now keeps the fixed context in `RCX` and
+  exposes the return pointer in `RDX`, while MinGW/non-MSVC retains upstream's
+  alternate order.
+- Fixed: callback setup now receives the ABI-selected parameter registers, so
+  emitters no longer hard-code SysV registers on Windows.
+
+### Missing items
+- None in the callback ABI slice.
+
+### Binary layout verification
+- PASS: emitted callback-call bytes are regression-tested and contain no
+  nested `RSP` adjustment; MSVC hidden-return register selection is tested.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/a32_emit_a32.rs vs dynarmic/backend/x64/a32_emit_x64.cpp
+
+### Intentional differences
+- Host function calls use rdynarmic's existing absolute-call helper sequence
+  rather than upstream's distance-selecting `BlockOfCode::CallFunction`.
+- `A32PcExecHook` is a Ruzu diagnostic extension with no upstream IR method.
+  Its three host arguments now use the selected host ABI instead of SysV-only
+  registers.
+
+### Unintentional differences (to fix)
+- Fixed: A32 SVC and exception callbacks wrote their user arguments to
+  `RSI`/`RDX`; under MSVC the fixed callback context occupies `RCX`, so the
+  user arguments belong in `RDX`/`R8`.
+- Fixed: the SVC emitter pre-set `halt_reason`. Upstream leaves halting to
+  `UserCallbacks::CallSVC`, which preserves callback ownership and atomic OR
+  semantics.
+- Fixed: A32 SVC and exception paths omitted upstream's MXCSR exit and the
+  cycle-counting `AddTicks`/`GetTicksRemaining` sequence. Their ordering now
+  matches `EmitA32CallSupervisor` and `EmitA32ExceptionRaised`.
+- Fixed: `EmitA32GetFpscr` passed the JIT state in `RDI` and omitted
+  `stmxcsr`; `EmitA32SetFpscr` passed the state in `RSI` and omitted the final
+  `ldmxcsr`. Both methods now match upstream on SysV and MSVC.
+
+### Missing items
+- None in the SVC, exception and FPSCR methods audited here.
+
+### Binary layout verification
+- PASS: JIT-state field offsets continue to come from `A32JitState`; FPSCR
+  VMSR/VMRS and cycle-counted SVC execution are covered by x64 JIT tests.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_a64.rs vs dynarmic/backend/x64/a64_emit_x64.cpp
+
+### Intentional differences
+- The Rust emitter obtains immediate values through `Argument` and emits the
+  callback setup closure through rdynarmic's object-safe callback trait.
+
+### Unintentional differences (to fix)
+- Fixed: A64 SVC and exception callbacks used `RSI`/`RDX` directly instead of
+  upstream's callback-provided parameter list, corrupting both values under
+  the MSVC ABI.
+- Fixed: the SVC emitter pre-set `halt_reason` before invoking the callback.
+  Upstream assigns that responsibility to `CallSVC`.
+- Fixed: argument discovery and allocation-scope ordering now follows
+  `EmitA64CallSupervisor` and `EmitA64ExceptionRaised`; exclusive-state clear
+  remains after the SVC callback as upstream requires.
+
+### Missing items
+- None in the A64 SVC and exception methods audited here.
+
+### Binary layout verification
+- PASS: only emitted host argument registers and ordering changed; the
+  `A64JitState::exclusive_state` offset remains owner-derived.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/block_of_code.rs vs dynarmic/backend/x64/{block_of_code.cpp,abi.cpp}
+
+### Intentional differences
+- rdynarmic's existing `StackLayout` has 192 spill slots and places the
+  Windows XMM save region below the Rust frame, whereas this upstream revision
+  has 64 spill slots and `CalculateFrameInfo` places XMM saves after the
+  caller frame. The allocation helper therefore derives the exact Rust frame
+  size while preserving upstream's alignment, shadow-space and callee-save
+  rules.
+- The module-level MXCSR emission helpers are mechanical counterparts of
+  `BlockOfCode::SwitchMxcsrOnEntry/Exit`; the methods remain owned by
+  `block_of_code.rs` and delegate to them so A32 emitters can reuse the same
+  upstream-owned behavior.
+
+### Unintentional differences (to fix)
+- Fixed: SEH setup received `sizeof(StackLayout)` even though the dispatcher
+  subtracts aligned frame size, Windows shadow space, XMM save space and
+  alignment padding from `RSP`.
+- Fixed: the stack-allocation formula was duplicated in push and pop paths.
+  One owner now implements upstream `CalculateFrameInfo::stack_subtraction`
+  behavior and also supplies the unwind metadata.
+- Fixed: destroying a `BlockOfCode` did not unregister its Windows runtime
+  function table.
+
+### Missing items
+- None in the dispatcher frame/allocation slice.
+
+### Binary layout verification
+- PASS: a Windows-only test checks the exact 89-byte emitted prologue, GPR push
+  bytes and encoded `sub rsp` allocation against the shared calculation.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/exception_handler.rs vs dynarmic/backend/{exception_handler.h,x64/exception_handler_windows.cpp}
+
+### Intentional differences
+- Rust keeps platform implementations in one cfg-partitioned source file;
+  upstream selects separate translation units.
+- Upstream stores one callback in an `ExceptionHandler::Impl`. rdynarmic's
+  existing API registers callbacks per compiled block, so the Windows owner
+  keeps one JIT record per code buffer and dispatches to that buffer's block
+  ranges. The ownership and fake-call behavior remain equivalent.
+- The upstream file hard-codes an older `sub rsp, 0xC8` prologue. Rust unwind
+  metadata uses the actual allocation emitted for rdynarmic's larger current
+  `StackLayout`; hard-coding `0xC8` would make Windows unwind through an
+  incorrect frame.
+
+### Unintentional differences (to fix)
+- Fixed: unwind operations were serialized in ascending prologue order;
+  Windows requires reverse order, matching upstream's
+  `GetPrologueInformation`.
+- Fixed: `CountOfCodes` included alignment padding instead of preserving the
+  pre-padding operation count.
+- Fixed: only the last-created JIT's runtime-function state was retained.
+  Each code buffer now owns registration data and is removed with
+  `RtlDeleteFunctionTable` during its `BlockOfCode` lifetime.
+- Fixed: the unwind allocation entry described only `StackLayout`, not the
+  actual dispatcher stack subtraction.
+
+### Missing items
+- None in the Windows x64 SEH registration and unwind slice.
+
+### Binary layout verification
+- PASS: unwind operation offsets are checked against the emitted 89-byte
+  prologue; the allocation entry is derived from the exact Rust frame and
+  `RUNTIME_FUNCTION` remains the Windows three-`u32` layout.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_data_processing.rs vs dynarmic/backend/x64 callback call sites
+
+### Intentional differences
+- The test-only `NoopCallback` signature follows the Rust callback trait's
+  fallible assembler-aware closure adaptation.
+
+### Unintentional differences (to fix)
+- None; production data-processing emission is unchanged.
+
+### Missing items
+- None in this trait-signature synchronization.
+
+### Binary layout verification
+- PASS: only a test double's method signatures changed.
+
+## 2026-07-31 — externals/rdynarmic/src/jit.rs vs Dynarmic A32 x64 execution contracts
+
+### Intentional differences
+- These are native Rust regression tests rather than ports of the excluded C++
+  test suite.
+
+### Unintentional differences (to fix)
+- Fixed behavior is guarded by end-to-end A32 x64 tests for VMSR/VMRS FPSCR
+  host calls and SVC callback execution with cycle counting enabled.
+
+### Missing items
+- None in this regression-test slice.
+
+### Binary layout verification
+- PASS: the tests execute generated code through the public A32 JIT and verify
+  FPSCR mode bits, SVC immediate delivery and halt behavior.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_exclusive_memory.rs vs dynarmic/backend/x64/emit_x64_memory.cpp.inc
+
+### Intentional differences
+- Upstream's 128-bit exclusive path calls a local lambda that owns global
+  monitor access. rdynarmic keeps that behavior in the existing
+  `exclusive_read_128_trampoline`; the emitter still owns argument placement,
+  temporary stack storage and result definition.
+- SysV retains its valid two-register `Pair128` return. The MSVC trampoline
+  uses an explicit third output pointer because it is a Rust free function,
+  not the C++ member-function wrapper modeled by
+  `ArgCallback::emit_call_with_return_pointer`.
+
+### Unintentional differences (to fix)
+- Fixed: the 128-bit exclusive-read emitter unconditionally consumed
+  `RAX:RDX`. MSVC aggregate returns require memory, and the old path crashed
+  during A64 `LDXP`.
+- Fixed: the MSVC path now reserves `16 + ABI_SHADOW_SPACE`, passes the
+  aligned output buffer in the third explicit callback argument, loads it with
+  `movups`, releases the same frame, then defines the XMM result in upstream
+  order.
+
+### Missing items
+- None in the 128-bit exclusive callback-return prerequisite.
+
+### Binary layout verification
+- PASS: `Pair128` is `repr(C)` with two ordered `u64` lanes; the LDXP
+  regression executes generated code and verifies both lanes.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_memory.rs vs dynarmic/backend/x64/{emit_x64_memory.cpp.inc,a64_emit_x64_memory.cpp}
+
+### Intentional differences
+- Upstream uses a generated `memory_read_128` accessor around
+  `EmitCallWithReturnPointer`. rdynarmic emits the equivalent stack-buffer
+  sequence at the IR call site and invokes a Rust trampoline with an explicit
+  output pointer on MSVC.
+- SysV retains upstream-equivalent `RAX:RDX` aggregate consumption.
+
+### Unintentional differences (to fix)
+- Fixed: ordinary 128-bit callback reads also assumed the SysV aggregate
+  return on Windows. They now reserve shadow space plus a 16-byte payload,
+  pass the output address in the third explicit argument and load the result
+  from that buffer.
+
+### Missing items
+- None in the ordinary 128-bit callback-read prerequisite.
+
+### Binary layout verification
+- PASS: an A64 `LDR Q0, [X1]` regression verifies both 64-bit lanes through
+  the real callback-emission path.
+
+## 2026-07-31 — externals/rdynarmic/src/jit.rs vs Dynarmic x64 128-bit callback accessors
+
+### Intentional differences
+- MSVC wrappers expose the output buffer as an explicit third argument. This
+  avoids depending on Rust free-function hidden-return ordering while
+  preserving upstream's concrete `context, address, output` behavior.
+- SysV wrappers continue returning the two-lane `repr(C)` payload in
+  `RAX:RDX`.
+
+### Unintentional differences (to fix)
+- Fixed: both A64 128-bit read trampolines had one cross-platform aggregate
+  return signature even though MSVC and SysV marshal it differently.
+
+### Missing items
+- None in this trampoline ABI prerequisite.
+
+### Binary layout verification
+- PASS: the shared payload remains two contiguous `u64` fields and both
+  regular and exclusive generated-code regressions pass on MSVC x64.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/a32_emit_x64.rs vs dynarmic/backend/x64/a32_emit_x64_memory.cpp
+
+### Intentional differences
+- Upstream pre-generates every A32 fastmem fallback in
+  `GenFastmemFallbacks`; rdynarmic's existing owner emits the same per-entry
+  fallback lazily from the recorded `FastmemEntry`.
+
+### Unintentional differences (to fix)
+- Fixed: read fallbacks always copied the virtual address into `RSI`, and
+  write fallbacks always marshalled address/value into `RSI`/`RDX`. Those are
+  only upstream's SysV `ABI_PARAM2`/`ABI_PARAM3`; on Windows the fixed callback
+  context occupies `RCX`, so address/value belong in `RDX`/`R8`.
+- Fixed: the write alias cases and value zero-extension now use
+  `ABI_PARAMS[1]`/`ABI_PARAMS[2]` exactly like upstream's
+  `code.ABI_PARAM2`/`code.ABI_PARAM3` branches.
+
+### Missing items
+- None in the ordinary 8/16/32/64-bit A32 fastmem fallback argument slice.
+
+### Binary layout verification
+- PASS: only generated host-register selection changed; guest address and
+  value widths remain unchanged.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/a64_emit_x64_memory.rs vs dynarmic/backend/x64/a64_emit_x64_memory.cpp
+
+### Intentional differences
+- The Rust fallback table currently covers ordinary 8/16/32/64-bit entries in
+  this helper; upstream's additional 128-bit and exclusive tables retain
+  their existing Rust owners.
+
+### Unintentional differences (to fix)
+- Fixed: ordinary fastmem fallbacks hard-coded SysV `RSI`/`RDX` instead of
+  upstream's ABI-selected second and third callback parameters.
+- Fixed: read address placement, write address/value alias handling, and
+  pre-call zero-extension now use `ABI_PARAMS[1]` and `ABI_PARAMS[2]`, yielding
+  `RDX`/`R8` on Windows and preserving `RSI`/`RDX` on SysV.
+
+### Missing items
+- None in the ordinary 8/16/32/64-bit A64 fastmem fallback argument slice.
+
+### Binary layout verification
+- PASS: a generated-code regression directly executes read and write fallback
+  stubs and verifies fixed context, virtual address, zero-extended value, and
+  callback return placement under the selected host ABI.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/exception_handler.rs vs dynarmic/backend/x64/exception_handler_windows.cpp
+
+### Intentional differences
+- The previously documented runtime-derived stack allocation remains required
+  because rdynarmic's current dispatcher frame is larger than the historical
+  upstream hard-coded `0xC8` frame.
+
+### Unintentional differences (to fix)
+- None found in the registered unwind-table encoding during this follow-up
+  runtime verification.
+
+### Missing items
+- None in the synthetic dispatcher unwind path.
+
+### Binary layout verification
+- PASS: a Windows-only regression invokes `RtlVirtualUnwind` against the
+  actually registered `RUNTIME_FUNCTION` and verifies restoration of caller
+  `RSP` and `RIP`.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/stack_layout.rs vs dynarmic/backend/x64/stack_layout.h
+
+### Intentional differences
+- Rust spells upstream's `bool check_bit` as `u8` so the one-byte host layout
+  is explicit; both fields have the same offset and width.
+
+### Unintentional differences (to fix)
+- Fixed: `SPILL_COUNT` was 192 instead of upstream `SpillCount = 64`.
+- Fixed: the layout regression checked only 16-byte divisibility. It now checks
+  the exact 1056-byte size and every parity-sensitive field offset.
+
+### Missing items
+- None in `StackLayout`.
+
+### Binary layout verification
+- PASS: alignment 16, size 1056, `spill` offset 16, `save_host_MXCSR` offset
+  1040, and `check_bit` offset 1044 match the C++ structure.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/reg_alloc.rs vs dynarmic/backend/x64/reg_alloc.cpp
+
+### Intentional differences
+- Rust indexes `HostLoc` values through a flat metadata array; this is the
+  existing mechanical representation of upstream's host-location state.
+
+### Unintentional differences (to fix)
+- Fixed: register allocation exposed 192 spill locations instead of the 64
+  locations owned by upstream `StackLayout`.
+- Fixed: spill addresses omitted `ABI_SHADOW_SPACE`; they now use
+  `reserved_stack_space + ABI_SHADOW_SPACE + offsetof(StackLayout, spill)`,
+  matching `RegAlloc::SpillToOpArg`.
+
+### Missing items
+- None in the spill-count and spill-address slice.
+
+### Binary layout verification
+- PASS: each spill remains a contiguous aligned 16-byte lane and the first
+  slot is addressed from the upstream `StackLayout` base.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/block_of_code.rs vs dynarmic/backend/x64/{abi.cpp,block_of_code.cpp}
+
+### Intentional differences
+- MXCSR instruction emission is also exposed as module-local functions so the
+  Rust A32 owner can reuse `BlockOfCode::SwitchMxcsrOnEntry/Exit` behavior.
+- Rust emits `movaps`; upstream conditionally emits `vmovaps` when AVX is
+  available. The saved bytes and frame ownership are unchanged.
+
+### Unintentional differences (to fix)
+- Fixed: the earlier audit entry incorrectly retained a 192-slot Rust frame
+  and placed XMM saves before `StackLayout`.
+- Fixed: `StackLayout` now begins at `ABI_SHADOW_SPACE`; callee-saved XMM
+  registers begin at aligned `frame_size + ABI_SHADOW_SPACE`; stack subtraction
+  follows upstream `CalculateFrameInfo` exactly.
+- Fixed: all cycle, check-bit, MXCSR and spill consumers now use the same
+  upstream frame base.
+
+### Missing items
+- None in the callee-save dispatcher-frame slice.
+
+### Binary layout verification
+- PASS: the Windows dispatcher emits the expected 107-byte prologue for the
+  1056-byte upstream frame, with 1256 bytes subtracted and XMM6 beginning at
+  `RSP + 1088`.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/exception_handler.rs vs dynarmic/backend/x64/exception_handler_windows.cpp
+
+### Intentional differences
+- The C++ unwind table hard-codes the historical 89-byte/`sub rsp, 0xC8`
+  prologue even though this upstream revision's 64-slot `StackLayout` and
+  `CalculateFrameInfo` emit a 107-byte/`sub rsp, 0x4E8` dispatcher prologue.
+  Rust derives unwind offsets from the actual upstream-owned frame formula so
+  Windows unwinds the code that was emitted.
+- Rust retains one registered record per code buffer because its existing
+  fastmem API registers block callbacks incrementally; upstream owns one
+  `ExceptionHandler::Impl` per emitter.
+
+### Unintentional differences (to fix)
+- Fixed: the previous follow-up audit still described the Rust frame as larger
+  than upstream. The frame now exactly matches upstream; only the stale
+  constants in upstream `GetPrologueInformation` are intentionally not copied.
+- Fixed: teardown, operation reversal, unpadded `CountOfCodes`, and
+  multi-code-buffer registration now follow the corresponding upstream
+  lifetime and Windows unwind rules.
+
+### Missing items
+- Exact structural ownership still differs because platform implementations
+  share `exception_handler.rs` rather than separate C++ translation units.
+
+### Binary layout verification
+- PASS: the registered `RUNTIME_FUNCTION` is three `u32` fields; a real
+  `RtlVirtualUnwind` regression restores RBX, RSI, RDI, RBP, R12-R15, RSP and
+  RIP through the emitted 107-byte prologue.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit.rs vs dynarmic/backend/x64/emit_x64.cpp
+
+### Intentional differences
+- Rust's common block emitter owns cycle subtraction that upstream exposes as
+  `EmitX64::EmitAddCycles`.
+
+### Unintentional differences (to fix)
+- Fixed: cycle subtraction addressed `StackLayout` directly at `RSP` and now
+  includes upstream `ABI_SHADOW_SPACE`.
+
+### Missing items
+- The ownership difference above predates this ABI correction.
+
+### Binary layout verification
+- PASS: the signed cycle field and subtraction width are unchanged.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_terminal.rs vs dynarmic/backend/x64/{a32_emit_x64.cpp,a64_emit_x64.cpp}
+
+### Intentional differences
+- Rust shares common terminal mechanics in this file while upstream keeps the
+  A32 and A64 terminal overloads in their emitter files.
+
+### Unintentional differences (to fix)
+- Fixed: link/check-bit/add-ticks terminal paths omitted
+  `ABI_SHADOW_SPACE` from `StackLayout` addresses.
+- Fixed: interpreter fallback and `AddTicks` hard-coded SysV argument
+  registers; both now use the callback-provided host ABI parameter list.
+
+### Missing items
+- Method ownership remains structurally consolidated compared with upstream.
+
+### Binary layout verification
+- PASS: no serialized payload is involved; stack-field offsets and callback
+  register placement now match the selected ABI.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_vector_helpers.rs vs dynarmic/backend/x64/emit_x64_vector*.cpp
+
+### Intentional differences
+- Ruzu currently centralizes several software vector fallbacks in a shared
+  helper file. Upstream keeps native instruction sequences and local lambdas
+  in the operation-owning vector source files.
+
+### Unintentional differences (to fix)
+- Fixed: fallback calls used SysV RDI/RSI/RDX/RCX on every platform and wrote
+  operands into Windows shadow space.
+- Fixed: one-, two-, three-operand, immediate, and saturation helpers now use
+  `ABI_PARAMS` and place every 16-byte payload after `ABI_SHADOW_SPACE`.
+
+### Missing items
+- The centralized fallback architecture remains structural parity debt.
+- Operations that upstream emits natively must still be replaced in their
+  corresponding Rust owner as those slices are audited.
+
+### Binary layout verification
+- PASS for the repaired callback frames: all vector payloads are aligned,
+  contiguous 16-byte values outside Windows shadow space.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_vector_arrangement.rs vs dynarmic/backend/x64/emit_x64_vector.cpp
+
+### Intentional differences
+- Rust obtains constants through its `ConstantPool`; this is the mechanical
+  counterpart of upstream `code.Const`.
+
+### Unintentional differences (to fix)
+- Fixed: `VectorTranspose8/16/32/64` used host callbacks, including a
+  SysV-only manual callback frame. Each method now emits upstream's exact SSE2
+  sequence (`pand`/shift/`por`, `shufps`/`pshufd`, or `shufpd`) in its owner.
+
+### Missing items
+- Other arrangement operations outside this transpose slice retain their
+  separately documented fallback/native parity status.
+
+### Binary layout verification
+- PASS: an x64 JIT regression executes A64 `TRN1` and `TRN2` for 8-, 16-, 32-
+  and 64-bit elements and verifies all 128 result bits.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_vector_misc.rs vs dynarmic/backend/x64/emit_x64_vector.cpp
+
+### Intentional differences
+- Rust's existing table-lookup fallback uses a fixed `TableLookupFrame`;
+  upstream specializes host-feature paths and sizes its temporary table frame
+  from the IR table length.
+
+### Unintentional differences (to fix)
+- Fixed: the table frame occupied Windows shadow space and its pointer was
+  passed in hard-coded RDI. It now starts after `ABI_SHADOW_SPACE` and uses
+  `ABI_PARAM1`.
+
+### Missing items
+- Upstream's SSSE3/AVX table-lookup paths and exact compact fallback frame
+  remain unported; this is a larger pre-existing behavioral/performance slice.
+
+### Binary layout verification
+- PASS for the repaired fixed frame: result/default/index/table fields keep
+  their prior offsets relative to the frame and no longer overlap shadow space.
+
+## 2026-07-31 — externals/rdynarmic/src/jit.rs vs dynarmic/backend/x64/{a64_emit_x64_memory.cpp,emit_x64_vector.cpp}
+
+### Intentional differences
+- MSVC 128-bit Rust trampolines use an explicit third output-pointer argument
+  instead of relying on the unstable Rust aggregate-return ABI; SysV retains
+  the upstream-equivalent `RAX:RDX` pair.
+- Regression tests are native Rust tests rather than ports of the excluded C++
+  test suite.
+
+### Unintentional differences (to fix)
+- None remaining in the ordinary/exclusive 128-bit callback and vector
+  transpose regressions added in this slice.
+
+### Missing items
+- The full crate suite still has pre-existing SIMD/fuzz failures recorded in
+  `PORTING_STATE.md`; they are not hidden by the focused green regressions.
+
+### Binary layout verification
+- PASS: `Pair128` remains `repr(C)` with ordered low/high `u64` lanes; the
+  `LDR Q`, `LDXP`, and all-size transpose execution regressions pass.
