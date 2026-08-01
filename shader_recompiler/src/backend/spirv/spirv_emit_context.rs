@@ -4565,6 +4565,21 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_bitwise_conversion::emit_pack_float2x16(self, a);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::UnpackFloat2x16 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_bitwise_conversion::emit_unpack_float2x16(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::PackHalf2x16 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_bitwise_conversion::emit_pack_half2x16(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::UnpackHalf2x16 => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_bitwise_conversion::emit_unpack_half2x16(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
 
             // ── Composite ─────────────────────────────────────────────
             Opcode::CompositeConstructF16x2 => {
