@@ -354,11 +354,17 @@ impl IFileSystem {
         }
     }
 
+    fn parse_create_file_arguments(ctx: &mut HLERequestContext) -> (i32, i64) {
+        let mut request = CmifRequest::new(ctx);
+        let option = request.raw::<i32>();
+        request.align_for::<i64>();
+        let size = request.raw::<i64>();
+        (option, size)
+    }
+
     fn create_file_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
-        let mut request = CmifRequest::new(ctx);
-        let option_raw = request.raw::<i32>();
-        let size = request.raw::<i64>();
+        let (option_raw, size) = Self::parse_create_file_arguments(ctx);
         let path = match Self::read_path(ctx, 0) {
             Ok(p) => p,
             Err(rc) => return Self::reply_result_only(ctx, rc),
@@ -689,6 +695,7 @@ impl ServiceFramework for IFileSystem {
 mod tests {
     use super::IFileSystem;
     use crate::file_sys::fssrv::fssrv_sf_path::Path as SfPath;
+    use crate::hle::service::hle_ipc::HLERequestContext;
 
     #[test]
     fn decode_path_bytes_round_trips_full_nested_path() {
@@ -706,5 +713,21 @@ mod tests {
     #[test]
     fn decode_path_bytes_rejects_short_buffer() {
         assert!(IFileSystem::decode_path_bytes(&[0u8; 8]).is_err());
+    }
+
+    #[test]
+    fn create_file_size_is_aligned_after_s32_option() {
+        let mut ctx = HLERequestContext::new();
+        ctx.data_payload_offset = 10;
+        let command_buffer = ctx.command_buffer_mut();
+        command_buffer[12] = 1;
+        command_buffer[13] = 0;
+        command_buffer[14] = 0x59e;
+        command_buffer[15] = 0;
+
+        let (option, size) = IFileSystem::parse_create_file_arguments(&mut ctx);
+
+        assert_eq!(option, 1);
+        assert_eq!(size, 0x59e);
     }
 }

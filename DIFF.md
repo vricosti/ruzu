@@ -30059,3 +30059,35 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   seconds under the same conditions, forces teardown, destroys the native
   render target, and restores the game list.
 - `cargo test -p ruzu --bin ruzu` passes: 129 passed, 0 failed.
+
+## 2026-08-01 — core/src/hle/service/filesystem/fsp/fs_i_filesystem.rs vs src/core/hle/service/filesystem/fsp/fs_i_filesystem.{h,cpp} and src/core/hle/service/cmif_serialization.h
+
+### Intentional differences
+- Rust's manually registered service handler reads the two raw arguments with
+  `CmifRequest`; upstream's `D<&IFileSystem::CreateFile>` wrapper performs the
+  same work through the generic `ReadInArgument` template. The explicit
+  `align_for::<i64>()` is the mechanical counterpart of upstream's
+  `AlignUp(DataOffset, alignof(s64))`.
+
+### Unintentional differences (fixed)
+- `CreateFile` previously read `size` immediately after the 32-bit `option`,
+  consuming the four-byte CMIF alignment padding as the low half of the value.
+  A guest size of `0x59e` consequently became `0x59e00000000`. The handler now
+  skips that padding before reading the signed 64-bit size.
+
+### Missing items
+- The Rust service framework still uses handwritten raw-argument parsers in
+  place of upstream's generated `D<>` serialization wrapper. This handler's
+  complete argument layout now matches upstream, but automatic alignment for
+  all service methods remains a broader framework parity slice.
+
+### Binary layout verification
+- PASS: the regression fixture encodes `s32 option`, four bytes of padding, and
+  `s64 size` at the same offsets computed by upstream `ReadInArgument`.
+
+### Behavioral verification
+- Re-read the upstream header, implementation, and CMIF serializer after the
+  change. `create_file_size_is_aligned_after_s32_option` passes.
+- A clean ANIMUS data directory now creates `ApplicationData` at 1,438 bytes
+  instead of a sparse `0x59e00000000` bytes, with no unmapped guest write or
+  `svcBreak` in the validation run.
