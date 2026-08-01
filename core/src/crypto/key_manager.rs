@@ -693,48 +693,8 @@ fn find_256_name_by_index(id: S256KeyType, field1: u64, field2: u64) -> Option<&
     None
 }
 
-/// Resolve the keys directory. Uses the common path manager (RuzuPath::KeysDir).
-/// Also searches fallback locations used by yuzu/suyu for user convenience.
 fn resolve_keys_dir() -> PathBuf {
-    // Primary: use the common path manager
-    let primary = get_ruzu_path(RuzuPath::KeysDir);
-
-    // Fallback locations (matching yuzu/suyu key file paths)
-    let home = std::env::var("HOME").unwrap_or_default();
-    let fallbacks = [
-        format!("{}/.local/share/yuzu/keys", home),
-        format!("{}/.config/yuzu/keys", home),
-        format!("{}/.local/share/suyu/keys", home),
-    ];
-
-    // Prefer any directory that actually contains prod.keys or dev.keys.
-    // Check primary first, then fallbacks.
-    let has_crypto_keys = |p: &PathBuf| p.join("prod.keys").exists() || p.join("dev.keys").exists();
-
-    if has_crypto_keys(&primary) {
-        return primary;
-    }
-
-    for fb in &fallbacks {
-        let p = PathBuf::from(fb);
-        if has_crypto_keys(&p) {
-            return p;
-        }
-    }
-
-    // No directory with crypto keys found. Fall back to the first existing dir.
-    if primary.exists() {
-        return primary;
-    }
-    for fb in &fallbacks {
-        let p = PathBuf::from(fb);
-        if p.exists() {
-            return p;
-        }
-    }
-
-    // Return primary even if it does not exist; caller will handle missing files.
-    primary
+    get_ruzu_path(RuzuPath::KeysDir)
 }
 
 /// Key manager singleton. Manages all cryptographic keys.
@@ -2620,4 +2580,14 @@ fn bignum_mul_mod(a: &BigNum, b: &BigNum, m: &BigNum) -> BigNum {
         result.pop();
     }
     bignum_mod(&result, m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_directory_is_owned_by_ruzu_path_manager() {
+        assert_eq!(resolve_keys_dir(), get_ruzu_path(RuzuPath::KeysDir));
+    }
 }

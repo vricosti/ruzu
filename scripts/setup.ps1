@@ -21,10 +21,13 @@ $ProgressPreference = "SilentlyContinue"
 
 $RustMinimum = [version]"1.75.0"
 $RustToolchain = "stable-x86_64-pc-windows-msvc"
-$VcpkgTriplet = "x64-windows"
+$VcpkgTriplet = "x64-windows-ruzu"
 $ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDirectory
 $EnvironmentBatch = Join-Path $env:TEMP "ruzu-windows-env.bat"
+$VcpkgOverlayTriplets = Join-Path $ScriptDirectory "vcpkg-triplets"
+$CmakeWrapper = Join-Path $ScriptDirectory "cmake-clean-env.cmd"
+$RequestedVcpkgRoot = $env:VCPKG_ROOT
 
 $VcpkgPackages = @(
     "gtk:$VcpkgTriplet"
@@ -57,10 +60,23 @@ function Invoke-Download {
     Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $Destination
 }
 
+function Set-CurrentPath {
+    param([Parameter(Mandatory)][string]$Value)
+
+    $pathKeys = @(
+        [Environment]::GetEnvironmentVariables("Process").Keys |
+            Where-Object { $_ -ieq "Path" }
+    )
+    foreach ($key in $pathKeys) {
+        [Environment]::SetEnvironmentVariable([string]$key, $null, "Process")
+    }
+    [Environment]::SetEnvironmentVariable("Path", $Value, "Process")
+}
+
 function Refresh-CommandPath {
     $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    $env:Path = "$machinePath;$userPath"
+    Set-CurrentPath -Value "$machinePath;$userPath"
 }
 
 function Add-CurrentPath {
@@ -68,9 +84,10 @@ function Add-CurrentPath {
 
     foreach ($entry in $Entries) {
         if ($entry -and (Test-Path $entry)) {
-            $parts = $env:Path -split ";" | Where-Object { $_ }
+            $currentPath = [Environment]::GetEnvironmentVariable("Path", "Process")
+            $parts = $currentPath -split ";" | Where-Object { $_ }
             if ($parts -notcontains $entry) {
-                $env:Path = "$entry;$env:Path"
+                Set-CurrentPath -Value "$entry;$currentPath"
             }
         }
     }
@@ -147,7 +164,12 @@ function Import-VSDevEnvironment {
         if ($separator -gt 0) {
             $name = $line.Substring(0, $separator)
             $value = $line.Substring($separator + 1)
-            [Environment]::SetEnvironmentVariable($name, $value, "Process")
+            if ($name -ieq "Path") {
+                Set-CurrentPath -Value $value
+            }
+            else {
+                [Environment]::SetEnvironmentVariable($name, $value, "Process")
+            }
         }
     }
 }
@@ -382,20 +404,26 @@ function Get-MissingVcpkgPackages {
 
 function Find-VcpkgRoot {
     $candidates = @()
-    if ($env:VCPKG_ROOT) {
-        $candidates += $env:VCPKG_ROOT
+    if ($RequestedVcpkgRoot) {
+        $candidates += $RequestedVcpkgRoot
     }
+
+    # Prefer Ruzu's standalone installation over vcpkg instances injected into
+    # PATH by Visual Studio's developer environment.
+    $candidates += Join-Path $env:LOCALAPPDATA "Ruzu\vcpkg"
 
     $command = Get-Command vcpkg.exe -ErrorAction SilentlyContinue
     if ($command) {
         $candidates += Split-Path -Parent $command.Source
     }
 
-    $candidates += Join-Path $env:LOCALAPPDATA "Ruzu\vcpkg"
     foreach ($candidate in $candidates | Select-Object -Unique) {
         $executable = Join-Path $candidate "vcpkg.exe"
         $toolchain = Join-Path $candidate "scripts\buildsystems\vcpkg.cmake"
-        if ((Test-Path $executable) -and (Test-Path $toolchain)) {
+        $visualStudioBundle = Join-Path $candidate "vcpkg-bundle.json"
+        if ((Test-Path $executable) -and
+            (Test-Path $toolchain) -and
+            -not (Test-Path $visualStudioBundle)) {
             return $candidate
         }
     }
@@ -413,8 +441,9 @@ function Ensure-VcpkgDependencies {
     $missingVcpkg = -not (Test-Path $vcpkgExecutable)
     $missingPackages = @()
     if (-not $missingVcpkg) {
+        $env:VCPKG_ROOT = $vcpkgRoot
         Write-Host "[OK] Found an existing vcpkg installation in $vcpkgRoot."
-        $missingPackages = Get-MissingVcpkgPackages -VcpkgExecutable $vcpkgExecutable
+        $missingPackages = @(Get-MissingVcpkgPackages -VcpkgExecutable $vcpkgExecutable)
     }
 
     if ($missingVcpkg -or $missingPackages.Count -gt 0) {
@@ -444,7 +473,15 @@ function Ensure-VcpkgDependencies {
         }
 
         $vcpkgExecutable = Join-Path $vcpkgRoot "vcpkg.exe"
-        & $vcpkgExecutable install $VcpkgPackages --disable-metrics
+        $env:VCPKG_ROOT = $vcpkgRoot
+        $installArguments = @(
+            "install"
+        ) + $VcpkgPackages + @(
+            "--host-triplet=$VcpkgTriplet"
+            "--overlay-triplets=$VcpkgOverlayTriplets"
+            "--disable-metrics"
+        )
+        & $vcpkgExecutable @installArguments
         if ($LASTEXITCODE -ne 0) {
             throw "vcpkg dependency installation failed."
         }
@@ -484,32 +521,58 @@ function Configure-NativeEnvironment {
         (Join-Path $installed "tools\glslang")
     )
     Add-CurrentPath $pathEntries
+    $cmakeExecutable = (Get-Command cmake.exe -ErrorAction Stop).Source
+    $gsettingsSchemaDirectory = Join-Path $installed "share\glib-2.0\schemas"
+    $glibCompileSchemas = Join-Path $installed "tools\glib\glib-compile-schemas.exe"
+    if (-not (Test-Path $glibCompileSchemas)) {
+        throw "The GLib schema compiler installed by vcpkg was not found."
+    }
+    & $glibCompileSchemas $gsettingsSchemaDirectory
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to compile GTK's GSettings schemas."
+    }
 
+    $env:CMAKE = $CmakeWrapper
+    $env:RUZU_CMAKE_EXE = $cmakeExecutable
     $env:VCPKG_ROOT = $VcpkgRoot
     $env:VCPKG_DEFAULT_TRIPLET = $VcpkgTriplet
+    $env:VCPKGRS_TRIPLET = $VcpkgTriplet
     $env:VCPKGRS_DYNAMIC = "1"
     $env:PKG_CONFIG = $pkgConfig.FullName
     $env:PKG_CONFIG_PATH = $pkgConfigPath
     $env:OPENSSL_DIR = $installed
+    $env:GSETTINGS_SCHEMA_DIR = $gsettingsSchemaDirectory
 
+    [Environment]::SetEnvironmentVariable("CMAKE", $CmakeWrapper, "User")
+    [Environment]::SetEnvironmentVariable("RUZU_CMAKE_EXE", $cmakeExecutable, "User")
     [Environment]::SetEnvironmentVariable("VCPKG_ROOT", $VcpkgRoot, "User")
     [Environment]::SetEnvironmentVariable("VCPKG_DEFAULT_TRIPLET", $VcpkgTriplet, "User")
+    [Environment]::SetEnvironmentVariable("VCPKGRS_TRIPLET", $VcpkgTriplet, "User")
     [Environment]::SetEnvironmentVariable("VCPKGRS_DYNAMIC", "1", "User")
     [Environment]::SetEnvironmentVariable("PKG_CONFIG", $pkgConfig.FullName, "User")
     [Environment]::SetEnvironmentVariable("PKG_CONFIG_PATH", $pkgConfigPath, "User")
     [Environment]::SetEnvironmentVariable("OPENSSL_DIR", $installed, "User")
+    [Environment]::SetEnvironmentVariable(
+        "GSETTINGS_SCHEMA_DIR",
+        $gsettingsSchemaDirectory,
+        "User"
+    )
     Add-UserPath $pathEntries
 
     $vsDevCmd = Join-Path $VSInstallPath "Common7\Tools\VsDevCmd.bat"
     $batchLines = @(
         "@echo off"
         "call `"$vsDevCmd`" -no_logo -arch=x64 -host_arch=x64"
+        "set `"CMAKE=$CmakeWrapper`""
+        "set `"RUZU_CMAKE_EXE=$cmakeExecutable`""
         "set `"VCPKG_ROOT=$VcpkgRoot`""
         "set `"VCPKG_DEFAULT_TRIPLET=$VcpkgTriplet`""
+        "set `"VCPKGRS_TRIPLET=$VcpkgTriplet`""
         "set `"VCPKGRS_DYNAMIC=1`""
         "set `"PKG_CONFIG=$($pkgConfig.FullName)`""
         "set `"PKG_CONFIG_PATH=$pkgConfigPath`""
         "set `"OPENSSL_DIR=$installed`""
+        "set `"GSETTINGS_SCHEMA_DIR=$gsettingsSchemaDirectory`""
         "set `"PATH=$($pathEntries -join ';');%PATH%`""
     )
     Set-Content -Path $EnvironmentBatch -Value $batchLines -Encoding ASCII
@@ -517,17 +580,17 @@ function Configure-NativeEnvironment {
 
 function Verify-NativeDependencies {
     $checks = @(
-        @("gtk4", "4.6")
-        @("sdl2", $null)
-        @("libavcodec", $null)
-        @("libavutil", $null)
-        @("openssl", $null)
-        @("vulkan", $null)
+        [pscustomobject]@{ Package = "gtk4"; Minimum = "4.6" }
+        [pscustomobject]@{ Package = "sdl2"; Minimum = $null }
+        [pscustomobject]@{ Package = "libavcodec"; Minimum = $null }
+        [pscustomobject]@{ Package = "libavutil"; Minimum = $null }
+        [pscustomobject]@{ Package = "openssl"; Minimum = $null }
+        [pscustomobject]@{ Package = "vulkan"; Minimum = $null }
     )
 
     foreach ($check in $checks) {
-        $package = $check[0]
-        $minimum = $check[1]
+        $package = $check.Package
+        $minimum = $check.Minimum
         if ($minimum) {
             & $env:PKG_CONFIG "--atleast-version=$minimum" $package
         }

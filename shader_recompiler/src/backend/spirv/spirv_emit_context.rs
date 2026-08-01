@@ -368,6 +368,8 @@ pub struct SpirvEmitContext {
     pub uniform_u32_vec2_ptr: spirv::Word,
     pub uniform_u32_vec4_ptr: spirv::Word,
     pub private_u32_ptr: spirv::Word,
+    /// Upstream `EmitContext::image_u32`, used by `OpImageTexelPointer`.
+    pub(crate) image_u32: spirv::Word,
 
     // ── Cached constants ──────────────────────────────────────────────
     pub const_zero_u32: spirv::Word,
@@ -732,6 +734,7 @@ impl SpirvEmitContext {
             uniform_u32_vec2_ptr,
             uniform_u32_vec4_ptr,
             private_u32_ptr,
+            image_u32: 0,
             const_zero_u32,
             const_one_u32,
             const_zero_f32,
@@ -3432,6 +3435,12 @@ impl SpirvEmitContext {
             *binding += 1;
         }
 
+        if info.uses_atomic_image_u32 {
+            self.image_u32 =
+                self.builder
+                    .type_pointer(None, spirv::StorageClass::Image, self.u32_type);
+        }
+
         let mut image_binding = if self.profile.unified_descriptor_binding {
             bindings.unified
         } else {
@@ -4702,6 +4711,62 @@ impl SpirvEmitContext {
             Opcode::ImageGather | Opcode::ImageGatherDref => {
                 super::emit_spirv_image::emit_image_gather_inst(self, inst, block_idx, inst_idx);
             }
+            Opcode::ImageRead => {
+                super::emit_spirv_image::emit_image_read_inst(self, inst, block_idx, inst_idx);
+            }
+            Opcode::ImageWrite => {
+                super::emit_spirv_image::emit_image_write_inst(self, inst);
+            }
+            Opcode::ImageAtomicIAdd32
+            | Opcode::ImageAtomicSMin32
+            | Opcode::ImageAtomicUMin32
+            | Opcode::ImageAtomicSMax32
+            | Opcode::ImageAtomicUMax32
+            | Opcode::ImageAtomicInc32
+            | Opcode::ImageAtomicDec32
+            | Opcode::ImageAtomicAnd32
+            | Opcode::ImageAtomicOr32
+            | Opcode::ImageAtomicXor32
+            | Opcode::ImageAtomicExchange32 => {
+                super::emit_spirv_image_atomic::emit_image_atomic(self, inst, block_idx, inst_idx);
+            }
+
+            Opcode::BoundImageRead
+            | Opcode::BindlessImageRead
+            | Opcode::BoundImageWrite
+            | Opcode::BindlessImageWrite => {
+                panic!(
+                    "SPIR-V: unreachable non-indexed storage-image instruction {:?}",
+                    inst.opcode
+                );
+            }
+            Opcode::BoundImageAtomicIAdd32
+            | Opcode::BindlessImageAtomicIAdd32
+            | Opcode::BoundImageAtomicSMin32
+            | Opcode::BindlessImageAtomicSMin32
+            | Opcode::BoundImageAtomicUMin32
+            | Opcode::BindlessImageAtomicUMin32
+            | Opcode::BoundImageAtomicSMax32
+            | Opcode::BindlessImageAtomicSMax32
+            | Opcode::BoundImageAtomicUMax32
+            | Opcode::BindlessImageAtomicUMax32
+            | Opcode::BoundImageAtomicInc32
+            | Opcode::BindlessImageAtomicInc32
+            | Opcode::BoundImageAtomicDec32
+            | Opcode::BindlessImageAtomicDec32
+            | Opcode::BoundImageAtomicAnd32
+            | Opcode::BindlessImageAtomicAnd32
+            | Opcode::BoundImageAtomicOr32
+            | Opcode::BindlessImageAtomicOr32
+            | Opcode::BoundImageAtomicXor32
+            | Opcode::BindlessImageAtomicXor32
+            | Opcode::BoundImageAtomicExchange32
+            | Opcode::BindlessImageAtomicExchange32 => {
+                panic!(
+                    "SPIR-V: non-indexed image atomic is not implemented upstream: {:?}",
+                    inst.opcode
+                );
+            }
 
             // ── Memory ────────────────────────────────────────────────
             Opcode::LoadGlobalU8
@@ -4975,6 +5040,7 @@ impl SpirvEmitContext {
             | Opcode::GetCarryFromOp
             | Opcode::GetOverflowFromOp
             | Opcode::GetInBoundsFromOp
+            | Opcode::GetSparseFromOp
             | Opcode::GetZFlag
             | Opcode::SetZFlag
             | Opcode::GetSFlag

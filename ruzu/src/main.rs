@@ -25,6 +25,8 @@ mod loading_screen;
 mod main_window;
 #[cfg(target_os = "macos")]
 mod render_window;
+#[cfg(target_os = "windows")]
+mod render_window_windows;
 #[cfg(target_os = "linux")]
 mod render_window_x11;
 mod status_bar;
@@ -136,7 +138,7 @@ fn main() -> glib::ExitCode {
     // `activate`. Boot the first file directly (like `yuzu <game>`); the window
     // defers the boot until its render surface is realized.
     app.connect_open(|app, files, _hint| {
-        let window = GMainWindow::new(app);
+        let window = GMainWindow::new_for_direct_game(app);
         window.present();
         if let Some(path) = files.first().and_then(|f| f.path()) {
             window.boot_game(path.to_string_lossy().into_owned());

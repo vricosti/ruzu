@@ -38,7 +38,7 @@ impl ParamPackage {
     pub fn from_serialized(serialized: &str) -> Self {
         let mut pkg = Self::new();
 
-        if serialized == EMPTY_PLACEHOLDER {
+        if serialized.is_empty() || serialized == EMPTY_PLACEHOLDER {
             return pkg;
         }
 
@@ -207,6 +207,12 @@ mod tests {
     fn test_empty_placeholder() {
         let pkg = ParamPackage::from_serialized("[empty]");
         assert!(!pkg.has("anything"));
+    }
+
+    #[test]
+    fn test_empty_serialized_string_matches_upstream_split_string() {
+        let pkg = ParamPackage::from_serialized("");
+        assert_eq!(pkg.serialize(), EMPTY_PLACEHOLDER);
     }
 
     #[test]

@@ -1598,6 +1598,7 @@ fn maybe_scan_bl(cb: &DynarmicCallbacks32) {
 /// Idempotent across cores: the host page is shared between all JIT
 /// instances on the same process, so the mprotect on core 0 covers
 /// every core. Subsequent cores log "already trapped" and bail out.
+#[cfg(any(unix, windows))]
 fn maybe_trap_fastmem_page(fastmem_pointer: Option<*mut u8>, core_index: usize) {
     use std::sync::OnceLock;
     static DONE: OnceLock<()> = OnceLock::new();
@@ -1670,7 +1671,23 @@ fn maybe_trap_fastmem_page(fastmem_pointer: Option<*mut u8>, core_index: usize) 
             while start.elapsed().as_millis() < duration_ms as u128 {
                 for &page in &pages {
                     let host_ptr = (fastmem_addr + page) as *mut libc::c_void;
+                    #[cfg(unix)]
                     let ret = unsafe { libc::mprotect(host_ptr, PAGE_SIZE, libc::PROT_READ) };
+                    #[cfg(windows)]
+                    let ret = unsafe {
+                        let mut old_protect = 0;
+                        if winapi::um::memoryapi::VirtualProtect(
+                            host_ptr.cast(),
+                            PAGE_SIZE,
+                            winapi::um::winnt::PAGE_READONLY,
+                            &mut old_protect,
+                        ) != 0
+                        {
+                            0
+                        } else {
+                            -1
+                        }
+                    };
                     // Log the FIRST success per page so we know when the
                     // trap "took" (the page is mapped) and every Nth
                     // success after that. EAGAIN-equivalent quiet path:
@@ -2674,6 +2691,7 @@ impl ArmDynarmic32 {
         // fire on stores that would otherwise be invisible. Used to
         // call chain (task #112) without paying the global `NO_FASTMEM`
         // slowdown.
+        #[cfg(any(unix, windows))]
         maybe_trap_fastmem_page(fastmem_pointer, core_index);
 
         // RUZU_WATCH_VADDR_POLL=0xADDR — non-intrusive memory watcher.

@@ -23,7 +23,7 @@
 use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
 
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ash::vk;
 use ash::vk::Handle;
@@ -113,6 +113,114 @@ struct DrawParams {
     num_vertices: u32,
     first_index: u32,
     is_indexed: bool,
+}
+
+fn vulkan_draw_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_VK_TRACE_DRAWS").is_some())
+}
+
+fn parse_vulkan_sync_draw_interval(value: Option<&str>) -> Option<u32> {
+    value?.parse::<u32>().ok().filter(|interval| *interval != 0)
+}
+
+fn vulkan_sync_draw_interval() -> Option<u32> {
+    static INTERVAL: OnceLock<Option<u32>> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("RUZU_VK_SYNC_DRAW_INTERVAL")
+            .ok()
+            .as_deref()
+            .and_then(|value| parse_vulkan_sync_draw_interval(Some(value)))
+    })
+}
+
+fn format_vulkan_draw_trace(
+    tick: u64,
+    draw_counter: u32,
+    draw: &DrawCall,
+    params: DrawParams,
+    unique_hashes: &[u64; crate::shader_cache::NUM_PROGRAMS],
+) -> String {
+    let shaders = unique_hashes
+        .iter()
+        .enumerate()
+        .filter(|(_, hash)| **hash != 0)
+        .map(|(stage, hash)| format!("{stage}:0x{hash:016X}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let vertex_streams = draw
+        .vertex_streams
+        .iter()
+        .filter(|stream| stream.enabled)
+        .map(|stream| {
+            format!(
+                "{}:0x{:X}/{}x{}",
+                stream.index, stream.address, stream.stride, stream.frequency
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let constant_buffers = draw
+        .cb_bindings
+        .iter()
+        .enumerate()
+        .flat_map(|(stage, bindings)| {
+            bindings
+                .iter()
+                .enumerate()
+                .filter(|(_, binding)| binding.enabled)
+                .map(move |(index, binding)| {
+                    format!(
+                        "{stage}:{index}=0x{:X}+0x{:X}",
+                        binding.address, binding.size
+                    )
+                })
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "[VK_DRAW_TRACE] tick={tick} draw={draw_counter} shaders=[{shaders}] topology={:?} indexed={} vertices={} instances={} first_index={} base_vertex={} base_instance={} index=0x{:X}..0x{:X}/{} streams=[{vertex_streams}] cbufs=[{constant_buffers}]",
+        draw.topology,
+        params.is_indexed,
+        params.num_vertices,
+        params.num_instances,
+        params.first_index,
+        params.base_vertex,
+        params.base_instance,
+        draw.index_buffer_addr,
+        draw.index_buffer_addr_end,
+        draw.index_buffer_count,
+    )
+}
+
+fn format_descriptor_buffer_infos(buffer_infos: &[vk::DescriptorBufferInfo]) -> String {
+    buffer_infos
+        .iter()
+        .map(|info| {
+            format!(
+                "0x{:X}@0x{:X}+0x{:X}",
+                info.buffer.as_raw(),
+                info.offset,
+                info.range
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_descriptor_image_infos(image_infos: &[vk::DescriptorImageInfo]) -> String {
+    image_infos
+        .iter()
+        .map(|info| {
+            format!(
+                "s=0x{:X}/v=0x{:X}/l={:?}",
+                info.sampler.as_raw(),
+                info.image_view.as_raw(),
+                info.image_layout
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn make_draw_params(draw: &DrawCall) -> DrawParams {
@@ -402,9 +510,15 @@ pub struct RasterizerVulkan {
     channel_caches: ChannelSetupCaches<ChannelInfo>,
 
     // Sub-components (matching zuyu's architecture)
-    scheduler: Box<Scheduler>,
+    /// Non-owning counterpart of upstream `Scheduler& scheduler`.
+    ///
+    /// `RendererVulkan` owns the single boxed scheduler and outlives this
+    /// rasterizer. The stable pointer preserves upstream ownership without a
+    /// self-referential Rust struct.
+    scheduler: OwnerReference<Scheduler>,
     memory_allocator: NonNull<MemoryAllocator>,
-    state_tracker: Box<StateTracker>,
+    /// Non-owning counterpart of upstream `StateTracker& state_tracker`.
+    state_tracker: OwnerReference<StateTracker>,
     staging_pool: Box<StagingBufferPool>,
     // Boxed like `scheduler`/`staging_pool`/`render_pass_cache`: sub-components
     // capture `NonNull` pointers to these during construction (BlitImageHelper
@@ -461,6 +575,7 @@ pub struct RasterizerVulkan {
     /// Draws redirected to the offscreen framebuffer because no guest
     /// render-target framebuffer could be resolved (diagnostic).
     draw_offscreen_fallback: u64,
+    has_null_descriptor: bool,
     extended_dynamic_state_supported: bool,
     extended_dynamic_state2_supported: bool,
     extended_dynamic_state2_extra_supported: bool,
@@ -487,6 +602,52 @@ pub struct RasterizerVulkan {
 // Raw pointers are only used for mapped memory
 unsafe impl Send for RasterizerVulkan {}
 
+/// Stable, non-owning Rust representation of an upstream C++ reference member.
+///
+/// The owner boxes the referenced value and is declared after the borrower so
+/// Rust drops the borrower first.
+struct OwnerReference<T> {
+    pointer: NonNull<T>,
+}
+
+impl<T> OwnerReference<T> {
+    fn new(value: &mut T) -> Self {
+        Self {
+            pointer: NonNull::from(value),
+        }
+    }
+}
+
+impl<T> std::ops::Deref for OwnerReference<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.pointer.as_ref() }
+    }
+}
+
+impl<T> std::ops::DerefMut for OwnerReference<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self.pointer.as_mut() }
+    }
+}
+
+#[cfg(test)]
+mod owner_reference_tests {
+    use super::OwnerReference;
+
+    #[test]
+    fn references_renderer_owned_stable_storage() {
+        let mut owner = Box::new(0x1234_u64);
+        let owner_address = std::ptr::from_ref(owner.as_ref());
+        let mut reference = OwnerReference::new(owner.as_mut());
+
+        assert_eq!(reference.pointer.as_ptr(), owner_address.cast_mut());
+        *reference = 0x5678;
+        assert_eq!(*owner, 0x5678);
+    }
+}
+
 impl RasterizerVulkan {
     /// Low-bit mask used by upstream to check every eighth operation.
     const DISPATCH_THRESHOLD: u32 = 7;
@@ -501,8 +662,6 @@ impl RasterizerVulkan {
         instance: ash::Instance,
         physical_device: vk::PhysicalDevice,
         device: ash::Device,
-        graphics_queue: vk::Queue,
-        queue_family_index: u32,
         width: u32,
         height: u32,
         supported_spirv_version: u32,
@@ -511,6 +670,7 @@ impl RasterizerVulkan {
         float_controls_properties: vk::PhysicalDeviceFloatControlsProperties,
         shader_demote_to_helper_invocation_supported: bool,
         depth_clip_control_supported: bool,
+        has_null_descriptor: bool,
         extended_dynamic_state_supported: bool,
         extended_dynamic_state2_supported: bool,
         extended_dynamic_state2_extra_supported: bool,
@@ -521,7 +681,6 @@ impl RasterizerVulkan {
         patch_list_primitive_restart_supported: bool,
         must_emulate_scaled_formats: bool,
         shader_stencil_export_supported: bool,
-        timeline_semaphore_supported: bool,
         image_format_list_supported: bool,
         optimal_astc_supported: bool,
         custom_border_color_supported: bool,
@@ -533,33 +692,20 @@ impl RasterizerVulkan {
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<MaxwellDeviceMemoryManager>,
         memory_allocator: &mut MemoryAllocator,
+        state_tracker: &mut StateTracker,
+        scheduler: &mut Scheduler,
     ) -> Result<Self, RendererError> {
         info!(
             "RasterizerVulkan: initializing {}x{} renderer",
             width, height
         );
 
-        // Create state tracker
-        let mut state_tracker = Box::new(StateTracker::new());
-
-        // Create scheduler
-        let mut scheduler = Box::new(
-            Scheduler::new(
-                device.clone(),
-                graphics_queue,
-                queue_family_index,
-                timeline_semaphore_supported,
-            )
-            .map_err(|e| RendererError::InitFailed(format!("scheduler: {:?}", e)))?,
-        );
-        scheduler.set_state_tracker(NonNull::from(state_tracker.as_mut()));
-
         // Create staging buffer pool
         let mut staging_pool = Box::new(StagingBufferPool::new(
             device.clone(),
             instance.clone(),
             physical_device,
-            scheduler.as_mut(),
+            scheduler,
         ));
 
         // Create descriptor pool. Boxed (with the descriptor queues and the
@@ -572,7 +718,7 @@ impl RasterizerVulkan {
         let mut compute_pass_desc_queue = Box::new(UpdateDescriptorQueue::new());
         let mut blit_image = Box::new(BlitImageHelper::new(
             device.clone(),
-            &mut scheduler,
+            scheduler,
             descriptor_pool.as_mut(),
             shader_stencil_export_supported,
         ));
@@ -585,6 +731,11 @@ impl RasterizerVulkan {
                 0x10000,
                 vk::BufferUsageFlags::UNIFORM_BUFFER,
             )?;
+        unsafe {
+            // Upstream's physical null-buffer fallback is deterministically
+            // zero-filled. Do the same for this legacy rasterizer fallback.
+            std::ptr::write_bytes(fallback_uniform_mapped, 0, 0x10000);
+        }
         let fallback_sampler = create_fallback_sampler(&device)?;
 
         // Create render pass cache
@@ -669,9 +820,10 @@ impl RasterizerVulkan {
             device.clone(),
             instance.clone(),
             physical_device,
-            scheduler.as_mut(),
+            scheduler,
             staging_pool.as_mut(),
             desc_queue.as_mut(),
+            has_null_descriptor,
             extended_dynamic_state_supported,
             max_vertex_input_bindings,
         );
@@ -688,7 +840,7 @@ impl RasterizerVulkan {
             instance.clone(),
             physical_device,
             device_memory,
-            scheduler.as_mut(),
+            scheduler,
             &mut *memory_allocator,
             staging_pool.as_mut(),
             blit_image.as_mut(),
@@ -698,7 +850,9 @@ impl RasterizerVulkan {
             image_format_list_supported,
             optimal_astc_supported,
             custom_border_color_supported,
-        );
+            has_null_descriptor,
+        )
+        .map_err(|e| RendererError::InitFailed(format!("texture cache: {:?}", e)))?;
 
         // Create query cache
         let query_cache = VulkanQueryCache::new();
@@ -757,9 +911,9 @@ impl RasterizerVulkan {
             physical_device,
             syncpoints,
             channel_caches: ChannelSetupCaches::new(),
-            scheduler,
+            scheduler: OwnerReference::new(scheduler),
             memory_allocator: NonNull::from(&mut *memory_allocator),
-            state_tracker,
+            state_tracker: OwnerReference::new(state_tracker),
             staging_pool,
             descriptor_pool,
             desc_queue,
@@ -797,6 +951,7 @@ impl RasterizerVulkan {
             draw_sequence: 0,
             draw_skipped_pipeline: 0,
             draw_offscreen_fallback: 0,
+            has_null_descriptor,
             extended_dynamic_state_supported,
             extended_dynamic_state2_supported,
             extended_dynamic_state2_extra_supported,
@@ -1046,6 +1201,14 @@ impl RasterizerVulkan {
             read_gpu,
             read_gpu_unsafe,
         );
+        if required_descriptor_set_missing(
+            descriptor_set_layout,
+            descriptor_bindings.len(),
+            descriptor_set,
+        ) {
+            warn!("RasterizerVulkan: draw skipped because required descriptors are incomplete");
+            return;
+        }
         // 5. The common geometry path was bound by
         // `bind_graphics_descriptors` in upstream ConfigureImpl order. Keep
         // legacy quad assembly until BufferCacheRuntime ports the upstream
@@ -1149,6 +1312,18 @@ impl RasterizerVulkan {
         self.update_dynamic_states(draw, dirty_flags, engine_dirty_flags);
 
         // 7. Issue draw call
+        if vulkan_draw_trace_enabled() {
+            info!(
+                "{}",
+                format_vulkan_draw_trace(
+                    self.scheduler.pending_tick(),
+                    self.draw_counter,
+                    draw,
+                    draw_params,
+                    &unique_hashes,
+                )
+            );
+        }
         if let Some((params, buffer, offset, count)) = indirect_binding {
             if buffer == vk::Buffer::null() {
                 warn!("RasterizerVulkan::draw_indirect skipped: missing indirect buffer");
@@ -1235,6 +1410,16 @@ impl RasterizerVulkan {
                     draw_params.base_instance,
                 );
             });
+        }
+        if let Some(interval) = vulkan_sync_draw_interval() {
+            if self.draw_counter % interval == 0 {
+                info!(
+                    "[VK_DRAW_SYNC] tick={} draw={} interval={interval}",
+                    self.scheduler.pending_tick(),
+                    self.draw_counter,
+                );
+                self.finish();
+            }
         }
     }
 
@@ -2297,7 +2482,7 @@ impl RasterizerVulkan {
         draw: &DrawCall,
         use_common_geometry: bool,
         is_indexed: bool,
-        _unique_hashes: [u64; crate::shader_cache::NUM_PROGRAMS],
+        unique_hashes: [u64; crate::shader_cache::NUM_PROGRAMS],
         _fixed_state: &FixedPipelineState,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
@@ -2749,9 +2934,15 @@ impl RasterizerVulkan {
                 }
                 self.texture_cache
                     .image_view_storage_view(view.id, texture_type, format)
-                    .unwrap_or(self.offscreen_view)
+                    .or_else(|| {
+                        self.texture_cache
+                            .null_storage_image_view(texture_type, format)
+                    })
+                    .unwrap_or(vk::ImageView::null())
             } else {
-                self.offscreen_view
+                self.texture_cache
+                    .null_storage_image_view(texture_type, format)
+                    .unwrap_or(vk::ImageView::null())
             };
             storage_image_infos.push(vk::DescriptorImageInfo {
                 sampler: vk::Sampler::null(),
@@ -2764,6 +2955,7 @@ impl RasterizerVulkan {
         let mut common_storage_cursor = 0usize;
         let mut common_texel_cursor = 0usize;
         let mut storage_image_cursor = 0usize;
+        let mut sampled_image_traces = Vec::new();
 
         for binding in descriptor_bindings {
             match binding.descriptor_type {
@@ -2839,7 +3031,10 @@ impl RasterizerVulkan {
                                 };
                             (buffer, offset, size)
                         } else {
-                            (self.fallback_uniform_buffer, 0, 0x10000)
+                            null_buffer_descriptor(
+                                self.has_null_descriptor,
+                                self.fallback_uniform_buffer,
+                            )
                         };
                         buffer_infos.push(vk::DescriptorBufferInfo {
                             buffer,
@@ -2867,7 +3062,7 @@ impl RasterizerVulkan {
                             "RasterizerVulkan: missing texel-buffer descriptors for binding {}",
                             binding.binding
                         );
-                        &[]
+                        return None;
                     };
                     common_texel_cursor = end.min(common_texel_buffer_views.len());
                     writes.push(
@@ -2888,19 +3083,26 @@ impl RasterizerVulkan {
                                 .get(sampled_index)
                                 .map(|view| view.id)
                                 .unwrap_or(NULL_IMAGE_VIEW_ID);
+                            let texture_type = binding
+                                .texture
+                                .map(|texture| texture.texture_type)
+                                .unwrap_or(shader_recompiler::shader_info::TextureType::Color2D);
                             let image_view = self
                                 .texture_cache
                                 .materialize_sampled_image_view(
                                     view_id,
-                                    binding
-                                        .texture
-                                        .map(|texture| texture.texture_type)
-                                        .unwrap_or(
-                                            shader_recompiler::shader_info::TextureType::Color2D,
-                                        ),
+                                    texture_type,
                                     read_gpu_unsafe,
                                 )
-                                .unwrap_or(self.offscreen_view);
+                                .unwrap_or_else(|| {
+                                    self.texture_cache.null_image_view_handle(texture_type)
+                                });
+                            if vulkan_draw_trace_enabled() {
+                                sampled_image_traces.push(
+                                    self.texture_cache
+                                        .sampled_image_view_trace(view_id, image_view),
+                                );
+                            }
                             let sampler_id = sampled_samplers
                                 .get(sampled_index)
                                 .copied()
@@ -2928,13 +3130,7 @@ impl RasterizerVulkan {
                                 "RasterizerVulkan: missing storage-image descriptors for binding {}",
                                 binding.binding
                             );
-                            image_infos.extend((0..binding.descriptor_count).map(|_| {
-                                vk::DescriptorImageInfo {
-                                    sampler: vk::Sampler::null(),
-                                    image_view: self.offscreen_view,
-                                    image_layout: vk::ImageLayout::GENERAL,
-                                }
-                            }));
+                            return None;
                         }
                         storage_image_cursor = end.min(storage_image_infos.len());
                     }
@@ -2958,6 +3154,23 @@ impl RasterizerVulkan {
 
         unsafe {
             self.device.update_descriptor_sets(&writes, &[]);
+        }
+        if vulkan_draw_trace_enabled() {
+            info!(
+                "[VK_DESCRIPTOR_TRACE] tick={} draw={} shaders={:X?} set=0x{:X} bindings={:?} buffers=[{}] images=[{}] image_meta=[{}] texel_views={:X?}",
+                self.scheduler.pending_tick(),
+                self.draw_counter,
+                unique_hashes,
+                descriptor_set.as_raw(),
+                descriptor_bindings,
+                format_descriptor_buffer_infos(&buffer_infos),
+                format_descriptor_image_infos(&image_infos),
+                sampled_image_traces.join(";"),
+                common_texel_buffer_views
+                    .iter()
+                    .map(|view| view.as_raw())
+                    .collect::<Vec<_>>(),
+            );
         }
         Some(descriptor_set)
     }
@@ -4543,6 +4756,27 @@ fn create_fallback_sampler(device: &ash::Device) -> Result<vk::Sampler, Renderer
     }
 }
 
+fn null_buffer_descriptor(
+    has_null_descriptor: bool,
+    fallback_buffer: vk::Buffer,
+) -> (vk::Buffer, vk::DeviceSize, vk::DeviceSize) {
+    if has_null_descriptor {
+        // Keep the non-zero range used by BufferCacheRuntime; the buffer
+        // handle itself is ignored by VK_EXT_robustness2 null descriptors.
+        (vk::Buffer::null(), 0, 1)
+    } else {
+        (fallback_buffer, 0, 0x10000)
+    }
+}
+
+fn required_descriptor_set_missing(
+    layout: vk::DescriptorSetLayout,
+    binding_count: usize,
+    descriptor_set: Option<vk::DescriptorSet>,
+) -> bool {
+    layout != vk::DescriptorSetLayout::null() && binding_count != 0 && descriptor_set.is_none()
+}
+
 fn create_host_buffer(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -4619,6 +4853,63 @@ mod tests {
     }
 
     #[test]
+    fn missing_buffer_uses_null_descriptor_when_supported() {
+        let fallback = vk::Buffer::from_raw(0x1234);
+        assert_eq!(
+            null_buffer_descriptor(true, fallback),
+            (vk::Buffer::null(), 0, 1)
+        );
+        assert_eq!(
+            null_buffer_descriptor(false, fallback),
+            (fallback, 0, 0x10000)
+        );
+    }
+
+    #[test]
+    fn descriptor_trace_preserves_handles_offsets_and_ranges() {
+        let infos = [
+            vk::DescriptorBufferInfo {
+                buffer: vk::Buffer::from_raw(0x1234),
+                offset: 0x80,
+                range: 0x400,
+            },
+            vk::DescriptorBufferInfo {
+                buffer: vk::Buffer::null(),
+                offset: 0,
+                range: 1,
+            },
+        ];
+        assert_eq!(
+            format_descriptor_buffer_infos(&infos),
+            "0x1234@0x80+0x400,0x0@0x0+0x1"
+        );
+    }
+
+    #[test]
+    fn sync_draw_interval_is_opt_in_and_rejects_zero_or_invalid_values() {
+        assert_eq!(parse_vulkan_sync_draw_interval(None), None);
+        assert_eq!(parse_vulkan_sync_draw_interval(Some("")), None);
+        assert_eq!(parse_vulkan_sync_draw_interval(Some("invalid")), None);
+        assert_eq!(parse_vulkan_sync_draw_interval(Some("0")), None);
+        assert_eq!(parse_vulkan_sync_draw_interval(Some("1")), Some(1));
+        assert_eq!(parse_vulkan_sync_draw_interval(Some("32")), Some(32));
+    }
+
+    #[test]
+    fn incomplete_required_descriptor_set_skips_draw() {
+        let layout = vk::DescriptorSetLayout::from_raw(0x1234);
+        let set = vk::DescriptorSet::from_raw(0x5678);
+        assert!(required_descriptor_set_missing(layout, 1, None));
+        assert!(!required_descriptor_set_missing(layout, 1, Some(set)));
+        assert!(!required_descriptor_set_missing(
+            vk::DescriptorSetLayout::null(),
+            1,
+            None
+        ));
+        assert!(!required_descriptor_set_missing(layout, 0, None));
+    }
+
+    #[test]
     fn graphics_descriptors_use_vulkan_texture_cache_view_wrapper() {
         let source = include_str!("vk_rasterizer.rs");
         let function = source
@@ -4633,6 +4924,12 @@ mod tests {
         assert!(!function.contains(
             "(*texture_cache)\n                .base\n                .fill_graphics_image_views"
         ));
+        assert!(function.contains("null_image_view_handle"));
+        assert!(function.contains("null_storage_image_view"));
+        assert!(
+            !function.contains("self.offscreen_view"),
+            "the framebuffer attachment is not a legal sampled/storage fallback"
+        );
     }
 
     #[test]

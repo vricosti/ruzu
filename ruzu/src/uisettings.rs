@@ -36,7 +36,7 @@ impl GameDir {
     /// Whether this entry is a real filesystem directory rather than one of the
     /// `SDMC` / `UserNAND` / `SysNAND` provider tokens.
     pub fn is_filesystem_path(&self) -> bool {
-        self.path.starts_with('/')
+        !matches!(self.path.as_str(), "SDMC" | "UserNAND" | "SysNAND")
     }
 }
 
@@ -215,6 +215,22 @@ mod tests {
             GAME_LIST_ROW_TEXT[*v.row_2_text_id.get_value() as usize],
             "Title ID"
         );
+    }
+
+    #[test]
+    fn game_dir_distinguishes_only_upstream_provider_tokens() {
+        let game_dir = |path: &str| GameDir {
+            path: path.to_owned(),
+            deep_scan: false,
+            expanded: true,
+        };
+
+        assert!(!game_dir("SDMC").is_filesystem_path());
+        assert!(!game_dir("UserNAND").is_filesystem_path());
+        assert!(!game_dir("SysNAND").is_filesystem_path());
+        assert!(game_dir("/games/switch").is_filesystem_path());
+        assert!(game_dir(r"D:\Games\Switch").is_filesystem_path());
+        assert!(game_dir(r"\\server\share\Switch").is_filesystem_path());
     }
 
     #[test]

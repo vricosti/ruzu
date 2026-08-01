@@ -17,6 +17,7 @@ sdl2.workspace = true
 [target.'cfg(windows)'.dependencies]
 # Native Windows builds use the x64-windows libraries installed by vcpkg.
 sdl2 = { workspace = true, features = ["use-vcpkg"] }
+winapi = { version = "0.3", features = ["combaseapi", "objbase"] }
 
 # cubeb-sys 0.34 asks Cargo to link the optional Rust PulseAudio archive on
 # FreeBSD, although its nested CMake build does not place that archive in the

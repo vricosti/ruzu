@@ -942,9 +942,13 @@ mod tests {
         };
 
         let process = Box::into_raw(Box::new(ruzu_core::hle::kernel::k_process::KProcess::new()));
+        let transfer_memory = Box::into_raw(Box::new(
+            ruzu_core::hle::kernel::k_transfer_memory::KTransferMemory::new(),
+        ));
         let session = audio_core
             .open_audio_renderer(
                 &raw,
+                transfer_memory,
                 RendererSystem::get_work_buffer_size(&params),
                 process,
                 1,
@@ -960,6 +964,7 @@ mod tests {
         drop(session);
         unsafe {
             drop(Box::from_raw(process));
+            drop(Box::from_raw(transfer_memory));
         }
     }
 }

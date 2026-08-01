@@ -111,6 +111,7 @@ dependencies = [
  "log",
  "parking_lot",
  "sdl2",
+ "winapi",
 ]
 
 [[package]]
@@ -331,6 +332,8 @@ dependencies = [
  "parking_lot",
  "thiserror",
  "toml 0.8.23",
+ "winapi",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
@@ -369,6 +372,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "winapi",
 ]
 
 [[package]]
@@ -1616,6 +1620,7 @@ dependencies = [
  "objc",
  "parking_lot",
  "video_core",
+ "windows-sys 0.59.0",
  "x11",
 ]
 

@@ -270,21 +270,19 @@ fn add_offset_to_coordinates(
     let texture_type = crate::shader_info::TextureType::from_u8(info.texture_type);
     let mut offset = ctx.resolve_value(offset);
     let result_type = match texture_type {
-        crate::shader_info::TextureType::Buffer
-        | crate::shader_info::TextureType::Color1D => ctx.u32_type,
+        crate::shader_info::TextureType::Buffer | crate::shader_info::TextureType::Color1D => {
+            ctx.u32_type
+        }
         crate::shader_info::TextureType::ColorArray1D => {
             offset = ctx
                 .builder
-                .composite_construct(
-                    ctx.u32_vec2_type,
-                    None,
-                    vec![offset, ctx.const_zero_u32],
-                )
+                .composite_construct(ctx.u32_vec2_type, None, vec![offset, ctx.const_zero_u32])
                 .unwrap();
             ctx.u32_vec2_type
         }
-        crate::shader_info::TextureType::Color2D
-        | crate::shader_info::TextureType::Color2DRect => ctx.u32_vec2_type,
+        crate::shader_info::TextureType::Color2D | crate::shader_info::TextureType::Color2DRect => {
+            ctx.u32_vec2_type
+        }
         crate::shader_info::TextureType::ColorArray2D => {
             let x = ctx
                 .builder
@@ -296,11 +294,7 @@ fn add_offset_to_coordinates(
                 .unwrap();
             offset = ctx
                 .builder
-                .composite_construct(
-                    ctx.u32_vec3_type,
-                    None,
-                    vec![x, y, ctx.const_zero_u32],
-                )
+                .composite_construct(ctx.u32_vec3_type, None, vec![x, y, ctx.const_zero_u32])
                 .unwrap();
             ctx.u32_vec3_type
         }
@@ -378,6 +372,76 @@ fn texture_image(ctx: &mut SpirvEmitContext, info: TextureInstInfo, index: Value
             .image(def.image_type, None, sampled_image)
             .unwrap(),
     )
+}
+
+/// Port of upstream `Image`: load a storage image and preserve whether its
+/// sampled component type is integer.
+fn image(ctx: &mut SpirvEmitContext, info: TextureInstInfo, index: Value) -> (Word, bool) {
+    if !index.is_immediate() || index.imm_u32() != 0 {
+        panic!("SPIR-V: indirect image indexing is not implemented");
+    }
+    let texture_type = crate::shader_info::TextureType::from_u8(info.texture_type);
+    let (id, image_type, count, is_integer) =
+        if texture_type == crate::shader_info::TextureType::Buffer {
+            let def = *ctx
+                .image_buffers
+                .get(info.descriptor_index as usize)
+                .expect("SPIR-V: missing image-buffer descriptor");
+            (def.id, def.image_type, def.count, def.is_integer)
+        } else {
+            let def = *ctx
+                .images
+                .get(info.descriptor_index as usize)
+                .expect("SPIR-V: missing image descriptor");
+            (def.id, def.image_type, def.count, def.is_integer)
+        };
+    assert_eq!(count, 1, "SPIR-V: indirect image indexing");
+    let image = ctx
+        .builder
+        .load(image_type, None, id, None, vec![])
+        .unwrap();
+    (image, is_integer)
+}
+
+fn image_read(
+    ctx: &mut SpirvEmitContext,
+    inst: &ir::Inst,
+    result_type: Word,
+    image: Word,
+    coords: Word,
+) -> Word {
+    let sample = if let Some(sparse) = inst.get_associated_pseudo(Opcode::GetSparseFromOp) {
+        let struct_type = ctx.builder.type_struct(vec![ctx.u32_type, result_type]);
+        let sparse_result = ctx
+            .builder
+            .image_sparse_read(struct_type, None, image, coords, None, vec![])
+            .unwrap();
+        let resident_code = ctx
+            .builder
+            .composite_extract(ctx.u32_type, None, sparse_result, vec![0])
+            .unwrap();
+        let resident = ctx
+            .builder
+            .image_sparse_texels_resident(ctx.bool_type, None, resident_code)
+            .unwrap();
+        ctx.set_value(sparse.block, sparse.inst, resident);
+        sparse_result
+    } else {
+        ctx.builder
+            .image_read(result_type, None, image, coords, None, vec![])
+            .unwrap()
+    };
+    let sample = decorate_sample(ctx, TextureInstInfo::from_u32(inst.flags), sample);
+    if inst
+        .get_associated_pseudo(Opcode::GetSparseFromOp)
+        .is_some()
+    {
+        ctx.builder
+            .composite_extract(result_type, None, sample, vec![1])
+            .unwrap()
+    } else {
+        sample
+    }
 }
 
 /// Dispatch ImageSampleImplicitLod / ImageSampleExplicitLod IR instructions.
@@ -561,8 +625,8 @@ pub fn emit_image_fetch_inst(
     if let Some(image) = texture_image(ctx, info, *inst.arg(0)) {
         let is_buffer = crate::shader_info::TextureType::from_u8(info.texture_type)
             == crate::shader_info::TextureType::Buffer;
-        let mut lod = (!is_buffer && !inst.arg(3).is_void())
-            .then(|| ctx.resolve_value(inst.arg(3)));
+        let mut lod =
+            (!is_buffer && !inst.arg(3).is_void()).then(|| ctx.resolve_value(inst.arg(3)));
         let sample = (!inst.arg(4).is_void()).then(|| ctx.resolve_value(inst.arg(4)));
         if sample.is_some() {
             lod = None;
@@ -643,8 +707,7 @@ pub fn emit_image_query(
         };
         let zero = ctx.const_zero_u32;
         let constituents = match texture_type {
-            crate::shader_info::TextureType::Color1D
-            | crate::shader_info::TextureType::Buffer => {
+            crate::shader_info::TextureType::Color1D | crate::shader_info::TextureType::Buffer => {
                 vec![query(ctx.u32_type), zero, zero, mips]
             }
             crate::shader_info::TextureType::ColorArray1D
@@ -728,13 +791,93 @@ pub fn emit_image_gather_inst(
     }
 }
 
+/// Port of upstream `EmitImageRead`.
+pub fn emit_image_read_inst(
+    ctx: &mut SpirvEmitContext,
+    inst: &ir::Inst,
+    block_idx: u32,
+    inst_idx: u32,
+) {
+    let info = TextureInstInfo::from_u32(inst.flags);
+    if crate::shader_info::ImageFormat::from_u8(info.image_format)
+        == crate::shader_info::ImageFormat::Typeless
+        && !ctx.profile.support_typeless_image_loads
+    {
+        log::warn!("SPIR-V: typeless image read not supported by host");
+        let color = ctx.builder.constant_null(ctx.u32_vec4_type);
+        ctx.set_value(block_idx, inst_idx, color);
+        return;
+    }
+    let coords = ctx.resolve_value(inst.arg(1));
+    let (image, is_integer) = image(ctx, info, *inst.arg(0));
+    let result_type = if is_integer {
+        ctx.u32_vec4_type
+    } else {
+        ctx.f32_vec4_type
+    };
+    let mut color = image_read(ctx, inst, result_type, image, coords);
+    if !is_integer {
+        color = ctx.builder.bitcast(ctx.u32_vec4_type, None, color).unwrap();
+    }
+    ctx.set_value(block_idx, inst_idx, color);
+}
+
+/// Port of upstream `EmitImageWrite`.
+pub fn emit_image_write_inst(ctx: &mut SpirvEmitContext, inst: &ir::Inst) {
+    let info = TextureInstInfo::from_u32(inst.flags);
+    let coords = ctx.resolve_value(inst.arg(1));
+    let mut color = ctx.resolve_value(inst.arg(2));
+    let (image, is_integer) = image(ctx, info, *inst.arg(0));
+    if !is_integer {
+        color = ctx.builder.bitcast(ctx.f32_vec4_type, None, color).unwrap();
+    }
+    ctx.builder
+        .image_write(image, coords, color, None, vec![])
+        .unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ir::basic_block::Block;
     use crate::ir::instruction::Inst;
-    use crate::ir::types::ShaderStage;
+    use crate::ir::types::{ShaderStage, TextureInstInfo};
     use crate::ir::value::InstRef;
+    use crate::ir::SyntaxNode;
+    use crate::profile::Profile;
+    use crate::runtime_info::RuntimeInfo;
+    use crate::shader_info::{ImageDescriptor, ImageFormat, TextureType};
+    use rspirv::binary::Assemble;
+
+    fn validate_with_external_tool(ctx: SpirvEmitContext, name: &str) {
+        let Some(validator) = std::env::var_os("RUZU_SPIRV_VAL") else {
+            return;
+        };
+        let words = ctx.builder.module().assemble();
+        let path = std::env::temp_dir().join(format!(
+            "ruzu-{name}-{}-{}.spv",
+            std::process::id(),
+            words.len()
+        ));
+        let mut bytes = Vec::with_capacity(words.len() * 4);
+        for word in words {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let output = std::process::Command::new(validator)
+            .arg("--target-env")
+            .arg("vulkan1.2")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(path);
+        assert!(
+            output.status.success(),
+            "spirv-val failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn constant_sample_offset_follows_identity_values() {
@@ -755,5 +898,85 @@ mod tests {
             immediate_offset_components(&program, Value::Inst(InstRef { block: 0, inst: 2 })),
             Some(vec![1, u32::MAX])
         );
+    }
+
+    #[test]
+    fn storage_image_read_write_emit_upstream_operations() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        program.info.image_descriptors.push(ImageDescriptor {
+            texture_type: TextureType::Color2D,
+            format: ImageFormat::R32G32B32A32Uint,
+            is_written: true,
+            is_read: true,
+            is_integer: true,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        let info = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Color2D as u8,
+            image_format: ImageFormat::R32G32B32A32Uint as u8,
+            ..TextureInstInfo::default()
+        };
+        let block = program.block_mut(0);
+        let coords = block.append_inst(Inst::new(
+            Opcode::CompositeConstructU32x2,
+            vec![Value::ImmU32(1), Value::ImmU32(2)],
+        ));
+        let color = block.append_inst(Inst::new(
+            Opcode::CompositeConstructU32x4,
+            vec![
+                Value::ImmU32(3),
+                Value::ImmU32(4),
+                Value::ImmU32(5),
+                Value::ImmU32(6),
+            ],
+        ));
+        block.append_inst(Inst::with_flags(
+            Opcode::ImageRead,
+            vec![
+                Value::ImmU32(0),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coords,
+                }),
+            ],
+            info.to_u32(),
+        ));
+        block.append_inst(Inst::with_flags(
+            Opcode::ImageWrite,
+            vec![
+                Value::ImmU32(0),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coords,
+                }),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: color,
+                }),
+            ],
+            info.to_u32(),
+        ));
+        program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+
+        let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+        ctx.emit_program(&program);
+        let opcodes = ctx
+            .builder
+            .module_ref()
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+            .map(|inst| inst.class.opcode)
+            .collect::<Vec<_>>();
+        assert!(opcodes.contains(&spirv::Op::ImageRead));
+        assert!(opcodes.contains(&spirv::Op::ImageWrite));
+        assert!(!opcodes.contains(&spirv::Op::Undef));
+        validate_with_external_tool(ctx, "storage-image-read-write");
     }
 }

@@ -8,7 +8,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use log::{error, info};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
+
+use log::error;
+#[cfg(unix)]
+use log::info;
 
 use super::fs;
 use super::fs_paths::*;
@@ -68,62 +73,6 @@ struct PathManager {
     ruzu_paths: HashMap<RuzuPath, PathBuf>,
 }
 
-fn has_populated_system_registered(root: &Path) -> bool {
-    let registered = root.join(NAND_DIR).join("system/Contents/registered");
-    let Ok(entries) = std::fs::read_dir(&registered) else {
-        return false;
-    };
-    entries.flatten().next().is_some()
-}
-
-fn is_meaningful_sdmc_entry(entry_path: &Path) -> bool {
-    entry_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name != "FsAccessLog.txt")
-}
-
-fn has_populated_sdmc(root: &Path) -> bool {
-    let sdmc = root.join(SDMC_DIR);
-    let Ok(entries) = std::fs::read_dir(&sdmc) else {
-        return false;
-    };
-    entries
-        .flatten()
-        .map(|entry| entry.path())
-        .any(|entry_path| is_meaningful_sdmc_entry(&entry_path))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LegacyYuzuRootReason {
-    NandEmpty,
-    SdmcEmpty,
-}
-
-impl LegacyYuzuRootReason {
-    fn as_log_reason(self) -> &'static str {
-        match self {
-            Self::NandEmpty => "ruzu NAND is empty",
-            Self::SdmcEmpty => "ruzu SDMC is empty",
-        }
-    }
-}
-
-fn legacy_yuzu_root_reason(
-    primary_root: &Path,
-    legacy_root: &Path,
-) -> Option<LegacyYuzuRootReason> {
-    if !has_populated_system_registered(primary_root)
-        && has_populated_system_registered(legacy_root)
-    {
-        return Some(LegacyYuzuRootReason::NandEmpty);
-    }
-    if !has_populated_sdmc(primary_root) && has_populated_sdmc(legacy_root) {
-        return Some(LegacyYuzuRootReason::SdmcEmpty);
-    }
-    None
-}
-
 impl PathManager {
     fn new() -> Self {
         let mut manager = Self {
@@ -145,65 +94,59 @@ impl PathManager {
     }
 
     fn reinitialize(&mut self, ruzu_path_override: Option<PathBuf>) {
+        #[cfg(windows)]
+        let ruzu_path_override = ruzu_path_override.filter(|path| fs::is_dir(path));
+
         let ruzu_path;
         let ruzu_path_cache;
         let ruzu_path_config;
-        let data_root;
 
         if let Some(override_path) = ruzu_path_override {
             ruzu_path = override_path;
             ruzu_path_cache = ruzu_path.join(CACHE_DIR);
             ruzu_path_config = ruzu_path.join(CONFIG_DIR);
-            data_root = ruzu_path.clone();
         } else {
-            // Use XDG directories on Unix, or a reasonable default
-            let data_dir = get_data_directory("XDG_DATA_HOME");
-            let candidate = data_dir.join(RUZU_DIR);
-            let legacy_candidate = data_dir.join(LEGACY_YUZU_DIR);
-
-            if fs::exists(&candidate) && fs::is_dir(&candidate) {
-                ruzu_path = candidate;
+            #[cfg(windows)]
+            {
+                let appdata_roaming = get_app_data_roaming_directory();
+                ruzu_path = appdata_roaming.join(RUZU_DIR);
                 ruzu_path_cache = ruzu_path.join(CACHE_DIR);
                 ruzu_path_config = ruzu_path.join(CONFIG_DIR);
-            } else {
-                ruzu_path = get_data_directory("XDG_DATA_HOME").join(RUZU_DIR);
-                ruzu_path_cache = get_data_directory("XDG_CACHE_HOME").join(RUZU_DIR);
-                ruzu_path_config = get_data_directory("XDG_CONFIG_HOME").join(RUZU_DIR);
             }
 
-            data_root = if let Some(reason) = legacy_yuzu_root_reason(&ruzu_path, &legacy_candidate)
+            #[cfg(not(windows))]
             {
-                info!(
-                    "Using legacy yuzu data root at {} because {}",
-                    path_to_utf8_string(&legacy_candidate),
-                    reason.as_log_reason()
-                );
-                legacy_candidate
-            } else {
-                ruzu_path.clone()
-            };
+                let data_dir = get_data_directory("XDG_DATA_HOME");
+                let candidate = data_dir.join(RUZU_DIR);
+
+                if fs::exists(&candidate) && fs::is_dir(&candidate) {
+                    ruzu_path = candidate.clone();
+                    ruzu_path_cache = ruzu_path.join(CACHE_DIR);
+                    ruzu_path_config = ruzu_path.join(CONFIG_DIR);
+                } else {
+                    ruzu_path = get_data_directory("XDG_DATA_HOME").join(RUZU_DIR);
+                    ruzu_path_cache = get_data_directory("XDG_CACHE_HOME").join(RUZU_DIR);
+                    ruzu_path_config = get_data_directory("XDG_CONFIG_HOME").join(RUZU_DIR);
+                }
+            }
         }
 
         self.generate_ruzu_path(RuzuPath::RuzuDir, &ruzu_path);
-        self.generate_ruzu_path(RuzuPath::AmiiboDir, &data_root.join(AMIIBO_DIR));
+        self.generate_ruzu_path(RuzuPath::AmiiboDir, &ruzu_path.join(AMIIBO_DIR));
         self.generate_ruzu_path(RuzuPath::CacheDir, &ruzu_path_cache);
         self.generate_ruzu_path(RuzuPath::ConfigDir, &ruzu_path_config);
         self.generate_ruzu_path(RuzuPath::CrashDumpsDir, &ruzu_path.join(CRASH_DUMPS_DIR));
-        self.generate_ruzu_path(RuzuPath::DumpDir, &data_root.join(DUMP_DIR));
-        self.generate_ruzu_path(RuzuPath::KeysDir, &data_root.join(KEYS_DIR));
-        self.generate_ruzu_path(RuzuPath::LoadDir, &data_root.join(LOAD_DIR));
+        self.generate_ruzu_path(RuzuPath::DumpDir, &ruzu_path.join(DUMP_DIR));
+        self.generate_ruzu_path(RuzuPath::KeysDir, &ruzu_path.join(KEYS_DIR));
+        self.generate_ruzu_path(RuzuPath::LoadDir, &ruzu_path.join(LOAD_DIR));
         self.generate_ruzu_path(RuzuPath::LogDir, &ruzu_path.join(LOG_DIR));
-        self.generate_ruzu_path(RuzuPath::NANDDir, &data_root.join(NAND_DIR));
-        self.generate_ruzu_path(RuzuPath::PlayTimeDir, &data_root.join(PLAY_TIME_DIR));
-        self.generate_ruzu_path(RuzuPath::ScreenshotsDir, &data_root.join(SCREENSHOTS_DIR));
-        self.generate_ruzu_path(RuzuPath::SDMCDir, &data_root.join(SDMC_DIR));
-        // Shader caches are emulator-private binary data. ruzu may borrow the
-        // legacy yuzu root for user/system data, but its disk shader cache
-        // layout is not yuzu-compatible and must not read or delete yuzu's
-        // `shader/<title>/vulkan*.bin` files.
+        self.generate_ruzu_path(RuzuPath::NANDDir, &ruzu_path.join(NAND_DIR));
+        self.generate_ruzu_path(RuzuPath::PlayTimeDir, &ruzu_path.join(PLAY_TIME_DIR));
+        self.generate_ruzu_path(RuzuPath::ScreenshotsDir, &ruzu_path.join(SCREENSHOTS_DIR));
+        self.generate_ruzu_path(RuzuPath::SDMCDir, &ruzu_path.join(SDMC_DIR));
         self.generate_ruzu_path(RuzuPath::ShaderDir, &ruzu_path.join(SHADER_DIR));
-        self.generate_ruzu_path(RuzuPath::TASDir, &data_root.join(TAS_DIR));
-        self.generate_ruzu_path(RuzuPath::IconsDir, &data_root.join(ICONS_DIR));
+        self.generate_ruzu_path(RuzuPath::TASDir, &ruzu_path.join(TAS_DIR));
+        self.generate_ruzu_path(RuzuPath::IconsDir, &ruzu_path.join(ICONS_DIR));
     }
 
     fn generate_ruzu_path(&mut self, ruzu_path: RuzuPath, new_path: &Path) {
@@ -411,22 +354,43 @@ pub fn get_data_directory(env_name: &str) -> PathBuf {
     }
 }
 
-#[cfg(not(unix))]
-pub fn get_home_directory() -> PathBuf {
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        return PathBuf::from(home);
-    }
-    PathBuf::new()
-}
+/// Gets the path of the current user's `%APPDATA%` directory.
+///
+/// Maps to upstream `GetAppDataRoamingDirectory`.
+#[cfg(windows)]
+pub fn get_app_data_roaming_directory() -> PathBuf {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_RoamingAppData, SHGetKnownFolderPath};
 
-#[cfg(not(unix))]
-pub fn get_data_directory(env_name: &str) -> PathBuf {
-    let home = get_home_directory();
-    match env_name {
-        "XDG_DATA_HOME" => home.join(".local/share"),
-        "XDG_CACHE_HOME" => home.join(".cache"),
-        "XDG_CONFIG_HOME" => home.join(".config"),
-        _ => PathBuf::new(),
+    let mut appdata_roaming_path = std::ptr::null_mut();
+    unsafe {
+        let _ = SHGetKnownFolderPath(
+            &FOLDERID_RoamingAppData,
+            0,
+            std::ptr::null_mut(),
+            &mut appdata_roaming_path,
+        );
+
+        if appdata_roaming_path.is_null() {
+            error!("Failed to get the path to the %APPDATA% directory");
+            return PathBuf::new();
+        }
+
+        let length = (0..)
+            .position(|index| *appdata_roaming_path.add(index) == 0)
+            .unwrap_or(0);
+        let path = PathBuf::from(std::ffi::OsString::from_wide(std::slice::from_raw_parts(
+            appdata_roaming_path,
+            length,
+        )));
+
+        CoTaskMemFree(appdata_roaming_path.cast());
+
+        if path.as_os_str().is_empty() {
+            error!("Failed to get the path to the %APPDATA% directory");
+        }
+
+        path
     }
 }
 
@@ -606,9 +570,6 @@ fn normalize_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
     use std::fs;
 
     #[test]
@@ -720,158 +681,70 @@ mod tests {
         assert_eq!(get_extension_from_filename("archive.tar.gz"), "gz");
     }
 
+    #[cfg(windows)]
     #[test]
-    fn test_legacy_yuzu_root_selected_when_ruzu_nand_is_empty() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!("ruzu-path-util-{unique}"));
-        let primary = base.join("ruzu");
-        let legacy = base.join("yuzu");
+    fn test_app_data_roaming_directory_matches_windows_known_folder() {
+        let appdata = get_app_data_roaming_directory();
+        assert!(!appdata.as_os_str().is_empty());
+        assert!(appdata.is_absolute());
 
-        fs::create_dir_all(primary.join("nand")).unwrap();
-        fs::create_dir_all(legacy.join("nand/system/Contents/registered")).unwrap();
-        fs::write(
-            legacy
-                .join("nand/system/Contents/registered")
-                .join("dummy.nca"),
-            b"x",
-        )
-        .unwrap();
-
-        assert_eq!(
-            legacy_yuzu_root_reason(&primary, &legacy),
-            Some(LegacyYuzuRootReason::NandEmpty)
-        );
-
-        let _ = fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn test_legacy_yuzu_root_selected_when_ruzu_sdmc_only_has_access_log() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!("ruzu-path-util-{unique}"));
-        let primary = base.join("ruzu");
-        let legacy = base.join("yuzu");
-
-        fs::create_dir_all(primary.join("sdmc")).unwrap();
-        fs::write(primary.join("sdmc/FsAccessLog.txt"), b"log").unwrap();
-        fs::create_dir_all(legacy.join("sdmc/share/supertuxkart/data")).unwrap();
-        fs::write(
-            legacy
-                .join("sdmc/share/supertuxkart/data")
-                .join("supertuxkart.1.5"),
-            b"x",
-        )
-        .unwrap();
-
-        assert_eq!(
-            legacy_yuzu_root_reason(&primary, &legacy),
-            Some(LegacyYuzuRootReason::SdmcEmpty)
-        );
-
-        let _ = fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn test_legacy_yuzu_root_not_selected_when_ruzu_sdmc_has_meaningful_content() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!("ruzu-path-util-{unique}"));
-        let primary = base.join("ruzu");
-        let legacy = base.join("yuzu");
-
-        fs::create_dir_all(primary.join("sdmc/share/supertuxkart/data")).unwrap();
-        fs::write(
-            primary
-                .join("sdmc/share/supertuxkart/data")
-                .join("supertuxkart.1.5"),
-            b"x",
-        )
-        .unwrap();
-        fs::create_dir_all(legacy.join("sdmc/share/supertuxkart/data")).unwrap();
-        fs::write(
-            legacy
-                .join("sdmc/share/supertuxkart/data")
-                .join("supertuxkart.1.5"),
-            b"x",
-        )
-        .unwrap();
-
-        assert_eq!(legacy_yuzu_root_reason(&primary, &legacy), None);
-
-        let _ = fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn test_shader_dir_stays_under_ruzu_root_when_legacy_yuzu_root_is_selected() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let old_data = std::env::var_os("XDG_DATA_HOME");
-        let old_cache = std::env::var_os("XDG_CACHE_HOME");
-        let old_config = std::env::var_os("XDG_CONFIG_HOME");
-
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!("ruzu-path-util-{unique}"));
-        let data = base.join("data");
-        let cache = base.join("cache");
-        let config = base.join("config");
-        let primary = data.join("ruzu");
-        let legacy = data.join("yuzu");
-
-        fs::create_dir_all(primary.join("nand")).unwrap();
-        fs::create_dir_all(legacy.join("nand/system/Contents/registered")).unwrap();
-        fs::write(
-            legacy
-                .join("nand/system/Contents/registered")
-                .join("dummy.nca"),
-            b"x",
-        )
-        .unwrap();
-
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", &data);
-            std::env::set_var("XDG_CACHE_HOME", &cache);
-            std::env::set_var("XDG_CONFIG_HOME", &config);
+        if let Some(environment_appdata) = std::env::var_os("APPDATA") {
+            assert_eq!(appdata, PathBuf::from(environment_appdata));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_invalid_windows_override_falls_back_to_app_data() {
+        let nonexistent = std::env::temp_dir().join("ruzu-path-util-nonexistent-override");
+        assert!(!nonexistent.is_dir());
 
         let mut manager = PathManager {
             ruzu_paths: HashMap::new(),
         };
-        manager.reinitialize(None);
+        manager.reinitialize(Some(nonexistent));
 
         assert_eq!(
+            manager.get_ruzu_path_impl(RuzuPath::RuzuDir),
+            get_app_data_roaming_directory().join(RUZU_DIR)
+        );
+    }
+
+    #[test]
+    fn test_explicit_ruzu_root_owns_all_runtime_directories() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ruzu-owned-paths-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+
+        let mut manager = PathManager {
+            ruzu_paths: HashMap::new(),
+        };
+        manager.reinitialize(Some(root.clone()));
+
+        assert_eq!(
+            manager.get_ruzu_path_impl(RuzuPath::ConfigDir),
+            root.join(CONFIG_DIR)
+        );
+        assert_eq!(
+            manager.get_ruzu_path_impl(RuzuPath::KeysDir),
+            root.join(KEYS_DIR)
+        );
+        assert_eq!(
             manager.get_ruzu_path_impl(RuzuPath::NANDDir),
-            legacy.join("nand").as_path()
+            root.join(NAND_DIR)
+        );
+        assert_eq!(
+            manager.get_ruzu_path_impl(RuzuPath::SDMCDir),
+            root.join(SDMC_DIR)
         );
         assert_eq!(
             manager.get_ruzu_path_impl(RuzuPath::ShaderDir),
-            primary.join("shader").as_path()
+            root.join(SHADER_DIR)
         );
 
-        unsafe {
-            match old_data {
-                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
-                None => std::env::remove_var("XDG_DATA_HOME"),
-            }
-            match old_cache {
-                Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
-                None => std::env::remove_var("XDG_CACHE_HOME"),
-            }
-            match old_config {
-                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-
-        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(root);
     }
 }

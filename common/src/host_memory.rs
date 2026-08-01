@@ -3,6 +3,7 @@
 //! Derniere synchro: 2026-03-05
 
 use crate::alignment::align_up;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::free_region_manager::FreeRegionManager;
 use crate::virtual_buffer::VirtualBuffer;
 use log::error;
@@ -11,6 +12,11 @@ use std::ffi::CString;
 use std::ptr;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_os = "windows")]
+use std::{
+    collections::BTreeMap,
+    sync::{Mutex, MutexGuard},
+};
 
 const PAGE_ALIGNMENT: usize = 0x1000;
 const HUGE_PAGE_SIZE: usize = 0x200000;
@@ -23,6 +29,491 @@ bitflags::bitflags! {
         const WRITE = 1 << 1;
         const READ_WRITE = Self::READ.bits() | Self::WRITE.bits();
         const EXECUTE = 1 << 2;
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+struct WindowsMapping {
+    end: usize,
+    host_offset: usize,
+}
+
+/// Windows placeholder-backed alias mapping.
+///
+/// Upstream owner: `common/host_memory.cpp`, `HostMemory::Impl` under
+/// `#ifdef _WIN32`.
+#[cfg(target_os = "windows")]
+struct HostMemoryImpl {
+    backing_size: usize,
+    virtual_size: usize,
+    backing_base: *mut u8,
+    virtual_base: *mut u8,
+    process: windows_sys::Win32::Foundation::HANDLE,
+    backing_handle: windows_sys::Win32::Foundation::HANDLE,
+    mappings: Mutex<BTreeMap<usize, WindowsMapping>>,
+}
+
+#[cfg(target_os = "windows")]
+impl HostMemoryImpl {
+    fn new(backing_size: usize, virtual_size: usize) -> Result<Self, String> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMapping2, MapViewOfFile3, VirtualAlloc2, FILE_MAP_READ, FILE_MAP_WRITE,
+            MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+            PAGE_READWRITE, SEC_COMMIT,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let process = unsafe { GetCurrentProcess() };
+        let mut result = Self {
+            backing_size,
+            virtual_size,
+            backing_base: ptr::null_mut(),
+            virtual_base: ptr::null_mut(),
+            process,
+            backing_handle: ptr::null_mut(),
+            mappings: Mutex::new(BTreeMap::new()),
+        };
+
+        result.backing_handle = unsafe {
+            CreateFileMapping2(
+                INVALID_HANDLE_VALUE,
+                ptr::null(),
+                FILE_MAP_WRITE | FILE_MAP_READ,
+                PAGE_READWRITE,
+                SEC_COMMIT,
+                backing_size as u64,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+            )
+        };
+        if result.backing_handle.is_null() {
+            return Err(format!(
+                "CreateFileMapping2 failed for {} MiB: {}",
+                backing_size >> 20,
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        result.backing_base = unsafe {
+            VirtualAlloc2(
+                process,
+                ptr::null(),
+                backing_size,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                ptr::null_mut(),
+                0,
+            )
+            .cast()
+        };
+        if result.backing_base.is_null() {
+            return Err(format!(
+                "VirtualAlloc2 failed to reserve {} MiB of backing memory: {}",
+                backing_size >> 20,
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let backing_view = unsafe {
+            MapViewOfFile3(
+                result.backing_handle,
+                process,
+                result.backing_base.cast(),
+                0,
+                backing_size,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        if backing_view.Value != result.backing_base.cast() {
+            return Err(format!(
+                "MapViewOfFile3 failed to map {} MiB of backing memory: {}",
+                backing_size >> 20,
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        result.virtual_base = unsafe {
+            VirtualAlloc2(
+                process,
+                ptr::null(),
+                virtual_size,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                ptr::null_mut(),
+                0,
+            )
+            .cast()
+        };
+        if result.virtual_base.is_null() {
+            return Err(format!(
+                "VirtualAlloc2 failed to reserve {} GiB of virtual memory: {}",
+                virtual_size >> 30,
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        Ok(result)
+    }
+
+    fn map(
+        &self,
+        virtual_offset: usize,
+        host_offset: usize,
+        length: usize,
+        _perms: MemoryPermission,
+    ) {
+        let mut mappings = self.mappings();
+        if !self.is_niche_placeholder(&mappings, virtual_offset, length) {
+            self.split(virtual_offset, length);
+        }
+        assert!(self
+            .find_overlapping(&mappings, virtual_offset, virtual_offset + length)
+            .is_none());
+        Self::track_mapping(&mut mappings, virtual_offset, host_offset, length);
+        self.map_view(virtual_offset, host_offset, length);
+    }
+
+    fn unmap(&self, virtual_offset: usize, length: usize) {
+        let mut mappings = self.mappings();
+        while self.unmap_one_mapping(&mut mappings, virtual_offset, length) {}
+    }
+
+    fn protect(
+        &self,
+        virtual_offset: usize,
+        length: usize,
+        read: bool,
+        write: bool,
+        _execute: bool,
+    ) {
+        use windows_sys::Win32::System::Memory::{
+            VirtualProtect, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+        };
+
+        let new_flags = match (read, write) {
+            (true, true) => PAGE_READWRITE,
+            (true, false) => PAGE_READONLY,
+            (false, false) => PAGE_NOACCESS,
+            (false, true) => panic!(
+                "unsupported Windows protection combination read={} write={}",
+                read, write
+            ),
+        };
+        let virtual_end = virtual_offset + length;
+        let mappings = self.mappings();
+        for (&start, mapping) in mappings.iter() {
+            if mapping.end <= virtual_offset {
+                continue;
+            }
+            if start >= virtual_end {
+                break;
+            }
+            let offset = start.max(virtual_offset);
+            let protect_length = mapping.end.min(virtual_end) - offset;
+            let mut old_flags = 0;
+            let success = unsafe {
+                VirtualProtect(
+                    self.virtual_base.add(offset).cast(),
+                    protect_length,
+                    new_flags,
+                    &mut old_flags,
+                )
+            };
+            if success == 0 {
+                error!(
+                    "Failed to change Windows virtual memory protection: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
+    fn clear_backing_region(&self, _physical_offset: usize, _length: usize) -> bool {
+        // Upstream: Windows cannot discard a range from the section mapping.
+        false
+    }
+
+    fn enable_direct_mapped_address(&mut self) {
+        panic!("EnableDirectMappedAddress is unreachable on Windows");
+    }
+
+    fn mappings(&self) -> MutexGuard<'_, BTreeMap<usize, WindowsMapping>> {
+        self.mappings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn find_overlapping(
+        &self,
+        mappings: &BTreeMap<usize, WindowsMapping>,
+        begin: usize,
+        end: usize,
+    ) -> Option<(usize, WindowsMapping)> {
+        if let Some((&start, &mapping)) = mappings.range(..=begin).next_back() {
+            if mapping.end > begin {
+                return Some((start, mapping));
+            }
+        }
+        mappings
+            .range(begin..end)
+            .next()
+            .map(|(&start, &mapping)| (start, mapping))
+    }
+
+    fn unmap_one_mapping(
+        &self,
+        mappings: &mut BTreeMap<usize, WindowsMapping>,
+        virtual_offset: usize,
+        length: usize,
+    ) -> bool {
+        use windows_sys::Win32::System::Memory::{UnmapViewOfFile2, MEM_PRESERVE_PLACEHOLDER};
+
+        let range_end = virtual_offset + length;
+        let Some((mapping_begin, mapping)) =
+            self.find_overlapping(mappings, virtual_offset, range_end)
+        else {
+            return false;
+        };
+        let mapping_end = mapping.end;
+        let unmap_begin = virtual_offset.max(mapping_begin);
+        let unmap_end = range_end.min(mapping_end);
+        let split_left = unmap_begin > mapping_begin;
+        let split_right = unmap_end < mapping_end;
+
+        let previous_end = mappings
+            .range(..mapping_begin)
+            .next_back()
+            .map(|(_, previous)| previous.end);
+        let next_begin = mappings
+            .range((mapping_begin + 1)..)
+            .next()
+            .map(|(&start, _)| start);
+
+        let success = unsafe {
+            UnmapViewOfFile2(
+                self.process,
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.virtual_base.add(mapping_begin).cast(),
+                },
+                MEM_PRESERVE_PLACEHOLDER,
+            )
+        };
+        if success == 0 {
+            error!(
+                "Failed to unmap Windows virtual memory placeholder: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        // Upstream's "panic region": partial unmaps must recreate both retained
+        // aliases before any unrelated work can observe the temporary hole.
+        if split_left || split_right {
+            self.split(unmap_begin, unmap_end - unmap_begin);
+        }
+        if split_left {
+            self.map_view(
+                mapping_begin,
+                mapping.host_offset,
+                unmap_begin - mapping_begin,
+            );
+        }
+        if split_right {
+            self.map_view(
+                unmap_end,
+                mapping.host_offset + unmap_end - mapping_begin,
+                mapping_end - unmap_end,
+            );
+        }
+
+        let mut coalesce_begin = unmap_begin;
+        if !split_left {
+            coalesce_begin = previous_end.unwrap_or(0);
+            if coalesce_begin != mapping_begin {
+                self.coalesce(coalesce_begin, unmap_end - coalesce_begin);
+            }
+        }
+        if !split_right {
+            let next_begin = next_begin.unwrap_or(self.virtual_size);
+            if mapping_end != next_begin {
+                self.coalesce(coalesce_begin, next_begin - coalesce_begin);
+            }
+        }
+
+        mappings.remove(&mapping_begin);
+        if split_left {
+            Self::track_mapping(
+                mappings,
+                mapping_begin,
+                mapping.host_offset,
+                unmap_begin - mapping_begin,
+            );
+        }
+        if split_right {
+            Self::track_mapping(
+                mappings,
+                unmap_end,
+                mapping.host_offset + unmap_end - mapping_begin,
+                mapping_end - unmap_end,
+            );
+        }
+        true
+    }
+
+    fn map_view(&self, virtual_offset: usize, host_offset: usize, length: usize) {
+        use windows_sys::Win32::System::Memory::{
+            MapViewOfFile3, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
+        };
+        let expected = unsafe { self.virtual_base.add(virtual_offset) };
+        let view = unsafe {
+            MapViewOfFile3(
+                self.backing_handle,
+                self.process,
+                expected.cast(),
+                host_offset as u64,
+                length,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        if view.Value != expected.cast() {
+            error!(
+                "Failed to map Windows placeholder: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    fn split(&self, virtual_offset: usize, length: usize) {
+        use windows_sys::Win32::System::Memory::{
+            VirtualFreeEx, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+        };
+        let success = unsafe {
+            VirtualFreeEx(
+                self.process,
+                self.virtual_base.add(virtual_offset).cast(),
+                length,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            )
+        };
+        if success == 0 {
+            error!(
+                "Failed to split Windows placeholder: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    fn coalesce(&self, virtual_offset: usize, length: usize) {
+        use windows_sys::Win32::System::Memory::{VirtualFreeEx, MEM_RELEASE};
+        use windows_sys::Win32::System::SystemServices::MEM_COALESCE_PLACEHOLDERS;
+        let success = unsafe {
+            VirtualFreeEx(
+                self.process,
+                self.virtual_base.add(virtual_offset).cast(),
+                length,
+                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
+            )
+        };
+        if success == 0 {
+            error!(
+                "Failed to coalesce Windows placeholders: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    fn is_niche_placeholder(
+        &self,
+        mappings: &BTreeMap<usize, WindowsMapping>,
+        virtual_offset: usize,
+        length: usize,
+    ) -> bool {
+        let end = virtual_offset + length;
+        let Some((&next_begin, _)) = mappings.range(end..).next() else {
+            return false;
+        };
+        if next_begin != end {
+            return false;
+        }
+        virtual_offset == 0
+            || mappings
+                .range(..next_begin)
+                .next_back()
+                .is_some_and(|(_, previous)| previous.end == virtual_offset)
+    }
+
+    fn track_mapping(
+        mappings: &mut BTreeMap<usize, WindowsMapping>,
+        virtual_offset: usize,
+        host_offset: usize,
+        length: usize,
+    ) {
+        let previous = mappings.insert(
+            virtual_offset,
+            WindowsMapping {
+                end: virtual_offset + length,
+                host_offset,
+            },
+        );
+        assert!(previous.is_none());
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for HostMemoryImpl {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            UnmapViewOfFile2, VirtualFree, VirtualFreeEx, MEMORY_MAPPED_VIEW_ADDRESS,
+            MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+        };
+
+        let mappings = self.mappings();
+        if !mappings.is_empty() && !self.virtual_base.is_null() {
+            for &start in mappings.keys() {
+                unsafe {
+                    UnmapViewOfFile2(
+                        self.process,
+                        MEMORY_MAPPED_VIEW_ADDRESS {
+                            Value: self.virtual_base.add(start).cast(),
+                        },
+                        MEM_PRESERVE_PLACEHOLDER,
+                    );
+                }
+            }
+            self.coalesce(0, self.virtual_size);
+        }
+        drop(mappings);
+
+        unsafe {
+            if !self.virtual_base.is_null() {
+                VirtualFree(self.virtual_base.cast(), 0, MEM_RELEASE);
+                self.virtual_base = ptr::null_mut();
+            }
+            if !self.backing_base.is_null() {
+                UnmapViewOfFile2(
+                    self.process,
+                    MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: self.backing_base.cast(),
+                    },
+                    MEM_PRESERVE_PLACEHOLDER,
+                );
+                VirtualFreeEx(self.process, self.backing_base.cast(), 0, MEM_RELEASE);
+                self.backing_base = ptr::null_mut();
+            }
+            if !self.backing_handle.is_null() {
+                CloseHandle(self.backing_handle);
+                self.backing_handle = ptr::null_mut();
+            }
+        }
     }
 }
 
@@ -374,7 +865,7 @@ impl Drop for HostMemoryImpl {
 pub struct HostMemory {
     backing_size: usize,
     virtual_size: usize,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     imp: Option<HostMemoryImpl>,
     backing_base: *mut u8,
     virtual_base: *mut u8,
@@ -391,7 +882,7 @@ impl HostMemory {
         let aligned_virtual =
             align_up(virtual_size as u64, PAGE_ALIGNMENT as u64) as usize + HUGE_PAGE_SIZE;
 
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         {
             match HostMemoryImpl::new(aligned_backing, aligned_virtual) {
                 Ok(imp) => {
@@ -429,7 +920,7 @@ impl HostMemory {
         Self {
             backing_size,
             virtual_size,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
             imp: None,
             backing_base,
             virtual_base: ptr::null_mut(),
@@ -460,7 +951,7 @@ impl HostMemory {
             return;
         }
 
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         if let Some(ref imp) = self.imp {
             imp.map(
                 virtual_offset + self.virtual_base_offset,
@@ -480,7 +971,7 @@ impl HostMemory {
             return;
         }
 
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         if let Some(ref imp) = self.imp {
             imp.unmap(virtual_offset + self.virtual_base_offset, length);
         }
@@ -499,7 +990,7 @@ impl HostMemory {
         let write = perm.contains(MemoryPermission::WRITE);
         let execute = perm.contains(MemoryPermission::EXECUTE);
 
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         if let Some(ref imp) = self.imp {
             imp.protect(
                 virtual_offset + self.virtual_base_offset,
@@ -512,7 +1003,7 @@ impl HostMemory {
     }
 
     pub fn clear_backing_region(&self, physical_offset: usize, length: usize, fill_value: u32) {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         {
             if fill_value == 0 {
                 if let Some(ref imp) = self.imp {
@@ -538,6 +1029,10 @@ impl HostMemory {
         if let Some(ref mut imp) = self.imp {
             imp.enable_direct_mapped_address();
             self.virtual_size += self.virtual_base as usize;
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(ref mut imp) = self.imp {
+            imp.enable_direct_mapped_address();
         }
     }
 
@@ -574,5 +1069,67 @@ mod tests {
         // Create a small host memory (backing + virtual)
         let hm = HostMemory::new(0x100000, 0x200000);
         assert!(!hm.backing_base_pointer().is_null());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_placeholder_mapping_aliases_backing_memory() {
+        let hm = HostMemory::new(0x20_000, 0x40_000);
+        assert!(!hm.virtual_base_pointer().is_null());
+
+        hm.map(
+            0x10_000,
+            0x4_000,
+            0x2_000,
+            MemoryPermission::READ_WRITE,
+            false,
+        );
+
+        unsafe {
+            hm.backing_base_pointer().add(0x4_123).write(0x5a);
+            assert_eq!(hm.virtual_base_pointer().add(0x10_123).read(), 0x5a);
+
+            hm.virtual_base_pointer().add(0x11_abc).write(0xc3);
+            assert_eq!(hm.backing_base_pointer().add(0x5_abc).read(), 0xc3);
+        }
+
+        hm.unmap(0x10_000, 0x2_000, false);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_partial_unmap_preserves_both_alias_fragments() {
+        let hm = HostMemory::new(0x40_000, 0x80_000);
+        assert!(!hm.virtual_base_pointer().is_null());
+
+        hm.map(
+            0x20_000,
+            0x8_000,
+            0x3_000,
+            MemoryPermission::READ_WRITE,
+            false,
+        );
+        hm.unmap(0x21_000, 0x1_000, false);
+
+        unsafe {
+            hm.backing_base_pointer().add(0x8_123).write(0x19);
+            hm.backing_base_pointer().add(0xa_456).write(0x73);
+            assert_eq!(hm.virtual_base_pointer().add(0x20_123).read(), 0x19);
+            assert_eq!(hm.virtual_base_pointer().add(0x22_456).read(), 0x73);
+        }
+
+        hm.map(
+            0x21_000,
+            0x10_000,
+            0x1_000,
+            MemoryPermission::READ_WRITE,
+            false,
+        );
+        unsafe {
+            hm.virtual_base_pointer().add(0x21_abc).write(0xd4);
+            assert_eq!(hm.backing_base_pointer().add(0x10_abc).read(), 0xd4);
+        }
+
+        hm.unmap(0x20_000, 0x3_000, false);
     }
 }

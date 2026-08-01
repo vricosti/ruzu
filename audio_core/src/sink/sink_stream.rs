@@ -222,6 +222,11 @@ impl SinkStream {
         self.release.queued_buffers.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn queued_buffer_front(&self) -> Option<&SinkBuffer> {
+        self.queue.front()
+    }
+
     pub fn set_ring_size(&mut self, ring_size: u32) {
         self.release
             .max_queue_size

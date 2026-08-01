@@ -34,3 +34,6 @@ openssl.workspace = true
 [target.'cfg(target_os = "openbsd")'.dependencies]
 # OpenBSD 7.9 ships LibreSSL 4.3, newer than openssl-sys currently accepts.
 openssl = { workspace = true, features = ["vendored"] }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["memoryapi", "winnt"] }

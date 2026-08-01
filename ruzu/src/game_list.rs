@@ -290,8 +290,6 @@ pub fn build<F: Fn(String) + 'static>(on_activate: F) -> (gtk::Widget, GameListH
         selection: selection.clone(),
     });
 
-    view.reload();
-
     // Toolbar + empty-state actions.
     for button in [&add_button, &empty.add_button] {
         let view = Rc::clone(&view);
@@ -357,6 +355,11 @@ pub fn build<F: Fn(String) + 'static>(on_activate: F) -> (gtk::Widget, GameListH
         });
     }
 
+    // Populate only after the selection handlers are connected. When there is
+    // exactly one configured filesystem directory, `reload` selects it so the
+    // per-directory actions are immediately usable.
+    view.reload();
+
     (root.upcast(), GameListHandle(view))
 }
 
@@ -420,6 +423,8 @@ impl GameListView {
             .into_iter()
             .filter(GameDir::is_filesystem_path)
             .collect();
+        let directory_to_select =
+            preferred_directory_path(previously_selected.as_deref(), &scannable);
 
         self.store.remove_all();
 
@@ -458,7 +463,7 @@ impl GameListView {
             PAGE_LIST
         });
 
-        if let Some(path) = previously_selected {
+        if let Some(path) = directory_to_select {
             self.select_directory(&path);
         }
     }
@@ -514,6 +519,7 @@ impl GameListView {
         });
         self.persist();
         self.reload();
+        self.select_directory(path);
     }
 
     /// Remove the directory at `path` — upstream's "Remove Game Directory".
@@ -552,6 +558,26 @@ fn selected_directory_path(selection: &gtk::SingleSelection) -> Option<String> {
         .and_downcast::<GameEntry>()
         .filter(|entry| entry.is_folder())
         .map(|entry| entry.path())
+}
+
+/// Preserve the selected directory across a reload. If there was no usable
+/// selection and only one filesystem directory exists, select that directory
+/// so the toolbar actions target it immediately.
+fn preferred_directory_path(
+    previously_selected: Option<&str>,
+    directories: &[GameDir],
+) -> Option<String> {
+    if let Some(path) = previously_selected {
+        if directories.iter().any(|directory| directory.path == path) {
+            return Some(path.to_owned());
+        }
+    }
+
+    if directories.len() == 1 {
+        return Some(directories[0].path.clone());
+    }
+
+    None
 }
 
 /// Install the game-list CSS once.
@@ -955,5 +981,24 @@ mod tests {
             .any(|game| game.path == nested.join("nested.nro")));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sole_directory_is_selected_for_toolbar_actions() {
+        let directory = GameDir {
+            path: String::from(r"D:\Games\Switch"),
+            deep_scan: false,
+            expanded: true,
+        };
+
+        assert_eq!(
+            preferred_directory_path(None, std::slice::from_ref(&directory)),
+            Some(directory.path.clone())
+        );
+        assert_eq!(
+            preferred_directory_path(Some(&directory.path), std::slice::from_ref(&directory)),
+            Some(directory.path)
+        );
+        assert_eq!(preferred_directory_path(Some("removed"), &[]), None);
     }
 }

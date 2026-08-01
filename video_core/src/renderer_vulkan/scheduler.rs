@@ -10,15 +10,60 @@ use ash::vk;
 use log::{debug, trace};
 use std::collections::VecDeque;
 use std::mem::{align_of, size_of, MaybeUninit};
+use std::panic::Location;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use super::command_pool::CommandPool;
 use super::state_tracker::StateTracker;
 
 const COMMAND_CHUNK_CAPACITY: usize = 0x8000;
 const NO_COMMAND: usize = usize::MAX;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CommandTraceLocation {
+    file: &'static str,
+    line: u32,
+}
+
+fn vulkan_submit_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("RUZU_VK_TRACE_DRAWS")
+            .is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+fn format_scheduler_submit_trace(
+    tick: u64,
+    signal_semaphore_count: usize,
+    locations: &[CommandTraceLocation],
+) -> String {
+    let mut counts: Vec<(CommandTraceLocation, usize)> = Vec::new();
+    for &location in locations {
+        if let Some((_, count)) = counts.iter_mut().find(|(known, _)| *known == location) {
+            *count += 1;
+        } else {
+            counts.push((location, 1));
+        }
+    }
+    let callsites = counts
+        .into_iter()
+        .map(|(location, count)| {
+            let file = location
+                .file
+                .rsplit_once("video_core/")
+                .map_or(location.file, |(_, relative)| relative);
+            format!("{file}:{}={count}", location.line)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "[VK_SUBMIT_TRACE] tick={tick} commands={} signal_semaphores={signal_semaphore_count} callsites=[{callsites}]",
+        locations.len()
+    )
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -39,6 +84,7 @@ struct CommandChunk {
     last: usize,
     command_offset: usize,
     submit: Option<SubmitRequest>,
+    trace_locations: Vec<CommandTraceLocation>,
 }
 
 impl CommandChunk {
@@ -53,6 +99,7 @@ impl CommandChunk {
             last: NO_COMMAND,
             command_offset: 0,
             submit: None,
+            trace_locations: Vec::new(),
         }
     }
 
@@ -319,6 +366,8 @@ impl SchedulerWorkerState {
 
 struct WorkerContext {
     device: ash::Device,
+    device_fault: Option<vk::ExtDeviceFaultFn>,
+    device_fault_reported: bool,
     queue: vk::Queue,
     command_pool: CommandPool,
     current_cmdbuf: vk::CommandBuffer,
@@ -328,6 +377,7 @@ struct WorkerContext {
     submit_mutex: Arc<Mutex<()>>,
     current_tick: Arc<AtomicU64>,
     submitted_tick: Arc<AtomicU64>,
+    pending_trace_locations: Vec<CommandTraceLocation>,
 }
 
 impl SchedulerWorker {
@@ -384,7 +434,21 @@ impl SchedulerWorker {
             };
 
             let submit = chunk.execute_all(context.current_cmdbuf, context.upload_cmdbuf);
+            context
+                .pending_trace_locations
+                .append(&mut chunk.trace_locations);
             if let Some(submit) = submit {
+                if vulkan_submit_trace_enabled() {
+                    log::info!(
+                        "{}",
+                        format_scheduler_submit_trace(
+                            submit.tick,
+                            submit.signal_semaphores.len(),
+                            &context.pending_trace_locations,
+                        )
+                    );
+                }
+                context.pending_trace_locations.clear();
                 if let Err(error) = context.submit_execution(&submit) {
                     log::error!(
                         "Vulkan worker failed to submit tick {}: {error:?}",
@@ -411,6 +475,69 @@ impl SchedulerWorker {
 }
 
 impl WorkerContext {
+    fn report_device_fault(&mut self) {
+        if self.device_fault_reported {
+            return;
+        }
+        self.device_fault_reported = true;
+        let Some(extension) = self.device_fault.as_ref() else {
+            return;
+        };
+        let mut counts = vk::DeviceFaultCountsEXT::default();
+        let first = unsafe {
+            (extension.get_device_fault_info_ext)(
+                self.device.handle(),
+                &mut counts,
+                std::ptr::null_mut(),
+            )
+        };
+        if first != vk::Result::SUCCESS {
+            log::error!("vkGetDeviceFaultInfoEXT count query failed: {first:?}");
+            return;
+        }
+        let mut addresses =
+            vec![vk::DeviceFaultAddressInfoEXT::default(); counts.address_info_count as usize];
+        let mut vendors =
+            vec![vk::DeviceFaultVendorInfoEXT::default(); counts.vendor_info_count as usize];
+        let mut vendor_binary = vec![0u8; counts.vendor_binary_size as usize];
+        let mut info = vk::DeviceFaultInfoEXT::default();
+        info.p_address_infos = addresses.as_mut_ptr();
+        info.p_vendor_infos = vendors.as_mut_ptr();
+        info.p_vendor_binary_data = vendor_binary.as_mut_ptr().cast();
+        let second = unsafe {
+            (extension.get_device_fault_info_ext)(self.device.handle(), &mut counts, &mut info)
+        };
+        if second != vk::Result::SUCCESS {
+            log::error!("vkGetDeviceFaultInfoEXT detail query failed: {second:?}");
+            return;
+        }
+        let description = unsafe { std::ffi::CStr::from_ptr(info.description.as_ptr()) };
+        log::error!(
+            "Vulkan device fault: description={} addresses={} vendors={} vendor_binary_size={}",
+            description.to_string_lossy(),
+            counts.address_info_count,
+            counts.vendor_info_count,
+            counts.vendor_binary_size
+        );
+        for (index, address) in addresses.iter().enumerate() {
+            log::error!(
+                "Vulkan device fault address[{index}]: type={:?} reported=0x{:016X} precision=0x{:016X}",
+                address.address_type,
+                address.reported_address,
+                address.address_precision
+            );
+        }
+        for (index, vendor) in vendors.iter().enumerate() {
+            let description = unsafe { std::ffi::CStr::from_ptr(vendor.description.as_ptr()) };
+            log::error!(
+                "Vulkan device fault vendor[{index}]: description={} code=0x{:016X} data=0x{:016X}",
+                description.to_string_lossy(),
+                vendor.vendor_fault_code,
+                vendor.vendor_fault_data
+            );
+        }
+    }
+
     fn known_gpu_tick(&self) -> u64 {
         if let Some(timeline) = self.timeline_semaphore {
             return unsafe {
@@ -454,7 +581,7 @@ impl WorkerContext {
         Ok(())
     }
 
-    fn submit_execution(&self, submit: &SubmitRequest) -> Result<(), vk::Result> {
+    fn submit_execution(&mut self, submit: &SubmitRequest) -> Result<(), vk::Result> {
         unsafe {
             let write_barrier = vk::MemoryBarrier::builder()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -492,8 +619,12 @@ impl WorkerContext {
                 self.device
                     .queue_submit(self.queue, &[submit_info], vk::Fence::null())
             };
+            drop(_submit_lock);
             if result.is_ok() {
                 self.submitted_tick.store(submit.tick, Ordering::SeqCst);
+            }
+            if result == Err(vk::Result::ERROR_DEVICE_LOST) {
+                self.report_device_fault();
             }
             result
         } else {
@@ -510,6 +641,9 @@ impl WorkerContext {
             };
             if result.is_ok() {
                 self.submitted_tick.store(submit.tick, Ordering::SeqCst);
+            }
+            if result == Err(vk::Result::ERROR_DEVICE_LOST) {
+                self.report_device_fault();
             }
             result
         }
@@ -545,6 +679,7 @@ impl Scheduler {
         queue: vk::Queue,
         graphics_family: u32,
         timeline_semaphore_supported: bool,
+        device_fault: Option<vk::ExtDeviceFaultFn>,
     ) -> Result<Self, vk::Result> {
         let fence_info = vk::FenceCreateInfo::builder()
             .flags(vk::FenceCreateFlags::SIGNALED)
@@ -573,6 +708,8 @@ impl Scheduler {
         let worker = Arc::new(SchedulerWorker::new());
         let mut worker_context = WorkerContext {
             device: device.clone(),
+            device_fault,
+            device_fault_reported: false,
             queue,
             command_pool: CommandPool::new_with_external_ticks(device.clone(), graphics_family),
             current_cmdbuf: vk::CommandBuffer::null(),
@@ -582,6 +719,7 @@ impl Scheduler {
             submit_mutex: Arc::clone(&submit_mutex),
             current_tick: Arc::clone(&current_tick),
             submitted_tick: Arc::clone(&submitted_tick),
+            pending_trace_locations: Vec::new(),
         };
         worker_context.allocate_worker_command_buffer()?;
         let thread_worker = Arc::clone(&worker);
@@ -628,23 +766,38 @@ impl Scheduler {
     }
 
     /// Record a command that only needs the render command buffer.
+    #[track_caller]
     pub fn record(&mut self, cmd: impl FnOnce(vk::CommandBuffer) + Send + 'static) {
         self.record_with_upload(move |render_cmd, _upload_cmd| cmd(render_cmd));
     }
 
     /// Record a command that needs both render and upload command buffers.
+    #[track_caller]
     pub fn record_with_upload(
         &mut self,
         cmd: impl FnOnce(vk::CommandBuffer, vk::CommandBuffer) + Send + 'static,
     ) {
+        let trace_location = if vulkan_submit_trace_enabled() {
+            let caller = Location::caller();
+            Some(CommandTraceLocation {
+                file: caller.file(),
+                line: caller.line(),
+            })
+        } else {
+            None
+        };
         let command = match self.current_chunk.record(cmd) {
-            Ok(()) => return,
+            Ok(()) => {
+                self.current_chunk.trace_locations.extend(trace_location);
+                return;
+            }
             Err(command) => command,
         };
         self.dispatch_work();
         if self.current_chunk.record(command).is_err() {
             panic!("Vulkan scheduler command exceeds the 32 KiB command chunk");
         }
+        self.current_chunk.trace_locations.extend(trace_location);
     }
 
     /// Begin a render pass if not already inside one with matching parameters.
@@ -1013,6 +1166,29 @@ mod tests {
 
         assert!(submit.is_none());
         assert_eq!(*order.lock().unwrap(), [3, 1, 4]);
+    }
+
+    #[test]
+    fn scheduler_submit_trace_groups_callsites_without_losing_command_count() {
+        let locations = [
+            CommandTraceLocation {
+                file: "video_core/src/renderer_vulkan/buffer_cache.rs",
+                line: 42,
+            },
+            CommandTraceLocation {
+                file: "video_core/src/renderer_vulkan/vk_rasterizer.rs",
+                line: 84,
+            },
+            CommandTraceLocation {
+                file: "video_core/src/renderer_vulkan/buffer_cache.rs",
+                line: 42,
+            },
+        ];
+
+        assert_eq!(
+            format_scheduler_submit_trace(1698, 1, &locations),
+            "[VK_SUBMIT_TRACE] tick=1698 commands=3 signal_semaphores=1 callsites=[src/renderer_vulkan/buffer_cache.rs:42=2,src/renderer_vulkan/vk_rasterizer.rs:84=1]"
+        );
     }
 
     #[test]

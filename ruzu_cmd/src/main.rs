@@ -549,6 +549,7 @@ fn main() {
         || want_shader_register_stall_profile
         || want_rasterizer_mark_cached_stall_profile
     {
+        #[cfg(unix)]
         extern "C" fn profile_signal(_signum: libc::c_int) {
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_profile();
             ruzu_core::hle::kernel::svc_dispatch::dump_svc_profile();
@@ -578,6 +579,7 @@ fn main() {
             video_core::shader_cache::dump_shader_register_stall_profile();
             ruzu_core::memory::memory::dump_rasterizer_mark_cached_stall_profile();
         }
+        #[cfg(unix)]
         unsafe {
             let mut sa: sdl2::libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = profile_signal as usize;
@@ -662,6 +664,7 @@ fn main() {
         || std::env::var_os("RUZU_FIRST_PCS_PER_CORE").is_some()
     {
         // SIGUSR2 path — useful when the JIT thread isn't flooding stderr.
+        #[cfg(unix)]
         extern "C" fn dump_counts(_: libc::c_int) {
             rdynarmic::jit::dump_block_count_summary();
             eprintln!("{}", rdynarmic::jit::block_prologue_count_summary_string());
@@ -669,6 +672,7 @@ fn main() {
             eprintln!("{}", rdynarmic::jit::first_pcs_per_core_summary_string());
             ruzu_core::arm::dynarmic::arm_dynarmic_64::dump_w64_by_core_counters();
         }
+        #[cfg(unix)]
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = dump_counts as usize;

@@ -595,11 +595,18 @@ impl Memory {
                                         );
                                     }
                                 }
+                                #[cfg(target_os = "linux")]
+                                {
+                                    eprintln!(
+                                        "[POLL_TRAP_CORRUPT] raising SIGSTOP. Attach gdb to inspect: gdb -p {}",
+                                        unsafe { libc::getpid() },
+                                    );
+                                    unsafe { libc::raise(libc::SIGSTOP) };
+                                }
+                                #[cfg(not(target_os = "linux"))]
                                 eprintln!(
-                                    "[POLL_TRAP_CORRUPT] raising SIGSTOP. Attach gdb to inspect: gdb -p {}",
-                                    unsafe { libc::getpid() },
+                                    "[POLL_TRAP_CORRUPT] automatic SIGSTOP is unavailable on this platform"
                                 );
-                                unsafe { libc::raise(libc::SIGSTOP) };
                             };
                             // SEGV-safety: we DO NOT dereference pt_ptr in the loop. The
                             // PageTable pointer captured at thread spawn can be freed at

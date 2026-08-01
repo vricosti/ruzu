@@ -28165,3 +28165,1828 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ### Binary layout verification
 - PASS: generated keyboard and analog parameter packages use the shared
   upstream-equivalent generators and existing settings arrays.
+
+## 2026-07-30 — core/src/arm/dynarmic/arm_dynarmic_64.rs vs core/arm/dynarmic/arm_dynarmic_64.{h,cpp}
+
+### Intentional differences
+- `RUZU_PROTECT_PAGE` is an opt-in ruzu diagnostic with no upstream C++
+  counterpart. Its code remains in the A64 Dynarmic owner and is inert unless
+  the environment variable is set.
+- Windows uses `VirtualProtect(..., PAGE_READONLY, ...)` where Unix uses
+  `mprotect(..., PROT_READ)`, preserving the diagnostic's host-page protection
+  behavior through the native platform API.
+
+### Unintentional differences (to fix)
+- Fixed: the diagnostic was enabled for Windows but still invoked Unix-only
+  `libc::mprotect`, preventing the Windows target from compiling.
+
+### Missing items
+- The broader pre-existing A64 callback and diagnostic differences recorded in
+  earlier entries are unchanged by this Windows portability slice.
+
+### Binary layout verification
+- PASS: this is an opt-in host virtual-memory diagnostic and changes no
+  guest-visible structure or serialized payload.
+
+## 2026-07-30 — ruzu_cmd/{Cargo.toml,src/main.rs} vs yuzu_cmd/{CMakeLists.txt,yuzu.cpp}
+
+### Intentional differences
+- Rust expresses upstream's unconditional `SDL2::SDL2` link as target-specific
+  Cargo dependencies so Unix can retain its pkg-config feature selection while
+  Windows uses the workspace/vcpkg configuration.
+- The `RUZU_*` profiling signal handlers are ruzu-only diagnostics absent from
+  `yuzu.cpp`; their definitions and registrations are restricted to Unix,
+  where `SIGUSR2` and `sigaction` exist.
+
+### Unintentional differences (to fix)
+- Fixed: the Windows command frontend had no SDL2 dependency even though
+  upstream links SDL2 on every supported command-frontend platform.
+- Fixed: Unix signal-handler definitions and registration code were compiled
+  on Windows.
+
+### Missing items
+- None in this Windows command-frontend build slice.
+
+### Binary layout verification
+- PASS: dependency selection and host signal registration do not alter guest
+  binary layouts.
+
+## 2026-07-30 — scripts/cmake-clean-env.cmd and video_core/build.rs vs upstream Windows build configuration
+
+### Intentional differences
+- Cargo build scripts need a wrapper around nested CMake invocations to
+  preserve the Visual Studio/vcpkg environment. Upstream's CMake build owns
+  that environment directly and has no corresponding wrapper file.
+- Rust's MSVC debug targets link the release-form dynamic CRT (`/MD`) rather
+  than CMake's default `/MDd`; the cubeb wrapper therefore keeps the CMake
+  configuration named Debug while selecting `MultiThreadedDLL` and
+  `_ITERATOR_DEBUG_LEVEL=0` to match the Rust and `cc`-crate objects.
+
+### Unintentional differences (to fix)
+- Fixed: the wrapper concatenated `%PATH%` and `%Path%`; Windows treats those
+  names case-insensitively, so the duplicated value could exceed `cmd.exe`'s
+  input-line limit before `cubeb-sys` launched CMake.
+- Fixed: cubeb's nested configure forced the static MSVC runtime while upstream
+  and `x64-windows-ruzu` select the dynamic runtime. The wrapper now passes
+  `USE_STATIC_MSVC_RUNTIME=OFF`, explicitly selects the dynamic release CRT
+  used by Rust's MSVC targets, and sets iterator-debug level zero for cubeb's
+  Debug configuration. The earlier `/MTd` compensation in
+  `video_core/build.rs` was removed.
+
+### Missing items
+- None in this nested-CMake/MSVC-runtime prerequisite.
+
+### Binary layout verification
+- PASS: all linked Rust and vcpkg artifacts now use the same dynamic MSVC CRT;
+  no guest payload layout is involved.
+
+## 2026-07-30 — audio_core/src/sink/cubeb_sink.rs vs audio_core/sink/cubeb_sink.{h,cpp}
+
+### Intentional differences
+- Rust stores successful stream COM initialization in a file-local RAII guard;
+  field ordering drops the cubeb stream backend before balancing
+  `CoUninitialize`, matching `CubebSinkStream::~CubebSinkStream`.
+- Failed Rust stream construction drops the temporary COM guard immediately
+  because there is no failed `CubebSinkStream` object to retain. Successful
+  stream, sink, enumeration and suitability lifetimes preserve upstream call
+  placement and ordering.
+- `cubeb` crate ownership replaces explicit `cubeb_destroy` and
+  `cubeb_stream_destroy`; `Drop` explicitly clears streams before dropping the
+  context so the upstream destruction order remains visible.
+
+### Unintentional differences (to fix)
+- Fixed: Windows never initialized COM before cubeb context or stream creation,
+  causing the real renderer-session backend to fail with
+  `CO_E_NOTINITIALIZED`.
+- Fixed: device enumeration and suitability probing now initialize and balance
+  COM in the same positions as `ListCubebSinkDevices` and `IsCubebSuitable`.
+
+### Missing items
+- Broader previously existing cubeb-rs callback and backend-selection
+  adaptations are outside this Windows COM lifecycle slice.
+
+### Binary layout verification
+- PASS: COM apartment management is host-only and introduces no guest-facing
+  data structure.
+
+## 2026-07-30 — audio_core/src/renderer/system.rs vs audio_core/renderer/system.{h,cpp}
+
+### Intentional differences
+- A test-only file-local helper owns boxed `KTransferMemory` and `KProcess`
+  prerequisites for the duration of each initialization assertion. Production
+  method ownership and the six-argument initialization interface are unchanged.
+
+### Unintentional differences (to fix)
+- Fixed: renderer-system tests called the obsolete five-argument initializer
+  instead of upstream's parameter, transfer-memory pointer, transfer-memory
+  size, process pointer, applet-resource ID and session-ID order.
+- Fixed: the rendered-event regression now installs the readable event owned
+  by the initialized system before exercising clear/signal ordering.
+
+### Missing items
+- None in this test-fixture synchronization slice.
+
+### Binary layout verification
+- PASS: the helper constructs the existing kernel objects and does not change
+  renderer work-buffer or IPC layouts.
+
+## 2026-07-30 — audio_core/src/{audio_core.rs,adsp/apps/audio_renderer/command_list_processor.rs,renderer/command/sink/device.rs,sink/sink_stream.rs} vs audio_core upstream owners
+
+### Intentional differences
+- A `cfg(test)` read-only queue-front accessor remains owned by
+  `sink_stream.rs`; it lets the device-command regression inspect the existing
+  private queue without moving queue ownership into the command module.
+- Rust tests retain their native fixtures while supplying real upstream-owned
+  `KProcess` and `KTransferMemory` objects instead of fabricated non-null
+  pointers.
+
+### Unintentional differences (to fix)
+- Fixed: the audio-core bridge test now supplies the transfer-memory argument
+  required by the renderer open contract.
+- Fixed: command-processor tests use the current direct `CoreTiming` accessor
+  and the upstream-owned per-delay-line state fields.
+- Fixed: the device-sink test uses public queue size behavior plus the
+  test-only owner accessor instead of reaching into `SinkStream`'s private
+  queue.
+
+### Missing items
+- The command-processor module still has pre-existing runtime test debt: its
+  full 29-test batch currently reports 13 failures. Several fixtures serialize
+  four-sample buffers even though upstream `DeviceSinkCommand::Process`
+  unconditionally consumes `TargetSampleCount` frames; auxiliary/capture,
+  circular-sink and delay fixtures also require separate upstream parity
+  investigation. This larger behavioral slice was not altered to make the
+  Windows build pass.
+
+### Binary layout verification
+- PASS for this fixture update: production command payload definitions and
+  serialized field ordering are unchanged.
+
+## 2026-07-30 — run-ruzu.cmd vs upstream Windows frontend launch environment
+
+### Intentional differences
+- Ruzu's Rust/GTK Windows build loads GTK, SDL2, FFmpeg and related native
+  libraries from the selected vcpkg triplet at runtime. The double-clickable
+  launcher prepends that triplet's `bin` directory to the child process
+  `PATH`; upstream's packaged frontend resolves its deployed dependencies
+  through its own distribution layout.
+- The setup and launcher compile GTK's installed GSettings schema XML files
+  when necessary and export `GSETTINGS_SCHEMA_DIR`. vcpkg installs the schema
+  sources and compiler but does not create `gschemas.compiled` for this custom
+  triplet.
+- The launcher selects `target/release/ruzu.exe`. `cubeb-sys` 0.34 explicitly
+  links `msvcrtd` in Cargo's debug profile, producing an unsupported mixed-CRT
+  GUI process with the release GTK/vcpkg libraries.
+
+### Unintentional differences (to fix)
+- Fixed for release launches: double-clicking the bare executable inherited no
+  vcpkg DLL search path and failed before GTK application startup.
+- Fixed: opening the GTK file chooser aborted with
+  `GLib-GIO-ERROR: No GSettings schemas are installed on the system`. The
+  launcher now guarantees the compiled schema prerequisite before startup.
+
+### Missing items
+- A self-contained distributable directory with copied runtime DLLs is not yet
+  produced; the launcher requires the vcpkg installation prepared by
+  `scripts/setup.ps1`.
+- A runnable Windows debug GUI still requires a local fix or upstream release
+  of `cubeb-sys` that does not inject `msvcrtd` into Rust debug targets.
+
+### Binary layout verification
+- PASS: the launcher only controls host executable, DLL discovery and GTK
+  settings metadata.
+
+## 2026-07-30 — ruzu/src/uisettings.rs vs yuzu/uisettings.h, yuzu/game_list_worker.cpp, and yuzu/main.cpp
+
+### Intentional differences
+- `GameDir::is_filesystem_path` is a Rust-owned predicate used by the GTK game
+  list coordinator. Upstream spells the same distinction as the ordered
+  `SDMC` / `UserNAND` / `SysNAND` comparisons in `GameListWorker::run`.
+
+### Unintentional differences (to fix)
+- Fixed: the predicate previously treated only paths beginning with `/` as
+  filesystem directories. That silently filtered a directory selected on
+  Windows (for example, `D:\Games\Switch`) out of the next game-list reload,
+  even though it had been persisted successfully. It now rejects only the
+  three upstream virtual-provider tokens and scans every other entry, matching
+  upstream's final `else` branch.
+
+### Missing items
+- The GTK game list still does not render the three virtual-provider rows or
+  enumerate their installed titles; this is pre-existing game-list parity debt
+  and is unchanged by the filesystem-directory fix.
+
+### Binary layout verification
+- PASS: `GameDir` fields and serialization are unchanged; only the
+  frontend-owned scan classification predicate changed.
+
+## 2026-07-30 — externals/rdynarmic/src/backend/{mod.rs,x64/exception_handler.rs} vs Dynarmic backend build selection and exception_handler_{windows,posix}.cpp
+
+### Intentional differences
+- Rust expresses upstream's architecture-specific CMake source selection with
+  `cfg(target_arch = "aarch64")` on the ARM64 backend module.
+- The Rust x64 exception-handler owner contains its Windows SEH, Linux signal,
+  and other-platform fallback implementations in one file; upstream separates
+  those implementations into platform-specific translation units.
+
+### Unintentional differences (to fix)
+- Fixed: the ARM64 backend was compiled on Windows x64 even though upstream
+  selects it only for an ARM64 host architecture.
+- Fixed: the generic non-Linux exception-handler fallbacks were also compiled
+  beside the Windows SEH implementations, creating duplicate function
+  definitions. Windows is now excluded from those fallback definitions just
+  as upstream selects only `exception_handler_windows.cpp`.
+
+### Missing items
+- None in this Windows host-selection slice.
+
+### Binary layout verification
+- PASS: module selection changes host compilation only. The existing
+  Windows SEH structure definitions and emitted unwind data are unchanged.
+
+## 2026-07-31 — core/src/crypto/key_manager.rs vs core/crypto/key_manager.{h,cpp}
+
+### Intentional differences
+- Upstream loads keys only from `GetYuzuPath(KeysDir)`; Ruzu uses the renamed
+  equivalent `get_ruzu_path(RuzuPath::KeysDir)`. The selected directory is
+  Ruzu-owned on every platform.
+
+### Unintentional differences (to fix)
+- Fixed: Rust previously searched legacy yuzu/suyu directories when Ruzu's own
+  key directory lacked keys. Upstream never changes ownership this way; the
+  fallback and its platform-specific test have been removed.
+
+### Missing items
+- None in this platform key-directory resolution prerequisite.
+
+### Binary layout verification
+- PASS: key types, maps, key loading order, and cryptographic payloads are
+  unchanged; only the host directory resolver was restored to upstream parity.
+
+### Behavioral verification
+- Re-read upstream `key_manager.h` ownership and `KeyManager::ReloadKeys` in
+  `key_manager.cpp` after implementation. `resolve_keys_dir` now returns only
+  the matching path-manager entry, and
+  `keys_directory_is_owned_by_ruzu_path_manager` guards that contract.
+
+## 2026-07-31 — ruzu/src/game_list.rs vs yuzu/game_list.cpp and yuzu/main.cpp
+
+### Intentional differences
+- Upstream exposes `Scan Subfolders` from a context menu opened on a specific
+  directory row. The GTK frontend keeps the already documented toolbar
+  adaptation, whose actions target the selected directory.
+- The GTK list selects a newly added directory and automatically selects the
+  sole configured filesystem directory. This supplies the row context that
+  upstream gets inherently from opening that row's context menu.
+
+### Unintentional differences (to fix)
+- Fixed: initial population ran before the GTK selection handlers were
+  connected and no directory was selected after adding one. Consequently the
+  toolbar's `Scan Subfolders` action remained disabled and clicking it did not
+  update `deep_scan` or rescan nested titles.
+
+### Missing items
+- The three virtual content-provider rows remain pre-existing game-list parity
+  debt, as recorded in the `uisettings.rs` entry.
+
+### Binary layout verification
+- PASS: game-directory fields and config serialization are unchanged; this
+  affects frontend selection and action routing only.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/callback.rs vs dynarmic/backend/x64/callback.{h,cpp}
+
+### Intentional differences
+- Rust callback setup closures also receive `&mut CodeAssembler` and return
+  `rxbyak::Result<()>`; this is a mechanical adaptation of upstream's closure
+  over `BlockOfCode` and preserves parameter ownership and emission order.
+- `emit_call_to` always uses `mov rax, imm64; call rax`; upstream
+  `BlockOfCode::CallFunction` selects a relative call when the target is in
+  range. Both forms call the same function without changing the dispatcher
+  stack frame.
+
+### Unintentional differences (to fix)
+- Fixed: callbacks created a second, dynamically realigned stack frame around
+  every host call. Upstream calls directly because the dispatcher prologue
+  already aligns `RSP` and reserves Windows shadow space.
+- Fixed: `ArgCallback::emit_call_with_return_pointer` always used the SysV
+  hidden-return order. The MSVC path now keeps the fixed context in `RCX` and
+  exposes the return pointer in `RDX`, while MinGW/non-MSVC retains upstream's
+  alternate order.
+- Fixed: callback setup now receives the ABI-selected parameter registers, so
+  emitters no longer hard-code SysV registers on Windows.
+
+### Missing items
+- None in the callback ABI slice.
+
+### Binary layout verification
+- PASS: emitted callback-call bytes are regression-tested and contain no
+  nested `RSP` adjustment; MSVC hidden-return register selection is tested.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/a32_emit_a32.rs vs dynarmic/backend/x64/a32_emit_x64.cpp
+
+### Intentional differences
+- Host function calls use rdynarmic's existing absolute-call helper sequence
+  rather than upstream's distance-selecting `BlockOfCode::CallFunction`.
+- `A32PcExecHook` is a Ruzu diagnostic extension with no upstream IR method.
+  Its three host arguments now use the selected host ABI instead of SysV-only
+  registers.
+
+### Unintentional differences (to fix)
+- Fixed: A32 SVC and exception callbacks wrote their user arguments to
+  `RSI`/`RDX`; under MSVC the fixed callback context occupies `RCX`, so the
+  user arguments belong in `RDX`/`R8`.
+- Fixed: the SVC emitter pre-set `halt_reason`. Upstream leaves halting to
+  `UserCallbacks::CallSVC`, which preserves callback ownership and atomic OR
+  semantics.
+- Fixed: A32 SVC and exception paths omitted upstream's MXCSR exit and the
+  cycle-counting `AddTicks`/`GetTicksRemaining` sequence. Their ordering now
+  matches `EmitA32CallSupervisor` and `EmitA32ExceptionRaised`.
+- Fixed: `EmitA32GetFpscr` passed the JIT state in `RDI` and omitted
+  `stmxcsr`; `EmitA32SetFpscr` passed the state in `RSI` and omitted the final
+  `ldmxcsr`. Both methods now match upstream on SysV and MSVC.
+
+### Missing items
+- None in the SVC, exception and FPSCR methods audited here.
+
+### Binary layout verification
+- PASS: JIT-state field offsets continue to come from `A32JitState`; FPSCR
+  VMSR/VMRS and cycle-counted SVC execution are covered by x64 JIT tests.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_a64.rs vs dynarmic/backend/x64/a64_emit_x64.cpp
+
+### Intentional differences
+- The Rust emitter obtains immediate values through `Argument` and emits the
+  callback setup closure through rdynarmic's object-safe callback trait.
+
+### Unintentional differences (to fix)
+- Fixed: A64 SVC and exception callbacks used `RSI`/`RDX` directly instead of
+  upstream's callback-provided parameter list, corrupting both values under
+  the MSVC ABI.
+- Fixed: the SVC emitter pre-set `halt_reason` before invoking the callback.
+  Upstream assigns that responsibility to `CallSVC`.
+- Fixed: argument discovery and allocation-scope ordering now follows
+  `EmitA64CallSupervisor` and `EmitA64ExceptionRaised`; exclusive-state clear
+  remains after the SVC callback as upstream requires.
+
+### Missing items
+- None in the A64 SVC and exception methods audited here.
+
+### Binary layout verification
+- PASS: only emitted host argument registers and ordering changed; the
+  `A64JitState::exclusive_state` offset remains owner-derived.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/block_of_code.rs vs dynarmic/backend/x64/{block_of_code.cpp,abi.cpp}
+
+### Intentional differences
+- rdynarmic's existing `StackLayout` has 192 spill slots and places the
+  Windows XMM save region below the Rust frame, whereas this upstream revision
+  has 64 spill slots and `CalculateFrameInfo` places XMM saves after the
+  caller frame. The allocation helper therefore derives the exact Rust frame
+  size while preserving upstream's alignment, shadow-space and callee-save
+  rules.
+- The module-level MXCSR emission helpers are mechanical counterparts of
+  `BlockOfCode::SwitchMxcsrOnEntry/Exit`; the methods remain owned by
+  `block_of_code.rs` and delegate to them so A32 emitters can reuse the same
+  upstream-owned behavior.
+
+### Unintentional differences (to fix)
+- Fixed: SEH setup received `sizeof(StackLayout)` even though the dispatcher
+  subtracts aligned frame size, Windows shadow space, XMM save space and
+  alignment padding from `RSP`.
+- Fixed: the stack-allocation formula was duplicated in push and pop paths.
+  One owner now implements upstream `CalculateFrameInfo::stack_subtraction`
+  behavior and also supplies the unwind metadata.
+- Fixed: destroying a `BlockOfCode` did not unregister its Windows runtime
+  function table.
+
+### Missing items
+- None in the dispatcher frame/allocation slice.
+
+### Binary layout verification
+- PASS: a Windows-only test checks the exact 89-byte emitted prologue, GPR push
+  bytes and encoded `sub rsp` allocation against the shared calculation.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/exception_handler.rs vs dynarmic/backend/{exception_handler.h,x64/exception_handler_windows.cpp}
+
+### Intentional differences
+- Rust keeps platform implementations in one cfg-partitioned source file;
+  upstream selects separate translation units.
+- Upstream stores one callback in an `ExceptionHandler::Impl`. rdynarmic's
+  existing API registers callbacks per compiled block, so the Windows owner
+  keeps one JIT record per code buffer and dispatches to that buffer's block
+  ranges. The ownership and fake-call behavior remain equivalent.
+- The upstream file hard-codes an older `sub rsp, 0xC8` prologue. Rust unwind
+  metadata uses the actual allocation emitted for rdynarmic's larger current
+  `StackLayout`; hard-coding `0xC8` would make Windows unwind through an
+  incorrect frame.
+
+### Unintentional differences (to fix)
+- Fixed: unwind operations were serialized in ascending prologue order;
+  Windows requires reverse order, matching upstream's
+  `GetPrologueInformation`.
+- Fixed: `CountOfCodes` included alignment padding instead of preserving the
+  pre-padding operation count.
+- Fixed: only the last-created JIT's runtime-function state was retained.
+  Each code buffer now owns registration data and is removed with
+  `RtlDeleteFunctionTable` during its `BlockOfCode` lifetime.
+- Fixed: the unwind allocation entry described only `StackLayout`, not the
+  actual dispatcher stack subtraction.
+
+### Missing items
+- None in the Windows x64 SEH registration and unwind slice.
+
+### Binary layout verification
+- PASS: unwind operation offsets are checked against the emitted 89-byte
+  prologue; the allocation entry is derived from the exact Rust frame and
+  `RUNTIME_FUNCTION` remains the Windows three-`u32` layout.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_data_processing.rs vs dynarmic/backend/x64 callback call sites
+
+### Intentional differences
+- The test-only `NoopCallback` signature follows the Rust callback trait's
+  fallible assembler-aware closure adaptation.
+
+### Unintentional differences (to fix)
+- None; production data-processing emission is unchanged.
+
+### Missing items
+- None in this trait-signature synchronization.
+
+### Binary layout verification
+- PASS: only a test double's method signatures changed.
+
+## 2026-07-31 — externals/rdynarmic/src/jit.rs vs Dynarmic A32 x64 execution contracts
+
+### Intentional differences
+- These are native Rust regression tests rather than ports of the excluded C++
+  test suite.
+
+### Unintentional differences (to fix)
+- Fixed behavior is guarded by end-to-end A32 x64 tests for VMSR/VMRS FPSCR
+  host calls and SVC callback execution with cycle counting enabled.
+
+### Missing items
+- None in this regression-test slice.
+
+### Binary layout verification
+- PASS: the tests execute generated code through the public A32 JIT and verify
+  FPSCR mode bits, SVC immediate delivery and halt behavior.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_exclusive_memory.rs vs dynarmic/backend/x64/emit_x64_memory.cpp.inc
+
+### Intentional differences
+- Upstream's 128-bit exclusive path calls a local lambda that owns global
+  monitor access. rdynarmic keeps that behavior in the existing
+  `exclusive_read_128_trampoline`; the emitter still owns argument placement,
+  temporary stack storage and result definition.
+- SysV retains its valid two-register `Pair128` return. The MSVC trampoline
+  uses an explicit third output pointer because it is a Rust free function,
+  not the C++ member-function wrapper modeled by
+  `ArgCallback::emit_call_with_return_pointer`.
+
+### Unintentional differences (to fix)
+- Fixed: the 128-bit exclusive-read emitter unconditionally consumed
+  `RAX:RDX`. MSVC aggregate returns require memory, and the old path crashed
+  during A64 `LDXP`.
+- Fixed: the MSVC path now reserves `16 + ABI_SHADOW_SPACE`, passes the
+  aligned output buffer in the third explicit callback argument, loads it with
+  `movups`, releases the same frame, then defines the XMM result in upstream
+  order.
+
+### Missing items
+- None in the 128-bit exclusive callback-return prerequisite.
+
+### Binary layout verification
+- PASS: `Pair128` is `repr(C)` with two ordered `u64` lanes; the LDXP
+  regression executes generated code and verifies both lanes.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_memory.rs vs dynarmic/backend/x64/{emit_x64_memory.cpp.inc,a64_emit_x64_memory.cpp}
+
+### Intentional differences
+- Upstream uses a generated `memory_read_128` accessor around
+  `EmitCallWithReturnPointer`. rdynarmic emits the equivalent stack-buffer
+  sequence at the IR call site and invokes a Rust trampoline with an explicit
+  output pointer on MSVC.
+- SysV retains upstream-equivalent `RAX:RDX` aggregate consumption.
+
+### Unintentional differences (to fix)
+- Fixed: ordinary 128-bit callback reads also assumed the SysV aggregate
+  return on Windows. They now reserve shadow space plus a 16-byte payload,
+  pass the output address in the third explicit argument and load the result
+  from that buffer.
+
+### Missing items
+- None in the ordinary 128-bit callback-read prerequisite.
+
+### Binary layout verification
+- PASS: an A64 `LDR Q0, [X1]` regression verifies both 64-bit lanes through
+  the real callback-emission path.
+
+## 2026-07-31 — externals/rdynarmic/src/jit.rs vs Dynarmic x64 128-bit callback accessors
+
+### Intentional differences
+- MSVC wrappers expose the output buffer as an explicit third argument. This
+  avoids depending on Rust free-function hidden-return ordering while
+  preserving upstream's concrete `context, address, output` behavior.
+- SysV wrappers continue returning the two-lane `repr(C)` payload in
+  `RAX:RDX`.
+
+### Unintentional differences (to fix)
+- Fixed: both A64 128-bit read trampolines had one cross-platform aggregate
+  return signature even though MSVC and SysV marshal it differently.
+
+### Missing items
+- None in this trampoline ABI prerequisite.
+
+### Binary layout verification
+- PASS: the shared payload remains two contiguous `u64` fields and both
+  regular and exclusive generated-code regressions pass on MSVC x64.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/a32_emit_x64.rs vs dynarmic/backend/x64/a32_emit_x64_memory.cpp
+
+### Intentional differences
+- Upstream pre-generates every A32 fastmem fallback in
+  `GenFastmemFallbacks`; rdynarmic's existing owner emits the same per-entry
+  fallback lazily from the recorded `FastmemEntry`.
+
+### Unintentional differences (to fix)
+- Fixed: read fallbacks always copied the virtual address into `RSI`, and
+  write fallbacks always marshalled address/value into `RSI`/`RDX`. Those are
+  only upstream's SysV `ABI_PARAM2`/`ABI_PARAM3`; on Windows the fixed callback
+  context occupies `RCX`, so address/value belong in `RDX`/`R8`.
+- Fixed: the write alias cases and value zero-extension now use
+  `ABI_PARAMS[1]`/`ABI_PARAMS[2]` exactly like upstream's
+  `code.ABI_PARAM2`/`code.ABI_PARAM3` branches.
+
+### Missing items
+- None in the ordinary 8/16/32/64-bit A32 fastmem fallback argument slice.
+
+### Binary layout verification
+- PASS: only generated host-register selection changed; guest address and
+  value widths remain unchanged.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/a64_emit_x64_memory.rs vs dynarmic/backend/x64/a64_emit_x64_memory.cpp
+
+### Intentional differences
+- The Rust fallback table currently covers ordinary 8/16/32/64-bit entries in
+  this helper; upstream's additional 128-bit and exclusive tables retain
+  their existing Rust owners.
+
+### Unintentional differences (to fix)
+- Fixed: ordinary fastmem fallbacks hard-coded SysV `RSI`/`RDX` instead of
+  upstream's ABI-selected second and third callback parameters.
+- Fixed: read address placement, write address/value alias handling, and
+  pre-call zero-extension now use `ABI_PARAMS[1]` and `ABI_PARAMS[2]`, yielding
+  `RDX`/`R8` on Windows and preserving `RSI`/`RDX` on SysV.
+
+### Missing items
+- None in the ordinary 8/16/32/64-bit A64 fastmem fallback argument slice.
+
+### Binary layout verification
+- PASS: a generated-code regression directly executes read and write fallback
+  stubs and verifies fixed context, virtual address, zero-extended value, and
+  callback return placement under the selected host ABI.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/exception_handler.rs vs dynarmic/backend/x64/exception_handler_windows.cpp
+
+### Intentional differences
+- The previously documented runtime-derived stack allocation remains required
+  because rdynarmic's current dispatcher frame is larger than the historical
+  upstream hard-coded `0xC8` frame.
+
+### Unintentional differences (to fix)
+- None found in the registered unwind-table encoding during this follow-up
+  runtime verification.
+
+### Missing items
+- None in the synthetic dispatcher unwind path.
+
+### Binary layout verification
+- PASS: a Windows-only regression invokes `RtlVirtualUnwind` against the
+  actually registered `RUNTIME_FUNCTION` and verifies restoration of caller
+  `RSP` and `RIP`.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/stack_layout.rs vs dynarmic/backend/x64/stack_layout.h
+
+### Intentional differences
+- Rust spells upstream's `bool check_bit` as `u8` so the one-byte host layout
+  is explicit; both fields have the same offset and width.
+
+### Unintentional differences (to fix)
+- Fixed: `SPILL_COUNT` was 192 instead of upstream `SpillCount = 64`.
+- Fixed: the layout regression checked only 16-byte divisibility. It now checks
+  the exact 1056-byte size and every parity-sensitive field offset.
+
+### Missing items
+- None in `StackLayout`.
+
+### Binary layout verification
+- PASS: alignment 16, size 1056, `spill` offset 16, `save_host_MXCSR` offset
+  1040, and `check_bit` offset 1044 match the C++ structure.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/reg_alloc.rs vs dynarmic/backend/x64/reg_alloc.cpp
+
+### Intentional differences
+- Rust indexes `HostLoc` values through a flat metadata array; this is the
+  existing mechanical representation of upstream's host-location state.
+
+### Unintentional differences (to fix)
+- Fixed: register allocation exposed 192 spill locations instead of the 64
+  locations owned by upstream `StackLayout`.
+- Fixed: spill addresses omitted `ABI_SHADOW_SPACE`; they now use
+  `reserved_stack_space + ABI_SHADOW_SPACE + offsetof(StackLayout, spill)`,
+  matching `RegAlloc::SpillToOpArg`.
+
+### Missing items
+- None in the spill-count and spill-address slice.
+
+### Binary layout verification
+- PASS: each spill remains a contiguous aligned 16-byte lane and the first
+  slot is addressed from the upstream `StackLayout` base.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/block_of_code.rs vs dynarmic/backend/x64/{abi.cpp,block_of_code.cpp}
+
+### Intentional differences
+- MXCSR instruction emission is also exposed as module-local functions so the
+  Rust A32 owner can reuse `BlockOfCode::SwitchMxcsrOnEntry/Exit` behavior.
+- Rust emits `movaps`; upstream conditionally emits `vmovaps` when AVX is
+  available. The saved bytes and frame ownership are unchanged.
+
+### Unintentional differences (to fix)
+- Fixed: the earlier audit entry incorrectly retained a 192-slot Rust frame
+  and placed XMM saves before `StackLayout`.
+- Fixed: `StackLayout` now begins at `ABI_SHADOW_SPACE`; callee-saved XMM
+  registers begin at aligned `frame_size + ABI_SHADOW_SPACE`; stack subtraction
+  follows upstream `CalculateFrameInfo` exactly.
+- Fixed: all cycle, check-bit, MXCSR and spill consumers now use the same
+  upstream frame base.
+
+### Missing items
+- None in the callee-save dispatcher-frame slice.
+
+### Binary layout verification
+- PASS: the Windows dispatcher emits the expected 107-byte prologue for the
+  1056-byte upstream frame, with 1256 bytes subtracted and XMM6 beginning at
+  `RSP + 1088`.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/exception_handler.rs vs dynarmic/backend/x64/exception_handler_windows.cpp
+
+### Intentional differences
+- The C++ unwind table hard-codes the historical 89-byte/`sub rsp, 0xC8`
+  prologue even though this upstream revision's 64-slot `StackLayout` and
+  `CalculateFrameInfo` emit a 107-byte/`sub rsp, 0x4E8` dispatcher prologue.
+  Rust derives unwind offsets from the actual upstream-owned frame formula so
+  Windows unwinds the code that was emitted.
+- Rust retains one registered record per code buffer because its existing
+  fastmem API registers block callbacks incrementally; upstream owns one
+  `ExceptionHandler::Impl` per emitter.
+
+### Unintentional differences (to fix)
+- Fixed: the previous follow-up audit still described the Rust frame as larger
+  than upstream. The frame now exactly matches upstream; only the stale
+  constants in upstream `GetPrologueInformation` are intentionally not copied.
+- Fixed: teardown, operation reversal, unpadded `CountOfCodes`, and
+  multi-code-buffer registration now follow the corresponding upstream
+  lifetime and Windows unwind rules.
+
+### Missing items
+- Exact structural ownership still differs because platform implementations
+  share `exception_handler.rs` rather than separate C++ translation units.
+
+### Binary layout verification
+- PASS: the registered `RUNTIME_FUNCTION` is three `u32` fields; a real
+  `RtlVirtualUnwind` regression restores RBX, RSI, RDI, RBP, R12-R15, RSP and
+  RIP through the emitted 107-byte prologue.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit.rs vs dynarmic/backend/x64/emit_x64.cpp
+
+### Intentional differences
+- Rust's common block emitter owns cycle subtraction that upstream exposes as
+  `EmitX64::EmitAddCycles`.
+
+### Unintentional differences (to fix)
+- Fixed: cycle subtraction addressed `StackLayout` directly at `RSP` and now
+  includes upstream `ABI_SHADOW_SPACE`.
+
+### Missing items
+- The ownership difference above predates this ABI correction.
+
+### Binary layout verification
+- PASS: the signed cycle field and subtraction width are unchanged.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_terminal.rs vs dynarmic/backend/x64/{a32_emit_x64.cpp,a64_emit_x64.cpp}
+
+### Intentional differences
+- Rust shares common terminal mechanics in this file while upstream keeps the
+  A32 and A64 terminal overloads in their emitter files.
+
+### Unintentional differences (to fix)
+- Fixed: link/check-bit/add-ticks terminal paths omitted
+  `ABI_SHADOW_SPACE` from `StackLayout` addresses.
+- Fixed: interpreter fallback and `AddTicks` hard-coded SysV argument
+  registers; both now use the callback-provided host ABI parameter list.
+
+### Missing items
+- Method ownership remains structurally consolidated compared with upstream.
+
+### Binary layout verification
+- PASS: no serialized payload is involved; stack-field offsets and callback
+  register placement now match the selected ABI.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_vector_helpers.rs vs dynarmic/backend/x64/emit_x64_vector*.cpp
+
+### Intentional differences
+- Ruzu currently centralizes several software vector fallbacks in a shared
+  helper file. Upstream keeps native instruction sequences and local lambdas
+  in the operation-owning vector source files.
+
+### Unintentional differences (to fix)
+- Fixed: fallback calls used SysV RDI/RSI/RDX/RCX on every platform and wrote
+  operands into Windows shadow space.
+- Fixed: one-, two-, three-operand, immediate, and saturation helpers now use
+  `ABI_PARAMS` and place every 16-byte payload after `ABI_SHADOW_SPACE`.
+
+### Missing items
+- The centralized fallback architecture remains structural parity debt.
+- Operations that upstream emits natively must still be replaced in their
+  corresponding Rust owner as those slices are audited.
+
+### Binary layout verification
+- PASS for the repaired callback frames: all vector payloads are aligned,
+  contiguous 16-byte values outside Windows shadow space.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_vector_arrangement.rs vs dynarmic/backend/x64/emit_x64_vector.cpp
+
+### Intentional differences
+- Rust obtains constants through its `ConstantPool`; this is the mechanical
+  counterpart of upstream `code.Const`.
+
+### Unintentional differences (to fix)
+- Fixed: `VectorTranspose8/16/32/64` used host callbacks, including a
+  SysV-only manual callback frame. Each method now emits upstream's exact SSE2
+  sequence (`pand`/shift/`por`, `shufps`/`pshufd`, or `shufpd`) in its owner.
+
+### Missing items
+- Other arrangement operations outside this transpose slice retain their
+  separately documented fallback/native parity status.
+
+### Binary layout verification
+- PASS: an x64 JIT regression executes A64 `TRN1` and `TRN2` for 8-, 16-, 32-
+  and 64-bit elements and verifies all 128 result bits.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_vector_misc.rs vs dynarmic/backend/x64/emit_x64_vector.cpp
+
+### Intentional differences
+- Rust's existing table-lookup fallback uses a fixed `TableLookupFrame`;
+  upstream specializes host-feature paths and sizes its temporary table frame
+  from the IR table length.
+
+### Unintentional differences (to fix)
+- Fixed: the table frame occupied Windows shadow space and its pointer was
+  passed in hard-coded RDI. It now starts after `ABI_SHADOW_SPACE` and uses
+  `ABI_PARAM1`.
+
+### Missing items
+- Upstream's SSSE3/AVX table-lookup paths and exact compact fallback frame
+  remain unported; this is a larger pre-existing behavioral/performance slice.
+
+### Binary layout verification
+- PASS for the repaired fixed frame: result/default/index/table fields keep
+  their prior offsets relative to the frame and no longer overlap shadow space.
+
+## 2026-07-31 — externals/rdynarmic/src/jit.rs vs dynarmic/backend/x64/{a64_emit_x64_memory.cpp,emit_x64_vector.cpp}
+
+### Intentional differences
+- MSVC 128-bit Rust trampolines use an explicit third output-pointer argument
+  instead of relying on the unstable Rust aggregate-return ABI; SysV retains
+  the upstream-equivalent `RAX:RDX` pair.
+- Regression tests are native Rust tests rather than ports of the excluded C++
+  test suite.
+
+### Unintentional differences (to fix)
+- None remaining in the ordinary/exclusive 128-bit callback and vector
+  transpose regressions added in this slice.
+
+### Missing items
+- The full crate suite still has pre-existing SIMD/fuzz failures recorded in
+  `PORTING_STATE.md`; they are not hidden by the focused green regressions.
+
+### Binary layout verification
+- PASS: `Pair128` remains `repr(C)` with ordered low/high `u64` lanes; the
+  `LDR Q`, `LDXP`, and all-size transpose execution regressions pass.
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/emit_vector_basic.rs vs externals/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp
+
+### Intentional differences
+- Rust releases scratch registers explicitly through `RegAlloc`; upstream C++
+  relies on its register-allocation scope. This is a mechanical ownership
+  adaptation and does not change the emitted instruction order.
+
+### Unintentional differences (to fix)
+- None in the audited `VectorReverseElementsIn{Half,Word,Long}Groups*` slice.
+  The previous shared `PSHUFB` helper and duplicated masks were removed.
+
+### Missing items
+- None in this six-method slice.
+
+### Binary layout verification
+- PASS: the methods operate entirely on a 128-bit XMM value and introduce no
+  serialized or stack payload.
+
+### Behavioral and platform verification
+- Re-read upstream `EmitVectorReverseElementsInHalfGroups8`,
+  `EmitVectorReverseElementsInWordGroups8/16`, and
+  `EmitVectorReverseElementsInLongGroups8/16/32` after implementation.
+- Rust now emits the same ordered `MOVDQA`, `PSLLW`, `PSRLW`, `POR`,
+  `PSHUFLW`, and `PSHUFHW` sequences with upstream immediates `0xB1`, `0x1B`,
+  and `0x4E`.
+- `jit::tests::test_a64_rev32_8h_reverses_halfwords_within_words` passes.
+- `jit::tests::test_a64_vector_reverse_group_family_matches_upstream_sequences`
+  passes for all six A64 vector `REV16`/`REV32`/`REV64` element arrangements.
+- The replacement uses only SSE2 instructions, which are baseline on x86_64.
+  Linux and macOS x86_64 retain the System V ABI path; Windows-only aggregate
+  return handling remains guarded by `cfg(all(target_os = "windows",
+  target_env = "msvc"))`. Cross-target compilation was not executed because
+  this host has only `x86_64-pc-windows-msvc` installed.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/renderer_vulkan.{h,cpp}
+
+### Intentional differences
+- Rust stores the renderer-owned `StateTracker` and `Scheduler` in `Box` values
+  so their addresses remain stable when `RendererVulkan` moves. Upstream owns
+  the same two values directly as class members.
+- Rust declares dependent fields in C++ destruction order because Rust drops
+  fields in declaration order while C++ destroys members in reverse
+  declaration order.
+
+### Unintentional differences (to fix)
+- None in the audited scheduler/state-tracker ownership slice. The previous
+  renderer scheduler plus independently rasterizer-owned scheduler has been
+  replaced by the single renderer-owned scheduler used by upstream.
+
+### Missing items
+- None in this ownership slice.
+
+### Binary layout verification
+- N/A: these are host-side owners and non-serialized Vulkan state objects.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.{h,cpp}
+
+### Intentional differences
+- Rust represents upstream `StateTracker&` and `Scheduler&` members with
+  private stable `NonNull` references behind `OwnerReference`; the boxed
+  owners live in `RendererVulkan` and are dropped after the rasterizer.
+
+### Unintentional differences (to fix)
+- None in the audited ownership and constructor slice.
+  `RasterizerVulkan::new` now receives both owners from `RendererVulkan`,
+  forwards that same scheduler to its sub-components, and no longer creates a
+  second queue-submission worker or submit mutex.
+
+### Missing items
+- None in this ownership slice.
+
+### Binary layout verification
+- N/A: the owner bridge is host-only and is not copied into guest-visible or
+  serialized memory.
+
+### Behavioral verification
+- Re-read both upstream headers and implementations after the Rust change and
+  compared the member ownership, constructor ordering, and sub-component
+  scheduler forwarding.
+- `cargo check -p video_core` passes.
+- `cargo test -p video_core
+  owner_reference_tests::references_renderer_owned_stable_storage --lib`
+  passes.
+
+## 2026-07-31 — core/src/file_sys/system_archive/time_zone_binary.rs vs core/file_sys/system_archive/time_zone_binary.{h,cpp}
+
+### Intentional differences
+- Rust represents upstream `std::map<std::string, const map&>` constants with
+  ordered slices of directory names and references to generated embedded-file
+  slices. The directory ownership and grouping remain in this matching file.
+- `time_zone_binary` returns `Option<VirtualDir>` to match the existing Rust
+  system-archive supplier interface; the embedded implementation always
+  returns `Some`, matching upstream's unconditional `VirtualDir`.
+- Rust uses `Arc<VectorVfsDirectory>` and owned byte-vector copies in place of
+  upstream `shared_ptr<VectorVfsDirectory>` and copied `std::vector<u8>`.
+
+### Unintentional differences (to fix)
+- None.
+
+### Missing items
+- None. `GenerateFiles`, `GenerateZoneinfoFiles`, the America subdirectory
+  construction, all sixteen zoneinfo region directories, root files and the
+  `data/zoneinfo` ownership tree are ported.
+
+### Binary layout verification
+- PASS: the embedded `nx_tzdb` 221202 payload contains the exact 599 files and
+  314,337 bytes from the archive selected by upstream. The generated Rust
+  source regenerates byte-for-byte identically from that archive.
+- PASS: focused tests verify `TZif` rule bytes for `Europe/Paris`, the
+  `binaryList.txt` entry, version `221202`, and the upstream directory shape.
+
+### Behavioral verification
+- Re-read upstream `time_zone_binary.h` and `.cpp` after implementation and
+  compared both static directory maps, both helper boundaries, file-copy
+  behavior, directory construction order and root naming line-by-line.
+- `cargo test -p core --release time_zone_binary --lib` passes.
+
+## 2026-07-31 — core/src/file_sys/system_archive/data/time_zone_binary.rs vs externals/nx_tzdb generated headers
+
+### Intentional differences
+- Upstream CMake generates one C++ header per time-zone directory. Rust keeps
+  the same named maps in one generated data module, analogous to the existing
+  generated system-archive font data modules.
+- The reproducible generator is
+  `scripts/generate_nx_tzdb.ps1`; the checked-in data avoids a runtime host
+  `/usr/share/zoneinfo` dependency on Windows, Linux and macOS.
+
+### Unintentional differences (to fix)
+- None.
+
+### Missing items
+- None from the upstream `nx_tzdb` 221202 archive.
+
+### Binary layout verification
+- PASS: 599 file payloads total 314,337 bytes, and regenerating the module from
+  the upstream-selected 221202 zip produces the same SHA-256 for the complete
+  generated Rust source.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/x64/a32_emit_a32.rs vs core/arm/dynarmic/dynarmic_cp15.{h,cpp}
+
+### Intentional differences
+- Upstream supplies CP15 behavior through Dynarmic's generic coprocessor
+  callback interface. The Rust Dynarmic port has no generic coprocessor
+  registry, so the equivalent host instructions are emitted in the existing
+  A32 x64 coprocessor emitter.
+- The prefetch-buffer dummy write produces no host code instead of returning
+  a pointer to a static dummy value; both discard the guest source value and
+  have no observable state effect.
+
+### Unintentional differences (to fix)
+- Unsupported CP15 operations are silently ignored or return zero instead of
+  emitting upstream's critical diagnostic. This predates the audited barrier
+  slice and requires the missing generic coprocessor error path.
+
+### Missing items
+- The generic CP15 callback/diagnostic ownership used by upstream remains
+  absent. The audited `CompileSendOneWord` prefetch, DSB, DMB and TPIDR_UPRW
+  cases are present with the exact upstream predicates and ordering.
+
+### Binary layout verification
+- N/A: the emitted barriers do not serialize guest-visible data structures.
+
+### Behavioral verification
+- Re-read upstream `dynarmic_cp15.h` and `.cpp` after implementation and
+  compared the `!two`, `opc1`, `CRn`, `CRm`, and `opc2` predicates
+  line-by-line.
+- The x64 DSB path emits `mfence; lfence`; DMB emits `mfence`.
+- `cargo test --manifest-path externals/rdynarmic/Cargo.toml
+  cp15_legacy_memory_barriers --lib` passes.
+
+## 2026-07-31 — externals/rdynarmic/src/backend/arm64/emit_arm64_a32_coprocessor.rs vs core/arm/dynarmic/dynarmic_cp15.{h,cpp}
+
+### Intentional differences
+- Upstream invokes host ARM64 barriers through Dynarmic coprocessor callbacks.
+  The Rust port emits the equivalent ARM64 instructions directly in its
+  existing A32 coprocessor backend because it has no generic coprocessor
+  registry.
+- The prefetch-buffer dummy write emits no host instruction, preserving the
+  same lack of observable state.
+
+### Unintentional differences (to fix)
+- Unsupported CP15 operations do not yet emit upstream's critical diagnostic;
+  this predates the barrier slice.
+
+### Missing items
+- The generic CP15 callback/diagnostic path remains absent. The audited
+  prefetch, DSB, DMB and TPIDR_UPRW send-one-word cases are present.
+
+### Binary layout verification
+- N/A: the emitted barriers do not serialize guest-visible data structures.
+
+### Behavioral verification
+- Re-read upstream `dynarmic_cp15.h` and `.cpp` after implementation. DSB
+  emits `dsb sy`, DMB emits `dmb sy`, and both require the exact upstream
+  `!two`, `opc1 == 0`, `c7,c10` encoding.
+- The ARM64-only unit test checks the exact instruction words and rejects an
+  `opc1 != 0` encoding. It is source-checked on this x64 Windows host; runtime
+  execution remains for an ARM64 host.
+
+## 2026-07-31 — common/src/host_memory.rs vs common/host_memory.{h,cpp}
+
+### Intentional differences
+- Rust calls the `windows-sys` bindings for `CreateFileMapping2`,
+  `VirtualAlloc2`, `MapViewOfFile3` and `UnmapViewOfFile2` directly instead of
+  resolving the same exports from `Kernelbase.dll` through
+  `Common::DynamicLibrary`. The called Windows APIs, arguments and failure
+  conditions are unchanged.
+- Rust represents upstream's `boost::icl::separate_interval_set` plus
+  `unordered_map` with one mutex-protected `BTreeMap` whose entries retain the
+  interval end and backing offset. This preserves separate adjacent mappings,
+  ordered overlap lookup and the same tracking ownership.
+- Upstream throws `std::bad_alloc` to select the fallback buffer; Rust returns
+  `Err` from the platform implementation and selects the same fallback in
+  `HostMemory::new`.
+
+### Unintentional differences (to fix)
+- None in the audited Windows `HostMemory::Impl` slice.
+
+### Missing items
+- None from the upstream Windows implementation. Backing-section creation,
+  placeholder reservation, mapping, protection, full and partial unmapping,
+  split/coalesce tracking, release ordering and the unreachable direct-mapped
+  path are present in the matching Rust owner.
+
+### Binary layout verification
+- N/A: this implementation aliases raw pages and does not serialize a
+  guest-visible structure.
+
+### Behavioral verification
+- Re-read upstream `host_memory.h` and the complete Windows section of
+  `host_memory.cpp` after implementation and compared constructor allocation
+  order, `Map`, `UnmapOnePlaceholder`, the partial-unmap panic region,
+  protection, tracking and `Release` line-by-line.
+- `windows_placeholder_mapping_aliases_backing_memory` verifies bidirectional
+  aliasing between the backing section and its virtual view.
+- `windows_partial_unmap_preserves_both_alias_fragments` verifies that both
+  retained fragments preserve their backing offsets and that the released
+  middle placeholder can be remapped.
+
+## 2026-07-31 — video_core/src/vulkan_common/vulkan_device.rs vs video_core/vulkan_common/vulkan_device.{h,cpp}
+
+### Intentional differences
+- Rust stores the queried `robustness2.nullDescriptor` feature as a boolean on
+  `Device`; upstream retains the complete feature structure in its generated
+  feature chain. The accessor and enabled feature bit are identical.
+- Ash builders replace upstream's macro-generated `pNext` feature chain and
+  extension-name table; `VkPhysicalDeviceRobustness2FeaturesEXT` and
+  `VK_EXT_robustness2` occupy the same device-owned capability slice.
+
+### Unintentional differences (to fix)
+- None in the audited robustness2/null-descriptor slice.
+
+### Missing items
+- None in this slice. The extension is queried, its feature structure is
+  chained into `vkGetPhysicalDeviceFeatures2` and device creation, and
+  `has_null_descriptor` returns the enabled `nullDescriptor` bit.
+
+### Binary layout verification
+- N/A: these structures are Vulkan host API structures, not guest-visible
+  serialized payloads.
+
+### Behavioral verification
+- Re-read upstream `vulkan_device.h` and the feature-chain/device-creation
+  sections of `vulkan_device.cpp` after implementation and compared extension
+  ownership, feature enabling and `Device::HasNullDescriptor` line-by-line.
+- The focused `video_core` tests compile the full device and renderer
+  capability forwarding path.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/renderer_vulkan.{h,cpp}
+
+### Intentional differences
+- Upstream sub-components retain a `Device&` and query
+  `Device::HasNullDescriptor` directly. The Rust constructor forwards the
+  immutable capability boolean because its rasterizer sub-components retain
+  ash handles rather than the complete wrapper.
+
+### Unintentional differences (to fix)
+- None in the audited capability-forwarding slice.
+
+### Missing items
+- None in this slice.
+
+### Binary layout verification
+- N/A: this is host renderer construction state.
+
+### Behavioral verification
+- Re-read the upstream renderer construction path after implementation; the
+  capability is still sourced from the renderer-owned Vulkan `Device` before
+  rasterizer construction.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.{h,cpp}
+
+### Intentional differences
+- Rust explicitly forwards the renderer's null-descriptor capability into
+  `BufferCacheRuntime::new`; upstream's buffer cache queries its retained
+  `Device&`.
+
+### Unintentional differences (to fix)
+- None in the audited constructor slice.
+
+### Missing items
+- None in this slice.
+
+### Binary layout verification
+- N/A: this is host-only constructor state.
+
+### Behavioral verification
+- Re-read upstream rasterizer and buffer-cache construction after the change;
+  the capability reaches the same `BufferCacheRuntime` owner before any
+  binding is recorded.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/buffer_cache.rs vs video_core/renderer_vulkan/vk_buffer_cache.{h,cpp}
+
+### Intentional differences
+- Rust's existing runtime fallback buffer is allocated eagerly instead of by
+  upstream `ReserveNullBuffer`. It remains four zero-filled bytes and is kept
+  even with null-descriptor support because index and transform-feedback
+  bindings cannot use null handles.
+- Upstream leaves `VK_WHOLE_SIZE` after substituting its four-byte fallback in
+  the extended-dynamic-state vertex path. Current Vulkan validation rejects
+  that value without maintenance5, so Rust supplies the fallback's actual
+  four-byte size when null descriptors are unavailable. The supported
+  null-descriptor path remains exact: null handle, zero offset and
+  `VK_WHOLE_SIZE`.
+- The fallback includes uniform/storage descriptor usage flags because the
+  current Rust descriptor queue also uses it when null descriptors are not
+  supported; upstream represents those null resources through its null
+  `Buffer` object lifecycle.
+
+### Unintentional differences (to fix)
+- None in the audited null-buffer binding slice.
+
+### Missing items
+- None in this slice. Null-descriptor detection, descriptor/vertex
+  substitution, index fallback retention, four-byte creation and deterministic
+  zero fill are present.
+
+### Binary layout verification
+- N/A: the fallback is host Vulkan memory. Its complete four-byte contents are
+  deterministically cleared before use.
+
+### Behavioral verification
+- Re-read upstream `vk_buffer_cache.h` and `vk_buffer_cache.cpp` after the
+  change and compared `BindVertexBuffers`, `ReserveNullBuffer` and
+  `CreateNullBuffer` line-by-line.
+- `cargo test -p video_core --release null_vertex_binding --lib` passes both
+  null-descriptor and bounded-fallback regression tests.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.{h,cpp}
+
+### Intentional differences
+- Upstream copies the view format's complete `ImageUsageFlags` into
+  `VkImageViewUsageCreateInfo`. For a compatible UNORM view of an sRGB image,
+  that can add `VK_IMAGE_USAGE_STORAGE_BIT` even though the image was created
+  without it, violating `VUID-VkImageViewCreateInfo-pNext-02662`. Rust
+  intersects the requested view usage with the base image's creation usage;
+  all upstream-permitted bits remain, while an impossible extra usage is not
+  advertised to the driver.
+- The usage intersection is a file-local mechanical helper so the Vulkan
+  subset invariant can be regression-tested without creating a GPU device.
+
+### Unintentional differences (to fix)
+- None in the audited image/view usage slice.
+
+### Missing items
+- None in this slice.
+
+### Binary layout verification
+- N/A: `VkImageViewUsageCreateInfo` is a host Vulkan API structure.
+
+### Behavioral verification
+- Re-read upstream `ImageUsageFlags`, `MakeImageCreateInfo`, `MakeImage`, and
+  the `ImageView` constructor after implementation and compared the image and
+  view usage construction line-by-line.
+- `cargo test -p video_core --release
+  mutable_image_view_usage_stays_within_base_image_usage --lib` passes and
+  reproduces the sRGB-base/UNORM-view storage mismatch without using Vulkan.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.{h,cpp}
+
+### Intentional differences
+- Upstream queries `Device::HasNullDescriptor()` through its retained device
+  wrapper. Rust's runtime retains ash handles, so it stores the immutable
+  capability boolean forwarded from the renderer-owned `Device`.
+- Vulkan wrapper construction failures propagate as `vk::Result`; upstream's
+  wrappers propagate the corresponding Vulkan exception.
+
+### Unintentional differences (to fix)
+- The existing Rust common/backend split keeps `ImageViewBase` in the common
+  slot vector and the Vulkan `ImageView` under the same ID in a backend map;
+  upstream owns both in one templated `SlotVector<ImageView>`. The null
+  resource now has identical index and lifecycle semantics, but the broader
+  texture-cache ownership structure is not yet identical.
+
+### Missing items
+- None in this slice. The null view owns true null handles when robustness2 is
+  enabled; otherwise it owns the dedicated `A8B8G8R8_UNORM` image, nine
+  identity-swizzled 1D views, and lazy signed/unsigned storage views.
+
+### Binary layout verification
+- N/A: these are host Vulkan handles and allocations, not serialized guest
+  structures.
+
+### Behavioral verification
+- Re-read upstream `vk_texture_cache.h`, `ImageUsageFlags`, `MakeImage`, the
+  null `ImageView` constructor, `StorageView`, `MakeView`, and the common
+  texture-cache index-zero insertion after implementation. Construction
+  order, format, dimensions, usage flags, handle selection, lazy storage-view
+  caching and view-before-image destruction match.
+- `cargo test -p video_core --release
+  null_image_matches_upstream_fallback_create_info --lib` passes without a GPU.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.{h,cpp}
+
+### Intentional differences
+- Rust retains a legacy host-visible uniform fallback for devices without
+  `nullDescriptor`; it is now deterministically zeroed. With robustness2, the
+  defensive missing-entry path writes the same null buffer handle selected by
+  the common buffer cache.
+- Upstream's generated descriptor template consumes a fixed, compile-time
+  payload and cannot return an incomplete descriptor set. Rust's explicit
+  assembly returns `None` if its texel/storage-image stream is shorter than
+  the pipeline layout and skips that draw, preventing an invalid zero-count
+  write or a draw with an unbound required set.
+
+### Unintentional differences (to fix)
+- The larger descriptor-configuration ownership split from upstream remains a
+  structural difference; moving it requires coordinating the Rust graphics
+  pipeline, descriptor queue, buffer cache and texture cache rather than a
+  local Vulkan fallback edit.
+
+### Missing items
+- None in the audited missing sampled/storage image routing. The offscreen
+  framebuffer view is no longer used as a shader descriptor.
+
+### Binary layout verification
+- N/A: descriptor writes are host Vulkan API structures.
+
+### Behavioral verification
+- Re-read upstream `vk_rasterizer.h/.cpp`, `vk_texture_cache.h/.cpp`, and the
+  buffer-cache null resource path after implementation. Missing image handles
+  now come from texture-cache slot zero and missing buffers respect
+  `nullDescriptor`, matching upstream resource selection.
+- Focused tests passing:
+  `null_image_matches_upstream_fallback_create_info`,
+  `missing_buffer_uses_null_descriptor_when_supported`, and
+  `graphics_descriptors_use_vulkan_texture_cache_view_wrapper`, plus
+  `incomplete_required_descriptor_set_skips_draw`.
+- Full `cargo test -p video_core --release --lib` did not pass: the parallel
+  run aborted on an unrelated 4,429,185,040-byte allocation request; a
+  single-threaded diagnostic run exceeded four minutes and was terminated.
+  All remaining `cargo`/`video_core` child processes were explicitly closed.
+
+## 2026-07-31 — shader_recompiler/src/backend/spirv/emit_spirv_image.rs vs shader_recompiler/backend/spirv/emit_spirv_image.cpp
+
+### Intentional differences
+- Rust emits through `rspirv::Builder` and records SSA definitions in the
+  existing `(block, instruction)` value map; upstream emits through Sirit and
+  writes the definition directly on `IR::Inst`.
+- Missing descriptor indices panic through Rust indexing, corresponding to
+  upstream `std::vector::at` failure. Indirect storage-image indexing remains
+  an explicit unsupported error in both implementations.
+- Regression tests optionally invoke an external `spirv-val` selected by
+  `RUZU_SPIRV_VAL`; the production emission path is unaffected when the
+  variable is absent.
+
+### Unintentional differences (to fix)
+- None in the audited indexed storage-image read/write slice. The previous
+  missing dispatch and emission were corrected.
+
+### Missing items
+- None in this slice. Indexed `ImageRead`/`ImageWrite`, typeless handling,
+  integer/float bitcasts, sparse residency extraction, and non-indexed
+  unreachable handling are present.
+
+### Binary layout verification
+- N/A: this emits SPIR-V instructions and does not serialize a guest ABI
+  structure.
+
+### Behavioral verification
+- Re-read upstream `Image`, `EmitImageRead`, `EmitImageWrite`, the instruction
+  declarations, and the sparse pseudo-operation handling after implementation
+  and compared their ordering and result types line-by-line.
+- `cargo test -p shader_recompiler` passes all 336 tests. The focused generated
+  read/write module also passes Vulkan 1.2 validation with Vulkan SDK 1.4.357
+  `spirv-val` and contains real `OpImageRead`/`OpImageWrite`, not `OpUndef`.
+
+## 2026-07-31 — shader_recompiler/src/backend/spirv/emit_spirv_image_atomic.rs vs shader_recompiler/backend/spirv/emit_spirv_image_atomic.cpp
+
+### Intentional differences
+- Rust selects the corresponding `rspirv::Builder` atomic method with a
+  file-local enum; upstream passes a Sirit member-function pointer to its
+  file-local `ImageAtomicU32` helper. Ownership and emitted instruction order
+  remain local to the matching file.
+- Rust panics for upstream's `NotImplementedException` paths: indirect image
+  indexing, indexed increment/decrement, and bound/bindless atomics.
+
+### Unintentional differences (to fix)
+- None in the audited indexed image-atomic slice. The former `OpUndef` stubs
+  were replaced with the upstream storage-image pointer and atomic operations.
+
+### Missing items
+- None relative to upstream. Indexed increment/decrement remain explicitly
+  unimplemented because their upstream methods are also unimplemented.
+
+### Binary layout verification
+- N/A: this emits SPIR-V instructions and does not serialize a guest ABI
+  structure.
+
+### Behavioral verification
+- Re-read the complete upstream `emit_spirv_image_atomic.cpp` after
+  implementation. Descriptor selection, `OpImageTexelPointer`, Device scope,
+  zero memory semantics, result type, and IAdd/SMin/UMin/SMax/UMax/And/Or/Xor/
+  Exchange opcode selection match line-by-line.
+- The focused generated atomic module contains all nine real atomic opcodes,
+  contains no `OpUndef`, and passes Vulkan 1.2 validation with Vulkan SDK
+  1.4.357 `spirv-val`.
+
+## 2026-07-31 — shader_recompiler/src/backend/spirv/spirv_emit_context.rs vs shader_recompiler/backend/spirv/spirv_emit_context.{h,cpp}
+
+### Intentional differences
+- Rust's existing monolithic opcode match performs the role of upstream's
+  generated emitter table. It now routes the same indexed storage-image
+  instructions to their matching Rust owners.
+- Rust stores `image_u32` as SPIR-V word zero when unused; upstream stores an
+  invalid default Sirit `Id`. Both declare the Image-storage pointer only when
+  `Info::uses_atomic_image_u32` is true.
+
+### Unintentional differences (to fix)
+- None in the audited dispatch/type-declaration slice. Missing image dispatch
+  and the missing `image_u32` context member were corrected.
+
+### Missing items
+- None in this slice. `GetSparseFromOp` is treated as a consumed pseudo
+  operation, matching upstream invalidation by the image emitter.
+
+### Binary layout verification
+- N/A: this is host-side SPIR-V builder state.
+
+### Behavioral verification
+- Re-read upstream `DefineTextures`, the `image_u32` member declaration, and
+  all image/image-atomic emitter declarations after implementation. Conditional
+  type creation and opcode ownership match upstream.
+- `cargo test -p shader_recompiler` passes all 336 tests.
+
+## 2026-07-31 — video_core/src/vulkan_common/vulkan_device.rs vs video_core/vulkan_common/vulkan_device.{h,cpp}
+
+### Intentional differences
+- Rust can opt into `VK_EXT_device_fault` with `RUZU_VK_DEVICE_FAULT` when the
+  host advertises both the extension and `deviceFault` feature. Upstream does
+  not use this cross-vendor diagnostic extension; it only logs device loss and
+  waits for optional NVIDIA Nsight Aftermath output.
+- The diagnostic extension is absent from the normal feature chain and enabled
+  extension list unless the environment variable is explicitly set, so normal
+  platform behavior remains unchanged.
+
+### Unintentional differences (to fix)
+- None introduced in the audited normal device-creation path.
+
+### Missing items
+- Upstream `Device::ReportLoss` still has broader ownership than Rust's Vulkan
+  scheduler because the Rust scheduler retains an ash device rather than the
+  complete `Device` wrapper. The opt-in fault report is diagnostic and does not
+  resolve that existing structural difference.
+
+### Binary layout verification
+- PASS: ash's `repr(C)` Vulkan feature structures are passed directly in the
+  queried/reused `pNext` chain; the existing duplicate-structure-type check
+  remains active.
+
+### Behavioral verification
+- Re-read upstream feature/extension macro lists, logical-device creation and
+  `Device::ReportLoss` after implementation. `VK_EXT_device_fault` is documented
+  here as an intentional diagnostic addition, not claimed as upstream parity.
+- `cargo check -p video_core --release --lib` passes.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/scheduler.rs vs video_core/renderer_vulkan/vk_scheduler.{h,cpp}
+
+### Intentional differences
+- With the existing opt-in `RUZU_VK_TRACE_DRAWS` diagnostic enabled, Rust now
+  records the source callsite of each scheduler command and emits a grouped
+  `[VK_SUBMIT_TRACE]` line for the tick that submits those commands. Upstream
+  has no equivalent logging; this is diagnostic metadata for correlating an
+  AMD device fault with non-draw work in the same Vulkan submission.
+- `#[track_caller]` preserves the owner callsite through `record` and
+  `record_with_upload`. The trace vector is populated only when the environment
+  flag is enabled and is drained at the same submission boundary as the
+  upstream `CommandChunk::MarkSubmit` boundary.
+
+### Unintentional differences (to fix)
+- None introduced in scheduler command execution or submission ordering. The
+  previously documented scheduler/master-semaphore ownership and post-device-
+  loss lifecycle differences remain.
+
+### Missing items
+- The trace identifies CPU recording callsites, not the precise GPU instruction
+  at which an asynchronous fault occurred. The driver may report the failure on
+  a later queue submission than the one containing the offending command.
+
+### Binary layout verification
+- N/A: trace locations and counts are host-only diagnostic metadata and are not
+  submitted to Vulkan or exposed to the guest.
+
+### Behavioral verification
+- Re-read upstream `vk_scheduler.h` command recording templates and
+  `vk_scheduler.cpp` `WorkerThread`, `DispatchWork`, and `SubmitExecution`
+  after implementation. Rust still executes chunks FIFO, ends and submits the
+  same command buffers, and rotates command buffers at the same submit marker.
+- `scheduler_submit_trace_groups_callsites_without_losing_command_count`
+  verifies grouping, exact tick/signal count, and total recorded-command count.
+- The focused release test passes.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.{h,cpp}
+
+### Intentional differences
+- Rust has an opt-in `RUZU_VK_TRACE_DRAWS` diagnostic that records the pending
+  scheduler tick, guest draw parameters, active vertex streams and constant
+  buffers, shader hashes, and the Vulkan buffer/image descriptors immediately
+  before draw emission. Upstream has no equivalent log; the diagnostic exists
+  only to correlate the AMD `VK_EXT_device_fault` address report with the
+  command batch that caused `VK_ERROR_DEVICE_LOST`.
+- The environment flag is cached once with `OnceLock`, and trace strings are
+  not allocated on the default path.
+
+### Unintentional differences (to fix)
+- None introduced by this diagnostic. The existing Rust descriptor
+  configuration split remains broader than upstream
+  `GraphicsPipeline::ConfigureImpl` and is already documented above.
+
+### Missing items
+- The trace correlates CPU-recorded commands with the submission tick but does
+  not add a vendor command-buffer checkpoint extension. The RX 5700 XT device
+  fault report exposes only address records, so the scheduler tick remains the
+  available cross-vendor correlation key.
+
+### Binary layout verification
+- N/A: trace formatting observes host Vulkan handles and guest draw snapshots;
+  it does not alter or serialize a guest-visible structure.
+
+### Behavioral verification
+- Re-read upstream `vk_rasterizer.h`, `PrepareDraw`, `Draw`, and
+  `BindGraphicsUniformBuffer` after implementation. Normal flush, configure,
+  dynamic-state and draw-recording order is unchanged; all diagnostics run
+  after resource configuration and before the same draw command is recorded.
+- `descriptor_trace_preserves_handles_offsets_and_ranges` verifies that the
+  diagnostic does not lose the exact buffer handle, offset, range, or null
+  descriptor values needed for fault correlation.
+- The focused release test and `cargo check -p video_core --release --lib`
+  pass.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp
+
+### Intentional differences
+- When the opt-in device-fault feature is enabled, Rust loads the extension's
+  device dispatch function from the renderer-owned Vulkan instance and passes
+  it to the scheduler worker. Upstream has no equivalent cross-vendor path.
+
+### Unintentional differences (to fix)
+- None in normal renderer construction; the optional dispatch object is `None`
+  unless device creation actually enabled the extension.
+
+### Missing items
+- None in this diagnostic handoff slice.
+
+### Binary layout verification
+- N/A: this passes a host Vulkan function table.
+
+### Behavioral verification
+- Re-read upstream renderer device/scheduler construction after implementation.
+  Normal construction order is unchanged.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/scheduler.rs vs video_core/renderer_vulkan/vk_scheduler.{h,cpp}
+
+### Intentional differences
+- On the first `VK_ERROR_DEVICE_LOST`, an opt-in Rust scheduler queries
+  `vkGetDeviceFaultInfoEXT` twice as required: first for counts with a null
+  `pFaultInfo`, then with
+  exact-size address/vendor/binary storage, and logs the returned description
+  and records. Upstream calls `Device::ReportLoss`, which logs and sleeps for
+  NVIDIA Aftermath; it does not query this AMD-supported extension.
+- The diagnostic runs only once per scheduler worker and after releasing the
+  queue submit mutex, preventing repeated reports or a diagnostic query while
+  holding the shared submission lock.
+
+### Unintentional differences (to fix)
+- The existing scheduler reports `ERROR_DEVICE_LOST` and continues draining
+  queued chunks, whereas upstream's checked Vulkan result terminates the
+  failing submission path after `ReportLoss`. This pre-existing lifecycle
+  difference remains outside the diagnostic slice and should be audited.
+
+### Missing items
+- No command-buffer checkpoints are attached, so a driver report can identify
+  a fault address/type but not necessarily the exact guest draw. This matches
+  the scope of `VK_EXT_device_fault` available on the AMD device.
+
+### Binary layout verification
+- PASS: count-provided vectors remain alive and stable for the complete second
+  Vulkan call; all output structures use ash's `repr(C)` definitions.
+
+### Behavioral verification
+- Re-read upstream `Scheduler::SubmitExecution` and `Device::ReportLoss` after
+  implementation. Queue submission and timeline signalling are unchanged
+  before the optional post-failure query.
+- `cargo check -p video_core --release --lib` passes.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/buffer_cache.rs vs video_core/renderer_vulkan/vk_buffer_cache.{h,cpp}
+
+### Intentional differences
+- Rust stores the raw allocation handle next to the null `VkBuffer` because
+  ash does not wrap buffer and memory ownership in upstream's `vk::Buffer` RAII
+  type. Destruction remains in `BufferCacheRuntime::drop`.
+
+### Unintentional differences (to fix)
+- The runtime null-buffer usage mask does not yet conditionally add
+  `VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT`. The Rust transform-
+  feedback binding path is still an existing no-op and must be ported as one
+  ownership slice before this conditional flag is exercised.
+
+### Missing items
+- Full `BindTransformFeedbackBuffer(s)` parity, including the extension-gated
+  null-buffer usage bit, remains missing in this file.
+
+### Binary layout verification
+- N/A: the change creates host Vulkan objects and does not serialize a guest
+  structure. The create-info size is exactly 4 bytes and the base usage mask
+  now matches upstream.
+
+### Behavioral verification
+- Re-read upstream `BufferCacheRuntime::ReserveNullBuffer`,
+  `CreateNullBuffer`, `BindIndexBuffer`, and `BindVertexBuffers` in both
+  `vk_buffer_cache.h` and `.cpp` after implementation.
+- Rust no longer allocates or records a fill for the runtime null buffer during
+  construction. Like upstream, it reserves the buffer on the first non-null-
+  descriptor index/vertex/descriptor fallback, records an all-zero
+  `VK_WHOLE_SIZE` fill, and reuses the same handle thereafter.
+- `runtime_null_buffer_base_usage_matches_upstream` passes in release mode.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.{h,cpp}
+
+### Intentional differences
+- Rust uses a local closure and `Vec<VkBufferImageCopy>` in
+  `transform_buffer_image_copies`; upstream uses the file-local `Maker` struct
+  and `boost::container::small_vector`. Field mapping, output length, and output
+  ordering are identical.
+
+### Unintentional differences (to fix)
+- None in the reviewed `TransformBufferImageCopies` / `Image::UploadMemory`
+  slice. Fixed: combined depth/stencil uploads no longer emit a combined aspect
+  mask for each `VkBufferImageCopy`. Rust now emits all depth-only copies first,
+  followed by all stencil-only copies, exactly like upstream.
+
+### Missing items
+- None in this helper slice.
+
+### Binary layout verification
+- N/A: the helper maps common copy metadata into ash Vulkan command
+  structures; no guest structure is serialized by raw memory copy.
+
+### Behavioral verification
+- Re-read upstream `vk_texture_cache.h` image/runtime declarations,
+  `TransformBufferImageCopies`, and both `Image::UploadMemory` overloads after
+  implementation. Re-read the Rust helper, test, and upload call site
+  line-by-line.
+- `transform_buffer_image_copies_splits_depth_stencil_like_upstream` verifies
+  the doubled length, depth-then-stencil ordering, identical buffer offsets,
+  and exact row/image/subresource field mapping; it passes in release mode.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.{h,cpp}
+
+### Intentional differences
+- When `RUZU_VK_SYNC_DRAW_INTERVAL` contains a non-zero `u32`, the diagnostic
+  Rust path calls the existing rasterizer `finish()` after each configured
+  number of recorded draws and logs `[VK_DRAW_SYNC]`. Upstream retains normal
+  `FlushWork` batching and has no such environment-gated fault-localization
+  mode. With the variable absent, invalid, or zero, no extra submit or wait is
+  performed and normal upstream batching is unchanged.
+
+### Unintentional differences (to fix)
+- None introduced in the reviewed draw-recording slice.
+
+### Missing items
+- This diagnostic only narrows an asynchronous device loss to a draw group; it
+  does not identify non-draw commands within that group.
+
+### Binary layout verification
+- N/A: the diagnostic changes command submission boundaries only when opted in
+  and does not serialize a guest structure.
+
+### Behavioral verification
+- Re-read upstream `vk_rasterizer.h` draw/`PrepareDraw`/`FlushWork`
+  declarations and upstream `RasterizerVulkan::{PrepareDraw,Draw,DrawIndirect}`
+  after implementation. Re-read the Rust draw-command tail and parser test.
+- `sync_draw_interval_is_opt_in_and_rejects_zero_or_invalid_values` passes in
+  release mode and verifies that the default, zero, malformed, and valid
+  interval cases are distinct.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/{texture_cache.rs,vk_rasterizer.rs} vs video_core/renderer_vulkan/{vk_texture_cache,vk_rasterizer}.{h,cpp}
+
+### Intentional differences
+- Under the existing opt-in `RUZU_VK_TRACE_DRAWS` diagnostic only, Rust logs
+  `Image::upload_memory` image identity, format, dimensions, aspect, staging
+  range, and common `BufferImageCopy` fields. It also augments descriptor traces
+  with the common image-view/image ids and backend Vulkan image metadata.
+  Upstream has no equivalent verbose device-loss trace.
+- The texture-cache owner formats backend image/view state, while the
+  rasterizer owner only requests and appends that formatted metadata when it
+  binds the corresponding sampled descriptor. This preserves the normal owner
+  boundary instead of exposing the backend image maps to the rasterizer.
+
+### Unintentional differences (to fix)
+- None introduced. Upload transformation, initialization exchange, command
+  recording, descriptor materialization, and descriptor writes are unchanged.
+
+### Missing items
+- The trace currently annotates sampled combined-image descriptors; storage
+  image diagnostics are not required by the isolated MK8D draw, which has no
+  storage-image binding.
+
+### Binary layout verification
+- N/A: the added code only formats existing typed fields after/before normal
+  operations and does not serialize or modify guest payloads.
+
+### Behavioral verification
+- Re-read upstream `vk_texture_cache.h` `Image`/`ImageView` declarations and
+  upstream `Image::UploadMemory` after implementation. Re-read upstream
+  `vk_rasterizer.h` draw ownership and `RasterizerVulkan::{PrepareDraw,Draw}`.
+  The opt-in logging does not move or reorder upstream operations.
+- `upload_trace_preserves_copy_identity_and_geometry` passes in release mode.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/maxwell_to_vk.rs vs video_core/renderer_vulkan/maxwell_to_vk.{h,cpp}
+
+### Intentional differences
+- Rust splits upstream `MaxwellToVK::SurfaceFormat` at the existing ownership
+  boundary: `surface_format_with_recompression` owns the table, ASTC/BCn
+  conversion, `with_srgb`, and usage-bit behavior in `maxwell_to_vk.rs`, while
+  the Vulkan runtime that owns the physical-device handle resolves the selected
+  format against device features. For `FormatType::Optimal`, the composed
+  result and usage query match upstream.
+- The recompression mode is passed explicitly to the pure conversion function
+  instead of read from global settings inside it. The runtime passes the current
+  `Settings::values.astc_recompression` value at every call; this permits
+  deterministic tests without mutating process-global settings.
+
+### Unintentional differences (to fix)
+- None in the reviewed ASTC/BCn optimal-image format selection slice.
+
+### Missing items
+- None in this slice.
+
+### Binary layout verification
+- N/A: `FormatInfo` contains typed Vulkan format and boolean capability fields;
+  no guest payload is copied as raw bytes.
+
+### Behavioral verification
+- Re-read upstream `maxwell_to_vk.h` `FormatInfo`/`SurfaceFormat` declarations
+  and upstream `maxwell_to_vk.cpp` `SurfaceFormat` line-by-line after the Rust
+  implementation. ASTC Uncompressed, BC1 and BC3 selection; base-versus-view
+  sRGB handling; ASTC Uncompressed storage usage; and every BCn fallback match.
+- `surface_format_recompresses_astc_like_upstream` and
+  `surface_format_bcn_transcode_honors_with_srgb` pass in release mode.
+
+## 2026-07-31 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.{h,cpp}
+
+### Intentional differences
+- Rust caches physical-device format properties in `TextureCacheRuntime` before
+  selecting a supported alternative. Upstream performs the equivalent query
+  through its `Device` wrapper.
+- Rust removes duplicate/undefined entries while building the image format
+  list; upstream appends every compatible result. This does not change the set
+  of formats advertised to Vulkan.
+
+### Unintentional differences (to fix)
+- None in the reviewed image/view format-selection paths.
+
+### Missing items
+- None in this slice.
+
+### Binary layout verification
+- N/A: this change selects Vulkan formats and usage flags; it does not alter or
+  serialize guest structures.
+
+### Behavioral verification
+- Re-read upstream `vk_texture_cache.h` runtime, `Image`, and `ImageView`
+  declarations plus `MakeImageCreateInfo`, runtime view-format initialization,
+  `Image::StorageImageView`, `Image::NeedsScaleHelper`, the main `ImageView`
+  constructor, and depth/stencil auxiliary views after implementation.
+- Image allocation and backend materialization now request
+  `SurfaceFormat(..., false, ...)`; compatible, sampled, storage, depth, and
+  stencil views request `SurfaceFormat(..., true, ...)`, matching upstream.
+  The special uncompressed ASTC base view format remains present exactly where
+  upstream adds it.
+- `image_creation_and_views_select_srgb_like_upstream` passes in release mode.
+## 2026-07-31 — common/src/fs/{fs_paths.rs,path_util.rs} vs common/fs/{fs_paths.h,path_util.{h,cpp}}
+
+### Intentional differences
+- Ruzu substitutes the application-specific names `RUZU_DIR`/`ruzu_log.txt`
+  for upstream `YUZU_DIR`/`yuzu_log.txt`. All runtime directories remain children
+  of that one application-owned root exactly as they are upstream; no yuzu NAND,
+  key, SDMC, or cache directory is borrowed.
+- The Rust `GetAppDataRoamingDirectory` equivalent checks the returned pointer
+  before constructing a path. Upstream constructs the filesystem path directly;
+  the guard preserves successful behavior and avoids dereferencing a null pointer
+  if the Windows Known Folder call fails.
+
+### Unintentional differences (to fix)
+- None in the reviewed Windows application-data path slice.
+
+### Missing items
+- `GetExeDirectory` and the `YUZU_ENABLE_PORTABLE` Windows path override are not
+  part of this fix and remain unported.
+
+### Binary layout verification
+- N/A: this code selects host filesystem paths and serializes no binary payload.
+
+### Behavioral verification
+- Re-read upstream `path_util.h` Windows declarations and
+  `PathManagerImpl::Reinitialize`/`GetAppDataRoamingDirectory` in
+  `path_util.cpp` after implementation. The default Windows root now comes from
+  `SHGetKnownFolderPath(FOLDERID_RoamingAppData)`; cache/config remain children
+  of the application root; and an invalid explicit Windows root falls back to
+  `%APPDATA%`, matching upstream ordering.
+- Re-read upstream `fs_paths.h`; every remaining Rust directory constant maps to
+  the matching upstream constant in the same file. The former Rust-only
+  `LEGACY_YUZU_DIR` constant and runtime fallback were removed.
+- The non-Windows/XDG branch was not changed. The 16 focused `path_util` tests
+  pass, including Known Folder resolution, invalid Windows override fallback,
+  and ownership of config/keys/NAND/SDMC/shader directories by the Ruzu root.
+
+## 2026-07-31 — ruzu/src/{main.rs,main_window.rs,config_import.rs} (frontend-specific; upstream Qt frontend excluded)
+
+### Intentional differences
+- Ruzu's GTK frontend offers a one-time import of yuzu's compatible INI files.
+  On Windows it reads only `%APPDATA%/yuzu/config`; accepted files are copied to
+  `%APPDATA%/ruzu/config`. The frontend never points Ruzu at yuzu's live config.
+- This GTK file has no direct C++ counterpart because `src/yuzu` is explicitly
+  excluded from the Rust port and uses Qt upstream.
+- A direct game launch constructs the same window without scheduling the
+  first-run config-import dialog. A launcher-only start still offers the import;
+  this prevents a modal dialog from covering a game already booting.
+
+### Unintentional differences (to fix)
+- None in the reviewed Windows config-import path selection.
+
+### Missing items
+- None in this slice.
+
+### Binary layout verification
+- N/A: the importer copies INI files and serializes no binary payload.
+
+### Behavioral verification
+- Windows compilation of the release `ruzu` binary succeeds with the importer
+  using `GetAppDataRoamingDirectory`; Unix retains its existing XDG candidates.
+- Direct-launch verification checks that the log no longer reaches
+  `config_import::available_import`, while the normal `GMainWindow::new` path
+  continues to schedule the offer.
+## 2026-07-31 — externals/rdynarmic/src/backend/arm64/emit_arm64_a32_coprocessor.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp
+
+### Intentional differences
+- Generic coprocessor ownership remains adapted to the Rust backend's current CP15 configuration model.
+
+### Unintentional differences (to fix)
+- None in the `A32CoprocSendOneWord` argument-lifetime ordering verified by this pass.
+
+### Missing items
+- The generic configured-coprocessor registry remains outside this focused operand-lifetime fix.
+
+### Binary layout verification
+- PASS: no shared structure, serialized payload, function signature, or ABI layout changed.
+
+## 2026-08-01 — externals/rdynarmic/src/frontend/a32/translate/{mod.rs,conditional_state.rs,thumb16.rs} vs externals/dynarmic/src/dynarmic/frontend/A32/translate/{translate_arm.cpp,translate_thumb.cpp,conditional_state.cpp,impl/a32_translate_impl.cpp,impl/thumb16.cpp}
+
+### Intentional differences
+- Rust passes `current_instruction_size` explicitly to
+  `raise_exception_with_instruction_size`; upstream stores it on
+  `TranslatorVisitor`. The emitted IR and ordering are identical:
+  `UpdateUpperLocationDescriptor`, `BranchWritePC`, `ExceptionRaised`, then
+  `CheckHalt(ReturnToDispatch)`.
+- Rust retains its existing finite `MAX_BLOCK_INSTRUCTIONS` guard and terminal
+  fallback. Upstream translates until a terminal condition and asserts that a
+  terminal exists. This pre-existing structural divergence is outside the
+  no-execute-fault fix.
+
+### Unintentional differences (to fix)
+- None in the reviewed missing-code, ARM `NV`, or Thumb16 `IT`/exception paths.
+
+### Missing items
+- Thumb conditional execution remains structurally reduced: the Rust
+  `translate_conditional_thumb16`/`translate_conditional_thumb32` helpers do
+  not yet reproduce upstream `ThumbConditionPassed` and conditional block
+  state completely. This is a separate control-flow parity slice and is not a
+  prerequisite for handling an instruction fetch failure.
+- Rust's translation callback surface still lacks upstream's
+  `PreCodeReadHook`, `PreCodeTranslationHook`, and per-instruction tick query.
+
+### Binary layout verification
+- PASS: no shared structure, serialized payload, function signature, or ABI
+  layout changed.
+
+### Behavioral verification
+- Re-read all five upstream owners after implementation. ARM and Thumb fetch
+  failures now raise `NoExecuteFault`, advance the location by four or two
+  bytes respectively (including `AdvanceIT` for Thumb), and increment the
+  cycle count before leaving the translation loop.
+- `cond == NV` now raises `UnpredictableInstruction` through the complete
+  exception lifecycle instead of linking back to the same location.
+- Thumb16 `IT` now validates the encoding and current IT state, then terminates
+  at the next descriptor carrying the new IT state. Thumb16 `BKPT`, `UDF`, and
+  unknown encodings now use the complete two-byte exception lifecycle; `UDF`
+  raises `UndefinedInstruction` as upstream does.
+- `cargo test --lib frontend::a32::translate` passes: 58 passed, 0 failed.
+- The affected ARM64 address-space fixtures pass (6/6), as do both
+  `get_or_emit` fixtures. A full `cargo test --lib` was attempted in parallel
+  and serial modes but still terminates with `SIGBUS` in the pre-existing
+  `backend::arm64::a32_core::tests::run_existing_block_calls_arm64_prelude`,
+  which executes a manually inserted host block and does not invoke the A32
+  translation paths changed here.

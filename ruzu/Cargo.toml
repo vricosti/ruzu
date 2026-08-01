@@ -72,3 +72,13 @@ core-foundation = "0.9"
 # `WindowSystemInfo::display_connection` needs for `VkXlibSurfaceCreateInfoKHR`.
 gdk4-x11 = { version = "0.9", features = ["xlib"] }
 x11 = { version = "2", features = ["xlib"] }
+
+# Windows: create the same native child render window that upstream gets from
+# `RenderWidget::setAttribute(Qt::WA_NativeWindow)`, then hand its HWND to
+# `VkWin32SurfaceCreateInfoKHR`.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
