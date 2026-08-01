@@ -29929,3 +29929,64 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Direct-launch verification checks that the log no longer reaches
   `config_import::available_import`, while the normal `GMainWindow::new` path
   continues to schedule the offer.
+## 2026-07-31 — externals/rdynarmic/src/backend/arm64/emit_arm64_a32_coprocessor.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp
+
+### Intentional differences
+- Generic coprocessor ownership remains adapted to the Rust backend's current CP15 configuration model.
+
+### Unintentional differences (to fix)
+- None in the `A32CoprocSendOneWord` argument-lifetime ordering verified by this pass.
+
+### Missing items
+- The generic configured-coprocessor registry remains outside this focused operand-lifetime fix.
+
+### Binary layout verification
+- PASS: no shared structure, serialized payload, function signature, or ABI layout changed.
+
+## 2026-08-01 — externals/rdynarmic/src/frontend/a32/translate/{mod.rs,conditional_state.rs,thumb16.rs} vs externals/dynarmic/src/dynarmic/frontend/A32/translate/{translate_arm.cpp,translate_thumb.cpp,conditional_state.cpp,impl/a32_translate_impl.cpp,impl/thumb16.cpp}
+
+### Intentional differences
+- Rust passes `current_instruction_size` explicitly to
+  `raise_exception_with_instruction_size`; upstream stores it on
+  `TranslatorVisitor`. The emitted IR and ordering are identical:
+  `UpdateUpperLocationDescriptor`, `BranchWritePC`, `ExceptionRaised`, then
+  `CheckHalt(ReturnToDispatch)`.
+- Rust retains its existing finite `MAX_BLOCK_INSTRUCTIONS` guard and terminal
+  fallback. Upstream translates until a terminal condition and asserts that a
+  terminal exists. This pre-existing structural divergence is outside the
+  no-execute-fault fix.
+
+### Unintentional differences (to fix)
+- None in the reviewed missing-code, ARM `NV`, or Thumb16 `IT`/exception paths.
+
+### Missing items
+- Thumb conditional execution remains structurally reduced: the Rust
+  `translate_conditional_thumb16`/`translate_conditional_thumb32` helpers do
+  not yet reproduce upstream `ThumbConditionPassed` and conditional block
+  state completely. This is a separate control-flow parity slice and is not a
+  prerequisite for handling an instruction fetch failure.
+- Rust's translation callback surface still lacks upstream's
+  `PreCodeReadHook`, `PreCodeTranslationHook`, and per-instruction tick query.
+
+### Binary layout verification
+- PASS: no shared structure, serialized payload, function signature, or ABI
+  layout changed.
+
+### Behavioral verification
+- Re-read all five upstream owners after implementation. ARM and Thumb fetch
+  failures now raise `NoExecuteFault`, advance the location by four or two
+  bytes respectively (including `AdvanceIT` for Thumb), and increment the
+  cycle count before leaving the translation loop.
+- `cond == NV` now raises `UnpredictableInstruction` through the complete
+  exception lifecycle instead of linking back to the same location.
+- Thumb16 `IT` now validates the encoding and current IT state, then terminates
+  at the next descriptor carrying the new IT state. Thumb16 `BKPT`, `UDF`, and
+  unknown encodings now use the complete two-byte exception lifecycle; `UDF`
+  raises `UndefinedInstruction` as upstream does.
+- `cargo test --lib frontend::a32::translate` passes: 58 passed, 0 failed.
+- The affected ARM64 address-space fixtures pass (6/6), as do both
+  `get_or_emit` fixtures. A full `cargo test --lib` was attempted in parallel
+  and serial modes but still terminates with `SIGBUS` in the pre-existing
+  `backend::arm64::a32_core::tests::run_existing_block_calls_arm64_prelude`,
+  which executes a manually inserted host block and does not invoke the A32
+  translation paths changed here.
