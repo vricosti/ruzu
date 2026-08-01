@@ -30116,12 +30116,12 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   apparently valid shader with missing instructions.
 
 ### Missing items
-- Runtime parity is not complete. In the current Vulkan comparison, ruzu
-  creates three vertex/fragment shader pairs before the menu while yuzu creates
-  four; ruzu's full-screen textures and logo are still corrupted. The dumped
-  ruzu modules pass `spirv-val --target-env vulkan1.3 --scalar-block-layout`, so
-  the remaining divergence is being traced at pipeline identity, translated IR,
-  and generated-SPIR-V level.
+- Runtime parity is not complete. Both renderers create four vertex/fragment
+  shader pairs through the menu, but ruzu's full-screen textures and logo are
+  still corrupted. The dumped ruzu modules pass
+  `spirv-val --target-env vulkan1.3 --scalar-block-layout`, so the remaining
+  divergence is being traced at translated IR, generated-SPIR-V, descriptor,
+  and draw-state level.
 
 ### Binary layout verification
 - N/A: this slice changes shader translation and host SPIR-V generation; it
