@@ -14,7 +14,260 @@ use crate::ir::program::{CbufDescriptor, Program, TexDescriptor};
 use crate::ir::types::{TextureInstInfo, Type};
 use crate::ir::value::{Attribute, Value};
 use crate::program_header::{PixelImap, ProgramHeader};
-use crate::shader_info::TextureType;
+use crate::shader_info::{Info, TextureType};
+
+fn visit_usages(info: &mut Info, opcode: Opcode) {
+    if matches!(
+        opcode,
+        Opcode::CompositeConstructF16x2
+            | Opcode::CompositeConstructF16x3
+            | Opcode::CompositeConstructF16x4
+            | Opcode::CompositeExtractF16x2
+            | Opcode::CompositeExtractF16x3
+            | Opcode::CompositeExtractF16x4
+            | Opcode::CompositeInsertF16x2
+            | Opcode::CompositeInsertF16x3
+            | Opcode::CompositeInsertF16x4
+            | Opcode::SelectF16
+            | Opcode::BitCastU16F16
+            | Opcode::BitCastF16U16
+            | Opcode::PackFloat2x16
+            | Opcode::UnpackFloat2x16
+            | Opcode::ConvertS16F16
+            | Opcode::ConvertS32F16
+            | Opcode::ConvertS64F16
+            | Opcode::ConvertU16F16
+            | Opcode::ConvertU32F16
+            | Opcode::ConvertU64F16
+            | Opcode::ConvertF16S8
+            | Opcode::ConvertF16S16
+            | Opcode::ConvertF16S32
+            | Opcode::ConvertF16S64
+            | Opcode::ConvertF16U8
+            | Opcode::ConvertF16U16
+            | Opcode::ConvertF16U32
+            | Opcode::ConvertF16U64
+            | Opcode::ConvertF16F32
+            | Opcode::ConvertF32F16
+            | Opcode::FPAbs16
+            | Opcode::FPAdd16
+            | Opcode::FPCeil16
+            | Opcode::FPFloor16
+            | Opcode::FPFma16
+            | Opcode::FPMul16
+            | Opcode::FPNeg16
+            | Opcode::FPRoundEven16
+            | Opcode::FPSaturate16
+            | Opcode::FPClamp16
+            | Opcode::FPTrunc16
+            | Opcode::FPOrdEqual16
+            | Opcode::FPUnordEqual16
+            | Opcode::FPOrdNotEqual16
+            | Opcode::FPUnordNotEqual16
+            | Opcode::FPOrdLessThan16
+            | Opcode::FPUnordLessThan16
+            | Opcode::FPOrdGreaterThan16
+            | Opcode::FPUnordGreaterThan16
+            | Opcode::FPOrdLessThanEqual16
+            | Opcode::FPUnordLessThanEqual16
+            | Opcode::FPOrdGreaterThanEqual16
+            | Opcode::FPUnordGreaterThanEqual16
+            | Opcode::FPIsNan16
+            | Opcode::GlobalAtomicAddF16x2
+            | Opcode::GlobalAtomicMinF16x2
+            | Opcode::GlobalAtomicMaxF16x2
+            | Opcode::StorageAtomicAddF16x2
+            | Opcode::StorageAtomicMinF16x2
+            | Opcode::StorageAtomicMaxF16x2
+    ) {
+        info.uses_fp16 = true;
+    }
+
+    if matches!(
+        opcode,
+        Opcode::CompositeConstructF64x2
+            | Opcode::CompositeConstructF64x3
+            | Opcode::CompositeConstructF64x4
+            | Opcode::CompositeExtractF64x2
+            | Opcode::CompositeExtractF64x3
+            | Opcode::CompositeExtractF64x4
+            | Opcode::SelectF64
+            | Opcode::BitCastU64F64
+            | Opcode::BitCastF64U64
+            | Opcode::PackDouble2x32
+            | Opcode::UnpackDouble2x32
+            | Opcode::FPAbs64
+            | Opcode::FPAdd64
+            | Opcode::FPCeil64
+            | Opcode::FPFloor64
+            | Opcode::FPFma64
+            | Opcode::FPMax64
+            | Opcode::FPMin64
+            | Opcode::FPMul64
+            | Opcode::FPNeg64
+            | Opcode::FPRecip64
+            | Opcode::FPRecipSqrt64
+            | Opcode::FPRoundEven64
+            | Opcode::FPSaturate64
+            | Opcode::FPClamp64
+            | Opcode::FPTrunc64
+            | Opcode::FPOrdEqual64
+            | Opcode::FPUnordEqual64
+            | Opcode::FPOrdNotEqual64
+            | Opcode::FPUnordNotEqual64
+            | Opcode::FPOrdLessThan64
+            | Opcode::FPUnordLessThan64
+            | Opcode::FPOrdGreaterThan64
+            | Opcode::FPUnordGreaterThan64
+            | Opcode::FPOrdLessThanEqual64
+            | Opcode::FPUnordLessThanEqual64
+            | Opcode::FPOrdGreaterThanEqual64
+            | Opcode::FPUnordGreaterThanEqual64
+            | Opcode::FPIsNan64
+            | Opcode::ConvertS16F64
+            | Opcode::ConvertS32F64
+            | Opcode::ConvertS64F64
+            | Opcode::ConvertU16F64
+            | Opcode::ConvertU32F64
+            | Opcode::ConvertU64F64
+            | Opcode::ConvertF32F64
+            | Opcode::ConvertF64F32
+            | Opcode::ConvertF64S8
+            | Opcode::ConvertF64S16
+            | Opcode::ConvertF64S32
+            | Opcode::ConvertF64S64
+            | Opcode::ConvertF64U8
+            | Opcode::ConvertF64U16
+            | Opcode::ConvertF64U32
+            | Opcode::ConvertF64U64
+    ) {
+        info.uses_fp64 = true;
+    }
+
+    if matches!(
+        opcode,
+        Opcode::GetCbufU8
+            | Opcode::GetCbufS8
+            | Opcode::UndefU8
+            | Opcode::LoadGlobalU8
+            | Opcode::LoadGlobalS8
+            | Opcode::WriteGlobalU8
+            | Opcode::WriteGlobalS8
+            | Opcode::LoadStorageU8
+            | Opcode::LoadStorageS8
+            | Opcode::WriteStorageU8
+            | Opcode::WriteStorageS8
+            | Opcode::LoadSharedU8
+            | Opcode::LoadSharedS8
+            | Opcode::WriteSharedU8
+            | Opcode::SelectU8
+            | Opcode::ConvertF16S8
+            | Opcode::ConvertF16U8
+            | Opcode::ConvertF32S8
+            | Opcode::ConvertF32U8
+            | Opcode::ConvertF64S8
+            | Opcode::ConvertF64U8
+    ) {
+        info.uses_int8 = true;
+    }
+
+    if matches!(
+        opcode,
+        Opcode::GetCbufU16
+            | Opcode::GetCbufS16
+            | Opcode::UndefU16
+            | Opcode::LoadGlobalU16
+            | Opcode::LoadGlobalS16
+            | Opcode::WriteGlobalU16
+            | Opcode::WriteGlobalS16
+            | Opcode::LoadStorageU16
+            | Opcode::LoadStorageS16
+            | Opcode::WriteStorageU16
+            | Opcode::WriteStorageS16
+            | Opcode::LoadSharedU16
+            | Opcode::LoadSharedS16
+            | Opcode::WriteSharedU16
+            | Opcode::SelectU16
+            | Opcode::BitCastU16F16
+            | Opcode::BitCastF16U16
+            | Opcode::ConvertS16F16
+            | Opcode::ConvertS16F32
+            | Opcode::ConvertS16F64
+            | Opcode::ConvertU16F16
+            | Opcode::ConvertU16F32
+            | Opcode::ConvertU16F64
+            | Opcode::ConvertF16S16
+            | Opcode::ConvertF16U16
+            | Opcode::ConvertF32S16
+            | Opcode::ConvertF32U16
+            | Opcode::ConvertF64S16
+            | Opcode::ConvertF64U16
+    ) {
+        info.uses_int16 = true;
+    }
+
+    if matches!(
+        opcode,
+        Opcode::UndefU64
+            | Opcode::LoadGlobalU8
+            | Opcode::LoadGlobalS8
+            | Opcode::LoadGlobalU16
+            | Opcode::LoadGlobalS16
+            | Opcode::LoadGlobal32
+            | Opcode::LoadGlobal64
+            | Opcode::LoadGlobal128
+            | Opcode::WriteGlobalU8
+            | Opcode::WriteGlobalS8
+            | Opcode::WriteGlobalU16
+            | Opcode::WriteGlobalS16
+            | Opcode::WriteGlobal32
+            | Opcode::WriteGlobal64
+            | Opcode::WriteGlobal128
+            | Opcode::SelectU64
+            | Opcode::BitCastU64F64
+            | Opcode::BitCastF64U64
+            | Opcode::PackUint2x32
+            | Opcode::UnpackUint2x32
+            | Opcode::IAdd64
+            | Opcode::ISub64
+            | Opcode::INeg64
+            | Opcode::ShiftLeftLogical64
+            | Opcode::ShiftRightLogical64
+            | Opcode::ShiftRightArithmetic64
+            | Opcode::ConvertS64F16
+            | Opcode::ConvertS64F32
+            | Opcode::ConvertS64F64
+            | Opcode::ConvertU64F16
+            | Opcode::ConvertU64F32
+            | Opcode::ConvertU64F64
+            | Opcode::ConvertU64U32
+            | Opcode::ConvertU32U64
+            | Opcode::ConvertF16U64
+            | Opcode::ConvertF32U64
+            | Opcode::ConvertF64U64
+            | Opcode::SharedAtomicExchange64
+            | Opcode::GlobalAtomicIAdd64
+            | Opcode::GlobalAtomicSMin64
+            | Opcode::GlobalAtomicUMin64
+            | Opcode::GlobalAtomicSMax64
+            | Opcode::GlobalAtomicUMax64
+            | Opcode::GlobalAtomicAnd64
+            | Opcode::GlobalAtomicOr64
+            | Opcode::GlobalAtomicXor64
+            | Opcode::GlobalAtomicExchange64
+            | Opcode::StorageAtomicIAdd64
+            | Opcode::StorageAtomicSMin64
+            | Opcode::StorageAtomicUMin64
+            | Opcode::StorageAtomicSMax64
+            | Opcode::StorageAtomicUMax64
+            | Opcode::StorageAtomicAnd64
+            | Opcode::StorageAtomicOr64
+            | Opcode::StorageAtomicXor64
+            | Opcode::StorageAtomicExchange64
+    ) {
+        info.uses_int64 = true;
+    }
+}
 
 fn cbuf_type_bit(opcode: Opcode) -> u32 {
     match opcode {
@@ -54,6 +307,7 @@ pub fn collect_shader_info_pass(program: &mut Program) {
 
     for block in &program.blocks {
         for inst in block.iter() {
+            visit_usages(&mut program.info, inst.opcode);
             if matches!(
                 inst.opcode,
                 Opcode::SharedAtomicSMin32 | Opcode::StorageAtomicSMin32
@@ -604,6 +858,30 @@ mod tests {
     use crate::ir::value::{Attribute, Value};
     use crate::program_header::ProgramHeader;
     use crate::shader_info::TextureType;
+
+    #[test]
+    fn collect_info_marks_scalar_width_usages_like_upstream() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        for (opcode, argument) in [
+            (Opcode::UnpackFloat2x16, Value::ImmU32(0)),
+            (Opcode::ConvertF64S8, Value::ImmU32(0)),
+            (Opcode::ConvertF32U16, Value::ImmU32(0)),
+            (Opcode::PackUint2x32, Value::ImmU32(0)),
+        ] {
+            program
+                .block_mut(0)
+                .append_inst(Inst::new(opcode, vec![argument]));
+        }
+
+        collect_shader_info_pass(&mut program);
+
+        assert!(program.info.uses_fp16);
+        assert!(program.info.uses_fp64);
+        assert!(program.info.uses_int8);
+        assert!(program.info.uses_int16);
+        assert!(program.info.uses_int64);
+    }
 
     #[test]
     fn collect_info_records_demote_usage_like_upstream() {

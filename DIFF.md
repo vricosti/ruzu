@@ -30091,3 +30091,46 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - A clean ANIMUS data directory now creates `ApplicationData` at 1,438 bytes
   instead of a sparse `0x59e00000000` bytes, with no unmapped guest write or
   `svcBreak` in the validation run.
+
+## 2026-08-01 — shader_recompiler/src/{frontend/translate,backend/spirv,ir,ir_opt,pipeline_cache} vs src/shader_recompiler/{frontend/maxwell/translate,backend/spirv,frontend/ir,ir_opt}
+
+### Intentional differences
+- Rust uses typed `Value`/`Word` handles and `rspirv` builder calls where
+  upstream uses C++ IR values and Sirit. Instruction ownership, operand order,
+  result types, decorations, and emitted control flow remain in the matching
+  upstream-owned modules.
+- Invalid encodings and paths for which upstream throws
+  `NotImplementedException` use `panic!` in Rust. This replaces prior silent
+  fallthroughs while preserving upstream's fail-fast behavior.
+
+### Unintentional differences (fixed)
+- Maxwell dispatch and operand decoding now cover the matching upstream paths
+  for bitfield operations, F2I conversion, half arithmetic, integer add/shift,
+  local/shared memory, predicate/condition-code writes, geometry output, pixel
+  load, video operations, and warp shuffle instead of dropping or partially
+  translating them.
+- SPIR-V composite, conversion, and floating-point emission now handles the
+  F16/vector result shapes produced by those translators. Shader-info
+  collection recognizes the same scalar widths before backend emission.
+- Unknown Maxwell opcodes now fail at translation rather than returning an
+  apparently valid shader with missing instructions.
+
+### Missing items
+- Runtime parity is not complete. In the current Vulkan comparison, ruzu
+  creates three vertex/fragment shader pairs before the menu while yuzu creates
+  four; ruzu's full-screen textures and logo are still corrupted. The dumped
+  ruzu modules pass `spirv-val --target-env vulkan1.3 --scalar-block-layout`, so
+  the remaining divergence is being traced at pipeline identity, translated IR,
+  and generated-SPIR-V level.
+
+### Binary layout verification
+- N/A: this slice changes shader translation and host SPIR-V generation; it
+  does not alter guest-visible structures or serialized service payloads.
+
+### Behavioral verification
+- Rechecked every modified Maxwell translator file against its same-named
+  upstream implementation owner and the central dispatch table against
+  upstream `impl.cpp`.
+- `cargo test -p shader_recompiler` passes: 355 passed, 0 failed. Six SPIR-V
+  modules generated during the runtime comparison also pass Vulkan 1.3 scalar
+  block-layout validation.

@@ -3,49 +3,10 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/double_set_predicate.cpp
 
+use super::common_funcs::{floating_point_compare_64, predicate_combine};
 use super::{bit, field, TranslatorVisitor};
+use crate::ir::types::FpControl;
 use crate::ir::value::{Pred, Value};
-
-/// FP64 comparison helper (same as in double_compare_and_set).
-fn fp64_compare(tv: &mut TranslatorVisitor, cmp: u32, a: Value, b: Value) -> Value {
-    match cmp {
-        0 => tv.ir.imm_u1(false),
-        1 => tv.ir.fp_ord_less_than_64(a, b),
-        2 => tv.ir.fp_ord_equal_64(a, b),
-        3 => tv.ir.fp_ord_less_than_equal_64(a, b),
-        4 => tv.ir.fp_ord_greater_than_64(a, b),
-        5 => tv.ir.fp_ord_not_equal_64(a, b),
-        6 => tv.ir.fp_ord_greater_than_equal_64(a, b),
-        7 => {
-            let na = tv.ir.fp_is_nan_64(a);
-            let nb = tv.ir.fp_is_nan_64(b);
-            let e = tv.ir.logical_or(na, nb);
-            tv.ir.logical_not(e)
-        }
-        8 => {
-            let na = tv.ir.fp_is_nan_64(a);
-            let nb = tv.ir.fp_is_nan_64(b);
-            tv.ir.logical_or(na, nb)
-        }
-        9 => tv.ir.fp_unord_less_than_64(a, b),
-        10 => tv.ir.fp_unord_equal_64(a, b),
-        11 => tv.ir.fp_unord_less_than_64(a, b),
-        12 => tv.ir.fp_unord_greater_than_64(a, b),
-        13 => tv.ir.fp_unord_not_equal_64(a, b),
-        14 => tv.ir.fp_unord_greater_than_64(a, b),
-        15 => tv.ir.imm_u1(true),
-        _ => tv.ir.imm_u1(false),
-    }
-}
-
-fn combine_pred(tv: &mut TranslatorVisitor, r: Value, p: Value, bop: u32) -> Value {
-    match bop {
-        0 => tv.ir.logical_and(r, p),
-        1 => tv.ir.logical_or(r, p),
-        2 => tv.ir.logical_xor(r, p),
-        _ => r,
-    }
-}
 
 fn dsetp_impl(tv: &mut TranslatorVisitor, insn: u64, src_b: Value) {
     let dst_pred_b = field(insn, 0, 3);
@@ -65,11 +26,11 @@ fn dsetp_impl(tv: &mut TranslatorVisitor, insn: u64, src_b: Value) {
     let op_b = tv.ir.fp_abs_neg_64(src_b, abs_b, neg_b);
 
     let bop_pred = tv.ir.get_pred(Pred(bop_pred_idx as u8), neg_bop_pred);
-    let cmp = fp64_compare(tv, cmp_op, op_a, op_b);
+    let cmp = floating_point_compare_64(tv, op_a, op_b, cmp_op, FpControl::default());
 
-    let result_a = combine_pred(tv, cmp.clone(), bop_pred.clone(), bop);
+    let result_a = predicate_combine(tv, cmp.clone(), bop_pred.clone(), bop);
     let neg_cmp = tv.ir.logical_not(cmp);
-    let result_b = combine_pred(tv, neg_cmp, bop_pred, bop);
+    let result_b = predicate_combine(tv, neg_cmp, bop_pred, bop);
 
     tv.ir.set_pred(Pred(dst_pred_a as u8), result_a);
     tv.ir.set_pred(Pred(dst_pred_b as u8), result_b);

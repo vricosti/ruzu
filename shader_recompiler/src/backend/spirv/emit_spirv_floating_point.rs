@@ -19,6 +19,106 @@ fn decorate(ctx: &mut SpirvEmitContext, inst: &Inst, result: Word) -> Word {
     result
 }
 
+/// Port of the local `Clamp` helper in `emit_spirv_floating_point.cpp`.
+fn clamp(
+    ctx: &mut SpirvEmitContext,
+    result_type: Word,
+    value: Word,
+    min_value: Word,
+    max_value: Word,
+) -> Word {
+    if ctx.profile.has_broken_spirv_clamp {
+        let max = ctx
+            .builder
+            .ext_inst(
+                result_type,
+                None,
+                ctx.glsl_ext,
+                40, /* FMax */
+                vec![
+                    rspirv::dr::Operand::IdRef(value),
+                    rspirv::dr::Operand::IdRef(min_value),
+                ],
+            )
+            .unwrap();
+        ctx.builder
+            .ext_inst(
+                result_type,
+                None,
+                ctx.glsl_ext,
+                37, /* FMin */
+                vec![
+                    rspirv::dr::Operand::IdRef(max),
+                    rspirv::dr::Operand::IdRef(max_value),
+                ],
+            )
+            .unwrap()
+    } else {
+        ctx.builder
+            .ext_inst(
+                result_type,
+                None,
+                ctx.glsl_ext,
+                43, /* FClamp */
+                vec![
+                    rspirv::dr::Operand::IdRef(value),
+                    rspirv::dr::Operand::IdRef(min_value),
+                    rspirv::dr::Operand::IdRef(max_value),
+                ],
+            )
+            .unwrap()
+    }
+}
+
+/// FPAdd16: `OpFAdd` F16.
+pub fn emit_fp_add_16(ctx: &mut SpirvEmitContext, inst: &Inst, a: Word, b: Word) -> Word {
+    let result = ctx.builder.f_add(ctx.f16_type, None, a, b).unwrap();
+    decorate(ctx, inst, result)
+}
+
+/// FPMul16: `OpFMul` F16.
+pub fn emit_fp_mul_16(ctx: &mut SpirvEmitContext, inst: &Inst, a: Word, b: Word) -> Word {
+    let result = ctx.builder.f_mul(ctx.f16_type, None, a, b).unwrap();
+    decorate(ctx, inst, result)
+}
+
+/// FPFma16: `OpExtInst Fma` F16.
+pub fn emit_fp_fma_16(ctx: &mut SpirvEmitContext, inst: &Inst, a: Word, b: Word, c: Word) -> Word {
+    let result = ctx
+        .builder
+        .ext_inst(
+            ctx.f16_type,
+            None,
+            ctx.glsl_ext,
+            50, /* Fma */
+            vec![
+                rspirv::dr::Operand::IdRef(a),
+                rspirv::dr::Operand::IdRef(b),
+                rspirv::dr::Operand::IdRef(c),
+            ],
+        )
+        .unwrap();
+    decorate(ctx, inst, result)
+}
+
+/// FPNeg16: `OpFNegate` F16.
+pub fn emit_fp_neg_16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder.f_negate(ctx.f16_type, None, value).unwrap()
+}
+
+/// FPAbs16: `OpExtInst FAbs` F16.
+pub fn emit_fp_abs_16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .ext_inst(
+            ctx.f16_type,
+            None,
+            ctx.glsl_ext,
+            4, /* FAbs */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
+        .unwrap()
+}
+
 /// FPAdd32: `OpFAdd` F32.
 pub fn emit_fp_add_32(ctx: &mut SpirvEmitContext, inst: &Inst, a: Word, b: Word) -> Word {
     let result = ctx.builder.f_add(ctx.f32_type, None, a, b).unwrap();
@@ -115,20 +215,24 @@ pub fn emit_fp_clamp_32(
     min_val: Word,
     max_val: Word,
 ) -> Word {
-    let glsl_set = ctx.glsl_ext;
-    ctx.builder
-        .ext_inst(
-            ctx.f32_type,
-            None,
-            glsl_set,
-            43, /* FClamp */
-            vec![
-                rspirv::dr::Operand::IdRef(value),
-                rspirv::dr::Operand::IdRef(min_val),
-                rspirv::dr::Operand::IdRef(max_val),
-            ],
-        )
-        .unwrap()
+    clamp(ctx, ctx.f32_type, value, min_val, max_val)
+}
+
+/// FPSaturate16: clamp to [0, 1] as F16.
+pub fn emit_fp_saturate_16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    let zero = ctx.builder.constant_bit32(ctx.f16_type, 0);
+    let one = ctx.builder.constant_bit32(ctx.f16_type, 0x3c00);
+    clamp(ctx, ctx.f16_type, value, zero, one)
+}
+
+/// FPClamp16: clamp an F16 value.
+pub fn emit_fp_clamp_16(
+    ctx: &mut SpirvEmitContext,
+    value: Word,
+    min_val: Word,
+    max_val: Word,
+) -> Word {
+    clamp(ctx, ctx.f16_type, value, min_val, max_val)
 }
 
 /// FPSqrt32: `OpExtInst Sqrt` F32.
@@ -272,6 +376,58 @@ pub fn emit_fp_round_even_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
             None,
             glsl_set,
             2, /* RoundEven */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
+        .unwrap()
+}
+
+/// FPRoundEven16: `OpExtInst RoundEven` F16.
+pub fn emit_fp_round_even_16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .ext_inst(
+            ctx.f16_type,
+            None,
+            ctx.glsl_ext,
+            2, /* RoundEven */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
+        .unwrap()
+}
+
+/// FPFloor16: `OpExtInst Floor` F16.
+pub fn emit_fp_floor_16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .ext_inst(
+            ctx.f16_type,
+            None,
+            ctx.glsl_ext,
+            8, /* Floor */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
+        .unwrap()
+}
+
+/// FPCeil16: `OpExtInst Ceil` F16.
+pub fn emit_fp_ceil_16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .ext_inst(
+            ctx.f16_type,
+            None,
+            ctx.glsl_ext,
+            9, /* Ceil */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
+        .unwrap()
+}
+
+/// FPTrunc16: `OpExtInst Trunc` F16.
+pub fn emit_fp_trunc_16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .ext_inst(
+            ctx.f16_type,
+            None,
+            ctx.glsl_ext,
+            3, /* Trunc */
             vec![rspirv::dr::Operand::IdRef(value)],
         )
         .unwrap()
@@ -513,6 +669,75 @@ pub fn emit_fp_max_64(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
             glsl_set,
             40, /* FMax */
             vec![rspirv::dr::Operand::IdRef(a), rspirv::dr::Operand::IdRef(b)],
+        )
+        .unwrap()
+}
+
+/// FPSaturate64: clamp to [0, 1] as F64.
+pub fn emit_fp_saturate_64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    let zero = ctx.builder.constant_bit64(ctx.f64_type, 0.0f64.to_bits());
+    let one = ctx.builder.constant_bit64(ctx.f64_type, 1.0f64.to_bits());
+    clamp(ctx, ctx.f64_type, value, zero, one)
+}
+
+/// FPClamp64: clamp an F64 value.
+pub fn emit_fp_clamp_64(
+    ctx: &mut SpirvEmitContext,
+    value: Word,
+    min_val: Word,
+    max_val: Word,
+) -> Word {
+    clamp(ctx, ctx.f64_type, value, min_val, max_val)
+}
+
+/// FPRoundEven64: `OpExtInst RoundEven` F64.
+pub fn emit_fp_round_even_64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .ext_inst(
+            ctx.f64_type,
+            None,
+            ctx.glsl_ext,
+            2, /* RoundEven */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
+        .unwrap()
+}
+
+/// FPFloor64: `OpExtInst Floor` F64.
+pub fn emit_fp_floor_64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .ext_inst(
+            ctx.f64_type,
+            None,
+            ctx.glsl_ext,
+            8, /* Floor */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
+        .unwrap()
+}
+
+/// FPCeil64: `OpExtInst Ceil` F64.
+pub fn emit_fp_ceil_64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .ext_inst(
+            ctx.f64_type,
+            None,
+            ctx.glsl_ext,
+            9, /* Ceil */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
+        .unwrap()
+}
+
+/// FPTrunc64: `OpExtInst Trunc` F64.
+pub fn emit_fp_trunc_64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .ext_inst(
+            ctx.f64_type,
+            None,
+            ctx.glsl_ext,
+            3, /* Trunc */
+            vec![rspirv::dr::Operand::IdRef(value)],
         )
         .unwrap()
 }

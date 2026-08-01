@@ -3,50 +3,24 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_compare.cpp
 
+use super::common_funcs::floating_point_compare_32;
 use super::{bit, field, TranslatorVisitor};
+use crate::ir::types::{FmzMode, FpControl};
 use crate::ir::value::Value;
-
-/// FP32 comparison predicate helper.
-fn fp_compare(tv: &mut TranslatorVisitor, cmp: u32, a: Value, b: Value) -> Value {
-    match cmp {
-        0 => tv.ir.imm_u1(false),
-        1 => tv.ir.fp_ord_less_than_32(a, b),
-        2 => tv.ir.fp_ord_equal_32(a, b),
-        3 => tv.ir.fp_ord_less_than_equal_32(a, b),
-        4 => tv.ir.fp_ord_greater_than_32(a, b),
-        5 => tv.ir.fp_ord_not_equal_32(a, b),
-        6 => tv.ir.fp_ord_greater_than_equal_32(a, b),
-        7 => {
-            let na = tv.ir.fp_is_nan_32(a);
-            let nb = tv.ir.fp_is_nan_32(b);
-            let e = tv.ir.logical_or(na, nb);
-            tv.ir.logical_not(e)
-        }
-        8 => {
-            let na = tv.ir.fp_is_nan_32(a);
-            let nb = tv.ir.fp_is_nan_32(b);
-            tv.ir.logical_or(na, nb)
-        }
-        9 => tv.ir.fp_unord_less_than_32(a, b),
-        10 => tv.ir.fp_unord_equal_32(a, b),
-        11 => tv.ir.fp_unord_less_than_32(a, b),
-        12 => tv.ir.fp_unord_greater_than_32(a, b),
-        13 => tv.ir.fp_unord_not_equal_32(a, b),
-        14 => tv.ir.fp_unord_greater_than_32(a, b),
-        15 => tv.ir.imm_u1(true),
-        _ => tv.ir.imm_u1(false),
-    }
-}
 
 fn fcmp_impl(tv: &mut TranslatorVisitor, insn: u64, src_a: Value, operand: Value) {
     let dst = field(insn, 0, 8);
     let src_reg = field(insn, 8, 8);
-    let _ftz = bit(insn, 47);
+    let ftz = bit(insn, 47);
     let cmp_op = field(insn, 48, 4);
 
-    // Compare operand against zero; select src_reg or src_a based on result.
     let zero = Value::ImmF32(0.0f32);
-    let cmp_result = fp_compare(tv, cmp_op, operand, zero);
+    let control = FpControl {
+        no_contraction: false,
+        rounding: Default::default(),
+        fmz_mode: if ftz { FmzMode::FTZ } else { FmzMode::None },
+    };
+    let cmp_result = floating_point_compare_32(tv, operand, zero, cmp_op, control);
     let src_reg_val = tv.x(src_reg);
     let result = tv.ir.select_u32(cmp_result, src_reg_val, src_a);
     tv.set_x(dst, result);

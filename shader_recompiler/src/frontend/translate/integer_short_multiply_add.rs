@@ -7,33 +7,6 @@ use super::{bit, field, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::MaxwellOpcode;
 use crate::ir::value::Value;
 
-/// IMAD — Integer multiply-add.
-pub fn imad(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
-    let dst = tv.dst_reg(insn);
-    let src_a = tv.x(tv.src_a_reg(insn));
-    let src_b = tv.decode_src_b(insn, opcode);
-    let src_c_reg = field(insn, 39, 8);
-    let src_c = tv.x(src_c_reg);
-
-    let product = tv.ir.imul_32(src_a, src_b);
-    let result = tv.ir.iadd_32(product, src_c);
-
-    tv.set_x(dst, result);
-}
-
-/// IMAD32I — Integer multiply-add with 32-bit immediate.
-pub fn imad32i(tv: &mut TranslatorVisitor, insn: u64) {
-    let dst = tv.dst_reg(insn);
-    let src_a = tv.x(tv.src_a_reg(insn));
-    let imm = tv.decode_imm32(insn);
-
-    let product = tv.ir.imul_32(src_a, Value::ImmU32(imm));
-    let src_c = tv.x(dst); // IMAD32I uses dst as src_c
-    let result = tv.ir.iadd_32(product, src_c);
-
-    tv.set_x(dst, result);
-}
-
 /// XMAD — Extended multiply-add (16×16+32).
 ///
 /// Implements XMAD_reg, XMAD_rc, XMAD_cr, XMAD_imm.

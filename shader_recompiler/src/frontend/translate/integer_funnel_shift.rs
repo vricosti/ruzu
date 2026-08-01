@@ -37,8 +37,16 @@ fn shf_impl(
     let dst = field(insn, 0, 8);
     let lo_bits_reg = field(insn, 8, 8);
     let max_shift = MaxShift::from_bits(field(insn, 37, 2));
+    let cc = bit(insn, 47);
+    let x_mode = field(insn, 48, 2);
     let wrap = bit(insn, 50);
 
+    if cc {
+        panic!("SHF CC not implemented upstream");
+    }
+    if x_mode != 0 {
+        panic!("SHF X Mode not implemented upstream");
+    }
     // Upstream throws NotImplementedException for the reserved
     // Undefined max_shift encoding.
     if max_shift == MaxShift::Undefined {
@@ -111,7 +119,32 @@ pub fn shf_r_imm(tv: &mut TranslatorVisitor, insn: u64) {
     shf_impl(tv, insn, shift, high_bits, true);
 }
 
-/// SHF — dispatch wrapper (used when opcode doesn't differentiate l/r/reg/imm).
-pub fn shf(tv: &mut TranslatorVisitor, insn: u64) {
-    shf_l_reg(tv, insn);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::basic_block::Block;
+    use crate::ir::program::Program;
+    use crate::ir::types::ShaderStage;
+
+    fn visitor() -> (Program, u64) {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        (program, 0)
+    }
+
+    #[test]
+    #[should_panic(expected = "SHF CC not implemented upstream")]
+    fn shf_cc_matches_upstream_rejection() {
+        let (mut program, insn) = visitor();
+        let mut visitor = TranslatorVisitor::new(&mut program, 0);
+        shf_l_reg(&mut visitor, insn | 1u64 << 47);
+    }
+
+    #[test]
+    #[should_panic(expected = "SHF X Mode not implemented upstream")]
+    fn shf_x_mode_matches_upstream_rejection() {
+        let (mut program, insn) = visitor();
+        let mut visitor = TranslatorVisitor::new(&mut program, 0);
+        shf_l_reg(&mut visitor, insn | 1u64 << 48);
+    }
 }

@@ -16,17 +16,21 @@ fn dmnmx_impl(tv: &mut TranslatorVisitor, insn: u64, src_b: Value) {
     let neg_a = bit(insn, 48);
     let abs_b = bit(insn, 49);
 
-    let pred = tv.ir.get_pred(Pred(pred_idx as u8), neg_pred);
+    if bit(insn, 47) {
+        panic!("DMNMX CC");
+    }
+
+    let pred = tv.ir.get_pred(Pred(pred_idx as u8), false);
     let src_a = tv.d(src_a_reg);
     let op_a = tv.ir.fp_abs_neg_64(src_a, abs_a, neg_a);
     let op_b = tv.ir.fp_abs_neg_64(src_b, abs_b, neg_b);
 
-    let max_val = tv.ir.fp_max_64(op_a.clone(), op_b.clone());
-    let min_val = tv.ir.fp_min_64(op_a, op_b);
-
-    // pred=true → pick min; pred=false → pick max.
-    // When neg_pred is set the pred was already negated, so we swap min/max selection.
-    let result = tv.ir.select_u32(pred, min_val, max_val);
+    let mut max_val = tv.ir.fp_max_64(op_a.clone(), op_b.clone());
+    let mut min_val = tv.ir.fp_min_64(op_a, op_b);
+    if neg_pred {
+        std::mem::swap(&mut min_val, &mut max_val);
+    }
+    let result = tv.ir.select_f64(pred, min_val, max_val);
     tv.set_d(dst, result);
 }
 

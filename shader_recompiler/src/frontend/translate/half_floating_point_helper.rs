@@ -7,6 +7,7 @@
 //! swizzle extraction, and merge result operations.
 
 use super::TranslatorVisitor;
+use crate::ir::types::FmzMode;
 use crate::ir::value::Value;
 
 /// Half-precision mode for FP operations.
@@ -15,6 +16,7 @@ pub enum HalfPrecision {
     None = 0,
     Ftz = 1,
     Fmz = 2,
+    DontCare = 3,
 }
 
 impl HalfPrecision {
@@ -22,6 +24,7 @@ impl HalfPrecision {
         match v & 3 {
             1 => HalfPrecision::Ftz,
             2 => HalfPrecision::Fmz,
+            3 => HalfPrecision::DontCare,
             _ => HalfPrecision::None,
         }
     }
@@ -74,14 +77,15 @@ impl Merge {
     }
 }
 
-/// Convert HalfPrecision to FmzMode (as u32 flags value).
+/// Convert HalfPrecision to the corresponding IR flush mode.
 ///
 /// Corresponds to `HalfPrecision2FmzMode` in upstream.
-pub fn half_precision_to_fmz_mode(precision: HalfPrecision) -> u32 {
+pub fn half_precision_to_fmz_mode(precision: HalfPrecision) -> FmzMode {
     match precision {
-        HalfPrecision::None => 0, // FmzMode::None
-        HalfPrecision::Ftz => 1,  // FmzMode::FTZ
-        HalfPrecision::Fmz => 2,  // FmzMode::FMZ
+        HalfPrecision::None => FmzMode::None,
+        HalfPrecision::Ftz => FmzMode::FTZ,
+        HalfPrecision::Fmz => FmzMode::FMZ,
+        HalfPrecision::DontCare => FmzMode::DontCare,
     }
 }
 
@@ -128,10 +132,6 @@ pub fn fp_abs_neg_32(tv: &mut TranslatorVisitor, value: Value, abs: bool, neg: b
     tv.ir.fp_abs_neg_32(value, abs, neg)
 }
 
-/// Merge two F16 (or F32 — already promoted) results back into a U32 register value.
-///
-/// When `lhs`/`rhs` are F32 (from a Swizzle::F32 extraction), convert back to F16 before packing.
-///
 /// Corresponds to `MergeResult` in upstream.
 pub fn merge_result(
     tv: &mut TranslatorVisitor,
@@ -139,41 +139,75 @@ pub fn merge_result(
     lhs: Value,
     rhs: Value,
     merge: Merge,
-    lhs_is_f32: bool,
+    values_are_f32: bool,
 ) -> Value {
-    // If the values were promoted to F32 during computation, convert them back to F16 first.
-    let (lhs16, rhs16) = if lhs_is_f32 {
-        let l = tv.ir.convert_f16_from_f32(lhs);
-        let r = tv.ir.convert_f16_from_f32(rhs);
-        (l, r)
-    } else {
-        (lhs, rhs)
-    };
-
     match merge {
         Merge::H1H0 => {
-            // PackFloat2x16(CompositeConstruct(lhs16, rhs16))
+            let (lhs16, rhs16) = if values_are_f32 {
+                (
+                    tv.ir.convert_f16_from_f32(lhs),
+                    tv.ir.convert_f16_from_f32(rhs),
+                )
+            } else {
+                (lhs, rhs)
+            };
             let vec = tv.ir.composite_construct_f16x2(lhs16, rhs16);
             tv.ir.pack_float_2x16(vec)
         }
         Merge::F32 => {
-            // BitCast<U32>(FPConvert(32, lhs16))
-            let f32val = tv.ir.convert_f32_from_f16(lhs16);
+            let f32val = if values_are_f32 {
+                lhs
+            } else {
+                tv.ir.convert_f32_from_f16(lhs)
+            };
             tv.ir.bit_cast_u32_f32(f32val)
         }
-        Merge::MrgH0 => {
-            // Replace low half (element 0) of dest register with lhs16
+        Merge::MrgH0 | Merge::MrgH1 => {
+            let is_h0 = merge == Merge::MrgH0;
+            let selected = if is_h0 { lhs } else { rhs };
+            let insert = if values_are_f32 {
+                tv.ir.convert_f16_from_f32(selected)
+            } else {
+                selected
+            };
             let dest_val = tv.x(dest_reg);
             let vec = tv.ir.unpack_float_2x16(dest_val);
-            let new_vec = tv.ir.composite_insert_f16x2(vec, lhs16, 0);
+            let new_vec = tv
+                .ir
+                .composite_insert_f16x2(vec, insert, if is_h0 { 0 } else { 1 });
             tv.ir.pack_float_2x16(new_vec)
         }
-        Merge::MrgH1 => {
-            // Replace high half (element 1) of dest register with rhs16
-            let dest_val = tv.x(dest_reg);
-            let vec = tv.ir.unpack_float_2x16(dest_val);
-            let new_vec = tv.ir.composite_insert_f16x2(vec, rhs16, 1);
-            tv.ir.pack_float_2x16(new_vec)
-        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::basic_block::Block;
+    use crate::ir::opcodes::Opcode;
+    use crate::ir::program::Program;
+    use crate::ir::types::ShaderStage;
+
+    #[test]
+    fn f32_merge_does_not_round_through_f16() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let mut visitor = TranslatorVisitor::new(&mut program, 0);
+
+        let result = merge_result(
+            &mut visitor,
+            1,
+            Value::ImmF32(1.25),
+            Value::ImmF32(2.5),
+            Merge::F32,
+            true,
+        );
+
+        assert!(matches!(result, Value::Inst(_)));
+        let opcodes: Vec<_> = visitor.ir.program.blocks[0]
+            .iter()
+            .map(|inst| inst.opcode)
+            .collect();
+        assert_eq!(opcodes, vec![Opcode::BitCastU32F32]);
     }
 }

@@ -7,6 +7,7 @@ use super::half_floating_point_helper::{
     extract, half_precision_to_fmz_mode, merge_result, HalfPrecision, Merge, Swizzle,
 };
 use super::{bit, field, TranslatorVisitor};
+use crate::ir::types::{FpControl, FpRounding};
 use crate::ir::value::Value;
 
 /// Core HFMA2 implementation (inner `HFMA2` overloads from upstream).
@@ -67,23 +68,31 @@ fn hfma2_inner(
         rhs_c = tv.ir.fp_abs_neg_16(rhs_c, false, neg_c);
     }
 
-    let _ = half_precision_to_fmz_mode(precision);
+    let fp_control = FpControl {
+        no_contraction: true,
+        rounding: FpRounding::DontCare,
+        fmz_mode: half_precision_to_fmz_mode(precision),
+    };
     let (mut lhs, mut rhs) = if use_f32 {
         (
-            tv.ir.fp_fma_32(lhs_a, lhs_b, lhs_c),
-            tv.ir.fp_fma_32(rhs_a, rhs_b, rhs_c),
+            tv.ir
+                .fp_fma_32_with_control(lhs_a, lhs_b, lhs_c, fp_control),
+            tv.ir
+                .fp_fma_32_with_control(rhs_a, rhs_b, rhs_c, fp_control),
         )
     } else {
         (
-            tv.ir.fp_fma_16(lhs_a, lhs_b, lhs_c),
-            tv.ir.fp_fma_16(rhs_a, rhs_b, rhs_c),
+            tv.ir
+                .fp_fma_16_with_control(lhs_a, lhs_b, lhs_c, fp_control),
+            tv.ir
+                .fp_fma_16_with_control(rhs_a, rhs_b, rhs_c, fp_control),
         )
     };
 
     // FMZ mode: when A or B is zero, collapse to C (the addend).
     if precision == HalfPrecision::Fmz && !sat {
         if use_f32 {
-            let zero = tv.ir.imm_f32(0.0);
+            let zero = Value::ImmF32(0.0);
             let lhs_zero_a = tv.ir.fp_ord_equal_32(lhs_a, zero);
             let lhs_zero_b = tv.ir.fp_ord_equal_32(lhs_b, zero);
             let lhs_any_zero = tv.ir.logical_or(lhs_zero_a, lhs_zero_b);
@@ -93,6 +102,17 @@ fn hfma2_inner(
             let rhs_zero_b = tv.ir.fp_ord_equal_32(rhs_b, zero);
             let rhs_any_zero = tv.ir.logical_or(rhs_zero_a, rhs_zero_b);
             rhs = tv.ir.select_f32(rhs_any_zero, rhs_c, rhs);
+        } else {
+            let zero = Value::ImmF16(0);
+            let lhs_zero_a = tv.ir.fp_ord_equal_16(lhs_a, zero);
+            let lhs_zero_b = tv.ir.fp_ord_equal_16(lhs_b, zero);
+            let lhs_any_zero = tv.ir.logical_or(lhs_zero_a, lhs_zero_b);
+            lhs = tv.ir.select_f16(lhs_any_zero, lhs_c, lhs);
+
+            let rhs_zero_a = tv.ir.fp_ord_equal_16(rhs_a, zero);
+            let rhs_zero_b = tv.ir.fp_ord_equal_16(rhs_b, zero);
+            let rhs_any_zero = tv.ir.logical_or(rhs_zero_a, rhs_zero_b);
+            rhs = tv.ir.select_f16(rhs_any_zero, rhs_c, rhs);
         }
     }
 
@@ -111,8 +131,7 @@ fn hfma2_inner(
         rhs = tv.ir.convert_f16_from_f32(rhs);
     }
 
-    let result_is_f32 = a_is_f32 && !promotion;
-    let result = merge_result(tv, dest_reg, lhs, rhs, merge, result_is_f32);
+    let result = merge_result(tv, dest_reg, lhs, rhs, merge, use_f32 && !promotion);
     tv.set_x(dest_reg, result);
 }
 
@@ -245,9 +264,4 @@ pub fn hfma2_32i(tv: &mut TranslatorVisitor, insn: u64) {
         false,
         precision,
     );
-}
-
-/// Public entry-point stub used when a single dispatch opcode covers HFMA2.
-pub fn hfma2(tv: &mut TranslatorVisitor, insn: u64) {
-    hfma2_reg(tv, insn);
 }

@@ -6,8 +6,7 @@
 //!
 //! Handles the ISBERD instruction for reading internal stage buffer entries.
 
-use super::{field, TranslatorVisitor};
-use crate::ir::value::Value;
+use super::{bit, field, TranslatorVisitor};
 
 impl<'a> TranslatorVisitor<'a> {
     /// Translate the ISBERD instruction.
@@ -19,8 +18,21 @@ impl<'a> TranslatorVisitor<'a> {
     pub fn translate_isberd(&mut self, insn: u64) {
         let dst = self.dst_reg(insn);
         let src = self.src_a_reg(insn);
-        // ISBERD effectively passes through the register value
-        // with some internal stage buffer indexing
+        if bit(insn, 31) {
+            panic!("ISBERD SKEW not implemented");
+        }
+        if bit(insn, 32) {
+            panic!("ISBERD O not implemented");
+        }
+        let mode = field(insn, 33, 2);
+        if mode != 0 {
+            panic!("ISBERD mode {mode} not implemented");
+        }
+        let shift = field(insn, 47, 2);
+        if shift != 0 {
+            panic!("ISBERD shift {shift} not implemented");
+        }
+        log::warn!("(STUBBED) ISBERD called");
         let val = self.x(src);
         self.set_x(dst, val);
     }

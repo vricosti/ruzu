@@ -1711,7 +1711,7 @@ mod tests {
         ];
 
         let program = translate_cfg_to_program(
-            &[0, 0],
+            &[0, 0x50B0_0000_0000_0000],
             ShaderStage::VertexB,
             0,
             cfg_blocks.as_slice(),
@@ -1821,7 +1821,7 @@ mod tests {
         ];
 
         let program = translate_cfg_to_program(
-            &[0, 0, 0],
+            &[0, 0x50B0_0000_0000_0000, 0x50B0_0000_0000_0000],
             ShaderStage::VertexB,
             0,
             cfg_blocks.as_slice(),

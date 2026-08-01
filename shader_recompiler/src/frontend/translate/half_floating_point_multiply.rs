@@ -7,6 +7,7 @@ use super::half_floating_point_helper::{
     extract, half_precision_to_fmz_mode, merge_result, HalfPrecision, Merge, Swizzle,
 };
 use super::{bit, field, TranslatorVisitor};
+use crate::ir::types::{FpControl, FpRounding};
 use crate::ir::value::Value;
 
 /// Core HMUL2 implementation (inner `HMUL2` overloads from upstream).
@@ -59,18 +60,28 @@ fn hmul2_inner(
         rhs_b = tv.ir.fp_abs_neg_16(rhs_b, abs_b, neg_b);
     }
 
-    let _ = half_precision_to_fmz_mode(precision); // approximated — FpControl not threaded through
+    let fp_control = FpControl {
+        no_contraction: true,
+        rounding: FpRounding::DontCare,
+        fmz_mode: half_precision_to_fmz_mode(precision),
+    };
     let (mut lhs, mut rhs) = if use_f32 {
-        (tv.ir.fp_mul_32(lhs_a, lhs_b), tv.ir.fp_mul_32(rhs_a, rhs_b))
+        (
+            tv.ir.fp_mul_32_with_control(lhs_a, lhs_b, fp_control),
+            tv.ir.fp_mul_32_with_control(rhs_a, rhs_b, fp_control),
+        )
     } else {
-        (tv.ir.fp_mul_16(lhs_a, lhs_b), tv.ir.fp_mul_16(rhs_a, rhs_b))
+        (
+            tv.ir.fp_mul_16_with_control(lhs_a, lhs_b, fp_control),
+            tv.ir.fp_mul_16_with_control(rhs_a, rhs_b, fp_control),
+        )
     };
 
     // FMZ mode: if enabled and not saturating, replace result with zero when either operand is zero.
     // Value is Copy so operands can be re-read after the multiply.
     if precision == HalfPrecision::Fmz && !sat {
         if use_f32 {
-            let zero = tv.ir.imm_f32(0.0);
+            let zero = Value::ImmF32(0.0);
             let lhs_zero_a = tv.ir.fp_ord_equal_32(lhs_a, zero);
             let lhs_zero_b = tv.ir.fp_ord_equal_32(lhs_b, zero);
             let lhs_any_zero = tv.ir.logical_or(lhs_zero_a, lhs_zero_b);
@@ -80,8 +91,18 @@ fn hmul2_inner(
             let rhs_zero_b = tv.ir.fp_ord_equal_32(rhs_b, zero);
             let rhs_any_zero = tv.ir.logical_or(rhs_zero_a, rhs_zero_b);
             rhs = tv.ir.select_f32(rhs_any_zero, zero, rhs);
+        } else {
+            let zero = Value::ImmF16(0);
+            let lhs_zero_a = tv.ir.fp_ord_equal_16(lhs_a, zero);
+            let lhs_zero_b = tv.ir.fp_ord_equal_16(lhs_b, zero);
+            let lhs_any_zero = tv.ir.logical_or(lhs_zero_a, lhs_zero_b);
+            lhs = tv.ir.select_f16(lhs_any_zero, zero, lhs);
+
+            let rhs_zero_a = tv.ir.fp_ord_equal_16(rhs_a, zero);
+            let rhs_zero_b = tv.ir.fp_ord_equal_16(rhs_b, zero);
+            let rhs_any_zero = tv.ir.logical_or(rhs_zero_a, rhs_zero_b);
+            rhs = tv.ir.select_f16(rhs_any_zero, zero, rhs);
         }
-        // F16 FMZ: upstream also handles this but we rely on F32 promotion for most cases.
     }
 
     if sat {
@@ -99,8 +120,7 @@ fn hmul2_inner(
         rhs = tv.ir.convert_f16_from_f32(rhs);
     }
 
-    let result_is_f32 = a_is_f32 && !promotion;
-    let result = merge_result(tv, dest_reg, lhs, rhs, merge, result_is_f32);
+    let result = merge_result(tv, dest_reg, lhs, rhs, merge, use_f32 && !promotion);
     tv.set_x(dest_reg, result);
 }
 
@@ -202,7 +222,29 @@ pub fn hmul2_32i(tv: &mut TranslatorVisitor, insn: u64) {
     );
 }
 
-/// Public entry-point stub used when a single dispatch opcode covers HMUL2.
-pub fn hmul2(tv: &mut TranslatorVisitor, insn: u64) {
-    hmul2_reg(tv, insn);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::basic_block::Block;
+    use crate::ir::opcodes::Opcode;
+    use crate::ir::program::Program;
+    use crate::ir::types::{FmzMode, FpControl, ShaderStage};
+
+    #[test]
+    fn hmul2_f16_preserves_upstream_fp_control() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let mut visitor = TranslatorVisitor::new(&mut program, 0);
+        let insn = 1u64 | 2u64 << 8 | 3u64 << 20 | 1u64 << 39;
+
+        hmul2_reg(&mut visitor, insn);
+
+        let multiply = visitor.ir.program.blocks[0]
+            .iter()
+            .find(|inst| inst.opcode == Opcode::FPMul16)
+            .expect("HMUL2 must emit an F16 multiply");
+        let control = FpControl::from_u32(multiply.flags);
+        assert!(control.no_contraction);
+        assert_eq!(control.fmz_mode, FmzMode::FTZ);
+    }
 }

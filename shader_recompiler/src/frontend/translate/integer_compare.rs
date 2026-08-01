@@ -3,45 +3,9 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/integer_compare.cpp
 
+use super::common_funcs::integer_compare;
 use super::{bit, field, TranslatorVisitor};
 use crate::ir::value::Value;
-
-/// Integer comparison helper.
-fn int_compare(tv: &mut TranslatorVisitor, cmp: u32, a: Value, b: Value, is_signed: bool) -> Value {
-    match cmp {
-        1 => {
-            if is_signed {
-                tv.ir.s_less_than(a, b)
-            } else {
-                tv.ir.u_less_than(a, b)
-            }
-        }
-        2 => tv.ir.i_equal(a, b),
-        3 => {
-            if is_signed {
-                tv.ir.s_less_than_equal(a, b)
-            } else {
-                tv.ir.u_less_than_equal(a, b)
-            }
-        }
-        4 => {
-            if is_signed {
-                tv.ir.s_greater_than(a, b)
-            } else {
-                tv.ir.u_greater_than(a, b)
-            }
-        }
-        5 => tv.ir.i_not_equal(a, b),
-        6 => {
-            if is_signed {
-                tv.ir.s_greater_than_equal(a, b)
-            } else {
-                tv.ir.u_greater_than_equal(a, b)
-            }
-        }
-        _ => tv.ir.imm_u1(false),
-    }
-}
 
 fn icmp_impl(tv: &mut TranslatorVisitor, insn: u64, src_a: Value, operand: Value) {
     let dst = field(insn, 0, 8);
@@ -50,7 +14,7 @@ fn icmp_impl(tv: &mut TranslatorVisitor, insn: u64, src_a: Value, operand: Value
     let cmp_op = field(insn, 49, 3);
 
     let zero = Value::ImmU32(0);
-    let cmp_result = int_compare(tv, cmp_op, operand, zero, is_signed);
+    let cmp_result = integer_compare(tv, operand, zero, cmp_op, is_signed);
     let src_reg_val = tv.x(src_reg);
     let result = tv.ir.select_u32(cmp_result, src_reg_val, src_a);
     tv.set_x(dst, result);

@@ -11,6 +11,14 @@
 use super::TranslatorVisitor;
 
 impl<'a> TranslatorVisitor<'a> {
+    pub fn translate_atom_cas(&mut self, _insn: u64) {
+        panic!("Instruction ATOM_cas not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_atoms_cas(&mut self, _insn: u64) {
+        panic!("Instruction ATOMS_cas not implemented (upstream throws NotImplementedException)");
+    }
+
     /// NOP — No operation. Upstream is a no-op.
     pub fn translate_nop(&mut self, _insn: u64) {
         // NOP is No-Op.
@@ -61,6 +69,14 @@ impl<'a> TranslatorVisitor<'a> {
         panic!("Instruction BPT not implemented (upstream throws NotImplementedException)");
     }
 
+    pub fn translate_bra(&mut self, _insn: u64) {
+        panic!("Instruction BRA not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_brk(&mut self, _insn: u64) {
+        panic!("Instruction BRK not implemented (upstream throws NotImplementedException)");
+    }
+
     /// CCTL — Not implemented in upstream.
     pub fn translate_cctl(&mut self, _insn: u64) {
         panic!("Instruction CCTL not implemented (upstream throws NotImplementedException)");
@@ -71,9 +87,25 @@ impl<'a> TranslatorVisitor<'a> {
         panic!("Instruction CCTLL not implemented (upstream throws NotImplementedException)");
     }
 
+    pub fn translate_cont(&mut self, _insn: u64) {
+        panic!("Instruction CONT not implemented (upstream throws NotImplementedException)");
+    }
+
     /// CS2R — Not implemented in upstream.
     pub fn translate_cs2r(&mut self, _insn: u64) {
         panic!("Instruction CS2R not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_fchk_reg(&mut self, _insn: u64) {
+        panic!("Instruction FCHK_reg not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_fchk_cbuf(&mut self, _insn: u64) {
+        panic!("Instruction FCHK_cbuf not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_fchk_imm(&mut self, _insn: u64) {
+        panic!("Instruction FCHK_imm not implemented (upstream throws NotImplementedException)");
     }
 
     /// GETCRSPTR — Not implemented in upstream.
@@ -89,6 +121,66 @@ impl<'a> TranslatorVisitor<'a> {
     /// IDE — Not implemented in upstream.
     pub fn translate_ide(&mut self, _insn: u64) {
         panic!("Instruction IDE not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_idp_reg(&mut self, _insn: u64) {
+        panic!("Instruction IDP_reg not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_idp_imm(&mut self, _insn: u64) {
+        panic!("Instruction IDP_imm not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_imadsp_reg(&mut self, _insn: u64) {
+        panic!("Instruction IMADSP_reg not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_imadsp_rc(&mut self, _insn: u64) {
+        panic!("Instruction IMADSP_rc not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_imadsp_cr(&mut self, _insn: u64) {
+        panic!("Instruction IMADSP_cr not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_imadsp_imm(&mut self, _insn: u64) {
+        panic!("Instruction IMADSP_imm not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_imad_reg(&mut self, _insn: u64) {
+        panic!("Instruction IMAD_reg not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_imad_rc(&mut self, _insn: u64) {
+        panic!("Instruction IMAD_rc not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_imad_cr(&mut self, _insn: u64) {
+        panic!("Instruction IMAD_cr not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_imad_imm(&mut self, _insn: u64) {
+        panic!("Instruction IMAD_imm not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_imad32i(&mut self, _insn: u64) {
+        panic!("Instruction IMAD32I not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_imul_reg(&mut self, _insn: u64) {
+        panic!("Instruction IMUL_reg not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_imul_cbuf(&mut self, _insn: u64) {
+        panic!("Instruction IMUL_cbuf not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_imul_imm(&mut self, _insn: u64) {
+        panic!("Instruction IMUL_imm not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_imul32i(&mut self, _insn: u64) {
+        panic!("Instruction IMUL32I not implemented (upstream throws NotImplementedException)");
     }
 
     /// JCAL — Not implemented in upstream.
@@ -131,6 +223,22 @@ impl<'a> TranslatorVisitor<'a> {
         panic!("Instruction PRET not implemented (upstream throws NotImplementedException)");
     }
 
+    pub fn translate_prmt_reg(&mut self, _insn: u64) {
+        panic!("Instruction PRMT_reg not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_prmt_rc(&mut self, _insn: u64) {
+        panic!("Instruction PRMT_rc not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_prmt_cr(&mut self, _insn: u64) {
+        panic!("Instruction PRMT_cr not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_prmt_imm(&mut self, _insn: u64) {
+        panic!("Instruction PRMT_imm not implemented (upstream throws NotImplementedException)");
+    }
+
     /// R2B — Not implemented in upstream.
     pub fn translate_r2b(&mut self, _insn: u64) {
         panic!("Instruction R2B not implemented (upstream throws NotImplementedException)");
@@ -166,6 +274,10 @@ impl<'a> TranslatorVisitor<'a> {
         panic!("Instruction STP not implemented (upstream throws NotImplementedException)");
     }
 
+    pub fn translate_suatom_cas(&mut self, _insn: u64) {
+        panic!("Instruction SUATOM_cas not implemented (upstream throws NotImplementedException)");
+    }
+
     /// SYNC — Not implemented in upstream.
     pub fn translate_sync(&mut self, _insn: u64) {
         panic!("Instruction SYNC not implemented (upstream throws NotImplementedException)");
@@ -184,5 +296,21 @@ impl<'a> TranslatorVisitor<'a> {
     /// VABSDIFF4 — Not implemented in upstream.
     pub fn translate_vabsdiff4(&mut self, _insn: u64) {
         panic!("Instruction VABSDIFF4 not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_vadd(&mut self, _insn: u64) {
+        panic!("Instruction VADD not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_vset(&mut self, _insn: u64) {
+        panic!("Instruction VSET not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_vshl(&mut self, _insn: u64) {
+        panic!("Instruction VSHL not implemented (upstream throws NotImplementedException)");
+    }
+
+    pub fn translate_vshr(&mut self, _insn: u64) {
+        panic!("Instruction VSHR not implemented (upstream throws NotImplementedException)");
     }
 }

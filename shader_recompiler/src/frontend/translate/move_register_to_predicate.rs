@@ -3,43 +3,50 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/move_register_to_predicate.cpp
 
-use super::{bit, field, TranslatorVisitor};
+use super::{field, TranslatorVisitor};
 use crate::ir::value::{Pred, Value};
 
-/// Inner R2P implementation (PR mode only — CC mode requires condition-code IR).
-///
-/// For each of the 7 predicate registers in the byte-selector window, we
-/// extract the corresponding source bit from `src` and, if the mask bit
-/// is set (i.e. inv_mask_bit is false), write it to the predicate register.
 fn r2p_impl(tv: &mut TranslatorVisitor, insn: u64, mask: Value, src: Value) {
     let mode = field(insn, 40, 1); // 0 = PR, 1 = CC
     let byte_selector = field(insn, 41, 2);
-
-    if mode != 0 {
-        // Upstream throws NotImplementedException for R2P.CC.
-        panic!("R2P: CC mode not implemented");
-    }
-
+    let pr_mode = mode == 0;
+    let num_items = if pr_mode { 7 } else { 4 };
     let count = Value::ImmU32(1);
     let offset_base = byte_selector * 8;
-    for i in 0u32..7 {
-        let offset = Value::ImmU32(offset_base + i);
-        // Extract bit `i` from mask: if the bit is 0 the mask covers this pred.
-        let mask_bfe = tv
-            .ir
-            .bit_field_u_extract(mask.clone(), Value::ImmU32(i), count.clone());
-        let inv_mask_bit = tv.ir.get_zero_from_op(mask_bfe);
-        // Extract source bit from `src` at the offset-relative position.
+    for index in 0..num_items {
+        let offset = Value::ImmU32(offset_base + index);
         let src_bfe = tv
             .ir
             .bit_field_u_extract(src.clone(), offset, count.clone());
         let src_zero = tv.ir.get_zero_from_op(src_bfe);
         let src_bit = tv.ir.logical_not(src_zero);
-        // If inv_mask_bit is true (mask bit = 0), keep existing pred value; else use src_bit.
-        let pred = Pred(i as u8);
-        let existing = tv.ir.get_pred(pred, false);
-        let new_val = tv.ir.select_u1(inv_mask_bit, existing, src_bit);
-        tv.ir.set_pred(pred, new_val);
+        let mask_bfe = tv
+            .ir
+            .bit_field_u_extract(mask.clone(), Value::ImmU32(index), count.clone());
+        let inv_mask_bit = tv.ir.get_zero_from_op(mask_bfe);
+
+        if pr_mode {
+            let pred = Pred(index as u8);
+            let existing = tv.ir.get_pred(pred, false);
+            let value = tv.ir.select_u1(inv_mask_bit, existing, src_bit);
+            tv.ir.set_pred(pred, value);
+        } else {
+            let existing = match index {
+                0 => tv.ir.get_z_flag(),
+                1 => tv.ir.get_s_flag(),
+                2 => tv.ir.get_c_flag(),
+                3 => tv.ir.get_o_flag(),
+                _ => unreachable!("R2P condition-code index"),
+            };
+            let value = tv.ir.select_u1(inv_mask_bit, existing, src_bit);
+            match index {
+                0 => tv.ir.set_z_flag(value),
+                1 => tv.ir.set_s_flag(value),
+                2 => tv.ir.set_c_flag(value),
+                3 => tv.ir.set_o_flag(value),
+                _ => unreachable!("R2P condition-code index"),
+            }
+        }
     }
 }
 

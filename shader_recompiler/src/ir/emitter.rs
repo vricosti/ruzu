@@ -586,6 +586,10 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::FPClamp32, vec![value, min, max]))
     }
 
+    pub fn fp_clamp_16(&mut self, value: Value, min: Value, max: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPClamp16, vec![value, min, max]))
+    }
+
     pub fn fp_round_even_32(&mut self, a: Value) -> Value {
         self.emit(Inst::new(Opcode::FPRoundEven32, vec![a]))
     }
@@ -1496,6 +1500,41 @@ impl<'a> Emitter<'a> {
 
     pub fn convert_u32_from_f32(&mut self, a: Value) -> Value {
         self.emit(Inst::new(Opcode::ConvertU32F32, vec![a]))
+    }
+
+    /// Port of upstream `IREmitter::ConvertFToI`.
+    pub fn convert_f_to_i(
+        &mut self,
+        dest_bits: u32,
+        src_bits: u32,
+        is_signed: bool,
+        value: Value,
+    ) -> Value {
+        let opcode = match (dest_bits, src_bits, is_signed) {
+            (16, 16, true) => Opcode::ConvertS16F16,
+            (16, 32, true) => Opcode::ConvertS16F32,
+            (16, 64, true) => Opcode::ConvertS16F64,
+            (32, 16, true) => Opcode::ConvertS32F16,
+            (32, 32, true) => Opcode::ConvertS32F32,
+            (32, 64, true) => Opcode::ConvertS32F64,
+            (64, 16, true) => Opcode::ConvertS64F16,
+            (64, 32, true) => Opcode::ConvertS64F32,
+            (64, 64, true) => Opcode::ConvertS64F64,
+            (16, 16, false) => Opcode::ConvertU16F16,
+            (16, 32, false) => Opcode::ConvertU16F32,
+            (16, 64, false) => Opcode::ConvertU16F64,
+            (32, 16, false) => Opcode::ConvertU32F16,
+            (32, 32, false) => Opcode::ConvertU32F32,
+            (32, 64, false) => Opcode::ConvertU32F64,
+            (64, 16, false) => Opcode::ConvertU64F16,
+            (64, 32, false) => Opcode::ConvertU64F32,
+            (64, 64, false) => Opcode::ConvertU64F64,
+            _ => panic!(
+                "Invalid float-to-integer bit size combination dst={} src={}",
+                dest_bits, src_bits
+            ),
+        };
+        self.emit(Inst::new(opcode, vec![value]))
     }
 
     pub fn convert_f16_from_f32(&mut self, a: Value) -> Value {
@@ -2420,6 +2459,14 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::FPUnordGreaterThan64, vec![a, b]))
     }
 
+    pub fn fp_unord_less_than_equal_64(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPUnordLessThanEqual64, vec![a, b]))
+    }
+
+    pub fn fp_unord_greater_than_equal_64(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPUnordGreaterThanEqual64, vec![a, b]))
+    }
+
     pub fn fp_is_nan_64(&mut self, a: Value) -> Value {
         self.emit(Inst::new(Opcode::FPIsNan64, vec![a]))
     }
@@ -2439,6 +2486,20 @@ impl<'a> Emitter<'a> {
 
     pub fn fp_swizzle_add(&mut self, a: Value, b: Value, swizzle: Value) -> Value {
         self.emit(Inst::new(Opcode::FSwizzleAdd, vec![a, b, swizzle]))
+    }
+
+    pub fn fp_swizzle_add_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        swizzle: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FSwizzleAdd,
+            vec![a, b, swizzle],
+            control.to_u32(),
+        ))
     }
 
     // ── FP16 arithmetic ───────────────────────────────────────────────
@@ -2515,8 +2576,30 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::FPMul16, vec![a, b]))
     }
 
+    pub fn fp_mul_16_with_control(&mut self, a: Value, b: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPMul16,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_fma_16(&mut self, a: Value, b: Value, c: Value) -> Value {
         self.emit(Inst::new(Opcode::FPFma16, vec![a, b, c]))
+    }
+
+    pub fn fp_fma_16_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        c: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPFma16,
+            vec![a, b, c],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_min_16(&mut self, a: Value, b: Value) -> Value {
@@ -2548,48 +2631,204 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::FPOrdEqual16, vec![a, b]))
     }
 
+    pub fn fp_ord_equal_16_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPOrdEqual16,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_ord_not_equal_16(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPOrdNotEqual16, vec![a, b]))
+    }
+
+    pub fn fp_ord_not_equal_16_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPOrdNotEqual16,
+            vec![a, b],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_ord_less_than_16(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPOrdLessThan16, vec![a, b]))
     }
 
+    pub fn fp_ord_less_than_16_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPOrdLessThan16,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_ord_greater_than_16(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPOrdGreaterThan16, vec![a, b]))
+    }
+
+    pub fn fp_ord_greater_than_16_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPOrdGreaterThan16,
+            vec![a, b],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_ord_less_than_equal_16(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPOrdLessThanEqual16, vec![a, b]))
     }
 
+    pub fn fp_ord_less_than_equal_16_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPOrdLessThanEqual16,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_ord_greater_than_equal_16(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPOrdGreaterThanEqual16, vec![a, b]))
+    }
+
+    pub fn fp_ord_greater_than_equal_16_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPOrdGreaterThanEqual16,
+            vec![a, b],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_unord_equal_16(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPUnordEqual16, vec![a, b]))
     }
 
+    pub fn fp_unord_equal_16_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPUnordEqual16,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_unord_not_equal_16(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPUnordNotEqual16, vec![a, b]))
+    }
+
+    pub fn fp_unord_not_equal_16_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPUnordNotEqual16,
+            vec![a, b],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_unord_less_than_16(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPUnordLessThan16, vec![a, b]))
     }
 
+    pub fn fp_unord_less_than_16_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPUnordLessThan16,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_unord_greater_than_16(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPUnordGreaterThan16, vec![a, b]))
+    }
+
+    pub fn fp_unord_greater_than_16_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPUnordGreaterThan16,
+            vec![a, b],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_unord_less_than_equal_16(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPUnordLessThanEqual16, vec![a, b]))
     }
 
+    pub fn fp_unord_less_than_equal_16_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPUnordLessThanEqual16,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_unord_greater_than_equal_16(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPUnordGreaterThanEqual16, vec![a, b]))
+    }
+
+    pub fn fp_unord_greater_than_equal_16_with_control(
+        &mut self,
+        a: Value,
+        b: Value,
+        control: FpControl,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPUnordGreaterThanEqual16,
+            vec![a, b],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_is_nan_16(&mut self, a: Value) -> Value {
@@ -2667,8 +2906,48 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::LoadSharedU32, vec![offset]))
     }
 
+    pub fn load_shared_u8(&mut self, offset: Value) -> Value {
+        self.emit(Inst::new(Opcode::LoadSharedU8, vec![offset]))
+    }
+
+    pub fn load_shared_s8(&mut self, offset: Value) -> Value {
+        self.emit(Inst::new(Opcode::LoadSharedS8, vec![offset]))
+    }
+
+    pub fn load_shared_u16(&mut self, offset: Value) -> Value {
+        self.emit(Inst::new(Opcode::LoadSharedU16, vec![offset]))
+    }
+
+    pub fn load_shared_s16(&mut self, offset: Value) -> Value {
+        self.emit(Inst::new(Opcode::LoadSharedS16, vec![offset]))
+    }
+
+    pub fn load_shared_u64(&mut self, offset: Value) -> Value {
+        self.emit(Inst::new(Opcode::LoadSharedU64, vec![offset]))
+    }
+
+    pub fn load_shared_u128(&mut self, offset: Value) -> Value {
+        self.emit(Inst::new(Opcode::LoadSharedU128, vec![offset]))
+    }
+
+    pub fn write_shared_u8(&mut self, offset: Value, value: Value) {
+        self.emit_void(Inst::new(Opcode::WriteSharedU8, vec![offset, value]));
+    }
+
+    pub fn write_shared_u16(&mut self, offset: Value, value: Value) {
+        self.emit_void(Inst::new(Opcode::WriteSharedU16, vec![offset, value]));
+    }
+
     pub fn write_shared_u32(&mut self, offset: Value, value: Value) {
         self.emit_void(Inst::new(Opcode::WriteSharedU32, vec![offset, value]));
+    }
+
+    pub fn write_shared_u64(&mut self, offset: Value, value: Value) {
+        self.emit_void(Inst::new(Opcode::WriteSharedU64, vec![offset, value]));
+    }
+
+    pub fn write_shared_u128(&mut self, offset: Value, value: Value) {
+        self.emit_void(Inst::new(Opcode::WriteSharedU128, vec![offset, value]));
     }
 
     // ── Double (F64) packing from register pair ────────────────────────

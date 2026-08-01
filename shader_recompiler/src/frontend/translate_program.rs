@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn translate_program_uses_cfg_driver_instead_of_empty_stub() {
-        let program = translate_program(&[0, 0], ShaderStage::VertexB);
+        let program = translate_program(&[0, 0x50B0_0000_0000_0000], ShaderStage::VertexB);
 
         assert_eq!(program.stage, ShaderStage::VertexB);
         assert!(

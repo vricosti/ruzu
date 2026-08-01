@@ -1,37 +1,10 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of upstream warp-level instruction translate files:
-//! - `impl/vote.cpp`
-//! - `impl/warp_shuffle.cpp`
+//! Port of upstream `impl/warp_shuffle.cpp`.
 
 use super::{bit, field, TranslatorVisitor};
 use crate::ir::value::{Pred, Value};
-
-/// VOTE — Warp vote operations (ALL, ANY, EQ).
-///
-/// Matches upstream `TranslatorVisitor::VOTE(u64 insn)`.
-pub fn vote(v: &mut TranslatorVisitor<'_>, insn: u64) {
-    let dest_reg = field(insn, 0, 8);
-    let pred_a_idx = field(insn, 39, 3);
-    let neg_pred_a = bit(insn, 42);
-    let pred_b_idx = field(insn, 45, 3);
-    let vote_op = (insn >> 48) & 3;
-
-    let vote_pred = v.ir.get_pred(Pred(pred_a_idx as u8), neg_pred_a);
-
-    let result = match vote_op {
-        0 => v.ir.vote_all(vote_pred),
-        1 => v.ir.vote_any(vote_pred),
-        2 => v.ir.vote_equal(vote_pred),
-        _ => panic!("VOTE: invalid vote op {}", vote_op),
-    };
-
-    v.ir.set_pred(Pred(pred_b_idx as u8), result);
-
-    let ballot = v.ir.subgroup_ballot(vote_pred);
-    v.set_x(dest_reg, ballot);
-}
 
 /// SHFL — Warp shuffle.
 ///

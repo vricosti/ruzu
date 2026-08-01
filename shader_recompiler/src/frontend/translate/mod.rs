@@ -100,7 +100,7 @@ pub mod warp_shuffle;
 
 use crate::frontend::maxwell_opcodes::{self, MaxwellOpcode, SrcType};
 use crate::ir::emitter::Emitter;
-use crate::ir::program::{Program, ShaderInfo};
+use crate::ir::program::Program;
 use crate::ir::types::ShaderStage;
 use crate::ir::value::{Reg, Value};
 use crate::program_header::ProgramHeader;
@@ -299,6 +299,12 @@ impl<'a> TranslatorVisitor<'a> {
         self.set_x(reg_idx + 1, hi);
     }
 
+    /// Get a reg from bits [8:15] as U32 (GetReg8 upstream).
+    pub fn get_reg8(&mut self, insn: u64) -> Value {
+        let idx = field(insn, 8, 8);
+        self.x(idx)
+    }
+
     /// Get a reg from bits [20:27] as U32 (GetReg20 upstream).
     pub fn get_reg20(&mut self, insn: u64) -> Value {
         let idx = field(insn, 20, 8);
@@ -327,6 +333,9 @@ impl<'a> TranslatorVisitor<'a> {
     pub fn get_cbuf(&mut self, insn: u64) -> Value {
         let cb_index = field(insn, 34, 5);
         let cb_offset = field(insn, 20, 14) << 2;
+        if cb_index >= 18 {
+            panic!("Out of bounds constant buffer binding {cb_index}");
+        }
         let binding = Value::ImmU32(cb_index);
         let offset = Value::ImmU32(cb_offset);
         self.ir.program.info.register_cbuf(cb_index);
@@ -342,6 +351,9 @@ impl<'a> TranslatorVisitor<'a> {
         }
         let cb_index = field(insn, 34, 5);
         let cb_offset = field(insn, 20, 14) << 2;
+        if cb_index >= 18 {
+            panic!("Out of bounds constant buffer binding {cb_index}");
+        }
         self.ir.program.info.register_cbuf(cb_index);
         let binding = Value::ImmU32(cb_index);
         let lo = self
@@ -356,6 +368,9 @@ impl<'a> TranslatorVisitor<'a> {
     pub fn get_float_cbuf(&mut self, insn: u64) -> Value {
         let cb_index = field(insn, 34, 5);
         let cb_offset = field(insn, 20, 14) << 2;
+        if cb_index >= 18 {
+            panic!("Out of bounds constant buffer binding {cb_index}");
+        }
         let binding = Value::ImmU32(cb_index);
         let offset = Value::ImmU32(cb_offset);
         self.ir.program.info.register_cbuf(cb_index);
@@ -366,12 +381,24 @@ impl<'a> TranslatorVisitor<'a> {
     pub fn get_double_cbuf(&mut self, insn: u64) -> Value {
         let cb_index = field(insn, 34, 5);
         let cb_offset = field(insn, 20, 14) << 2;
+        if cb_index >= 18 {
+            panic!("Out of bounds constant buffer binding {cb_index}");
+        }
+        let unaligned = bit(insn, 20);
         let binding = Value::ImmU32(cb_index);
         self.ir.program.info.register_cbuf(cb_index);
-        let lo = self
-            .ir
-            .get_cbuf_u32(binding.clone(), Value::ImmU32(cb_offset));
-        let hi = self.ir.get_cbuf_u32(binding, Value::ImmU32(cb_offset + 4));
+        let upper_offset = if unaligned {
+            cb_offset | 4
+        } else {
+            (cb_offset & !7) | 4
+        };
+        let hi = self.ir.get_cbuf_u32(binding, Value::ImmU32(upper_offset));
+        let lo = if unaligned {
+            Value::ImmU32(0)
+        } else {
+            self.ir
+                .get_cbuf_u32(Value::ImmU32(cb_index), Value::ImmU32(cb_offset))
+        };
         let vec = self.ir.composite_construct_u32x2(lo, hi);
         self.ir.pack_double_2x32(vec)
     }
@@ -404,10 +431,11 @@ impl<'a> TranslatorVisitor<'a> {
         Value::ImmF32(f32::from_bits(imm | sign))
     }
 
-    /// Get a 20-bit double immediate packed into F64 (upper bits zero).
+    /// Get a 20-bit double immediate as an IEEE-754 bit pattern.
     pub fn get_double_imm20(&self, insn: u64) -> Value {
-        let imm = sfield(insn, 20, 20) as i64;
-        Value::ImmF64(imm as f64)
+        let value = (field(insn, 20, 19) as u64) << 44;
+        let sign = if bit(insn, 56) { 1u64 << 63 } else { 0 };
+        Value::ImmF64(f64::from_bits(value | sign))
     }
 
     /// Get a register value from bits [8:15] as F32 (GetFloatReg8 upstream).
@@ -434,10 +462,7 @@ impl<'a> TranslatorVisitor<'a> {
     pub fn translate_instruction(&mut self, insn: u64) {
         let opcode = match maxwell_opcodes::decode_opcode(insn) {
             Some(op) => op,
-            None => {
-                log::warn!("Unknown Maxwell opcode: 0x{:016X}", insn);
-                return;
-            }
+            None => panic!("Invalid Maxwell opcode 0x{insn:016X}"),
         };
 
         match opcode {
@@ -457,6 +482,16 @@ impl<'a> TranslatorVisitor<'a> {
                 self::floating_point_multiply::fmul32i(self, insn);
             }
 
+            // double_add.cpp
+            MaxwellOpcode::DADD_reg => self::double_add::dadd_reg(self, insn),
+            MaxwellOpcode::DADD_cbuf => self::double_add::dadd_cbuf(self, insn),
+            MaxwellOpcode::DADD_imm => self::double_add::dadd_imm(self, insn),
+
+            // double_multiply.cpp
+            MaxwellOpcode::DMUL_reg => self::double_multiply::dmul_reg(self, insn),
+            MaxwellOpcode::DMUL_cbuf => self::double_multiply::dmul_cbuf(self, insn),
+            MaxwellOpcode::DMUL_imm => self::double_multiply::dmul_imm(self, insn),
+
             // floating_point_fused_multiply_add.cpp
             MaxwellOpcode::FFMA_reg
             | MaxwellOpcode::FFMA_rc
@@ -468,14 +503,95 @@ impl<'a> TranslatorVisitor<'a> {
                 self::floating_point_fused_multiply_add::ffma32i(self, insn);
             }
 
+            // double_fused_multiply_add.cpp
+            MaxwellOpcode::DFMA_reg => self::double_fused_multiply_add::dfma_reg(self, insn),
+            MaxwellOpcode::DFMA_rc => self::double_fused_multiply_add::dfma_rc(self, insn),
+            MaxwellOpcode::DFMA_cr => self::double_fused_multiply_add::dfma_cr(self, insn),
+            MaxwellOpcode::DFMA_imm => self::double_fused_multiply_add::dfma_imm(self, insn),
+
             // floating_point_min_max.cpp
             MaxwellOpcode::FMNMX_reg | MaxwellOpcode::FMNMX_cbuf | MaxwellOpcode::FMNMX_imm => {
                 self::floating_point_min_max::fmnmx(self, insn, opcode);
             }
 
+            // double_min_max.cpp
+            MaxwellOpcode::DMNMX_reg => self::double_min_max::dmnmx_reg(self, insn),
+            MaxwellOpcode::DMNMX_cbuf => self::double_min_max::dmnmx_cbuf(self, insn),
+            MaxwellOpcode::DMNMX_imm => self::double_min_max::dmnmx_imm(self, insn),
+
+            // floating_point_swizzled_add.cpp
+            MaxwellOpcode::FSWZADD => self::floating_point_swizzled_add::fswzadd(self, insn),
+
             // floating_point_multi_function.cpp
             MaxwellOpcode::MUFU => {
                 self::floating_point_multi_function::mufu(self, insn);
+            }
+
+            // half_floating_point_add.cpp
+            MaxwellOpcode::HADD2_reg => {
+                self::half_floating_point_add::hadd2_reg(self, insn);
+            }
+            MaxwellOpcode::HADD2_cbuf => {
+                self::half_floating_point_add::hadd2_cbuf(self, insn);
+            }
+            MaxwellOpcode::HADD2_imm => {
+                self::half_floating_point_add::hadd2_imm(self, insn);
+            }
+            MaxwellOpcode::HADD2_32I => {
+                self::half_floating_point_add::hadd2_32i(self, insn);
+            }
+
+            // half_floating_point_fused_multiply_add.cpp
+            MaxwellOpcode::HFMA2_reg => {
+                self::half_floating_point_fused_multiply_add::hfma2_reg(self, insn);
+            }
+            MaxwellOpcode::HFMA2_rc => {
+                self::half_floating_point_fused_multiply_add::hfma2_rc(self, insn);
+            }
+            MaxwellOpcode::HFMA2_cr => {
+                self::half_floating_point_fused_multiply_add::hfma2_cr(self, insn);
+            }
+            MaxwellOpcode::HFMA2_imm => {
+                self::half_floating_point_fused_multiply_add::hfma2_imm(self, insn);
+            }
+            MaxwellOpcode::HFMA2_32I => {
+                self::half_floating_point_fused_multiply_add::hfma2_32i(self, insn);
+            }
+
+            // half_floating_point_multiply.cpp
+            MaxwellOpcode::HMUL2_reg => {
+                self::half_floating_point_multiply::hmul2_reg(self, insn);
+            }
+            MaxwellOpcode::HMUL2_cbuf => {
+                self::half_floating_point_multiply::hmul2_cbuf(self, insn);
+            }
+            MaxwellOpcode::HMUL2_imm => {
+                self::half_floating_point_multiply::hmul2_imm(self, insn);
+            }
+            MaxwellOpcode::HMUL2_32I => {
+                self::half_floating_point_multiply::hmul2_32i(self, insn);
+            }
+
+            // half_floating_point_set.cpp
+            MaxwellOpcode::HSET2_reg => {
+                self::half_floating_point_set::hset2_reg(self, insn);
+            }
+            MaxwellOpcode::HSET2_cbuf => {
+                self::half_floating_point_set::hset2_cbuf(self, insn);
+            }
+            MaxwellOpcode::HSET2_imm => {
+                self::half_floating_point_set::hset2_imm(self, insn);
+            }
+
+            // half_floating_point_set_predicate.cpp
+            MaxwellOpcode::HSETP2_reg => {
+                self::half_floating_point_set_predicate::hsetp2_reg(self, insn);
+            }
+            MaxwellOpcode::HSETP2_cbuf => {
+                self::half_floating_point_set_predicate::hsetp2_cbuf(self, insn);
+            }
+            MaxwellOpcode::HSETP2_imm => {
+                self::half_floating_point_set_predicate::hsetp2_imm(self, insn);
             }
 
             // floating_point_range_reduction.cpp
@@ -483,7 +599,7 @@ impl<'a> TranslatorVisitor<'a> {
                 self::floating_point_range_reduction::rro(self, insn, opcode);
             }
             MaxwellOpcode::RRO_imm => {
-                panic!("RRO (imm)");
+                self::floating_point_range_reduction::rro(self, insn, opcode);
             }
 
             // integer_add.cpp
@@ -499,16 +615,14 @@ impl<'a> TranslatorVisitor<'a> {
                 self::integer_add_three_input::iadd3(self, insn, opcode);
             }
 
+            // not_implemented.cpp
+            MaxwellOpcode::IMAD_reg => self.translate_imad_reg(insn),
+            MaxwellOpcode::IMAD_rc => self.translate_imad_rc(insn),
+            MaxwellOpcode::IMAD_cr => self.translate_imad_cr(insn),
+            MaxwellOpcode::IMAD_imm => self.translate_imad_imm(insn),
+            MaxwellOpcode::IMAD32I => self.translate_imad32i(insn),
+
             // integer_short_multiply_add.cpp
-            MaxwellOpcode::IMAD_reg
-            | MaxwellOpcode::IMAD_rc
-            | MaxwellOpcode::IMAD_cr
-            | MaxwellOpcode::IMAD_imm => {
-                self::integer_short_multiply_add::imad(self, insn, opcode);
-            }
-            MaxwellOpcode::IMAD32I => {
-                self::integer_short_multiply_add::imad32i(self, insn);
-            }
             MaxwellOpcode::XMAD_reg
             | MaxwellOpcode::XMAD_rc
             | MaxwellOpcode::XMAD_cr
@@ -519,6 +633,9 @@ impl<'a> TranslatorVisitor<'a> {
             // integer_scaled_add.cpp
             MaxwellOpcode::ISCADD_reg | MaxwellOpcode::ISCADD_cbuf | MaxwellOpcode::ISCADD_imm => {
                 self::integer_scaled_add::iscadd(self, insn, opcode);
+            }
+            MaxwellOpcode::ISCADD32I => {
+                self::integer_scaled_add::iscadd32i(self, insn);
             }
 
             // integer_minimum_maximum.cpp
@@ -541,10 +658,32 @@ impl<'a> TranslatorVisitor<'a> {
                 self::floating_point_compare_and_set::fset(self, insn, opcode);
             }
 
+            // floating_point_compare.cpp
+            MaxwellOpcode::FCMP_reg => self::floating_point_compare::fcmp_reg(self, insn),
+            MaxwellOpcode::FCMP_rc => self::floating_point_compare::fcmp_rc(self, insn),
+            MaxwellOpcode::FCMP_cr => self::floating_point_compare::fcmp_cr(self, insn),
+            MaxwellOpcode::FCMP_imm => self::floating_point_compare::fcmp_imm(self, insn),
+
             // integer_compare_and_set.cpp
             MaxwellOpcode::ISET_reg | MaxwellOpcode::ISET_cbuf | MaxwellOpcode::ISET_imm => {
                 self::integer_compare_and_set::iset(self, insn, opcode);
             }
+
+            // integer_compare.cpp
+            MaxwellOpcode::ICMP_reg => self::integer_compare::icmp_reg(self, insn),
+            MaxwellOpcode::ICMP_rc => self::integer_compare::icmp_rc(self, insn),
+            MaxwellOpcode::ICMP_cr => self::integer_compare::icmp_cr(self, insn),
+            MaxwellOpcode::ICMP_imm => self::integer_compare::icmp_imm(self, insn),
+
+            // double_compare_and_set.cpp
+            MaxwellOpcode::DSET_reg => self::double_compare_and_set::dset_reg(self, insn),
+            MaxwellOpcode::DSET_cbuf => self::double_compare_and_set::dset_cbuf(self, insn),
+            MaxwellOpcode::DSET_imm => self::double_compare_and_set::dset_imm(self, insn),
+
+            // double_set_predicate.cpp
+            MaxwellOpcode::DSETP_reg => self::double_set_predicate::dsetp_reg(self, insn),
+            MaxwellOpcode::DSETP_cbuf => self::double_set_predicate::dsetp_cbuf(self, insn),
+            MaxwellOpcode::DSETP_imm => self::double_set_predicate::dsetp_imm(self, insn),
 
             // floating_point_conversion_integer.cpp
             MaxwellOpcode::F2I_reg | MaxwellOpcode::F2I_cbuf | MaxwellOpcode::F2I_imm => {
@@ -595,6 +734,12 @@ impl<'a> TranslatorVisitor<'a> {
                 self::integer_shift_right::shr(self, insn, opcode);
             }
 
+            // integer_funnel_shift.cpp
+            MaxwellOpcode::SHF_l_reg => self::integer_funnel_shift::shf_l_reg(self, insn),
+            MaxwellOpcode::SHF_l_imm => self::integer_funnel_shift::shf_l_imm(self, insn),
+            MaxwellOpcode::SHF_r_reg => self::integer_funnel_shift::shf_r_reg(self, insn),
+            MaxwellOpcode::SHF_r_imm => self::integer_funnel_shift::shf_r_imm(self, insn),
+
             // bitfield_extract.cpp
             MaxwellOpcode::BFE_reg | MaxwellOpcode::BFE_cbuf | MaxwellOpcode::BFE_imm => {
                 self::bitfield_extract::bfe(self, insn, opcode);
@@ -635,6 +780,30 @@ impl<'a> TranslatorVisitor<'a> {
             MaxwellOpcode::S2R => {
                 self::move_special_register::s2r(self, insn);
             }
+
+            // move_predicate_to_register.cpp
+            MaxwellOpcode::P2R_reg => self::move_predicate_to_register::p2r_reg(self, insn),
+            MaxwellOpcode::P2R_cbuf => self::move_predicate_to_register::p2r_cbuf(self, insn),
+            MaxwellOpcode::P2R_imm => self::move_predicate_to_register::p2r_imm(self, insn),
+
+            // move_register_to_predicate.cpp
+            MaxwellOpcode::R2P_reg => self::move_register_to_predicate::r2p_reg(self, insn),
+            MaxwellOpcode::R2P_cbuf => self::move_register_to_predicate::r2p_cbuf(self, insn),
+            MaxwellOpcode::R2P_imm => self::move_register_to_predicate::r2p_imm(self, insn),
+
+            // attribute_memory_to_physical.cpp
+            MaxwellOpcode::AL2P => self::attribute_memory_to_physical::al2p(self, insn),
+
+            // internal_stage_buffer_entry_read.cpp
+            MaxwellOpcode::ISBERD => self.translate_isberd(insn),
+
+            // pixel_load.cpp
+            MaxwellOpcode::PIXLD => self.translate_pixld(insn),
+
+            // vote.cpp / warp_shuffle.cpp
+            MaxwellOpcode::VOTE => self.translate_vote(insn),
+            MaxwellOpcode::VOTE_vtg => self.translate_vote_vtg(insn),
+            MaxwellOpcode::SHFL => self::warp_shuffle::shfl(self, insn),
 
             // predicate_set_predicate.cpp
             MaxwellOpcode::PSETP => {
@@ -679,6 +848,9 @@ impl<'a> TranslatorVisitor<'a> {
                 self::load_store_memory::stg(self, insn);
             }
 
+            MaxwellOpcode::LDS => self::load_store_local_shared::lds(self, insn),
+            MaxwellOpcode::STS => self::load_store_local_shared::sts(self, insn),
+
             // atomic_operations_global_memory.cpp
             MaxwellOpcode::ATOM => {
                 self::atomic_operations_global_memory::atom(self, insn);
@@ -687,7 +859,7 @@ impl<'a> TranslatorVisitor<'a> {
                 self::atomic_operations_global_memory::red(self, insn);
             }
             MaxwellOpcode::ATOM_cas => {
-                panic!("Instruction ATOM_cas not implemented (upstream throws)");
+                self.translate_atom_cas(insn);
             }
 
             // atomic_operations_shared_memory.cpp
@@ -695,8 +867,14 @@ impl<'a> TranslatorVisitor<'a> {
                 self::atomic_operations_shared_memory::atoms(self, insn);
             }
             MaxwellOpcode::ATOMS_cas => {
-                self::atomic_operations_shared_memory::atoms_cas(self, insn);
+                self.translate_atoms_cas(insn);
             }
+
+            // surface_load_store.cpp / surface_atomic_operations.cpp
+            MaxwellOpcode::SULD => self::surface_load_store::suld(self, insn),
+            MaxwellOpcode::SUST => self::surface_load_store::sust(self, insn),
+            MaxwellOpcode::SUATOM => self::surface_atomic_operations::suatom(self, insn),
+            MaxwellOpcode::SURED => self::surface_atomic_operations::sured(self, insn),
 
             // load_constant.cpp
             MaxwellOpcode::LDC => {
@@ -738,6 +916,15 @@ impl<'a> TranslatorVisitor<'a> {
             MaxwellOpcode::TLD4_b => {
                 self::texture_gather::tld4_b(self, insn, opcode);
             }
+            MaxwellOpcode::TLD4S => self::texture_gather_swizzled::tld4s(self, insn),
+
+            // texture_gradient.cpp
+            MaxwellOpcode::TXD => self::texture_gradient::txd(self, insn),
+            MaxwellOpcode::TXD_b => self::texture_gradient::txd_b(self, insn),
+
+            // texture_mipmap_level.cpp
+            MaxwellOpcode::TMML => self::texture_mipmap_level::tmml(self, insn),
+            MaxwellOpcode::TMML_b => self::texture_mipmap_level::tmml_b(self, insn),
 
             // texture_query.cpp
             MaxwellOpcode::TXQ | MaxwellOpcode::TXQ_b => {
@@ -755,6 +942,76 @@ impl<'a> TranslatorVisitor<'a> {
                 self::load_store_attribute::ipa(self, insn);
             }
 
+            // output_geometry.cpp
+            MaxwellOpcode::OUT_reg => self::output_geometry::out_reg(self, insn),
+            MaxwellOpcode::OUT_cbuf => self::output_geometry::out_cbuf(self, insn),
+            MaxwellOpcode::OUT_imm => self::output_geometry::out_imm(self, insn),
+
+            // video_minimum_maximum.cpp / video_multiply_add.cpp /
+            // video_set_predicate.cpp
+            MaxwellOpcode::VMNMX => self::video_minimum_maximum::vmnmx(self, insn),
+            MaxwellOpcode::VMAD => self::video_multiply_add::vmad(self, insn),
+            MaxwellOpcode::VSETP => self::video_set_predicate::vsetp(self, insn),
+
+            // barrier_operations.cpp
+            MaxwellOpcode::BAR => self::barrier_operations::bar(self, insn),
+
+            // branch_indirect.cpp
+            MaxwellOpcode::BRX => self::branch_indirect::brx(self, insn),
+            MaxwellOpcode::JMX => self::branch_indirect::jmx(self, insn),
+
+            // not_implemented.cpp: upstream rejects these opcodes explicitly.
+            MaxwellOpcode::B2R => self.translate_b2r(insn),
+            MaxwellOpcode::BPT => self.translate_bpt(insn),
+            MaxwellOpcode::CCTL => self.translate_cctl(insn),
+            MaxwellOpcode::CCTLL => self.translate_cctll(insn),
+            MaxwellOpcode::CS2R => self.translate_cs2r(insn),
+            MaxwellOpcode::FCHK_reg => self.translate_fchk_reg(insn),
+            MaxwellOpcode::FCHK_cbuf => self.translate_fchk_cbuf(insn),
+            MaxwellOpcode::FCHK_imm => self.translate_fchk_imm(insn),
+            MaxwellOpcode::GETCRSPTR => self.translate_getcrsptr(insn),
+            MaxwellOpcode::GETLMEMBASE => self.translate_getlmembase(insn),
+            MaxwellOpcode::IDE => self.translate_ide(insn),
+            MaxwellOpcode::IDP_reg => self.translate_idp_reg(insn),
+            MaxwellOpcode::IDP_imm => self.translate_idp_imm(insn),
+            MaxwellOpcode::IMADSP_reg => self.translate_imadsp_reg(insn),
+            MaxwellOpcode::IMADSP_rc => self.translate_imadsp_rc(insn),
+            MaxwellOpcode::IMADSP_cr => self.translate_imadsp_cr(insn),
+            MaxwellOpcode::IMADSP_imm => self.translate_imadsp_imm(insn),
+            MaxwellOpcode::IMUL_reg => self.translate_imul_reg(insn),
+            MaxwellOpcode::IMUL_cbuf => self.translate_imul_cbuf(insn),
+            MaxwellOpcode::IMUL_imm => self.translate_imul_imm(insn),
+            MaxwellOpcode::IMUL32I => self.translate_imul32i(insn),
+            MaxwellOpcode::JCAL => self.translate_jcal(insn),
+            MaxwellOpcode::JMP => self.translate_jmp(insn),
+            MaxwellOpcode::LD => self.translate_ld(insn),
+            MaxwellOpcode::LEPC => self.translate_lepc(insn),
+            MaxwellOpcode::LONGJMP => self.translate_longjmp(insn),
+            MaxwellOpcode::PLONGJMP => self.translate_plongjmp(insn),
+            MaxwellOpcode::PRET => self.translate_pret(insn),
+            MaxwellOpcode::PRMT_reg => self.translate_prmt_reg(insn),
+            MaxwellOpcode::PRMT_rc => self.translate_prmt_rc(insn),
+            MaxwellOpcode::PRMT_cr => self.translate_prmt_cr(insn),
+            MaxwellOpcode::PRMT_imm => self.translate_prmt_imm(insn),
+            MaxwellOpcode::R2B => self.translate_r2b(insn),
+            MaxwellOpcode::RTT => self.translate_rtt(insn),
+            MaxwellOpcode::SETCRSPTR => self.translate_setcrsptr(insn),
+            MaxwellOpcode::SETLMEMBASE => self.translate_setlmembase(insn),
+            MaxwellOpcode::ST => self.translate_st(insn),
+            MaxwellOpcode::STP => self.translate_stp(insn),
+            MaxwellOpcode::SUATOM_cas => self.translate_suatom_cas(insn),
+            MaxwellOpcode::TXA => self.translate_txa(insn),
+            MaxwellOpcode::VABSDIFF => self.translate_vabsdiff(insn),
+            MaxwellOpcode::VABSDIFF4 => self.translate_vabsdiff4(insn),
+            MaxwellOpcode::VADD => self.translate_vadd(insn),
+            MaxwellOpcode::VSET => self.translate_vset(insn),
+            MaxwellOpcode::VSHL => self.translate_vshl(insn),
+            MaxwellOpcode::VSHR => self.translate_vshr(insn),
+
+            // not_implemented.cpp: upstream deliberately logs and continues.
+            MaxwellOpcode::RAM => self.translate_ram(insn),
+            MaxwellOpcode::SAM => self.translate_sam(insn),
+
             // Control flow. The CFG builder owns block/successor structure, but
             // EXIT still has stage-specific side effects upstream: fragment
             // shaders write their color/depth/sample outputs in
@@ -763,40 +1020,29 @@ impl<'a> TranslatorVisitor<'a> {
                 self.translate_exit(insn);
             }
 
-            // Control flow — handled by the CFG builder
-            MaxwellOpcode::BRA
-            | MaxwellOpcode::BRK
-            | MaxwellOpcode::SYNC
-            | MaxwellOpcode::CONT
-            | MaxwellOpcode::SSY
-            | MaxwellOpcode::PBK
-            | MaxwellOpcode::PCNT
-            | MaxwellOpcode::PEXIT
-            | MaxwellOpcode::CAL
-            | MaxwellOpcode::RET => {
-                // Control flow is handled by the CFG/structured CF passes.
-            }
+            // Control-flow structure is owned by the CFG builder. These calls
+            // preserve upstream behavior if a control instruction reaches the
+            // instruction translator directly.
+            MaxwellOpcode::BRA => self.translate_bra(insn),
+            MaxwellOpcode::BRK => self.translate_brk(insn),
+            MaxwellOpcode::CONT => self.translate_cont(insn),
+            MaxwellOpcode::SYNC => self.translate_sync(insn),
+            MaxwellOpcode::PEXIT => self.translate_pexit(insn),
+            MaxwellOpcode::RET => self.translate_ret(insn),
+            MaxwellOpcode::SSY => self.translate_ssy(insn),
+            MaxwellOpcode::PBK => self.translate_pbk(insn),
+            MaxwellOpcode::PCNT => self.translate_pcnt(insn),
+            MaxwellOpcode::CAL => self.translate_cal(insn),
 
-            // NOP / dependency barrier
-            MaxwellOpcode::NOP | MaxwellOpcode::DEPBAR => {}
+            MaxwellOpcode::NOP => self.translate_nop(insn),
+            MaxwellOpcode::DEPBAR => self::barrier_operations::depbar(self),
 
             // Kill. Upstream `TranslatorVisitor::KIL()` is a no-op; the
             // structured control-flow pass owns demote/discard insertion.
-            MaxwellOpcode::KIL => {}
+            MaxwellOpcode::KIL => self.translate_kil(insn),
 
-            // Memory barrier
-            MaxwellOpcode::MEMBAR => {
-                self.ir.device_memory_barrier();
-            }
-
-            // Everything else
-            _ => {
-                log::trace!(
-                    "Unimplemented Maxwell opcode in translator: {} (0x{:016X})",
-                    opcode,
-                    insn
-                );
-            }
+            // barrier_operations.cpp
+            MaxwellOpcode::MEMBAR => self::barrier_operations::membar(self, insn),
         }
     }
 }
@@ -876,6 +1122,22 @@ mod tests {
     }
 
     #[test]
+    fn hmul2_reg_is_dispatched_to_half_multiply() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+
+        tv.translate_instruction(0x5D0B_0000_1037_0403);
+
+        let opcodes: Vec<_> = tv.ir.program.blocks[0]
+            .iter()
+            .map(|inst| inst.opcode)
+            .collect();
+        assert!(opcodes.contains(&Opcode::FPMul32));
+        assert!(opcodes.contains(&Opcode::SetRegister));
+    }
+
+    #[test]
     fn instruction_translation_leaves_execution_predication_to_cfg() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
@@ -916,5 +1178,37 @@ mod tests {
         assert!(opcodes.contains(&Opcode::IMul32));
         assert!(opcodes.iter().filter(|&&op| op == Opcode::IAdd32).count() >= 2);
         assert!(opcodes.contains(&Opcode::SetRegister));
+    }
+
+    #[test]
+    fn unaligned_double_cbuf_zeroes_the_lower_word() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+
+        let _ = tv.get_double_cbuf(1u64 << 20);
+
+        let instructions: Vec<_> = tv.ir.program.blocks[0].iter().collect();
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|inst| inst.opcode == Opcode::GetCbufU32)
+                .count(),
+            1
+        );
+        let construct = instructions
+            .iter()
+            .find(|inst| inst.opcode == Opcode::CompositeConstructU32x2)
+            .expect("GetDoubleCbuf must construct a pair");
+        assert_eq!(construct.args[0], Value::ImmU32(0));
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid Maxwell opcode")]
+    fn invalid_opcode_is_not_silently_ignored() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+        tv.translate_instruction(0);
     }
 }

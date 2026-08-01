@@ -3,91 +3,13 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/half_floating_point_set.cpp
 
+use super::common_funcs::{
+    floating_point_compare_16, floating_point_compare_32, predicate_combine,
+};
 use super::half_floating_point_helper::{extract, Swizzle};
 use super::{bit, field, TranslatorVisitor};
+use crate::ir::types::{FmzMode, FpControl};
 use crate::ir::value::{Pred, Value};
-
-/// Perform a floating-point comparison for HSET2/HSETP2.
-///
-/// `cmp` is the 4-bit FPCompareOp encoding (same as FSET2).
-/// Works on both F16 and F32 values — the opcode is selected based on whether the operand is F32.
-fn fp_compare_hset(
-    tv: &mut TranslatorVisitor,
-    cmp: u32,
-    a: Value,
-    b: Value,
-    is_f32: bool,
-) -> Value {
-    if is_f32 {
-        match cmp {
-            0 => tv.ir.imm_u1(false),
-            1 => tv.ir.fp_ord_less_than_32(a, b),
-            2 => tv.ir.fp_ord_equal_32(a, b),
-            3 => tv.ir.fp_ord_less_than_equal_32(a, b),
-            4 => tv.ir.fp_ord_greater_than_32(a, b),
-            5 => tv.ir.fp_ord_not_equal_32(a, b),
-            6 => tv.ir.fp_ord_greater_than_equal_32(a, b),
-            7 => {
-                let na = tv.ir.fp_is_nan_32(a);
-                let nb = tv.ir.fp_is_nan_32(b);
-                let e = tv.ir.logical_or(na, nb);
-                tv.ir.logical_not(e)
-            }
-            8 => {
-                let na = tv.ir.fp_is_nan_32(a);
-                let nb = tv.ir.fp_is_nan_32(b);
-                tv.ir.logical_or(na, nb)
-            }
-            9 => tv.ir.fp_unord_less_than_32(a, b),
-            10 => tv.ir.fp_unord_equal_32(a, b),
-            11 => tv.ir.fp_unord_less_than_32(a, b),
-            12 => tv.ir.fp_unord_greater_than_32(a, b),
-            13 => tv.ir.fp_unord_not_equal_32(a, b),
-            14 => tv.ir.fp_unord_greater_than_32(a, b),
-            15 => tv.ir.imm_u1(true),
-            _ => tv.ir.imm_u1(false),
-        }
-    } else {
-        match cmp {
-            0 => tv.ir.imm_u1(false),
-            1 => tv.ir.fp_ord_less_than_16(a, b),
-            2 => tv.ir.fp_ord_equal_16(a, b),
-            3 => tv.ir.fp_ord_less_than_equal_16(a, b),
-            4 => tv.ir.fp_ord_greater_than_16(a, b),
-            5 => tv.ir.fp_ord_not_equal_16(a, b),
-            6 => tv.ir.fp_ord_greater_than_equal_16(a, b),
-            7 => {
-                let na = tv.ir.fp_is_nan_16(a);
-                let nb = tv.ir.fp_is_nan_16(b);
-                let e = tv.ir.logical_or(na, nb);
-                tv.ir.logical_not(e)
-            }
-            8 => {
-                let na = tv.ir.fp_is_nan_16(a);
-                let nb = tv.ir.fp_is_nan_16(b);
-                tv.ir.logical_or(na, nb)
-            }
-            9 => tv.ir.fp_unord_less_than_16(a, b),
-            10 => tv.ir.fp_unord_equal_16(a, b),
-            11 => tv.ir.fp_unord_less_than_equal_16(a, b),
-            12 => tv.ir.fp_unord_greater_than_16(a, b),
-            13 => tv.ir.fp_unord_not_equal_16(a, b),
-            14 => tv.ir.fp_unord_greater_than_equal_16(a, b),
-            15 => tv.ir.imm_u1(true),
-            _ => tv.ir.imm_u1(false),
-        }
-    }
-}
-
-/// Apply a boolean operation to two predicates (AND=0, OR=1, XOR=2).
-fn pred_combine(tv: &mut TranslatorVisitor, a: Value, b: Value, bop: u32) -> Value {
-    match bop {
-        0 => tv.ir.logical_and(a, b),
-        1 => tv.ir.logical_or(a, b),
-        2 => tv.ir.logical_xor(a, b),
-        _ => a,
-    }
-}
 
 /// Core HSET2 implementation.
 fn hset2_inner(
@@ -128,7 +50,6 @@ fn hset2_inner(
     }
 
     let use_f32 = a_is_f32 || b_is_f32;
-    let _ = ftz;
 
     if use_f32 {
         lhs_a = tv.ir.fp_abs_neg_32(lhs_a, abs_a, neg_a);
@@ -147,10 +68,24 @@ fn hset2_inner(
         pred = tv.ir.logical_not(pred);
     }
 
-    let cmp_lhs = fp_compare_hset(tv, compare_op, lhs_a, lhs_b, use_f32);
-    let cmp_rhs = fp_compare_hset(tv, compare_op, rhs_a, rhs_b, use_f32);
-    let bop_lhs = pred_combine(tv, cmp_lhs, pred, bop);
-    let bop_rhs = pred_combine(tv, cmp_rhs, pred, bop);
+    let control = FpControl {
+        no_contraction: false,
+        rounding: Default::default(),
+        fmz_mode: if ftz { FmzMode::FTZ } else { FmzMode::None },
+    };
+    let (cmp_lhs, cmp_rhs) = if use_f32 {
+        (
+            floating_point_compare_32(tv, lhs_a, lhs_b, compare_op, control),
+            floating_point_compare_32(tv, rhs_a, rhs_b, compare_op, control),
+        )
+    } else {
+        (
+            floating_point_compare_16(tv, lhs_a, lhs_b, compare_op, control),
+            floating_point_compare_16(tv, rhs_a, rhs_b, compare_op, control),
+        )
+    };
+    let bop_lhs = predicate_combine(tv, cmp_lhs, pred.clone(), bop);
+    let bop_rhs = predicate_combine(tv, cmp_rhs, pred, bop);
 
     // true_value: if bf mode, 0x3c00 (F16 1.0), else 0xffff.
     let true_value = if bf { 0x3c00u32 } else { 0xffffu32 };
@@ -222,9 +157,4 @@ pub fn hset2_imm(tv: &mut TranslatorVisitor, insn: u64) {
         compare_op,
         Swizzle::H1H0,
     );
-}
-
-/// Public entry-point stub used when a single dispatch opcode covers HSET2.
-pub fn hset2(tv: &mut TranslatorVisitor, insn: u64) {
-    hset2_reg(tv, insn);
 }

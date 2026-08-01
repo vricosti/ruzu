@@ -5,6 +5,16 @@
 
 use super::{bit, field, TranslatorVisitor};
 
+pub fn membar(v: &mut TranslatorVisitor<'_>, insn: u64) {
+    if field(insn, 8, 2) == 0 {
+        v.ir.workgroup_memory_barrier();
+    } else {
+        v.ir.device_memory_barrier();
+    }
+}
+
+pub fn depbar(_v: &mut TranslatorVisitor<'_>) {}
+
 /// BAR — Barrier synchronization.
 ///
 /// Matches upstream `TranslatorVisitor::BAR(u64 insn)`.
@@ -28,6 +38,8 @@ pub fn bar(v: &mut TranslatorVisitor<'_>, insn: u64) {
     let is_b_imm = bit(insn, 44);
     let imm_a = field(insn, 8, 8);
     let imm_b = field(insn, 20, 12);
+    let neg_pred = bit(insn, 42);
+    let pred = field(insn, 39, 3);
 
     if !is_a_imm {
         panic!("BAR: non-immediate input A not implemented");
@@ -40,6 +52,9 @@ pub fn bar(v: &mut TranslatorVisitor<'_>, insn: u64) {
     }
     if imm_b != 0 {
         panic!("BAR: non-zero input B not implemented");
+    }
+    if pred != 7 && neg_pred {
+        panic!("BAR: non-true input predicate not implemented");
     }
 
     v.ir.barrier();

@@ -287,7 +287,6 @@ pub fn f2f_imm(tv: &mut TranslatorVisitor, insn: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frontend::maxwell_opcodes::MaxwellOpcode;
     use crate::ir::basic_block::Block;
     use crate::ir::opcodes::Opcode;
     use crate::ir::program::Program;

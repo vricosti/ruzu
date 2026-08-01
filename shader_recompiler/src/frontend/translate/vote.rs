@@ -7,7 +7,6 @@
 //! Handles the VOTE and VOTE_vtg instructions for subgroup voting operations.
 
 use super::{field, TranslatorVisitor};
-use crate::ir::value::Value;
 
 /// VOTE operation types, matching upstream `VoteOp` enum.
 #[repr(u64)]

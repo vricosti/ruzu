@@ -345,6 +345,8 @@ pub struct SpirvEmitContext {
     pub f16_type: spirv::Word,
     pub f32_type: spirv::Word,
     pub f16_vec2_type: spirv::Word,
+    pub f16_vec3_type: spirv::Word,
+    pub f16_vec4_type: spirv::Word,
     pub u32_vec2_type: spirv::Word,
     pub u32_vec3_type: spirv::Word,
     pub u32_vec4_type: spirv::Word,
@@ -594,6 +596,16 @@ impl SpirvEmitContext {
         } else {
             f32_vec2_type
         };
+        let f16_vec3_type = if program.info.uses_fp16 {
+            builder.type_vector(f16_type, 3)
+        } else {
+            f32_vec3_type
+        };
+        let f16_vec4_type = if program.info.uses_fp16 {
+            builder.type_vector(f16_type, 4)
+        } else {
+            f32_vec4_type
+        };
 
         // Upstream only defines 64-bit scalar types when the program uses
         // them. Declaring OpTypeInt/OpTypeFloat 64 without the corresponding
@@ -713,6 +725,8 @@ impl SpirvEmitContext {
             f16_type,
             f32_type,
             f16_vec2_type,
+            f16_vec3_type,
+            f16_vec4_type,
             u32_vec2_type,
             u32_vec3_type,
             u32_vec4_type,
@@ -3796,6 +3810,69 @@ impl SpirvEmitContext {
     ) {
         use ir::Opcode;
         match inst.opcode {
+            // ── FP16 arithmetic ───────────────────────────────────────
+            Opcode::FPAdd16 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_add_16(self, inst, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPMul16 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_mul_16(self, inst, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPFma16 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let c = self.resolve_value(inst.arg(2));
+                let id = super::emit_spirv_floating_point::emit_fp_fma_16(self, inst, a, b, c);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPNeg16 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_neg_16(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPAbs16 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_abs_16(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPSaturate16 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_saturate_16(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPClamp16 => {
+                let value = self.resolve_value(inst.arg(0));
+                let min = self.resolve_value(inst.arg(1));
+                let max = self.resolve_value(inst.arg(2));
+                let id = super::emit_spirv_floating_point::emit_fp_clamp_16(self, value, min, max);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPRoundEven16 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_round_even_16(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPFloor16 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_floor_16(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPCeil16 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_ceil_16(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPTrunc16 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_trunc_16(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+
             // ── FP32 arithmetic ───────────────────────────────────────
             Opcode::FPAdd32 => {
                 let a = self.resolve_value(inst.arg(0));
@@ -3938,6 +4015,60 @@ impl SpirvEmitContext {
                 let b = self.resolve_value(inst.arg(1));
                 let c = self.resolve_value(inst.arg(2));
                 let id = super::emit_spirv_floating_point::emit_fp_fma_64(self, inst, a, b, c);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPNeg64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_neg_64(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPAbs64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_abs_64(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPMin64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_min_64(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPMax64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_max_64(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPSaturate64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_saturate_64(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPClamp64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let min = self.resolve_value(inst.arg(1));
+                let max = self.resolve_value(inst.arg(2));
+                let id = super::emit_spirv_floating_point::emit_fp_clamp_64(self, value, min, max);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPRoundEven64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_round_even_64(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPFloor64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_floor_64(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPCeil64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_ceil_64(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPTrunc64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_trunc_64(self, value);
                 self.set_value(block_idx, inst_idx, id);
             }
 
@@ -4400,14 +4531,114 @@ impl SpirvEmitContext {
             }
 
             // ── Conversion ────────────────────────────────────────────
+            Opcode::ConvertS16F16 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_s16_f16(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertS16F32 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_s16_f32(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertS16F64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_s16_f64(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertS32F16 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_s32_f16(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::ConvertS32F32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let id = super::emit_spirv_convert::emit_convert_s32_f32(self, a);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::ConvertS32F64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_s32_f64(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertS64F16 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_s64_f16(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertS64F32 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_s64_f32(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertS64F64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_s64_f64(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertU16F16 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_u16_f16(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertU16F32 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_u16_f32(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertU16F64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_u16_f64(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertU32F16 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_u32_f16(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::ConvertU32F32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let id = super::emit_spirv_convert::emit_convert_u32_f32(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertU32F64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_u32_f64(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertU64F16 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_u64_f16(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertU64F32 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_u64_f32(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertU64F64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_u64_f64(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF16F32 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f16_f32(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF32F16 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f32_f16(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF32F64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f32_f64(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertF64F32 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_f64_f32(self, value);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::ConvertF32S32 => {
@@ -4582,10 +4813,150 @@ impl SpirvEmitContext {
             }
 
             // ── Composite ─────────────────────────────────────────────
+            Opcode::CompositeConstructU32x2 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_composite::emit_composite_construct_u32x2(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeConstructU32x3 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let c = self.resolve_value(inst.arg(2));
+                let id = super::emit_spirv_composite::emit_composite_construct_u32x3(self, a, b, c);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeConstructU32x4 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let c = self.resolve_value(inst.arg(2));
+                let d = self.resolve_value(inst.arg(3));
+                let id =
+                    super::emit_spirv_composite::emit_composite_construct_u32x4(self, a, b, c, d);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeExtractU32x2 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let index = inst.arg(1).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_extract_u32x2(
+                    self, composite, index,
+                );
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeExtractU32x3 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let index = inst.arg(1).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_extract_u32x3(
+                    self, composite, index,
+                );
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeExtractU32x4 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let index = inst.arg(1).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_extract_u32x4(
+                    self, composite, index,
+                );
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeInsertU32x2 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let object = self.resolve_value(inst.arg(1));
+                let index = inst.arg(2).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_insert_u32x2(
+                    self, composite, object, index,
+                );
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeInsertU32x3 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let object = self.resolve_value(inst.arg(1));
+                let index = inst.arg(2).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_insert_u32x3(
+                    self, composite, object, index,
+                );
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeInsertU32x4 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let object = self.resolve_value(inst.arg(1));
+                let index = inst.arg(2).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_insert_u32x4(
+                    self, composite, object, index,
+                );
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::CompositeConstructF16x2 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
                 let id = super::emit_spirv_composite::emit_composite_construct_f16x2(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeConstructF16x3 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let c = self.resolve_value(inst.arg(2));
+                let id = super::emit_spirv_composite::emit_composite_construct_f16x3(self, a, b, c);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeConstructF16x4 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let c = self.resolve_value(inst.arg(2));
+                let d = self.resolve_value(inst.arg(3));
+                let id =
+                    super::emit_spirv_composite::emit_composite_construct_f16x4(self, a, b, c, d);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeExtractF16x2 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let index = inst.arg(1).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_extract_f16x2(
+                    self, composite, index,
+                );
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeExtractF16x3 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let index = inst.arg(1).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_extract_f16x3(
+                    self, composite, index,
+                );
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeExtractF16x4 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let index = inst.arg(1).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_extract_f16x4(
+                    self, composite, index,
+                );
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeInsertF16x2 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let object = self.resolve_value(inst.arg(1));
+                let index = inst.arg(2).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_insert_f16x2(
+                    self, composite, object, index,
+                );
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeInsertF16x3 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let object = self.resolve_value(inst.arg(1));
+                let index = inst.arg(2).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_insert_f16x3(
+                    self, composite, object, index,
+                );
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeInsertF16x4 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let object = self.resolve_value(inst.arg(1));
+                let index = inst.arg(2).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_insert_f16x4(
+                    self, composite, object, index,
+                );
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::CompositeConstructF32x2 => {
@@ -4610,19 +4981,20 @@ impl SpirvEmitContext {
                     super::emit_spirv_composite::emit_composite_construct_f32x4(self, a, b, c, d);
                 self.set_value(block_idx, inst_idx, id);
             }
-            Opcode::CompositeConstructU32x2 => {
-                let a = self.resolve_value(inst.arg(0));
-                let b = self.resolve_value(inst.arg(1));
-                let id = super::emit_spirv_composite::emit_composite_construct_u32x2(self, a, b);
+            Opcode::CompositeExtractF32x2 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let index = inst.arg(1).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_extract_f32x2(
+                    self, composite, index,
+                );
                 self.set_value(block_idx, inst_idx, id);
             }
-            Opcode::CompositeConstructU32x4 => {
-                let a = self.resolve_value(inst.arg(0));
-                let b = self.resolve_value(inst.arg(1));
-                let c = self.resolve_value(inst.arg(2));
-                let d = self.resolve_value(inst.arg(3));
-                let id =
-                    super::emit_spirv_composite::emit_composite_construct_u32x4(self, a, b, c, d);
+            Opcode::CompositeExtractF32x3 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let index = inst.arg(1).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_extract_f32x3(
+                    self, composite, index,
+                );
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::CompositeExtractF32x4 => {
@@ -4633,19 +5005,30 @@ impl SpirvEmitContext {
                 );
                 self.set_value(block_idx, inst_idx, id);
             }
-            Opcode::CompositeExtractU32x2 => {
+            Opcode::CompositeInsertF32x2 => {
                 let composite = self.resolve_value(inst.arg(0));
-                let index = inst.arg(1).imm_u32();
-                let id = super::emit_spirv_composite::emit_composite_extract_u32x2(
-                    self, composite, index,
+                let object = self.resolve_value(inst.arg(1));
+                let index = inst.arg(2).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_insert_f32x2(
+                    self, composite, object, index,
                 );
                 self.set_value(block_idx, inst_idx, id);
             }
-            Opcode::CompositeExtractU32x4 => {
+            Opcode::CompositeInsertF32x3 => {
                 let composite = self.resolve_value(inst.arg(0));
-                let index = inst.arg(1).imm_u32();
-                let id = super::emit_spirv_composite::emit_composite_extract_u32x4(
-                    self, composite, index,
+                let object = self.resolve_value(inst.arg(1));
+                let index = inst.arg(2).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_insert_f32x3(
+                    self, composite, object, index,
+                );
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeInsertF32x4 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let object = self.resolve_value(inst.arg(1));
+                let index = inst.arg(2).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_insert_f32x4(
+                    self, composite, object, index,
                 );
                 self.set_value(block_idx, inst_idx, id);
             }
@@ -6407,5 +6790,148 @@ mod tests {
         assert_eq!(emitted_phi.class.opcode, spirv::Op::Phi);
         assert_eq!(emitted_phi.operands[0], Operand::IdRef(value_id));
         assert_ne!(emitted_phi.operands[0], Operand::IdRef(0));
+    }
+
+    #[test]
+    fn f16_f2i_pipeline_emits_every_translated_opcode() {
+        let mut program = ir::Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+
+        let value = program
+            .block_mut(0)
+            .append_inst(Inst::new(Opcode::ConvertF16F32, vec![Value::ImmF32(1.5)]));
+        let min = program
+            .block_mut(0)
+            .append_inst(Inst::new(Opcode::ConvertF16F32, vec![Value::ImmF32(0.0)]));
+        let max = program
+            .block_mut(0)
+            .append_inst(Inst::new(Opcode::ConvertF16F32, vec![Value::ImmF32(2.0)]));
+        let pair = program.block_mut(0).append_inst(Inst::new(
+            Opcode::CompositeConstructF16x2,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: value,
+                }),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: min,
+                }),
+            ],
+        ));
+        let extracted = program.block_mut(0).append_inst(Inst::new(
+            Opcode::CompositeExtractF16x2,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: pair,
+                }),
+                Value::ImmU32(0),
+            ],
+        ));
+        let inserted = program.block_mut(0).append_inst(Inst::new(
+            Opcode::CompositeInsertF16x2,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: pair,
+                }),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: max,
+                }),
+                Value::ImmU32(1),
+            ],
+        ));
+        program.block_mut(0).append_inst(Inst::new(
+            Opcode::PackFloat2x16,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: inserted,
+            })],
+        ));
+        let promoted = program.block_mut(0).append_inst(Inst::new(
+            Opcode::ConvertF32F16,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: extracted,
+            })],
+        ));
+        let lowered = program.block_mut(0).append_inst(Inst::new(
+            Opcode::ConvertF16F32,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: promoted,
+            })],
+        ));
+        let multiplied = program.block_mut(0).append_inst(Inst::new(
+            Opcode::FPMul16,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: lowered,
+                }),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: max,
+                }),
+            ],
+        ));
+        let rounded = program.block_mut(0).append_inst(Inst::new(
+            Opcode::FPRoundEven16,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: multiplied,
+            })],
+        ));
+        let clamped = program.block_mut(0).append_inst(Inst::new(
+            Opcode::FPClamp16,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: rounded,
+                }),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: min,
+                }),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: max,
+                }),
+            ],
+        ));
+        program.block_mut(0).append_inst(Inst::new(
+            Opcode::ConvertS32F16,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: clamped,
+            })],
+        ));
+        program.syntax_list = vec![ir::SyntaxNode::Block(0), ir::SyntaxNode::Return];
+        crate::ir_opt::collect_info::collect_shader_info_pass(&mut program);
+        assert!(program.info.uses_fp16);
+
+        let profile = Profile::default();
+        let runtime_info = RuntimeInfo::default();
+        let mut ctx = context_with_capabilities(&program, &profile, &runtime_info);
+        ctx.emit_program(&program);
+
+        let emitted = ctx
+            .builder
+            .module_ref()
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+            .map(|inst| inst.class.opcode)
+            .collect::<Vec<_>>();
+        assert!(emitted.contains(&spirv::Op::FConvert));
+        assert!(emitted.contains(&spirv::Op::FMul));
+        assert!(emitted.contains(&spirv::Op::ExtInst));
+        assert!(emitted.contains(&spirv::Op::ConvertFToS));
+        assert!(emitted.contains(&spirv::Op::CompositeConstruct));
+        assert!(emitted.contains(&spirv::Op::CompositeExtract));
+        assert!(emitted.contains(&spirv::Op::CompositeInsert));
     }
 }

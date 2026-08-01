@@ -15,6 +15,92 @@ pub fn emit_composite_construct_f16x2(ctx: &mut SpirvEmitContext, e1: Word, e2: 
         .unwrap()
 }
 
+pub fn emit_composite_construct_f16x3(
+    ctx: &mut SpirvEmitContext,
+    e1: Word,
+    e2: Word,
+    e3: Word,
+) -> Word {
+    ctx.builder
+        .composite_construct(ctx.f16_vec3_type, None, vec![e1, e2, e3])
+        .unwrap()
+}
+
+pub fn emit_composite_construct_f16x4(
+    ctx: &mut SpirvEmitContext,
+    e1: Word,
+    e2: Word,
+    e3: Word,
+    e4: Word,
+) -> Word {
+    ctx.builder
+        .composite_construct(ctx.f16_vec4_type, None, vec![e1, e2, e3, e4])
+        .unwrap()
+}
+
+pub fn emit_composite_extract_f16x2(
+    ctx: &mut SpirvEmitContext,
+    composite: Word,
+    index: u32,
+) -> Word {
+    ctx.builder
+        .composite_extract(ctx.f16_type, None, composite, vec![index])
+        .unwrap()
+}
+
+pub fn emit_composite_extract_f16x3(
+    ctx: &mut SpirvEmitContext,
+    composite: Word,
+    index: u32,
+) -> Word {
+    ctx.builder
+        .composite_extract(ctx.f16_type, None, composite, vec![index])
+        .unwrap()
+}
+
+pub fn emit_composite_extract_f16x4(
+    ctx: &mut SpirvEmitContext,
+    composite: Word,
+    index: u32,
+) -> Word {
+    ctx.builder
+        .composite_extract(ctx.f16_type, None, composite, vec![index])
+        .unwrap()
+}
+
+pub fn emit_composite_insert_f16x2(
+    ctx: &mut SpirvEmitContext,
+    composite: Word,
+    object: Word,
+    index: u32,
+) -> Word {
+    ctx.builder
+        .composite_insert(ctx.f16_vec2_type, None, object, composite, vec![index])
+        .unwrap()
+}
+
+pub fn emit_composite_insert_f16x3(
+    ctx: &mut SpirvEmitContext,
+    composite: Word,
+    object: Word,
+    index: u32,
+) -> Word {
+    ctx.builder
+        .composite_insert(ctx.f16_vec3_type, None, object, composite, vec![index])
+        .unwrap()
+}
+
+pub fn emit_composite_insert_f16x4(
+    ctx: &mut SpirvEmitContext,
+    composite: Word,
+    object: Word,
+    index: u32,
+) -> Word {
+    ctx.builder
+        .composite_insert(ctx.f16_vec4_type, None, object, composite, vec![index])
+        .unwrap()
+}
+
 // ── U32 composite operations ─────────────────────────────────────────────
 
 /// Emit `OpCompositeConstruct` for U32x2.

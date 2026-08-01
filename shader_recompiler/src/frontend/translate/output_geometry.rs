@@ -1,34 +1,37 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! OUT instruction translation — maps to zuyu's
-//! `frontend/maxwell/translate/impl/output_geometry.cpp`.
-//!
-//! Handles the OUT instruction for geometry shader output (emit vertex,
-//! end primitive).
+//! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/output_geometry.cpp
 
 use super::{bit, field, TranslatorVisitor};
 use crate::ir::value::Value;
 
-impl<'a> TranslatorVisitor<'a> {
-    /// Translate the OUT instruction (geometry shader emit/cut).
-    ///
-    /// Matches upstream `TranslatorVisitor::OUT(u64)`.
-    ///
-    /// Encoding:
-    /// - bit 0:    emit (1 = EmitVertex)
-    /// - bit 1:    cut (1 = EndPrimitive)
-    /// - bits [7:2]: stream index
-    pub fn translate_out(&mut self, insn: u64) {
-        let do_emit = bit(insn, 0);
-        let do_cut = bit(insn, 1);
-        let stream = field(insn, 2, 6);
+fn out(tv: &mut TranslatorVisitor<'_>, insn: u64, stream_index: Value) {
+    let dest_reg = field(insn, 0, 8);
+    let emit = bit(insn, 39);
+    let cut = bit(insn, 40);
+    let stream_index = tv.ir.bitwise_and_32(stream_index, Value::ImmU32(0b11));
 
-        if do_emit {
-            self.ir.emit_vertex(Value::ImmU32(stream));
-        }
-        if do_cut {
-            self.ir.end_primitive(Value::ImmU32(stream));
-        }
+    if emit {
+        tv.ir.emit_vertex(stream_index.clone());
     }
+    if cut {
+        tv.ir.end_primitive(stream_index);
+    }
+    tv.set_x(dest_reg, Value::ImmU32(0));
+}
+
+pub fn out_reg(tv: &mut TranslatorVisitor<'_>, insn: u64) {
+    let stream_index = tv.get_reg20(insn);
+    out(tv, insn, stream_index);
+}
+
+pub fn out_cbuf(tv: &mut TranslatorVisitor<'_>, insn: u64) {
+    let stream_index = tv.get_cbuf(insn);
+    out(tv, insn, stream_index);
+}
+
+pub fn out_imm(tv: &mut TranslatorVisitor<'_>, insn: u64) {
+    let stream_index = tv.get_imm20(insn);
+    out(tv, insn, stream_index);
 }

@@ -7,18 +7,6 @@
 //! Handles pixel-level loads for fragment shader helper/coverage queries.
 
 use super::{field, TranslatorVisitor};
-use crate::ir::value::Value;
-
-/// PIXLD mode, matching upstream pixel load modes.
-#[repr(u32)]
-#[derive(Debug, Clone, Copy)]
-enum PixelLoadMode {
-    CoverageMask = 1,
-    CoveredThreadCount = 2,
-    CoveredThreadIndex = 3,
-    InnerCoverage = 4,
-    StencilValue = 5,
-}
 
 impl<'a> TranslatorVisitor<'a> {
     /// Translate the PIXLD instruction.
@@ -26,26 +14,21 @@ impl<'a> TranslatorVisitor<'a> {
     /// Matches upstream `TranslatorVisitor::PIXLD(u64)`.
     pub fn translate_pixld(&mut self, insn: u64) {
         let dst = self.dst_reg(insn);
-        let mode_raw = field(insn, 8, 3);
+        let addr_reg = field(insn, 8, 8);
+        let addr_offset = field(insn, 20, 8);
+        let mode = field(insn, 31, 3);
+        let dest_pred = field(insn, 45, 3);
 
-        match mode_raw {
-            1 => {
-                // CoverageMask — returns sample mask
-                let val = self.ir.sample_id();
-                self.set_x(dst, val);
-            }
-            4 => {
-                // InnerCoverage — returns whether this is a helper invocation
-                let helper = self.ir.is_helper_invocation();
-                let not_helper = self.ir.logical_not(helper);
-                let result =
-                    self.ir
-                        .select_u32(not_helper, Value::ImmU32(0xFFFFFFFF), Value::ImmU32(0));
-                self.set_x(dst, result);
-            }
-            // Upstream throws NotImplementedException for CoveredThreadCount,
-            // CoveredThreadIndex, StencilValue, and any reserved encoding.
-            _ => panic!("PIXLD mode {} not implemented", mode_raw),
+        if dest_pred != 7 {
+            panic!("PIXLD destination predicate not implemented");
         }
+        if addr_reg != 255 || addr_offset != 0 {
+            panic!("PIXLD non-zero source register not implemented");
+        }
+        if mode != 5 {
+            panic!("PIXLD mode {mode} not implemented");
+        }
+        let sample_id = self.ir.sample_id();
+        self.set_x(dst, sample_id);
     }
 }

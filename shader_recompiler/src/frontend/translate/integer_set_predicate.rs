@@ -6,7 +6,7 @@
 use super::common_funcs::{extended_integer_compare, integer_compare, predicate_combine};
 use super::{bit, field, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::MaxwellOpcode;
-use crate::ir::value::{Pred, Value};
+use crate::ir::value::Pred;
 
 pub fn isetp(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let src_a = tv.x(tv.src_a_reg(insn));
@@ -42,6 +42,7 @@ mod tests {
     use crate::ir::opcodes::Opcode;
     use crate::ir::program::Program;
     use crate::ir::types::ShaderStage;
+    use crate::ir::value::Value;
 
     #[test]
     fn isetp_writes_upstream_predicate_destinations_and_negates_bop_pred() {

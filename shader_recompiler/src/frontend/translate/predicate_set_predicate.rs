@@ -3,6 +3,7 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/predicate_set_predicate.cpp
 
+use super::common_funcs::predicate_combine;
 use super::{bit, field, TranslatorVisitor};
 use crate::ir::value::Pred;
 
@@ -49,19 +50,4 @@ pub fn psetp(tv: &mut TranslatorVisitor, insn: u64) {
 
     tv.ir.set_pred(Pred(dest_pred_a_idx as u8), result_a);
     tv.ir.set_pred(Pred(dest_pred_b_idx as u8), result_b);
-}
-
-/// Apply a boolean operation to two predicates (AND=0, OR=1, XOR=2).
-fn predicate_combine(
-    tv: &mut TranslatorVisitor,
-    a: crate::ir::value::Value,
-    b: crate::ir::value::Value,
-    op: u32,
-) -> crate::ir::value::Value {
-    match op {
-        0 => tv.ir.logical_and(a, b),
-        1 => tv.ir.logical_or(a, b),
-        2 => tv.ir.logical_xor(a, b),
-        _ => a,
-    }
 }

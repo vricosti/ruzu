@@ -18,7 +18,9 @@ pub fn flo(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let tilde = bit(insn, 40);
     // BitField<41, 1> shift — XOR result with 31 when set (unless result == -1)
     let shift = bit(insn, 41);
-    // BitField<47, 1> cc — condition code write (not yet supported)
+    if bit(insn, 47) {
+        panic!("FLO CC not implemented upstream");
+    }
     // BitField<48, 1> is_signed
     let is_signed = bit(insn, 48);
 
@@ -40,4 +42,21 @@ pub fn flo(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     }
 
     tv.set_x(dst, result);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::basic_block::Block;
+    use crate::ir::program::Program;
+    use crate::ir::types::ShaderStage;
+
+    #[test]
+    #[should_panic(expected = "FLO CC not implemented upstream")]
+    fn flo_cc_matches_upstream_rejection() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let mut visitor = TranslatorVisitor::new(&mut program, 0);
+        flo(&mut visitor, 1u64 << 47, MaxwellOpcode::FLO_reg);
+    }
 }

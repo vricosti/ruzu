@@ -3,6 +3,7 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/video_set_predicate.cpp
 
+use super::common_funcs::predicate_combine;
 use super::video_helper::{extract_video_operand_value, get_video_source_width, VideoWidth};
 use super::{bit, field, TranslatorVisitor};
 use crate::ir::value::{Pred, Value};
@@ -46,17 +47,7 @@ fn integer_compare(tv: &mut TranslatorVisitor, a: Value, b: Value, op: u32, sign
             }
         } // GE
         19 => tv.ir.imm_u1(true),      // True
-        _ => tv.ir.imm_u1(false),
-    }
-}
-
-/// Apply a boolean operation to two predicates.
-fn pred_combine(tv: &mut TranslatorVisitor, a: Value, b: Value, bop: u32) -> Value {
-    match bop {
-        0 => tv.ir.logical_and(a, b),
-        1 => tv.ir.logical_or(a, b),
-        2 => tv.ir.logical_xor(a, b),
-        _ => a,
+        _ => panic!("Invalid VSETP compare op {op}"),
     }
 }
 
@@ -102,8 +93,8 @@ pub fn vsetp(tv: &mut TranslatorVisitor, insn: u64) {
     let not_comparison = tv.ir.logical_not(comparison);
 
     let bop_pred = tv.ir.get_pred(Pred(bop_pred_idx as u8), neg_bop_pred);
-    let result_a = pred_combine(tv, comparison, bop_pred, bop);
-    let result_b = pred_combine(tv, not_comparison, bop_pred, bop);
+    let result_a = predicate_combine(tv, comparison, bop_pred, bop);
+    let result_b = predicate_combine(tv, not_comparison, bop_pred, bop);
 
     tv.ir.set_pred(dest_pred_a, result_a);
     tv.ir.set_pred(dest_pred_b, result_b);

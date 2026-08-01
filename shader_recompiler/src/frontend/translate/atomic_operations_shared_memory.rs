@@ -125,14 +125,6 @@ pub fn atoms(tv: &mut TranslatorVisitor<'_>, insn: u64) {
     }
 }
 
-/// ATOMS_CAS — Atomic Compare-and-Swap on Shared Memory.
-///
-/// Upstream does not implement ATOMS_CAS as a real instruction —
-/// it's covered by `not_implemented.cpp::ATOMS_cas` which throws.
-pub fn atoms_cas(_tv: &mut TranslatorVisitor<'_>, _insn: u64) {
-    panic!("ATOMS_cas not implemented (upstream NotImplementedException)");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,47 +11,111 @@ use rspirv::spirv::Word;
 
 /// Extract lower 16 bits as unsigned.
 fn extract_u16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    let zero = ctx.const_zero_u32;
-    let sixteen = ctx.constant_u32(16);
-    ctx.builder
-        .bit_field_u_extract(ctx.u32_type, None, value, zero, sixteen)
-        .unwrap()
+    if ctx.profile.support_int16 {
+        ctx.builder.u_convert(ctx.u16_type, None, value).unwrap()
+    } else {
+        let zero = ctx.const_zero_u32;
+        let sixteen = ctx.constant_u32(16);
+        ctx.builder
+            .bit_field_u_extract(ctx.u32_type, None, value, zero, sixteen)
+            .unwrap()
+    }
 }
 
 /// Extract lower 16 bits as signed (sign-extend).
 fn extract_s16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    let zero = ctx.const_zero_u32;
-    let sixteen = ctx.constant_u32(16);
-    ctx.builder
-        .bit_field_s_extract(ctx.u32_type, None, value, zero, sixteen)
-        .unwrap()
+    if ctx.profile.support_int16 {
+        ctx.builder.s_convert(ctx.i16_type, None, value).unwrap()
+    } else {
+        let zero = ctx.const_zero_u32;
+        let sixteen = ctx.constant_u32(16);
+        ctx.builder
+            .bit_field_s_extract(ctx.u32_type, None, value, zero, sixteen)
+            .unwrap()
+    }
 }
 
 /// Extract lower 8 bits as unsigned.
 fn extract_u8(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    let zero = ctx.const_zero_u32;
-    let eight = ctx.constant_u32(8);
-    ctx.builder
-        .bit_field_u_extract(ctx.u32_type, None, value, zero, eight)
-        .unwrap()
+    if ctx.profile.support_int8 {
+        ctx.builder.u_convert(ctx.u8_type, None, value).unwrap()
+    } else {
+        let zero = ctx.const_zero_u32;
+        let eight = ctx.constant_u32(8);
+        ctx.builder
+            .bit_field_u_extract(ctx.u32_type, None, value, zero, eight)
+            .unwrap()
+    }
 }
 
 /// Extract lower 8 bits as signed (sign-extend).
 fn extract_s8(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    let zero = ctx.const_zero_u32;
-    let eight = ctx.constant_u32(8);
-    ctx.builder
-        .bit_field_s_extract(ctx.u32_type, None, value, zero, eight)
-        .unwrap()
+    if ctx.profile.support_int8 {
+        ctx.builder.s_convert(ctx.i8_type, None, value).unwrap()
+    } else {
+        let zero = ctx.const_zero_u32;
+        let eight = ctx.constant_u32(8);
+        ctx.builder
+            .bit_field_s_extract(ctx.u32_type, None, value, zero, eight)
+            .unwrap()
+    }
+}
+
+fn emit_convert_s16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    if ctx.profile.support_int16 {
+        let converted = ctx
+            .builder
+            .convert_f_to_s(ctx.u16_type, None, value)
+            .unwrap();
+        ctx.builder
+            .s_convert(ctx.u32_type, None, converted)
+            .unwrap()
+    } else {
+        let converted = ctx
+            .builder
+            .convert_f_to_s(ctx.u32_type, None, value)
+            .unwrap();
+        extract_s16(ctx, converted)
+    }
+}
+
+fn emit_convert_u16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    if ctx.profile.support_int16 {
+        let converted = ctx
+            .builder
+            .convert_f_to_u(ctx.u16_type, None, value)
+            .unwrap();
+        ctx.builder
+            .u_convert(ctx.u32_type, None, converted)
+            .unwrap()
+    } else {
+        let converted = ctx
+            .builder
+            .convert_f_to_u(ctx.u32_type, None, value)
+            .unwrap();
+        extract_u16(ctx, converted)
+    }
 }
 
 // ── Signed float-to-integer conversions ──────────────────────────────────
 
+pub fn emit_convert_s16_f16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    emit_convert_s16(ctx, value)
+}
+
 /// ConvertS32F32: `OpConvertFToS` F32 -> S32.
 pub fn emit_convert_s32_f32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    ctx.builder
-        .convert_f_to_s(ctx.u32_type, None, value)
-        .unwrap()
+    if ctx.profile.has_broken_signed_operations {
+        let signed = ctx
+            .builder
+            .convert_f_to_s(ctx.i32_type, None, value)
+            .unwrap();
+        ctx.builder.bitcast(ctx.u32_type, None, signed).unwrap()
+    } else {
+        ctx.builder
+            .convert_f_to_s(ctx.u32_type, None, value)
+            .unwrap()
+    }
 }
 
 /// ConvertS32F64: `OpConvertFToS` F64 -> S32.
@@ -63,11 +127,18 @@ pub fn emit_convert_s32_f64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 
 /// ConvertS16F32: `OpConvertFToS` F32 -> S16 (via S32 + extract).
 pub fn emit_convert_s16_f32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    let s32 = ctx
-        .builder
+    emit_convert_s16(ctx, value)
+}
+
+pub fn emit_convert_s16_f64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    emit_convert_s16(ctx, value)
+}
+
+/// ConvertS32F16: `OpConvertFToS` F16 -> S32.
+pub fn emit_convert_s32_f16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
         .convert_f_to_s(ctx.u32_type, None, value)
-        .unwrap();
-    extract_s16(ctx, s32)
+        .unwrap()
 }
 
 /// ConvertS64F32: `OpConvertFToS` F32 -> S64.
@@ -84,7 +155,18 @@ pub fn emit_convert_s64_f64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
         .unwrap()
 }
 
+/// ConvertS64F16: `OpConvertFToS` F16 -> S64.
+pub fn emit_convert_s64_f16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .convert_f_to_s(ctx.u64_type, None, value)
+        .unwrap()
+}
+
 // ── Unsigned float-to-integer conversions ────────────────────────────────
+
+pub fn emit_convert_u16_f16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    emit_convert_u16(ctx, value)
+}
 
 /// ConvertU32F32: `OpConvertFToU` F32 -> U32.
 pub fn emit_convert_u32_f32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
@@ -102,11 +184,18 @@ pub fn emit_convert_u32_f64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 
 /// ConvertU16F32: `OpConvertFToU` F32 -> U16 (via U32 + extract).
 pub fn emit_convert_u16_f32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    let u32_val = ctx
-        .builder
+    emit_convert_u16(ctx, value)
+}
+
+pub fn emit_convert_u16_f64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    emit_convert_u16(ctx, value)
+}
+
+/// ConvertU32F16: `OpConvertFToU` F16 -> U32.
+pub fn emit_convert_u32_f16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
         .convert_f_to_u(ctx.u32_type, None, value)
-        .unwrap();
-    extract_u16(ctx, u32_val)
+        .unwrap()
 }
 
 /// ConvertU64F32: `OpConvertFToU` F32 -> U64.
@@ -118,6 +207,13 @@ pub fn emit_convert_u64_f32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 
 /// ConvertU64F64: `OpConvertFToU` F64 -> U64.
 pub fn emit_convert_u64_f64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .convert_f_to_u(ctx.u64_type, None, value)
+        .unwrap()
+}
+
+/// ConvertU64F16: `OpConvertFToU` F16 -> U64.
+pub fn emit_convert_u64_f16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     ctx.builder
         .convert_f_to_u(ctx.u64_type, None, value)
         .unwrap()
@@ -181,6 +277,11 @@ pub fn emit_convert_f32_s16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 
 /// ConvertF32S32: `OpConvertSToF` S32 -> F32.
 pub fn emit_convert_f32_s32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    let value = if ctx.profile.has_broken_signed_operations {
+        ctx.builder.bitcast(ctx.i32_type, None, value).unwrap()
+    } else {
+        value
+    };
     ctx.builder
         .convert_s_to_f(ctx.f32_type, None, value)
         .unwrap()
@@ -195,6 +296,11 @@ pub fn emit_convert_f32_s64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 
 /// ConvertF64S32: `OpConvertSToF` S32 -> F64.
 pub fn emit_convert_f64_s32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    let value = if ctx.profile.has_broken_signed_operations {
+        ctx.builder.bitcast(ctx.i32_type, None, value).unwrap()
+    } else {
+        value
+    };
     ctx.builder
         .convert_s_to_f(ctx.f64_type, None, value)
         .unwrap()
@@ -305,6 +411,16 @@ pub fn emit_convert_f64_u64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 }
 
 // ── Float-to-float conversions ───────────────────────────────────────────
+
+/// ConvertF16F32: `OpFConvert` F32 -> F16.
+pub fn emit_convert_f16_f32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder.f_convert(ctx.f16_type, None, value).unwrap()
+}
+
+/// ConvertF32F16: `OpFConvert` F16 -> F32.
+pub fn emit_convert_f32_f16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder.f_convert(ctx.f32_type, None, value).unwrap()
+}
 
 /// ConvertF32F64: `OpFConvert` F64 -> F32.
 pub fn emit_convert_f32_f64(ctx: &mut SpirvEmitContext, value: Word) -> Word {

@@ -13,18 +13,19 @@ use crate::ir::value::Value;
 #[repr(u32)]
 pub enum VideoWidth {
     Byte = 0,
-    Short = 1,
-    Word = 2,
-    Unknown = 3,
+    Unknown = 1,
+    Short = 2,
+    Word = 3,
 }
 
 impl VideoWidth {
     pub fn from_u32(v: u32) -> Self {
         match v {
             0 => VideoWidth::Byte,
-            1 => VideoWidth::Short,
-            2 => VideoWidth::Word,
-            _ => VideoWidth::Unknown,
+            1 => VideoWidth::Unknown,
+            2 => VideoWidth::Short,
+            3 => VideoWidth::Word,
+            _ => unreachable!("2-bit VideoWidth field"),
         }
     }
 }

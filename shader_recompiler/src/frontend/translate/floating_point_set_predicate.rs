@@ -3,66 +3,11 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_set_predicate.cpp
 
+use super::common_funcs::{floating_point_compare_32, predicate_combine};
 use super::{bit, field, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::MaxwellOpcode;
 use crate::ir::types::{FmzMode, FpControl};
-use crate::ir::value::{Pred, Value};
-
-/// FP comparison predicate (from bits).
-fn fp_compare(
-    tv: &mut TranslatorVisitor,
-    cmp: u32,
-    a: Value,
-    b: Value,
-    control: FpControl,
-) -> Value {
-    match cmp {
-        0 => tv.ir.imm_u1(false),                                   // F (false)
-        1 => tv.ir.fp_ord_less_than_32_with_control(a, b, control), // LT
-        2 => tv.ir.fp_ord_equal_32_with_control(a, b, control),     // EQ
-        3 => tv.ir.fp_ord_less_than_equal_32_with_control(a, b, control), // LE
-        4 => tv.ir.fp_ord_greater_than_32_with_control(a, b, control), // GT
-        5 => tv.ir.fp_ord_not_equal_32_with_control(a, b, control), // NE
-        6 => tv
-            .ir
-            .fp_ord_greater_than_equal_32_with_control(a, b, control), // GE
-        7 => {
-            // NUM (ordered)
-            let nan_a = tv.ir.fp_is_nan_32(a);
-            let nan_b = tv.ir.fp_is_nan_32(b);
-            let either_nan = tv.ir.logical_or(nan_a, nan_b);
-            tv.ir.logical_not(either_nan)
-        }
-        8 => {
-            // NAN (unordered)
-            let nan_a = tv.ir.fp_is_nan_32(a);
-            let nan_b = tv.ir.fp_is_nan_32(b);
-            tv.ir.logical_or(nan_a, nan_b)
-        }
-        9 => tv.ir.fp_unord_less_than_32_with_control(a, b, control), // LTU
-        10 => tv.ir.fp_unord_equal_32_with_control(a, b, control),    // EQU
-        11 => tv
-            .ir
-            .fp_unord_less_than_equal_32_with_control(a, b, control), // LEU
-        12 => tv.ir.fp_unord_greater_than_32_with_control(a, b, control), // GTU
-        13 => tv.ir.fp_unord_not_equal_32_with_control(a, b, control), // NEU
-        14 => tv
-            .ir
-            .fp_unord_greater_than_equal_32_with_control(a, b, control), // GEU
-        15 => tv.ir.imm_u1(true),                                     // T (true)
-        _ => panic!("Invalid FP compare op {}", cmp),
-    }
-}
-
-/// Combine comparison result with predicate via boolean op.
-fn combine_pred(tv: &mut TranslatorVisitor, result: Value, pred: Value, bool_op: u32) -> Value {
-    match bool_op {
-        0 => tv.ir.logical_and(result, pred), // AND
-        1 => tv.ir.logical_or(result, pred),  // OR
-        2 => tv.ir.logical_xor(result, pred), // XOR
-        _ => panic!("Invalid FSETP boolean op {}", bool_op),
-    }
-}
+use crate::ir::value::Pred;
 
 pub fn fsetp(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let src_a = tv.f(tv.src_a_reg(insn));
@@ -89,10 +34,10 @@ pub fn fsetp(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let neg_bop_pred = bit(insn, 42);
     let pred39 = tv.ir.get_pred(pred_idx, neg_bop_pred);
 
-    let cmp_result = fp_compare(tv, cmp_op, a, b, control);
-    let result_a = combine_pred(tv, cmp_result, pred39, bool_op);
+    let cmp_result = floating_point_compare_32(tv, a, b, cmp_op, control);
+    let result_a = predicate_combine(tv, cmp_result.clone(), pred39.clone(), bool_op);
     let not_cmp = tv.ir.logical_not(cmp_result);
-    let result_b = combine_pred(tv, not_cmp, pred39, bool_op);
+    let result_b = predicate_combine(tv, not_cmp, pred39, bool_op);
 
     tv.ir.set_pred(dest_pred_a, result_a);
     tv.ir.set_pred(dest_pred_b, result_b);
@@ -105,6 +50,7 @@ mod tests {
     use crate::ir::opcodes::Opcode;
     use crate::ir::program::Program;
     use crate::ir::types::{FmzMode, FpControl, ShaderStage};
+    use crate::ir::value::Value;
 
     #[test]
     fn fsetp_writes_upstream_predicate_destinations_and_negates_bop_pred() {
@@ -175,7 +121,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Invalid FSETP boolean op 3")]
+    #[should_panic(expected = "Invalid boolean op 3")]
     fn fsetp_rejects_invalid_boolean_op_like_upstream() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
