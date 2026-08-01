@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use gtk::prelude::*;
 use gtk::{gio, glib, Application, ApplicationWindow};
 
+use common::settings_enums::ConfirmStop;
 use input_common::drivers::mouse::MouseButton;
 use ruzu_core::frontend::framebuffer_layout::{default_frame_layout, FramebufferLayout};
 
@@ -58,6 +59,24 @@ enum FullscreenHotkey {
     Exit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopConfirmation {
+    None,
+    ChangeGame,
+    ForceLockedExit,
+}
+
+fn stop_confirmation(setting: ConfirmStop, exit_locked: bool) -> StopConfirmation {
+    match (setting, exit_locked) {
+        (ConfirmStop::AskAlways, false) => StopConfirmation::ChangeGame,
+        (ConfirmStop::AskAlways | ConfirmStop::AskBasedOnGame, true) => {
+            StopConfirmation::ForceLockedExit
+        }
+        (ConfirmStop::AskBasedOnGame | ConfirmStop::AskNever, false)
+        | (ConfirmStop::AskNever, true) => StopConfirmation::None,
+    }
+}
+
 fn fullscreen_hotkey(keyval: gtk::gdk::Key) -> Option<FullscreenHotkey> {
     match keyval {
         gtk::gdk::Key::F11 => Some(FullscreenHotkey::Toggle),
@@ -90,6 +109,8 @@ pub struct GMainWindow {
     /// through the close handler exactly once.
     close_confirmation_pending: Cell<bool>,
     close_confirmed: Cell<bool>,
+    /// Prevent duplicate asynchronous `ConfirmShutdownGame` dialogs.
+    stop_confirmation_pending: Cell<bool>,
     /// Invalidates the previous session's GTK event poller when another title
     /// is booted before that poller receives a terminal event.
     session_generation: Cell<u64>,
@@ -316,6 +337,14 @@ mod loading_event_mailbox_tests {
             })
         ));
     }
+
+    #[test]
+    fn requested_stop_completion_is_preserved() {
+        let mut mailbox = LoadingEventMailbox::default();
+        mailbox.push(LoadingEvent::StopComplete);
+
+        assert!(matches!(mailbox.pop(), Some(LoadingEvent::StopComplete)));
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +362,39 @@ mod fullscreen_hotkey_tests {
             Some(FullscreenHotkey::Exit)
         );
         assert_eq!(fullscreen_hotkey(gtk::gdk::Key::F10), None);
+    }
+}
+
+#[cfg(test)]
+mod stop_confirmation_tests {
+    use super::*;
+
+    #[test]
+    fn follows_upstream_confirm_shutdown_policy() {
+        assert_eq!(
+            stop_confirmation(ConfirmStop::AskAlways, false),
+            StopConfirmation::ChangeGame
+        );
+        assert_eq!(
+            stop_confirmation(ConfirmStop::AskAlways, true),
+            StopConfirmation::ForceLockedExit
+        );
+        assert_eq!(
+            stop_confirmation(ConfirmStop::AskBasedOnGame, false),
+            StopConfirmation::None
+        );
+        assert_eq!(
+            stop_confirmation(ConfirmStop::AskBasedOnGame, true),
+            StopConfirmation::ForceLockedExit
+        );
+        assert_eq!(
+            stop_confirmation(ConfirmStop::AskNever, false),
+            StopConfirmation::None
+        );
+        assert_eq!(
+            stop_confirmation(ConfirmStop::AskNever, true),
+            StopConfirmation::None
+        );
     }
 }
 
@@ -492,6 +554,7 @@ impl GMainWindow {
             session: RefCell::new(None),
             close_confirmation_pending: Cell::new(false),
             close_confirmed: Cell::new(false),
+            stop_confirmation_pending: Cell::new(false),
             session_generation: Cell::new(0),
             status_bar,
             render: RefCell::new(None),
@@ -651,6 +714,17 @@ impl GMainWindow {
         ));
         app.add_action(&load_folder);
 
+        // Upstream `connect_menu(action_Stop, OnStopGame)` and the default
+        // "Stop Emulation" hotkey.
+        let stop = gio::SimpleAction::new("stop", None);
+        stop.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.on_stop_game()
+        ));
+        app.add_action(&stop);
+        app.set_accels_for_action("app.stop", &["F5"]);
+
         // Upstream `connect_menu(action_Configure, OnConfigure)`. Overrides the
         // startup stub, since the dialog is parented to this window.
         let configure = gio::SimpleAction::new("configure", None);
@@ -804,6 +878,10 @@ impl GMainWindow {
             glib::Propagation::Proceed,
             move |_, keyval, _keycode, state| {
                 if this.session.borrow().is_some() {
+                    if keyval == gtk::gdk::Key::F5 {
+                        this.on_stop_game();
+                        return glib::Propagation::Stop;
+                    }
                     if let Some(hotkey) = fullscreen_hotkey(keyval) {
                         if let Some(app) = this.window.application() {
                             match hotkey {
@@ -832,7 +910,9 @@ impl GMainWindow {
             #[weak(rename_to = this)]
             self,
             move |_, keyval, _keycode, state| {
-                if this.session.borrow().is_some() && fullscreen_hotkey(keyval).is_some() {
+                if this.session.borrow().is_some()
+                    && (keyval == gtk::gdk::Key::F5 || fullscreen_hotkey(keyval).is_some())
+                {
                     return;
                 }
                 this.on_key_event(keyval, state, false);
@@ -1582,6 +1662,10 @@ impl GMainWindow {
                     this.on_emulation_stopped(failure);
                     return glib::ControlFlow::Break;
                 }
+                Some(LoadingEvent::StopComplete) => {
+                    this.on_emulation_stopped(None);
+                    return glib::ControlFlow::Break;
+                }
                 None => {}
             }
             glib::ControlFlow::Continue
@@ -1742,6 +1826,10 @@ impl GMainWindow {
                     this.on_emulation_stopped(failure);
                     return glib::ControlFlow::Break;
                 }
+                Some(LoadingEvent::StopComplete) => {
+                    this.on_emulation_stopped(None);
+                    return glib::ControlFlow::Break;
+                }
                 None => {}
             }
             glib::ControlFlow::Continue
@@ -1892,6 +1980,10 @@ impl GMainWindow {
                     this.on_emulation_stopped(failure);
                     return glib::ControlFlow::Break;
                 }
+                Some(LoadingEvent::StopComplete) => {
+                    this.on_emulation_stopped(None);
+                    return glib::ControlFlow::Break;
+                }
                 None => {}
             }
             glib::ControlFlow::Continue
@@ -2040,12 +2132,96 @@ impl GMainWindow {
         self.stack.set_visible_child_name(PAGE_GAME_LIST);
     }
 
+    /// Upstream `GMainWindow::OnStopGame` and `ConfirmShutdownGame`.
+    fn on_stop_game(self: &Rc<Self>) {
+        let Some(exit_locked) = self
+            .session
+            .borrow()
+            .as_ref()
+            .map(EmulationSession::exit_locked)
+        else {
+            return;
+        };
+        let setting = crate::uisettings::with(|values| *values.confirm_before_stopping.get_value());
+        let confirmation = stop_confirmation(setting, exit_locked);
+        if confirmation == StopConfirmation::None {
+            self.begin_stop_game();
+            return;
+        }
+        if self.stop_confirmation_pending.replace(true) {
+            return;
+        }
+
+        let detail = match confirmation {
+            StopConfirmation::ChangeGame => {
+                "Are you sure you want to stop the emulation? Any unsaved progress will be lost."
+            }
+            StopConfirmation::ForceLockedExit => {
+                "The currently running application has requested ruzu to not exit.\n\n\
+                 Would you like to bypass this and exit anyway?"
+            }
+            StopConfirmation::None => unreachable!(),
+        };
+        crate::gtk_compat::ask_question(
+            Some(&self.window),
+            "ruzu",
+            detail,
+            "No",
+            "Yes",
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |accepted| {
+                    this.stop_confirmation_pending.set(false);
+                    if accepted {
+                        this.begin_stop_game();
+                    }
+                }
+            ),
+        );
+    }
+
+    /// Begin the non-blocking half of upstream `OnShutdownBegin`. The boot
+    /// thread requests guest exit, applies the upstream timeout, and reports
+    /// `StopComplete` after forced teardown if necessary.
+    fn begin_stop_game(self: &Rc<Self>) {
+        let requested = self
+            .session
+            .borrow_mut()
+            .as_mut()
+            .map(EmulationSession::request_stop)
+            .unwrap_or(false);
+        if !requested {
+            return;
+        }
+
+        if let Some(app) = self.window.application() {
+            if self.window.is_fullscreen() {
+                self.set_fullscreen_action_state(&app, false);
+                crate::uisettings::with_mut(|values| values.fullscreen.set_value(false));
+                self.set_fullscreen(false);
+            }
+            for name in ["pause", "restart", "stop"] {
+                if let Some(action) = app
+                    .lookup_action(name)
+                    .and_then(|action| action.downcast::<gio::SimpleAction>().ok())
+                {
+                    action.set_enabled(false);
+                }
+            }
+        }
+        if let Some(game_list) = self.game_list.borrow().as_ref() {
+            game_list.reload();
+        }
+    }
+
     /// Finish a session after a load failure or guest-requested exit.
     ///
     /// This follows upstream `OnEmulationStopped`: stop and join emulation
     /// before releasing the native render target, clear the loading assets,
     /// restore the game list, and then report an error when applicable.
     fn on_emulation_stopped(self: &Rc<Self>, failure: Option<(String, String)>) {
+        self.stop_confirmation_pending.set(false);
         if let Some(mut session) = self.session.borrow_mut().take() {
             session.stop();
         }

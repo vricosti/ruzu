@@ -976,9 +976,14 @@ pub struct System {
     is_powered_on: AtomicBool,
 
     /// Whether exit is locked (prevents accidental exit).
-    exit_locked: bool,
+    ///
+    /// Services update this from guest CPU threads while the frontend reads it
+    /// to implement upstream's stop-confirmation policy. `Arc<AtomicBool>` is
+    /// the Rust synchronization counterpart of the state owned by
+    /// `Core::System::Impl` upstream.
+    exit_locked: Arc<AtomicBool>,
     /// Whether exit has been requested.
-    exit_requested: bool,
+    exit_requested: AtomicBool,
 
     /// Whether NVDEC is active.
     nvdec_active: AtomicBool,
@@ -1108,8 +1113,8 @@ impl System {
             is_paused: AtomicBool::new(false),
             is_shutting_down: AtomicBool::new(false),
             is_powered_on: AtomicBool::new(false),
-            exit_locked: false,
-            exit_requested: false,
+            exit_locked: Arc::new(AtomicBool::new(false)),
+            exit_requested: AtomicBool::new(false),
             nvdec_active: AtomicBool::new(false),
             is_multicore: false,
             is_async_gpu: false,
@@ -1403,8 +1408,8 @@ impl System {
 
         // Upstream: is_powered_on = true, exit_locked = false, exit_requested = false
         self.is_powered_on.store(true, Ordering::Relaxed);
-        self.exit_locked = false;
-        self.exit_requested = false;
+        self.exit_locked.store(false, Ordering::Release);
+        self.exit_requested.store(false, Ordering::Release);
 
         log::info!("System: application process setup complete (services created)");
     }
@@ -1758,8 +1763,8 @@ impl System {
         }
 
         self.is_powered_on.store(false, Ordering::Relaxed);
-        self.exit_locked = false;
-        self.exit_requested = false;
+        self.exit_locked.store(false, Ordering::Release);
+        self.exit_requested.store(false, Ordering::Release);
 
         if let Some(ref gpu_core) = self.gpu_core {
             gpu_core.notify_shutdown();
@@ -2113,23 +2118,31 @@ impl System {
     }
 
     /// Set whether exit is locked.
-    pub fn set_exit_locked(&mut self, locked: bool) {
-        self.exit_locked = locked;
+    pub fn set_exit_locked(&self, locked: bool) {
+        self.exit_locked.store(locked, Ordering::Release);
     }
 
     /// Get whether exit is locked.
     pub fn get_exit_locked(&self) -> bool {
-        self.exit_locked
+        self.exit_locked.load(Ordering::Acquire)
+    }
+
+    /// Share the exit-lock state with a frontend that owns the emulation
+    /// lifecycle. Upstream's GUI reads `System::GetExitLocked()` directly; the
+    /// Rust GUI runs on a different host thread and therefore retains this
+    /// synchronized handle instead of a non-owning `SystemRef`.
+    pub fn exit_locked_state(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.exit_locked)
     }
 
     /// Set whether exit has been requested.
-    pub fn set_exit_requested(&mut self, requested: bool) {
-        self.exit_requested = requested;
+    pub fn set_exit_requested(&self, requested: bool) {
+        self.exit_requested.store(requested, Ordering::Release);
     }
 
     /// Get whether exit has been requested.
     pub fn get_exit_requested(&self) -> bool {
-        self.exit_requested
+        self.exit_requested.load(Ordering::Acquire)
     }
 
     /// Set the application process build ID.
@@ -2639,5 +2652,23 @@ impl System {
 impl Default for System {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod exit_state_tests {
+    use super::*;
+
+    #[test]
+    fn exit_lock_handle_tracks_system_state() {
+        let system = System::new();
+        let state = system.exit_locked_state();
+
+        assert!(!state.load(Ordering::Acquire));
+        system.set_exit_locked(true);
+        assert!(system.get_exit_locked());
+        assert!(state.load(Ordering::Acquire));
+        system.set_exit_locked(false);
+        assert!(!state.load(Ordering::Acquire));
     }
 }

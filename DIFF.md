@@ -29990,3 +29990,72 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   `backend::arm64::a32_core::tests::run_existing_block_calls_arm64_prelude`,
   which executes a manually inserted host block and does not invoke the A32
   translation paths changed here.
+
+## 2026-08-01 — core/src/{core.rs,hle/service/am/service/self_controller.rs} vs src/core/{core.h,core.cpp} and src/core/hle/service/am/service/{self_controller.h,self_controller.cpp}
+
+### Intentional differences
+- `exit_locked` is shared as an `Arc<AtomicBool>` and `exit_requested` is an
+  `AtomicBool`. Upstream stores plain booleans, while Rust services and the GTK
+  lifecycle owner access this state from separate host threads; acquire/release
+  operations preserve the same values without an unsynchronized alias.
+- `ISelfController` retains its existing null-`SystemRef` guard for isolated
+  service fixtures. Production construction always supplies the same mandatory
+  `System` reference as upstream.
+
+### Unintentional differences (to fix)
+- None in the reviewed exit-lock propagation slice.
+
+### Missing items
+- None for `LockExit`/`UnlockExit` system-state propagation.
+
+### Binary layout verification
+- N/A: these flags are internal host state and are not serialized or copied to
+  guest memory.
+
+### Behavioral verification
+- Re-read both upstream headers and implementations after the change.
+  `LockExit` now sets both applet and `System` state only when no exit is already
+  requested; `UnlockExit` clears both before processing a pending request.
+- `cargo test -p core exit_lock_handle_tracks_system_state --lib` passes.
+- The complete `cargo test -p core --lib` run still reaches pre-existing test
+  failures and then aborts in
+  `k_server_session::tests::cleanup_map_succeeds_without_resolved_processes`
+  on an invalid `slice::from_raw_parts` precondition. The new focused test had
+  already passed in the same binary.
+
+## 2026-08-01 — ruzu/src/{boot.rs,main_window.rs} vs src/yuzu/{main.h,main.cpp,uisettings.h}
+
+### Intentional differences
+- GTK confirmation dialogs are asynchronous. `EmulationSession::request_stop`
+  sends the request to the thread owning `System`, and `StopComplete` returns
+  completion to GTK instead of using Qt signals, `QThread::finished`, and a
+  `QTimer`.
+- The synchronized `System` exit-lock handle replaces the upstream GUI's direct
+  `System::GetExitLocked()` call because the Rust `System` is owned by the boot
+  thread.
+- Ruzu retains the rendered frame while shutdown is pending instead of creating
+  upstream's Qt-specific `OverlayDialog` saying "Closing software...". Menu
+  actions are disabled for the same interval and native render ownership is
+  released only after shutdown completes.
+
+### Unintentional differences (to fix)
+- None in the reviewed Stop/F5, confirmation, graceful-exit, and return-to-list
+  path.
+
+### Missing items
+- The configured controller shortcut `L+Plus+Minus` depends on the broader
+  frontend controller-hotkey registry, which is not yet wired to GTK actions.
+  Menu activation and the upstream default keyboard shortcut F5 are complete.
+
+### Binary layout verification
+- N/A: frontend actions and host-thread lifecycle messages serialize no guest
+  payload.
+
+### Behavioral verification
+- Re-read `OnStopGame`, `ConfirmShutdownGame`, `OnShutdownBegin`,
+  `RequestGameExit`, `OnEmulationStopTimeExpired`, and `OnEmulationStopped`
+  after implementation. Ruzu now applies the three `ConfirmStop` policies,
+  honors application exit locking, requests guest exit, waits zero/one/five
+  seconds under the same conditions, forces teardown, destroys the native
+  render target, and restores the game list.
+- `cargo test -p ruzu --bin ruzu` passes: 129 passed, 0 failed.

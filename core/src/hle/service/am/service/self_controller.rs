@@ -287,6 +287,9 @@ impl ISelfController {
             applet.process.terminate();
         } else {
             applet.exit_locked = true;
+            if !self.system.is_null() {
+                self.system.get().set_exit_locked(true);
+            }
         }
     }
 
@@ -295,6 +298,9 @@ impl ISelfController {
         log::debug!("UnlockExit called");
         let mut applet = self.applet.lock().unwrap();
         applet.exit_locked = false;
+        if !self.system.is_null() {
+            self.system.get().set_exit_locked(false);
+        }
         if applet.lifecycle_manager.get_exit_requested() {
             applet.process.terminate();
         }

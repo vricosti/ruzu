@@ -21,7 +21,7 @@
 // deferred tech debt.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -56,6 +56,7 @@ pub enum LoadingEvent {
     Stopped {
         before_first_frame: bool,
     },
+    StopComplete,
 }
 
 /// Loading event callback marshaled to the GTK main thread.
@@ -69,6 +70,8 @@ pub struct EmulationSession {
     join: Option<JoinHandle<()>>,
     perf_results: Arc<RwLock<PerfStatsResults>>,
     running: Arc<AtomicBool>,
+    exit_locked: Arc<AtomicBool>,
+    frontend_stop_requested: Arc<AtomicBool>,
 }
 
 impl EmulationSession {
@@ -89,11 +92,27 @@ impl EmulationSession {
         )
     }
 
+    /// Whether the running application requested that frontend exits be
+    /// confirmed. Mirrors `Core::System::GetExitLocked()`.
+    pub fn exit_locked(&self) -> bool {
+        self.exit_locked.load(Ordering::Acquire)
+    }
+
+    /// Begin the upstream graceful shutdown path without blocking the GTK main
+    /// loop. Completion is reported through [`LoadingEvent::StopComplete`].
+    pub fn request_stop(&mut self) -> bool {
+        if let Some(tx) = self.stop_tx.take() {
+            self.frontend_stop_requested.store(true, Ordering::Release);
+            let _ = tx.send(());
+            true
+        } else {
+            false
+        }
+    }
+
     /// Signal the boot thread to shut the system down and join it.
     pub fn stop(&mut self) {
-        if let Some(tx) = self.stop_tx.take() {
-            let _ = tx.send(());
-        }
+        let _ = self.request_stop();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -123,8 +142,11 @@ pub fn boot_game(
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let perf_results = Arc::new(RwLock::new(PerfStatsResults::default()));
     let running = Arc::new(AtomicBool::new(false));
+    let frontend_stop_requested = Arc::new(AtomicBool::new(false));
+    let (exit_locked_tx, exit_locked_rx) = std::sync::mpsc::sync_channel(1);
     let boot_perf_results = Arc::clone(&perf_results);
     let boot_running = Arc::clone(&running);
+    let boot_frontend_stop_requested = Arc::clone(&frontend_stop_requested);
 
     let join = std::thread::Builder::new()
         .name("ruzu-boot".into())
@@ -140,15 +162,23 @@ pub fn boot_game(
                 stop_rx,
                 boot_perf_results,
                 boot_running,
+                exit_locked_tx,
+                boot_frontend_stop_requested,
             );
         })
         .expect("spawn boot thread");
+
+    let exit_locked = exit_locked_rx
+        .recv()
+        .expect("boot thread publishes System exit-lock state");
 
     EmulationSession {
         stop_tx: Some(stop_tx),
         join: Some(join),
         perf_results,
         running,
+        exit_locked,
+        frontend_stop_requested,
     }
 }
 
@@ -164,6 +194,8 @@ fn run_boot(
     stop_rx: Receiver<()>,
     perf_results: Arc<RwLock<PerfStatsResults>>,
     running: Arc<AtomicBool>,
+    exit_locked_tx: SyncSender<Arc<AtomicBool>>,
+    frontend_stop_requested: Arc<AtomicBool>,
 ) {
     use ruzu_core::core::{System, SystemRef, SystemResultStatus};
 
@@ -181,6 +213,7 @@ fn run_boot(
 
     // System init — upstream `Core::System system{}; system.Initialize();`.
     let mut system = System::new_with_hid_core(hid_core);
+    let _ = exit_locked_tx.send(system.exit_locked_state());
     system.initialize();
 
     // Content provider / filesystem / factories (upstream core.cpp:367-370).
@@ -453,8 +486,11 @@ fn run_boot(
     let exit_loading_event = Arc::clone(&loading_event);
     let exit_first_frame_displayed = Arc::clone(&first_frame_displayed);
     let exit_requested = Arc::clone(&guest_exit_requested);
+    let callback_frontend_stop_requested = Arc::clone(&frontend_stop_requested);
     system.register_exit_callback(Box::new(move || {
-        if !exit_requested.swap(true, Ordering::AcqRel) {
+        if !exit_requested.swap(true, Ordering::AcqRel)
+            && !callback_frontend_stop_requested.load(Ordering::Acquire)
+        {
             exit_loading_event(LoadingEvent::Stopped {
                 before_first_frame: !exit_first_frame_displayed.load(Ordering::Acquire),
             });
@@ -467,12 +503,15 @@ fn run_boot(
     // GTK owns the main event loop. The boot thread retains ownership of
     // `System`, samples the same counters as upstream's 500 ms GUI timer, and
     // waits for a stop request between samples.
-    loop {
+    let stopped_by_frontend = loop {
         if guest_exit_requested.load(Ordering::Acquire) {
-            break;
+            break false;
         }
         match stop_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                frontend_stop_requested.store(true, Ordering::Release);
+                break true;
+            }
             Err(RecvTimeoutError::Timeout) => {
                 let sample = system.get_and_reset_perf_stats();
                 *perf_results
@@ -481,12 +520,35 @@ fn run_boot(
                 running.store(true, Ordering::Release);
             }
         }
-    }
+    };
     running.store(false, Ordering::Release);
+
+    if stopped_by_frontend {
+        // Upstream `RequestGameExit`: let the application process its normal
+        // exit request before `OnEmulationStopTimeExpired` forces shutdown.
+        system.set_shutting_down(true);
+        system.set_exit_requested(true);
+        system.get_applet_manager().request_exit();
+        let timeout = if system.debugger_enabled() {
+            Duration::ZERO
+        } else if system.get_exit_locked() {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(1)
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        while !guest_exit_requested.load(Ordering::Acquire) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     log::info!("Emulation stopping: pause + shutdown");
     system.pause();
     system.shutdown_main_process();
+    if stopped_by_frontend {
+        loading_event(LoadingEvent::StopComplete);
+    }
 }
 
 fn load_error_detail(status: ruzu_core::core::SystemResultStatus) -> &'static str {
@@ -508,6 +570,25 @@ fn load_error_detail(status: ruzu_core::core::SystemResultStatus) -> &'static st
 mod tests {
     use super::*;
     use ruzu_core::core::SystemResultStatus;
+
+    #[test]
+    fn requesting_stop_is_idempotent_and_marks_frontend_shutdown() {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let frontend_stop_requested = Arc::new(AtomicBool::new(false));
+        let mut session = EmulationSession {
+            stop_tx: Some(stop_tx),
+            join: None,
+            perf_results: Arc::new(RwLock::new(PerfStatsResults::default())),
+            running: Arc::new(AtomicBool::new(false)),
+            exit_locked: Arc::new(AtomicBool::new(false)),
+            frontend_stop_requested: Arc::clone(&frontend_stop_requested),
+        };
+
+        assert!(session.request_stop());
+        assert!(frontend_stop_requested.load(Ordering::Acquire));
+        assert_eq!(stop_rx.recv(), Ok(()));
+        assert!(!session.request_stop());
+    }
 
     #[test]
     fn load_errors_have_frontend_facing_details() {
