@@ -31050,3 +31050,44 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - `backend::arm64::inst::tests::encodes_known_arm64_words` covers the four
   instruction encoders with words independently assembled by Apple's ARM64
   assembler.
+
+## 2026-08-03 — audio_core/src/audio_core.rs vs audio_core/audio_core.{h,cpp}
+
+### Intentional differences
+- Rust explicitly shuts down ADSP and closes both sinks from `AudioCore::shutdown`.
+  Upstream obtains the same ordering from reverse destruction of its uniquely
+  owned `adsp`, `input_sink`, and `output_sink` fields after the destructor body.
+  The explicit calls are required because Rust service sessions can retain
+  shared `SinkHandle` owners after `System::audio_core` is cleared.
+
+### Unintentional differences (to fix)
+- None in the AudioCore teardown ordering after this pass.
+
+### Missing items
+- None for this teardown slice.
+
+### Binary layout verification
+- PASS: only host-side destruction ordering changed.
+
+### Behavioral verification
+- Re-read `AudioCore::~AudioCore`, `AudioCore::Shutdown`, the ADSP-owned app
+  destructors, and `CubebSinkStream::Finalize`. Rust now stops ADSP first and
+  synchronously destroys every backend stream before `Core::System` can be
+  released, including streams retained indirectly by deferred service owners.
+
+## 2026-08-03 — audio_core/src/adsp/adsp.rs vs audio_core/adsp/adsp.{h,cpp}
+
+### Intentional differences
+- `ADSP::shutdown` names the work performed implicitly by destruction of
+  upstream's `audio_renderer` and `opus_decoder` unique owners. `Drop` delegates
+  to the same idempotent method so explicit AudioCore shutdown and ordinary
+  destruction share one ordering path.
+
+### Unintentional differences (to fix)
+- None in ADSP application shutdown after this pass.
+
+### Missing items
+- None for this teardown slice.
+
+### Binary layout verification
+- PASS: no guest-visible or serialized structure changed.

@@ -38,11 +38,16 @@ impl ADSP {
     pub fn opus_decoder(&self) -> OpusDecoderHandle {
         self.opus_decoder.clone()
     }
+
+    /// Reproduce the destruction of upstream's two owned ADSP applications.
+    pub fn shutdown(&mut self) {
+        self.audio_renderer.lock().stop();
+        self.opus_decoder.lock().shutdown();
+    }
 }
 
 impl Drop for ADSP {
     fn drop(&mut self) {
-        self.audio_renderer.lock().stop();
-        self.opus_decoder.lock().shutdown();
+        self.shutdown();
     }
 }
