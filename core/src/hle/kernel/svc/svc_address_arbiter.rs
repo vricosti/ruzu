@@ -70,22 +70,22 @@ fn log_sync_context(system: &System, label: &str) {
     }
 }
 
-fn is_valid_signal_type(signal_type: SignalType) -> bool {
-    matches!(
-        signal_type,
-        SignalType::Signal
-            | SignalType::SignalAndIncrementIfEqual
-            | SignalType::SignalAndModifyByWaitingCountIfEqual
-    )
+fn parse_signal_type(signal_type: u32) -> Option<SignalType> {
+    match signal_type {
+        0 => Some(SignalType::Signal),
+        1 => Some(SignalType::SignalAndIncrementIfEqual),
+        2 => Some(SignalType::SignalAndModifyByWaitingCountIfEqual),
+        _ => None,
+    }
 }
 
-fn is_valid_arbitration_type(arb_type: ArbitrationType) -> bool {
-    matches!(
-        arb_type,
-        ArbitrationType::WaitIfLessThan
-            | ArbitrationType::DecrementAndWaitIfLessThan
-            | ArbitrationType::WaitIfEqual
-    )
+fn parse_arbitration_type(arb_type: u32) -> Option<ArbitrationType> {
+    match arb_type {
+        0 => Some(ArbitrationType::WaitIfLessThan),
+        1 => Some(ArbitrationType::DecrementAndWaitIfLessThan),
+        2 => Some(ArbitrationType::WaitIfEqual),
+        _ => None,
+    }
 }
 
 /// Convert SVC ArbitrationType to KAddressArbiter ArbitrationType.
@@ -112,23 +112,23 @@ fn to_k_sig_type(signal_type: SignalType) -> KSigType {
 pub fn wait_for_address(
     system: &System,
     address: u64,
-    arb_type: ArbitrationType,
+    arb_type_raw: u32,
     value: i32,
     timeout_ns: i64,
 ) -> ResultCode {
     log::trace!(
-        "svc::WaitForAddress called, address=0x{:X}, arb_type={:?}, value=0x{:X}, timeout_ns={}",
+        "svc::WaitForAddress called, address=0x{:X}, arb_type=0x{:X}, value=0x{:X}, timeout_ns={}",
         address,
-        arb_type,
+        arb_type_raw,
         value,
         timeout_ns
     );
     if should_trace_sync_debug() {
         log::info!(
-            "svc::WaitForAddress tid={:?} address=0x{:X} arb_type={:?} value=0x{:X} timeout_ns={}",
+            "svc::WaitForAddress tid={:?} address=0x{:X} arb_type=0x{:X} value=0x{:X} timeout_ns={}",
             system.current_thread_id(),
             address,
-            arb_type,
+            arb_type_raw,
             value,
             timeout_ns
         );
@@ -142,9 +142,9 @@ pub fn wait_for_address(
     if address % 4 != 0 {
         return RESULT_INVALID_ADDRESS;
     }
-    if !is_valid_arbitration_type(arb_type) {
+    let Some(arb_type) = parse_arbitration_type(arb_type_raw) else {
         return RESULT_INVALID_ENUM_VALUE;
-    }
+    };
 
     // Convert timeout from nanoseconds to ticks.
     // Upstream: kernel.HardwareTimer().GetTick() + offset_tick + 2
@@ -187,23 +187,23 @@ pub fn wait_for_address(
 pub fn signal_to_address(
     system: &System,
     address: u64,
-    signal_type: SignalType,
+    signal_type_raw: u32,
     value: i32,
     count: i32,
 ) -> ResultCode {
     log::trace!(
-        "svc::SignalToAddress called, address=0x{:X}, signal_type={:?}, value=0x{:X}, count=0x{:X}",
+        "svc::SignalToAddress called, address=0x{:X}, signal_type=0x{:X}, value=0x{:X}, count=0x{:X}",
         address,
-        signal_type,
+        signal_type_raw,
         value,
         count
     );
     if should_trace_sync_debug() {
         log::info!(
-            "svc::SignalToAddress tid={:?} address=0x{:X} signal_type={:?} value=0x{:X} count=0x{:X}",
+            "svc::SignalToAddress tid={:?} address=0x{:X} signal_type=0x{:X} value=0x{:X} count=0x{:X}",
             system.current_thread_id(),
             address,
-            signal_type,
+            signal_type_raw,
             value,
             count
         );
@@ -217,9 +217,9 @@ pub fn signal_to_address(
     if address % 4 != 0 {
         return RESULT_INVALID_ADDRESS;
     }
-    if !is_valid_signal_type(signal_type) {
+    let Some(signal_type) = parse_signal_type(signal_type_raw) else {
         return RESULT_INVALID_ENUM_VALUE;
-    }
+    };
 
     let result = system
         .current_process_arc()

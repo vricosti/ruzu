@@ -7,90 +7,10 @@
 use super::applet::Applet;
 use std::sync::Mutex;
 
-// ---------------------------------------------------------------------------
-// Stub types for service layer enums.
-// Local definitions until hle::service::am::frontend types are ported.
-// ---------------------------------------------------------------------------
-
-/// Corresponds to upstream `Service::AM::Frontend::SwkbdType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u32)]
-pub enum SwkbdType {
-    #[default]
-    Normal = 0,
-    NumberPad = 1,
-    Qwerty = 2,
-    Unknown3 = 3,
-    Latin = 4,
-    SimplifiedChinese = 5,
-    TraditionalChinese = 6,
-    Korean = 7,
-}
-
-/// Corresponds to upstream `Service::AM::Frontend::SwkbdPasswordMode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u32)]
-pub enum SwkbdPasswordMode {
-    #[default]
-    Disabled = 0,
-    Enabled = 1,
-}
-
-/// Corresponds to upstream `Service::AM::Frontend::SwkbdTextDrawType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u32)]
-pub enum SwkbdTextDrawType {
-    #[default]
-    Line = 0,
-    Box = 1,
-    DownloadCode = 2,
-}
-
-/// Corresponds to upstream `Service::AM::Frontend::SwkbdKeyDisableFlags`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SwkbdKeyDisableFlags {
-    pub raw: u32,
-}
-
-/// Corresponds to upstream `Service::AM::Frontend::SwkbdReplyType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum SwkbdReplyType {
-    FinishedInitialize = 0,
-    Default = 1,
-    ChangedString = 2,
-    MovedCursor = 3,
-    MovedTab = 4,
-    DecidedEnter = 5,
-    DecidedCancel = 6,
-    ChangedStringUtf8 = 7,
-    MovedCursorUtf8 = 8,
-    DecidedEnterUtf8 = 9,
-    UnsetCustomizeDic = 10,
-    ReleasedUserWordInfo = 11,
-    UnsetCustomizedDictionaries = 12,
-    ChangedStringV2 = 13,
-    MovedCursorV2 = 14,
-    ChangedStringUtf8V2 = 15,
-    MovedCursorUtf8V2 = 16,
-}
-
-/// Corresponds to upstream `Service::AM::Frontend::SwkbdResult`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum SwkbdResult {
-    Ok = 0,
-    Cancel = 1,
-}
-
-/// Corresponds to upstream `Service::AM::Frontend::SwkbdTextCheckResult`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum SwkbdTextCheckResult {
-    Success = 0,
-    ShowFailureDialog = 1,
-    ShowConfirmDialog = 2,
-}
+pub use crate::hle::service::am::frontend::applet_software_keyboard_types::{
+    SwkbdKeyDisableFlags, SwkbdPasswordMode, SwkbdReplyType, SwkbdResult, SwkbdTextCheckResult,
+    SwkbdTextDrawType, SwkbdType,
+};
 
 // ---------------------------------------------------------------------------
 // Keyboard parameter types
@@ -106,8 +26,8 @@ pub struct KeyboardInitializeParameters {
     pub sub_text: String,
     pub guide_text: String,
     pub initial_text: String,
-    pub left_optional_symbol_key: char,
-    pub right_optional_symbol_key: char,
+    pub left_optional_symbol_key: u16,
+    pub right_optional_symbol_key: u16,
     pub max_text_length: u32,
     pub min_text_length: u32,
     pub initial_cursor_position: i32,
@@ -164,7 +84,7 @@ pub type SubmitInlineCallback = Box<dyn Fn(SwkbdReplyType, String, i32) + Send +
 /// Corresponds to upstream `Core::Frontend::SoftwareKeyboardApplet`.
 pub trait SoftwareKeyboardApplet: Applet {
     fn initialize_keyboard(
-        &mut self,
+        &self,
         is_inline: bool,
         initialize_parameters: KeyboardInitializeParameters,
         submit_normal_callback: SubmitNormalCallback,
@@ -192,7 +112,7 @@ pub trait SoftwareKeyboardApplet: Applet {
 ///
 /// Corresponds to upstream `Core::Frontend::DefaultSoftwareKeyboardApplet`.
 pub struct DefaultSoftwareKeyboardApplet {
-    parameters: KeyboardInitializeParameters,
+    parameters: Mutex<KeyboardInitializeParameters>,
     submit_normal_callback: Mutex<Option<SubmitNormalCallback>>,
     submit_inline_callback: Mutex<Option<SubmitInlineCallback>>,
 }
@@ -200,7 +120,7 @@ pub struct DefaultSoftwareKeyboardApplet {
 impl Default for DefaultSoftwareKeyboardApplet {
     fn default() -> Self {
         Self {
-            parameters: KeyboardInitializeParameters::default(),
+            parameters: Mutex::new(KeyboardInitializeParameters::default()),
             submit_normal_callback: Mutex::new(None),
             submit_inline_callback: Mutex::new(None),
         }
@@ -253,7 +173,7 @@ impl Applet for DefaultSoftwareKeyboardApplet {
 
 impl SoftwareKeyboardApplet for DefaultSoftwareKeyboardApplet {
     fn initialize_keyboard(
-        &mut self,
+        &self,
         is_inline: bool,
         initialize_parameters: KeyboardInitializeParameters,
         submit_normal_callback: SubmitNormalCallback,
@@ -271,7 +191,8 @@ impl SoftwareKeyboardApplet for DefaultSoftwareKeyboardApplet {
             *self.submit_normal_callback.lock().unwrap() = Some(submit_normal_callback);
         }
 
-        self.parameters = initialize_parameters;
+        *self.parameters.lock().unwrap() = initialize_parameters;
+        let parameters = self.parameters.lock().unwrap();
 
         log::info!(
             "\nKeyboardInitializeParameters:\
@@ -291,28 +212,28 @@ impl SoftwareKeyboardApplet for DefaultSoftwareKeyboardApplet {
              \nenable_backspace_button={}\
              \nenable_return_button={}\
              \ndisable_cancel_button={}",
-            self.parameters.ok_text,
-            self.parameters.header_text,
-            self.parameters.sub_text,
-            self.parameters.guide_text,
-            self.parameters.initial_text,
-            self.parameters.max_text_length,
-            self.parameters.min_text_length,
-            self.parameters.initial_cursor_position,
-            self.parameters.swkbd_type,
-            self.parameters.password_mode,
-            self.parameters.text_draw_type,
-            self.parameters.key_disable_flags.raw,
-            self.parameters.use_blur_background,
-            self.parameters.enable_backspace_button,
-            self.parameters.enable_return_button,
-            self.parameters.disable_cancel_button,
+            parameters.ok_text,
+            parameters.header_text,
+            parameters.sub_text,
+            parameters.guide_text,
+            parameters.initial_text,
+            parameters.max_text_length,
+            parameters.min_text_length,
+            parameters.initial_cursor_position,
+            parameters.swkbd_type,
+            parameters.password_mode,
+            parameters.text_draw_type,
+            parameters.key_disable_flags.raw,
+            parameters.use_blur_background,
+            parameters.enable_backspace_button,
+            parameters.enable_return_button,
+            parameters.disable_cancel_button,
         );
     }
 
     fn show_normal_keyboard(&self) {
         log::warn!("(STUBBED) called, backend requested to show the normal software keyboard.");
-        self.submit_normal_text("zuyu");
+        self.submit_normal_text("yuzu");
     }
 
     fn show_text_check_dialog(
@@ -362,7 +283,7 @@ impl SoftwareKeyboardApplet for DefaultSoftwareKeyboardApplet {
         // directly since the Mutex<Option<Arc>> pattern already supports shared access.
         // A true detached thread would block the test harness, so we call synchronously
         // like upstream does in practice (the thread is fire-and-forget).
-        self.submit_inline_text("zuyu");
+        self.submit_inline_text("yuzu");
     }
 
     fn hide_inline_keyboard(&self) {

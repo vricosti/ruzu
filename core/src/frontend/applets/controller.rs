@@ -4,6 +4,12 @@
 //! Port of zuyu/src/core/frontend/applets/controller.h and controller.cpp
 //! Controller configuration applet interface.
 
+use std::sync::Arc;
+
+use hid_core::hid_core::{HIDCore, AVAILABLE_CONTROLLERS};
+use hid_core::hid_types::{NpadIdType, NpadStyleIndex};
+use parking_lot::Mutex;
+
 use super::applet::Applet;
 
 /// Corresponds to upstream `BorderColor` (std::array<u8, 4>).
@@ -70,12 +76,17 @@ pub trait ControllerApplet: Applet {
     );
 }
 
-/// Default (stub) controller applet implementation.
-///
 /// Corresponds to upstream `Core::Frontend::DefaultControllerApplet`.
-/// NOTE: Upstream holds a reference to HIDCore and performs actual controller
-/// configuration logic. This stub simply calls the callback with `true`.
-pub struct DefaultControllerApplet;
+#[derive(Clone)]
+pub struct DefaultControllerApplet {
+    hid_core: Arc<Mutex<HIDCore>>,
+}
+
+impl DefaultControllerApplet {
+    pub fn new(hid_core: Arc<Mutex<HIDCore>>) -> Self {
+        Self { hid_core }
+    }
+}
 
 impl Applet for DefaultControllerApplet {
     fn close(&self) {}
@@ -95,17 +106,91 @@ impl ControllerApplet for DefaultControllerApplet {
             parameters.min_players as usize
         };
 
-        // Upstream holds a reference to HID::HIDCore and performs:
-        // 1. Disconnect handheld controller
-        // 2. For each controller index 0..available_controllers-2:
-        //    a. Disconnect the controller
-        //    b. If index < min_supported_players, connect with priority:
-        //       ProController > DualJoycons > Left/Right Joycon > Handheld
-        // This requires HIDCore integration (hid_core crate) which is not yet
-        // wired into the frontend applet layer. The callback(true) below matches
-        // upstream's final call after successful reconfiguration.
-        let _ = min_supported_players;
+        let (handheld, controllers) = {
+            let hid_core = self.hid_core.lock();
+            let handheld = hid_core.get_emulated_controller(NpadIdType::Handheld);
+            let controllers = (0..AVAILABLE_CONTROLLERS - 2)
+                .map(|index| hid_core.get_emulated_controller_by_index(index))
+                .collect::<Vec<_>>();
+            (handheld, controllers)
+        };
+
+        handheld.lock().disconnect();
+
+        for (index, controller) in controllers.into_iter().enumerate() {
+            let mut controller = controller.lock();
+            controller.disconnect();
+
+            if index >= min_supported_players {
+                continue;
+            }
+
+            if parameters.allow_pro_controller {
+                controller.set_npad_style_index(NpadStyleIndex::Fullkey);
+                controller.connect(true);
+            } else if parameters.allow_dual_joycons {
+                controller.set_npad_style_index(NpadStyleIndex::JoyconDual);
+                controller.connect(true);
+            } else if parameters.allow_left_joycon && parameters.allow_right_joycon {
+                controller.set_npad_style_index(if index % 2 == 0 {
+                    NpadStyleIndex::JoyconLeft
+                } else {
+                    NpadStyleIndex::JoyconRight
+                });
+                controller.connect(true);
+            } else if index == 0
+                && parameters.enable_single_mode
+                && parameters.allow_handheld
+                && !common::settings::is_docked_mode(&common::settings::values())
+            {
+                controller.set_npad_style_index(NpadStyleIndex::Handheld);
+                controller.connect(true);
+            } else {
+                panic!("Unable to add a new controller based on the given parameters");
+            }
+        }
 
         callback(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use hid_core::hid_types::NpadStyleIndex;
+
+    use super::*;
+
+    #[test]
+    fn default_applet_connects_minimum_players_as_fullkey() {
+        let hid_core = Arc::new(Mutex::new(HIDCore::new()));
+        let applet = DefaultControllerApplet::new(Arc::clone(&hid_core));
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback_called_copy = Arc::clone(&callback_called);
+        let parameters = ControllerParameters {
+            min_players: 1,
+            max_players: 4,
+            allow_pro_controller: true,
+            ..ControllerParameters::default()
+        };
+
+        applet.reconfigure_controllers(
+            Box::new(move |success| {
+                assert!(success);
+                callback_called_copy.store(true, Ordering::Relaxed);
+            }),
+            &parameters,
+        );
+
+        assert!(callback_called.load(Ordering::Relaxed));
+        let player_1 = hid_core.lock().get_emulated_controller(NpadIdType::Player1);
+        let player_2 = hid_core.lock().get_emulated_controller(NpadIdType::Player2);
+        assert!(player_1.lock().is_connected(false));
+        assert_eq!(
+            player_1.lock().get_npad_style_index(false),
+            NpadStyleIndex::Fullkey
+        );
+        assert!(!player_2.lock().is_connected(false));
     }
 }

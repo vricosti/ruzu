@@ -1698,6 +1698,9 @@ mod tests {
                 branch_false: None,
                 cond: Condition::always(),
                 stack_depth: 0,
+                branch_reg: 0,
+                branch_offset: 0,
+                indirect_branches: Vec::new(),
             },
             CfgBlock {
                 begin: 1,
@@ -1707,6 +1710,9 @@ mod tests {
                 branch_false: None,
                 cond: Condition::always(),
                 stack_depth: 0,
+                branch_reg: 0,
+                branch_offset: 0,
+                indirect_branches: Vec::new(),
             },
         ];
 
@@ -1740,6 +1746,9 @@ mod tests {
             branch_false: None,
             cond: Condition::always(),
             stack_depth: 0,
+            branch_reg: 0,
+            branch_offset: 0,
+            indirect_branches: Vec::new(),
         }];
 
         let program = translate_cfg_to_program(&[0], ShaderStage::VertexB, 0, &cfg_blocks, None);
@@ -1770,6 +1779,9 @@ mod tests {
             branch_false: None,
             cond: Condition::always(),
             stack_depth: 0,
+            branch_reg: 0,
+            branch_offset: 0,
+            indirect_branches: Vec::new(),
         }];
 
         let program = translate_cfg_to_program(&[0], ShaderStage::Fragment, 0, &cfg_blocks, None);
@@ -1799,6 +1811,9 @@ mod tests {
                     negated: true,
                 },
                 stack_depth: 0,
+                branch_reg: 0,
+                branch_offset: 0,
+                indirect_branches: Vec::new(),
             },
             CfgBlock {
                 begin: 1,
@@ -1808,6 +1823,9 @@ mod tests {
                 branch_false: None,
                 cond: Condition::always(),
                 stack_depth: 0,
+                branch_reg: 0,
+                branch_offset: 0,
+                indirect_branches: Vec::new(),
             },
             CfgBlock {
                 begin: 2,
@@ -1817,6 +1835,9 @@ mod tests {
                 branch_false: None,
                 cond: Condition::always(),
                 stack_depth: 0,
+                branch_reg: 0,
+                branch_offset: 0,
+                indirect_branches: Vec::new(),
             },
         ];
 

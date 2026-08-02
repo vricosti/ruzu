@@ -52,6 +52,10 @@ pub struct KSession {
     pub initialized: bool,
     /// Whether the process `SessionCountMax` reservation was committed.
     session_resource_committed: bool,
+    /// Rust representation of the two parent references held by upstream's
+    /// embedded server and client endpoints.
+    server_endpoint_closed: bool,
+    client_endpoint_closed: bool,
 }
 
 impl KSession {
@@ -67,6 +71,8 @@ impl KSession {
             atomic_state: AtomicU8::new(SessionState::Invalid as u8),
             initialized: false,
             session_resource_committed: false,
+            server_endpoint_closed: false,
+            client_endpoint_closed: false,
         }
     }
 
@@ -79,6 +85,8 @@ impl KSession {
         self.name = name;
         self.set_state(SessionState::Normal);
         self.initialized = true;
+        self.server_endpoint_closed = false;
+        self.client_endpoint_closed = false;
     }
 
     pub fn is_initialized(&self) -> bool {
@@ -206,6 +214,20 @@ impl KSession {
                 .unwrap()
                 .on_client_closed_with_process(process);
         }
+    }
+
+    /// Release upstream's reference held by `KServerSession`.
+    /// Returns true once both embedded endpoint references have closed.
+    pub fn close_server_endpoint(&mut self) -> bool {
+        self.server_endpoint_closed = true;
+        self.client_endpoint_closed
+    }
+
+    /// Release upstream's reference held by `KClientSession`.
+    /// Returns true once both embedded endpoint references have closed.
+    pub fn close_client_endpoint(&mut self) -> bool {
+        self.client_endpoint_closed = true;
+        self.server_endpoint_closed
     }
 
     /// Finalize the session.

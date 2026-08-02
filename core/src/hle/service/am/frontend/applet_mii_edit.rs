@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::core::SystemRef;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::am::am_types::LibraryAppletMode;
 use crate::hle::service::am::applet_data_broker::AppletDataBroker;
 use crate::hle::service::mii::mii::{IStaticService, SERVICE_NAME_E};
@@ -206,6 +207,10 @@ impl FrontendApplet for MiiEdit {
         panic!("Attempted to call interactive execution on non-interactive applet.");
     }
 
+    fn get_status(&self) -> ResultCode {
+        RESULT_SUCCESS
+    }
+
     fn execute(&mut self) {
         if self.is_complete {
             return;
@@ -300,5 +305,9 @@ impl FrontendApplet for MiiEdit {
 
     fn is_initialized(&self) -> bool {
         self.initialized
+    }
+
+    fn is_complete(&self) -> bool {
+        self.is_complete
     }
 }

@@ -15,7 +15,7 @@ pub struct AudioManager {
     needs_update: Arc<AtomicBool>,
     events: Arc<Event>,
     buffer_events: Arc<Mutex<[Option<BufferEventFunc>; 3]>>,
-    thread: Option<JoinHandle<()>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl AudioManager {
@@ -47,14 +47,19 @@ impl AudioManager {
             needs_update,
             events,
             buffer_events,
-            thread: Some(thread),
+            thread: Mutex::new(Some(thread)),
         }
     }
 
-    pub fn shutdown(&mut self) {
+    pub fn shutdown(&self) {
         self.running.store(false, Ordering::SeqCst);
         self.events.set_audio_event(Type::Max, true);
-        if let Some(thread) = self.thread.take() {
+        if let Some(thread) = self
+            .thread
+            .lock()
+            .expect("audio manager thread handle poisoned")
+            .take()
+        {
             let _ = thread.join();
         }
     }
@@ -133,5 +138,25 @@ impl Default for AudioManager {
 impl Drop for AudioManager {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_joins_thread_with_shared_manager_owners() {
+        let manager = Arc::new(AudioManager::new());
+        let other_owner = Arc::clone(&manager);
+
+        manager.shutdown();
+
+        assert!(!manager.running.load(Ordering::SeqCst));
+        assert!(manager.thread.lock().unwrap().is_none());
+        assert!(manager.set_out_manager(Arc::new(|| {})).is_error());
+
+        other_owner.shutdown();
+        assert!(other_owner.thread.lock().unwrap().is_none());
     }
 }

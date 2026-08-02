@@ -160,6 +160,13 @@ fn replace_uses_with(program: &mut Program, old: InstRef, replacement: Value) {
 }
 
 fn propagate(inst: &mut Inst) {
+    // Upstream's FoldWhenAllImmediates and FoldAdd preserve an instruction
+    // while it owns pseudo-operations: the backend emits those flags together
+    // with their parent. Folding the parent would orphan Get*FromOp users.
+    if inst.associated.is_some() {
+        return;
+    }
+
     match inst.opcode {
         // ── Special register/predicate folding ────────────────────────
         Opcode::GetRegister => {
@@ -939,15 +946,51 @@ fn fold_fp_mul_interpolation(program: &mut Program, inst_ref: InstRef) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend;
     use crate::environment::Environment;
     use crate::ir::basic_block::Block;
+    use crate::ir::emitter::Emitter;
+    use crate::ir::program::SyntaxNode;
     use crate::ir::types::ShaderStage;
     use crate::ir::value::Attribute;
     use crate::program_header::ProgramHeader;
+    use crate::runtime_info::RuntimeInfo;
     use crate::shader_info::{ReplaceConstant, TexturePixelFormat, TextureType};
+    use crate::Profile;
 
     fn inst(block: u32, inst: u32) -> Value {
         Value::Inst(InstRef { block, inst })
+    }
+
+    #[test]
+    fn immediate_parent_with_pseudo_is_not_folded() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let (extract_ref, zero_ref) = {
+            let mut ir = Emitter::new(&mut program, 0);
+            let extract =
+                ir.bit_field_u_extract(Value::ImmU32(1), Value::ImmU32(0), Value::ImmU32(1));
+            let zero = ir.get_zero_from_op(extract);
+            ir.select_u1(zero, Value::ImmU1(false), Value::ImmU1(true));
+            (extract.inst_ref(), zero.inst_ref())
+        };
+        program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+
+        constant_propagation_pass(&mut program);
+
+        let extract = program.block(0).inst(extract_ref.inst);
+        assert_eq!(extract.opcode, Opcode::BitFieldUExtract);
+        assert_eq!(
+            extract.get_associated_pseudo(Opcode::GetZeroFromOp),
+            Some(zero_ref)
+        );
+        assert_eq!(
+            program.block(0).inst(zero_ref.inst).args,
+            vec![Value::Inst(extract_ref)]
+        );
+
+        let spirv = backend::emit_spirv(&program, &Profile::default(), &RuntimeInfo::default());
+        assert!(!spirv.is_empty());
     }
 
     #[test]

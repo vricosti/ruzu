@@ -235,6 +235,7 @@ pub struct ServerManager {
     /// fully refactored into per-field locks (upstream pattern), this queue
     /// can be removed in favor of direct calls.
     pending_registrations: PendingRegistrationQueue,
+    pending_session_closures: Arc<Mutex<Vec<u64>>>,
 
     /// Stop flag. Upstream: `std::stop_source m_stop_source`.
     stop_requested: Arc<AtomicBool>,
@@ -460,6 +461,7 @@ impl ServerManager {
             stopped: AtomicBool::new(false),
             loop_started: AtomicBool::new(false),
             pending_registrations: Arc::new(Mutex::new(Vec::new())),
+            pending_session_closures: Arc::new(Mutex::new(Vec::new())),
             pending_additional_host_threads: Vec::new(),
             host_threads: Arc::new(Mutex::new(Vec::new())),
             self_reference: None,
@@ -533,6 +535,24 @@ impl ServerManager {
         }
         for (server_session, manager) in drained {
             let _ = self.register_session(server_session, manager);
+        }
+    }
+
+    /// Consume endpoint-close notifications from sessions handled by the
+    /// temporary inline IPC path. Upstream observes the same closures directly
+    /// through `MultiWait`; this queue avoids linking a second request consumer
+    /// while preserving ServerManager ownership of session destruction.
+    fn drain_pending_session_closures(&mut self) {
+        let closed_parent_ids = {
+            let mut queue = self.pending_session_closures.lock().unwrap();
+            std::mem::take(&mut *queue)
+        };
+        for parent_id in closed_parent_ids {
+            if let Some(index) = self.sessions.iter().position(|session| {
+                Self::server_session_parent_id(&session.server_session) == Some(parent_id)
+            }) {
+                self.destroy_session(index);
+            }
         }
     }
 
@@ -717,6 +737,14 @@ impl ServerManager {
         let session_id = self.next_session_id;
         self.next_session_id = self.next_session_id.wrapping_add(1).max(1);
         let mut session = Session::new(session_id, server_session, manager);
+        session
+            .server_session
+            .lock()
+            .unwrap()
+            .set_manager_close_notification(
+                Arc::downgrade(&self.pending_session_closures),
+                Arc::downgrade(&self.wakeup_event),
+            );
         // Reactive session consumption is only safe when svc_ipc.rs routes the
         // same session through the host-thread path. Non-routed sessions still
         // use the inline fallback, where linking this holder would create a
@@ -1128,6 +1156,7 @@ impl ServerManager {
 
             self.ensure_kernel_port_registrations();
             self.drain_pending_registrations();
+            self.drain_pending_session_closures();
             self.link_deferred();
 
             if self.stop_requested.load(Ordering::Relaxed) {
@@ -1178,8 +1207,39 @@ impl ServerManager {
             return;
         }
 
-        let session_id = self.sessions[session_index].id;
-        self.sessions.remove(session_index);
+        let session = self.sessions.remove(session_index);
+        let session_id = session.id;
+
+        // Deleting upstream's Session wrapper closes its native
+        // KServerSession. Rust's Arc does not run that kernel-object close, so
+        // perform KServerSession::Destroy explicitly before dropping the
+        // wrapper. This also finalizes the parent KSession once its client end
+        // has closed and releases the parent KClientPort session slot.
+        let parent_id = session.server_session.lock().unwrap().get_parent_id();
+        if let Some(parent_id) = parent_id {
+            let owner_process = (!self.system.is_null())
+                .then(|| self.system.get().kernel())
+                .flatten()
+                .and_then(|kernel| kernel.get_session_owner_process_id(parent_id))
+                .and_then(|process_id| {
+                    self.system
+                        .get()
+                        .kernel()
+                        .and_then(|kernel| kernel.get_process_by_id(process_id))
+                });
+            if let Some(owner_process) = owner_process {
+                let mut process = owner_process.lock().unwrap();
+                session
+                    .server_session
+                    .lock()
+                    .unwrap()
+                    .destroy_with_process(&mut process);
+            } else {
+                session.server_session.lock().unwrap().destroy();
+            }
+        } else {
+            session.server_session.lock().unwrap().destroy();
+        }
 
         // Upstream stores raw `Session*` entries in `m_deferred_sessions`; a
         // destroyed session pointer must no longer be retried. Rust stores
@@ -2124,6 +2184,28 @@ mod tests {
 
         assert_eq!(manager.sessions.len(), 1);
         assert!(!manager.sessions[0].holder.is_linked());
+    }
+
+    #[test]
+    fn inline_session_close_returns_to_server_manager_for_destruction() {
+        let mut manager = ServerManager::new(SystemRef::null());
+        let server_session = Arc::new(Mutex::new(KServerSession::new()));
+        server_session.lock().unwrap().initialize(0x1000);
+        let request_manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+
+        assert_eq!(
+            manager.register_session(Arc::clone(&server_session), request_manager),
+            RESULT_SUCCESS
+        );
+        assert!(!manager.sessions[0].holder.is_linked());
+
+        server_session.lock().unwrap().on_client_closed();
+        assert!(manager.wakeup_event.is_signaled());
+        assert_eq!(*manager.pending_session_closures.lock().unwrap(), [0x1000]);
+
+        manager.drain_pending_session_closures();
+        assert!(manager.sessions.is_empty());
+        assert!(manager.pending_session_closures.lock().unwrap().is_empty());
     }
 
     #[test]

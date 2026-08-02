@@ -3,15 +3,16 @@
 
 //! Port of hid_core/resources/npad/npad_vibration.h and npad_vibration.cpp
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use common::ResultCode;
 
 use crate::hid_result;
 
 /// Handles vibration master volume and permit sessions
+#[derive(Clone)]
 pub struct NpadVibration {
-    inner: Mutex<NpadVibrationInner>,
+    inner: Arc<Mutex<NpadVibrationInner>>,
 }
 
 struct NpadVibrationInner {
@@ -22,10 +23,10 @@ struct NpadVibrationInner {
 impl Default for NpadVibration {
     fn default() -> Self {
         Self {
-            inner: Mutex::new(NpadVibrationInner {
+            inner: Arc::new(Mutex::new(NpadVibrationInner {
                 volume: 0.0,
                 session_aruid: 0,
-            }),
+            })),
         }
     }
 }

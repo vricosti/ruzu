@@ -8,6 +8,7 @@
 //!
 //! Ref: zuyu `frontend/maxwell/control_flow.cpp`
 
+use super::indirect_branch_table_track::track_indirect_branch_table;
 use super::instruction::{Instruction, Predicate};
 use super::location::Location;
 use super::maxwell_opcodes::{self, MaxwellOpcode};
@@ -70,6 +71,11 @@ pub struct CfgBlock {
     pub cond: Condition,
     /// Stack depth at entry (for SSY/PBK/PCNT tracking).
     pub stack_depth: u32,
+    /// Register and offset used to materialize an indirect branch address.
+    pub branch_reg: u32,
+    pub branch_offset: i32,
+    /// Resolved indirect branch destinations.
+    pub indirect_branches: Vec<IndirectBranch>,
 }
 
 /// Convergence stack entry — tracks SSY/PBK/PCNT push points.
@@ -373,7 +379,7 @@ impl FlowCfg {
                 AnalysisState::Continue
             }
             MaxwellOpcode::BRX | MaxwellOpcode::JMX => {
-                self.analyze_indirect_branch(block, pc, opcode, function_id)
+                self.analyze_indirect_branch(env, block, pc, inst, opcode, function_id)
             }
             MaxwellOpcode::EXIT => self.analyze_exit(block, function_id, pc, inst),
             MaxwellOpcode::CAL | MaxwellOpcode::JCAL => {
@@ -511,19 +517,60 @@ impl FlowCfg {
 
     fn analyze_indirect_branch(
         &mut self,
+        env: &mut dyn Environment,
         block: usize,
         pc: Location,
+        inst: Instruction,
         opcode: MaxwellOpcode,
-        _function_id: usize,
+        function_id: usize,
     ) -> AnalysisState {
+        let table = track_indirect_branch_table(env, pc, self.program_start)
+            .unwrap_or_else(|| panic!("Failed to track indirect branch"));
+        let flow_test = inst.branch_flow_test().unwrap_or(FlowTest::T);
+        let pred = inst.pred();
+        if flow_test != FlowTest::T || pred != Predicate::from_bool(true) {
+            panic!("Conditional indirect branch");
+        }
+
+        let mut targets = Vec::with_capacity(table.num_entries as usize);
+        for index in 0..table.num_entries {
+            let mut target = env.read_cbuf_value(
+                table.cbuf_index,
+                table.cbuf_offset.wrapping_add(index.wrapping_mul(4)),
+            );
+            if !is_absolute_jump(opcode) {
+                target = target.wrapping_add(pc.offset());
+            }
+            target = target.wrapping_add(table.branch_offset as u32);
+            target = target.wrapping_add(8);
+            targets.push(target);
+        }
+        targets.sort_unstable();
+        targets.dedup();
+
+        self.blocks[block].indirect_branches.reserve(targets.len());
+        for target in targets {
+            let branch = self.add_label(
+                block,
+                self.blocks[block].stack.clone(),
+                pc.with_offset(target),
+                function_id,
+            );
+            self.blocks[block].indirect_branches.push(IndirectBranch {
+                block: branch,
+                address: target,
+            });
+        }
         self.blocks[block].cond = Condition::always();
         self.blocks[block].end = pc.next();
         self.blocks[block].end_class = EndClass::IndirectBranch;
-        self.blocks[block].branch_offset = if is_absolute_jump(opcode) {
-            8
-        } else {
-            pc.offset() as i32 + 8
-        };
+        self.blocks[block].branch_reg = table.branch_reg;
+        self.blocks[block].branch_offset = table.branch_offset.wrapping_add(8);
+        if !is_absolute_jump(opcode) {
+            self.blocks[block].branch_offset = self.blocks[block]
+                .branch_offset
+                .wrapping_add(pc.offset() as i32);
+        }
         AnalysisState::Branch
     }
 
@@ -700,6 +747,18 @@ impl FlowCfg {
                         .and_then(|target| index_by_block.get(&target).copied()),
                     cond: flow.cond,
                     stack_depth: flow.stack.entries.len() as u32,
+                    branch_reg: flow.branch_reg,
+                    branch_offset: flow.branch_offset,
+                    indirect_branches: flow
+                        .indirect_branches
+                        .iter()
+                        .filter_map(|indirect| {
+                            Some(IndirectBranch {
+                                block: *index_by_block.get(&indirect.block)?,
+                                address: indirect.address,
+                            })
+                        })
+                        .collect(),
                 }
             })
             .collect()
@@ -930,6 +989,9 @@ pub fn build_cfg(instructions: &[u64]) -> Vec<CfgBlock> {
             branch_false: None,
             cond,
             stack_depth: 0,
+            branch_reg: 0,
+            branch_offset: 0,
+            indirect_branches: Vec::new(),
         });
     }
 

@@ -248,11 +248,20 @@ impl GotoPass {
                     self.root.insert(
                         ip,
                         Statement::SetIndirectBranchVariable {
-                            branch_reg: 0,
-                            branch_offset: 0,
+                            branch_reg: block.branch_reg,
+                            branch_offset: block.branch_offset,
                         },
                     );
-                    self.root.insert(ip + 1, Statement::Unreachable);
+                    ip += 1;
+                    for indirect in &block.indirect_branches {
+                        self.insert_goto(
+                            ip,
+                            Expr::IndirectBranchCond(indirect.address),
+                            indirect.block as u32,
+                        );
+                        ip += 1;
+                    }
+                    self.root.insert(ip, Statement::Unreachable);
                 }
                 EndClass::Call => {}
                 EndClass::Exit if !block.cond.is_always() => {
@@ -998,6 +1007,59 @@ mod tests {
             branch_false: None,
             cond,
             stack_depth: 0,
+            branch_reg: 0,
+            branch_offset: 0,
+            indirect_branches: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn indirect_branch_materializes_each_resolved_target() {
+        let mut indirect = block(EndClass::IndirectBranch, Condition::always());
+        indirect.branch_reg = 12;
+        indirect.branch_offset = 0x201_0080;
+        indirect.indirect_branches = vec![
+            super::super::control_flow::IndirectBranch {
+                block: 1,
+                address: 0x201_0498,
+            },
+            super::super::control_flow::IndirectBranch {
+                block: 2,
+                address: 0x201_04A8,
+            },
+        ];
+        let cfg = vec![
+            indirect,
+            block(EndClass::Return, Condition::always()),
+            block(EndClass::Return, Condition::always()),
+        ];
+
+        let structured = structure_cfg_detailed(&cfg);
+
+        assert!(structured.actions.iter().any(|action| matches!(
+            action,
+            StructuredAction::SetIndirectBranchVariable {
+                branch_reg: 12,
+                branch_offset: 0x201_0080,
+                ..
+            }
+        )));
+        fn contains_target(expr: &Expr, target: u32) -> bool {
+            match expr {
+                Expr::IndirectBranchCond(address) => *address == target,
+                Expr::Not(expr) => contains_target(expr, target),
+                Expr::Or(lhs, rhs) => contains_target(lhs, target) || contains_target(rhs, target),
+                Expr::Identity(_) | Expr::Variable(_) => false,
+            }
+        }
+        for target in [0x201_0498, 0x201_04A8] {
+            assert!(structured.actions.iter().any(|action| {
+                match action {
+                    StructuredAction::Condition { expr, .. }
+                    | StructuredAction::SetVariable { expr, .. } => contains_target(expr, target),
+                    _ => false,
+                }
+            }));
         }
     }
 

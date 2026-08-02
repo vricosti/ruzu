@@ -9,6 +9,16 @@
 //! Upstream nfp.cpp defines IUser, ISystem, IDebug classes (each deriving from Interface),
 //! plus IUserManager, ISystemManager, IDebugManager service entry points.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{
+    HLERequestContext, SessionRequestHandler, SessionRequestHandlerPtr,
+};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
 /// IPC command table for IUserManager.
 pub mod user_manager_commands {
     pub const CREATE_USER_INTERFACE: u32 = 0;
@@ -136,28 +146,88 @@ pub mod idebug_commands {
 /// IUserManager — entry point for "nfp:user".
 ///
 /// Corresponds to `IUserManager` in upstream nfp.cpp.
-pub struct IUserManager;
+pub struct IUserManager {
+    system: crate::core::SystemRef,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl IUserManager {
-    pub fn new() -> Self {
-        Self
+    pub fn new(system: crate::core::SystemRef) -> Self {
+        Self {
+            system,
+            handlers: build_handler_map(&[(
+                user_manager_commands::CREATE_USER_INTERFACE,
+                Some(Self::create_user_interface_handler),
+                "CreateUserInterface",
+            )]),
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// CreateUserInterface (cmd 0).
     pub fn create_user_interface(&self) -> super::nfp_interface::Interface {
         log::debug!("IUserManager::create_user_interface called");
-        super::nfp_interface::Interface::new(crate::core::SystemRef::null(), "IUser")
+        super::nfp_interface::Interface::new(self.system, "NFP:IUser")
+    }
+
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
+
+    fn create_user_interface_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let object: Arc<dyn SessionRequestHandler> = Arc::new(service.create_user_interface());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(object);
+    }
+}
+
+impl SessionRequestHandler for IUserManager {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "nfp:user"
+    }
+}
+
+impl ServiceFramework for IUserManager {
+    fn get_service_name(&self) -> &str {
+        "nfp:user"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }
 
 /// ISystemManager — entry point for "nfp:sys".
 ///
 /// Corresponds to `ISystemManager` in upstream nfp.cpp.
-pub struct ISystemManager;
+pub struct ISystemManager {
+    system: crate::core::SystemRef,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl ISystemManager {
-    pub fn new() -> Self {
-        Self
+    pub fn new(system: crate::core::SystemRef) -> Self {
+        Self {
+            system,
+            handlers: build_handler_map(&[(
+                system_manager_commands::CREATE_SYSTEM_INTERFACE,
+                Some(Self::create_system_interface_handler),
+                "CreateSystemInterface",
+            )]),
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// CreateSystemInterface (cmd 0).
@@ -165,18 +235,66 @@ impl ISystemManager {
     /// Upstream creates an ISystem (which derives from Interface with name "NFP:ISystem").
     pub fn create_system_interface(&self) -> super::nfp_interface::Interface {
         log::debug!("ISystemManager::create_system_interface called");
-        super::nfp_interface::Interface::new(crate::core::SystemRef::null(), "ISystem")
+        super::nfp_interface::Interface::new(self.system, "NFP:ISystem")
+    }
+
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
+
+    fn create_system_interface_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let object: Arc<dyn SessionRequestHandler> = Arc::new(service.create_system_interface());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(object);
+    }
+}
+
+impl SessionRequestHandler for ISystemManager {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "nfp:sys"
+    }
+}
+
+impl ServiceFramework for ISystemManager {
+    fn get_service_name(&self) -> &str {
+        "nfp:sys"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }
 
 /// IDebugManager — entry point for "nfp:dbg".
 ///
 /// Corresponds to `IDebugManager` in upstream nfp.cpp.
-pub struct IDebugManager;
+pub struct IDebugManager {
+    system: crate::core::SystemRef,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl IDebugManager {
-    pub fn new() -> Self {
-        Self
+    pub fn new(system: crate::core::SystemRef) -> Self {
+        Self {
+            system,
+            handlers: build_handler_map(&[(
+                debug_manager_commands::CREATE_DEBUG_INTERFACE,
+                Some(Self::create_debug_interface_handler),
+                "CreateDebugInterface",
+            )]),
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// CreateDebugInterface (cmd 0).
@@ -184,7 +302,43 @@ impl IDebugManager {
     /// Upstream creates an IDebug (which derives from Interface with name "NFP:IDebug").
     pub fn create_debug_interface(&self) -> super::nfp_interface::Interface {
         log::debug!("IDebugManager::create_debug_interface called");
-        super::nfp_interface::Interface::new(crate::core::SystemRef::null(), "IDebug")
+        super::nfp_interface::Interface::new(self.system, "NFP:IDebug")
+    }
+
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
+
+    fn create_debug_interface_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let object: Arc<dyn SessionRequestHandler> = Arc::new(service.create_debug_interface());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(object);
+    }
+}
+
+impl SessionRequestHandler for IDebugManager {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "nfp:dbg"
+    }
+}
+
+impl ServiceFramework for IDebugManager {
+    fn get_service_name(&self) -> &str {
+        "nfp:dbg"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }
 
@@ -199,10 +353,34 @@ pub fn loop_process(system: crate::core::SystemRef) {
     let server_manager = ServerManager::new_shared(system);
     {
         let mut server_manager = server_manager.lock().unwrap();
-        crate::hle::service::services::register_stub_services(
-            &mut server_manager,
-            &["nfp:user", "nfp:sys", "nfp:dbg"],
+        server_manager.register_named_service(
+            "nfp:user",
+            Box::new(move || -> SessionRequestHandlerPtr { Arc::new(IUserManager::new(system)) }),
+            64,
+        );
+        server_manager.register_named_service(
+            "nfp:sys",
+            Box::new(move || -> SessionRequestHandlerPtr { Arc::new(ISystemManager::new(system)) }),
+            64,
+        );
+        server_manager.register_named_service(
+            "nfp:dbg",
+            Box::new(move || -> SessionRequestHandlerPtr { Arc::new(IDebugManager::new(system)) }),
+            64,
         );
     }
     ServerManager::run_server_shared(server_manager);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manager_handler_tables_match_upstream() {
+        let system = crate::core::SystemRef::null();
+        assert_eq!(IUserManager::new(system).handlers().len(), 1);
+        assert_eq!(ISystemManager::new(system).handlers().len(), 1);
+        assert_eq!(IDebugManager::new(system).handlers().len(), 1);
+    }
 }

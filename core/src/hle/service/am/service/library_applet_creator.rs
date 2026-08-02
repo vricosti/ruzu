@@ -12,7 +12,6 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
 use crate::hle::service::am::am_types::{AppletId, AppletProgramId, AppletType, LibraryAppletMode};
 use crate::hle::service::am::applet::Applet;
 use crate::hle::service::am::applet_data_broker::AppletDataBroker;
-use crate::hle::service::am::frontend::applets::FrontendAppletHolder;
 use crate::hle::service::am::library_applet_storage::{
     create_handle_storage, create_transfer_memory_storage,
 };
@@ -180,7 +179,7 @@ impl ILibraryAppletCreator {
             applet_guard.library_applet_mode = mode;
             applet_guard.caller_applet = Arc::downgrade(&self.applet);
             applet_guard.caller_applet_broker = Some(Arc::clone(&broker));
-            applet_guard.frontend = FrontendAppletHolder::new().get_applet(
+            applet_guard.frontend = self.system.get().frontend_applet_holder().get_applet(
                 self.system,
                 Arc::clone(&broker),
                 applet_id,

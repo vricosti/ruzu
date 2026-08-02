@@ -80,8 +80,16 @@ impl ILibraryAppletAccessor {
                 Some(Self::pop_interactive_out_data_handler),
                 "PopInteractiveOutData",
             ),
-            (105, None, "GetPopOutDataEvent"),
-            (106, None, "GetPopInteractiveOutDataEvent"),
+            (
+                105,
+                Some(Self::get_pop_out_data_event_handler),
+                "GetPopOutDataEvent",
+            ),
+            (
+                106,
+                Some(Self::get_pop_interactive_out_data_event_handler),
+                "GetPopInteractiveOutDataEvent",
+            ),
             (110, None, "NeedsToExitProcess"),
             (120, None, "GetLibraryAppletInfo"),
             (150, None, "RequestForAppletToGetForeground"),
@@ -296,13 +304,49 @@ impl ILibraryAppletAccessor {
         }
     }
 
+    fn get_pop_out_data_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ILibraryAppletAccessor) };
+        log::debug!("ILibraryAppletAccessor::GetPopOutDataEvent called");
+        let object_id = service
+            .broker
+            .get_out_data()
+            .get_event_object_id(ctx)
+            .unwrap_or(0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(object_id);
+    }
+
+    fn get_pop_interactive_out_data_event_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ILibraryAppletAccessor) };
+        log::debug!("ILibraryAppletAccessor::GetPopInteractiveOutDataEvent called");
+        let object_id = service
+            .broker
+            .get_interactive_out_data()
+            .get_event_object_id(ctx)
+            .unwrap_or(0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(object_id);
+    }
+
     fn frontend_execute(&self) {
         let mut applet = self.applet.lock().unwrap();
-        if let Some(frontend) = applet.frontend.as_mut() {
-            if !frontend.is_initialized() {
-                frontend.initialize();
-            }
+        let complete = if let Some(frontend) = applet.frontend.as_mut() {
+            frontend.initialize();
             frontend.execute();
+            frontend.is_complete()
+        } else {
+            false
+        };
+        if complete {
             applet.is_completed = true;
             applet.signal_state_changed_event_without_process();
         }
@@ -310,9 +354,14 @@ impl ILibraryAppletAccessor {
 
     fn frontend_execute_interactive(&self) {
         let mut applet = self.applet.lock().unwrap();
-        if let Some(frontend) = applet.frontend.as_mut() {
+        let complete = if let Some(frontend) = applet.frontend.as_mut() {
             frontend.execute_interactive();
             frontend.execute();
+            frontend.is_complete()
+        } else {
+            false
+        };
+        if complete {
             applet.is_completed = true;
             applet.signal_state_changed_event_without_process();
         }

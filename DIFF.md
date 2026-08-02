@@ -30562,3 +30562,413 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ### Behavioral verification
 - Re-read upstream `FCVTL` after implementation. Translation tests cover the
   opcode and a JIT regression verifies NaN conversion and `FPSR.IOC`.
+
+## 2026-08-02 — audio_core/src/{audio_manager.rs,audio_core.rs} vs src/audio_core/{audio_manager,audio_core}.{h,cpp}
+
+### Intentional differences
+- Rust protects the optional `JoinHandle` with a mutex so `Shutdown` can remain
+  callable through the shared manager ownership used by the crate boundary.
+
+### Unintentional differences (fixed)
+- `AudioCore::shutdown` no longer silently skips shutdown when input/output
+  managers hold `Arc<AudioManager>` clones. It now always stops and joins the
+  audio thread before manager destruction, matching upstream destruction order.
+- Audio-manager shutdown is idempotent; only the first caller consumes and
+  joins the thread handle.
+
+### Binary layout verification
+- PASS: the manager is host-only and has no guest-visible serialized layout.
+
+### Behavioral verification
+- Re-read upstream `AudioManager::Shutdown`, `AudioCore::Shutdown` and
+  `System::ShutdownMainProcess`. The focused regression keeps a second manager
+  owner alive and verifies that shutdown still joins the thread and rejects new
+  callbacks.
+
+## 2026-08-02 — core/src/hle/kernel/{svc_dispatch.rs,svc/svc_address_arbiter.rs} vs src/core/hle/kernel/{svc.cpp,svc/svc_address_arbiter.cpp}
+
+### Intentional differences
+- Rust keeps guest enum arguments as raw `u32` values until validation because
+  constructing a Rust enum with an invalid discriminant is undefined behavior.
+  The accepted values and validation order match upstream.
+
+### Unintentional differences (fixed)
+- AArch64 `WaitForAddress` and `SignalToAddress` now route to the existing
+  address-arbiter handlers instead of falling through to stub success.
+- The AArch32 wrappers no longer transmute untrusted guest values into Rust
+  enums before upstream's invalid-enum check.
+
+### Binary layout verification
+- PASS: the wrappers preserve upstream's AArch64 register ABI and signed
+  conversions; no guest-visible structure is involved.
+
+### Behavioral verification
+- Re-read upstream generated wrappers, Call64 dispatch, and both address-arbiter
+  handlers after implementation. The regression test verifies that both SVCs
+  reach validation rather than returning stub success.
+
+## 2026-08-02 — core/src/hle/service/nfp/nfp.rs vs src/core/hle/service/nfp/nfp.{h,cpp}
+
+### Unintentional differences (fixed)
+- `nfp:user`, `nfp:sys` and `nfp:dbg` now register concrete manager services
+  instead of generic stubs. Command 0 returns the corresponding IPC interface
+  with the same two-word success response and one moved domain object as
+  upstream.
+
+### Missing items
+- The existing shared `nfp_interface::Interface` still installs the IUser
+  command table for all three returned interface types. Upstream owns distinct
+  IUser, ISystem and IDebug tables in `nfp.cpp`; completing those system/debug
+  tables is a separate structural parity slice.
+
+### Binary layout verification
+- PASS: the manager response contains the upstream result word and one IPC
+  interface; no NFP payload structure changed.
+
+### Behavioral verification
+- Re-read all three upstream manager constructors, create-interface handlers
+  and `LoopProcess` after implementation. The focused test verifies one command
+  0 handler per manager, and runtime dispatch reaches the real IUser interface.
+
+## 2026-08-02 — core/src/hle/kernel/{k_session.rs,k_client_session.rs,k_server_session.rs} vs src/core/hle/kernel/{k_session,k_client_session,k_server_session}.{h,cpp}
+
+### Intentional differences
+- Rust tracks the two endpoint references with explicit closed flags because
+  the parent session and embedded endpoints are registry-owned `Arc` objects;
+  upstream obtains the same lifetime from two `KAutoObject::Close` calls.
+
+### Unintentional differences (fixed)
+- Destroying a server endpoint now calls `OnServerClosed`, cleans pending
+  requests and releases its parent reference. Destroying a client endpoint
+  likewise calls `OnClientClosed` and releases its parent reference.
+- Parent finalization now occurs only after both endpoint references close, at
+  which point it notifies `KClientPort::OnSessionFinalized` and releases the
+  process session resource. Closed HLE sessions therefore no longer leak port
+  slots or release them prematurely.
+
+### Binary layout verification
+- PASS: all added lifetime fields are host-only kernel bookkeeping and are not
+  copied to guest memory.
+
+### Behavioral verification
+- Re-read upstream endpoint `Destroy`, parent `On*Closed`/`Finalize`, and client
+  port `OnSessionFinalized` after implementation. Focused regressions cover
+  client-then-server and server-then-client closure ordering.
+
+## 2026-08-02 — core/src/hle/service/server_manager.rs vs src/core/hle/service/server_manager.{h,cpp}
+
+### Intentional differences
+- Removing the Rust `Session` wrapper explicitly destroys its registry-owned
+  `KServerSession`; deleting upstream's wrapper performs the equivalent native
+  kernel-object close through RAII.
+- Sessions still served by Rust's temporary inline IPC fallback cannot also be
+  linked to `MultiWait` without creating a second request consumer. Their
+  endpoint closures therefore enter a manager-owned closure queue and signal
+  its wakeup event; the manager drains that queue and remains the sole owner of
+  server-endpoint destruction.
+
+### Unintentional differences (fixed)
+- `DestroySession` no longer drops only the host wrapper while leaving the
+  kernel server endpoint and parent session alive. Deferred session IDs are
+  still removed at the same ownership boundary.
+- Closing an unlinked inline session now wakes its owning manager and releases
+  the parent port slot. Previously such sessions accumulated until a 64-slot
+  service port returned `ResultOutOfSessions`.
+
+### Behavioral verification
+- Re-read upstream `Session` ownership, `MultiWait` lifecycle and
+  `DestroySession` after implementation. The focused suite includes an
+  unlinked inline-session closure regression.
+
+## 2026-08-02 — shader_recompiler/src/frontend/{indirect_branch_table_track.rs,control_flow.rs,structured_control_flow.rs} vs src/shader_recompiler/frontend/maxwell/{indirect_branch_table_track.{h,cpp},control_flow.{h,cpp},structured_control_flow.cpp}
+
+### Intentional differences
+- Rust carries the resolved branch register, offset and destinations through
+  its existing flat `CfgBlock` bridge; upstream keeps the same fields directly
+  on pointer-linked `Flow::Block` objects.
+- Failed or conditional indirect-branch tracking uses `panic!` where upstream
+  throws `LogicError` or `NotImplementedException`.
+
+### Unintentional differences (fixed)
+- `TrackIndirectBranchTable` no longer returns an unconditional stub failure.
+  It now recognizes upstream's `IMNMX_imm` / `SHL_imm` / default `LDC.B32` /
+  `BRX` or `JMX` sequence and returns the same table metadata.
+- `AnalyzeBRX` now reads every constant-buffer table entry, applies the same
+  relative or absolute branch arithmetic, sorts and deduplicates destinations,
+  and registers each target block.
+- Structured control flow now emits one indirect-branch condition per resolved
+  destination before the upstream fallback `Unreachable` statement.
+
+### Binary layout verification
+- PASS: the added metadata is host-only shader analysis state; no guest-visible
+  or serialized structure layout changes.
+
+### Behavioral verification
+- Re-read all three upstream implementations after the port. Focused tests
+  cover the exact failing Maxwell instruction pattern and materialization of
+  every resolved destination. The generated SPIR-V validates and contains all
+  six expected switch targets; runtime rendering restores the previously
+  missing title, description and confirmation prompt.
+
+## 2026-08-02 — externals/rdynarmic/src/frontend/a64/translate/simd_scalar_pairwise.rs vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_scalar_pairwise.cpp
+
+### Intentional differences
+- Decoder fields are read from `DecodedInst` inside each Rust translator; upstream receives the decoded operands as method arguments.
+
+### Unintentional differences (fixed)
+- Added the missing scalar `FADDP`, `FMAXNMP`, `FMAXP`, `FMINNMP`, and `FMINP` translators and dispatcher ownership. Each reads both source lanes, emits the corresponding scalar FP IR operation, zero-extends the result to 128 bits, and writes the destination exactly as upstream.
+
+### Missing items
+- None in the upstream scalar-pairwise file after this pass.
+
+### Binary layout verification
+- PASS: the change emits IR only and does not alter decoded instruction or guest-state layout.
+
+### Behavioral verification
+- Re-read the complete upstream scalar-pairwise implementation after the port. The focused translator test covers single/double `FADDP` and all four min/max variants without an `Interpret` terminal.
+
+## 2026-08-02 — shader_recompiler/src/ir_opt/constant_propagation.rs vs shader_recompiler/ir_opt/constant_propagation_pass.cpp
+
+### Intentional differences
+- Rust applies the associated-pseudo guard once at the entry to `propagate`; upstream applies the same `HasAssociatedPseudoOperation` condition in its folding helpers. The observable ownership rule is identical.
+
+### Unintentional differences (fixed)
+- Constant propagation no longer replaces an immediate parent instruction while it owns a `Get*FromOp` pseudo-operation. This preserves the producer that the backend must use to define its associated flags.
+
+### Missing items
+- None for the associated-pseudo preservation rule addressed by this pass.
+
+### Binary layout verification
+- PASS: this is an IR ownership/lifetime correction with no serialized structure change.
+
+### Behavioral verification
+- Re-read `FoldWhenAllImmediates` and `FoldAdd` after the change. The regression retains `BitFieldUExtract` and its `GetZeroFromOp`, then successfully emits SPIR-V.
+
+## 2026-08-02 — core/src/frontend/applets/controller.rs vs core/frontend/applets/controller.{h,cpp}
+
+### Intentional differences
+- Rust retains shared HID ownership as `Arc<parking_lot::Mutex<HIDCore>>`; controller handles are cloned while the HIDCore lock is held and operated on after releasing it.
+
+### Unintentional differences (fixed)
+- `DefaultControllerApplet` now performs upstream's complete fallback reconfiguration instead of returning success without changing HID state: disconnect handheld and P1-P8, connect only the minimum player count, and apply the Fullkey/JoyconDual/JoyconLeft-Right/Handheld priority order.
+
+### Missing items
+- None in the upstream default controller frontend behavior.
+
+### Binary layout verification
+- PASS: frontend parameter field types and ordering remain unchanged; no raw guest payload is owned by this file.
+
+### Behavioral verification
+- Re-read both upstream files after implementation. The focused test verifies callback success, Fullkey connection for P1, and disconnection of P2 above the requested minimum.
+
+## 2026-08-02 — core/src/hle/service/am/frontend/applet_controller.rs vs core/hle/service/am/frontend/applet_controller.{h,cpp}
+
+### Intentional differences
+- The only installed Rust controller frontend completes callbacks synchronously, so `Execute` receives the callback result through a shared slot before producing output. Upstream permits an asynchronous GUI frontend whose callback invokes `ConfigurationComplete` later.
+- Rust stores enum-backed guest fields as raw integers until validation, avoiding construction of invalid Rust enum discriminants while preserving upstream's accepted values and fallback rules.
+
+### Unintentional differences (fixed)
+- Ported controller initialization, private-argument mode/caller correction, old/new argument revisions, frontend parameter conversion, execution modes, result serialization, status, and exit handling. The previous class contained no executable applet behavior.
+- Added the missing firmware-update and key-remapping payload layouts with upstream sizes `0x4` and `0x10`.
+
+### Missing items
+- Asynchronous custom frontend completion requires moving `ConfigurationComplete` state behind shared ownership; it is not required by the currently installed default frontend.
+
+### Binary layout verification
+- PASS: compile-time assertions verify private/header/old/new/update/remapping/result sizes `0x14`, `0x7`, `0x21C`, `0x430`, `0x4`, `0x10`, and `0xC`. Result padding is deterministically zero-initialized.
+
+### Behavioral verification
+- Re-read both upstream files line by line after implementation. The integration regression feeds Version8 arguments through the broker, verifies controller reconfiguration, and checks the exact 12-byte success result.
+
+## 2026-08-02 — core/src/hle/service/am/frontend/applets.rs vs core/hle/service/am/frontend/applets.{h,cpp}
+
+### Intentional differences
+- Rust's `FrontendApplet` trait does not own a weak reference to the AM `Applet`; the accessor performs the equivalent completion signal after synchronous execution.
+- The default controller frontend is installed when the holder is constructed rather than by a separate `SetDefaultAppletsIfMissing` call during `System::Initialize`.
+
+### Unintentional differences (fixed)
+- Added the missing `GetStatus` interface contract and registered `AppletId::Controller` with the shared default controller frontend.
+
+### Missing items
+- `FrontendAppletSet`, replacement/clear APIs, cabinet mode, stub fallback, and the cabinet/error/profile/software-keyboard/web/general frontend registrations remain absent from the pre-existing partial holder.
+
+### Binary layout verification
+- PASS: holder and trait state are host-only.
+
+## 2026-08-02 — core/src/hle/service/am/frontend/applet_mii_edit.rs vs core/hle/service/am/frontend/applet_mii_edit.{h,cpp}
+
+### Intentional differences
+- None for the status method added by this interface-completion slice.
+
+### Unintentional differences (fixed)
+- `MiiEdit` now implements the upstream `GetStatus` frontend contract and returns success.
+
+### Missing items
+- No additional MiiEdit behavior was changed or audited in this slice.
+
+### Binary layout verification
+- PASS: no Mii payload layout changed.
+
+## 2026-08-02 — core/src/hle/service/am/service/library_applet_creator.rs vs core/hle/service/am/service/library_applet_creator.{h,cpp}
+
+### Intentional differences
+- Rust passes its existing `SystemRef` and broker directly because the frontend trait does not own the complete AM applet object.
+
+### Unintentional differences (fixed)
+- Library applet creation now uses the system-owned persistent `FrontendAppletHolder`; the previous code constructed a temporary empty holder for every applet and could never retain a configured frontend.
+
+### Missing items
+- None for frontend-holder selection in `CreateLibraryApplet`.
+
+### Binary layout verification
+- PASS: no guest payload layout changed.
+
+## 2026-08-02 — core/src/hle/service/am/service/library_applet_accessor.rs vs core/hle/service/am/service/library_applet_accessor.{h,cpp}
+
+### Intentional differences
+- After synchronous frontend execution, Rust marks the applet complete and signals its state event in the accessor; upstream performs those two actions through `FrontendApplet::Exit`, which owns a weak applet pointer.
+
+### Unintentional differences (fixed)
+- `FrontendExecute` now calls `Initialize` on every `Start`, preserving upstream ordering instead of conditionally skipping initialization.
+
+### Missing items
+- Asynchronous frontend completion remains coupled to the synchronous accessor adaptation described above.
+
+### Binary layout verification
+- PASS: no guest payload layout changed.
+
+## 2026-08-02 — core/src/core.rs vs core/core.{h,cpp}
+
+### Intentional differences
+- The Rust `System` directly owns `FrontendAppletHolder` instead of placing it inside a separate pImpl object.
+
+### Unintentional differences (fixed)
+- Added system lifetime ownership and access for the frontend applet holder, sharing the same `HIDCore` instance used by HID services and frontend input.
+
+### Missing items
+- The setter for replacing the complete upstream `FrontendAppletSet` depends on the missing holder APIs documented above.
+
+### Binary layout verification
+- PASS: `System` is host-only and is not copied into guest memory.
+
+## 2026-08-02 — core/src/hle/service/am/frontend/applet_software_keyboard_types.rs vs core/hle/service/am/frontend/applet_software_keyboard_types.h
+
+### Intentional differences
+- Guest enum fields are retained as raw `u32` values until validation, avoiding invalid Rust enum discriminants while preserving their exact bit patterns.
+- `SwkbdMovedTabArg` aliases the layout-identical `SwkbdMovedCursorArg`; both upstream structures contain the same `u32` and `s32` fields.
+
+### Unintentional differences (fixed)
+- Ported every keyboard version, command, reply, flag and payload structure. The packed callback pointers and customized dictionary entries now retain upstream's `u64` field types and four-byte packing.
+
+### Missing items
+- Bit accessors currently cover every flag consumed by `applet_software_keyboard.cpp`; the remaining named flag bits are preserved in `raw` but have no unused Rust accessors.
+
+### Binary layout verification
+- PASS: compile-time assertions cover all 16 upstream payload sizes, including `0x3D4`, `0x48`, `0x70`, `0x4A0 - 0x18`, and `0x4E8 - 0x18`.
+
+## 2026-08-02 — core/src/frontend/applets/software_keyboard.rs vs core/frontend/applets/software_keyboard.{h,cpp}
+
+### Intentional differences
+- Callback payload strings use Rust `String`, while optional symbol keys remain raw UTF-16 `u16` values as upstream requires.
+- The default inline frontend performs upstream's delayed synthetic `yuzu` submission synchronously. The HLE owner queues callbacks and drains them before returning because a detached callback cannot safely borrow the Rust applet trait object owned by AM.
+
+### Unintentional differences (fixed)
+- The shared default frontend now retains initialization parameters and both callbacks, and implements normal submission, inline character updates, decided-enter, text changes, hide and exit behavior.
+
+### Missing items
+- A custom GUI software-keyboard frontend is not installed; this matches use of upstream's default stub frontend rather than changing the HLE protocol.
+
+### Binary layout verification
+- PASS: these are host frontend types; guest-visible payload layouts remain owned by `applet_software_keyboard_types.rs`.
+
+## 2026-08-02 — core/src/hle/service/am/frontend/applet_software_keyboard.rs vs core/hle/service/am/frontend/applet_software_keyboard.{h,cpp}
+
+### Intentional differences
+- Frontend callbacks enqueue submissions so Rust can mutate the HLE state machine only while its AM owner holds exclusive access; responses are drained at the same frontend call boundaries.
+- The applet exposes `is_complete` to its accessor instead of owning upstream's weak pointer back to its AM `Applet`, avoiding an ownership cycle while preserving `Exit` timing.
+
+### Unintentional differences (fixed)
+- Replaced the empty stub with foreground and inline initialization, request dispatch, old/new `Calc` handling, state transitions, UTF-8/UTF-16 output, text-check flow, and all 17 upstream reply formats.
+- Inline mode now remains active across interactive requests and completes only after `Finalize`; it is no longer completed immediately by `Start`.
+
+### Missing items
+- `SetCustomizeDic` and `SetCustomizedDictionaries` remain warning-only because the upstream implementation is also explicitly unimplemented.
+
+### Binary layout verification
+- PASS: every input is copied from its asserted ABI structure and every reply uses upstream's exact base, text-buffer and trailing-argument sizes with zero-initialized reserved bytes.
+
+## 2026-08-02 — core/src/hle/service/am/applet_data_broker.rs vs core/hle/service/am/applet_data_broker.{h,cpp}
+
+### Intentional differences
+- Rust's service `Event` materializes its kernel readable end lazily when IPC first requests a copy handle; upstream creates all four kernel events in the broker constructor.
+
+### Unintentional differences (fixed)
+- Each storage channel now owns an event, signals it after every push, and clears it only after a pop leaves the queue empty, matching upstream ordering.
+
+### Missing items
+- Storage remains represented by the channel's existing `Vec<u8>` payload rather than an `IStorage` pointer; ownership and FIFO behavior are unchanged.
+
+### Binary layout verification
+- PASS: broker queues and events are host-only.
+
+## 2026-08-02 — core/src/hle/service/am/service/library_applet_accessor.rs vs core/hle/service/am/service/library_applet_accessor.{h,cpp}
+
+### Intentional differences
+- Completion is queried from the Rust frontend after execution and then applied to the owning applet; upstream performs the same mutation from `FrontendApplet::Exit` through a weak applet pointer.
+
+### Unintentional differences (fixed)
+- `FrontendExecute` and `FrontendExecuteInteractive` no longer complete every frontend unconditionally.
+- IPC commands 105 and 106 now return copy handles for the broker's normal and interactive output events.
+
+### Missing items
+- Commands 110, 120 and 150 remain absent from the pre-existing accessor and are unrelated to the software-keyboard exchange.
+
+### Binary layout verification
+- PASS: the change only returns kernel object handles and does not alter guest payload layout.
+
+## 2026-08-02 — hid_core/src/resources/vibration/vibration_device.rs vs hid_core/resources/vibration/vibration_device.{h,cpp}
+
+### Intentional differences
+- Rust stores shared `EmulatedControllerHandle` and `NpadVibration` handles instead of upstream raw observer pointers. `NpadVibration` therefore shares its mutex-protected state through `Arc` when handed to a mounted device.
+
+### Unintentional differences (fixed)
+- `Mount`, `Activate`, `Deactivate`, `Unmount`, `SendVibrationValue`, and `GetActualVibrationValue` now call the emulated controller in upstream order instead of discarding every vibration request.
+- Vibration amplitudes are multiplied by the master volume, and a non-positive volume sends `DEFAULT_VIBRATION_VALUE`, matching upstream.
+- `SendVibrationNotificationPattern` now retrieves the volume and propagates errors before reaching the same upstream TODO boundary.
+
+### Missing items
+- The surrounding Rust `NPad` still owns one left/right device pair for its currently modeled Player 1 path instead of obtaining per-NPAD devices from fully wired `AbstractPad` instances.
+
+### Binary layout verification
+- PASS: all added state is host-only; `VibrationValue` remains the existing `repr(C)` 0x10-byte guest ABI type.
+
+## 2026-08-02 — input_common/src/drivers/sdl_driver.rs vs input_common/drivers/sdl_driver.{h,cpp}
+
+### Intentional differences
+- Rust's mutex-protected `VecDeque` replaces upstream's concurrent queue, while draining and last-request-per-controller filtering preserve upstream ordering.
+
+### Unintentional differences (fixed)
+- `SetVibration` now applies upstream's exponential/linear/HD-rumble amplitude curve and scales the result by `0xFFFF` before queuing it.
+- `IsVibrationEnabled` now performs the upstream first-rumble probe, 15 ms delay, stop command, and cached capability update.
+- `SendVibrations` now coalesces queued requests by controller and sends only the newest request for each controller.
+- `GetSDLJoystickByGUID` behavior now materializes placeholder ports for saved controller identifiers instead of treating a temporarily absent device as permanently unavailable.
+
+### Missing items
+- No missing SDL vibration behavior remains in the audited methods.
+
+### Binary layout verification
+- PASS: SDL vibration requests are host-only and do not change guest ABI structures.
+
+## 2026-08-02 — hid_core/src/resources/npad/npad.rs vs hid_core/resources/npad/npad.{h,cpp}
+
+### Intentional differences
+- Until the pre-existing incomplete `AbstractPad` ownership is replaced, the modeled Player 1 controller supplies the two standard vibration devices directly.
+
+### Unintentional differences (fixed)
+- The existing Player 1 vibration devices now mount the live emulated controller and shared vibration-volume handler, and their mounted state follows controller connection updates.
+
+### Missing items
+- Upstream's `abstracted_pads` array must eventually own and update vibration devices for every NPAD ID; the current direct Player 1 adapter does not provide multi-controller vibration parity.
+
+### Binary layout verification
+- PASS: device ownership changes are host-only and leave NPAD shared-memory layouts unchanged.

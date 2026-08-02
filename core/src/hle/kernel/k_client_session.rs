@@ -211,15 +211,22 @@ impl KClientSession {
     /// but the parent close notification must still run before the endpoint is
     /// removed from `KProcess`.
     pub fn destroy_with_process(&mut self, process: &mut KProcess) {
-        if let Some(parent_id) = self.parent_id {
+        let Some(parent_id) = self.parent_id.take() else {
+            return;
+        };
+
+        let should_finalize =
             if let Some(parent_session) = process.get_session_by_object_id(parent_id) {
-                parent_session
-                    .lock()
-                    .unwrap()
-                    .on_client_closed_with_process(process);
-            }
+                let mut parent = parent_session.lock().unwrap();
+                parent.on_client_closed_with_process(process);
+                parent.close_client_endpoint()
+            } else {
+                false
+            };
+
+        if should_finalize {
+            process.unregister_session_object_by_object_id(parent_id);
         }
-        self.parent_id = None;
     }
 }
 

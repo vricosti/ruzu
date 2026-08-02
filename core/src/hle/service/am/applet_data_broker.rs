@@ -5,48 +5,54 @@
 //! Port of zuyu/src/core/hle/service/am/applet_data_broker.cpp
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::am_results;
 use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::HLERequestContext;
+use crate::hle::service::os::event::Event;
 
 /// Port of AppletStorageChannel
 pub struct AppletStorageChannel {
-    lock: Mutex<()>,
     data: Mutex<VecDeque<Vec<u8>>>,
-    signaled: Mutex<bool>,
+    event: Arc<Event>,
 }
 
 impl AppletStorageChannel {
     pub fn new() -> Self {
         Self {
-            lock: Mutex::new(()),
             data: Mutex::new(VecDeque::new()),
-            signaled: Mutex::new(false),
+            event: Arc::new(Event::new()),
         }
     }
 
     pub fn push(&self, storage_data: Vec<u8>) {
         let mut data = self.data.lock().unwrap();
         data.push_back(storage_data);
-        *self.signaled.lock().unwrap() = true;
+        self.event.signal();
     }
 
     pub fn pop(&self) -> Result<Vec<u8>, ResultCode> {
         let mut data = self.data.lock().unwrap();
 
         if data.is_empty() {
-            *self.signaled.lock().unwrap() = false;
+            self.event.clear();
             return Err(am_results::RESULT_NO_DATA_IN_CHANNEL);
         }
 
         let result = data.pop_front().unwrap();
 
         if data.is_empty() {
-            *self.signaled.lock().unwrap() = false;
+            self.event.clear();
         }
 
         Ok(result)
+    }
+
+    /// Port of `AppletStorageChannel::GetEvent()` followed by IPC copy-handle
+    /// translation in `ILibraryAppletAccessor`.
+    pub fn get_event_object_id(&self, ctx: &HLERequestContext) -> Option<u64> {
+        self.event.copy_object_id(ctx)
     }
 }
 
@@ -82,5 +88,25 @@ impl AppletDataBroker {
 
     pub fn get_interactive_out_data(&self) -> &AppletStorageChannel {
         &self.interactive_out_data
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_event_tracks_queue_occupancy() {
+        let channel = AppletStorageChannel::new();
+        assert!(!channel.event.is_signaled());
+
+        channel.push(vec![1]);
+        channel.push(vec![2]);
+        assert!(channel.event.is_signaled());
+
+        assert_eq!(channel.pop().unwrap(), vec![1]);
+        assert!(channel.event.is_signaled());
+        assert_eq!(channel.pop().unwrap(), vec![2]);
+        assert!(!channel.event.is_signaled());
     }
 }

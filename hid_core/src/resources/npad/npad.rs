@@ -142,13 +142,7 @@ impl Default for NPad {
             press_state: AtomicU64::new(0),
             npad_resource: NPadResource::new(),
             vibration: NpadVibration::new(),
-            vibration_devices: {
-                let mut left = NpadVibrationDevice::new();
-                left.mount_virtual(DeviceIndex::Left);
-                let mut right = NpadVibrationDevice::new();
-                right.mount_virtual(DeviceIndex::Right);
-                [left, right]
-            },
+            vibration_devices: [NpadVibrationDevice::new(), NpadVibrationDevice::new()],
             ref_counter: 0,
             applet_resource_holder: AppletResourceHolder::new(),
         }
@@ -169,6 +163,13 @@ impl NPad {
                 .map(|index| hid_core.get_emulated_controller_by_index(index))
                 .collect()
         };
+        let player_1 = Arc::clone(&controllers[0]);
+        npad.vibration_devices[0].mount(
+            Arc::clone(&player_1),
+            DeviceIndex::Left,
+            npad.vibration.clone(),
+        );
+        npad.vibration_devices[1].mount(player_1, DeviceIndex::Right, npad.vibration.clone());
         for aruid_index in 0..ARUID_INDEX_MAX {
             for (controller_index, device) in controllers.iter().enumerate() {
                 let callback_events = Arc::clone(&npad.callback_events);
@@ -290,6 +291,27 @@ impl NPad {
                 log::info!("[NPAD_UPDATE] skip ref_counter=0");
             }
             return;
+        }
+
+        if let Some(controller) = self.controller_data[0][0].device.clone() {
+            if controller.lock().is_connected(false) {
+                for (index, device_index) in [DeviceIndex::Left, DeviceIndex::Right]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if !self.vibration_devices[index].is_vibration_mounted() {
+                        self.vibration_devices[index].mount(
+                            Arc::clone(&controller),
+                            device_index,
+                            self.vibration.clone(),
+                        );
+                    }
+                }
+            } else {
+                for device in &mut self.vibration_devices {
+                    device.unmount();
+                }
+            }
         }
 
         let Some(applet_resource) = self.applet_resource_holder.applet_resource.clone() else {

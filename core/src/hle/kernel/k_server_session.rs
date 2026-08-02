@@ -211,6 +211,13 @@ pub struct KServerSession {
     /// on the host thread; ruzu's host service threads use a host-side wait
     /// path (no guest thread context) so we wire the wakeup explicitly.
     pub manager_wakeup: Option<std::sync::Weak<Event>>,
+    /// Rust bridge for inline IPC sessions: upstream's ServerManager waits on
+    /// every server endpoint, while the temporary inline path cannot link the
+    /// same endpoint without introducing a second request consumer. Closure
+    /// notifications still return to the owning ServerManager through this
+    /// queue so it retains endpoint destruction ownership.
+    manager_close_queue: Option<std::sync::Weak<Mutex<Vec<u64>>>>,
+    manager_close_wakeup: Option<std::sync::Weak<Event>>,
 }
 
 impl KServerSession {
@@ -2029,6 +2036,8 @@ impl KServerSession {
             manager: None,
             sync_object: SynchronizationObjectState::new(),
             manager_wakeup: None,
+            manager_close_queue: None,
+            manager_close_wakeup: None,
         }
     }
 
@@ -2037,6 +2046,43 @@ impl KServerSession {
     /// Called by `ServerManager::register_session`.
     pub fn set_manager_wakeup(&mut self, wakeup: std::sync::Weak<Event>) {
         self.manager_wakeup = Some(wakeup);
+    }
+
+    pub fn set_manager_close_notification(
+        &mut self,
+        queue: std::sync::Weak<Mutex<Vec<u64>>>,
+        wakeup: std::sync::Weak<Event>,
+    ) {
+        self.manager_close_queue = Some(queue);
+        self.manager_close_wakeup = Some(wakeup);
+        if self.client_closed {
+            self.notify_manager_closed();
+        }
+    }
+
+    fn notify_manager_closed(&self) {
+        let Some(parent_id) = self.parent_id else {
+            return;
+        };
+        let Some(queue) = self
+            .manager_close_queue
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        else {
+            return;
+        };
+        let mut queue = queue.lock().unwrap();
+        if !queue.contains(&parent_id) {
+            queue.push(parent_id);
+        }
+        drop(queue);
+        if let Some(wakeup) = self
+            .manager_close_wakeup
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            wakeup.signal_host_only();
+        }
     }
 
     /// Initialize with a parent session.
@@ -2082,6 +2128,7 @@ impl KServerSession {
         self.client_closed = true;
         self.cleanup_requests();
         self.notify_available(RESULT_SESSION_CLOSED.get_inner_value());
+        self.notify_manager_closed();
     }
 
     /// Port of upstream `KServerSession::OnClientClosed`, when the owner
@@ -2093,6 +2140,7 @@ impl KServerSession {
         self.client_closed = true;
         self.cleanup_requests();
         self.notify_available(RESULT_SESSION_CLOSED.get_inner_value());
+        self.notify_manager_closed();
     }
 
     /// Enqueue a request.
@@ -2830,7 +2878,47 @@ impl KServerSession {
 
     /// Destroy the server session.
     pub fn destroy(&mut self) {
+        let Some(parent_id) = self.parent_id else {
+            self.cleanup_requests();
+            return;
+        };
+        let Some(kernel) = crate::hle::kernel::kernel::get_kernel_ref() else {
+            self.cleanup_requests();
+            self.parent_id = None;
+            return;
+        };
+        let Some(owner_process_id) = kernel.get_session_owner_process_id(parent_id) else {
+            self.cleanup_requests();
+            self.parent_id = None;
+            return;
+        };
+        let Some(process) = kernel.get_process_by_id(owner_process_id) else {
+            self.cleanup_requests();
+            self.parent_id = None;
+            return;
+        };
+        self.destroy_with_process(&mut process.lock().unwrap());
+    }
+
+    /// Port of upstream `KServerSession::Destroy` when the owner process is
+    /// already locked by the caller.
+    pub fn destroy_with_process(&mut self, process: &mut crate::hle::kernel::k_process::KProcess) {
+        let Some(parent_id) = self.parent_id.take() else {
+            self.cleanup_requests();
+            return;
+        };
+
+        let should_finalize = process
+            .get_session_by_object_id(parent_id)
+            .is_some_and(|parent| {
+                let mut parent = parent.lock().unwrap();
+                parent.on_server_closed();
+                parent.close_server_endpoint()
+            });
         self.cleanup_requests();
+        if should_finalize {
+            process.unregister_session_object_by_object_id(parent_id);
+        }
     }
 }
 
@@ -2846,6 +2934,7 @@ mod tests {
     use crate::core::SystemRef;
     use crate::device_memory::{dram_memory_map, DeviceMemory};
     use crate::hle::kernel::k_memory_block::{KMemoryAttribute, KMemoryBlockDisableMergeAttribute};
+    use crate::hle::kernel::k_port::KPort;
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_readable_event::KReadableEvent;
     use crate::hle::kernel::k_scheduler::KScheduler;
@@ -2857,6 +2946,115 @@ mod tests {
     struct SessionPageTableMemoryForTest {
         _device_memory: Box<DeviceMemory>,
         memory: Arc<Mutex<Memory>>,
+    }
+
+    fn make_port_session(
+        system: &mut crate::core::System,
+    ) -> (
+        Arc<crate::hle::kernel::k_process::ProcessLock>,
+        Arc<Mutex<KPort>>,
+        u64,
+        Arc<Mutex<crate::hle::kernel::k_client_session::KClientSession>>,
+        Arc<Mutex<KServerSession>>,
+    ) {
+        let process = Arc::new(crate::hle::kernel::k_process::ProcessLock::from_value(
+            KProcess::new(),
+        ));
+        {
+            let mut process = process.lock().unwrap();
+            process.process_id = 1;
+            process.initialize_handle_table();
+        }
+        system.set_current_process_arc(process.clone());
+
+        let port_id = 0x1234;
+        let port = Arc::new(Mutex::new(KPort::new()));
+        port.lock().unwrap().initialize(1, false, 0x66);
+        process
+            .lock()
+            .unwrap()
+            .register_client_port_object(port_id, port.clone());
+
+        let kernel = system.kernel().unwrap();
+        let (session_id, client_id, server_session) = {
+            let port = port.lock().unwrap();
+            let (session_id, client_id) = port
+                .client
+                .create_session(
+                    &mut process.lock().unwrap(),
+                    kernel,
+                    Some(port_id),
+                    port.get_name(),
+                )
+                .unwrap();
+            let server_session = process
+                .lock()
+                .unwrap()
+                .get_server_session_by_object_id(session_id)
+                .unwrap();
+            (session_id, client_id, server_session)
+        };
+
+        let client_session = process
+            .lock()
+            .unwrap()
+            .get_client_session_by_object_id(client_id)
+            .unwrap();
+
+        (process, port, session_id, client_session, server_session)
+    }
+
+    #[test]
+    fn client_then_server_close_releases_parent_port_session_slot() {
+        let mut system = crate::core::System::new_for_test();
+        let (process, port, session_id, client_session, server_session) =
+            make_port_session(&mut system);
+
+        assert_eq!(port.lock().unwrap().client.get_num_sessions(), 1);
+        client_session
+            .lock()
+            .unwrap()
+            .destroy_with_process(&mut process.lock().unwrap());
+        assert_eq!(port.lock().unwrap().client.get_num_sessions(), 1);
+        server_session
+            .lock()
+            .unwrap()
+            .destroy_with_process(&mut process.lock().unwrap());
+        assert!(process
+            .lock()
+            .unwrap()
+            .get_session_by_object_id(session_id)
+            .is_none());
+        assert_eq!(port.lock().unwrap().client.get_num_sessions(), 0);
+    }
+
+    #[test]
+    fn server_then_client_close_releases_parent_port_session_slot() {
+        let mut system = crate::core::System::new_for_test();
+        let (process, port, session_id, client_session, server_session) =
+            make_port_session(&mut system);
+
+        server_session
+            .lock()
+            .unwrap()
+            .destroy_with_process(&mut process.lock().unwrap());
+        assert!(process
+            .lock()
+            .unwrap()
+            .get_session_by_object_id(session_id)
+            .is_some());
+        assert_eq!(port.lock().unwrap().client.get_num_sessions(), 1);
+
+        client_session
+            .lock()
+            .unwrap()
+            .destroy_with_process(&mut process.lock().unwrap());
+        assert!(process
+            .lock()
+            .unwrap()
+            .get_session_by_object_id(session_id)
+            .is_none());
+        assert_eq!(port.lock().unwrap().client.get_num_sessions(), 0);
     }
 
     impl SessionPageTableMemoryForTest {

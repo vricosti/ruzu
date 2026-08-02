@@ -22,6 +22,7 @@ use crate::hle::service::am::am_types::{AppletId, AppletType};
 use crate::hle::service::am::applet_manager::{
     AppletManager, FrontendAppletParameters, LaunchType,
 };
+use crate::hle::service::am::frontend::applets::FrontendAppletHolder;
 use crate::hle::service::am::process_creation::build_application_launch_property;
 use crate::hle::service::apm::apm_controller::Controller as ApmController;
 use crate::hle::service::glue::glue_manager::{ARPManager, ApplicationLaunchProperty};
@@ -907,6 +908,9 @@ pub struct System {
     /// frontend hold the same object while the HID service thread updates it.
     hid_core: Arc<Mutex<HIDCore>>,
 
+    /// Upstream owner: `System::Impl::frontend_applet_holder`.
+    frontend_applet_holder: FrontendAppletHolder,
+
     /// The kernel core (schedulers, physical cores, kernel objects).
     kernel: Option<KernelCore>,
 
@@ -1093,6 +1097,7 @@ impl System {
         Self {
             core_timing: Arc::new(CoreTiming::new()),
             cpu_manager: CpuManager::new(),
+            frontend_applet_holder: FrontendAppletHolder::new(Arc::clone(&hid_core)),
             hid_core,
             kernel: None,
             telemetry_session: None,
@@ -1149,6 +1154,13 @@ impl System {
     /// Upstream: `HID::HIDCore& System::HIDCore()`.
     pub fn hid_core(&self) -> Arc<Mutex<HIDCore>> {
         Arc::clone(&self.hid_core)
+    }
+
+    /// Gets the frontend applet holder.
+    ///
+    /// Upstream: `Frontend::FrontendAppletHolder& System::GetFrontendAppletHolder()`.
+    pub fn frontend_applet_holder(&self) -> &FrontendAppletHolder {
+        &self.frontend_applet_holder
     }
 
     /// Initializes the system.

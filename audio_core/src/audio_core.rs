@@ -60,9 +60,7 @@ impl AudioCore {
     }
 
     pub fn shutdown(&mut self) {
-        if let Some(manager) = Arc::get_mut(&mut self.audio_manager) {
-            manager.shutdown();
-        }
+        self.audio_manager.shutdown();
     }
 
     pub fn get_audio_manager(&self) -> Arc<AudioManager> {

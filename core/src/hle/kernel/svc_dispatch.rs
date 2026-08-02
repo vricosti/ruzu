@@ -884,7 +884,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             let result = svc_address_arbiter::wait_for_address(
                 system,
                 get_arg32(args, 0) as u64,
-                unsafe { std::mem::transmute(get_arg32(args, 1)) },
+                get_arg32(args, 1),
                 get_arg32(args, 2) as i32,
                 gather64(args, 3, 4) as i64,
             );
@@ -894,7 +894,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             let result = svc_address_arbiter::signal_to_address(
                 system,
                 get_arg32(args, 0) as u64,
-                unsafe { std::mem::transmute(get_arg32(args, 1)) },
+                get_arg32(args, 1),
                 get_arg32(args, 2) as i32,
                 get_arg32(args, 3) as i32,
             );
@@ -1635,6 +1635,26 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
                 get_arg64(args, 0),        // cv_key
                 get_arg64(args, 1) as i32, // count
             );
+        }
+        Some(SvcId::WaitForAddress) => {
+            let result = svc_address_arbiter::wait_for_address(
+                system,
+                get_arg64(args, 0),
+                get_arg64(args, 1) as u32,
+                get_arg64(args, 2) as i32,
+                get_arg64(args, 3) as i64,
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::SignalToAddress) => {
+            let result = svc_address_arbiter::signal_to_address(
+                system,
+                get_arg64(args, 0),
+                get_arg64(args, 1) as u32,
+                get_arg64(args, 2) as i32,
+                get_arg64(args, 3) as i32,
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
         }
 
         // ====================================================================
@@ -3351,6 +3371,24 @@ mod tests {
         scatter64(&mut args, 1, 2, 0xAAAABBBB_CCCCDDDD);
         assert_eq!(args[1], 0xCCCCDDDD);
         assert_eq!(args[2], 0xAAAABBBB);
+    }
+
+    #[test]
+    fn call64_routes_address_arbiter_svcs() {
+        let system = test_system();
+
+        for svc in [SvcId::WaitForAddress, SvcId::SignalToAddress] {
+            let mut args: SvcArgs = [0; 8];
+            args[0] = 0x20_0000;
+            args[1] = u32::MAX as u64;
+            call64(&system, svc as u32, &mut args);
+            assert_eq!(
+                args[0],
+                crate::hle::kernel::svc::svc_results::RESULT_INVALID_ENUM_VALUE.get_inner_value()
+                    as u64,
+                "{svc:?} must be dispatched instead of returning stub success"
+            );
+        }
     }
 
     #[test]

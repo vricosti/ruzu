@@ -112,6 +112,21 @@ unsafe extern "C" fn sdl_event_watcher(user_data: *mut c_void, event: *mut sdl::
 }
 
 impl SdlState {
+    /// Upstream `SDLDriver::GetSDLJoystickByGUID`.
+    fn joystick_by_identifier(&self, identifier: &PadIdentifier) -> Arc<Mutex<SdlJoystick>> {
+        let mut map = self.joystick_map.lock();
+        let joysticks = map.entry(identifier.guid).or_default();
+        while joysticks.len() <= identifier.port {
+            joysticks.push(Arc::new(Mutex::new(SdlJoystick::new(
+                identifier.guid,
+                joysticks.len() as i32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ))));
+        }
+        Arc::clone(&joysticks[identifier.port])
+    }
+
     /// Upstream `SDLDriver::GetSDLJoystickBySDLID`.
     fn joystick_by_sdl_id(&self, sdl_id: sdl::SDL_JoystickID) -> Option<Arc<Mutex<SdlJoystick>>> {
         let map = self.joystick_map.lock();
@@ -300,19 +315,24 @@ impl SdlState {
 
     /// Upstream `SDLDriver::SendVibrations`.
     fn send_vibrations(&self) {
-        loop {
-            let request = self.vibration_queue.lock().pop_front();
-            let Some(request) = request else { return };
-            let map = self.joystick_map.lock();
-            let Some(group) = map.get(&request.identifier.guid) else {
-                continue;
-            };
-            let Some(joystick) = group.get(request.identifier.port) else {
-                continue;
-            };
-            let joystick = Arc::clone(joystick);
-            drop(map);
-            joystick.lock().rumble_play(&request.vibration);
+        let mut filtered = Vec::<VibrationRequest>::new();
+        {
+            let mut queue = self.vibration_queue.lock();
+            while let Some(request) = queue.pop_front() {
+                if let Some(existing) = filtered
+                    .iter_mut()
+                    .find(|existing| existing.identifier == request.identifier)
+                {
+                    *existing = request;
+                } else {
+                    filtered.push(request);
+                }
+            }
+        }
+        for request in filtered {
+            self.joystick_by_identifier(&request.identifier)
+                .lock()
+                .rumble_play(&request.vibration);
         }
     }
 
@@ -321,19 +341,52 @@ impl SdlState {
         identifier: &PadIdentifier,
         vibration: &VibrationStatus,
     ) -> DriverResult {
+        let joystick = self.joystick_by_identifier(identifier);
+        let factor = if joystick.lock().has_hd_rumble() {
+            1.0
+        } else if vibration.amplification_type == common::input::VibrationAmplificationType::Linear
+        {
+            0.5
+        } else {
+            0.35
+        };
+        let process_amplitude_exp =
+            |amplitude: f32| (amplitude + amplitude.powf(factor)) * 0.5 * u16::MAX as f32;
         self.vibration_queue.lock().push_back(VibrationRequest {
             identifier: identifier.clone(),
-            vibration: vibration.clone(),
+            vibration: VibrationStatus {
+                low_amplitude: process_amplitude_exp(vibration.low_amplitude),
+                low_frequency: vibration.low_frequency,
+                high_amplitude: process_amplitude_exp(vibration.high_amplitude),
+                high_frequency: vibration.high_frequency,
+                amplification_type: common::input::VibrationAmplificationType::Exponential,
+            },
         });
         DriverResult::Success
     }
 
     fn is_vibration_enabled(&self, identifier: &PadIdentifier) -> bool {
-        let map = self.joystick_map.lock();
-        map.get(&identifier.guid)
-            .and_then(|group| group.get(identifier.port))
-            .map(|joystick| joystick.lock().has_vibration())
-            .unwrap_or(false)
+        let joystick = self.joystick_by_identifier(identifier);
+        if joystick.lock().is_vibration_tested() {
+            return joystick.lock().has_vibration();
+        }
+
+        let test_vibration = VibrationStatus {
+            low_amplitude: 1.0,
+            low_frequency: 160.0,
+            high_amplitude: 1.0,
+            high_frequency: 320.0,
+            amplification_type: common::input::VibrationAmplificationType::Exponential,
+        };
+        let mut zero_vibration = test_vibration;
+        zero_vibration.low_amplitude = 0.0;
+        zero_vibration.high_amplitude = 0.0;
+
+        joystick.lock().rumble_play(&test_vibration);
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let enabled = joystick.lock().rumble_play(&zero_vibration);
+        joystick.lock().enable_vibration(enabled);
+        enabled
     }
 }
 
@@ -1154,5 +1207,46 @@ impl Drop for SDLDriver {
                 sdl::SDL_QuitSubSystem(sdl::SDL_INIT_JOYSTICK | sdl::SDL_INIT_GAMECONTROLLER)
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::input::VibrationAmplificationType;
+
+    fn test_state() -> SdlState {
+        SdlState {
+            engine: Arc::new(Mutex::new(InputEngine::new("sdl_test".to_string()))),
+            joystick_map: Mutex::new(HashMap::new()),
+            vibration_queue: Mutex::new(VecDeque::new()),
+            initialized: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn set_vibration_applies_upstream_sdl_amplitude_curve() {
+        let state = test_state();
+        let identifier = PadIdentifier::default();
+        let vibration = VibrationStatus {
+            low_amplitude: 1.0,
+            low_frequency: 160.0,
+            high_amplitude: 0.25,
+            high_frequency: 320.0,
+            amplification_type: VibrationAmplificationType::Exponential,
+        };
+
+        assert_eq!(
+            state.set_vibration(&identifier, &vibration),
+            DriverResult::Success
+        );
+        let queued = state.vibration_queue.lock().pop_front().unwrap();
+        assert_eq!(queued.vibration.low_amplitude, u16::MAX as f32);
+        let expected_high = (0.25_f32 + 0.25_f32.powf(0.35)) * 0.5 * u16::MAX as f32;
+        assert_eq!(queued.vibration.high_amplitude, expected_high);
+        assert_eq!(
+            queued.vibration.amplification_type,
+            VibrationAmplificationType::Exponential
+        );
     }
 }
