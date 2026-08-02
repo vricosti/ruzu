@@ -11,7 +11,7 @@
 
 use crate::ir::opcodes::Opcode;
 use crate::ir::program::{CbufDescriptor, Program, TexDescriptor};
-use crate::ir::types::{TextureInstInfo, Type};
+use crate::ir::types::{FmzMode, FpControl, TextureInstInfo, Type};
 use crate::ir::value::{Attribute, Value};
 use crate::program_header::{PixelImap, ProgramHeader};
 use crate::shader_info::{Info, TextureType};
@@ -269,6 +269,59 @@ fn visit_usages(info: &mut Info, opcode: Opcode) {
     }
 }
 
+/// Port of upstream `VisitFpModifiers`.
+fn visit_fp_modifiers(info: &mut Info, opcode: Opcode, flags: u32) {
+    let control = FpControl::from_u32(flags);
+    if matches!(
+        opcode,
+        Opcode::FPAdd16
+            | Opcode::FPFma16
+            | Opcode::FPMul16
+            | Opcode::FPRoundEven16
+            | Opcode::FPFloor16
+            | Opcode::FPCeil16
+            | Opcode::FPTrunc16
+    ) {
+        match control.fmz_mode {
+            FmzMode::DontCare => {}
+            FmzMode::FTZ | FmzMode::FMZ => info.uses_fp16_denorms_flush = true,
+            FmzMode::None => info.uses_fp16_denorms_preserve = true,
+        }
+        return;
+    }
+
+    if matches!(
+        opcode,
+        Opcode::FPAdd32
+            | Opcode::FPFma32
+            | Opcode::FPMul32
+            | Opcode::FPRoundEven32
+            | Opcode::FPFloor32
+            | Opcode::FPCeil32
+            | Opcode::FPTrunc32
+            | Opcode::FPOrdEqual32
+            | Opcode::FPUnordEqual32
+            | Opcode::FPOrdNotEqual32
+            | Opcode::FPUnordNotEqual32
+            | Opcode::FPOrdLessThan32
+            | Opcode::FPUnordLessThan32
+            | Opcode::FPOrdGreaterThan32
+            | Opcode::FPUnordGreaterThan32
+            | Opcode::FPOrdLessThanEqual32
+            | Opcode::FPUnordLessThanEqual32
+            | Opcode::FPOrdGreaterThanEqual32
+            | Opcode::FPUnordGreaterThanEqual32
+            | Opcode::ConvertF16F32
+            | Opcode::ConvertF64F32
+    ) {
+        match control.fmz_mode {
+            FmzMode::DontCare => {}
+            FmzMode::FTZ | FmzMode::FMZ => info.uses_fp32_denorms_flush = true,
+            FmzMode::None => info.uses_fp32_denorms_preserve = true,
+        }
+    }
+}
+
 fn cbuf_type_bit(opcode: Opcode) -> u32 {
     match opcode {
         Opcode::GetCbufU8 | Opcode::GetCbufS8 => Type::U8 as u32,
@@ -308,6 +361,7 @@ pub fn collect_shader_info_pass(program: &mut Program) {
     for block in &program.blocks {
         for inst in block.iter() {
             visit_usages(&mut program.info, inst.opcode);
+            visit_fp_modifiers(&mut program.info, inst.opcode, inst.flags);
             if matches!(
                 inst.opcode,
                 Opcode::SharedAtomicSMin32 | Opcode::StorageAtomicSMin32
@@ -854,7 +908,7 @@ mod tests {
     use crate::ir::instruction::Inst;
     use crate::ir::opcodes::Opcode;
     use crate::ir::program::Program;
-    use crate::ir::types::{ShaderStage, TextureInstInfo};
+    use crate::ir::types::{FmzMode, FpControl, ShaderStage, TextureInstInfo};
     use crate::ir::value::{Attribute, Value};
     use crate::program_header::ProgramHeader;
     use crate::shader_info::TextureType;
@@ -881,6 +935,33 @@ mod tests {
         assert!(program.info.uses_int8);
         assert!(program.info.uses_int16);
         assert!(program.info.uses_int64);
+    }
+
+    #[test]
+    fn collect_info_records_fp_denorm_modes_like_upstream() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        for (opcode, fmz_mode) in [
+            (Opcode::FPAdd16, FmzMode::FTZ),
+            (Opcode::FPFma16, FmzMode::None),
+            (Opcode::FPMul32, FmzMode::FMZ),
+            (Opcode::FPOrdEqual32, FmzMode::None),
+        ] {
+            let flags = FpControl {
+                fmz_mode,
+                ..Default::default()
+            };
+            program
+                .block_mut(0)
+                .append_inst(Inst::with_flags(opcode, Vec::new(), flags.to_u32()));
+        }
+
+        collect_shader_info_pass(&mut program);
+
+        assert!(program.info.uses_fp16_denorms_flush);
+        assert!(program.info.uses_fp16_denorms_preserve);
+        assert!(program.info.uses_fp32_denorms_flush);
+        assert!(program.info.uses_fp32_denorms_preserve);
     }
 
     #[test]

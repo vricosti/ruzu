@@ -487,7 +487,14 @@ fn propagate(inst: &mut Inst) {
         }
 
         // ── Select folding ───────────────────────────────────────────
-        Opcode::SelectU32 | Opcode::SelectF32 | Opcode::SelectU1 => {
+        Opcode::SelectU1
+        | Opcode::SelectU8
+        | Opcode::SelectU16
+        | Opcode::SelectU32
+        | Opcode::SelectU64
+        | Opcode::SelectF16
+        | Opcode::SelectF32
+        | Opcode::SelectF64 => {
             if let Some(&Value::ImmU1(cond)) = inst.args.first() {
                 let result = if cond { inst.args[1] } else { inst.args[2] };
                 inst.opcode = Opcode::Identity;
@@ -553,11 +560,152 @@ fn fold_instruction_references(program: &mut Program) {
         match opcode {
             Opcode::BitCastU32F32 => fold_bitcast(program, inst_ref, Opcode::BitCastF32U32),
             Opcode::BitCastF32U32 => fold_bitcast(program, inst_ref, Opcode::BitCastU32F32),
+            Opcode::PackHalf2x16 => {
+                fold_inverse_function(program, inst_ref, Opcode::UnpackHalf2x16)
+            }
+            Opcode::UnpackHalf2x16 => {
+                fold_inverse_function(program, inst_ref, Opcode::PackHalf2x16)
+            }
+            Opcode::PackFloat2x16 => {
+                fold_inverse_function(program, inst_ref, Opcode::UnpackFloat2x16)
+            }
+            Opcode::UnpackFloat2x16 => {
+                fold_inverse_function(program, inst_ref, Opcode::PackFloat2x16)
+            }
+            Opcode::CompositeExtractU32x2 => fold_composite_extract(
+                program,
+                inst_ref,
+                Opcode::CompositeConstructU32x2,
+                Opcode::CompositeInsertU32x2,
+            ),
+            Opcode::CompositeExtractU32x3 => fold_composite_extract(
+                program,
+                inst_ref,
+                Opcode::CompositeConstructU32x3,
+                Opcode::CompositeInsertU32x3,
+            ),
+            Opcode::CompositeExtractU32x4 => fold_composite_extract(
+                program,
+                inst_ref,
+                Opcode::CompositeConstructU32x4,
+                Opcode::CompositeInsertU32x4,
+            ),
+            Opcode::CompositeExtractF16x2 => fold_composite_extract(
+                program,
+                inst_ref,
+                Opcode::CompositeConstructF16x2,
+                Opcode::CompositeInsertF16x2,
+            ),
+            Opcode::CompositeExtractF16x3 => fold_composite_extract(
+                program,
+                inst_ref,
+                Opcode::CompositeConstructF16x3,
+                Opcode::CompositeInsertF16x3,
+            ),
+            Opcode::CompositeExtractF16x4 => fold_composite_extract(
+                program,
+                inst_ref,
+                Opcode::CompositeConstructF16x4,
+                Opcode::CompositeInsertF16x4,
+            ),
+            Opcode::CompositeExtractF32x2 => fold_composite_extract(
+                program,
+                inst_ref,
+                Opcode::CompositeConstructF32x2,
+                Opcode::CompositeInsertF32x2,
+            ),
+            Opcode::CompositeExtractF32x3 => fold_composite_extract(
+                program,
+                inst_ref,
+                Opcode::CompositeConstructF32x3,
+                Opcode::CompositeInsertF32x3,
+            ),
+            Opcode::CompositeExtractF32x4 => fold_composite_extract(
+                program,
+                inst_ref,
+                Opcode::CompositeConstructF32x4,
+                Opcode::CompositeInsertF32x4,
+            ),
             Opcode::FPMul32 => fold_fp_mul_interpolation(program, inst_ref),
             Opcode::LogicalNot => fold_double_logical_not(program, inst_ref),
             Opcode::FSwizzleAdd => fold_fswizzle_add(program, inst_ref),
             _ => {}
         }
+    }
+}
+
+/// Port of upstream `FoldInverseFunc`.
+fn fold_inverse_function(program: &mut Program, inst_ref: InstRef, reverse: Opcode) {
+    let value = program
+        .block(inst_ref.block)
+        .inst(inst_ref.inst)
+        .args
+        .first()
+        .copied();
+    let Some(value) = value else {
+        return;
+    };
+    if value.is_immediate() {
+        return;
+    }
+    let Some(arg_ref) = inst_recursive(value, program) else {
+        return;
+    };
+    let arg_inst = program.block(arg_ref.block).inst(arg_ref.inst);
+    if arg_inst.opcode == reverse {
+        if let Some(replacement) = arg_inst.args.first().copied() {
+            replace_with_identity(program, inst_ref, replacement);
+        }
+    }
+}
+
+/// Port of upstream `FoldCompositeExtractImpl`.
+fn fold_composite_extract_impl(
+    program: &Program,
+    value: Value,
+    insert: Opcode,
+    construct: Opcode,
+    first_index: u32,
+) -> Option<Value> {
+    let inst_ref = inst_recursive(value, program)?;
+    let inst = program.block(inst_ref.block).inst(inst_ref.inst);
+    if inst.opcode == construct {
+        return inst.args.get(first_index as usize).copied();
+    }
+    if inst.opcode != insert {
+        return None;
+    }
+    let Value::ImmU32(second_index) = *inst.args.get(2)? else {
+        return None;
+    };
+    if first_index == second_index {
+        return inst.args.get(1).copied();
+    }
+    let composite = *inst.args.first()?;
+    if composite.is_immediate() {
+        return None;
+    }
+    fold_composite_extract_impl(program, composite, insert, construct, first_index)
+}
+
+/// Port of upstream `FoldCompositeExtract`.
+fn fold_composite_extract(
+    program: &mut Program,
+    inst_ref: InstRef,
+    construct: Opcode,
+    insert: Opcode,
+) {
+    let inst = program.block(inst_ref.block).inst(inst_ref.inst);
+    let (Some(&composite), Some(&Value::ImmU32(index))) = (inst.args.first(), inst.args.get(1))
+    else {
+        return;
+    };
+    if composite.is_immediate() {
+        return;
+    }
+    if let Some(result) = fold_composite_extract_impl(program, composite, insert, construct, index)
+    {
+        replace_with_identity(program, inst_ref, result);
     }
 }
 
@@ -819,6 +967,44 @@ mod tests {
         let folded = program.block(0).inst(2);
         assert_eq!(folded.opcode, Opcode::Identity);
         assert_eq!(folded.args, vec![inst(0, 0)]);
+    }
+
+    #[test]
+    fn packed_half_insert_extract_eliminates_overwritten_cbuf_lane() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let block = program.block_mut(0);
+        block.append_inst(Inst::new(
+            Opcode::GetCbufU32,
+            vec![Value::ImmU32(3), Value::ImmU32(0xb4)],
+        ));
+        block.append_inst(Inst::new(Opcode::UnpackFloat2x16, vec![inst(0, 0)]));
+        block.append_inst(Inst::new(Opcode::ConvertF32F16, vec![Value::ImmF32(0.75)]));
+        block.append_inst(Inst::new(
+            Opcode::CompositeInsertF16x2,
+            vec![inst(0, 1), inst(0, 2), Value::ImmU32(0)],
+        ));
+        block.append_inst(Inst::new(Opcode::PackFloat2x16, vec![inst(0, 3)]));
+        block.append_inst(Inst::new(Opcode::UnpackFloat2x16, vec![inst(0, 4)]));
+        block.append_inst(Inst::new(
+            Opcode::CompositeExtractF16x2,
+            vec![inst(0, 5), Value::ImmU32(0)],
+        ));
+
+        constant_propagation_pass(&mut program);
+
+        let unpack = program.block(0).inst(5);
+        assert_eq!(unpack.opcode, Opcode::Identity);
+        assert_eq!(unpack.args, vec![inst(0, 3)]);
+        let extract = program.block(0).inst(6);
+        assert_eq!(extract.opcode, Opcode::Identity);
+        assert_eq!(extract.args, vec![inst(0, 2)]);
+
+        crate::ir_opt::dead_code_elimination::dead_code_elimination_pass(&mut program);
+        assert!(!program
+            .block(0)
+            .iter()
+            .any(|inst| inst.opcode == Opcode::GetCbufU32));
     }
 
     #[test]
