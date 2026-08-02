@@ -369,6 +369,7 @@ impl NPad {
                 let controller_type = device.get_npad_style_index(false);
                 let npad_id = device.get_npad_id_type();
                 let is_connected = device.is_connected(false);
+                let events = pending_events[aruid_index][entry_index];
 
                 if !is_connected {
                     if controller.is_connected {
@@ -382,6 +383,17 @@ impl NPad {
 
                 let colors = device.get_colors();
                 let battery = device.get_battery();
+                let reconnected =
+                    events & controller_trigger_bit(ControllerTriggerType::Disconnected) != 0
+                        && events & controller_trigger_bit(ControllerTriggerType::Connected) != 0;
+                if reconnected && controller.is_connected {
+                    // Upstream handles controller callbacks synchronously, so a
+                    // Disconnect/SetType/Connect sequence updates shared memory
+                    // in order. The Rust callback adapter coalesces callbacks
+                    // until OnUpdate; replay the lost disconnect before using
+                    // the final connected type.
+                    Self::disconnect_controller(npad, controller);
+                }
                 if !controller.is_connected
                     && self
                         .npad_resource
@@ -396,7 +408,6 @@ impl NPad {
                     );
                     last_active_controller = Some(npad_id);
                 } else {
-                    let events = pending_events[aruid_index][entry_index];
                     if events
                         & (controller_trigger_bit(ControllerTriggerType::Battery)
                             | controller_trigger_bit(ControllerTriggerType::All))
@@ -1901,5 +1912,82 @@ mod tests {
                 "{style:?} used the wrong connection bits"
             );
         }
+    }
+
+    #[test]
+    fn coalesced_reconnect_reinitializes_shared_memory_for_final_style() {
+        const ARUID: u64 = 0x53;
+
+        let hid_core = Arc::new(Mutex::new(HIDCore::new()));
+        let controller = hid_core.lock().get_emulated_controller(NpadIdType::Player1);
+        {
+            let mut controller = controller.lock();
+            controller.set_npad_style_index(NpadStyleIndex::JoyconDual);
+            controller.connect(false);
+            controller.enable_configuration();
+            controller.set_npad_style_index(NpadStyleIndex::Fullkey);
+            controller.disable_configuration();
+        }
+
+        let mut applet_resource = AppletResource::new();
+        applet_resource.set_shared_memory_backing(Arc::new(TestSharedMemoryBacking));
+        assert!(applet_resource
+            .register_applet_resource_user_id(ARUID, true)
+            .is_success());
+        assert!(applet_resource.create_applet_resource(ARUID).is_success());
+        let applet_resource = Arc::new(Mutex::new(applet_resource));
+
+        let mut npad = NPad::new_with_hid_core(Arc::clone(&hid_core));
+        npad.set_npad_externals(AppletResourceHolder {
+            applet_resource: Some(Arc::clone(&applet_resource)),
+            handheld_config: None,
+        });
+        assert!(npad.register_applet_resource_user_id(ARUID).is_success());
+        assert!(npad.activate_npad_resource_with_aruid(ARUID).is_success());
+        assert!(npad.activate().is_success());
+        assert!(npad.activate_for_aruid(ARUID).is_success());
+
+        assert!(npad
+            .set_supported_npad_style_set(ARUID, NpadStyleSet::JOY_DUAL)
+            .is_success());
+        {
+            let resource = applet_resource.lock();
+            let state = &resource
+                .get_shared_memory_format(ARUID)
+                .unwrap()
+                .npad
+                .npad_entry[0]
+                .internal_state;
+            assert_eq!(state.style_tag.raw, NpadStyleSet::JOY_DUAL);
+        }
+
+        // Supporting Fullkey again restores the configured controller type.
+        // Disconnect, Type and Connect callbacks can all arrive before the
+        // next update, but upstream applies them synchronously in this order.
+        assert!(npad
+            .set_supported_npad_style_set(ARUID, NpadStyleSet::ALL)
+            .is_success());
+
+        assert_eq!(
+            controller.lock().get_npad_style_index(false),
+            NpadStyleIndex::Fullkey
+        );
+        let resource = applet_resource.lock();
+        let state = &resource
+            .get_shared_memory_format(ARUID)
+            .unwrap()
+            .npad
+            .npad_entry[0]
+            .internal_state;
+        assert_eq!(state.style_tag.raw, NpadStyleSet::FULLKEY);
+        assert!(
+            state
+                .fullkey_lifo
+                .read_current_entry()
+                .state
+                .connection_status
+                .raw
+                != 0
+        );
     }
 }
