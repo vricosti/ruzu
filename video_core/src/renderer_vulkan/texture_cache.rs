@@ -1123,7 +1123,9 @@ impl TextureCacheRuntime {
                 .texture_compression_bc
                 != 0
         };
-        let astc_decoder_pass =
+        let astc_decoder_pass = if *common::settings::values().accelerate_astc.get_value()
+            == common::settings_enums::AstcDecodeMode::Gpu
+        {
             match AstcDecoderPass::new(&device, descriptor_pool, compute_pass_descriptor_queue) {
                 Ok(pass) => Some(pass),
                 Err(err) => {
@@ -1133,7 +1135,10 @@ impl TextureCacheRuntime {
                     );
                     None
                 }
-            };
+            }
+        } else {
+            None
+        };
         let msaa_copy_pass = if storage_image_multisample_supported {
             match MsaaCopyPass::new(&device, descriptor_pool, compute_pass_descriptor_queue) {
                 Ok(pass) => Some(pass),
@@ -4014,9 +4019,41 @@ impl TextureCache {
     }
 
     fn apply_backend_image_flags(&self, image: &mut ImageBase) {
-        if crate::surface::is_pixel_format_bcn(image.info.format)
-            && !self.runtime.optimal_bcn_supported
-        {
+        Self::apply_backend_image_flags_with_capabilities(
+            image,
+            self.runtime.optimal_astc_supported,
+            self.runtime.optimal_bcn_supported,
+            *common::settings::values().accelerate_astc.get_value(),
+            *common::settings::values().astc_recompression.get_value(),
+        );
+    }
+
+    fn apply_backend_image_flags_with_capabilities(
+        image: &mut ImageBase,
+        optimal_astc_supported: bool,
+        optimal_bcn_supported: bool,
+        astc_decode_mode: common::settings_enums::AstcDecodeMode,
+        astc_recompression: common::settings_enums::AstcRecompression,
+    ) {
+        if crate::surface::is_pixel_format_astc(image.info.format) && !optimal_astc_supported {
+            match astc_decode_mode {
+                common::settings_enums::AstcDecodeMode::Gpu => {
+                    if astc_recompression == common::settings_enums::AstcRecompression::Uncompressed
+                        && image.info.size.depth == 1
+                    {
+                        image.flags.insert(ImageFlagBits::ACCELERATED_UPLOAD);
+                    }
+                }
+                common::settings_enums::AstcDecodeMode::CpuAsynchronous => {
+                    image.flags.insert(ImageFlagBits::ASYNCHRONOUS_DECODE);
+                }
+                common::settings_enums::AstcDecodeMode::Cpu => {}
+            }
+            image
+                .flags
+                .insert(ImageFlagBits::CONVERTED | ImageFlagBits::COSTLY_LOAD);
+        }
+        if crate::surface::is_pixel_format_bcn(image.info.format) && !optimal_bcn_supported {
             image
                 .flags
                 .insert(ImageFlagBits::CONVERTED | ImageFlagBits::COSTLY_LOAD);
@@ -4093,7 +4130,8 @@ impl TextureCache {
         if !self.base_image_exists(image_id) {
             return false;
         }
-        let image_base = self.base.slot_images[image_id].clone();
+        let mut image_base = self.base.slot_images[image_id].clone();
+        self.apply_backend_image_flags(&mut image_base);
         let format = self.runtime.surface_format(image_base.info.format, false);
         let aspect = image_aspect_mask(image_base.info.format);
         !aspect.is_empty()
@@ -5050,7 +5088,8 @@ impl TextureCache {
         if self.image_up_to_date(image_id) {
             return true;
         }
-        let image_base = self.base.slot_images[image_id].clone();
+        let mut image_base = self.base.slot_images[image_id].clone();
+        self.apply_backend_image_flags(&mut image_base);
         let format = self.runtime.surface_format(image_base.info.format, false);
         let aspect = image_aspect_mask(image_base.info.format);
         if aspect.is_empty() {
@@ -6632,6 +6671,100 @@ mod tests {
                 | vk::ImageUsageFlags::STORAGE
                 | vk::ImageUsageFlags::COLOR_ATTACHMENT
         ));
+    }
+
+    #[test]
+    fn astc_backend_flags_match_upstream_vulkan_image_policy() {
+        use common::settings_enums::{AstcDecodeMode, AstcRecompression};
+
+        let info = ImageInfo {
+            format: PixelFormat::Astc2d4x4Unorm,
+            image_type: ImageType::E2D,
+            size: Extent3D {
+                width: 64,
+                height: 64,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        let classify = |decode_mode, recompression, native_astc, depth| {
+            let mut image_info = info.clone();
+            image_info.size.depth = depth;
+            let mut image = ImageBase::new(image_info, 0, 0);
+            TextureCache::apply_backend_image_flags_with_capabilities(
+                &mut image,
+                native_astc,
+                true,
+                decode_mode,
+                recompression,
+            );
+            image.flags
+        };
+
+        let gpu = classify(
+            AstcDecodeMode::Gpu,
+            AstcRecompression::Uncompressed,
+            false,
+            1,
+        );
+        assert!(gpu.contains(ImageFlagBits::ACCELERATED_UPLOAD));
+        assert!(!gpu.contains(ImageFlagBits::ASYNCHRONOUS_DECODE));
+        assert!(gpu.contains(ImageFlagBits::CONVERTED | ImageFlagBits::COSTLY_LOAD));
+
+        let asynchronous = classify(
+            AstcDecodeMode::CpuAsynchronous,
+            AstcRecompression::Uncompressed,
+            false,
+            1,
+        );
+        assert!(asynchronous.contains(ImageFlagBits::ASYNCHRONOUS_DECODE));
+        assert!(!asynchronous.contains(ImageFlagBits::ACCELERATED_UPLOAD));
+
+        let three_dimensional = classify(
+            AstcDecodeMode::Gpu,
+            AstcRecompression::Uncompressed,
+            false,
+            2,
+        );
+        assert!(!three_dimensional.contains(ImageFlagBits::ACCELERATED_UPLOAD));
+        assert!(three_dimensional.contains(ImageFlagBits::CONVERTED | ImageFlagBits::COSTLY_LOAD));
+
+        let native = classify(
+            AstcDecodeMode::Gpu,
+            AstcRecompression::Uncompressed,
+            true,
+            1,
+        );
+        assert!(!native.intersects(
+            ImageFlagBits::ACCELERATED_UPLOAD
+                | ImageFlagBits::ASYNCHRONOUS_DECODE
+                | ImageFlagBits::CONVERTED
+                | ImageFlagBits::COSTLY_LOAD
+        ));
+    }
+
+    #[test]
+    fn refresh_classifies_backend_flags_before_selecting_upload_path() {
+        let source = include_str!("texture_cache.rs");
+        let refresh = source
+            .split("fn refresh_contents_with_reader")
+            .nth(1)
+            .expect("refresh owner must exist")
+            .split("fn queue_async_decode")
+            .next()
+            .expect("refresh boundary must exist");
+        let classify = refresh
+            .find("self.apply_backend_image_flags(&mut image_base)")
+            .expect("backend flags must be applied during refresh");
+        let ensure = refresh
+            .find("self.ensure_image(image_id, &image_base, format, aspect)")
+            .expect("backend image materialization must remain in refresh");
+        let accelerated = refresh
+            .find("image_base.flags.contains(ImageFlagBits::ACCELERATED_UPLOAD)")
+            .expect("accelerated upload selection must remain in refresh");
+
+        assert!(classify < ensure);
+        assert!(ensure < accelerated);
     }
 
     #[test]

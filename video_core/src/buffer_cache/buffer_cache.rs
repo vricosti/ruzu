@@ -1110,6 +1110,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Return true when there are uncommitted buffers to be downloaded.
     pub fn has_uncommitted_flushes(&self) -> bool {
         !self.uncommitted_gpu_modified_ranges.empty()
+            || !self.committed_gpu_modified_ranges.is_empty()
     }
 
     /// Accumulate current uncommitted ranges into committed.
@@ -1190,25 +1191,35 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                         let new_start = buffer_start.max(device_addr);
                         let new_end = buffer_end.min(device_addr + size);
                         if new_start < new_end {
-                            // Collect GPU-modified sub-ranges.
-                            let mut sub_intervals: Vec<(VAddr, VAddr)> = Vec::new();
-                            self.gpu_modified_ranges.for_each_in_range(
+                            let mut tracked_ranges = Vec::new();
+                            self.memory_tracker.for_each_download_range(
                                 new_start,
-                                (new_end - new_start) as usize,
-                                |s, e| sub_intervals.push((s, e)),
+                                new_end - new_start,
+                                false,
+                                &mut |start, range_size| {
+                                    tracked_ranges.push((start, range_size));
+                                },
                             );
-                            for (sub_start, sub_end) in sub_intervals {
-                                let new_offset = sub_start - buffer_start;
-                                let new_size = sub_end - sub_start;
-                                downloads.push((
-                                    BufferCopy {
-                                        src_offset: new_offset,
-                                        dst_offset: total_size_bytes,
-                                        size: new_size,
-                                    },
-                                    buffer_id,
-                                ));
-                                constexpr_align_up(&mut total_size_bytes, new_size, 64);
+                            for (tracked_start, tracked_size) in tracked_ranges {
+                                let mut sub_intervals = Vec::new();
+                                self.gpu_modified_ranges.for_each_in_range(
+                                    tracked_start,
+                                    tracked_size as usize,
+                                    |start, end| sub_intervals.push((start, end)),
+                                );
+                                for (sub_start, sub_end) in sub_intervals {
+                                    let new_offset = sub_start - buffer_start;
+                                    let new_size = sub_end - sub_start;
+                                    downloads.push((
+                                        BufferCopy {
+                                            src_offset: new_offset,
+                                            dst_offset: total_size_bytes,
+                                            size: new_size,
+                                        },
+                                        buffer_id,
+                                    ));
+                                    constexpr_align_up(&mut total_size_bytes, new_size, 64);
+                                }
                             }
                         }
                         let buf_end_page = div_ceil(buffer_end, CACHING_PAGESIZE);
@@ -1365,6 +1376,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return false;
         }
 
+        self.clear_download(cpu_dest_address, amount);
+
         // Find (or create) buffers covering source and destination.
         let mut buffer_a = NULL_BUFFER_ID;
         let mut buffer_b = NULL_BUFFER_ID;
@@ -1435,6 +1448,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         if has_new_downloads {
             self.memory_tracker
                 .mark_region_as_gpu_modified(cpu_dest_address, amount);
+        }
+
+        // Match DeviceGuestMemoryScoped<UnsafeReadWrite>: the host buffer copy
+        // must also be reflected in device memory before returning.
+        if let Some(ref device_memory) = self.device_memory {
+            self.tmp_buffer.resize(amount as usize, 0);
+            device_memory.read_block_unsafe(cpu_src_address, &mut self.tmp_buffer);
+            device_memory.write_block_unsafe(cpu_dest_address, &self.tmp_buffer);
         }
 
         true
@@ -4065,6 +4086,56 @@ mod tests {
         const USE_MEMORY_MAPS_FOR_UPLOADS: bool = false;
     }
 
+    struct IdentityGpuMemory;
+
+    impl GpuMemoryAccess for IdentityGpuMemory {
+        fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
+            Some(gpu_addr)
+        }
+
+        fn read_u64(&self, _gpu_addr: u64) -> Option<u64> {
+            None
+        }
+
+        fn read_u32(&self, _gpu_addr: u64) -> Option<u32> {
+            None
+        }
+
+        fn is_within_gpu_address_range(&self, _gpu_addr: u64) -> bool {
+            true
+        }
+
+        fn max_continuous_range(&self, _gpu_addr: u64, size: u64) -> u64 {
+            size
+        }
+
+        fn get_memory_layout_size(&self, _gpu_addr: u64) -> u64 {
+            0x1_0000
+        }
+    }
+
+    struct SharedDeviceMemory {
+        bytes: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>,
+    }
+
+    impl DeviceMemoryAccess for SharedDeviceMemory {
+        fn get_pointer(&self, _device_addr: u64) -> Option<*const u8> {
+            None
+        }
+
+        fn read_block_unsafe(&self, device_addr: u64, dst: &mut [u8]) {
+            let start = device_addr as usize;
+            let end = start + dst.len();
+            dst.copy_from_slice(&self.bytes.lock()[start..end]);
+        }
+
+        fn write_block_unsafe(&self, device_addr: u64, src: &[u8]) {
+            let start = device_addr as usize;
+            let end = start + src.len();
+            self.bytes.lock()[start..end].copy_from_slice(src);
+        }
+    }
+
     fn bind_test_channel(cache: &mut BufferCache<TestParams, DummyTracker>, bind_id: i32) {
         let channel = ChannelState::new(bind_id);
         cache.create_channel(&channel);
@@ -4196,6 +4267,57 @@ mod tests {
     }
 
     #[test]
+    fn dma_copy_cancels_pending_destination_download() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        cache.set_gpu_memory(Box::new(IdentityGpuMemory));
+        let src = 0x1_0000;
+        let dst = 0x2_0000;
+        cache.create_buffer(src, 0x1000);
+        cache.create_buffer(dst, 0x1000);
+        cache.async_downloads.add(dst, 0x200);
+        cache.uncommitted_gpu_modified_ranges.add(dst, 0x200);
+        let mut committed = RangeSet::new();
+        committed.add(dst, 0x200);
+        cache.committed_gpu_modified_ranges.push_back(committed);
+
+        assert!(cache.dma_copy(src, dst, 0x200));
+
+        assert!(cache.async_downloads.empty());
+        assert!(cache.uncommitted_gpu_modified_ranges.empty());
+        assert!(cache.committed_gpu_modified_ranges[0].empty());
+    }
+
+    #[test]
+    fn dma_copy_mirrors_source_into_device_memory_destination() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        cache.set_gpu_memory(Box::new(IdentityGpuMemory));
+
+        let src = 0x1_0000;
+        let dst = 0x2_0000;
+        let amount = 0x80;
+        let bytes = std::sync::Arc::new(parking_lot::Mutex::new(vec![0u8; 0x3_0000]));
+        {
+            let mut memory = bytes.lock();
+            for (index, byte) in memory[src..src + amount].iter_mut().enumerate() {
+                *byte = index as u8 ^ 0x5a;
+            }
+            memory[dst..dst + amount].fill(0xcc);
+        }
+        cache.set_device_memory(Box::new(SharedDeviceMemory {
+            bytes: std::sync::Arc::clone(&bytes),
+        }));
+        cache.create_buffer(src as u64, 0x1000);
+        cache.create_buffer(dst as u64, 0x1000);
+
+        assert!(cache.dma_copy(src as u64, dst as u64, amount as u64));
+
+        let memory = bytes.lock();
+        assert_eq!(&memory[dst..dst + amount], &memory[src..src + amount]);
+    }
+
+    #[test]
     fn test_on_cpu_write_unregistered() {
         let tracker = DummyTracker;
         let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
@@ -4277,13 +4399,18 @@ mod tests {
     }
 
     #[test]
-    fn test_accumulate_flushes() {
+    fn accumulated_flushes_still_require_a_real_fence() {
         let tracker = DummyTracker;
         let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
         // Add something to uncommitted ranges.
         cache.uncommitted_gpu_modified_ranges.add(0x1000, 0x1000);
         assert!(cache.has_uncommitted_flushes());
         cache.accumulate_flushes();
+        assert!(
+            cache.has_uncommitted_flushes(),
+            "SignalOrdering must not make the next fence stubbed"
+        );
+        cache.committed_gpu_modified_ranges.clear();
         assert!(!cache.has_uncommitted_flushes());
         // Upstream ShouldWaitAsyncFlushes checks the committed async buffer
         // queue, not committed_gpu_modified_ranges directly.

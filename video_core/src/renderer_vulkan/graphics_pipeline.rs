@@ -38,7 +38,7 @@ use shader_recompiler::shader_info::{Info as ShaderInfo, TextureType};
 use shader_recompiler::{CompiledShader, PipelineCache, Profile, RuntimeInfo, ShaderStage};
 
 use super::descriptor_pool::{DescriptorAllocator, DescriptorBankInfo, DescriptorPool};
-use super::fixed_pipeline_state::{DynamicFeatures, FixedPipelineState};
+use super::fixed_pipeline_state::{pack_logic_op, DynamicFeatures, FixedPipelineState};
 use super::maxwell_to_vk;
 use super::pipeline_helper::{
     RENDERAREA_LAYOUT_SIZE, RESCALING_LAYOUT_SIZE, RESCALING_LAYOUT_WORDS_OFFSET,
@@ -1397,7 +1397,7 @@ impl GraphicsPipelineCache {
         let color_blend = vk::PipelineColorBlendStateCreateInfo::builder()
             .logic_op_enable(fixed_state.dynamic_state.logic_op_enable())
             .logic_op(vk::LogicOp::from_raw(
-                fixed_state.dynamic_state.logic_op() as i32
+                pack_logic_op(fixed_state.dynamic_state.logic_op()) as i32,
             ))
             .attachments(&blend_attachments)
             .build();

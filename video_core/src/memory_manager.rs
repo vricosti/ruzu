@@ -1172,8 +1172,8 @@ impl GpuMemoryManager {
     pub fn copy_block(&mut self, gpu_dest: u64, gpu_src: u64, size: u64) -> bool {
         let mut tmp = vec![0u8; size as usize];
         self.read_block(gpu_src, &mut tmp);
-        self.write_block(gpu_dest, &tmp);
         self.flush_region(gpu_dest, size);
+        self.write_block(gpu_dest, &tmp);
         true
     }
 
@@ -1528,8 +1528,8 @@ impl GpuMemoryManager {
     ) {
         let mut tmp = vec![0u8; size as usize];
         self.read_with_callback(gpu_src, &mut tmp, read_cpu);
-        self.write_with_callback(gpu_dest, &tmp, write_cpu);
         self.flush_region(gpu_dest, size);
+        self.write_with_callback(gpu_dest, &tmp, write_cpu);
     }
 
     /// Upstream: `MemoryManager::GetPageKind(gpu_addr)`.
@@ -2466,7 +2466,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_block_flushes_destination_device_range() {
+    fn copy_block_flushes_destination_before_writing() {
         let mut mm = MemoryManager::new_with_geometry(12, 32, 0x1_0000_0000, 16, 12);
         let rasterizer = TestRasterizer::new();
         let flush_calls = Arc::clone(&rasterizer.flush_calls);
@@ -2486,6 +2486,7 @@ mod tests {
                 }
             },
             &mut |addr, data| {
+                assert_eq!(*flush_calls.lock().unwrap(), vec![(0x9000_0040, 0x20)]);
                 writes.push((addr, data.to_vec()));
             },
         );

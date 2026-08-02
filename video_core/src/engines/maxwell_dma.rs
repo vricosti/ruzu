@@ -784,7 +784,44 @@ impl MaxwellDMA {
         self.pending_launch = true;
     }
 
+    fn execute_multi_line_pitch_to_pitch(&mut self) -> bool {
+        if !self.launch_multi_line_enable()
+            || !self.launch_src_is_pitch()
+            || !self.launch_dst_is_pitch()
+        {
+            return false;
+        }
+
+        if self.launch_data_transfer_type() != LAUNCH_DATA_TRANSFER_NON_PIPELINED {
+            self.stop_unimplemented_dma_path("data_transfer_type is not NON_PIPELINED");
+        }
+
+        let lines = self.line_count();
+        let line_length = self.line_length() as u64;
+        let pitch_in = self.pitch_in() as u64;
+        let pitch_out = self.pitch_out() as u64;
+        let src_addr = self.src_addr();
+        let dst_addr = self.dst_addr();
+        {
+            let mut memory_manager = self.memory_manager.lock();
+            memory_manager.flush_caching();
+            for line in 0..lines {
+                let source_line = src_addr + u64::from(line) * pitch_in;
+                let dest_line = dst_addr + u64::from(line) * pitch_out;
+                memory_manager.copy_block(dest_line, source_line, line_length);
+            }
+        }
+        self.release_semaphore();
+        true
+    }
+
     fn launch_immediate(&mut self) {
+        if self.execute_multi_line_pitch_to_pitch() {
+            return;
+        }
+        if self.launch_multi_line_enable() {
+            self.memory_manager.lock().flush_caching();
+        }
         let memory_manager = Arc::clone(&self.memory_manager);
         let read_gpu = move |addr: u64, buf: &mut [u8]| {
             let _ = memory_manager.lock().read_block(addr, buf);
@@ -1469,6 +1506,36 @@ mod tests {
         assert_eq!(&dst[4..16], &[0x7E; 12]);
         // Line 1 starts at pitch_out and contributes only its copied bytes.
         assert_eq!(&dst[16..20], &[5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn test_immediate_pitch_copy_executes_lines_sequentially() {
+        let mut eng = new_test_engine();
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let rasterizer = TestRasterizer::new(Arc::clone(&calls));
+        bind_memory_rasterizer(
+            &mut eng,
+            &rasterizer,
+            &[(0x1000, 0x1_1000), (0x8000, 0x1_8000)],
+        );
+
+        eng.write_reg(SRC_ADDR_HIGH, 0);
+        eng.write_reg(SRC_ADDR_LOW, 0x1000);
+        eng.write_reg(DST_ADDR_HIGH, 0);
+        eng.write_reg(DST_ADDR_LOW, 0x8000);
+        eng.write_reg(PITCH_IN, 8);
+        eng.write_reg(PITCH_OUT, 16);
+        eng.write_reg(LINE_LENGTH, 4);
+        eng.write_reg(LINE_COUNT, 2);
+
+        eng.call_method(LAUNCH_DMA, MULTI_LINE_PITCH_TO_PITCH_LAUNCH, true);
+
+        let calls = calls.lock();
+        assert_eq!(
+            calls.flushes,
+            vec![(0x1_1000, 4), (0x1_8000, 4), (0x1_1008, 4), (0x1_8010, 4),]
+        );
+        assert_eq!(calls.invalidations, vec![(0x1_8000, 4), (0x1_8010, 4)]);
     }
 
     #[test]
@@ -2343,19 +2410,19 @@ mod tests {
     }
 
     #[test]
-    fn test_call_method_launch_trigger_sets_pending() {
+    fn test_call_method_launch_executes_immediately() {
         let mut eng = new_test_engine();
         assert!(!eng.pending_launch);
         eng.call_method(LAUNCH_DMA, MULTI_LINE_PITCH_TO_PITCH_LAUNCH, true);
-        assert!(eng.pending_launch);
+        assert!(!eng.pending_launch);
     }
 
     #[test]
-    fn test_call_multi_method_launch_trigger_sets_pending() {
+    fn test_call_multi_method_launch_executes_immediately() {
         let mut eng = new_test_engine();
         assert!(!eng.pending_launch);
         eng.call_multi_method(LAUNCH_DMA, &[MULTI_LINE_PITCH_TO_PITCH_LAUNCH], 1, 1);
-        assert!(eng.pending_launch);
+        assert!(!eng.pending_launch);
     }
 
     #[test]

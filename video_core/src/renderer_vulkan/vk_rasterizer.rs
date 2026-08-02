@@ -4219,6 +4219,29 @@ impl RasterizerInterface for RasterizerVulkan {
         }
     }
 
+    fn accelerate_dma_buffer_copy(
+        &mut self,
+        src_address: u64,
+        dest_address: u64,
+        amount: u64,
+    ) -> bool {
+        unsafe {
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            self.common_buffer_cache
+                .dma_copy(src_address, dest_address, amount)
+        }
+    }
+
+    fn accelerate_dma_buffer_clear(&mut self, dst_address: u64, amount: u64, value: u32) -> bool {
+        unsafe {
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            self.common_buffer_cache
+                .dma_clear(dst_address, amount, value)
+        }
+    }
+
     fn accelerate_dma_image_to_buffer(
         &mut self,
         copy_info: &dma::ImageCopy,
