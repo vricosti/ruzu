@@ -402,9 +402,7 @@ fn run_boot(
         system.set_gpu_core(gpu);
 
         // AudioCore (upstream core.cpp:283).
-        let shared_system: audio_core::SharedSystem =
-            Arc::new(parking_lot::Mutex::new(System::new()));
-        let ac = audio_core::AudioCore::new(shared_system);
+        let ac = audio_core::AudioCore::new(SystemRef::from_ref(system));
         system.set_audio_core(Box::new(ac));
     }));
 

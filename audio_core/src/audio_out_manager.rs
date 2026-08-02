@@ -127,7 +127,7 @@ mod tests {
     use std::time::Duration;
 
     fn make_system() -> SharedSystem {
-        Arc::new(Mutex::new(ruzu_core::core::System::new()))
+        crate::make_test_system()
     }
 
     fn wait_for_event(flag: &AtomicBool) -> bool {

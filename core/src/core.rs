@@ -792,6 +792,7 @@ pub trait AudioCoreInterface: Send {
         name: &[u8; 0x100],
         protocol: [u32; 2],
         params: AudioInParameterWire,
+        process: *mut crate::hle::kernel::k_process::KProcess,
         applet_resource_user_id: u64,
     ) -> std::result::Result<AudioInOpenResponse, crate::hle::result::ResultCode>;
 
@@ -800,6 +801,7 @@ pub trait AudioCoreInterface: Send {
         &self,
         name: &[u8; 0x100],
         params: AudioOutParameterWire,
+        process: *mut crate::hle::kernel::k_process::KProcess,
         applet_resource_user_id: u64,
     ) -> std::result::Result<AudioOutOpenResponse, crate::hle::result::ResultCode>;
 

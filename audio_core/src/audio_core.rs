@@ -459,6 +459,7 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
         name: &[u8; 0x100],
         protocol: [u32; 2],
         params: ruzu_core::core::AudioInParameterWire,
+        process: *mut ruzu_core::hle::kernel::k_process::KProcess,
         applet_resource_user_id: u64,
     ) -> std::result::Result<ruzu_core::core::AudioInOpenResponse, ruzu_core::hle::result::ResultCode>
     {
@@ -496,6 +497,13 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
             buffer_event.clone(),
             session_id,
         );
+        if !process.is_null() {
+            if let Some(memory) = unsafe { (*process).get_memory() } {
+                system.set_guest_memory(Some(Arc::new(crate::device::ProcessMemoryProvider::new(
+                    memory,
+                ))));
+            }
+        }
         system.set_audio_manager(Some(self.audio_manager.clone()));
         let result = system.initialize(device_name, &parsed, applet_resource_user_id);
         if result.is_error() {
@@ -564,6 +572,7 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
         &self,
         name: &[u8; 0x100],
         params: ruzu_core::core::AudioOutParameterWire,
+        process: *mut ruzu_core::hle::kernel::k_process::KProcess,
         applet_resource_user_id: u64,
     ) -> std::result::Result<
         ruzu_core::core::AudioOutOpenResponse,
@@ -603,6 +612,13 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
             buffer_event.clone(),
             session_id,
         );
+        if !process.is_null() {
+            if let Some(memory) = unsafe { (*process).get_memory() } {
+                system.set_guest_memory(Some(Arc::new(crate::device::ProcessMemoryProvider::new(
+                    memory,
+                ))));
+            }
+        }
         system.set_audio_manager(Some(self.audio_manager.clone()));
         let result = system.initialize(device_name, &parsed, applet_resource_user_id);
         if result.is_error() {
@@ -877,9 +893,7 @@ mod tests {
     use std::sync::Arc;
 
     fn make_audio_core() -> AudioCore {
-        let system: SharedSystem =
-            Arc::new(parking_lot::Mutex::new(ruzu_core::core::System::new()));
-        AudioCore::new(system)
+        AudioCore::new(crate::make_test_system())
     }
 
     #[test]

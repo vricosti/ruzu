@@ -322,7 +322,7 @@ mod tests {
     use std::sync::Arc;
 
     fn make_system() -> SharedSystem {
-        Arc::new(Mutex::new(ruzu_core::core::System::new()))
+        crate::make_test_system()
     }
 
     #[test]

@@ -305,9 +305,7 @@ mod tests {
 
     #[test]
     fn adsp_backed_manager_populates_required_workbuffer_sizes() {
-        let decoder = Arc::new(Mutex::new(AdspOpusDecoder::new(Arc::new(Mutex::new(
-            ruzu_core::core::System::new(),
-        )))));
+        let decoder = Arc::new(Mutex::new(AdspOpusDecoder::new(crate::make_test_system())));
         {
             let decoder = decoder.lock();
             decoder.send(Direction::Dsp, Message::Start);

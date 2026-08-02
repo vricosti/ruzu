@@ -177,7 +177,7 @@ impl System {
             self.session.clear_buffers();
             let current_time = self
                 .system
-                .lock()
+                .get()
                 .core_timing()
                 .get_global_time_ns()
                 .as_nanos() as u64;
@@ -274,7 +274,7 @@ impl System {
         self.session.tick();
         let current_time = self
             .system
-            .lock()
+            .get()
             .core_timing()
             .get_global_time_ns()
             .as_nanos() as u64;
@@ -427,7 +427,7 @@ mod tests {
     use parking_lot::Mutex;
 
     fn make_system() -> SharedSystem {
-        Arc::new(Mutex::new(ruzu_core::core::System::new()))
+        crate::make_test_system()
     }
 
     #[test]

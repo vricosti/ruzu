@@ -1228,9 +1228,7 @@ fn main() {
         system.set_gpu_core(gpu);
 
         // AudioCore (upstream core.cpp:283): audio_core = make_unique<AudioCore>(system)
-        let shared_system: audio_core::SharedSystem =
-            Arc::new(parking_lot::Mutex::new(ruzu_core::core::System::new()));
-        let ac = audio_core::AudioCore::new(shared_system);
+        let ac = audio_core::AudioCore::new(ruzu_core::core::SystemRef::from_ref(system));
         system.set_audio_core(Box::new(ac));
     }));
 

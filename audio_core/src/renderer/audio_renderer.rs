@@ -146,7 +146,7 @@ mod tests {
     use std::sync::Arc;
 
     fn make_shared_system() -> crate::SharedSystem {
-        Arc::new(Mutex::new(ruzu_core::core::System::new()))
+        crate::make_test_system()
     }
 
     fn make_renderer_handle(core: crate::SharedSystem) -> crate::adsp::adsp::AudioRendererHandle {

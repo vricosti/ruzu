@@ -491,9 +491,7 @@ mod tests {
 
     #[test]
     fn adsp_backed_decoder_decodes_single_stream_packet() {
-        let adsp_decoder = Arc::new(Mutex::new(AdspOpusDecoder::new(Arc::new(Mutex::new(
-            ruzu_core::core::System::new(),
-        )))));
+        let adsp_decoder = Arc::new(Mutex::new(AdspOpusDecoder::new(crate::make_test_system())));
         {
             let decoder = adsp_decoder.lock();
             decoder.send(Direction::Dsp, Message::Start);
@@ -533,9 +531,7 @@ mod tests {
 
     #[test]
     fn adsp_backed_decoder_decodes_multistream_packet() {
-        let adsp_decoder = Arc::new(Mutex::new(AdspOpusDecoder::new(Arc::new(Mutex::new(
-            ruzu_core::core::System::new(),
-        )))));
+        let adsp_decoder = Arc::new(Mutex::new(AdspOpusDecoder::new(crate::make_test_system())));
         {
             let decoder = adsp_decoder.lock();
             decoder.send(Direction::Dsp, Message::Start);

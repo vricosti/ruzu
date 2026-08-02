@@ -431,7 +431,7 @@ impl System {
             }
         }
         let transfer_memory_source_address = unsafe { (*transfer_memory).get_source_address() };
-        if let Some(memory) = self.core.lock().get_svc_memory() {
+        if let Some(memory) = self.core.get().get_svc_memory() {
             memory.lock().unwrap().zero_block(
                 transfer_memory_source_address,
                 transfer_memory_size as usize,
@@ -1164,7 +1164,7 @@ impl System {
 
     fn current_time_ns(&self) -> u64 {
         self.core
-            .lock()
+            .get()
             .core_timing()
             .get_global_time_ns()
             .as_nanos() as u64
@@ -1205,7 +1205,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     fn make_shared_system() -> SharedSystem {
-        Arc::new(Mutex::new(ruzu_core::core::System::new()))
+        crate::make_test_system()
     }
 
     fn make_renderer_handle(core: SharedSystem) -> AudioRendererHandle {

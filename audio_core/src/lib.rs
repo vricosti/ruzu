@@ -26,11 +26,14 @@ pub use crate::audio_manager::AudioManager;
 pub use crate::audio_out_manager::Manager as AudioOutManager;
 pub use crate::audio_render_manager::Manager as AudioRenderManager;
 pub use ::common::ResultCode;
-use parking_lot::Mutex;
-use std::sync::Arc;
-
-pub type SharedSystem = Arc<Mutex<ruzu_core::core::System>>;
+pub type SharedSystem = ruzu_core::core::SystemRef;
 pub type Result = ResultCode;
+
+#[cfg(test)]
+pub(crate) fn make_test_system() -> SharedSystem {
+    let system = Box::leak(Box::new(ruzu_core::core::System::new()));
+    ruzu_core::core::SystemRef::from_ref(system)
+}
 
 /// Global guest memory accessor for the audio renderer's decode path.
 ///

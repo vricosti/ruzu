@@ -437,7 +437,7 @@ mod tests {
     use parking_lot::Mutex;
 
     fn make_system() -> SharedSystem {
-        Arc::new(Mutex::new(ruzu_core::core::System::new()))
+        crate::make_test_system()
     }
 
     #[test]

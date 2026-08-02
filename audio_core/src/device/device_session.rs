@@ -130,7 +130,7 @@ impl DeviceSession {
                 self.thread_event = Some(self.make_thread_event(stream.clone()));
             }
             if let Some(thread_event) = &self.thread_event {
-                self.system.lock().core_timing().schedule_looping_event(
+                self.system.get().core_timing().schedule_looping_event(
                     Duration::ZERO,
                     INCREMENT_TIME,
                     thread_event,
@@ -149,7 +149,7 @@ impl DeviceSession {
             stream.lock().stop();
             if let Some(thread_event) = &self.thread_event {
                 self.system
-                    .lock()
+                    .get()
                     .core_timing()
                     .unschedule_event(thread_event, UnscheduleEventType::NoWait);
             }
@@ -297,7 +297,7 @@ mod tests {
     use ruzu_core::memory::memory_manager::{MemoryManager, MemoryPermission, MemoryState};
 
     fn make_system() -> SharedSystem {
-        Arc::new(Mutex::new(ruzu_core::core::System::new()))
+        crate::make_test_system()
     }
 
     fn make_guest_memory() -> Arc<Mutex<MemoryManager>> {
@@ -423,7 +423,7 @@ mod tests {
         stream.lock().process_audio_out_and_render(&mut rendered, 2);
 
         session.start();
-        let _ = system.lock().core_timing().advance();
+        let _ = system.get().core_timing().advance();
 
         assert!(session.get_played_sample_count() >= 2);
     }

@@ -151,7 +151,7 @@ impl IAudioInManager {
         };
         let process_handle = ctx.get_copy_handle(0);
         let process = Self::resolve_process_handle(&owner_process, process_handle);
-        let Some(_process) = process else {
+        let Some(process) = process else {
             return ResultCode::from_module_description(
                 crate::hle::result::ErrorModule::Audio,
                 crate::hle::service::audio::errors::RESULT_INVALID_HANDLE.1,
@@ -173,6 +173,7 @@ impl IAudioInManager {
                     &name[0].name,
                     protocol,
                     params,
+                    process,
                     applet_resource_user_id,
                 )
             });

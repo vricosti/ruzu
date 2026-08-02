@@ -143,7 +143,7 @@ impl AudioRenderer {
     pub fn signal(&mut self) {
         self.signalled_tick = self
             .system
-            .lock()
+            .get()
             .core_timing()
             .get_global_time_ns()
             .as_nanos() as u64;
@@ -350,7 +350,7 @@ impl AudioRenderer {
                     let mut prof_send_response_us = 0u128;
 
                     let t = std::time::Instant::now();
-                    if system.lock().is_shutting_down() {
+                    if system.get().is_shutting_down() {
                         if profile {
                             prof_shutdown_check_us = t.elapsed().as_micros();
                         }
@@ -371,7 +371,7 @@ impl AudioRenderer {
                     let mut render_times_taken = [0u64; MAX_RENDERER_SESSIONS];
                     let t = std::time::Instant::now();
                     let start_time =
-                        system.lock().core_timing().get_global_time_us().as_micros() as u64;
+                        system.get().core_timing().get_global_time_us().as_micros() as u64;
                     if profile {
                         prof_timing_lock_us = t.elapsed().as_micros();
                     }
@@ -504,7 +504,7 @@ impl AudioRenderer {
                         }
                         let t = std::time::Instant::now();
                         let end_time =
-                            system.lock().core_timing().get_global_time_us().as_micros() as u64;
+                            system.get().core_timing().get_global_time_us().as_micros() as u64;
                         if profile {
                             prof_end_time_lock_us += t.elapsed().as_micros();
                         }
@@ -596,7 +596,7 @@ mod tests {
     use std::time::Duration;
 
     fn make_system() -> SharedSystem {
-        Arc::new(Mutex::new(ruzu_core::core::System::new()))
+        crate::make_test_system()
     }
 
     fn serialize_commands(

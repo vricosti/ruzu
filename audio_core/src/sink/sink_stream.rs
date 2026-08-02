@@ -393,7 +393,7 @@ impl SinkStream {
 
     pub fn process_audio_in(&mut self, input_buffer: &[i16], num_frames: usize) {
         let (paused, shutting_down) = {
-            let sys = self.system.lock();
+            let sys = self.system.get();
             (sys.is_paused(), sys.is_shutting_down())
         };
         if paused || shutting_down {
@@ -452,7 +452,7 @@ impl SinkStream {
 
     pub fn process_audio_out_and_render(&mut self, output_buffer: &mut [i16], num_frames: usize) {
         let (paused, shutting_down) = {
-            let sys = self.system.lock();
+            let sys = self.system.get();
             (sys.is_paused(), sys.is_shutting_down())
         };
         if paused || shutting_down {
@@ -532,7 +532,7 @@ mod tests {
     use parking_lot::Mutex;
 
     fn make_system() -> SharedSystem {
-        Arc::new(Mutex::new(ruzu_core::core::System::new()))
+        crate::make_test_system()
     }
 
     #[test]
