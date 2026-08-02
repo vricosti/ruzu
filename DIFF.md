@@ -29801,7 +29801,7 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 
 ### Missing items
 - The trace currently annotates sampled combined-image descriptors; storage
-  image diagnostics are not required by the isolated MK8D draw, which has no
+  image diagnostics are not required by the isolated VMRD draw, which has no
   storage-image binding.
 
 ### Binary layout verification
@@ -30414,3 +30414,151 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ### Behavioral verification
 - Re-read upstream `ControllerUpdate` and `OnUpdate` after implementation.
   `coalesced_reconnect_reinitializes_shared_memory_for_final_style` passes.
+
+## 2026-08-02 — externals/rdynarmic/src/backend/x64/emit_floating_point.rs vs externals/dynarmic/src/dynarmic/backend/x64/emit_x64_floating_point.cpp
+
+### Intentional differences
+- Rust evaluates scalar FP min/max semantics in a typed host fallback rather
+  than reproducing upstream's deferred SSE control-flow emitter. The fallback
+  remains owned by the matching floating-point emitter and receives the same
+  two operands, block FPCR and sticky FPSR exception state.
+
+### Unintentional differences (fixed)
+- Scalar `FPMax`, `FPMin`, `FPMaxNumeric` and `FPMinNumeric` no longer use raw
+  x86 `maxss`/`minss`/`maxsd`/`minsd` semantics. They now preserve ARM NaN
+  priority, quiet signaling NaNs, honor default-NaN and flush-to-zero modes,
+  set `FPSR.IOC`, preserve upstream's DAZ behavior without spuriously setting
+  `FPSR.IDC`, and select signed zero according to max/min.
+
+### Missing items
+- Upstream emits this operation inline and has an AVX-512 numeric-min/max fast
+  path. The Rust fallback is behaviorally covered but still has host-call
+  overhead until the shared NaN post-processing emitter is ported.
+
+### Binary layout verification
+- PASS: no guest-visible structure changed; the fallback updates the existing
+  `fpsr_exc` field in place.
+
+### Behavioral verification
+- Re-read upstream `EmitFPMinMax` and `EmitFPMinMaxNumeric` after the Rust
+  implementation. Pure semantic tests and an A64 x64-JIT pairwise min/max test
+  pass for finite values, NaN priority, numeric NaN handling, signed zero,
+  default-NaN, flush-to-zero and sticky exceptions.
+
+## 2026-08-02 — externals/rdynarmic/src/backend/x64/emit_fp_vector.rs and emit_vector_helpers.rs vs externals/dynarmic/src/dynarmic/backend/x64/emit_x64_vector_floating_point.cpp
+
+### Intentional differences
+- Rust uses the scalar min/max semantic helper for each vector lane inside the
+  host fallback. Upstream implements the same lane rules with SSE/AVX masks and
+  reserves `EmitThreeOpFallback` for unsupported host paths.
+
+### Unintentional differences (fixed)
+- Vector `FPMax` and `FPMin` no longer use raw x86 `maxps`/`minps` or
+  `maxpd`/`minpd` behavior.
+- Numeric vector min/max no longer uses Rust `f32::min`/`max` or
+  `f64::min`/`max`, which lost NaN payload, signaling-NaN priority, FPCR and
+  FPSR behavior.
+- Added the upstream-equivalent five-argument `EmitThreeOpFallback` ABI bridge,
+  including the Windows shadow-space slot for `FPSR*` and 16-byte-aligned
+  vector operands.
+
+### Missing items
+- Upstream's inline SSE/AVX and AVX-512 fast paths are not yet ported; the Rust
+  fallback is bit-accurate but adds host-call overhead.
+
+### Binary layout verification
+- PASS: the System V stack uses three 16-byte slots. The Windows stack uses
+  32-byte shadow space, its fifth-argument pointer at offset 32, padding, then
+  three aligned 16-byte slots at offsets 48, 64 and 80, matching upstream.
+
+### Behavioral verification
+- Re-read upstream `EmitThreeOpFallbackWithoutRegAlloc`,
+  `EmitFPVectorMinMax` and `EmitFPVectorMinMaxNumeric` after implementation.
+  The A64 x64-JIT vector regression passes for regular/numeric NaNs, signaling
+  NaN quieting and `FPSR.IOC`, signed zero and finite lane selection.
+
+## 2026-08-02 — hid_core scripted NPad diagnostic vs src/hid_core/frontend/emulated_controller.cpp and resources/npad/npad.cpp
+
+### Intentional differences
+- The env-gated `RUZU_SCRIPTED_NPAD` diagnostic has no upstream equivalent.
+  Directional stick bits now also override the corresponding analog coordinate
+  while their scripted interval is active, matching the guest-visible result of
+  upstream `EmulatedController::SetStick`.
+
+### Binary layout verification
+- PASS: no HID shared-memory structure or field layout changed.
+
+### Behavioral verification
+- Re-read upstream `EmulatedController::SetStick` and NPad `OnUpdate`. The
+  diagnostic is merged only after reading the real controller state and before
+  the existing shared-memory update, preserving the normal upstream path when
+  the environment variable is absent.
+
+## 2026-08-02 — externals/rdynarmic/src/common/fp/{fused.rs,unpacked.rs,process_nan.rs,op/*.rs} vs externals/dynarmic/src/dynarmic/common/fp/{fused,unpacked,process_nan,op/FPConvert,op/FPMulAdd,op/FPRecipStepFused,op/FPRSqrtStepFused,op/FPToFixed}.{h,cpp}
+
+### Intentional differences
+- Rust uses its native `u128` for upstream's two-word `Common::u128`; sticky
+  shifts and mantissa reduction retain the same bit ordering and round-to-odd
+  behavior.
+- Template instantiations are represented by the existing `FloatFormat` trait.
+
+### Unintentional differences (fixed)
+- Added the missing exact unpack/round, conversion, fused multiply-add,
+  reciprocal-step and reciprocal-square-root-step algorithms. The previous
+  host arithmetic lost ARM rounding, NaN priority, flush modes and FPSR flags.
+- Added two- and three-operand NaN processing in signaling-before-quiet order.
+
+### Binary layout verification
+- PASS: these modules operate on integer bit patterns and the existing `Fpcr`,
+  `Fpsr` and `FpUnpacked` values; no guest-visible layout changed.
+
+### Behavioral verification
+- Re-read all listed headers and implementations after the port. Common FP unit
+  tests pass; the A64 differential corpus passes 10,520 guest instructions with
+  eight randomized register/FPCR/FPSR states each.
+
+## 2026-08-02 — externals/rdynarmic/src/backend/x64/{emit_fp_vector_convert.rs,emit_vector_helpers.rs,emit_context.rs,fp_helpers.rs} vs externals/dynarmic/src/dynarmic/backend/x64/{emit_x64_vector_floating_point.cpp,a64_jitstate.cpp}
+
+### Intentional differences
+- Exact common-FP host fallbacks replace several inline SSE/AVX correction
+  paths. The vector FMA and reciprocal-square-root fallbacks explicitly model
+  upstream's observable native-path `IDC`/`IXC` behavior when FMA/AVX exists.
+
+### Unintentional differences (fixed)
+- Vector FP conversions now receive FPCR and update sticky FPSR state.
+- Added the upstream-equivalent FP-aware fallback ABIs for one, two and three
+  vector operands, including Windows shadow space and System V argument order.
+- Vector fixed-point conversion now follows upstream saturation, scaling,
+  rounding and MXCSR selection instead of approximate Rust casts.
+- Vector FMA, reciprocal steps and reciprocal-square-root steps now use fused
+  reference arithmetic and ARM NaN/default-NaN rules.
+- `FRSQRTE` now preserves the `IXC` side effect of upstream's AVX sqrt/div path
+  only when every lane is positive, normal and finite.
+
+### Missing items
+- Several upstream inline fast paths remain represented by exact host calls;
+  behavior is covered, but those operations retain additional call overhead.
+
+### Binary layout verification
+- PASS: A64/A32 MXCSR offsets use `offset_of!` on their existing JIT states.
+  The six-argument fallback stack layouts match the upstream platform ABIs.
+
+### Behavioral verification
+- Re-read `EmitFourOpFallbackWithoutRegAlloc`, `EmitFPVectorMulAdd`,
+  `EmitRSqrtEstimate`, vector conversion emitters and A64 MXCSR handling.
+  Focused FMA and FRSQRTE tests each pass 100,000 randomized states against the
+  reset-per-case upstream oracle; the complete extracted FP corpus also passes.
+
+## 2026-08-02 — externals/rdynarmic/src/frontend/a64/translate/{simd_two_register_misc.rs,visitor.rs} vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_two_register_misc.cpp
+
+### Unintentional differences (fixed)
+- `FCVTL`/`FCVTL2` no longer fall through to interpretation. The translator
+  reads the selected 64-bit vector half, converts each half/single lane with
+  the current FPCR rounding mode, and writes the full widened vector.
+
+### Binary layout verification
+- PASS: no decoded-instruction or guest-state layout changed.
+
+### Behavioral verification
+- Re-read upstream `FCVTL` after implementation. Translation tests cover the
+  opcode and a JIT regression verifies NaN conversion and `FPSR.IOC`.

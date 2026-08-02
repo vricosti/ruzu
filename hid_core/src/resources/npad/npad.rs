@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::frontend::emulated_controller::{
-    get_simple_npad_button_state, AnalogSticks, BatteryLevelState, ControllerColors,
-    ControllerTriggerType, ControllerUpdateCallback,
+    apply_simple_npad_stick_buttons, get_simple_npad_button_state, AnalogSticks, BatteryLevelState,
+    ControllerColors, ControllerTriggerType, ControllerUpdateCallback,
 };
 use crate::hid_core::{EmulatedControllerHandle, HIDCore, AVAILABLE_CONTROLLERS};
 use crate::hid_result;
@@ -424,9 +424,11 @@ impl NPad {
                 }
 
                 device.status_update();
+                let simple_buttons = get_simple_npad_button_state().raw;
                 let mut button_state = device.get_npad_buttons();
-                button_state.raw |= get_simple_npad_button_state().raw;
-                let stick_state = device.get_sticks();
+                button_state.raw |= simple_buttons;
+                let mut stick_state = device.get_sticks();
+                apply_simple_npad_stick_buttons(&mut stick_state, simple_buttons);
                 let trigger_state = device.get_triggers();
                 drop(device);
 

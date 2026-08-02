@@ -114,6 +114,40 @@ pub fn get_simple_npad_button_state() -> NpadButtonState {
     }
 }
 
+/// Keeps the env-gated scripted stick-direction bits consistent with the
+/// analog coordinates a real `EmulatedController::SetStick` update exposes.
+pub fn apply_simple_npad_stick_buttons(sticks: &mut AnalogSticks, buttons: NpadButton) {
+    let left_x = i32::from(buttons.contains(NpadButton::STICK_L_RIGHT))
+        - i32::from(buttons.contains(NpadButton::STICK_L_LEFT));
+    let left_y = i32::from(buttons.contains(NpadButton::STICK_L_UP))
+        - i32::from(buttons.contains(NpadButton::STICK_L_DOWN));
+    let right_x = i32::from(buttons.contains(NpadButton::STICK_R_RIGHT))
+        - i32::from(buttons.contains(NpadButton::STICK_R_LEFT));
+    let right_y = i32::from(buttons.contains(NpadButton::STICK_R_UP))
+        - i32::from(buttons.contains(NpadButton::STICK_R_DOWN));
+
+    let left_active = buttons.intersects(
+        NpadButton::STICK_L_LEFT
+            | NpadButton::STICK_L_UP
+            | NpadButton::STICK_L_RIGHT
+            | NpadButton::STICK_L_DOWN,
+    );
+    let right_active = buttons.intersects(
+        NpadButton::STICK_R_LEFT
+            | NpadButton::STICK_R_UP
+            | NpadButton::STICK_R_RIGHT
+            | NpadButton::STICK_R_DOWN,
+    );
+    if left_active {
+        sticks.left.x = left_x * HID_JOYSTICK_MAX;
+        sticks.left.y = left_y * HID_JOYSTICK_MAX;
+    }
+    if right_active {
+        sticks.right.x = right_x * HID_JOYSTICK_MAX;
+        sticks.right.y = right_y * HID_JOYSTICK_MAX;
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AnalogSticks {
     pub left: AnalogStickState,
@@ -2028,7 +2062,7 @@ mod tests {
         assert_eq!(weak.amplification_type, VibrationAmplificationType::Linear);
     }
 
-    use super::parse_u64_auto;
+    use super::{apply_simple_npad_stick_buttons, parse_u64_auto, AnalogSticks};
 
     #[test]
     fn scripted_npad_parser_uses_decimal_unless_prefixed_hex() {
@@ -2036,5 +2070,19 @@ mod tests {
         assert_eq!(parse_u64_auto("0x1000"), Some(0x1000));
         assert_eq!(parse_u64_auto("0X4C0"), Some(0x4C0));
         assert_eq!(parse_u64_auto("not-a-number"), None);
+    }
+
+    #[test]
+    fn scripted_stick_direction_bits_also_drive_analog_coordinates() {
+        let mut sticks = AnalogSticks::default();
+        apply_simple_npad_stick_buttons(
+            &mut sticks,
+            NpadButton::STICK_L_DOWN | NpadButton::STICK_R_LEFT,
+        );
+
+        assert_eq!(sticks.left.x, 0);
+        assert_eq!(sticks.left.y, -HID_JOYSTICK_MAX);
+        assert_eq!(sticks.right.x, -HID_JOYSTICK_MAX);
+        assert_eq!(sticks.right.y, 0);
     }
 }
