@@ -30972,3 +30972,81 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 
 ### Binary layout verification
 - PASS: device ownership changes are host-only and leave NPAD shared-memory layouts unchanged.
+## 2026-08-03 — externals/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp
+
+### Intentional differences
+- The Rust instruction encoder exposes `mov_v_d1_from_v_d0` explicitly instead
+  of using Oaknut's typed `MOV(Vd.D[1], Vn.D[0])` API. It emits the identical
+  ARM64 instruction word.
+
+### Unintentional differences (to fix)
+- None in `Pack2x64To1x128` after this pass.
+
+### Missing items
+- None for this opcode.
+
+### Binary layout verification
+- PASS: no shared structure or serialized layout changed.
+
+### Behavioral verification
+- Re-read upstream after implementation. All four GPR/FPR location
+  combinations preserve upstream's argument acquisition, register-allocation,
+  realization, low-lane move, and high-lane insertion order.
+- `emit_arm64_packs_two_gprs_into_one_q_register` passes and covers the A64
+  exclusive-store path used by the reproducer.
+- `backend::arm64::inst::tests::encodes_known_arm64_words` passes; the two new
+  lane-move fixtures match words independently assembled by Apple's ARM64
+  assembler.
+
+## 2026-08-03 — externals/rdynarmic/src/backend/arm64/emit_arm64_vector_floating_point.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector_floating_point.cpp
+
+### Intentional differences
+- The Rust instruction encoder names the fixed half-precision sign-bit clear
+  `bic_v8h_sign_bit`; upstream expresses the same instruction through
+  Oaknut's typed immediate `BIC` API.
+
+### Unintentional differences (to fix)
+- None in `FPVectorAbs16`, `FPVectorAbs32`, or `FPVectorAbs64` after this pass.
+
+### Missing items
+- Other vector floating-point opcodes remain governed by their existing audit
+  entries; this slice only covers the three upstream `FPVectorAbs` owners.
+
+### Binary layout verification
+- PASS: no shared structure or serialized layout changed.
+
+### Behavioral verification
+- Re-read upstream after implementation. The 16-bit path preserves the
+  in-place `ReadWriteQ` and immediate `BIC`; the 32/64-bit paths use the same
+  two-operand arranged helper, FPSR load, FPCR handling, and `FABS` ordering.
+- `emit_arm64_routes_fp_vector_abs_to_vector_fp_owner` passes for all three
+  element sizes.
+- `backend::arm64::inst::tests::encodes_known_arm64_words` passes; the new
+  instruction words match Apple's ARM64 assembler.
+
+## 2026-08-03 — externals/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs vs externals/dynarmic/src/dynarmic/backend/arm64/emit_arm64_floating_point.cpp
+
+### Intentional differences
+- Rust passes the raw ARM64 encoders `fmax_s`, `fmax_d`, `fmin_s`, and
+  `fmin_d` to the existing `emit_three_op` helper; upstream passes equivalent
+  Oaknut lambdas to `EmitThreeOp<32/64>`.
+
+### Unintentional differences (to fix)
+- None in `FPMax32`, `FPMax64`, `FPMin32`, or `FPMin64` after this pass.
+
+### Missing items
+- Other scalar floating-point opcodes remain governed by their existing audit
+  entries; this slice covers only the four opcodes exposed by the reproducer.
+
+### Binary layout verification
+- PASS: no shared structure or serialized layout changed.
+
+### Behavioral verification
+- Re-read upstream after implementation. All four paths use the same
+  three-operand register acquisition, FPSR load, FPCR handling, and native
+  `FMAX`/`FMIN` instruction ordering as upstream.
+- `emit_arm64_routes_scalar_fp_min_max_to_fp_owner` covers all four outer
+  dispatcher routes.
+- `backend::arm64::inst::tests::encodes_known_arm64_words` covers the four
+  instruction encoders with words independently assembled by Apple's ARM64
+  assembler.
